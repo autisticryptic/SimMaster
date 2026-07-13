@@ -14,7 +14,7 @@ use crate::access::vowifi::runtime::VowifiRuntime;
 use crate::cellular::cell_lock_store::CellLockStore;
 use crate::config::ConfigManager;
 use crate::db::Database;
-use crate::device_network::DdnsManager;
+use crate::network::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
 use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;

@@ -1,6 +1,6 @@
 use crate::config::{ConfigManager, NotificationRule};
 use crate::db::{Database, PeriodSmsStats};
-use crate::device_network::DdnsManager;
+use crate::network::device_network::DdnsManager;
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::cellular::modem_manager::{
@@ -442,7 +442,7 @@ pub async fn collect_device_status_report(
         &items,
         &["wlan_enabled", "wlan_connected", "wlan_ssid", "wlan_ip"],
     ) {
-        if let Ok(wlan) = crate::device_network::wlan_status().await {
+        if let Ok(wlan) = crate::network::device_network::wlan_status().await {
             if items.contains("wlan_enabled") {
                 lines.push(format!(
                     "WLAN：{}，{}",

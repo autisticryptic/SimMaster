@@ -1698,7 +1698,7 @@ pub async fn clear_device_ddns_logs_handler(State(app): State<AppState>) -> impl
 
 /// GET /api/device-network/wlan/status
 pub async fn get_device_wlan_status_handler() -> impl IntoResponse {
-    match crate::device_network::wlan_status().await {
+    match crate::network::device_network::wlan_status().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1717,7 +1717,7 @@ pub async fn get_device_wlan_status_handler() -> impl IntoResponse {
 pub async fn set_device_wlan_enabled_handler(
     Json(payload): Json<WlanEnabledRequest>,
 ) -> impl IntoResponse {
-    match crate::device_network::wlan_set_enabled(payload).await {
+    match crate::network::device_network::wlan_set_enabled(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1737,7 +1737,7 @@ pub async fn set_device_wlan_enabled_handler(
 
 /// POST /api/device-network/wlan/scan
 pub async fn scan_device_wlan_handler() -> impl IntoResponse {
-    match crate::device_network::wlan_scan().await {
+    match crate::network::device_network::wlan_scan().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1754,7 +1754,7 @@ pub async fn scan_device_wlan_handler() -> impl IntoResponse {
 
 /// GET /api/device-network/wlan/profiles
 pub async fn get_device_wlan_profiles_handler() -> impl IntoResponse {
-    match crate::device_network::wlan_profiles().await {
+    match crate::network::device_network::wlan_profiles().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1773,7 +1773,7 @@ pub async fn get_device_wlan_profiles_handler() -> impl IntoResponse {
 pub async fn forget_device_wlan_handler(
     Json(payload): Json<WlanForgetRequest>,
 ) -> impl IntoResponse {
-    match crate::device_network::wlan_forget(payload).await {
+    match crate::network::device_network::wlan_forget(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1797,8 +1797,8 @@ pub async fn connect_device_wlan_handler(
     Json(payload): Json<WlanConnectRequest>,
 ) -> impl IntoResponse {
     let target_ssid = payload.ssid.clone();
-    let previous = crate::device_network::wlan_status().await.ok();
-    match crate::device_network::wlan_connect(payload).await {
+    let previous = crate::network::device_network::wlan_status().await.ok();
+    match crate::network::device_network::wlan_connect(payload).await {
         Ok(data) => {
             if data.connected {
                 app.system_event_emitter
@@ -1851,8 +1851,8 @@ pub async fn connect_device_wlan_handler(
 
 /// POST /api/device-network/wlan/disconnect
 pub async fn disconnect_device_wlan_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let previous = crate::device_network::wlan_status().await.ok();
-    match crate::device_network::wlan_disconnect().await {
+    let previous = crate::network::device_network::wlan_status().await.ok();
+    match crate::network::device_network::wlan_disconnect().await {
         Ok(data) => {
             if previous
                 .as_ref()
@@ -1889,7 +1889,7 @@ pub async fn disconnect_device_wlan_handler(State(app): State<AppState>) -> impl
 pub async fn save_device_wlan_profile_handler(
     Json(payload): Json<WlanProfileRequest>,
 ) -> impl IntoResponse {
-    match crate::device_network::wlan_save_profile(payload).await {
+    match crate::network::device_network::wlan_save_profile(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(

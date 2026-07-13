@@ -6105,7 +6105,7 @@ pub async fn data_connection_watchdog(
     config: std::sync::Arc<ConfigManager>,
     system_events: std::sync::Arc<SystemEventEmitter>,
 ) {
-    use crate::iptables::get_iptables_rule_count;
+    use crate::network::iptables::get_iptables_rule_count;
 
     let mut last_log = String::new();
     let mut iptables_rules_logged = false;
