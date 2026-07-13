@@ -11,7 +11,7 @@ use zbus::Connection;
 
 use crate::access::volte::runtime::VolteRuntime;
 use crate::access::vowifi::runtime::VowifiRuntime;
-use crate::cell_lock_store::CellLockStore;
+use crate::cellular::cell_lock_store::CellLockStore;
 use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::device_network::DdnsManager;

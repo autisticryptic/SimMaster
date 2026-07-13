@@ -25,7 +25,7 @@ use crate::{
         DeviceInfoResponse, NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode,
         RadioModeResponse, ServingCell, SetApnRequest, SignalStrengthResponse, SimInfoResponse,
     },
-    serial::with_serial,
+    cellular::serial::with_serial,
     system_event::{
         codes as system_event_codes, severity as system_event_severity,
         status as system_event_status, SystemEventEmitter,

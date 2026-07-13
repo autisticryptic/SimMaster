@@ -10,7 +10,7 @@ use crate::db::{
 };
 use crate::device_status::DeviceStatusReport;
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
-use crate::modem_manager::get_sim_info_data_with_cache;
+use crate::cellular::modem_manager::get_sim_info_data_with_cache;
 use crate::system_event::SystemEvent;
 use crate::verification_code::extract_verification_code;
 use base64::{engine::general_purpose, Engine as _};
@@ -279,7 +279,7 @@ impl NotificationSender {
     async fn sms_template_context(&self) -> SmsTemplateContext {
         let own_number = self.get_own_number().await;
 
-        let carrier = crate::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
+        let carrier = crate::cellular::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
             .await
             .ok()
             .map(|net| net.operator_name)

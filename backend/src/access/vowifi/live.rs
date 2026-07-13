@@ -40,7 +40,7 @@ use super::{
         self, ImsEspFlowConfig, ImsEspPolicyConfig, TunGatewayConfig, TunGatewayRuntime,
     },
 };
-use crate::modem_manager::{current_sim_identity, get_sim_info_data_with_cache};
+use crate::cellular::modem_manager::{current_sim_identity, get_sim_info_data_with_cache};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},

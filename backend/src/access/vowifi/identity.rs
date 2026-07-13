@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::{modem_manager::SimIdentity, system_event::mask_identifier};
+use crate::{cellular::modem_manager::SimIdentity, system_event::mask_identifier};
 
 /// SIM identity held by the local VoWiFi runtime.
 ///

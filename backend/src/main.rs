@@ -26,7 +26,6 @@ use zbus::Connection;
 
 mod api;
 mod automation;
-mod cell_lock_store;
 mod config;
 mod db;
 mod device_network;
@@ -34,11 +33,10 @@ mod device_status;
 mod esim;
 mod ims;
 mod iptables;
-mod modem_manager;
+mod cellular;
 mod notification;
 mod notification_queue;
 mod ota;
-mod serial;
 mod sms_listener;
 mod state;
 mod system_event;
@@ -52,7 +50,7 @@ use db::Database;
 use device_network::DdnsManager;
 use esim::EsimSupervisor;
 use api::handlers::*;
-use modem_manager::{ensure_nm_modem_profile, init_data_connection};
+use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notification::NotificationSender;
 use notification_queue::*;
 use state::AppState;
@@ -456,7 +454,7 @@ async fn main() -> Result<()> {
             // 初始延迟 5 秒，等待系统稳定
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             tracing::info!(interval = 15, "Watchdog started");
-            modem_manager::data_connection_watchdog(
+            cellular::modem_manager::data_connection_watchdog(
                 conn_clone,
                 15,
                 user_off,

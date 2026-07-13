@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use zbus::Connection;
 
 use crate::{
-    modem_manager,
+    cellular::modem_manager,
     config::{ApnConfig, VolteConfig, VowifiConfig},
     db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -26,7 +26,7 @@ use crate::{
     },
     esim::EsimApiError,
     api::models::*,
-    modem_manager::{
+    cellular::modem_manager::{
         answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
         find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
         get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
@@ -174,7 +174,7 @@ fn split_profile_operator_code(code: &str) -> (String, String) {
 
 fn enrich_profiles_with_current_identity(
     profiles: &mut [EsimProfile],
-    identity: &crate::modem_manager::SimIdentity,
+    identity: &crate::cellular::modem_manager::SimIdentity,
 ) {
     let current_index = profiles
         .iter()
@@ -1081,7 +1081,7 @@ pub async fn update_sim_cache_handler(
     };
 
     if let Some(sms_center) = &payload.sms_center {
-        crate::modem_manager::cache_smsc_for_identity(
+        crate::cellular::modem_manager::cache_smsc_for_identity(
             &app.database,
             &identity,
             sms_center,
@@ -1090,7 +1090,7 @@ pub async fn update_sim_cache_handler(
     }
 
     if let Some(phone_number) = &payload.phone_number {
-        crate::modem_manager::cache_own_numbers_for_identity(
+        crate::cellular::modem_manager::cache_own_numbers_for_identity(
             &app.database,
             &identity,
             &[phone_number.clone()],
@@ -5648,7 +5648,7 @@ pub async fn test_automation_task_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::modem_manager::SimIdentity;
+    use crate::cellular::modem_manager::SimIdentity;
 
     #[test]
     fn enriches_enabled_esim_profile_from_current_sim_identity() {

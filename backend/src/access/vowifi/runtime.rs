@@ -18,7 +18,7 @@ use super::{
     identity::VowifiSimIdentity,
     restore::RestoreProgress,
 };
-use crate::modem_manager::current_sim_identity;
+use crate::cellular::modem_manager::current_sim_identity;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePhase {

@@ -292,7 +292,7 @@ pub async fn read_interface_stats(
 
     if let Some(c) = conn {
         if let Ok(Some(mm_stats)) =
-            crate::modem_manager::get_bearer_stats_for_interface(c, interface).await
+            crate::cellular::modem_manager::get_bearer_stats_for_interface(c, interface).await
         {
             rx_bytes = std::cmp::max(rx_bytes, mm_stats.rx_bytes);
             tx_bytes = std::cmp::max(tx_bytes, mm_stats.tx_bytes);
@@ -1257,7 +1257,7 @@ pub async fn read_network_interfaces(
 
     let mut interfaces = Vec::new();
     let bearer_stats_by_interface = if let Some(c) = conn {
-        crate::modem_manager::get_bearer_stats_by_interface(c)
+        crate::cellular::modem_manager::get_bearer_stats_by_interface(c)
             .await
             .unwrap_or_default()
     } else {

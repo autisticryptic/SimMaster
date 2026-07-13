@@ -3,7 +3,7 @@ use crate::db::{Database, PeriodSmsStats};
 use crate::device_network::DdnsManager;
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
-use crate::modem_manager::{
+use crate::cellular::modem_manager::{
     get_airplane_mode, get_cells_data, get_data_connection_status, get_device_info_data,
     get_is_roaming_mm, get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
 };

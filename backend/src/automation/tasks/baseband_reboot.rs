@@ -1,5 +1,5 @@
 use crate::automation::traits::AutomationTaskHandler;
-use crate::modem_manager::restart_baseband;
+use crate::cellular::modem_manager::restart_baseband;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
