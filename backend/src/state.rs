@@ -17,7 +17,7 @@ use crate::db::Database;
 use crate::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
 use crate::notification::NotificationSender;
-use crate::sms_listener::SmsResyncHandle;
+use crate::messaging::sms_listener::SmsResyncHandle;
 use crate::system_event::SystemEventEmitter;
 
 #[derive(Clone)]

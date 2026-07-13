@@ -37,12 +37,11 @@ mod cellular;
 mod notification;
 mod notification_queue;
 mod ota;
-mod sms_listener;
+mod messaging;
 mod state;
 mod system_event;
 mod system_event_monitor;
 mod utils;
-mod verification_code;
 mod access;
 
 use config::{get_default_config_path, ConfigManager};
@@ -338,7 +337,7 @@ async fn main() -> Result<()> {
         Arc::clone(&app_db),
     ));
     let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
-    let (sms_resync, sms_resync_rx) = sms_listener::sms_resync_channel();
+    let (sms_resync, sms_resync_rx) = messaging::sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
     {
         let notification_queue_worker = Arc::clone(&notification_sender);
@@ -409,7 +408,7 @@ async fn main() -> Result<()> {
         let sms_config_clone = Arc::clone(&config_manager);
         let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
-            let _ = sms_listener::start_sms_listener(
+            let _ = messaging::sms_listener::start_sms_listener(
                 conn_clone,
                 db_clone,
                 notification_clone,
