@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::db::{CallRecord, CallStats, SmsMessage, SmsStats};
+use crate::infra::db::{CallRecord, CallStats, SmsMessage, SmsStats};
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {

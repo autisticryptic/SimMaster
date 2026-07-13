@@ -14,8 +14,8 @@ use zbus::{
 };
 
 use crate::{
-    config::{ApnConfig, ConfigManager},
-    db::Database,
+    infra::config::{ApnConfig, ConfigManager},
+    infra::db::Database,
 };
 use crate::{
     api::models::{
@@ -1159,7 +1159,7 @@ pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
         .await
         .unwrap_or_default();
-    let iccid = crate::utils::normalize_iccid(
+    let iccid = crate::infra::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
             .map(extract_string)
@@ -1851,7 +1851,7 @@ pub async fn get_sim_info_data_with_cache(
 
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
     let msg_smsc = messaging_smsc_fallback(conn, &modem_path).await;
-    let iccid = crate::utils::normalize_iccid(
+    let iccid = crate::infra::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
             .map(extract_string)

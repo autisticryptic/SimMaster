@@ -26,9 +26,8 @@ use zbus::Connection;
 
 mod api;
 mod automation;
-mod config;
-mod db;
 mod ims;
+mod infra;
 mod cellular;
 mod network;
 mod notify;
@@ -36,11 +35,10 @@ mod messaging;
 mod sim;
 mod state;
 mod system;
-mod utils;
 mod access;
 
-use config::{get_default_config_path, ConfigManager};
-use db::Database;
+use infra::config::{get_default_config_path, ConfigManager};
+use infra::db::Database;
 use network::device_network::DdnsManager;
 use sim::esim::EsimSupervisor;
 use api::handlers::*;

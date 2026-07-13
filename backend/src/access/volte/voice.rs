@@ -17,7 +17,7 @@
 //! parameters (from `VolteConfig`) and wires the call state machine to the VoLTE
 //! IMS session established in `runtime`/`register`.
 
-use crate::config::VolteConfig;
+use crate::infra::config::VolteConfig;
 use crate::access::vowifi::voice::{
     build_mo_audio_offer_with_params, build_sdp_answer_with_params, parse_audio_sdp, AudioCodec,
     CallEndReason, SdpAddrType, SdpAudioDescription, VoiceCallStateMachine, VoiceLegKind,

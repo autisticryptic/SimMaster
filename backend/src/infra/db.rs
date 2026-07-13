@@ -2966,7 +2966,7 @@ impl Database {
     // ==================== eSIM Profile cache ====================
 
     pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
-        let iccid = crate::utils::normalize_iccid(&entry.iccid);
+        let iccid = crate::infra::utils::normalize_iccid(&entry.iccid);
         if iccid.is_empty() {
             return Ok(());
         }
@@ -3033,7 +3033,7 @@ impl Database {
     }
 
     pub fn get_esim_profile_cache(&self, iccid: &str) -> Result<Option<EsimProfileCacheEntry>> {
-        let iccid = crate::utils::normalize_iccid(iccid);
+        let iccid = crate::infra::utils::normalize_iccid(iccid);
         if iccid.is_empty() {
             return Ok(None);
         }
@@ -3096,7 +3096,7 @@ impl Database {
     }
 
     pub fn delete_esim_profile_cache(&self, iccid: &str) -> Result<()> {
-        let iccid = crate::utils::normalize_iccid(iccid);
+        let iccid = crate::infra::utils::normalize_iccid(iccid);
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "DELETE FROM esim_profile_cache WHERE iccid = ?1",

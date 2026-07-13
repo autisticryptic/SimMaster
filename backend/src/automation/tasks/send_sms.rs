@@ -1,5 +1,5 @@
 use crate::automation::traits::AutomationTaskHandler;
-use crate::db::beijing_sms_now_string;
+use crate::infra::db::beijing_sms_now_string;
 use crate::cellular::modem_manager::send_sms;
 use crate::state::AppState;
 use anyhow::{Context, Result};

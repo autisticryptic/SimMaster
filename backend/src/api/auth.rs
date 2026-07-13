@@ -20,8 +20,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    config::SecurityConfig,
-    db::Database,
+    infra::config::SecurityConfig,
+    infra::db::Database,
     api::models::ApiResponse,
     state::AppState,
     system::system_event::{

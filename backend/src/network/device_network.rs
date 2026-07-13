@@ -12,7 +12,7 @@ use ring::{digest, hmac};
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex;
 
-use crate::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
+use crate::infra::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
 use crate::api::models::{
     DdnsEvent, DdnsLogEntry, DdnsLogsResponse, DdnsRecordSyncResult, DdnsStatusResponse,
     DdnsSyncResponse, WlanConnectRequest, WlanEnabledRequest, WlanForgetRequest, WlanNetwork,
@@ -20,7 +20,7 @@ use crate::api::models::{
     WlanStatusResponse,
 };
 use crate::notify::notification::NotificationSender;
-use crate::utils::{
+use crate::infra::utils::{
     interface_addresses_for_family, preferred_interface_for_family, read_network_interfaces,
     NetworkAddressFamily,
 };

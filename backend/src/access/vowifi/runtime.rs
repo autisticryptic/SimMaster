@@ -206,14 +206,14 @@ impl VowifiRuntime {
         snapshot
     }
 
-    pub async fn refresh_live_readiness(&self, db: Option<&crate::db::Database>) -> RuntimeSnapshot {
+    pub async fn refresh_live_readiness(&self, db: Option<&crate::infra::db::Database>) -> RuntimeSnapshot {
         self.refresh_live_readiness_with_stage_timeout(db, Duration::from_secs(30))
             .await
     }
 
     pub async fn refresh_status_readiness_with_stage_timeout(
         &self,
-        db: Option<&crate::db::Database>,
+        db: Option<&crate::infra::db::Database>,
         stage_timeout: Duration,
     ) -> RuntimeSnapshot {
         self.refresh_live_readiness_controlled(
@@ -227,7 +227,7 @@ impl VowifiRuntime {
 
     pub async fn refresh_live_readiness_with_stage_timeout(
         &self,
-        db: Option<&crate::db::Database>,
+        db: Option<&crate::infra::db::Database>,
         stage_timeout: Duration,
     ) -> RuntimeSnapshot {
         self.refresh_live_readiness_controlled(
@@ -241,7 +241,7 @@ impl VowifiRuntime {
 
     pub async fn connect_live_with_stage_timeout(
         &self,
-        db: Option<&crate::db::Database>,
+        db: Option<&crate::infra::db::Database>,
         stage_timeout: Duration,
     ) -> RuntimeSnapshot {
         let _refresh =
@@ -278,7 +278,7 @@ impl VowifiRuntime {
 
     async fn refresh_live_readiness_controlled(
         &self,
-        db: Option<&crate::db::Database>,
+        db: Option<&crate::infra::db::Database>,
         stage_timeout: Duration,
         min_interval: Duration,
         scope: LiveRefreshScope,
@@ -300,7 +300,7 @@ impl VowifiRuntime {
 
     async fn refresh_live_readiness_once(
         &self,
-        db: Option<&crate::db::Database>,
+        db: Option<&crate::infra::db::Database>,
         stage_timeout: Duration,
         scope: LiveRefreshScope,
     ) -> RuntimeSnapshot {
@@ -354,7 +354,7 @@ impl VowifiRuntime {
                         _ => ("", "", ""),
                     };
                     if !event_type.is_empty() {
-                        let _ = database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+                        let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
                             trace_id: Some("runtime-connect"),
                             level,
                             phase,
@@ -398,7 +398,7 @@ impl VowifiRuntime {
                             _ => vec![],
                         };
                         for (event_type, phase, level) in events {
-                            let _ = database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+                            let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
                                 trace_id: Some("runtime-connect"),
                                 level,
                                 phase,
@@ -423,7 +423,7 @@ impl VowifiRuntime {
                             } else {
                                 "{}".to_string()
                             };
-                            let _ = database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+                            let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
                                 trace_id: Some("runtime-connect"),
                                 level: "error",
                                 phase,

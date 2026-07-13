@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 
-use crate::db::Database;
+use crate::infra::db::Database;
 use crate::api::models::ApiResponse;
 
 #[derive(Debug, Default, Deserialize)]
@@ -26,7 +26,7 @@ pub async fn get_notification_queue_handler(
     State(database): State<Arc<Database>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::db::NotificationQueueResponse>>,
+    Json<ApiResponse<crate::infra::db::NotificationQueueResponse>>,
 ) {
     match database.get_notification_queue(query.limit) {
         Ok(queue) => (

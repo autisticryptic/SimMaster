@@ -19,8 +19,8 @@ use zbus::Connection;
 
 use crate::{
     cellular::modem_manager,
-    config::{ApnConfig, VolteConfig, VowifiConfig},
-    db::{
+    infra::config::{ApnConfig, VolteConfig, VowifiConfig},
+    infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
     },
@@ -43,7 +43,7 @@ use crate::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
-    utils::{
+    infra::utils::{
         connection_addresses_from_interfaces, format_uptime, get_active_interfaces, read_cpu_info,
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
@@ -434,7 +434,7 @@ pub async fn get_esim_config_handler(State(app): State<AppState>) -> impl IntoRe
 /// POST /api/esim/config
 pub async fn set_esim_config_handler(
     State(app): State<AppState>,
-    Json(payload): Json<crate::config::EsimConfig>,
+    Json(payload): Json<crate::infra::config::EsimConfig>,
 ) -> impl IntoResponse {
     match app.config_manager.set_esim_config(payload) {
         Ok(_) => (
@@ -767,7 +767,7 @@ pub async fn download_esim_profile_handler(
         app.esim_supervisor.get_profiles().await.ok().map(|resp| {
             resp.profiles
                 .into_iter()
-                .map(|p| crate::utils::normalize_iccid(&p.iccid))
+                .map(|p| crate::infra::utils::normalize_iccid(&p.iccid))
                 .collect()
         });
 
@@ -849,7 +849,7 @@ pub async fn download_esim_profile_handler(
                     if let Some(resp) = profiles_resp {
                         if let Some(ref init_iccids) = initial_iccids_opt {
                             for p in resp.profiles {
-                                let norm_iccid = crate::utils::normalize_iccid(&p.iccid);
+                                let norm_iccid = crate::infra::utils::normalize_iccid(&p.iccid);
                                 let is_new_profile = !init_iccids.contains(&norm_iccid);
 
                                 if is_new_profile {
@@ -1576,7 +1576,7 @@ pub async fn get_device_ddns_config_handler(State(app): State<AppState>) -> impl
 /// POST /api/device-network/ddns/config
 pub async fn set_device_ddns_config_handler(
     State(app): State<AppState>,
-    Json(mut payload): Json<crate::config::DdnsConfig>,
+    Json(mut payload): Json<crate::infra::config::DdnsConfig>,
 ) -> impl IntoResponse {
     let current = app.config_manager.get_ddns_config();
     if is_masked_secret(&payload.access_id) {
@@ -1616,7 +1616,7 @@ pub async fn set_device_ddns_config_handler(
 }
 
 fn ddns_config_response(
-    mut config: crate::config::DdnsConfig,
+    mut config: crate::infra::config::DdnsConfig,
     access_secret_set: bool,
 ) -> serde_json::Value {
     config.access_id = mask_secret(&config.access_id);
@@ -2225,7 +2225,7 @@ pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> i
 
 // ============ 短信功能 ============
 
-use crate::db::{Database, EsimProfileCacheEntry};
+use crate::infra::db::{Database, EsimProfileCacheEntry};
 
 fn schedule_sms_db_maintenance(app: &AppState, deleted: usize) {
     if deleted < SMS_DB_MAINTENANCE_DELETE_THRESHOLD {
@@ -2319,7 +2319,7 @@ fn persist_vowifi_mt_deliveries(db: &Database, outcome: &MoSmsSipOutcome) -> Vec
             let storage_marker = format!("vowifi-mt:{storage_key}");
             api_sms_id = db.sms_id_by_pdu(&storage_marker).unwrap_or(None);
             if api_sms_id.is_none() {
-                let timestamp = crate::db::beijing_sms_now_string();
+                let timestamp = crate::infra::db::beijing_sms_now_string();
                 api_sms_id = db
                     .insert_sms_at_with_transport(
                         "incoming",
@@ -2468,7 +2468,7 @@ fn persist_vowifi_restore_phase(
 ) {
     if let Err(err) = app
         .database
-        .upsert_vowifi_esim_restore(crate::db::NewVowifiEsimRestore {
+        .upsert_vowifi_esim_restore(crate::infra::db::NewVowifiEsimRestore {
             switch_token: Some(switch_token),
             switch_phase: Some(switch_phase),
             phase_ms: Some(phase_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64),
@@ -2509,7 +2509,7 @@ pub async fn send_sms_handler(
             let current_snap = app.vowifi_runtime.snapshot().await;
             let profile_meta = current_snap.profile.profile.as_ref();
             let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
-            let _ = app.database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+            let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
                 trace_id: Some("runtime-connect"),
                 level: "info",
                 phase: "connect_start",
@@ -3365,7 +3365,7 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
     let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
 
     // 1. IPSEC Event: 发送 IKEv2 INFORMATIONAL 报文，拆除全部 ESP 安全关联并注销会话
-    let _ = app.database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
         trace_id: Some("runtime-stop"),
         level: "info",
         phase: "connection_stop",
@@ -3381,7 +3381,7 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
     restore_cellular_data_after_vowifi(app).await;
 
     // 2. SMS Event: 短信路径已释放，成功退回到蜂窝基站数据链路。
-    let _ = app.database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
         trace_id: Some("runtime-stop"),
         level: "info",
         phase: "connection_stop",
@@ -3393,7 +3393,7 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
     let status = reset_vowifi_runtime(app, reason).await;
 
     // 3. SYS Event: WiFi Calling 核心服务运行时已停止
-    let _ = app.database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
         trace_id: Some("runtime-stop"),
         level: "info",
         phase: "connection_stop",
@@ -3906,7 +3906,7 @@ async fn connect_vowifi_with_attempts(
     // let _ = app.database.clear_vowifi_runtime_events();
     let profile_meta = current.profile.profile.as_ref();
     let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
-    let _ = app.database.insert_vowifi_runtime_event(crate::db::NewVowifiRuntimeEvent {
+    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
         trace_id: Some("runtime-connect"),
         level: "info",
         phase: "connect_start",
@@ -4301,7 +4301,7 @@ fn persist_vowifi_runtime_snapshot(app: &AppState, status: &VowifiStatusResponse
     let profile_meta = status.profile.profile.as_ref();
     if let Err(err) =
         app.database
-            .upsert_vowifi_runtime_snapshot(crate::db::NewVowifiRuntimeSnapshot {
+            .upsert_vowifi_runtime_snapshot(crate::infra::db::NewVowifiRuntimeSnapshot {
                 phase: status.phase,
                 profile_id: profile_meta.map(|profile| profile.profile_id),
                 plmn: profile_meta.map(|profile| profile.plmn),
@@ -4473,7 +4473,7 @@ pub async fn get_vowifi_sms_delivery_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Option<crate::db::VowifiSmsDeliveryEntry>>>,
+    Json<ApiResponse<Option<crate::infra::db::VowifiSmsDeliveryEntry>>>,
 ) {
     match app.database.get_vowifi_sms_delivery(&message_id) {
         Ok(delivery) => (
@@ -5100,7 +5100,7 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
     )
 }
 
-use crate::config::ConfigManager;
+use crate::infra::config::ConfigManager;
 use crate::notify::notification::NotificationSender;
 
 #[derive(Debug, Default, Deserialize)]
@@ -5142,7 +5142,7 @@ pub async fn get_notification_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::config::NotificationConfig>>,
+    Json<ApiResponse<crate::infra::config::NotificationConfig>>,
 ) {
     let config = config_manager.get_notifications();
     (
@@ -5154,7 +5154,7 @@ pub async fn get_notification_config_handler(
 /// POST /api/notifications/config
 pub async fn set_notification_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
-    Json(notification_config): Json<crate::config::NotificationConfig>,
+    Json(notification_config): Json<crate::infra::config::NotificationConfig>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match config_manager.set_notifications(notification_config) {
         Ok(_) => (
@@ -5211,7 +5211,7 @@ pub async fn get_notification_logs_handler(
     State(database): State<Arc<Database>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::db::NotificationLogsResponse>>,
+    Json<ApiResponse<crate::infra::db::NotificationLogsResponse>>,
 ) {
     match database.get_notification_logs(
         &query.event_type,
@@ -5469,7 +5469,7 @@ pub async fn get_automation_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::config::AutomationConfig>>,
+    Json<ApiResponse<crate::infra::config::AutomationConfig>>,
 ) {
     let config = config_manager.get_automation_config();
     (
@@ -5481,7 +5481,7 @@ pub async fn get_automation_config_handler(
 /// POST /api/automation/config
 pub async fn set_automation_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
-    Json(config): Json<crate::config::AutomationConfig>,
+    Json(config): Json<crate::infra::config::AutomationConfig>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match config_manager.set_automation_config(config) {
         Ok(_) => (
@@ -5504,7 +5504,7 @@ pub async fn get_automation_logs_handler(
     State(database): State<Arc<Database>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::db::AutomationLogsResponse>>,
+    Json<ApiResponse<crate::infra::db::AutomationLogsResponse>>,
 ) {
     match database.get_automation_logs(
         &query.task_type,
@@ -5567,9 +5567,9 @@ pub async fn test_automation_task_handler(
     tokio::spawn(async move {
         let registry = crate::automation::tasks::TaskRegistry::new();
         let task_type = match &task.action {
-            crate::config::AutomationAction::RestartBaseband => "restart_baseband",
-            crate::config::AutomationAction::RebootDevice { .. } => "reboot_device",
-            crate::config::AutomationAction::SendSms { .. } => "send_sms",
+            crate::infra::config::AutomationAction::RestartBaseband => "restart_baseband",
+            crate::infra::config::AutomationAction::RebootDevice { .. } => "reboot_device",
+            crate::infra::config::AutomationAction::SendSms { .. } => "send_sms",
         };
 
         let handler = match registry.get(task_type) {
@@ -5585,11 +5585,11 @@ pub async fn test_automation_task_handler(
 
         let mut delay_secs = 0u64;
         let params = match &task.action {
-            crate::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
-            crate::config::AutomationAction::RebootDevice { delay_seconds } => {
+            crate::infra::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
+            crate::infra::config::AutomationAction::RebootDevice { delay_seconds } => {
                 serde_json::json!({ "delay_seconds": delay_seconds })
             }
-            crate::config::AutomationAction::SendSms {
+            crate::infra::config::AutomationAction::SendSms {
                 phone_number,
                 content,
                 random_delay_seconds,
@@ -5627,7 +5627,7 @@ pub async fn test_automation_task_handler(
             task_type: task_type.to_string(),
             status: status.to_string(),
             message: detail.clone(),
-            timestamp: crate::db::beijing_sms_now_string(),
+            timestamp: crate::infra::db::beijing_sms_now_string(),
         };
 
         let _ = app_state

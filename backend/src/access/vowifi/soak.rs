@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::db::{Database, NewVowifiSoakRun, NewVowifiSoakSample};
+use crate::infra::db::{Database, NewVowifiSoakRun, NewVowifiSoakSample};
 
 use super::{
     executor::{ExecutorStageRequest, ExecutorStageResult},
@@ -59,7 +59,7 @@ where
 mod tests {
     use super::*;
     use crate::{
-        db::Database,
+        infra::db::Database,
         access::vowifi::executor::{
             readiness_key_for_stage, soak_observation_for_stage, ExecutorStage,
             ExecutorStageRequest, ExecutorStageResult, ExecutorStageStatus,

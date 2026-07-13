@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 use tokio::sync::Mutex;
 
-use crate::config::ConfigManager;
+use crate::infra::config::ConfigManager;
 use crate::api::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
     EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,

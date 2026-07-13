@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::db::{
+use crate::infra::db::{
     VowifiEsimRestoreEntry, VowifiRuntimeEventsResponse, VowifiRuntimeSnapshotEntry,
     VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
 };

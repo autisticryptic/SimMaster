@@ -1,11 +1,11 @@
-use crate::config::{
+use crate::infra::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
     LegacyNotificationConfig, MatcherOperator, MessageChannelConfig, NotificationChannel,
     NotificationChannelInstance, NotificationConfig, NotificationEventType, NotificationRule,
     PushPlusConfig, QuietHoursSchedule, TelegramConfig, WebhookConfig, WecomAppConfig,
     WecomRobotConfig,
 };
-use crate::db::{
+use crate::infra::db::{
     CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
 };
 use crate::system::device_status::DeviceStatusReport;
@@ -219,7 +219,7 @@ impl NotificationEvent<'_> {
 
     fn render(&self, template: &str) -> String {
         let template = if template.trim().is_empty() {
-            crate::config::default_rule_template(self.event_type())
+            crate::infra::config::default_rule_template(self.event_type())
         } else {
             template.to_string()
         };
@@ -670,7 +670,7 @@ impl NotificationSender {
     ) {
         if let Err(err) = self
             .database
-            .insert_notification_log(crate::db::NewNotificationLog {
+            .insert_notification_log(crate::infra::db::NewNotificationLog {
                 event_type,
                 status,
                 summary,
@@ -3025,7 +3025,7 @@ fn compute_legacy_signature(secret: &str, data: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::RuleMatcher;
+    use crate::infra::config::RuleMatcher;
 
     #[test]
     fn quiet_schedule_matches_weekday_and_overnight_range() {
@@ -3075,8 +3075,8 @@ mod tests {
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 1,
-            device_status_items: crate::config::default_device_status_items(),
-            device_status_schedule: crate::config::DeviceStatusSchedule::default(),
+            device_status_items: crate::infra::config::default_device_status_items(),
+            device_status_schedule: crate::infra::config::DeviceStatusSchedule::default(),
             device_status_sms_period: "last_24h".to_string(),
         };
         assert!(rule_matches(&contains_rule, &event));
@@ -3105,8 +3105,8 @@ mod tests {
             template: String::new(),
             quiet_hours: Vec::new(),
             ddns_failure_threshold: 5,
-            device_status_items: crate::config::default_device_status_items(),
-            device_status_schedule: crate::config::DeviceStatusSchedule::default(),
+            device_status_items: crate::infra::config::default_device_status_items(),
+            device_status_schedule: crate::infra::config::DeviceStatusSchedule::default(),
             device_status_sms_period: "last_24h".to_string(),
         };
         let mut ddns = DdnsEvent {
