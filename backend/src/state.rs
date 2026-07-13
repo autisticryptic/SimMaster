@@ -15,7 +15,7 @@ use crate::cellular::cell_lock_store::CellLockStore;
 use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::network::device_network::DdnsManager;
-use crate::esim::EsimSupervisor;
+use crate::sim::esim::EsimSupervisor;
 use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;
 use crate::system::system_event::SystemEventEmitter;

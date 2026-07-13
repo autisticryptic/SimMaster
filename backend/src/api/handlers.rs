@@ -24,7 +24,7 @@ use crate::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
     },
-    esim::EsimApiError,
+    sim::esim::EsimApiError,
     api::models::*,
     cellular::modem_manager::{
         answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
@@ -729,7 +729,7 @@ pub async fn delete_esim_profile_handler(
 fn find_and_normalize_profile(value: &serde_json::Value) -> Option<EsimProfile> {
     if let Some(obj) = value.as_object() {
         if obj.contains_key("iccid") || obj.contains_key("ICCID") {
-            return Some(crate::esim::normalize_profile(value));
+            return Some(crate::sim::esim::normalize_profile(value));
         }
         for (_, val) in obj {
             if let Some(p) = find_and_normalize_profile(val) {
