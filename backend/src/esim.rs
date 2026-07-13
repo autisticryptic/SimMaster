@@ -142,7 +142,7 @@ impl EsimSupervisor {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let proxy_prefix = crate::ota::normalize_proxy_prefix(request.proxy_prefix);
+        let proxy_prefix = crate::system::ota::normalize_proxy_prefix(request.proxy_prefix);
         let candidates = match requested_asset_url {
             Some(asset_url) => vec![LpacAssetCandidate {
                 name: asset_url

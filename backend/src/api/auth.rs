@@ -24,7 +24,7 @@ use crate::{
     db::Database,
     api::models::ApiResponse,
     state::AppState,
-    system_event::{
+    system::system_event::{
         codes as system_event_codes, severity as system_event_severity,
         status as system_event_status,
     },

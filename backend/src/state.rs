@@ -18,7 +18,7 @@ use crate::network::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
 use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;
-use crate::system_event::SystemEventEmitter;
+use crate::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {

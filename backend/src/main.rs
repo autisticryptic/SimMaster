@@ -28,17 +28,14 @@ mod api;
 mod automation;
 mod config;
 mod db;
-mod device_status;
 mod esim;
 mod ims;
 mod cellular;
 mod network;
 mod notify;
-mod ota;
 mod messaging;
 mod state;
-mod system_event;
-mod system_event_monitor;
+mod system;
 mod utils;
 mod access;
 
@@ -51,7 +48,7 @@ use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notify::notification::NotificationSender;
 use notify::notification_queue::*;
 use state::AppState;
-use system_event::{
+use system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
 };
@@ -343,11 +340,11 @@ async fn main() -> Result<()> {
             notification_queue_worker.run_queue_worker().await;
         });
     }
-    system_event_monitor::spawn_system_event_monitor(
+    system::system_event_monitor::spawn_system_event_monitor(
         Arc::clone(&system_event_emitter),
         Arc::clone(&dbus_conn),
     );
-    device_status::spawn_device_status_scheduler(
+    system::device_status::spawn_device_status_scheduler(
         Arc::clone(&config_manager),
         Arc::clone(&notification_sender),
         Arc::clone(&app_db),
@@ -382,10 +379,10 @@ async fn main() -> Result<()> {
         let notification_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(crate::ota::duration_until_next_update_check()).await;
+                tokio::time::sleep(crate::system::ota::duration_until_next_update_check()).await;
                 let config = config_clone.get_version_update_notifications();
                 if config.enabled {
-                    if let Err(err) = crate::ota::check_and_notify_version_update(
+                    if let Err(err) = crate::system::ota::check_and_notify_version_update(
                         Arc::clone(&config_clone),
                         Arc::clone(&notification_clone),
                     )

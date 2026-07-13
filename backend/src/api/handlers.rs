@@ -39,7 +39,7 @@ use crate::{
         set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
     },
     state::AppState,
-    system_event::{
+    system::system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
@@ -4907,7 +4907,7 @@ pub async fn system_reboot(
 
 pub async fn run_safe_os_reboot_sequence(
     delay_seconds: u32,
-    system_events: Arc<crate::system_event::SystemEventEmitter>,
+    system_events: Arc<crate::system::system_event::SystemEventEmitter>,
 ) {
     if delay_seconds > 0 {
         tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds as u64)).await;
@@ -5261,7 +5261,7 @@ pub async fn clear_notification_logs_handler(
 
 /// GET /api/ota/status
 pub async fn get_ota_status_handler() -> impl IntoResponse {
-    let status = crate::ota::get_ota_status();
+    let status = crate::system::ota::get_ota_status();
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", status)),
@@ -5270,7 +5270,7 @@ pub async fn get_ota_status_handler() -> impl IntoResponse {
 
 /// POST /api/ota/upload
 pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
-    match crate::ota::handle_ota_upload(&body) {
+    match crate::system::ota::handle_ota_upload(&body) {
         Ok(response) => {
             let message = if response.validation.valid {
                 "OTA uploaded and validated"
@@ -5301,10 +5301,10 @@ pub async fn get_latest_ota_release_handler(
             .as_ref()
             .map(|prefix| !prefix.trim().is_empty())
             .unwrap_or(false);
-        let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = crate::ota::build_ota_http_client()?;
+        let proxy_prefix = crate::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let client = crate::system::ota::build_ota_http_client()?;
 
-        crate::ota::fetch_latest_github_release(&client, &proxy_prefix, include_builtin_proxies)
+        crate::system::ota::fetch_latest_github_release(&client, &proxy_prefix, include_builtin_proxies)
             .await
     }
     .await;
@@ -5334,28 +5334,28 @@ pub async fn prepare_online_ota_handler(
             .as_ref()
             .map(|prefix| !prefix.trim().is_empty())
             .unwrap_or(false);
-        let proxy_prefix = crate::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = crate::ota::build_ota_http_client()?;
+        let proxy_prefix = crate::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let client = crate::system::ota::build_ota_http_client()?;
 
-        let release = crate::ota::fetch_latest_github_release(
+        let release = crate::system::ota::fetch_latest_github_release(
             &client,
             &proxy_prefix,
             include_builtin_proxies,
         )
         .await?;
 
-        let asset = crate::ota::supported_release_asset(&release)
+        let asset = crate::system::ota::supported_release_asset(&release)
             .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
 
-        if asset.size > crate::ota::MAX_OTA_BYTES {
+        if asset.size > crate::system::ota::MAX_OTA_BYTES {
             return Err(format!(
                 "OTA asset is too large: {} bytes exceeds {} bytes",
                 asset.size,
-                crate::ota::MAX_OTA_BYTES
+                crate::system::ota::MAX_OTA_BYTES
             ));
         }
 
-        let bytes = crate::ota::download_ota_asset_bytes(
+        let bytes = crate::system::ota::download_ota_asset_bytes(
             &client,
             &proxy_prefix,
             include_builtin_proxies,
@@ -5363,7 +5363,7 @@ pub async fn prepare_online_ota_handler(
         )
         .await?;
 
-        crate::ota::handle_ota_upload(&bytes)
+        crate::system::ota::handle_ota_upload(&bytes)
     }
     .await;
 
@@ -5392,7 +5392,7 @@ pub async fn prepare_online_ota_handler(
 pub async fn apply_ota_handler(
     Json(req): Json<crate::api::models::OtaApplyRequest>,
 ) -> impl IntoResponse {
-    match crate::ota::apply_ota_update(req.restart_now) {
+    match crate::system::ota::apply_ota_update(req.restart_now) {
         Ok(message) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -5412,7 +5412,7 @@ pub async fn apply_ota_handler(
 
 /// POST /api/ota/cancel
 pub async fn cancel_ota_handler() -> impl IntoResponse {
-    match crate::ota::cancel_pending_update() {
+    match crate::system::ota::cancel_pending_update() {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(

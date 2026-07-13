@@ -8,10 +8,10 @@ use crate::config::{
 use crate::db::{
     CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
 };
-use crate::device_status::DeviceStatusReport;
+use crate::system::device_status::DeviceStatusReport;
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
 use crate::cellular::modem_manager::get_sim_info_data_with_cache;
-use crate::system_event::SystemEvent;
+use crate::system::system_event::SystemEvent;
 use crate::messaging::verification_code::extract_verification_code;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{

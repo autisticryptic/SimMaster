@@ -794,14 +794,14 @@ fn top_temperatures(mut sensors: Vec<ThermalZone>, limit: usize) -> Vec<String> 
 }
 
 async fn collect_ota_status(config_manager: Arc<ConfigManager>) -> String {
-    let current = crate::ota::CURRENT_VERSION.to_string();
+    let current = crate::system::ota::CURRENT_VERSION.to_string();
     let update_config = config_manager.get_version_update_notifications();
-    let proxy_prefix = crate::ota::normalize_proxy_prefix(Some(update_config.proxy_prefix));
+    let proxy_prefix = crate::system::ota::normalize_proxy_prefix(Some(update_config.proxy_prefix));
     let latest = fetch_latest_release_tag(&proxy_prefix).await;
     match latest {
         Ok(release) => {
             let latest_version = release.tag_name.trim_start_matches('v').to_string();
-            let updatable = crate::ota::compare_versions(&release.tag_name, &current);
+            let updatable = crate::system::ota::compare_versions(&release.tag_name, &current);
             format!(
                 "OTA：{}，当前 {}，最新 {}",
                 if updatable {
@@ -818,8 +818,8 @@ async fn collect_ota_status(config_manager: Arc<ConfigManager>) -> String {
 }
 
 async fn fetch_latest_release_tag(proxy_prefix: &str) -> Result<OtaLatestReleaseResponse, String> {
-    let client = crate::ota::build_ota_http_client()?;
-    crate::ota::fetch_latest_github_release(&client, proxy_prefix, !proxy_prefix.is_empty()).await
+    let client = crate::system::ota::build_ota_http_client()?;
+    crate::system::ota::fetch_latest_github_release(&client, proxy_prefix, !proxy_prefix.is_empty()).await
 }
 
 fn period_since(period: &str) -> Option<String> {

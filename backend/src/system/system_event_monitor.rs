@@ -1,4 +1,4 @@
-use crate::system_event::{codes, severity, status, SystemEventEmitter};
+use crate::system::system_event::{codes, severity, status, SystemEventEmitter};
 use crate::utils::{read_disk_info, read_memory_info, read_network_interfaces, sample_cpu_usage};
 use std::collections::HashMap;
 use std::fs;
