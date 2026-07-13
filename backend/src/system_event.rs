@@ -1,4 +1,4 @@
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 use chrono::Utc;
 use serde::Serialize;
 use std::collections::VecDeque;

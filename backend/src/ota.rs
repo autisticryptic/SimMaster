@@ -7,7 +7,7 @@ use crate::api::models::{
     OtaLatestReleaseResponse, OtaMeta, OtaReleaseAsset, OtaStatusResponse, OtaUploadResponse,
     OtaValidation, VersionUpdateEvent,
 };
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 use chrono::{DateTime, FixedOffset, NaiveTime, TimeZone, Utc};
 use std::fs;
 use std::io::{Read, Write};

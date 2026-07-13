@@ -7,7 +7,7 @@ use crate::cellular::modem_manager::{
     get_airplane_mode, get_cells_data, get_data_connection_status, get_device_info_data,
     get_is_roaming_mm, get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
 };
-use crate::notification::{quiet_hours_active, NotificationSender};
+use crate::notify::notification::{quiet_hours_active, NotificationSender};
 use crate::utils::{
     connection_addresses_from_interfaces, format_uptime, read_cpu_load_sync, read_disk_info,
     read_memory_info, read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,

@@ -34,8 +34,7 @@ mod esim;
 mod ims;
 mod iptables;
 mod cellular;
-mod notification;
-mod notification_queue;
+mod notify;
 mod ota;
 mod messaging;
 mod state;
@@ -50,8 +49,8 @@ use device_network::DdnsManager;
 use esim::EsimSupervisor;
 use api::handlers::*;
 use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
-use notification::NotificationSender;
-use notification_queue::*;
+use notify::notification::NotificationSender;
+use notify::notification_queue::*;
 use state::AppState;
 use system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,

@@ -5101,7 +5101,7 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
 }
 
 use crate::config::ConfigManager;
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NotificationLogQuery {
@@ -5621,7 +5621,7 @@ pub async fn test_automation_task_handler(
             .database
             .insert_automation_log(&task.id, &task.name, task_type, status, &detail);
 
-        let event = crate::notification::AutomationEvent {
+        let event = crate::notify::notification::AutomationEvent {
             task_id: task.id.clone(),
             task_name: task.name.clone(),
             task_type: task_type.to_string(),

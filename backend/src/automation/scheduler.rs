@@ -1,7 +1,7 @@
 use crate::automation::tasks::TaskRegistry;
 use crate::config::{AutomationAction, AutomationTask, AutomationTrigger};
 use crate::db::beijing_sms_now_string;
-use crate::notification::AutomationEvent;
+use crate::notify::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Utc};

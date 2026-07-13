@@ -7,7 +7,7 @@ use crate::db::{
     beijing_sms_now_string, normalize_sms_timestamp_for_display, Database, SmsMessage,
 };
 use crate::cellular::modem_manager::{cache_smsc_for_identity, current_sim_identity, find_modem_path};
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;

@@ -16,7 +16,7 @@ use crate::config::ConfigManager;
 use crate::db::Database;
 use crate::device_network::DdnsManager;
 use crate::esim::EsimSupervisor;
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;
 use crate::system_event::SystemEventEmitter;
 

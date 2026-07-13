@@ -19,7 +19,7 @@ use crate::api::models::{
     WlanProfileRequest, WlanProfilesResponse, WlanSavedNetwork, WlanScanResponse,
     WlanStatusResponse,
 };
-use crate::notification::NotificationSender;
+use crate::notify::notification::NotificationSender;
 use crate::utils::{
     interface_addresses_for_family, preferred_interface_for_family, read_network_interfaces,
     NetworkAddressFamily,
