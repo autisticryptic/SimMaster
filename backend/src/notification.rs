@@ -9,7 +9,7 @@ use crate::db::{
     CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
 };
 use crate::device_status::DeviceStatusReport;
-use crate::models::{DdnsEvent, VersionUpdateEvent};
+use crate::api::models::{DdnsEvent, VersionUpdateEvent};
 use crate::modem_manager::get_sim_info_data_with_cache;
 use crate::system_event::SystemEvent;
 use crate::verification_code::extract_verification_code;

@@ -25,7 +25,7 @@ use crate::{
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
     },
     esim::EsimApiError,
-    models::*,
+    api::models::*,
     modem_manager::{
         answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
         find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
@@ -5177,7 +5177,7 @@ pub async fn test_notification_channel_handler(
     State(notification_sender): State<Arc<NotificationSender>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::models::WebhookTestResponse>>,
+    Json<ApiResponse<crate::api::models::WebhookTestResponse>>,
 ) {
     match notification_sender.test_channel(&channel).await {
         Ok(message) => (
@@ -5284,7 +5284,7 @@ pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
         }
         Err(e) => (
             StatusCode::OK,
-            Json(ApiResponse::<crate::models::OtaUploadResponse>::error(
+            Json(ApiResponse::<crate::api::models::OtaUploadResponse>::error(
                 format!("Failed: {}", e),
             )),
         ),
@@ -5293,9 +5293,9 @@ pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
 
 /// POST /api/ota/latest-release
 pub async fn get_latest_ota_release_handler(
-    Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
+    Json(req): Json<crate::api::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
-    let result: Result<crate::models::OtaLatestReleaseResponse, String> = async {
+    let result: Result<crate::api::models::OtaLatestReleaseResponse, String> = async {
         let include_builtin_proxies = req
             .proxy_prefix
             .as_ref()
@@ -5316,7 +5316,7 @@ pub async fn get_latest_ota_release_handler(
         ),
         Err(e) => (
             StatusCode::OK,
-            Json(ApiResponse::<crate::models::OtaLatestReleaseResponse>::error(format!(
+            Json(ApiResponse::<crate::api::models::OtaLatestReleaseResponse>::error(format!(
                 "Failed: {}. GitHub may have rate-limited this request; try again later or enable a proxy.",
                 e
             ))),
@@ -5326,9 +5326,9 @@ pub async fn get_latest_ota_release_handler(
 
 /// POST /api/ota/online-prepare
 pub async fn prepare_online_ota_handler(
-    Json(req): Json<crate::models::OtaOnlinePrepareRequest>,
+    Json(req): Json<crate::api::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
-    let result: Result<crate::models::OtaUploadResponse, String> = async {
+    let result: Result<crate::api::models::OtaUploadResponse, String> = async {
         let include_builtin_proxies = req
             .proxy_prefix
             .as_ref()
@@ -5381,7 +5381,7 @@ pub async fn prepare_online_ota_handler(
         }
         Err(e) => (
             StatusCode::OK,
-            Json(ApiResponse::<crate::models::OtaUploadResponse>::error(
+            Json(ApiResponse::<crate::api::models::OtaUploadResponse>::error(
                 format!("Failed: {}", e),
             )),
         ),
@@ -5390,7 +5390,7 @@ pub async fn prepare_online_ota_handler(
 
 /// POST /api/ota/apply
 pub async fn apply_ota_handler(
-    Json(req): Json<crate::models::OtaApplyRequest>,
+    Json(req): Json<crate::api::models::OtaApplyRequest>,
 ) -> impl IntoResponse {
     match crate::ota::apply_ota_update(req.restart_now) {
         Ok(message) => (

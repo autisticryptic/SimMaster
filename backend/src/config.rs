@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
-use crate::models::WorkMode;
+use crate::api::models::WorkMode;
 
 /// Webhook 配置
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

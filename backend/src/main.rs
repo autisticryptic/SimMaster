@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zbus::Connection;
 
-mod auth;
+mod api;
 mod automation;
 mod cell_lock_store;
 mod config;
@@ -32,10 +32,8 @@ mod db;
 mod device_network;
 mod device_status;
 mod esim;
-mod handlers;
 mod ims;
 mod iptables;
-mod models;
 mod modem_manager;
 mod notification;
 mod notification_queue;
@@ -53,7 +51,7 @@ use config::{get_default_config_path, ConfigManager};
 use db::Database;
 use device_network::DdnsManager;
 use esim::EsimSupervisor;
-use handlers::*;
+use api::handlers::*;
 use modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notification::NotificationSender;
 use notification_queue::*;
@@ -299,8 +297,8 @@ async fn main() -> Result<()> {
         let config_manager = ConfigManager::new(get_default_config_path());
         let security = config_manager.get_security();
         return match command {
-            AuthCommand::ResetPassword => auth::reset_admin_password_interactive(&db, &security),
-            AuthCommand::Clear => auth::clear_admin_auth(&db),
+            AuthCommand::ResetPassword => api::auth::reset_admin_password_interactive(&db, &security),
+            AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
     }
 
@@ -983,36 +981,36 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/auth/password",
-            post(auth::change_password).options(options_handler),
+            post(api::auth::change_password).options(options_handler),
         )
         .route(
             "/api/auth/settings",
-            get(auth::get_settings)
-                .post(auth::set_settings)
+            get(api::auth::get_settings)
+                .post(api::auth::set_settings)
                 .options(options_handler),
         )
         .route_layer(middleware::from_fn_with_state(
             app_state.clone(),
-            auth::auth_middleware,
+            api::auth::auth_middleware,
         ));
 
     let app = Router::new()
         .route("/api/health", get(health_check).options(options_handler))
         .route(
             "/api/auth/status",
-            get(auth::status).options(options_handler),
+            get(api::auth::status).options(options_handler),
         )
         .route(
             "/api/auth/setup",
-            post(auth::setup).options(options_handler),
+            post(api::auth::setup).options(options_handler),
         )
         .route(
             "/api/auth/login",
-            post(auth::login).options(options_handler),
+            post(api::auth::login).options(options_handler),
         )
         .route(
             "/api/auth/logout",
-            post(auth::logout).options(options_handler),
+            post(api::auth::logout).options(options_handler),
         )
         .merge(protected_routes)
         .with_state(app_state)

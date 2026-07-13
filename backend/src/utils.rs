@@ -2,7 +2,7 @@
 //!
 //! 包含系统状态、资源统计和网络接口读取等工具函数
 
-use crate::models::{ConnectionAddressesResponse, IpAddress, NetworkInterfaceInfo};
+use crate::api::models::{ConnectionAddressesResponse, IpAddress, NetworkInterfaceInfo};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::Path;
@@ -49,7 +49,7 @@ pub fn read_memory_info() -> Result<(u64, u64, u64, u64), String> {
 /// # Returns
 /// 包含各个分区信息的 Vec<DiskInfo>
 #[cfg(unix)]
-pub fn read_disk_info() -> Vec<crate::models::DiskInfo> {
+pub fn read_disk_info() -> Vec<crate::api::models::DiskInfo> {
     use std::collections::HashMap;
     use std::ffi::CString;
     use std::fs;
@@ -175,7 +175,7 @@ pub fn read_disk_info() -> Vec<crate::models::DiskInfo> {
 
         let used_percent = (used as f64 / total as f64) * 100.0;
 
-        disks.push(crate::models::DiskInfo {
+        disks.push(crate::api::models::DiskInfo {
             mount_point,
             fs_type,
             total_bytes: total,
@@ -200,7 +200,7 @@ pub fn read_disk_info() -> Vec<crate::models::DiskInfo> {
 }
 
 #[cfg(not(unix))]
-pub fn read_disk_info() -> Vec<crate::models::DiskInfo> {
+pub fn read_disk_info() -> Vec<crate::api::models::DiskInfo> {
     Vec::new()
 }
 
@@ -437,8 +437,8 @@ fn parse_cpu_stat() -> Result<(u64, u64), String> {
 ///
 /// # Returns
 /// CpuLoadInfo 结构（不含实时 CPU 使用率）
-pub fn read_cpu_load_sync() -> Result<crate::models::CpuLoadInfo, String> {
-    use crate::models::CpuLoadInfo;
+pub fn read_cpu_load_sync() -> Result<crate::api::models::CpuLoadInfo, String> {
+    use crate::api::models::CpuLoadInfo;
     use std::fs;
 
     // 读取 /proc/loadavg 获取负载平均值
@@ -507,8 +507,8 @@ pub async fn sample_cpu_usage() -> Result<f64, String> {
 ///
 /// # Returns
 /// CpuInfo 结构
-pub fn read_cpu_info() -> Result<crate::models::CpuInfo, String> {
-    use crate::models::{CpuCore, CpuInfo};
+pub fn read_cpu_info() -> Result<crate::api::models::CpuInfo, String> {
+    use crate::api::models::{CpuCore, CpuInfo};
     use std::fs;
 
     let content = fs::read_to_string("/proc/cpuinfo")
@@ -599,8 +599,8 @@ pub fn read_cpu_info() -> Result<crate::models::CpuInfo, String> {
 /// # Returns
 /// SystemInfo 结构
 #[cfg(unix)]
-pub fn read_system_info() -> Result<crate::models::SystemInfo, String> {
-    use crate::models::SystemInfo;
+pub fn read_system_info() -> Result<crate::api::models::SystemInfo, String> {
+    use crate::api::models::SystemInfo;
     use std::ffi::CStr;
 
     unsafe {
@@ -653,8 +653,8 @@ pub fn read_system_info() -> Result<crate::models::SystemInfo, String> {
 }
 
 #[cfg(not(unix))]
-pub fn read_system_info() -> Result<crate::models::SystemInfo, String> {
-    use crate::models::SystemInfo;
+pub fn read_system_info() -> Result<crate::api::models::SystemInfo, String> {
+    use crate::api::models::SystemInfo;
 
     let sysname = std::env::consts::OS.to_string();
     let machine = std::env::consts::ARCH.to_string();

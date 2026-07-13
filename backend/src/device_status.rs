@@ -1,8 +1,8 @@
 use crate::config::{ConfigManager, NotificationRule};
 use crate::db::{Database, PeriodSmsStats};
 use crate::device_network::DdnsManager;
-use crate::handlers::{async_ping_host, read_temperature_sensors};
-use crate::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
+use crate::api::handlers::{async_ping_host, read_temperature_sensors};
+use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::modem_manager::{
     get_airplane_mode, get_cells_data, get_data_connection_status, get_device_info_data,
     get_is_roaming_mm, get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
@@ -677,7 +677,7 @@ fn registration_label(value: &str) -> String {
     }
 }
 
-fn format_ping(label: &str, result: &crate::models::PingResult) -> String {
+fn format_ping(label: &str, result: &crate::api::models::PingResult) -> String {
     if result.success {
         match result.latency_ms {
             Some(latency) => format!("{label}：正常，{latency:.0}ms"),

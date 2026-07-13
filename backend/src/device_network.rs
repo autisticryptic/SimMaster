@@ -13,7 +13,7 @@ use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex;
 
 use crate::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
-use crate::models::{
+use crate::api::models::{
     DdnsEvent, DdnsLogEntry, DdnsLogsResponse, DdnsRecordSyncResult, DdnsStatusResponse,
     DdnsSyncResponse, WlanConnectRequest, WlanEnabledRequest, WlanForgetRequest, WlanNetwork,
     WlanProfileRequest, WlanProfilesResponse, WlanSavedNetwork, WlanScanResponse,
@@ -1399,7 +1399,7 @@ fn unescape_nmcli(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::models::IpAddress;
+    use crate::api::models::IpAddress;
 
     use super::*;
 
@@ -1489,8 +1489,8 @@ mod tests {
         is_default_ipv4: bool,
         is_default_ipv6: bool,
         ip_addresses: Vec<IpAddress>,
-    ) -> crate::models::NetworkInterfaceInfo {
-        crate::models::NetworkInterfaceInfo {
+    ) -> crate::api::models::NetworkInterfaceInfo {
+        crate::api::models::NetworkInterfaceInfo {
             name: name.to_string(),
             status: "up".to_string(),
             is_wireless,

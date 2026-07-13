@@ -22,7 +22,7 @@ use serde_json::Value;
 use crate::{
     config::SecurityConfig,
     db::Database,
-    models::ApiResponse,
+    api::models::ApiResponse,
     state::AppState,
     system_event::{
         codes as system_event_codes, severity as system_event_severity,

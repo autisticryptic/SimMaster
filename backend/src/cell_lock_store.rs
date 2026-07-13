@@ -1,5 +1,5 @@
 //! In-memory 小区锁定状态（无底层锁网能力时仅会话内展示）。
-use crate::models::{CellLockRatStatus, CellLockRequest, CellLockStatusResponse};
+use crate::api::models::{CellLockRatStatus, CellLockRequest, CellLockStatusResponse};
 
 #[derive(Debug, Default, Clone)]
 pub struct CellLockStore {

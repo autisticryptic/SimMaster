@@ -18,7 +18,7 @@ use crate::{
     db::Database,
 };
 use crate::{
-    models::{
+    api::models::{
         AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
         BasebandRestartResponse, BasebandRestartStep, CallInfo, CallListResponse,
         CallSettingsResponse, CellInfo, CellLocationInfo, CellLocationResponse, CellsResponse,

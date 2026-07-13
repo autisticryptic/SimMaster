@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::Mutex;
 
 use crate::config::ConfigManager;
-use crate::models::{
+use crate::api::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
     EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,
     WorkModeResponse,

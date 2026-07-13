@@ -1,5 +1,5 @@
 use crate::automation::traits::AutomationTaskHandler;
-use crate::handlers::run_safe_os_reboot_sequence;
+use crate::api::handlers::run_safe_os_reboot_sequence;
 use crate::state::AppState;
 use anyhow::Result;
 use futures_util::future::{BoxFuture, FutureExt};

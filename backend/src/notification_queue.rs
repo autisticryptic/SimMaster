@@ -8,7 +8,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 use crate::db::Database;
-use crate::models::ApiResponse;
+use crate::api::models::ApiResponse;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NotificationQueueQuery {

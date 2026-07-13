@@ -3,7 +3,7 @@
 //! 处理 OTA 更新包的上传、验证和应用
 
 use crate::config::ConfigManager;
-use crate::models::{
+use crate::api::models::{
     OtaLatestReleaseResponse, OtaMeta, OtaReleaseAsset, OtaStatusResponse, OtaUploadResponse,
     OtaValidation, VersionUpdateEvent,
 };
