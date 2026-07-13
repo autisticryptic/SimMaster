@@ -1,0 +1,15 @@
+meta {
+  name: get_device_wlan_profiles
+  type: http
+  seq: 92
+}
+
+get {
+  url: http://192.168.68.1:3000/api/device-network/wlan/profiles
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

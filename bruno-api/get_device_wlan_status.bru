@@ -1,0 +1,15 @@
+meta {
+  name: get_device_wlan_status
+  type: http
+  seq: 85
+}
+
+get {
+  url: http://192.168.68.1:3000/api/device-network/wlan/status
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

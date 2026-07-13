@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_status
+  type: http
+  seq: 140
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/status?live=true
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

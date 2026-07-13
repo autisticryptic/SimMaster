@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_soak
+  type: http
+  seq: 149
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/soak?limit=20
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

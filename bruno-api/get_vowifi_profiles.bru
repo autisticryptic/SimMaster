@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_profiles
+  type: http
+  seq: 147
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/profiles
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

@@ -1,0 +1,21 @@
+meta {
+  name: set_vowifi_connection
+  type: http
+  seq: 143
+}
+
+post {
+  url: http://192.168.68.1:3000/api/vowifi/connection
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "enabled": true
+  }
+}
+
+settings {
+  encodeUrl: true
+}

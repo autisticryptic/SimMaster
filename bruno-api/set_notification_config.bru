@@ -1,0 +1,45 @@
+meta {
+  name: set_notification_config
+  type: http
+  seq: 2
+}
+
+post {
+  url: http://192.168.68.1:3000/api/notifications/config
+  body: json
+  auth: none
+}
+
+body:json {
+  {
+    "webhook": {
+      "enabled": true,
+      "url": "https://example.com/webhook",
+      "forward_sms": true,
+      "forward_calls": true,
+      "forward_ddns": true,
+      "headers": {
+        "Authorization": "Bearer your-token"
+      },
+      "secret": "your-secret-key"
+    },
+    "bark": {
+      "enabled": false,
+      "forward_sms": true,
+      "forward_calls": true,
+      "forward_ddns": true,
+      "server_url": "https://api.day.app",
+      "device_key": "",
+      "title_template": "SimAdmin 短信通知",
+      "group": "",
+      "sound": "",
+      "level": "",
+      "auto_copy": true,
+      "save_history": true
+    }
+  }
+}
+
+settings {
+  encodeUrl: true
+}

@@ -1,0 +1,11 @@
+[Unit]
+Description=SimAdmin Modem Recovery
+After=network.target ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/simadmin-modem-recovery.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

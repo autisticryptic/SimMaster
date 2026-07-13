@@ -1,0 +1,54 @@
+meta {
+  name: set_device_ddns_config
+  type: http
+  seq: 81
+}
+
+post {
+  url: http://192.168.68.1:3000/api/device-network/ddns/config
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "enabled": true,
+    "provider": "cloudflare",
+    "access_id": "your-cloudflare-zone-id",
+    "access_secret": "your-cloudflare-api-token",
+    "interval_seconds": 300,
+    "ttl": 600,
+    "ipv4": {
+      "enabled": true,
+      "get_type": "interface",
+      "interface_name": "eth0",
+      "urls": [
+        "https://api.ipify.org",
+        "https://ip.3322.net",
+        "https://4.ident.me",
+        "https://ddns.oray.com/checkip",
+        "https://4.ipw.cn"
+      ],
+      "domains": [
+        "home.example.com"
+      ]
+    },
+    "ipv6": {
+      "enabled": false,
+      "get_type": "interface",
+      "interface_name": "wlan0",
+      "urls": [
+        "https://api6.ipify.org",
+        "https://speed.neu6.edu.cn/getIP.php",
+        "https://v6.ident.me",
+        "https://myip6.ipip.net",
+        "https://6.ipw.cn"
+      ],
+      "domains": []
+    }
+  }
+}
+
+settings {
+  encodeUrl: true
+}

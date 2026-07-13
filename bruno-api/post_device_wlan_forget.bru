@@ -1,0 +1,22 @@
+meta {
+  name: post_device_wlan_forget
+  type: http
+  seq: 93
+}
+
+post {
+  url: http://192.168.68.1:3000/api/device-network/wlan/forget
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "uuid": "saved-wifi-connection-uuid",
+    "connection_id": "Saved WiFi"
+  }
+}
+
+settings {
+  encodeUrl: true
+}

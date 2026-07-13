@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_events
+  type: http
+  seq: 148
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/events?limit=50
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

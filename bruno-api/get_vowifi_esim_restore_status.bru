@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_esim_restore_status
+  type: http
+  seq: 151
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/esim-restore/status
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

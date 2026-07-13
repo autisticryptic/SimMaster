@@ -1,0 +1,15 @@
+meta {
+  name: get_vowifi_diagnostics
+  type: http
+  seq: 146
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vowifi/diagnostics?live=true&limit=100
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

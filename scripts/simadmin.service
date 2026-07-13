@@ -1,0 +1,31 @@
+[Unit]
+Description=SimAdmin Backend Service
+After=network.target ModemManager.service
+Wants=ModemManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/simadmin
+ExecStart=/opt/simadmin/simadmin
+Restart=always
+RestartSec=5
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=simadmin
+
+# VoWiFi 拨号网络访问权限（未配置时默认为 1 开启。若设为 0，则连接流程会被拦截跳过，用于调试离线/干运行模式）
+Environment=SIMADMIN_VOWIFI_LIVE_NETWORK_ALLOWED=1
+
+# VoWiFi 底层设备状态修改权限（未配置时默认为 1 开启。若设为 0，则禁止调用 adb 执行飞行模式切换、蜂窝网卡状态变动等）
+Environment=SIMADMIN_VOWIFI_DEVICE_CHANGES_ALLOWED=1
+
+# 可选：用于 eSIM 卡 profile 自动切换的 ADB 命令行路径（非 eSIM 多卡选路用户无需配置）
+# Environment=SIMADMIN_VOWIFI_ADB_PATH=/usr/bin/adb
+
+# 可选：设备后台的管理面板 URL（仅在多卡 eSIM 路由选路或高阶状态监控下使用）
+# Environment=SIMADMIN_VOWIFI_DEVICE_ADMIN_URL=http://localhost:3000/
+
+[Install]
+WantedBy=multi-user.target

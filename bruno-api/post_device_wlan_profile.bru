@@ -1,0 +1,23 @@
+meta {
+  name: post_device_wlan_profile
+  type: http
+  seq: 90
+}
+
+post {
+  url: http://192.168.68.1:3000/api/device-network/wlan/profile
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "connection_id": "Your-WiFi",
+    "auto_join": true,
+    "ipv4_mode": "dhcp"
+  }
+}
+
+settings {
+  encodeUrl: true
+}

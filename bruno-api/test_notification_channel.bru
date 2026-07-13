@@ -1,0 +1,35 @@
+meta {
+  name: test_notification_channel
+  type: http
+  seq: 3
+}
+
+post {
+  url: http://192.168.68.1:3000/api/notifications/test/{{channel}}
+  body: none
+  auth: none
+}
+
+vars:pre-request {
+  channel: webhook
+}
+
+docs {
+  # 测试指定通知渠道
+  
+  `channel` 是通知渠道参数，不是独立接口名称。
+  
+  可用值：
+  - `webhook`
+  - `bark`
+  - `wecom_app`
+  - `wecom_robot`
+  - `dingtalk_robot`
+  - `dingtalk_app`
+  - `feishu_robot`
+  - `telegram`
+}
+
+settings {
+  encodeUrl: true
+}

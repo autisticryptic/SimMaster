@@ -1,0 +1,15 @@
+meta {
+  name: get_device_ddns_config
+  type: http
+  seq: 80
+}
+
+get {
+  url: http://192.168.68.1:3000/api/device-network/ddns/config
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}
