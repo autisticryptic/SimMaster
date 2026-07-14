@@ -864,6 +864,12 @@ async fn main() -> Result<()> {
             "/api/voicemail/status",
             get(get_voicemail_status_handler).options(options_handler),
         )
+        .route(
+            "/api/sms/path-policy",
+            get(get_sms_path_policy_handler)
+                .post(set_sms_path_policy_handler)
+                .options(options_handler),
+        )
         // ========== 短信功能接口 ==========
         .route(
             "/api/sms/send",

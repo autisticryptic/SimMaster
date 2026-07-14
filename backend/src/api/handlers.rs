@@ -19,7 +19,7 @@ use zbus::Connection;
 
 use crate::{
     cellular::modem_manager,
-    infra::config::{ApnConfig, VolteConfig, VowifiConfig},
+    infra::config::{ApnConfig, SmsPathPolicy, VolteConfig, VowifiConfig},
     infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
@@ -4117,6 +4117,44 @@ pub async fn set_volte_voice_handler(
     }
 }
 
+// ============ SMS multi-path orchestration policy (phase C) ============
+
+/// Read the current SMS multi-path routing policy. The returned policy is
+/// normalized so the priority list always contains every path kind exactly
+/// once (missing kinds appended in canonical order), which keeps the UI's
+/// reorder/enable controls well-defined.
+pub async fn get_sms_path_policy_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<SmsPathPolicy>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_sms_path_policy(),
+        )),
+    )
+}
+
+/// Replace the SMS multi-path routing policy. The incoming policy is normalized
+/// before persisting, so a partial or duplicated priority list from the UI can
+/// never leave the config in an invalid state.
+pub async fn set_sms_path_policy_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<SmsPathPolicy>,
+) -> (StatusCode, Json<ApiResponse<SmsPathPolicy>>) {
+    match app.config_manager.set_sms_path_policy(payload) {
+        Ok(policy) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", policy)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<SmsPathPolicy>::error(format!(
+                "Failed: {err}"
+            ))),
+        ),
+    }
+}
 
 pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<VowifiProfilesResponse>>)
 {
