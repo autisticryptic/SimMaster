@@ -34,11 +34,11 @@ use super::{
         verify_usim_application_via_proxy_reason_with_retry, USIM_AID_PREFIX,
     },
     sms,
-    voice,
     transport::{DnsResolver, ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
     tun_gateway::{
         self, ImsEspFlowConfig, ImsEspPolicyConfig, TunGatewayConfig, TunGatewayRuntime,
     },
+    voice,
 };
 use crate::cellular::modem_manager::{current_sim_identity, get_sim_info_data_with_cache};
 use tokio::{
@@ -113,9 +113,7 @@ struct LiveImsSecurityVerify {
 struct LiveImsTcpChannel {
     profile_id: &'static str,
     expires_at: Instant,
-    local_addr: SocketAddr,
-    stream: TcpStream,
-    pending: Vec<u8>,
+    channel: super::channel::EpdgSipChannel,
 }
 
 #[derive(Debug, Clone)]
@@ -1672,7 +1670,12 @@ async fn run_live_voice_until(profile: &'static CarrierProfile) -> Result<(), Li
     info!(
         vowifi_voice_enabled = profile.voice.vowifi_enabled,
         carrier_fallback_enabled = profile.voice.carrier_fallback_enabled,
-        preferred_codec = profile.voice.preferred_codecs.first().copied().unwrap_or("none"),
+        preferred_codec = profile
+            .voice
+            .preferred_codecs
+            .first()
+            .copied()
+            .unwrap_or("none"),
         "Voice over IMS signaling readiness validated"
     );
     Ok(())
@@ -1760,8 +1763,7 @@ async fn place_live_voice_call_for_profile(
     };
     let media_port = live_voice_media_port();
     let connection_addr = sip_host(route.local_addr);
-    let offer =
-        voice::build_mo_audio_offer(profile, &connection_addr, media_addr, media_port);
+    let offer = voice::build_mo_audio_offer(profile, &connection_addr, media_addr, media_port);
     let offered_codecs = offer.codecs.iter().map(|codec| codec.codec).collect();
     let sdp_offer = offer.to_sdp().into_bytes();
 
@@ -1883,9 +1885,7 @@ async fn send_live_invite(
         outcome.call_state = voice::CallState::Failed;
         outcome.failure_cause = Some(format!("sip_{final_status}"));
         abort_tcp_stream(stream);
-        return Ok(start_live_call_followup_task(
-            profile, outcome, None,
-        ));
+        return Ok(start_live_call_followup_task(profile, outcome, None));
     }
 
     // Parse the SDP answer to learn the negotiated codec (the answer body
@@ -1893,8 +1893,7 @@ async fn send_live_invite(
     let negotiated_codec = voice::parse_audio_sdp(sip_body(&final_frame))
         .ok()
         .and_then(|answer| {
-            let offer =
-                voice::build_profile_codec_offer(profile);
+            let offer = voice::build_profile_codec_offer(profile);
             answer
                 .codecs
                 .iter()
@@ -1942,7 +1941,7 @@ async fn send_live_invite(
 /// attached it runs here, wrapping [`voice::AudioSource`] frames into RTP via
 /// [`voice::RtpPacket`] and delivering received RTP to the [`voice::AudioSink`].
 fn start_live_call_followup_task(
-    profile: &'static CarrierProfile,
+    _profile: &'static CarrierProfile,
     outcome: voice::MoCallSipOutcome,
     dialog: Option<(TcpStream, Vec<u8>)>,
 ) -> LiveCallResult {
@@ -2089,7 +2088,9 @@ async fn cached_live_ims_security_verify(profile: &'static CarrierProfile) -> Op
 async fn record_live_ims_tcp_channel(
     profile: &'static CarrierProfile,
     local_addr: SocketAddr,
+    remote_addr: SocketAddr,
     stream: TcpStream,
+    security_verify: Option<String>,
     expires_seconds: Option<u32>,
 ) {
     let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
@@ -2097,9 +2098,16 @@ async fn record_live_ims_tcp_channel(
     *guard = Some(LiveImsTcpChannel {
         profile_id: profile.meta.profile_id,
         expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
-        local_addr,
+        channel: super::channel::EpdgSipChannel::new(
         stream,
-        pending: Vec::new(),
+            Vec::new(),
+            crate::ims::context::ImsRoute {
+                local_addr,
+                pcscf_addr: remote_addr,
+                transport: crate::ims::context::SipTransport::Tcp,
+            },
+            security_verify,
+        ),
     });
 }
 
@@ -2118,7 +2126,8 @@ pub async fn clear_all_live_runtime() {
     let tcp_cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
     let channel = tcp_cache.lock().await.take();
     if let Some(channel) = channel {
-        abort_tcp_stream(channel.stream);
+        let (stream, _) = channel.channel.into_parts();
+        abort_tcp_stream(stream);
     }
 
     let ready_cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
@@ -2755,7 +2764,9 @@ async fn run_protected_authenticated_register_candidates(
                     record_live_ims_tcp_channel(
                         profile,
                         protected_local_addr,
+                        target,
                         protected_stream,
+                        security_verify.map(str::to_string),
                         summary.expires_seconds,
                     )
                     .await;
@@ -2925,7 +2936,7 @@ async fn send_live_sms_message_on_cached_channel(
     security_verify: Option<&str>,
 ) -> Result<Option<LiveSmsSendResult>, LiveStageError> {
     let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
-    let mut channel = {
+    let channel = {
         let mut guard = cache.lock().await;
         let Some(channel) = guard.take() else {
             return Ok(None);
@@ -2933,10 +2944,12 @@ async fn send_live_sms_message_on_cached_channel(
         channel
     };
     if channel.profile_id != profile.meta.profile_id || channel.expires_at <= Instant::now() {
-        abort_tcp_stream(channel.stream);
+        let (stream, _) = channel.channel.into_parts();
+        abort_tcp_stream(stream);
         return Ok(None);
     }
-    let local_addr = channel.local_addr;
+    let local_addr = crate::ims::access::ImsChannel::route(&channel.channel).local_addr;
+    let (mut stream, mut pending) = channel.channel.into_parts();
     match send_live_sms_message_on_stream(
         profile,
         route,
@@ -2945,8 +2958,8 @@ async fn send_live_sms_message_on_cached_channel(
         variant,
         security_verify,
         local_addr,
-        &mut channel.stream,
-        &mut channel.pending,
+        &mut stream,
+        &mut pending,
     )
     .await
     {
@@ -2958,8 +2971,8 @@ async fn send_live_sms_message_on_cached_channel(
             variant.clone(),
             security_verify.map(ToString::to_string),
             local_addr,
-            channel.stream,
-            channel.pending,
+            stream,
+            pending,
             outcome,
         ))),
         Err(err) => {
@@ -2968,7 +2981,7 @@ async fn send_live_sms_message_on_cached_channel(
                 reason = err.reason.as_str(),
                 "VoWiFi cached IMS TCP channel failed during MESSAGE exchange"
             );
-            abort_tcp_stream(channel.stream);
+            abort_tcp_stream(stream);
             Err(err)
         }
     }
@@ -3068,9 +3081,12 @@ fn start_live_sms_followup_task(
                 *guard = Some(LiveImsTcpChannel {
                     profile_id: profile.meta.profile_id,
                     expires_at,
-                    local_addr,
+                    channel: super::channel::EpdgSipChannel::new(
                     stream,
                     pending,
+                        shared_vowifi_route(profile, &route, local_addr),
+                        security_verify,
+                    ),
                 });
             }
             Err(err) => {
@@ -3252,52 +3268,55 @@ fn build_live_sms_message_request(
     local_addr: SocketAddr,
 ) -> Vec<u8> {
     let branch = format!("z9hG4bK{}", hex_token(12));
-    let local_host = sip_host(local_addr.ip());
     let route_host = sip_host(route.remote_addr);
     let call_id = format!("{}@simadmin", hex_token(16));
     let from_tag = hex_token(8);
-    let mut headers = String::new();
-    headers.push_str(&format!("MESSAGE {} SIP/2.0\r\n", variant.request_uri));
-    headers.push_str(&format!(
-        "Via: SIP/2.0/TCP {local_host}:{};branch={branch};rport\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str("Max-Forwards: 70\r\n");
-    headers.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str(&format!(
-        "From: <{}>;tag={from_tag}\r\n",
-        identity.public_uri
-    ));
-    headers.push_str(&format!("To: <{}>\r\n", variant.to_uri));
-    headers.push_str(&format!("Call-ID: {call_id}\r\n"));
-    headers.push_str("CSeq: 1 MESSAGE\r\n");
-    headers.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    headers.push_str(&format!(
-        "P-Access-Network-Info: {}\r\n",
-        build_p_access_network_info(profile)
-    ));
+    let to_value = format!("<{}>", variant.to_uri);
+    let mut headers = vec![
+        crate::ims::sip_message::SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", profile.ims.local_port),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Preferred-Identity",
+            format!("<{}>", identity.public_uri),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Access-Network-Info",
+            build_p_access_network_info(profile),
+        ),
+    ];
     if let Some(security_verify) = security_verify {
-        headers.push_str(&format!("Security-Verify: {security_verify}\r\n"));
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Security-Verify",
+            security_verify,
+        ));
     }
-    headers.push_str("Accept-Contact: *;+g.3gpp.smsip\r\n");
-    headers.push_str(&format!(
-        "User-Agent: {}\r\n",
-        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault)
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Accept-Contact",
+        "*;+g.3gpp.smsip",
     ));
-    headers.push_str("Content-Type: application/vnd.3gpp.sms\r\n");
-    headers.push_str(&format!(
-        "Content-Length: {}\r\n\r\n",
-        submission.body.len()
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "User-Agent",
+        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault),
     ));
-    let mut frame = headers.into_bytes();
-    frame.extend_from_slice(&submission.body);
-    frame
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Content-Type",
+        "application/vnd.3gpp.sms",
+    ));
+    crate::ims::sip_message::build_message(&crate::ims::sip_message::SipRequest {
+        method: "MESSAGE",
+        request_uri: &variant.request_uri,
+        route: shared_vowifi_route(profile, route, local_addr),
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &from_tag,
+        to_value: &to_value,
+        call_id: &call_id,
+        cseq: 1,
+        headers: &headers,
+        body: &submission.body,
+    })
 }
 
 fn build_live_sms_rp_ack_request(
@@ -3311,51 +3330,69 @@ fn build_live_sms_rp_ack_request(
     local_addr: SocketAddr,
 ) -> Vec<u8> {
     let branch = format!("z9hG4bK{}", hex_token(12));
-    let local_host = sip_host(local_addr.ip());
     let route_host = sip_host(route.remote_addr);
     let call_id = format!("{}@simadmin", hex_token(16));
     let from_tag = hex_token(8);
     let request_uri =
         sip_header_uri(inbound_frame, "From").unwrap_or_else(|| variant.request_uri.clone());
-    let mut headers = String::new();
-    headers.push_str(&format!("MESSAGE {request_uri} SIP/2.0\r\n"));
-    headers.push_str(&format!(
-        "Via: SIP/2.0/TCP {local_host}:{};branch={branch};rport\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str("Max-Forwards: 70\r\n");
-    headers.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str(&format!(
-        "From: <{}>;tag={from_tag}\r\n",
-        identity.public_uri
-    ));
-    headers.push_str(&format!("To: <{request_uri}>\r\n"));
-    headers.push_str(&format!("Call-ID: {call_id}\r\n"));
-    headers.push_str("CSeq: 1 MESSAGE\r\n");
-    headers.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    headers.push_str(&format!(
-        "P-Access-Network-Info: {}\r\n",
-        build_p_access_network_info(profile)
-    ));
+    let to_value = format!("<{request_uri}>");
+    let mut headers = vec![
+        crate::ims::sip_message::SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", profile.ims.local_port),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Preferred-Identity",
+            format!("<{}>", identity.public_uri),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Access-Network-Info",
+            build_p_access_network_info(profile),
+        ),
+    ];
     if let Some(security_verify) = security_verify {
-        headers.push_str(&format!("Security-Verify: {security_verify}\r\n"));
-    }
-    headers.push_str("Accept-Contact: *;+g.3gpp.smsip\r\n");
-    headers.push_str(&format!(
-        "User-Agent: {}\r\n",
-        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault)
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Security-Verify",
+            security_verify,
     ));
-    headers.push_str("Content-Type: application/vnd.3gpp.sms\r\n");
-    headers.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    let mut frame = headers.into_bytes();
-    frame.extend_from_slice(body);
-    frame
+    }
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Accept-Contact",
+        "*;+g.3gpp.smsip",
+    ));
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "User-Agent",
+        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault),
+    ));
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Content-Type",
+        "application/vnd.3gpp.sms",
+    ));
+    crate::ims::sip_message::build_rp_ack(&crate::ims::sip_message::SipRequest {
+        method: "MESSAGE",
+        request_uri: &request_uri,
+        route: shared_vowifi_route(profile, route, local_addr),
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &from_tag,
+        to_value: &to_value,
+        call_id: &call_id,
+        cseq: 1,
+        headers: &headers,
+        body,
+    })
+}
+
+fn shared_vowifi_route(
+    profile: &'static CarrierProfile,
+    route: &tun_gateway::ImsClientTcpRoute,
+    local_addr: SocketAddr,
+) -> crate::ims::context::ImsRoute {
+    crate::ims::context::ImsRoute {
+        local_addr: SocketAddr::new(local_addr.ip(), profile.ims.local_port),
+        pcscf_addr: SocketAddr::new(route.remote_addr, profile.ims.local_port),
+        transport: crate::ims::context::SipTransport::Tcp,
+    }
 }
 
 fn build_live_invite_request(
@@ -3368,58 +3405,73 @@ fn build_live_invite_request(
     local_addr: SocketAddr,
 ) -> Vec<u8> {
     let branch = format!("z9hG4bK{}", hex_token(12));
-    let local_host = sip_host(local_addr.ip());
     let route_host = sip_host(route.remote_addr);
     let from_tag = hex_token(8);
-    let mut headers = String::new();
-    headers.push_str(&format!("INVITE {request_uri} SIP/2.0\r\n"));
-    headers.push_str(&format!(
-        "Via: SIP/2.0/TCP {local_host}:{};branch={branch};rport\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str("Max-Forwards: 70\r\n");
-    headers.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str(&format!("From: <{}>;tag={from_tag}\r\n", identity.public_uri));
-    headers.push_str(&format!("To: <{request_uri}>\r\n"));
-    headers.push_str(&format!("Call-ID: {}\r\n", invite.call_id));
-    headers.push_str("CSeq: 1 INVITE\r\n");
-    headers.push_str(&format!(
-        "Contact: <{}>;+g.3gpp.icsi-ref=\"{}\"\r\n",
+    let to_value = format!("<{request_uri}>");
+    let mut headers = vec![
+        crate::ims::sip_message::SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", profile.ims.local_port),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "Contact",
+            format!(
+                "<{}>;+g.3gpp.icsi-ref=\"{}\"",
         identity.public_uri, LIVE_VOICE_MMTEL_ICSI
-    ));
-    headers.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    headers.push_str(&format!(
-        "P-Access-Network-Info: {}\r\n",
-        build_p_access_network_info(profile)
-    ));
+            ),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Preferred-Identity",
+            format!("<{}>", identity.public_uri),
+        ),
+        crate::ims::sip_message::SipHeader::new(
+            "P-Access-Network-Info",
+            build_p_access_network_info(profile),
+        ),
+    ];
     if let Some(security_verify) = security_verify {
-        headers.push_str(&format!("Security-Verify: {security_verify}\r\n"));
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Security-Verify",
+            security_verify,
+    ));
     }
-    headers.push_str(&format!(
-        "Accept-Contact: *;+g.3gpp.icsi-ref=\"{}\"\r\n",
-        LIVE_VOICE_MMTEL_ICSI
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Accept-Contact",
+        format!("*;+g.3gpp.icsi-ref=\"{LIVE_VOICE_MMTEL_ICSI}\""),
     ));
-    headers.push_str(&format!(
-        "P-Asserted-Service: {}\r\n",
-        "urn:urn-7:3gpp-service.ims.icsi.mmtel"
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "P-Asserted-Service",
+        "urn:urn-7:3gpp-service.ims.icsi.mmtel",
     ));
-    headers.push_str("Supported: 100rel,timer\r\n");
-    headers.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK\r\n");
-    headers.push_str(&format!(
-        "User-Agent: {}\r\n",
-        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault)
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Supported",
+        "100rel,timer",
     ));
-    headers.push_str("Content-Type: application/sdp\r\n");
-    headers.push_str(&format!("Content-Length: {}\r\n\r\n", invite.sdp_offer.len()));
-    let mut frame = headers.into_bytes();
-    frame.extend_from_slice(&invite.sdp_offer);
-    frame
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Allow",
+        "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK",
+    ));
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "User-Agent",
+        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault),
+    ));
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "Content-Type",
+        "application/sdp",
+    ));
+    crate::ims::sip_message::build_invite(&crate::ims::sip_message::SipRequest {
+        method: "INVITE",
+        request_uri,
+        route: shared_vowifi_route(profile, route, local_addr),
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &from_tag,
+        to_value: &to_value,
+        call_id: &invite.call_id,
+        cseq: 1,
+        headers: &headers,
+        body: &invite.sdp_offer,
+    })
 }
 
 fn build_live_ack_request(
@@ -3432,33 +3484,36 @@ fn build_live_ack_request(
     local_addr: SocketAddr,
 ) -> Vec<u8> {
     let branch = format!("z9hG4bK{}", hex_token(12));
-    let local_host = sip_host(local_addr.ip());
     let route_host = sip_host(route.remote_addr);
     let from_tag = hex_token(8);
-    let mut headers = String::new();
-    headers.push_str(&format!("ACK {request_uri} SIP/2.0\r\n"));
-    headers.push_str(&format!(
-        "Via: SIP/2.0/TCP {local_host}:{};branch={branch};rport\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str("Max-Forwards: 70\r\n");
-    headers.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        profile.ims.local_port
-    ));
-    headers.push_str(&format!("From: <{}>;tag={from_tag}\r\n", identity.public_uri));
-    headers.push_str(&format!("To: <{request_uri}>\r\n"));
-    headers.push_str(&format!("Call-ID: {}\r\n", invite.call_id));
-    headers.push_str("CSeq: 1 ACK\r\n");
+    let to_value = format!("<{request_uri}>");
+    let mut headers = vec![crate::ims::sip_message::SipHeader::new(
+        "Route",
+        format!("<sip:{route_host}:{};lr>", profile.ims.local_port),
+    )];
     if let Some(security_verify) = security_verify {
-        headers.push_str(&format!("Security-Verify: {security_verify}\r\n"));
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Security-Verify",
+            security_verify,
+        ));
     }
-    headers.push_str(&format!(
-        "User-Agent: {}\r\n",
-        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault)
+    headers.push(crate::ims::sip_message::SipHeader::new(
+        "User-Agent",
+        build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault),
     ));
-    headers.push_str("Content-Length: 0\r\n\r\n");
-    headers.into_bytes()
+    crate::ims::sip_message::build_ack(&crate::ims::sip_message::SipRequest {
+        method: "ACK",
+        request_uri,
+        route: shared_vowifi_route(profile, route, local_addr),
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &from_tag,
+        to_value: &to_value,
+        call_id: &invite.call_id,
+        cseq: 1,
+        headers: &headers,
+        body: &[],
+    })
 }
 
 fn sip_header_uri(frame: &[u8], header_name: &str) -> Option<String> {
@@ -3742,11 +3797,16 @@ fn find_sip_header_end(buffer: &[u8]) -> Option<usize> {
 
 #[derive(Debug, Clone)]
 struct LiveImsRegisterIdentity {
-    private_user: String,
-    public_uri: String,
-    contact_user: String,
-    contact_user_phone: bool,
+    shared: crate::ims::context::ImsIdentity,
     shape: &'static str,
+}
+
+impl std::ops::Deref for LiveImsRegisterIdentity {
+    type Target = crate::ims::context::ImsIdentity;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
 }
 
 struct LiveRegisterRequestContext {
@@ -3836,111 +3896,162 @@ impl LiveRegisterRequestContext {
         let branch = format!("z9hG4bK{}", hex_token(12));
         let request_uri = self.request_uri(profile, variant);
         let local_host = sip_host(self.local_addr.ip());
-        let header_port = profile.ims.local_port;
         let visited_network = format!(
             "ims.mnc{}.mcc{}.3gppnetwork.org",
             three_digit_mnc(profile),
             profile.meta.mcc
         );
-        let mut request = String::new();
-        request.push_str(&format!("REGISTER {request_uri} SIP/2.0\r\n"));
-        request.push_str(&format!(
-            "Via: SIP/2.0/TCP {local_host}:{};branch={branch};rport\r\n",
-            header_port
-        ));
-        request.push_str("Max-Forwards: 70\r\n");
-        request.push_str(&format!(
-            "From: <{}>;tag={}\r\n",
-            self.identity.public_uri, self.from_tag
-        ));
-        request.push_str(&format!("To: <{}>\r\n", self.identity.public_uri));
-        request.push_str(&format!("Call-ID: {}\r\n", self.call_id));
-        request.push_str(&format!("CSeq: {cseq} REGISTER\r\n"));
-        if let Some(authorization) = authorization {
-            request.push_str(authorization);
-            request.push_str("\r\n");
-        } else if cseq == 1 {
-            if let Some(authorization) = self.build_initial_authorization_header(profile, variant) {
-                request.push_str(&authorization);
-                request.push_str("\r\n");
+        let require_sec_agree =
+            profile.ims.register.require_sec_agree_headers || variant.force_sec_agree_headers;
+        let pani = match variant.header_profile.pani {
+            LivePaniFormat::ProfileDefault => {
+                Some(build_p_access_network_info(profile).to_string())
             }
+            LivePaniFormat::PlainWifi => {
+                Some("IEEE-802.11;i-wlan-node-id=000000000000".to_string())
+            }
+            LivePaniFormat::Omit => None,
+        };
+        let visited_network_header = match variant.header_profile.visited_network {
+            LiveVisitedNetworkFormat::QuotedHome => Some(format!("\"{visited_network}\"")),
+            LiveVisitedNetworkFormat::UnquotedHome => Some(visited_network),
+            LiveVisitedNetworkFormat::Omit => None,
+        };
+        let params = crate::ims::context::ImsRegisterParams {
+            realm: profile.ims.realm.to_string(),
+            domain: profile.ims.domain.to_string(),
+            registrar: profile.ims.registrar.map(str::to_string),
+            supported_header: profile.ims.register.supported_header.to_string(),
+            require_sec_agree,
+            user_agent: build_live_user_agent(profile, variant.header_profile.user_agent),
+            pani,
+            visited_network: visited_network_header,
+            allow_header: "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+                .to_string(),
+            expires: 3600,
+        };
+        let mut headers = Vec::new();
+        let authorization = authorization.map(str::to_string).or_else(|| {
+            (cseq == 1)
+                .then(|| self.build_initial_authorization_header(profile, variant))
+                .flatten()
+        });
+        if let Some(authorization) = authorization {
+            if let Some((name, value)) = authorization.split_once(':') {
+                headers.push(crate::ims::sip_message::SipHeader::new(
+                    name.trim(),
+                    value.trim(),
+                ));
+            }
+            }
+        let contact = self.build_contact_header(&local_host, variant.header_profile);
+        if let Some(value) = contact
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("Contact: ")
+        {
+            headers.push(crate::ims::sip_message::SipHeader::new("Contact", value));
         }
-        request.push_str(&self.build_contact_header(&local_host, variant.header_profile));
         if variant.header_profile.include_accept_contact {
-            request.push_str("Accept-Contact: *;+g.3gpp.smsip\r\n");
-            request.push_str(&format!(
-                "Accept-Contact: *;+g.3gpp.icsi-ref=\"{}\"\r\n",
-                IMS_MMTEL_ICSI_REF
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Accept-Contact",
+                "*;+g.3gpp.smsip",
+            ));
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Accept-Contact",
+                format!("*;+g.3gpp.icsi-ref=\"{IMS_MMTEL_ICSI_REF}\""),
             ));
         }
         if variant.include_route_header {
-            request.push_str(&format!(
-                "Route: <sip:{}:{};lr>\r\n",
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Route",
+                format!(
+                    "<sip:{}:{};lr>",
                 sip_host(self.route_addr),
                 profile.ims.local_port
+                ),
             ));
         }
-        request.push_str("Expires: 3600\r\n");
-        request.push_str(&format!(
-            "Supported: {}\r\n",
-            profile.ims.register.supported_header
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Expires",
+            params.expires.to_string(),
         ));
-        if profile.ims.register.require_sec_agree_headers || variant.force_sec_agree_headers {
-            request.push_str("Require: sec-agree\r\n");
-            request.push_str("Proxy-Require: sec-agree\r\n");
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Supported",
+            &params.supported_header,
+        ));
+        if params.require_sec_agree {
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Require",
+                "sec-agree",
+            ));
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Proxy-Require",
+                "sec-agree",
+        ));
         }
-        request.push_str(
-            "Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n",
-        );
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "Allow",
+            &params.allow_header,
+        ));
         if variant.header_profile.include_p_preferred_identity {
-            request.push_str(&format!(
-                "P-Preferred-Identity: <{}>\r\n",
-                self.identity.public_uri
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "P-Preferred-Identity",
+                format!("<{}>", self.identity.public_uri),
             ));
         }
-        match variant.header_profile.visited_network {
-            LiveVisitedNetworkFormat::QuotedHome => {
-                request.push_str(&format!("P-Visited-Network-ID: \"{visited_network}\"\r\n"));
-            }
-            LiveVisitedNetworkFormat::UnquotedHome => {
-                request.push_str(&format!("P-Visited-Network-ID: {visited_network}\r\n"));
-            }
-            LiveVisitedNetworkFormat::Omit => {}
-        }
-        match variant.header_profile.pani {
-            LivePaniFormat::ProfileDefault => {
-                request.push_str(&format!(
-                    "P-Access-Network-Info: {}\r\n",
-                    build_p_access_network_info(profile)
+        if let Some(visited_network) = &params.visited_network {
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "P-Visited-Network-ID",
+                visited_network,
                 ));
             }
-            LivePaniFormat::PlainWifi => {
-                request
-                    .push_str("P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=000000000000\r\n");
-            }
-            LivePaniFormat::Omit => {}
+        if let Some(pani) = &params.pani {
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "P-Access-Network-Info",
+                pani,
+            ));
         }
         if variant.header_profile.include_cellular_network_info {
-            request.push_str(&format!(
-                "Cellular-Network-Info: {}\r\n",
-                build_cellular_network_info(profile)
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Cellular-Network-Info",
+                build_cellular_network_info(profile),
             ));
         }
         if variant.include_security_client {
-            request.push_str(&format!(
-                "Security-Client: {}\r\n",
-                self.security_client_header(variant.security_client_format)
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Security-Client",
+                self.security_client_header(variant.security_client_format),
             ));
         }
         if let Some(security_verify) = security_verify {
-            request.push_str(&format!("Security-Verify: {security_verify}\r\n"));
+            headers.push(crate::ims::sip_message::SipHeader::new(
+                "Security-Verify",
+                security_verify,
+            ));
         }
-        request.push_str(&format!(
-            "User-Agent: {}\r\n",
-            build_live_user_agent(profile, variant.header_profile.user_agent)
+        headers.push(crate::ims::sip_message::SipHeader::new(
+            "User-Agent",
+            &params.user_agent,
         ));
-        request.push_str("Content-Length: 0\r\n\r\n");
-        request
+        let to_value = format!("<{}>", self.identity.public_uri);
+        let frame = crate::ims::sip_message::build_register(&crate::ims::sip_message::SipRequest {
+            method: "REGISTER",
+            request_uri: &request_uri,
+            route: crate::ims::context::ImsRoute {
+                local_addr: SocketAddr::new(self.local_addr.ip(), profile.ims.local_port),
+                pcscf_addr: SocketAddr::new(self.route_addr, profile.ims.local_port),
+                transport: crate::ims::context::SipTransport::Tcp,
+            },
+            branch: &branch,
+            from_uri: &self.identity.public_uri,
+            from_tag: &self.from_tag,
+            to_value: &to_value,
+            call_id: &self.call_id,
+            cseq,
+            headers: &headers,
+            body: &[],
+        });
+        String::from_utf8(frame).expect("REGISTER builder emits UTF-8 headers")
     }
 
     fn request_uri(
@@ -4094,36 +4205,48 @@ async fn live_ims_register_identity(
 
     Ok(match format {
         LiveRegisterIdentityFormat::ImsiHomeDomain => LiveImsRegisterIdentity {
+            shared: crate::ims::context::ImsIdentity {
             private_user: format!("{imsi}@{}", profile.ims.realm),
             public_uri: format!("sip:{imsi}@{}", profile.ims.domain),
             contact_user: imsi.to_string(),
+                home_domain: profile.ims.domain.to_string(),
             contact_user_phone: false,
+            },
             shape: "imsi_home_domain",
         },
         LiveRegisterIdentityFormat::PrefixedImsiHomeDomain => {
             let prefixed = format!("0{imsi}");
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: format!("{prefixed}@{}", profile.ims.realm),
                 public_uri: format!("sip:{prefixed}@{}", profile.ims.domain),
                 contact_user: prefixed,
+                    home_domain: profile.ims.domain.to_string(),
                 contact_user_phone: false,
+                },
                 shape: "prefixed_imsi_home_domain",
             }
         }
         LiveRegisterIdentityFormat::ImsiPhoneUri => LiveImsRegisterIdentity {
+            shared: crate::ims::context::ImsIdentity {
             private_user: format!("{imsi}@{}", profile.ims.realm),
             public_uri: format!("sip:{imsi}@{};user=phone", profile.ims.domain),
             contact_user: imsi.to_string(),
+                home_domain: profile.ims.domain.to_string(),
             contact_user_phone: true,
+            },
             shape: "imsi_phone_uri",
         },
         LiveRegisterIdentityFormat::MsisdnPhoneUri => {
             let phone_number = read_live_msisdn_candidate(&conn).await?;
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: format!("{imsi}@{}", profile.ims.realm),
                 public_uri: format!("sip:{}@{};user=phone", phone_number, profile.ims.domain),
                 contact_user: phone_number,
+                    home_domain: profile.ims.domain.to_string(),
                 contact_user_phone: true,
+                },
                 shape: "msisdn_phone_uri",
             }
         }
@@ -6109,10 +6232,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6160,10 +6286,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6194,10 +6323,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6221,10 +6353,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example;user=phone".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: true,
+                },
                 shape: "imsi_phone_uri",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6251,10 +6386,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &crate::access::vowifi::profiles::NL_VODAFONE_20404,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6277,10 +6415,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
@@ -6309,10 +6450,13 @@ mod tests {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
             LiveImsRegisterIdentity {
+                shared: crate::ims::context::ImsIdentity {
                 private_user: "001010123456789@ims.example".to_string(),
                 public_uri: "sip:001010123456789@ims.example".to_string(),
                 contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
                 contact_user_phone: false,
+                },
                 shape: "fixture",
             },
             SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),

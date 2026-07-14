@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::access::vowifi::sms::{parse_mt_rp_data, MtSmsDeliver, SmsEncodingError};
+use crate::ims::sms_codec::{parse_mt_rp_data, MtSmsDeliver, SmsEncodingError};
 
 /// Transport tag stored on the shared `sms_messages` row (db `transport`
 /// column), distinguishing VoLTE-delivered SMS from modem/vowifi ones.
@@ -188,12 +188,12 @@ fn text_hash(text: &str) -> String {
 /// Build the RP-ACK RPDU body to return to the network for a received MT SMS.
 /// The `reference` is the RP message reference from the inbound deliver.
 pub fn build_rp_ack_body(reference: u8) -> Vec<u8> {
-    crate::access::vowifi::sms::build_network_rp_ack(reference)
+    crate::ims::sms_codec::build_network_rp_ack(reference)
 }
 
 // ============================ MO (send) side ============================
 
-pub use crate::access::vowifi::sms::MoSmsSubmission;
+pub use crate::ims::sms_codec::MoSmsSubmission;
 
 /// Build a single-part MO SMS submission (RP-DATA + SMS-SUBMIT TPDU). Reuses the
 /// vowifi 3GPP codec. Long-message segmentation (>160 GSM7 / >70 UCS2) is a
@@ -203,7 +203,7 @@ pub fn build_mo_submission(
     text: &str,
     service_center: &str,
 ) -> Result<MoSmsSubmission, SmsEncodingError> {
-    crate::access::vowifi::sms::build_single_part_mo_submission(recipient, text, service_center)
+    crate::ims::sms_codec::build_single_part_mo_submission(recipient, text, service_center)
 }
 
 #[cfg(test)]

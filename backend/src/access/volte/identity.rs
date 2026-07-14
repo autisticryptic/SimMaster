@@ -16,11 +16,7 @@ use crate::access::vowifi::qmi_uim::{UsimAkaApduResult, USIM_AID_PREFIX};
 /// Build the IMS home domain from MCC/MNC (TS 23.003). MNC is zero-padded to 3
 /// digits per the 3GPP domain rule (even when the operator uses a 2-digit MNC).
 pub fn home_domain(mcc: &str, mnc: &str) -> String {
-    format!(
-        "ims.mnc{}.mcc{}.3gppnetwork.org",
-        pad_mnc(mnc),
-        mcc
-    )
+    format!("ims.mnc{}.mcc{}.3gppnetwork.org", pad_mnc(mnc), mcc)
 }
 
 fn pad_mnc(mnc: &str) -> String {
@@ -52,6 +48,7 @@ pub fn derive_identity(imsi: &str, mcc: &str, mnc: &str) -> ImsIdentity {
         public_uri: format!("sip:{imsi}@{domain}"),
         contact_user: imsi.to_string(),
         home_domain: domain,
+        contact_user_phone: false,
     }
 }
 
@@ -154,7 +151,10 @@ mod tests {
         good.extend_from_slice(&[0xff, 0xff]);
         assert_eq!(resolve_usim_aid(Some(&good)), good);
         // Non-USIM discovered -> fall back to built-in prefix.
-        assert_eq!(resolve_usim_aid(Some(&[0x01, 0x02])), USIM_AID_PREFIX.to_vec());
+        assert_eq!(
+            resolve_usim_aid(Some(&[0x01, 0x02])),
+            USIM_AID_PREFIX.to_vec()
+        );
         assert_eq!(resolve_usim_aid(None), USIM_AID_PREFIX.to_vec());
     }
 }

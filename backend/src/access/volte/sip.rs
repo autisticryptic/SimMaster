@@ -11,9 +11,12 @@
 //! `MESSAGE`/`REGISTER` builders are used for both `register_ipsec` and
 //! `register_udp` modes.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 
 use super::errors::VolteError;
+use crate::ims::sip_message::{SipHeader, SipRequest};
+
+pub use crate::ims::context::{ImsIdentity, ImsRegisterParams, ImsRoute as SipRoute, SipTransport};
 
 /// 3GPP SMS-over-IP ICSI service identifier (TS 24.341).
 pub const SMS_ICSI: &str = "urn:urn-7:3gpp-service.ims.icsi.sms";
@@ -25,49 +28,6 @@ pub const MMTEL_ICSI_REF: &str = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 pub const PANI_EUTRAN: &str = "3GPP-E-UTRAN-FDD";
 pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
-
-/// SIP transport used in the topmost `Via` and Contact `transport=` param.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SipTransport {
-    Udp,
-    Tcp,
-}
-
-impl SipTransport {
-    pub fn as_via(self) -> &'static str {
-        match self {
-            SipTransport::Udp => "SIP/2.0/UDP",
-            SipTransport::Tcp => "SIP/2.0/TCP",
-        }
-    }
-
-    pub fn as_param(self) -> &'static str {
-        match self {
-            SipTransport::Udp => "udp",
-            SipTransport::Tcp => "tcp",
-        }
-    }
-}
-
-/// IMS identity used to populate From/To/Contact/P-Preferred-Identity.
-/// Derived (per TS 23.003) from the IMSI when no ISIM IMPU is provisioned:
-///   private_user (IMPI) = <IMSI>@ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
-///   public_uri   (IMPU) = sip:<IMSI>@ims.mnc<MNC>.mcc<MCC>.3gppnetwork.org
-#[derive(Debug, Clone)]
-pub struct ImsIdentity {
-    pub private_user: String,
-    pub public_uri: String,
-    pub contact_user: String,
-    pub home_domain: String,
-}
-
-/// Per-request routing/addressing context.
-#[derive(Debug, Clone)]
-pub struct SipRoute {
-    pub local_addr: SocketAddr,
-    pub pcscf_addr: SocketAddr,
-    pub transport: SipTransport,
-}
 
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
@@ -141,29 +101,32 @@ pub fn build_register(
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
-    let request_uri = format!("sip:{}", identity.home_domain);
-
-    let mut r = String::new();
-    r.push_str(&format!("REGISTER {request_uri} SIP/2.0\r\n"));
-    r.push_str(&format!(
-        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
-        route.transport.as_via()
-    ));
-    r.push_str("Max-Forwards: 70\r\n");
-    r.push_str(&format!(
-        "From: <{}>;tag={}\r\n",
-        identity.public_uri, ids.from_tag
-    ));
-    r.push_str(&format!("To: <{}>\r\n", identity.public_uri));
-    r.push_str(&format!("Call-ID: {}\r\n", ids.call_id));
-    r.push_str(&format!("CSeq: {} REGISTER\r\n", ids.cseq));
+    let params = ImsRegisterParams {
+        realm: identity.home_domain.clone(),
+        domain: identity.home_domain.clone(),
+        registrar: None,
+        supported_header: "path, gruu, sec-agree".to_string(),
+        require_sec_agree: true,
+        user_agent: USER_AGENT.to_string(),
+        pani: Some(PANI_EUTRAN.to_string()),
+        visited_network: None,
+        allow_header: "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+            .to_string(),
+        expires,
+    };
+    let request_uri = params.request_uri();
+    let to_value = format!("<{}>", identity.public_uri);
+    let mut headers = Vec::new();
     if let Some(auth) = authorization {
-        r.push_str(auth);
-        r.push_str("\r\n");
+        if let Some((name, value)) = auth.split_once(':') {
+            headers.push(SipHeader::new(name.trim(), value.trim()));
+        }
     }
     // Contact with 3GPP access type + smsip feature tag + sip.instance.
-    r.push_str(&format!(
-        "Contact: <sip:{}@{}:{};transport={}>;+g.3gpp.accesstype=\"{}\";+g.3gpp.smsip;+sip.instance=\"<{}>\";expires={}\r\n",
+    headers.push(SipHeader::new(
+        "Contact",
+        format!(
+        "<sip:{}@{}:{};transport={}>;+g.3gpp.accesstype=\"{}\";+g.3gpp.smsip;+sip.instance=\"<{}>\";expires={}",
         identity.contact_user,
         local_host,
         local_port,
@@ -171,26 +134,41 @@ pub fn build_register(
         PANI_EUTRAN,
         sip_instance,
         expires,
+    ),
     ));
-    r.push_str(&format!("Expires: {expires}\r\n"));
-    r.push_str("Supported: path, gruu, sec-agree\r\n");
-    r.push_str("Require: sec-agree\r\n");
-    r.push_str("Proxy-Require: sec-agree\r\n");
-    r.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n");
-    r.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
+    headers.push(SipHeader::new("Expires", expires.to_string()));
+    headers.push(SipHeader::new("Supported", &params.supported_header));
+    headers.push(SipHeader::new("Require", "sec-agree"));
+    headers.push(SipHeader::new("Proxy-Require", "sec-agree"));
+    headers.push(SipHeader::new("Allow", &params.allow_header));
+    headers.push(SipHeader::new(
+        "P-Preferred-Identity",
+        format!("<{}>", identity.public_uri),
     ));
-    r.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
+    headers.push(SipHeader::new(
+        "P-Access-Network-Info",
+        params.pani.as_deref().unwrap_or(PANI_EUTRAN),
+    ));
     if let Some(sc) = security_client {
-        r.push_str(&format!("Security-Client: {sc}\r\n"));
+        headers.push(SipHeader::new("Security-Client", sc));
     }
     if let Some(sv) = security_verify {
-        r.push_str(&format!("Security-Verify: {sv}\r\n"));
+        headers.push(SipHeader::new("Security-Verify", sv));
     }
-    r.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    r.push_str("Content-Length: 0\r\n\r\n");
-    r.into_bytes()
+    headers.push(SipHeader::new("User-Agent", &params.user_agent));
+    crate::ims::sip_message::build_register(&SipRequest {
+        method: "REGISTER",
+        request_uri: &request_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &ids.from_tag,
+        to_value: &to_value,
+        call_id: &ids.call_id,
+        cseq: ids.cseq,
+        headers: &headers,
+        body: &[],
+    })
 }
 
 /// Build a SIP MESSAGE carrying a 3GPP SMS RPDU body (MO submit).
@@ -204,46 +182,38 @@ pub fn build_sms_message(
     security_verify: Option<&str>,
 ) -> Vec<u8> {
     let branch = new_branch();
-    let local_host = sip_host(route.local_addr.ip());
-    let local_port = route.local_addr.port();
     let route_host = sip_host(route.pcscf_addr.ip());
     let call_id = format!("{}@simadmin", hex_token(16));
     let from_tag = hex_token(8);
-
-    let mut h = String::new();
-    h.push_str(&format!("MESSAGE {request_uri} SIP/2.0\r\n"));
-    h.push_str(&format!(
-        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
-        route.transport.as_via()
-    ));
-    h.push_str("Max-Forwards: 70\r\n");
-    h.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        route.pcscf_addr.port()
-    ));
-    h.push_str(&format!(
-        "From: <{}>;tag={from_tag}\r\n",
-        identity.public_uri
-    ));
-    h.push_str(&format!("To: <{to_uri}>\r\n"));
-    h.push_str(&format!("Call-ID: {call_id}\r\n"));
-    h.push_str("CSeq: 1 MESSAGE\r\n");
-    h.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
-    h.push_str(&format!("P-Preferred-Service: {SMS_ICSI}\r\n"));
+    let to_value = format!("<{to_uri}>");
+    let mut headers = vec![
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("P-Preferred-Service", SMS_ICSI),
+    ];
     if let Some(sv) = security_verify {
-        h.push_str(&format!("Security-Verify: {sv}\r\n"));
+        headers.push(SipHeader::new("Security-Verify", sv));
     }
-    h.push_str("Accept-Contact: *;+g.3gpp.smsip\r\n");
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    h.push_str(&format!("Content-Type: {SMS_CONTENT_TYPE}\r\n"));
-    h.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
-    let mut frame = h.into_bytes();
-    frame.extend_from_slice(body);
-    frame
+    headers.push(SipHeader::new("Accept-Contact", "*;+g.3gpp.smsip"));
+    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    headers.push(SipHeader::new("Content-Type", SMS_CONTENT_TYPE));
+    crate::ims::sip_message::build_message(&SipRequest {
+        method: "MESSAGE",
+        request_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &from_tag,
+        to_value: &to_value,
+        call_id: &call_id,
+        cseq: 1,
+        headers: &headers,
+        body,
+    })
 }
 
 /// Build the RP-ACK MESSAGE sent back to the network for a received MT SMS.
@@ -317,54 +287,54 @@ pub fn build_invite(
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
     let route_host = sip_host(route.pcscf_addr.ip());
-
-    let mut h = String::new();
-    h.push_str(&format!("INVITE {callee_uri} SIP/2.0\r\n"));
-    h.push_str(&format!(
-        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
-        route.transport.as_via()
-    ));
-    h.push_str("Max-Forwards: 70\r\n");
-    h.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        route.pcscf_addr.port()
-    ));
-    h.push_str(&format!(
-        "From: <{}>;tag={}\r\n",
-        identity.public_uri, dialog.local_tag
-    ));
-    h.push_str(&format!("To: <{callee_uri}>\r\n"));
-    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
-    h.push_str(&format!("CSeq: {} INVITE\r\n", dialog.cseq));
-    h.push_str(&format!(
-        "Contact: <sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"\r\n",
+    let to_value = format!("<{callee_uri}>");
+    let mut headers = vec![
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new(
+            "Contact",
+            format!(
+                "<sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"",
         identity.contact_user,
         local_host,
         local_port,
         route.transport.as_param(),
         MMTEL_ICSI_REF,
-    ));
-    h.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
-    h.push_str(&format!("P-Preferred-Service: {MMTEL_ICSI}\r\n"));
-    h.push_str(&format!(
-        "Accept-Contact: *;+g.3gpp.icsi-ref=\"{}\"\r\n",
-        MMTEL_ICSI_REF
-    ));
-    h.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n");
-    h.push_str("Supported: 100rel, precondition\r\n");
+            ),
+        ),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("P-Preferred-Service", MMTEL_ICSI),
+        SipHeader::new(
+            "Accept-Contact",
+            format!("*;+g.3gpp.icsi-ref=\"{MMTEL_ICSI_REF}\""),
+        ),
+        SipHeader::new(
+            "Allow",
+            "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS",
+        ),
+        SipHeader::new("Supported", "100rel, precondition"),
+    ];
     if let Some(sv) = security_verify {
-        h.push_str(&format!("Security-Verify: {sv}\r\n"));
+        headers.push(SipHeader::new("Security-Verify", sv));
     }
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    h.push_str("Content-Type: application/sdp\r\n");
-    h.push_str(&format!("Content-Length: {}\r\n\r\n", sdp_offer.len()));
-    let mut frame = h.into_bytes();
-    frame.extend_from_slice(sdp_offer);
-    frame
+    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    headers.push(SipHeader::new("Content-Type", "application/sdp"));
+    crate::ims::sip_message::build_invite(&SipRequest {
+        method: "INVITE",
+        request_uri: callee_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &dialog.local_tag,
+        to_value: &to_value,
+        call_id: &dialog.call_id,
+        cseq: dialog.cseq,
+        headers: &headers,
+        body: sdp_offer,
+    })
 }
 
 /// Build an in-dialog **re-INVITE** to renegotiate media on an *already
@@ -402,54 +372,53 @@ pub fn build_reinvite(
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
         None => format!("<{callee_uri}>"),
     };
-
-    let mut h = String::new();
-    h.push_str(&format!("INVITE {callee_uri} SIP/2.0\r\n"));
-    h.push_str(&format!(
-        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
-        route.transport.as_via()
-    ));
-    h.push_str("Max-Forwards: 70\r\n");
-    h.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        route.pcscf_addr.port()
-    ));
-    h.push_str(&format!(
-        "From: <{}>;tag={}\r\n",
-        identity.public_uri, dialog.local_tag
-    ));
-    h.push_str(&format!("To: {to}\r\n"));
-    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
-    h.push_str(&format!("CSeq: {} INVITE\r\n", dialog.cseq));
-    h.push_str(&format!(
-        "Contact: <sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"\r\n",
+    let mut headers = vec![
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new(
+            "Contact",
+            format!(
+                "<sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"",
         identity.contact_user,
         local_host,
         local_port,
         route.transport.as_param(),
         MMTEL_ICSI_REF,
-    ));
-    h.push_str(&format!(
-        "P-Preferred-Identity: <{}>\r\n",
-        identity.public_uri
-    ));
-    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
-    h.push_str(&format!("P-Preferred-Service: {MMTEL_ICSI}\r\n"));
-    h.push_str(&format!(
-        "Accept-Contact: *;+g.3gpp.icsi-ref=\"{}\"\r\n",
-        MMTEL_ICSI_REF
-    ));
-    h.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n");
-    h.push_str("Supported: 100rel, precondition\r\n");
+            ),
+        ),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("P-Preferred-Service", MMTEL_ICSI),
+        SipHeader::new(
+            "Accept-Contact",
+            format!("*;+g.3gpp.icsi-ref=\"{MMTEL_ICSI_REF}\""),
+        ),
+        SipHeader::new(
+            "Allow",
+            "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS",
+        ),
+        SipHeader::new("Supported", "100rel, precondition"),
+    ];
     if let Some(sv) = security_verify {
-        h.push_str(&format!("Security-Verify: {sv}\r\n"));
+        headers.push(SipHeader::new("Security-Verify", sv));
     }
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    h.push_str("Content-Type: application/sdp\r\n");
-    h.push_str(&format!("Content-Length: {}\r\n\r\n", sdp_offer.len()));
-    let mut frame = h.into_bytes();
-    frame.extend_from_slice(sdp_offer);
-    frame
+    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    headers.push(SipHeader::new("Content-Type", "application/sdp"));
+    crate::ims::sip_message::build_invite(&SipRequest {
+        method: "INVITE",
+        request_uri: callee_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &dialog.local_tag,
+        to_value: &to,
+        call_id: &dialog.call_id,
+        cseq: dialog.cseq,
+        headers: &headers,
+        body: sdp_offer,
+    })
 }
 
 /// Build the ACK for a 2xx INVITE response (confirms the dialog). Uses the
@@ -462,35 +431,31 @@ pub fn build_ack(
     callee_uri: &str,
 ) -> Vec<u8> {
     let branch = new_branch();
-    let local_host = sip_host(route.local_addr.ip());
-    let local_port = route.local_addr.port();
     let route_host = sip_host(route.pcscf_addr.ip());
     let to = match &dialog.remote_tag {
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
         None => format!("<{callee_uri}>"),
     };
-
-    let mut h = String::new();
-    h.push_str(&format!("ACK {callee_uri} SIP/2.0\r\n"));
-    h.push_str(&format!(
-        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
-        route.transport.as_via()
-    ));
-    h.push_str("Max-Forwards: 70\r\n");
-    h.push_str(&format!(
-        "Route: <sip:{route_host}:{};lr>\r\n",
-        route.pcscf_addr.port()
-    ));
-    h.push_str(&format!(
-        "From: <{}>;tag={}\r\n",
-        identity.public_uri, dialog.local_tag
-    ));
-    h.push_str(&format!("To: {to}\r\n"));
-    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
-    h.push_str(&format!("CSeq: {} ACK\r\n", dialog.cseq));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    h.push_str("Content-Length: 0\r\n\r\n");
-    h.into_bytes()
+    let headers = [
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new("User-Agent", USER_AGENT),
+    ];
+    crate::ims::sip_message::build_ack(&SipRequest {
+        method: "ACK",
+        request_uri: callee_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &dialog.local_tag,
+        to_value: &to,
+        call_id: &dialog.call_id,
+        cseq: dialog.cseq,
+        headers: &headers,
+        body: &[],
+    })
 }
 
 /// Build a BYE to tear down a confirmed dialog. CSeq must be incremented past
@@ -680,7 +645,7 @@ pub fn sip_header_uri(frame: &[u8], header_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn ident() -> ImsIdentity {
         ImsIdentity {
@@ -688,6 +653,7 @@ mod tests {
             public_uri: "sip:460001234567890@ims.mnc000.mcc460.3gppnetwork.org".to_string(),
             contact_user: "460001234567890".to_string(),
             home_domain: "ims.mnc000.mcc460.3gppnetwork.org".to_string(),
+            contact_user_phone: false,
         }
     }
 
