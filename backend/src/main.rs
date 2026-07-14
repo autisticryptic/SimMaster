@@ -24,27 +24,28 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zbus::Connection;
 
+mod access;
 mod api;
 mod automation;
+mod cellular;
 mod ims;
 mod infra;
-mod cellular;
+mod messaging;
 mod network;
 mod notify;
-mod messaging;
+mod orchestrator;
 mod sim;
 mod state;
 mod system;
-mod access;
 
+use api::handlers::*;
+use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use infra::config::{get_default_config_path, ConfigManager};
 use infra::db::Database;
 use network::device_network::DdnsManager;
-use sim::esim::EsimSupervisor;
-use api::handlers::*;
-use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
 use notify::notification::NotificationSender;
 use notify::notification_queue::*;
+use sim::esim::EsimSupervisor;
 use state::AppState;
 use system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
@@ -287,7 +288,9 @@ async fn main() -> Result<()> {
         let config_manager = ConfigManager::new(get_default_config_path());
         let security = config_manager.get_security();
         return match command {
-            AuthCommand::ResetPassword => api::auth::reset_admin_password_interactive(&db, &security),
+            AuthCommand::ResetPassword => {
+                api::auth::reset_admin_password_interactive(&db, &security)
+            }
             AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
     }
@@ -493,6 +496,36 @@ async fn main() -> Result<()> {
 
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());
+
+    // Phase C: prune the cross-transport SMS dedup fingerprint table daily so
+    // long-running installs don't accumulate unbounded dedup rows. The
+    // retention window is user-configurable via the SMS path policy.
+    {
+        let cleanup_app = app_state.clone();
+        tokio::spawn(async move {
+            let db = cleanup_app.database.clone();
+            let config_manager = cleanup_app.config_manager.clone();
+            // Small startup delay so the first sweep doesn't race with boot.
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+            loop {
+                let retention_days = config_manager.get_sms_path_policy().dedup_retention_days;
+                match db.cleanup_sms_dedup(retention_days) {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(
+                            deleted,
+                            retention_days,
+                            "Pruned expired SMS dedup fingerprints"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to prune SMS dedup fingerprints");
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
+    }
 
     // Build protected routes - 使用统一的 AppState
     spawn_vowifi_auto_restore(app_state.clone());

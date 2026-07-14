@@ -528,6 +528,46 @@ mod tests {
     }
 
     #[test]
+    fn sms_dedup_claim_is_idempotent_across_transports() {
+        let db = test_database();
+        let fp = "volte-mt:single:+123:2026-07-14 10:00:00:abcdef";
+
+        // First leg claims it → true (proceed to store).
+        assert!(db.claim_sms_dedup(fp, "volte_ims").expect("claim 1"));
+        assert!(db.sms_dedup_exists(fp).expect("exists after claim"));
+        // Second leg (different transport) sees it already claimed → false (drop).
+        assert!(!db.claim_sms_dedup(fp, "modem").expect("claim 2"));
+        // A different fingerprint is independent.
+        assert!(db
+            .claim_sms_dedup("other-fp", "vowifi_ims")
+            .expect("claim other"));
+        assert_eq!(db.sms_dedup_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn sms_dedup_cleanup_prunes_expired_rows() {
+        let db = test_database();
+        db.claim_sms_dedup("fresh", "modem").expect("claim fresh");
+
+        // Backdate one row well beyond any retention window.
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO sms_dedup (fingerprint, transport, created_at)
+                 VALUES ('stale', 'modem', '2000-01-01 00:00:00')",
+                [],
+            )
+            .expect("insert stale");
+        }
+        assert_eq!(db.sms_dedup_count().expect("count before"), 2);
+
+        let deleted = db.cleanup_sms_dedup(30).expect("cleanup");
+        assert_eq!(deleted, 1, "only the stale row is pruned");
+        assert!(db.sms_dedup_exists("fresh").expect("fresh survives"));
+        assert!(!db.sms_dedup_exists("stale").expect("stale pruned"));
+    }
+
+    #[test]
     fn vowifi_sms_delivery_round_trips_with_parts() {
         let db = test_database();
 
@@ -957,6 +997,7 @@ fn non_empty_option(value: Option<&str>) -> Option<String> {
 fn normalized_sms_transport(value: &str) -> &'static str {
     match value.trim() {
         "vowifi_ims" => "vowifi_ims",
+        "volte_ims" => "volte_ims",
         _ => "modem",
     }
 }
@@ -1031,6 +1072,27 @@ impl Database {
             [],
         )?;
         normalize_existing_sms_timestamps(&conn)?;
+
+        // Phase C: cross-transport SMS dedup fingerprints.
+        //
+        // Kept in a dedicated table (rather than the user-visible sms_messages
+        // rows) so the dedup index stays bounded and can be pruned on a schedule
+        // without ever deleting stored messages. `fingerprint` is UNIQUE so a
+        // duplicate MT delivery arriving on a second access leg is rejected at
+        // insert time. `created_at` drives the retention-based cleanup.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sms_dedup (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                transport TEXT NOT NULL DEFAULT 'modem',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_dedup_created_at ON sms_dedup(created_at)",
+            [],
+        )?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS notification_logs (
@@ -2091,6 +2153,69 @@ impl Database {
             |row| row.get(0),
         )
         .optional()
+    }
+
+    // ================= Phase C: cross-transport SMS dedup =================
+    //
+    // The orchestrator can receive the same MT SMS on more than one leg (e.g.
+    // an IMS leg and the CS listener both surface it). To make sure a message
+    // lands in `sms_messages` exactly once regardless of which transport won
+    // the race, we record a content fingerprint in a dedicated `sms_dedup`
+    // table and consult it *before* inserting. This table is bounded: rows are
+    // pruned by `cleanup_sms_dedup` on a retention window so the DB does not
+    // grow without limit over long uptimes.
+
+    /// Atomically claim a dedup fingerprint. Returns `true` if this is the
+    /// first time we've seen `fingerprint` (caller should proceed to store the
+    /// SMS), or `false` if it was already claimed (caller should drop it as a
+    /// duplicate). `transport` is recorded for observability/debugging only.
+    ///
+    /// The claim is a single `INSERT OR IGNORE` on a UNIQUE column, so it is
+    /// race-free even if two legs call it concurrently: exactly one insert
+    /// affects a row.
+    pub fn claim_sms_dedup(&self, fingerprint: &str, transport: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let changed = conn.execute(
+            "INSERT OR IGNORE INTO sms_dedup (fingerprint, transport, created_at)
+             VALUES (?1, ?2, ?3)",
+            params![fingerprint, transport, beijing_sms_now_string()],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Whether a dedup fingerprint has already been claimed (non-mutating).
+    pub fn sms_dedup_exists(&self, fingerprint: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sms_dedup WHERE fingerprint = ?1",
+            params![fingerprint],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    /// Prune dedup fingerprints older than `retention_days`. Returns the number
+    /// of rows deleted. A retention of 0 is treated as "keep nothing older than
+    /// now" (still bounded). Intended to be called from a daily task.
+    pub fn cleanup_sms_dedup(&self, retention_days: u32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = Utc::now()
+            .with_timezone(&beijing_offset())
+            .checked_sub_signed(Duration::days(i64::from(retention_days)))
+            .unwrap_or_else(|| Utc::now().with_timezone(&beijing_offset()))
+            .format(SMS_TIMESTAMP_FORMAT)
+            .to_string();
+        let deleted = conn.execute(
+            "DELETE FROM sms_dedup WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
+    }
+
+    /// Number of live dedup fingerprints (for status/metrics).
+    pub fn sms_dedup_count(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row("SELECT COUNT(*) FROM sms_dedup", [], |row| row.get(0))
     }
 
     pub fn incoming_sms_exists_by_timestamp(
