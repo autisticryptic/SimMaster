@@ -98,6 +98,34 @@ pub fn build_register(
     security_verify: Option<&str>,
     sip_instance: &str,
 ) -> Vec<u8> {
+    build_register_with_security_policy(
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        true,
+    )
+}
+
+/// REGISTER builder with an explicit sec-agree policy. The normal VoLTE path
+/// requires IPsec; the `false` form is reserved for the documented UDP
+/// degradation path when the network omits Security-Server entirely.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_with_security_policy(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    require_sec_agree: bool,
+) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
@@ -105,8 +133,13 @@ pub fn build_register(
         realm: identity.home_domain.clone(),
         domain: identity.home_domain.clone(),
         registrar: None,
-        supported_header: "path, gruu, sec-agree".to_string(),
-        require_sec_agree: true,
+        supported_header: if require_sec_agree {
+            "path, gruu, sec-agree"
+        } else {
+            "path, gruu"
+        }
+        .to_string(),
+        require_sec_agree,
         user_agent: USER_AGENT.to_string(),
         pani: Some(PANI_EUTRAN.to_string()),
         visited_network: None,
@@ -138,8 +171,10 @@ pub fn build_register(
     ));
     headers.push(SipHeader::new("Expires", expires.to_string()));
     headers.push(SipHeader::new("Supported", &params.supported_header));
-    headers.push(SipHeader::new("Require", "sec-agree"));
-    headers.push(SipHeader::new("Proxy-Require", "sec-agree"));
+    if require_sec_agree {
+        headers.push(SipHeader::new("Require", "sec-agree"));
+        headers.push(SipHeader::new("Proxy-Require", "sec-agree"));
+    }
     headers.push(SipHeader::new("Allow", &params.allow_header));
     headers.push(SipHeader::new(
         "P-Preferred-Identity",

@@ -31,6 +31,60 @@ pub struct SecAgree {
     pub port_s: u16,
 }
 
+impl SecAgree {
+    pub fn security_client_value(self) -> String {
+        format!(
+            "ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c={};spi-s={};port-c={};port-s={}",
+            self.spi_c, self.spi_s, self.port_c, self.port_s
+        )
+    }
+}
+
+/// Parse the selected `Security-Server: ipsec-3gpp;...` value. Unknown
+/// extensions are ignored; all four port/SPI bindings are mandatory.
+pub fn parse_security_server(value: &str) -> Result<SecAgree, VolteError> {
+    let mut mechanism = None;
+    let mut spi_c = None;
+    let mut spi_s = None;
+    let mut port_c = None;
+    let mut port_s = None;
+    for (index, part) in value.split(';').enumerate() {
+        let part = part.trim();
+        if index == 0 {
+            mechanism = Some(part.to_ascii_lowercase());
+            continue;
+        }
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let raw = raw.trim().trim_matches('"');
+        match name.trim().to_ascii_lowercase().as_str() {
+            "spi-c" => spi_c = parse_u32(raw),
+            "spi-s" => spi_s = parse_u32(raw),
+            "port-c" => port_c = raw.parse().ok(),
+            "port-s" => port_s = raw.parse().ok(),
+            _ => {}
+        }
+    }
+    if mechanism.as_deref() != Some("ipsec-3gpp") {
+        return Err(VolteError::new(code::SECURITY_SERVER_MISSING));
+    }
+    Ok(SecAgree {
+        spi_c: spi_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        spi_s: spi_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        port_c: port_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        port_s: port_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+    })
+}
+
+fn parse_u32(value: &str) -> Option<u32> {
+    value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map(|hex| u32::from_str_radix(hex, 16).ok())
+        .unwrap_or_else(|| value.parse().ok())
+}
+
 /// Integrity + encryption algorithm tokens for the SA. IMS signaling protection
 /// is integrity-only, so `ealg` is null by default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +350,37 @@ pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), VolteError> {
     Ok(())
 }
 
+/// Remove only the SAs/policies installed for this IMS session. This avoids a
+/// global xfrm flush, which could tear down an unrelated VPN on the host.
+pub fn uninstall_plan(plan: &XfrmInstallPlan) {
+    for policy in plan.policies.iter().rev() {
+        let mut delete = policy.clone();
+        if let Some(action) = delete.get_mut(2) {
+            *action = "delete".to_string();
+        }
+        if let Some(template) = delete.iter().position(|part| part == "tmpl") {
+            delete.truncate(template);
+        }
+        let _ = run_ip(&delete);
+    }
+    for state in plan.states.iter().rev() {
+        let delete = vec![
+            "xfrm".to_string(),
+            "state".to_string(),
+            "delete".to_string(),
+            "src".to_string(),
+            state.src.to_string(),
+            "dst".to_string(),
+            state.dst.to_string(),
+            "proto".to_string(),
+            "esp".to_string(),
+            "spi".to_string(),
+            format!("0x{:08x}", state.spi),
+        ];
+        let _ = run_ip(&delete);
+    }
+}
+
 /// Best-effort teardown of all VoLTE xfrm state/policy.
 pub fn teardown() {
     for cmd in build_xfrm_flush() {
@@ -401,5 +486,44 @@ mod tests {
     #[test]
     fn hex_key_prefixes_0x() {
         assert_eq!(hex_key(&[0x0a, 0xff]), "0x0aff");
+    }
+
+    #[test]
+    fn security_server_round_trips_required_port_and_spi_values() {
+        let offered = SecAgree {
+            spi_c: 0x1020_3040,
+            spi_s: 0x5060_7080,
+            port_c: 5062,
+            port_s: 5064,
+        };
+        let parsed = parse_security_server(&offered.security_client_value()).unwrap();
+        assert_eq!(parsed, offered);
+        let hex = parse_security_server(
+            "ipsec-3gpp;alg=hmac-md5-96;spi-c=0x10203040;spi-s=0x50607080;port-c=5062;port-s=5064",
+        )
+        .unwrap();
+        assert_eq!(hex, offered);
+    }
+
+    #[test]
+    fn scoped_uninstall_arguments_do_not_flush_global_xfrm_state() {
+        let sec = SecAgree {
+            spi_c: 1,
+            spi_s: 2,
+            port_c: 5062,
+            port_s: 5064,
+        };
+        let plan = build_install_plan(v6(2), v6(1), &sec, &[1; 16]).unwrap();
+        for policy in &plan.policies {
+            assert!(policy.contains(&"add".to_string()));
+            assert!(!policy.contains(&"flush".to_string()));
+        }
+        for state in &plan.states {
+            let delete = format!(
+                "xfrm state delete src {} dst {} proto esp spi 0x{:08x}",
+                state.src, state.dst, state.spi
+            );
+            assert!(!delete.contains("flush"));
+        }
     }
 }

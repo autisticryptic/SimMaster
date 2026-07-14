@@ -4037,7 +4037,8 @@ pub async fn set_volte_feature_handler(
     match app.config_manager.set_volte_feature_enabled(payload.enabled) {
         Ok(config) => {
             if !payload.enabled {
-                app.volte_runtime.reset_runtime("volte_disabled").await;
+                crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
+                    .await;
             }
             let runtime = app.volte_runtime.status().await;
             (
@@ -4052,6 +4053,51 @@ pub async fn set_volte_feature_handler(
             StatusCode::OK,
             Json(ApiResponse::<VolteControlResponse>::error(format!(
                 "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+/// Start/stop the live VoLTE IMS bearer and REGISTER session. The feature gate
+/// must be enabled first; disabling performs scoped xfrm and bearer cleanup.
+pub async fn set_volte_connection_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VolteControlToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    let _guard = app.volte_connect_lock.lock().await;
+    match app
+        .config_manager
+        .set_volte_connection_enabled(payload.enabled)
+    {
+        Ok(config) => {
+            let result = if payload.enabled {
+                crate::access::volte::live::connect_live(&app.volte_runtime, &config).await
+            } else {
+                Ok(crate::access::volte::live::disconnect_live(
+                    &app.volte_runtime,
+                    "volte_connection_disabled",
+                )
+                .await)
+            };
+            let runtime = app.volte_runtime.status().await;
+            let response = VolteControlResponse::build(&config, runtime);
+            match result {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("Success", response)),
+                ),
+                Err(error) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::<VolteControlResponse>::error(format!(
+                        "Failed: {error}"
+                    ))),
+                ),
+            }
+        }
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VolteControlResponse>::error(format!(
+                "Failed: {error}"
             ))),
         ),
     }

@@ -34,6 +34,10 @@ impl VolteSipChannel {
     ) -> Result<Self, ImsError> {
         let socket = build_socket(route.local_addr, route.pcscf_addr, interface)
             .map_err(|_| ImsError::new("volte_channel_bind_failed"))?;
+        let mut route = route;
+        route.local_addr = socket
+            .local_addr()
+            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
         Ok(Self {
             socket,
             route,

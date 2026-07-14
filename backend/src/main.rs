@@ -853,6 +853,10 @@ async fn main() -> Result<()> {
             post(set_volte_feature_handler).options(options_handler),
         )
         .route(
+            "/api/volte/connection",
+            post(set_volte_connection_handler).options(options_handler),
+        )
+        .route(
             "/api/volte/call/status",
             get(get_volte_call_status_handler).options(options_handler),
         )
