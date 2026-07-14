@@ -436,6 +436,147 @@ pub fn build_single_part_mo_submission(
     })
 }
 
+/// Build one or more MO submissions, adding an 8-bit concatenation UDH when
+/// the payload exceeds the single-SMS GSM7/UCS2 limit.
+pub fn build_mo_submissions(
+    recipient: &str,
+    text: &str,
+    service_center: &str,
+) -> Result<Vec<MoSmsSubmission>, SmsEncodingError> {
+    let text = text.trim_end_matches(['\r', '\n']);
+    if recipient.trim().is_empty() {
+        return Err(SmsEncodingError::EmptyRecipient);
+    }
+    if text.is_empty() {
+        return Err(SmsEncodingError::EmptyText);
+    }
+    if let Some(septets) = gsm7_septets(text) {
+        if septets.len() <= 160 {
+            return build_single_part_mo_submission(recipient, text, service_center)
+                .map(|submission| vec![submission]);
+        }
+        let parts = split_gsm7_text(text, 153)?;
+        return build_concatenated_submissions(recipient, service_center, text, parts, true);
+    }
+    if text.encode_utf16().count() <= 70 {
+        return build_single_part_mo_submission(recipient, text, service_center)
+            .map(|submission| vec![submission]);
+    }
+    let parts = split_ucs2_text(text, 67)?;
+    build_concatenated_submissions(recipient, service_center, text, parts, false)
+}
+
+fn build_concatenated_submissions(
+    recipient: &str,
+    service_center: &str,
+    full_text: &str,
+    parts: Vec<String>,
+    gsm7: bool,
+) -> Result<Vec<MoSmsSubmission>, SmsEncodingError> {
+    let part_count = u8::try_from(parts.len()).map_err(|_| SmsEncodingError::TextTooLong)?;
+    if part_count < 2 {
+        return Err(SmsEncodingError::TextTooLong);
+    }
+    let counter = SMS_MESSAGE_COUNTER.fetch_add(u64::from(part_count), Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let concat_reference = (counter & 0xff) as u8;
+    let message_id = format!("ims-sms-{timestamp:x}-{counter:x}");
+    let trace_id = format!("ims-sms-trace-{timestamp:x}-{counter:x}");
+    let sc_address = encode_address_value(service_center)?;
+    let mut submissions = Vec::with_capacity(parts.len());
+
+    for (index, part) in parts.into_iter().enumerate() {
+        let sequence = u8::try_from(index + 1).map_err(|_| SmsEncodingError::TextTooLong)?;
+        let reference = concat_reference.wrapping_add(sequence.wrapping_sub(1));
+        let udh = [0x05, 0x00, 0x03, concat_reference, part_count, sequence];
+        let encoded = if gsm7 {
+            let septets = gsm7_septets(&part).ok_or(SmsEncodingError::TextTooLong)?;
+            EncodedSubmitUserData {
+                dcs: 0x00,
+                user_data_length: u8::try_from(7 + septets.len())
+                    .map_err(|_| SmsEncodingError::TextTooLong)?,
+                user_data: pack_gsm7_with_udh(&udh, &septets),
+            }
+        } else {
+            let mut user_data = udh.to_vec();
+            for unit in part.encode_utf16() {
+                user_data.extend_from_slice(&unit.to_be_bytes());
+            }
+            EncodedSubmitUserData {
+                dcs: 0x08,
+                user_data_length: u8::try_from(user_data.len())
+                    .map_err(|_| SmsEncodingError::TextTooLong)?,
+                user_data,
+            }
+        };
+        let tpdu = build_sms_submit_tpdu_encoded(recipient, reference, 0x41, encoded)?;
+        let mut body = Vec::with_capacity(5 + sc_address.len() + tpdu.len());
+        body.push(0x00);
+        body.push(reference);
+        body.push(0x00);
+        push_len_prefixed(&mut body, &sc_address)?;
+        push_len_prefixed(&mut body, &tpdu)?;
+        submissions.push(MoSmsSubmission {
+            trace_id: trace_id.clone(),
+            message_id: message_id.clone(),
+            rp_message_reference: reference,
+            part_index: sequence,
+            part_count,
+            body_bytes: body.len(),
+            text_utf16_units: full_text.encode_utf16().count(),
+            body,
+        });
+    }
+    Ok(submissions)
+}
+
+fn split_gsm7_text(text: &str, max_septets: usize) -> Result<Vec<String>, SmsEncodingError> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = if gsm7_basic_value(ch).is_some() {
+            1
+        } else if gsm7_extension_value(ch).is_some() {
+            2
+        } else {
+            return Err(SmsEncodingError::TextTooLong);
+        };
+        if used + width > max_septets && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += width;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
+fn split_ucs2_text(text: &str, max_units: usize) -> Result<Vec<String>, SmsEncodingError> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = ch.len_utf16();
+        if used + width > max_units && !current.is_empty() {
+            parts.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += width;
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
 pub fn classify_rp_ack(body: &[u8], expected_reference: u8) -> RpduAckState {
     if body.len() < 2 || body[1] != expected_reference {
         return RpduAckState::None;
@@ -576,12 +717,21 @@ fn build_sms_submit_tpdu(
     text: &str,
     message_reference: u8,
 ) -> Result<Vec<u8>, SmsEncodingError> {
-    let destination = encode_address_value(recipient)?;
     let encoded = encode_submit_user_data(text)?;
+    build_sms_submit_tpdu_encoded(recipient, message_reference, 0x01, encoded)
+}
+
+fn build_sms_submit_tpdu_encoded(
+    recipient: &str,
+    message_reference: u8,
+    first_octet: u8,
+    encoded: EncodedSubmitUserData,
+) -> Result<Vec<u8>, SmsEncodingError> {
+    let destination = encode_address_value(recipient)?;
 
     let recipient_digits = normalized_address_digits(recipient)?.digits;
     let mut tpdu = Vec::with_capacity(7 + destination.len() + encoded.user_data.len());
-    tpdu.push(0x01);
+    tpdu.push(first_octet);
     tpdu.push(message_reference);
     tpdu.push(u8::try_from(recipient_digits.len()).map_err(|_| SmsEncodingError::InvalidAddress)?);
     tpdu.extend_from_slice(&destination);
@@ -623,6 +773,15 @@ fn encode_submit_user_data(text: &str) -> Result<EncodedSubmitUserData, SmsEncod
 }
 
 fn encode_gsm7_user_data(text: &str) -> Option<(Vec<u8>, usize)> {
+    let septets = gsm7_septets(text)?;
+    let mut out = vec![0u8; (septets.len() * 7).div_ceil(8)];
+    for (index, septet) in septets.iter().copied().enumerate() {
+        write_septet(&mut out, index * 7, septet);
+    }
+    Some((out, septets.len()))
+}
+
+fn gsm7_septets(text: &str) -> Option<Vec<u8>> {
     let mut septets = Vec::with_capacity(text.len());
     for ch in text.chars() {
         if let Some(value) = gsm7_basic_value(ch) {
@@ -635,18 +794,26 @@ fn encode_gsm7_user_data(text: &str) -> Option<(Vec<u8>, usize)> {
         }
     }
 
-    let mut out = vec![0u8; (septets.len() * 7).div_ceil(8)];
+    Some(septets)
+}
+
+fn pack_gsm7_with_udh(udh: &[u8], septets: &[u8]) -> Vec<u8> {
+    let mut out = vec![0u8; (udh.len() * 8 + septets.len() * 7).div_ceil(8)];
+    out[..udh.len()].copy_from_slice(udh);
     for (index, septet) in septets.iter().copied().enumerate() {
-        let bit_index = index * 7;
-        for bit in 0..7 {
-            if septet & (1 << bit) == 0 {
-                continue;
-            }
-            let target = bit_index + bit;
-            out[target / 8] |= 1 << (target % 8);
-        }
+        write_septet(&mut out, udh.len() * 8 + index * 7, septet);
     }
-    Some((out, septets.len()))
+    out
+}
+
+fn write_septet(out: &mut [u8], bit_index: usize, septet: u8) {
+    for bit in 0..7 {
+        if septet & (1 << bit) == 0 {
+            continue;
+        }
+        let target = bit_index + bit;
+        out[target / 8] |= 1 << (target % 8);
+    }
 }
 
 fn encode_ucs2_user_data(text: &str) -> Result<Vec<u8>, SmsEncodingError> {
@@ -1745,6 +1912,57 @@ mod tests {
             }
         ));
         assert!(machine.snapshot().mt.parts.is_empty());
+    }
+
+    #[test]
+    fn gsm7_long_mo_sms_uses_153_septet_parts_and_concat_udh() {
+        let submissions = build_mo_submissions(
+            "+8613800138000",
+            &"A".repeat(161),
+            "+8613800100500",
+        )
+        .unwrap();
+        assert_eq!(submissions.len(), 2);
+        let concat_reference = submissions[0].rp_message_reference;
+        for (index, submission) in submissions.iter().enumerate() {
+            let expected = [
+                0x05,
+                0x00,
+                0x03,
+                concat_reference,
+                0x02,
+                u8::try_from(index + 1).unwrap(),
+            ];
+            assert_eq!(submission.part_count, 2);
+            assert!(submission.body.windows(6).any(|window| window == expected));
+        }
+        assert_eq!(submissions[0].message_id, submissions[1].message_id);
+    }
+
+    #[test]
+    fn ucs2_long_mo_sms_splits_on_utf16_boundaries() {
+        let submissions = build_mo_submissions(
+            "+8613800138000",
+            &"测".repeat(71),
+            "+8613800100500",
+        )
+        .unwrap();
+        assert_eq!(submissions.len(), 2);
+        assert_eq!(submissions[0].part_index, 1);
+        assert_eq!(submissions[1].part_index, 2);
+        assert_eq!(submissions[0].text_utf16_units, 71);
+        assert_eq!(submissions[1].text_utf16_units, 71);
+    }
+
+    #[test]
+    fn gsm7_extension_characters_count_as_two_septets_when_splitting() {
+        let submissions = build_mo_submissions(
+            "+8613800138000",
+            &"{".repeat(81),
+            "+8613800100500",
+        )
+        .unwrap();
+        assert_eq!(submissions.len(), 2);
     }
 
     #[test]

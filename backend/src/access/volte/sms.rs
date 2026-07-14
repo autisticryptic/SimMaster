@@ -206,6 +206,16 @@ pub fn build_mo_submission(
     crate::ims::sms_codec::build_single_part_mo_submission(recipient, text, service_center)
 }
 
+/// Build single or concatenated MO submissions. Multipart messages carry the
+/// standard 8-bit concatenation UDH and share one public message/trace id.
+pub fn build_mo_submissions(
+    recipient: &str,
+    text: &str,
+    service_center: &str,
+) -> Result<Vec<MoSmsSubmission>, SmsEncodingError> {
+    crate::ims::sms_codec::build_mo_submissions(recipient, text, service_center)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
