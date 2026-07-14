@@ -2952,7 +2952,7 @@ pub async fn delete_sms_batch_handler(
 
 // ============ 系统信息 ============
 
-/// 读取温度传感器数据
+// 读取温度传感器数据
 // ============ 电话功能 ============
 
 async fn track_call_start(

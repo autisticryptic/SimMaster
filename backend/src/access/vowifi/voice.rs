@@ -131,7 +131,7 @@ pub enum SipInviteState {
     Ringing,
     /// 183 Session Progress with early media SDP answer.
     EarlyMedia,
-    /// 200 OK received and ACK sent 锟?dialog confirmed.
+    /// 200 OK received and ACK sent — dialog confirmed.
     Confirmed,
     /// BYE exchanged, dialog terminated normally.
     Terminated,
@@ -283,7 +283,7 @@ impl AudioCodec {
         }
     }
 
-    /// Static RTP payload type, when the codec has one (dynamic 锟?None).
+    /// Static RTP payload type, when the codec has one (dynamic → None).
     pub fn static_payload_type(self) -> Option<u8> {
         match self {
             Self::Pcmu => Some(0),
@@ -962,7 +962,7 @@ impl RtpPacket {
 }
 
 /// Wrap an AMR/AMR-WB speech frame into an RTP payload using the
-/// bandwidth-efficient single-frame layout (RFC 4867 搂4.3), given the frame
+/// bandwidth-efficient single-frame layout (RFC 4867 §4.3), given the frame
 /// type index (FT) and the raw speech bits.
 ///
 /// This is the minimal framing needed to carry one speech frame per packet;
@@ -1433,7 +1433,8 @@ impl VoiceCallStateMachine {
 }
 
 /// Build the offline demo snapshot exercised by the dry-run executor. It walks
-/// a full MO call: register ready 锟?INVITE 锟?180 锟?183 锟?200 OK (AMR) 锟?media 锟?/// hangup, asserting state consistency at the end.
+/// a full MO call: register ready → INVITE → 180 → 183 → 200 OK (AMR) → media →
+/// hangup, asserting state consistency at the end.
 pub fn build_dry_run_voice_snapshot(
     profile: &'static CarrierProfile,
 ) -> VoiceRuntimePublicState {
@@ -1499,7 +1500,7 @@ pub trait AudioSink: Send + Sync {
     fn codec(&self) -> AudioCodec;
 }
 
-/// A silent audio source that never produces frames 锟?the default before a
+/// A silent audio source that never produces frames — the default before a
 /// real media backend is wired in.
 #[derive(Debug, Clone, Copy)]
 pub struct SilentAudioSource {
@@ -1515,7 +1516,7 @@ impl AudioSource for SilentAudioSource {
     }
 }
 
-/// An audio sink that discards everything 锟?the default before playback is
+/// An audio sink that discards everything — the default before playback is
 /// wired in.
 #[derive(Debug, Clone, Copy)]
 pub struct NullAudioSink {
@@ -1551,7 +1552,7 @@ pub trait CarrierVoiceLeg: Send + Sync {
     fn poll_state(&mut self) -> CallState;
 }
 
-/// A carrier leg that reports itself unavailable 锟?the safe default when no USB
+/// A carrier leg that reports itself unavailable — the safe default when no USB
 /// Audio device is present, disabling the operator fallback leg.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DisabledCarrierVoiceLeg;
@@ -1582,7 +1583,7 @@ impl CarrierVoiceLeg for DisabledCarrierVoiceLeg {
 /// endpoint per SIM so external UAs (Asterisk PBX, Linphone, etc.) can place
 /// and receive calls that SimAdmin then bridges onto the VoWiFi or carrier leg.
 ///
-/// This is the seam described by the target architecture ("瀵瑰锛氫竴鏉℃爣锟?SIP
+/// This is the seam described by the target architecture ("对外：一条标准 SIP
 /// endpoint (per SIM)"). It is intentionally trait-only for now.
 pub trait SipEndpointBridge: Send + Sync {
     /// Whether the outward SIP endpoint is currently exposed/enabled.
@@ -1596,7 +1597,7 @@ pub trait SipEndpointBridge: Send + Sync {
     fn on_external_invite(&mut self, callee: &str) -> Result<VoiceLegKind, VoiceRuntimeError>;
 }
 
-/// A SIP endpoint bridge that is not yet exposed 锟?the default until the
+/// A SIP endpoint bridge that is not yet exposed — the default until the
 /// outward endpoint feature is turned on.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct UnexposedSipEndpointBridge;

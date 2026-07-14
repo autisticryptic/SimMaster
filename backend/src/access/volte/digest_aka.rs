@@ -30,7 +30,7 @@ pub use core::AkaChallenge;
 /// Map a shared-core `ImsError` reason code onto the matching VoLTE error code.
 ///
 /// The shared core emits stable neutral codes (`aka_res_empty`, `hex_invalid`,
-/// 鈥?; VoLTE surfaces the `volte_`-prefixed variants its frontend contract and
+/// and so on; VoLTE surfaces the `volte_`-prefixed variants its frontend contract and
 /// error taxonomy expect. This is the single mapping seam.
 fn map_err(err: ImsError) -> VolteError {
     let mapped = match err.code() {
@@ -106,7 +106,7 @@ pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChalleng
     core::parse_digest_challenge(value, proxy).map_err(map_err)
 }
 
-/// HMAC-MD5 (RFC 2104) 鈥?re-exported from the shared core.
+/// HMAC-MD5 (RFC 2104) — re-exported from the shared core.
 pub use core::hmac_md5;
 
 #[cfg(test)]
@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn digest_response_matches_rfc2617_vector() {
-        // RFC 2617 搂3.5 (no qop) -> 670fd8c2df070c60b045671b8b24ff02.
+        // RFC 2617 §3.5 (no qop) -> 670fd8c2df070c60b045671b8b24ff02.
         let a = aka(b"Circle Of Life".to_vec(), vec![], vec![]);
         let resp = compute_aka_response(
             "Mufasa",

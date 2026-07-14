@@ -1,7 +1,7 @@
 //! VoLTE gateway RTP relay (skeleton).
 //!
 //! Clean-room from RFC 3550 (RTP). The target device has no audio hardware, so
-//! voice media is never decoded locally 鈥?it is relayed at the packet level
+//! voice media is never decoded locally — it is relayed at the packet level
 //! between two endpoints:
 //!   - the operator IMS media endpoint (negotiated via the VoLTE SDP), and
 //!   - the internal SIP UA (Linphone/Asterisk) media endpoint.
@@ -12,8 +12,8 @@
 //! `#[cfg(unix)]` layer that plugs this logic onto real sockets; it is compiled
 //! out on Windows so the logic can still be unit-tested there.
 //!
-//! Scope note (per plan stage E): this is the relay **skeleton** 鈥?symmetric
-//! two-leg forwarding with counters. Transcoding (AMR 鈫?G.711/opus), RTCP
+//! Scope note (per plan stage E): this is the relay **skeleton** — symmetric
+//! two-leg forwarding with counters. Transcoding (AMR ↔ G.711/opus), RTCP
 //! handling, and jitter buffering are explicitly out of scope here (a pure
 //! relay defers transcoding to the PBX, and the device only shuffles UDP).
 
@@ -91,7 +91,7 @@ pub enum RelayError {
 }
 
 /// The transport-agnostic RTP relay core: two legs, symmetric forwarding,
-/// peer learning, and counters. No sockets 鈥?feed it `(leg, src, datagram)`
+/// peer learning, and counters. No sockets — feed it `(leg, src, datagram)`
 /// and it tells you where to forward.
 #[derive(Debug, Clone)]
 pub struct RtpRelayCore {
