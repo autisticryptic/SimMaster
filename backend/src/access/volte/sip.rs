@@ -221,7 +221,10 @@ pub fn build_sms_message(
         "Route: <sip:{route_host}:{};lr>\r\n",
         route.pcscf_addr.port()
     ));
-    h.push_str(&format!("From: <{}>;tag={from_tag}\r\n", identity.public_uri));
+    h.push_str(&format!(
+        "From: <{}>;tag={from_tag}\r\n",
+        identity.public_uri
+    ));
     h.push_str(&format!("To: <{to_uri}>\r\n"));
     h.push_str(&format!("Call-ID: {call_id}\r\n"));
     h.push_str("CSeq: 1 MESSAGE\r\n");
@@ -230,9 +233,7 @@ pub fn build_sms_message(
         identity.public_uri
     ));
     h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
-    h.push_str(&format!(
-        "P-Preferred-Service: {SMS_ICSI}\r\n"
-    ));
+    h.push_str(&format!("P-Preferred-Service: {SMS_ICSI}\r\n"));
     if let Some(sv) = security_verify {
         h.push_str(&format!("Security-Verify: {sv}\r\n"));
     }
@@ -258,7 +259,14 @@ pub fn build_rp_ack(
 ) -> Vec<u8> {
     let request_uri =
         sip_header_uri(inbound_frame, "From").unwrap_or_else(|| fallback_uri.to_string());
-    build_sms_message(identity, route, &request_uri, &request_uri, body, security_verify)
+    build_sms_message(
+        identity,
+        route,
+        &request_uri,
+        &request_uri,
+        body,
+        security_verify,
+    )
 }
 
 // ============================ Voice (INVITE dialog) ============================
@@ -326,6 +334,91 @@ pub fn build_invite(
         identity.public_uri, dialog.local_tag
     ));
     h.push_str(&format!("To: <{callee_uri}>\r\n"));
+    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
+    h.push_str(&format!("CSeq: {} INVITE\r\n", dialog.cseq));
+    h.push_str(&format!(
+        "Contact: <sip:{}@{}:{};transport={}>;+g.3gpp.icsi-ref=\"{}\"\r\n",
+        identity.contact_user,
+        local_host,
+        local_port,
+        route.transport.as_param(),
+        MMTEL_ICSI_REF,
+    ));
+    h.push_str(&format!(
+        "P-Preferred-Identity: <{}>\r\n",
+        identity.public_uri
+    ));
+    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
+    h.push_str(&format!("P-Preferred-Service: {MMTEL_ICSI}\r\n"));
+    h.push_str(&format!(
+        "Accept-Contact: *;+g.3gpp.icsi-ref=\"{}\"\r\n",
+        MMTEL_ICSI_REF
+    ));
+    h.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n");
+    h.push_str("Supported: 100rel, precondition\r\n");
+    if let Some(sv) = security_verify {
+        h.push_str(&format!("Security-Verify: {sv}\r\n"));
+    }
+    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str("Content-Type: application/sdp\r\n");
+    h.push_str(&format!("Content-Length: {}\r\n\r\n", sdp_offer.len()));
+    let mut frame = h.into_bytes();
+    frame.extend_from_slice(sdp_offer);
+    frame
+}
+
+/// Build an in-dialog **re-INVITE** to renegotiate media on an *already
+/// established* call — this is how VoLTE⇄ViLTE switching works (add or drop the
+/// `m=video` section mid-call), exactly like "turn video on/off during a call"
+/// on a smartphone.
+///
+/// Differences from the initial [`build_invite`] (RFC 3261 §14):
+///   - It is sent **within the confirmed dialog**, so `To` carries the learned
+///     `remote_tag` (a re-INVITE is not a dialog-creating request).
+///   - `CSeq` is the next value in the dialog (the caller bumps `dialog.cseq`
+///     before calling; we assert the remote tag is present).
+///   - The SDP offer is the *new* media description (audio-only to downgrade
+///     ViLTE→VoLTE, or audio+video to upgrade VoLTE→ViLTE).
+///
+/// The far end answers with a 200 OK (new SDP answer), which the caller ACKs via
+/// [`build_ack`]. If the peer rejects the change it returns e.g. 488 Not
+/// Acceptable Here and the *existing* media continues unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn build_reinvite(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    sdp_offer: &[u8],
+    security_verify: Option<&str>,
+) -> Vec<u8> {
+    let branch = new_branch();
+    let local_host = sip_host(route.local_addr.ip());
+    let local_port = route.local_addr.port();
+    let route_host = sip_host(route.pcscf_addr.ip());
+    // In-dialog: To MUST carry the remote tag. If it is somehow absent we still
+    // emit a tagless To (degrades to initial-INVITE semantics) rather than panic.
+    let to = match &dialog.remote_tag {
+        Some(tag) => format!("<{callee_uri}>;tag={tag}"),
+        None => format!("<{callee_uri}>"),
+    };
+
+    let mut h = String::new();
+    h.push_str(&format!("INVITE {callee_uri} SIP/2.0\r\n"));
+    h.push_str(&format!(
+        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
+        route.transport.as_via()
+    ));
+    h.push_str("Max-Forwards: 70\r\n");
+    h.push_str(&format!(
+        "Route: <sip:{route_host}:{};lr>\r\n",
+        route.pcscf_addr.port()
+    ));
+    h.push_str(&format!(
+        "From: <{}>;tag={}\r\n",
+        identity.public_uri, dialog.local_tag
+    ));
+    h.push_str(&format!("To: {to}\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {} INVITE\r\n", dialog.cseq));
     h.push_str(&format!(
@@ -546,7 +639,8 @@ pub fn build_response(
 
 /// Parse the SIP status code (delegates to shared framing; remaps the error).
 pub fn parse_status(frame: &[u8]) -> Result<u16, VolteError> {
-    crate::ims::sip_frame::parse_status(frame).map_err(|_| VolteError::new("volte_sip_status_invalid"))
+    crate::ims::sip_frame::parse_status(frame)
+        .map_err(|_| VolteError::new("volte_sip_status_invalid"))
 }
 
 /// Everything after the header terminator (may be empty).
@@ -608,10 +702,7 @@ mod tests {
     #[test]
     fn sip_host_brackets_ipv6_only() {
         assert_eq!(sip_host(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))), "1.2.3.4");
-        assert_eq!(
-            sip_host(IpAddr::V6(Ipv6Addr::LOCALHOST)),
-            "[::1]"
-        );
+        assert_eq!(sip_host(IpAddr::V6(Ipv6Addr::LOCALHOST)), "[::1]");
     }
 
     #[test]
@@ -718,7 +809,14 @@ mod tests {
     #[test]
     fn rp_ack_targets_inbound_from_uri() {
         let inbound = b"MESSAGE sip:me SIP/2.0\r\nFrom: <sip:+8613800138000@h>;tag=x\r\n\r\nBODY";
-        let frame = build_rp_ack(&ident(), &route_udp(), inbound, &[0x02, 0x00], "sip:fallback@h", None);
+        let frame = build_rp_ack(
+            &ident(),
+            &route_udp(),
+            inbound,
+            &[0x02, 0x00],
+            "sip:fallback@h",
+            None,
+        );
         let text = String::from_utf8_lossy(&frame);
         assert!(text.starts_with("MESSAGE sip:+8613800138000@h SIP/2.0\r\n"));
         assert_eq!(sip_body(&frame), &[0x02, 0x00]);
@@ -737,7 +835,9 @@ mod tests {
             None,
         );
         let text = String::from_utf8_lossy(&frame);
-        assert!(text.starts_with("INVITE sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org SIP/2.0\r\n"));
+        assert!(text.starts_with(
+            "INVITE sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org SIP/2.0\r\n"
+        ));
         assert!(text.contains("CSeq: 1 INVITE\r\n"));
         assert!(text.contains("P-Preferred-Service: urn:urn-7:3gpp-service.ims.icsi.mmtel\r\n"));
         assert!(text.contains("Content-Type: application/sdp\r\n"));

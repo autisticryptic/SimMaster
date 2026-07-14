@@ -1233,6 +1233,18 @@ impl VoiceCallStateMachine {
         self.reg_ready = true;
     }
 
+    /// Read-only accessor for the current aggregate call state. Used by callers
+    /// (e.g. the VoLTE leg's mid-call media switch) to guard in-dialog actions
+    /// that are only valid on an active call.
+    pub fn call_state(&self) -> CallState {
+        self.call.call_state
+    }
+
+    /// Read-only accessor for the negotiated audio codec, if the call is active.
+    pub fn negotiated_codec(&self) -> Option<AudioCodec> {
+        self.call.negotiated_codec
+    }
+
     /// Queue an MO call, recording the leg that will carry it.
     pub fn queue_mo_call(&mut self, leg: VoiceLegKind) {
         self.call.direction = CallDirection::MobileOriginated;
