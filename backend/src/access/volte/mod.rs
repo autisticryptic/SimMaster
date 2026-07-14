@@ -20,6 +20,7 @@
 #![allow(unused_imports)]
 
 pub mod bearer;
+pub mod channel;
 pub mod digest_aka;
 pub mod errors;
 pub mod identity;
