@@ -5,6 +5,7 @@
 //! metadata, not on any third-party binary or private preset naming.
 
 pub mod aka;
+pub mod channel;
 pub mod dataplane;
 pub mod diagnostics;
 pub mod eap_aka;
@@ -29,7 +30,9 @@ pub mod profiles;
 pub mod qmi_uim;
 pub mod restore;
 pub mod runtime;
-pub mod sms;
+pub mod sms {
+    pub use crate::ims::sms_codec::*;
+}
 pub mod soak;
 pub mod stability;
 pub mod transport;

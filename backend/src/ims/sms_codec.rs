@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::profiles::CarrierProfile;
+use crate::access::vowifi::profiles::CarrierProfile;
 
 static SMS_MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -957,7 +957,7 @@ fn gsm7_basic_char(value: u8) -> char {
         0x5c => '脰',
         0x5d => '脩',
         0x5e => '脺',
-        0x5f => '搂',
+        0x5f => '§',
         0x60 => '驴',
         0x7b => '盲',
         0x7c => '枚',
@@ -1511,6 +1511,13 @@ mod tests {
         assert_eq!(tpdu[8], 0x00);
         assert_eq!(tpdu[9], 5);
         assert_eq!(decode_gsm7_text(&tpdu[10..], 5), "CHECK");
+    }
+
+    #[test]
+    fn gsm7_section_sign_round_trips_without_encoding_corruption() {
+        let (packed, septets) = encode_gsm7_user_data("§").expect("GSM7 section sign");
+        assert_eq!(septets, 1);
+        assert_eq!(decode_gsm7_text(&packed, septets), "§");
     }
 
     #[test]
