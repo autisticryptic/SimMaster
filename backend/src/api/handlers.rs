@@ -19,7 +19,7 @@ use zbus::Connection;
 
 use crate::{
     cellular::modem_manager,
-    infra::config::{ApnConfig, SmsPathPolicy, VolteConfig, VowifiConfig},
+    infra::config::{ApnConfig, SmsPathPolicy, VilteConfig, VolteConfig, VowifiConfig},
     infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
@@ -4150,6 +4150,95 @@ pub async fn set_sms_path_policy_handler(
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::<SmsPathPolicy>::error(format!(
+                "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+// ==================== ViLTE (video over LTE) policy (phase F) ====================
+
+/// ViLTE status: persisted config + a derived `enabled` that reflects the full
+/// gating chain (`volte.feature_enabled && volte.voice_enabled &&
+/// vilte.feature_enabled`). `gateway_mode`/`local_video_capable` mirror the
+/// VoLTE voice response: the device is a pure video relay, never a video
+/// endpoint.
+#[derive(Debug, serde::Serialize, Default)]
+pub struct VilteStatusResponse {
+    pub enabled: bool,
+    pub feature_enabled: bool,
+    pub gateway_mode: bool,
+    pub local_video_capable: bool,
+    pub config: VilteConfig,
+}
+
+impl VilteStatusResponse {
+    fn build(app: &AppState) -> Self {
+        let volte = app.config_manager.get_volte_config();
+        let vilte = app.config_manager.get_vilte_config();
+        let voice_ready = volte.feature_enabled && volte.voice_enabled;
+        Self {
+            enabled: voice_ready && vilte.feature_enabled,
+            feature_enabled: vilte.feature_enabled,
+            // Qualcomm 410 pocket-WiFi has no camera/display/codec: relay only.
+            gateway_mode: true,
+            local_video_capable: false,
+            config: vilte,
+        }
+    }
+}
+
+pub async fn get_vilte_control_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            VilteStatusResponse::build(&app),
+        )),
+    )
+}
+
+pub async fn set_vilte_feature_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VolteControlToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
+    match app.config_manager.set_vilte_feature_enabled(payload.enabled) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VilteStatusResponse::build(&app),
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VilteStatusResponse>::error(format!(
+                "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+/// Replace the full ViLTE config (codec / payload type / fmtp). The
+/// `feature_enabled` field is honored only when VoLTE voice is enabled;
+/// otherwise it is forced off by the config layer.
+pub async fn set_vilte_config_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VilteConfig>,
+) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
+    match app.config_manager.set_vilte_config(payload) {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VilteStatusResponse::build(&app),
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VilteStatusResponse>::error(format!(
                 "Failed: {err}"
             ))),
         ),

@@ -870,6 +870,16 @@ async fn main() -> Result<()> {
                 .post(set_sms_path_policy_handler)
                 .options(options_handler),
         )
+        .route(
+            "/api/vilte/control",
+            get(get_vilte_control_handler)
+                .post(set_vilte_feature_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/vilte/config",
+            post(set_vilte_config_handler).options(options_handler),
+        )
         // ========== 短信功能接口 ==========
         .route(
             "/api/sms/send",

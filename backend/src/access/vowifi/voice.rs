@@ -472,6 +472,12 @@ impl MediaDirection {
             _ => None,
         }
     }
+
+    /// Public wrapper over [`from_token`](Self::from_token) so other access
+    /// modules (e.g. the ViLTE video SDP parser) can reuse direction parsing.
+    pub fn from_token_pub(token: &str) -> Option<Self> {
+        Self::from_token(token)
+    }
 }
 
 /// Whether the connection address is IPv4 or IPv6 (drives the SDP `c=` line).

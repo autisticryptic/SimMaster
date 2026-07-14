@@ -29,9 +29,10 @@ pub mod rtp_relay;
 pub mod runtime;
 pub mod sip;
 pub mod sms;
+pub mod vilte;
 pub mod voice;
 
 pub use errors::VolteError;
 pub use runtime::{
-    RegistrationMode, VolteRuntime, VolteRuntimeStatus, VolteSnapshot, VoltePhase, VolteStage,
+    RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteSnapshot, VolteStage,
 };

@@ -1512,6 +1512,47 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn vilte_feature_requires_volte_voice() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_vilte_gate_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let manager = ConfigManager::new(path.clone());
+
+        // Without VoLTE voice, enabling ViLTE is rejected.
+        assert_eq!(
+            manager.set_vilte_feature_enabled(true).unwrap_err(),
+            "volte_voice_disabled"
+        );
+
+        // Turn on VoLTE feature then voice, then ViLTE is allowed.
+        manager.set_volte_feature_enabled(true).unwrap();
+        manager.set_volte_voice_enabled(true).unwrap();
+        let vilte = manager.set_vilte_feature_enabled(true).unwrap();
+        assert!(vilte.feature_enabled);
+        assert_eq!(vilte.codec, "h264");
+
+        // set_vilte_config forces feature off when voice is off.
+        manager.set_volte_voice_enabled(false).unwrap();
+        let forced = manager
+            .set_vilte_config(VilteConfig {
+                feature_enabled: true,
+                ..VilteConfig::default()
+            })
+            .unwrap();
+        assert!(
+            !forced.feature_enabled,
+            "ViLTE must be forced off when VoLTE voice is disabled"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn default_ddns_provider() -> String {
@@ -1731,6 +1772,62 @@ impl Default for VolteConfig {
     }
 }
 
+// ===================== Phase F: ViLTE (video telephony over LTE) =====================
+
+fn default_vilte_codec() -> String {
+    "h264".to_string()
+}
+
+fn default_vilte_video_payload_type() -> u8 {
+    // Dynamic payload type; 99 is a common ViLTE choice for H.264.
+    99
+}
+
+fn default_vilte_h264_fmtp() -> String {
+    // Baseline profile, packetization-mode 1 (non-interleaved). profile-level-id
+    // 42e01f = Constrained Baseline, level 3.1 — a widely interoperable ViLTE
+    // default. The relay never transcodes, so this is purely what we advertise
+    // to the far end on the offer/answer; the negotiated value is carried
+    // through verbatim.
+    "profile-level-id=42e01f;packetization-mode=1".to_string()
+}
+
+/// ViLTE (video telephony over LTE) configuration.
+///
+/// Video rides the *same* IMS voice session as VoLTE voice (one INVITE, an
+/// audio `m=` line plus a video `m=` line), so `feature_enabled` here is gated
+/// on the VoLTE voice feature at the `ConfigManager` layer. On the target
+/// hardware class (no audio/video capture) the device is a pure media relay: it
+/// forwards RTP between the operator IMS leg and an internal SIP UA and never
+/// encodes/decodes video. Therefore only pass-through codecs are meaningful —
+/// `codec` is what we advertise, not something we transcode to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VilteConfig {
+    #[serde(default)]
+    pub feature_enabled: bool,
+    /// Advertised video codec name (relay is pass-through; H.264 is the ViLTE
+    /// baseline mandated by GSMA IR.94).
+    #[serde(default = "default_vilte_codec")]
+    pub codec: String,
+    /// Dynamic RTP payload type to advertise for the video stream.
+    #[serde(default = "default_vilte_video_payload_type")]
+    pub video_payload_type: u8,
+    /// `a=fmtp` parameters advertised for the video codec.
+    #[serde(default = "default_vilte_h264_fmtp")]
+    pub h264_fmtp: String,
+}
+
+impl Default for VilteConfig {
+    fn default() -> Self {
+        Self {
+            feature_enabled: false,
+            codec: default_vilte_codec(),
+            video_payload_type: default_vilte_video_payload_type(),
+            h264_fmtp: default_vilte_h264_fmtp(),
+        }
+    }
+}
+
 // ===================== Phase C: multi-path SMS orchestrator =====================
 
 /// One access path the orchestrator can route SMS/voice through.
@@ -1942,6 +2039,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub volte: VolteConfig,
     #[serde(default)]
+    pub vilte: VilteConfig,
+    #[serde(default)]
     pub sms_path: SmsPathPolicy,
 }
 
@@ -1961,6 +2060,7 @@ impl Default for AppConfig {
             automation: AutomationConfig::default(),
             vowifi: VowifiConfig::default(),
             volte: VolteConfig::default(),
+            vilte: VilteConfig::default(),
             sms_path: SmsPathPolicy::default(),
         }
     }
@@ -2260,6 +2360,45 @@ impl ConfigManager {
             let mut c = self.config.write().unwrap();
             c.sms_path = next.clone();
         }
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn get_vilte_config(&self) -> VilteConfig {
+        self.config.read().unwrap().vilte.clone()
+    }
+
+    /// Toggle the ViLTE video feature. Video rides the VoLTE voice session, so
+    /// enabling ViLTE requires the VoLTE voice feature to be on (which in turn
+    /// requires the VoLTE feature). This keeps the gating chain
+    /// `volte.feature_enabled -> volte.voice_enabled -> vilte.feature_enabled`
+    /// consistent with the "video is an add-on to the voice call" model.
+    pub fn set_vilte_feature_enabled(&self, enabled: bool) -> Result<VilteConfig, String> {
+        let next = {
+            let mut c = self.config.write().unwrap();
+            if enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+                return Err("volte_voice_disabled".to_string());
+            }
+            c.vilte.feature_enabled = enabled;
+            c.vilte.clone()
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Replace the full ViLTE config (codec / payload type / fmtp). Does not
+    /// change the gating; `feature_enabled` in the incoming value is honored
+    /// only if VoLTE voice is enabled, otherwise it is forced off.
+    pub fn set_vilte_config(&self, vilte: VilteConfig) -> Result<VilteConfig, String> {
+        let next = {
+            let mut c = self.config.write().unwrap();
+            let mut incoming = vilte;
+            if incoming.feature_enabled && !(c.volte.feature_enabled && c.volte.voice_enabled) {
+                incoming.feature_enabled = false;
+            }
+            c.vilte = incoming;
+            c.vilte.clone()
+        };
         self.save()?;
         Ok(next)
     }
