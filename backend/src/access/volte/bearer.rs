@@ -12,7 +12,14 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use super::errors::{code, VolteError};
+use std::{net::IpAddr, process::Output};
+
+use tokio::process::Command;
+
+use super::{
+    errors::{code, VolteError},
+    pcscf::ImsIpSettings,
+};
 
 /// The IMS APN used for the dedicated IMS bearer.
 pub const IMS_APN: &str = "ims";
@@ -31,6 +38,27 @@ pub struct BearerRequest {
     pub allow_roaming: bool,
     /// Optional 3GPP profile id (as in `--wds-start-network=...,3gpp-profile=<n>`).
     pub profile_id: Option<u32>,
+}
+
+/// Connected IMS bearer details returned by ModemManager. These values are
+/// enough to configure only the dedicated WWAN link without touching the
+/// host's normal default route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerConnection {
+    pub path: String,
+    pub interface: String,
+    pub settings: ImsIpSettings,
+    pub ipv4_prefix: Option<u8>,
+    pub ipv6_prefix: Option<u8>,
+    pub mtu: Option<u32>,
+}
+
+impl BearerConnection {
+    pub fn local_addr(&self) -> Result<IpAddr, VolteError> {
+        self.settings
+            .local_addr()
+            .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))
+    }
 }
 
 impl Default for BearerRequest {
@@ -80,6 +108,258 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
         return Err(VolteError::new(code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN));
     }
     Ok(())
+}
+
+/// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
+/// non-IMS bearers are never changed or deleted.
+pub async fn ensure_ims_bearer(
+    modem: &str,
+    request: &BearerRequest,
+) -> Result<BearerConnection, VolteError> {
+    if let Some(path) = bearer_path_override() {
+        return connect_and_read(&path).await;
+    }
+
+    let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
+    for path in parse_bearer_paths(&modem_output) {
+        let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
+        if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
+            return connect_and_read(&path).await;
+        }
+    }
+
+    let properties = format!(
+        "apn={},ip-type=ipv4v6,allow-roaming={}",
+        request.apn,
+        if request.allow_roaming { "yes" } else { "no" }
+    );
+    let created = run_command(
+        "mmcli",
+        &["-m", modem, &format!("--create-bearer={properties}")],
+    )
+    .await?;
+    let path = parse_created_bearer_path(&created)
+        .ok_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING))?;
+    connect_and_read(&path).await
+}
+
+async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
+    let before = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
+    if value(&before, "bearer.status.connected").as_deref() != Some("yes") {
+        run_command("mmcli", &["-b", path, "--connect"])
+            .await
+            .map_err(|error| {
+                VolteError::with_detail(code::RUNTIME_MM_BEARER_CONNECT_FAILED, error.to_string())
+            })?;
+    }
+    let connected = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
+    parse_bearer_connection(path, &connected)
+}
+
+pub fn parse_bearer_connection(
+    path: &str,
+    output: &str,
+) -> Result<BearerConnection, VolteError> {
+    if value(output, "bearer.status.connected").as_deref() != Some("yes") {
+        return Err(VolteError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
+    }
+    let interface = value(output, "bearer.status.interface")
+        .filter(|item| item != "--")
+        .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
+    let mut settings = ImsIpSettings::default();
+    settings.ipv4_address = ip_value(output, "bearer.ipv4-config.address");
+    settings.ipv4_gateway = ip_value(output, "bearer.ipv4-config.gateway");
+    settings.ipv4_dns = list_ip_values(output, "bearer.ipv4-config.dns.value");
+    settings.ipv6_address = ip_value(output, "bearer.ipv6-config.address");
+    settings.ipv6_gateway = ip_value(output, "bearer.ipv6-config.gateway");
+    settings.ipv6_dns = list_ip_values(output, "bearer.ipv6-config.dns.value");
+    let ipv4_prefix = number_value(output, "bearer.ipv4-config.prefix");
+    let ipv6_prefix = number_value(output, "bearer.ipv6-config.prefix");
+    let mtu = number_value(output, "bearer.ipv6-config.mtu")
+        .or_else(|| number_value(output, "bearer.ipv4-config.mtu"));
+    if settings.local_addr().is_none() {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    }
+    Ok(BearerConnection {
+        path: path.to_string(),
+        interface,
+        settings,
+        ipv4_prefix,
+        ipv6_prefix,
+        mtu,
+    })
+}
+
+/// Configure the address and DNS host routes for the dedicated bearer. No
+/// default route is added, preserving the management/Wi-Fi path.
+pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
+    run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
+    if let Some(mtu) = bearer.mtu {
+        let mtu = mtu.to_string();
+        run_ip(&[
+            "link",
+            "set",
+            "dev",
+            &bearer.interface,
+            "mtu",
+            &mtu,
+        ])
+        .await?;
+    }
+
+    match bearer.local_addr()? {
+        IpAddr::V6(address) => {
+            let prefix = bearer.ipv6_prefix.unwrap_or(64);
+            let address = format!("{address}/{prefix}");
+            run_ip(&[
+                "-6",
+                "address",
+                "replace",
+                &address,
+                "dev",
+                &bearer.interface,
+            ])
+            .await?;
+            let gateway = bearer
+                .settings
+                .ipv6_gateway
+                .ok_or_else(|| VolteError::new(code::IPV6_GATEWAY_MISSING))?;
+            for dns in &bearer.settings.ipv6_dns {
+                route_host(&bearer.interface, *dns, gateway).await?;
+            }
+        }
+        IpAddr::V4(address) => {
+            let prefix = bearer.ipv4_prefix.unwrap_or(32);
+            let address = format!("{address}/{prefix}");
+            run_ip(&[
+                "address",
+                "replace",
+                &address,
+                "dev",
+                &bearer.interface,
+            ])
+            .await?;
+            let gateway = bearer
+                .settings
+                .ipv4_gateway
+                .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
+            for dns in &bearer.settings.ipv4_dns {
+                route_host(&bearer.interface, *dns, gateway).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub async fn route_pcscf(
+    bearer: &BearerConnection,
+    pcscf: IpAddr,
+) -> Result<(), VolteError> {
+    let gateway = match pcscf {
+        IpAddr::V6(_) => bearer.settings.ipv6_gateway,
+        IpAddr::V4(_) => bearer.settings.ipv4_gateway,
+    }
+    .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
+    route_host(&bearer.interface, pcscf, gateway).await
+}
+
+async fn route_host(interface: &str, host: IpAddr, gateway: IpAddr) -> Result<(), VolteError> {
+    if host.is_ipv4() != gateway.is_ipv4() {
+        return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
+    }
+    let (family, suffix) = if host.is_ipv6() { (Some("-6"), 128) } else { (None, 32) };
+    let destination = format!("{host}/{suffix}");
+    let gateway = gateway.to_string();
+    let mut args = Vec::new();
+    if let Some(family) = family {
+        args.push(family);
+    }
+    args.extend_from_slice(&[
+        "route",
+        "replace",
+        &destination,
+        "via",
+        &gateway,
+        "dev",
+        interface,
+    ]);
+    run_ip(&args).await.map(|_| ())
+}
+
+pub async fn disconnect_bearer(path: &str) {
+    let _ = run_command("mmcli", &["-b", path, "--disconnect"]).await;
+}
+
+async fn run_ip(args: &[&str]) -> Result<String, VolteError> {
+    run_command("ip", args).await
+}
+
+async fn run_command(program: &str, args: &[&str]) -> Result<String, VolteError> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| {
+            VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
+        })?;
+    command_output(program, output)
+}
+
+fn command_output(program: &str, output: Output) -> Result<String, VolteError> {
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(VolteError::with_detail(
+            code::COMMAND_FAILED,
+            format!("{program}:{}", output.status.code().unwrap_or(-1)),
+        ))
+    }
+}
+
+fn parse_bearer_paths(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.trim().starts_with("modem.generic.bearers.value"))
+        .map(|(_, value)| value.trim().to_string())
+        .filter(|path| is_valid_bearer_path(path))
+        .collect()
+}
+
+fn parse_created_bearer_path(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|item| is_valid_bearer_path(item.trim()))
+        .map(|item| item.trim().to_string())
+}
+
+fn value(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (candidate, value) = line.split_once(':')?;
+        (candidate.trim() == key).then(|| value.trim().to_string())
+    })
+}
+
+fn number_value<T>(output: &str, key: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    value(output, key).and_then(|item| item.parse().ok())
+}
+
+fn ip_value(output: &str, key: &str) -> Option<IpAddr> {
+    value(output, key)
+        .filter(|item| item != "--")
+        .and_then(|item| item.parse().ok())
+}
+
+fn list_ip_values(output: &str, key_prefix: &str) -> Vec<IpAddr> {
+    output
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter(|(key, _)| key.trim().starts_with(key_prefix))
+        .filter_map(|(_, value)| value.trim().parse().ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -133,5 +413,45 @@ mod tests {
     fn default_request_uses_ims_apn() {
         assert_eq!(BearerRequest::default().apn, "ims");
         assert!(!BearerRequest::default().allow_roaming);
+    }
+
+    #[test]
+    fn parses_connected_ipv6_only_bearer_without_default_route_assumptions() {
+        let output = r#"
+bearer.status.connected                  : yes
+bearer.status.interface                  : wwan0
+bearer.properties.apn                    : ims
+bearer.ipv4-config.address               : --
+bearer.ipv6-config.address               : 2001:db8:1::20
+bearer.ipv6-config.prefix                : 64
+bearer.ipv6-config.gateway               : 2001:db8:1::1
+bearer.ipv6-config.dns.length            : 2
+bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
+bearer.ipv6-config.dns.value[2]          : 2001:db8:53::2
+bearer.ipv6-config.mtu                   : 1500
+"#;
+        let bearer = parse_bearer_connection(
+            "/org/freedesktop/ModemManager1/Bearer/2",
+            output,
+        )
+        .unwrap();
+        assert_eq!(bearer.interface, "wwan0");
+        assert!(bearer.local_addr().unwrap().is_ipv6());
+        assert_eq!(bearer.settings.ipv6_dns.len(), 2);
+        assert_eq!(bearer.ipv6_prefix, Some(64));
+        assert_eq!(bearer.mtu, Some(1500));
+    }
+
+    #[test]
+    fn extracts_created_and_existing_bearer_paths() {
+        let path = "/org/freedesktop/ModemManager1/Bearer/7";
+        assert_eq!(
+            parse_created_bearer_path(&format!("Successfully created new bearer:\n {path}")),
+            Some(path.to_string())
+        );
+        assert_eq!(
+            parse_bearer_paths(&format!("modem.generic.bearers.value[1] : {path}")),
+            vec![path]
+        );
     }
 }

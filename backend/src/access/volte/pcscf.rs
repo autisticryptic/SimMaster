@@ -12,9 +12,19 @@
 //! The P-CSCF is typically delivered via the PCO and equals a primary DNS /
 //! dedicated P-CSCF PCO field depending on operator.
 
-use std::net::IpAddr;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
+
+use tokio::net::UdpSocket;
 
 use super::errors::{code, VolteError};
+
+const DNS_TIMEOUT: Duration = Duration::from_secs(4);
+const DNS_PORT: u16 = 53;
+const SIP_PORT: u16 = 5060;
+const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
 
 /// Parsed IP settings for the IMS bearer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -90,6 +100,225 @@ pub fn parse_ip_settings(block: &str) -> ImsIpSettings {
         }
     }
     s
+}
+
+/// Discover a P-CSCF without changing the system resolver. IMS APNs commonly
+/// provide private DNS servers that are reachable only through the dedicated
+/// bearer, so queries are sent directly from the bearer address.
+pub async fn discover_pcscf(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+) -> Result<IpAddr, VolteError> {
+    if let Ok(explicit) = std::env::var(ENV_PCSCF) {
+        if let Ok(address) = explicit.trim().parse::<IpAddr>() {
+            return settings.ensure_family_match(address);
+        }
+    }
+    if let Some(address) = settings.pcscf.first().copied() {
+        return settings.ensure_family_match(address);
+    }
+
+    let local = settings
+        .local_addr()
+        .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
+    let dns_servers = if local.is_ipv6() {
+        &settings.ipv6_dns
+    } else {
+        &settings.ipv4_dns
+    };
+    let pcscf_name = format!("pcscf.{home_domain}");
+    let srv_names = [
+        format!("_sip._udp.{home_domain}"),
+        format!("_sip._tcp.{home_domain}"),
+    ];
+
+    for server in dns_servers {
+        if server.is_ipv4() != local.is_ipv4() {
+            continue;
+        }
+        let address_type = if local.is_ipv6() { 28 } else { 1 };
+        if let Ok(records) = query_dns(local, *server, &pcscf_name, address_type).await {
+            if let Some(address) = records.addresses.into_iter().find(|item| {
+                item.is_ipv4() == local.is_ipv4()
+            }) {
+                return Ok(address);
+            }
+        }
+
+        for srv_name in &srv_names {
+            let Ok(records) = query_dns(local, *server, srv_name, 33).await else {
+                continue;
+            };
+            for target in records.srv_targets {
+                if let Ok(target_records) = query_dns(local, *server, &target, address_type).await {
+                    if let Some(address) = target_records.addresses.into_iter().find(|item| {
+                        item.is_ipv4() == local.is_ipv4()
+                    }) {
+                        return Ok(address);
+                    }
+                }
+            }
+        }
+    }
+    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+}
+
+pub fn pcscf_socket(address: IpAddr) -> SocketAddr {
+    SocketAddr::new(address, SIP_PORT)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct DnsRecords {
+    addresses: Vec<IpAddr>,
+    srv_targets: Vec<String>,
+}
+
+async fn query_dns(
+    local: IpAddr,
+    server: IpAddr,
+    name: &str,
+    record_type: u16,
+) -> Result<DnsRecords, VolteError> {
+    let query_id = dns_query_id(name, record_type);
+    let query = build_dns_query(query_id, name, record_type)?;
+    let socket = UdpSocket::bind(SocketAddr::new(local, 0))
+        .await
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    socket
+        .send_to(&query, SocketAddr::new(server, DNS_PORT))
+        .await
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    let mut response = [0u8; 4096];
+    let (read, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
+        .await
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    parse_dns_response(query_id, &response[..read])
+}
+
+fn dns_query_id(name: &str, record_type: u16) -> u16 {
+    let mut hash = 0x5a17u16 ^ record_type;
+    for byte in name.bytes() {
+        hash = hash.rotate_left(5) ^ u16::from(byte);
+    }
+    hash
+}
+
+fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, VolteError> {
+    let mut query = Vec::with_capacity(64 + name.len());
+    query.extend_from_slice(&id.to_be_bytes());
+    query.extend_from_slice(&0x0100u16.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    query.extend_from_slice(&0u16.to_be_bytes());
+    for label in name.trim_end_matches('.').split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        }
+        query.push(label.len() as u8);
+        query.extend_from_slice(label.as_bytes());
+    }
+    query.push(0);
+    query.extend_from_slice(&record_type.to_be_bytes());
+    query.extend_from_slice(&1u16.to_be_bytes());
+    Ok(query)
+}
+
+fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> {
+    if packet.len() < 12 || u16::from_be_bytes([packet[0], packet[1]]) != id {
+        return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+    }
+    let flags = u16::from_be_bytes([packet[2], packet[3]]);
+    if flags & 0x000f != 0 {
+        return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+    }
+    let questions = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+    let answers = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
+    let authorities = usize::from(u16::from_be_bytes([packet[8], packet[9]]));
+    let additional = usize::from(u16::from_be_bytes([packet[10], packet[11]]));
+    let mut offset = 12usize;
+    for _ in 0..questions {
+        offset = read_dns_name(packet, offset)?.1;
+        offset = offset
+            .checked_add(4)
+            .filter(|end| *end <= packet.len())
+            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    }
+
+    let mut records = DnsRecords::default();
+    for _ in 0..answers + authorities + additional {
+        offset = read_dns_name(packet, offset)?.1;
+        if offset + 10 > packet.len() {
+            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        }
+        let record_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
+        let length = usize::from(u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]));
+        let data_offset = offset + 10;
+        let data_end = data_offset
+            .checked_add(length)
+            .filter(|end| *end <= packet.len())
+            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        match (record_type, length) {
+            (1, 4) => records.addresses.push(IpAddr::V4(Ipv4Addr::new(
+                packet[data_offset],
+                packet[data_offset + 1],
+                packet[data_offset + 2],
+                packet[data_offset + 3],
+            ))),
+            (28, 16) => {
+                let octets: [u8; 16] = packet[data_offset..data_end]
+                    .try_into()
+                    .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+                records.addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
+            }
+            (33, 6..) => {
+                let (target, _) = read_dns_name(packet, data_offset + 6)?;
+                if !target.is_empty() && !records.srv_targets.contains(&target) {
+                    records.srv_targets.push(target);
+                }
+            }
+            _ => {}
+        }
+        offset = data_end;
+    }
+    Ok(records)
+}
+
+fn read_dns_name(packet: &[u8], start: usize) -> Result<(String, usize), VolteError> {
+    let mut labels = Vec::new();
+    let mut offset = start;
+    let mut end = None;
+    for _ in 0..128 {
+        let length = *packet
+            .get(offset)
+            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        if length == 0 {
+            return Ok((labels.join("."), end.unwrap_or(offset + 1)));
+        }
+        if length & 0xc0 == 0xc0 {
+            let low = *packet
+                .get(offset + 1)
+                .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+            end.get_or_insert(offset + 2);
+            offset = (usize::from(length & 0x3f) << 8) | usize::from(low);
+            continue;
+        }
+        if length & 0xc0 != 0 {
+            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        }
+        let label_start = offset + 1;
+        let label_end = label_start + usize::from(length);
+        let label = std::str::from_utf8(
+            packet
+                .get(label_start..label_end)
+                .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?,
+        )
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        labels.push(label.to_string());
+        offset = label_end;
+    }
+    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
 /// Strip a possible prefix length / netmask suffix and parse an IP.
@@ -200,5 +429,29 @@ IPv4 primary DNS: 10.0.0.53";
             parse_addr("10.0.0.2 255.255.255.0"),
             Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
         );
+    }
+
+    #[test]
+    fn parses_compressed_aaaa_dns_answer() {
+        let id = 0x1234;
+        let name = "pcscf.ims.example";
+        let query = build_dns_query(id, name, 28).unwrap();
+        let mut packet = query.clone();
+        packet[2..4].copy_from_slice(&0x8180u16.to_be_bytes());
+        packet[6..8].copy_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&[0xc0, 0x0c]);
+        packet.extend_from_slice(&28u16.to_be_bytes());
+        packet.extend_from_slice(&1u16.to_be_bytes());
+        packet.extend_from_slice(&60u32.to_be_bytes());
+        packet.extend_from_slice(&16u16.to_be_bytes());
+        packet.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+
+        let records = parse_dns_response(id, &packet).unwrap();
+        assert_eq!(records.addresses, vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+    }
+
+    #[test]
+    fn pcscf_socket_uses_standard_sip_port() {
+        assert_eq!(pcscf_socket(IpAddr::V4(Ipv4Addr::LOCALHOST)).port(), 5060);
     }
 }
