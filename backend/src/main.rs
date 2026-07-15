@@ -414,6 +414,7 @@ async fn main() -> Result<()> {
         let db_clone = Arc::clone(&app_db);
         let notification_clone = Arc::clone(&notification_sender);
         let sms_config_clone = Arc::clone(&config_manager);
+        let sms_line_registry = Arc::clone(&line_registry);
         let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
             let _ = messaging::sms_listener::start_sms_listener(
@@ -421,6 +422,7 @@ async fn main() -> Result<()> {
                 db_clone,
                 notification_clone,
                 sms_config_clone,
+                sms_line_registry,
                 resync_rx,
             )
             .await;
@@ -909,6 +911,18 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/connection",
             post(set_volte_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines",
+            get(get_volte_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}",
+            get(get_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/connection",
+            post(set_volte_line_connection_handler).options(options_handler),
         )
         .route(
             "/api/volte/ip-family",

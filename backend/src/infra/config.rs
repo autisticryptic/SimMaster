@@ -1281,6 +1281,39 @@ mod tests {
     }
 
     #[test]
+    fn old_config_defaults_to_no_explicit_line_profiles() {
+        let config: AppConfig = serde_json::from_str("{}").unwrap();
+        assert!(config.line_profiles.is_empty());
+        assert!(LineProfileConfig::for_line("line-test").enabled);
+    }
+
+    #[test]
+    fn per_line_volte_connection_requires_feature_and_persists() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-config-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            manager
+                .set_line_volte_connection_enabled(line_id, true)
+                .unwrap_err(),
+            "volte_feature_disabled"
+        );
+        manager.set_volte_feature_enabled(true).unwrap();
+        let profile = manager
+            .set_line_volte_connection_enabled(line_id, true)
+            .unwrap();
+        assert!(profile.volte_connection_enabled);
+
+        let reloaded = ConfigManager::new(path.clone());
+        assert!(reloaded.get_line_profile(line_id).volte_connection_enabled);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sms_path_policy_default_order_is_vowifi_volte_cs() {
         let policy = SmsPathPolicy::default();
         let order: Vec<AccessPathKind> = policy.enabled_layers().collect();
@@ -1838,6 +1871,38 @@ impl Default for VolteConfig {
     }
 }
 
+/// Persisted controls for one stable physical-modem + SIM line. Trunk settings
+/// will extend this same profile later; keeping the connection flag here makes
+/// multi-line auto-restore independent instead of relying on one global bool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineProfileConfig {
+    pub line_id: String,
+    #[serde(default = "default_line_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub volte_connection_enabled: bool,
+}
+
+fn default_line_enabled() -> bool {
+    true
+}
+
+impl LineProfileConfig {
+    pub fn for_line(line_id: impl Into<String>) -> Self {
+        Self {
+            line_id: line_id.into(),
+            enabled: true,
+            volte_connection_enabled: false,
+        }
+    }
+}
+
+fn valid_line_id(line_id: &str) -> bool {
+    line_id.strip_prefix("line-").is_some_and(|suffix| {
+        suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
 // ===================== Phase F: ViLTE (video telephony over LTE) =====================
 
 fn default_vilte_codec() -> String {
@@ -2387,6 +2452,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub volte: VolteConfig,
     #[serde(default)]
+    pub line_profiles: Vec<LineProfileConfig>,
+    #[serde(default)]
     pub vilte: VilteConfig,
     #[serde(default)]
     pub sms_path: SmsPathPolicy,
@@ -2412,6 +2479,7 @@ impl Default for AppConfig {
             automation: AutomationConfig::default(),
             vowifi: VowifiConfig::default(),
             volte: VolteConfig::default(),
+            line_profiles: Vec::new(),
             vilte: VilteConfig::default(),
             sms_path: SmsPathPolicy::default(),
             voice_path: VoicePathPolicy::default(),
@@ -2666,8 +2734,65 @@ impl ConfigManager {
             c.volte.feature_enabled = enabled;
             if !enabled {
                 c.volte.connection_enabled = false;
+                for profile in &mut c.line_profiles {
+                    profile.volte_connection_enabled = false;
+                }
             }
             c.volte.clone()
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn get_line_profiles(&self) -> Vec<LineProfileConfig> {
+        self.config.read().unwrap().line_profiles.clone()
+    }
+
+    pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {
+        self.config
+            .read()
+            .unwrap()
+            .line_profiles
+            .iter()
+            .find(|profile| profile.line_id == line_id)
+            .cloned()
+            .unwrap_or_else(|| LineProfileConfig::for_line(line_id))
+    }
+
+    pub fn set_line_volte_connection_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            if enabled && !config.volte.feature_enabled {
+                return Err("volte_feature_disabled".to_string());
+            }
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            if enabled && !profile.enabled {
+                return Err("line_disabled".to_string());
+            }
+            profile.volte_connection_enabled = enabled;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
         };
         self.save()?;
         Ok(next)

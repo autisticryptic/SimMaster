@@ -2,8 +2,9 @@
 //!
 //! 通过 D-Bus 信号监听 ModemManager 的短信接收事件，并增加轮询兜底，
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
+use crate::access::line_registry::LineRuntimeRegistry;
 use crate::cellular::modem_manager::{
-    cache_smsc_for_identity, current_sim_identity, find_modem_path,
+    cache_smsc_for_identity, find_modem_path, list_modem_paths, sim_identity_for_modem,
 };
 use crate::infra::config::ConfigManager;
 use crate::infra::db::{
@@ -199,7 +200,17 @@ struct SmsIngestContext<'a> {
     db: &'a Database,
     notification_sender: &'a Arc<NotificationSender>,
     modem_path: &'a str,
+    line_id: Option<&'a str>,
     config_manager: &'a ConfigManager,
+}
+
+#[derive(Clone, Copy)]
+struct SmsScanContext<'a> {
+    conn: &'a Connection,
+    db: &'a Database,
+    notification_sender: &'a Arc<NotificationSender>,
+    config_manager: &'a ConfigManager,
+    line_registry: &'a LineRuntimeRegistry,
 }
 
 async fn process_sms_path(
@@ -213,6 +224,7 @@ async fn process_sms_path(
         db,
         notification_sender,
         modem_path,
+        line_id,
         config_manager,
     } = context;
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
@@ -267,7 +279,7 @@ async fn process_sms_path(
     );
 
     if !incoming.smsc.is_empty() {
-        if let Some(identity) = current_sim_identity(conn).await {
+        if let Some(identity) = sim_identity_for_modem(conn, modem_path).await {
             cache_smsc_for_identity(db, &identity, &incoming.smsc, "sms_object");
         }
     }
@@ -295,13 +307,15 @@ async fn process_sms_path(
         }
     }
 
-    match db.insert_sms_at(
+    match db.insert_sms_at_with_transport_for_line(
         "incoming",
         &incoming.number,
         &incoming.content,
         &timestamp,
         "received",
         Some(&marker),
+        "modem",
+        line_id,
     ) {
         Ok(id) => {
             let sms = SmsMessage {
@@ -313,6 +327,7 @@ async fn process_sms_path(
                 status: "received".to_string(),
                 pdu: Some(marker),
                 transport: "modem".to_string(),
+                line_id: line_id.map(str::to_string),
             };
             if should_forward_after_insert(mode, forward_reconciled_new_sms) {
                 let notification_sender = Arc::clone(notification_sender);
@@ -336,14 +351,19 @@ async fn list_sms_paths(conn: &Connection, modem_path: &str) -> zbus::Result<Vec
 }
 
 async fn scan_sms_paths(
-    conn: &Connection,
-    db: &Database,
-    notification_sender: &Arc<NotificationSender>,
+    context: SmsScanContext<'_>,
     modem_path: &str,
     reason: &str,
     forward_new_sms: bool,
-    config_manager: &ConfigManager,
+    line_id: Option<&str>,
 ) {
+    let SmsScanContext {
+        conn,
+        db,
+        notification_sender,
+        config_manager,
+        ..
+    } = context;
     match list_sms_paths(conn, modem_path).await {
         Ok(paths) => {
             if !paths.is_empty() {
@@ -361,6 +381,7 @@ async fn scan_sms_paths(
                         db,
                         notification_sender,
                         modem_path,
+                        line_id,
                         config_manager,
                     },
                     &sms_path,
@@ -391,24 +412,39 @@ fn modem_sms_paused_for_vowifi(config_manager: &ConfigManager) -> bool {
 /// behavior "SMS listener paused while VoLTE IMS SMS path is registered": once
 /// an IMS leg owns MT SMS, the CS/modem scan must stand down to avoid duplicate
 /// delivery.
-fn modem_sms_paused_for_ims(config_manager: &ConfigManager) -> bool {
+async fn modem_sms_paused_for_ims(
+    config_manager: &ConfigManager,
+    line_registry: &LineRuntimeRegistry,
+    modem_path: &str,
+) -> bool {
     if modem_sms_paused_for_vowifi(config_manager) {
         return true;
     }
     let volte = config_manager.get_volte_config();
-    volte.feature_enabled && volte.sms_enabled && volte.connection_enabled
+    if !volte.feature_enabled || !volte.sms_enabled {
+        return false;
+    }
+    line_registry
+        .for_modem_path(modem_path)
+        .await
+        .is_some_and(|line| {
+            let profile = config_manager.get_line_profile(&line.binding().line_id);
+            profile.volte_connection_enabled || volte.connection_enabled
+        })
 }
 
 async fn maybe_scan_sms_paths(
-    conn: &Connection,
-    db: &Database,
-    notification_sender: &Arc<NotificationSender>,
+    context: SmsScanContext<'_>,
     modem_path: &str,
     reason: &str,
     forward_new_sms: bool,
-    config_manager: &ConfigManager,
 ) {
-    if modem_sms_paused_for_ims(config_manager)
+    let SmsScanContext {
+        config_manager,
+        line_registry,
+        ..
+    } = context;
+    if modem_sms_paused_for_ims(config_manager, line_registry, modem_path).await
         && !config_manager.get_sms_path_policy().cs_fallback_receiver
     {
         debug!(
@@ -417,58 +453,39 @@ async fn maybe_scan_sms_paths(
         );
         return;
     }
+    let line = line_registry.for_modem_path(modem_path).await;
+    let line_id = line.as_ref().map(|line| line.binding().line_id);
     scan_sms_paths(
-        conn,
-        db,
-        notification_sender,
+        context,
         modem_path,
         reason,
         forward_new_sms,
-        config_manager,
+        line_id.as_deref(),
     )
     .await;
 }
 
-async fn scan_current_modem_or_rebind(
-    conn: &Connection,
-    db: &Database,
-    notification_sender: &Arc<NotificationSender>,
-    modem_path: &str,
+async fn scan_all_modems_or_rebind(
+    context: SmsScanContext<'_>,
+    modem_paths: &[String],
     reason: &str,
     forward_new_sms: bool,
-    config_manager: &ConfigManager,
 ) -> bool {
-    match find_modem_path(conn).await {
-        Ok(current_path) if current_path == modem_path => {
-            maybe_scan_sms_paths(
-                conn,
-                db,
-                notification_sender,
-                modem_path,
-                reason,
-                forward_new_sms,
-                config_manager,
-            )
-            .await;
+    let conn = context.conn;
+    match list_modem_paths(conn).await {
+        Ok(current_paths) if current_paths == modem_paths => {
+            for modem_path in modem_paths {
+                maybe_scan_sms_paths(context, modem_path, reason, forward_new_sms).await;
+            }
             true
         }
-        Ok(current_path) => {
+        Ok(current_paths) => {
             info!(
-                old_modem_path = %modem_path,
-                new_modem_path = %current_path,
+                old_modem_paths = ?modem_paths,
+                new_modem_paths = ?current_paths,
                 reason = %reason,
-                "SMS listener detected modem path change"
+                "SMS listener detected modem inventory change"
             );
-            maybe_scan_sms_paths(
-                conn,
-                db,
-                notification_sender,
-                current_path.as_str(),
-                reason,
-                false,
-                config_manager,
-            )
-            .await;
             false
         }
         Err(e) => {
@@ -501,13 +518,19 @@ pub async fn start_sms_listener(
     db: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     config_manager: Arc<ConfigManager>,
+    line_registry: Arc<LineRuntimeRegistry>,
     mut resync_receiver: SmsResyncReceiver,
 ) -> zbus::Result<()> {
     info!("Starting SMS listener (ModemManager mode)");
     loop {
-        let modem_path = loop {
-            match find_modem_path(&conn).await {
-                Ok(path) => break path,
+        let modem_paths = loop {
+            match list_modem_paths(&conn).await {
+                Ok(paths) if !paths.is_empty() => break paths,
+                Ok(_) => {
+                    // Preserve the existing recovery scan/caching behavior.
+                    let _ = find_modem_path(&conn).await;
+                    tokio::time::sleep(Duration::from_secs(MODEM_RETRY_DELAY_SECS)).await;
+                }
                 Err(e) => {
                     warn!(
                         error = %e,
@@ -519,32 +542,45 @@ pub async fn start_sms_listener(
             }
         };
 
-        let rule = format!(
-            "type='signal',sender='{}',interface='{}',member='Added',path='{}'",
-            MM_SERVICE, MM_MESSAGING, modem_path
-        );
-        if let Err(e) = call_dbus_match(&conn, "AddMatch", rule.as_str()).await {
-            warn!(
-                error = %e,
-                retry_after_secs = MODEM_RETRY_DELAY_SECS,
-                "Failed to register SMS listener match"
+        let mut rules = Vec::with_capacity(modem_paths.len());
+        let mut registration_failed = false;
+        for modem_path in &modem_paths {
+            let rule = format!(
+                "type='signal',sender='{}',interface='{}',member='Added',path='{}'",
+                MM_SERVICE, MM_MESSAGING, modem_path
             );
+            if let Err(e) = call_dbus_match(&conn, "AddMatch", rule.as_str()).await {
+                warn!(
+                    error = %e,
+                    modem_path = %modem_path,
+                    retry_after_secs = MODEM_RETRY_DELAY_SECS,
+                    "Failed to register SMS listener match"
+                );
+                registration_failed = true;
+                break;
+            }
+            rules.push(rule);
+        }
+        if registration_failed {
+            for rule in &rules {
+                let _ = call_dbus_match(&conn, "RemoveMatch", rule).await;
+            }
             tokio::time::sleep(Duration::from_secs(MODEM_RETRY_DELAY_SECS)).await;
             continue;
         }
 
-        info!(modem_path = %modem_path, "SMS listener registered, waiting for messages...");
+        info!(modem_paths = ?modem_paths, "SMS listeners registered, waiting for messages...");
 
-        maybe_scan_sms_paths(
-            &conn,
-            &db,
-            &notification_sender,
-            modem_path.as_str(),
-            "initial",
-            false,
-            &config_manager,
-        )
-        .await;
+        let scan_context = SmsScanContext {
+            conn: &conn,
+            db: db.as_ref(),
+            notification_sender: &notification_sender,
+            config_manager: config_manager.as_ref(),
+            line_registry: line_registry.as_ref(),
+        };
+        for modem_path in &modem_paths {
+            maybe_scan_sms_paths(scan_context, modem_path, "initial", false).await;
+        }
 
         let mut stream = MessageStream::from(&conn);
         let mut poll_interval = tokio::time::interval(Duration::from_secs(SMS_POLL_INTERVAL_SECS));
@@ -565,6 +601,12 @@ pub async fn start_sms_listener(
 
                     if let Some(member) = msg.header().member() {
                         if member.as_str() == "Added" {
+                            let Some(signal_path) = msg.header().path().map(|path| path.to_string()) else {
+                                continue;
+                            };
+                            if !modem_paths.contains(&signal_path) {
+                                continue;
+                            }
                             if let Ok((sms_path, received)) = msg
                                 .body()
                                 .deserialize::<(zbus::zvariant::ObjectPath, bool)>()
@@ -573,7 +615,11 @@ pub async fn start_sms_listener(
                                     continue;
                                 }
 
-                                if modem_sms_paused_for_ims(&config_manager)
+                                if modem_sms_paused_for_ims(
+                                    &config_manager,
+                                    &line_registry,
+                                    &signal_path,
+                                ).await
                                     && !config_manager
                                         .get_sms_path_policy()
                                         .cs_fallback_receiver
@@ -584,6 +630,9 @@ pub async fn start_sms_listener(
 
                                 let sms_path_str = sms_path.to_string();
                                 info!(path = %sms_path_str, "New SMS received");
+                                let signal_line = line_registry.for_modem_path(&signal_path).await;
+                                let signal_line_id =
+                                    signal_line.as_ref().map(|line| line.binding().line_id);
 
                                 // Give ModemManager a short moment to assemble multipart SMS content.
                                 tokio::time::sleep(Duration::from_millis(500)).await;
@@ -592,7 +641,8 @@ pub async fn start_sms_listener(
                                         conn: &conn,
                                         db: &db,
                                         notification_sender: &notification_sender,
-                                        modem_path: modem_path.as_str(),
+                                        modem_path: signal_path.as_str(),
+                                        line_id: signal_line_id.as_deref(),
                                         config_manager: &config_manager,
                                     },
                                     &sms_path_str,
@@ -605,28 +655,22 @@ pub async fn start_sms_listener(
                     }
                 }
                 _ = poll_interval.tick() => {
-                    if !scan_current_modem_or_rebind(
-                        &conn,
-                        &db,
-                        &notification_sender,
-                        modem_path.as_str(),
+                    if !scan_all_modems_or_rebind(
+                        scan_context,
+                        &modem_paths,
                         "poll",
                         true,
-                        &config_manager,
                     ).await {
                         break;
                     }
                 }
                 Some(request) = resync_receiver.recv() => {
                     info!(reason = %request.reason, "SMS resync requested");
-                    if !scan_current_modem_or_rebind(
-                        &conn,
-                        &db,
-                        &notification_sender,
-                        modem_path.as_str(),
+                    if !scan_all_modems_or_rebind(
+                        scan_context,
+                        &modem_paths,
                         request.reason.as_str(),
                         false,
-                        &config_manager,
                     ).await {
                         break;
                     }
@@ -634,8 +678,10 @@ pub async fn start_sms_listener(
             }
         }
 
-        if let Err(e) = call_dbus_match(&conn, "RemoveMatch", rule.as_str()).await {
-            warn!(error = %e, "Failed to remove SMS listener match");
+        for rule in &rules {
+            if let Err(e) = call_dbus_match(&conn, "RemoveMatch", rule).await {
+                warn!(error = %e, "Failed to remove SMS listener match");
+            }
         }
 
         warn!(

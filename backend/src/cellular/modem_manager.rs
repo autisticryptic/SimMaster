@@ -728,7 +728,7 @@ pub struct SimIdentity {
 /// `/Modem/0` style paths may be reassigned after reboot or USB hotplug. The
 /// identifier is derived from a hardware identity plus the active ICCID, so a
 /// SIM replacement cannot silently inherit the old line's runtime/trunk state.
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
 pub struct ModemBinding {
     pub line_id: String,
     pub modem_id: String,
@@ -1258,10 +1258,14 @@ async fn get_sim_path(conn: &Connection, modem_path: &str) -> zbus::Result<Strin
 
 pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
     let modem_path = find_modem_path(conn).await.ok()?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP)
+    sim_identity_for_modem(conn, &modem_path).await
+}
+
+pub async fn sim_identity_for_modem(conn: &Connection, modem_path: &str) -> Option<SimIdentity> {
+    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP)
         .await
         .unwrap_or_default();
-    let sim_path = get_sim_path(conn, &modem_path).await.ok()?;
+    let sim_path = get_sim_path(conn, modem_path).await.ok()?;
     if sim_path.is_empty() || sim_path == "/" {
         return None;
     }
@@ -1947,9 +1951,17 @@ pub async fn get_sim_info_data_with_cache(
     db: Option<&Database>,
 ) -> zbus::Result<SimInfoResponse> {
     let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
-    let sim_path = get_sim_path(conn, &modem_path).await?;
+    get_sim_info_for_modem_with_cache(conn, &modem_path, db).await
+}
+
+pub async fn get_sim_info_for_modem_with_cache(
+    conn: &Connection,
+    modem_path: &str,
+    db: Option<&Database>,
+) -> zbus::Result<SimInfoResponse> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
+    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP).await?;
+    let sim_path = get_sim_path(conn, modem_path).await?;
 
     if sim_path.is_empty() || sim_path == "/" {
         return Ok(SimInfoResponse {
@@ -1959,7 +1971,7 @@ pub async fn get_sim_info_data_with_cache(
     }
 
     let sim_props = get_all_properties(conn, &sim_path, MM_SIM).await?;
-    let msg_smsc = messaging_smsc_fallback(conn, &modem_path).await;
+    let msg_smsc = messaging_smsc_fallback(conn, modem_path).await;
     let iccid = crate::infra::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
@@ -2007,7 +2019,7 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
     if phone_numbers.is_empty() {
-        phone_numbers = simple_status_own_numbers_fallback(conn, &modem_path).await;
+        phone_numbers = simple_status_own_numbers_fallback(conn, modem_path).await;
         if !phone_numbers.is_empty() {
             if let Some(db) = db {
                 cache_own_numbers_for_identity(db, &identity, &phone_numbers, "dbus_status");
@@ -2027,7 +2039,7 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
     if phone_numbers.is_empty() {
-        phone_numbers = active_protocol_own_numbers_fallback(conn, &modem_path).await;
+        phone_numbers = active_protocol_own_numbers_fallback(conn, modem_path).await;
         if !phone_numbers.is_empty() {
             if let Some(db) = db {
                 cache_own_numbers_for_identity(db, &identity, &phone_numbers, "protocol");
@@ -2047,7 +2059,7 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
     if sms_center.is_empty() {
-        sms_center = existing_sms_smsc_fallback(conn, &modem_path).await;
+        sms_center = existing_sms_smsc_fallback(conn, modem_path).await;
         if !sms_center.is_empty() {
             if let Some(db) = db {
                 cache_smsc_for_identity(db, &identity, &sms_center, "sms_object");
@@ -2068,7 +2080,7 @@ pub async fn get_sim_info_data_with_cache(
         }
     }
     if sms_center.is_empty() {
-        sms_center = active_protocol_smsc_fallback(conn, &modem_path).await;
+        sms_center = active_protocol_smsc_fallback(conn, modem_path).await;
         if !sms_center.is_empty() {
             if let Some(db) = db {
                 cache_smsc_for_identity(db, &identity, &sms_center, "protocol");
@@ -2140,7 +2152,7 @@ pub async fn get_sim_info_data_with_cache(
 
     let mut sms_used = None;
     let mut sms_total = None;
-    if let Ok(cpms_output) = send_at_via_modem_command(conn, &modem_path, "AT+CPMS?").await {
+    if let Ok(cpms_output) = send_at_via_modem_command(conn, modem_path, "AT+CPMS?").await {
         if let Some((used, total)) = parse_sms_storage_info(&cpms_output) {
             sms_used = Some(used);
             sms_total = Some(total);
@@ -2158,7 +2170,7 @@ pub async fn get_sim_info_data_with_cache(
         phone_number_is_manual,
         sms_center_is_manual,
         sim_path,
-        modem_path,
+        modem_path: modem_path.to_string(),
         sim_type,
         esim_status,
         active,
@@ -5476,9 +5488,18 @@ pub async fn send_sms(
     phone_number: &str,
     content: &str,
 ) -> zbus::Result<String> {
+    let modem_path = find_modem_path(conn).await?;
+    send_sms_via_modem(conn, &modem_path, phone_number, content).await
+}
+
+pub async fn send_sms_via_modem(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+    content: &str,
+) -> zbus::Result<String> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
-        let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await?;
+        let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MESSAGING).await?;
 
         let mut sms_props: HashMap<String, Value<'_>> = HashMap::new();
         sms_props.insert("number".to_string(), Value::new(phone_number));
@@ -5489,7 +5510,7 @@ pub async fn send_sms(
         sms_proxy.call::<_, _, ()>("Send", &()).await?;
 
         info!(path = %sms_path, "SMS sent successfully");
-        schedule_sent_sms_delete(conn, modem_path.as_str(), sms_path.clone());
+        schedule_sent_sms_delete(conn, modem_path, sms_path.clone());
         Ok(sms_path.to_string())
     })
     .await

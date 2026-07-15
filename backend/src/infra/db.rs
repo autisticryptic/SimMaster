@@ -27,6 +27,8 @@ pub struct SmsMessage {
     pub pdu: Option<String>,  // 原始 PDU（如果有）
     #[serde(default = "default_sms_transport")]
     pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
 }
 
 fn default_sms_transport() -> String {
@@ -878,6 +880,26 @@ mod tests {
     }
 
     #[test]
+    fn sms_line_identity_round_trips_without_changing_transport_label() {
+        let db = test_database();
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        db.insert_sms_with_transport_for_line(
+            "outgoing",
+            "10086",
+            "line-test",
+            "sent",
+            None,
+            "volte_ims",
+            Some(line_id),
+        )
+        .expect("insert line sms");
+
+        let message = db.get_sms_messages(1, 0, None).expect("list sms").remove(0);
+        assert_eq!(message.transport, "volte_ims");
+        assert_eq!(message.line_id.as_deref(), Some(line_id));
+    }
+
+    #[test]
     fn vowifi_restore_and_events_are_readable_when_empty_or_present() {
         let db = test_database();
 
@@ -1112,6 +1134,7 @@ fn sms_message_from_row(row: &Row<'_>) -> Result<SmsMessage> {
         status: row.get(5)?,
         pdu: row.get(6)?,
         transport: row.get(7)?,
+        line_id: row.get(8)?,
     })
 }
 
@@ -1187,6 +1210,7 @@ impl Database {
                 notification_status TEXT NOT NULL DEFAULT 'pending',
                 pdu TEXT,
                 transport TEXT NOT NULL DEFAULT 'modem',
+                line_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
@@ -1206,6 +1230,9 @@ impl Database {
                 [],
             )?;
         }
+        if !table_has_column(&conn, "sms_messages", "line_id")? {
+            conn.execute("ALTER TABLE sms_messages ADD COLUMN line_id TEXT", [])?;
+        }
 
         // 创建短信索引
         conn.execute(
@@ -1224,6 +1251,10 @@ impl Database {
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sms_transport ON sms_messages(transport)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_line_id ON sms_messages(line_id)",
             [],
         )?;
         normalize_existing_sms_timestamps(&conn)?;
@@ -2264,7 +2295,7 @@ impl Database {
         transport: &str,
     ) -> Result<i64> {
         let timestamp = beijing_sms_now_string();
-        self.insert_sms_at_with_transport(
+        self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,
             content,
@@ -2272,6 +2303,31 @@ impl Database {
             status,
             pdu,
             transport,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_sms_with_transport_for_line(
+        &self,
+        direction: &str,
+        phone_number: &str,
+        content: &str,
+        status: &str,
+        pdu: Option<&str>,
+        transport: &str,
+        line_id: Option<&str>,
+    ) -> Result<i64> {
+        let timestamp = beijing_sms_now_string();
+        self.insert_sms_at_with_transport_for_line(
+            direction,
+            phone_number,
+            content,
+            &timestamp,
+            status,
+            pdu,
+            transport,
+            line_id,
         )
     }
 
@@ -2284,7 +2340,7 @@ impl Database {
         status: &str,
         pdu: Option<&str>,
     ) -> Result<i64> {
-        self.insert_sms_at_with_transport(
+        self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,
             content,
@@ -2292,6 +2348,7 @@ impl Database {
             status,
             pdu,
             "modem",
+            None,
         )
     }
 
@@ -2307,12 +2364,37 @@ impl Database {
         pdu: Option<&str>,
         transport: &str,
     ) -> Result<i64> {
+        self.insert_sms_at_with_transport_for_line(
+            direction,
+            phone_number,
+            content,
+            timestamp,
+            status,
+            pdu,
+            transport,
+            None,
+        )
+    }
+
+    // SQL boundary: parameters deliberately mirror the persisted SMS columns.
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_sms_at_with_transport_for_line(
+        &self,
+        direction: &str,
+        phone_number: &str,
+        content: &str,
+        timestamp: &str,
+        status: &str,
+        pdu: Option<&str>,
+        transport: &str,
+        line_id: Option<&str>,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let timestamp = sms_timestamp_for_storage(timestamp);
         let transport = normalized_sms_transport(transport);
         conn.execute(
-            "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu, transport)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu, transport, line_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 direction,
                 phone_number,
@@ -2320,7 +2402,8 @@ impl Database {
                 timestamp,
                 status,
                 pdu,
-                transport
+                transport,
+                line_id.filter(|value| !value.trim().is_empty())
             ],
         )?;
 
@@ -2487,7 +2570,7 @@ impl Database {
         match direction {
             Some(direction) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
+                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
                      FROM sms_messages
                      WHERE direction = ?1
                      ORDER BY timestamp DESC, id DESC
@@ -2506,7 +2589,7 @@ impl Database {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
+                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
                      FROM sms_messages
                      ORDER BY timestamp DESC, id DESC
                      LIMIT ?1 OFFSET ?2",
@@ -2528,7 +2611,7 @@ impl Database {
     pub fn get_sms_conversation(&self, phone_number: &str, limit: i64) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport
+            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
              FROM sms_messages
              WHERE phone_number = ?1
              ORDER BY timestamp DESC, id DESC

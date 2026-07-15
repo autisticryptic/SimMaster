@@ -38,15 +38,17 @@ use crate::{
         get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
         get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
         get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
-        get_sim_info_data_with_cache, hangup_all_calls, hangup_call, list_apn_contexts,
-        list_current_calls, make_call, nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch,
-        register_operator_auto, register_operator_manual, restart_baseband, scan_operators,
-        send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
-        set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
+        get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache, hangup_all_calls,
+        hangup_call, list_apn_contexts, list_current_calls, make_call, nm_set_autoconnect_pub,
+        power_cycle_sim_for_profile_switch, register_operator_auto, register_operator_manual,
+        restart_baseband, scan_operators, send_sms, send_sms_via_modem, set_airplane_mode,
+        set_apn_on_bearer, set_band_lock, set_call_waiting, set_data_connection_with_apn,
+        set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
     },
     infra::config::{
-        AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
-        VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference, VowifiConfig,
+        AccessPathKind, ApnConfig, LineProfileConfig, MidFlightDisablePolicy, SmsPathPolicy,
+        VilteConfig, VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference,
+        VowifiConfig,
     },
     infra::db::{
         NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
@@ -2383,6 +2385,7 @@ fn persist_vowifi_mt_deliveries(db: &Database, outcome: &MoSmsSipOutcome) -> Vec
                         status: "received".to_string(),
                         pdu: Some(storage_marker.clone()),
                         transport: "vowifi_ims".to_string(),
+                        line_id: None,
                     });
                 }
             }
@@ -2538,6 +2541,11 @@ pub async fn send_sms_handler(
     let stop_on_failure = policy.mid_flight_disable == MidFlightDisablePolicy::Fail;
     let mut failures = Vec::new();
     for path in policy.enabled_layers() {
+        if payload.line_id.is_some() && path == AccessPathKind::Vowifi {
+            // VoWiFi still has one ePDG runtime and cannot yet prove that it is
+            // using the explicitly selected physical line.
+            continue;
+        }
         let result = match path {
             AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &payload).await,
             AccessPathKind::Volte => send_sms_over_volte_path(&app, &payload).await,
@@ -2667,8 +2675,82 @@ async fn send_sms_over_volte_path(
     app: &AppState,
     payload: &SendSmsRequest,
 ) -> Result<serde_json::Value, String> {
-    let config = app.config_manager.get_volte_config();
-    if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
+    let mut config = app.config_manager.get_volte_config();
+    if !config.feature_enabled || !config.sms_enabled {
+        return Err("disabled".to_string());
+    }
+    if let Some(line_id) = payload.line_id.as_deref() {
+        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let line = app
+            .line_registry
+            .get(line_id)
+            .await
+            .ok_or_else(|| "line_not_found".to_string())?;
+        let binding = line.binding();
+        if !binding.present {
+            return Err("line_not_present".to_string());
+        }
+        let profile = app.config_manager.get_line_profile(line_id);
+        if !profile.enabled || !profile.volte_connection_enabled {
+            return Err("line_volte_connection_disabled".to_string());
+        }
+        config.connection_enabled = true;
+        if !line.volte.status().await.registered {
+            let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
+                .map_err(|error| error.to_string())?;
+            let _guard = line.volte_connect_lock.lock().await;
+            if !line.volte.status().await.registered {
+                crate::access::volte::live::connect_live_for_line(
+                    &line.volte_live,
+                    &device,
+                    &line.volte,
+                    &config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            }
+        }
+        let sim = get_sim_info_for_modem_with_cache(
+            &app.dbus_conn,
+            &binding.modem_path,
+            Some(&app.database),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = crate::access::volte::live::send_live_sms_for_line(
+            &line.volte_live,
+            &line.volte,
+            &payload.phone_number,
+            &payload.content,
+            &sim.sms_center,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        app.database
+            .insert_sms_with_transport_for_line(
+                "outgoing",
+                &payload.phone_number,
+                &payload.content,
+                "sent",
+                None,
+                "volte_ims",
+                Some(line_id),
+            )
+            .map_err(|error| error.to_string())?;
+        return Ok(json!({
+            "path": "volte_ims",
+            "transport": "volte_ims",
+            "line_id": line_id,
+            "message_id": result.message_id,
+            "trace_id": result.trace_id,
+            "part_count": result.part_count,
+            "sip_statuses": result.sip_statuses,
+        }));
+    }
+    if !config.connection_enabled {
         return Err("disabled".to_string());
     }
     if !app.volte_runtime.status().await.registered {
@@ -2717,19 +2799,48 @@ async fn send_sms_over_cs_path(
     app: &AppState,
     payload: &SendSmsRequest,
 ) -> Result<serde_json::Value, String> {
-    let path = send_sms(&app.dbus_conn, &payload.phone_number, &payload.content)
-        .await
-        .map_err(|error| error.to_string())?;
+    let (path, line_id) = if let Some(line_id) = payload.line_id.as_deref() {
+        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let line = app
+            .line_registry
+            .get(line_id)
+            .await
+            .ok_or_else(|| "line_not_found".to_string())?;
+        let binding = line.binding();
+        if !binding.present {
+            return Err("line_not_present".to_string());
+        }
+        (
+            send_sms_via_modem(
+                &app.dbus_conn,
+                &binding.modem_path,
+                &payload.phone_number,
+                &payload.content,
+            )
+            .await
+            .map_err(|error| error.to_string())?,
+            Some(line_id),
+        )
+    } else {
+        (
+            send_sms(&app.dbus_conn, &payload.phone_number, &payload.content)
+                .await
+                .map_err(|error| error.to_string())?,
+            None,
+        )
+    };
     app.database
-        .insert_sms(
+        .insert_sms_with_transport_for_line(
             "outgoing",
             &payload.phone_number,
             &payload.content,
             "sent",
             None,
+            "modem",
+            line_id,
         )
         .map_err(|error| error.to_string())?;
-    Ok(json!({ "path": path, "transport": "modem" }))
+    Ok(json!({ "path": path, "transport": "modem", "line_id": line_id }))
 }
 
 #[allow(dead_code)]
@@ -4272,6 +4383,147 @@ pub struct VolteControlResponse {
     pub runtime: crate::access::volte::VolteRuntimeStatus,
 }
 
+#[derive(Debug, serde::Serialize, Default)]
+pub struct VolteLineControlResponse {
+    pub modem: crate::cellular::modem_manager::ModemBinding,
+    pub profile: LineProfileConfig,
+    pub runtime: crate::access::volte::VolteRuntimeStatus,
+}
+
+fn build_volte_line_response(
+    app: &AppState,
+    status: crate::access::line_registry::LineRuntimeStatus,
+) -> VolteLineControlResponse {
+    VolteLineControlResponse {
+        profile: app.config_manager.get_line_profile(&status.modem.line_id),
+        modem: status.modem,
+        runtime: status.volte,
+    }
+}
+
+pub async fn get_volte_lines_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<Vec<VolteLineControlResponse>>>) {
+    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(format!(
+                "Failed to discover modems: {error}"
+            ))),
+        );
+    }
+    let lines = app
+        .line_registry
+        .statuses()
+        .await
+        .into_iter()
+        .map(|status| build_volte_line_response(&app, status))
+        .collect();
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", lines)),
+    )
+}
+
+pub async fn get_volte_line_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_volte_line_response(&app, line.status().await),
+        )),
+    )
+}
+
+pub async fn set_volte_line_connection_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<VolteControlToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let binding = line.binding();
+    if payload.enabled && !binding.present {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_not_present")),
+        );
+    }
+    let profile = match app
+        .config_manager
+        .set_line_volte_connection_enabled(&line_id, payload.enabled)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    let _guard = line.volte_connect_lock.lock().await;
+    let result = if payload.enabled {
+        let device = match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
+            Ok(device) => device,
+            Err(error) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::error(format!("Failed: {error}"))),
+                )
+            }
+        };
+        let mut config = app.config_manager.get_volte_config();
+        config.connection_enabled = true;
+        crate::access::volte::live::connect_live_for_line(
+            &line.volte_live,
+            &device,
+            &line.volte,
+            &config,
+            app.config_manager.get_sms_path_policy().dedupe_enabled,
+            Arc::clone(&app.database),
+            Arc::clone(&app.notification_sender),
+        )
+        .await
+    } else {
+        Ok(crate::access::volte::live::disconnect_live_for_line(
+            &line.volte_live,
+            &line.volte,
+            "volte_line_connection_disabled",
+        )
+        .await)
+    };
+    let response = VolteLineControlResponse {
+        modem: line.binding(),
+        profile,
+        runtime: line.volte.status().await,
+    };
+    match result {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", response)),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        ),
+    }
+}
+
 impl VolteControlResponse {
     fn build(config: &VolteConfig, runtime: crate::access::volte::VolteRuntimeStatus) -> Self {
         Self {
@@ -4311,6 +4563,14 @@ pub async fn set_volte_feature_handler(
             if !payload.enabled {
                 crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
                     .await;
+                for line in app.line_registry.all().await {
+                    crate::access::volte::live::disconnect_live_for_line(
+                        &line.volte_live,
+                        &line.volte,
+                        "volte_disabled",
+                    )
+                    .await;
+                }
             }
             let runtime = app.volte_runtime.status().await;
             (
@@ -4394,7 +4654,7 @@ pub async fn set_volte_ip_family_handler(
         .set_volte_ip_family_preference(payload.preference)
     {
         Ok(config) => {
-            let result = if config.connection_enabled {
+            let mut result = if config.connection_enabled {
                 crate::access::volte::live::disconnect_live(
                     &app.volte_runtime,
                     "volte_ip_family_changed",
@@ -4411,6 +4671,52 @@ pub async fn set_volte_ip_family_handler(
             } else {
                 Ok(app.volte_runtime.status().await)
             };
+            for profile in app
+                .config_manager
+                .get_line_profiles()
+                .into_iter()
+                .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+            {
+                let Some(line) = app.line_registry.get(&profile.line_id).await else {
+                    continue;
+                };
+                let binding = line.binding();
+                if !binding.present {
+                    continue;
+                }
+                let _line_guard = line.volte_connect_lock.lock().await;
+                crate::access::volte::live::disconnect_live_for_line(
+                    &line.volte_live,
+                    &line.volte,
+                    "volte_ip_family_changed",
+                )
+                .await;
+                let device =
+                    match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
+                        Ok(device) => device,
+                        Err(error) => {
+                            if result.is_ok() {
+                                result = Err(error);
+                            }
+                            continue;
+                        }
+                    };
+                let mut line_config = config.clone();
+                line_config.connection_enabled = true;
+                let line_result = crate::access::volte::live::connect_live_for_line(
+                    &line.volte_live,
+                    &device,
+                    &line.volte,
+                    &line_config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await;
+                if result.is_ok() {
+                    result = line_result;
+                }
+            }
             let runtime = app.volte_runtime.status().await;
             let response = VolteControlResponse::build(&config, runtime);
             match result {
@@ -4816,6 +5122,52 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            if config.feature_enabled {
+                let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+                for profile in app
+                    .config_manager
+                    .get_line_profiles()
+                    .into_iter()
+                    .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+                {
+                    let Some(line) = app.line_registry.get(&profile.line_id).await else {
+                        continue;
+                    };
+                    let binding = line.binding();
+                    if !binding.present || line.volte.status().await.registered {
+                        continue;
+                    }
+                    let Ok(device) =
+                        crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
+                    else {
+                        continue;
+                    };
+                    let _guard = line.volte_connect_lock.lock().await;
+                    if line.volte.status().await.registered {
+                        continue;
+                    }
+                    let mut line_config = config.clone();
+                    line_config.connection_enabled = true;
+                    if let Err(error) = crate::access::volte::live::connect_live_for_line(
+                        &line.volte_live,
+                        &device,
+                        &line.volte,
+                        &line_config,
+                        app.config_manager.get_sms_path_policy().dedupe_enabled,
+                        Arc::clone(&app.database),
+                        Arc::clone(&app.notification_sender),
+                    )
+                    .await
+                    {
+                        warn!(
+                            line_id = %profile.line_id,
+                            error = %error,
+                            "Per-line VoLTE IMS auto-restore failed"
+                        );
                     }
                 }
             }

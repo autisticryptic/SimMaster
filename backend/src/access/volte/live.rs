@@ -14,6 +14,7 @@ use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 
 use crate::{
+    cellular::modem_manager::ModemBinding,
     ims::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
@@ -41,15 +42,77 @@ use super::{
     sms::{MtIngest, MtReassembler, TRANSPORT_TAG},
 };
 
-const MODEM_ID: &str = "0";
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
-const QMI_DEVICE: &str = "/dev/wwan0qmi0";
-const UIM_SLOT: u8 = 1;
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
 
-static LIVE_SESSION: OnceLock<Mutex<Option<VolteLiveSession>>> = OnceLock::new();
-static LIVE_LISTENER: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
+static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
+
+/// Device-specific inputs formerly hard-coded to modem 0, `/dev/wwan0qmi0`
+/// and UIM slot 1. A distinct value is injected for every discovered line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolteDeviceBinding {
+    pub line_id: String,
+    pub modem_id: String,
+    pub qmi_device: String,
+    pub uim_slot: u8,
+}
+
+impl VolteDeviceBinding {
+    pub fn from_modem(binding: &ModemBinding) -> Result<Self, VolteError> {
+        let qmi_device = binding
+            .qmi_device
+            .clone()
+            .ok_or_else(|| VolteError::new("volte_qmi_device_missing"))?;
+        Ok(Self {
+            line_id: binding.line_id.clone(),
+            modem_id: binding.modem_id.clone(),
+            qmi_device,
+            uim_slot: binding.uim_slot,
+        })
+    }
+
+    fn legacy_default() -> Self {
+        Self {
+            line_id: "legacy-primary".to_string(),
+            modem_id: "0".to_string(),
+            qmi_device: "/dev/wwan0qmi0".to_string(),
+            uim_slot: 1,
+        }
+    }
+}
+
+/// One independently owned protected SIP session/listener pair. The handle is
+/// cloneable so its receive task and API callers coordinate only within the
+/// same physical modem/SIM line.
+#[derive(Clone)]
+pub struct VolteLiveHandle {
+    session: Arc<Mutex<Option<VolteLiveSession>>>,
+    listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl Default for VolteLiveHandle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl VolteLiveHandle {
+    pub fn new() -> Self {
+        Self {
+            session: Arc::new(Mutex::new(None)),
+            listener: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn legacy_shared() -> Self {
+        default_live_handle().clone()
+    }
+}
+
+fn default_live_handle() -> &'static VolteLiveHandle {
+    DEFAULT_LIVE_HANDLE.get_or_init(VolteLiveHandle::new)
+}
 
 struct VolteLiveSession {
     channel: VolteSipChannel,
@@ -90,6 +153,7 @@ struct VolteRegisterAuthenticator {
     pending: Option<PreparedAuth>,
     mode: RegistrationMode,
     xfrm_plan: Option<XfrmInstallPlan>,
+    device: VolteDeviceBinding,
 }
 
 impl VolteRegisterAuthenticator {
@@ -99,6 +163,7 @@ impl VolteRegisterAuthenticator {
         sip_instance: String,
         offered_security_binding: SecAgree,
         route: ImsRoute,
+        device: VolteDeviceBinding,
     ) -> Self {
         let offered_security = offered_security_binding.security_client_value();
         Self {
@@ -111,6 +176,7 @@ impl VolteRegisterAuthenticator {
             pending: None,
             mode: RegistrationMode::None,
             xfrm_plan: None,
+            device,
         }
     }
 }
@@ -126,11 +192,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         let aid = identity::resolve_usim_aid(None);
         let rand = aka_challenge.rand;
         let autn = aka_challenge.autn;
+        let qmi_device = self.device.qmi_device.clone();
+        let uim_slot = self.device.uim_slot;
         let aka = tokio::task::spawn_blocking(move || {
             identity::run_usim_aka(
                 QMI_PROXY_SOCKET,
-                QMI_DEVICE,
-                UIM_SLOT,
+                qmi_device.as_str(),
+                uim_slot,
                 &aid,
                 &rand,
                 &autn,
@@ -277,16 +345,32 @@ pub async fn connect_live(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
+    connect_live_for_line(
+        default_live_handle(),
+        &VolteDeviceBinding::legacy_default(),
+        runtime,
+        config,
+        dedupe_enabled,
+        database,
+        notification_sender,
+    )
+    .await
+}
+
+pub async fn connect_live_for_line(
+    live: &VolteLiveHandle,
+    device: &VolteDeviceBinding,
+    runtime: &Arc<VolteRuntime>,
+    config: &VolteConfig,
+    dedupe_enabled: bool,
+    database: Arc<Database>,
+    notification_sender: Arc<NotificationSender>,
+) -> Result<VolteRuntimeStatus, VolteError> {
     if !config.feature_enabled || !config.connection_enabled {
         return Err(VolteError::new(code::RUNTIME_NOT_RUNNING));
     }
     let _advance = runtime.advance_guard().await;
-    if LIVE_SESSION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .await
-        .is_some()
-    {
+    if live.session.lock().await.is_some() {
         return Ok(runtime.status().await);
     }
     let generation = runtime.generation();
@@ -299,7 +383,7 @@ pub async fn connect_live(
         })
         .await;
 
-    match connect_inner(runtime, generation, config).await {
+    match connect_inner(runtime, generation, config, device).await {
         Ok(session) => {
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
@@ -308,7 +392,7 @@ pub async fn connect_live(
             };
             let pcscf = session.pcscf.to_string();
             let data_path_mode = format!("dedicated_ims_bearer_{}", session.ip_family);
-            *LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await = Some(session);
+            *live.session.lock().await = Some(session);
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Registered;
@@ -320,6 +404,8 @@ pub async fn connect_live(
                 })
                 .await;
             start_live_listener(
+                live.clone(),
+                device.line_id.clone(),
                 Arc::clone(runtime),
                 database,
                 notification_sender,
@@ -347,24 +433,25 @@ async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
     config: &VolteConfig,
+    device: &VolteDeviceBinding,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity = load_device_identity().await?;
+    let device_identity = load_device_identity(device).await?;
     ensure_generation(runtime, generation)?;
 
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
-    disconnect_existing_ims_bearers(MODEM_ID).await?;
-    let at_pcscf = discover_pcscf_via_at(MODEM_ID, config.ip_family_preference).await;
+    disconnect_existing_ims_bearers(&device.modem_id).await?;
+    let at_pcscf = discover_pcscf_via_at(&device.modem_id, config.ip_family_preference).await;
     ensure_generation(runtime, generation)?;
 
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let mut bearer = ensure_ims_bearer(MODEM_ID, &BearerRequest::default()).await?;
+    let mut bearer = ensure_ims_bearer(&device.modem_id, &BearerRequest::default()).await?;
     for candidate in at_pcscf {
         if !bearer.settings.pcscf.contains(&candidate) {
             bearer.settings.pcscf.push(candidate);
@@ -382,7 +469,7 @@ async fn connect_inner(
         let mut last_error = None;
         for (index, local_addr) in local_addrs.iter().copied().enumerate() {
             ensure_generation(runtime, generation)?;
-            match connect_family(runtime, &bearer, &device_identity, local_addr).await {
+            match connect_family(runtime, &bearer, &device_identity, local_addr, device).await {
                 Ok(session) => return Ok(session),
                 Err(error) if index + 1 < local_addrs.len() && should_try_next_family(&error) => {
                     last_error = Some(error);
@@ -405,6 +492,7 @@ async fn connect_family(
     bearer: &BearerConnection,
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
+    device: &VolteDeviceBinding,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
@@ -459,6 +547,7 @@ async fn connect_family(
         sip_instance,
         offered_binding,
         channel.route(),
+        device.clone(),
     );
     let registration = match run_register(&mut channel, &initial, &mut authenticator).await {
         Ok(registration) => registration,
@@ -502,32 +591,40 @@ async fn connect_family(
 
 /// Tear down only resources owned by the current VoLTE session.
 pub async fn disconnect_live(runtime: &Arc<VolteRuntime>, reason: &str) -> VolteRuntimeStatus {
-    if let Some(listener) = LIVE_LISTENER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .await
-        .take()
-    {
+    disconnect_live_for_line(default_live_handle(), runtime, reason).await
+}
+
+pub async fn disconnect_live_for_line(
+    live: &VolteLiveHandle,
+    runtime: &Arc<VolteRuntime>,
+    reason: &str,
+) -> VolteRuntimeStatus {
+    if let Some(listener) = live.listener.lock().await.take() {
         listener.abort();
     }
-    cleanup_live_session().await;
+    cleanup_live_session(live).await;
     runtime.reset_runtime(reason).await;
     runtime.status().await
 }
 
 async fn start_live_listener(
+    live: VolteLiveHandle,
+    line_id: String,
     runtime: Arc<VolteRuntime>,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     generation: u64,
     dedupe_enabled: bool,
 ) {
-    let mut listener = LIVE_LISTENER.get_or_init(|| Mutex::new(None)).lock().await;
+    let mut listener = live.listener.lock().await;
     if let Some(previous) = listener.take() {
         previous.abort();
     }
+    let receive_live = live.clone();
     *listener = Some(tokio::spawn(async move {
         live_receive_loop(
+            receive_live,
+            line_id,
             runtime,
             database,
             notification_sender,
@@ -539,6 +636,8 @@ async fn start_live_listener(
 }
 
 async fn live_receive_loop(
+    live: VolteLiveHandle,
+    line_id: String,
     runtime: Arc<VolteRuntime>,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
@@ -559,11 +658,11 @@ async fn live_receive_loop(
                     state.reconnect_count += 1;
                 })
                 .await;
-            cleanup_live_session().await;
+            cleanup_live_session(&live).await;
             break;
         }
         let frame = {
-            let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+            let mut sessions = live.session.lock().await;
             let Some(session) = sessions.as_mut() else {
                 break;
             };
@@ -580,19 +679,23 @@ async fn live_receive_loop(
                         })
                         .await;
                     drop(sessions);
-                    cleanup_live_session().await;
+                    cleanup_live_session(&live).await;
                     break;
                 }
             }
         };
         runtime.update(|state| state.last_rx_at = Some(now())).await;
         if let Err(error) = handle_live_frame(
-            &runtime,
-            &database,
-            &notification_sender,
+            LiveFrameContext {
+                live: &live,
+                line_id: &line_id,
+                runtime: &runtime,
+                database: &database,
+                notification_sender: &notification_sender,
+                dedupe_enabled,
+            },
             &mut reassembler,
             &frame,
-            dedupe_enabled,
         )
         .await
         {
@@ -601,12 +704,8 @@ async fn live_receive_loop(
     }
 }
 
-async fn cleanup_live_session() {
-    let session = LIVE_SESSION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .await
-        .take();
+async fn cleanup_live_session(live: &VolteLiveHandle) {
+    let session = live.session.lock().await.take();
     if let Some(session) = session {
         if let Some(plan) = session.xfrm_plan.as_ref() {
             ipsec::uninstall_plan(plan);
@@ -616,14 +715,28 @@ async fn cleanup_live_session() {
     }
 }
 
+struct LiveFrameContext<'a> {
+    live: &'a VolteLiveHandle,
+    line_id: &'a str,
+    runtime: &'a Arc<VolteRuntime>,
+    database: &'a Arc<Database>,
+    notification_sender: &'a Arc<NotificationSender>,
+    dedupe_enabled: bool,
+}
+
 async fn handle_live_frame(
-    runtime: &Arc<VolteRuntime>,
-    database: &Arc<Database>,
-    notification_sender: &Arc<NotificationSender>,
+    context: LiveFrameContext<'_>,
     reassembler: &mut MtReassembler,
     frame: &[u8],
-    dedupe_enabled: bool,
 ) -> Result<(), VolteError> {
+    let LiveFrameContext {
+        live,
+        line_id,
+        runtime,
+        database,
+        notification_sender,
+        dedupe_enabled,
+    } = context;
     if !sip::is_request(frame, "MESSAGE") {
         if let Ok(sip_status) = sip::parse_status(frame) {
             tracing::debug!(sip_status, "VoLTE protected SIP response received");
@@ -635,19 +748,19 @@ async fn handle_live_frame(
             (200, "OK")
         };
         let response = sip::build_response(frame, status, reason, None, None, None);
-        send_live_frame(runtime, &response).await?;
+        send_live_frame(live, runtime, &response).await?;
         return Ok(());
     }
 
     // Complete the SIP transaction before parsing/storing the RP-DATA.
     let response = sip::build_response(frame, 200, "OK", None, None, None);
-    send_live_frame(runtime, &response).await?;
+    send_live_frame(live, runtime, &response).await?;
 
     let deliver = crate::ims::sms_codec::parse_mt_rp_data(sip::sip_body(frame))
         .map_err(|_| VolteError::new("volte_mt_rp_data_invalid"))?;
     let rp_ack_body = crate::ims::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
     let rp_ack = {
-        let sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+        let sessions = live.session.lock().await;
         let session = sessions
             .as_ref()
             .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
@@ -661,7 +774,7 @@ async fn handle_live_frame(
             session.channel.security_verify(),
         )
     };
-    send_live_frame(runtime, &rp_ack).await?;
+    send_live_frame(live, runtime, &rp_ack).await?;
     tracing::info!(
         originator_len = deliver.originator.len(),
         body_bytes = sip::sip_body(frame).len(),
@@ -706,7 +819,7 @@ async fn handle_live_frame(
                 message.service_center_timestamp.clone()
             };
             let id = database
-                .insert_sms_at_with_transport(
+                .insert_sms_at_with_transport_for_line(
                     "incoming",
                     &message.originator,
                     &message.text,
@@ -714,6 +827,7 @@ async fn handle_live_frame(
                     "received",
                     Some(&message.dedup_marker),
                     TRANSPORT_TAG,
+                    Some(line_id),
                 )
                 .map_err(|error| {
                     VolteError::with_detail("volte_sms_db_failed", error.to_string())
@@ -728,6 +842,7 @@ async fn handle_live_frame(
                 status: "received".to_string(),
                 pdu: Some(message.dedup_marker),
                 transport: TRANSPORT_TAG.to_string(),
+                line_id: Some(line_id.to_string()),
             };
             let notification_sender = Arc::clone(notification_sender);
             tokio::spawn(async move {
@@ -752,8 +867,12 @@ async fn handle_live_frame(
     Ok(())
 }
 
-async fn send_live_frame(runtime: &Arc<VolteRuntime>, frame: &[u8]) -> Result<(), VolteError> {
-    let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+async fn send_live_frame(
+    live: &VolteLiveHandle,
+    runtime: &Arc<VolteRuntime>,
+    frame: &[u8],
+) -> Result<(), VolteError> {
+    let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
         .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
@@ -770,6 +889,23 @@ async fn send_live_frame(runtime: &Arc<VolteRuntime>, frame: &[u8]) -> Result<()
 /// channel. Holding the session lock across each MESSAGE transaction prevents
 /// the background MT listener from consuming the corresponding SIP response.
 pub async fn send_live_sms(
+    runtime: &Arc<VolteRuntime>,
+    recipient: &str,
+    text: &str,
+    service_center: &str,
+) -> Result<VolteSmsSendResult, VolteError> {
+    send_live_sms_for_line(
+        default_live_handle(),
+        runtime,
+        recipient,
+        text,
+        service_center,
+    )
+    .await
+}
+
+pub async fn send_live_sms_for_line(
+    live: &VolteLiveHandle,
     runtime: &Arc<VolteRuntime>,
     recipient: &str,
     text: &str,
@@ -794,7 +930,7 @@ pub async fn send_live_sms(
     let mut sip_statuses = Vec::with_capacity(part_count);
 
     for submission in submissions {
-        let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+        let mut sessions = live.session.lock().await;
         let session = sessions
             .as_mut()
             .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
@@ -920,8 +1056,12 @@ fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, V
     Err(VolteError::new(code::DIGEST_CHALLENGE_MISSING))
 }
 
-async fn load_device_identity() -> Result<DeviceIdentity, VolteError> {
-    let modem = command_output("mmcli", &["-m", MODEM_ID, "--output-keyvalue"]).await?;
+async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdentity, VolteError> {
+    let modem = command_output(
+        "mmcli",
+        &["-m", device.modem_id.as_str(), "--output-keyvalue"],
+    )
+    .await?;
     let operator = key_value(&modem, "modem.3gpp.operator-code")
         .filter(|value| value.len() == 5 || value.len() == 6)
         .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
@@ -1041,6 +1181,26 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_binding_uses_discovered_modem_qmi_and_slot() {
+        let modem = ModemBinding {
+            line_id: "line-0123456789abcdef0123456789abcdef".to_string(),
+            modem_id: "7".to_string(),
+            qmi_device: Some("/dev/cdc-wdm3".to_string()),
+            uim_slot: 2,
+            ..ModemBinding::default()
+        };
+        let device = VolteDeviceBinding::from_modem(&modem).unwrap();
+        assert_eq!(device.modem_id, "7");
+        assert_eq!(device.qmi_device, "/dev/cdc-wdm3");
+        assert_eq!(device.uim_slot, 2);
+    }
+
+    #[test]
+    fn device_binding_rejects_modem_without_qmi_control_port() {
+        assert!(VolteDeviceBinding::from_modem(&ModemBinding::default()).is_err());
+    }
 
     #[test]
     fn parses_device_identity_without_serializing_it() {

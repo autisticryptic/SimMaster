@@ -18,21 +18,23 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use zbus::Connection;
 
 use crate::{
-    access::volte::{VolteRuntime, VolteRuntimeStatus},
+    access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
 };
 
 pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
     pub volte: Arc<VolteRuntime>,
+    pub volte_live: VolteLiveHandle,
     pub volte_connect_lock: Mutex<()>,
 }
 
 impl LineRuntime {
-    fn new(binding: ModemBinding, volte: Arc<VolteRuntime>) -> Self {
+    fn new(binding: ModemBinding, volte: Arc<VolteRuntime>, volte_live: VolteLiveHandle) -> Self {
         Self {
             binding: RwLock::new(binding),
             volte,
+            volte_live,
             volte_connect_lock: Mutex::new(()),
         }
     }
@@ -102,14 +104,20 @@ impl LineRuntimeRegistry {
                 line.replace_binding(binding);
                 continue;
             }
-            let runtime = if !self.seed_claimed.swap(true, Ordering::SeqCst) {
+            let is_seed = !self.seed_claimed.swap(true, Ordering::SeqCst);
+            let runtime = if is_seed {
                 Arc::clone(&self.seed_runtime)
             } else {
                 Arc::new(VolteRuntime::new())
             };
+            let live = if is_seed {
+                VolteLiveHandle::legacy_shared()
+            } else {
+                VolteLiveHandle::new()
+            };
             lines.insert(
                 binding.line_id.clone(),
-                Arc::new(LineRuntime::new(binding, runtime)),
+                Arc::new(LineRuntime::new(binding, runtime, live)),
             );
         }
         Ok(lines.values().filter(|line| line.binding().present).count())
@@ -119,12 +127,28 @@ impl LineRuntimeRegistry {
         self.lines.read().await.get(line_id).cloned()
     }
 
+    pub async fn all(&self) -> Vec<Arc<LineRuntime>> {
+        self.lines.read().await.values().cloned().collect()
+    }
+
     pub async fn primary(&self) -> Option<Arc<LineRuntime>> {
         self.lines
             .read()
             .await
             .values()
             .find(|line| line.binding().present)
+            .cloned()
+    }
+
+    pub async fn for_modem_path(&self, modem_path: &str) -> Option<Arc<LineRuntime>> {
+        self.lines
+            .read()
+            .await
+            .values()
+            .find(|line| {
+                let binding = line.binding();
+                binding.present && binding.modem_path == modem_path
+            })
             .cloned()
     }
 
@@ -179,7 +203,7 @@ mod tests {
     #[tokio::test]
     async fn line_status_keeps_runtime_and_binding_together() {
         let runtime = Arc::new(VolteRuntime::new());
-        let line = LineRuntime::new(binding("line-a", true), runtime);
+        let line = LineRuntime::new(binding("line-a", true), runtime, VolteLiveHandle::new());
         let status = line.status().await;
         assert_eq!(status.modem.line_id, "line-a");
         assert_eq!(status.volte.phase, "disabled");
@@ -188,7 +212,7 @@ mod tests {
     #[test]
     fn absent_transition_does_not_change_stable_identity() {
         let runtime = Arc::new(VolteRuntime::new());
-        let line = LineRuntime::new(binding("line-a", true), runtime);
+        let line = LineRuntime::new(binding("line-a", true), runtime, VolteLiveHandle::new());
         line.mark_absent();
         assert_eq!(line.binding().line_id, "line-a");
         assert!(!line.binding().present);

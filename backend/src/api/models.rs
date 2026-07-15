@@ -980,6 +980,10 @@ pub struct VoiceServicesStatusResponse {
 pub struct SendSmsRequest {
     pub phone_number: String,
     pub content: String,
+    /// Optional stable modem+SIM line. Omitted requests preserve the legacy
+    /// primary-line behavior.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 /// Request body for placing a VoWiFi voice call.

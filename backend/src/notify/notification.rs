@@ -3061,6 +3061,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
             transport: "modem".to_string(),
+            line_id: None,
         };
         let context = SmsTemplateContext::default();
         let event = NotificationEvent::Sms {
@@ -3167,6 +3168,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
             transport: "modem".to_string(),
+            line_id: None,
         };
         let context = SmsTemplateContext::default();
 
@@ -3187,6 +3189,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
             transport: "modem".to_string(),
+            line_id: None,
         };
         let context = SmsTemplateContext {
             own_number: "+10001".to_string(),
@@ -3215,6 +3218,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
             transport: "modem".to_string(),
+            line_id: None,
         };
         let context = SmsTemplateContext {
             own_number: "+10001".to_string(),
@@ -3243,6 +3247,7 @@ mod tests {
             status: "received".to_string(),
             pdu: None,
             transport: "modem".to_string(),
+            line_id: None,
         };
         let context = SmsTemplateContext::default();
 
@@ -3274,6 +3279,7 @@ mod tests {
                 status: "received".to_string(),
                 pdu: None,
                 transport: stored.to_string(),
+                line_id: None,
             };
             assert_eq!(
                 render_sms_template(
