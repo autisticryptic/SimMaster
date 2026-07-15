@@ -2515,11 +2515,16 @@ pub async fn send_sms_handler(
             }
         }
     }
+    let detail = if failures.is_empty() {
+        "no enabled SMS path".to_string()
+    } else {
+        failures.join("; ")
+    };
     (
         StatusCode::OK,
         Json(ApiResponse::<serde_json::Value>::error(format!(
             "Failed to send SMS: {}",
-            failures.join("; ")
+            detail
         ))),
     )
 }

@@ -536,6 +536,7 @@ async fn live_receive_loop(
                     tracing::warn!(error = %error, "VoLTE protected SIP receive failed");
                     runtime
                         .update(|state| {
+                            state.phase = VoltePhase::Degraded;
                             state.last_error = Some(error.to_string());
                             state.last_failure_at = Some(now());
                         })
