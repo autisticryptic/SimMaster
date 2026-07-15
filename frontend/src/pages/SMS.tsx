@@ -41,8 +41,10 @@ import {
   SelectAll,
   Close,
   Search,
+  Settings,
 } from '@mui/icons-material'
 import { api, type SmsMessage, type SmsStats } from '../api/current'
+import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
 interface ConversationGroup {
   phoneNumber: string
@@ -165,6 +167,7 @@ export default function SMSPage() {
   const [success, setSuccess] = useState<string | null>(null)
   const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
   const [newChatNumber, setNewChatNumber] = useState('')
+  const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
 
   // 对话状态
   const [conversations, setConversations] = useState<ConversationGroup[]>([])
@@ -1162,6 +1165,11 @@ export default function SMSPage() {
         <Typography variant="h5" fontWeight={700}>
           短信管理
         </Typography>
+        <Tooltip title="短信路径策略">
+          <IconButton sx={{ ml: 'auto' }} onClick={() => setPathPolicyOpen(true)}>
+            <Settings />
+          </IconButton>
+        </Tooltip>
       </Box>
 
       <Snackbar open={!!error} autoHideDuration={4000} resumeHideDuration={3000} onClose={() => setError(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
@@ -1236,6 +1244,7 @@ export default function SMSPage() {
           <Button onClick={handleStartNewChat} variant="contained">开始对话</Button>
         </DialogActions>
       </Dialog>
+      <SmsPathPolicyDialog open={pathPolicyOpen} onClose={() => setPathPolicyOpen(false)} />
     </Box>
   )
 }

@@ -44,6 +44,7 @@ import {
   Refresh,
 } from '@mui/icons-material'
 import { api, type CallInfo, type CallRecord, type CallStats } from '../api/current'
+import VoiceServicesPanel from './phone/VoiceServicesPanel'
 
 const dialpadButtons = [
   ['1', '2', '3'],
@@ -310,6 +311,7 @@ export default function PhonePage() {
       <Tabs value={tabValue} onChange={(_, value: number) => setTabValue(value)} sx={{ mb: 2 }}>
         <Tab icon={<Dialpad />} label="拨号" iconPosition="start" />
         <Tab icon={<History />} label="通话记录" iconPosition="start" />
+        <Tab icon={<PhoneCallback />} label="语音服务" iconPosition="start" />
       </Tabs>
 
       {tabValue === 0 && (
@@ -453,6 +455,8 @@ export default function PhonePage() {
           </CardContent>
         </Card>
       )}
+
+      {tabValue === 2 && <VoiceServicesPanel />}
 
       <Dialog open={clearDialogOpen} onClose={() => setClearDialogOpen(false)}>
         <DialogTitle>确认清空</DialogTitle>

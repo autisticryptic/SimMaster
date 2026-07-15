@@ -61,6 +61,7 @@ import type {
   SmsConversationRequest,
   SmsListRequest,
   SmsStats,
+  SmsPathPolicy,
   SystemStatsResponse,
   VowifiConfig,
   VowifiDiagnosticsResponse,
@@ -75,6 +76,15 @@ import type {
   WorkMode,
   WorkModeRequest,
   WorkModeResponse,
+  VoiceInboxListResponse,
+  VoicePathPolicy,
+  VoiceServicesConfig,
+  VoiceServicesStatusResponse,
+  CallScreeningDecision,
+  WebCallCapabilitiesResponse,
+  VilteConfig,
+  VilteStatusResponse,
+  VolteVoiceStatusResponse,
   WlanConnectRequest,
   WlanForgetRequest,
   WlanProfileRequest,
@@ -631,6 +641,17 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<SmsStats>>('/sms/stats')
   }
 
+  async getSmsPathPolicy() {
+    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy')
+  }
+
+  async setSmsPathPolicy(policy: SmsPathPolicy) {
+    return request<ApiResponse<SmsPathPolicy>>('/sms/path-policy', {
+      method: 'POST',
+      body: JSON.stringify(policy),
+    })
+  }
+
   async clearAllSms() {
     return request<ApiResponse<Record<string, never>>>('/sms/clear', {
       method: 'POST',
@@ -708,6 +729,85 @@ class SimAdminCurrentAPI {
   async clearCallHistory() {
     return request<ApiResponse<Record<string, never>>>('/call/history/clear', {
       method: 'POST',
+    })
+  }
+
+  async getVoiceServicesStatus() {
+    return request<ApiResponse<VoiceServicesStatusResponse>>('/voice-services/status')
+  }
+
+  async setVoiceServicesConfig(config: VoiceServicesConfig) {
+    return request<ApiResponse<VoiceServicesConfig>>('/voice-services/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async getVoicePathPolicy() {
+    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy')
+  }
+
+  async setVoicePathPolicy(policy: VoicePathPolicy) {
+    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy', {
+      method: 'POST',
+      body: JSON.stringify(policy),
+    })
+  }
+
+  async screenVoiceCall(phoneNumber: string, transcript?: string) {
+    return request<ApiResponse<CallScreeningDecision>>('/voice-services/screen', {
+      method: 'POST',
+      body: JSON.stringify({ phone_number: phoneNumber, transcript }),
+    })
+  }
+
+  async getVoiceInbox(limit = 100, offset = 0) {
+    return request<ApiResponse<VoiceInboxListResponse>>(`/voice-services/inbox?limit=${limit}&offset=${offset}`)
+  }
+
+  async setVoiceInboxRead(id: number, read = true) {
+    return request<ApiResponse<{ updated: number }>>(`/voice-services/inbox/${id}/read`, {
+      method: 'POST',
+      body: JSON.stringify({ read }),
+    })
+  }
+
+  async deleteVoiceInbox(id: number) {
+    return request<ApiResponse<{ deleted: number }>>(`/voice-services/inbox/${id}`, {
+      method: 'DELETE',
+    })
+  }
+
+  async getWebCallCapabilities() {
+    return request<ApiResponse<WebCallCapabilitiesResponse>>('/web-call/capabilities')
+  }
+
+  async getVolteVoiceStatus() {
+    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/call/status')
+  }
+
+  async setVolteVoice(enabled: boolean) {
+    return request<ApiResponse<VolteVoiceStatusResponse>>('/volte/voice', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async getVilteStatus() {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/control')
+  }
+
+  async setVilteFeature(enabled: boolean) {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/control', {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async setVilteConfig(config: VilteConfig) {
+    return request<ApiResponse<VilteStatusResponse>>('/vilte/config', {
+      method: 'POST',
+      body: JSON.stringify(config),
     })
   }
 
