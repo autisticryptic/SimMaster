@@ -52,8 +52,14 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    channel.send_sip(initial_request).await?;
-    let mut response = channel.recv_sip(REGISTER_TIMEOUT).await?;
+    channel
+        .send_sip(initial_request)
+        .await
+        .map_err(|_| ImsError::new("ims_register_initial_send_failed"))?;
+    let mut response = channel
+        .recv_sip(REGISTER_TIMEOUT)
+        .await
+        .map_err(|_| ImsError::new("ims_register_initial_receive_failed"))?;
     let mut auth_rounds = 0u8;
 
     loop {
@@ -73,11 +79,24 @@ where
                 let request = authenticator
                     .authenticated_request(&response, u32::from(auth_rounds) + 1)
                     .await?;
-                channel.send_sip(&request).await?;
-                response = channel.recv_sip(REGISTER_TIMEOUT).await?;
+                channel
+                    .send_sip(&request)
+                    .await
+                    .map_err(|_| ImsError::new("ims_register_authenticated_send_failed"))?;
+                response = channel
+                    .recv_sip(REGISTER_TIMEOUT)
+                    .await
+                    .map_err(|_| ImsError::new("ims_register_authenticated_receive_failed"))?;
             }
             401 | 407 => return Err(ImsError::new("ims_register_auth_rejected")),
-            _ => return Err(ImsError::new("ims_register_unexpected_status")),
+            _ if auth_rounds == 0 => {
+                return Err(ImsError::new("ims_register_initial_unexpected_status"))
+            }
+            _ => {
+                return Err(ImsError::new(
+                    "ims_register_authenticated_unexpected_status",
+                ))
+            }
         }
     }
 }
@@ -209,5 +228,39 @@ mod tests {
 
         assert_eq!(channel.transport, SipTransport::Tcp);
         assert_eq!(channel.sends[1], b"REGISTER protected CSeq 2");
+    }
+
+    #[tokio::test]
+    async fn initial_receive_failure_has_initial_stage_code() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::new(),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let error = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "ims_register_initial_receive_failed");
+        assert_eq!(channel.sends.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn authenticated_receive_failure_has_authenticated_stage_code() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([response(401, "Unauthorized")]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let error = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "ims_register_authenticated_receive_failed");
+        assert_eq!(channel.sends.len(), 2);
     }
 }

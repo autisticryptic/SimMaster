@@ -9,8 +9,9 @@
 //! Observed data-path settings block anchors (from the reference):
 //!   `IPv6 address:` / `IPv6 gateway address:` / `IPv6 primary DNS:` /
 //!   `IPv4 address:` / `IPv4 gateway address:` / `IPv4 primary DNS:` ...
-//! The P-CSCF is typically delivered via the PCO and equals a primary DNS /
-//! dedicated P-CSCF PCO field depending on operator.
+//! The P-CSCF is normally delivered via PCO. DNS addresses are resolver
+//! endpoints, not implicit SIP proxies; they are only used to resolve the
+//! standard P-CSCF/SRV names.
 
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -45,19 +46,14 @@ impl ImsIpSettings {
         self.ipv6_address.or(self.ipv4_address)
     }
 
-    /// Resolve the P-CSCF address to register against. Preference order:
-    /// explicit PCO P-CSCF > IPv6 primary DNS > IPv4 primary DNS. This mirrors
-    /// the common operator behavior where the P-CSCF is delivered in the PCO,
-    /// falling back to the DNS-advertised proxy.
+    /// Return an explicit P-CSCF delivered by the bearer PCO.
+    ///
+    /// DNS server addresses must never be returned here. Some Qualcomm
+    /// devices expose public carrier resolvers in the IMS bearer DNS slots;
+    /// sending SIP REGISTER to those addresses produces a misleading timeout.
     pub fn resolve_pcscf(&self) -> Result<IpAddr, VolteError> {
         if let Some(p) = self.pcscf.first() {
             return Ok(*p);
-        }
-        if let Some(dns) = self.ipv6_dns.first() {
-            return Ok(*dns);
-        }
-        if let Some(dns) = self.ipv4_dns.first() {
-            return Ok(*dns);
         }
         Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
     }
@@ -160,10 +156,7 @@ pub async fn discover_pcscf(
             }
         }
     }
-    // Some Qualcomm/operator combinations expose P-CSCF candidates in the
-    // DNS slots but do not run a recursive DNS service on those addresses.
-    // Preserve the documented data-path fallback after bounded DNS attempts.
-    settings.resolve_pcscf()
+    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
 pub fn pcscf_socket(address: IpAddr) -> SocketAddr {
@@ -386,14 +379,12 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn resolve_pcscf_prefers_explicit_then_dns() {
+    fn resolve_pcscf_accepts_only_explicit_pco_address() {
         let mut s = parse_ip_settings(SAMPLE);
-        // No explicit P-CSCF -> IPv6 primary DNS.
         assert_eq!(
-            s.resolve_pcscf().unwrap(),
-            IpAddr::V6("2001:db8::53".parse::<Ipv6Addr>().unwrap())
+            s.resolve_pcscf().unwrap_err().code(),
+            code::RUNTIME_ALL_PCSCF_FAILED
         );
-        // Explicit PCO P-CSCF wins.
         s.pcscf.push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
         assert_eq!(
             s.resolve_pcscf().unwrap(),

@@ -500,7 +500,13 @@ fn map_channel_error(error: ImsError) -> VolteError {
 }
 
 fn map_register_error(error: ImsError) -> VolteError {
-    VolteError::with_detail(code::REGISTER_AUTH_UNEXPECTED_STATUS, error.code())
+    let stage = match error.code() {
+        "ims_register_initial_send_failed"
+        | "ims_register_initial_receive_failed"
+        | "ims_register_initial_unexpected_status" => code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+        _ => code::REGISTER_AUTH_UNEXPECTED_STATUS,
+    };
+    VolteError::with_detail(stage, error.code())
 }
 
 #[cfg(test)]
@@ -533,5 +539,23 @@ mod tests {
         let challenge = parse_digest_challenge(frame).unwrap();
         assert_eq!(challenge.realm, "ims.example");
         assert!(!challenge.proxy);
+    }
+
+    #[test]
+    fn register_transport_errors_preserve_initial_vs_authenticated_stage() {
+        let initial = map_register_error(ImsError::new("ims_register_initial_receive_failed"));
+        assert_eq!(initial.code(), code::REGISTER_INITIAL_UNEXPECTED_STATUS);
+        assert_eq!(
+            initial.detail(),
+            Some("ims_register_initial_receive_failed")
+        );
+
+        let authenticated =
+            map_register_error(ImsError::new("ims_register_authenticated_receive_failed"));
+        assert_eq!(authenticated.code(), code::REGISTER_AUTH_UNEXPECTED_STATUS);
+        assert_eq!(
+            authenticated.detail(),
+            Some("ims_register_authenticated_receive_failed")
+        );
     }
 }
