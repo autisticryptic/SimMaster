@@ -18,18 +18,20 @@ use tracing::{error, info, warn};
 use zbus::Connection;
 
 use crate::{
-    cellular::modem_manager,
-    infra::config::{
-        AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
-        VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference, VowifiConfig,
+    access::vowifi::diagnostics::{
+        self as vowifi_diagnostics, VowifiDiagnosticsResponse, VowifiProfileMatchResponse,
+        VowifiProfilesResponse, VowifiStatusResponse,
     },
-    infra::db::{
-        NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
-        VowifiEsimRestoreEntry, VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse,
-        VowifiSoakRunsResponse,
+    access::vowifi::restore::RestorePhase,
+    access::vowifi::{
+        live::{
+            clear_all_live_runtime, place_live_voice_call, send_live_sms_over_ims,
+            verify_live_sim_auth_access,
+        },
+        sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
-    sim::esim::EsimApiError,
     api::models::*,
+    cellular::modem_manager,
     cellular::modem_manager::{
         answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
         find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
@@ -42,27 +44,25 @@ use crate::{
         send_sms, set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
         set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
     },
-    state::AppState,
-    system::system_event::{
-        codes as system_event_codes, mask_identifier, severity as system_event_severity,
-        status as system_event_status,
+    infra::config::{
+        AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
+        VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference, VowifiConfig,
+    },
+    infra::db::{
+        NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
+        VowifiEsimRestoreEntry, VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse,
+        VowifiSoakRunsResponse,
     },
     infra::utils::{
         connection_addresses_from_interfaces, format_uptime, get_active_interfaces, read_cpu_info,
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
     },
-    access::vowifi::diagnostics::{
-        self as vowifi_diagnostics, VowifiDiagnosticsResponse, VowifiProfileMatchResponse,
-        VowifiProfilesResponse, VowifiStatusResponse,
-    },
-    access::vowifi::restore::RestorePhase,
-    access::vowifi::{
-        live::{
-            clear_all_live_runtime, place_live_voice_call, send_live_sms_over_ims,
-            verify_live_sim_auth_access,
-        },
-        sms::{MoSmsSipOutcome, MtSmsDeliver},
+    sim::esim::EsimApiError,
+    state::AppState,
+    system::system_event::{
+        codes as system_event_codes, mask_identifier, severity as system_event_severity,
+        status as system_event_status,
     },
     voice_services::{
         screening::{decide_call, CallCategory},
@@ -572,7 +572,11 @@ pub async fn enable_esim_profile_handler(
     tokio::spawn(async move {
         let _guard = modem_manager::BasebandRestartRunGuard;
 
-        match bg_app.esim_supervisor.enable_profile(bg_iccid.clone()).await {
+        match bg_app
+            .esim_supervisor
+            .enable_profile(bg_iccid.clone())
+            .await
+        {
             Ok(data) => {
                 if esim_command_succeeded(&data) {
                     modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
@@ -593,10 +597,7 @@ pub async fn enable_esim_profile_handler(
                             } else {
                                 warn!("Failed to request SMS resync after eSIM profile switch");
                             }
-                            spawn_vowifi_profile_switch_restore(
-                                bg_app.clone(),
-                                bg_switch_token,
-                            );
+                            spawn_vowifi_profile_switch_restore(bg_app.clone(), bg_switch_token);
                             bg_app
                                 .system_event_emitter
                                 .emit_code(
@@ -623,9 +624,7 @@ pub async fn enable_esim_profile_handler(
                                 .sms_resync
                                 .request_scan("profile-switch-recovery-failed")
                             {
-                                info!(
-                                    "Requested SMS resync after failed eSIM profile recovery"
-                                );
+                                info!("Requested SMS resync after failed eSIM profile recovery");
                             } else {
                                 warn!(
                                     "Failed to request SMS resync after failed eSIM profile recovery"
@@ -634,8 +633,13 @@ pub async fn enable_esim_profile_handler(
                         }
                     }
                 } else {
-                    modem_manager::record_restart_step("启用 eSIM Profile", "error", Some(data.msg.clone()));
-                    bg_app.system_event_emitter
+                    modem_manager::record_restart_step(
+                        "启用 eSIM Profile",
+                        "error",
+                        Some(data.msg.clone()),
+                    );
+                    bg_app
+                        .system_event_emitter
                         .emit_code(
                             system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
                             system_event_severity::WARNING,
@@ -648,8 +652,13 @@ pub async fn enable_esim_profile_handler(
             }
             Err(err) => {
                 let message = err.message();
-                modem_manager::record_restart_step("启用 eSIM Profile", "error", Some(message.clone()));
-                bg_app.system_event_emitter
+                modem_manager::record_restart_step(
+                    "启用 eSIM Profile",
+                    "error",
+                    Some(message.clone()),
+                );
+                bg_app
+                    .system_event_emitter
                     .emit_code(
                         system_event_codes::ESIM_PROFILE_ENABLE_FAILED,
                         system_event_severity::WARNING,
@@ -677,8 +686,6 @@ pub async fn enable_esim_profile_handler(
         )),
     )
 }
-
-
 
 /// POST /api/esim/profiles/{iccid}/rename
 pub async fn rename_esim_profile_handler(
@@ -2387,7 +2394,9 @@ fn persist_vowifi_mt_deliveries(db: &Database, outcome: &MoSmsSipOutcome) -> Vec
 
 fn spawn_vowifi_sms_followup_persist(
     app: AppState,
-    mut followup: tokio::sync::mpsc::UnboundedReceiver<crate::access::vowifi::live::LiveSmsFollowupFrame>,
+    mut followup: tokio::sync::mpsc::UnboundedReceiver<
+        crate::access::vowifi::live::LiveSmsFollowupFrame,
+    >,
 ) {
     tokio::spawn(async move {
         while let Some(frame) = followup.recv().await {
@@ -2478,17 +2487,17 @@ fn persist_vowifi_restore_phase(
     degraded_reason: Option<&str>,
     retry_count: u8,
 ) {
-    if let Err(err) = app
-        .database
-        .upsert_vowifi_esim_restore(crate::infra::db::NewVowifiEsimRestore {
-            switch_token: Some(switch_token),
-            switch_phase: Some(switch_phase),
-            phase_ms: Some(phase_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64),
-            identity_ready,
-            sim_auth_ready,
-            degraded_reason,
-            retry_count: i64::from(retry_count),
-        })
+    if let Err(err) =
+        app.database
+            .upsert_vowifi_esim_restore(crate::infra::db::NewVowifiEsimRestore {
+                switch_token: Some(switch_token),
+                switch_phase: Some(switch_phase),
+                phase_ms: Some(phase_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64),
+                identity_ready,
+                sim_auth_ready,
+                degraded_reason,
+                retry_count: i64::from(retry_count),
+            })
     {
         warn!(error = %err, "Failed to persist VoWiFi eSIM restore phase");
     }
@@ -2598,22 +2607,24 @@ async fn send_sms_over_vowifi_path(
             "vowifi_ims",
         )
         .ok();
-    let _ = app.database.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
-        message_id: &outcome.message_id,
-        trace_id: &outcome.trace_id,
-        direction: "mobile_originated",
-        state: outcome.delivery_state.as_str(),
-        sip_state: if (200..300).contains(&outcome.sip_status) {
-            "accepted"
-        } else {
-            "rejected"
-        },
-        rpdu_ack: outcome.rpdu_ack.as_str(),
-        delivery_reported: false,
-        failure_cause: outcome.failure_cause.as_deref(),
-        retry_count: 0,
-        api_sms_id,
-    });
+    let _ = app
+        .database
+        .upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+            message_id: &outcome.message_id,
+            trace_id: &outcome.trace_id,
+            direction: "mobile_originated",
+            state: outcome.delivery_state.as_str(),
+            sip_state: if (200..300).contains(&outcome.sip_status) {
+                "accepted"
+            } else {
+                "rejected"
+            },
+            rpdu_ack: outcome.rpdu_ack.as_str(),
+            delivery_reported: false,
+            failure_cause: outcome.failure_cause.as_deref(),
+            retry_count: 0,
+            api_sms_id,
+        });
     spawn_vowifi_sms_followup_persist(app.clone(), send_result.followup);
     Ok(json!({
         "path": "vowifi_ims",
@@ -2722,14 +2733,16 @@ pub async fn send_sms_handler_legacy(
             let current_snap = app.vowifi_runtime.snapshot().await;
             let profile_meta = current_snap.profile.profile.as_ref();
             let profile_id = profile_meta.map(|p| p.profile_id);
-            let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-                trace_id: Some("runtime-connect"),
-                level: "info",
-                phase: "connect_start",
-                profile_id,
-                event_type: "connect_start",
-                detail_json: "{}",
-            });
+            let _ =
+                app.database
+                    .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+                        trace_id: Some("runtime-connect"),
+                        level: "info",
+                        phase: "connect_start",
+                        profile_id,
+                        event_type: "connect_start",
+                        detail_json: "{}",
+                    });
             let snapshot = app
                 .vowifi_runtime
                 .connect_live_with_stage_timeout(
@@ -3579,14 +3592,16 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
     let profile_id = profile_meta.map(|p| p.profile_id);
 
     // 1. IPSEC Event: 发送 IKEv2 INFORMATIONAL 报文，拆除全部 ESP 安全关联并注销会话
-    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-        trace_id: Some("runtime-stop"),
-        level: "info",
-        phase: "connection_stop",
-        profile_id,
-        event_type: "ike_teardown",
-        detail_json: "{}",
-    });
+    let _ = app
+        .database
+        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+            trace_id: Some("runtime-stop"),
+            level: "info",
+            phase: "connection_stop",
+            profile_id,
+            event_type: "ike_teardown",
+            detail_json: "{}",
+        });
 
     if let Err(err) = set_vowifi_airplane_mode(app, false).await {
         warn!(error = %err, "Failed to disable airplane mode while stopping WiFi Calling");
@@ -3595,26 +3610,30 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
     restore_cellular_data_after_vowifi(app).await;
 
     // 2. SMS Event: 短信路径已释放，成功退回到蜂窝基站数据链路。
-    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-        trace_id: Some("runtime-stop"),
-        level: "info",
-        phase: "connection_stop",
-        profile_id,
-        event_type: "sms_path_released",
-        detail_json: "{}",
-    });
+    let _ = app
+        .database
+        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+            trace_id: Some("runtime-stop"),
+            level: "info",
+            phase: "connection_stop",
+            profile_id,
+            event_type: "sms_path_released",
+            detail_json: "{}",
+        });
 
     let status = reset_vowifi_runtime(app, reason).await;
 
     // 3. SYS Event: WiFi Calling 核心服务运行时已停止
-    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-        trace_id: Some("runtime-stop"),
-        level: "info",
-        phase: "connection_stop",
-        profile_id,
-        event_type: "runtime_stop",
-        detail_json: "{}",
-    });
+    let _ = app
+        .database
+        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+            trace_id: Some("runtime-stop"),
+            level: "info",
+            phase: "connection_stop",
+            profile_id,
+            event_type: "runtime_stop",
+            detail_json: "{}",
+        });
 
     status
 }
@@ -4121,14 +4140,16 @@ async fn connect_vowifi_with_attempts(
     // let _ = app.database.clear_vowifi_runtime_events();
     let profile_meta = current.profile.profile.as_ref();
     let profile_id = profile_meta.map(|p| p.profile_id);
-    let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-        trace_id: Some("runtime-connect"),
-        level: "info",
-        phase: "connect_start",
-        profile_id,
-        event_type: "connect_start",
-        detail_json: "{}",
-    });
+    let _ = app
+        .database
+        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+            trace_id: Some("runtime-connect"),
+            level: "info",
+            phase: "connect_start",
+            profile_id,
+            event_type: "connect_start",
+            detail_json: "{}",
+        });
 
     let attempts = attempts.max(1);
     if let Err(err) = pause_cellular_data_for_vowifi(app).await {
@@ -4256,7 +4277,10 @@ pub async fn set_volte_feature_handler(
     State(app): State<AppState>,
     Json(payload): Json<VolteControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
-    match app.config_manager.set_volte_feature_enabled(payload.enabled) {
+    match app
+        .config_manager
+        .set_volte_feature_enabled(payload.enabled)
+    {
         Ok(config) => {
             if !payload.enabled {
                 crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
@@ -4532,7 +4556,10 @@ pub async fn set_vilte_feature_handler(
     State(app): State<AppState>,
     Json(payload): Json<VolteControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
-    match app.config_manager.set_vilte_feature_enabled(payload.enabled) {
+    match app
+        .config_manager
+        .set_vilte_feature_enabled(payload.enabled)
+    {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -6169,8 +6196,12 @@ pub async fn get_latest_ota_release_handler(
         let proxy_prefix = crate::system::ota::normalize_proxy_prefix(req.proxy_prefix);
         let client = crate::system::ota::build_ota_http_client()?;
 
-        crate::system::ota::fetch_latest_github_release(&client, &proxy_prefix, include_builtin_proxies)
-            .await
+        crate::system::ota::fetch_latest_github_release(
+            &client,
+            &proxy_prefix,
+            include_builtin_proxies,
+        )
+        .await
     }
     .await;
 

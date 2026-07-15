@@ -1,6 +1,6 @@
 use crate::automation::traits::AutomationTaskHandler;
-use crate::infra::db::beijing_sms_now_string;
 use crate::cellular::modem_manager::send_sms;
+use crate::infra::db::beijing_sms_now_string;
 use crate::state::AppState;
 use anyhow::{Context, Result};
 use ring::rand::{SecureRandom, SystemRandom};

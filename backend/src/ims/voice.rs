@@ -543,12 +543,7 @@ impl SdpAudioDescription {
     pub fn common_codecs(&self, remote: &SdpAudioDescription) -> Vec<AudioCodec> {
         self.codecs
             .iter()
-            .filter(|local| {
-                remote
-                    .codecs
-                    .iter()
-                    .any(|other| other.codec == local.codec)
-            })
+            .filter(|local| remote.codecs.iter().any(|other| other.codec == local.codec))
             .map(|local| local.codec)
             .collect()
     }
@@ -789,10 +784,7 @@ pub fn build_sdp_answer_with_params(
     // for codecs we also support, honoring the offerer's preference order.
     let mut answer_codecs = Vec::new();
     for offered in &offer.codecs {
-        if local_offer
-            .iter()
-            .any(|local| local.codec == offered.codec)
-        {
+        if local_offer.iter().any(|local| local.codec == offered.codec) {
             answer_codecs.push(offered.clone());
         }
     }
@@ -1277,8 +1269,10 @@ impl VoiceCallStateMachine {
     /// Update RTP counters as media flows. Kept coarse (counts only).
     pub fn record_media_progress(&mut self, packets_sent: u64, packets_received: u64) {
         self.call.rtp_packets_sent = self.call.rtp_packets_sent.saturating_add(packets_sent);
-        self.call.rtp_packets_received =
-            self.call.rtp_packets_received.saturating_add(packets_received);
+        self.call.rtp_packets_received = self
+            .call
+            .rtp_packets_received
+            .saturating_add(packets_received);
         self.last_media = Some(self.media_summary());
     }
 
@@ -1355,8 +1349,7 @@ impl VoiceCallStateMachine {
             last_sdp: self.last_sdp.clone(),
             last_media: self.last_media.clone(),
             sip_endpoint_exposed: false,
-            state_consistency_policy:
-                "ims_voice_call_is_single_fact_source_for_logs_api_and_ui",
+            state_consistency_policy: "ims_voice_call_is_single_fact_source_for_logs_api_and_ui",
             sensitive_values_policy:
                 "phone_numbers_sdp_body_rtp_media_and_media_keys_not_serialized",
         }
@@ -1647,12 +1640,8 @@ mod tests {
 
     #[test]
     fn sdp_offer_round_trips_through_parser() {
-        let offer = build_mo_audio_offer_with_params(
-            &test_params(),
-            "192.0.2.10",
-            SdpAddrType::Ip4,
-            40000,
-        );
+        let offer =
+            build_mo_audio_offer_with_params(&test_params(), "192.0.2.10", SdpAddrType::Ip4, 40000);
         let body = offer.to_sdp();
         let parsed = parse_audio_sdp(body.as_bytes()).expect("parse own offer");
         assert_eq!(parsed.media_port, 40000);

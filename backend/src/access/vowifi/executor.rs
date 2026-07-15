@@ -146,7 +146,8 @@ impl LiveExecutorGateReport {
 
     pub fn from_environment() -> Self {
         let live_network_authorized = env_flag_default_true("SIMADMIN_VOWIFI_LIVE_NETWORK_ALLOWED");
-        let device_state_changes_authorized = env_flag_default_true("SIMADMIN_VOWIFI_DEVICE_CHANGES_ALLOWED");
+        let device_state_changes_authorized =
+            env_flag_default_true("SIMADMIN_VOWIFI_DEVICE_CHANGES_ALLOWED");
         let adb_path_configured = env_non_empty("SIMADMIN_VOWIFI_ADB_PATH");
         let device_admin_url_configured = env_non_empty("SIMADMIN_VOWIFI_DEVICE_ADMIN_URL");
         let implementation_ready = live_runtime_implementation_complete();

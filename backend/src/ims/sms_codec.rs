@@ -1915,12 +1915,8 @@ mod tests {
 
     #[test]
     fn gsm7_long_mo_sms_uses_153_septet_parts_and_concat_udh() {
-        let submissions = build_mo_submissions(
-            "+8613800138000",
-            &"A".repeat(161),
-            "+8613800100500",
-        )
-        .unwrap();
+        let submissions =
+            build_mo_submissions("+8613800138000", &"A".repeat(161), "+8613800100500").unwrap();
         assert_eq!(submissions.len(), 2);
         let concat_reference = submissions[0].rp_message_reference;
         for (index, submission) in submissions.iter().enumerate() {
@@ -1940,12 +1936,8 @@ mod tests {
 
     #[test]
     fn ucs2_long_mo_sms_splits_on_utf16_boundaries() {
-        let submissions = build_mo_submissions(
-            "+8613800138000",
-            &"测".repeat(71),
-            "+8613800100500",
-        )
-        .unwrap();
+        let submissions =
+            build_mo_submissions("+8613800138000", &"测".repeat(71), "+8613800100500").unwrap();
         assert_eq!(submissions.len(), 2);
         assert_eq!(submissions[0].part_index, 1);
         assert_eq!(submissions[1].part_index, 2);
@@ -1955,12 +1947,8 @@ mod tests {
 
     #[test]
     fn gsm7_extension_characters_count_as_two_septets_when_splitting() {
-        let submissions = build_mo_submissions(
-            "+8613800138000",
-            &"{".repeat(81),
-            "+8613800100500",
-        )
-        .unwrap();
+        let submissions =
+            build_mo_submissions("+8613800138000", &"{".repeat(81), "+8613800100500").unwrap();
         assert_eq!(submissions.len(), 2);
     }
 

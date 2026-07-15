@@ -14,10 +14,6 @@ use zbus::{
 };
 
 use crate::{
-    infra::config::{ApnConfig, ConfigManager},
-    infra::db::Database,
-};
-use crate::{
     api::models::{
         AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
         BasebandRestartResponse, BasebandRestartStep, CallInfo, CallListResponse,
@@ -30,6 +26,10 @@ use crate::{
         codes as system_event_codes, severity as system_event_severity,
         status as system_event_status, SystemEventEmitter,
     },
+};
+use crate::{
+    infra::config::{ApnConfig, ConfigManager},
+    infra::db::Database,
 };
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
@@ -5763,7 +5763,6 @@ pub async fn power_cycle_sim_for_profile_switch(
     .await
 }
 
-
 async fn power_cycle_sim_for_profile_switch_inner(
     conn: &Connection,
     auto_connect_data: bool,
@@ -5911,7 +5910,8 @@ async fn power_cycle_sim_for_profile_switch_inner(
                 path
             }
             None => {
-                let message = "等待基带重新枚举超时：ModemManager 启动后 15 秒内未检测到 Modem".to_string();
+                let message =
+                    "等待基带重新枚举超时：ModemManager 启动后 15 秒内未检测到 Modem".to_string();
                 record_baseband_step(
                     &mut steps,
                     "等待基带重新枚举",

@@ -171,11 +171,7 @@ fn build_socket(
 }
 
 fn build_bound_socket(local: SocketAddr, interface: Option<&str>) -> io::Result<Socket> {
-    let socket = Socket::new(
-        Domain::for_address(local),
-        Type::DGRAM,
-        Some(Protocol::UDP),
-    )?;
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     bind_to_interface(&socket, interface)?;
     socket.bind(&local.into())?;
@@ -255,7 +251,10 @@ mod tests {
         let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
         let client_addr = channel.local_addr().unwrap();
 
-        channel.send_sip(b"REGISTER sip:ims.example SIP/2.0\r\n\r\n").await.unwrap();
+        channel
+            .send_sip(b"REGISTER sip:ims.example SIP/2.0\r\n\r\n")
+            .await
+            .unwrap();
         let mut request = [0u8; 256];
         let (read, peer) = server.recv_from(&mut request).await.unwrap();
         assert_eq!(peer, client_addr);

@@ -68,9 +68,7 @@ pub fn build_sdp_answer(
     )
 }
 
-pub fn build_dry_run_voice_snapshot(
-    profile: &'static CarrierProfile,
-) -> VoiceRuntimePublicState {
+pub fn build_dry_run_voice_snapshot(profile: &'static CarrierProfile) -> VoiceRuntimePublicState {
     build_dry_run_voice_snapshot_with_params(voice_params(profile))
 }
 

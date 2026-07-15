@@ -194,10 +194,7 @@ fn parse_esp_proposal(proposal: &'static str) -> EspProposalPlan {
     }
 }
 
-fn first_token(
-    tokens: &[&'static str],
-    predicate: impl Fn(&str) -> bool,
-) -> Option<&'static str> {
+fn first_token(tokens: &[&'static str], predicate: impl Fn(&str) -> bool) -> Option<&'static str> {
     tokens.iter().copied().find(|token| predicate(token))
 }
 

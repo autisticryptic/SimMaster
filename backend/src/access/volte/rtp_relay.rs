@@ -266,7 +266,11 @@ mod tests {
         .with_require_rtp(false);
         // A short (RTCP-like/noise) datagram still forwards.
         let d = relay
-            .ingest(RelayLeg::Internal, addr(2, 40000), &[0x80, 0xc8, 0x00, 0x06])
+            .ingest(
+                RelayLeg::Internal,
+                addr(2, 40000),
+                &[0x80, 0xc8, 0x00, 0x06],
+            )
             .expect("forward without rtp check");
         assert_eq!(d.to, RelayLeg::Operator);
     }
@@ -305,8 +309,20 @@ pub mod io {
         internal_sock.set_read_timeout(Some(std::time::Duration::from_millis(200)))?;
 
         while !stop.load(Ordering::Relaxed) {
-            relay_once(RelayLeg::Operator, operator_sock, internal_sock, core, &mut buf);
-            relay_once(RelayLeg::Internal, internal_sock, operator_sock, core, &mut buf);
+            relay_once(
+                RelayLeg::Operator,
+                operator_sock,
+                internal_sock,
+                core,
+                &mut buf,
+            );
+            relay_once(
+                RelayLeg::Internal,
+                internal_sock,
+                operator_sock,
+                core,
+                &mut buf,
+            );
         }
         Ok(())
     }

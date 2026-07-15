@@ -457,7 +457,8 @@ mod tests {
             opaque: Some("op".to_string()),
             proxy: false,
         };
-        let h = build_authorization_header(&challenge, "user", "sip:r", "abc123", "cnon", "00000001");
+        let h =
+            build_authorization_header(&challenge, "user", "sip:r", "abc123", "cnon", "00000001");
         assert!(h.starts_with("Authorization: Digest username=\"user\""));
         assert!(h.contains("qop=auth,nc=00000001,cnonce=\"cnon\""));
         assert!(h.contains("opaque=\"op\""));

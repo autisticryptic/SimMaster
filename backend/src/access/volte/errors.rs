@@ -147,7 +147,10 @@ mod tests {
 
     #[test]
     fn display_without_detail_is_bare_code() {
-        assert_eq!(VolteError::new(code::IMSI_MISSING).to_string(), "volte_imsi_missing");
+        assert_eq!(
+            VolteError::new(code::IMSI_MISSING).to_string(),
+            "volte_imsi_missing"
+        );
     }
 
     #[test]

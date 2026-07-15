@@ -208,7 +208,10 @@ impl VowifiRuntime {
         snapshot
     }
 
-    pub async fn refresh_live_readiness(&self, db: Option<&crate::infra::db::Database>) -> RuntimeSnapshot {
+    pub async fn refresh_live_readiness(
+        &self,
+        db: Option<&crate::infra::db::Database>,
+    ) -> RuntimeSnapshot {
         self.refresh_live_readiness_with_stage_timeout(db, Duration::from_secs(30))
             .await
     }
@@ -295,7 +298,9 @@ impl VowifiRuntime {
             return self.snapshot().await;
         }
 
-        let snapshot = self.refresh_live_readiness_once(db, stage_timeout, scope).await;
+        let snapshot = self
+            .refresh_live_readiness_once(db, stage_timeout, scope)
+            .await;
         refresh.last_finished = Some(Instant::now());
         snapshot
     }
@@ -356,14 +361,16 @@ impl VowifiRuntime {
                         _ => ("", "", ""),
                     };
                     if !event_type.is_empty() {
-                        let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-                            trace_id: Some("runtime-connect"),
-                            level,
-                            phase,
-                            profile_id: profile_id.as_deref(),
-                            event_type,
-                            detail_json: "{}",
-                        });
+                        let _ = database.insert_vowifi_runtime_event(
+                            crate::infra::db::NewVowifiRuntimeEvent {
+                                trace_id: Some("runtime-connect"),
+                                level,
+                                phase,
+                                profile_id: profile_id.as_deref(),
+                                event_type,
+                                detail_json: "{}",
+                            },
+                        );
                     }
                 }
             }
@@ -391,32 +398,44 @@ impl VowifiRuntime {
                                 ("profile_search", "profile_search", "info"),
                                 ("profile_match", "profile_matched", "success"),
                             ],
-                            ExecutorStage::Epdg => vec![("dns_resolved", "dns_resolved", "success")],
+                            ExecutorStage::Epdg => {
+                                vec![("dns_resolved", "dns_resolved", "success")]
+                            }
                             ExecutorStage::Ike => vec![("ike_established", "ike_ready", "success")],
                             ExecutorStage::Esp => vec![("esp_ready", "esp_ready", "success")],
-                            ExecutorStage::ImsRegister => vec![("ims_registered", "ims_registered", "success")],
+                            ExecutorStage::ImsRegister => {
+                                vec![("ims_registered", "ims_registered", "success")]
+                            }
                             ExecutorStage::Sms => vec![("sms_ready", "sms_ready", "success")],
                             ExecutorStage::Voice => vec![("voice_ready", "voice_ready", "success")],
                             _ => vec![],
                         };
                         for (event_type, phase, level) in events {
-                            let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-                                trace_id: Some("runtime-connect"),
-                                level,
-                                phase,
-                                profile_id: profile_id.as_deref(),
-                                event_type,
-                                detail_json: "{}",
-                            });
+                            let _ = database.insert_vowifi_runtime_event(
+                                crate::infra::db::NewVowifiRuntimeEvent {
+                                    trace_id: Some("runtime-connect"),
+                                    level,
+                                    phase,
+                                    profile_id: profile_id.as_deref(),
+                                    event_type,
+                                    detail_json: "{}",
+                                },
+                            );
                         }
                     } else {
                         let (event_type, phase) = match stage {
                             ExecutorStage::SimAuth => ("identity_failed", "identity_failed"),
                             ExecutorStage::Epdg => ("dns_failed", "dns_failed"),
-                            ExecutorStage::Ike | ExecutorStage::ChildSa | ExecutorStage::Esp => ("ike_failed", "ike_failed"),
-                            ExecutorStage::ImsRegister => ("ims_register_rejected", "ims_register_rejected"),
+                            ExecutorStage::Ike | ExecutorStage::ChildSa | ExecutorStage::Esp => {
+                                ("ike_failed", "ike_failed")
+                            }
+                            ExecutorStage::ImsRegister => {
+                                ("ims_register_rejected", "ims_register_rejected")
+                            }
                             ExecutorStage::Sms => ("sms_binding_failed", "sms_binding_failed"),
-                            ExecutorStage::Voice => ("voice_binding_failed", "voice_binding_failed"),
+                            ExecutorStage::Voice => {
+                                ("voice_binding_failed", "voice_binding_failed")
+                            }
                             _ => ("", ""),
                         };
                         if !event_type.is_empty() {
@@ -425,14 +444,16 @@ impl VowifiRuntime {
                             } else {
                                 "{}".to_string()
                             };
-                            let _ = database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-                                trace_id: Some("runtime-connect"),
-                                level: "error",
-                                phase,
-                                profile_id: profile_id.as_deref(),
-                                event_type,
-                                detail_json: &detail_json,
-                            });
+                            let _ = database.insert_vowifi_runtime_event(
+                                crate::infra::db::NewVowifiRuntimeEvent {
+                                    trace_id: Some("runtime-connect"),
+                                    level: "error",
+                                    phase,
+                                    profile_id: profile_id.as_deref(),
+                                    event_type,
+                                    detail_json: &detail_json,
+                                },
+                            );
                         }
                     }
                 }

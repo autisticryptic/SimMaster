@@ -28,7 +28,11 @@ pub enum MtIngest {
     /// message: fully assembled and ready to persist.
     Complete(AssembledSms),
     /// A multipart segment was buffered; more segments are still awaited.
-    Buffered { reference: u16, have: usize, total: u8 },
+    Buffered {
+        reference: u16,
+        have: usize,
+        total: u8,
+    },
     /// The RP-DATA could not be parsed as a deliver.
     ParseError,
 }
@@ -243,7 +247,14 @@ mod tests {
     #[test]
     fn single_part_completes_immediately() {
         let mut r = MtReassembler::new();
-        let out = r.ingest_deliver(deliver("+8613800138000", "hello", "0011223344556677", None, 0, 0));
+        let out = r.ingest_deliver(deliver(
+            "+8613800138000",
+            "hello",
+            "0011223344556677",
+            None,
+            0,
+            0,
+        ));
         match out {
             MtIngest::Complete(sms) => {
                 assert_eq!(sms.text, "hello");
@@ -261,7 +272,14 @@ mod tests {
         let mut r = MtReassembler::new();
         // Receive segment 2 first (out of order), then segment 1.
         let out2 = r.ingest_deliver(deliver("+861380", "World", "00", Some(0x1234), 2, 2));
-        assert!(matches!(out2, MtIngest::Buffered { have: 1, total: 2, .. }));
+        assert!(matches!(
+            out2,
+            MtIngest::Buffered {
+                have: 1,
+                total: 2,
+                ..
+            }
+        ));
         assert_eq!(r.pending_groups(), 1);
 
         let out1 = r.ingest_deliver(deliver("+861380", "Hello ", "00", Some(0x1234), 1, 2));
@@ -289,7 +307,10 @@ mod tests {
             MtIngest::Complete(s) => s,
             _ => panic!(),
         };
-        assert_eq!(a.dedup_marker, b.dedup_marker, "same content -> same dedup key");
+        assert_eq!(
+            a.dedup_marker, b.dedup_marker,
+            "same content -> same dedup key"
+        );
     }
 
     #[test]

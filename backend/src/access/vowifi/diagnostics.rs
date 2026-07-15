@@ -39,8 +39,7 @@ pub struct VowifiProfilesResponse {
     pub count: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct VowifiProfileMatchResponse {
     pub matched: bool,
     pub matched_prefix: Option<String>,
@@ -52,7 +51,6 @@ pub struct VowifiProfileMatchResponse {
     pub ims: Option<PublicImsPlan>,
     pub sim: MaskedSimIdentity,
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicEpdgPlan {
@@ -202,8 +200,7 @@ pub struct PublicAkaAdapterPlan {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct VowifiReadiness {
     pub identity_ready: bool,
     pub sim_auth_ready: bool,
@@ -216,7 +213,6 @@ pub struct VowifiReadiness {
     pub sms_ready: bool,
     pub voice_ready: bool,
 }
-
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VowifiStatusResponse {
@@ -468,8 +464,12 @@ fn diagnostics_timeline(
 
     // ── Translated runtime events ──
     for event in &events.events {
-        let (kind, title, detail) =
-            translate_runtime_event(&event.event_type, &event.phase, event.profile_id.as_deref(), &event.detail_json);
+        let (kind, title, detail) = translate_runtime_event(
+            &event.event_type,
+            &event.phase,
+            event.profile_id.as_deref(),
+            &event.detail_json,
+        );
         timeline.push(VowifiDiagnosticsTimelineEntry {
             kind,
             timestamp: Some(event.created_at.clone()),
@@ -496,7 +496,11 @@ fn translate_runtime_event(
 ) -> (String, String, String) {
     let reason = serde_json::from_str::<serde_json::Value>(detail_json)
         .ok()
-        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(|s| s.to_string()));
+        .and_then(|v| {
+            v.get("reason")
+                .and_then(|r| r.as_str())
+                .map(|s| s.to_string())
+        });
 
     match event_type {
         // ── SIM / Identity ──────────────────────────────────────
@@ -575,10 +579,7 @@ fn translate_runtime_event(
         // ── Profile Matching ────────────────────────────────────
         "profile_match" | "profile_matched" => (
             "PROFILE".into(),
-            format!(
-                "匹配配置模板: ID={}",
-                profile_id.unwrap_or("unknown")
-            ),
+            format!("匹配配置模板: ID={}", profile_id.unwrap_or("unknown")),
             "ePDG 安全接入网关与 IMS 域载入成功。".into(),
         ),
         "profile_search" | "profile_lookup" => (
@@ -877,7 +878,13 @@ fn classify_event_kind(event_type: &str, phase: &str) -> String {
     if lower.contains("dns") {
         return "DNS".into();
     }
-    if lower.contains("ike") || lower.contains("ipsec") || lower.contains("esp") || lower.contains("tunnel") || lower.contains("sa_") || lower.contains("child_sa") {
+    if lower.contains("ike")
+        || lower.contains("ipsec")
+        || lower.contains("esp")
+        || lower.contains("tunnel")
+        || lower.contains("sa_")
+        || lower.contains("child_sa")
+    {
         return "IPSEC".into();
     }
     if lower.contains("ims") || lower.contains("sip") || lower.contains("register") {

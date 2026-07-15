@@ -192,7 +192,10 @@ mod tests {
 
     #[test]
     fn body_after_terminator() {
-        assert_eq!(body(b"SIP/2.0 200 OK\r\nContent-Length: 3\r\n\r\nabc"), b"abc");
+        assert_eq!(
+            body(b"SIP/2.0 200 OK\r\nContent-Length: 3\r\n\r\nabc"),
+            b"abc"
+        );
         assert_eq!(body(b"no terminator"), b"");
     }
 }

@@ -131,8 +131,7 @@ pub struct WecomAppConfig {
     pub safe: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct WecomRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -142,8 +141,7 @@ pub struct WecomRobotConfig {
     pub key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct DingtalkRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -175,8 +173,7 @@ pub struct DingtalkAppConfig {
     pub msg_key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FeishuRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -202,8 +199,7 @@ pub struct TelegramConfig {
     pub disable_web_page_preview: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LegacyNotificationConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
@@ -787,8 +783,6 @@ impl Default for WecomAppConfig {
     }
 }
 
-
-
 impl Default for DingtalkAppConfig {
     fn default() -> Self {
         Self {
@@ -802,7 +796,6 @@ impl Default for DingtalkAppConfig {
     }
 }
 
-
 impl Default for TelegramConfig {
     fn default() -> Self {
         Self {
@@ -814,7 +807,6 @@ impl Default for TelegramConfig {
         }
     }
 }
-
 
 impl Default for NotificationConfig {
     fn default() -> Self {
@@ -1155,7 +1147,6 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
         }
     }
 }
-
 
 impl Default for VersionUpdateNotificationConfig {
     fn default() -> Self {
@@ -2492,9 +2483,10 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
     // 2. Notification rules templates
     for rule in &mut config.notifications.rules {
         if rule.event_type == NotificationEventType::VersionUpdate
-            && migrate_template_string(&mut rule.template) {
-                changed = true;
-            }
+            && migrate_template_string(&mut rule.template)
+        {
+            changed = true;
+        }
     }
 
     // 3. Notification channels templates
@@ -2881,9 +2873,7 @@ impl ConfigManager {
     pub fn set_notifications(&self, notifications: NotificationConfig) -> Result<(), String> {
         {
             let mut config = self.config.write().unwrap();
-            config.webhook = notifications
-                .first_webhook_config()
-                .unwrap_or_default();
+            config.webhook = notifications.first_webhook_config().unwrap_or_default();
             config.notifications = notifications;
         }
         self.save()

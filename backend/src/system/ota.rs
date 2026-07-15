@@ -2,11 +2,11 @@
 //!
 //! 处理 OTA 更新包的上传、验证和应用
 
-use crate::infra::config::ConfigManager;
 use crate::api::models::{
     OtaLatestReleaseResponse, OtaMeta, OtaReleaseAsset, OtaStatusResponse, OtaUploadResponse,
     OtaValidation, VersionUpdateEvent,
 };
+use crate::infra::config::ConfigManager;
 use crate::notify::notification::NotificationSender;
 use chrono::{DateTime, FixedOffset, NaiveTime, TimeZone, Utc};
 use std::fs;

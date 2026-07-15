@@ -11,9 +11,9 @@
 //! call `volte::digest_aka::*` with `VolteError` semantics, while the crypto is
 //! implemented and vector-tested exactly once in the shared core.
 
+use crate::access::vowifi::qmi_uim::UsimAkaApduResult;
 use crate::ims::digest_aka as core;
 use crate::ims::ImsError;
-use crate::access::vowifi::qmi_uim::UsimAkaApduResult;
 
 use super::errors::{code, VolteError};
 

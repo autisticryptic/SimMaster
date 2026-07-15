@@ -273,20 +273,8 @@ pub fn build_install_plan(
         dport: ue_sec.port_s,
     };
     let policies = vec![
-        build_xfrm_policy_add(
-            ue,
-            pcscf,
-            ue_sec.port_c,
-            pcscf_sec.port_s,
-            PolicyDir::Out,
-        ),
-        build_xfrm_policy_add(
-            pcscf,
-            ue,
-            pcscf_sec.port_c,
-            ue_sec.port_s,
-            PolicyDir::In,
-        ),
+        build_xfrm_policy_add(ue, pcscf, ue_sec.port_c, pcscf_sec.port_s, PolicyDir::Out),
+        build_xfrm_policy_add(pcscf, ue, pcscf_sec.port_c, ue_sec.port_s, PolicyDir::In),
     ];
     Ok(XfrmInstallPlan {
         states: vec![out_sa, in_sa],

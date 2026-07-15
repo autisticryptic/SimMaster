@@ -52,10 +52,7 @@ impl ImsIpSettings {
     }
 
     /// Available bearer addresses in the configured attempt order.
-    pub fn ordered_local_addrs(
-        &self,
-        preference: VolteIpFamilyPreference,
-    ) -> Vec<IpAddr> {
+    pub fn ordered_local_addrs(&self, preference: VolteIpFamilyPreference) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
         match preference {
             VolteIpFamilyPreference::Ipv6First => {
@@ -94,11 +91,7 @@ impl ImsIpSettings {
     }
 
     /// Validate the family invariant: local addr and P-CSCF must share family.
-    pub fn ensure_family_match(
-        &self,
-        local: IpAddr,
-        pcscf: IpAddr,
-    ) -> Result<IpAddr, VolteError> {
+    pub fn ensure_family_match(&self, local: IpAddr, pcscf: IpAddr) -> Result<IpAddr, VolteError> {
         if !same_family(local, pcscf) {
             return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
         }
@@ -171,11 +164,7 @@ async fn probe_pcscf_context(
         .and_then(|output| cgdccont_restore_command(&output, cid))
         .unwrap_or_else(|| format!("AT+CGDCONT={cid},\"IPV4V6\",\"\""));
     let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
-    run_at(
-        modem,
-        &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\""),
-    )
-    .await?;
+    run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await?;
     run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},1,1,1")).await?;
     if let Err(error) = run_at(modem, &format!("AT+CGACT=1,{cid}")).await {
         cleanup_pcscf_context(modem, cid, &restore_context).await;
@@ -330,9 +319,11 @@ pub async fn discover_pcscf(
         }
         let address_type = if local.is_ipv6() { 28 } else { 1 };
         if let Ok(records) = query_dns(local, *server, &pcscf_name, address_type).await {
-            if let Some(address) = records.addresses.into_iter().find(|item| {
-                item.is_ipv4() == local.is_ipv4()
-            }) {
+            if let Some(address) = records
+                .addresses
+                .into_iter()
+                .find(|item| item.is_ipv4() == local.is_ipv4())
+            {
                 return Ok(address);
             }
         }
@@ -343,9 +334,11 @@ pub async fn discover_pcscf(
             };
             for target in records.srv_targets {
                 if let Ok(target_records) = query_dns(local, *server, &target, address_type).await {
-                    if let Some(address) = target_records.addresses.into_iter().find(|item| {
-                        item.is_ipv4() == local.is_ipv4()
-                    }) {
+                    if let Some(address) = target_records
+                        .addresses
+                        .into_iter()
+                        .find(|item| item.is_ipv4() == local.is_ipv4())
+                    {
                         return Ok(address);
                     }
                 }
@@ -547,9 +540,7 @@ fn same_family(left: IpAddr, right: IpAddr) -> bool {
 
 fn parse_pcscf_override(value: &str) -> Vec<IpAddr> {
     value
-        .split(|character: char| {
-            character == ',' || character == ';' || character.is_whitespace()
-        })
+        .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
         .filter_map(|candidate| candidate.trim().parse::<IpAddr>().ok())
         .fold(Vec::new(), |mut addresses, address| {
             if !addresses.contains(&address) {
@@ -585,10 +576,7 @@ IPv4 primary DNS: 10.0.0.53";
             Some(IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()))
         );
         assert_eq!(s.ipv6_dns.len(), 2);
-        assert_eq!(
-            s.ipv4_address,
-            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
-        );
+        assert_eq!(s.ipv4_address, Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))));
     }
 
     #[test]
@@ -610,9 +598,7 @@ IPv4 primary DNS: 10.0.0.53";
         );
         assert_eq!(
             s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6Only),
-            vec![IpAddr::V6(
-                "2001:db8::2".parse::<Ipv6Addr>().unwrap()
-            )]
+            vec![IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap())]
         );
         assert_eq!(
             s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4Only),
@@ -629,7 +615,8 @@ IPv4 primary DNS: 10.0.0.53";
                 .code(),
             code::RUNTIME_ALL_PCSCF_FAILED
         );
-        s.pcscf.push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
+        s.pcscf
+            .push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
         assert_eq!(
             s.resolve_pcscf_for(IpAddr::V6("2001:db8::2".parse().unwrap()))
                 .unwrap(),
@@ -659,7 +646,10 @@ IPv4 primary DNS: 10.0.0.53";
             code::PCSCF_FAMILY_MISMATCH
         );
         let v6 = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(s.ensure_family_match(s.local_addr().unwrap(), v6).unwrap(), v6);
+        assert_eq!(
+            s.ensure_family_match(s.local_addr().unwrap(), v6).unwrap(),
+            v6
+        );
     }
 
     #[test]
@@ -669,14 +659,8 @@ IPv4 primary DNS: 10.0.0.53";
         let v6 = IpAddr::V6("2001:db8::99".parse().unwrap());
         s.pcscf.extend([v6, v4]);
 
-        assert_eq!(
-            s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(),
-            v4
-        );
-        assert_eq!(
-            s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(),
-            v6
-        );
+        assert_eq!(s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(), v4);
+        assert_eq!(s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(), v6);
         assert_eq!(
             parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
             vec![v6, v4]

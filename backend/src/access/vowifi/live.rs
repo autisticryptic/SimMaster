@@ -1022,7 +1022,7 @@ fn live_ike_proposal_groups(
             .map_err(|_| live_stage_error("ike_profile_proposal_parse_failed"))?;
         let dh_group = DhGroup::from_transform_id(dh_transform)
             .ok_or_else(|| live_stage_error("ike_dh_group_unsupported"))?;
-        
+
         if let Some(existing) = groups.iter_mut().find(|g| g.dh_group == dh_group) {
             existing.proposals.push(*proposal);
         } else {
@@ -1398,36 +1398,35 @@ async fn run_live_ike_with_destination(
         return Err(live_stage_error("eap_aka_success_not_reached"));
     }
 
-    if target == LiveIkeTarget::ChildSaReady
-        && !success_includes_child_sa {
-            info!("Child SA not included in EapSuccess. Building final IKE_AUTH request...");
-            let msk = eap_response
-                .msk_for_ike_auth()
-                .ok_or_else(|| live_stage_error("eap_aka_msk_unavailable"))?;
-            let expected_message_id = machine.next_message_id();
-            let final_auth_packet = machine
-                .build_encrypted_final_auth_packet(msk)
-                .map_err(|_| live_stage_error("ike_auth_final_request_build_failed"))?;
-            info!("Sending final IKE_AUTH request to {:?}", ike_destination);
-            auth_transport
-                .send_ike_message_metadata(use_nat_t, ike_destination, &final_auth_packet)
-                .await
-                .map_err(map_transport_error)?;
-            let child_sa_response = recv_ike_response_with_retransmit(
-                &auth_transport,
-                ike_destination,
-                &final_auth_packet,
-                use_nat_t,
-                "ike_child_sa_timeout",
-                LIVE_IKE_AUTH_ATTEMPTS,
-            )
-            .await?;
-            info!("Received final IKE_AUTH response, validating...");
-            validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
-            machine
-                .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
-                .map_err(|reason| LiveStageError { reason })?;
-        }
+    if target == LiveIkeTarget::ChildSaReady && !success_includes_child_sa {
+        info!("Child SA not included in EapSuccess. Building final IKE_AUTH request...");
+        let msk = eap_response
+            .msk_for_ike_auth()
+            .ok_or_else(|| live_stage_error("eap_aka_msk_unavailable"))?;
+        let expected_message_id = machine.next_message_id();
+        let final_auth_packet = machine
+            .build_encrypted_final_auth_packet(msk)
+            .map_err(|_| live_stage_error("ike_auth_final_request_build_failed"))?;
+        info!("Sending final IKE_AUTH request to {:?}", ike_destination);
+        auth_transport
+            .send_ike_message_metadata(use_nat_t, ike_destination, &final_auth_packet)
+            .await
+            .map_err(map_transport_error)?;
+        let child_sa_response = recv_ike_response_with_retransmit(
+            &auth_transport,
+            ike_destination,
+            &final_auth_packet,
+            use_nat_t,
+            "ike_child_sa_timeout",
+            LIVE_IKE_AUTH_ATTEMPTS,
+        )
+        .await?;
+        info!("Received final IKE_AUTH response, validating...");
+        validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
+        machine
+            .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
+            .map_err(|reason| LiveStageError { reason })?;
+    }
 
     Ok(LiveIkeSession {
         child_sa: machine
@@ -2098,7 +2097,7 @@ async fn record_live_ims_tcp_channel(
         profile_id: profile.meta.profile_id,
         expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
         channel: super::channel::EpdgSipChannel::new(
-        stream,
+            stream,
             Vec::new(),
             crate::ims::context::ImsRoute {
                 local_addr,
@@ -3086,8 +3085,8 @@ fn start_live_sms_followup_task(
                     profile_id: profile.meta.profile_id,
                     expires_at,
                     channel: super::channel::EpdgSipChannel::new(
-                    stream,
-                    pending,
+                        stream,
+                        pending,
                         shared_vowifi_route(profile, &route, local_addr),
                         security_verify,
                     ),
@@ -3360,7 +3359,7 @@ fn build_live_sms_rp_ack_request(
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Security-Verify",
             security_verify,
-    ));
+        ));
     }
     headers.push(crate::ims::sip_message::SipHeader::new(
         "Accept-Contact",
@@ -3423,7 +3422,7 @@ fn build_live_invite_request(
             "Contact",
             format!(
                 "<{}>;+g.3gpp.icsi-ref=\"{}\"",
-        identity.public_uri, LIVE_VOICE_MMTEL_ICSI
+                identity.public_uri, LIVE_VOICE_MMTEL_ICSI
             ),
         ),
         crate::ims::sip_message::SipHeader::new(
@@ -3439,7 +3438,7 @@ fn build_live_invite_request(
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Security-Verify",
             security_verify,
-    ));
+        ));
     }
     headers.push(crate::ims::sip_message::SipHeader::new(
         "Accept-Contact",
@@ -3949,7 +3948,7 @@ impl LiveRegisterRequestContext {
                     value.trim(),
                 ));
             }
-            }
+        }
         let contact = self.build_contact_header(&local_host, variant.header_profile);
         if let Some(value) = contact
             .trim_end_matches(['\r', '\n'])
@@ -3972,8 +3971,8 @@ impl LiveRegisterRequestContext {
                 "Route",
                 format!(
                     "<sip:{}:{};lr>",
-                sip_host(self.route_addr),
-                profile.ims.local_port
+                    sip_host(self.route_addr),
+                    profile.ims.local_port
                 ),
             ));
         }
@@ -3993,7 +3992,7 @@ impl LiveRegisterRequestContext {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "Proxy-Require",
                 "sec-agree",
-        ));
+            ));
         }
         headers.push(crate::ims::sip_message::SipHeader::new(
             "Allow",
@@ -4009,8 +4008,8 @@ impl LiveRegisterRequestContext {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "P-Visited-Network-ID",
                 visited_network,
-                ));
-            }
+            ));
+        }
         if let Some(pani) = &params.pani {
             headers.push(crate::ims::sip_message::SipHeader::new(
                 "P-Access-Network-Info",
@@ -4212,11 +4211,11 @@ async fn live_ims_register_identity(
     Ok(match format {
         LiveRegisterIdentityFormat::ImsiHomeDomain => LiveImsRegisterIdentity {
             shared: crate::ims::context::ImsIdentity {
-            private_user: format!("{imsi}@{}", profile.ims.realm),
-            public_uri: format!("sip:{imsi}@{}", profile.ims.domain),
-            contact_user: imsi.to_string(),
+                private_user: format!("{imsi}@{}", profile.ims.realm),
+                public_uri: format!("sip:{imsi}@{}", profile.ims.domain),
+                contact_user: imsi.to_string(),
                 home_domain: profile.ims.domain.to_string(),
-            contact_user_phone: false,
+                contact_user_phone: false,
             },
             shape: "imsi_home_domain",
         },
@@ -4224,22 +4223,22 @@ async fn live_ims_register_identity(
             let prefixed = format!("0{imsi}");
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: format!("{prefixed}@{}", profile.ims.realm),
-                public_uri: format!("sip:{prefixed}@{}", profile.ims.domain),
-                contact_user: prefixed,
+                    private_user: format!("{prefixed}@{}", profile.ims.realm),
+                    public_uri: format!("sip:{prefixed}@{}", profile.ims.domain),
+                    contact_user: prefixed,
                     home_domain: profile.ims.domain.to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "prefixed_imsi_home_domain",
             }
         }
         LiveRegisterIdentityFormat::ImsiPhoneUri => LiveImsRegisterIdentity {
             shared: crate::ims::context::ImsIdentity {
-            private_user: format!("{imsi}@{}", profile.ims.realm),
-            public_uri: format!("sip:{imsi}@{};user=phone", profile.ims.domain),
-            contact_user: imsi.to_string(),
+                private_user: format!("{imsi}@{}", profile.ims.realm),
+                public_uri: format!("sip:{imsi}@{};user=phone", profile.ims.domain),
+                contact_user: imsi.to_string(),
                 home_domain: profile.ims.domain.to_string(),
-            contact_user_phone: true,
+                contact_user_phone: true,
             },
             shape: "imsi_phone_uri",
         },
@@ -4247,11 +4246,11 @@ async fn live_ims_register_identity(
             let phone_number = read_live_msisdn_candidate(&conn).await?;
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: format!("{imsi}@{}", profile.ims.realm),
-                public_uri: format!("sip:{}@{};user=phone", phone_number, profile.ims.domain),
-                contact_user: phone_number,
+                    private_user: format!("{imsi}@{}", profile.ims.realm),
+                    public_uri: format!("sip:{}@{};user=phone", phone_number, profile.ims.domain),
+                    contact_user: phone_number,
                     home_domain: profile.ims.domain.to_string(),
-                contact_user_phone: true,
+                    contact_user_phone: true,
                 },
                 shape: "msisdn_phone_uri",
             }
@@ -6240,11 +6239,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6294,11 +6293,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6331,11 +6330,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6361,11 +6360,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example;user=phone".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example;user=phone".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: true,
+                    contact_user_phone: true,
                 },
                 shape: "imsi_phone_uri",
             },
@@ -6394,11 +6393,11 @@ mod tests {
             &crate::access::vowifi::profiles::NL_VODAFONE_20404,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6423,11 +6422,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },
@@ -6458,11 +6457,11 @@ mod tests {
             &GB_EE_23433,
             LiveImsRegisterIdentity {
                 shared: crate::ims::context::ImsIdentity {
-                private_user: "001010123456789@ims.example".to_string(),
-                public_uri: "sip:001010123456789@ims.example".to_string(),
-                contact_user: "001010123456789".to_string(),
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
                     home_domain: "ims.example".to_string(),
-                contact_user_phone: false,
+                    contact_user_phone: false,
                 },
                 shape: "fixture",
             },

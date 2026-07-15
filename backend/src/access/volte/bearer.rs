@@ -179,10 +179,7 @@ async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
     parse_bearer_connection(path, &connected)
 }
 
-pub fn parse_bearer_connection(
-    path: &str,
-    output: &str,
-) -> Result<BearerConnection, VolteError> {
+pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnection, VolteError> {
     if value(output, "bearer.status.connected").as_deref() != Some("yes") {
         return Err(VolteError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
     }
@@ -221,15 +218,7 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
-        run_ip(&[
-            "link",
-            "set",
-            "dev",
-            &bearer.interface,
-            "mtu",
-            &mtu,
-        ])
-        .await?;
+        run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
     }
 
     let mut configured = false;
@@ -253,14 +242,7 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     if let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address {
         let prefix = bearer.ipv4_prefix.unwrap_or(32);
         let address = format!("{address}/{prefix}");
-        run_ip(&[
-            "address",
-            "replace",
-            &address,
-            "dev",
-            &bearer.interface,
-        ])
-        .await?;
+        run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
         for dns in &bearer.settings.ipv4_dns {
             route_host(&bearer.interface, *dns).await?;
         }
@@ -272,27 +254,22 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     Ok(())
 }
 
-pub async fn route_pcscf(
-    bearer: &BearerConnection,
-    pcscf: IpAddr,
-) -> Result<(), VolteError> {
+pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
     route_host(&bearer.interface, pcscf).await
 }
 
 async fn route_host(interface: &str, host: IpAddr) -> Result<(), VolteError> {
-    let (family, suffix) = if host.is_ipv6() { (Some("-6"), 128) } else { (None, 32) };
+    let (family, suffix) = if host.is_ipv6() {
+        (Some("-6"), 128)
+    } else {
+        (None, 32)
+    };
     let destination = format!("{host}/{suffix}");
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&[
-        "route",
-        "replace",
-        &destination,
-        "dev",
-        interface,
-    ]);
+    args.extend_from_slice(&["route", "replace", &destination, "dev", interface]);
     run_ip(&args).await.map(|_| ())
 }
 
@@ -450,11 +427,8 @@ bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
 bearer.ipv6-config.dns.value[2]          : 2001:db8:53::2
 bearer.ipv6-config.mtu                   : 1500
 "#;
-        let bearer = parse_bearer_connection(
-            "/org/freedesktop/ModemManager1/Bearer/2",
-            output,
-        )
-        .unwrap();
+        let bearer =
+            parse_bearer_connection("/org/freedesktop/ModemManager1/Bearer/2", output).unwrap();
         assert_eq!(bearer.interface, "wwan0");
         assert!(bearer.local_addr().unwrap().is_ipv6());
         assert_eq!(bearer.settings.ipv6_dns.len(), 2);
@@ -478,11 +452,8 @@ bearer.ipv6-config.gateway               : 2001:db8:1::1
 bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
 bearer.ipv6-config.mtu                   : 1428
 "#;
-        let bearer = parse_bearer_connection(
-            "/org/freedesktop/ModemManager1/Bearer/9",
-            output,
-        )
-        .unwrap();
+        let bearer =
+            parse_bearer_connection("/org/freedesktop/ModemManager1/Bearer/9", output).unwrap();
 
         assert_eq!(
             bearer.settings.ipv4_address,

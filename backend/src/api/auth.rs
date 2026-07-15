@@ -20,9 +20,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    api::models::ApiResponse,
     infra::config::SecurityConfig,
     infra::db::Database,
-    api::models::ApiResponse,
     state::AppState,
     system::system_event::{
         codes as system_event_codes, severity as system_event_severity,

@@ -268,7 +268,11 @@ impl VolteRuntime {
                 phase: VoltePhase::Disabled,
                 stage: VolteStage::Disabled,
                 reconnect_count: prev_reconnect,
-                last_error: if reason.is_empty() { None } else { Some(reason) },
+                last_error: if reason.is_empty() {
+                    None
+                } else {
+                    Some(reason)
+                },
                 ..VolteSnapshot::default()
             };
         })
@@ -339,7 +343,10 @@ mod tests {
         let snap = rt.reset_runtime("volte_disabled").await;
         assert_eq!(snap.phase, VoltePhase::Disabled);
         assert_eq!(snap.stage, VolteStage::Disabled);
-        assert_eq!(snap.reconnect_count, 5, "reconnect count is preserved across reset");
+        assert_eq!(
+            snap.reconnect_count, 5,
+            "reconnect count is preserved across reset"
+        );
         assert_eq!(snap.last_error.as_deref(), Some("volte_disabled"));
         assert_eq!(rt.generation(), g0 + 1);
     }

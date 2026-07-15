@@ -1,17 +1,17 @@
-use crate::infra::config::{ConfigManager, NotificationRule};
-use crate::infra::db::{Database, PeriodSmsStats};
-use crate::network::device_network::DdnsManager;
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::cellular::modem_manager::{
     get_airplane_mode, get_cells_data, get_data_connection_status, get_device_info_data,
     get_is_roaming_mm, get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
 };
-use crate::notify::notification::{quiet_hours_active, NotificationSender};
+use crate::infra::config::{ConfigManager, NotificationRule};
+use crate::infra::db::{Database, PeriodSmsStats};
 use crate::infra::utils::{
     connection_addresses_from_interfaces, format_uptime, read_cpu_load_sync, read_disk_info,
     read_memory_info, read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
 };
+use crate::network::device_network::DdnsManager;
+use crate::notify::notification::{quiet_hours_active, NotificationSender};
 use chrono::{
     Datelike, Duration as ChronoDuration, FixedOffset, NaiveTime, TimeZone, Timelike, Utc,
 };
@@ -819,7 +819,8 @@ async fn collect_ota_status(config_manager: Arc<ConfigManager>) -> String {
 
 async fn fetch_latest_release_tag(proxy_prefix: &str) -> Result<OtaLatestReleaseResponse, String> {
     let client = crate::system::ota::build_ota_http_client()?;
-    crate::system::ota::fetch_latest_github_release(&client, proxy_prefix, !proxy_prefix.is_empty()).await
+    crate::system::ota::fetch_latest_github_release(&client, proxy_prefix, !proxy_prefix.is_empty())
+        .await
 }
 
 fn period_since(period: &str) -> Option<String> {

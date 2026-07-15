@@ -2,11 +2,13 @@
 //!
 //! 通过 D-Bus 信号监听 ModemManager 的短信接收事件，并增加轮询兜底，
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
+use crate::cellular::modem_manager::{
+    cache_smsc_for_identity, current_sim_identity, find_modem_path,
+};
 use crate::infra::config::ConfigManager;
 use crate::infra::db::{
     beijing_sms_now_string, normalize_sms_timestamp_for_display, Database, SmsMessage,
 };
-use crate::cellular::modem_manager::{cache_smsc_for_identity, current_sim_identity, find_modem_path};
 use crate::notify::notification::NotificationSender;
 use crate::orchestrator::{message_fingerprint, MessageFingerprintInput};
 use futures_util::StreamExt;

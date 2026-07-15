@@ -13,15 +13,13 @@ pub struct VowifiSimIdentity {
     operator_id: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct MaskedSimIdentity {
     pub present: bool,
     pub iccid: String,
     pub imsi: String,
     pub operator_id: String,
 }
-
 
 impl VowifiSimIdentity {
     pub fn from_modem(identity: &SimIdentity) -> Self {

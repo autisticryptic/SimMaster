@@ -569,10 +569,15 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
     NZ_SPARK_53005,
 ];
 
-static DYNAMIC_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> = OnceLock::new();
+static DYNAMIC_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
+    OnceLock::new();
 
 /// 动态生成标准的 3GPP 运营商配置，并将其转化为静态生命周期的引用
-pub fn generate_standard_3gpp_profile(mcc: &str, mnc: &str, mnc_len: u8) -> &'static CarrierProfile {
+pub fn generate_standard_3gpp_profile(
+    mcc: &str,
+    mnc: &str,
+    mnc_len: u8,
+) -> &'static CarrierProfile {
     let plmn = format!("{}{}", mcc, mnc);
     let cache = DYNAMIC_PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
     let mut guard = cache.lock().unwrap();
@@ -583,8 +588,11 @@ pub fn generate_standard_3gpp_profile(mcc: &str, mnc: &str, mnc_len: u8) -> &'st
 
     // 格式化补全 MNC（标准 3GPP 域名中，MNC 必须固定补齐为 3 位，例如 15 需补为 015）
     let padded_mnc = format!("{:0>3}", mnc);
-    let epdg_host = Box::leak(format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
-    let ims_domain = Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
+    let epdg_host = Box::leak(
+        format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str(),
+    );
+    let ims_domain =
+        Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
     let profile_id = Box::leak(format!("dynamic_3gpp_{}", plmn).into_boxed_str());
 
     let profile = CarrierProfile {
@@ -686,7 +694,11 @@ pub fn resolve_by_imsi(imsi: &str) -> Option<CarrierMatch> {
     let digits = imsi.trim();
     if digits.len() >= 5 && digits.chars().all(|c| c.is_ascii_digit()) {
         let mcc = &digits[..3];
-        let mnc_len = if digits.starts_with("310") || digits.starts_with("405") { 3 } else { 2 };
+        let mnc_len = if digits.starts_with("310") || digits.starts_with("405") {
+            3
+        } else {
+            2
+        };
         if digits.len() >= 3 + mnc_len {
             let mnc = &digits[3..3 + mnc_len];
             let profile = generate_standard_3gpp_profile(mcc, mnc, mnc_len as u8);
@@ -732,8 +744,10 @@ pub fn resolve_by_plmn(mcc: &str, mnc: &str) -> Option<&'static CarrierProfile> 
     }
 
     // 2. 尝试动态生成 3GPP 预设
-    if mcc.len() == 3 && mcc.chars().all(|c| c.is_ascii_digit())
-        && !mnc.is_empty() && mnc.chars().all(|c| c.is_ascii_digit())
+    if mcc.len() == 3
+        && mcc.chars().all(|c| c.is_ascii_digit())
+        && !mnc.is_empty()
+        && mnc.chars().all(|c| c.is_ascii_digit())
     {
         return Some(generate_standard_3gpp_profile(mcc, mnc, mnc.len() as u8));
     }
@@ -878,15 +892,22 @@ mod tests {
         // 测试通过未内置的 Telekom DE (262-01) IMSI 动态解析
         let match_result = resolve_by_imsi("262011234567890").expect("should resolve dynamically");
         assert_eq!(match_result.profile.meta.profile_id, "dynamic_3gpp_26201");
-        assert_eq!(match_result.profile.epdg.host, "epdg.epc.mnc001.mcc262.pub.3gppnetwork.org");
-        assert_eq!(match_result.profile.ims.domain, "ims.mnc001.mcc262.3gppnetwork.org");
+        assert_eq!(
+            match_result.profile.epdg.host,
+            "epdg.epc.mnc001.mcc262.pub.3gppnetwork.org"
+        );
+        assert_eq!(
+            match_result.profile.ims.domain,
+            "ims.mnc001.mcc262.3gppnetwork.org"
+        );
 
         // 测试通过 PLMN 动态解析
         let profile = resolve_by_plmn("262", "01").expect("should resolve dynamically");
         assert_eq!(profile.meta.profile_id, "dynamic_3gpp_26201");
 
         // 测试通过 Profile ID 动态解析
-        let profile_by_id = resolve_by_profile_id("dynamic_3gpp_26201").expect("should resolve dynamically");
+        let profile_by_id =
+            resolve_by_profile_id("dynamic_3gpp_26201").expect("should resolve dynamically");
         assert_eq!(profile_by_id.meta.plmn, "26201");
     }
 }

@@ -14,7 +14,6 @@ use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 
 use crate::{
-    infra::db::{Database, SmsMessage},
     ims::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
@@ -22,14 +21,14 @@ use crate::{
         ImsError,
     },
     infra::config::VolteConfig,
+    infra::db::{Database, SmsMessage},
     notify::notification::NotificationSender,
 };
 
 use super::{
     bearer::{
         configure_bearer_network, disconnect_bearer, disconnect_existing_ims_bearers,
-        ensure_ims_bearer, route_pcscf, teardown_bearer_network, BearerConnection,
-        BearerRequest,
+        ensure_ims_bearer, route_pcscf, teardown_bearer_network, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
     digest_aka,
@@ -186,7 +185,11 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
 
         let security_server = sip::header_values(challenge_response, "Security-Server")
             .into_iter()
-            .find_map(|value| ipsec::parse_security_server(&value).ok().map(|sec| (sec, value)));
+            .find_map(|value| {
+                ipsec::parse_security_server(&value)
+                    .ok()
+                    .map(|sec| (sec, value))
+            });
         if let Some((selected, verify)) = security_server {
             let route = channel.route();
             let plan = ipsec::build_install_plan(
@@ -206,10 +209,8 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_s),
                 transport: SipTransport::Udp,
             };
-            let receive_local = SocketAddr::new(
-                route.local_addr.ip(),
-                self.offered_security_binding.port_s,
-            );
+            let receive_local =
+                SocketAddr::new(route.local_addr.ip(), self.offered_security_binding.port_s);
             let receive_remote = SocketAddr::new(route.pcscf_addr.ip(), selected.port_c);
             if let Err(error) = channel.activate_security(
                 protected_send_route,
@@ -346,16 +347,22 @@ async fn connect_inner(
     generation: u64,
     config: &VolteConfig,
 ) -> Result<VolteLiveSession, VolteError> {
-    runtime.update(|state| state.stage = VolteStage::Identity).await;
+    runtime
+        .update(|state| state.stage = VolteStage::Identity)
+        .await;
     let device_identity = load_device_identity().await?;
     ensure_generation(runtime, generation)?;
 
-    runtime.update(|state| state.stage = VolteStage::Pcscf).await;
+    runtime
+        .update(|state| state.stage = VolteStage::Pcscf)
+        .await;
     disconnect_existing_ims_bearers(MODEM_ID).await?;
     let at_pcscf = discover_pcscf_via_at(MODEM_ID, config.ip_family_preference).await;
     ensure_generation(runtime, generation)?;
 
-    runtime.update(|state| state.stage = VolteStage::Bearer).await;
+    runtime
+        .update(|state| state.stage = VolteStage::Bearer)
+        .await;
     let mut bearer = ensure_ims_bearer(MODEM_ID, &BearerRequest::default()).await?;
     for candidate in at_pcscf {
         if !bearer.settings.pcscf.contains(&candidate) {
@@ -376,9 +383,7 @@ async fn connect_inner(
             ensure_generation(runtime, generation)?;
             match connect_family(runtime, &bearer, &device_identity, local_addr).await {
                 Ok(session) => return Ok(session),
-                Err(error)
-                    if index + 1 < local_addrs.len() && should_try_next_family(&error) =>
-                {
+                Err(error) if index + 1 < local_addrs.len() && should_try_next_family(&error) => {
                     last_error = Some(error);
                 }
                 Err(error) => return Err(error),
@@ -400,7 +405,9 @@ async fn connect_family(
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
 ) -> Result<VolteLiveSession, VolteError> {
-    runtime.update(|state| state.stage = VolteStage::Pcscf).await;
+    runtime
+        .update(|state| state.stage = VolteStage::Pcscf)
+        .await;
     let pcscf = discover_pcscf(
         &bearer.settings,
         &device_identity.ims.home_domain,
@@ -420,8 +427,8 @@ async fn connect_family(
         pcscf_addr: pcscf_socket(pcscf),
         transport: SipTransport::Udp,
     };
-    let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
-        .map_err(map_channel_error)?;
+    let mut channel =
+        VolteSipChannel::bind(route, Some(&bearer.interface), None).map_err(map_channel_error)?;
     let receive_port = channel
         .reserve_security_receive_port()
         .map_err(map_channel_error)?;
@@ -460,7 +467,9 @@ async fn connect_family(
         return Err(map_register_error(error));
     }
     if authenticator.mode == RegistrationMode::Udp {
-        runtime.update(|state| state.stage = VolteStage::RegisterUdp).await;
+        runtime
+            .update(|state| state.stage = VolteStage::RegisterUdp)
+            .await;
     }
     Ok(VolteLiveSession {
         channel,
@@ -494,10 +503,7 @@ async fn start_live_listener(
     generation: u64,
     dedupe_enabled: bool,
 ) {
-    let mut listener = LIVE_LISTENER
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .await;
+    let mut listener = LIVE_LISTENER.get_or_init(|| Mutex::new(None)).lock().await;
     if let Some(previous) = listener.take() {
         previous.abort();
     }
@@ -521,8 +527,7 @@ async fn live_receive_loop(
     dedupe_enabled: bool,
 ) {
     let mut reassembler = MtReassembler::new();
-    let refresh_at = tokio::time::Instant::now()
-        + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+    let refresh_at = tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
     loop {
         if runtime.generation() != generation {
             break;
@@ -561,9 +566,7 @@ async fn live_receive_loop(
                 }
             }
         };
-        runtime
-            .update(|state| state.last_rx_at = Some(now()))
-            .await;
+        runtime.update(|state| state.last_rx_at = Some(now())).await;
         if let Err(error) = handle_live_frame(
             &runtime,
             &database,
@@ -670,7 +673,9 @@ async fn handle_live_frame(
             }
             if database
                 .sms_exists_by_pdu(&message.dedup_marker)
-                .map_err(|error| VolteError::with_detail("volte_sms_db_failed", error.to_string()))?
+                .map_err(|error| {
+                    VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                })?
             {
                 runtime.update(|state| state.duplicate_count += 1).await;
                 return Ok(());
@@ -690,7 +695,9 @@ async fn handle_live_frame(
                     Some(&message.dedup_marker),
                     TRANSPORT_TAG,
                 )
-                .map_err(|error| VolteError::with_detail("volte_sms_db_failed", error.to_string()))?;
+                .map_err(|error| {
+                    VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                })?;
             runtime.update(|state| state.received_count += 1).await;
             let sms = SmsMessage {
                 id,
@@ -713,17 +720,19 @@ async fn handle_live_frame(
             have,
             total,
         } => {
-            tracing::debug!(reference, have, total, "Buffered VoLTE MT multipart segment");
+            tracing::debug!(
+                reference,
+                have,
+                total,
+                "Buffered VoLTE MT multipart segment"
+            );
         }
         MtIngest::ParseError => return Err(VolteError::new("volte_mt_rp_data_invalid")),
     }
     Ok(())
 }
 
-async fn send_live_frame(
-    runtime: &Arc<VolteRuntime>,
-    frame: &[u8],
-) -> Result<(), VolteError> {
+async fn send_live_frame(runtime: &Arc<VolteRuntime>, frame: &[u8]) -> Result<(), VolteError> {
     let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
     let session = sessions
         .as_mut()
@@ -752,12 +761,10 @@ pub async fn send_live_sms(
     if service_center.trim().is_empty() {
         return Err(VolteError::new("volte_smsc_missing"));
     }
-    let submissions = crate::access::volte::sms::build_mo_submissions(
-        recipient,
-        text,
-        service_center,
-    )
-    .map_err(|error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()))?;
+    let submissions =
+        crate::access::volte::sms::build_mo_submissions(recipient, text, service_center).map_err(
+            |error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()),
+        )?;
     let first = submissions
         .first()
         .ok_or_else(|| VolteError::new("volte_sms_encode_failed"))?;
@@ -813,10 +820,9 @@ pub async fn send_live_sms(
 fn phone_uri(number: &str, domain: &str) -> Result<String, VolteError> {
     let number = number.trim();
     if number.is_empty()
-        || !number
-            .chars()
-            .enumerate()
-            .all(|(index, character)| character.is_ascii_digit() || (index == 0 && character == '+'))
+        || !number.chars().enumerate().all(|(index, character)| {
+            character.is_ascii_digit() || (index == 0 && character == '+')
+        })
     {
         return Err(VolteError::new("volte_phone_uri_invalid"));
     }
@@ -944,7 +950,11 @@ fn should_try_next_family(error: &VolteError) -> bool {
 }
 
 fn ip_family_name(address: IpAddr) -> &'static str {
-    if address.is_ipv6() { "ipv6" } else { "ipv4" }
+    if address.is_ipv6() {
+        "ipv6"
+    } else {
+        "ipv4"
+    }
 }
 
 #[cfg(test)]

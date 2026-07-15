@@ -12,18 +12,18 @@ use ring::{digest, hmac};
 use serde_json::{json, Value as JsonValue};
 use tokio::sync::Mutex;
 
-use crate::infra::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
 use crate::api::models::{
     DdnsEvent, DdnsLogEntry, DdnsLogsResponse, DdnsRecordSyncResult, DdnsStatusResponse,
     DdnsSyncResponse, WlanConnectRequest, WlanEnabledRequest, WlanForgetRequest, WlanNetwork,
     WlanProfileRequest, WlanProfilesResponse, WlanSavedNetwork, WlanScanResponse,
     WlanStatusResponse,
 };
-use crate::notify::notification::NotificationSender;
+use crate::infra::config::{ConfigManager, DdnsConfig, DdnsIpConfig};
 use crate::infra::utils::{
     interface_addresses_for_family, preferred_interface_for_family, read_network_interfaces,
     NetworkAddressFamily,
 };
+use crate::notify::notification::NotificationSender;
 
 const DDNS_LOG_LIMIT: usize = 50;
 const WLAN_ROUTE_METRIC: &str = "100";

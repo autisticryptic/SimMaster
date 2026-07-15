@@ -59,7 +59,6 @@ where
 mod tests {
     use super::*;
     use crate::{
-        infra::db::Database,
         access::vowifi::executor::{
             readiness_key_for_stage, soak_observation_for_stage, ExecutorStage,
             ExecutorStageRequest, ExecutorStageResult, ExecutorStageStatus,
@@ -68,6 +67,7 @@ mod tests {
             live::{LiveAdapterFuture, LiveStageObservation},
             profiles::{CarrierProfile, GB_EE_23433},
         },
+        infra::db::Database,
     };
     use std::path::PathBuf;
 

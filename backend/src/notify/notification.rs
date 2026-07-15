@@ -1,3 +1,5 @@
+use crate::api::models::{DdnsEvent, VersionUpdateEvent};
+use crate::cellular::modem_manager::get_sim_info_data_with_cache;
 use crate::infra::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
     LegacyNotificationConfig, MatcherOperator, MessageChannelConfig, NotificationChannel,
@@ -9,11 +11,9 @@ use crate::infra::db::{
     CallRecord, Database, NewNotificationLog, NewNotificationQueueItem, NotificationQueueEntry,
     SmsMessage,
 };
-use crate::system::device_status::DeviceStatusReport;
-use crate::api::models::{DdnsEvent, VersionUpdateEvent};
-use crate::cellular::modem_manager::get_sim_info_data_with_cache;
-use crate::system::system_event::SystemEvent;
 use crate::messaging::verification_code::extract_verification_code;
+use crate::system::device_status::DeviceStatusReport;
+use crate::system::system_event::SystemEvent;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::{
     DateTime, Datelike, Duration as ChronoDuration, FixedOffset, NaiveDateTime, Timelike, Utc,
@@ -292,11 +292,12 @@ impl NotificationSender {
     async fn sms_template_context(&self) -> SmsTemplateContext {
         let own_number = self.get_own_number().await;
 
-        let carrier = crate::cellular::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
-            .await
-            .ok()
-            .map(|net| net.operator_name)
-            .unwrap_or_default();
+        let carrier =
+            crate::cellular::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
+                .await
+                .ok()
+                .map(|net| net.operator_name)
+                .unwrap_or_default();
 
         SmsTemplateContext {
             own_number,

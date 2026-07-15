@@ -14,10 +14,10 @@ use crate::access::vowifi::runtime::VowifiRuntime;
 use crate::cellular::cell_lock_store::CellLockStore;
 use crate::infra::config::ConfigManager;
 use crate::infra::db::Database;
-use crate::network::device_network::DdnsManager;
-use crate::sim::esim::EsimSupervisor;
-use crate::notify::notification::NotificationSender;
 use crate::messaging::sms_listener::SmsResyncHandle;
+use crate::network::device_network::DdnsManager;
+use crate::notify::notification::NotificationSender;
+use crate::sim::esim::EsimSupervisor;
 use crate::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
