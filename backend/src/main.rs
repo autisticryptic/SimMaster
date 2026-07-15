@@ -326,6 +326,13 @@ async fn main() -> Result<()> {
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
     let vowifi_runtime = Arc::new(access::vowifi::runtime::VowifiRuntime::new());
     let volte_runtime = Arc::new(access::volte::runtime::VolteRuntime::new());
+    let line_registry = Arc::new(access::line_registry::LineRuntimeRegistry::new(Arc::clone(
+        &volte_runtime,
+    )));
+    match line_registry.refresh(dbus_conn.as_ref()).await {
+        Ok(count) => info!(count, "Discovered modem/SIM lines"),
+        Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
+    }
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
@@ -496,8 +503,29 @@ async fn main() -> Result<()> {
         airplane_mode_requested,
         vowifi_runtime,
         volte_runtime,
+        line_registry,
         cell_monitoring_active,
     });
+
+    // Keep the line inventory synchronized with ModemManager hotplug and SIM
+    // replacement events. Refresh preserves existing per-line runtime state.
+    {
+        let refresh_app = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if let Err(error) = refresh_app
+                    .line_registry
+                    .refresh(refresh_app.dbus_conn.as_ref())
+                    .await
+                {
+                    tracing::warn!(error = %error, "Modem/SIM line inventory refresh failed");
+                }
+            }
+        });
+    }
 
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());
@@ -553,6 +581,12 @@ async fn main() -> Result<()> {
     let protected_routes = Router::new()
         // ========== 设备信息接口 ==========
         .route("/api/device", get(get_device_info).options(options_handler))
+        .route(
+            "/api/modems",
+            get(get_modem_lines_handler)
+                .post(get_modem_lines_handler)
+                .options(options_handler),
+        )
         // ========== SIM 卡接口 ==========
         .route("/api/sim", get(get_sim_info).options(options_handler))
         .route(

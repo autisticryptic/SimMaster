@@ -722,6 +722,39 @@ pub struct SimIdentity {
     pub operator_id: String,
 }
 
+/// Stable description of one physical modem and its currently selected SIM.
+///
+/// `line_id` deliberately does not use the ModemManager object number because
+/// `/Modem/0` style paths may be reassigned after reboot or USB hotplug. The
+/// identifier is derived from a hardware identity plus the active ICCID, so a
+/// SIM replacement cannot silently inherit the old line's runtime/trunk state.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ModemBinding {
+    pub line_id: String,
+    pub modem_id: String,
+    pub modem_path: String,
+    pub manufacturer: String,
+    pub model: String,
+    pub primary_port: String,
+    pub qmi_device: Option<String>,
+    pub uim_slot: u8,
+    pub sim_path: Option<String>,
+    pub sim_iccid: String,
+    pub operator_id: String,
+    pub state: String,
+    pub present: bool,
+    /// Raw stable hardware selector. It is required for rebinding but must not
+    /// be returned by the HTTP inventory endpoint.
+    #[serde(skip)]
+    pub hardware_key: String,
+}
+
+fn stable_line_id(hardware_key: &str, sim_key: &str) -> String {
+    let material = format!("{}\0{}", hardware_key.trim(), sim_key.trim());
+    let digest = md5::compute(material.as_bytes());
+    format!("line-{digest:x}")
+}
+
 fn sim_identity_keys(identity: &SimIdentity) -> Vec<String> {
     let mut keys = Vec::new();
     if !identity.iccid.is_empty() {
@@ -1059,7 +1092,7 @@ fn single_current_band_label(current_bands: &[u32], tech: &str) -> Option<String
     None
 }
 
-async fn list_modem_paths(conn: &Connection) -> zbus::Result<Vec<String>> {
+pub async fn list_modem_paths(conn: &Connection) -> zbus::Result<Vec<String>> {
     let proxy = Proxy::new(conn, MM_SERVICE, MM_ROOT_PATH, DBUS_OBJECT_MANAGER).await?;
     let managed_objects: ManagedObjects = proxy.call("GetManagedObjects", &()).await?;
 
@@ -1071,6 +1104,86 @@ async fn list_modem_paths(conn: &Connection) -> zbus::Result<Vec<String>> {
         .collect();
     modem_paths.sort();
     Ok(modem_paths)
+}
+
+/// Enumerate every ModemManager modem instead of selecting only the first one.
+/// This is the discovery boundary used by the multi-line runtime registry.
+pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<ModemBinding>> {
+    let mut bindings = Vec::new();
+    for modem_path in list_modem_paths(conn).await? {
+        let modem_props = get_all_properties(conn, &modem_path, MM_MODEM)
+            .await
+            .unwrap_or_default();
+        let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP)
+            .await
+            .unwrap_or_default();
+        let modem_id = modem_path
+            .rsplit('/')
+            .find(|part| !part.is_empty())
+            .unwrap_or(modem_path.as_str())
+            .to_string();
+        let manufacturer = property_string(&modem_props, "Manufacturer").unwrap_or_default();
+        let model = property_string(&modem_props, "Model").unwrap_or_default();
+        let primary_port = property_string(&modem_props, "PrimaryPort").unwrap_or_default();
+        let state = mm_state_to_string(
+            modem_props
+                .get("State")
+                .map(extract_i32)
+                .unwrap_or_default(),
+        )
+        .to_string();
+
+        let sim_path = get_sim_path(conn, &modem_path)
+            .await
+            .ok()
+            .filter(|path| !path.is_empty() && path != "/");
+        let sim_props = if let Some(path) = sim_path.as_deref() {
+            get_all_properties(conn, path, MM_SIM)
+                .await
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
+        let sim_iccid = crate::infra::utils::normalize_iccid(
+            &property_string(&sim_props, "SimIdentifier").unwrap_or_default(),
+        );
+        let imsi = property_string(&sim_props, "Imsi").unwrap_or_default();
+        let mut operator_id = property_string(&sim_props, "OperatorIdentifier")
+            .unwrap_or_else(|| operator_code_from_imsi(&imsi));
+        if operator_id.is_empty() {
+            operator_id = property_string(&gpp_props, "OperatorCode").unwrap_or_default();
+        }
+
+        let hardware_key = property_string(&modem_props, "DeviceIdentifier")
+            .or_else(|| property_string(&gpp_props, "Imei"))
+            .or_else(|| property_string(&modem_props, "Device"))
+            .or_else(|| non_empty_string(primary_port.clone()))
+            .unwrap_or_else(|| modem_path.clone());
+        let sim_key = if sim_iccid.is_empty() {
+            sim_path.as_deref().unwrap_or("no-sim")
+        } else {
+            sim_iccid.as_str()
+        };
+
+        bindings.push(ModemBinding {
+            line_id: stable_line_id(&hardware_key, sim_key),
+            modem_id,
+            modem_path: modem_path.clone(),
+            manufacturer,
+            model,
+            primary_port,
+            qmi_device: qmi_control_device(conn, &modem_path).await,
+            uim_slot: 1,
+            sim_path,
+            sim_iccid,
+            operator_id,
+            state,
+            present: true,
+            hardware_key,
+        });
+    }
+    bindings.sort_by(|left, right| left.line_id.cmp(&right.line_id));
+    Ok(bindings)
 }
 
 fn no_modem_error(detail: impl Into<String>) -> zbus::Error {
@@ -2528,6 +2641,22 @@ async fn get_cells_data_qmicli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stable_line_identity_survives_modemmanager_renumbering() {
+        assert_eq!(
+            stable_line_id("imei:123", "iccid:456"),
+            stable_line_id("imei:123", "iccid:456")
+        );
+    }
+
+    #[test]
+    fn stable_line_identity_changes_when_sim_changes() {
+        assert_ne!(
+            stable_line_id("imei:123", "iccid:456"),
+            stable_line_id("imei:123", "iccid:789")
+        );
+    }
 
     #[test]
     fn treats_only_data_attach_transitions_as_connection_in_progress() {

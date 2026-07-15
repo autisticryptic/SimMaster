@@ -12,5 +12,6 @@
 //! belong here too. Keeping every leg under one roof makes the "shared core +
 //! pluggable access legs" architecture self-evident from the directory tree.
 
+pub mod line_registry;
 pub mod volte;
 pub mod vowifi;

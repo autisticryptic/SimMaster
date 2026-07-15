@@ -94,6 +94,32 @@ pub async fn options_handler() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+/// Enumerate every physical modem together with its active SIM and independent
+/// VoLTE runtime. Discovery is refreshed on demand so hotplug does not require
+/// a service restart.
+pub async fn get_modem_lines_handler(
+    State(app): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::access::line_registry::LineRuntimeStatus>>>,
+) {
+    match app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                app.line_registry.statuses().await,
+            )),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(format!(
+                "Failed to discover modems: {error}"
+            ))),
+        ),
+    }
+}
+
 /// GET /api/health
 pub async fn health_check() -> impl IntoResponse {
     (

@@ -9,6 +9,7 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
+use crate::access::line_registry::LineRuntimeRegistry;
 use crate::access::volte::runtime::VolteRuntime;
 use crate::access::vowifi::runtime::VowifiRuntime;
 use crate::cellular::cell_lock_store::CellLockStore;
@@ -55,6 +56,9 @@ pub struct AppState {
     pub vowifi_connect_lock: Arc<Mutex<()>>,
     pub volte_runtime: Arc<VolteRuntime>,
     pub volte_connect_lock: Arc<Mutex<()>>,
+    /// Per physical-modem + active-SIM runtime registry. Legacy handlers still
+    /// use `volte_runtime`, which is also the seed runtime of the first line.
+    pub line_registry: Arc<LineRuntimeRegistry>,
     /// 小区/信号轮询是否已按需唤醒。
     pub cell_monitoring_active: Arc<AtomicBool>,
 }
@@ -73,6 +77,7 @@ pub struct AppStateDependencies {
     pub airplane_mode_requested: Arc<AtomicBool>,
     pub vowifi_runtime: Arc<VowifiRuntime>,
     pub volte_runtime: Arc<VolteRuntime>,
+    pub line_registry: Arc<LineRuntimeRegistry>,
     pub cell_monitoring_active: Arc<AtomicBool>,
 }
 
@@ -92,6 +97,7 @@ impl AppState {
             airplane_mode_requested,
             vowifi_runtime,
             volte_runtime,
+            line_registry,
             cell_monitoring_active,
         } = dependencies;
         Self {
@@ -112,6 +118,7 @@ impl AppState {
             vowifi_connect_lock: Arc::new(Mutex::new(())),
             volte_runtime,
             volte_connect_lock: Arc::new(Mutex::new(())),
+            line_registry,
             cell_monitoring_active,
         }
     }
