@@ -43,7 +43,9 @@ import {
   Search,
   Settings,
 } from '@mui/icons-material'
-import { api, type SmsMessage, type SmsStats } from '../api/current'
+import { api, type SmsMessage, type SmsStats, type VolteLineControlResponse } from '../api/current'
+import ModemLineSelector from '../components/ModemLineSelector'
+import { shortLineId } from '../components/modemLineFormat'
 import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
 interface ConversationGroup {
@@ -179,6 +181,8 @@ export default function SMSPage() {
   const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
   const [newChatNumber, setNewChatNumber] = useState('')
   const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
+  const [volteLines, setVolteLines] = useState<VolteLineControlResponse[]>([])
+  const [selectedLineId, setSelectedLineId] = useState('')
 
   // 对话状态
   const [conversations, setConversations] = useState<ConversationGroup[]>([])
@@ -277,18 +281,44 @@ export default function SMSPage() {
     }
   }, [])
 
+  const fetchLines = useCallback(async () => {
+    try {
+      const response = await api.getVolteLines()
+      const nextLines = response.data ?? []
+      setVolteLines(nextLines)
+      setSelectedLineId((current) => (
+        current && !nextLines.some((line) => line.modem.line_id === current && line.modem.present)
+          ? ''
+          : current
+      ))
+    } catch (err) {
+      console.warn('Failed to load modem lines:', err)
+    }
+  }, [])
+
   useEffect(() => {
     void fetchMessages(false)
     void fetchStats()
+    void fetchLines()
     const interval = setInterval(() => {
       if (inputFocusedRef.current) {
         return
       }
       void fetchMessages(true)
       void fetchStats()
+      void fetchLines()
     }, 10000)
     return () => clearInterval(interval)
-  }, [fetchMessages, fetchStats])
+  }, [fetchLines, fetchMessages, fetchStats])
+
+  const lineNameById = useMemo(() => new Map(
+    volteLines.map((line, index) => [line.modem.line_id, `线路 ${index + 1}`]),
+  ), [volteLines])
+
+  const messageLineLabel = useCallback((lineId?: string) => {
+    if (!lineId) return ''
+    return lineNameById.get(lineId) ?? `线路 ${shortLineId(lineId)}`
+  }, [lineNameById])
 
   const messageById = useMemo(() => {
     const map = new Map<number, SmsMessage>()
@@ -417,10 +447,11 @@ export default function SMSPage() {
     setSuccess(null)
 
     try {
-      const response = await api.sendSms(phoneNumber, content)
+      const response = await api.sendSms(phoneNumber, content, selectedLineId || undefined)
       if (response.status === 'ok') {
         const path = smsTransportInfo(response.data?.transport ?? response.data?.path).label
-        setSuccess(`短信已通过 ${path} 发送到 ${phoneNumber}`)
+        const usedLine = response.data?.line_id ? `（${messageLineLabel(response.data.line_id)}）` : ''
+        setSuccess(`短信已通过 ${path}${usedLine} 发送到 ${phoneNumber}`)
         setContent('')
         setTimeout(() => {
           void fetchMessages()
@@ -895,7 +926,8 @@ export default function SMSPage() {
                     secondary={
                       <Typography variant="body2" color="text.secondary" noWrap sx={{ maxWidth: 180 }}>
                         {displayMessage.direction === 'outgoing' ? '你: ' : ''}
-                        [{smsTransportInfo(displayMessage.transport).label}] {' '}
+                        [{smsTransportInfo(displayMessage.transport).label}
+                        {displayMessage.line_id ? ` · ${messageLineLabel(displayMessage.line_id)}` : ''}] {' '}
                         {renderHighlightedText(displayMessage.content, searchTerm)}
                       </Typography>
                     }
@@ -1057,6 +1089,20 @@ export default function SMSPage() {
                         ml: 0.5,
                       }}
                     />
+                    {msg.line_id && (
+                      <Chip
+                        label={messageLineLabel(msg.line_id)}
+                        size="small"
+                        variant="outlined"
+                        sx={{
+                          height: 16,
+                          fontSize: '0.65rem',
+                          color: msg.direction === 'outgoing' ? 'white' : 'text.secondary',
+                          borderColor: msg.direction === 'outgoing' ? 'rgba(255,255,255,0.55)' : 'divider',
+                          borderRadius: 0.5,
+                        }}
+                      />
+                    )}
                     {msg.direction === 'outgoing' && (
                       msg.status === 'sent' ? (
                         <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff' }} />
@@ -1103,40 +1149,48 @@ export default function SMSPage() {
           bgcolor: 'background.paper',
         }}
       >
-        <TextField
-          fullWidth
-          multiline
-          maxRows={4}
-          value={content}
-          onChange={(e: ChangeEvent<HTMLInputElement>) => setContent(e.target.value)}
-          placeholder="输入短信内容..."
-          disabled={sendLoading}
-          onFocus={() => { inputFocusedRef.current = true }}
-          onBlur={() => { inputFocusedRef.current = false }}
-          onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
-              e.preventDefault()
-              void handleSend()
-            }
-          }}
-          slotProps={{
-            input: {
-              endAdornment: (
-                <InputAdornment position="end">
-                  <IconButton
-                    color="primary"
-                    onClick={() => void handleSend()}
-                    disabled={sendLoading || !content.trim()}
-                  >
-                    {sendLoading ? <CircularProgress size={24} /> : <Send />}
-                  </IconButton>
-                </InputAdornment>
-              ),
-            },
-          }}
-        />
+        <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '230px minmax(0, 1fr)' }} gap={1} alignItems="start">
+          <ModemLineSelector
+            lines={volteLines}
+            value={selectedLineId}
+            onChange={setSelectedLineId}
+            disabled={sendLoading}
+          />
+          <TextField
+            fullWidth
+            multiline
+            maxRows={4}
+            value={content}
+            onChange={(e: ChangeEvent<HTMLInputElement>) => setContent(e.target.value)}
+            placeholder="输入短信内容..."
+            disabled={sendLoading}
+            onFocus={() => { inputFocusedRef.current = true }}
+            onBlur={() => { inputFocusedRef.current = false }}
+            onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                void handleSend()
+              }
+            }}
+            slotProps={{
+              input: {
+                endAdornment: (
+                  <InputAdornment position="end">
+                    <IconButton
+                      color="primary"
+                      onClick={() => void handleSend()}
+                      disabled={sendLoading || !content.trim()}
+                    >
+                      {sendLoading ? <CircularProgress size={24} /> : <Send />}
+                    </IconButton>
+                  </InputAdornment>
+                ),
+              },
+            }}
+          />
+        </Box>
         <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-          {content.length} 字符 | Enter 发送，Shift+Enter 换行
+          {content.length} 字符 · {selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '按现有路径策略自动选择'} · Enter 发送，Shift+Enter 换行
         </Typography>
       </Box>
     </Box>

@@ -37,7 +37,11 @@ import type {
   EsimLpacStatusResponse,
   EsimProfilesResponse,
   LoginRequest,
+  LineRuntimeStatus,
   ManualRegisterRequest,
+  VolteControlResponse,
+  VolteIpFamilyPreference,
+  VolteLineControlResponse,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -614,10 +618,50 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async sendSms(phoneNumber: string, content: string) {
-    return request<ApiResponse<{ path: string; transport?: string }>>('/sms/send', {
+  async getModemLines() {
+    return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
+  }
+
+  async getVolteControl() {
+    return request<ApiResponse<VolteControlResponse>>('/volte/control')
+  }
+
+  async setVolteFeature(enabled: boolean) {
+    return request<ApiResponse<VolteControlResponse>>('/volte/feature', {
       method: 'POST',
-      body: JSON.stringify({ phone_number: phoneNumber, content }),
+      body: JSON.stringify({ enabled }),
+    })
+  }
+
+  async setVolteIpFamily(preference: VolteIpFamilyPreference) {
+    return request<ApiResponse<VolteControlResponse>>('/volte/ip-family', {
+      method: 'POST',
+      body: JSON.stringify({ preference }),
+    })
+  }
+
+  async getVolteLines() {
+    return request<ApiResponse<VolteLineControlResponse[]>>('/volte/lines')
+  }
+
+  async getVolteLine(lineId: string) {
+    return request<ApiResponse<VolteLineControlResponse>>(`/volte/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async setVolteLineConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/connection`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      },
+    )
+  }
+
+  async sendSms(phoneNumber: string, content: string, lineId?: string) {
+    return request<ApiResponse<{ path: string; transport?: string; line_id?: string }>>('/sms/send', {
+      method: 'POST',
+      body: JSON.stringify({ phone_number: phoneNumber, content, line_id: lineId || undefined }),
     })
   }
 

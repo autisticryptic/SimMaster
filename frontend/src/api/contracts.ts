@@ -429,6 +429,71 @@ export interface SmsMessage {
   status: string
   pdu?: string
   transport?: string
+  line_id?: string
+}
+
+export interface ModemBinding {
+  line_id: string
+  modem_id: string
+  modem_path: string
+  manufacturer: string
+  model: string
+  primary_port: string
+  qmi_device?: string | null
+  uim_slot: number
+  sim_path?: string | null
+  sim_iccid: string
+  operator_id: string
+  state: string
+  present: boolean
+}
+
+export interface VolteRuntimeStatus {
+  phase: string
+  stage: string
+  registration_mode: string
+  pcscf?: string
+  session_started_at?: string
+  registered_at?: string
+  last_rx_at?: string
+  last_tx_at?: string
+  last_error?: string
+  last_failure_at?: string
+  next_retry_at?: string
+  registered: boolean
+  sent_count: number
+  received_count: number
+  duplicate_count: number
+  reconnect_count: number
+  data_path_mode?: string
+}
+
+export type VolteIpFamilyPreference = 'ipv6_first' | 'ipv4_first' | 'ipv6_only' | 'ipv4_only'
+
+export interface LineProfileConfig {
+  line_id: string
+  enabled: boolean
+  volte_connection_enabled: boolean
+}
+
+export interface LineRuntimeStatus {
+  modem: ModemBinding
+  volte: VolteRuntimeStatus
+}
+
+export interface VolteLineControlResponse {
+  modem: ModemBinding
+  profile: LineProfileConfig
+  runtime: VolteRuntimeStatus
+}
+
+export interface VolteControlResponse {
+  enabled: boolean
+  feature_enabled: boolean
+  sms_enabled: boolean
+  connection_enabled: boolean
+  ip_family_preference: VolteIpFamilyPreference
+  runtime: VolteRuntimeStatus
 }
 
 export interface SmsListRequest {

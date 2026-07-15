@@ -44,7 +44,7 @@ export default defineConfig({
     // 配置开发服务器代理，将 /api 请求转发到 Rust 后端
     proxy: {
       '/api': {
-        target: 'http://192.168.68.1:3000',
+        target: process.env.VITE_API_PROXY_TARGET || 'http://192.168.68.1:3000',
         changeOrigin: true,
       }
     }

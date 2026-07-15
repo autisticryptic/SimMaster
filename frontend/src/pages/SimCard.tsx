@@ -34,6 +34,7 @@ import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
 import VowifiDiagnosticsPage from './VowifiDiagnostics'
+import ModemLinesPanel from './sim/ModemLinesPanel'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
 function getSensitiveStyle(show: boolean) {
@@ -618,6 +619,7 @@ export default function SimCardPage() {
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基本信息" value="basic" />
+          <Tab label="基带线路" value="lines" />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
           {vowifiEnabled && <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />}
         </Tabs>
@@ -625,6 +627,7 @@ export default function SimCardPage() {
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'basic' && <SimBasicInfo />}
+        {activeTab === 'lines' && <ModemLinesPanel />}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
         {activeTab === 'vowifi' && vowifiEnabled && <VowifiDiagnosticsPage />}
       </Box>
