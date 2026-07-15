@@ -190,14 +190,14 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                     route.local_addr.ip(),
                     self.offered_security_binding.port_c,
                 ),
-                pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_c),
+                pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_s),
                 transport: SipTransport::Udp,
             };
             let receive_local = SocketAddr::new(
                 route.local_addr.ip(),
                 self.offered_security_binding.port_s,
             );
-            let receive_remote = SocketAddr::new(route.pcscf_addr.ip(), selected.port_s);
+            let receive_remote = SocketAddr::new(route.pcscf_addr.ip(), selected.port_c);
             if let Err(error) = channel.activate_security(
                 protected_send_route,
                 receive_local,

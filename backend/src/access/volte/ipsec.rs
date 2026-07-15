@@ -135,7 +135,7 @@ fn ip_str(ip: IpAddr) -> String {
 /// Build `ip xfrm state add ...` for one SA direction (transport mode,
 /// integrity-only). Returns the argv (without the leading `ip`).
 pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
-    let mut v = vec![
+    vec![
         "xfrm".into(),
         "state".into(),
         "add".into(),
@@ -156,20 +156,7 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         "enc".into(),
         sa.algs.enc.into(),
         String::new(),
-        "sel".into(),
-        "src".into(),
-        ip_str(sa.src),
-        "dst".into(),
-        ip_str(sa.dst),
-        "proto".into(),
-        "udp".into(),
-    ];
-    // Port selectors bind the SA to the negotiated sec-agree ports.
-    v.push("sport".into());
-    v.push(sa.sport.to_string());
-    v.push("dport".into());
-    v.push(sa.dport.to_string());
-    v
+    ]
 }
 
 /// Direction for a policy entry.
@@ -196,7 +183,6 @@ pub fn build_xfrm_policy_add(
     sport: u16,
     dport: u16,
     dir: PolicyDir,
-    spi: u32,
 ) -> Vec<String> {
     vec![
         "xfrm".into(),
@@ -221,8 +207,6 @@ pub fn build_xfrm_policy_add(
         ip_str(dst),
         "proto".into(),
         "esp".into(),
-        "spi".into(),
-        format!("0x{:08x}", spi),
         "mode".into(),
         "transport".into(),
     ]
@@ -268,24 +252,24 @@ pub fn build_install_plan(
     // `-c` identifies packets sent by the client; `-s` identifies packets
     // sent by the server. Each endpoint advertises its own ports/SPIs, so the
     // two directions deliberately use values from different headers.
-    // Outbound: UE client/send port -> P-CSCF client/receive port.
+    // Outbound: UE client/send port -> P-CSCF server/send port.
     let out_sa = XfrmSa {
         src: ue,
         dst: pcscf,
-        spi: pcscf_sec.spi_c,
+        spi: pcscf_sec.spi_s,
         auth_key: auth_key.to_vec(),
         algs,
         sport: ue_sec.port_c,
-        dport: pcscf_sec.port_c,
+        dport: pcscf_sec.port_s,
     };
-    // Inbound: P-CSCF server/send port -> UE server/receive port.
+    // Inbound: P-CSCF client port -> UE server/receive port.
     let in_sa = XfrmSa {
         src: pcscf,
         dst: ue,
         spi: ue_sec.spi_s,
         auth_key: auth_key.to_vec(),
         algs,
-        sport: pcscf_sec.port_s,
+        sport: pcscf_sec.port_c,
         dport: ue_sec.port_s,
     };
     let policies = vec![
@@ -293,17 +277,15 @@ pub fn build_install_plan(
             ue,
             pcscf,
             ue_sec.port_c,
-            pcscf_sec.port_c,
+            pcscf_sec.port_s,
             PolicyDir::Out,
-            pcscf_sec.spi_c,
         ),
         build_xfrm_policy_add(
             pcscf,
             ue,
-            pcscf_sec.port_s,
+            pcscf_sec.port_c,
             ue_sec.port_s,
             PolicyDir::In,
-            ue_sec.spi_s,
         ),
     ];
     Ok(XfrmInstallPlan {
@@ -436,21 +418,20 @@ mod tests {
         assert!(joined.contains("proto esp spi 0x00001234"));
         assert!(joined.contains("mode transport"));
         assert!(joined.contains("auth-trunc hmac(md5) 0xaabbcc 96"));
-        assert!(joined.contains("enc cipher_null  sel"));
-        assert!(joined.contains("proto udp sport 6000"));
-        assert!(joined.contains("sport 6000"));
-        assert!(joined.contains("dport 6001"));
+        assert!(joined.contains("enc cipher_null"));
+        assert!(!joined.contains(" sel "));
+        assert!(!joined.contains(" sport "));
     }
 
     #[test]
     fn policy_add_binds_ports_and_direction() {
-        let argv = build_xfrm_policy_add(v6(2), v6(1), 6000, 6001, PolicyDir::Out, 0xdead_beef);
+        let argv = build_xfrm_policy_add(v6(2), v6(1), 6000, 6001, PolicyDir::Out);
         let joined = argv.join(" ");
         assert!(joined.contains("xfrm policy add"));
         assert!(joined.contains("dir out"));
         assert!(joined.contains("sport 6000"));
         assert!(joined.contains("dport 6001"));
-        assert!(joined.contains("proto esp spi 0xdeadbeef"));
+        assert!(joined.contains("tmpl src 2001:db8::2 dst 2001:db8::1 proto esp mode transport"));
         assert!(joined.contains("mode transport"));
     }
 
@@ -478,12 +459,13 @@ mod tests {
         let plan = build_install_plan(v6(2), v6(1), &ue_sec, &pcscf_sec, &[0x01; 16]).unwrap();
         assert_eq!(plan.states.len(), 2);
         assert_eq!(plan.policies.len(), 2);
-        // Outbound SA uses server SPI; inbound uses client SPI.
-        assert_eq!(plan.states[0].spi, 0x3333);
+        // Outbound uses P-CSCF spi-s/port-s; inbound uses UE spi-s and
+        // P-CSCF port-c, matching the target kernel's successful runtime plan.
+        assert_eq!(plan.states[0].spi, 0x4444);
         assert_eq!(plan.states[0].sport, 6000);
-        assert_eq!(plan.states[0].dport, 7000);
+        assert_eq!(plan.states[0].dport, 7001);
         assert_eq!(plan.states[1].spi, 0x2222);
-        assert_eq!(plan.states[1].sport, 7001);
+        assert_eq!(plan.states[1].sport, 7000);
         assert_eq!(plan.states[1].dport, 6001);
     }
 
