@@ -26,7 +26,7 @@ use crate::{
 use super::{
     bearer::{
         configure_bearer_network, disconnect_bearer, ensure_ims_bearer, route_pcscf,
-        BearerConnection, BearerRequest,
+        teardown_bearer_network, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
     digest_aka,
@@ -375,6 +375,7 @@ async fn connect_inner(
     }
     .await;
     if result.is_err() {
+        teardown_bearer_network(&bearer).await;
         disconnect_bearer(&bearer.path).await;
     }
     result
@@ -391,6 +392,7 @@ pub async fn disconnect_live(runtime: &VolteRuntime, reason: &str) -> VolteRunti
         if let Some(plan) = session.xfrm_plan.as_ref() {
             ipsec::uninstall_plan(plan);
         }
+        teardown_bearer_network(&session.bearer).await;
         disconnect_bearer(&session.bearer.path).await;
     }
     runtime.reset_runtime(reason).await;

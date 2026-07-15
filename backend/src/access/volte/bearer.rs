@@ -220,12 +220,8 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
                 &bearer.interface,
             ])
             .await?;
-            let gateway = bearer
-                .settings
-                .ipv6_gateway
-                .ok_or_else(|| VolteError::new(code::IPV6_GATEWAY_MISSING))?;
             for dns in &bearer.settings.ipv6_dns {
-                route_host(&bearer.interface, *dns, gateway).await?;
+                route_host(&bearer.interface, *dns).await?;
             }
         }
         IpAddr::V4(address) => {
@@ -239,12 +235,8 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
                 &bearer.interface,
             ])
             .await?;
-            let gateway = bearer
-                .settings
-                .ipv4_gateway
-                .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
             for dns in &bearer.settings.ipv4_dns {
-                route_host(&bearer.interface, *dns, gateway).await?;
+                route_host(&bearer.interface, *dns).await?;
             }
         }
     }
@@ -255,21 +247,12 @@ pub async fn route_pcscf(
     bearer: &BearerConnection,
     pcscf: IpAddr,
 ) -> Result<(), VolteError> {
-    let gateway = match pcscf {
-        IpAddr::V6(_) => bearer.settings.ipv6_gateway,
-        IpAddr::V4(_) => bearer.settings.ipv4_gateway,
-    }
-    .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
-    route_host(&bearer.interface, pcscf, gateway).await
+    route_host(&bearer.interface, pcscf).await
 }
 
-async fn route_host(interface: &str, host: IpAddr, gateway: IpAddr) -> Result<(), VolteError> {
-    if host.is_ipv4() != gateway.is_ipv4() {
-        return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
-    }
+async fn route_host(interface: &str, host: IpAddr) -> Result<(), VolteError> {
     let (family, suffix) = if host.is_ipv6() { (Some("-6"), 128) } else { (None, 32) };
     let destination = format!("{host}/{suffix}");
-    let gateway = gateway.to_string();
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
@@ -278,12 +261,20 @@ async fn route_host(interface: &str, host: IpAddr, gateway: IpAddr) -> Result<()
         "route",
         "replace",
         &destination,
-        "via",
-        &gateway,
         "dev",
         interface,
     ]);
     run_ip(&args).await.map(|_| ())
+}
+
+/// Remove network state only from the dedicated bearer interface. This is
+/// used on failed registration and normal teardown so stale IPv6 addresses or
+/// host routes cannot accumulate across long-running retries.
+pub async fn teardown_bearer_network(bearer: &BearerConnection) {
+    let _ = run_ip(&["-6", "route", "flush", "dev", &bearer.interface]).await;
+    let _ = run_ip(&["route", "flush", "dev", &bearer.interface]).await;
+    let _ = run_ip(&["address", "flush", "dev", &bearer.interface]).await;
+    let _ = run_ip(&["link", "set", "dev", &bearer.interface, "down"]).await;
 }
 
 pub async fn disconnect_bearer(path: &str) {

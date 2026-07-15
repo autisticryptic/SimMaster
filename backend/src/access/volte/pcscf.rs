@@ -160,7 +160,10 @@ pub async fn discover_pcscf(
             }
         }
     }
-    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+    // Some Qualcomm/operator combinations expose P-CSCF candidates in the
+    // DNS slots but do not run a recursive DNS service on those addresses.
+    // Preserve the documented data-path fallback after bounded DNS attempts.
+    settings.resolve_pcscf()
 }
 
 pub fn pcscf_socket(address: IpAddr) -> SocketAddr {

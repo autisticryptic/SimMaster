@@ -139,7 +139,10 @@ async fn spa_fallback(uri: Uri) -> Response {
 /// 这完美绕过了 Modem.Command 的 Unauthorized 限制，同时保持系统纯净。
 fn ensure_modemmanager_debug_override() {
     let override_dir = "/etc/systemd/system/ModemManager.service.d";
-    let override_file = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
+    // `zz-` must sort after vendor drop-ins such as `mobile-tweaks.conf`, which
+    // also reset ExecStart on the Qualcomm image.
+    let override_file = "/etc/systemd/system/ModemManager.service.d/zz-simadmin-debug.conf";
+    let legacy_override = "/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf";
 
     let desired_content = "\
 # SimAdmin: enable ModemManager debug mode so that Modem.Command D-Bus
@@ -163,6 +166,7 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
             tracing::warn!("Failed to write MM debug override: {}", e);
             return;
         }
+        let _ = std::fs::remove_file(legacy_override);
 
         // Reload systemd & restart ModemManager silently
         let _ = std::process::Command::new("systemctl")
