@@ -64,6 +64,14 @@ struct DeviceIdentity {
     ims: ImsIdentity,
 }
 
+#[derive(Debug, Clone)]
+pub struct VolteSmsSendResult {
+    pub message_id: String,
+    pub trace_id: String,
+    pub part_count: usize,
+    pub sip_statuses: Vec<u16>,
+}
+
 struct PreparedAuth {
     authorization: String,
     security_client: Option<String>,
@@ -674,6 +682,92 @@ async fn send_live_frame(
     Ok(())
 }
 
+/// Send one single- or multipart MO SMS over the registered protected IMS
+/// channel. Holding the session lock across each MESSAGE transaction prevents
+/// the background MT listener from consuming the corresponding SIP response.
+pub async fn send_live_sms(
+    runtime: &Arc<VolteRuntime>,
+    recipient: &str,
+    text: &str,
+    service_center: &str,
+) -> Result<VolteSmsSendResult, VolteError> {
+    if !runtime.status().await.registered {
+        return Err(VolteError::new("volte_runtime_not_registered"));
+    }
+    if service_center.trim().is_empty() {
+        return Err(VolteError::new("volte_smsc_missing"));
+    }
+    let submissions = crate::access::volte::sms::build_mo_submissions(
+        recipient,
+        text,
+        service_center,
+    )
+    .map_err(|error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()))?;
+    let first = submissions
+        .first()
+        .ok_or_else(|| VolteError::new("volte_sms_encode_failed"))?;
+    let message_id = first.message_id.clone();
+    let trace_id = first.trace_id.clone();
+    let part_count = submissions.len();
+    let mut sip_statuses = Vec::with_capacity(part_count);
+
+    for submission in submissions {
+        let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+        let session = sessions
+            .as_mut()
+            .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+        let service_center_uri = phone_uri(service_center, &session.identity.home_domain)?;
+        let frame = sip::build_sms_message(
+            &session.identity,
+            &session.channel.route(),
+            &service_center_uri,
+            &service_center_uri,
+            &submission.body,
+            session.channel.security_verify(),
+        );
+        session
+            .channel
+            .send_sip(&frame)
+            .await
+            .map_err(map_channel_error)?;
+        runtime.update(|state| state.last_tx_at = Some(now())).await;
+        let response = session
+            .channel
+            .recv_sip(Duration::from_secs(10))
+            .await
+            .map_err(map_channel_error)?;
+        let sip_status = sip::parse_status(&response)?;
+        runtime.update(|state| state.last_rx_at = Some(now())).await;
+        if !(200..300).contains(&sip_status) {
+            return Err(VolteError::with_detail(
+                "volte_sms_message_rejected",
+                sip_status.to_string(),
+            ));
+        }
+        sip_statuses.push(sip_status);
+    }
+    runtime.update(|state| state.sent_count += 1).await;
+    Ok(VolteSmsSendResult {
+        message_id,
+        trace_id,
+        part_count,
+        sip_statuses,
+    })
+}
+
+fn phone_uri(number: &str, domain: &str) -> Result<String, VolteError> {
+    let number = number.trim();
+    if number.is_empty()
+        || !number
+            .chars()
+            .enumerate()
+            .all(|(index, character)| character.is_ascii_digit() || (index == 0 && character == '+'))
+    {
+        return Err(VolteError::new("volte_phone_uri_invalid"));
+    }
+    Ok(format!("sip:{number}@{domain};user=phone"))
+}
+
 fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, VolteError> {
     if let Some(value) = sip::header_value(frame, "WWW-Authenticate") {
         return digest_aka::parse_digest_challenge(&value, false);
@@ -820,6 +914,16 @@ mod tests {
         assert_ne!(parsed.spi_s, 0);
         assert_eq!(parsed.port_c, 42799);
         assert_eq!(parsed.port_s, 45652);
+    }
+
+    #[test]
+    fn phone_uri_accepts_e164_and_rejects_non_phone_text() {
+        assert_eq!(
+            phone_uri("+8613800138000", "ims.example").unwrap(),
+            "sip:+8613800138000@ims.example;user=phone"
+        );
+        assert!(phone_uri("+86-138", "ims.example").is_err());
+        assert!(phone_uri("", "ims.example").is_err());
     }
 
     #[test]

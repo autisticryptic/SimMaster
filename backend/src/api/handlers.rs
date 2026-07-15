@@ -20,8 +20,8 @@ use zbus::Connection;
 use crate::{
     cellular::modem_manager,
     infra::config::{
-        ApnConfig, SmsPathPolicy, VilteConfig, VolteConfig, VolteIpFamilyPreference,
-        VowifiConfig,
+        AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
+        VolteConfig, VolteIpFamilyPreference, VowifiConfig,
     },
     infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -2487,6 +2487,201 @@ fn persist_vowifi_restore_phase(
 
 /// POST /api/sms/send
 pub async fn send_sms_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<SendSmsRequest>,
+) -> impl IntoResponse {
+    let policy = app.config_manager.get_sms_path_policy().normalized();
+    let stop_on_failure = policy.mid_flight_disable == MidFlightDisablePolicy::Fail;
+    let mut failures = Vec::new();
+    for path in policy.enabled_layers() {
+        let result = match path {
+            AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &payload).await,
+            AccessPathKind::Volte => send_sms_over_volte_path(&app, &payload).await,
+            AccessPathKind::Cs => send_sms_over_cs_path(&app, &payload).await,
+        };
+        match result {
+            Ok(data) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("SMS sent", data)),
+                );
+            }
+            Err(reason) => {
+                failures.push(format!("{}:{reason}", path.as_str()));
+                if stop_on_failure {
+                    break;
+                }
+                warn!(path = path.as_str(), reason = %reason, "SMS path failed; trying next path");
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::<serde_json::Value>::error(format!(
+            "Failed to send SMS: {}",
+            failures.join("; ")
+        ))),
+    )
+}
+
+async fn send_sms_over_vowifi_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let control = app.config_manager.get_vowifi_config();
+    if !control.feature_enabled || !control.connection_enabled {
+        return Err("disabled".to_string());
+    }
+    let mut ready = app.vowifi_runtime.snapshot().await.readiness().sms_ready;
+    if !ready {
+        let airplane_enabled = get_airplane_mode(&app.dbus_conn)
+            .await
+            .map(|state| state.enabled)
+            .unwrap_or(false);
+        if airplane_enabled {
+            app.vowifi_runtime
+                .refresh_identity_with_timeout(
+                    &app.dbus_conn,
+                    std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
+                )
+                .await;
+            ready = app
+                .vowifi_runtime
+                .connect_live_with_stage_timeout(
+                    Some(&app.database),
+                    std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
+                )
+                .await
+                .readiness()
+                .sms_ready;
+        } else {
+            ready = connect_vowifi_with_attempts(
+                app,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                std::time::Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                false,
+            )
+            .await
+            .readiness
+            .sms_ready;
+        }
+    }
+    if !ready {
+        return Err("sms_ready_not_reached".to_string());
+    }
+    let send_result = send_live_sms_over_ims(&payload.phone_number, &payload.content)
+        .await
+        .map_err(|error| error.reason)?;
+    let outcome = send_result.outcome;
+    let api_sms_id = app
+        .database
+        .insert_sms_with_transport(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            outcome.api_status(),
+            None,
+            "vowifi_ims",
+        )
+        .ok();
+    let _ = app.database.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+        message_id: &outcome.message_id,
+        trace_id: &outcome.trace_id,
+        direction: "mobile_originated",
+        state: outcome.delivery_state.as_str(),
+        sip_state: if (200..300).contains(&outcome.sip_status) {
+            "accepted"
+        } else {
+            "rejected"
+        },
+        rpdu_ack: outcome.rpdu_ack.as_str(),
+        delivery_reported: false,
+        failure_cause: outcome.failure_cause.as_deref(),
+        retry_count: 0,
+        api_sms_id,
+    });
+    spawn_vowifi_sms_followup_persist(app.clone(), send_result.followup);
+    Ok(json!({
+        "path": "vowifi_ims",
+        "transport": "vowifi_ims",
+        "message_id": outcome.message_id,
+        "trace_id": outcome.trace_id,
+        "delivery_state": outcome.delivery_state.as_str(),
+        "rpdu_ack": outcome.rpdu_ack.as_str(),
+        "mt_followup": "background",
+    }))
+}
+
+async fn send_sms_over_volte_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let config = app.config_manager.get_volte_config();
+    if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
+        return Err("disabled".to_string());
+    }
+    if !app.volte_runtime.status().await.registered {
+        crate::access::volte::live::connect_live(
+            &app.volte_runtime,
+            &config,
+            Arc::clone(&app.database),
+            Arc::clone(&app.notification_sender),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let sim = get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database))
+        .await
+        .map_err(|error| error.to_string())?;
+    let result = crate::access::volte::live::send_live_sms(
+        &app.volte_runtime,
+        &payload.phone_number,
+        &payload.content,
+        &sim.sms_center,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    app.database
+        .insert_sms_with_transport(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            "sent",
+            None,
+            "volte_ims",
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "path": "volte_ims",
+        "transport": "volte_ims",
+        "message_id": result.message_id,
+        "trace_id": result.trace_id,
+        "part_count": result.part_count,
+        "sip_statuses": result.sip_statuses,
+    }))
+}
+
+async fn send_sms_over_cs_path(
+    app: &AppState,
+    payload: &SendSmsRequest,
+) -> Result<serde_json::Value, String> {
+    let path = send_sms(&app.dbus_conn, &payload.phone_number, &payload.content)
+        .await
+        .map_err(|error| error.to_string())?;
+    app.database
+        .insert_sms(
+            "outgoing",
+            &payload.phone_number,
+            &payload.content,
+            "sent",
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(json!({ "path": path, "transport": "modem" }))
+}
+
+#[allow(dead_code)]
+pub async fn send_sms_handler_legacy(
     State(app): State<AppState>,
     Json(payload): Json<SendSmsRequest>,
 ) -> impl IntoResponse {
