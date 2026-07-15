@@ -44,8 +44,6 @@ const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const QMI_DEVICE: &str = "/dev/wwan0qmi0";
 const UIM_SLOT: u8 = 1;
 const REGISTER_EXPIRES: u32 = 3600;
-const SECURITY_CLIENT_PORT: u16 = 5062;
-const SECURITY_SERVER_PORT: u16 = 5064;
 
 static LIVE_SESSION: OnceLock<Mutex<Option<VolteLiveSession>>> = OnceLock::new();
 
@@ -74,6 +72,7 @@ struct VolteRegisterAuthenticator {
     ids: RequestIds,
     sip_instance: String,
     offered_security: String,
+    offered_security_binding: SecAgree,
     route: ImsRoute,
     pending: Option<PreparedAuth>,
     mode: RegistrationMode,
@@ -85,14 +84,16 @@ impl VolteRegisterAuthenticator {
         identity: ImsIdentity,
         ids: RequestIds,
         sip_instance: String,
-        offered_security: String,
+        offered_security_binding: SecAgree,
         route: ImsRoute,
     ) -> Self {
+        let offered_security = offered_security_binding.security_client_value();
         Self {
             identity,
             ids,
             sip_instance,
             offered_security,
+            offered_security_binding,
             route,
             pending: None,
             mode: RegistrationMode::None,
@@ -178,17 +179,31 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             let plan = ipsec::build_install_plan(
                 route.local_addr.ip(),
                 route.pcscf_addr.ip(),
+                &self.offered_security_binding,
                 &selected,
                 &aka.ik,
             )
             .map_err(to_ims_error)?;
             ipsec::install_plan(&plan).map_err(to_ims_error)?;
-            let protected_route = ImsRoute {
-                local_addr: SocketAddr::new(route.local_addr.ip(), selected.port_c),
-                pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_s),
+            let protected_send_route = ImsRoute {
+                local_addr: SocketAddr::new(
+                    route.local_addr.ip(),
+                    self.offered_security_binding.port_c,
+                ),
+                pcscf_addr: SocketAddr::new(route.pcscf_addr.ip(), selected.port_c),
                 transport: SipTransport::Udp,
             };
-            if let Err(error) = channel.rebind(protected_route, Some(verify.clone())) {
+            let receive_local = SocketAddr::new(
+                route.local_addr.ip(),
+                self.offered_security_binding.port_s,
+            );
+            let receive_remote = SocketAddr::new(route.pcscf_addr.ip(), selected.port_s);
+            if let Err(error) = channel.activate_security(
+                protected_send_route,
+                receive_local,
+                receive_remote,
+                Some(verify.clone()),
+            ) {
                 ipsec::uninstall_plan(&plan);
                 return Err(error);
             }
@@ -383,9 +398,13 @@ async fn connect_family(
     };
     let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
         .map_err(map_channel_error)?;
+    let receive_port = channel
+        .reserve_security_receive_port()
+        .map_err(map_channel_error)?;
     let ids = RequestIds::fresh(1);
     let sip_instance = new_sip_instance();
-    let offered = offered_security();
+    let offered_binding = offered_security(channel.route().local_addr.port(), receive_port);
+    let offered = offered_binding.security_client_value();
     let initial_authorization = digest_aka::build_initial_authorization_header(
         &device_identity.ims.private_user,
         &device_identity.ims.home_domain,
@@ -406,7 +425,7 @@ async fn connect_family(
         device_identity.ims.clone(),
         ids,
         sip_instance,
-        offered,
+        offered_binding,
         channel.route(),
     );
     let registration = run_register(&mut channel, &initial, &mut authenticator).await;
@@ -499,7 +518,7 @@ fn key_value(output: &str, key: &str) -> Option<String> {
     })
 }
 
-fn offered_security() -> String {
+fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
     let spi = || {
         u32::from_str_radix(&sip::hex_token(4), 16)
             .ok()
@@ -509,10 +528,9 @@ fn offered_security() -> String {
     SecAgree {
         spi_c: spi(),
         spi_s: spi(),
-        port_c: SECURITY_CLIENT_PORT,
-        port_s: SECURITY_SERVER_PORT,
+        port_c: send_port,
+        port_s: receive_port,
     }
-    .security_client_value()
 }
 
 fn new_sip_instance() -> String {
@@ -587,13 +605,13 @@ mod tests {
     }
 
     #[test]
-    fn security_offer_contains_nonzero_spis_and_expected_ports() {
-        let offer = offered_security();
-        let parsed = ipsec::parse_security_server(&offer).unwrap();
+    fn security_offer_contains_nonzero_spis_and_distinct_send_receive_ports() {
+        let offer = offered_security(42799, 45652);
+        let parsed = ipsec::parse_security_server(&offer.security_client_value()).unwrap();
         assert_ne!(parsed.spi_c, 0);
         assert_ne!(parsed.spi_s, 0);
-        assert_eq!(parsed.port_c, SECURITY_CLIENT_PORT);
-        assert_eq!(parsed.port_s, SECURITY_SERVER_PORT);
+        assert_eq!(parsed.port_c, 42799);
+        assert_eq!(parsed.port_s, 45652);
     }
 
     #[test]

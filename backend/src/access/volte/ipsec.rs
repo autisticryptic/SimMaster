@@ -251,7 +251,8 @@ pub struct XfrmInstallPlan {
 pub fn build_install_plan(
     ue: IpAddr,
     pcscf: IpAddr,
-    sec: &SecAgree,
+    ue_sec: &SecAgree,
+    pcscf_sec: &SecAgree,
     auth_key: &[u8],
 ) -> Result<XfrmInstallPlan, VolteError> {
     // IMS IPsec requires IPv6 in most deployments (observed
@@ -264,29 +265,46 @@ pub fn build_install_plan(
         return Err(VolteError::new(code::IPSEC_IK_INVALID));
     }
     let algs = XfrmAlgs::default();
-    // Outbound: UE:port_c -> P-CSCF:port_s, protected by spi_s (server SA).
+    // `-c` identifies packets sent by the client; `-s` identifies packets
+    // sent by the server. Each endpoint advertises its own ports/SPIs, so the
+    // two directions deliberately use values from different headers.
+    // Outbound: UE client/send port -> P-CSCF client/receive port.
     let out_sa = XfrmSa {
         src: ue,
         dst: pcscf,
-        spi: sec.spi_s,
+        spi: pcscf_sec.spi_c,
         auth_key: auth_key.to_vec(),
         algs,
-        sport: sec.port_c,
-        dport: sec.port_s,
+        sport: ue_sec.port_c,
+        dport: pcscf_sec.port_c,
     };
-    // Inbound: P-CSCF:port_s -> UE:port_c, protected by spi_c (client SA).
+    // Inbound: P-CSCF server/send port -> UE server/receive port.
     let in_sa = XfrmSa {
         src: pcscf,
         dst: ue,
-        spi: sec.spi_c,
+        spi: ue_sec.spi_s,
         auth_key: auth_key.to_vec(),
         algs,
-        sport: sec.port_s,
-        dport: sec.port_c,
+        sport: pcscf_sec.port_s,
+        dport: ue_sec.port_s,
     };
     let policies = vec![
-        build_xfrm_policy_add(ue, pcscf, sec.port_c, sec.port_s, PolicyDir::Out, sec.spi_s),
-        build_xfrm_policy_add(pcscf, ue, sec.port_s, sec.port_c, PolicyDir::In, sec.spi_c),
+        build_xfrm_policy_add(
+            ue,
+            pcscf,
+            ue_sec.port_c,
+            pcscf_sec.port_c,
+            PolicyDir::Out,
+            pcscf_sec.spi_c,
+        ),
+        build_xfrm_policy_add(
+            pcscf,
+            ue,
+            pcscf_sec.port_s,
+            ue_sec.port_s,
+            PolicyDir::In,
+            ue_sec.spi_s,
+        ),
     ];
     Ok(XfrmInstallPlan {
         states: vec![out_sa, in_sa],
@@ -445,22 +463,28 @@ mod tests {
 
     #[test]
     fn install_plan_builds_two_sas_and_two_policies() {
-        let sec = SecAgree {
+        let ue_sec = SecAgree {
             spi_c: 0x1111,
             spi_s: 0x2222,
             port_c: 6000,
             port_s: 6001,
         };
-        let plan = build_install_plan(v6(2), v6(1), &sec, &[0x01; 16]).unwrap();
+        let pcscf_sec = SecAgree {
+            spi_c: 0x3333,
+            spi_s: 0x4444,
+            port_c: 7000,
+            port_s: 7001,
+        };
+        let plan = build_install_plan(v6(2), v6(1), &ue_sec, &pcscf_sec, &[0x01; 16]).unwrap();
         assert_eq!(plan.states.len(), 2);
         assert_eq!(plan.policies.len(), 2);
         // Outbound SA uses server SPI; inbound uses client SPI.
-        assert_eq!(plan.states[0].spi, 0x2222);
+        assert_eq!(plan.states[0].spi, 0x3333);
         assert_eq!(plan.states[0].sport, 6000);
-        assert_eq!(plan.states[0].dport, 6001);
-        assert_eq!(plan.states[1].spi, 0x1111);
-        assert_eq!(plan.states[1].sport, 6001);
-        assert_eq!(plan.states[1].dport, 6000);
+        assert_eq!(plan.states[0].dport, 7000);
+        assert_eq!(plan.states[1].spi, 0x2222);
+        assert_eq!(plan.states[1].sport, 7001);
+        assert_eq!(plan.states[1].dport, 6001);
     }
 
     #[test]
@@ -472,7 +496,7 @@ mod tests {
             port_s: 6001,
         };
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
-        let err = build_install_plan(v4, v6(1), &sec, &[0x01; 16]).unwrap_err();
+        let err = build_install_plan(v4, v6(1), &sec, &sec, &[0x01; 16]).unwrap_err();
         assert_eq!(err.code(), code::PCSCF_FAMILY_MISMATCH);
     }
 
@@ -484,7 +508,7 @@ mod tests {
             port_c: 6000,
             port_s: 6001,
         };
-        let err = build_install_plan(v6(2), v6(1), &sec, &[]).unwrap_err();
+        let err = build_install_plan(v6(2), v6(1), &sec, &sec, &[]).unwrap_err();
         assert_eq!(err.code(), code::IPSEC_IK_INVALID);
     }
 
@@ -518,7 +542,7 @@ mod tests {
             port_c: 5062,
             port_s: 5064,
         };
-        let plan = build_install_plan(v6(2), v6(1), &sec, &[1; 16]).unwrap();
+        let plan = build_install_plan(v6(2), v6(1), &sec, &sec, &[1; 16]).unwrap();
         for policy in &plan.policies {
             assert!(policy.contains(&"add".to_string()));
             assert!(!policy.contains(&"flush".to_string()));
