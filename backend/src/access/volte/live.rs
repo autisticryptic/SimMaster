@@ -271,6 +271,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
 pub async fn connect_live(
     runtime: &Arc<VolteRuntime>,
     config: &VolteConfig,
+    dedupe_enabled: bool,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
@@ -321,6 +322,7 @@ pub async fn connect_live(
                 database,
                 notification_sender,
                 generation,
+                dedupe_enabled,
             )
             .await;
             Ok(runtime.status().await)
@@ -490,6 +492,7 @@ async fn start_live_listener(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     generation: u64,
+    dedupe_enabled: bool,
 ) {
     let mut listener = LIVE_LISTENER
         .get_or_init(|| Mutex::new(None))
@@ -499,7 +502,14 @@ async fn start_live_listener(
         previous.abort();
     }
     *listener = Some(tokio::spawn(async move {
-        live_receive_loop(runtime, database, notification_sender, generation).await;
+        live_receive_loop(
+            runtime,
+            database,
+            notification_sender,
+            generation,
+            dedupe_enabled,
+        )
+        .await;
     }));
 }
 
@@ -508,6 +518,7 @@ async fn live_receive_loop(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     generation: u64,
+    dedupe_enabled: bool,
 ) {
     let mut reassembler = MtReassembler::new();
     let refresh_at = tokio::time::Instant::now()
@@ -559,6 +570,7 @@ async fn live_receive_loop(
             &notification_sender,
             &mut reassembler,
             &frame,
+            dedupe_enabled,
         )
         .await
         {
@@ -588,6 +600,7 @@ async fn handle_live_frame(
     notification_sender: &Arc<NotificationSender>,
     reassembler: &mut MtReassembler,
     frame: &[u8],
+    dedupe_enabled: bool,
 ) -> Result<(), VolteError> {
     if !sip::is_request(frame, "MESSAGE") {
         if let Ok(sip_status) = sip::parse_status(frame) {
@@ -634,6 +647,27 @@ async fn handle_live_frame(
 
     match reassembler.ingest_deliver(deliver) {
         MtIngest::Complete(message) => {
+            if dedupe_enabled {
+                let fingerprint = crate::orchestrator::message_fingerprint(
+                    &crate::orchestrator::MessageFingerprintInput {
+                        service_center_timestamp: &message.service_center_timestamp,
+                        originator: &message.originator,
+                        text: &message.text,
+                        segment_reference: None,
+                        segment_sequence: 1,
+                        segment_total: 1,
+                    },
+                );
+                let claimed = database
+                    .claim_sms_dedup(&fingerprint, TRANSPORT_TAG)
+                    .map_err(|error| {
+                        VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                    })?;
+                if !claimed {
+                    runtime.update(|state| state.duplicate_count += 1).await;
+                    return Ok(());
+                }
+            }
             if database
                 .sms_exists_by_pdu(&message.dedup_marker)
                 .map_err(|error| VolteError::with_detail("volte_sms_db_failed", error.to_string()))?

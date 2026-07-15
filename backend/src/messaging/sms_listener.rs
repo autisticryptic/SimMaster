@@ -8,6 +8,7 @@ use crate::infra::db::{
 };
 use crate::cellular::modem_manager::{cache_smsc_for_identity, current_sim_identity, find_modem_path};
 use crate::notify::notification::NotificationSender;
+use crate::orchestrator::{message_fingerprint, MessageFingerprintInput};
 use futures_util::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -93,7 +94,8 @@ fn sms_marker(incoming: &IncomingSms) -> String {
 
 fn sms_timestamp(incoming: &IncomingSms, mode: SmsIngestMode) -> String {
     match mode {
-        SmsIngestMode::Live => beijing_sms_now_string(),
+        SmsIngestMode::Live => normalize_sms_timestamp_for_display(&incoming.timestamp)
+            .unwrap_or_else(beijing_sms_now_string),
         SmsIngestMode::Reconcile => normalize_sms_timestamp_for_display(&incoming.timestamp)
             .unwrap_or_else(beijing_sms_now_string),
     }
@@ -198,6 +200,7 @@ async fn process_sms_path(
     sms_path: &str,
     mode: SmsIngestMode,
     forward_reconciled_new_sms: bool,
+    config_manager: &ConfigManager,
 ) {
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
         return;
@@ -256,6 +259,29 @@ async fn process_sms_path(
         }
     }
 
+    let policy = config_manager.get_sms_path_policy();
+    if policy.dedupe_enabled {
+        let fingerprint = message_fingerprint(&MessageFingerprintInput {
+            service_center_timestamp: &timestamp,
+            originator: &incoming.number,
+            text: &incoming.content,
+            segment_reference: None,
+            segment_sequence: 1,
+            segment_total: 1,
+        });
+        match db.claim_sms_dedup(&fingerprint, "modem") {
+            Ok(true) => {}
+            Ok(false) => {
+                schedule_sms_delete(conn, modem_path, incoming.path);
+                return;
+            }
+            Err(error) => {
+                warn!(error = %error, "Failed to claim cross-transport SMS fingerprint");
+                return;
+            }
+        }
+    }
+
     match db.insert_sms_at(
         "incoming",
         &incoming.number,
@@ -303,6 +329,7 @@ async fn scan_sms_paths(
     modem_path: &str,
     reason: &str,
     forward_new_sms: bool,
+    config_manager: &ConfigManager,
 ) {
     match list_sms_paths(conn, modem_path).await {
         Ok(paths) => {
@@ -323,6 +350,7 @@ async fn scan_sms_paths(
                     &sms_path,
                     SmsIngestMode::Reconcile,
                     forward_new_sms,
+                    config_manager,
                 )
                 .await;
             }
@@ -365,7 +393,9 @@ async fn maybe_scan_sms_paths(
     forward_new_sms: bool,
     config_manager: &ConfigManager,
 ) {
-    if modem_sms_paused_for_ims(config_manager) {
+    if modem_sms_paused_for_ims(config_manager)
+        && !config_manager.get_sms_path_policy().cs_fallback_receiver
+    {
         debug!(
             reason = %reason,
             "Skipping ModemManager SMS scan while an IMS (VoWiFi/VoLTE) SMS path is active"
@@ -379,6 +409,7 @@ async fn maybe_scan_sms_paths(
         modem_path,
         reason,
         forward_new_sms,
+        config_manager,
     )
     .await;
 }
@@ -527,6 +558,15 @@ pub async fn start_sms_listener(
                                     continue;
                                 }
 
+                                if modem_sms_paused_for_ims(&config_manager)
+                                    && !config_manager
+                                        .get_sms_path_policy()
+                                        .cs_fallback_receiver
+                                {
+                                    debug!("Ignoring ModemManager SMS event while IMS owns reception");
+                                    continue;
+                                }
+
                                 let sms_path_str = sms_path.to_string();
                                 info!(path = %sms_path_str, "New SMS received");
 
@@ -540,6 +580,7 @@ pub async fn start_sms_listener(
                                     &sms_path_str,
                                     SmsIngestMode::Live,
                                     false,
+                                    &config_manager,
                                 )
                                 .await;
                             }

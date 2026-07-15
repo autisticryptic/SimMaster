@@ -2629,6 +2629,7 @@ async fn send_sms_over_volte_path(
         crate::access::volte::live::connect_live(
             &app.volte_runtime,
             &config,
+            app.config_manager.get_sms_path_policy().dedupe_enabled,
             Arc::clone(&app.database),
             Arc::clone(&app.notification_sender),
         )
@@ -4284,6 +4285,7 @@ pub async fn set_volte_connection_handler(
                 crate::access::volte::live::connect_live(
                     &app.volte_runtime,
                     &config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
                     Arc::clone(&app.database),
                     Arc::clone(&app.notification_sender),
                 )
@@ -4340,6 +4342,7 @@ pub async fn set_volte_ip_family_handler(
                 crate::access::volte::live::connect_live(
                     &app.volte_runtime,
                     &config,
+                    app.config_manager.get_sms_path_policy().dedupe_enabled,
                     Arc::clone(&app.database),
                     Arc::clone(&app.notification_sender),
                 )
@@ -4729,6 +4732,7 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                         match crate::access::volte::live::connect_live(
                             &app.volte_runtime,
                             &config,
+                            app.config_manager.get_sms_path_policy().dedupe_enabled,
                             Arc::clone(&app.database),
                             Arc::clone(&app.notification_sender),
                         )
