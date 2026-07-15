@@ -41,6 +41,45 @@ pub struct CallRecord {
     pub answered: bool,           // 是否接通
 }
 
+/// A call-screening/voicemail result. `recording_ref` is an opaque adapter
+/// token, never a host filesystem path exposed to the browser.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceInboxEntry {
+    pub id: i64,
+    pub session_id: String,
+    pub phone_number: String,
+    pub category: String,
+    pub action: String,
+    pub transcript: String,
+    pub verification_code: Option<String>,
+    pub recording_ref: Option<String>,
+    pub duration_seconds: u32,
+    pub confidence: Option<f32>,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+pub struct NewVoiceInboxEntry<'a> {
+    pub session_id: &'a str,
+    pub phone_number: &'a str,
+    pub category: &'a str,
+    pub action: &'a str,
+    pub transcript: &'a str,
+    pub verification_code: Option<&'a str>,
+    pub recording_ref: Option<&'a str>,
+    pub duration_seconds: u32,
+    pub confidence: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct VoiceInboxStats {
+    pub total: i64,
+    pub waiting: i64,
+    pub verification: i64,
+    pub marketing: i64,
+}
+
 /// 短信统计
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct SmsStats {
@@ -542,6 +581,70 @@ mod tests {
             .claim_sms_dedup("other-fp", "vowifi_ims")
             .expect("claim other"));
         assert_eq!(db.sms_dedup_count().expect("count"), 2);
+    }
+
+    #[test]
+    fn voice_inbox_upsert_is_idempotent_and_tracks_waiting() {
+        let db = test_database();
+        let id = db
+            .upsert_voice_inbox(NewVoiceInboxEntry {
+                session_id: "call-1",
+                phone_number: "+8613800138000",
+                category: "verification",
+                action: "voicemail",
+                transcript: "您的验证码是 123456",
+                verification_code: Some("123456"),
+                recording_ref: Some("recording-token-1"),
+                duration_seconds: 8,
+                confidence: Some(0.97),
+            })
+            .expect("insert voice inbox");
+        let updated_id = db
+            .upsert_voice_inbox(NewVoiceInboxEntry {
+                session_id: "call-1",
+                phone_number: "+8613800138000",
+                category: "verification",
+                action: "voicemail",
+                transcript: "您的登录验证码是 654321",
+                verification_code: Some("654321"),
+                recording_ref: None,
+                duration_seconds: 9,
+                confidence: Some(0.98),
+            })
+            .expect("update voice inbox");
+        assert_eq!(updated_id, id);
+
+        let entries = db.get_voice_inbox(20, 0).expect("list voice inbox");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].verification_code.as_deref(), Some("654321"));
+        assert_eq!(
+            entries[0].recording_ref.as_deref(),
+            Some("recording-token-1")
+        );
+        assert_eq!(db.get_voice_inbox_stats().unwrap().waiting, 1);
+        assert!(db.mark_voice_inbox_read(id, true).unwrap());
+        assert_eq!(db.get_voice_inbox_stats().unwrap().waiting, 0);
+    }
+
+    #[test]
+    fn voice_inbox_cleanup_enforces_max_entries() {
+        let db = test_database();
+        for index in 0..4 {
+            db.upsert_voice_inbox(NewVoiceInboxEntry {
+                session_id: &format!("cleanup-{index}"),
+                phone_number: "10086",
+                category: "ordinary",
+                action: "voicemail",
+                transcript: "test",
+                verification_code: None,
+                recording_ref: None,
+                duration_seconds: 1,
+                confidence: None,
+            })
+            .unwrap();
+        }
+        assert_eq!(db.cleanup_voice_inbox(30, 2).unwrap(), 2);
+        assert_eq!(db.get_voice_inbox_stats().unwrap().total, 2);
     }
 
     #[test]
@@ -1177,6 +1280,42 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_phone ON call_history(phone_number)",
+            [],
+        )?;
+
+        // Voice services: metadata/transcripts only. Audio storage is owned by
+        // a future media adapter and referenced by an opaque recording token.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS voice_inbox (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL UNIQUE,
+                phone_number TEXT NOT NULL,
+                category TEXT NOT NULL,
+                action TEXT NOT NULL,
+                transcript TEXT NOT NULL DEFAULT '',
+                verification_code TEXT,
+                recording_ref TEXT,
+                duration_seconds INTEGER NOT NULL DEFAULT 0,
+                confidence REAL,
+                status TEXT NOT NULL DEFAULT 'new',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_created_at
+             ON voice_inbox(created_at DESC, id DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_status
+             ON voice_inbox(status, created_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_voice_inbox_category
+             ON voice_inbox(category, created_at DESC)",
             [],
         )?;
 
@@ -3352,6 +3491,136 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM call_history", [])?;
         Ok(())
+    }
+
+    // ==================== 语音筛选 / 语音信箱 ====================
+
+    /// Idempotently store a transcript result. Media adapters may retry the
+    /// same callback, so `session_id` is unique and updates the existing row.
+    pub fn upsert_voice_inbox(&self, entry: NewVoiceInboxEntry<'_>) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO voice_inbox (
+                session_id, phone_number, category, action, transcript,
+                verification_code, recording_ref, duration_seconds, confidence,
+                status, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'new', ?10, ?10)
+             ON CONFLICT(session_id) DO UPDATE SET
+                phone_number = excluded.phone_number,
+                category = excluded.category,
+                action = excluded.action,
+                transcript = excluded.transcript,
+                verification_code = excluded.verification_code,
+                recording_ref = COALESCE(excluded.recording_ref, voice_inbox.recording_ref),
+                duration_seconds = excluded.duration_seconds,
+                confidence = excluded.confidence,
+                updated_at = excluded.updated_at",
+            params![
+                entry.session_id,
+                entry.phone_number,
+                entry.category,
+                entry.action,
+                entry.transcript,
+                entry.verification_code,
+                entry.recording_ref,
+                entry.duration_seconds,
+                entry.confidence,
+                now,
+            ],
+        )?;
+        conn.query_row(
+            "SELECT id FROM voice_inbox WHERE session_id = ?1",
+            params![entry.session_id],
+            |row| row.get(0),
+        )
+    }
+
+    pub fn get_voice_inbox(&self, limit: i64, offset: i64) -> Result<Vec<VoiceInboxEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, session_id, phone_number, category, action, transcript,
+                    verification_code, recording_ref, duration_seconds, confidence,
+                    status, created_at, updated_at
+             FROM voice_inbox
+             ORDER BY created_at DESC, id DESC
+             LIMIT ?1 OFFSET ?2",
+        )?;
+        let rows = stmt.query_map(params![limit.clamp(1, 500), offset.max(0)], |row| {
+            Ok(VoiceInboxEntry {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                phone_number: row.get(2)?,
+                category: row.get(3)?,
+                action: row.get(4)?,
+                transcript: row.get(5)?,
+                verification_code: row.get(6)?,
+                recording_ref: row.get(7)?,
+                duration_seconds: row.get::<_, i64>(8)?.max(0) as u32,
+                confidence: row.get(9)?,
+                status: row.get(10)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_voice_inbox_stats(&self) -> Result<VoiceInboxStats> {
+        let conn = self.conn.lock().unwrap();
+        Ok(VoiceInboxStats {
+            total: conn.query_row("SELECT COUNT(*) FROM voice_inbox", [], |row| row.get(0))?,
+            waiting: conn.query_row(
+                "SELECT COUNT(*) FROM voice_inbox WHERE status = 'new'",
+                [],
+                |row| row.get(0),
+            )?,
+            verification: conn.query_row(
+                "SELECT COUNT(*) FROM voice_inbox WHERE category = 'verification'",
+                [],
+                |row| row.get(0),
+            )?,
+            marketing: conn.query_row(
+                "SELECT COUNT(*) FROM voice_inbox WHERE category = 'marketing'",
+                [],
+                |row| row.get(0),
+            )?,
+        })
+    }
+
+    pub fn mark_voice_inbox_read(&self, id: i64, read: bool) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let now = Utc::now().to_rfc3339();
+        let changed = conn.execute(
+            "UPDATE voice_inbox SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![if read { "read" } else { "new" }, now, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn delete_voice_inbox(&self, id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute("DELETE FROM voice_inbox WHERE id = ?1", params![id])? > 0)
+    }
+
+    /// Bound long-running storage by age and row count. Returns deleted rows.
+    pub fn cleanup_voice_inbox(&self, retention_days: u32, max_entries: u32) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - Duration::days(retention_days.max(1) as i64)).to_rfc3339();
+        let by_age = conn.execute(
+            "DELETE FROM voice_inbox WHERE created_at < ?1",
+            params![cutoff],
+        )?;
+        let by_count = conn.execute(
+            "DELETE FROM voice_inbox
+             WHERE id IN (
+                SELECT id FROM voice_inbox
+                ORDER BY created_at DESC, id DESC
+                LIMIT -1 OFFSET ?1
+             )",
+            params![max_entries.max(1)],
+        )?;
+        Ok(by_age + by_count)
     }
 
     // ==================== 自动化运行日志相关方法 ====================

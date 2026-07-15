@@ -21,11 +21,12 @@ use crate::{
     cellular::modem_manager,
     infra::config::{
         AccessPathKind, ApnConfig, MidFlightDisablePolicy, SmsPathPolicy, VilteConfig,
-        VolteConfig, VolteIpFamilyPreference, VowifiConfig,
+        VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference, VowifiConfig,
     },
     infra::db::{
-        NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
-        VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
+        NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
+        VowifiEsimRestoreEntry, VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse,
+        VowifiSoakRunsResponse,
     },
     sim::esim::EsimApiError,
     api::models::*,
@@ -62,6 +63,10 @@ use crate::{
             verify_live_sim_auth_access,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
+    },
+    voice_services::{
+        screening::{decide_call, CallCategory},
+        MediaIngressCapabilities,
     },
 };
 
@@ -5000,11 +5005,370 @@ pub async fn get_vowifi_esim_restore_handler(
     }
 }
 
-pub async fn get_voicemail_status_handler() -> impl IntoResponse {
+pub async fn get_voicemail_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+    match app.database.get_voice_inbox_stats() {
+        Ok(stats) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VoicemailStatusResponse {
+                    waiting: stats.waiting > 0,
+                    message_count: stats.waiting.min(u8::MAX as i64) as u8,
+                    mailbox_number: "simadmin_voice_inbox".to_string(),
+                },
+            )),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VoicemailStatusResponse>::error(format!(
+                "Failed: {err}"
+            ))),
+        ),
+    }
+}
+
+pub async fn get_voice_services_status_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<VoiceServicesStatusResponse>>) {
     (
         StatusCode::OK,
-        Json(ApiResponse::<VoicemailStatusResponse>::error(
-            "Voicemail status is not exposed by ModemManager on this backend",
+        Json(ApiResponse::success_with_message(
+            "Success",
+            VoiceServicesStatusResponse {
+                config: app.config_manager.get_voice_services_config(),
+                voice_path: app.config_manager.get_voice_path_policy(),
+                media_ingress: MediaIngressCapabilities::unwired(),
+            },
+        )),
+    )
+}
+
+pub async fn set_voice_services_config_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceServicesConfig>,
+) -> (StatusCode, Json<ApiResponse<VoiceServicesConfig>>) {
+    match app.config_manager.set_voice_services_config(payload) {
+        Ok(config) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Saved", config)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn get_voice_path_policy_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<VoicePathPolicy>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_voice_path_policy(),
+        )),
+    )
+}
+
+pub async fn set_voice_path_policy_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoicePathPolicy>,
+) -> (StatusCode, Json<ApiResponse<VoicePathPolicy>>) {
+    match app.config_manager.set_voice_path_policy(payload) {
+        Ok(policy) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Saved", policy)),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn screen_voice_call_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceScreenRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<crate::voice_services::screening::CallScreeningDecision>>,
+) {
+    if payload.phone_number.trim().is_empty() || payload.phone_number.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid phone number")),
+        );
+    }
+    if payload
+        .transcript
+        .as_ref()
+        .is_some_and(|text| text.chars().count() > 10_000)
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Transcript is too long")),
+        );
+    }
+    let config = app.config_manager.get_voice_services_config();
+    let decision = decide_call(
+        &config,
+        &payload.phone_number,
+        payload.transcript.as_deref(),
+    );
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", decision)),
+    )
+}
+
+fn valid_recording_ref(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+}
+
+fn compact_voice_transcript(value: &str) -> String {
+    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = compact.chars();
+    let head: String = chars.by_ref().take(500).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
+pub async fn ingest_voice_transcript_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VoiceTranscriptIngestRequest>,
+) -> (StatusCode, Json<ApiResponse<VoiceTranscriptIngestResponse>>) {
+    let session_id = payload.session_id.trim();
+    let phone_number = payload.phone_number.trim();
+    let transcript = payload.transcript.trim();
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid session id")),
+        );
+    }
+    if phone_number.is_empty() || phone_number.chars().count() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid phone number")),
+        );
+    }
+    if transcript.is_empty() || transcript.chars().count() > 10_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid transcript length")),
+        );
+    }
+    if payload
+        .recording_ref
+        .as_deref()
+        .is_some_and(|value| !valid_recording_ref(value))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Invalid recording reference")),
+        );
+    }
+    if payload
+        .confidence
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("Confidence must be between 0 and 1")),
+        );
+    }
+
+    let config = app.config_manager.get_voice_services_config();
+    if !config.feature_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("Voice services are disabled")),
+        );
+    }
+    let decision = decide_call(&config, phone_number, Some(transcript));
+
+    // Ordinary calls configured for immediate forwarding are intentionally not
+    // retained: screening audio is transient unless policy diverts the call.
+    if decision.action == crate::infra::config::CallHandlingAction::Forward {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Forward without retention",
+                VoiceTranscriptIngestResponse {
+                    entry_id: 0,
+                    decision,
+                },
+            )),
+        );
+    }
+
+    let entry_id = match app.database.upsert_voice_inbox(NewVoiceInboxEntry {
+        session_id,
+        phone_number,
+        category: decision.category.as_str(),
+        action: decision.action.as_str(),
+        transcript,
+        verification_code: decision.verification_code.as_deref(),
+        recording_ref: payload.recording_ref.as_deref(),
+        duration_seconds: payload.duration_seconds.min(24 * 60 * 60),
+        confidence: payload.confidence,
+    }) {
+        Ok(id) => id,
+        Err(err) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {err}"))),
+            )
+        }
+    };
+    if let Err(err) = app
+        .database
+        .cleanup_voice_inbox(config.inbox_retention_days, config.inbox_max_entries)
+    {
+        warn!(error = %err, "Voice inbox cleanup failed");
+    }
+
+    let compact = compact_voice_transcript(transcript);
+    let (code, message) = match decision.category {
+        CallCategory::Verification => (
+            system_event_codes::VOICE_VERIFICATION_CAPTURED,
+            format!(
+                "来电 {phone_number} 的语音验证码：{}；转写：{compact}",
+                decision
+                    .verification_code
+                    .as_deref()
+                    .unwrap_or("未提取到数字")
+            ),
+        ),
+        CallCategory::Marketing => (
+            system_event_codes::VOICE_MARKETING_FILTERED,
+            format!("疑似营销来电 {phone_number} 已过滤；转写：{compact}"),
+        ),
+        _ => (
+            system_event_codes::VOICE_VOICEMAIL_RECEIVED,
+            format!("来自 {phone_number} 的语音留言：{compact}"),
+        ),
+    };
+    app.system_event_emitter
+        .emit_code(
+            code,
+            system_event_severity::INFO,
+            system_event_status::TRIGGERED,
+            phone_number,
+            message,
+        )
+        .await;
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Stored",
+            VoiceTranscriptIngestResponse { entry_id, decision },
+        )),
+    )
+}
+
+pub async fn get_voice_inbox_handler(
+    State(app): State<AppState>,
+    Query(query): Query<VoiceInboxQuery>,
+) -> (StatusCode, Json<ApiResponse<VoiceInboxListResponse>>) {
+    match (
+        app.database.get_voice_inbox(query.limit, query.offset),
+        app.database.get_voice_inbox_stats(),
+    ) {
+        (Ok(messages), Ok(stats)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                VoiceInboxListResponse { messages, stats },
+            )),
+        ),
+        (Err(err), _) | (_, Err(err)) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn set_voice_inbox_read_handler(
+    State(app): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<VoiceInboxReadRequest>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match app.database.mark_voice_inbox_read(id, payload.read) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Updated",
+                json!({ "updated": 1 }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Voice inbox message not found")),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn delete_voice_inbox_handler(
+    State(app): State<AppState>,
+    Path(id): Path<i64>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match app.database.delete_voice_inbox(id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Deleted",
+                json!({ "deleted": 1 }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("Voice inbox message not found")),
+        ),
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+pub async fn get_web_call_capabilities_handler(
+) -> (StatusCode, Json<ApiResponse<WebCallCapabilitiesResponse>>) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            WebCallCapabilitiesResponse {
+                available: false,
+                control_plane_ready: true,
+                ingress: MediaIngressCapabilities::unwired(),
+                recommended_adapter: "browser_webrtc_gateway".to_string(),
+                required_media_security: vec![
+                    "wss".to_string(),
+                    "webrtc_dtls_srtp".to_string(),
+                    "ice".to_string(),
+                    "short_lived_session_token".to_string(),
+                ],
+                note: "网页可作为独立内部话机，但浏览器不能直接收发 IMS SIP/RTP；需先接入可插拔 WebRTC 媒体网关。".to_string(),
+            },
         )),
     )
 }

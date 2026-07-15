@@ -30,6 +30,7 @@
 pub mod dedup;
 pub mod listener_election;
 pub mod sms_router;
+pub mod voice_router;
 
 // Re-exported as the module's public API surface; consumed by the live wiring
 // (and by tests) rather than within this file.
@@ -44,3 +45,5 @@ pub use sms_router::{
     plan_candidates, AttemptOutcome, Candidate, LegSendReadiness, RouteDecision, SendRouter,
     SkipReason,
 };
+#[allow(unused_imports)]
+pub use voice_router::{plan_voice_route, VoiceLegReadiness, VoiceRoutePlan, VoiceRouteRejection};
