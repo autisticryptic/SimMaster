@@ -502,9 +502,9 @@ async fn main() -> Result<()> {
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());
 
-    // Phase C: prune the cross-transport SMS dedup fingerprint table daily so
-    // long-running installs don't accumulate unbounded dedup rows. The
-    // retention window is user-configurable via the SMS path policy.
+    // Phase C: prune both dedup fingerprints and user-visible SMS history each
+    // day so long-running installs remain bounded. Both limits are
+    // user-configurable via the SMS path policy.
     {
         let cleanup_app = app_state.clone();
         tokio::spawn(async move {
@@ -513,7 +513,8 @@ async fn main() -> Result<()> {
             // Small startup delay so the first sweep doesn't race with boot.
             tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
             loop {
-                let retention_days = config_manager.get_sms_path_policy().dedup_retention_days;
+                let policy = config_manager.get_sms_path_policy();
+                let retention_days = policy.dedup_retention_days;
                 match db.cleanup_sms_dedup(retention_days) {
                     Ok(deleted) if deleted > 0 => {
                         tracing::info!(
@@ -525,6 +526,19 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(err) => {
                         tracing::warn!(error = %err, "Failed to prune SMS dedup fingerprints");
+                    }
+                }
+                match db.prune_sms_messages(policy.message_retention_limit) {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(
+                            deleted,
+                            message_retention_limit = policy.message_retention_limit,
+                            "Pruned oldest SMS history rows"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(error = %err, "Failed to prune SMS history rows");
                     }
                 }
                 tokio::time::sleep(tokio::time::Duration::from_secs(24 * 60 * 60)).await;

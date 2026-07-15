@@ -626,7 +626,7 @@ fn default_sms_template() -> String {
     r#"{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\n号码: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n来源: {{own_number}}"
+    "text": "📱 短信通知\n号码: {{phone_number}}\n内容: {{content}}\n时间: {{timestamp}}\n路径: {{transport}}\n来源: {{own_number}}"
   }
 }"#
     .to_string()
@@ -663,7 +663,7 @@ fn default_update_template() -> String {
 }
 
 fn default_plain_sms_template() -> String {
-    "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}"
+    "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}"
         .to_string()
 }
 
@@ -1128,7 +1128,7 @@ fn webhook_text_template(template: &str, fallback: &str) -> String {
 pub fn default_rule_template(event_type: NotificationEventType) -> String {
     match event_type {
         NotificationEventType::Sms => {
-            "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}".to_string()
+            "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}".to_string()
         }
         NotificationEventType::Ddns => {
             "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()
@@ -1298,6 +1298,7 @@ mod tests {
             MidFlightDisablePolicy::AutoSwitch
         );
         assert_eq!(policy.dedup_retention_days, 30);
+        assert_eq!(policy.message_retention_limit, 10_000);
     }
 
     #[test]
@@ -1367,6 +1368,25 @@ mod tests {
         assert!(cfg.sms_path.dedupe_enabled);
         assert_eq!(cfg.sms_path.priority.len(), 1);
         assert_eq!(cfg.sms_path.priority[0].kind, AccessPathKind::Cs);
+    }
+
+    #[test]
+    fn sms_path_policy_normalizes_retention_bounds() {
+        let policy = SmsPathPolicy {
+            dedup_retention_days: 0,
+            message_retention_limit: u32::MAX,
+            ..SmsPathPolicy::default()
+        }
+        .normalized();
+        assert_eq!(policy.dedup_retention_days, 1);
+        assert_eq!(policy.message_retention_limit, 100_000);
+
+        let minimum = SmsPathPolicy {
+            message_retention_limit: 0,
+            ..SmsPathPolicy::default()
+        }
+        .normalized();
+        assert_eq!(minimum.message_retention_limit, 100);
     }
 
     #[test]
@@ -1985,10 +2005,19 @@ pub struct SmsPathPolicy {
     /// Retention window (days) for dedup fingerprint rows before cleanup.
     #[serde(default = "default_sms_dedup_retention_days")]
     pub dedup_retention_days: u32,
+    /// Maximum number of user-visible SMS rows retained in SQLite. Oldest rows
+    /// are pruned after the limit is exceeded so long-running devices cannot
+    /// grow the database without bound.
+    #[serde(default = "default_sms_message_retention_limit")]
+    pub message_retention_limit: u32,
 }
 
 fn default_sms_dedup_retention_days() -> u32 {
     30
+}
+
+fn default_sms_message_retention_limit() -> u32 {
+    10_000
 }
 
 impl Default for SmsPathPolicy {
@@ -1999,6 +2028,7 @@ impl Default for SmsPathPolicy {
             cs_fallback_receiver: false,
             mid_flight_disable: MidFlightDisablePolicy::AutoSwitch,
             dedup_retention_days: default_sms_dedup_retention_days(),
+            message_retention_limit: default_sms_message_retention_limit(),
         }
     }
 }
@@ -2050,6 +2080,8 @@ impl SmsPathPolicy {
             }
         }
         self.priority = deduped;
+        self.dedup_retention_days = self.dedup_retention_days.clamp(1, 3650);
+        self.message_retention_limit = self.message_retention_limit.clamp(100, 100_000);
         self
     }
 }

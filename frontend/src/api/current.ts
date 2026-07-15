@@ -615,7 +615,7 @@ class SimAdminCurrentAPI {
   }
 
   async sendSms(phoneNumber: string, content: string) {
-    return request<ApiResponse<{ path: string }>>('/sms/send', {
+    return request<ApiResponse<{ path: string; transport?: string }>>('/sms/send', {
       method: 'POST',
       body: JSON.stringify({ phone_number: phoneNumber, content }),
     })

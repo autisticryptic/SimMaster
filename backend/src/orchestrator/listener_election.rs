@@ -103,6 +103,7 @@ mod tests {
             cs_fallback_receiver: cs_fallback,
             mid_flight_disable: MidFlightDisablePolicy::AutoSwitch,
             dedup_retention_days: 30,
+            message_retention_limit: 10_000,
         }
         .normalized()
     }

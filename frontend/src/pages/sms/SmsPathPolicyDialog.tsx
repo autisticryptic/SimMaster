@@ -103,6 +103,12 @@ export default function SmsPathPolicyDialog({ open, onClose }: Props) {
               onChange={(event) => setPolicy({ ...policy, dedup_retention_days: Math.max(1, Math.min(3650, Number(event.target.value) || 1)) })}
               inputProps={{ min: 1, max: 3650 }} sx={{ mt: 2 }}
             />
+            <TextField
+              fullWidth type="number" label="短信数据库最多保留条数" value={policy.message_retention_limit}
+              helperText="超过上限后自动删除最旧记录；基带短信在成功入库后独立删除。"
+              onChange={(event) => setPolicy({ ...policy, message_retention_limit: Math.max(100, Math.min(100000, Number(event.target.value) || 100)) })}
+              inputProps={{ min: 100, max: 100000, step: 100 }} sx={{ mt: 2 }}
+            />
           </>
         )}
       </DialogContent>

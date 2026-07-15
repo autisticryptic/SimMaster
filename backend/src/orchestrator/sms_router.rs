@@ -172,6 +172,7 @@ mod tests {
             cs_fallback_receiver: false,
             mid_flight_disable: mid_flight,
             dedup_retention_days: 30,
+            message_retention_limit: 10_000,
         }
         .normalized()
     }

@@ -150,7 +150,7 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
 }
 
 export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
-  sms: '📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n来源: {{本机号码}}',
+  sms: '📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}',
   ddns: 'DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}',
   version_update: '🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}',
   system_event: DEFAULT_SYSTEM_EVENT_TEMPLATE,
@@ -168,6 +168,7 @@ export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[
     { label: '运营商', token: '{{运营商}}' },
     { label: '短信方向', token: '{{短信方向}}' },
     { label: '短信状态', token: '{{短信状态}}' },
+    { label: '短信途径', token: '{{短信途径}}' },
   ],
   ddns: [
     { label: '域名', token: '{{域名}}' },

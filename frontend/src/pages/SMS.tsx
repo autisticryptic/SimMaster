@@ -80,6 +80,17 @@ function compareSmsNewestFirst(a: SmsMessage, b: SmsMessage): number {
   return smsTimestampMillis(b.timestamp) - smsTimestampMillis(a.timestamp) || b.id - a.id
 }
 
+function smsTransportInfo(transport?: string) {
+  switch (transport) {
+    case 'vowifi_ims':
+      return { label: 'VoWiFi', color: '#2aae67' }
+    case 'volte_ims':
+      return { label: 'VoLTE', color: '#1976d2' }
+    default:
+      return { label: 'CS', color: '#6b7280' }
+  }
+}
+
 function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
   const groups = new Map<string, SmsMessage[]>()
 
@@ -408,7 +419,8 @@ export default function SMSPage() {
     try {
       const response = await api.sendSms(phoneNumber, content)
       if (response.status === 'ok') {
-        setSuccess(`短信已发送到 ${phoneNumber}`)
+        const path = smsTransportInfo(response.data?.transport ?? response.data?.path).label
+        setSuccess(`短信已通过 ${path} 发送到 ${phoneNumber}`)
         setContent('')
         setTimeout(() => {
           void fetchMessages()
@@ -883,6 +895,7 @@ export default function SMSPage() {
                     secondary={
                       <Typography variant="body2" color="text.secondary" noWrap sx={{ maxWidth: 180 }}>
                         {displayMessage.direction === 'outgoing' ? '你: ' : ''}
+                        [{smsTransportInfo(displayMessage.transport).label}] {' '}
                         {renderHighlightedText(displayMessage.content, searchTerm)}
                       </Typography>
                     }
@@ -1031,40 +1044,22 @@ export default function SMSPage() {
                     >
                       {formatTime(msg.timestamp)}
                     </Typography>
-                    {msg.direction === 'incoming' && msg.transport === 'vowifi_ims' && (
-                      <Chip
-                        label="WiFi Calling"
-                        size="small"
-                        sx={{
-                          height: 16,
-                          fontSize: '0.65rem',
-                          bgcolor: '#2aae67',
-                          color: 'white',
-                          borderRadius: 0.5,
-                          px: 0.5,
-                          ml: 0.5,
-                        }}
-                      />
-                    )}
+                    <Chip
+                      label={smsTransportInfo(msg.transport).label}
+                      size="small"
+                      sx={{
+                        height: 16,
+                        fontSize: '0.65rem',
+                        bgcolor: smsTransportInfo(msg.transport).color,
+                        color: 'white',
+                        borderRadius: 0.5,
+                        px: 0.5,
+                        ml: 0.5,
+                      }}
+                    />
                     {msg.direction === 'outgoing' && (
                       msg.status === 'sent' ? (
-                        <>
-                          <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff', mr: msg.transport === 'vowifi_ims' ? 0.5 : 0 }} />
-                          {msg.transport === 'vowifi_ims' && (
-                            <Chip
-                              label="WiFi Calling"
-                              size="small"
-                              sx={{
-                                height: 16,
-                                fontSize: '0.65rem',
-                                bgcolor: '#2aae67',
-                                color: 'white',
-                                borderRadius: 0.5,
-                                px: 0.5,
-                              }}
-                            />
-                          )}
-                        </>
+                        <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff' }} />
                       ) : msg.status === 'failed' ? (
                         <Chip label="失败" size="small" color="error" sx={{ height: 16, fontSize: '0.65rem' }} />
                       ) : null

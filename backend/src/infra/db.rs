@@ -759,6 +759,54 @@ mod tests {
     }
 
     #[test]
+    fn sms_retention_keeps_newest_rows_and_unlinks_delivery_diagnostics() {
+        let db = test_database();
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            ids.push(
+                db.insert_sms(
+                    "incoming",
+                    "10086",
+                    &format!("message-{index}"),
+                    "received",
+                    Some(&format!("marker-{index}")),
+                )
+                .unwrap(),
+            );
+        }
+        db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+            message_id: "msg-pruned",
+            trace_id: "trace-pruned",
+            direction: "mobile_terminated",
+            state: "received",
+            sip_state: "accepted",
+            rpdu_ack: "acked",
+            delivery_reported: true,
+            failure_cause: None,
+            retry_count: 0,
+            api_sms_id: Some(ids[0]),
+        })
+        .unwrap();
+
+        assert_eq!(db.prune_sms_messages(3).unwrap(), 2);
+        let messages = db.get_sms_messages(10, 0, None).unwrap();
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            vec![ids[4], ids[3], ids[2]]
+        );
+        assert_eq!(
+            db.get_vowifi_sms_delivery("msg-pruned")
+                .unwrap()
+                .unwrap()
+                .api_sms_id,
+            None
+        );
+    }
+
+    #[test]
     fn sms_lists_use_id_as_timestamp_tiebreaker() {
         let db = test_database();
 
@@ -2354,6 +2402,32 @@ impl Database {
             "DELETE FROM sms_dedup WHERE created_at < ?1",
             params![cutoff],
         )?;
+        Ok(deleted)
+    }
+
+    /// Keep only the newest `max_messages` user-visible SMS rows. Diagnostic
+    /// delivery rows are retained, but their API foreign-key-like reference is
+    /// cleared before the corresponding SMS row is removed.
+    pub fn prune_sms_messages(&self, max_messages: u32) -> Result<usize> {
+        let max_messages = i64::from(max_messages.max(1));
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE vowifi_sms_delivery
+             SET api_sms_id = NULL
+             WHERE api_sms_id IN (
+                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![max_messages],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM sms_messages
+             WHERE id IN (
+                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+             )",
+            params![max_messages],
+        )?;
+        tx.commit()?;
         Ok(deleted)
     }
 

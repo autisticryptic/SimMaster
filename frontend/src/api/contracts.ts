@@ -509,6 +509,7 @@ export interface SmsPathPolicy {
   cs_fallback_receiver: boolean
   mid_flight_disable: 'auto_switch' | 'fail'
   dedup_retention_days: number
+  message_retention_limit: number
 }
 
 export interface VoicePathPolicy {
@@ -933,7 +934,7 @@ export interface NotificationQueueResponse {
 export const DEFAULT_SMS_TEMPLATE = `{
   "msg_type": "text",
   "content": {
-    "text": "📱 短信通知\\n号码: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n来源: {{own_number}}"
+    "text": "📱 短信通知\\n号码: {{phone_number}}\\n内容: {{content}}\\n时间: {{timestamp}}\\n路径: {{transport}}\\n来源: {{own_number}}"
   }
 }`
 
@@ -962,6 +963,7 @@ export const DEFAULT_PLAIN_SMS_TEMPLATE = `📱 短信通知
 号码: {{phone_number}}
 内容: {{content}}
 时间: {{timestamp}}
+路径: {{transport}}
 来源: {{own_number}}`
 
 export const DEFAULT_PLAIN_CALL_TEMPLATE = `📞 来电通知

@@ -144,9 +144,12 @@ impl NotificationEvent<'_> {
 
     fn summary(&self) -> String {
         match self {
-            NotificationEvent::Sms { message, .. } => {
-                compact_summary(&format!("[{}] {}", message.phone_number, message.content))
-            }
+            NotificationEvent::Sms { message, .. } => compact_summary(&format!(
+                "[{}][{}] {}",
+                sms_transport_label(&message.transport),
+                message.phone_number,
+                message.content
+            )),
             NotificationEvent::Ddns(event) => compact_summary(&format!(
                 "{} {} {}",
                 event.domains.join(", "),
@@ -179,6 +182,7 @@ impl NotificationEvent<'_> {
                 }
                 "direction" => message.direction.clone(),
                 "status" => message.status.clone(),
+                "transport" | "path" => sms_transport_label(&message.transport).to_string(),
                 _ => self.summary(),
             },
             NotificationEvent::Ddns(event) => match field {
@@ -2852,6 +2856,7 @@ fn render_sms_template(
     };
     let timestamp = render_time_value(&message.timestamp, escape_json);
     let verification_code = extract_verification_code(&message.content).unwrap_or_default();
+    let transport = sms_transport_label(&message.transport);
 
     let rendered = template
         .replace("{{id}}", &message.id.to_string())
@@ -2872,6 +2877,11 @@ fn render_sms_template(
         .replace("{{status}}", &message.status)
         .replace("{{短信状态}}", &message.status)
         .replace("{{状态}}", &message.status)
+        .replace("{{transport}}", transport)
+        .replace("{{path}}", transport)
+        .replace("{{短信途径}}", transport)
+        .replace("{{短信路径}}", transport)
+        .replace("{{传输方式}}", transport)
         .replace("{{sender}}", &message.phone_number)
         .replace("{{message}}", &content)
         .replace("{{time}}", &timestamp)
@@ -2879,6 +2889,14 @@ fn render_sms_template(
         .replace("{{operator}}", &carrier)
         .replace("{{运营商}}", &carrier);
     replace_own_number(rendered, &own_number)
+}
+
+fn sms_transport_label(transport: &str) -> &'static str {
+    match transport.trim() {
+        "vowifi_ims" => "VoWiFi",
+        "volte_ims" => "VoLTE",
+        _ => "CS",
+    }
 }
 
 fn format_own_numbers_for_template(numbers: &[String]) -> String {
@@ -3237,6 +3255,36 @@ mod tests {
             ),
             "248521|248521"
         );
+    }
+
+    #[test]
+    fn renders_human_readable_sms_transport_variables() {
+        let context = SmsTemplateContext::default();
+        for (stored, expected) in [
+            ("modem", "CS"),
+            ("volte_ims", "VoLTE"),
+            ("vowifi_ims", "VoWiFi"),
+        ] {
+            let message = SmsMessage {
+                id: 1,
+                direction: "incoming".to_string(),
+                phone_number: "10086".to_string(),
+                content: "test".to_string(),
+                timestamp: "2026-07-15 18:00:00".to_string(),
+                status: "received".to_string(),
+                pdu: None,
+                transport: stored.to_string(),
+            };
+            assert_eq!(
+                render_sms_template(
+                    "{{短信途径}}|{{短信路径}}|{{transport}}|{{path}}",
+                    &message,
+                    &context,
+                    false,
+                ),
+                format!("{expected}|{expected}|{expected}|{expected}")
+            );
+        }
     }
 
     #[test]
