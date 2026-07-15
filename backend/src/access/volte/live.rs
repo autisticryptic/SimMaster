@@ -470,6 +470,20 @@ async fn connect_family(
         }
     };
     let service_route = register_service_route(&registration.response);
+    let associated_uri = register_associated_uri(&registration.response);
+    let mut registered_identity = device_identity.ims.clone();
+    if let Some(uri) = associated_uri.as_deref() {
+        // The network-provided default public user identity is authoritative
+        // after REGISTER.  In particular, operators commonly authenticate
+        // with the IMSI-derived IMPU but require subsequent MESSAGE requests
+        // to use the MSISDN-associated IMPU in From/P-Preferred-Identity.
+        registered_identity.public_uri = uri.to_string();
+    }
+    tracing::info!(
+        service_route_present = service_route.is_some(),
+        associated_uri_present = associated_uri.is_some(),
+        "VoLTE IMS registration routing identities captured"
+    );
     if authenticator.mode == RegistrationMode::Udp {
         runtime
             .update(|state| state.stage = VolteStage::RegisterUdp)
@@ -477,7 +491,7 @@ async fn connect_family(
     }
     Ok(VolteLiveSession {
         channel,
-        identity: device_identity.ims.clone(),
+        identity: registered_identity,
         service_route,
         bearer: bearer.clone(),
         pcscf: pcscf_socket(pcscf),
@@ -839,6 +853,40 @@ fn register_service_route(response: &[u8]) -> Option<String> {
     })
 }
 
+/// Return the network-selected default public user identity from REGISTER.
+/// P-Associated-URI is an ordered list (possibly repeated across header lines),
+/// so the first supported URI is the default identity for later requests.
+fn register_associated_uri(response: &[u8]) -> Option<String> {
+    for value in sip::header_values(response, "P-Associated-URI") {
+        let mut remainder = value.as_str();
+        while let Some(start) = remainder.find('<') {
+            let after_start = &remainder[start + 1..];
+            let Some(end) = after_start.find('>') else {
+                break;
+            };
+            let uri = after_start[..end].trim();
+            if supported_associated_uri(uri) {
+                return Some(uri.to_string());
+            }
+            remainder = &after_start[end + 1..];
+        }
+
+        for entry in value.split(',') {
+            if let Some(uri) = crate::ims::sip_frame::uri_from_header_value(entry) {
+                let uri = uri.trim();
+                if supported_associated_uri(uri) {
+                    return Some(uri.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn supported_associated_uri(uri: &str) -> bool {
+    uri.starts_with("sip:") || uri.starts_with("sips:") || uri.starts_with("tel:")
+}
+
 fn mo_sms_uris(
     recipient: &str,
     service_center: &str,
@@ -1040,6 +1088,25 @@ mod tests {
             Some("<sip:pcscf.example:9900;lr>")
         );
         assert!(register_service_route(b"SIP/2.0 200 OK\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn register_default_associated_uri_is_preserved_for_later_requests() {
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+8613800138000@ims.example;user=phone>, <tel:+8613800138000>\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            register_associated_uri(response).as_deref(),
+            Some("sip:+8613800138000@ims.example;user=phone")
+        );
+        assert!(register_associated_uri(b"SIP/2.0 200 OK\r\n\r\n").is_none());
+    }
+
+    #[test]
+    fn register_associated_uri_accepts_repeated_bare_tel_header() {
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: tel:+8613800138000\r\nP-Associated-URI: <sip:460001234567890@ims.example>\r\n\r\n";
+        assert_eq!(
+            register_associated_uri(response).as_deref(),
+            Some("tel:+8613800138000")
+        );
     }
 
     #[test]
