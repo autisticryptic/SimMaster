@@ -797,10 +797,16 @@ fn gsm7_septets(text: &str) -> Option<Vec<u8>> {
 }
 
 fn pack_gsm7_with_udh(udh: &[u8], septets: &[u8]) -> Vec<u8> {
-    let mut out = vec![0u8; (udh.len() * 8 + septets.len() * 7).div_ceil(8)];
+    // GSM 03.38 text following a UDH starts on the next septet boundary, not
+    // immediately after the last UDH bit.  A six-octet concatenation header
+    // therefore occupies seven septets (49 bits), leaving one fill bit between
+    // the 48-bit header and the first character.
+    let header_septets = (udh.len() * 8).div_ceil(7);
+    let text_bit_offset = header_septets * 7;
+    let mut out = vec![0u8; (text_bit_offset + septets.len() * 7).div_ceil(8)];
     out[..udh.len()].copy_from_slice(udh);
     for (index, septet) in septets.iter().copied().enumerate() {
-        write_septet(&mut out, udh.len() * 8 + index * 7, septet);
+        write_septet(&mut out, text_bit_offset + index * 7, septet);
     }
     out
 }
@@ -1984,5 +1990,29 @@ mod tests {
                 "SMS snapshot must not expose {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn gsm7_long_mo_sms_round_trips_text_after_udh_fill_bit() {
+        let text = "SimAdmin multipart round trip. ".repeat(7);
+        let submissions = build_mo_submissions("+8613800138000", &text, "+8613800100500").unwrap();
+        assert!(submissions.len() > 1);
+
+        let mut decoded = String::new();
+        for submission in submissions {
+            let body = &submission.body;
+            let service_center_len = usize::from(body[3]);
+            let tpdu_len_offset = 4 + service_center_len;
+            let tpdu_len = usize::from(body[tpdu_len_offset]);
+            let tpdu = &body[tpdu_len_offset + 1..tpdu_len_offset + 1 + tpdu_len];
+            let destination_digits = usize::from(tpdu[2]);
+            let destination_octets = 1 + destination_digits.div_ceil(2);
+            let udl_offset = 3 + destination_octets + 2;
+            let udl = usize::from(tpdu[udl_offset]);
+            let user_data = &tpdu[udl_offset + 1..];
+            decoded.push_str(&decode_gsm7_user_data(user_data, udl, 6));
+        }
+
+        assert_eq!(decoded, text);
     }
 }
