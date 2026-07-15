@@ -4081,7 +4081,13 @@ pub async fn set_volte_connection_handler(
     {
         Ok(config) => {
             let result = if payload.enabled {
-                crate::access::volte::live::connect_live(&app.volte_runtime, &config).await
+                crate::access::volte::live::connect_live(
+                    &app.volte_runtime,
+                    &config,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await
             } else {
                 Ok(crate::access::volte::live::disconnect_live(
                     &app.volte_runtime,
@@ -4131,7 +4137,13 @@ pub async fn set_volte_ip_family_handler(
                     "volte_ip_family_changed",
                 )
                 .await;
-                crate::access::volte::live::connect_live(&app.volte_runtime, &config).await
+                crate::access::volte::live::connect_live(
+                    &app.volte_runtime,
+                    &config,
+                    Arc::clone(&app.database),
+                    Arc::clone(&app.notification_sender),
+                )
+                .await
             } else {
                 Ok(app.volte_runtime.status().await)
             };

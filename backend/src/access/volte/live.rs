@@ -6,7 +6,7 @@
 
 use std::{
     net::{IpAddr, SocketAddr},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -14,6 +14,7 @@ use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 
 use crate::{
+    infra::db::{Database, SmsMessage},
     ims::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
@@ -21,6 +22,7 @@ use crate::{
         ImsError,
     },
     infra::config::VolteConfig,
+    notify::notification::NotificationSender,
 };
 
 use super::{
@@ -37,6 +39,7 @@ use super::{
     pcscf::{discover_pcscf, discover_pcscf_via_at, pcscf_socket},
     runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
     sip::{self, ImsIdentity, RequestIds},
+    sms::{MtIngest, MtReassembler, TRANSPORT_TAG},
 };
 
 const MODEM_ID: &str = "0";
@@ -46,6 +49,7 @@ const UIM_SLOT: u8 = 1;
 const REGISTER_EXPIRES: u32 = 3600;
 
 static LIVE_SESSION: OnceLock<Mutex<Option<VolteLiveSession>>> = OnceLock::new();
+static LIVE_LISTENER: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
 
 struct VolteLiveSession {
     channel: VolteSipChannel,
@@ -256,8 +260,10 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
 /// Establish the dedicated IMS bearer and REGISTER session. This is serialized
 /// by the runtime guard and is safe to call repeatedly.
 pub async fn connect_live(
-    runtime: &VolteRuntime,
+    runtime: &Arc<VolteRuntime>,
     config: &VolteConfig,
+    database: Arc<Database>,
+    notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
     if !config.feature_enabled || !config.connection_enabled {
         return Err(VolteError::new(code::RUNTIME_NOT_RUNNING));
@@ -301,6 +307,13 @@ pub async fn connect_live(
                     state.data_path_mode = Some(data_path_mode);
                 })
                 .await;
+            start_live_listener(
+                Arc::clone(runtime),
+                database,
+                notification_sender,
+                generation,
+            )
+            .await;
             Ok(runtime.status().await)
         }
         Err(error) => {
@@ -449,7 +462,15 @@ async fn connect_family(
 }
 
 /// Tear down only resources owned by the current VoLTE session.
-pub async fn disconnect_live(runtime: &VolteRuntime, reason: &str) -> VolteRuntimeStatus {
+pub async fn disconnect_live(runtime: &Arc<VolteRuntime>, reason: &str) -> VolteRuntimeStatus {
+    if let Some(listener) = LIVE_LISTENER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .await
+        .take()
+    {
+        listener.abort();
+    }
     let session = LIVE_SESSION
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -464,6 +485,193 @@ pub async fn disconnect_live(runtime: &VolteRuntime, reason: &str) -> VolteRunti
     }
     runtime.reset_runtime(reason).await;
     runtime.status().await
+}
+
+async fn start_live_listener(
+    runtime: Arc<VolteRuntime>,
+    database: Arc<Database>,
+    notification_sender: Arc<NotificationSender>,
+    generation: u64,
+) {
+    let mut listener = LIVE_LISTENER
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .await;
+    if let Some(previous) = listener.take() {
+        previous.abort();
+    }
+    *listener = Some(tokio::spawn(async move {
+        live_receive_loop(runtime, database, notification_sender, generation).await;
+    }));
+}
+
+async fn live_receive_loop(
+    runtime: Arc<VolteRuntime>,
+    database: Arc<Database>,
+    notification_sender: Arc<NotificationSender>,
+    generation: u64,
+) {
+    let mut reassembler = MtReassembler::new();
+    loop {
+        if runtime.generation() != generation {
+            break;
+        }
+        let frame = {
+            let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+            let Some(session) = sessions.as_mut() else {
+                break;
+            };
+            match session.channel.recv_sip(Duration::from_secs(1)).await {
+                Ok(frame) => frame,
+                Err(error) if error.code() == "volte_channel_read_timeout" => continue,
+                Err(error) => {
+                    tracing::warn!(error = %error, "VoLTE protected SIP receive failed");
+                    runtime
+                        .update(|state| {
+                            state.last_error = Some(error.to_string());
+                            state.last_failure_at = Some(now());
+                        })
+                        .await;
+                    break;
+                }
+            }
+        };
+        runtime
+            .update(|state| state.last_rx_at = Some(now()))
+            .await;
+        if let Err(error) = handle_live_frame(
+            &runtime,
+            &database,
+            &notification_sender,
+            &mut reassembler,
+            &frame,
+        )
+        .await
+        {
+            tracing::warn!(error = %error, "VoLTE protected SIP frame handling failed");
+        }
+    }
+}
+
+async fn handle_live_frame(
+    runtime: &Arc<VolteRuntime>,
+    database: &Arc<Database>,
+    notification_sender: &Arc<NotificationSender>,
+    reassembler: &mut MtReassembler,
+    frame: &[u8],
+) -> Result<(), VolteError> {
+    if !sip::is_request(frame, "MESSAGE") {
+        if let Ok(sip_status) = sip::parse_status(frame) {
+            tracing::debug!(sip_status, "VoLTE protected SIP response received");
+            return Ok(());
+        }
+        let (status, reason) = if sip::is_request(frame, "INVITE") {
+            (480, "Temporarily Unavailable")
+        } else {
+            (200, "OK")
+        };
+        let response = sip::build_response(frame, status, reason, None, None, None);
+        send_live_frame(runtime, &response).await?;
+        return Ok(());
+    }
+
+    // Complete the SIP transaction before parsing/storing the RP-DATA.
+    let response = sip::build_response(frame, 200, "OK", None, None, None);
+    send_live_frame(runtime, &response).await?;
+
+    let deliver = crate::ims::sms_codec::parse_mt_rp_data(sip::sip_body(frame))
+        .map_err(|_| VolteError::new("volte_mt_rp_data_invalid"))?;
+    let rp_ack_body = crate::ims::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
+    let rp_ack = {
+        let sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+        let session = sessions
+            .as_ref()
+            .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+        sip::build_rp_ack(
+            &session.identity,
+            &session.channel.route(),
+            frame,
+            &rp_ack_body,
+            &session.identity.public_uri,
+            session.channel.security_verify(),
+        )
+    };
+    send_live_frame(runtime, &rp_ack).await?;
+    tracing::info!(
+        originator_len = deliver.originator.len(),
+        body_bytes = sip::sip_body(frame).len(),
+        "VoLTE MT SMS received and RP-ACK submitted"
+    );
+
+    match reassembler.ingest_deliver(deliver) {
+        MtIngest::Complete(message) => {
+            if database
+                .sms_exists_by_pdu(&message.dedup_marker)
+                .map_err(|error| VolteError::with_detail("volte_sms_db_failed", error.to_string()))?
+            {
+                runtime.update(|state| state.duplicate_count += 1).await;
+                return Ok(());
+            }
+            let timestamp = if message.service_center_timestamp.trim().is_empty() {
+                crate::infra::db::beijing_sms_now_string()
+            } else {
+                message.service_center_timestamp.clone()
+            };
+            let id = database
+                .insert_sms_at_with_transport(
+                    "incoming",
+                    &message.originator,
+                    &message.text,
+                    &timestamp,
+                    "received",
+                    Some(&message.dedup_marker),
+                    TRANSPORT_TAG,
+                )
+                .map_err(|error| VolteError::with_detail("volte_sms_db_failed", error.to_string()))?;
+            runtime.update(|state| state.received_count += 1).await;
+            let sms = SmsMessage {
+                id,
+                direction: "incoming".to_string(),
+                phone_number: message.originator,
+                content: message.text,
+                timestamp,
+                status: "received".to_string(),
+                pdu: Some(message.dedup_marker),
+                transport: TRANSPORT_TAG.to_string(),
+            };
+            let notification_sender = Arc::clone(notification_sender);
+            tokio::spawn(async move {
+                let _ = notification_sender.forward_sms(&sms).await;
+            });
+            tracing::info!(segment_total = message.segment_total, "Stored VoLTE MT SMS");
+        }
+        MtIngest::Buffered {
+            reference,
+            have,
+            total,
+        } => {
+            tracing::debug!(reference, have, total, "Buffered VoLTE MT multipart segment");
+        }
+        MtIngest::ParseError => return Err(VolteError::new("volte_mt_rp_data_invalid")),
+    }
+    Ok(())
+}
+
+async fn send_live_frame(
+    runtime: &Arc<VolteRuntime>,
+    frame: &[u8],
+) -> Result<(), VolteError> {
+    let mut sessions = LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await;
+    let session = sessions
+        .as_mut()
+        .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+    session
+        .channel
+        .send_sip(frame)
+        .await
+        .map_err(map_channel_error)?;
+    runtime.update(|state| state.last_tx_at = Some(now())).await;
+    Ok(())
 }
 
 fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, VolteError> {
