@@ -211,6 +211,7 @@ pub fn build_register_with_security_policy(
 pub fn build_sms_message(
     identity: &ImsIdentity,
     route: &SipRoute,
+    service_route: Option<&str>,
     request_uri: &str,
     to_uri: &str,
     body: &[u8],
@@ -221,11 +222,11 @@ pub fn build_sms_message(
     let call_id = format!("{}@simadmin", hex_token(16));
     let from_tag = hex_token(8);
     let to_value = format!("<{to_uri}>");
+    let route_value = service_route
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()));
     let mut headers = vec![
-        SipHeader::new(
-            "Route",
-            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
-        ),
+        SipHeader::new("Route", route_value),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
         SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
         SipHeader::new("P-Preferred-Service", SMS_ICSI),
@@ -234,6 +235,7 @@ pub fn build_sms_message(
         headers.push(SipHeader::new("Security-Verify", sv));
     }
     headers.push(SipHeader::new("Accept-Contact", "*;+g.3gpp.smsip"));
+    headers.push(SipHeader::new("Accept", SMS_CONTENT_TYPE));
     headers.push(SipHeader::new("User-Agent", USER_AGENT));
     headers.push(SipHeader::new("Content-Type", SMS_CONTENT_TYPE));
     crate::ims::sip_message::build_message(&SipRequest {
@@ -257,6 +259,7 @@ pub fn build_sms_message(
 pub fn build_rp_ack(
     identity: &ImsIdentity,
     route: &SipRoute,
+    service_route: Option<&str>,
     inbound_frame: &[u8],
     body: &[u8],
     fallback_uri: &str,
@@ -267,6 +270,7 @@ pub fn build_rp_ack(
     build_sms_message(
         identity,
         route,
+        service_route,
         &request_uri,
         &request_uri,
         body,
@@ -736,8 +740,9 @@ mod tests {
         let frame = build_sms_message(
             &ident(),
             &route_udp(),
-            "sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org",
-            "sip:+8613800138000@ims.mnc000.mcc460.3gppnetwork.org",
+            Some("<sip:service-route.example:9900;lr>"),
+            "sip:+8613800100500@ims.mnc000.mcc460.3gppnetwork.org",
+            "sip:+8619399144749@ims.mnc000.mcc460.3gppnetwork.org",
             &body,
             None,
         );
@@ -745,6 +750,12 @@ mod tests {
         assert_eq!(sip_body(&frame), &body[..]);
         let text = String::from_utf8_lossy(&frame);
         assert!(text.contains("Content-Type: application/vnd.3gpp.sms\r\n"));
+        assert!(text.contains("Accept: application/vnd.3gpp.sms\r\n"));
+        assert!(text.contains("Route: <sip:service-route.example:9900;lr>\r\n"));
+        assert!(text.starts_with(
+            "MESSAGE sip:+8613800100500@ims.mnc000.mcc460.3gppnetwork.org SIP/2.0\r\n"
+        ));
+        assert!(text.contains("To: <sip:+8619399144749@ims.mnc000.mcc460.3gppnetwork.org>\r\n"));
         assert!(text.contains("Content-Length: 4\r\n"));
         assert!(text.contains("Accept-Contact: *;+g.3gpp.smsip\r\n"));
     }
@@ -813,6 +824,7 @@ mod tests {
         let frame = build_rp_ack(
             &ident(),
             &route_udp(),
+            None,
             inbound,
             &[0x02, 0x00],
             "sip:fallback@h",

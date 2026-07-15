@@ -54,6 +54,7 @@ static LIVE_LISTENER: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = Onc
 struct VolteLiveSession {
     channel: VolteSipChannel,
     identity: ImsIdentity,
+    service_route: Option<String>,
     bearer: BearerConnection,
     pcscf: SocketAddr,
     ip_family: &'static str,
@@ -459,13 +460,16 @@ async fn connect_family(
         offered_binding,
         channel.route(),
     );
-    let registration = run_register(&mut channel, &initial, &mut authenticator).await;
-    if let Err(error) = registration {
-        if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-            ipsec::uninstall_plan(plan);
+    let registration = match run_register(&mut channel, &initial, &mut authenticator).await {
+        Ok(registration) => registration,
+        Err(error) => {
+            if let Some(plan) = authenticator.xfrm_plan.as_ref() {
+                ipsec::uninstall_plan(plan);
+            }
+            return Err(map_register_error(error));
         }
-        return Err(map_register_error(error));
-    }
+    };
+    let service_route = register_service_route(&registration.response);
     if authenticator.mode == RegistrationMode::Udp {
         runtime
             .update(|state| state.stage = VolteStage::RegisterUdp)
@@ -474,6 +478,7 @@ async fn connect_family(
     Ok(VolteLiveSession {
         channel,
         identity: device_identity.ims.clone(),
+        service_route,
         bearer: bearer.clone(),
         pcscf: pcscf_socket(pcscf),
         ip_family: ip_family_name(local_addr),
@@ -635,6 +640,7 @@ async fn handle_live_frame(
         sip::build_rp_ack(
             &session.identity,
             &session.channel.route(),
+            session.service_route.as_deref(),
             frame,
             &rp_ack_body,
             &session.identity.public_uri,
@@ -783,6 +789,7 @@ pub async fn send_live_sms(
         let frame = sip::build_sms_message(
             &session.identity,
             &session.channel.route(),
+            session.service_route.as_deref(),
             &service_center_uri,
             &recipient_uri,
             &submission.body,
@@ -802,6 +809,13 @@ pub async fn send_live_sms(
         let sip_status = sip::parse_status(&response)?;
         runtime.update(|state| state.last_rx_at = Some(now())).await;
         if !(200..300).contains(&sip_status) {
+            tracing::warn!(
+                sip_status,
+                reason = ?sip::header_value(&response, "Reason"),
+                warning = ?sip::header_value(&response, "Warning"),
+                service_route_present = session.service_route.is_some(),
+                "VoLTE MO SMS SIP MESSAGE rejected"
+            );
             return Err(VolteError::with_detail(
                 "volte_sms_message_rejected",
                 sip_status.to_string(),
@@ -815,6 +829,13 @@ pub async fn send_live_sms(
         trace_id,
         part_count,
         sip_statuses,
+    })
+}
+
+fn register_service_route(response: &[u8]) -> Option<String> {
+    sip::header_value(response, "Service-Route").and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
     })
 }
 
@@ -1009,6 +1030,16 @@ mod tests {
             mo_sms_uris("+8619399144749", "+8613800100500", "ims.example").unwrap();
         assert_eq!(request_uri, "sip:+8613800100500@ims.example;user=phone");
         assert_eq!(to_uri, "sip:+8619399144749@ims.example;user=phone");
+    }
+
+    #[test]
+    fn register_service_route_is_preserved_for_later_requests() {
+        let response = b"SIP/2.0 200 OK\r\nService-Route: <sip:pcscf.example:9900;lr>\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            register_service_route(response).as_deref(),
+            Some("<sip:pcscf.example:9900;lr>")
+        );
+        assert!(register_service_route(b"SIP/2.0 200 OK\r\n\r\n").is_none());
     }
 
     #[test]
