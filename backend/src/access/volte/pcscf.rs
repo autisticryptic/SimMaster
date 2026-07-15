@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::net::UdpSocket;
+use tokio::{net::UdpSocket, process::Command, time::sleep};
 
 use crate::infra::config::VolteIpFamilyPreference;
 
@@ -28,6 +28,9 @@ const DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const DNS_PORT: u16 = 53;
 const SIP_PORT: u16 = 5060;
 const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
+const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
+const DEFAULT_IMS_CID: u8 = 2;
+const AT_CONTEXT_SETTLE: Duration = Duration::from_secs(3);
 
 /// Parsed IP settings for the IMS bearer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -129,6 +132,165 @@ pub fn parse_ip_settings(block: &str) -> ImsIpSettings {
         }
     }
     s
+}
+
+/// Ask a Qualcomm modem to request IMS P-CSCF PCO fields for a temporary PDP
+/// context, then read those fields through +CGCONTRDP.
+///
+/// $QCPDPIMSCFGE=<cid>,1,1,1 is the Qualcomm control that makes the missing
+/// P-CSCF address fields appear in CGCONTRDP on devices where ModemManager's
+/// QMI Get Current Settings reports PCSCF Address Using PCO: false.
+pub async fn discover_pcscf_via_at(
+    modem: &str,
+    preference: VolteIpFamilyPreference,
+) -> Vec<IpAddr> {
+    let cid = std::env::var(ENV_IMS_CID)
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(DEFAULT_IMS_CID);
+
+    for pdp_type in ordered_pdp_types(preference) {
+        if let Ok(candidates) = probe_pcscf_context(modem, cid, pdp_type).await {
+            if !candidates.is_empty() {
+                return candidates;
+            }
+        }
+    }
+    Vec::new()
+}
+
+async fn probe_pcscf_context(
+    modem: &str,
+    cid: u8,
+    pdp_type: &str,
+) -> Result<Vec<IpAddr>, VolteError> {
+    let restore_context = run_at(modem, "AT+CGDCONT?")
+        .await
+        .ok()
+        .and_then(|output| cgdccont_restore_command(&output, cid))
+        .unwrap_or_else(|| format!("AT+CGDCONT={cid},\"IPV4V6\",\"\""));
+    let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
+    run_at(
+        modem,
+        &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\""),
+    )
+    .await?;
+    run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},1,1,1")).await?;
+    if let Err(error) = run_at(modem, &format!("AT+CGACT=1,{cid}")).await {
+        cleanup_pcscf_context(modem, cid, &restore_context).await;
+        return Err(error);
+    }
+    sleep(AT_CONTEXT_SETTLE).await;
+    let settings = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await;
+    cleanup_pcscf_context(modem, cid, &restore_context).await;
+    settings.map(|output| parse_cgcontrdp_pcscf(&output, cid))
+}
+
+async fn cleanup_pcscf_context(modem: &str, cid: u8, restore_context: &str) {
+    let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
+    let _ = run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},0,0,0")).await;
+    let _ = run_at(modem, restore_context).await;
+}
+
+async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
+    let argument = format!("--command={command}");
+    let output = Command::new("mmcli")
+        .args(["-m", modem, &argument])
+        .output()
+        .await
+        .map_err(|error| {
+            VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("mmcli:{error}"))
+        })?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Err(VolteError::with_detail(
+            code::COMMAND_FAILED,
+            format!("mmcli:{}", output.status.code().unwrap_or(-1)),
+        ))
+    }
+}
+
+fn ordered_pdp_types(preference: VolteIpFamilyPreference) -> &'static [&'static str] {
+    match preference {
+        VolteIpFamilyPreference::Ipv6First => &["IPV6", "IP"],
+        VolteIpFamilyPreference::Ipv4First => &["IP", "IPV6"],
+        VolteIpFamilyPreference::Ipv6Only => &["IPV6"],
+        VolteIpFamilyPreference::Ipv4Only => &["IP"],
+    }
+}
+
+fn cgdccont_restore_command(output: &str, expected_cid: u8) -> Option<String> {
+    for line in output.lines() {
+        let Some((_, values)) = line.split_once("+CGDCONT:") else {
+            continue;
+        };
+        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
+        if fields.len() < 3 || fields[0].parse::<u8>().ok() != Some(expected_cid) {
+            continue;
+        }
+        let pdp_type = fields[1].trim_matches('"');
+        let apn = fields[2].trim_matches('"');
+        if !pdp_type.is_empty() {
+            return Some(format!(
+                "AT+CGDCONT={expected_cid},\"{pdp_type}\",\"{apn}\""
+            ));
+        }
+    }
+    None
+}
+
+/// Parse the primary/secondary P-CSCF columns from a 3GPP +CGCONTRDP response.
+/// Qualcomm renders IPv6 values as 16 dot-separated decimal octets.
+pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8) -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    for line in output.lines() {
+        let Some((_, values)) = line.split_once("+CGCONTRDP:") else {
+            continue;
+        };
+        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
+        if fields.len() < 8 || fields[0].parse::<u8>().ok() != Some(expected_cid) {
+            continue;
+        }
+        for field in fields.iter().skip(7).take(2) {
+            for address in parse_cgcontrdp_addresses(field) {
+                if !candidates.contains(&address) {
+                    candidates.push(address);
+                }
+            }
+        }
+    }
+    candidates
+}
+
+fn parse_cgcontrdp_addresses(field: &str) -> Vec<IpAddr> {
+    field
+        .trim_matches(|character| character == '\'' || character == '"')
+        .split_whitespace()
+        .filter_map(parse_cgcontrdp_address)
+        .collect()
+}
+
+fn parse_cgcontrdp_address(value: &str) -> Option<IpAddr> {
+    if let Ok(address) = value.parse::<IpAddr>() {
+        return Some(address);
+    }
+    let octets: Vec<u8> = value
+        .split('.')
+        .map(str::parse::<u8>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match octets.len() {
+        4 => Some(IpAddr::V4(Ipv4Addr::new(
+            octets[0], octets[1], octets[2], octets[3],
+        ))),
+        16 => {
+            let bytes: [u8; 16] = octets.try_into().ok()?;
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
 }
 
 /// Discover a P-CSCF without changing the system resolver. IMS APNs commonly
@@ -519,6 +681,49 @@ IPv4 primary DNS: 10.0.0.53";
             parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
             vec![v6, v4]
         );
+    }
+
+    #[test]
+    fn parses_qualcomm_cgcontrdp_pcscf_columns() {
+        let response = "response: '+CGCONTRDP: 2,5,ims,36.14.87.128.10.128.45.91.1.2.3.4.5.6.7.8,36.14.87.128.10.128.45.91.8.7.6.5.4.3.2.1,36.14.0.90.0.0.0.0.0.0.0.0.0.102.102.36,36.14.0.91.0.0.0.0.0.0.0.0.0.102.102.254,36.14.0.46.130.1.192.0.0.9.0.0.0.0.0.1,36.14.0.46.130.1.192.0.0.9.0.0.0.0.0.2'";
+        assert_eq!(
+            parse_cgcontrdp_pcscf(response, 2),
+            vec![
+                "240e:2e:8201:c000:9::1".parse::<IpAddr>().unwrap(),
+                "240e:2e:8201:c000:9::2".parse::<IpAddr>().unwrap(),
+            ]
+        );
+        assert!(parse_cgcontrdp_pcscf(response, 3).is_empty());
+    }
+
+    #[test]
+    fn at_probe_family_order_matches_runtime_preference() {
+        assert_eq!(
+            ordered_pdp_types(VolteIpFamilyPreference::Ipv6First),
+            &["IPV6", "IP"]
+        );
+        assert_eq!(
+            ordered_pdp_types(VolteIpFamilyPreference::Ipv4First),
+            &["IP", "IPV6"]
+        );
+        assert_eq!(
+            ordered_pdp_types(VolteIpFamilyPreference::Ipv6Only),
+            &["IPV6"]
+        );
+        assert_eq!(
+            ordered_pdp_types(VolteIpFamilyPreference::Ipv4Only),
+            &["IP"]
+        );
+    }
+
+    #[test]
+    fn temporary_at_probe_restores_original_pdp_context() {
+        let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"ctnet\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV6\",\"private-ims\",\"0.0.0.0\",0,0'";
+        assert_eq!(
+            cgdccont_restore_command(contexts, 2).as_deref(),
+            Some("AT+CGDCONT=2,\"IPV6\",\"private-ims\"")
+        );
+        assert!(cgdccont_restore_command(contexts, 3).is_none());
     }
 
     #[test]

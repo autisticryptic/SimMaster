@@ -33,7 +33,7 @@ use super::{
     errors::{code, VolteError},
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
-    pcscf::{discover_pcscf, pcscf_socket},
+    pcscf::{discover_pcscf, discover_pcscf_via_at, pcscf_socket},
     runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
     sip::{self, ImsIdentity, RequestIds},
 };
@@ -310,8 +310,17 @@ async fn connect_inner(
     let device_identity = load_device_identity().await?;
     ensure_generation(runtime, generation)?;
 
+    runtime.update(|state| state.stage = VolteStage::Pcscf).await;
+    let at_pcscf = discover_pcscf_via_at(MODEM_ID, config.ip_family_preference).await;
+    ensure_generation(runtime, generation)?;
+
     runtime.update(|state| state.stage = VolteStage::Bearer).await;
-    let bearer = ensure_ims_bearer(MODEM_ID, &BearerRequest::default()).await?;
+    let mut bearer = ensure_ims_bearer(MODEM_ID, &BearerRequest::default()).await?;
+    for candidate in at_pcscf {
+        if !bearer.settings.pcscf.contains(&candidate) {
+            bearer.settings.pcscf.push(candidate);
+        }
+    }
     let result = async {
         configure_bearer_network(&bearer).await?;
         ensure_generation(runtime, generation)?;
