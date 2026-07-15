@@ -778,12 +778,13 @@ pub async fn send_live_sms(
         let session = sessions
             .as_mut()
             .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
-        let service_center_uri = phone_uri(service_center, &session.identity.home_domain)?;
+        let (service_center_uri, recipient_uri) =
+            mo_sms_uris(recipient, service_center, &session.identity.home_domain)?;
         let frame = sip::build_sms_message(
             &session.identity,
             &session.channel.route(),
             &service_center_uri,
-            &service_center_uri,
+            &recipient_uri,
             &submission.body,
             session.channel.security_verify(),
         );
@@ -815,6 +816,17 @@ pub async fn send_live_sms(
         part_count,
         sip_statuses,
     })
+}
+
+fn mo_sms_uris(
+    recipient: &str,
+    service_center: &str,
+    domain: &str,
+) -> Result<(String, String), VolteError> {
+    Ok((
+        phone_uri(service_center, domain)?,
+        phone_uri(recipient, domain)?,
+    ))
 }
 
 fn phone_uri(number: &str, domain: &str) -> Result<String, VolteError> {
@@ -989,6 +1001,14 @@ mod tests {
         );
         assert!(phone_uri("+86-138", "ims.example").is_err());
         assert!(phone_uri("", "ims.example").is_err());
+    }
+
+    #[test]
+    fn mo_sms_routes_via_service_center_but_targets_recipient() {
+        let (request_uri, to_uri) =
+            mo_sms_uris("+8619399144749", "+8613800100500", "ims.example").unwrap();
+        assert_eq!(request_uri, "sip:+8613800100500@ims.example;user=phone");
+        assert_eq!(to_uri, "sip:+8619399144749@ims.example;user=phone");
     }
 
     #[test]
