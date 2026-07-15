@@ -1482,6 +1482,29 @@ mod tests {
     }
 
     #[test]
+    fn volte_ip_family_preference_defaults_and_round_trips() {
+        let defaulted: VolteConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            defaulted.ip_family_preference,
+            VolteIpFamilyPreference::Ipv6First
+        );
+
+        let configured: VolteConfig =
+            serde_json::from_str(r#"{"ip_family_preference":"ipv4_first"}"#).unwrap();
+        assert_eq!(
+            configured.ip_family_preference,
+            VolteIpFamilyPreference::Ipv4First
+        );
+        assert_eq!(
+            serde_json::to_value(configured)
+                .unwrap()
+                .get("ip_family_preference")
+                .and_then(serde_json::Value::as_str),
+            Some("ipv4_first")
+        );
+    }
+
+    #[test]
     fn vowifi_connection_intent_requires_feature_switch() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-vowifi-config-{}-{}.json",
@@ -1734,6 +1757,32 @@ fn default_volte_auto_restore_retry_delay_secs() -> u64 {
     30
 }
 
+/// Address-family selection for the dedicated VoLTE IMS bearer.
+///
+/// The bearer itself is requested as dual-stack. `*_first` controls the
+/// ordered P-CSCF discovery/REGISTER attempts, while `*_only` is useful for
+/// operators or diagnostics that require one family strictly.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VolteIpFamilyPreference {
+    #[default]
+    Ipv6First,
+    Ipv4First,
+    Ipv6Only,
+    Ipv4Only,
+}
+
+impl VolteIpFamilyPreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ipv6First => "ipv6_first",
+            Self::Ipv4First => "ipv4_first",
+            Self::Ipv6Only => "ipv6_only",
+            Self::Ipv4Only => "ipv4_only",
+        }
+    }
+}
+
 /// VoLTE (IMS over LTE) SMS configuration.
 ///
 /// `feature_enabled` + `sms_enabled` mirror the observed persisted config on the
@@ -1750,6 +1799,8 @@ pub struct VolteConfig {
     pub voice_enabled: bool,
     #[serde(default)]
     pub connection_enabled: bool,
+    #[serde(default)]
+    pub ip_family_preference: VolteIpFamilyPreference,
     #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
     pub auto_restore_initial_delay_secs: u64,
     #[serde(default = "default_volte_auto_restore_attempts")]
@@ -1765,6 +1816,7 @@ impl Default for VolteConfig {
             sms_enabled: default_volte_sms_enabled(),
             voice_enabled: default_volte_voice_enabled(),
             connection_enabled: false,
+            ip_family_preference: VolteIpFamilyPreference::default(),
             auto_restore_initial_delay_secs: default_volte_auto_restore_initial_delay_secs(),
             auto_restore_attempts: default_volte_auto_restore_attempts(),
             auto_restore_retry_delay_secs: default_volte_auto_restore_retry_delay_secs(),
@@ -2324,6 +2376,19 @@ impl ConfigManager {
                 return Err("volte_feature_disabled".to_string());
             }
             c.volte.connection_enabled = enabled;
+            c.volte.clone()
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn set_volte_ip_family_preference(
+        &self,
+        preference: VolteIpFamilyPreference,
+    ) -> Result<VolteConfig, String> {
+        let next = {
+            let mut c = self.config.write().unwrap();
+            c.volte.ip_family_preference = preference;
             c.volte.clone()
         };
         self.save()?;

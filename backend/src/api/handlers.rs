@@ -19,7 +19,10 @@ use zbus::Connection;
 
 use crate::{
     cellular::modem_manager,
-    infra::config::{ApnConfig, SmsPathPolicy, VilteConfig, VolteConfig, VowifiConfig},
+    infra::config::{
+        ApnConfig, SmsPathPolicy, VilteConfig, VolteConfig, VolteIpFamilyPreference,
+        VowifiConfig,
+    },
     infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
@@ -3992,6 +3995,11 @@ pub struct VolteControlToggleRequest {
     pub enabled: bool,
 }
 
+#[derive(Deserialize)]
+pub struct VolteIpFamilyPreferenceRequest {
+    pub preference: VolteIpFamilyPreference,
+}
+
 /// Combined VoLTE control response: persisted config + live runtime snapshot.
 /// The `runtime` field carries the `volteStatus.js`-contract fields; `enabled`
 /// mirrors the frontend `m()` helper (`feature_enabled && sms_enabled`).
@@ -4001,6 +4009,7 @@ pub struct VolteControlResponse {
     pub feature_enabled: bool,
     pub sms_enabled: bool,
     pub connection_enabled: bool,
+    pub ip_family_preference: VolteIpFamilyPreference,
     pub runtime: crate::access::volte::VolteRuntimeStatus,
 }
 
@@ -4011,6 +4020,7 @@ impl VolteControlResponse {
             feature_enabled: config.feature_enabled,
             sms_enabled: config.sms_enabled,
             connection_enabled: config.connection_enabled,
+            ip_family_preference: config.ip_family_preference,
             runtime,
         }
     }
@@ -4078,6 +4088,52 @@ pub async fn set_volte_connection_handler(
                     "volte_connection_disabled",
                 )
                 .await)
+            };
+            let runtime = app.volte_runtime.status().await;
+            let response = VolteControlResponse::build(&config, runtime);
+            match result {
+                Ok(_) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message("Success", response)),
+                ),
+                Err(error) => (
+                    StatusCode::OK,
+                    Json(ApiResponse::<VolteControlResponse>::error(format!(
+                        "Failed: {error}"
+                    ))),
+                ),
+            }
+        }
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<VolteControlResponse>::error(format!(
+                "Failed: {error}"
+            ))),
+        ),
+    }
+}
+
+/// Change the preferred IMS address family. If a live connection is enabled,
+/// reconnect it so the new ordered family policy takes effect immediately.
+pub async fn set_volte_ip_family_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VolteIpFamilyPreferenceRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    let _guard = app.volte_connect_lock.lock().await;
+    match app
+        .config_manager
+        .set_volte_ip_family_preference(payload.preference)
+    {
+        Ok(config) => {
+            let result = if config.connection_enabled {
+                crate::access::volte::live::disconnect_live(
+                    &app.volte_runtime,
+                    "volte_ip_family_changed",
+                )
+                .await;
+                crate::access::volte::live::connect_live(&app.volte_runtime, &config).await
+            } else {
+                Ok(app.volte_runtime.status().await)
             };
             let runtime = app.volte_runtime.status().await;
             let response = VolteControlResponse::build(&config, runtime);

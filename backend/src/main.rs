@@ -861,6 +861,10 @@ async fn main() -> Result<()> {
             post(set_volte_connection_handler).options(options_handler),
         )
         .route(
+            "/api/volte/ip-family",
+            post(set_volte_ip_family_handler).options(options_handler),
+        )
+        .route(
             "/api/volte/call/status",
             get(get_volte_call_status_handler).options(options_handler),
         )

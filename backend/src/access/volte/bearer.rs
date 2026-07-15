@@ -207,38 +207,42 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
         .await?;
     }
 
-    match bearer.local_addr()? {
-        IpAddr::V6(address) => {
-            let prefix = bearer.ipv6_prefix.unwrap_or(64);
-            let address = format!("{address}/{prefix}");
-            run_ip(&[
-                "-6",
-                "address",
-                "replace",
-                &address,
-                "dev",
-                &bearer.interface,
-            ])
-            .await?;
-            for dns in &bearer.settings.ipv6_dns {
-                route_host(&bearer.interface, *dns).await?;
-            }
+    let mut configured = false;
+    if let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address {
+        let prefix = bearer.ipv6_prefix.unwrap_or(64);
+        let address = format!("{address}/{prefix}");
+        run_ip(&[
+            "-6",
+            "address",
+            "replace",
+            &address,
+            "dev",
+            &bearer.interface,
+        ])
+        .await?;
+        for dns in &bearer.settings.ipv6_dns {
+            route_host(&bearer.interface, *dns).await?;
         }
-        IpAddr::V4(address) => {
-            let prefix = bearer.ipv4_prefix.unwrap_or(32);
-            let address = format!("{address}/{prefix}");
-            run_ip(&[
-                "address",
-                "replace",
-                &address,
-                "dev",
-                &bearer.interface,
-            ])
-            .await?;
-            for dns in &bearer.settings.ipv4_dns {
-                route_host(&bearer.interface, *dns).await?;
-            }
+        configured = true;
+    }
+    if let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address {
+        let prefix = bearer.ipv4_prefix.unwrap_or(32);
+        let address = format!("{address}/{prefix}");
+        run_ip(&[
+            "address",
+            "replace",
+            &address,
+            "dev",
+            &bearer.interface,
+        ])
+        .await?;
+        for dns in &bearer.settings.ipv4_dns {
+            route_host(&bearer.interface, *dns).await?;
         }
+        configured = true;
+    }
+    if !configured {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     }
     Ok(())
 }
@@ -431,6 +435,49 @@ bearer.ipv6-config.mtu                   : 1500
         assert_eq!(bearer.settings.ipv6_dns.len(), 2);
         assert_eq!(bearer.ipv6_prefix, Some(64));
         assert_eq!(bearer.mtu, Some(1500));
+    }
+
+    #[test]
+    fn parses_dual_stack_bearer_without_dropping_either_family() {
+        let output = r#"
+bearer.status.connected                  : yes
+bearer.status.interface                  : wwan0
+bearer.properties.apn                    : ims
+bearer.ipv4-config.address               : 10.23.4.5
+bearer.ipv4-config.prefix                : 30
+bearer.ipv4-config.gateway               : 10.23.4.6
+bearer.ipv4-config.dns.value[1]          : 10.23.4.53
+bearer.ipv6-config.address               : 2001:db8:1::20
+bearer.ipv6-config.prefix                : 64
+bearer.ipv6-config.gateway               : 2001:db8:1::1
+bearer.ipv6-config.dns.value[1]          : 2001:db8:53::1
+bearer.ipv6-config.mtu                   : 1428
+"#;
+        let bearer = parse_bearer_connection(
+            "/org/freedesktop/ModemManager1/Bearer/9",
+            output,
+        )
+        .unwrap();
+
+        assert_eq!(
+            bearer.settings.ipv4_address,
+            Some("10.23.4.5".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            bearer.settings.ipv6_address,
+            Some("2001:db8:1::20".parse::<IpAddr>().unwrap())
+        );
+        assert_eq!(
+            bearer.settings.ipv4_dns,
+            vec!["10.23.4.53".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            bearer.settings.ipv6_dns,
+            vec!["2001:db8:53::1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(bearer.ipv4_prefix, Some(30));
+        assert_eq!(bearer.ipv6_prefix, Some(64));
+        assert_eq!(bearer.mtu, Some(1428));
     }
 
     #[test]

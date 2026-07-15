@@ -20,6 +20,8 @@ use std::{
 
 use tokio::net::UdpSocket;
 
+use crate::infra::config::VolteIpFamilyPreference;
+
 use super::errors::{code, VolteError};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
@@ -46,24 +48,55 @@ impl ImsIpSettings {
         self.ipv6_address.or(self.ipv4_address)
     }
 
+    /// Available bearer addresses in the configured attempt order.
+    pub fn ordered_local_addrs(
+        &self,
+        preference: VolteIpFamilyPreference,
+    ) -> Vec<IpAddr> {
+        let mut addresses = Vec::with_capacity(2);
+        match preference {
+            VolteIpFamilyPreference::Ipv6First => {
+                push_optional_addr(&mut addresses, self.ipv6_address);
+                push_optional_addr(&mut addresses, self.ipv4_address);
+            }
+            VolteIpFamilyPreference::Ipv4First => {
+                push_optional_addr(&mut addresses, self.ipv4_address);
+                push_optional_addr(&mut addresses, self.ipv6_address);
+            }
+            VolteIpFamilyPreference::Ipv6Only => {
+                push_optional_addr(&mut addresses, self.ipv6_address);
+            }
+            VolteIpFamilyPreference::Ipv4Only => {
+                push_optional_addr(&mut addresses, self.ipv4_address);
+            }
+        }
+        addresses
+    }
+
     /// Return an explicit P-CSCF delivered by the bearer PCO.
     ///
     /// DNS server addresses must never be returned here. Some Qualcomm
     /// devices expose public carrier resolvers in the IMS bearer DNS slots;
     /// sending SIP REGISTER to those addresses produces a misleading timeout.
-    pub fn resolve_pcscf(&self) -> Result<IpAddr, VolteError> {
-        if let Some(p) = self.pcscf.first() {
-            return Ok(*p);
+    pub fn resolve_pcscf_for(&self, local: IpAddr) -> Result<IpAddr, VolteError> {
+        if let Some(p) = self
+            .pcscf
+            .iter()
+            .copied()
+            .find(|candidate| same_family(local, *candidate))
+        {
+            return Ok(p);
         }
         Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
     }
 
     /// Validate the family invariant: local addr and P-CSCF must share family.
-    pub fn ensure_family_match(&self, pcscf: IpAddr) -> Result<IpAddr, VolteError> {
-        let local = self
-            .local_addr()
-            .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
-        if std::mem::discriminant(&local) != std::mem::discriminant(&pcscf) {
+    pub fn ensure_family_match(
+        &self,
+        local: IpAddr,
+        pcscf: IpAddr,
+    ) -> Result<IpAddr, VolteError> {
+        if !same_family(local, pcscf) {
             return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
         }
         Ok(pcscf)
@@ -104,19 +137,20 @@ pub fn parse_ip_settings(block: &str) -> ImsIpSettings {
 pub async fn discover_pcscf(
     settings: &ImsIpSettings,
     home_domain: &str,
+    local: IpAddr,
 ) -> Result<IpAddr, VolteError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
-        if let Ok(address) = explicit.trim().parse::<IpAddr>() {
-            return settings.ensure_family_match(address);
+        if let Some(address) = parse_pcscf_override(&explicit)
+            .into_iter()
+            .find(|candidate| same_family(local, *candidate))
+        {
+            return settings.ensure_family_match(local, address);
         }
     }
-    if let Some(address) = settings.pcscf.first().copied() {
-        return settings.ensure_family_match(address);
+    if let Ok(address) = settings.resolve_pcscf_for(local) {
+        return settings.ensure_family_match(local, address);
     }
 
-    let local = settings
-        .local_addr()
-        .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
     let dns_servers = if local.is_ipv6() {
         &settings.ipv6_dns
     } else {
@@ -337,6 +371,32 @@ fn push_addr(list: &mut Vec<IpAddr>, value: &str) {
     }
 }
 
+fn push_optional_addr(list: &mut Vec<IpAddr>, value: Option<IpAddr>) {
+    if let Some(value) = value {
+        if !list.contains(&value) {
+            list.push(value);
+        }
+    }
+}
+
+fn same_family(left: IpAddr, right: IpAddr) -> bool {
+    left.is_ipv4() == right.is_ipv4()
+}
+
+fn parse_pcscf_override(value: &str) -> Vec<IpAddr> {
+    value
+        .split(|character: char| {
+            character == ',' || character == ';' || character.is_whitespace()
+        })
+        .filter_map(|candidate| candidate.trim().parse::<IpAddr>().ok())
+        .fold(Vec::new(), |mut addresses, address| {
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+            addresses
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -370,11 +430,31 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn local_addr_prefers_ipv6() {
+    fn address_order_honors_preference_and_strict_modes() {
         let s = parse_ip_settings(SAMPLE);
         assert_eq!(
-            s.local_addr(),
-            Some(IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()))
+            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6First),
+            vec![
+                IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+            ]
+        );
+        assert_eq!(
+            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4First),
+            vec![
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+                IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+            ]
+        );
+        assert_eq!(
+            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6Only),
+            vec![IpAddr::V6(
+                "2001:db8::2".parse::<Ipv6Addr>().unwrap()
+            )]
+        );
+        assert_eq!(
+            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4Only),
+            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
     }
 
@@ -382,12 +462,15 @@ IPv4 primary DNS: 10.0.0.53";
     fn resolve_pcscf_accepts_only_explicit_pco_address() {
         let mut s = parse_ip_settings(SAMPLE);
         assert_eq!(
-            s.resolve_pcscf().unwrap_err().code(),
+            s.resolve_pcscf_for(IpAddr::V6("2001:db8::2".parse().unwrap()))
+                .unwrap_err()
+                .code(),
             code::RUNTIME_ALL_PCSCF_FAILED
         );
         s.pcscf.push(IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap()));
         assert_eq!(
-            s.resolve_pcscf().unwrap(),
+            s.resolve_pcscf_for(IpAddr::V6("2001:db8::2".parse().unwrap()))
+                .unwrap(),
             IpAddr::V6("2001:db8::99".parse::<Ipv6Addr>().unwrap())
         );
     }
@@ -396,7 +479,9 @@ IPv4 primary DNS: 10.0.0.53";
     fn resolve_pcscf_errors_when_nothing() {
         let s = ImsIpSettings::default();
         assert_eq!(
-            s.resolve_pcscf().unwrap_err().code(),
+            s.resolve_pcscf_for(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                .unwrap_err()
+                .code(),
             code::RUNTIME_ALL_PCSCF_FAILED
         );
     }
@@ -406,11 +491,34 @@ IPv4 primary DNS: 10.0.0.53";
         let s = parse_ip_settings("IPv6 address: 2001:db8::2");
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         assert_eq!(
-            s.ensure_family_match(v4).unwrap_err().code(),
+            s.ensure_family_match(s.local_addr().unwrap(), v4)
+                .unwrap_err()
+                .code(),
             code::PCSCF_FAMILY_MISMATCH
         );
         let v6 = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
-        assert_eq!(s.ensure_family_match(v6).unwrap(), v6);
+        assert_eq!(s.ensure_family_match(s.local_addr().unwrap(), v6).unwrap(), v6);
+    }
+
+    #[test]
+    fn explicit_pcscf_and_override_candidates_are_filtered_by_family() {
+        let mut s = parse_ip_settings(SAMPLE);
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let v6 = IpAddr::V6("2001:db8::99".parse().unwrap());
+        s.pcscf.extend([v6, v4]);
+
+        assert_eq!(
+            s.resolve_pcscf_for(s.ipv4_address.unwrap()).unwrap(),
+            v4
+        );
+        assert_eq!(
+            s.resolve_pcscf_for(s.ipv6_address.unwrap()).unwrap(),
+            v6
+        );
+        assert_eq!(
+            parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
+            vec![v6, v4]
+        );
     }
 
     #[test]

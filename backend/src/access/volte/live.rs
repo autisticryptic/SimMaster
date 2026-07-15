@@ -5,7 +5,7 @@
 //! the shared `ims::register` driver owns the SIP transaction sequence.
 
 use std::{
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     sync::OnceLock,
     time::Duration,
 };
@@ -53,6 +53,7 @@ struct VolteLiveSession {
     identity: ImsIdentity,
     bearer: BearerConnection,
     pcscf: SocketAddr,
+    ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
 }
 
@@ -264,7 +265,7 @@ pub async fn connect_live(
         })
         .await;
 
-    match connect_inner(runtime, generation).await {
+    match connect_inner(runtime, generation, config).await {
         Ok(session) => {
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
@@ -272,6 +273,7 @@ pub async fn connect_live(
                 RegistrationMode::Udp
             };
             let pcscf = session.pcscf.to_string();
+            let data_path_mode = format!("dedicated_ims_bearer_{}", session.ip_family);
             *LIVE_SESSION.get_or_init(|| Mutex::new(None)).lock().await = Some(session);
             runtime
                 .update(|state| {
@@ -280,7 +282,7 @@ pub async fn connect_live(
                     state.registration_mode = mode;
                     state.pcscf = Some(pcscf);
                     state.registered_at = Some(now());
-                    state.data_path_mode = Some("dedicated_ims_bearer".to_string());
+                    state.data_path_mode = Some(data_path_mode);
                 })
                 .await;
             Ok(runtime.status().await)
@@ -302,6 +304,7 @@ pub async fn connect_live(
 async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
+    config: &VolteConfig,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime.update(|state| state.stage = VolteStage::Identity).await;
     let device_identity = load_device_identity().await?;
@@ -312,66 +315,26 @@ async fn connect_inner(
     let result = async {
         configure_bearer_network(&bearer).await?;
         ensure_generation(runtime, generation)?;
-        runtime.update(|state| state.stage = VolteStage::Pcscf).await;
-        let pcscf = discover_pcscf(&bearer.settings, &device_identity.ims.home_domain).await?;
-        route_pcscf(&bearer, pcscf).await?;
-        runtime
-            .update(|state| {
-                state.stage = VolteStage::RegisterIpsec;
-                state.pcscf = Some(pcscf.to_string());
-            })
-            .await;
-
-        let route = ImsRoute {
-            local_addr: SocketAddr::new(bearer.local_addr()?, 0),
-            pcscf_addr: pcscf_socket(pcscf),
-            transport: SipTransport::Udp,
-        };
-        let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
-            .map_err(map_channel_error)?;
-        let ids = RequestIds::fresh(1);
-        let sip_instance = new_sip_instance();
-        let offered = offered_security();
-        let initial_authorization = digest_aka::build_initial_authorization_header(
-            &device_identity.ims.private_user,
-            &device_identity.ims.home_domain,
-            &format!("sip:{}", device_identity.ims.home_domain),
-        );
-        let initial = sip::build_register_with_security_policy(
-            &device_identity.ims,
-            &channel.route(),
-            &ids,
-            REGISTER_EXPIRES,
-            Some(&initial_authorization),
-            Some(&offered),
-            None,
-            &sip_instance,
-            true,
-        );
-        let mut authenticator = VolteRegisterAuthenticator::new(
-            device_identity.ims.clone(),
-            ids,
-            sip_instance,
-            offered,
-            channel.route(),
-        );
-        let registration = run_register(&mut channel, &initial, &mut authenticator).await;
-        if let Err(error) = registration {
-            if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-                ipsec::uninstall_plan(plan);
+        let local_addrs = bearer
+            .settings
+            .ordered_local_addrs(config.ip_family_preference);
+        if local_addrs.is_empty() {
+            return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+        }
+        let mut last_error = None;
+        for (index, local_addr) in local_addrs.iter().copied().enumerate() {
+            ensure_generation(runtime, generation)?;
+            match connect_family(runtime, &bearer, &device_identity, local_addr).await {
+                Ok(session) => return Ok(session),
+                Err(error)
+                    if index + 1 < local_addrs.len() && should_try_next_family(&error) =>
+                {
+                    last_error = Some(error);
+                }
+                Err(error) => return Err(error),
             }
-            return Err(map_register_error(error));
         }
-        if authenticator.mode == RegistrationMode::Udp {
-            runtime.update(|state| state.stage = VolteStage::RegisterUdp).await;
-        }
-        Ok(VolteLiveSession {
-            channel,
-            identity: device_identity.ims,
-            bearer: bearer.clone(),
-            pcscf: pcscf_socket(pcscf),
-            xfrm_plan: authenticator.xfrm_plan,
-        })
+        Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
     }
     .await;
     if result.is_err() {
@@ -379,6 +342,80 @@ async fn connect_inner(
         disconnect_bearer(&bearer.path).await;
     }
     result
+}
+
+async fn connect_family(
+    runtime: &VolteRuntime,
+    bearer: &BearerConnection,
+    device_identity: &DeviceIdentity,
+    local_addr: IpAddr,
+) -> Result<VolteLiveSession, VolteError> {
+    runtime.update(|state| state.stage = VolteStage::Pcscf).await;
+    let pcscf = discover_pcscf(
+        &bearer.settings,
+        &device_identity.ims.home_domain,
+        local_addr,
+    )
+    .await?;
+    route_pcscf(bearer, pcscf).await?;
+    runtime
+        .update(|state| {
+            state.stage = VolteStage::RegisterIpsec;
+            state.pcscf = Some(pcscf.to_string());
+        })
+        .await;
+
+    let route = ImsRoute {
+        local_addr: SocketAddr::new(local_addr, 0),
+        pcscf_addr: pcscf_socket(pcscf),
+        transport: SipTransport::Udp,
+    };
+    let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
+        .map_err(map_channel_error)?;
+    let ids = RequestIds::fresh(1);
+    let sip_instance = new_sip_instance();
+    let offered = offered_security();
+    let initial_authorization = digest_aka::build_initial_authorization_header(
+        &device_identity.ims.private_user,
+        &device_identity.ims.home_domain,
+        &format!("sip:{}", device_identity.ims.home_domain),
+    );
+    let initial = sip::build_register_with_security_policy(
+        &device_identity.ims,
+        &channel.route(),
+        &ids,
+        REGISTER_EXPIRES,
+        Some(&initial_authorization),
+        Some(&offered),
+        None,
+        &sip_instance,
+        true,
+    );
+    let mut authenticator = VolteRegisterAuthenticator::new(
+        device_identity.ims.clone(),
+        ids,
+        sip_instance,
+        offered,
+        channel.route(),
+    );
+    let registration = run_register(&mut channel, &initial, &mut authenticator).await;
+    if let Err(error) = registration {
+        if let Some(plan) = authenticator.xfrm_plan.as_ref() {
+            ipsec::uninstall_plan(plan);
+        }
+        return Err(map_register_error(error));
+    }
+    if authenticator.mode == RegistrationMode::Udp {
+        runtime.update(|state| state.stage = VolteStage::RegisterUdp).await;
+    }
+    Ok(VolteLiveSession {
+        channel,
+        identity: device_identity.ims.clone(),
+        bearer: bearer.clone(),
+        pcscf: pcscf_socket(pcscf),
+        ip_family: ip_family_name(local_addr),
+        xfrm_plan: authenticator.xfrm_plan,
+    })
 }
 
 /// Tear down only resources owned by the current VoLTE session.
@@ -509,6 +546,21 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
+fn should_try_next_family(error: &VolteError) -> bool {
+    matches!(
+        error.code(),
+        code::RUNTIME_ALL_PCSCF_FAILED
+            | code::PCSCF_FAMILY_MISMATCH
+            | code::IPSEC_UDP_BIND_FAILED
+            | code::REGISTER_INITIAL_UNEXPECTED_STATUS
+            | code::COMMAND_FAILED
+    )
+}
+
+fn ip_family_name(address: IpAddr) -> &'static str {
+    if address.is_ipv6() { "ipv6" } else { "ipv4" }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -557,5 +609,23 @@ mod tests {
             authenticated.detail(),
             Some("ims_register_authenticated_receive_failed")
         );
+    }
+
+    #[test]
+    fn family_fallback_is_limited_to_discovery_and_initial_transport_failures() {
+        assert!(should_try_next_family(&VolteError::new(
+            code::RUNTIME_ALL_PCSCF_FAILED
+        )));
+        assert!(should_try_next_family(&VolteError::new(
+            code::REGISTER_INITIAL_UNEXPECTED_STATUS
+        )));
+        assert!(!should_try_next_family(&VolteError::new(
+            code::REGISTER_AUTH_UNEXPECTED_STATUS
+        )));
+        assert!(!should_try_next_family(&VolteError::new(
+            code::USIM_AKA_FAILED
+        )));
+        assert_eq!(ip_family_name("2001:db8::1".parse().unwrap()), "ipv6");
+        assert_eq!(ip_family_name("192.0.2.1".parse().unwrap()), "ipv4");
     }
 }
