@@ -47,6 +47,7 @@ const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const QMI_DEVICE: &str = "/dev/wwan0qmi0";
 const UIM_SLOT: u8 = 1;
 const REGISTER_EXPIRES: u32 = 3600;
+const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
 
 static LIVE_SESSION: OnceLock<Mutex<Option<VolteLiveSession>>> = OnceLock::new();
 static LIVE_LISTENER: OnceLock<Mutex<Option<tokio::task::JoinHandle<()>>>> = OnceLock::new();
@@ -479,18 +480,7 @@ pub async fn disconnect_live(runtime: &Arc<VolteRuntime>, reason: &str) -> Volte
     {
         listener.abort();
     }
-    let session = LIVE_SESSION
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .await
-        .take();
-    if let Some(session) = session {
-        if let Some(plan) = session.xfrm_plan.as_ref() {
-            ipsec::uninstall_plan(plan);
-        }
-        teardown_bearer_network(&session.bearer).await;
-        disconnect_bearer(&session.bearer.path).await;
-    }
+    cleanup_live_session().await;
     runtime.reset_runtime(reason).await;
     runtime.status().await
 }
@@ -520,8 +510,21 @@ async fn live_receive_loop(
     generation: u64,
 ) {
     let mut reassembler = MtReassembler::new();
+    let refresh_at = tokio::time::Instant::now()
+        + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
     loop {
         if runtime.generation() != generation {
+            break;
+        }
+        if tokio::time::Instant::now() >= refresh_at {
+            runtime
+                .update(|state| {
+                    state.phase = VoltePhase::Degraded;
+                    state.last_error = Some("volte_register_refresh_due".to_string());
+                    state.reconnect_count += 1;
+                })
+                .await;
+            cleanup_live_session().await;
             break;
         }
         let frame = {
@@ -541,6 +544,8 @@ async fn live_receive_loop(
                             state.last_failure_at = Some(now());
                         })
                         .await;
+                    drop(sessions);
+                    cleanup_live_session().await;
                     break;
                 }
             }
@@ -559,6 +564,21 @@ async fn live_receive_loop(
         {
             tracing::warn!(error = %error, "VoLTE protected SIP frame handling failed");
         }
+    }
+}
+
+async fn cleanup_live_session() {
+    let session = LIVE_SESSION
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .await
+        .take();
+    if let Some(session) = session {
+        if let Some(plan) = session.xfrm_plan.as_ref() {
+            ipsec::uninstall_plan(plan);
+        }
+        teardown_bearer_network(&session.bearer).await;
+        disconnect_bearer(&session.bearer.path).await;
     }
 }
 

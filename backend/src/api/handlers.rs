@@ -4706,6 +4706,56 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
     });
 }
 
+/// Keep an explicitly enabled VoLTE connection alive across service restarts,
+/// bearer/socket faults, and the controlled pre-expiry session rebuild.
+pub fn spawn_volte_auto_restore(app: AppState) {
+    tokio::spawn(async move {
+        let initial = app.config_manager.get_volte_config();
+        tokio::time::sleep(Duration::from_secs(
+            initial.auto_restore_initial_delay_secs.clamp(5, 300),
+        ))
+        .await;
+        loop {
+            let config = app.config_manager.get_volte_config();
+            if config.feature_enabled
+                && config.sms_enabled
+                && config.connection_enabled
+                && !app.volte_runtime.status().await.registered
+            {
+                let _guard = app.volte_connect_lock.lock().await;
+                if !app.volte_runtime.status().await.registered {
+                    let attempts = config.auto_restore_attempts.clamp(1, 5);
+                    for attempt in 1..=attempts {
+                        match crate::access::volte::live::connect_live(
+                            &app.volte_runtime,
+                            &config,
+                            Arc::clone(&app.database),
+                            Arc::clone(&app.notification_sender),
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                info!(attempt, "VoLTE IMS auto-restore registered");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(attempt, error = %error, "VoLTE IMS auto-restore failed");
+                                if attempt < attempts {
+                                    tokio::time::sleep(Duration::from_secs(
+                                        config.auto_restore_retry_delay_secs.clamp(5, 180),
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        }
+    });
+}
+
 pub async fn connect_vowifi_handler(
     State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<VowifiStatusResponse>>) {

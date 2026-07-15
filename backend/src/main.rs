@@ -533,6 +533,7 @@ async fn main() -> Result<()> {
 
     // Build protected routes - 使用统一的 AppState
     spawn_vowifi_auto_restore(app_state.clone());
+    spawn_volte_auto_restore(app_state.clone());
 
     let protected_routes = Router::new()
         // ========== 设备信息接口 ==========
