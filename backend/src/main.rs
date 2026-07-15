@@ -251,6 +251,8 @@ enum CliCommand {
         /// 解压目标目录
         target: String,
     },
+    /// Read-only JSON inventory of every ModemManager modem/SIM line.
+    InspectModems,
 }
 
 #[derive(Subcommand, Debug)]
@@ -298,6 +300,15 @@ async fn main() -> Result<()> {
             }
             AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
+    }
+    if matches!(&cli.command, Some(CliCommand::InspectModems)) {
+        let conn = Connection::system().await?;
+        let mut bindings = cellular::modem_manager::discover_modem_bindings(&conn).await?;
+        for binding in &mut bindings {
+            binding.sim_iccid = system::system_event::mask_identifier(&binding.sim_iccid);
+        }
+        println!("{}", serde_json::to_string_pretty(&bindings)?);
+        return Ok(());
     }
 
     let args = match cli.command {
