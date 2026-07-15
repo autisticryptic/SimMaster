@@ -18,7 +18,7 @@
 //! IMS session established in `runtime`/`register`.
 
 use crate::access::volte::vilte::{build_av_sdp, build_video_offer, VideoMediaDescription};
-use crate::access::vowifi::voice::{
+use crate::ims::voice::{
     build_mo_audio_offer_with_params, build_sdp_answer_with_params, parse_audio_sdp, AudioCodec,
     CallEndReason, CallState, SdpAddrType, SdpAudioDescription, VoiceCallStateMachine,
     VoiceLegKind, VoiceParams, VoiceRuntimeError,
