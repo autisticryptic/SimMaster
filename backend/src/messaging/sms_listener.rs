@@ -192,16 +192,27 @@ fn schedule_sms_delete(conn: &Connection, modem_path: &str, sms_path: String) {
     });
 }
 
+struct SmsIngestContext<'a> {
+    conn: &'a Connection,
+    db: &'a Database,
+    notification_sender: &'a Arc<NotificationSender>,
+    modem_path: &'a str,
+    config_manager: &'a ConfigManager,
+}
+
 async fn process_sms_path(
-    conn: &Connection,
-    db: &Database,
-    notification_sender: &Arc<NotificationSender>,
-    modem_path: &str,
+    context: SmsIngestContext<'_>,
     sms_path: &str,
     mode: SmsIngestMode,
     forward_reconciled_new_sms: bool,
-    config_manager: &ConfigManager,
 ) {
+    let SmsIngestContext {
+        conn,
+        db,
+        notification_sender,
+        modem_path,
+        config_manager,
+    } = context;
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
         return;
     };
@@ -343,14 +354,16 @@ async fn scan_sms_paths(
             }
             for sms_path in paths {
                 process_sms_path(
-                    conn,
-                    db,
-                    notification_sender,
-                    modem_path,
+                    SmsIngestContext {
+                        conn,
+                        db,
+                        notification_sender,
+                        modem_path,
+                        config_manager,
+                    },
                     &sms_path,
                     SmsIngestMode::Reconcile,
                     forward_new_sms,
-                    config_manager,
                 )
                 .await;
             }
@@ -573,14 +586,16 @@ pub async fn start_sms_listener(
                                 // Give ModemManager a short moment to assemble multipart SMS content.
                                 tokio::time::sleep(Duration::from_millis(500)).await;
                                 process_sms_path(
-                                    &conn,
-                                    &db,
-                                    &notification_sender,
-                                    modem_path.as_str(),
+                                    SmsIngestContext {
+                                        conn: &conn,
+                                        db: &db,
+                                        notification_sender: &notification_sender,
+                                        modem_path: modem_path.as_str(),
+                                        config_manager: &config_manager,
+                                    },
                                     &sms_path_str,
                                     SmsIngestMode::Live,
                                     false,
-                                    &config_manager,
                                 )
                                 .await;
                             }

@@ -477,9 +477,9 @@ fn find_transform(
 fn encryption_key_bits(transform: &TransformSpec) -> Option<usize> {
     transform
         .attributes
-        .iter()
-        .find_map(|attribute| match attribute {
-            TransformAttribute::KeyLength(bits) => Some(usize::from(*bits)),
+        .first()
+        .map(|attribute| match attribute {
+            TransformAttribute::KeyLength(bits) => usize::from(*bits),
         })
 }
 

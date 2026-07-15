@@ -541,7 +541,7 @@ fn push_attribute(
     out.push(attribute_type);
     out.push((total / 4) as u8);
     out.extend_from_slice(value);
-    out.extend(std::iter::repeat(0).take(pad));
+    out.extend(std::iter::repeat_n(0, pad));
     Ok(())
 }
 

@@ -14,6 +14,7 @@ pub struct VowifiSimIdentity {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[derive(Default)]
 pub struct MaskedSimIdentity {
     pub present: bool,
     pub iccid: String,
@@ -21,16 +22,6 @@ pub struct MaskedSimIdentity {
     pub operator_id: String,
 }
 
-impl Default for MaskedSimIdentity {
-    fn default() -> Self {
-        Self {
-            present: false,
-            iccid: String::new(),
-            imsi: String::new(),
-            operator_id: String::new(),
-        }
-    }
-}
 
 impl VowifiSimIdentity {
     pub fn from_modem(identity: &SimIdentity) -> Self {

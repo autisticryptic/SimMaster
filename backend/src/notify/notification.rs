@@ -6,7 +6,8 @@ use crate::infra::config::{
     WecomRobotConfig,
 };
 use crate::infra::db::{
-    CallRecord, Database, NewNotificationQueueItem, NotificationQueueEntry, SmsMessage,
+    CallRecord, Database, NewNotificationLog, NewNotificationQueueItem, NotificationQueueEntry,
+    SmsMessage,
 };
 use crate::system::device_status::DeviceStatusReport;
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
@@ -100,6 +101,18 @@ enum NotificationEvent<'a> {
     SystemEvent(&'a SystemEvent),
     DeviceStatus(&'a DeviceStatusReport),
     Automation(&'a AutomationEvent, String),
+}
+
+struct PendingNotification<'a, 'event> {
+    event: &'a NotificationEvent<'event>,
+    rule: &'a NotificationRule,
+    channel: &'a NotificationChannelInstance,
+    title: &'a str,
+    body: &'a str,
+    summary: &'a str,
+    status: &'a str,
+    reason: &'a str,
+    next_attempt_at: &'a str,
 }
 
 impl NotificationEvent<'_> {
@@ -645,8 +658,8 @@ impl NotificationSender {
         let (channel_id, channel_name) = channel
             .map(|channel| (channel.id.as_str(), channel.name.as_str()))
             .unwrap_or(("", ""));
-        self.record_notification_log_raw(
-            notification_event_type_key(event_type),
+        self.record_notification_log_raw(NewNotificationLog {
+            event_type: notification_event_type_key(event_type),
             status,
             summary,
             rule_id,
@@ -654,33 +667,11 @@ impl NotificationSender {
             channel_id,
             channel_name,
             message,
-        );
+        });
     }
 
-    fn record_notification_log_raw(
-        &self,
-        event_type: &str,
-        status: &str,
-        summary: &str,
-        rule_id: &str,
-        rule_name: &str,
-        channel_id: &str,
-        channel_name: &str,
-        message: &str,
-    ) {
-        if let Err(err) = self
-            .database
-            .insert_notification_log(crate::infra::db::NewNotificationLog {
-                event_type,
-                status,
-                summary,
-                rule_id,
-                rule_name,
-                channel_id,
-                channel_name,
-                message,
-            })
-        {
+    fn record_notification_log_raw(&self, entry: NewNotificationLog<'_>) {
+        if let Err(err) = self.database.insert_notification_log(entry) {
             warn!(error = %err, "Failed to insert notification log");
             return;
         }
@@ -738,17 +729,17 @@ impl NotificationSender {
         if let Some(reason) = self.rate_limit_reason(channel)? {
             let next_attempt_at =
                 beijing_time_after_seconds(i64::from(channel.rate_limit.window_seconds.max(1)));
-            self.enqueue_notification(
+            self.enqueue_notification(PendingNotification {
                 event,
                 rule,
                 channel,
                 title,
-                text,
+                body: text,
                 summary,
-                "scheduled",
-                &reason,
-                &next_attempt_at,
-            )?;
+                status: "scheduled",
+                reason: &reason,
+                next_attempt_at: &next_attempt_at,
+            })?;
             return Ok(ChannelDeliveryResult::Queued(reason));
         }
 
@@ -757,17 +748,17 @@ impl NotificationSender {
             Err(err) => {
                 let next_attempt_at = beijing_time_after_seconds(60);
                 let reason = format!("发送失败，已加入通知队列：{err}");
-                self.enqueue_notification(
+                self.enqueue_notification(PendingNotification {
                     event,
                     rule,
                     channel,
                     title,
-                    text,
+                    body: text,
                     summary,
-                    "retrying",
-                    &reason,
-                    &next_attempt_at,
-                )?;
+                    status: "retrying",
+                    reason: &reason,
+                    next_attempt_at: &next_attempt_at,
+                })?;
                 Ok(ChannelDeliveryResult::Queued(reason))
             }
         }
@@ -805,18 +796,18 @@ impl NotificationSender {
         }
     }
 
-    fn enqueue_notification(
-        &self,
-        event: &NotificationEvent<'_>,
-        rule: &NotificationRule,
-        channel: &NotificationChannelInstance,
-        title: &str,
-        body: &str,
-        summary: &str,
-        status: &str,
-        reason: &str,
-        next_attempt_at: &str,
-    ) -> Result<i64, String> {
+    fn enqueue_notification(&self, pending: PendingNotification<'_, '_>) -> Result<i64, String> {
+        let PendingNotification {
+            event,
+            rule,
+            channel,
+            title,
+            body,
+            summary,
+            status,
+            reason,
+            next_attempt_at,
+        } = pending;
         self.database
             .insert_notification_queue_item(NewNotificationQueueItem {
                 status,
@@ -901,16 +892,16 @@ impl NotificationSender {
                 if let Err(err) = self.database.mark_notification_queue_sent(item.id) {
                     warn!(error = %err, id = item.id, "Failed to mark notification queue item sent");
                 }
-                self.record_notification_log_raw(
-                    &item.event_type,
-                    "success",
-                    &item.summary,
-                    &item.rule_id,
-                    &item.rule_name,
-                    &channel.id,
-                    &channel.name,
-                    &message,
-                );
+                self.record_notification_log_raw(NewNotificationLog {
+                    event_type: &item.event_type,
+                    status: "success",
+                    summary: &item.summary,
+                    rule_id: &item.rule_id,
+                    rule_name: &item.rule_name,
+                    channel_id: &channel.id,
+                    channel_name: &channel.name,
+                    message: &message,
+                });
             }
             Err(err) => {
                 let next_attempt = item.attempt_count + 1;
@@ -934,16 +925,16 @@ impl NotificationSender {
         if let Err(db_err) = self.database.mark_notification_queue_failed(item.id, err) {
             warn!(error = %db_err, id = item.id, "Failed to mark notification queue item failed");
         }
-        self.record_notification_log_raw(
-            &item.event_type,
-            "failed",
-            &item.summary,
-            &item.rule_id,
-            &item.rule_name,
-            &item.channel_id,
-            &item.channel_name,
-            err,
-        );
+        self.record_notification_log_raw(NewNotificationLog {
+            event_type: &item.event_type,
+            status: "failed",
+            summary: &item.summary,
+            rule_id: &item.rule_id,
+            rule_name: &item.rule_name,
+            channel_id: &item.channel_id,
+            channel_name: &item.channel_name,
+            message: err,
+        });
     }
 
     async fn send_text_to_channel(
@@ -2908,9 +2899,7 @@ fn format_own_number_for_template(number: &str) -> String {
     let mut compact = String::new();
 
     for ch in value.chars() {
-        if ch == '+' && compact.is_empty() {
-            compact.push(ch);
-        } else if ch.is_ascii_digit() {
+        if (ch == '+' && compact.is_empty()) || ch.is_ascii_digit() {
             compact.push(ch);
         }
     }

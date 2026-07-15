@@ -214,7 +214,7 @@ pub fn read_uptime() -> Result<(u64, u64), String> {
     let content = fs::read_to_string("/proc/uptime")
         .map_err(|e| format!("Failed to read /proc/uptime: {}", e))?;
 
-    let parts: Vec<&str> = content.trim().split_whitespace().collect();
+    let parts: Vec<&str> = content.split_whitespace().collect();
     if parts.len() < 2 {
         return Err("Invalid /proc/uptime format".to_string());
     }
@@ -1182,7 +1182,7 @@ pub fn preferred_interface_for_family(
         .iter()
         .filter(|iface| {
             iface.name != "lo"
-                && iface.status.to_ascii_lowercase() != "down"
+                && !iface.status.eq_ignore_ascii_case("down")
                 && !interface_addresses_for_family(&iface.ip_addresses, family).is_empty()
         })
         .min_by_key(|iface| preferred_interface_priority(iface, family))
@@ -1344,8 +1344,8 @@ pub async fn read_network_interfaces(
                 .ok()
                 .and_then(|s| {
                     let s = s.trim();
-                    if s.starts_with("0x") {
-                        u32::from_str_radix(&s[2..], 16).ok()
+                    if let Some(hex) = s.strip_prefix("0x") {
+                        u32::from_str_radix(hex, 16).ok()
                     } else {
                         s.parse::<u32>().ok()
                     }

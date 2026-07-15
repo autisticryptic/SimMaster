@@ -131,8 +131,10 @@ impl VowifiRuntime {
     }
 
     pub fn with_live_gate(live_gate: LiveExecutorGateReport) -> Self {
-        let mut snapshot = RuntimeSnapshot::default();
-        snapshot.executor = LiveRuntimeExecutor::from_gate(live_gate).describe();
+        let snapshot = RuntimeSnapshot {
+            executor: LiveRuntimeExecutor::from_gate(live_gate).describe(),
+            ..Default::default()
+        };
         Self {
             snapshot: Arc::new(RwLock::new(snapshot)),
             live_refresh: Arc::new(Mutex::new(LiveRefreshState {

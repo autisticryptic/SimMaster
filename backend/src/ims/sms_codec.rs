@@ -786,11 +786,10 @@ fn gsm7_septets(text: &str) -> Option<Vec<u8>> {
     for ch in text.chars() {
         if let Some(value) = gsm7_basic_value(ch) {
             septets.push(value);
-        } else if let Some(value) = gsm7_extension_value(ch) {
+        } else {
+            let value = gsm7_extension_value(ch)?;
             septets.push(0x1b);
             septets.push(value);
-        } else {
-            return None;
         }
     }
 
@@ -1020,7 +1019,7 @@ fn parse_user_data_header(user_data: &[u8]) -> Result<SmsUserDataHeader, SmsEnco
 
 fn decode_ucs2_text(user_data: &[u8], octets: usize) -> Result<String, SmsEncodingError> {
     let len = std::cmp::min(user_data.len(), octets);
-    if len % 2 != 0 {
+    if !len.is_multiple_of(2) {
         return Err(SmsEncodingError::BodyTooLong);
     }
     let units: Vec<u16> = user_data[..len]

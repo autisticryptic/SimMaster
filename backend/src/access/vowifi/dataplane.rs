@@ -662,15 +662,13 @@ impl ChildSaStateMachine {
         selected_profile_proposal: &'static str,
     ) -> Result<(), DataplaneStateError> {
         self.require_phase(DataplanePhase::Idle)?;
-        let inbound_sa = SaDirectionState::new(inbound_sa_identifier).map_err(|err| {
+        let inbound_sa = SaDirectionState::new(inbound_sa_identifier).inspect_err(|err| {
             self.phase = DataplanePhase::Failed;
             self.last_error = Some(err.to_string());
-            err
         })?;
-        let outbound_sa = SaDirectionState::new(outbound_sa_identifier).map_err(|err| {
+        let outbound_sa = SaDirectionState::new(outbound_sa_identifier).inspect_err(|err| {
             self.phase = DataplanePhase::Failed;
             self.last_error = Some(err.to_string());
-            err
         })?;
         if !self
             .profile
@@ -1068,7 +1066,7 @@ pub fn protect_inner_packet_for_esp(
     plaintext.push(pad_len as u8);
     plaintext.push(next_header);
     let ciphertext = esp_encrypt_cbc(
-        &plan.encryption,
+        plan.encryption,
         secrets.outbound_encryption.expose_for_protocol(),
         &iv,
         &plaintext,
@@ -1082,7 +1080,7 @@ pub fn protect_inner_packet_for_esp(
     frame.extend_from_slice(&iv);
     frame.extend_from_slice(&ciphertext);
     let icv = esp_integrity_tag(
-        &plan.integrity,
+        plan.integrity,
         secrets.outbound_integrity.expose_for_protocol(),
         &frame,
     )?;
@@ -1108,7 +1106,7 @@ pub fn unprotect_inner_packet_from_esp(
 ) -> Result<(Vec<u8>, EspProtectedPacketSummary), DataplaneStateError> {
     let metadata = parse_esp_frame_metadata(frame)?;
     let plan = secrets.summary();
-    let icv_len = esp_integrity_len(&plan.integrity)?;
+    let icv_len = esp_integrity_len(plan.integrity)?;
     let min_len = ESP_HEADER_BYTES as usize + AES_CBC_IV_BYTES as usize + icv_len;
     if frame.len() < min_len {
         return Err(DataplaneStateError::EspPacketTooShort);
@@ -1116,7 +1114,7 @@ pub fn unprotect_inner_packet_from_esp(
     let signed_len = frame.len() - icv_len;
     let (signed, received_icv) = frame.split_at(signed_len);
     let expected_icv = esp_integrity_tag(
-        &plan.integrity,
+        plan.integrity,
         secrets.inbound_integrity.expose_for_protocol(),
         signed,
     )?;
@@ -1128,7 +1126,7 @@ pub fn unprotect_inner_packet_from_esp(
     let iv = &frame[iv_start..iv_end];
     let ciphertext = &frame[iv_end..signed_len];
     let plaintext = esp_decrypt_cbc(
-        &plan.encryption,
+        plan.encryption,
         secrets.inbound_encryption.expose_for_protocol(),
         iv,
         ciphertext,

@@ -132,6 +132,7 @@ pub struct WecomAppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct WecomRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -142,6 +143,7 @@ pub struct WecomRobotConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct DingtalkRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -174,6 +176,7 @@ pub struct DingtalkAppConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct FeishuRobotConfig {
     #[serde(flatten)]
     pub common: MessageChannelConfig,
@@ -200,6 +203,7 @@ pub struct TelegramConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct LegacyNotificationConfig {
     #[serde(default)]
     pub webhook: WebhookConfig,
@@ -545,6 +549,7 @@ impl<'de> Deserialize<'de> for NotificationConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub struct DeviceNetworkConfig {
     #[serde(default)]
     pub ddns: DdnsConfig,
@@ -782,28 +787,7 @@ impl Default for WecomAppConfig {
     }
 }
 
-impl Default for WecomRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            key: String::new(),
-        }
-    }
-}
 
-impl Default for DingtalkRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            access_token: String::new(),
-            secret: String::new(),
-            at_mobiles: String::new(),
-            at_all: false,
-        }
-    }
-}
 
 impl Default for DingtalkAppConfig {
     fn default() -> Self {
@@ -818,16 +802,6 @@ impl Default for DingtalkAppConfig {
     }
 }
 
-impl Default for FeishuRobotConfig {
-    fn default() -> Self {
-        Self {
-            common: MessageChannelConfig::default(),
-            webhook_url: String::new(),
-            token: String::new(),
-            secret: String::new(),
-        }
-    }
-}
 
 impl Default for TelegramConfig {
     fn default() -> Self {
@@ -841,21 +815,6 @@ impl Default for TelegramConfig {
     }
 }
 
-impl Default for LegacyNotificationConfig {
-    fn default() -> Self {
-        Self {
-            webhook: WebhookConfig::default(),
-            bark: BarkConfig::default(),
-            pushplus: PushPlusConfig::default(),
-            wecom_app: WecomAppConfig::default(),
-            wecom_robot: WecomRobotConfig::default(),
-            dingtalk_robot: DingtalkRobotConfig::default(),
-            dingtalk_app: DingtalkAppConfig::default(),
-            feishu_robot: FeishuRobotConfig::default(),
-            telegram: TelegramConfig::default(),
-        }
-    }
-}
 
 impl Default for NotificationConfig {
     fn default() -> Self {
@@ -1197,13 +1156,6 @@ pub fn default_rule_template(event_type: NotificationEventType) -> String {
     }
 }
 
-impl Default for DeviceNetworkConfig {
-    fn default() -> Self {
-        Self {
-            ddns: DdnsConfig::default(),
-        }
-    }
-}
 
 impl Default for VersionUpdateNotificationConfig {
     fn default() -> Self {
@@ -2450,14 +2402,16 @@ fn migrate_legacy_webhook_config(config: &mut AppConfig) {
         && config.notifications.rules.is_empty()
         && config.webhook != WebhookConfig::default()
     {
-        let mut legacy = LegacyNotificationConfig::default();
-        legacy.webhook = config.webhook.clone();
+        let legacy = LegacyNotificationConfig {
+            webhook: config.webhook.clone(),
+            ..Default::default()
+        };
         config.notifications = NotificationConfig::from_legacy(legacy);
     }
     config.webhook = config
         .notifications
         .first_webhook_config()
-        .unwrap_or_else(WebhookConfig::default);
+        .unwrap_or_default();
 }
 
 fn migrate_template_string(template: &mut String) -> bool {
@@ -2537,11 +2491,10 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
 
     // 2. Notification rules templates
     for rule in &mut config.notifications.rules {
-        if rule.event_type == NotificationEventType::VersionUpdate {
-            if migrate_template_string(&mut rule.template) {
+        if rule.event_type == NotificationEventType::VersionUpdate
+            && migrate_template_string(&mut rule.template) {
                 changed = true;
             }
-        }
     }
 
     // 3. Notification channels templates
@@ -2930,7 +2883,7 @@ impl ConfigManager {
             let mut config = self.config.write().unwrap();
             config.webhook = notifications
                 .first_webhook_config()
-                .unwrap_or_else(WebhookConfig::default);
+                .unwrap_or_default();
             config.notifications = notifications;
         }
         self.save()

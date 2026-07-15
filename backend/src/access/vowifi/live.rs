@@ -1398,8 +1398,8 @@ async fn run_live_ike_with_destination(
         return Err(live_stage_error("eap_aka_success_not_reached"));
     }
 
-    if target == LiveIkeTarget::ChildSaReady {
-        if !success_includes_child_sa {
+    if target == LiveIkeTarget::ChildSaReady
+        && !success_includes_child_sa {
             info!("Child SA not included in EapSuccess. Building final IKE_AUTH request...");
             let msk = eap_response
                 .msk_for_ike_auth()
@@ -1428,7 +1428,6 @@ async fn run_live_ike_with_destination(
                 .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
                 .map_err(|reason| LiveStageError { reason })?;
         }
-    }
 
     Ok(LiveIkeSession {
         child_sa: machine
@@ -2659,6 +2658,9 @@ async fn run_authenticated_register_after_challenge(
     }
 }
 
+// These protocol helpers keep security/session inputs explicit. Collapsing them
+// into broad context bags would hide which values cross an authentication step.
+#[allow(clippy::too_many_arguments)]
 async fn run_protected_authenticated_register_candidates(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
@@ -2987,6 +2989,7 @@ async fn send_live_sms_message_on_cached_channel(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_live_sms_message_on_stream(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3040,6 +3043,7 @@ async fn send_live_sms_message_on_stream(
     Ok(outcome)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_live_sms_followup_task(
     profile: &'static CarrierProfile,
     route: tun_gateway::ImsClientTcpRoute,
@@ -3106,6 +3110,7 @@ fn start_live_sms_followup_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_live_sms_followup_frames(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3319,6 +3324,7 @@ fn build_live_sms_message_request(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_live_sms_rp_ack_request(
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
@@ -3772,7 +3778,7 @@ fn append_sip_header_values(out: &mut String, headers: &str, name: &str) {
         };
         if header_name.eq_ignore_ascii_case(name) {
             out.push_str(name);
-            out.push_str(":");
+            out.push(':');
             out.push_str(value);
             if name.eq_ignore_ascii_case("To") && !value.to_ascii_lowercase().contains(";tag=") {
                 out.push_str(";tag=");
@@ -4515,7 +4521,7 @@ fn parse_live_digest_challenge_value(
     header_kind: &'static str,
     value: &str,
 ) -> Result<LiveDigestChallenge, LiveStageError> {
-    let params = parse_live_digest_params(&value);
+    let params = parse_live_digest_params(value);
     let param = |name: &str| {
         params
             .iter()
@@ -4705,7 +4711,7 @@ fn select_live_security_server_offer(
         return Ok(None);
     }
     let mut offers = challenge.security_server_offers.clone();
-    offers.sort_by(|left, right| right.q_milli.cmp(&left.q_milli));
+    offers.sort_by_key(|offer| std::cmp::Reverse(offer.q_milli));
     for offer in offers {
         if live_security_offer_matches_profile(profile, &offer) {
             return Ok(Some(offer));
@@ -4967,7 +4973,7 @@ fn realm_plmn_matches_expected(realm: &str, expected_realm: &str) -> bool {
 
 fn decode_digest_nonce(value: &str) -> Result<Vec<u8>, LiveStageError> {
     let trimmed = value.trim();
-    if trimmed.len() % 2 == 0
+    if trimmed.len().is_multiple_of(2)
         && !trimmed.is_empty()
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit())
     {
@@ -4984,7 +4990,7 @@ fn decode_digest_nonce(value: &str) -> Result<Vec<u8>, LiveStageError> {
         .decode(value.as_bytes())
         .or_else(|_| {
             let mut padded = value.to_string();
-            while padded.len() % 4 != 0 {
+            while !padded.len().is_multiple_of(4) {
                 padded.push('=');
             }
             BASE64_STANDARD.decode(padded.as_bytes())
@@ -5010,7 +5016,7 @@ struct DigestNonceShape {
 
 fn digest_nonce_shape(value: &str) -> DigestNonceShape {
     let trimmed = value.trim();
-    let ascii_hex = trimmed.len() % 2 == 0
+    let ascii_hex = trimmed.len().is_multiple_of(2)
         && !trimmed.is_empty()
         && trimmed.bytes().all(|b| b.is_ascii_hexdigit());
     let base64_like = !trimmed.is_empty()
@@ -5024,6 +5030,7 @@ fn digest_nonce_shape(value: &str) -> DigestNonceShape {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_aka_md5_response(
     username: &str,
     realm: &str,

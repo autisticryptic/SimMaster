@@ -151,6 +151,9 @@ pub struct IkeConfigurationMaterial {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+// The EAP prefix is intentional: it distinguishes protocol-round outcomes from
+// the surrounding IKE_AUTH state machine when values appear in traces.
+#[allow(clippy::enum_variant_names)]
 pub enum IkeAuthProgress {
     EapAkaIdentity { packet: Vec<u8> },
     EapAkaNotification { packet: Vec<u8> },
@@ -1136,7 +1139,7 @@ impl IkeStateMachine {
                 direction: "inbound",
                 payloads: payloads
                     .iter()
-                    .map(|payload| payload.payload_type.as_str())
+                    .map(|payload| payload.payload_type.name())
                     .collect(),
                 note: "encrypted_eap_aka_identity_received",
             });
@@ -1154,7 +1157,7 @@ impl IkeStateMachine {
                 direction: "inbound",
                 payloads: payloads
                     .iter()
-                    .map(|payload| payload.payload_type.as_str())
+                    .map(|payload| payload.payload_type.name())
                     .collect(),
                 note: "encrypted_eap_aka_notification_received",
             });
@@ -1185,7 +1188,7 @@ impl IkeStateMachine {
             direction: "inbound",
             payloads: payloads
                 .iter()
-                .map(|payload| payload.payload_type.as_str())
+                .map(|payload| payload.payload_type.name())
                 .collect(),
             note: if child_sa_included {
                 "encrypted_auth_success_child_sa_accepted"
@@ -1300,7 +1303,7 @@ impl IkeStateMachine {
             direction: "inbound",
             payloads: payloads
                 .iter()
-                .map(|payload| payload.payload_type.as_str())
+                .map(|payload| payload.payload_type.name())
                 .collect(),
             note: "child_sa_response_accepted",
         });
@@ -1369,12 +1372,12 @@ impl IkeStateMachine {
     fn push_event(&mut self, message: &IkeMessage, direction: &'static str, note: &'static str) {
         self.transcript.push(IkeTranscriptEvent {
             message_id: message.header.message_id,
-            exchange: message.header.exchange_type.as_str(),
+            exchange: message.header.exchange_type.name(),
             direction,
             payloads: message
                 .payloads
                 .iter()
-                .map(|payload| payload.payload_type.as_str())
+                .map(|payload| payload.payload_type.name())
                 .collect(),
             note,
         });
@@ -1834,11 +1837,11 @@ impl IkeMessageExt for IkeMessage {
 }
 
 trait IkeExchangeTypeName {
-    fn as_str(self) -> &'static str;
+    fn name(self) -> &'static str;
 }
 
 impl IkeExchangeTypeName for IkeExchangeType {
-    fn as_str(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::IkeSaInit => "ike_sa_init",
             Self::IkeAuth => "ike_auth",
@@ -1851,11 +1854,11 @@ impl IkeExchangeTypeName for IkeExchangeType {
 }
 
 trait IkePayloadTypeName {
-    fn as_str(self) -> &'static str;
+    fn name(self) -> &'static str;
 }
 
 impl IkePayloadTypeName for IkePayloadType {
-    fn as_str(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::NoNext => "no_next",
             Self::SecurityAssociation => "security_association",

@@ -189,13 +189,15 @@ pub fn parse_bearer_connection(
     let interface = value(output, "bearer.status.interface")
         .filter(|item| item != "--")
         .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
-    let mut settings = ImsIpSettings::default();
-    settings.ipv4_address = ip_value(output, "bearer.ipv4-config.address");
-    settings.ipv4_gateway = ip_value(output, "bearer.ipv4-config.gateway");
-    settings.ipv4_dns = list_ip_values(output, "bearer.ipv4-config.dns.value");
-    settings.ipv6_address = ip_value(output, "bearer.ipv6-config.address");
-    settings.ipv6_gateway = ip_value(output, "bearer.ipv6-config.gateway");
-    settings.ipv6_dns = list_ip_values(output, "bearer.ipv6-config.dns.value");
+    let settings = ImsIpSettings {
+        ipv4_address: ip_value(output, "bearer.ipv4-config.address"),
+        ipv4_gateway: ip_value(output, "bearer.ipv4-config.gateway"),
+        ipv4_dns: list_ip_values(output, "bearer.ipv4-config.dns.value"),
+        ipv6_address: ip_value(output, "bearer.ipv6-config.address"),
+        ipv6_gateway: ip_value(output, "bearer.ipv6-config.gateway"),
+        ipv6_dns: list_ip_values(output, "bearer.ipv6-config.dns.value"),
+        ..Default::default()
+    };
     let ipv4_prefix = number_value(output, "bearer.ipv4-config.prefix");
     let ipv6_prefix = number_value(output, "bearer.ipv6-config.prefix");
     let mtu = number_value(output, "bearer.ipv6-config.mtu")

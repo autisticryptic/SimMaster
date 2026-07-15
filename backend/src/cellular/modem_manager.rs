@@ -420,7 +420,7 @@ fn parse_crsm_fcp_record_length(output: &str) -> usize {
                 // inner[i+3] = data coding byte
                 // inner[i+4..i+6] = record length (big-endian u16)
                 let record_len = ((inner[i + 4] as usize) << 8) | (inner[i + 5] as usize);
-                if record_len >= 28 && record_len <= 256 {
+                if (28..=256).contains(&record_len) {
                     return record_len;
                 }
             }
@@ -544,9 +544,7 @@ fn normalize_phone_number(value: &str) -> String {
 
     let mut normalized = String::new();
     for ch in value.chars() {
-        if ch == '+' && normalized.is_empty() {
-            normalized.push(ch);
-        } else if ch.is_ascii_digit() {
+        if (ch == '+' && normalized.is_empty()) || ch.is_ascii_digit() {
             normalized.push(ch);
         }
     }
@@ -1083,9 +1081,7 @@ fn recent_modem_discovery_failure() -> Option<String> {
     let Ok(guard) = MODEM_DISCOVERY_FAILURE.lock() else {
         return None;
     };
-    let Some((recorded_at, detail)) = guard.as_ref() else {
-        return None;
-    };
+    let (recorded_at, detail) = guard.as_ref()?;
     (recorded_at.elapsed() < Duration::from_secs(MODEM_DISCOVERY_FAILURE_CACHE_SECS))
         .then(|| detail.clone())
 }
@@ -3062,8 +3058,8 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
         if is_serving {
             serving_cell = ServingCell {
                 tech: tech.clone(),
-                cell_id: parse_hex_u32(&cell_id_hex.trim_start_matches("0x")),
-                tac: parse_hex_u32(&tac_hex.trim_start_matches("0x")),
+                cell_id: parse_hex_u32(cell_id_hex.trim_start_matches("0x")),
+                tac: parse_hex_u32(tac_hex.trim_start_matches("0x")),
             };
         }
 
@@ -3099,7 +3095,7 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
             tech.to_uppercase()
         };
 
-        let cell_id_u = parse_hex_u32(&cell_id_hex.trim_start_matches("0x"));
+        let cell_id_u = parse_hex_u32(cell_id_hex.trim_start_matches("0x"));
         parsed_cells.push(CellInfo {
             is_serving,
             band: single_current_band_label(&current_bands, &tech).unwrap_or_default(),
@@ -3697,7 +3693,7 @@ pub async fn apply_roaming_policy(
 ) -> zbus::Result<()> {
     config
         .set_roaming_allowed(allowed)
-        .map_err(|e| zbus::fdo::Error::Failed(e))?;
+        .map_err(zbus::fdo::Error::Failed)?;
     if get_data_connection_status(conn).await.unwrap_or(false) {
         let apn_config = config.get_apn_config();
         set_data_connection_with_apn(conn, false, allowed, Some(&apn_config)).await?;
@@ -4856,7 +4852,7 @@ pub async fn hangup_call(conn: &Connection, call_path: &str) -> zbus::Result<()>
     if is_at_call_path(call_path) {
         run_direct_at_command(conn, "ATH")
             .await
-            .map_err(|err| zbus::fdo::Error::Failed(err))?;
+            .map_err(zbus::fdo::Error::Failed)?;
         return Ok(());
     }
     terminate_call(conn, call_path).await
@@ -5250,7 +5246,7 @@ pub async fn hangup_all_calls(conn: &Connection) -> zbus::Result<()> {
         {
             run_direct_at_command(conn, "ATH")
                 .await
-                .map_err(|err| zbus::fdo::Error::Failed(err))?;
+                .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
         }
         let modem_path = find_modem_path(conn).await?;
@@ -5269,7 +5265,7 @@ pub async fn answer_call(conn: &Connection, call_path: &str) -> zbus::Result<()>
         if is_at_call_path(call_path) {
             run_direct_at_command(conn, "ATA")
                 .await
-                .map_err(|err| zbus::fdo::Error::Failed(err))?;
+                .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
         }
         let call_proxy = Proxy::new(conn, MM_SERVICE, call_path, MM_CALL).await?;
@@ -5882,9 +5878,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
         }
     }
 
-    if let Err(err) = power_result {
-        return Err(err);
-    }
+    power_result?;
     if let Err(err) = start_result {
         return Err(format!("SIM 已重新上电，但 ModemManager 启动失败：{err}"));
     }

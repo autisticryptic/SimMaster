@@ -2,6 +2,10 @@
 //!
 //! 使用 SQLite 存储短信历史记录和通话记录
 
+// The legacy unit-test module predates later database domains. Moving the large
+// block creates a high-conflict diff without changing runtime organization.
+#![allow(clippy::items_after_test_module)]
+
 use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
@@ -2243,6 +2247,8 @@ impl Database {
         )
     }
 
+    // SQL boundary: parameters deliberately mirror the persisted SMS columns.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_sms_at_with_transport(
         &self,
         direction: &str,
@@ -2545,6 +2551,8 @@ impl Database {
         )
     }
 
+    // Query boundary: explicit filters keep optional/empty-string SQL semantics visible.
+    #[allow(clippy::too_many_arguments)]
     pub fn get_notification_logs(
         &self,
         event_type: &str,
@@ -3645,6 +3653,7 @@ impl Database {
     }
 
     /// 获取自动化执行日志（分页与过滤）
+    #[allow(clippy::too_many_arguments)]
     pub fn get_automation_logs(
         &self,
         task_type: &str,

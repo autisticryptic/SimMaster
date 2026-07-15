@@ -347,7 +347,7 @@ pub fn execute_usim_authenticate_via_proxy(
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, rand, autn, timeout);
-        return Err(QmiUimError::InvalidFrame);
+        Err(QmiUimError::InvalidFrame)
     }
 
     #[cfg(unix)]
@@ -376,7 +376,7 @@ pub fn execute_usim_authenticate_via_proxy_reason(
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, rand, autn, timeout);
-        return Err("sim_auth_platform_unsupported");
+        Err("sim_auth_platform_unsupported")
     }
 
     #[cfg(unix)]
@@ -427,6 +427,9 @@ pub fn execute_usim_authenticate_via_proxy_reason(
     }
 }
 
+// The public adapter mirrors the QMI transaction contract; keeping each retry
+// and APDU input explicit is safer than a loosely scoped mutable context.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_usim_authenticate_via_proxy_reason_with_retry(
     proxy_socket: &str,
     device_path: &str,
@@ -473,7 +476,7 @@ pub fn verify_usim_application_via_proxy_reason(
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, timeout);
-        return Err("sim_auth_platform_unsupported");
+        Err("sim_auth_platform_unsupported")
     }
 
     #[cfg(unix)]

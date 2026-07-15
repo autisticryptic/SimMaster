@@ -40,6 +40,7 @@ pub struct VowifiProfilesResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[derive(Default)]
 pub struct VowifiProfileMatchResponse {
     pub matched: bool,
     pub matched_prefix: Option<String>,
@@ -52,21 +53,6 @@ pub struct VowifiProfileMatchResponse {
     pub sim: MaskedSimIdentity,
 }
 
-impl Default for VowifiProfileMatchResponse {
-    fn default() -> Self {
-        Self {
-            matched: false,
-            matched_prefix: None,
-            profile: None,
-            sim_auth: None,
-            epdg: None,
-            ike: None,
-            dataplane: None,
-            ims: None,
-            sim: MaskedSimIdentity::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicEpdgPlan {
@@ -217,6 +203,7 @@ pub struct PublicAkaAdapterPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Default)]
 pub struct VowifiReadiness {
     pub identity_ready: bool,
     pub sim_auth_ready: bool,
@@ -230,22 +217,6 @@ pub struct VowifiReadiness {
     pub voice_ready: bool,
 }
 
-impl Default for VowifiReadiness {
-    fn default() -> Self {
-        Self {
-            identity_ready: false,
-            sim_auth_ready: false,
-            profile_matched: false,
-            epdg_ready: false,
-            ike_ready: false,
-            child_sa_ready: false,
-            esp_ready: false,
-            ims_registered: false,
-            sms_ready: false,
-            voice_ready: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VowifiStatusResponse {

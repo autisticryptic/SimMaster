@@ -962,6 +962,9 @@ pub async fn download_esim_profile_handler(
                                     mnc: p.mnc.clone(),
                                     updated_at: chrono::Utc::now().to_rfc3339(),
                                 };
+                                // Keep the result alive through the branch so any future Drop
+                                // side effects retain the established ordering.
+                                #[allow(clippy::redundant_pattern_matching)]
                                 if let Ok(_) = app.database.upsert_esim_profile_cache(&entry) {
                                     cached_fallback_iccid = Some(p.iccid.clone());
                                     break;
@@ -1101,7 +1104,7 @@ pub async fn update_sim_cache_handler(
         crate::cellular::modem_manager::cache_own_numbers_for_identity(
             &app.database,
             &identity,
-            &[phone_number.clone()],
+            std::slice::from_ref(phone_number),
             "manual",
         );
     }
@@ -1590,9 +1593,7 @@ pub async fn set_device_ddns_config_handler(
     if is_masked_secret(&payload.access_id) {
         payload.access_id = current.access_id;
     }
-    if payload.access_secret.trim().is_empty() {
-        payload.access_secret = current.access_secret;
-    } else if is_masked_secret(&payload.access_secret) {
+    if payload.access_secret.trim().is_empty() || is_masked_secret(&payload.access_secret) {
         payload.access_secret = current.access_secret;
     }
     if payload.interval_seconds == 0 {
@@ -2464,6 +2465,9 @@ fn new_vowifi_switch_token(reason: &str) -> String {
     format!("{reason}-{millis:x}")
 }
 
+// This is a persistence boundary whose fields intentionally mirror one restore
+// snapshot. Named arguments are supplied from a small set of local call sites.
+#[allow(clippy::too_many_arguments)]
 fn persist_vowifi_restore_phase(
     app: &AppState,
     switch_token: &str,
@@ -2717,7 +2721,7 @@ pub async fn send_sms_handler_legacy(
             // let _ = app.database.clear_vowifi_runtime_events();
             let current_snap = app.vowifi_runtime.snapshot().await;
             let profile_meta = current_snap.profile.profile.as_ref();
-            let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
+            let profile_id = profile_meta.map(|p| p.profile_id);
             let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
                 trace_id: Some("runtime-connect"),
                 level: "info",
@@ -3548,9 +3552,10 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
 }
 
 fn disabled_vowifi_status(reason: &str) -> VowifiStatusResponse {
-    let mut status = VowifiStatusResponse::default();
-    status.degraded_reason = Some(reason.to_string());
-    status
+    VowifiStatusResponse {
+        degraded_reason: Some(reason.to_string()),
+        ..Default::default()
+    }
 }
 fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
     matches!(
@@ -3571,7 +3576,7 @@ async fn reset_vowifi_runtime(app: &AppState, reason: &str) -> VowifiStatusRespo
 async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> VowifiStatusResponse {
     let current = app.vowifi_runtime.snapshot().await.status_response();
     let profile_meta = current.profile.profile.as_ref();
-    let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
+    let profile_id = profile_meta.map(|p| p.profile_id);
 
     // 1. IPSEC Event: 发送 IKEv2 INFORMATIONAL 报文，拆除全部 ESP 安全关联并注销会话
     let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
@@ -3978,6 +3983,7 @@ async fn wait_for_vowifi_sim_auth_gate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn persist_optional_vowifi_restore_phase(
     app: &AppState,
     workflow: &VowifiRestoreWorkflow,
@@ -4114,7 +4120,7 @@ async fn connect_vowifi_with_attempts(
 
     // let _ = app.database.clear_vowifi_runtime_events();
     let profile_meta = current.profile.profile.as_ref();
-    let profile_id = profile_meta.map(|p| p.profile_id.as_ref());
+    let profile_id = profile_meta.map(|p| p.profile_id);
     let _ = app.database.insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
         trace_id: Some("runtime-connect"),
         level: "info",
@@ -5465,7 +5471,7 @@ pub(crate) fn temperature_sensor_label(sensor_type: &str, zone: &str) -> String 
     }
 
     let cleaned = source
-        .replace(|ch: char| matches!(ch, '-' | '_' | ' '), " ")
+        .replace(['-', '_', ' '], " ")
         .split_whitespace()
         .filter(|part| {
             !matches!(

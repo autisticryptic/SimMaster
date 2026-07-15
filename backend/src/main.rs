@@ -47,7 +47,7 @@ use network::device_network::DdnsManager;
 use notify::notification::NotificationSender;
 use notify::notification_queue::*;
 use sim::esim::EsimSupervisor;
-use state::AppState;
+use state::{AppState, AppStateDependencies};
 use system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
@@ -483,21 +483,21 @@ async fn main() -> Result<()> {
         .allow_headers(Any);
 
     // 创建统一的应用状态
-    let app_state = AppState::new(
+    let app_state = AppState::new(AppStateDependencies {
         dbus_conn,
-        app_db,
+        database: app_db,
         config_manager,
         notification_sender,
         system_event_emitter,
         ddns_manager,
-        Arc::clone(&esim_supervisor),
+        esim_supervisor: Arc::clone(&esim_supervisor),
         sms_resync,
         data_user_disabled,
         airplane_mode_requested,
         vowifi_runtime,
         volte_runtime,
         cell_monitoring_active,
-    );
+    });
 
     // 启动自动化中心后台调度引擎
     automation::spawn_automation_scheduler(app_state.clone());

@@ -122,7 +122,7 @@ pub fn build_encrypted_payload_plan(
     Ok(EncryptedPayloadPlan {
         mode: EncryptedPayloadMode::MetadataOnly.as_str(),
         outer_payload: "encrypted",
-        first_inner_payload: inner_payloads[0].payload_type.as_str(),
+        first_inner_payload: inner_payloads[0].payload_type.name(),
         cipher: key_schedule.encryption,
         integrity: key_schedule.integrity,
         iv_bytes,
@@ -520,11 +520,11 @@ fn encrypted_body_from_encoded_message(
 }
 
 trait PayloadTypeName {
-    fn as_str(self) -> &'static str;
+    fn name(self) -> &'static str;
 }
 
 impl PayloadTypeName for IkePayloadType {
-    fn as_str(self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
             Self::NoNext => "no_next",
             Self::SecurityAssociation => "security_association",
