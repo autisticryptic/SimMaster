@@ -155,12 +155,14 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         sa.algs.auth_trunc_bits.to_string(),
         "enc".into(),
         sa.algs.enc.into(),
-        "0x".into(),
+        String::new(),
         "sel".into(),
         "src".into(),
         ip_str(sa.src),
         "dst".into(),
         ip_str(sa.dst),
+        "proto".into(),
+        "udp".into(),
     ];
     // Port selectors bind the SA to the negotiated sec-agree ports.
     v.push("sport".into());
@@ -204,6 +206,8 @@ pub fn build_xfrm_policy_add(
         ip_str(src),
         "dst".into(),
         ip_str(dst),
+        "proto".into(),
+        "udp".into(),
         "sport".into(),
         sport.to_string(),
         "dport".into(),
@@ -414,7 +418,8 @@ mod tests {
         assert!(joined.contains("proto esp spi 0x00001234"));
         assert!(joined.contains("mode transport"));
         assert!(joined.contains("auth-trunc hmac(md5) 0xaabbcc 96"));
-        assert!(joined.contains("enc cipher_null 0x"));
+        assert!(joined.contains("enc cipher_null  sel"));
+        assert!(joined.contains("proto udp sport 6000"));
         assert!(joined.contains("sport 6000"));
         assert!(joined.contains("dport 6001"));
     }

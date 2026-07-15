@@ -25,8 +25,9 @@ use crate::{
 
 use super::{
     bearer::{
-        configure_bearer_network, disconnect_bearer, ensure_ims_bearer, route_pcscf,
-        teardown_bearer_network, BearerConnection, BearerRequest,
+        configure_bearer_network, disconnect_bearer, disconnect_existing_ims_bearers,
+        ensure_ims_bearer, route_pcscf, teardown_bearer_network, BearerConnection,
+        BearerRequest,
     },
     channel::VolteSipChannel,
     digest_aka,
@@ -311,6 +312,7 @@ async fn connect_inner(
     ensure_generation(runtime, generation)?;
 
     runtime.update(|state| state.stage = VolteStage::Pcscf).await;
+    disconnect_existing_ims_bearers(MODEM_ID).await?;
     let at_pcscf = discover_pcscf_via_at(MODEM_ID, config.ip_family_preference).await;
     ensure_generation(runtime, generation)?;
 

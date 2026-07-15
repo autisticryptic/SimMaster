@@ -143,6 +143,29 @@ pub async fn ensure_ims_bearer(
     connect_and_read(&path).await
 }
 
+/// Disconnect an IMS bearer left active by a previous process before the
+/// Qualcomm AT P-CSCF probe temporarily reuses its PDP context.  Keep the
+/// bearer object itself so `ensure_ims_bearer` can reconnect it afterwards.
+pub async fn disconnect_existing_ims_bearers(modem: &str) -> Result<(), VolteError> {
+    let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
+    for path in parse_bearer_paths(&modem_output) {
+        let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
+        if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN)
+            && value(&details, "bearer.status.connected").as_deref() == Some("yes")
+        {
+            run_command("mmcli", &["-b", &path, "--disconnect"])
+                .await
+                .map_err(|error| {
+                    VolteError::with_detail(
+                        code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                        format!("disconnect_before_pcscf:{error}"),
+                    )
+                })?;
+        }
+    }
+    Ok(())
+}
+
 async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
     let before = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
     if value(&before, "bearer.status.connected").as_deref() != Some("yes") {
