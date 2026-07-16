@@ -28,6 +28,7 @@ pub const MMTEL_ICSI_REF: &str = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 pub const PANI_EUTRAN: &str = "3GPP-E-UTRAN-FDD";
 pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
+pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
 
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
@@ -538,6 +539,62 @@ pub fn build_bye(
     h.into_bytes()
 }
 
+/// Build an in-dialog SIP INFO carrying one DTMF digit. This is the signaling
+/// fallback when the operator dialog did not negotiate RFC 4733
+/// `telephone-event`, or when Asterisk explicitly delivered DTMF via INFO.
+/// RTP telephone-event remains preferred because it stays on the media path.
+pub fn build_dtmf_info(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    digit: char,
+    duration_ms: u16,
+) -> Result<Vec<u8>, VolteError> {
+    let digit = digit.to_ascii_uppercase();
+    if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D') {
+        return Err(VolteError::new("volte_dtmf_digit_invalid"));
+    }
+    if !(40..=5000).contains(&duration_ms) {
+        return Err(VolteError::new("volte_dtmf_duration_invalid"));
+    }
+    let branch = new_branch();
+    let local_host = sip_host(route.local_addr.ip());
+    let local_port = route.local_addr.port();
+    let route_host = sip_host(route.pcscf_addr.ip());
+    let to = match &dialog.remote_tag {
+        Some(tag) => format!("<{callee_uri}>;tag={tag}"),
+        None => format!("<{callee_uri}>"),
+    };
+    let body = format!("Signal={digit}\r\nDuration={duration_ms}\r\n");
+    let mut h = String::new();
+    h.push_str(&format!("INFO {callee_uri} SIP/2.0\r\n"));
+    h.push_str(&format!(
+        "Via: {} {local_host}:{local_port};branch={branch};rport\r\n",
+        route.transport.as_via()
+    ));
+    h.push_str("Max-Forwards: 70\r\n");
+    h.push_str(&format!(
+        "Route: <sip:{route_host}:{};lr>\r\n",
+        route.pcscf_addr.port()
+    ));
+    h.push_str(&format!(
+        "From: <{}>;tag={}\r\n",
+        identity.public_uri, dialog.local_tag
+    ));
+    h.push_str(&format!("To: {to}\r\n"));
+    h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
+    h.push_str(&format!("CSeq: {cseq} INFO\r\n"));
+    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
+    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("Content-Type: {DTMF_RELAY_CONTENT_TYPE}\r\n"));
+    h.push_str("Content-Disposition: signal;handling=optional\r\n");
+    h.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    h.push_str(&body);
+    Ok(h.into_bytes())
+}
+
 /// Build a CANCEL for a not-yet-answered INVITE. Per RFC 3261 the CANCEL copies
 /// the INVITE's Call-ID/From/To/CSeq-number (method CANCEL) and top Via branch.
 pub fn build_cancel(
@@ -880,5 +937,52 @@ mod tests {
         assert!(text.starts_with("BYE sip:+8613800138000@h SIP/2.0\r\n"));
         assert!(text.contains("CSeq: 2 BYE\r\n"));
         assert!(text.contains("To: <sip:+8613800138000@h>;tag=rt\r\n"));
+    }
+
+    #[test]
+    fn dtmf_info_uses_confirmed_dialog_and_dtmf_relay_body() {
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("remote-tag");
+        let frame = build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            3,
+            '5',
+            240,
+        )
+        .unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.starts_with("INFO sip:+8613800138000@h SIP/2.0\r\n"));
+        assert!(text.contains("To: <sip:+8613800138000@h>;tag=remote-tag\r\n"));
+        assert!(text.contains("CSeq: 3 INFO\r\n"));
+        assert!(text.contains("Content-Type: application/dtmf-relay\r\n"));
+        assert!(text.ends_with("Signal=5\r\nDuration=240\r\n"));
+    }
+
+    #[test]
+    fn dtmf_info_rejects_invalid_digit_and_duration() {
+        let dialog = DialogIds::fresh();
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            'Z',
+            160,
+        )
+        .is_err());
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            '1',
+            10,
+        )
+        .is_err());
     }
 }

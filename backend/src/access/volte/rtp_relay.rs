@@ -79,6 +79,16 @@ pub struct ForwardDecision {
     pub to: RelayLeg,
     /// Destination address (the peer leg's learned or configured remote).
     pub dest: SocketAddr,
+    /// Optional RTP payload type expected by the destination leg. This is used
+    /// for dynamic codecs such as RFC 4733 telephone-event when the two SIP
+    /// dialogs negotiated different payload numbers.
+    pub rewrite_payload_type: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PayloadTypeMapping {
+    pub operator: u8,
+    pub internal: u8,
 }
 
 /// Errors from the relay core (pure logic).
@@ -99,6 +109,7 @@ pub struct RtpRelayCore {
     internal: LegEndpoint,
     /// If true, only forward payloads that parse as RTP v2 (drop stray/noise).
     require_rtp: bool,
+    payload_type_mappings: Vec<PayloadTypeMapping>,
 }
 
 impl RtpRelayCore {
@@ -107,12 +118,24 @@ impl RtpRelayCore {
             operator,
             internal,
             require_rtp: true,
+            payload_type_mappings: Vec::new(),
         }
     }
 
     /// Allow forwarding non-RTP datagrams (e.g. RTCP) without RTP validation.
     pub fn with_require_rtp(mut self, require: bool) -> Self {
         self.require_rtp = require;
+        self
+    }
+
+    /// Add a dynamic RTP payload mapping between the operator and internal
+    /// dialogs. Marker/sequence/timestamp/SSRC and payload bytes remain intact;
+    /// only the 7-bit PT field is rewritten when required.
+    pub fn with_payload_type_mapping(mut self, operator: u8, internal: u8) -> Self {
+        if operator <= 0x7f && internal <= 0x7f {
+            self.payload_type_mappings
+                .push(PayloadTypeMapping { operator, internal });
+        }
         self
     }
 
@@ -171,8 +194,32 @@ impl RtpRelayCore {
             .leg(peer)
             .remote
             .ok_or(RelayError::PeerAddressUnknown)?;
-        Ok(ForwardDecision { to: peer, dest })
+        let current_payload_type = datagram.get(1).map(|byte| byte & 0x7f);
+        let rewrite_payload_type = current_payload_type.and_then(|current| {
+            self.payload_type_mappings
+                .iter()
+                .find_map(|mapping| match leg {
+                    RelayLeg::Operator if current == mapping.operator => Some(mapping.internal),
+                    RelayLeg::Internal if current == mapping.internal => Some(mapping.operator),
+                    _ => None,
+                })
+        });
+        Ok(ForwardDecision {
+            to: peer,
+            dest,
+            rewrite_payload_type,
+        })
     }
+}
+
+pub fn rewrite_rtp_payload_type(datagram: &[u8], payload_type: u8) -> Option<Vec<u8>> {
+    if payload_type > 0x7f {
+        return None;
+    }
+    RtpPacket::parse(datagram)?;
+    let mut rewritten = datagram.to_vec();
+    rewritten[1] = (rewritten[1] & 0x80) | payload_type;
+    Some(rewritten)
 }
 
 #[cfg(test)]
@@ -214,6 +261,7 @@ mod tests {
             .expect("forward");
         assert_eq!(d.to, RelayLeg::Internal);
         assert_eq!(d.dest, addr(2, 40000));
+        assert_eq!(d.rewrite_payload_type, None);
         // Counters incremented on the receiving (operator) leg.
         let (pkts, bytes) = relay.counters(RelayLeg::Operator);
         assert_eq!(pkts, 1);
@@ -273,6 +321,36 @@ mod tests {
             )
             .expect("forward without rtp check");
         assert_eq!(d.to, RelayLeg::Operator);
+    }
+
+    #[test]
+    fn telephone_event_payload_type_is_rewritten_between_dialogs() {
+        let mut relay = RtpRelayCore::new(
+            LegEndpoint::new(Some(addr(1, 5004)), false),
+            LegEndpoint::new(Some(addr(2, 40000)), false),
+        )
+        .with_payload_type_mapping(96, 101);
+        let mut packet = RtpPacket {
+            payload_type: 101,
+            marker: true,
+            sequence: 9,
+            timestamp: 800,
+            ssrc: 0x1234,
+            // RFC 4733 event=5, end=0, volume=10, duration=160 samples.
+            payload: vec![5, 10, 0, 160],
+        }
+        .encode();
+        let decision = relay
+            .ingest(RelayLeg::Internal, addr(2, 40000), &packet)
+            .unwrap();
+        assert_eq!(decision.rewrite_payload_type, Some(96));
+        packet = rewrite_rtp_payload_type(&packet, 96).unwrap();
+        assert_eq!(packet[1], 0x80 | 96, "marker bit must be preserved");
+        assert!(rewrite_rtp_payload_type(&packet, 128).is_none());
+        assert_eq!(
+            RtpPacket::parse(&packet).unwrap().payload,
+            vec![5, 10, 0, 160]
+        );
     }
 }
 
@@ -338,7 +416,13 @@ pub mod io {
             Ok((n, src)) => {
                 if let Ok(decision) = core.ingest(leg, src, &buf[..n]) {
                     // Forward out the peer leg's socket to the learned dest.
-                    let _ = send_sock.send_to(&buf[..n], decision.dest);
+                    if let Some(payload_type) = decision.rewrite_payload_type {
+                        if let Some(rewritten) = rewrite_rtp_payload_type(&buf[..n], payload_type) {
+                            let _ = send_sock.send_to(&rewritten, decision.dest);
+                        }
+                    } else {
+                        let _ = send_sock.send_to(&buf[..n], decision.dest);
+                    }
                 }
             }
             Err(ref e)

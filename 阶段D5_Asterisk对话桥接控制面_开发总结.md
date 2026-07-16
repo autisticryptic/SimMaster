@@ -36,26 +36,40 @@
 - ViLTE 的视频 offer 作为独立媒体端点保留，为 D6 的双路 RTP relay 和 `TrunkVideoSeam` 接线提供输入。
 - SimAdmin 仍只负责信令映射和 RTP relay，不转码、不承担网页 WebRTC/DTLS-SRTP。
 
+### 5. 通话中数字键（DTMF）桥接
+
+- Asterisk/Linphone 侧优先通过 SDP 协商 `telephone-event/8000`，按 RFC 4733（兼容旧称 RFC 2833）在 RTP 媒体流中传递 `0-9`、`*`、`#`、`A-D`。
+- SDP 解析会保存 `telephone-event` 的动态 payload type 与 `fmtp` 事件范围；当 Asterisk 腿与运营商 IMS 腿协商出的 payload type 不同（例如 101↔96）时，relay 只改写 RTP 头部的 7-bit PT 字段，保留 marker、序号、时间戳、SSRC 和 DTMF event payload。
+- Asterisk 也可发送通话内 SIP INFO；支持 `application/dtmf-relay` 和 `application/dtmf`，解析后产生 `OperatorCommand::SendDtmf`。合法请求返回 200，非法数字/时长返回 400，未建立对话返回 481，不支持的 Content-Type 返回 415。
+- 运营商侧新增通话内 DTMF INFO 构造器，作为 IMS 未协商 RFC 4733 时的兼容回退；数字范围为 `0-9`、`*`、`#`、`A-D`，时长限制 40–5000 ms。
+- 不实现带内音频音调检测或重新生成。该方案需要解码 AMR/其他音频并破坏 SimAdmin 的纯 RTP relay 定位；若运营商只接受带内 DTMF，后续应由 Asterisk 的媒体能力处理。
+- FreePBX/PJSIP Trunk 建议使用 `dtmf_mode=rfc4733`；SIP INFO 仅作为兼容回退。
+
 ## 二、离线验证
 
 - Mock bridge 覆盖：
   - 无 IMS 能力：100 Trying → 480；
   - 事件驱动 200：200 SDP → ACK → BYE；
   - CANCEL：CANCEL 200 + 原 INVITE 487 + CancelCall；
-  - 音频 SDP endpoint 解析及无效请求拒绝。
-- 后端全量：516 项测试通过。
+  - 音频 SDP endpoint、`telephone-event/8000`、`fmtp 0-16` 解析及无效请求拒绝；
+  - 通话内 SIP INFO 数字键转发、非法 DTMF 拒绝；
+  - 运营商 IMS DTMF INFO 构造；
+  - RFC 4733 RTP payload type 101↔96 双向改写。
+- 后端全量：522 项测试通过。
 - `cargo clippy --all-targets -- -D warnings` 通过。
 
 ## 三、当前明确未完成项
 
 - `OperatorCommand` 尚未接入 `access/volte/live.rs` 的真实 IMS INVITE/应答事件队列。
+- `OperatorCommand::SendDtmf` 与运营商 DTMF INFO 构造器尚未接入真实 IMS voice session；当前只完成控制面、报文和 RTP PT 映射。
 - RTP relay 仍复用 `access/volte/rtp_relay.rs` 的纯逻辑骨架，尚未由 Trunk 呼叫建立实际 UDP relay socket。
-- 双向 re-INVITE、真实 VoLTE/ViLTE 呼叫、媒体抓包和真机拨号不在本阶段伪造；需要 Asterisk Trunk 已可拨号后再执行。
+- 双向 re-INVITE、真实 VoLTE/ViLTE 呼叫、媒体抓包、真机拨号和银行 IVR 数字键验证不在本阶段伪造；需要 D6 完成真实通话桥接后再执行。
 - Asterisk 侧 Digest/IP ACL、TLS/SRTP 和 Web 电话仍按后续 D7/D8 Todo 处理。
 
 ## 四、下一检查点
 
 1. 将 `OperatorCommand`/`OperatorEvent` 接到每线路 VoLTE live session 的非阻塞事件分发器。
-2. 为每条线路分配音频/视频 relay UDP 端口，并在 SDP answer 生成时写入内部端点。
-3. 在高通 410 上仅验证 REGISTER、OPTIONS、INVITE 无 IMS 能力时的 100→480，不执行真实拨号。
-4. Trunk 已能稳定桥接后，再由用户安排 Asterisk 6108 的真实语音/视频拨号测试。
+2. 将 `OperatorCommand::SendDtmf` 接到真实 IMS dialog；优先沿 RFC 4733 RTP 事件转发，未协商时生成 SIP INFO。
+3. 为每条线路分配音频/视频 relay UDP 端口，并在 SDP answer 生成时写入内部端点，同时应用双方协商出的 `telephone-event` PT 映射。
+4. 在高通 410 上仅验证 REGISTER、OPTIONS、INVITE 无 IMS 能力时的 100→480，不执行真实拨号。
+5. Trunk 已能稳定桥接后，再由用户安排 Asterisk 6108 的真实语音/视频拨号和银行 IVR 数字键测试。

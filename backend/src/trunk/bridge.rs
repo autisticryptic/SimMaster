@@ -41,12 +41,42 @@ pub struct MediaOffer {
     pub audio: SdpAudioDescription,
     pub audio_endpoint: SocketAddr,
     pub video: Option<VideoOffer>,
+    pub dtmf: DtmfCapabilities,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoOffer {
     pub description: VideoMediaDescription,
     pub endpoint: SocketAddr,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DtmfCapabilities {
+    /// RFC 4733/RFC 2833 dynamic payload negotiated in the audio m-line.
+    pub rtp_event: Option<RtpTelephoneEvent>,
+    /// The trunk endpoint always accepts RFC 2976-style SIP INFO as fallback.
+    pub sip_info: bool,
+    pub preferred: DtmfSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RtpTelephoneEvent {
+    pub payload_type: u8,
+    pub clock_rate: u32,
+    pub events: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtmfSource {
+    SipInfo,
+    RtpEvent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DtmfSignal {
+    pub digit: char,
+    pub duration_ms: u16,
+    pub source: DtmfSource,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +109,10 @@ pub enum OperatorCommand {
     RejectCall {
         call_id: String,
         status: u16,
+    },
+    SendDtmf {
+        call_id: String,
+        signal: DtmfSignal,
     },
 }
 
@@ -238,6 +272,7 @@ impl TrunkBridge {
             "ACK" => self.handle_ack(frame),
             "CANCEL" => self.handle_cancel(frame),
             "BYE" => self.handle_bye(frame),
+            "INFO" => self.handle_info(frame),
             "OPTIONS" => Ok(BridgeOutput {
                 asterisk_frames: vec![
                     sip::build_response(frame, 200, "OK").map_err(BridgeError::MalformedRequest)?
@@ -512,6 +547,82 @@ impl TrunkBridge {
         })
     }
 
+    fn handle_info(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
+        let call_id = dialog::call_id(frame)
+            .ok_or_else(|| BridgeError::MalformedRequest("trunk_info_call-id_missing".into()))?;
+        let Some(call) = self.calls.get(&call_id) else {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response(
+                    frame,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        };
+        if call.dialog.state != InviteTransactionState::Confirmed {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response_with_body(
+                    frame,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                    Some(&call.dialog.local_tag),
+                    &[],
+                    &[],
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        }
+        let signal = match parse_dtmf_info(frame) {
+            Ok(signal) => signal,
+            Err(DtmfInfoError::UnsupportedContentType) => {
+                return Ok(BridgeOutput {
+                    asterisk_frames: vec![sip::build_response_with_body(
+                        frame,
+                        415,
+                        "Unsupported Media Type",
+                        Some(&call.dialog.local_tag),
+                        &[],
+                        &[],
+                    )
+                    .map_err(BridgeError::MalformedRequest)?],
+                    ..BridgeOutput::default()
+                });
+            }
+            Err(DtmfInfoError::Malformed) => {
+                return Ok(BridgeOutput {
+                    asterisk_frames: vec![sip::build_response_with_body(
+                        frame,
+                        400,
+                        "Bad Request",
+                        Some(&call.dialog.local_tag),
+                        &[],
+                        &[],
+                    )
+                    .map_err(BridgeError::MalformedRequest)?],
+                    ..BridgeOutput::default()
+                });
+            }
+        };
+        Ok(BridgeOutput {
+            asterisk_frames: vec![sip::build_response_with_body(
+                frame,
+                200,
+                "OK",
+                Some(&call.dialog.local_tag),
+                &[],
+                &[],
+            )
+            .map_err(BridgeError::MalformedRequest)?],
+            operator_commands: vec![OperatorCommand::SendDtmf {
+                call_id: call.operator_call_id.clone(),
+                signal,
+            }],
+        })
+    }
+
     fn handle_asterisk_response(&mut self, frame: &[u8]) -> BridgeOutput {
         let Some(call_id) = dialog::call_id(frame) else {
             return BridgeOutput::default();
@@ -587,11 +698,138 @@ fn parse_media_offer(body: &[u8]) -> Result<MediaOffer, BridgeError> {
             })
         })
         .transpose()?;
+    let rtp_event = parse_rtp_telephone_event(body);
+    let preferred = if rtp_event.is_some() {
+        DtmfSource::RtpEvent
+    } else {
+        DtmfSource::SipInfo
+    };
     Ok(MediaOffer {
         audio,
         audio_endpoint,
         video,
+        dtmf: DtmfCapabilities {
+            rtp_event,
+            sip_info: true,
+            preferred,
+        },
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DtmfInfoError {
+    UnsupportedContentType,
+    Malformed,
+}
+
+fn parse_dtmf_info(frame: &[u8]) -> Result<DtmfSignal, DtmfInfoError> {
+    let content_type = sip_frame::header_value(frame, "Content-Type")
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let body = std::str::from_utf8(sip_frame::body(frame)).map_err(|_| DtmfInfoError::Malformed)?;
+    let (digit, duration_ms) = match content_type.as_str() {
+        "application/dtmf-relay" => {
+            let mut digit = None;
+            let mut duration = None;
+            for line in body.lines() {
+                let Some((name, value)) = line.trim().split_once('=') else {
+                    continue;
+                };
+                if name.trim().eq_ignore_ascii_case("signal") {
+                    digit = value.trim().chars().next();
+                } else if name.trim().eq_ignore_ascii_case("duration") {
+                    duration = value.trim().parse::<u16>().ok();
+                }
+            }
+            (
+                digit.ok_or(DtmfInfoError::Malformed)?,
+                duration.unwrap_or(160),
+            )
+        }
+        "application/dtmf" => {
+            let digit = body.trim().chars().next().ok_or(DtmfInfoError::Malformed)?;
+            (digit, 160)
+        }
+        _ => return Err(DtmfInfoError::UnsupportedContentType),
+    };
+    if !is_dtmf_digit(digit) || !(40..=5000).contains(&duration_ms) {
+        return Err(DtmfInfoError::Malformed);
+    }
+    Ok(DtmfSignal {
+        digit,
+        duration_ms,
+        source: DtmfSource::SipInfo,
+    })
+}
+
+fn parse_rtp_telephone_event(body: &[u8]) -> Option<RtpTelephoneEvent> {
+    let text = std::str::from_utf8(body).ok()?;
+    let mut in_audio = false;
+    let mut event = None;
+    let mut fmtps = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim_end_matches('\r').trim();
+        if let Some(media) = line.strip_prefix("m=") {
+            in_audio = media.split_whitespace().next() == Some("audio");
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if let Some(value) = line.strip_prefix("a=rtpmap:") {
+            let mut fields = value.split_whitespace();
+            let Some(payload_type) = fields.next().and_then(|value| value.parse::<u8>().ok())
+            else {
+                continue;
+            };
+            if payload_type > 0x7f {
+                continue;
+            }
+            let Some(encoding) = fields.next() else {
+                continue;
+            };
+            let mut encoding_fields = encoding.split('/');
+            if encoding_fields
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("telephone-event"))
+            {
+                let Some(clock_rate) = encoding_fields
+                    .next()
+                    .and_then(|value| value.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if clock_rate == 0 {
+                    continue;
+                }
+                event = Some((payload_type, clock_rate));
+            }
+        } else if let Some(value) = line.strip_prefix("a=fmtp:") {
+            if let Some((payload_type, params)) = value.split_once(char::is_whitespace) {
+                if let Ok(payload_type) = payload_type.parse::<u8>() {
+                    fmtps.push((payload_type, params.trim().to_string()));
+                }
+            }
+        }
+    }
+    let (payload_type, clock_rate) = event?;
+    let events = fmtps
+        .into_iter()
+        .find(|(fmtp_payload, _)| *fmtp_payload == payload_type)
+        .map(|(_, params)| params);
+    Some(RtpTelephoneEvent {
+        payload_type,
+        clock_rate,
+        events,
+    })
+}
+
+fn is_dtmf_digit(digit: char) -> bool {
+    matches!(digit.to_ascii_uppercase(), '0'..='9' | '*' | '#' | 'A'..='D')
 }
 
 fn media_endpoint(address: &str, port: u16) -> Result<SocketAddr, BridgeError> {
@@ -634,7 +872,7 @@ mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     fn sdp() -> &'static [u8] {
-        b"v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=call\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+        b"v=0\r\no=- 1 1 IN IP4 192.0.2.10\r\ns=call\r\nc=IN IP4 192.0.2.10\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n"
     }
 
     fn invite() -> Vec<u8> {
@@ -660,6 +898,23 @@ mod tests {
         );
         let output = bridge.handle_asterisk(&invite()).unwrap();
         assert_eq!(output.asterisk_frames.len(), 2);
+        let OperatorCommand::StartCall { offer, .. } = &output.operator_commands[0] else {
+            panic!("expected start call");
+        };
+        assert_eq!(
+            offer.dtmf.rtp_event,
+            Some(RtpTelephoneEvent {
+                payload_type: 101,
+                clock_rate: 8000,
+                events: Some("0-16".into()),
+            })
+        );
+        assert!(offer.dtmf.sip_info);
+        assert_eq!(offer.dtmf.preferred, DtmfSource::RtpEvent);
+        assert!(parse_rtp_telephone_event(
+            b"m=audio 40000 RTP/AVP 200\r\na=rtpmap:200 telephone-event/8000\r\n"
+        )
+        .is_none());
         assert!(String::from_utf8_lossy(&output.asterisk_frames[0]).starts_with("SIP/2.0 100"));
         assert!(String::from_utf8_lossy(&output.asterisk_frames[1]).starts_with("SIP/2.0 480"));
         assert_eq!(bridge.active_call_count(), 0);
@@ -743,5 +998,64 @@ mod tests {
                 body: sdp().to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn confirmed_call_forwards_sip_info_dtmf() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+        let body = b"Signal=5\r\nDuration=240\r\n";
+        let info = format!(
+            "INFO sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKinfo\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 2 INFO\r\nContent-Type: application/dtmf-relay\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body),
+        );
+        let output = bridge.handle_asterisk(info.as_bytes()).unwrap();
+        assert!(output.asterisk_frames[0].starts_with(b"SIP/2.0 200 OK"));
+        assert_eq!(
+            output.operator_commands,
+            vec![OperatorCommand::SendDtmf {
+                call_id: "call-a".into(),
+                signal: DtmfSignal {
+                    digit: '5',
+                    duration_ms: 240,
+                    source: DtmfSource::SipInfo,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn invalid_dtmf_info_is_rejected_without_operator_command() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+        let info = b"INFO sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKinfo\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 2 INFO\r\nContent-Type: application/dtmf\r\nContent-Length: 1\r\n\r\nZ";
+        let output = bridge.handle_asterisk(info).unwrap();
+        assert!(output.asterisk_frames[0].starts_with(b"SIP/2.0 400 Bad Request"));
+        assert!(output.operator_commands.is_empty());
     }
 }
