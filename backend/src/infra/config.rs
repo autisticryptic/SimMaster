@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn trunk_static_peer_requires_explicit_local_port() {
+    fn trunk_enabled_profile_requires_stable_local_port() {
         let (manager, path) = trunk_test_manager();
         let err = manager
             .set_line_trunk_profile(
@@ -1700,7 +1700,7 @@ mod tests {
                 },
             )
             .unwrap_err();
-        assert_eq!(err, "trunk_static_local_port_required");
+        assert_eq!(err, "trunk_local_port_required");
         let _ = std::fs::remove_file(path);
     }
 
@@ -3152,15 +3152,13 @@ impl ConfigManager {
                 if incoming.asterisk_host.trim().is_empty() {
                     return Err("trunk_asterisk_host_required".to_string());
                 }
-                if incoming.registration_mode == TrunkRegistrationMode::StaticPeer
-                    && incoming.local_port == 0
-                {
-                    return Err("trunk_static_local_port_required".to_string());
-                }
                 if incoming.registration_mode == TrunkRegistrationMode::OutboundRegister
                     && incoming.username.trim().is_empty()
                 {
                     return Err("trunk_username_required".to_string());
+                }
+                if incoming.local_port == 0 {
+                    return Err("trunk_local_port_required".to_string());
                 }
             }
             profile.trunk = incoming;

@@ -7,7 +7,7 @@ use std::sync::{
 
 use serde::Serialize;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{watch, Mutex, RwLock},
     task::JoinHandle,
 };
 
@@ -164,8 +164,13 @@ pub struct TrunkRuntime {
     snapshot: Arc<RwLock<TrunkSnapshot>>,
     active_profile: Arc<RwLock<Option<TrunkProfileConfig>>>,
     operation_lock: Arc<Mutex<()>>,
-    driver_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    driver_task: Arc<Mutex<Option<TrunkDriverTask>>>,
     generation: Arc<AtomicU64>,
+}
+
+struct TrunkDriverTask {
+    shutdown: watch::Sender<bool>,
+    task: JoinHandle<()>,
 }
 
 impl TrunkRuntime {
@@ -236,22 +241,31 @@ impl TrunkRuntime {
     }
 
     /// Stop the previous per-line endpoint, apply the persisted profile and,
-    /// when enabled, start a fresh D4 driver. Aborting and awaiting the old task
-    /// before bumping state prevents stale retries from overwriting new intent.
+    /// when enabled, start a fresh D4 driver. A registered driver gets a short
+    /// grace period to send Expires: 0 before it is force-aborted.
     pub async fn activate_profile(&self, profile: &TrunkProfileConfig) -> TrunkSnapshot {
         let _guard = self.operation_guard().await;
-        if let Some(task) = self.driver_task.lock().await.take() {
-            task.abort();
-            let _ = task.await;
+        if let Some(driver) = self.driver_task.lock().await.take() {
+            let _ = driver.shutdown.send(true);
+            let mut task = driver.task;
+            if tokio::time::timeout(std::time::Duration::from_secs(6), &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+                let _ = task.await;
+            }
         }
         let snapshot = self.apply_profile(profile).await;
         if profile.enabled {
             let generation = self.generation();
             let state = self.state_writer(generation);
             let profile = profile.clone();
-            *self.driver_task.lock().await = Some(tokio::spawn(async move {
-                crate::trunk::driver::run(profile, state).await;
-            }));
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                crate::trunk::driver::run(profile, state, shutdown_rx).await;
+            });
+            *self.driver_task.lock().await = Some(TrunkDriverTask { shutdown, task });
         }
         snapshot
     }

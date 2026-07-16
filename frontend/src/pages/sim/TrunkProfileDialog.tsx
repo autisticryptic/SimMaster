@@ -57,9 +57,8 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
     if (!draft) return '没有可编辑的线路'
     if (!draft.asterisk_host.trim()) return '请填写 Asterisk 地址'
     if (draft.asterisk_port < 1 || draft.asterisk_port > 65535) return '端口必须在 1–65535 之间'
-    if (draft.local_port < 0 || draft.local_port > 65535) return '本地端口必须在 0–65535 之间'
-    if (draft.registration_mode === 'static_peer' && draft.local_port === 0) {
-      return '静态 Peer 模式需要为每条线路配置唯一的本地 SIP 端口'
+    if (draft.local_port < 1 || draft.local_port > 65535) {
+      return '启用 Trunk 时需要为每条线路配置唯一的本地 SIP 端口（1–65535）'
     }
     if (draft.registration_mode === 'outbound_register' && !draft.username.trim()) {
       return '主动注册模式需要填写用户名'
@@ -147,9 +146,7 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
               label="本地 SIP 监听端口"
               value={draft.local_port}
               onChange={(event) => update('local_port', Number(event.target.value))}
-              helperText={draft.registration_mode === 'static_peer'
-                ? '静态 Peer 必填；多线路必须使用不同端口'
-                : '主动注册可填 0，由系统自动分配'}
+              helperText="保持 Contact 稳定；多线路必须使用不同端口，例如 5062、5064"
             />
             <TextField
               size="small"
