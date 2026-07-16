@@ -90,9 +90,19 @@
 - [x] `cargo test` —— 492 项全量测试通过。
 - [x] `cargo clippy --all-targets -- -D warnings` 零告警。
 - [x] `cargo fmt --all --check` 通过。
-- [ ] **git commit** 打阶段检查点（提交信息建议 `feat(trunk): per-line trunk profile config + API (stage D3b)`）。
+- [x] **git commit**：`b675d32 feat(trunk): add per-line trunk profile API`。
 
 **已知需真机验证的边界**：本轮不涉及任何真机 IO，无 aarch64 依赖，Windows CI 单测即可全量覆盖。
+
+### 3.1 高通 410 隔离验证（2026-07-16）
+
+- 使用 `cargo zigbuild --release --target aarch64-unknown-linux-musl` 完成交叉编译；候选提交 `b675d32`，SHA-256 为 `294D5E95C0AF43A9E290AA9B09DDC9AB688CB050C96A8B6B39B6B4BC50B66B0F`。
+- 候选部署到 `/opt/simadmin/releases/b675d32-d3b/simadmin`，仅监听设备本机 `127.0.0.1:3101`；正式 `simadmin.service` 全程保持 inactive。
+- 真机正确识别一条稳定线路；默认 Trunk 为关闭、`static_peer`、端口 5060、注册周期 3600 秒。
+- 验证 outbound register 缺用户名会返回 `trunk_username_required`；禁用状态可保存完整配置。
+- 测试凭据确实写入隔离配置，但 GET/POST/toggle 以及 `/api/volte/lines` 响应中的 `secret` 始终为空，`secret_set=true`；重启候选后配置与提示位保持。
+- D3b 只有配置层，因此测试开关不会创建 SIP socket、不会解析 Asterisk 地址，也不会发送 REGISTER，符合当前能力边界。
+- 测试结束后临时服务停止、端口 3101 关闭、测试配置和数据库删除；`wwan0` 保持 DOWN、XFRM state/policy 为 0/0、ModemManager active。设备仅保留已验证候选二进制。
 
 ---
 
