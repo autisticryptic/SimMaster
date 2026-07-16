@@ -1705,6 +1705,35 @@ mod tests {
     }
 
     #[test]
+    fn trunk_enabled_profiles_reject_duplicate_local_ports() {
+        let (manager, path) = trunk_test_manager();
+        manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        let err = manager
+            .set_line_trunk_profile(
+                "line-fedcba9876543210fedcba9876543210",
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, "trunk_local_port_in_use");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trunk_invalid_line_id_rejected() {
         let (manager, path) = trunk_test_manager();
         let err = manager
@@ -3129,24 +3158,24 @@ impl ConfigManager {
         }
         let next = {
             let mut config = self.config.write().unwrap();
-            let profile = if let Some(profile) = config
+            let profile_index = if let Some(index) = config
                 .line_profiles
-                .iter_mut()
-                .find(|profile| profile.line_id == line_id)
+                .iter()
+                .position(|profile| profile.line_id == line_id)
             {
-                profile
+                index
             } else {
                 config
                     .line_profiles
                     .push(LineProfileConfig::for_line(line_id));
-                config.line_profiles.last_mut().expect("profile inserted")
+                config.line_profiles.len() - 1
             };
             let mut incoming = trunk;
             if incoming.secret.is_empty() {
-                incoming.secret = profile.trunk.secret.clone();
+                incoming.secret = config.line_profiles[profile_index].trunk.secret.clone();
             }
             if incoming.enabled {
-                if !profile.enabled {
+                if !config.line_profiles[profile_index].enabled {
                     return Err("line_disabled".to_string());
                 }
                 if incoming.asterisk_host.trim().is_empty() {
@@ -3160,7 +3189,15 @@ impl ConfigManager {
                 if incoming.local_port == 0 {
                     return Err("trunk_local_port_required".to_string());
                 }
+                if config.line_profiles.iter().any(|profile| {
+                    profile.line_id != line_id
+                        && profile.trunk.enabled
+                        && profile.trunk.local_port == incoming.local_port
+                }) {
+                    return Err("trunk_local_port_in_use".to_string());
+                }
             }
+            let profile = &mut config.line_profiles[profile_index];
             profile.trunk = incoming;
             let next = profile.clone();
             config
