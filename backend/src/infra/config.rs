@@ -1644,6 +1644,7 @@ mod tests {
         let profile = manager.get_line_profile(TRUNK_TEST_LINE);
         assert!(!profile.trunk.enabled);
         assert_eq!(profile.trunk.asterisk_port, 5060);
+        assert_eq!(profile.trunk.local_port, 0);
         assert_eq!(profile.trunk.register_expiry_secs, 3600);
         assert_eq!(
             profile.trunk.registration_mode,
@@ -1687,6 +1688,23 @@ mod tests {
     }
 
     #[test]
+    fn trunk_static_peer_requires_explicit_local_port() {
+        let (manager, path) = trunk_test_manager();
+        let err = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, "trunk_static_local_port_required");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trunk_invalid_line_id_rejected() {
         let (manager, path) = trunk_test_manager();
         let err = manager
@@ -1706,6 +1724,7 @@ mod tests {
                     enabled: true,
                     registration_mode: TrunkRegistrationMode::StaticPeer,
                     asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
                     username: "line0".to_string(),
                     secret: "s3cr3t".to_string(),
                     match_host: Some("192.168.1.10".to_string()),
@@ -1740,6 +1759,7 @@ mod tests {
                 TrunkProfileConfig {
                     enabled: true,
                     asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
                     secret: "keepme".to_string(),
                     ..TrunkProfileConfig::default()
                 },
@@ -1754,6 +1774,7 @@ mod tests {
                 TrunkProfileConfig {
                     enabled: true,
                     asterisk_host: "192.168.1.20".to_string(),
+                    local_port: 5062,
                     secret: String::new(),
                     ..TrunkProfileConfig::default()
                 },
@@ -1780,6 +1801,7 @@ mod tests {
                 TrunkProfileConfig {
                     enabled: false,
                     asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
                     ..TrunkProfileConfig::default()
                 },
             )
@@ -2086,6 +2108,11 @@ pub struct TrunkProfileConfig {
     pub asterisk_host: String,
     #[serde(default = "default_trunk_asterisk_port")]
     pub asterisk_port: u16,
+    /// Local UDP port used by this logical endpoint. Zero asks the OS for an
+    /// ephemeral port and is suitable for outbound REGISTER. Static peers
+    /// should use a unique, explicitly configured port per line.
+    #[serde(default)]
+    pub local_port: u16,
     /// Endpoint / auth username presented to Asterisk.
     #[serde(default)]
     pub username: String,
@@ -2119,6 +2146,7 @@ impl Default for TrunkProfileConfig {
             registration_mode: TrunkRegistrationMode::StaticPeer,
             asterisk_host: String::new(),
             asterisk_port: default_trunk_asterisk_port(),
+            local_port: 0,
             username: String::new(),
             secret: String::new(),
             context: String::new(),
@@ -3123,6 +3151,11 @@ impl ConfigManager {
                 }
                 if incoming.asterisk_host.trim().is_empty() {
                     return Err("trunk_asterisk_host_required".to_string());
+                }
+                if incoming.registration_mode == TrunkRegistrationMode::StaticPeer
+                    && incoming.local_port == 0
+                {
+                    return Err("trunk_static_local_port_required".to_string());
                 }
                 if incoming.registration_mode == TrunkRegistrationMode::OutboundRegister
                     && incoming.username.trim().is_empty()

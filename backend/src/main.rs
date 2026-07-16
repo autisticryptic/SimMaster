@@ -539,6 +539,11 @@ async fn main() -> Result<()> {
                     .await
                 {
                     tracing::warn!(error = %error, "Modem/SIM line inventory refresh failed");
+                } else {
+                    refresh_app
+                        .line_registry
+                        .sync_trunk_profiles(refresh_app.config_manager.as_ref())
+                        .await;
                 }
             }
         });

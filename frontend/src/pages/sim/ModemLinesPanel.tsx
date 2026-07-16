@@ -75,7 +75,8 @@ function modemStateLabel(state: string) {
 function trunkRuntimeLabel(line?: TrunkProfileResponse) {
   if (!line || !line.trunk.enabled) return 'Trunk 未启用'
   if (line.runtime.registered) return 'Asterisk 已注册'
-  if (line.runtime.phase === 'configured') return '已配置，等待 D4 接线'
+  if (line.runtime.phase === 'ready') return '静态 Peer 已监听'
+  if (line.runtime.phase === 'configured') return '已配置，等待启动'
   if (line.runtime.phase === 'degraded') return '连接异常'
   return line.runtime.stage || '等待启动'
 }
@@ -356,8 +357,8 @@ export default function ModemLinesPanel() {
                           <Chip
                             size="small"
                             label={trunkRuntimeLabel(trunkLine)}
-                            color={trunkLine?.runtime.registered ? 'success' : trunkLine?.trunk.enabled ? 'warning' : 'default'}
-                            variant={trunkLine?.runtime.registered ? 'filled' : 'outlined'}
+                            color={trunkLine?.runtime.registered || trunkLine?.runtime.phase === 'ready' ? 'success' : trunkLine?.trunk.enabled ? 'warning' : 'default'}
+                            variant={trunkLine?.runtime.registered || trunkLine?.runtime.phase === 'ready' ? 'filled' : 'outlined'}
                           />
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25} noWrap>

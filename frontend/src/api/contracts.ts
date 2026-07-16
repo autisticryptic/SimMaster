@@ -477,6 +477,7 @@ export interface TrunkProfileConfig {
   registration_mode: TrunkRegistrationMode
   asterisk_host: string
   asterisk_port: number
+  local_port: number
   username: string
   secret: string
   context: string

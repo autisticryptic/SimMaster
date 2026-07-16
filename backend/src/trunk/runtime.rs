@@ -6,7 +6,10 @@ use std::sync::{
 };
 
 use serde::Serialize;
-use tokio::sync::{Mutex, RwLock};
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
+};
 
 use crate::infra::config::{TrunkProfileConfig, TrunkRegistrationMode};
 
@@ -15,6 +18,7 @@ pub enum TrunkPhase {
     Disabled,
     Configured,
     Starting,
+    Ready,
     Registered,
     Degraded,
     Stopping,
@@ -26,6 +30,7 @@ impl TrunkPhase {
             Self::Disabled => "disabled",
             Self::Configured => "configured",
             Self::Starting => "starting",
+            Self::Ready => "ready",
             Self::Registered => "registered",
             Self::Degraded => "degraded",
             Self::Stopping => "stopping",
@@ -40,6 +45,7 @@ pub enum TrunkStage {
     Resolving,
     Connecting,
     Registering,
+    Listening,
     Registered,
     Backoff,
     Stopping,
@@ -53,6 +59,7 @@ impl TrunkStage {
             Self::Resolving => "resolving",
             Self::Connecting => "connecting",
             Self::Registering => "registering",
+            Self::Listening => "listening",
             Self::Registered => "registered",
             Self::Backoff => "backoff",
             Self::Stopping => "stopping",
@@ -155,7 +162,9 @@ impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
 #[derive(Clone, Default)]
 pub struct TrunkRuntime {
     snapshot: Arc<RwLock<TrunkSnapshot>>,
+    active_profile: Arc<RwLock<Option<TrunkProfileConfig>>>,
     operation_lock: Arc<Mutex<()>>,
+    driver_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     generation: Arc<AtomicU64>,
 }
 
@@ -180,10 +189,19 @@ impl TrunkRuntime {
         self.operation_lock.lock().await
     }
 
+    pub(crate) fn state_writer(&self, generation: u64) -> TrunkStateWriter {
+        TrunkStateWriter {
+            snapshot: Arc::clone(&self.snapshot),
+            current_generation: Arc::clone(&self.generation),
+            generation,
+        }
+    }
+
     /// Apply persisted intent and cancel any future driver using the previous
     /// generation. Enabling stops at `configured` until the D4 driver starts.
     pub async fn apply_profile(&self, profile: &TrunkProfileConfig) -> TrunkSnapshot {
         self.generation.fetch_add(1, Ordering::SeqCst);
+        *self.active_profile.write().await = Some(profile.clone());
         let mut snapshot = self.snapshot.write().await;
         let reconnect_count = snapshot.reconnect_count;
         *snapshot = if profile.enabled {
@@ -217,14 +235,62 @@ impl TrunkRuntime {
         snapshot.clone()
     }
 
+    /// Stop the previous per-line endpoint, apply the persisted profile and,
+    /// when enabled, start a fresh D4 driver. Aborting and awaiting the old task
+    /// before bumping state prevents stale retries from overwriting new intent.
+    pub async fn activate_profile(&self, profile: &TrunkProfileConfig) -> TrunkSnapshot {
+        let _guard = self.operation_guard().await;
+        if let Some(task) = self.driver_task.lock().await.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        let snapshot = self.apply_profile(profile).await;
+        if profile.enabled {
+            let generation = self.generation();
+            let state = self.state_writer(generation);
+            let profile = profile.clone();
+            *self.driver_task.lock().await = Some(tokio::spawn(async move {
+                crate::trunk::driver::run(profile, state).await;
+            }));
+        }
+        snapshot
+    }
+
     /// Startup/hotplug reconciliation that does not disturb an already active
     /// D4 session. Explicit config changes continue to use `apply_profile`.
     pub async fn reconcile_profile(&self, profile: &TrunkProfileConfig) -> TrunkSnapshot {
-        let snapshot = self.snapshot().await;
-        if snapshot.enabled != profile.enabled {
-            return self.apply_profile(profile).await;
+        let current = self.active_profile.read().await.clone();
+        if current.as_ref() != Some(profile) {
+            return self.activate_profile(profile).await;
         }
-        snapshot
+        self.snapshot().await
+    }
+}
+
+/// Cloneable, task-safe access to one generation of runtime state. Every write
+/// is discarded after a profile change or explicit disable.
+#[derive(Clone)]
+pub(crate) struct TrunkStateWriter {
+    snapshot: Arc<RwLock<TrunkSnapshot>>,
+    current_generation: Arc<AtomicU64>,
+    generation: u64,
+}
+
+impl TrunkStateWriter {
+    pub fn is_current(&self) -> bool {
+        self.current_generation.load(Ordering::SeqCst) == self.generation
+    }
+
+    pub async fn update(&self, update: impl FnOnce(&mut TrunkSnapshot)) -> bool {
+        if !self.is_current() {
+            return false;
+        }
+        let mut snapshot = self.snapshot.write().await;
+        if !self.is_current() {
+            return false;
+        }
+        update(&mut snapshot);
+        true
     }
 }
 

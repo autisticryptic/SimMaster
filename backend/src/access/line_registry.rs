@@ -176,7 +176,7 @@ impl LineRuntimeRegistry {
     pub async fn sync_trunk_profiles(&self, config_manager: &ConfigManager) {
         for line in self.all().await {
             let profile = config_manager.get_line_profile(&line.binding().line_id);
-            line.trunk.apply_profile(&profile.trunk).await;
+            line.trunk.reconcile_profile(&profile.trunk).await;
         }
     }
 

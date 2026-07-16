@@ -4623,7 +4623,7 @@ pub async fn set_line_trunk_handler(
     };
     match app.config_manager.set_line_trunk_profile(&line_id, payload) {
         Ok(profile) => {
-            line.trunk.apply_profile(&profile.trunk).await;
+            line.trunk.activate_profile(&profile.trunk).await;
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
@@ -4659,7 +4659,7 @@ pub async fn set_line_trunk_enabled_handler(
         .set_line_trunk_enabled(&line_id, payload.enabled)
     {
         Ok(profile) => {
-            line.trunk.apply_profile(&profile.trunk).await;
+            line.trunk.activate_profile(&profile.trunk).await;
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(

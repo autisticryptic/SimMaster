@@ -1,6 +1,11 @@
 //! Per-line SIP Trunk gateway.
 //!
-//! Stage D3b provides the persisted profile and runtime/status boundary. The
-//! actual SIP transport, REGISTER driver and media bridge are added in D4-D6.
+//! D3b provides the persisted profile and runtime/status boundary. D4 adds the
+//! per-line UDP endpoint and outbound REGISTER client. The call/media bridge is
+//! deliberately kept for D5-D6.
 
+pub mod digest;
+pub mod driver;
 pub mod runtime;
+pub mod sip;
+pub mod transport;

@@ -1,0 +1,499 @@
+//! Per-line Asterisk endpoint driver (D4).
+//!
+//! `outbound_register` performs REGISTER, standard Digest authentication,
+//! refresh and bounded backoff. `static_peer` opens the same bidirectional UDP
+//! endpoint without REGISTER. Call bridging is intentionally not implemented
+//! here; until D5-D6, inbound INVITE receives an honest 503 response.
+
+use std::{net::SocketAddr, time::Duration};
+
+use chrono::{SecondsFormat, Utc};
+use tracing::{debug, warn};
+
+use crate::{
+    ims::sip_frame,
+    infra::config::{TrunkProfileConfig, TrunkRegistrationMode},
+    trunk::{
+        digest,
+        runtime::{TrunkPhase, TrunkStage, TrunkStateWriter},
+        sip,
+        transport::{self, TrunkUdpTransport},
+    },
+};
+
+const REGISTER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
+const RECEIVE_POLL: Duration = Duration::from_secs(1);
+const STATIC_KEEPALIVE: Duration = Duration::from_secs(25);
+const MAX_BACKOFF_SECS: u64 = 300;
+
+pub(crate) async fn run(profile: TrunkProfileConfig, state: TrunkStateWriter) {
+    let started_at = timestamp_now();
+    state
+        .update(|snapshot| {
+            snapshot.phase = TrunkPhase::Starting;
+            snapshot.stage = TrunkStage::Resolving;
+            snapshot.started_at = Some(started_at);
+            snapshot.last_error = None;
+            snapshot.next_retry_at = None;
+        })
+        .await;
+
+    let mut failure_count = 0u32;
+    loop {
+        if !state.is_current() {
+            return;
+        }
+        match run_session(&profile, &state).await {
+            Ok(()) => return,
+            Err(error) if state.is_current() => {
+                failure_count = failure_count.saturating_add(1);
+                let backoff = backoff_duration(failure_count);
+                let next_retry_at = timestamp_after(backoff);
+                warn!(
+                    peer = %format!("{}:{}", profile.asterisk_host, profile.asterisk_port),
+                    mode = ?profile.registration_mode,
+                    error = %error,
+                    retry_secs = backoff.as_secs(),
+                    "Asterisk trunk session degraded"
+                );
+                state
+                    .update(|snapshot| {
+                        snapshot.phase = TrunkPhase::Degraded;
+                        snapshot.stage = TrunkStage::Backoff;
+                        snapshot.registered = false;
+                        snapshot.last_error = Some(error);
+                        snapshot.next_retry_at = Some(next_retry_at);
+                        snapshot.reconnect_count = snapshot.reconnect_count.saturating_add(1);
+                    })
+                    .await;
+                tokio::time::sleep(backoff).await;
+                state
+                    .update(|snapshot| {
+                        snapshot.phase = TrunkPhase::Starting;
+                        snapshot.stage = TrunkStage::Resolving;
+                        snapshot.next_retry_at = None;
+                    })
+                    .await;
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+async fn run_session(profile: &TrunkProfileConfig, state: &TrunkStateWriter) -> Result<(), String> {
+    validate_profile(profile)?;
+    state
+        .update(|snapshot| snapshot.stage = TrunkStage::Resolving)
+        .await;
+    let peer_host = if profile.registration_mode == TrunkRegistrationMode::StaticPeer {
+        profile
+            .match_host
+            .as_deref()
+            .filter(|host| !host.trim().is_empty())
+            .unwrap_or(&profile.asterisk_host)
+    } else {
+        &profile.asterisk_host
+    };
+    let addresses = transport::resolve(peer_host, profile.asterisk_port).await?;
+    state
+        .update(|snapshot| snapshot.stage = TrunkStage::Connecting)
+        .await;
+    let transport = connect_any(&addresses, profile.local_port).await?;
+    let peer = transport.peer_addr().to_string();
+    state.update(|snapshot| snapshot.peer = Some(peer)).await;
+    match profile.registration_mode {
+        TrunkRegistrationMode::StaticPeer => run_static_peer(transport, state).await,
+        TrunkRegistrationMode::OutboundRegister => {
+            run_outbound_register(transport, profile, state).await
+        }
+    }
+}
+
+async fn connect_any(
+    addresses: &[SocketAddr],
+    local_port: u16,
+) -> Result<TrunkUdpTransport, String> {
+    let mut last_error = None;
+    for address in addresses {
+        match TrunkUdpTransport::connect(*address, local_port).await {
+            Ok(transport) => return Ok(transport),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "trunk_peer_unreachable".to_string()))
+}
+
+async fn run_static_peer(
+    transport: TrunkUdpTransport,
+    state: &TrunkStateWriter,
+) -> Result<(), String> {
+    // A harmless RFC 5626-style CRLF keepalive exposes the selected source port
+    // to the configured peer and NAT without pretending to REGISTER.
+    transport.send(b"\r\n").await?;
+    state
+        .update(|snapshot| {
+            snapshot.phase = TrunkPhase::Ready;
+            snapshot.stage = TrunkStage::Listening;
+            snapshot.registered = false;
+            snapshot.last_error = None;
+            snapshot.next_retry_at = None;
+        })
+        .await;
+    let mut next_keepalive = tokio::time::Instant::now() + STATIC_KEEPALIVE;
+    loop {
+        if !state.is_current() {
+            return Ok(());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= next_keepalive {
+            transport.send(b"\r\n").await?;
+            next_keepalive = now + STATIC_KEEPALIVE;
+        }
+        match transport.recv(RECEIVE_POLL).await {
+            Ok(frame) => handle_inbound(&transport, &frame).await?,
+            Err(error) if error == "trunk_udp_receive_timeout" => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn run_outbound_register(
+    transport: TrunkUdpTransport,
+    profile: &TrunkProfileConfig,
+    state: &TrunkStateWriter,
+) -> Result<(), String> {
+    let mut dialog = sip::RegisterDialog::fresh();
+    loop {
+        let expiry = register_transaction(&transport, profile, state, &mut dialog).await?;
+        let refresh_after = Duration::from_secs((u64::from(expiry) * 85 / 100).max(30));
+        let registered_at = timestamp_now();
+        let expires_at = timestamp_after(Duration::from_secs(u64::from(expiry)));
+        state
+            .update(|snapshot| {
+                snapshot.phase = TrunkPhase::Registered;
+                snapshot.stage = TrunkStage::Registered;
+                snapshot.registered = true;
+                snapshot.registered_at = Some(registered_at);
+                snapshot.expires_at = Some(expires_at);
+                snapshot.next_retry_at = None;
+                snapshot.last_error = None;
+            })
+            .await;
+        let deadline = tokio::time::Instant::now() + refresh_after;
+        while tokio::time::Instant::now() < deadline {
+            if !state.is_current() {
+                return Ok(());
+            }
+            match transport.recv(RECEIVE_POLL).await {
+                Ok(frame) => handle_inbound(&transport, &frame).await?,
+                Err(error) if error == "trunk_udp_receive_timeout" => {}
+                Err(error) => return Err(error),
+            }
+        }
+        state
+            .update(|snapshot| {
+                snapshot.phase = TrunkPhase::Starting;
+                snapshot.stage = TrunkStage::Registering;
+                snapshot.registered = false;
+            })
+            .await;
+    }
+}
+
+async fn register_transaction(
+    transport: &TrunkUdpTransport,
+    profile: &TrunkProfileConfig,
+    state: &TrunkStateWriter,
+    dialog: &mut sip::RegisterDialog,
+) -> Result<u32, String> {
+    let mut authorization = None;
+    let mut expires = profile.register_expiry_secs.clamp(60, 86_400);
+    for challenge_round in 0..3u32 {
+        state
+            .update(|snapshot| {
+                snapshot.phase = TrunkPhase::Starting;
+                snapshot.stage = TrunkStage::Registering;
+                snapshot.registered = false;
+                snapshot.register_attempts = snapshot.register_attempts.saturating_add(1);
+            })
+            .await;
+        let request = sip::build_register(
+            &profile.username,
+            &profile.asterisk_host,
+            profile.asterisk_port,
+            transport.local_addr()?,
+            dialog,
+            expires,
+            authorization.as_deref(),
+        )?;
+        let expected_cseq = sip_frame::header_value(&request, "CSeq")
+            .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+            .ok_or_else(|| "trunk_register_cseq_invalid".to_string())?;
+        let response = send_register_and_receive(transport, &request, expected_cseq).await?;
+        let status = sip::status(&response)?;
+        state
+            .update(|snapshot| snapshot.last_sip_status = Some(status))
+            .await;
+        match status {
+            200..=299 => return Ok(sip::response_expiry(&response, expires).clamp(60, 86_400)),
+            401 | 407 => {
+                if profile.secret.is_empty() {
+                    return Err("trunk_digest_secret_missing".to_string());
+                }
+                let proxy = status == 407;
+                let challenge_header = if proxy {
+                    "Proxy-Authenticate"
+                } else {
+                    "WWW-Authenticate"
+                };
+                let value = sip_frame::header_value(&response, challenge_header)
+                    .ok_or_else(|| "trunk_digest_challenge_missing".to_string())?;
+                let challenge = digest::parse_challenge(&value, proxy)?;
+                authorization = Some(digest::build_authorization(
+                    &challenge,
+                    &profile.username,
+                    &profile.secret,
+                    "REGISTER",
+                    &sip::registrar_uri(&profile.asterisk_host, profile.asterisk_port),
+                    &sip::token(12),
+                    challenge_round + 1,
+                )?);
+            }
+            423 => {
+                expires = sip::min_expires(&response)
+                    .filter(|minimum| *minimum <= 86_400)
+                    .ok_or_else(|| "trunk_register_min_expires_invalid".to_string())?;
+            }
+            _ => return Err(format!("trunk_register_rejected:{status}")),
+        }
+    }
+    Err("trunk_register_challenge_limit".to_string())
+}
+
+async fn send_register_and_receive(
+    transport: &TrunkUdpTransport,
+    request: &[u8],
+    expected_cseq: u32,
+) -> Result<Vec<u8>, String> {
+    let deadline = tokio::time::Instant::now() + REGISTER_RESPONSE_TIMEOUT;
+    let mut retransmit_after = Duration::from_millis(500);
+    transport.send(request).await?;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("trunk_register_timeout".to_string());
+        }
+        let wait = (deadline - now).min(retransmit_after);
+        match transport.recv(wait).await {
+            Ok(frame) if sip::is_request(&frame) => handle_inbound(transport, &frame).await?,
+            Ok(frame) => {
+                let cseq = sip_frame::header_value(&frame, "CSeq").unwrap_or_default();
+                let mut parts = cseq.split_whitespace();
+                let matching = parts.next().and_then(|value| value.parse::<u32>().ok())
+                    == Some(expected_cseq)
+                    && parts
+                        .next()
+                        .is_some_and(|method| method.eq_ignore_ascii_case("REGISTER"));
+                if matching {
+                    let status = sip::status(&frame)?;
+                    if status >= 200 {
+                        return Ok(frame);
+                    }
+                }
+            }
+            Err(error) if error == "trunk_udp_receive_timeout" => {
+                transport.send(request).await?;
+                retransmit_after = (retransmit_after * 2).min(Duration::from_secs(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn handle_inbound(transport: &TrunkUdpTransport, frame: &[u8]) -> Result<(), String> {
+    if frame == b"\r\n" || frame == b"\r\n\r\n" {
+        return Ok(());
+    }
+    if !sip::is_request(frame) {
+        debug!(peer = %transport.peer_addr(), "Ignoring unrelated SIP response");
+        return Ok(());
+    }
+    let method = frame
+        .split(|byte| *byte == b' ')
+        .next()
+        .and_then(|value| std::str::from_utf8(value).ok())
+        .unwrap_or("");
+    let response = match method {
+        "OPTIONS" => Some(sip::build_response(frame, 200, "OK")?),
+        // D4 owns the endpoint but D5-D6 do not yet own a call/media bridge.
+        "INVITE" => Some(sip::build_response(frame, 503, "Service Unavailable")?),
+        "ACK" => None,
+        "CANCEL" | "BYE" => Some(sip::build_response(
+            frame,
+            481,
+            "Call/Transaction Does Not Exist",
+        )?),
+        "REGISTER" => Some(sip::build_response(frame, 405, "Method Not Allowed")?),
+        _ => Some(sip::build_response(frame, 501, "Not Implemented")?),
+    };
+    if let Some(response) = response {
+        transport.send(&response).await?;
+    }
+    Ok(())
+}
+
+fn validate_profile(profile: &TrunkProfileConfig) -> Result<(), String> {
+    if profile.asterisk_host.trim().is_empty() {
+        return Err("trunk_asterisk_host_required".to_string());
+    }
+    if profile.asterisk_port == 0 {
+        return Err("trunk_asterisk_port_invalid".to_string());
+    }
+    if profile.registration_mode == TrunkRegistrationMode::OutboundRegister
+        && profile.username.trim().is_empty()
+    {
+        return Err("trunk_username_required".to_string());
+    }
+    Ok(())
+}
+
+fn backoff_duration(failure_count: u32) -> Duration {
+    let exponent = failure_count.saturating_sub(1).min(6);
+    Duration::from_secs((5u64.saturating_mul(1u64 << exponent)).min(MAX_BACKOFF_SECS))
+}
+
+fn timestamp_now() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn timestamp_after(duration: Duration) -> String {
+    let seconds = i64::try_from(duration.as_secs()).unwrap_or(i64::MAX);
+    (Utc::now() + chrono::Duration::seconds(seconds)).to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trunk::runtime::TrunkRuntime;
+    use std::net::Ipv4Addr;
+    use tokio::net::UdpSocket;
+
+    async fn wait_for_phase(runtime: &TrunkRuntime, phase: &str) {
+        for _ in 0..100 {
+            if runtime.status().await.phase == phase {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "runtime did not reach {phase}: {:?}",
+            runtime.status().await
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_register_completes_digest_challenge() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut frame = [0u8; 8192];
+            let (read, peer) = server.recv_from(&mut frame).await.unwrap();
+            let first = String::from_utf8_lossy(&frame[..read]);
+            assert!(first.starts_with("REGISTER sip:127.0.0.1:"));
+            assert!(!first.contains("Authorization:"));
+            let cseq = sip_frame::header_value(&frame[..read], "CSeq").unwrap();
+            server
+                .send_to(
+                    format!(
+                        "SIP/2.0 401 Unauthorized\r\nCSeq: {cseq}\r\nWWW-Authenticate: Digest realm=\"pbx\", nonce=\"abc\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                    peer,
+                )
+                .await
+                .unwrap();
+            let (read, peer) = server.recv_from(&mut frame).await.unwrap();
+            let authenticated = String::from_utf8_lossy(&frame[..read]);
+            assert!(authenticated.contains("Authorization: Digest username=\"4101\""));
+            assert!(authenticated.contains("algorithm=MD5"));
+            let cseq = sip_frame::header_value(&frame[..read], "CSeq").unwrap();
+            server
+                .send_to(
+                    format!(
+                        "SIP/2.0 200 OK\r\nCSeq: {cseq}\r\nExpires: 60\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .as_bytes(),
+                    peer,
+                )
+                .await
+                .unwrap();
+        });
+
+        let runtime = TrunkRuntime::new();
+        runtime
+            .activate_profile(&TrunkProfileConfig {
+                enabled: true,
+                registration_mode: TrunkRegistrationMode::OutboundRegister,
+                asterisk_host: server_addr.ip().to_string(),
+                asterisk_port: server_addr.port(),
+                username: "4101".to_string(),
+                secret: "secret".to_string(),
+                register_expiry_secs: 60,
+                ..TrunkProfileConfig::default()
+            })
+            .await;
+        wait_for_phase(&runtime, "registered").await;
+        let status = runtime.status().await;
+        assert!(status.registered);
+        assert_eq!(status.last_sip_status, Some(200));
+        assert_eq!(status.register_attempts, 2);
+        runtime
+            .activate_profile(&TrunkProfileConfig::default())
+            .await;
+        mock.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn static_peer_listens_and_answers_options() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let runtime = TrunkRuntime::new();
+        runtime
+            .activate_profile(&TrunkProfileConfig {
+                enabled: true,
+                registration_mode: TrunkRegistrationMode::StaticPeer,
+                asterisk_host: server_addr.ip().to_string(),
+                asterisk_port: server_addr.port(),
+                ..TrunkProfileConfig::default()
+            })
+            .await;
+        let mut frame = [0u8; 8192];
+        let (read, peer) =
+            tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut frame))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(&frame[..read], b"\r\n");
+        let request = b"OPTIONS sip:4101@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1\r\nFrom: <sip:pbx@local>;tag=a\r\nTo: <sip:4101@simadmin>\r\nCall-ID: options-1\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+        server.send_to(request, peer).await.unwrap();
+        let (read, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 200 OK"));
+        wait_for_phase(&runtime, "ready").await;
+        let status = runtime.status().await;
+        assert_eq!(status.stage, "listening");
+        assert!(!status.registered);
+        runtime
+            .activate_profile(&TrunkProfileConfig::default())
+            .await;
+    }
+
+    #[test]
+    fn backoff_is_bounded() {
+        assert_eq!(backoff_duration(1), Duration::from_secs(5));
+        assert_eq!(backoff_duration(3), Duration::from_secs(20));
+        assert!(backoff_duration(100) <= Duration::from_secs(MAX_BACKOFF_SECS));
+    }
+}
