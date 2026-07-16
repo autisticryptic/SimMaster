@@ -1,9 +1,10 @@
-//! Per-line Asterisk endpoint driver (D4).
+//! Per-line Asterisk endpoint driver (D4-D5).
 //!
 //! `outbound_register` performs REGISTER, standard Digest authentication,
 //! refresh and bounded backoff. `static_peer` opens the same bidirectional UDP
-//! endpoint without REGISTER. Call bridging is intentionally not implemented
-//! here; until D5-D6, inbound INVITE receives an honest 503 response.
+//! endpoint without REGISTER. D5 adds the event-driven SIP dialog bridge;
+//! until an IMS voice session is attached, new calls receive 100 Trying
+//! followed by an honest 480.
 
 use std::{net::SocketAddr, time::Duration};
 
@@ -15,6 +16,7 @@ use crate::{
     ims::sip_frame,
     infra::config::{TrunkProfileConfig, TrunkRegistrationMode},
     trunk::{
+        bridge::{BridgeError, OperatorAvailability, TrunkBridge},
         digest,
         runtime::{TrunkPhase, TrunkStage, TrunkStateWriter},
         sip,
@@ -117,10 +119,22 @@ async fn run_session(
     let transport = connect_any(&addresses, profile.local_port).await?;
     let peer = transport.peer_addr().to_string();
     state.update(|snapshot| snapshot.peer = Some(peer)).await;
+    let local_addr = transport.local_addr()?;
+    let local_aor = format!("sip:{}@{}", profile.username, profile.asterisk_host);
+    let mut bridge =
+        TrunkBridge::new(local_addr, local_aor).with_operator(OperatorAvailability::Unavailable);
+    if !profile.extension.trim().is_empty() {
+        bridge = bridge.with_asterisk_target(format!(
+            "sip:{}@{}:{}",
+            profile.extension, profile.asterisk_host, profile.asterisk_port
+        ));
+    }
     match profile.registration_mode {
-        TrunkRegistrationMode::StaticPeer => run_static_peer(transport, state, shutdown).await,
+        TrunkRegistrationMode::StaticPeer => {
+            run_static_peer(transport, state, shutdown, &mut bridge).await
+        }
         TrunkRegistrationMode::OutboundRegister => {
-            run_outbound_register(transport, profile, state, shutdown).await
+            run_outbound_register(transport, profile, state, shutdown, &mut bridge).await
         }
     }
 }
@@ -143,6 +157,7 @@ async fn run_static_peer(
     transport: TrunkUdpTransport,
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
+    bridge: &mut TrunkBridge,
 ) -> Result<(), String> {
     // A harmless RFC 5626-style CRLF keepalive exposes the selected source port
     // to the configured peer and NAT without pretending to REGISTER.
@@ -168,7 +183,7 @@ async fn run_static_peer(
         }
         tokio::select! {
             received = transport.recv(RECEIVE_POLL) => match received {
-                Ok(frame) => handle_inbound(&transport, &frame).await?,
+                Ok(frame) => handle_inbound(&transport, &frame, bridge).await?,
                 Err(error) if error == "trunk_udp_receive_timeout" => {}
                 Err(error) => return Err(error),
             },
@@ -186,10 +201,11 @@ async fn run_outbound_register(
     profile: &TrunkProfileConfig,
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
+    bridge: &mut TrunkBridge,
 ) -> Result<(), String> {
     let mut dialog = sip::RegisterDialog::fresh();
     loop {
-        let expiry = register_transaction(&transport, profile, state, &mut dialog).await?;
+        let expiry = register_transaction(&transport, profile, state, &mut dialog, bridge).await?;
         let refresh_after = Duration::from_secs((u64::from(expiry) * 85 / 100).max(30));
         let registered_at = timestamp_now();
         let expires_at = timestamp_after(Duration::from_secs(u64::from(expiry)));
@@ -211,7 +227,7 @@ async fn run_outbound_register(
             }
             tokio::select! {
                 received = transport.recv(RECEIVE_POLL) => match received {
-                    Ok(frame) => handle_inbound(&transport, &frame).await?,
+                    Ok(frame) => handle_inbound(&transport, &frame, bridge).await?,
                     Err(error) if error == "trunk_udp_receive_timeout" => {}
                     Err(error) => return Err(error),
                 },
@@ -225,6 +241,7 @@ async fn run_outbound_register(
                             &transport,
                             profile,
                             &mut dialog,
+                            bridge,
                         ).await {
                             warn!(error = %error, "Asterisk trunk unregister failed during shutdown");
                         }
@@ -248,6 +265,7 @@ async fn register_transaction(
     profile: &TrunkProfileConfig,
     state: &TrunkStateWriter,
     dialog: &mut sip::RegisterDialog,
+    bridge: &mut TrunkBridge,
 ) -> Result<u32, String> {
     let mut authorization = None;
     let mut expires = profile.register_expiry_secs.clamp(60, 86_400);
@@ -272,7 +290,8 @@ async fn register_transaction(
         let expected_cseq = sip_frame::header_value(&request, "CSeq")
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_register_cseq_invalid".to_string())?;
-        let response = send_register_and_receive(transport, &request, expected_cseq).await?;
+        let response =
+            send_register_and_receive(transport, &request, expected_cseq, bridge).await?;
         let status = sip::status(&response)?;
         state
             .update(|snapshot| snapshot.last_sip_status = Some(status))
@@ -317,6 +336,7 @@ async fn unregister_transaction(
     transport: &TrunkUdpTransport,
     profile: &TrunkProfileConfig,
     dialog: &mut sip::RegisterDialog,
+    bridge: &mut TrunkBridge,
 ) -> Result<(), String> {
     let mut authorization = None;
     for challenge_round in 0..3u32 {
@@ -332,7 +352,8 @@ async fn unregister_transaction(
         let expected_cseq = sip_frame::header_value(&request, "CSeq")
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_unregister_cseq_invalid".to_string())?;
-        let response = send_register_and_receive(transport, &request, expected_cseq).await?;
+        let response =
+            send_register_and_receive(transport, &request, expected_cseq, bridge).await?;
         let status = sip::status(&response)?;
         match status {
             200..=299 => {
@@ -372,6 +393,7 @@ async fn send_register_and_receive(
     transport: &TrunkUdpTransport,
     request: &[u8],
     expected_cseq: u32,
+    bridge: &mut TrunkBridge,
 ) -> Result<Vec<u8>, String> {
     let deadline = tokio::time::Instant::now() + REGISTER_RESPONSE_TIMEOUT;
     let mut retransmit_after = Duration::from_millis(500);
@@ -383,7 +405,9 @@ async fn send_register_and_receive(
         }
         let wait = (deadline - now).min(retransmit_after);
         match transport.recv(wait).await {
-            Ok(frame) if sip::is_request(&frame) => handle_inbound(transport, &frame).await?,
+            Ok(frame) if sip::is_request(&frame) => {
+                handle_inbound(transport, &frame, bridge).await?
+            }
             Ok(frame) => {
                 let cseq = sip_frame::header_value(&frame, "CSeq").unwrap_or_default();
                 let mut parts = cseq.split_whitespace();
@@ -408,33 +432,39 @@ async fn send_register_and_receive(
     }
 }
 
-async fn handle_inbound(transport: &TrunkUdpTransport, frame: &[u8]) -> Result<(), String> {
+async fn handle_inbound(
+    transport: &TrunkUdpTransport,
+    frame: &[u8],
+    bridge: &mut TrunkBridge,
+) -> Result<(), String> {
     if frame == b"\r\n" || frame == b"\r\n\r\n" {
         return Ok(());
     }
-    if !sip::is_request(frame) {
-        debug!(peer = %transport.peer_addr(), "Ignoring unrelated SIP response");
+    if sip_frame::is_request(frame, "REGISTER") {
+        let response = sip::build_response(frame, 405, "Method Not Allowed")?;
+        transport.send(&response).await?;
         return Ok(());
     }
-    let method = frame
-        .split(|byte| *byte == b' ')
-        .next()
-        .and_then(|value| std::str::from_utf8(value).ok())
-        .unwrap_or("");
-    let response = match method {
-        "OPTIONS" => Some(sip::build_response(frame, 200, "OK")?),
-        // D4 owns the endpoint but D5-D6 do not yet own a call/media bridge.
-        "INVITE" => Some(sip::build_response(frame, 503, "Service Unavailable")?),
-        "ACK" => None,
-        "CANCEL" | "BYE" => Some(sip::build_response(
-            frame,
-            481,
-            "Call/Transaction Does Not Exist",
-        )?),
-        "REGISTER" => Some(sip::build_response(frame, 405, "Method Not Allowed")?),
-        _ => Some(sip::build_response(frame, 501, "Not Implemented")?),
+    let output = match bridge.handle_asterisk(frame) {
+        Ok(output) => output,
+        Err(error) if sip::is_request(frame) => {
+            let (status, reason) = match &error {
+                BridgeError::UnsupportedMedia(_) => (488, "Not Acceptable Here"),
+                BridgeError::InvalidState(_) => (481, "Call/Transaction Does Not Exist"),
+                BridgeError::MalformedRequest(_) => (400, "Bad Request"),
+            };
+            warn!(status, error = %error, "Rejecting invalid Asterisk trunk request");
+            if let Ok(response) = sip::build_response(frame, status, reason) {
+                transport.send(&response).await?;
+            }
+            return Ok(());
+        }
+        Err(error) => {
+            debug!(error = %error, "Ignoring unrelated Asterisk trunk response");
+            return Ok(());
+        }
     };
-    if let Some(response) = response {
+    for response in output.asterisk_frames {
         transport.send(&response).await?;
     }
     Ok(())
@@ -610,6 +640,26 @@ mod tests {
         let status = runtime.status().await;
         assert_eq!(status.stage, "listening");
         assert!(!status.registered);
+
+        let sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\n";
+        let invite = format!(
+            "INVITE sip:4101@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKcall\r\nFrom: <sip:6108@pbx>;tag=pbx-a\r\nTo: <sip:4101@simadmin>\r\nCall-ID: static-call-1\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            server_addr.port(),
+            sdp.len(),
+            String::from_utf8_lossy(sdp)
+        );
+        server.send_to(invite.as_bytes(), peer).await.unwrap();
+        let (read, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 100 Trying"));
+        let (read, _) = tokio::time::timeout(Duration::from_secs(1), server.recv_from(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 480 Temporarily Unavailable"));
+        assert_eq!(runtime.status().await.phase, "ready");
         runtime
             .activate_profile(&TrunkProfileConfig::default())
             .await;

@@ -2,7 +2,7 @@
 
 > 日期：2026-07-16  
 > 分支：`codex/ims-core-stage-a-b-live`  
-> 本阶段边界：完成 Asterisk 方向 SIP UDP endpoint、双模式运行时和 REGISTER；INVITE 对话桥接、RTP relay、真实语音/视频仍属于 D5-D7。
+> 本阶段边界：完成 Asterisk 方向 SIP UDP endpoint、双模式运行时和 REGISTER；D5 已补上事件驱动的 INVITE 对话控制面，真实 IMS 接线、RTP relay 和语音/视频仍属于 D6-D7。
 
 ## 一、已完成内容
 
@@ -18,7 +18,7 @@
 - DNS/IPv4/IPv6 地址解析与 connected UDP peer 校验。
 - UDP REGISTER 重传、CSeq 匹配、临时 1xx 忽略、最终响应处理。
 - `static_peer` 不发送 REGISTER，但会打开双向 SIP socket、发送 CRLF keepalive 并应答 OPTIONS。
-- D5-D6 桥接前，INVITE 明确返回 503，不伪报通话能力；无效对话的 BYE/CANCEL 返回 481。
+- D5 前，INVITE 明确返回 503；D5 控制面接入后，INVITE 先返回 100 Trying，再由 IMS 能力决定 480/200；无效对话的 BYE/CANCEL 返回 481。
 
 ### 3. 主动 REGISTER 与鉴权
 
@@ -44,7 +44,7 @@
 
 ## 二、验证
 
-- 后端全量：507 项测试通过。
+- 后端全量：516 项测试通过（包含 D5 Bridge Mock）。
 - `cargo clippy --all-targets -- -D warnings` 通过。
 - 前端 lint、TypeScript 类型检查通过；此前 D3b/D4 UI 已完成完整构建和桌面/390px 浏览器验证，零横向溢出、零控制台错误。
 - Mock Asterisk 覆盖：401 Digest→鉴权 REGISTER→200、MD5-sess、静态 Peer OPTIONS、REGISTER UDP 回环、稳定本地端口、关闭时 Expires 0 注销。
@@ -82,7 +82,7 @@
 
 ## 六、后续阶段
 
-- D5：Asterisk 侧 INVITE/UAS-UAC 对话、运营商 IMS live voice 接线。
-- D6：音频/视频 RTP relay、SDP 对接和 `TrunkVideoSeam`。
+- D5：✅ Asterisk 侧 INVITE/UAS-UAC 对话控制面、事务状态机、Mock bridge；详见 `阶段D5_Asterisk对话桥接控制面_开发总结.md`。
+- D6：运营商 IMS live voice 事件接线、音频/视频 RTP relay、SDP 对接和 `TrunkVideoSeam`。
 - D7：双向 re-INVITE、真实 VoLTE/ViLTE 通话、鉴权/ACL/抓包安全验收。
 - Web 电话仍为最终 Todo，只连接 Asterisk WSS，不进入 SimAdmin 管理前端。

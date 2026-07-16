@@ -99,24 +99,163 @@ pub fn build_register(
 }
 
 pub fn build_response(request: &[u8], status: u16, reason: &str) -> Result<Vec<u8>, String> {
+    build_response_with_body(request, status, reason, None, &[], &[])
+}
+
+pub fn build_response_with_body(
+    request: &[u8],
+    status: u16,
+    reason: &str,
+    local_tag: Option<&str>,
+    extra_headers: &[SipHeader],
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
     let mut response = format!("SIP/2.0 {status} {reason}\r\n");
-    for header in ["Via", "From", "To", "Call-ID", "CSeq"] {
-        let value = sip_frame::header_value(request, header)
+    for value in sip_frame::header_values(request, "Via") {
+        response.push_str("Via: ");
+        response.push_str(&value);
+        response.push_str("\r\n");
+    }
+    for header in ["From", "To", "Call-ID", "CSeq"] {
+        let mut value = sip_frame::header_value(request, header)
             .ok_or_else(|| format!("trunk_request_{}_missing", header.to_ascii_lowercase()))?;
+        if header == "To" && !value.to_ascii_lowercase().contains(";tag=") {
+            value.push_str(";tag=");
+            value.push_str(local_tag.unwrap_or("simadmin"));
+        }
         response.push_str(header);
         response.push_str(": ");
         response.push_str(&value);
-        if header == "To" && !value.to_ascii_lowercase().contains(";tag=") {
-            response.push_str(&format!(";tag={}", token(8)));
-        }
         response.push_str("\r\n");
     }
-    response.push_str(&format!(
-        "Server: {USER_AGENT}\r\nContent-Length: 0\r\n\r\n"
-    ));
-    Ok(response.into_bytes())
+    response.push_str(&format!("Server: {USER_AGENT}\r\n"));
+    response.push_str("Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n");
+    for header in extra_headers {
+        response.push_str(&header.name);
+        response.push_str(": ");
+        response.push_str(&header.value);
+        response.push_str("\r\n");
+    }
+    if !body.is_empty() {
+        response.push_str("Content-Type: application/sdp\r\n");
+    }
+    response.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut bytes = response.into_bytes();
+    bytes.extend_from_slice(body);
+    Ok(bytes)
 }
 
+#[derive(Debug, Clone)]
+pub struct DialogRequest<'a> {
+    pub method: &'a str,
+    pub request_uri: &'a str,
+    pub local_addr: SocketAddr,
+    pub from_uri: &'a str,
+    pub from_tag: &'a str,
+    pub to_uri: &'a str,
+    pub to_tag: Option<&'a str>,
+    pub call_id: &'a str,
+    pub cseq: u32,
+    pub contact_uri: Option<&'a str>,
+    pub body: &'a [u8],
+}
+
+pub fn build_dialog_request(request: &DialogRequest<'_>) -> Result<Vec<u8>, String> {
+    validate_token(request.method, "trunk_dialog_method_invalid")?;
+    if !request.request_uri.starts_with("sip:")
+        || !request.from_uri.starts_with("sip:")
+        || !request.to_uri.starts_with("sip:")
+    {
+        return Err("trunk_dialog_uri_invalid".to_string());
+    }
+    let host = sip_frame::sip_host(request.local_addr.ip());
+    let branch = format!("z9hG4bK{}", token(12));
+    let mut frame = format!(
+        "{} {} SIP/2.0\r\nVia: SIP/2.0/UDP {}:{};branch={};rport\r\nMax-Forwards: 70\r\nFrom: <{}>;tag={}\r\nTo: <{}>{}\r\nCall-ID: {}\r\nCSeq: {} {}\r\n",
+        request.method,
+        request.request_uri,
+        host,
+        request.local_addr.port(),
+        branch,
+        request.from_uri,
+        request.from_tag,
+        request.to_uri,
+        request
+            .to_tag
+            .map(|tag| format!(";tag={tag}"))
+            .unwrap_or_default(),
+        request.call_id,
+        request.cseq,
+        request.method,
+    );
+    if let Some(contact) = request.contact_uri {
+        frame.push_str(&format!("Contact: <{contact}>\r\n"));
+    }
+    frame.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, OPTIONS\r\n");
+    if !request.body.is_empty() {
+        frame.push_str("Content-Type: application/sdp\r\n");
+    }
+    frame.push_str(&format!("Content-Length: {}\r\n\r\n", request.body.len()));
+    let mut bytes = frame.into_bytes();
+    bytes.extend_from_slice(request.body);
+    Ok(bytes)
+}
+
+#[allow(dead_code)]
+pub fn build_cancel(invite: &[u8]) -> Result<Vec<u8>, String> {
+    let request_uri = request_uri(invite)?;
+    let via = sip_frame::header_value(invite, "Via")
+        .ok_or_else(|| "trunk_request_via_missing".to_string())?;
+    let from = sip_frame::header_value(invite, "From")
+        .ok_or_else(|| "trunk_request_from_missing".to_string())?;
+    let to = sip_frame::header_value(invite, "To")
+        .ok_or_else(|| "trunk_request_to_missing".to_string())?;
+    let call_id = sip_frame::header_value(invite, "Call-ID")
+        .ok_or_else(|| "trunk_request_call-id_missing".to_string())?;
+    let cseq = cseq_number(invite)?;
+    Ok(format!(
+        "CANCEL {request_uri} SIP/2.0\r\nVia: {via}\r\nMax-Forwards: 70\r\nFrom: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq} CANCEL\r\nUser-Agent: {USER_AGENT}\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes())
+}
+
+pub fn build_ack_for_final(invite: &[u8], response: &[u8]) -> Result<Vec<u8>, String> {
+    let request_uri = request_uri(invite)?;
+    let via = sip_frame::header_value(invite, "Via")
+        .ok_or_else(|| "trunk_request_via_missing".to_string())?;
+    let from = sip_frame::header_value(invite, "From")
+        .ok_or_else(|| "trunk_request_from_missing".to_string())?;
+    let to = sip_frame::header_value(response, "To")
+        .or_else(|| sip_frame::header_value(invite, "To"))
+        .ok_or_else(|| "trunk_request_to_missing".to_string())?;
+    let call_id = sip_frame::header_value(invite, "Call-ID")
+        .ok_or_else(|| "trunk_request_call-id_missing".to_string())?;
+    let cseq = cseq_number(invite)?;
+    Ok(format!(
+        "ACK {request_uri} SIP/2.0\r\nVia: {via}\r\nMax-Forwards: 70\r\nFrom: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq} ACK\r\nUser-Agent: {USER_AGENT}\r\nContent-Length: 0\r\n\r\n"
+    )
+    .into_bytes())
+}
+
+fn request_uri(frame: &[u8]) -> Result<String, String> {
+    let line_end = frame
+        .windows(2)
+        .position(|window| window == b"\r\n")
+        .ok_or_else(|| "trunk_request_line_missing".to_string())?;
+    let line = std::str::from_utf8(&frame[..line_end])
+        .map_err(|_| "trunk_request_line_invalid".to_string())?;
+    line.split_whitespace()
+        .nth(1)
+        .map(str::to_string)
+        .ok_or_else(|| "trunk_request_uri_invalid".to_string())
+}
+
+fn cseq_number(frame: &[u8]) -> Result<u32, String> {
+    sip_frame::header_value(frame, "CSeq")
+        .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+        .ok_or_else(|| "trunk_cseq_invalid".to_string())
+}
 pub fn response_expiry(frame: &[u8], fallback: u32) -> u32 {
     sip_frame::header_value(frame, "Expires")
         .and_then(|value| value.parse::<u32>().ok())
@@ -215,6 +354,54 @@ mod tests {
         assert!(response.starts_with("SIP/2.0 200 OK"));
         assert!(response.contains("To: <sip:4101@pbx>;tag="));
         assert!(response.contains("CSeq: 1 OPTIONS"));
+    }
+
+    #[test]
+    fn response_uses_stable_tag_and_sdp_length() {
+        let request = b"INVITE sip:4101@pbx SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bK1\r\nFrom: <sip:pbx@local>;tag=a\r\nTo: <sip:4101@pbx>\r\nCall-ID: c\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let body = b"v=0\r\n";
+        let response = String::from_utf8(
+            build_response_with_body(request, 200, "OK", Some("local-a"), &[], body).unwrap(),
+        )
+        .unwrap();
+        assert!(response.contains("To: <sip:4101@pbx>;tag=local-a\r\n"));
+        assert!(response.contains("Content-Type: application/sdp\r\n"));
+        assert!(response.contains("Content-Length: 5\r\n\r\nv=0\r\n"));
+    }
+
+    #[test]
+    fn dialog_requests_include_tags_cseq_and_body() {
+        let frame = build_dialog_request(&DialogRequest {
+            method: "INVITE",
+            request_uri: "sip:41000@pbx",
+            local_addr: SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 5062)),
+            from_uri: "sip:+8613800@simadmin",
+            from_tag: "local-a",
+            to_uri: "sip:6108@pbx",
+            to_tag: None,
+            call_id: "call-a@simadmin",
+            cseq: 7,
+            contact_uri: Some("sip:41000@10.0.0.2:5062"),
+            body: b"v=0\r\n",
+        })
+        .unwrap();
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.starts_with("INVITE sip:41000@pbx SIP/2.0\r\n"));
+        assert!(text.contains("CSeq: 7 INVITE\r\n"));
+        assert!(text.contains("Content-Length: 5\r\n\r\nv=0\r\n"));
+    }
+
+    #[test]
+    fn cancel_and_ack_reuse_invite_transaction_identity() {
+        let invite = b"INVITE sip:6108@pbx SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bKsame\r\nFrom: <sip:41000@simadmin>;tag=local\r\nTo: <sip:6108@pbx>\r\nCall-ID: call-a\r\nCSeq: 9 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let cancel = String::from_utf8(build_cancel(invite).unwrap()).unwrap();
+        assert!(cancel.contains("branch=z9hG4bKsame"));
+        assert!(cancel.contains("CSeq: 9 CANCEL"));
+        let response =
+            b"SIP/2.0 200 OK\r\nTo: <sip:6108@pbx>;tag=remote\r\nContent-Length: 0\r\n\r\n";
+        let ack = String::from_utf8(build_ack_for_final(invite, response).unwrap()).unwrap();
+        assert!(ack.contains("To: <sip:6108@pbx>;tag=remote"));
+        assert!(ack.contains("CSeq: 9 ACK"));
     }
 
     #[test]

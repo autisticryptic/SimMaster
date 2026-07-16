@@ -4,6 +4,8 @@
 //! per-line UDP endpoint and outbound REGISTER client. The call/media bridge is
 //! deliberately kept for D5-D6.
 
+pub mod bridge;
+pub mod dialog;
 pub mod digest;
 pub mod driver;
 pub mod runtime;
