@@ -20,6 +20,8 @@ use zbus::Connection;
 use crate::{
     access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
+    infra::config::ConfigManager,
+    trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
 };
 
 pub struct LineRuntime {
@@ -27,6 +29,7 @@ pub struct LineRuntime {
     pub volte: Arc<VolteRuntime>,
     pub volte_live: VolteLiveHandle,
     pub volte_connect_lock: Mutex<()>,
+    pub trunk: Arc<TrunkRuntime>,
 }
 
 impl LineRuntime {
@@ -36,6 +39,7 @@ impl LineRuntime {
             volte,
             volte_live,
             volte_connect_lock: Mutex::new(()),
+            trunk: Arc::new(TrunkRuntime::new()),
         }
     }
 
@@ -64,6 +68,7 @@ impl LineRuntime {
         LineRuntimeStatus {
             modem: self.binding(),
             volte: self.volte.status().await,
+            trunk: self.trunk.status().await,
         }
     }
 }
@@ -72,6 +77,7 @@ impl LineRuntime {
 pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
     pub volte: VolteRuntimeStatus,
+    pub trunk: TrunkRuntimeStatus,
 }
 
 #[derive(Default)]
@@ -167,6 +173,13 @@ impl LineRuntimeRegistry {
         statuses
     }
 
+    pub async fn sync_trunk_profiles(&self, config_manager: &ConfigManager) {
+        for line in self.all().await {
+            let profile = config_manager.get_line_profile(&line.binding().line_id);
+            line.trunk.apply_profile(&profile.trunk).await;
+        }
+    }
+
     pub async fn present_count(&self) -> usize {
         self.lines
             .read()
@@ -207,6 +220,7 @@ mod tests {
         let status = line.status().await;
         assert_eq!(status.modem.line_id, "line-a");
         assert_eq!(status.volte.phase, "disabled");
+        assert_eq!(status.trunk.phase, "disabled");
     }
 
     #[test]

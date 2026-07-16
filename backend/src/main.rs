@@ -37,6 +37,7 @@ mod orchestrator;
 mod sim;
 mod state;
 mod system;
+mod trunk;
 mod voice_services;
 
 use api::handlers::*;
@@ -344,6 +345,9 @@ async fn main() -> Result<()> {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),
         Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
     }
+    line_registry
+        .sync_trunk_profiles(config_manager.as_ref())
+        .await;
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
@@ -934,6 +938,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/lines/{line_id}/connection",
             post(set_volte_line_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/trunk/lines",
+            get(get_trunk_lines_handler).options(options_handler),
         )
         .route(
             "/api/trunk/lines/{line_id}",

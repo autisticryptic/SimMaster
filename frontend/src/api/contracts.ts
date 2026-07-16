@@ -470,15 +470,58 @@ export interface VolteRuntimeStatus {
 
 export type VolteIpFamilyPreference = 'ipv6_first' | 'ipv4_first' | 'ipv6_only' | 'ipv4_only'
 
+export type TrunkRegistrationMode = 'static_peer' | 'outbound_register'
+
+export interface TrunkProfileConfig {
+  enabled: boolean
+  registration_mode: TrunkRegistrationMode
+  asterisk_host: string
+  asterisk_port: number
+  username: string
+  secret: string
+  context: string
+  extension: string
+  codec_allow: string[]
+  register_expiry_secs: number
+  match_host?: string | null
+}
+
+export interface TrunkRuntimeStatus {
+  phase: string
+  stage: string
+  enabled: boolean
+  registration_mode: TrunkRegistrationMode
+  peer?: string
+  registered: boolean
+  last_sip_status?: number
+  started_at?: string
+  registered_at?: string
+  expires_at?: string
+  next_retry_at?: string
+  last_error?: string
+  register_attempts: number
+  reconnect_count: number
+}
+
+export interface TrunkProfileResponse {
+  line_id: string
+  modem: ModemBinding
+  trunk: TrunkProfileConfig
+  secret_set: boolean
+  runtime: TrunkRuntimeStatus
+}
+
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
   volte_connection_enabled: boolean
+  trunk: TrunkProfileConfig
 }
 
 export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus
+  trunk: TrunkRuntimeStatus
 }
 
 export interface VolteLineControlResponse {

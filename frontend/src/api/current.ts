@@ -39,6 +39,8 @@ import type {
   LoginRequest,
   LineRuntimeStatus,
   ManualRegisterRequest,
+  TrunkProfileConfig,
+  TrunkProfileResponse,
   VolteControlResponse,
   VolteIpFamilyPreference,
   VolteLineControlResponse,
@@ -656,6 +658,28 @@ class SimAdminCurrentAPI {
         body: JSON.stringify({ enabled }),
       },
     )
+  }
+
+  async getTrunkLines() {
+    return request<ApiResponse<TrunkProfileResponse[]>>('/trunk/lines')
+  }
+
+  async getTrunkLine(lineId: string) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async setTrunkLine(lineId: string, profile: TrunkProfileConfig) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}`, {
+      method: 'POST',
+      body: JSON.stringify(profile),
+    })
+  }
+
+  async setTrunkLineEnabled(lineId: string, enabled: boolean) {
+    return request<ApiResponse<TrunkProfileResponse>>(`/trunk/lines/${encodeURIComponent(lineId)}/enabled`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    })
   }
 
   async sendSms(phoneNumber: string, content: string, lineId?: string) {

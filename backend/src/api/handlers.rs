@@ -4537,18 +4537,49 @@ pub async fn set_volte_line_connection_handler(
 #[derive(Debug, Default, serde::Serialize)]
 pub struct TrunkProfileResponse {
     pub line_id: String,
+    pub modem: crate::cellular::modem_manager::ModemBinding,
     pub trunk: TrunkProfileConfig,
     pub secret_set: bool,
+    pub runtime: crate::trunk::runtime::TrunkRuntimeStatus,
 }
 
 impl TrunkProfileResponse {
-    fn from_profile(profile: &LineProfileConfig) -> Self {
+    async fn from_line(
+        profile: &LineProfileConfig,
+        line: &crate::access::line_registry::LineRuntime,
+    ) -> Self {
         Self {
             line_id: profile.line_id.clone(),
+            modem: line.binding(),
             secret_set: profile.trunk.secret_set(),
             trunk: profile.trunk.redacted(),
+            runtime: line.trunk.status().await,
         }
     }
+}
+
+pub async fn get_trunk_lines_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<Vec<TrunkProfileResponse>>>) {
+    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(format!(
+                "Failed to discover modems: {error}"
+            ))),
+        );
+    }
+    let lines = app.line_registry.all().await;
+    let mut responses = Vec::with_capacity(lines.len());
+    for line in lines {
+        let profile = app.config_manager.get_line_profile(&line.binding().line_id);
+        line.trunk.reconcile_profile(&profile.trunk).await;
+        responses.push(TrunkProfileResponse::from_line(&profile, &line).await);
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", responses)),
+    )
 }
 
 /// Read one line's trunk settings (secret redacted). Returns the inert default
@@ -4557,12 +4588,20 @@ pub async fn get_line_trunk_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
     let profile = app.config_manager.get_line_profile(&line_id);
+    line.trunk.reconcile_profile(&profile.trunk).await;
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            TrunkProfileResponse::from_profile(&profile),
+            TrunkProfileResponse::from_line(&profile, &line).await,
         )),
     )
 }
@@ -4575,14 +4614,24 @@ pub async fn set_line_trunk_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<TrunkProfileConfig>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
     match app.config_manager.set_line_trunk_profile(&line_id, payload) {
-        Ok(profile) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                TrunkProfileResponse::from_profile(&profile),
-            )),
-        ),
+        Ok(profile) => {
+            line.trunk.apply_profile(&profile.trunk).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    TrunkProfileResponse::from_line(&profile, &line).await,
+                )),
+            )
+        }
         Err(error) => (
             StatusCode::OK,
             Json(ApiResponse::<TrunkProfileResponse>::error(format!(
@@ -4598,17 +4647,27 @@ pub async fn set_line_trunk_enabled_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<VolteControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
     match app
         .config_manager
         .set_line_trunk_enabled(&line_id, payload.enabled)
     {
-        Ok(profile) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                TrunkProfileResponse::from_profile(&profile),
-            )),
-        ),
+        Ok(profile) => {
+            line.trunk.apply_profile(&profile.trunk).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    TrunkProfileResponse::from_line(&profile, &line).await,
+                )),
+            )
+        }
         Err(error) => (
             StatusCode::OK,
             Json(ApiResponse::<TrunkProfileResponse>::error(format!(

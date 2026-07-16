@@ -20,14 +20,16 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, Refresh, Router, SimCard } from '@mui/icons-material'
+import { CellTower, Refresh, Router, SettingsEthernet, SimCard } from '@mui/icons-material'
 import {
   api,
+  type TrunkProfileResponse,
   type VolteControlResponse,
   type VolteIpFamilyPreference,
   type VolteLineControlResponse,
 } from '../../api/current'
 import { maskedIccid, shortLineId } from '../../components/modemLineFormat'
+import TrunkProfileDialog from './TrunkProfileDialog'
 
 const familyLabels: Record<VolteIpFamilyPreference, string> = {
   ipv4_first: 'IPv4 优先，失败后尝试 IPv6',
@@ -70,9 +72,19 @@ function modemStateLabel(state: string) {
   return (labels[state] ?? state) || '未知'
 }
 
+function trunkRuntimeLabel(line?: TrunkProfileResponse) {
+  if (!line || !line.trunk.enabled) return 'Trunk 未启用'
+  if (line.runtime.registered) return 'Asterisk 已注册'
+  if (line.runtime.phase === 'configured') return '已配置，等待 D4 接线'
+  if (line.runtime.phase === 'degraded') return '连接异常'
+  return line.runtime.stage || '等待启动'
+}
+
 export default function ModemLinesPanel() {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [control, setControl] = useState<VolteControlResponse | null>(null)
+  const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
+  const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [familyDraft, setFamilyDraft] = useState<VolteIpFamilyPreference>('ipv6_first')
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
@@ -82,15 +94,17 @@ export default function ModemLinesPanel() {
   const load = useCallback(async (background = false) => {
     if (!background) setLoading(true)
     try {
-      const [controlResponse, lineResponse] = await Promise.all([
+      const [controlResponse, lineResponse, trunkResponse] = await Promise.all([
         api.getVolteControl(),
         api.getVolteLines(),
+        api.getTrunkLines(),
       ])
       if (controlResponse.data) {
         setControl(controlResponse.data)
         setFamilyDraft(controlResponse.data.ip_family_preference)
       }
       setLines(lineResponse.data ?? [])
+      setTrunkLines(trunkResponse.data ?? [])
       setError(null)
     } catch (err) {
       if (!background) setError(err instanceof Error ? err.message : String(err))
@@ -107,6 +121,9 @@ export default function ModemLinesPanel() {
 
   const presentCount = useMemo(() => lines.filter((line) => line.modem.present).length, [lines])
   const registeredCount = useMemo(() => lines.filter((line) => line.runtime.registered).length, [lines])
+  const trunkByLineId = useMemo(() => new Map(
+    trunkLines.map((line) => [line.line_id, line]),
+  ), [trunkLines])
 
   const toggleFeature = async (enabled: boolean) => {
     setSavingKey('feature')
@@ -141,7 +158,7 @@ export default function ModemLinesPanel() {
   }
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
-    setSavingKey(lineId)
+    setSavingKey(`volte:${lineId}`)
     setError(null)
     setSuccess(null)
     try {
@@ -159,6 +176,31 @@ export default function ModemLinesPanel() {
     } finally {
       setSavingKey(null)
     }
+  }
+
+  const toggleTrunk = async (lineId: string, enabled: boolean) => {
+    setSavingKey(`trunk:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.setTrunkLineEnabled(lineId, enabled)
+      if (response.data) {
+        const updated = response.data
+        setTrunkLines((current) => current.map((line) => line.line_id === lineId ? updated : line))
+      }
+      setSuccess(`${shortLineId(lineId)} ${enabled ? '已保存 Trunk 启用意图' : '已关闭 Trunk'}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  const handleTrunkSaved = (updated: TrunkProfileResponse) => {
+    setTrunkLines((current) => current.map((line) => line.line_id === updated.line_id ? updated : line))
+    setEditingTrunkLine(updated)
+    setSuccess(`${shortLineId(updated.line_id)} 的 Asterisk Trunk 配置已保存`)
   }
 
   if (loading) {
@@ -229,7 +271,9 @@ export default function ModemLinesPanel() {
       ) : (
         <Grid container spacing={2.5}>
           {lines.map((line, index) => {
-            const busy = savingKey === line.modem.line_id
+            const volteBusy = savingKey === `volte:${line.modem.line_id}`
+            const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
+            const trunkLine = trunkByLineId.get(line.modem.line_id)
             const runtimeColor = line.runtime.registered
               ? 'success'
               : line.profile.volte_connection_enabled
@@ -295,11 +339,47 @@ export default function ModemLinesPanel() {
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
-                        {busy && <CircularProgress size={18} />}
+                        {volteBusy && <CircularProgress size={18} />}
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
                           disabled={!control?.feature_enabled || !line.modem.present || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
+                          <SettingsEthernet color="action" fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>Asterisk Trunk</Typography>
+                          <Chip
+                            size="small"
+                            label={trunkRuntimeLabel(trunkLine)}
+                            color={trunkLine?.runtime.registered ? 'success' : trunkLine?.trunk.enabled ? 'warning' : 'default'}
+                            variant={trunkLine?.runtime.registered ? 'filled' : 'outlined'}
+                          />
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25} noWrap>
+                          {trunkLine?.trunk.asterisk_host
+                            ? `${trunkLine.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'} · ${trunkLine.trunk.asterisk_host}:${trunkLine.trunk.asterisk_port}`
+                            : '尚未配置远程 Asterisk'}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={0.5}>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => trunkLine && setEditingTrunkLine(trunkLine)}
+                          disabled={!trunkLine || savingKey !== null}
+                        >
+                          配置
+                        </Button>
+                        {trunkBusy && <CircularProgress size={18} />}
+                        <Switch
+                          checked={trunkLine?.trunk.enabled ?? false}
+                          onChange={(_, enabled) => void toggleTrunk(line.modem.line_id, enabled)}
+                          disabled={!trunkLine || savingKey !== null}
                         />
                       </Box>
                     </Box>
@@ -310,6 +390,13 @@ export default function ModemLinesPanel() {
           })}
         </Grid>
       )}
+
+      <TrunkProfileDialog
+        open={editingTrunkLine !== null}
+        line={editingTrunkLine}
+        onClose={() => setEditingTrunkLine(null)}
+        onSaved={handleTrunkSaved}
+      />
     </Stack>
   )
 }
