@@ -44,7 +44,7 @@
 
 ## 二、验证
 
-- 后端全量：506 项测试通过。
+- 后端全量：507 项测试通过。
 - `cargo clippy --all-targets -- -D warnings` 通过。
 - 前端 lint、TypeScript 类型检查通过；此前 D3b/D4 UI 已完成完整构建和桌面/390px 浏览器验证，零横向溢出、零控制台错误。
 - Mock Asterisk 覆盖：401 Digest→鉴权 REGISTER→200、MD5-sess、静态 Peer OPTIONS、REGISTER UDP 回环、稳定本地端口、关闭时 Expires 0 注销。
@@ -55,25 +55,29 @@
 - `47b57d4 feat(trunk): add UDP endpoint and digest registration`
 - `d97f37f fix(config): allow isolated candidate config path`
 - `6d10cae fix(trunk): keep contacts stable and unregister cleanly`
+- `d2debb3 fix(trunk): reject duplicate per-line SIP ports`
 
 ## 四、高通 410 / Asterisk 实测进度
 
 设备保持正式 `simadmin.service` inactive，候选仅监听 `127.0.0.1:3101`，配置和数据库位于独立 release 目录，`data_enabled=false`，未建立蜂窝数据或 XFRM。
 
-第一版候选向 `10.0.0.3:8060` 发出 REGISTER：
+第一版候选向 `10.0.0.3:8060` 发出 REGISTER，随后使用 `6d10cae` 候选完成终验：
 
 - 首次请求直接得到 SIP 200，运行态进入 `registered`，Expires 3600 秒。
-- 服务端没有返回 401/407，因此该次注册没有使用 Digest 密码；需要检查 PJSIP endpoint 的 `auth=` 绑定。
-- 将注册周期改为 60 秒时，旧实现因随机本地端口产生第二个 Contact，Asterisk 返回 403；随后 8060 返回 UDP connection refused。
-- 候选 Trunk 已关闭，停止继续重试。
-- 针对上述问题已完成 `6d10cae`：强制稳定本地端口并在关闭/切换时主动注销。等待 Asterisk 清理旧 Contact、启用 `remove_existing=yes` 并恢复 8060 UDP 监听后复测。
+- 将注册周期改为 60 秒时，旧实现因随机本地端口产生第二个 Contact；FreePBX 的 AOR 只允许一个 Contact，已有 `sip:41000@10.0.0.116:59448`，因此返回 403。
+- 复用旧 Contact 的 59448 端口后，真实 401/407→Digest→200 成功，`register_attempts=2`，确认 InAuth、用户名和密码均实际生效。
+- 60 秒注册周期连续刷新多轮，每轮均完成 challenge + authenticated REGISTER，`registered_at/expires_at` 持续前移，重连计数保持 0。
+- 新候选先在 59448 接管现有 Contact；关闭时约 0.7 秒完成 Digest `Expires: 0` 注销；随后固定端口 5062 可立即注册，证明旧 Contact 已从 AOR 删除。
+- 对候选进程执行强制终止后，使用同一 5062 端口重启，Digest 注册立即恢复，无 403，证明异常重启时稳定 Contact URI 可复用。
+- 多线路配置层新增端口冲突门禁：另一条已启用线路不能占用相同本地 SIP 端口。
+- 测试结束后完成正常注销并停止候选；正式服务 inactive、3101 关闭、`wwan0` DOWN、XFRM state/policy 0/0、ModemManager active。含凭据的隔离配置、数据库和日志均已删除，只保留校验过的候选二进制。
 
 ## 五、剩余 D4 联调项
 
-- [ ] 在 Asterisk 正确绑定 userpass auth 后，验证真实 401/407→Digest→200。
-- [ ] 使用稳定本地端口 5062 完成 60 秒 REGISTER refresh。
-- [ ] 验证关闭时 Asterisk Contact 立即删除，重新启用不会产生第二个 Contact。
-- [ ] 验证进程重启后同一 Contact URI 可恢复。
+- [x] 在 Asterisk InAuth 下验证真实 401/407→Digest→200。
+- [x] 使用稳定本地端口 5062 完成 60 秒 REGISTER refresh。
+- [x] 验证关闭时 Asterisk Contact 立即删除，重新启用不会产生第二个 Contact。
+- [x] 验证进程异常退出后同一 Contact URI 可恢复。
 - [ ] static peer 真机 OPTIONS/来源地址匹配。
 
 ## 六、后续阶段
