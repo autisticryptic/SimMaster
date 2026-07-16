@@ -1,5 +1,7 @@
 # 阶段 D3b 开发工作总结：每线路 SIP Trunk 配置层与 API
 
+> **后续进展（2026-07-16）**：D3b-runtime 与 D3b-UI 已由 `2b78d5f` 完成；D4 SIP UDP endpoint、Digest REGISTER、刷新/退避、静态 Peer 监听已由 `47b57d4` 完成，并在 `6d10cae` 补齐稳定本地 Contact 与关闭时注销。详细记录见 `阶段D4_SIP端点与Asterisk注册_开发总结.md`。
+
 > **文档性质**：单阶段开发工作记录（工作成果 + 剩余待办）
 > **日期**：2026-07-16
 > **对应规划**：`SimAdmin_扩展开发文档_多路径语音短信Trunk_进度更新版_v2_视频切换与Trunk对接.md` 第二十章 + 阶段 D（每线路 SIP Trunk 网关）
