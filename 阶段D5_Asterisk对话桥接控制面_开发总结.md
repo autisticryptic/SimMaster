@@ -1,6 +1,6 @@
 # 阶段 D5 开发总结：Asterisk SIP 对话桥接控制面
 
-> 日期：2026-07-16
+> 日期：2026-07-16（DTMF 与真机验证更新：2026-07-17）
 > 分支：`codex/ims-core-stage-a-b-live`
 > 本阶段边界：完成每线路 Trunk 的 SIP UAS/UAC 对话标识、INVITE 事务状态机和事件驱动桥接控制面；真实 IMS INVITE、RTP socket relay、VoLTE/ViLTE 拨号仍需后续阶段接入。
 
@@ -58,7 +58,18 @@
 - 后端全量：522 项测试通过。
 - `cargo clippy --all-targets -- -D warnings` 通过。
 
-## 三、当前明确未完成项
+## 三、高通 410 非拨号真机验证（2026-07-17）
+
+- Git 检查点：`d251ae9 feat(voice): add DTMF relay control and RTP mapping`。
+- ARM64 musl 候选：9,405,528 bytes；SHA-256 `88070BE8686769136FB0BEA493B76D18802F1CE09F7CE07949945287F7AA06BB`。
+- 正式 `simadmin.service` 保持 inactive；候选仅监听 `127.0.0.1:3101`，使用独立配置、数据库、认证和日志，`data_enabled=false`，没有建立 IMS bearer 或 XFRM。
+- 候选向真实 FreePBX/PJSIP `10.0.0.3:8060` 完成 Digest REGISTER 200，并以 120 秒周期连续刷新；运行态保持 `registered`，`reconnect_count=0`。
+- 观察到 Asterisk OPTIONS 轮询及候选 200 响应；随后切换到设备本机隔离 static-peer 对端，实测 `OPTIONS → 200`、无 IMS voice session 的 `INVITE → 100 Trying → 480 Temporarily Unavailable`。
+- 实测无对话的 `application/dtmf-relay` INFO 返回 481，证明 ARM64 运行时已识别 INFO 且执行对话门禁。确认通话内的 200 + `OperatorCommand::SendDtmf` 由离线测试覆盖；真实银行 IVR 数字键仍必须等 D6 接通 IMS voice session 后验证。
+- 测试完成前先正常切换配置，日志确认向 Asterisk 完成注销；随后停止候选并删除设备上的二进制、含凭据配置、数据库、Cookie、日志和临时包计数规则。
+- 清理后确认：3101/5062/18062 均未监听，正式服务 inactive，`wwan0` DOWN，XFRM state/policy 0/0，ModemManager active；本机临时 8765 HTTP 服务与 SSH 辅助文件也已删除。
+
+## 四、当前明确未完成项
 
 - `OperatorCommand` 尚未接入 `access/volte/live.rs` 的真实 IMS INVITE/应答事件队列。
 - `OperatorCommand::SendDtmf` 与运营商 DTMF INFO 构造器尚未接入真实 IMS voice session；当前只完成控制面、报文和 RTP PT 映射。
@@ -66,7 +77,7 @@
 - 双向 re-INVITE、真实 VoLTE/ViLTE 呼叫、媒体抓包、真机拨号和银行 IVR 数字键验证不在本阶段伪造；需要 D6 完成真实通话桥接后再执行。
 - Asterisk 侧 Digest/IP ACL、TLS/SRTP 和 Web 电话仍按后续 D7/D8 Todo 处理。
 
-## 四、下一检查点
+## 五、下一检查点
 
 1. 将 `OperatorCommand`/`OperatorEvent` 接到每线路 VoLTE live session 的非阻塞事件分发器。
 2. 将 `OperatorCommand::SendDtmf` 接到真实 IMS dialog；优先沿 RFC 4733 RTP 事件转发，未协商时生成 SIP INFO。
