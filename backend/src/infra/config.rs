@@ -3445,6 +3445,15 @@ impl ConfigManager {
 
 /// 获取默认配置文件路径
 pub fn get_default_config_path() -> PathBuf {
+    // Tests, recovery tools and side-by-side release candidates must be able
+    // to avoid the device-wide `/data/config.json` without moving or editing
+    // the production file.
+    if let Some(path) = std::env::var_os("SIMADMIN_CONFIG_PATH") {
+        if !path.is_empty() {
+            return PathBuf::from(path);
+        }
+    }
+
     // 尝试 /data/config.json（设备上的持久化目录）
     let device_path = PathBuf::from("/data/config.json");
     if device_path.parent().map(|p| p.exists()).unwrap_or(false) {
