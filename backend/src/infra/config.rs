@@ -1623,6 +1623,177 @@ mod tests {
 
         let _ = std::fs::remove_file(path);
     }
+
+    fn trunk_test_manager() -> (ConfigManager, PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_trunk_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (ConfigManager::new(path.clone()), path)
+    }
+
+    const TRUNK_TEST_LINE: &str = "line-0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn trunk_defaults_are_inert_and_off() {
+        let (manager, path) = trunk_test_manager();
+        let profile = manager.get_line_profile(TRUNK_TEST_LINE);
+        assert!(!profile.trunk.enabled);
+        assert_eq!(profile.trunk.asterisk_port, 5060);
+        assert_eq!(profile.trunk.register_expiry_secs, 3600);
+        assert_eq!(
+            profile.trunk.registration_mode,
+            TrunkRegistrationMode::StaticPeer
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_enable_requires_asterisk_host() {
+        let (manager, path) = trunk_test_manager();
+        let err = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, "trunk_asterisk_host_required");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_outbound_register_requires_username() {
+        let (manager, path) = trunk_test_manager();
+        let err = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    registration_mode: TrunkRegistrationMode::OutboundRegister,
+                    asterisk_host: "pbx.example.com".to_string(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err, "trunk_username_required");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_invalid_line_id_rejected() {
+        let (manager, path) = trunk_test_manager();
+        let err = manager
+            .set_line_trunk_profile("not-a-line", TrunkProfileConfig::default())
+            .unwrap_err();
+        assert_eq!(err, "invalid_line_id");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_static_peer_persists_and_redacts_secret() {
+        let (manager, path) = trunk_test_manager();
+        let saved = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    registration_mode: TrunkRegistrationMode::StaticPeer,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    username: "line0".to_string(),
+                    secret: "s3cr3t".to_string(),
+                    match_host: Some("192.168.1.10".to_string()),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        assert!(saved.trunk.enabled);
+        assert!(saved.trunk.secret_set());
+
+        // Persisted to disk with the secret intact.
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(
+            reloaded.get_line_profile(TRUNK_TEST_LINE).trunk.secret,
+            "s3cr3t"
+        );
+
+        // Redacted copy never carries the secret.
+        let redacted = saved.redacted();
+        assert!(redacted.trunk.secret.is_empty());
+        assert!(saved.trunk.secret_set());
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_empty_secret_keeps_stored_secret() {
+        let (manager, path) = trunk_test_manager();
+        manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    secret: "keepme".to_string(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+
+        // Re-submit with a blank secret (as a redacted round-trip would): the
+        // stored secret must survive.
+        let updated = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.20".to_string(),
+                    secret: String::new(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.trunk.asterisk_host, "192.168.1.20");
+        assert_eq!(updated.trunk.secret, "keepme");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_toggle_revalidates_stored_profile() {
+        let (manager, path) = trunk_test_manager();
+        // Enabling an unconfigured trunk via the toggle is rejected.
+        let err = manager
+            .set_line_trunk_enabled(TRUNK_TEST_LINE, true)
+            .unwrap_err();
+        assert_eq!(err, "trunk_asterisk_host_required");
+
+        // Configure it disabled, then the toggle can switch it on.
+        manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: false,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        let on = manager
+            .set_line_trunk_enabled(TRUNK_TEST_LINE, true)
+            .unwrap();
+        assert!(on.trunk.enabled);
+        let off = manager
+            .set_line_trunk_enabled(TRUNK_TEST_LINE, false)
+            .unwrap();
+        assert!(!off.trunk.enabled);
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn default_ddns_provider() -> String {
@@ -1871,9 +2042,115 @@ impl Default for VolteConfig {
     }
 }
 
+/// How this line's logical SIP trunk associates with the remote Asterisk/FreePBX.
+///
+/// Both modes share the same SIP transport and RTP relay; the only difference is
+/// whether SimAdmin actively REGISTERs to Asterisk. Decided 2026-07-16 to support
+/// both and let the user pick per line (see extension doc §8.1 / §17.2).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrunkRegistrationMode {
+    /// Static peer: both sides pin each other's IP:port and do not REGISTER.
+    /// SIP requests remain bidirectional; `match_host` identifies the peer.
+    #[default]
+    StaticPeer,
+    /// SimAdmin actively REGISTERs to Asterisk as an endpoint and refreshes it
+    /// every `register_expiry_secs`. NAT-friendly and supports dynamic presence.
+    OutboundRegister,
+}
+
+fn default_trunk_asterisk_port() -> u16 {
+    5060
+}
+
+fn default_trunk_register_expiry_secs() -> u32 {
+    3600
+}
+
+/// Per-line SIP trunk settings toward a remote Asterisk/FreePBX. This is a pure
+/// configuration record (stage D3b); the actual SIP endpoint / RTP bridge that
+/// consumes it lands in the `trunk/` module (stage D4/D5). All fields default to
+/// an inert, disabled state so existing configs deserialize unchanged and the
+/// feature stays off until explicitly configured.
+///
+/// `secret` is persisted to the on-disk config but MUST be redacted before it
+/// crosses any API boundary — callers use [`TrunkProfileConfig::redacted`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrunkProfileConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub registration_mode: TrunkRegistrationMode,
+    /// Asterisk/FreePBX host (IP or DNS name). Empty until configured.
+    #[serde(default)]
+    pub asterisk_host: String,
+    #[serde(default = "default_trunk_asterisk_port")]
+    pub asterisk_port: u16,
+    /// Endpoint / auth username presented to Asterisk.
+    #[serde(default)]
+    pub username: String,
+    /// Digest secret. Persisted on disk; redacted on every API response.
+    #[serde(default)]
+    pub secret: String,
+    /// Expected Asterisk dialplan context. This is deployment metadata for UI
+    /// and generated configuration; SIP requests do not carry a context name.
+    #[serde(default)]
+    pub context: String,
+    /// Asterisk extension targeted when SimAdmin forwards a mobile-originated
+    /// incoming call to the PBX. It can also serve as the per-line route key.
+    #[serde(default)]
+    pub extension: String,
+    /// Codec allow-list advertised toward Asterisk (pass-through, never
+    /// transcoded here). Empty means "advertise the negotiated defaults".
+    #[serde(default)]
+    pub codec_allow: Vec<String>,
+    /// OutboundRegister only: registration lifetime / refresh period.
+    #[serde(default = "default_trunk_register_expiry_secs")]
+    pub register_expiry_secs: u32,
+    /// StaticPeer only: the far-end host used to identify inbound requests.
+    #[serde(default)]
+    pub match_host: Option<String>,
+}
+
+impl Default for TrunkProfileConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            registration_mode: TrunkRegistrationMode::StaticPeer,
+            asterisk_host: String::new(),
+            asterisk_port: default_trunk_asterisk_port(),
+            username: String::new(),
+            secret: String::new(),
+            context: String::new(),
+            extension: String::new(),
+            codec_allow: Vec::new(),
+            register_expiry_secs: default_trunk_register_expiry_secs(),
+            match_host: None,
+        }
+    }
+}
+
+impl TrunkProfileConfig {
+    /// A copy safe to serialize across an API boundary: the secret is blanked and
+    /// its presence is not otherwise revealed. Callers that need to tell the UI
+    /// whether a secret is set should surface a separate `secret_set` flag.
+    pub fn redacted(&self) -> Self {
+        Self {
+            secret: String::new(),
+            ..self.clone()
+        }
+    }
+
+    /// Whether a non-empty secret is currently stored (for UI hints without
+    /// leaking the value).
+    pub fn secret_set(&self) -> bool {
+        !self.secret.is_empty()
+    }
+}
+
 /// Persisted controls for one stable physical-modem + SIM line. Trunk settings
-/// will extend this same profile later; keeping the connection flag here makes
-/// multi-line auto-restore independent instead of relying on one global bool.
+/// extend this same profile; keeping the connection flag here makes multi-line
+/// auto-restore independent instead of relying on one global bool.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineProfileConfig {
     pub line_id: String,
@@ -1881,6 +2158,8 @@ pub struct LineProfileConfig {
     pub enabled: bool,
     #[serde(default)]
     pub volte_connection_enabled: bool,
+    #[serde(default)]
+    pub trunk: TrunkProfileConfig,
 }
 
 fn default_line_enabled() -> bool {
@@ -1893,6 +2172,15 @@ impl LineProfileConfig {
             line_id: line_id.into(),
             enabled: true,
             volte_connection_enabled: false,
+            trunk: TrunkProfileConfig::default(),
+        }
+    }
+
+    /// A copy safe to serialize across an API boundary (trunk secret redacted).
+    pub fn redacted(&self) -> Self {
+        Self {
+            trunk: self.trunk.redacted(),
+            ..self.clone()
         }
     }
 }
@@ -2796,6 +3084,73 @@ impl ConfigManager {
         };
         self.save()?;
         Ok(next)
+    }
+
+    /// Replace one line's trunk settings (stage D3b). Gating mirrors the VoLTE
+    /// line toggle: enabling requires the line itself to be enabled, a non-empty
+    /// Asterisk host, and — in `OutboundRegister` mode — a username. An empty
+    /// incoming `secret` means "keep the stored secret" so the UI can round-trip
+    /// redacted responses without wiping credentials.
+    pub fn set_line_trunk_profile(
+        &self,
+        line_id: &str,
+        trunk: TrunkProfileConfig,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            let mut incoming = trunk;
+            if incoming.secret.is_empty() {
+                incoming.secret = profile.trunk.secret.clone();
+            }
+            if incoming.enabled {
+                if !profile.enabled {
+                    return Err("line_disabled".to_string());
+                }
+                if incoming.asterisk_host.trim().is_empty() {
+                    return Err("trunk_asterisk_host_required".to_string());
+                }
+                if incoming.registration_mode == TrunkRegistrationMode::OutboundRegister
+                    && incoming.username.trim().is_empty()
+                {
+                    return Err("trunk_username_required".to_string());
+                }
+            }
+            profile.trunk = incoming;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    /// Toggle one line's trunk without resubmitting the full settings. Enabling
+    /// revalidates the stored profile so a half-configured trunk cannot be
+    /// switched on.
+    pub fn set_line_trunk_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        let current = self.get_line_profile(line_id).trunk;
+        self.set_line_trunk_profile(line_id, TrunkProfileConfig { enabled, ..current })
     }
 
     pub fn set_volte_connection_enabled(&self, enabled: bool) -> Result<VolteConfig, String> {

@@ -47,8 +47,8 @@ use crate::{
     },
     infra::config::{
         AccessPathKind, ApnConfig, LineProfileConfig, MidFlightDisablePolicy, SmsPathPolicy,
-        VilteConfig, VoicePathPolicy, VoiceServicesConfig, VolteConfig, VolteIpFamilyPreference,
-        VowifiConfig,
+        TrunkProfileConfig, VilteConfig, VoicePathPolicy, VoiceServicesConfig, VolteConfig,
+        VolteIpFamilyPreference, VowifiConfig,
     },
     infra::db::{
         NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
@@ -4395,7 +4395,12 @@ fn build_volte_line_response(
     status: crate::access::line_registry::LineRuntimeStatus,
 ) -> VolteLineControlResponse {
     VolteLineControlResponse {
-        profile: app.config_manager.get_line_profile(&status.modem.line_id),
+        // Redacted: the embedded trunk settings carry a Digest secret that must
+        // never cross the API boundary.
+        profile: app
+            .config_manager
+            .get_line_profile(&status.modem.line_id)
+            .redacted(),
         modem: status.modem,
         runtime: status.volte,
     }
@@ -4509,7 +4514,7 @@ pub async fn set_volte_line_connection_handler(
     };
     let response = VolteLineControlResponse {
         modem: line.binding(),
-        profile,
+        profile: profile.redacted(),
         runtime: line.volte.status().await,
     };
     match result {
@@ -4520,6 +4525,95 @@ pub async fn set_volte_line_connection_handler(
         Err(error) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {error}"))),
+        ),
+    }
+}
+
+// ===================== Trunk handlers (stage D3b: config only) =====================
+
+/// Response for the per-line trunk config endpoints. The trunk `secret` is
+/// always redacted; `secret_set` tells the UI whether one is stored so it can
+/// show a "configured" hint without leaking the value.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct TrunkProfileResponse {
+    pub line_id: String,
+    pub trunk: TrunkProfileConfig,
+    pub secret_set: bool,
+}
+
+impl TrunkProfileResponse {
+    fn from_profile(profile: &LineProfileConfig) -> Self {
+        Self {
+            line_id: profile.line_id.clone(),
+            secret_set: profile.trunk.secret_set(),
+            trunk: profile.trunk.redacted(),
+        }
+    }
+}
+
+/// Read one line's trunk settings (secret redacted). Returns the inert default
+/// for a line that has never been configured, so the UI always has a shape.
+pub async fn get_line_trunk_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    let profile = app.config_manager.get_line_profile(&line_id);
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            TrunkProfileResponse::from_profile(&profile),
+        )),
+    )
+}
+
+/// Replace one line's trunk settings. An empty `secret` in the payload keeps the
+/// stored secret (redacted round-trip). Validation/gating lives in the config
+/// layer; its error strings are surfaced verbatim for the UI to map.
+pub async fn set_line_trunk_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<TrunkProfileConfig>,
+) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    match app.config_manager.set_line_trunk_profile(&line_id, payload) {
+        Ok(profile) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                TrunkProfileResponse::from_profile(&profile),
+            )),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<TrunkProfileResponse>::error(format!(
+                "Failed: {error}"
+            ))),
+        ),
+    }
+}
+
+/// Toggle one line's trunk on/off without resubmitting the full settings.
+pub async fn set_line_trunk_enabled_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<VolteControlToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
+    match app
+        .config_manager
+        .set_line_trunk_enabled(&line_id, payload.enabled)
+    {
+        Ok(profile) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                TrunkProfileResponse::from_profile(&profile),
+            )),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<TrunkProfileResponse>::error(format!(
+                "Failed: {error}"
+            ))),
         ),
     }
 }

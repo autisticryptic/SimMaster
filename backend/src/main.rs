@@ -936,6 +936,16 @@ async fn main() -> Result<()> {
             post(set_volte_line_connection_handler).options(options_handler),
         )
         .route(
+            "/api/trunk/lines/{line_id}",
+            get(get_line_trunk_handler)
+                .post(set_line_trunk_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/trunk/lines/{line_id}/enabled",
+            post(set_line_trunk_enabled_handler).options(options_handler),
+        )
+        .route(
             "/api/volte/ip-family",
             post(set_volte_ip_family_handler).options(options_handler),
         )
