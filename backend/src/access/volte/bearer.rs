@@ -310,17 +310,12 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
-    // Qualcomm raw-IP WWAN links may stay administratively DOWN and reject an
-    // explicit `ip link set up` with EINVAL even while the WDS bearer is
-    // connected and accepts addresses/routes. Treat link-up as best effort;
-    // the mandatory address and route operations below remain the real gate.
-    if let Err(error) = run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await {
-        tracing::debug!(
-            interface = %bearer.interface,
-            error = %error,
-            "Dedicated IMS raw-IP link rejected explicit link-up"
-        );
-    }
+    // A raw-IP bearer still has to be administratively UP before Linux accepts
+    // host routes or transmits bound SIP/RTP sockets.  In particular, a
+    // bam-dmux runtime-PM/firmware failure may surface here as EINVAL or
+    // ETIMEDOUT.  Propagate that first failure instead of obscuring it with the
+    // inevitable later "Device for nexthop is not up" route error.
+    run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
