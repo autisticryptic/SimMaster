@@ -126,13 +126,26 @@ async fn run_session(
     let local_aor = format!("sip:{}@{}", profile.username, profile.asterisk_host);
     let mut bridge =
         TrunkBridge::new(local_addr, local_aor).with_operator(OperatorAvailability::Unavailable);
-    if !profile.extension.trim().is_empty() {
+    if !profile.outgoing_binding.trim().is_empty() {
+        bridge = bridge.with_outgoing_binding(profile.outgoing_binding.clone());
+    }
+    if !profile.incoming_binding.trim().is_empty() {
         bridge = bridge.with_asterisk_target(format!(
             "sip:{}@{}:{}",
-            profile.extension, profile.asterisk_host, profile.asterisk_port
+            profile.incoming_binding, profile.asterisk_host, profile.asterisk_port
         ));
     }
-    operator.set_trunk_local_ip((!profile.extension.trim().is_empty()).then_some(local_addr.ip()));
+    operator.set_trunk_local_ip(
+        (!profile.incoming_binding.trim().is_empty()).then_some(local_addr.ip()),
+    );
+    operator.set_incoming_mode(profile.incoming_mode);
+    tracing::info!(
+        incoming_mode = ?profile.incoming_mode,
+        incoming_binding = %profile.incoming_binding,
+        outgoing_binding = %profile.outgoing_binding,
+        ip_connect_on_operator_answer = profile.ip_connect_on_operator_answer,
+        "Asterisk trunk call routing active"
+    );
     let result = match profile.registration_mode {
         TrunkRegistrationMode::StaticPeer => {
             run_static_peer(transport, state, shutdown, &mut bridge, operator).await
@@ -142,6 +155,7 @@ async fn run_session(
         }
     };
     operator.set_trunk_local_ip(None);
+    operator.set_incoming_mode(crate::infra::config::TrunkIncomingMode::default());
     result
 }
 
@@ -486,6 +500,7 @@ async fn handle_inbound(
                 BridgeError::UnsupportedMedia(_) => (488, "Not Acceptable Here"),
                 BridgeError::InvalidState(_) => (481, "Call/Transaction Does Not Exist"),
                 BridgeError::MalformedRequest(_) => (400, "Bad Request"),
+                BridgeError::Forbidden(_) => (403, "Forbidden"),
             };
             warn!(status, error = %error, "Rejecting invalid Asterisk trunk request");
             if let Ok(response) = sip::build_response(frame, status, reason) {
@@ -561,6 +576,11 @@ fn validate_profile(profile: &TrunkProfileConfig) -> Result<(), String> {
         && profile.username.trim().is_empty()
     {
         return Err("trunk_username_required".to_string());
+    }
+    if profile.registration_mode == TrunkRegistrationMode::OutboundRegister
+        && !(60..=86_400).contains(&profile.register_expiry_secs)
+    {
+        return Err("trunk_register_expiry_invalid".to_string());
     }
     Ok(())
 }
@@ -844,7 +864,7 @@ mod tests {
                 asterisk_port: server_addr.port(),
                 local_port: free_udp_port().await,
                 username: "41000".into(),
-                extension: "6108".into(),
+                incoming_binding: "6108".into(),
                 ..TrunkProfileConfig::default()
             })
             .await;

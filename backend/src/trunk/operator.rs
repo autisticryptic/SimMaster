@@ -11,6 +11,7 @@ use std::{
 use tokio::sync::broadcast;
 
 use super::bridge::{OperatorCommand, OperatorEvent};
+use crate::infra::config::TrunkIncomingMode;
 
 #[derive(Clone)]
 pub struct OperatorLink {
@@ -20,6 +21,7 @@ pub struct OperatorLink {
 struct OperatorLinkInner {
     ready: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
+    incoming_mode: RwLock<TrunkIncomingMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
 }
@@ -32,6 +34,7 @@ impl Default for OperatorLink {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
                 trunk_local_ip: RwLock::new(None),
+                incoming_mode: RwLock::new(TrunkIncomingMode::default()),
                 commands,
                 events,
             }),
@@ -63,6 +66,20 @@ impl OperatorLink {
             .read()
             .ok()
             .and_then(|address| *address)
+    }
+
+    pub fn set_incoming_mode(&self, mode: TrunkIncomingMode) {
+        if let Ok(mut current) = self.inner.incoming_mode.write() {
+            *current = mode;
+        }
+    }
+
+    pub fn incoming_mode(&self) -> TrunkIncomingMode {
+        self.inner
+            .incoming_mode
+            .read()
+            .map(|mode| *mode)
+            .unwrap_or_default()
     }
 
     pub fn subscribe_commands(&self) -> broadcast::Receiver<OperatorCommand> {
@@ -110,6 +127,14 @@ mod tests {
         assert_eq!(link.trunk_local_ip(), Some(address));
         link.set_trunk_local_ip(None);
         assert_eq!(link.trunk_local_ip(), None);
+    }
+
+    #[test]
+    fn shares_incoming_route_mode_with_ims_task() {
+        let link = OperatorLink::default();
+        assert_eq!(link.incoming_mode(), TrunkIncomingMode::BoundPending);
+        link.set_incoming_mode(TrunkIncomingMode::BoundImmediate);
+        assert_eq!(link.incoming_mode(), TrunkIncomingMode::BoundImmediate);
     }
 
     #[tokio::test]

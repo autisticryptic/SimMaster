@@ -1528,7 +1528,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_ip_family_preference_defaults_and_round_trips() {
+    fn legacy_volte_ip_family_preference_is_read_but_not_serialized() {
         let defaulted: VolteConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(
             defaulted.ip_family_preference,
@@ -1541,13 +1541,10 @@ mod tests {
             configured.ip_family_preference,
             VolteIpFamilyPreference::Ipv4First
         );
-        assert_eq!(
-            serde_json::to_value(configured)
-                .unwrap()
-                .get("ip_family_preference")
-                .and_then(serde_json::Value::as_str),
-            Some("ipv4_first")
-        );
+        assert!(serde_json::to_value(configured)
+            .unwrap()
+            .get("ip_family_preference")
+            .is_none());
     }
 
     #[test]
@@ -1815,6 +1812,74 @@ mod tests {
     }
 
     #[test]
+    fn trunk_legacy_extension_migrates_to_incoming_binding() {
+        let profile: TrunkProfileConfig = serde_json::from_str(r#"{"extension":"6108"}"#).unwrap();
+        assert_eq!(profile.incoming_mode, TrunkIncomingMode::BoundPending);
+        assert_eq!(profile.incoming_binding, "6108");
+        assert!(profile.outgoing_binding.is_empty());
+        assert!(profile.ip_connect_on_operator_answer);
+
+        let serialized = serde_json::to_value(profile).unwrap();
+        assert!(serialized.get("extension").is_none());
+        assert_eq!(serialized["incoming_binding"], "6108");
+    }
+
+    #[test]
+    fn trunk_routing_fields_are_trimmed_validated_and_persisted() {
+        let (manager, path) = trunk_test_manager();
+        let saved = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    registration_mode: TrunkRegistrationMode::OutboundRegister,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    username: "41000".to_string(),
+                    register_expiry_secs: 3600,
+                    incoming_mode: TrunkIncomingMode::BoundImmediate,
+                    incoming_binding: " 6108 ".to_string(),
+                    outgoing_binding: " 6109 ".to_string(),
+                    ip_connect_on_operator_answer: false,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(saved.trunk.incoming_mode, TrunkIncomingMode::BoundImmediate);
+        assert_eq!(saved.trunk.incoming_binding, "6108");
+        assert_eq!(saved.trunk.outgoing_binding, "6109");
+        assert!(!saved.trunk.ip_connect_on_operator_answer);
+
+        let invalid_expiry = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    registration_mode: TrunkRegistrationMode::OutboundRegister,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    username: "41000".to_string(),
+                    register_expiry_secs: 59,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(invalid_expiry, "trunk_register_expiry_invalid");
+
+        let invalid_binding = manager
+            .set_line_trunk_profile(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    incoming_binding: "6108/evil".to_string(),
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(invalid_binding, "trunk_incoming_binding_invalid");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trunk_toggle_revalidates_stored_profile() {
         let (manager, path) = trunk_test_manager();
         // Enabling an unconfigured trunk via the toggle is rejected.
@@ -2026,11 +2091,9 @@ fn default_volte_auto_restore_retry_delay_secs() -> u64 {
     30
 }
 
-/// Address-family selection for the dedicated VoLTE IMS bearer.
-///
-/// The bearer itself is requested as dual-stack. `*_first` controls the
-/// ordered P-CSCF discovery/REGISTER attempts, while `*_only` is useful for
-/// operators or diagnostics that require one family strictly.
+/// Legacy address-family values accepted while reading older configurations.
+/// Runtime selection is now fixed to dual-stack first with bounded IPv4/IPv6
+/// fallback, so this value is ignored and no longer serialized or exposed.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolteIpFamilyPreference {
@@ -2068,7 +2131,7 @@ pub struct VolteConfig {
     pub voice_enabled: bool,
     #[serde(default)]
     pub connection_enabled: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub ip_family_preference: VolteIpFamilyPreference,
     #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
     pub auto_restore_initial_delay_secs: u64,
@@ -2110,12 +2173,30 @@ pub enum TrunkRegistrationMode {
     OutboundRegister,
 }
 
+/// How a mobile-terminated operator call is presented to Asterisk.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrunkIncomingMode {
+    /// Route to the configured Asterisk IVR/secondary-dial extension. SimAdmin
+    /// remains a transparent media relay; Asterisk owns prompts and digit use.
+    SecondaryDial,
+    /// Ring the bound extension and answer IMS only after Asterisk answers.
+    #[default]
+    BoundPending,
+    /// Answer IMS immediately, then ring the bound Asterisk extension.
+    BoundImmediate,
+}
+
 fn default_trunk_asterisk_port() -> u16 {
     5060
 }
 
 fn default_trunk_register_expiry_secs() -> u32 {
     3600
+}
+
+fn default_trunk_ip_connect_on_operator_answer() -> bool {
+    true
 }
 
 /// Per-line SIP trunk settings toward a remote Asterisk/FreePBX. This is a pure
@@ -2152,10 +2233,21 @@ pub struct TrunkProfileConfig {
     /// and generated configuration; SIP requests do not carry a context name.
     #[serde(default)]
     pub context: String,
-    /// Asterisk extension targeted when SimAdmin forwards a mobile-originated
-    /// incoming call to the PBX. It can also serve as the per-line route key.
+    /// Mobile-terminated routing behavior toward Asterisk.
     #[serde(default)]
-    pub extension: String,
+    pub incoming_mode: TrunkIncomingMode,
+    /// Asterisk extension targeted for operator-originated incoming calls.
+    /// `extension` is accepted as a legacy on-disk/API alias.
+    #[serde(default, alias = "extension")]
+    pub incoming_binding: String,
+    /// Optional Asterisk From-user allowed to originate calls through this SIM.
+    /// Empty keeps backward-compatible per-peer routing without user binding.
+    #[serde(default)]
+    pub outgoing_binding: String,
+    /// When the operator leg answers an Asterisk-originated call, immediately
+    /// complete the Asterisk/IP leg as well. This is the existing safe default.
+    #[serde(default = "default_trunk_ip_connect_on_operator_answer")]
+    pub ip_connect_on_operator_answer: bool,
     /// Codec allow-list advertised toward Asterisk (pass-through, never
     /// transcoded here). Empty means "advertise the negotiated defaults".
     #[serde(default)]
@@ -2179,7 +2271,10 @@ impl Default for TrunkProfileConfig {
             username: String::new(),
             secret: String::new(),
             context: String::new(),
-            extension: String::new(),
+            incoming_mode: TrunkIncomingMode::BoundPending,
+            incoming_binding: String::new(),
+            outgoing_binding: String::new(),
+            ip_connect_on_operator_answer: default_trunk_ip_connect_on_operator_answer(),
             codec_allow: Vec::new(),
             register_expiry_secs: default_trunk_register_expiry_secs(),
             match_host: None,
@@ -2246,6 +2341,13 @@ fn valid_line_id(line_id: &str) -> bool {
     line_id.strip_prefix("line-").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+fn valid_trunk_binding(binding: &str) -> bool {
+    binding.is_empty()
+        || binding.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'_' | b'.' | b'*' | b'#')
+        })
 }
 
 // ===================== Phase F: ViLTE (video telephony over LTE) =====================
@@ -3174,6 +3276,14 @@ impl ConfigManager {
             if incoming.secret.is_empty() {
                 incoming.secret = config.line_profiles[profile_index].trunk.secret.clone();
             }
+            incoming.incoming_binding = incoming.incoming_binding.trim().to_string();
+            incoming.outgoing_binding = incoming.outgoing_binding.trim().to_string();
+            if !valid_trunk_binding(&incoming.incoming_binding) {
+                return Err("trunk_incoming_binding_invalid".to_string());
+            }
+            if !valid_trunk_binding(&incoming.outgoing_binding) {
+                return Err("trunk_outgoing_binding_invalid".to_string());
+            }
             if incoming.enabled {
                 if !config.line_profiles[profile_index].enabled {
                     return Err("line_disabled".to_string());
@@ -3185,6 +3295,11 @@ impl ConfigManager {
                     && incoming.username.trim().is_empty()
                 {
                     return Err("trunk_username_required".to_string());
+                }
+                if incoming.registration_mode == TrunkRegistrationMode::OutboundRegister
+                    && !(60..=86_400).contains(&incoming.register_expiry_secs)
+                {
+                    return Err("trunk_register_expiry_invalid".to_string());
                 }
                 if incoming.local_port == 0 {
                     return Err("trunk_local_port_required".to_string());
@@ -3228,19 +3343,6 @@ impl ConfigManager {
                 return Err("volte_feature_disabled".to_string());
             }
             c.volte.connection_enabled = enabled;
-            c.volte.clone()
-        };
-        self.save()?;
-        Ok(next)
-    }
-
-    pub fn set_volte_ip_family_preference(
-        &self,
-        preference: VolteIpFamilyPreference,
-    ) -> Result<VolteConfig, String> {
-        let next = {
-            let mut c = self.config.write().unwrap();
-            c.volte.ip_family_preference = preference;
             c.volte.clone()
         };
         self.save()?;

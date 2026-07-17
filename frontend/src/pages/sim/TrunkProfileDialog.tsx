@@ -19,6 +19,7 @@ import {
 } from '@mui/material'
 import {
   api,
+  type TrunkIncomingMode,
   type TrunkProfileConfig,
   type TrunkProfileResponse,
   type TrunkRegistrationMode,
@@ -106,7 +107,7 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
       <DialogContent dividers>
         <Stack spacing={2.25}>
           <Alert severity="info">
-            SIP UDP、REGISTER 和静态 Peer 监听已可用；INVITE 与 RTP 桥接将在后续阶段接线。
+            SIP UDP、REGISTER、双向 INVITE、DTMF 与 RTP 转发均已接线；SimAdmin 仅转发已协商的媒体，不执行转码。
           </Alert>
 
           <FormControlLabel
@@ -126,6 +127,15 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
                 <MenuItem value="static_peer">静态 Peer（不注册、双向 INVITE）</MenuItem>
               </Select>
             </FormControl>
+            <TextField
+              size="small"
+              type="number"
+              label="注册时长（秒）"
+              value={draft.register_expiry_secs}
+              onChange={(event) => update('register_expiry_secs', Number(event.target.value))}
+              disabled={draft.registration_mode !== 'outbound_register'}
+              helperText="主动 REGISTER 有效期，允许 60–86400 秒"
+            />
             <TextField
               size="small"
               label="Asterisk 地址"
@@ -171,12 +181,44 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
               onChange={(event) => update('context', event.target.value)}
               helperText="部署元数据；Context 实际由 Asterisk endpoint 决定"
             />
+            <FormControl size="small" fullWidth>
+              <InputLabel>呼入类型</InputLabel>
+              <Select
+                value={draft.incoming_mode}
+                label="呼入类型"
+                onChange={(event) => update('incoming_mode', event.target.value as TrunkIncomingMode)}
+              >
+                <MenuItem value="secondary_dial">二次拨号（Asterisk IVR）</MenuItem>
+                <MenuItem value="bound_pending">绑定待接（分机接听后接通运营商）</MenuItem>
+                <MenuItem value="bound_immediate">绑定立接（先接通运营商再呼叫分机）</MenuItem>
+              </Select>
+            </FormControl>
             <TextField
               size="small"
-              label="入呼 Extension / 线路路由键"
-              value={draft.extension}
-              onChange={(event) => update('extension', event.target.value)}
-              placeholder="4101"
+              label="呼入绑定"
+              value={draft.incoming_binding}
+              onChange={(event) => update('incoming_binding', event.target.value)}
+              placeholder="6108"
+              helperText={draft.incoming_mode === 'secondary_dial'
+                ? '填写 Asterisk IVR 分机；提示音、收号和二次路由由 Asterisk 处理'
+                : '运营商来电将呼叫此 Asterisk 分机'}
+            />
+            <TextField
+              size="small"
+              label="呼出绑定"
+              value={draft.outgoing_binding}
+              onChange={(event) => update('outgoing_binding', event.target.value)}
+              placeholder="6108"
+              helperText="填写后，仅允许 From 用户匹配的 Asterisk 分机通过此 SIM 呼出；留空不限制"
+            />
+            <FormControlLabel
+              control={(
+                <Switch
+                  checked={draft.ip_connect_on_operator_answer}
+                  onChange={(_, enabled) => update('ip_connect_on_operator_answer', enabled)}
+                />
+              )}
+              label="IP 接通（GSM/运营商接通时立即接通）"
             />
             <TextField
               size="small"
@@ -185,14 +227,6 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
               onChange={(event) => setCodecText(event.target.value)}
               placeholder="amr-wb, amr"
               helperText="使用英文逗号分隔；SimAdmin 只转发，不转码"
-            />
-            <TextField
-              size="small"
-              type="number"
-              label="REGISTER 周期（秒）"
-              value={draft.register_expiry_secs}
-              onChange={(event) => update('register_expiry_secs', Number(event.target.value))}
-              disabled={draft.registration_mode !== 'outbound_register'}
             />
             {draft.registration_mode === 'static_peer' && (
               <TextField

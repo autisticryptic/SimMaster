@@ -469,6 +469,7 @@ export interface VolteRuntimeStatus {
 }
 
 export type TrunkRegistrationMode = 'static_peer' | 'outbound_register'
+export type TrunkIncomingMode = 'secondary_dial' | 'bound_pending' | 'bound_immediate'
 
 export interface TrunkProfileConfig {
   enabled: boolean
@@ -479,7 +480,10 @@ export interface TrunkProfileConfig {
   username: string
   secret: string
   context: string
-  extension: string
+  incoming_mode: TrunkIncomingMode
+  incoming_binding: string
+  outgoing_binding: string
+  ip_connect_on_operator_answer: boolean
   codec_allow: string[]
   register_expiry_secs: number
   match_host?: string | null

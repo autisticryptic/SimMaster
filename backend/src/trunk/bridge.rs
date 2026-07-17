@@ -157,6 +157,7 @@ pub enum BridgeError {
     MalformedRequest(String),
     InvalidState(String),
     UnsupportedMedia(String),
+    Forbidden(String),
 }
 
 impl std::fmt::Display for BridgeError {
@@ -165,6 +166,7 @@ impl std::fmt::Display for BridgeError {
             Self::MalformedRequest(reason) => write!(f, "malformed trunk request: {reason}"),
             Self::InvalidState(reason) => write!(f, "invalid trunk bridge state: {reason}"),
             Self::UnsupportedMedia(reason) => write!(f, "unsupported trunk media: {reason}"),
+            Self::Forbidden(reason) => write!(f, "forbidden trunk request: {reason}"),
         }
     }
 }
@@ -183,6 +185,7 @@ pub struct TrunkBridge {
     local_addr: SocketAddr,
     local_aor: String,
     asterisk_target: Option<String>,
+    outgoing_binding: Option<String>,
     operator: OperatorAvailability,
     calls: HashMap<String, BridgedCall>,
 }
@@ -193,6 +196,7 @@ impl TrunkBridge {
             local_addr,
             local_aor: local_aor.into(),
             asterisk_target: None,
+            outgoing_binding: None,
             operator: OperatorAvailability::Unavailable,
             calls: HashMap::new(),
         }
@@ -209,6 +213,12 @@ impl TrunkBridge {
 
     pub fn with_asterisk_target(mut self, target: impl Into<String>) -> Self {
         self.asterisk_target = Some(target.into());
+        self
+    }
+
+    pub fn with_outgoing_binding(mut self, binding: impl Into<String>) -> Self {
+        let binding = binding.into();
+        self.outgoing_binding = (!binding.trim().is_empty()).then(|| binding.trim().to_string());
         self
     }
 
@@ -437,6 +447,14 @@ impl TrunkBridge {
                     .map_err(BridgeError::MalformedRequest)?;
                     output.asterisk_frames.push(bye);
                     call.dialog.state = InviteTransactionState::Terminated;
+                } else if call.dialog.direction == dialog::DialogDirection::OperatorOriginated
+                    && call.dialog.state == InviteTransactionState::Proceeding
+                {
+                    output.asterisk_frames.push(
+                        sip::build_cancel(&call.dialog.initial_invite)
+                            .map_err(BridgeError::MalformedRequest)?,
+                    );
+                    call.dialog.state = InviteTransactionState::Failed;
                 }
             }
             OperatorEvent::Cancelled { .. } => {
@@ -496,6 +514,14 @@ impl TrunkBridge {
         let dialog =
             SipDialog::from_asterisk_invite(frame).map_err(BridgeError::MalformedRequest)?;
         let caller = sip_frame::header_uri(frame, "From").unwrap_or_else(|| "sip:unknown".into());
+        if let Some(binding) = self.outgoing_binding.as_deref() {
+            let caller_user = sip_user(&caller).unwrap_or_default();
+            if caller_user != binding {
+                return Err(BridgeError::Forbidden(
+                    "trunk_outgoing_binding_mismatch".into(),
+                ));
+            }
+        }
         let callee = request_uri(frame)
             .or_else(|| sip_frame::header_uri(frame, "To"))
             .unwrap_or_else(|| self.local_aor.clone());
@@ -899,6 +925,13 @@ fn media_endpoint(address: &str, port: u16) -> Result<SocketAddr, BridgeError> {
     Ok(SocketAddr::new(ip, port))
 }
 
+fn sip_user(uri: &str) -> Option<&str> {
+    uri.strip_prefix("sip:")?
+        .split(['@', ';'])
+        .next()
+        .filter(|user| !user.is_empty())
+}
+
 fn first_token(frame: &[u8]) -> Option<String> {
     frame
         .split(|byte| *byte == b' ')
@@ -983,6 +1016,33 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.asterisk_frames[0]).starts_with("SIP/2.0 100"));
         assert!(String::from_utf8_lossy(&output.asterisk_frames[1]).starts_with("SIP/2.0 480"));
         assert_eq!(bridge.active_call_count(), 0);
+    }
+
+    #[test]
+    fn outgoing_binding_allows_only_matching_asterisk_from_user() {
+        let mut allowed = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven)
+        .with_outgoing_binding("6108");
+        let output = allowed.handle_asterisk(&invite()).unwrap();
+        assert!(matches!(
+            output.operator_commands.as_slice(),
+            [OperatorCommand::StartCall { .. }]
+        ));
+
+        let mut rejected = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven)
+        .with_outgoing_binding("6109");
+        assert!(matches!(
+            rejected.handle_asterisk(&invite()),
+            Err(BridgeError::Forbidden(reason)) if reason == "trunk_outgoing_binding_mismatch"
+        ));
+        assert_eq!(rejected.active_call_count(), 0);
     }
 
     #[test]
@@ -1127,6 +1187,30 @@ mod tests {
         let cancel = String::from_utf8_lossy(&output.asterisk_frames[0]);
         assert!(cancel.starts_with("CANCEL sip:6108@192.0.2.20:8060 SIP/2.0"));
         assert!(cancel.contains("CSeq: 1 CANCEL\r\n"));
+        assert_eq!(bridge.active_call_count(), 0);
+    }
+
+    #[test]
+    fn operator_end_cancels_pending_asterisk_invite() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_asterisk_target("sip:6108@192.0.2.20:8060");
+        bridge
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "ims-call-ended".into(),
+                caller: "sip:+8613800@ims.example".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Ended {
+                call_id: "ims-call-ended".into(),
+            })
+            .unwrap();
+        assert_eq!(output.asterisk_frames.len(), 1);
+        assert!(output.asterisk_frames[0].starts_with(b"CANCEL "));
         assert_eq!(bridge.active_call_count(), 0);
     }
 
