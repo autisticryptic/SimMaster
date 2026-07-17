@@ -209,6 +209,13 @@ async fn run_outbound_register(
         let refresh_after = Duration::from_secs((u64::from(expiry) * 85 / 100).max(30));
         let registered_at = timestamp_now();
         let expires_at = timestamp_after(Duration::from_secs(u64::from(expiry)));
+        tracing::info!(
+            peer = %transport.peer_addr(),
+            local = %transport.local_addr()?,
+            expiry_secs = expiry,
+            refresh_after_secs = refresh_after.as_secs(),
+            "Asterisk trunk registration active"
+        );
         state
             .update(|snapshot| {
                 snapshot.phase = TrunkPhase::Registered;

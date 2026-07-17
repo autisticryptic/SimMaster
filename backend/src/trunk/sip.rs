@@ -257,12 +257,13 @@ fn cseq_number(frame: &[u8]) -> Result<u32, String> {
         .ok_or_else(|| "trunk_cseq_invalid".to_string())
 }
 pub fn response_expiry(frame: &[u8], fallback: u32) -> u32 {
-    sip_frame::header_value(frame, "Expires")
-        .and_then(|value| value.parse::<u32>().ok())
+    // RFC 3261 section 10.2.4: a Contact-level expires parameter overrides
+    // the response's generic Expires value for that registration binding.
+    sip_frame::header_values(frame, "Contact")
+        .into_iter()
+        .find_map(|value| parameter_value(&value, "expires")?.parse::<u32>().ok())
         .or_else(|| {
-            sip_frame::header_values(frame, "Contact")
-                .into_iter()
-                .find_map(|value| parameter_value(&value, "expires")?.parse::<u32>().ok())
+            sip_frame::header_value(frame, "Expires").and_then(|value| value.parse::<u32>().ok())
         })
         .unwrap_or(fallback)
 }
@@ -408,5 +409,11 @@ mod tests {
     fn response_expiry_prefers_server_value() {
         let frame = b"SIP/2.0 200 OK\r\nContact: <sip:u@127.0.0.1>;expires=120\r\nContent-Length: 0\r\n\r\n";
         assert_eq!(response_expiry(frame, 3600), 120);
+    }
+
+    #[test]
+    fn contact_expiry_overrides_generic_response_expiry() {
+        let frame = b"SIP/2.0 200 OK\r\nExpires: 3600\r\nContact: <sip:u@127.0.0.1>;expires=1800\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(response_expiry(frame, 7200), 1800);
     }
 }
