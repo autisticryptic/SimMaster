@@ -23,7 +23,7 @@ use crate::{
         voice::{parse_audio_sdp, SdpAddrType, SdpAudioDescription},
         ImsError,
     },
-    infra::config::{TrunkIncomingMode, VolteConfig, VolteIpFamilyPreference},
+    infra::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteConfig, VolteIpFamilyPreference},
     infra::db::{Database, SmsMessage},
     notify::notification::NotificationSender,
     trunk::{
@@ -1285,7 +1285,8 @@ async fn handle_operator_sip_frame(
         if (100..200).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
-            let delayed_ip_connect = !live.operator.ip_connect_on_operator_answer();
+            let delayed_ip_connect =
+                live.operator.ip_connect_mode() == TrunkIpConnectMode::FirstRtp;
             let (body, prack, first_operator_rtp) = {
                 let call = session
                     .voice_calls
@@ -1350,7 +1351,8 @@ async fn handle_operator_sip_frame(
         if (200..300).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
-            let immediate_ip_connect = live.operator.ip_connect_on_operator_answer();
+            let immediate_ip_connect =
+                live.operator.ip_connect_mode() == TrunkIpConnectMode::GsmAnswer;
             let (ack, answer, first_operator_rtp) = {
                 let call = session
                     .voice_calls

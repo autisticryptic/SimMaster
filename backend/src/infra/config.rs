@@ -1817,7 +1817,7 @@ mod tests {
         assert_eq!(profile.incoming_mode, TrunkIncomingMode::BoundPending);
         assert_eq!(profile.incoming_binding, "6108");
         assert!(profile.outgoing_binding.is_empty());
-        assert!(profile.ip_connect_on_operator_answer);
+        assert_eq!(profile.ip_connect_mode, TrunkIpConnectMode::GsmAnswer);
 
         let serialized = serde_json::to_value(profile).unwrap();
         assert!(serialized.get("extension").is_none());
@@ -1840,7 +1840,7 @@ mod tests {
                     incoming_mode: TrunkIncomingMode::BoundImmediate,
                     incoming_binding: " 6108 ".to_string(),
                     outgoing_binding: " 6109 ".to_string(),
-                    ip_connect_on_operator_answer: false,
+                    ip_connect_mode: TrunkIpConnectMode::FirstRtp,
                     ..TrunkProfileConfig::default()
                 },
             )
@@ -1848,7 +1848,14 @@ mod tests {
         assert_eq!(saved.trunk.incoming_mode, TrunkIncomingMode::BoundImmediate);
         assert_eq!(saved.trunk.incoming_binding, "6108");
         assert_eq!(saved.trunk.outgoing_binding, "6109");
-        assert!(!saved.trunk.ip_connect_on_operator_answer);
+        assert_eq!(saved.trunk.ip_connect_mode, TrunkIpConnectMode::FirstRtp);
+
+        let legacy_true: TrunkProfileConfig =
+            serde_json::from_str(r#"{"ip_connect_on_operator_answer":true}"#).unwrap();
+        let legacy_false: TrunkProfileConfig =
+            serde_json::from_str(r#"{"ip_connect_on_operator_answer":false}"#).unwrap();
+        assert_eq!(legacy_true.ip_connect_mode, TrunkIpConnectMode::GsmAnswer);
+        assert_eq!(legacy_false.ip_connect_mode, TrunkIpConnectMode::FirstRtp);
 
         let invalid_expiry = manager
             .set_line_trunk_profile(
@@ -2187,16 +2194,43 @@ pub enum TrunkIncomingMode {
     BoundImmediate,
 }
 
+/// When an Asterisk-originated call should receive its final 200 response.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TrunkIpConnectMode {
+    /// Complete the IP leg after the first valid RTP packet from the operator.
+    FirstRtp,
+    /// Complete the IP leg as soon as the operator/GSM leg answers.
+    #[default]
+    GsmAnswer,
+}
+
+fn deserialize_trunk_ip_connect_mode<'de, D>(
+    deserializer: D,
+) -> Result<TrunkIpConnectMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Value {
+        Mode(TrunkIpConnectMode),
+        LegacyBool(bool),
+    }
+
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Mode(mode) => mode,
+        Value::LegacyBool(true) => TrunkIpConnectMode::GsmAnswer,
+        Value::LegacyBool(false) => TrunkIpConnectMode::FirstRtp,
+    })
+}
+
 fn default_trunk_asterisk_port() -> u16 {
     5060
 }
 
 fn default_trunk_register_expiry_secs() -> u32 {
     3600
-}
-
-fn default_trunk_ip_connect_on_operator_answer() -> bool {
-    true
 }
 
 /// Per-line SIP trunk settings toward a remote Asterisk/FreePBX. This is a pure
@@ -2244,11 +2278,15 @@ pub struct TrunkProfileConfig {
     /// Empty keeps backward-compatible per-peer routing without user binding.
     #[serde(default)]
     pub outgoing_binding: String,
-    /// When true, operator answer immediately completes the Asterisk/IP leg.
-    /// When false, the first valid operator RTP packet completes it instead.
-    /// True preserves the existing behavior and remains the safe default.
-    #[serde(default = "default_trunk_ip_connect_on_operator_answer")]
-    pub ip_connect_on_operator_answer: bool,
+    /// Select whether operator RTP or operator/GSM answer completes the IP leg.
+    /// The alias accepts the short-lived boolean field introduced before this
+    /// was corrected to two explicit choices (`true` -> GSM answer).
+    #[serde(
+        default,
+        alias = "ip_connect_on_operator_answer",
+        deserialize_with = "deserialize_trunk_ip_connect_mode"
+    )]
+    pub ip_connect_mode: TrunkIpConnectMode,
     /// Codec allow-list advertised toward Asterisk (pass-through, never
     /// transcoded here). Empty means "advertise the negotiated defaults".
     #[serde(default)]
@@ -2275,7 +2313,7 @@ impl Default for TrunkProfileConfig {
             incoming_mode: TrunkIncomingMode::BoundPending,
             incoming_binding: String::new(),
             outgoing_binding: String::new(),
-            ip_connect_on_operator_answer: default_trunk_ip_connect_on_operator_answer(),
+            ip_connect_mode: TrunkIpConnectMode::GsmAnswer,
             codec_allow: Vec::new(),
             register_expiry_secs: default_trunk_register_expiry_secs(),
             match_host: None,

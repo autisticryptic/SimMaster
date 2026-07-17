@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::broadcast;
 
 use super::bridge::{OperatorCommand, OperatorEvent};
-use crate::infra::config::TrunkIncomingMode;
+use crate::infra::config::{TrunkIncomingMode, TrunkIpConnectMode};
 
 #[derive(Clone)]
 pub struct OperatorLink {
@@ -20,9 +20,9 @@ pub struct OperatorLink {
 
 struct OperatorLinkInner {
     ready: AtomicBool,
-    ip_connect_on_operator_answer: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
     incoming_mode: RwLock<TrunkIncomingMode>,
+    ip_connect_mode: RwLock<TrunkIpConnectMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
 }
@@ -34,9 +34,9 @@ impl Default for OperatorLink {
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
-                ip_connect_on_operator_answer: AtomicBool::new(true),
                 trunk_local_ip: RwLock::new(None),
                 incoming_mode: RwLock::new(TrunkIncomingMode::default()),
+                ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
                 commands,
                 events,
             }),
@@ -53,16 +53,18 @@ impl OperatorLink {
         self.inner.ready.load(Ordering::SeqCst) && self.inner.commands.receiver_count() > 0
     }
 
-    pub fn set_ip_connect_on_operator_answer(&self, enabled: bool) {
-        self.inner
-            .ip_connect_on_operator_answer
-            .store(enabled, Ordering::SeqCst);
+    pub fn set_ip_connect_mode(&self, mode: TrunkIpConnectMode) {
+        if let Ok(mut current) = self.inner.ip_connect_mode.write() {
+            *current = mode;
+        }
     }
 
-    pub fn ip_connect_on_operator_answer(&self) -> bool {
+    pub fn ip_connect_mode(&self) -> TrunkIpConnectMode {
         self.inner
-            .ip_connect_on_operator_answer
-            .load(Ordering::SeqCst)
+            .ip_connect_mode
+            .read()
+            .map(|mode| *mode)
+            .unwrap_or_default()
     }
 
     /// Publish the address selected by the connected Asterisk UDP socket. The
@@ -152,11 +154,11 @@ mod tests {
     }
 
     #[test]
-    fn shares_ip_connect_policy_with_ims_task() {
+    fn shares_ip_connect_mode_with_ims_task() {
         let link = OperatorLink::default();
-        assert!(link.ip_connect_on_operator_answer());
-        link.set_ip_connect_on_operator_answer(false);
-        assert!(!link.ip_connect_on_operator_answer());
+        assert_eq!(link.ip_connect_mode(), TrunkIpConnectMode::GsmAnswer);
+        link.set_ip_connect_mode(TrunkIpConnectMode::FirstRtp);
+        assert_eq!(link.ip_connect_mode(), TrunkIpConnectMode::FirstRtp);
     }
 
     #[tokio::test]

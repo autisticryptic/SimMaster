@@ -20,6 +20,7 @@ import {
 import {
   api,
   type TrunkIncomingMode,
+  type TrunkIpConnectMode,
   type TrunkProfileConfig,
   type TrunkProfileResponse,
   type TrunkRegistrationMode,
@@ -212,17 +213,19 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
               helperText="填写后，仅允许 From 用户匹配的 Asterisk 分机通过此 SIM 呼出；留空不限制"
             />
             <Box>
-              <FormControlLabel
-                control={(
-                  <Switch
-                    checked={draft.ip_connect_on_operator_answer}
-                    onChange={(_, enabled) => update('ip_connect_on_operator_answer', enabled)}
-                  />
-                )}
-                label="IP 接通（GSM/运营商接通时立即接通）"
-              />
+              <FormControl size="small" fullWidth>
+                <InputLabel>IP 接通方式</InputLabel>
+                <Select
+                  value={draft.ip_connect_mode}
+                  label="IP 接通方式"
+                  onChange={(event) => update('ip_connect_mode', event.target.value as TrunkIpConnectMode)}
+                >
+                  <MenuItem value="first_rtp">IP 接通</MenuItem>
+                  <MenuItem value="gsm_answer">GSM 接通时，立即接通</MenuItem>
+                </Select>
+              </FormControl>
               <Typography variant="caption" color="text.secondary" display="block">
-                开启：运营商应答即向 Asterisk 返回 200；关闭：收到运营商侧首个 RTP 后自动返回 200。
+                IP 接通：首个运营商 RTP 后向 Asterisk 返回 200；GSM 接通：运营商应答后立即返回 200。
               </Typography>
             </Box>
             <TextField

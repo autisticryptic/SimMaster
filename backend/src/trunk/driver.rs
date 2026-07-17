@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::{
     ims::sip_frame,
-    infra::config::{TrunkProfileConfig, TrunkRegistrationMode},
+    infra::config::{TrunkIpConnectMode, TrunkProfileConfig, TrunkRegistrationMode},
     trunk::{
         bridge::{BridgeError, OperatorAvailability, OperatorEvent, TrunkBridge},
         digest,
@@ -139,12 +139,12 @@ async fn run_session(
         (!profile.incoming_binding.trim().is_empty()).then_some(local_addr.ip()),
     );
     operator.set_incoming_mode(profile.incoming_mode);
-    operator.set_ip_connect_on_operator_answer(profile.ip_connect_on_operator_answer);
+    operator.set_ip_connect_mode(profile.ip_connect_mode);
     tracing::info!(
         incoming_mode = ?profile.incoming_mode,
         incoming_binding = %profile.incoming_binding,
         outgoing_binding = %profile.outgoing_binding,
-        ip_connect_on_operator_answer = profile.ip_connect_on_operator_answer,
+        ip_connect_mode = ?profile.ip_connect_mode,
         "Asterisk trunk call routing active"
     );
     let result = match profile.registration_mode {
@@ -157,7 +157,7 @@ async fn run_session(
     };
     operator.set_trunk_local_ip(None);
     operator.set_incoming_mode(crate::infra::config::TrunkIncomingMode::default());
-    operator.set_ip_connect_on_operator_answer(true);
+    operator.set_ip_connect_mode(TrunkIpConnectMode::default());
     result
 }
 
