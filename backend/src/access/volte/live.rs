@@ -23,7 +23,7 @@ use crate::{
         voice::{parse_audio_sdp, SdpAddrType, SdpAudioDescription},
         ImsError,
     },
-    infra::config::VolteConfig,
+    infra::config::{VolteConfig, VolteIpFamilyPreference},
     infra::db::{Database, SmsMessage},
     notify::notification::NotificationSender,
     trunk::{
@@ -55,6 +55,7 @@ use super::{
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
+const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv4First;
 
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
 
@@ -420,7 +421,7 @@ pub async fn connect_live_for_line(
         })
         .await;
 
-    match connect_inner(runtime, generation, config, device).await {
+    match connect_inner(runtime, generation, device).await {
         Ok(session) => {
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
@@ -470,7 +471,6 @@ pub async fn connect_live_for_line(
 async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
-    config: &VolteConfig,
     device: &VolteDeviceBinding,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime
@@ -483,7 +483,7 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
     disconnect_existing_ims_bearers(&device.modem_id).await?;
-    let at_pcscf = discover_pcscf_via_at(&device.modem_id, config.ip_family_preference).await;
+    let at_pcscf = discover_pcscf_via_at(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await;
     ensure_generation(runtime, generation)?;
 
     runtime
@@ -498,9 +498,7 @@ async fn connect_inner(
     let result = async {
         configure_bearer_network(&bearer).await?;
         ensure_generation(runtime, generation)?;
-        let local_addrs = bearer
-            .settings
-            .ordered_local_addrs(config.ip_family_preference);
+        let local_addrs = bearer.settings.ordered_local_addrs(FIXED_IMS_FAMILY_ORDER);
         if local_addrs.is_empty() {
             return Err(VolteError::new(code::IP_SETTINGS_MISSING));
         }

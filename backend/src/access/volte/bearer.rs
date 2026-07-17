@@ -12,7 +12,7 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use std::{net::IpAddr, process::Output};
+use std::{collections::VecDeque, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
@@ -111,9 +111,11 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 }
 
 /// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
-/// non-IMS bearers are never changed or deleted. If the network explicitly
-/// rejects dual-stack with `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed`, only the failed
-/// IMS bearer is recreated with the required address family.
+/// non-IMS bearers are never changed or deleted. New sessions always request
+/// dual-stack first. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response
+/// jumps directly to the required family; otherwise IPv4 then IPv6 are tried
+/// once each. Every failed temporary bearer is deleted before the next bounded
+/// attempt.
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
@@ -126,52 +128,44 @@ pub async fn ensure_ims_bearer(
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-            if let Some(ip_type) = required_ip_type_after_failure(&details) {
-                delete_bearer(modem, &path).await?;
-                return create_and_connect(modem, request, ip_type).await;
+            if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                return parse_bearer_connection(&path, &details);
             }
-            return match connect_and_read(&path).await {
-                Ok(bearer) => Ok(bearer),
-                Err(error) => {
-                    let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
-                    let Some(ip_type) = required_ip_type_after_failure(&after) else {
-                        return Err(error);
-                    };
-                    delete_bearer(modem, &path).await?;
-                    create_and_connect(modem, request, ip_type).await
-                }
-            };
+            delete_bearer(modem, &path).await?;
         }
     }
 
-    match create_and_connect(modem, request, "ipv4v6").await {
-        Ok(bearer) => Ok(bearer),
-        Err(error) => {
-            let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
-            let mut fallback = None;
-            for path in parse_bearer_paths(&modem_output) {
-                let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
-                if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-                    if let Some(ip_type) = required_ip_type_after_failure(&details) {
-                        fallback = Some((path, ip_type));
-                        break;
-                    }
+    let mut pending = VecDeque::from(["ipv4v6"]);
+    let mut attempted = Vec::with_capacity(3);
+    let mut last_error = None;
+    while let Some(ip_type) = pending.pop_front() {
+        if attempted.contains(&ip_type) {
+            continue;
+        }
+        attempted.push(ip_type);
+        match create_and_connect_attempt(modem, request, ip_type).await {
+            Ok(bearer) => return Ok(bearer),
+            Err(failure) => {
+                last_error = Some(failure.error);
+                if ip_type == "ipv4v6" {
+                    pending.extend(fallback_ip_types(&failure.details));
                 }
             }
-            let Some((path, ip_type)) = fallback else {
-                return Err(error);
-            };
-            delete_bearer(modem, &path).await?;
-            create_and_connect(modem, request, ip_type).await
         }
     }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
 }
 
-async fn create_and_connect(
+struct BearerAttemptFailure {
+    error: VolteError,
+    details: String,
+}
+
+async fn create_and_connect_attempt(
     modem: &str,
     request: &BearerRequest,
     ip_type: &str,
-) -> Result<BearerConnection, VolteError> {
+) -> Result<BearerConnection, BearerAttemptFailure> {
     let properties = format!(
         "apn={},ip-type={ip_type},allow-roaming={}",
         request.apn,
@@ -181,10 +175,30 @@ async fn create_and_connect(
         "mmcli",
         &["-m", modem, &format!("--create-bearer={properties}")],
     )
-    .await?;
-    let path = parse_created_bearer_path(&created)
-        .ok_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING))?;
-    connect_and_read(&path).await
+    .await
+    .map_err(|error| BearerAttemptFailure {
+        error,
+        details: String::new(),
+    })?;
+    let path = parse_created_bearer_path(&created).ok_or_else(|| BearerAttemptFailure {
+        error: VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
+        details: String::new(),
+    })?;
+    match connect_and_read(&path).await {
+        Ok(bearer) => Ok(bearer),
+        Err(error) => {
+            let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
+                .await
+                .unwrap_or_default();
+            if let Err(cleanup) = delete_bearer(modem, &path).await {
+                return Err(BearerAttemptFailure {
+                    error: cleanup,
+                    details,
+                });
+            }
+            Err(BearerAttemptFailure { error, details })
+        }
+    }
 }
 
 async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
@@ -202,6 +216,12 @@ fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn fallback_ip_types(details: &str) -> Vec<&'static str> {
+    required_ip_type_after_failure(details)
+        .map(|ip_type| vec![ip_type])
+        .unwrap_or_else(|| vec!["ipv4", "ipv6"])
 }
 
 /// Disconnect an IMS bearer left active by a previous process before the
@@ -481,6 +501,10 @@ mod tests {
         assert_eq!(required_ip_type_after_failure(ipv4), Some("ipv4"));
         let generic = "bearer.status.connection-error.name : org.example.Failed\n";
         assert_eq!(required_ip_type_after_failure(generic), None);
+        assert_eq!(fallback_ip_types(ipv6), vec!["ipv6"]);
+        assert_eq!(fallback_ip_types(ipv4), vec!["ipv4"]);
+        assert_eq!(fallback_ip_types(generic), vec!["ipv4", "ipv6"]);
+        assert_eq!(fallback_ip_types(""), vec!["ipv4", "ipv6"]);
     }
 
     #[test]

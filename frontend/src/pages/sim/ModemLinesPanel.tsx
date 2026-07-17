@@ -8,12 +8,8 @@ import {
   CardHeader,
   Chip,
   CircularProgress,
-  FormControl,
   FormControlLabel,
   IconButton,
-  InputLabel,
-  MenuItem,
-  Select,
   Stack,
   Switch,
   Tooltip,
@@ -25,18 +21,10 @@ import {
   api,
   type TrunkProfileResponse,
   type VolteControlResponse,
-  type VolteIpFamilyPreference,
   type VolteLineControlResponse,
 } from '../../api/current'
 import { maskedIccid, shortLineId } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
-
-const familyLabels: Record<VolteIpFamilyPreference, string> = {
-  ipv4_first: 'IPv4 优先，失败后尝试 IPv6',
-  ipv6_first: 'IPv6 优先，失败后尝试 IPv4',
-  ipv4_only: '仅 IPv4',
-  ipv6_only: '仅 IPv6',
-}
 
 const stageLabels: Record<string, string> = {
   disabled: '未连接',
@@ -86,7 +74,6 @@ export default function ModemLinesPanel() {
   const [control, setControl] = useState<VolteControlResponse | null>(null)
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
-  const [familyDraft, setFamilyDraft] = useState<VolteIpFamilyPreference>('ipv6_first')
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -102,7 +89,6 @@ export default function ModemLinesPanel() {
       ])
       if (controlResponse.data) {
         setControl(controlResponse.data)
-        setFamilyDraft(controlResponse.data.ip_family_preference)
       }
       setLines(lineResponse.data ?? [])
       setTrunkLines(trunkResponse.data ?? [])
@@ -134,22 +120,6 @@ export default function ModemLinesPanel() {
       const response = await api.setVolteFeature(enabled)
       if (response.data) setControl(response.data)
       setSuccess(enabled ? 'VoLTE 总开关已启用' : 'VoLTE 已关闭，所有线路连接已停止')
-      await load(true)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSavingKey(null)
-    }
-  }
-
-  const applyFamily = async () => {
-    setSavingKey('family')
-    setError(null)
-    setSuccess(null)
-    try {
-      const response = await api.setVolteIpFamily(familyDraft)
-      if (response.data) setControl(response.data)
-      setSuccess('IMS 地址族策略已更新')
       await load(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -230,7 +200,7 @@ export default function ModemLinesPanel() {
           }
         />
         <CardContent sx={{ pt: 0 }}>
-          <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'minmax(220px, 1fr) minmax(260px, 1.5fr) auto' }} gap={2} alignItems="center">
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'minmax(220px, 1fr) minmax(320px, 2fr)' }} gap={2} alignItems="center">
             <FormControlLabel
               control={
                 <Switch
@@ -241,28 +211,12 @@ export default function ModemLinesPanel() {
               }
               label="启用 VoLTE IMS 能力"
             />
-            <FormControl size="small" fullWidth disabled={!control?.feature_enabled || savingKey !== null}>
-              <InputLabel>IMS 地址族策略</InputLabel>
-              <Select
-                value={familyDraft}
-                label="IMS 地址族策略"
-                onChange={(event) => setFamilyDraft(event.target.value as VolteIpFamilyPreference)}
-              >
-                {Object.entries(familyLabels).map(([value, label]) => (
-                  <MenuItem key={value} value={value}>{label}</MenuItem>
-                ))}
-              </Select>
-            </FormControl>
-            <Button
-              variant="outlined"
-              onClick={() => void applyFamily()}
-              disabled={!control?.feature_enabled || savingKey !== null || familyDraft === control?.ip_family_preference}
-            >
-              {savingKey === 'family' ? '应用中…' : '应用策略'}
-            </Button>
+            <Alert severity="info" sx={{ py: 0.25 }}>
+              IMS Bearer 固定先申请 IPv4/IPv6 双栈；网络明确只允许单栈时直接回退到对应地址族，错误不明确时依次尝试 IPv4、IPv6。
+            </Alert>
           </Box>
           <Typography variant="caption" color="text.secondary" display="block" mt={1.5}>
-            修改地址族策略会重建已启用线路的 IMS 连接；支持 IPv4/IPv6 自动回退及单栈限制。
+            每种地址族最多尝试一次，失败 Bearer 会先清理，最多三次后结束；该策略不提供自定义入口。
           </Typography>
         </CardContent>
       </Card>

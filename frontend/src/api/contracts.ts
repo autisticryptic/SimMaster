@@ -468,8 +468,6 @@ export interface VolteRuntimeStatus {
   data_path_mode?: string
 }
 
-export type VolteIpFamilyPreference = 'ipv6_first' | 'ipv4_first' | 'ipv6_only' | 'ipv4_only'
-
 export type TrunkRegistrationMode = 'static_peer' | 'outbound_register'
 
 export interface TrunkProfileConfig {
@@ -536,7 +534,6 @@ export interface VolteControlResponse {
   feature_enabled: boolean
   sms_enabled: boolean
   connection_enabled: boolean
-  ip_family_preference: VolteIpFamilyPreference
   runtime: VolteRuntimeStatus
 }
 

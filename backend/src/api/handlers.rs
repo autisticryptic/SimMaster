@@ -48,7 +48,7 @@ use crate::{
     infra::config::{
         AccessPathKind, ApnConfig, LineProfileConfig, MidFlightDisablePolicy, SmsPathPolicy,
         TrunkProfileConfig, VilteConfig, VoicePathPolicy, VoiceServicesConfig, VolteConfig,
-        VolteIpFamilyPreference, VowifiConfig,
+        VowifiConfig,
     },
     infra::db::{
         NewVoiceInboxEntry, NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage,
@@ -4365,11 +4365,6 @@ pub struct VolteControlToggleRequest {
     pub enabled: bool,
 }
 
-#[derive(Deserialize)]
-pub struct VolteIpFamilyPreferenceRequest {
-    pub preference: VolteIpFamilyPreference,
-}
-
 /// Combined VoLTE control response: persisted config + live runtime snapshot.
 /// The `runtime` field carries the `volteStatus.js`-contract fields; `enabled`
 /// mirrors the frontend `m()` helper (`feature_enabled && sms_enabled`).
@@ -4379,7 +4374,6 @@ pub struct VolteControlResponse {
     pub feature_enabled: bool,
     pub sms_enabled: bool,
     pub connection_enabled: bool,
-    pub ip_family_preference: VolteIpFamilyPreference,
     pub runtime: crate::access::volte::VolteRuntimeStatus,
 }
 
@@ -4684,7 +4678,6 @@ impl VolteControlResponse {
             feature_enabled: config.feature_enabled,
             sms_enabled: config.sms_enabled,
             connection_enabled: config.connection_enabled,
-            ip_family_preference: config.ip_family_preference,
             runtime,
         }
     }
@@ -4771,105 +4764,6 @@ pub async fn set_volte_connection_handler(
                 )
                 .await)
             };
-            let runtime = app.volte_runtime.status().await;
-            let response = VolteControlResponse::build(&config, runtime);
-            match result {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message("Success", response)),
-                ),
-                Err(error) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<VolteControlResponse>::error(format!(
-                        "Failed: {error}"
-                    ))),
-                ),
-            }
-        }
-        Err(error) => (
-            StatusCode::OK,
-            Json(ApiResponse::<VolteControlResponse>::error(format!(
-                "Failed: {error}"
-            ))),
-        ),
-    }
-}
-
-/// Change the preferred IMS address family. If a live connection is enabled,
-/// reconnect it so the new ordered family policy takes effect immediately.
-pub async fn set_volte_ip_family_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<VolteIpFamilyPreferenceRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
-    let _guard = app.volte_connect_lock.lock().await;
-    match app
-        .config_manager
-        .set_volte_ip_family_preference(payload.preference)
-    {
-        Ok(config) => {
-            let mut result = if config.connection_enabled {
-                crate::access::volte::live::disconnect_live(
-                    &app.volte_runtime,
-                    "volte_ip_family_changed",
-                )
-                .await;
-                crate::access::volte::live::connect_live(
-                    &app.volte_runtime,
-                    &config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
-                .await
-            } else {
-                Ok(app.volte_runtime.status().await)
-            };
-            for profile in app
-                .config_manager
-                .get_line_profiles()
-                .into_iter()
-                .filter(|profile| profile.enabled && profile.volte_connection_enabled)
-            {
-                let Some(line) = app.line_registry.get(&profile.line_id).await else {
-                    continue;
-                };
-                let binding = line.binding();
-                if !binding.present {
-                    continue;
-                }
-                let _line_guard = line.volte_connect_lock.lock().await;
-                crate::access::volte::live::disconnect_live_for_line(
-                    &line.volte_live,
-                    &line.volte,
-                    "volte_ip_family_changed",
-                )
-                .await;
-                let device =
-                    match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
-                        Ok(device) => device,
-                        Err(error) => {
-                            if result.is_ok() {
-                                result = Err(error);
-                            }
-                            continue;
-                        }
-                    };
-                let mut line_config = config.clone();
-                line_config.connection_enabled = true;
-                let line_result = crate::access::volte::live::connect_live_for_line(
-                    &line.volte_live,
-                    &device,
-                    &line.volte,
-                    &line_config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
-                .await;
-                if result.is_ok() {
-                    result = line_result;
-                }
-            }
             let runtime = app.volte_runtime.status().await;
             let response = VolteControlResponse::build(&config, runtime);
             match result {
