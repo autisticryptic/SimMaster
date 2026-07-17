@@ -153,6 +153,7 @@ struct LiveVoiceCall {
     internal_local: SocketAddr,
     pending_relay: Option<PendingRtpRelay>,
     active_relay: Option<ActiveRtpRelay>,
+    ip_answer_wait_armed: bool,
     operator_answered: bool,
     next_cseq: u32,
 }
@@ -862,6 +863,7 @@ async fn handle_operator_command_inner(
                     internal_local,
                     pending_relay: Some(relay),
                     active_relay: None,
+                    ip_answer_wait_armed: false,
                     operator_answered: false,
                 },
             );
@@ -1283,7 +1285,8 @@ async fn handle_operator_sip_frame(
         if (100..200).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
-            let (body, prack) = {
+            let delayed_ip_connect = !live.operator.ip_connect_on_operator_answer();
+            let (body, prack, first_operator_rtp) = {
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
@@ -1296,6 +1299,9 @@ async fn handle_operator_sip_frame(
                 } else {
                     Some(prepare_operator_media(call, sip::sip_body(frame))?)
                 };
+                let first_operator_rtp = delayed_ip_connect
+                    .then(|| arm_first_rtp_ip_answer(call))
+                    .flatten();
                 let reliable = sip::header_value(frame, "Require")
                     .is_some_and(|value| value.split(',').any(|item| item.trim() == "100rel"));
                 let prack = if reliable {
@@ -1316,7 +1322,7 @@ async fn handle_operator_sip_frame(
                 } else {
                     None
                 };
-                (body, prack)
+                (body, prack, first_operator_rtp)
             };
             if let Some(prack) = prack {
                 session
@@ -1327,16 +1333,25 @@ async fn handle_operator_sip_frame(
                 runtime.update(|state| state.last_tx_at = Some(now())).await;
             }
             live.operator.send_event(OperatorEvent::Provisional {
-                call_id: trunk_call_id,
+                call_id: trunk_call_id.clone(),
                 status,
-                body: body.map(String::into_bytes),
+                body: body.clone().map(String::into_bytes),
             });
+            if let (Some(answer), Some(first_operator_rtp)) = (body, first_operator_rtp) {
+                spawn_first_rtp_ip_answer(
+                    live.operator.clone(),
+                    trunk_call_id,
+                    answer.into_bytes(),
+                    first_operator_rtp,
+                );
+            }
             return Ok(true);
         }
         if (200..300).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
-            let (ack, answer) = {
+            let immediate_ip_connect = live.operator.ip_connect_on_operator_answer();
+            let (ack, answer, first_operator_rtp) = {
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
@@ -1345,8 +1360,13 @@ async fn handle_operator_sip_frame(
                     .ok_or_else(|| VolteError::new("volte_voice_remote_tag_missing"))?;
                 call.dialog.set_remote_tag(tag);
                 let answer = prepare_operator_media(call, sip::sip_body(frame));
+                let first_operator_rtp = if !immediate_ip_connect && answer.is_ok() {
+                    arm_first_rtp_ip_answer(call)
+                } else {
+                    None
+                };
                 let ack = sip::build_ack(&identity, &route, &call.dialog, &call.callee_uri);
-                (ack, answer)
+                (ack, answer, first_operator_rtp)
             };
             session
                 .channel
@@ -1355,10 +1375,22 @@ async fn handle_operator_sip_frame(
                 .map_err(map_channel_error)?;
             runtime.update(|state| state.last_tx_at = Some(now())).await;
             match answer {
-                Ok(answer) => live.operator.send_event(OperatorEvent::Answered {
-                    call_id: trunk_call_id,
-                    body: answer.into_bytes(),
-                }),
+                Ok(answer) if immediate_ip_connect => {
+                    live.operator.send_event(OperatorEvent::Answered {
+                        call_id: trunk_call_id,
+                        body: answer.into_bytes(),
+                    });
+                }
+                Ok(answer) => {
+                    if let Some(first_operator_rtp) = first_operator_rtp {
+                        spawn_first_rtp_ip_answer(
+                            live.operator.clone(),
+                            trunk_call_id,
+                            answer.into_bytes(),
+                            first_operator_rtp,
+                        );
+                    }
+                }
                 Err(error) => {
                     let bye = session.voice_calls.get(&trunk_call_id).map(|call| {
                         sip::build_bye(
@@ -1518,6 +1550,7 @@ async fn begin_incoming_operator_call(
             internal_local,
             pending_relay: Some(relay),
             active_relay: None,
+            ip_answer_wait_armed: false,
             operator_answered,
             next_cseq: 1,
         },
@@ -1627,6 +1660,31 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         internal_dtmf,
         call.internal_local,
     ))
+}
+
+fn arm_first_rtp_ip_answer(call: &mut LiveVoiceCall) -> Option<tokio::sync::watch::Receiver<bool>> {
+    if call.ip_answer_wait_armed {
+        return None;
+    }
+    let first_operator_rtp = call.active_relay.as_ref()?.subscribe_first_operator_rtp();
+    call.ip_answer_wait_armed = true;
+    Some(first_operator_rtp)
+}
+
+fn spawn_first_rtp_ip_answer(
+    operator: OperatorLink,
+    call_id: String,
+    body: Vec<u8>,
+    mut first_operator_rtp: tokio::sync::watch::Receiver<bool>,
+) {
+    tokio::spawn(async move {
+        while !*first_operator_rtp.borrow() {
+            if first_operator_rtp.changed().await.is_err() {
+                return;
+            }
+        }
+        operator.send_event(OperatorEvent::Answered { call_id, body });
+    });
 }
 
 /// Translate Asterisk's answer for an MT call back into the payload numbers
@@ -2438,6 +2496,7 @@ mod tests {
             internal_local,
             pending_relay: Some(pending),
             active_relay: None,
+            ip_answer_wait_armed: false,
             operator_answered: false,
             next_cseq: 2,
         };
@@ -2448,6 +2507,16 @@ mod tests {
         let answer = prepare_operator_media(&mut call, operator_sdp.as_bytes()).unwrap();
         assert!(answer.contains(&format!("m=audio {} RTP/AVP 0 101", internal_local.port())));
         assert!(call.active_relay.is_some());
+        let operator = OperatorLink::default();
+        let mut events = operator.subscribe_events();
+        let first_operator_rtp = arm_first_rtp_ip_answer(&mut call).unwrap();
+        assert!(arm_first_rtp_ip_answer(&mut call).is_none());
+        spawn_first_rtp_ip_answer(
+            operator,
+            "delayed-ip-answer".into(),
+            answer.as_bytes().to_vec(),
+            first_operator_rtp,
+        );
 
         let packet = crate::access::vowifi::voice::RtpPacket {
             payload_type: 96,
@@ -2470,6 +2539,14 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Answered { call_id, body }
+                if call_id == "delayed-ip-answer" && body == answer.as_bytes()
+        ));
         assert_eq!(received[1] & 0x7f, 101);
         assert_eq!(&received[2..len], &packet[2..]);
     }
@@ -2518,6 +2595,7 @@ mod tests {
             internal_local,
             pending_relay: Some(pending),
             active_relay: None,
+            ip_answer_wait_armed: false,
             operator_answered: false,
             next_cseq: 1,
         };

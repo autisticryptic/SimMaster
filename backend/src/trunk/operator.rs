@@ -20,6 +20,7 @@ pub struct OperatorLink {
 
 struct OperatorLinkInner {
     ready: AtomicBool,
+    ip_connect_on_operator_answer: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
     incoming_mode: RwLock<TrunkIncomingMode>,
     commands: broadcast::Sender<OperatorCommand>,
@@ -33,6 +34,7 @@ impl Default for OperatorLink {
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
+                ip_connect_on_operator_answer: AtomicBool::new(true),
                 trunk_local_ip: RwLock::new(None),
                 incoming_mode: RwLock::new(TrunkIncomingMode::default()),
                 commands,
@@ -49,6 +51,18 @@ impl OperatorLink {
 
     pub fn is_available(&self) -> bool {
         self.inner.ready.load(Ordering::SeqCst) && self.inner.commands.receiver_count() > 0
+    }
+
+    pub fn set_ip_connect_on_operator_answer(&self, enabled: bool) {
+        self.inner
+            .ip_connect_on_operator_answer
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn ip_connect_on_operator_answer(&self) -> bool {
+        self.inner
+            .ip_connect_on_operator_answer
+            .load(Ordering::SeqCst)
     }
 
     /// Publish the address selected by the connected Asterisk UDP socket. The
@@ -135,6 +149,14 @@ mod tests {
         assert_eq!(link.incoming_mode(), TrunkIncomingMode::BoundPending);
         link.set_incoming_mode(TrunkIncomingMode::BoundImmediate);
         assert_eq!(link.incoming_mode(), TrunkIncomingMode::BoundImmediate);
+    }
+
+    #[test]
+    fn shares_ip_connect_policy_with_ims_task() {
+        let link = OperatorLink::default();
+        assert!(link.ip_connect_on_operator_answer());
+        link.set_ip_connect_on_operator_answer(false);
+        assert!(!link.ip_connect_on_operator_answer());
     }
 
     #[tokio::test]

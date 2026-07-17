@@ -268,24 +268,38 @@ impl PendingRtpRelay {
             core = core.with_payload_type_mapping(mapping.operator, mapping.internal);
         }
         let (stop, stop_rx) = watch::channel(false);
+        let (first_operator_rtp, first_operator_rtp_rx) = watch::channel(false);
         let task = tokio::spawn(run_async_relay(
             self.operator_socket,
             self.internal_socket,
             core,
             stop_rx,
+            first_operator_rtp,
         ));
-        ActiveRtpRelay { stop, task }
+        ActiveRtpRelay {
+            stop,
+            first_operator_rtp: first_operator_rtp_rx,
+            task,
+        }
     }
 }
 
 pub struct ActiveRtpRelay {
     stop: watch::Sender<bool>,
+    first_operator_rtp: watch::Receiver<bool>,
     task: JoinHandle<std_io::Result<()>>,
 }
 
 impl ActiveRtpRelay {
     pub fn stop(&self) {
         let _ = self.stop.send(true);
+    }
+
+    /// Subscribe to the first valid RTP packet observed on the operator leg.
+    /// A watch channel retains the event if the packet arrives before the
+    /// caller starts waiting.
+    pub fn subscribe_first_operator_rtp(&self) -> watch::Receiver<bool> {
+        self.first_operator_rtp.clone()
     }
 }
 
@@ -301,6 +315,7 @@ async fn run_async_relay(
     internal_socket: Arc<UdpSocket>,
     mut core: RtpRelayCore,
     mut stop: watch::Receiver<bool>,
+    first_operator_rtp: watch::Sender<bool>,
 ) -> std_io::Result<()> {
     let mut operator_buf = vec![0u8; 65_535];
     let mut internal_buf = vec![0u8; 65_535];
@@ -313,13 +328,15 @@ async fn run_async_relay(
             }
             received = operator_socket.recv_from(&mut operator_buf) => {
                 let (len, source) = received?;
-                forward_async(
+                if forward_async(
                     &mut core,
                     RelayLeg::Operator,
                     source,
                     &operator_buf[..len],
                     &internal_socket,
-                ).await;
+                ).await {
+                    let _ = first_operator_rtp.send(true);
+                }
             }
             received = internal_socket.recv_from(&mut internal_buf) => {
                 let (len, source) = received?;
@@ -341,9 +358,9 @@ async fn forward_async(
     source: SocketAddr,
     datagram: &[u8],
     send_socket: &UdpSocket,
-) {
+) -> bool {
     let Ok(decision) = core.ingest(leg, source, datagram) else {
-        return;
+        return false;
     };
     if let Some(payload_type) = decision.rewrite_payload_type {
         if let Some(rewritten) = rewrite_rtp_payload_type(datagram, payload_type) {
@@ -352,6 +369,7 @@ async fn forward_async(
     } else {
         let _ = send_socket.send_to(datagram, decision.dest).await;
     }
+    true
 }
 
 #[cfg(test)]
@@ -505,6 +523,7 @@ mod tests {
                 internal: 101,
             }],
         );
+        let mut first_operator_rtp = relay.subscribe_first_operator_rtp();
 
         let mut packet = rtp_datagram();
         packet[1] = 96;
@@ -512,6 +531,14 @@ mod tests {
             .send_to(&packet, operator_local)
             .await
             .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            first_operator_rtp.changed(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(*first_operator_rtp.borrow());
         let mut received = [0u8; 256];
         let (len, _) = tokio::time::timeout(
             std::time::Duration::from_secs(1),

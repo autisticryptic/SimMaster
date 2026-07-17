@@ -211,15 +211,20 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
               placeholder="6108"
               helperText="填写后，仅允许 From 用户匹配的 Asterisk 分机通过此 SIM 呼出；留空不限制"
             />
-            <FormControlLabel
-              control={(
-                <Switch
-                  checked={draft.ip_connect_on_operator_answer}
-                  onChange={(_, enabled) => update('ip_connect_on_operator_answer', enabled)}
-                />
-              )}
-              label="IP 接通（GSM/运营商接通时立即接通）"
-            />
+            <Box>
+              <FormControlLabel
+                control={(
+                  <Switch
+                    checked={draft.ip_connect_on_operator_answer}
+                    onChange={(_, enabled) => update('ip_connect_on_operator_answer', enabled)}
+                  />
+                )}
+                label="IP 接通（GSM/运营商接通时立即接通）"
+              />
+              <Typography variant="caption" color="text.secondary" display="block">
+                开启：运营商应答即向 Asterisk 返回 200；关闭：收到运营商侧首个 RTP 后自动返回 200。
+              </Typography>
+            </Box>
             <TextField
               size="small"
               label="允许的编解码器"

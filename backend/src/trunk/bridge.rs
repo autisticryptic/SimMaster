@@ -178,6 +178,7 @@ struct BridgedCall {
     dialog: SipDialog,
     operator_call_id: String,
     pending_invite: Option<Vec<u8>>,
+    hangup_after_ack: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -270,6 +271,7 @@ impl TrunkBridge {
                 dialog,
                 operator_call_id,
                 pending_invite: None,
+                hangup_after_ack: false,
             },
         );
         Ok(BridgeOutput {
@@ -388,22 +390,46 @@ impl TrunkBridge {
                 call.pending_invite = None;
             }
             OperatorEvent::Rejected { status, .. } => {
-                if call.pending_invite.is_none() {
+                if call.dialog.state == InviteTransactionState::Confirmed {
+                    let cseq = call
+                        .dialog
+                        .begin_local_request()
+                        .map_err(BridgeError::InvalidState)?;
+                    output.asterisk_frames.push(
+                        sip::build_dialog_request(&DialogRequest {
+                            method: "BYE",
+                            request_uri: &call.dialog.remote_uri,
+                            local_addr: self.local_addr,
+                            from_uri: &call.dialog.local_uri,
+                            from_tag: &call.dialog.local_tag,
+                            to_uri: &call.dialog.remote_uri,
+                            to_tag: call.dialog.remote_tag.as_deref(),
+                            call_id: &call.dialog.call_id,
+                            cseq,
+                            contact_uri: None,
+                            body: &[],
+                        })
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
+                    call.dialog.state = InviteTransactionState::Terminated;
+                } else if call.dialog.state == InviteTransactionState::AcceptedAwaitingAck {
+                    call.hangup_after_ack = true;
+                } else {
                     call.dialog
                         .on_final(status)
                         .map_err(BridgeError::InvalidState)?;
+                    output.asterisk_frames.push(
+                        sip::build_response_with_body(
+                            &response_request,
+                            status,
+                            reason(status),
+                            Some(&call.dialog.local_tag),
+                            &[],
+                            &[],
+                        )
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
                 }
-                output.asterisk_frames.push(
-                    sip::build_response_with_body(
-                        &response_request,
-                        status,
-                        reason(status),
-                        Some(&call.dialog.local_tag),
-                        &[],
-                        &[],
-                    )
-                    .map_err(BridgeError::MalformedRequest)?,
-                );
                 call.pending_invite = None;
             }
             OperatorEvent::Unavailable { .. } => {
@@ -447,6 +473,8 @@ impl TrunkBridge {
                     .map_err(BridgeError::MalformedRequest)?;
                     output.asterisk_frames.push(bye);
                     call.dialog.state = InviteTransactionState::Terminated;
+                } else if call.dialog.state == InviteTransactionState::AcceptedAwaitingAck {
+                    call.hangup_after_ack = true;
                 } else if call.dialog.direction == dialog::DialogDirection::OperatorOriginated
                     && call.dialog.state == InviteTransactionState::Proceeding
                 {
@@ -455,6 +483,23 @@ impl TrunkBridge {
                             .map_err(BridgeError::MalformedRequest)?,
                     );
                     call.dialog.state = InviteTransactionState::Failed;
+                } else if call.dialog.direction == dialog::DialogDirection::AsteriskOriginated
+                    && call.dialog.state == InviteTransactionState::Proceeding
+                {
+                    call.dialog
+                        .on_final(487)
+                        .map_err(BridgeError::InvalidState)?;
+                    output.asterisk_frames.push(
+                        sip::build_response_with_body(
+                            &response_request,
+                            487,
+                            "Request Terminated",
+                            Some(&call.dialog.local_tag),
+                            &[],
+                            &[],
+                        )
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
                 }
             }
             OperatorEvent::Cancelled { .. } => {
@@ -550,6 +595,7 @@ impl TrunkBridge {
                 dialog,
                 operator_call_id: call_id.clone(),
                 pending_invite: None,
+                hangup_after_ack: false,
             },
         );
         if self.operator == OperatorAvailability::Unavailable {
@@ -562,12 +608,41 @@ impl TrunkBridge {
     fn handle_ack(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
         let call_id = dialog::call_id(frame)
             .ok_or_else(|| BridgeError::MalformedRequest("trunk_ack_call-id_missing".into()))?;
+        let mut output = BridgeOutput::default();
+        let mut remove = false;
         if let Some(call) = self.calls.get_mut(&call_id) {
             if call.dialog.state == InviteTransactionState::AcceptedAwaitingAck {
                 call.dialog.on_ack().map_err(BridgeError::InvalidState)?;
+                if call.hangup_after_ack {
+                    let cseq = call
+                        .dialog
+                        .begin_local_request()
+                        .map_err(BridgeError::InvalidState)?;
+                    output.asterisk_frames.push(
+                        sip::build_dialog_request(&DialogRequest {
+                            method: "BYE",
+                            request_uri: &call.dialog.remote_uri,
+                            local_addr: self.local_addr,
+                            from_uri: &call.dialog.local_uri,
+                            from_tag: &call.dialog.local_tag,
+                            to_uri: &call.dialog.remote_uri,
+                            to_tag: call.dialog.remote_tag.as_deref(),
+                            call_id: &call.dialog.call_id,
+                            cseq,
+                            contact_uri: None,
+                            body: &[],
+                        })
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
+                    call.dialog.state = InviteTransactionState::Terminated;
+                    remove = true;
+                }
             }
         }
-        Ok(BridgeOutput::default())
+        if remove {
+            self.calls.remove(&call_id);
+        }
+        Ok(output)
     }
 
     fn handle_cancel(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
@@ -1067,6 +1142,54 @@ mod tests {
         let bye = b"BYE sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKbye\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n";
         let output = bridge.handle_asterisk(bye).unwrap();
         assert!(String::from_utf8_lossy(&output.asterisk_frames[0]).starts_with("SIP/2.0 200"));
+        assert_eq!(bridge.active_call_count(), 0);
+    }
+
+    #[test]
+    fn operator_end_before_ip_answer_terminates_asterisk_invite() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Ended {
+                call_id: "call-a".into(),
+            })
+            .unwrap();
+        assert_eq!(output.asterisk_frames.len(), 1);
+        assert!(output.asterisk_frames[0].starts_with(b"SIP/2.0 487 Request Terminated"));
+        assert_eq!(bridge.active_call_count(), 0);
+    }
+
+    #[test]
+    fn operator_rejection_after_first_rtp_answers_then_hangs_up_after_ack() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        let answered = bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        assert!(answered.asterisk_frames[0].starts_with(b"SIP/2.0 200 OK"));
+
+        let rejected = bridge
+            .handle_operator_event(OperatorEvent::Rejected {
+                call_id: "call-a".into(),
+                status: 486,
+            })
+            .unwrap();
+        assert!(rejected.asterisk_frames.is_empty());
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        let output = bridge.handle_asterisk(ack).unwrap();
+        assert_eq!(output.asterisk_frames.len(), 1);
+        assert!(output.asterisk_frames[0].starts_with(b"BYE "));
         assert_eq!(bridge.active_call_count(), 0);
     }
 

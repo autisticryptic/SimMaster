@@ -2244,8 +2244,9 @@ pub struct TrunkProfileConfig {
     /// Empty keeps backward-compatible per-peer routing without user binding.
     #[serde(default)]
     pub outgoing_binding: String,
-    /// When the operator leg answers an Asterisk-originated call, immediately
-    /// complete the Asterisk/IP leg as well. This is the existing safe default.
+    /// When true, operator answer immediately completes the Asterisk/IP leg.
+    /// When false, the first valid operator RTP packet completes it instead.
+    /// True preserves the existing behavior and remains the safe default.
     #[serde(default = "default_trunk_ip_connect_on_operator_answer")]
     pub ip_connect_on_operator_answer: bool,
     /// Codec allow-list advertised toward Asterisk (pass-through, never

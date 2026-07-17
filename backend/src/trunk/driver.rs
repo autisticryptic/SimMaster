@@ -139,6 +139,7 @@ async fn run_session(
         (!profile.incoming_binding.trim().is_empty()).then_some(local_addr.ip()),
     );
     operator.set_incoming_mode(profile.incoming_mode);
+    operator.set_ip_connect_on_operator_answer(profile.ip_connect_on_operator_answer);
     tracing::info!(
         incoming_mode = ?profile.incoming_mode,
         incoming_binding = %profile.incoming_binding,
@@ -156,6 +157,7 @@ async fn run_session(
     };
     operator.set_trunk_local_ip(None);
     operator.set_incoming_mode(crate::infra::config::TrunkIncomingMode::default());
+    operator.set_ip_connect_on_operator_answer(true);
     result
 }
 
