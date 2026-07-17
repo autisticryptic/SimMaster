@@ -84,3 +84,11 @@
 3. 为每条线路分配音频/视频 relay UDP 端口，并在 SDP answer 生成时写入内部端点，同时应用双方协商出的 `telephone-event` PT 映射。
 4. 在高通 410 上仅验证 REGISTER、OPTIONS、INVITE 无 IMS 能力时的 100→480，不执行真实拨号。
 5. Trunk 已能稳定桥接后，再由用户安排 Asterisk 6108 的真实语音/视频拨号和银行 IVR 数字键测试。
+
+## 六、D6a 后续进展（2026-07-17）
+
+- 新增每线路 `OperatorLink` 非阻塞双向事件总线，Trunk 驱动可发送 `OperatorCommand` 并异步接收 `OperatorEvent`，不再需要在 UDP 收包任务内同步等待 IMS。
+- `LineRuntime` 让同一线路的 `VolteLiveHandle` 与 `TrunkRuntime` 共享唯一事件链路；VoLTE session 建立/清理时同步更新语音能力门禁。
+- 可用性同时要求 live session 标记 ready 且存在真实命令订阅者；尚未接入 IMS 命令消费者时继续返回 100→480，避免假接通。
+- 全量 525 项测试和严格 Clippy 通过。Git 检查点：`6a75838 feat(trunk): add per-line operator event link`。
+- 下一步仍是让 `access/volte/live.rs` 消费命令并维护真实 IMS INVITE dialog，再接 RTP 端口与 SDP 映射；本节点不宣称已能真实拨号。
