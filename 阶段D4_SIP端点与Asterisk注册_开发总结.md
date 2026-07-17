@@ -72,6 +72,16 @@
 - 多线路配置层新增端口冲突门禁：另一条已启用线路不能占用相同本地 SIP 端口。
 - 测试结束后完成正常注销并停止候选；正式服务 inactive、3101 关闭、`wwan0` DOWN、XFRM state/policy 0/0、ModemManager active。含凭据的隔离配置、数据库和日志均已删除，只保留校验过的候选二进制。
 
+### 2026-07-17 外部 Asterisk 3600 秒注册复验
+
+- 使用用户给定的真实 PJSIP Trunk 参数复验：远端 `10.0.0.3:8060`、本地稳定端口 `5062`、账号 `41000`、来电扩展 `6108`、注册有效期 `3600` 秒；凭据明文未写入日志或文档。
+- 候选继续仅监听 `127.0.0.1:3101`，正式 `simadmin.service` 保持 inactive，`data_enabled=false`、VoLTE runtime disabled，未建立 IMS bearer。
+- 运行态确认 `registered=true`、`last_sip_status=200`、`register_attempts=2`（Digest challenge 后成功）、`expires_at-registered_at=3600s`、`reconnect_count=0`；设备 UDP `10.0.0.116:5062` 已连接远端 PJSIP 端口。
+- 候选持续运行约 80 分钟，跨过 3600 秒有效期在 85%（3060 秒）处的计划刷新时点，期间未出现 Trunk 降级或重连告警；停止前未再次采集 API 状态，因此该条仅记为长窗口无异常观察，不替代后续多轮 refresh/断网 soak。
+- 修复 RFC 3261 注册有效期优先级：200 响应同时包含 Contact `expires=` 与全局 `Expires` 时，按 Contact 级绑定有效期刷新；新增回归测试与无凭据的注册成功日志。Git 检查点：`3ed7628 fix(trunk): honor contact registration expiry`。
+- 本地质量基线更新为 523 项测试全绿，`cargo clippy --all-targets -- -D warnings` 通过。
+- 测试结束后正常停止候选并清理设备与本地临时凭据；确认 5062/3101 均释放、正式服务 inactive、`wwan0` DOWN、XFRM state/policy 为 0。
+
 ## 五、剩余 D4 联调项
 
 - [x] 在 Asterisk InAuth 下验证真实 401/407→Digest→200。
