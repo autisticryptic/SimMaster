@@ -125,19 +125,33 @@ pub async fn ensure_ims_bearer(
     }
 
     let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
+    let mut required_fallback = None;
+    let mut last_error = None;
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
             if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
                 return parse_bearer_connection(&path, &details);
             }
+            match connect_and_read(&path).await {
+                Ok(bearer) => return Ok(bearer),
+                Err(error) => {
+                    let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
+                        .await
+                        .unwrap_or_default();
+                    required_fallback = required_ip_type_after_failure(&after);
+                    last_error = Some(error);
+                }
+            }
             delete_bearer(modem, &path).await?;
+            break;
         }
     }
 
-    let mut pending = VecDeque::from(["ipv4v6"]);
+    let mut pending = required_fallback
+        .map(|ip_type| VecDeque::from([ip_type]))
+        .unwrap_or_else(|| VecDeque::from(["ipv4v6"]));
     let mut attempted = Vec::with_capacity(3);
-    let mut last_error = None;
     while let Some(ip_type) = pending.pop_front() {
         if attempted.contains(&ip_type) {
             continue;
