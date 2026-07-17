@@ -1,8 +1,8 @@
 //! Per-line SIP Trunk gateway.
 //!
-//! D3b provides the persisted profile and runtime/status boundary. D4 adds the
-//! per-line UDP endpoint and outbound REGISTER client. The call/media bridge is
-//! deliberately kept for D5-D6.
+//! D3b provides the persisted profile and runtime/status boundary, D4 the UDP
+//! endpoint and outbound REGISTER client, and D5-D6 the dialog/event/RTP bridge
+//! to each line's VoLTE live session.
 
 pub mod bridge;
 pub mod dialog;

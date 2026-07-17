@@ -579,7 +579,11 @@ fn timestamp_after(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::trunk::runtime::TrunkRuntime;
+    use crate::trunk::{
+        bridge::{OperatorCommand, OperatorEvent},
+        operator::OperatorLink,
+        runtime::TrunkRuntime,
+    };
     use std::net::Ipv4Addr;
     use tokio::net::UdpSocket;
 
@@ -734,6 +738,88 @@ mod tests {
             .unwrap();
         assert!(frame[..read].starts_with(b"SIP/2.0 480 Temporarily Unavailable"));
         assert_eq!(runtime.status().await.phase, "ready");
+        runtime
+            .activate_profile(&TrunkProfileConfig::default())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn event_link_drives_asterisk_call_dialog_without_blocking_udp() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let local_port = free_udp_port().await;
+        let operator = OperatorLink::default();
+        let mut commands = operator.subscribe_commands();
+        operator.set_ready(true);
+        let runtime = TrunkRuntime::with_operator(operator.clone());
+        runtime
+            .activate_profile(&TrunkProfileConfig {
+                enabled: true,
+                registration_mode: TrunkRegistrationMode::StaticPeer,
+                asterisk_host: server_addr.ip().to_string(),
+                asterisk_port: server_addr.port(),
+                local_port,
+                ..TrunkProfileConfig::default()
+            })
+            .await;
+        let mut frame = [0u8; 8192];
+        let (_, peer) = server.recv_from(&mut frame).await.unwrap();
+        let sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n";
+        let invite = format!(
+            "INVITE sip:+8613800138000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKcall\r\nFrom: <sip:6108@pbx>;tag=pbx-a\r\nTo: <sip:41000@simadmin>\r\nCall-ID: linked-call-1\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            server_addr.port(),
+            sdp.len(),
+            String::from_utf8_lossy(sdp)
+        );
+        server.send_to(invite.as_bytes(), peer).await.unwrap();
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 100 Trying"));
+        let command = commands.recv().await.unwrap();
+        let OperatorCommand::StartCall {
+            call_id,
+            callee,
+            trunk_local_ip,
+            ..
+        } = command
+        else {
+            panic!("expected StartCall");
+        };
+        assert_eq!(call_id, "linked-call-1");
+        assert_eq!(callee, "sip:+8613800138000@simadmin");
+        assert_eq!(trunk_local_ip, std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+        operator.send_event(OperatorEvent::Provisional {
+            call_id: call_id.clone(),
+            status: 180,
+            body: None,
+        });
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 180 Ringing"));
+        operator.send_event(OperatorEvent::Answered {
+            call_id: call_id.clone(),
+            body: sdp.to_vec(),
+        });
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        let answer = String::from_utf8_lossy(&frame[..read]);
+        assert!(answer.starts_with("SIP/2.0 200 OK"));
+        let to = sip_frame::header_value(&frame[..read], "To").unwrap();
+        let tag = to.split(";tag=").nth(1).unwrap();
+        let ack = format!(
+            "ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=pbx-a\r\nTo: <sip:41000@simadmin>;tag={}\r\nCall-ID: linked-call-1\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n",
+            server_addr.port(), tag
+        );
+        server.send_to(ack.as_bytes(), peer).await.unwrap();
+        let bye = format!(
+            "BYE sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:{};branch=z9hG4bKbye\r\nFrom: <sip:6108@pbx>;tag=pbx-a\r\nTo: <sip:41000@simadmin>;tag={}\r\nCall-ID: linked-call-1\r\nCSeq: 2 BYE\r\nContent-Length: 0\r\n\r\n",
+            server_addr.port(), tag
+        );
+        server.send_to(bye.as_bytes(), peer).await.unwrap();
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        assert!(frame[..read].starts_with(b"SIP/2.0 200 OK"));
+        assert!(matches!(
+            commands.recv().await.unwrap(),
+            OperatorCommand::HangupCall { call_id } if call_id == "linked-call-1"
+        ));
         runtime
             .activate_profile(&TrunkProfileConfig::default())
             .await;

@@ -12,12 +12,18 @@
 //! `#[cfg(unix)]` layer that plugs this logic onto real sockets; it is compiled
 //! out on Windows so the logic can still be unit-tested there.
 //!
-//! Scope note (per plan stage E): this is the relay **skeleton** — symmetric
-//! two-leg forwarding with counters. Transcoding (AMR ↔ G.711/opus), RTCP
-//! handling, and jitter buffering are explicitly out of scope here (a pure
-//! relay defers transcoding to the PBX, and the device only shuffles UDP).
+//! The relay has both a pure decision core and a Tokio UDP lifecycle used by
+//! live Trunk dialogs. Transcoding (AMR ↔ G.711/Opus), RTCP interpretation and
+//! jitter buffering remain out of scope: Asterisk owns media conversion while
+//! the device forwards packets and rewrites negotiated dynamic payload types.
 
-use std::net::SocketAddr;
+use std::{
+    io as std_io,
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+};
+
+use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
 
 use crate::access::vowifi::voice::RtpPacket;
 
@@ -222,6 +228,132 @@ pub fn rewrite_rtp_payload_type(datagram: &[u8], payload_type: u8) -> Option<Vec
     Some(rewritten)
 }
 
+/// Bound sockets allocated before SIP offer/answer exchange. Their local
+/// addresses are advertised independently to IMS and Asterisk; forwarding is
+/// activated only after both remote SDP endpoints are known.
+pub struct PendingRtpRelay {
+    operator_socket: Arc<UdpSocket>,
+    internal_socket: Arc<UdpSocket>,
+}
+
+impl PendingRtpRelay {
+    pub async fn bind(operator_ip: IpAddr, internal_ip: IpAddr) -> std_io::Result<Self> {
+        let operator_socket = Arc::new(UdpSocket::bind(SocketAddr::new(operator_ip, 0)).await?);
+        let internal_socket = Arc::new(UdpSocket::bind(SocketAddr::new(internal_ip, 0)).await?);
+        Ok(Self {
+            operator_socket,
+            internal_socket,
+        })
+    }
+
+    pub fn operator_local_addr(&self) -> std_io::Result<SocketAddr> {
+        self.operator_socket.local_addr()
+    }
+
+    pub fn internal_local_addr(&self) -> std_io::Result<SocketAddr> {
+        self.internal_socket.local_addr()
+    }
+
+    pub fn activate(
+        self,
+        operator_remote: SocketAddr,
+        internal_remote: SocketAddr,
+        payload_mappings: impl IntoIterator<Item = PayloadTypeMapping>,
+    ) -> ActiveRtpRelay {
+        let mut core = RtpRelayCore::new(
+            LegEndpoint::new(Some(operator_remote), true),
+            LegEndpoint::new(Some(internal_remote), true),
+        );
+        for mapping in payload_mappings {
+            core = core.with_payload_type_mapping(mapping.operator, mapping.internal);
+        }
+        let (stop, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_async_relay(
+            self.operator_socket,
+            self.internal_socket,
+            core,
+            stop_rx,
+        ));
+        ActiveRtpRelay { stop, task }
+    }
+}
+
+pub struct ActiveRtpRelay {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<std_io::Result<()>>,
+}
+
+impl ActiveRtpRelay {
+    pub fn stop(&self) {
+        let _ = self.stop.send(true);
+    }
+}
+
+impl Drop for ActiveRtpRelay {
+    fn drop(&mut self) {
+        let _ = self.stop.send(true);
+        self.task.abort();
+    }
+}
+
+async fn run_async_relay(
+    operator_socket: Arc<UdpSocket>,
+    internal_socket: Arc<UdpSocket>,
+    mut core: RtpRelayCore,
+    mut stop: watch::Receiver<bool>,
+) -> std_io::Result<()> {
+    let mut operator_buf = vec![0u8; 65_535];
+    let mut internal_buf = vec![0u8; 65_535];
+    loop {
+        tokio::select! {
+            changed = stop.changed() => {
+                if changed.is_err() || *stop.borrow() {
+                    return Ok(());
+                }
+            }
+            received = operator_socket.recv_from(&mut operator_buf) => {
+                let (len, source) = received?;
+                forward_async(
+                    &mut core,
+                    RelayLeg::Operator,
+                    source,
+                    &operator_buf[..len],
+                    &internal_socket,
+                ).await;
+            }
+            received = internal_socket.recv_from(&mut internal_buf) => {
+                let (len, source) = received?;
+                forward_async(
+                    &mut core,
+                    RelayLeg::Internal,
+                    source,
+                    &internal_buf[..len],
+                    &operator_socket,
+                ).await;
+            }
+        }
+    }
+}
+
+async fn forward_async(
+    core: &mut RtpRelayCore,
+    leg: RelayLeg,
+    source: SocketAddr,
+    datagram: &[u8],
+    send_socket: &UdpSocket,
+) {
+    let Ok(decision) = core.ingest(leg, source, datagram) else {
+        return;
+    };
+    if let Some(payload_type) = decision.rewrite_payload_type {
+        if let Some(rewritten) = rewrite_rtp_payload_type(datagram, payload_type) {
+            let _ = send_socket.send_to(&rewritten, decision.dest).await;
+        }
+    } else {
+        let _ = send_socket.send_to(datagram, decision.dest).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +483,61 @@ mod tests {
             RtpPacket::parse(&packet).unwrap().payload,
             vec![5, 10, 0, 160]
         );
+    }
+
+    #[tokio::test]
+    async fn async_relay_forwards_both_legs_and_rewrites_payload_type() {
+        let operator_remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let internal_remote = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let pending = PendingRtpRelay::bind(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        )
+        .await
+        .unwrap();
+        let operator_local = pending.operator_local_addr().unwrap();
+        let internal_local = pending.internal_local_addr().unwrap();
+        let relay = pending.activate(
+            operator_remote.local_addr().unwrap(),
+            internal_remote.local_addr().unwrap(),
+            [PayloadTypeMapping {
+                operator: 96,
+                internal: 101,
+            }],
+        );
+
+        let mut packet = rtp_datagram();
+        packet[1] = 96;
+        operator_remote
+            .send_to(&packet, operator_local)
+            .await
+            .unwrap();
+        let mut received = [0u8; 256];
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            internal_remote.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received[1] & 0x7f, 101);
+        assert_eq!(&received[2..len], &packet[2..]);
+
+        packet[1] = 101;
+        internal_remote
+            .send_to(&packet, internal_local)
+            .await
+            .unwrap();
+        let (len, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            operator_remote.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received[1] & 0x7f, 96);
+        assert_eq!(&received[2..len], &packet[2..]);
+        relay.stop();
     }
 }
 

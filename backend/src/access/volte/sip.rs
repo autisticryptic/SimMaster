@@ -498,6 +498,49 @@ pub fn build_ack(
     })
 }
 
+/// Build PRACK for a reliable provisional response (RFC 3262). The dialog must
+/// already contain the To-tag learned from the 18x response. `cseq` is the next
+/// local in-dialog sequence while `invite_cseq` remains the INVITE sequence
+/// referenced by RAck.
+#[allow(clippy::too_many_arguments)]
+pub fn build_prack(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    rseq: u32,
+    invite_cseq: u32,
+) -> Vec<u8> {
+    let branch = new_branch();
+    let route_host = sip_host(route.pcscf_addr.ip());
+    let to = match &dialog.remote_tag {
+        Some(tag) => format!("<{callee_uri}>;tag={tag}"),
+        None => format!("<{callee_uri}>"),
+    };
+    let headers = [
+        SipHeader::new(
+            "Route",
+            format!("<sip:{route_host}:{};lr>", route.pcscf_addr.port()),
+        ),
+        SipHeader::new("RAck", format!("{rseq} {invite_cseq} INVITE")),
+        SipHeader::new("User-Agent", USER_AGENT),
+    ];
+    crate::ims::sip_message::build_request(&SipRequest {
+        method: "PRACK",
+        request_uri: callee_uri,
+        route: *route,
+        branch: &branch,
+        from_uri: &identity.public_uri,
+        from_tag: &dialog.local_tag,
+        to_value: &to,
+        call_id: &dialog.call_id,
+        cseq,
+        headers: &headers,
+        body: &[],
+    })
+}
+
 /// Build a BYE to tear down a confirmed dialog. CSeq must be incremented past
 /// the INVITE (the caller passes the next value).
 pub fn build_bye(
@@ -926,6 +969,26 @@ mod tests {
         assert!(text.contains("To: <sip:+8613800138000@h>;tag=remotetag123\r\n"));
         assert!(text.contains("CSeq: 1 ACK\r\n"));
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn prack_references_reliable_provisional_response() {
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("early-tag");
+        let frame = build_prack(
+            &ident(),
+            &route_udp(),
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            77,
+            1,
+        );
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.starts_with("PRACK sip:+8613800138000@h SIP/2.0\r\n"));
+        assert!(text.contains("To: <sip:+8613800138000@h>;tag=early-tag\r\n"));
+        assert!(text.contains("RAck: 77 1 INVITE\r\n"));
+        assert!(text.contains("CSeq: 2 PRACK\r\n"));
     }
 
     #[test]
