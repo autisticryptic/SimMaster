@@ -115,9 +115,13 @@ pub enum OperatorCommand {
     },
 }
 
-#[allow(dead_code)] // Constructed by the future IMS live event dispatcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorEvent {
+    Incoming {
+        call_id: String,
+        caller: String,
+        body: Vec<u8>,
+    },
     Provisional {
         call_id: String,
         status: u16,
@@ -135,6 +139,9 @@ pub enum OperatorEvent {
         call_id: String,
     },
     Ended {
+        call_id: String,
+    },
+    Cancelled {
         call_id: String,
     },
 }
@@ -208,7 +215,6 @@ impl TrunkBridge {
     /// Start a mobile-terminated call toward the configured Asterisk target.
     /// The returned frame is a normal UAC INVITE; subsequent Asterisk
     /// responses are fed through [`handle_asterisk`].
-    #[allow(dead_code)]
     pub fn start_operator_incoming(
         &mut self,
         operator_call_id: impl Into<String>,
@@ -296,12 +302,22 @@ impl TrunkBridge {
         &mut self,
         event: OperatorEvent,
     ) -> Result<BridgeOutput, BridgeError> {
+        if let OperatorEvent::Incoming {
+            call_id,
+            caller,
+            body,
+        } = event
+        {
+            return self.start_operator_incoming(call_id, &caller, &body);
+        }
         let call_id = match &event {
+            OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { call_id, .. }
             | OperatorEvent::Answered { call_id, .. }
             | OperatorEvent::Rejected { call_id, .. }
             | OperatorEvent::Unavailable { call_id }
-            | OperatorEvent::Ended { call_id } => call_id,
+            | OperatorEvent::Ended { call_id }
+            | OperatorEvent::Cancelled { call_id } => call_id,
         }
         .clone();
         let asterisk_call_id = self
@@ -321,6 +337,7 @@ impl TrunkBridge {
             .clone()
             .unwrap_or_else(|| call.dialog.initial_invite.clone());
         match event {
+            OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { status, body, .. } => {
                 if call.pending_invite.is_none() {
                     call.dialog
@@ -420,6 +437,17 @@ impl TrunkBridge {
                     .map_err(BridgeError::MalformedRequest)?;
                     output.asterisk_frames.push(bye);
                     call.dialog.state = InviteTransactionState::Terminated;
+                }
+            }
+            OperatorEvent::Cancelled { .. } => {
+                if call.dialog.direction == dialog::DialogDirection::OperatorOriginated
+                    && call.dialog.state == InviteTransactionState::Proceeding
+                {
+                    output.asterisk_frames.push(
+                        sip::build_cancel(&call.dialog.initial_invite)
+                            .map_err(BridgeError::MalformedRequest)?,
+                    );
+                    call.dialog.state = InviteTransactionState::Failed;
                 }
             }
         }
@@ -1047,7 +1075,11 @@ mod tests {
         .with_operator(OperatorAvailability::EventDriven)
         .with_asterisk_target("sip:6108@192.0.2.20:8060");
         let output = bridge
-            .start_operator_incoming("ims-call-a", "sip:+8613800@ims.example", sdp())
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "ims-call-a".into(),
+                caller: "sip:+8613800@ims.example".into(),
+                body: sdp().to_vec(),
+            })
             .unwrap();
         let invite = &output.asterisk_frames[0];
         assert!(
@@ -1071,6 +1103,31 @@ mod tests {
                 body: sdp().to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn operator_cancel_terminates_pending_asterisk_invite() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_asterisk_target("sip:6108@192.0.2.20:8060");
+        bridge
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "ims-call-cancel".into(),
+                caller: "sip:+8613800@ims.example".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Cancelled {
+                call_id: "ims-call-cancel".into(),
+            })
+            .unwrap();
+        let cancel = String::from_utf8_lossy(&output.asterisk_frames[0]);
+        assert!(cancel.starts_with("CANCEL sip:6108@192.0.2.20:8060 SIP/2.0"));
+        assert!(cancel.contains("CSeq: 1 CANCEL\r\n"));
+        assert_eq!(bridge.active_call_count(), 0);
     }
 
     #[test]

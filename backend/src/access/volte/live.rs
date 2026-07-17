@@ -27,7 +27,10 @@ use crate::{
     infra::db::{Database, SmsMessage},
     notify::notification::NotificationSender,
     trunk::{
-        bridge::{MediaOffer, OperatorCommand, OperatorEvent, RtpTelephoneEvent},
+        bridge::{
+            DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
+            RtpTelephoneEvent,
+        },
         operator::OperatorLink,
     },
 };
@@ -139,15 +142,23 @@ struct VolteLiveSession {
 }
 
 struct LiveVoiceCall {
+    direction: LiveVoiceDirection,
     dialog: sip::DialogIds,
     callee_uri: String,
     invite_branch: String,
+    initial_invite: Option<Vec<u8>>,
     internal_offer: MediaOffer,
     operator_local: SocketAddr,
     internal_local: SocketAddr,
     pending_relay: Option<PendingRtpRelay>,
     active_relay: Option<ActiveRtpRelay>,
     next_cseq: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveVoiceDirection {
+    MobileOriginated,
+    MobileTerminated,
 }
 
 struct DeviceIdentity {
@@ -841,10 +852,12 @@ async fn handle_operator_command_inner(
             session.voice_calls.insert(
                 call_id,
                 LiveVoiceCall {
+                    direction: LiveVoiceDirection::MobileOriginated,
                     next_cseq: dialog.cseq.saturating_add(1),
                     dialog,
                     callee_uri,
                     invite_branch,
+                    initial_invite: None,
                     internal_offer: offer,
                     operator_local,
                     internal_local,
@@ -929,10 +942,120 @@ async fn handle_operator_command_inner(
                 session.channel.security_verify(),
             )
         }
-        OperatorCommand::ReportProvisional { .. }
-        | OperatorCommand::AcceptCall { .. }
-        | OperatorCommand::RejectCall { .. } => {
-            return Err(VolteError::new("volte_operator_incoming_not_connected"));
+        OperatorCommand::ReportProvisional {
+            call_id,
+            status,
+            body,
+        } => {
+            let (request, local_tag, answer) = {
+                let call = session
+                    .voice_calls
+                    .get_mut(&call_id)
+                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                if call.direction != LiveVoiceDirection::MobileTerminated {
+                    return Err(VolteError::new("volte_voice_direction_mismatch"));
+                }
+                let request = call
+                    .initial_invite
+                    .clone()
+                    .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+                let local_tag = call.dialog.local_tag.clone();
+                let answer = body
+                    .as_deref()
+                    .map(|body| prepare_incoming_media(call, body))
+                    .transpose();
+                (request, local_tag, answer)
+            };
+            match answer {
+                Ok(answer) => sip::build_response(
+                    &request,
+                    status,
+                    ims_reason(status),
+                    Some(&local_tag),
+                    None,
+                    answer.as_deref().map(str::as_bytes),
+                ),
+                Err(error) => {
+                    session.voice_calls.remove(&call_id);
+                    live.operator.send_event(OperatorEvent::Cancelled {
+                        call_id: call_id.clone(),
+                    });
+                    tracing::warn!(error = %error, "Rejected unusable Asterisk early media");
+                    sip::build_response(
+                        &request,
+                        488,
+                        "Not Acceptable Here",
+                        Some(&local_tag),
+                        None,
+                        None,
+                    )
+                }
+            }
+        }
+        OperatorCommand::AcceptCall { call_id, body } => {
+            let contact = ims_contact(&session.identity, &session.channel.route());
+            let (request, local_tag, answer) = {
+                let call = session
+                    .voice_calls
+                    .get_mut(&call_id)
+                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                if call.direction != LiveVoiceDirection::MobileTerminated {
+                    return Err(VolteError::new("volte_voice_direction_mismatch"));
+                }
+                let request = call
+                    .initial_invite
+                    .clone()
+                    .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+                let local_tag = call.dialog.local_tag.clone();
+                let answer = prepare_incoming_media(call, &body);
+                (request, local_tag, answer)
+            };
+            match answer {
+                Ok(answer) => sip::build_response(
+                    &request,
+                    200,
+                    "OK",
+                    Some(&local_tag),
+                    Some(&contact),
+                    Some(answer.as_bytes()),
+                ),
+                Err(error) => {
+                    session.voice_calls.remove(&call_id);
+                    live.operator.send_event(OperatorEvent::Ended {
+                        call_id: call_id.clone(),
+                    });
+                    tracing::warn!(error = %error, "Rejected unusable Asterisk answer");
+                    sip::build_response(
+                        &request,
+                        488,
+                        "Not Acceptable Here",
+                        Some(&local_tag),
+                        None,
+                        None,
+                    )
+                }
+            }
+        }
+        OperatorCommand::RejectCall { call_id, status } => {
+            let call = session
+                .voice_calls
+                .remove(&call_id)
+                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+            if call.direction != LiveVoiceDirection::MobileTerminated {
+                return Err(VolteError::new("volte_voice_direction_mismatch"));
+            }
+            let request = call
+                .initial_invite
+                .as_deref()
+                .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+            sip::build_response(
+                request,
+                status,
+                ims_reason(status),
+                Some(&call.dialog.local_tag),
+                None,
+                None,
+            )
         }
     };
     session
@@ -1046,8 +1169,47 @@ async fn handle_operator_sip_frame(
         .find(|(_, call)| call.dialog.call_id == ims_call_id)
         .map(|(call_id, _)| call_id.clone())
     else {
+        if sip::is_request(frame, "INVITE") {
+            return begin_incoming_operator_call(live, runtime, session, frame, ims_call_id).await;
+        }
         return Ok(false);
     };
+
+    if sip::is_request(frame, "CANCEL") {
+        let call = session
+            .voice_calls
+            .remove(&trunk_call_id)
+            .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+        if call.direction != LiveVoiceDirection::MobileTerminated {
+            return Ok(false);
+        }
+        let ok = sip::build_response(frame, 200, "OK", None, None, None);
+        session
+            .channel
+            .send_sip(&ok)
+            .await
+            .map_err(map_channel_error)?;
+        if let Some(invite) = call.initial_invite.as_deref() {
+            let terminated = sip::build_response(
+                invite,
+                487,
+                "Request Terminated",
+                Some(&call.dialog.local_tag),
+                None,
+                None,
+            );
+            session
+                .channel
+                .send_sip(&terminated)
+                .await
+                .map_err(map_channel_error)?;
+        }
+        live.operator.send_event(OperatorEvent::Cancelled {
+            call_id: trunk_call_id,
+        });
+        runtime.update(|state| state.last_tx_at = Some(now())).await;
+        return Ok(true);
+    }
 
     if sip::is_request(frame, "BYE") {
         let response = sip::build_response(frame, 200, "OK", None, None, None);
@@ -1186,6 +1348,156 @@ async fn handle_operator_sip_frame(
     Ok(false)
 }
 
+async fn begin_incoming_operator_call(
+    live: &VolteLiveHandle,
+    runtime: &Arc<VolteRuntime>,
+    session: &mut VolteLiveSession,
+    frame: &[u8],
+    ims_call_id: String,
+) -> Result<bool, VolteError> {
+    let Some(trunk_local_ip) = live.operator.trunk_local_ip() else {
+        send_incoming_rejection(session, runtime, frame, 480).await?;
+        return Ok(true);
+    };
+    if !live.operator.is_available() {
+        send_incoming_rejection(session, runtime, frame, 480).await?;
+        return Ok(true);
+    }
+    let operator_audio = match parse_audio_sdp(sip::sip_body(frame)) {
+        Ok(audio) => audio,
+        Err(_) => {
+            send_incoming_rejection(session, runtime, frame, 488).await?;
+            return Ok(true);
+        }
+    };
+    let operator_remote = match media_socket_addr(&operator_audio) {
+        Ok(remote) => remote,
+        Err(_) => {
+            send_incoming_rejection(session, runtime, frame, 488).await?;
+            return Ok(true);
+        }
+    };
+    let Some(from_uri) = sip::sip_header_uri(frame, "From") else {
+        send_incoming_rejection(session, runtime, frame, 400).await?;
+        return Ok(true);
+    };
+    let caller =
+        sip::sip_header_uri(frame, "P-Asserted-Identity").unwrap_or_else(|| from_uri.clone());
+    let remote_target = sip::sip_header_uri(frame, "Contact").unwrap_or(from_uri);
+    let Some(remote_tag) =
+        sip::header_value(frame, "From").and_then(|value| sip_parameter(&value, "tag"))
+    else {
+        send_incoming_rejection(session, runtime, frame, 400).await?;
+        return Ok(true);
+    };
+    let Some(invite_cseq) = sip::header_value(frame, "CSeq")
+        .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+    else {
+        send_incoming_rejection(session, runtime, frame, 400).await?;
+        return Ok(true);
+    };
+    let relay = match PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
+        .await
+    {
+        Ok(relay) => relay,
+        Err(error) => {
+            tracing::warn!(error = %error, "Unable to allocate MT RTP relay");
+            send_incoming_rejection(session, runtime, frame, 500).await?;
+            return Ok(true);
+        }
+    };
+    let operator_local = relay.operator_local_addr().map_err(|error| {
+        VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+    })?;
+    let internal_local = relay.internal_local_addr().map_err(|error| {
+        VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+    })?;
+    let operator_dtmf = parse_telephone_event(sip::sip_body(frame));
+    let trunk_offer = relay_audio_sdp(&operator_audio, operator_dtmf.as_ref(), internal_local);
+    let dialog = sip::DialogIds {
+        call_id: ims_call_id.clone(),
+        local_tag: sip::hex_token(8),
+        remote_tag: Some(remote_tag),
+        cseq: invite_cseq,
+    };
+    let trying = sip::build_response(frame, 100, "Trying", Some(&dialog.local_tag), None, None);
+    session
+        .channel
+        .send_sip(&trying)
+        .await
+        .map_err(map_channel_error)?;
+    session.voice_calls.insert(
+        ims_call_id.clone(),
+        LiveVoiceCall {
+            direction: LiveVoiceDirection::MobileTerminated,
+            dialog,
+            callee_uri: remote_target,
+            invite_branch: String::new(),
+            initial_invite: Some(frame.to_vec()),
+            internal_offer: MediaOffer {
+                audio: operator_audio,
+                audio_endpoint: operator_remote,
+                video: None,
+                dtmf: DtmfCapabilities {
+                    preferred: if operator_dtmf.is_some() {
+                        DtmfSource::RtpEvent
+                    } else {
+                        DtmfSource::SipInfo
+                    },
+                    rtp_event: operator_dtmf,
+                    sip_info: true,
+                },
+            },
+            operator_local,
+            internal_local,
+            pending_relay: Some(relay),
+            active_relay: None,
+            next_cseq: 1,
+        },
+    );
+    live.operator.send_event(OperatorEvent::Incoming {
+        call_id: ims_call_id,
+        caller: normalize_incoming_caller(&caller),
+        body: trunk_offer.into_bytes(),
+    });
+    runtime.update(|state| state.last_tx_at = Some(now())).await;
+    Ok(true)
+}
+
+async fn send_incoming_rejection(
+    session: &mut VolteLiveSession,
+    runtime: &Arc<VolteRuntime>,
+    frame: &[u8],
+    status: u16,
+) -> Result<(), VolteError> {
+    let response = sip::build_response(frame, status, ims_reason(status), None, None, None);
+    session
+        .channel
+        .send_sip(&response)
+        .await
+        .map_err(map_channel_error)?;
+    runtime.update(|state| state.last_tx_at = Some(now())).await;
+    Ok(())
+}
+
+fn sip_parameter(value: &str, expected: &str) -> Option<String> {
+    value.split(';').skip(1).find_map(|parameter| {
+        let (name, value) = parameter.trim().split_once('=')?;
+        name.eq_ignore_ascii_case(expected)
+            .then(|| value.trim().trim_matches('"').to_string())
+    })
+}
+
+fn normalize_incoming_caller(caller: &str) -> String {
+    if let Some(number) = caller.strip_prefix("tel:") {
+        format!("sip:{number}@simadmin")
+    } else if let Some(uri) = caller.strip_prefix("sips:") {
+        format!("sip:{uri}")
+    } else {
+        caller.to_string()
+    }
+}
+
 fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<String, VolteError> {
     let operator_audio = parse_audio_sdp(body)
         .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
@@ -1248,6 +1560,101 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         internal_dtmf,
         call.internal_local,
     ))
+}
+
+/// Translate Asterisk's answer for an MT call back into the payload numbers
+/// and relay address advertised on the operator IMS dialog.
+fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<String, VolteError> {
+    let internal_audio = parse_audio_sdp(body)
+        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+    let internal_remote = media_socket_addr(&internal_audio)?;
+    let mut operator_answer = call.internal_offer.audio.clone();
+    operator_answer.codecs = call
+        .internal_offer
+        .audio
+        .codecs
+        .iter()
+        .filter(|operator| {
+            internal_audio
+                .codecs
+                .iter()
+                .any(|internal| internal.codec == operator.codec)
+        })
+        .cloned()
+        .collect();
+    if operator_answer.codecs.is_empty() {
+        return Err(VolteError::new("volte_voice_no_common_codec"));
+    }
+    let operator_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
+    let internal_dtmf = parse_telephone_event(body);
+    let mut mappings = operator_answer
+        .codecs
+        .iter()
+        .filter_map(|operator| {
+            let internal = internal_audio
+                .codecs
+                .iter()
+                .find(|codec| codec.codec == operator.codec)?;
+            (operator.payload_type != internal.payload_type).then_some(PayloadTypeMapping {
+                operator: operator.payload_type,
+                internal: internal.payload_type,
+            })
+        })
+        .collect::<Vec<_>>();
+    if let (Some(operator), Some(internal)) = (operator_dtmf, internal_dtmf.as_ref()) {
+        if operator.payload_type != internal.payload_type {
+            mappings.push(PayloadTypeMapping {
+                operator: operator.payload_type,
+                internal: internal.payload_type,
+            });
+        }
+    }
+    if call.active_relay.is_none() {
+        let pending = call
+            .pending_relay
+            .take()
+            .ok_or_else(|| VolteError::new("volte_rtp_relay_missing"))?;
+        call.active_relay = Some(pending.activate(
+            call.internal_offer.audio_endpoint,
+            internal_remote,
+            mappings,
+        ));
+    }
+    Ok(relay_audio_sdp(
+        &operator_answer,
+        operator_dtmf,
+        call.operator_local,
+    ))
+}
+
+fn ims_contact(identity: &ImsIdentity, route: &ImsRoute) -> String {
+    format!(
+        "sip:{}@{}:{};transport={}",
+        identity.contact_user,
+        sip::sip_host(route.local_addr.ip()),
+        route.local_addr.port(),
+        route.transport.as_param(),
+    )
+}
+
+fn ims_reason(status: u16) -> &'static str {
+    match status {
+        100 => "Trying",
+        180 => "Ringing",
+        183 => "Session Progress",
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        480 => "Temporarily Unavailable",
+        486 => "Busy Here",
+        487 => "Request Terminated",
+        488 => "Not Acceptable Here",
+        500 => "Server Internal Error",
+        603 => "Decline",
+        _ => "Call Failed",
+    }
 }
 
 fn media_socket_addr(audio: &SdpAudioDescription) -> Result<SocketAddr, VolteError> {
@@ -1896,6 +2303,14 @@ mod tests {
             "sip:+8613800138000@ims.example;user=phone"
         );
         assert!(normalize_operator_callee("sip:not-a-number@pbx", "ims.example").is_err());
+        assert_eq!(
+            normalize_incoming_caller("tel:+8613800138000"),
+            "sip:+8613800138000@simadmin"
+        );
+        assert_eq!(
+            normalize_incoming_caller("sips:+8613800138000@ims.example"),
+            "sip:+8613800138000@ims.example"
+        );
     }
 
     #[test]
@@ -1933,9 +2348,11 @@ mod tests {
         let operator_local = pending.operator_local_addr().unwrap();
         let internal_local = pending.internal_local_addr().unwrap();
         let mut call = LiveVoiceCall {
+            direction: LiveVoiceDirection::MobileOriginated,
             dialog: sip::DialogIds::fresh(),
             callee_uri: "sip:+8613800138000@ims.example;user=phone".into(),
             invite_branch: "z9hG4bKtest".into(),
+            initial_invite: None,
             internal_offer: MediaOffer {
                 audio_endpoint: internal_remote.local_addr().unwrap(),
                 audio: internal_audio,
@@ -1986,6 +2403,85 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(received[1] & 0x7f, 101);
+        assert_eq!(&received[2..len], &packet[2..]);
+    }
+
+    #[tokio::test]
+    async fn asterisk_answer_activates_mt_relay_and_maps_dtmf_payload() {
+        let operator_remote = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let internal_remote = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let operator_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 96\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-16\r\na=sendrecv\r\n",
+            operator_remote.local_addr().unwrap().port()
+        );
+        let operator_audio = parse_audio_sdp(operator_sdp.as_bytes()).unwrap();
+        let pending =
+            PendingRtpRelay::bind("127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap();
+        let operator_local = pending.operator_local_addr().unwrap();
+        let internal_local = pending.internal_local_addr().unwrap();
+        let mut call = LiveVoiceCall {
+            direction: LiveVoiceDirection::MobileTerminated,
+            dialog: sip::DialogIds {
+                call_id: "ims-mt-1".into(),
+                local_tag: "local".into(),
+                remote_tag: Some("remote".into()),
+                cseq: 1,
+            },
+            callee_uri: "sip:+8613800138000@ims.example".into(),
+            invite_branch: String::new(),
+            initial_invite: Some(Vec::new()),
+            internal_offer: MediaOffer {
+                audio_endpoint: operator_remote.local_addr().unwrap(),
+                audio: operator_audio,
+                video: None,
+                dtmf: DtmfCapabilities {
+                    rtp_event: Some(RtpTelephoneEvent {
+                        payload_type: 96,
+                        clock_rate: 8000,
+                        events: Some("0-16".into()),
+                    }),
+                    sip_info: true,
+                    preferred: DtmfSource::RtpEvent,
+                },
+            },
+            operator_local,
+            internal_local,
+            pending_relay: Some(pending),
+            active_relay: None,
+            next_cseq: 1,
+        };
+        let internal_sdp = format!(
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n",
+            internal_remote.local_addr().unwrap().port()
+        );
+        let answer = prepare_incoming_media(&mut call, internal_sdp.as_bytes()).unwrap();
+        assert!(answer.contains(&format!("m=audio {} RTP/AVP 0 96", operator_local.port())));
+        assert!(call.active_relay.is_some());
+
+        let packet = crate::access::vowifi::voice::RtpPacket {
+            payload_type: 101,
+            marker: true,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 9,
+            payload: vec![5, 0, 0, 160],
+        }
+        .encode();
+        internal_remote
+            .send_to(&packet, internal_local)
+            .await
+            .unwrap();
+        let mut received = [0u8; 256];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            operator_remote.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(received[1] & 0x7f, 96);
         assert_eq!(&received[2..len], &packet[2..]);
     }
 }

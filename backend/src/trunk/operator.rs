@@ -1,8 +1,11 @@
 //! Per-line non-blocking seam between the Asterisk trunk task and VoLTE live IO.
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    net::IpAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
 };
 
 use tokio::sync::broadcast;
@@ -16,6 +19,7 @@ pub struct OperatorLink {
 
 struct OperatorLinkInner {
     ready: AtomicBool,
+    trunk_local_ip: RwLock<Option<IpAddr>>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
 }
@@ -27,6 +31,7 @@ impl Default for OperatorLink {
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
+                trunk_local_ip: RwLock::new(None),
                 commands,
                 events,
             }),
@@ -41,6 +46,23 @@ impl OperatorLink {
 
     pub fn is_available(&self) -> bool {
         self.inner.ready.load(Ordering::SeqCst) && self.inner.commands.receiver_count() > 0
+    }
+
+    /// Publish the address selected by the connected Asterisk UDP socket. The
+    /// IMS task uses it to bind the internal side of an MT-call RTP relay
+    /// before it asks the trunk task to originate the INVITE toward Asterisk.
+    pub fn set_trunk_local_ip(&self, address: Option<IpAddr>) {
+        if let Ok(mut current) = self.inner.trunk_local_ip.write() {
+            *current = address;
+        }
+    }
+
+    pub fn trunk_local_ip(&self) -> Option<IpAddr> {
+        self.inner
+            .trunk_local_ip
+            .read()
+            .ok()
+            .and_then(|address| *address)
     }
 
     pub fn subscribe_commands(&self) -> broadcast::Receiver<OperatorCommand> {
@@ -77,6 +99,17 @@ mod tests {
         assert!(link.is_available());
         link.set_ready(false);
         assert!(!link.is_available());
+    }
+
+    #[test]
+    fn shares_selected_trunk_media_address_with_ims_task() {
+        let link = OperatorLink::default();
+        let address = "192.0.2.10".parse().unwrap();
+        assert_eq!(link.trunk_local_ip(), None);
+        link.set_trunk_local_ip(Some(address));
+        assert_eq!(link.trunk_local_ip(), Some(address));
+        link.set_trunk_local_ip(None);
+        assert_eq!(link.trunk_local_ip(), None);
     }
 
     #[tokio::test]

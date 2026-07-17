@@ -132,14 +132,17 @@ async fn run_session(
             profile.extension, profile.asterisk_host, profile.asterisk_port
         ));
     }
-    match profile.registration_mode {
+    operator.set_trunk_local_ip((!profile.extension.trim().is_empty()).then_some(local_addr.ip()));
+    let result = match profile.registration_mode {
         TrunkRegistrationMode::StaticPeer => {
             run_static_peer(transport, state, shutdown, &mut bridge, operator).await
         }
         TrunkRegistrationMode::OutboundRegister => {
             run_outbound_register(transport, profile, state, shutdown, &mut bridge, operator).await
         }
-    }
+    };
+    operator.set_trunk_local_ip(None);
+    result
 }
 
 async fn connect_any(
@@ -823,6 +826,71 @@ mod tests {
         runtime
             .activate_profile(&TrunkProfileConfig::default())
             .await;
+    }
+
+    #[tokio::test]
+    async fn operator_incoming_event_dials_extension_and_returns_answer_command() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let operator = OperatorLink::default();
+        let mut commands = operator.subscribe_commands();
+        operator.set_ready(true);
+        let runtime = TrunkRuntime::with_operator(operator.clone());
+        runtime
+            .activate_profile(&TrunkProfileConfig {
+                enabled: true,
+                registration_mode: TrunkRegistrationMode::StaticPeer,
+                asterisk_host: server_addr.ip().to_string(),
+                asterisk_port: server_addr.port(),
+                local_port: free_udp_port().await,
+                username: "41000".into(),
+                extension: "6108".into(),
+                ..TrunkProfileConfig::default()
+            })
+            .await;
+        let mut frame = [0u8; 8192];
+        let (_, peer) = server.recv_from(&mut frame).await.unwrap();
+        assert_eq!(operator.trunk_local_ip(), Some(Ipv4Addr::LOCALHOST.into()));
+        let sdp = b"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n";
+        operator.send_event(OperatorEvent::Incoming {
+            call_id: "ims-mt-1".into(),
+            caller: "sip:+8613800138000@ims.example".into(),
+            body: sdp.to_vec(),
+        });
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        let invite = frame[..read].to_vec();
+        assert!(invite.starts_with(b"INVITE sip:6108@127.0.0.1:"));
+        assert_eq!(sip_frame::body(&invite), sdp);
+        let via = sip_frame::header_value(&invite, "Via").unwrap();
+        let from = sip_frame::header_value(&invite, "From").unwrap();
+        let to = sip_frame::header_value(&invite, "To").unwrap();
+        let call_id = sip_frame::header_value(&invite, "Call-ID").unwrap();
+        let ringing = format!(
+            "SIP/2.0 180 Ringing\r\nVia: {via}\r\nFrom: {from}\r\nTo: {to};tag=pbx-mt\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n"
+        );
+        server.send_to(ringing.as_bytes(), peer).await.unwrap();
+        assert!(matches!(
+            commands.recv().await.unwrap(),
+            OperatorCommand::ReportProvisional { call_id, status: 180, body: None }
+                if call_id == "ims-mt-1"
+        ));
+        let answered = format!(
+            "SIP/2.0 200 OK\r\nVia: {via}\r\nFrom: {from}\r\nTo: {to};tag=pbx-mt\r\nCall-ID: {call_id}\r\nCSeq: 1 INVITE\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            sdp.len(),
+            String::from_utf8_lossy(sdp),
+        );
+        server.send_to(answered.as_bytes(), peer).await.unwrap();
+        let (read, _) = server.recv_from(&mut frame).await.unwrap();
+        assert!(frame[..read].starts_with(b"ACK sip:6108@127.0.0.1:"));
+        assert!(matches!(
+            commands.recv().await.unwrap(),
+            OperatorCommand::AcceptCall { call_id, body }
+                if call_id == "ims-mt-1" && body == sdp
+        ));
+        runtime
+            .activate_profile(&TrunkProfileConfig::default())
+            .await;
+        assert_eq!(operator.trunk_local_ip(), None);
     }
 
     #[test]
