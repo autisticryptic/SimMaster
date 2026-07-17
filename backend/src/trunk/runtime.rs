@@ -11,7 +11,10 @@ use tokio::{
     task::JoinHandle,
 };
 
-use crate::infra::config::{TrunkProfileConfig, TrunkRegistrationMode};
+use crate::{
+    infra::config::{TrunkProfileConfig, TrunkRegistrationMode},
+    trunk::operator::OperatorLink,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrunkPhase {
@@ -159,13 +162,27 @@ impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TrunkRuntime {
     snapshot: Arc<RwLock<TrunkSnapshot>>,
     active_profile: Arc<RwLock<Option<TrunkProfileConfig>>>,
     operation_lock: Arc<Mutex<()>>,
     driver_task: Arc<Mutex<Option<TrunkDriverTask>>>,
     generation: Arc<AtomicU64>,
+    operator: OperatorLink,
+}
+
+impl Default for TrunkRuntime {
+    fn default() -> Self {
+        Self {
+            snapshot: Arc::new(RwLock::new(TrunkSnapshot::default())),
+            active_profile: Arc::new(RwLock::new(None)),
+            operation_lock: Arc::new(Mutex::new(())),
+            driver_task: Arc::new(Mutex::new(None)),
+            generation: Arc::new(AtomicU64::new(0)),
+            operator: OperatorLink::default(),
+        }
+    }
 }
 
 struct TrunkDriverTask {
@@ -176,6 +193,13 @@ struct TrunkDriverTask {
 impl TrunkRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_operator(operator: OperatorLink) -> Self {
+        Self {
+            operator,
+            ..Self::default()
+        }
     }
 
     pub async fn snapshot(&self) -> TrunkSnapshot {
@@ -261,9 +285,10 @@ impl TrunkRuntime {
             let generation = self.generation();
             let state = self.state_writer(generation);
             let profile = profile.clone();
+            let operator = self.operator.clone();
             let (shutdown, shutdown_rx) = watch::channel(false);
             let task = tokio::spawn(async move {
-                crate::trunk::driver::run(profile, state, shutdown_rx).await;
+                crate::trunk::driver::run(profile, state, shutdown_rx, operator).await;
             });
             *self.driver_task.lock().await = Some(TrunkDriverTask { shutdown, task });
         }

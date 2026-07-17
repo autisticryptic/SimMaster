@@ -24,6 +24,7 @@ use crate::{
     infra::config::VolteConfig,
     infra::db::{Database, SmsMessage},
     notify::notification::NotificationSender,
+    trunk::operator::OperatorLink,
 };
 
 use super::{
@@ -89,6 +90,7 @@ impl VolteDeviceBinding {
 pub struct VolteLiveHandle {
     session: Arc<Mutex<Option<VolteLiveSession>>>,
     listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    operator: OperatorLink,
 }
 
 impl Default for VolteLiveHandle {
@@ -102,11 +104,16 @@ impl VolteLiveHandle {
         Self {
             session: Arc::new(Mutex::new(None)),
             listener: Arc::new(Mutex::new(None)),
+            operator: OperatorLink::default(),
         }
     }
 
     pub fn legacy_shared() -> Self {
         default_live_handle().clone()
+    }
+
+    pub fn operator_link(&self) -> OperatorLink {
+        self.operator.clone()
     }
 }
 
@@ -393,6 +400,7 @@ pub async fn connect_live_for_line(
             let pcscf = session.pcscf.to_string();
             let data_path_mode = format!("dedicated_ims_bearer_{}", session.ip_family);
             *live.session.lock().await = Some(session);
+            live.operator.set_ready(config.voice_enabled);
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Registered;
@@ -705,6 +713,7 @@ async fn live_receive_loop(
 }
 
 async fn cleanup_live_session(live: &VolteLiveHandle) {
+    live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
         if let Some(plan) = session.xfrm_plan.as_ref() {

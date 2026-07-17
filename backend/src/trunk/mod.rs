@@ -8,6 +8,7 @@ pub mod bridge;
 pub mod dialog;
 pub mod digest;
 pub mod driver;
+pub mod operator;
 pub mod runtime;
 pub mod sip;
 pub mod transport;

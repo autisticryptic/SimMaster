@@ -34,12 +34,13 @@ pub struct LineRuntime {
 
 impl LineRuntime {
     fn new(binding: ModemBinding, volte: Arc<VolteRuntime>, volte_live: VolteLiveHandle) -> Self {
+        let operator = volte_live.operator_link();
         Self {
             binding: RwLock::new(binding),
             volte,
             volte_live,
             volte_connect_lock: Mutex::new(()),
-            trunk: Arc::new(TrunkRuntime::new()),
+            trunk: Arc::new(TrunkRuntime::with_operator(operator)),
         }
     }
 

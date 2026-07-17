@@ -16,8 +16,9 @@ use crate::{
     ims::sip_frame,
     infra::config::{TrunkProfileConfig, TrunkRegistrationMode},
     trunk::{
-        bridge::{BridgeError, OperatorAvailability, TrunkBridge},
+        bridge::{BridgeError, OperatorAvailability, OperatorEvent, TrunkBridge},
         digest,
+        operator::OperatorLink,
         runtime::{TrunkPhase, TrunkStage, TrunkStateWriter},
         sip,
         transport::{self, TrunkUdpTransport},
@@ -33,6 +34,7 @@ pub(crate) async fn run(
     profile: TrunkProfileConfig,
     state: TrunkStateWriter,
     mut shutdown: watch::Receiver<bool>,
+    operator: OperatorLink,
 ) {
     let started_at = timestamp_now();
     state
@@ -50,7 +52,7 @@ pub(crate) async fn run(
         if !state.is_current() || *shutdown.borrow() {
             return;
         }
-        match run_session(&profile, &state, &mut shutdown).await {
+        match run_session(&profile, &state, &mut shutdown, &operator).await {
             Ok(()) => return,
             Err(error) if state.is_current() => {
                 failure_count = failure_count.saturating_add(1);
@@ -98,6 +100,7 @@ async fn run_session(
     profile: &TrunkProfileConfig,
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
+    operator: &OperatorLink,
 ) -> Result<(), String> {
     validate_profile(profile)?;
     state
@@ -131,10 +134,10 @@ async fn run_session(
     }
     match profile.registration_mode {
         TrunkRegistrationMode::StaticPeer => {
-            run_static_peer(transport, state, shutdown, &mut bridge).await
+            run_static_peer(transport, state, shutdown, &mut bridge, operator).await
         }
         TrunkRegistrationMode::OutboundRegister => {
-            run_outbound_register(transport, profile, state, shutdown, &mut bridge).await
+            run_outbound_register(transport, profile, state, shutdown, &mut bridge, operator).await
         }
     }
 }
@@ -158,6 +161,7 @@ async fn run_static_peer(
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
     bridge: &mut TrunkBridge,
+    operator: &OperatorLink,
 ) -> Result<(), String> {
     // A harmless RFC 5626-style CRLF keepalive exposes the selected source port
     // to the configured peer and NAT without pretending to REGISTER.
@@ -172,6 +176,7 @@ async fn run_static_peer(
         })
         .await;
     let mut next_keepalive = tokio::time::Instant::now() + STATIC_KEEPALIVE;
+    let mut operator_events = operator.subscribe_events();
     loop {
         if !state.is_current() || *shutdown.borrow() {
             return Ok(());
@@ -183,9 +188,14 @@ async fn run_static_peer(
         }
         tokio::select! {
             received = transport.recv(RECEIVE_POLL) => match received {
-                Ok(frame) => handle_inbound(&transport, &frame, bridge).await?,
+                Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator)).await?,
                 Err(error) if error == "trunk_udp_receive_timeout" => {}
                 Err(error) => return Err(error),
+            },
+            event = operator_events.recv() => {
+                if let Ok(event) = event {
+                    handle_operator_event(&transport, bridge, event).await?;
+                }
             },
             changed = shutdown.changed() => {
                 if changed.is_ok() && *shutdown.borrow() {
@@ -202,8 +212,10 @@ async fn run_outbound_register(
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
     bridge: &mut TrunkBridge,
+    operator: &OperatorLink,
 ) -> Result<(), String> {
     let mut dialog = sip::RegisterDialog::fresh();
+    let mut operator_events = operator.subscribe_events();
     loop {
         let expiry = register_transaction(&transport, profile, state, &mut dialog, bridge).await?;
         let refresh_after = Duration::from_secs((u64::from(expiry) * 85 / 100).max(30));
@@ -234,9 +246,14 @@ async fn run_outbound_register(
             }
             tokio::select! {
                 received = transport.recv(RECEIVE_POLL) => match received {
-                    Ok(frame) => handle_inbound(&transport, &frame, bridge).await?,
+                    Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator)).await?,
                     Err(error) if error == "trunk_udp_receive_timeout" => {}
                     Err(error) => return Err(error),
+                },
+                event = operator_events.recv() => {
+                    if let Ok(event) = event {
+                        handle_operator_event(&transport, bridge, event).await?;
+                    }
                 },
                 changed = shutdown.changed() => {
                     if changed.is_ok() && *shutdown.borrow() {
@@ -413,7 +430,7 @@ async fn send_register_and_receive(
         let wait = (deadline - now).min(retransmit_after);
         match transport.recv(wait).await {
             Ok(frame) if sip::is_request(&frame) => {
-                handle_inbound(transport, &frame, bridge).await?
+                handle_inbound(transport, &frame, bridge, None).await?
             }
             Ok(frame) => {
                 let cseq = sip_frame::header_value(&frame, "CSeq").unwrap_or_default();
@@ -443,6 +460,7 @@ async fn handle_inbound(
     transport: &TrunkUdpTransport,
     frame: &[u8],
     bridge: &mut TrunkBridge,
+    operator: Option<&OperatorLink>,
 ) -> Result<(), String> {
     if frame == b"\r\n" || frame == b"\r\n\r\n" {
         return Ok(());
@@ -452,6 +470,12 @@ async fn handle_inbound(
         transport.send(&response).await?;
         return Ok(());
     }
+    let operator_available = operator.is_some_and(OperatorLink::is_available);
+    bridge.set_operator(if operator_available {
+        OperatorAvailability::EventDriven
+    } else {
+        OperatorAvailability::Unavailable
+    });
     let output = match bridge.handle_asterisk(frame) {
         Ok(output) => output,
         Err(error) if sip::is_request(frame) => {
@@ -473,6 +497,49 @@ async fn handle_inbound(
     };
     for response in output.asterisk_frames {
         transport.send(&response).await?;
+    }
+    if !operator_available {
+        return Ok(());
+    }
+    for command in output.operator_commands {
+        let result = operator
+            .expect("available operator link")
+            .send_command(command);
+        if let Err(command) = result {
+            let call_id = match *command {
+                crate::trunk::bridge::OperatorCommand::StartCall { call_id, .. } => Some(call_id),
+                _ => None,
+            };
+            if let Some(call_id) = call_id {
+                let unavailable = bridge
+                    .handle_operator_event(crate::trunk::bridge::OperatorEvent::Unavailable {
+                        call_id,
+                    })
+                    .map_err(|error| error.to_string())?;
+                for response in unavailable.asterisk_frames {
+                    transport.send(&response).await?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn handle_operator_event(
+    transport: &TrunkUdpTransport,
+    bridge: &mut TrunkBridge,
+    event: OperatorEvent,
+) -> Result<(), String> {
+    let output = match bridge.handle_operator_event(event) {
+        Ok(output) => output,
+        Err(BridgeError::InvalidState(error)) => {
+            debug!(error, "Ignoring stale operator event");
+            return Ok(());
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    for frame in output.asterisk_frames {
+        transport.send(&frame).await?;
     }
     Ok(())
 }

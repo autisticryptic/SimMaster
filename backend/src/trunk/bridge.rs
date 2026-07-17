@@ -196,6 +196,10 @@ impl TrunkBridge {
         self
     }
 
+    pub fn set_operator(&mut self, operator: OperatorAvailability) {
+        self.operator = operator;
+    }
+
     pub fn with_asterisk_target(mut self, target: impl Into<String>) -> Self {
         self.asterisk_target = Some(target.into());
         self
