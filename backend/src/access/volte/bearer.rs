@@ -111,7 +111,9 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 }
 
 /// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
-/// non-IMS bearers are never changed or deleted.
+/// non-IMS bearers are never changed or deleted. If the network explicitly
+/// rejects dual-stack with `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed`, only the failed
+/// IMS bearer is recreated with the required address family.
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
@@ -124,12 +126,54 @@ pub async fn ensure_ims_bearer(
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-            return connect_and_read(&path).await;
+            if let Some(ip_type) = required_ip_type_after_failure(&details) {
+                delete_bearer(modem, &path).await?;
+                return create_and_connect(modem, request, ip_type).await;
+            }
+            return match connect_and_read(&path).await {
+                Ok(bearer) => Ok(bearer),
+                Err(error) => {
+                    let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
+                    let Some(ip_type) = required_ip_type_after_failure(&after) else {
+                        return Err(error);
+                    };
+                    delete_bearer(modem, &path).await?;
+                    create_and_connect(modem, request, ip_type).await
+                }
+            };
         }
     }
 
+    match create_and_connect(modem, request, "ipv4v6").await {
+        Ok(bearer) => Ok(bearer),
+        Err(error) => {
+            let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
+            let mut fallback = None;
+            for path in parse_bearer_paths(&modem_output) {
+                let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
+                if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
+                    if let Some(ip_type) = required_ip_type_after_failure(&details) {
+                        fallback = Some((path, ip_type));
+                        break;
+                    }
+                }
+            }
+            let Some((path, ip_type)) = fallback else {
+                return Err(error);
+            };
+            delete_bearer(modem, &path).await?;
+            create_and_connect(modem, request, ip_type).await
+        }
+    }
+}
+
+async fn create_and_connect(
+    modem: &str,
+    request: &BearerRequest,
+    ip_type: &str,
+) -> Result<BearerConnection, VolteError> {
     let properties = format!(
-        "apn={},ip-type=ipv4v6,allow-roaming={}",
+        "apn={},ip-type={ip_type},allow-roaming={}",
         request.apn,
         if request.allow_roaming { "yes" } else { "no" }
     );
@@ -141,6 +185,23 @@ pub async fn ensure_ims_bearer(
     let path = parse_created_bearer_path(&created)
         .ok_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING))?;
     connect_and_read(&path).await
+}
+
+async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
+    run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
+        .await
+        .map(|_| ())
+}
+
+fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
+    let error = value(details, "bearer.status.connection-error.name")?;
+    if error.ends_with(".Ipv6OnlyAllowed") {
+        Some("ipv6")
+    } else if error.ends_with(".Ipv4OnlyAllowed") {
+        Some("ipv4")
+    } else {
+        None
+    }
 }
 
 /// Disconnect an IMS bearer left active by a previous process before the
@@ -410,6 +471,16 @@ mod tests {
     fn default_request_uses_ims_apn() {
         assert_eq!(BearerRequest::default().apn, "ims");
         assert!(!BearerRequest::default().allow_roaming);
+    }
+
+    #[test]
+    fn network_family_rejection_selects_required_bearer_type() {
+        let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
+        assert_eq!(required_ip_type_after_failure(ipv6), Some("ipv6"));
+        let ipv4 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed\n";
+        assert_eq!(required_ip_type_after_failure(ipv4), Some("ipv4"));
+        let generic = "bearer.status.connection-error.name : org.example.Failed\n";
+        assert_eq!(required_ip_type_after_failure(generic), None);
     }
 
     #[test]
