@@ -494,7 +494,7 @@ async fn connect_inner(
         .await;
     disconnect_existing_ims_bearers(&device.modem_id).await?;
     let at_discovery =
-        discover_pcscf_via_at_with_context(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await;
+        discover_pcscf_via_at_with_context(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await?;
     let at_pcscf = at_discovery.candidates;
     let mut at_context = at_discovery.context;
     if let Err(error) = ensure_generation(runtime, generation) {
@@ -520,8 +520,22 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let mut bearer = match ensure_ims_bearer(&device.modem_id, &BearerRequest::default()).await {
+    let request = BearerRequest::default();
+    let mut bearer = match ensure_ims_bearer(&device.modem_id, &request).await {
         Ok(bearer) => bearer,
+        Err(error)
+            if at_context.is_some() && should_retry_bearer_after_at_context_cleanup(&error) =>
+        {
+            tracing::warn!(
+                error = %error,
+                "VoLTE IMS bearer prefix unavailable with retained AT context; retrying after legacy context cleanup"
+            );
+            if let Some(context) = at_context.take() {
+                context.cleanup().await;
+            }
+            device = resolve_device_binding(&device).await?;
+            ensure_ims_bearer(&device.modem_id, &request).await?
+        }
         Err(error) => {
             if let Some(context) = at_context.take() {
                 context.cleanup().await;
@@ -2393,6 +2407,13 @@ fn should_try_next_family(error: &VolteError) -> bool {
     )
 }
 
+fn should_retry_bearer_after_at_context_cleanup(error: &VolteError) -> bool {
+    error.code() == code::RUNTIME_MM_BEARER_CONNECT_FAILED
+        && error
+            .detail()
+            .is_some_and(|detail| detail.contains("prefix-unavailable"))
+}
+
 fn ip_family_name(address: IpAddr) -> &'static str {
     if address.is_ipv6() {
         "ipv6"
@@ -2454,6 +2475,24 @@ mod tests {
         assert!(modem_is_ready("modem.generic.state : connected\n"));
         assert!(!modem_is_ready("modem.generic.state : enabling\n"));
         assert!(!modem_is_ready("modem.generic.state : disabled\n"));
+    }
+
+    #[test]
+    fn retained_at_context_fallback_is_limited_to_ipv6_prefix_failure() {
+        let prefix = VolteError::with_detail(
+            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+            "volte_command_failed:mmcli:prefix-unavailable",
+        );
+        assert!(should_retry_bearer_after_at_context_cleanup(&prefix));
+
+        let generic = VolteError::with_detail(
+            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+            "volte_command_failed:mmcli:operation-failed",
+        );
+        assert!(!should_retry_bearer_after_at_context_cleanup(&generic));
+        assert!(!should_retry_bearer_after_at_context_cleanup(
+            &VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
+        ));
     }
 
     #[test]

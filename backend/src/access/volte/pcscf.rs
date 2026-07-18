@@ -31,6 +31,7 @@ const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
 const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
 const DEFAULT_IMS_CID: u8 = 2;
 const AT_CONTEXT_SETTLE: Duration = Duration::from_secs(3);
+const AT_DISCOVERY_ROUNDS: usize = 3;
 
 /// An IMS PDP context kept alive while the dedicated bearer is negotiated.
 ///
@@ -164,11 +165,15 @@ pub async fn discover_pcscf_via_at(
     modem: &str,
     preference: VolteIpFamilyPreference,
 ) -> Vec<IpAddr> {
-    let discovery = discover_pcscf_via_at_with_context(modem, preference).await;
-    if let Some(context) = discovery.context {
-        context.cleanup().await;
+    match discover_pcscf_via_at_with_context(modem, preference).await {
+        Ok(discovery) => {
+            if let Some(context) = discovery.context {
+                context.cleanup().await;
+            }
+            discovery.candidates
+        }
+        Err(_) => Vec::new(),
     }
-    discovery.candidates
 }
 
 /// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
@@ -180,30 +185,36 @@ pub async fn discover_pcscf_via_at(
 pub async fn discover_pcscf_via_at_with_context(
     modem: &str,
     preference: VolteIpFamilyPreference,
-) -> AtPcscfDiscovery {
+) -> Result<AtPcscfDiscovery, VolteError> {
     let cid = std::env::var(ENV_IMS_CID)
         .ok()
         .and_then(|value| value.trim().parse::<u8>().ok())
         .filter(|value| (1..=16).contains(value))
         .unwrap_or(DEFAULT_IMS_CID);
 
-    for pdp_type in ordered_pdp_types(preference) {
-        if let Ok((candidates, context)) = probe_pcscf_context(modem, cid, pdp_type).await {
-            if !candidates.is_empty() {
-                return AtPcscfDiscovery {
-                    candidates,
-                    context: Some(context),
-                    cid,
-                };
+    let mut last_error = None;
+    for _ in 0..AT_DISCOVERY_ROUNDS {
+        for pdp_type in ordered_pdp_types(preference) {
+            match probe_pcscf_context(modem, cid, pdp_type).await {
+                Ok((candidates, context)) if !candidates.is_empty() => {
+                    return Ok(AtPcscfDiscovery {
+                        candidates,
+                        context: Some(context),
+                        cid,
+                    });
+                }
+                Ok((_, context)) => {
+                    context.cleanup().await;
+                    last_error = Some(VolteError::with_detail(
+                        code::RUNTIME_ALL_PCSCF_FAILED,
+                        format!("AT+CGCONTRDP={cid}:{pdp_type}:no-pcscf"),
+                    ));
+                }
+                Err(error) => last_error = Some(error),
             }
-            context.cleanup().await;
         }
     }
-    AtPcscfDiscovery {
-        candidates: Vec::new(),
-        context: None,
-        cid,
-    }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
 }
 
 async fn probe_pcscf_context(
