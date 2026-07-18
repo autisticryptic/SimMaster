@@ -759,6 +759,14 @@ fn stable_line_id(hardware_key: &str, sim_key: &str) -> String {
     format!("line-{digest:x}")
 }
 
+fn line_hardware_key(hardware_key: &str, uim_slot: u8) -> String {
+    if uim_slot <= 1 {
+        hardware_key.to_string()
+    } else {
+        format!("{hardware_key}#uim{uim_slot}")
+    }
+}
+
 fn sim_identity_keys(identity: &SimIdentity) -> Vec<String> {
     let mut keys = Vec::new();
     if !identity.iccid.is_empty() {
@@ -1136,6 +1144,12 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
                 .unwrap_or_default(),
         )
         .to_string();
+        let uim_slot = modem_props
+            .get("PrimarySimSlot")
+            .map(extract_u32)
+            .filter(|slot| (1..=u8::MAX as u32).contains(slot))
+            .map(|slot| slot as u8)
+            .unwrap_or(1);
 
         let sim_path = get_sim_path(conn, &modem_path)
             .await
@@ -1168,9 +1182,12 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
         } else {
             sim_iccid.as_str()
         };
+        // Preserve the historical slot-1 line ID while distinguishing the
+        // same SIM when it is moved to another physical UIM slot.
+        let line_hardware_key = line_hardware_key(&hardware_key, uim_slot);
 
         bindings.push(ModemBinding {
-            line_id: stable_line_id(&hardware_key, sim_key),
+            line_id: stable_line_id(&line_hardware_key, sim_key),
             display_order: 0,
             slot_label: String::new(),
             modem_id,
@@ -1179,7 +1196,7 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             model,
             primary_port,
             qmi_device: qmi_control_device(conn, &modem_path).await,
-            uim_slot: 1,
+            uim_slot,
             sim_path,
             sim_iccid,
             operator_id,
@@ -2675,6 +2692,16 @@ mod tests {
         assert_ne!(
             stable_line_id("imei:123", "iccid:456"),
             stable_line_id("imei:123", "iccid:789")
+        );
+    }
+
+    #[test]
+    fn non_primary_uim_slot_gets_distinct_line_identity() {
+        let hardware_key = "imei:123";
+        assert_eq!(line_hardware_key(hardware_key, 1), hardware_key);
+        assert_ne!(
+            stable_line_id(&line_hardware_key(hardware_key, 1), "iccid:456"),
+            stable_line_id(&line_hardware_key(hardware_key, 2), "iccid:456")
         );
     }
 
