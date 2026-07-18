@@ -194,9 +194,15 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("mmcli:{}", output.status.code().unwrap_or(-1)),
+            format!(
+                "mmcli:{}:-m {modem} {argument}:{stderr}",
+                output.status.code().unwrap_or(-1)
+            ),
         ))
     }
 }

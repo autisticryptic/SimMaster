@@ -475,10 +475,11 @@ async fn connect_inner(
     generation: u64,
     device: &VolteDeviceBinding,
 ) -> Result<VolteLiveSession, VolteError> {
+    let device = resolve_device_binding(device).await?;
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity = load_device_identity(device).await?;
+    let device_identity = load_device_identity(&device).await?;
     ensure_generation(runtime, generation)?;
 
     runtime
@@ -507,7 +508,7 @@ async fn connect_inner(
         let mut last_error = None;
         for (index, local_addr) in local_addrs.iter().copied().enumerate() {
             ensure_generation(runtime, generation)?;
-            match connect_family(runtime, &bearer, &device_identity, local_addr, device).await {
+            match connect_family(runtime, &bearer, &device_identity, local_addr, &device).await {
                 Ok(session) => return Ok(session),
                 Err(error) if index + 1 < local_addrs.len() && should_try_next_family(&error) => {
                     last_error = Some(error);
@@ -2187,6 +2188,39 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
     })
 }
 
+async fn resolve_device_binding(
+    requested: &VolteDeviceBinding,
+) -> Result<VolteDeviceBinding, VolteError> {
+    if command_output(
+        "mmcli",
+        &["-m", requested.modem_id.as_str(), "--output-keyvalue"],
+    )
+    .await
+    .is_ok()
+    {
+        return Ok(requested.clone());
+    }
+
+    let modem_list = command_output("mmcli", &["-L", "--output-keyvalue"]).await?;
+    let current_modem_id = primary_modem_id(&modem_list)
+        .ok_or_else(|| VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))?;
+    tracing::warn!(
+        requested_modem = %requested.modem_id,
+        current_modem = %current_modem_id,
+        "VoLTE modem object changed; using current ModemManager modem"
+    );
+    let mut resolved = requested.clone();
+    resolved.modem_id = current_modem_id;
+    Ok(resolved)
+}
+
+fn primary_modem_id(output: &str) -> Option<String> {
+    let path = key_value(output, "modem-list.value[1]")?;
+    let modem_id = path.rsplit('/').next()?.trim();
+    (!modem_id.is_empty() && modem_id.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| modem_id.to_string())
+}
+
 async fn command_output(program: &str, args: &[&str]) -> Result<String, VolteError> {
     let output = Command::new(program)
         .args(args)
@@ -2198,9 +2232,17 @@ async fn command_output(program: &str, args: &[&str]) -> Result<String, VolteErr
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("{program}:{}", output.status.code().unwrap_or(-1)),
+            format!(
+                "{program}:{}:{}:{}",
+                output.status.code().unwrap_or(-1),
+                args.join(" "),
+                stderr
+            ),
         ))
     }
 }
@@ -2320,6 +2362,14 @@ mod tests {
             Some("46011")
         );
         assert!(!format!("{modem:?}").contains("460111234567890"));
+    }
+
+    #[test]
+    fn parses_current_modem_id_after_modem_manager_reenumeration() {
+        let list =
+            "modem-list.length : 1\nmodem-list.value[1] : /org/freedesktop/ModemManager1/Modem/7\n";
+        assert_eq!(primary_modem_id(list).as_deref(), Some("7"));
+        assert_eq!(primary_modem_id("modem-list.length : 0"), None);
     }
 
     #[test]

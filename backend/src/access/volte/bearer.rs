@@ -399,16 +399,24 @@ async fn run_command(program: &str, args: &[&str]) -> Result<String, VolteError>
         .map_err(|error| {
             VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
         })?;
-    command_output(program, output)
+    command_output(program, args, output)
 }
 
-fn command_output(program: &str, output: Output) -> Result<String, VolteError> {
+fn command_output(program: &str, args: &[&str], output: Output) -> Result<String, VolteError> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .replace('\n', " ");
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("{program}:{}", output.status.code().unwrap_or(-1)),
+            format!(
+                "{program}:{}:{}:{}",
+                output.status.code().unwrap_or(-1),
+                args.join(" "),
+                stderr
+            ),
         ))
     }
 }

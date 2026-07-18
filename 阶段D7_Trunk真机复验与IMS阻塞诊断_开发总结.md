@@ -60,3 +60,20 @@
 2. IMS 注册成功后，从 Asterisk 分机发起外呼，依次验证 provisional、首 RTP 或 GSM 接通触发 200、双向 RTP、DTMF、CANCEL/BYE。
 3. 再执行运营商呼入到绑定分机 6108，验证 `secondary_dial`、`bound_pending`、`bound_immediate` 三种呼入模式。
 4. 音频稳定后继续 operator-originated re-INVITE 与 ViLTE 视频 relay。
+
+## 八、2026-07-18 参考成品对照与结论修正
+
+1. 在隔离 `/data`、仅监听 `127.0.0.1:3102` 的条件下运行参考成品 `1.1.6-dev18 / 05ea96a`。参考成品成功激活 IMS 上下文并发现 2 个 P-CSCF；对 `wwan1/a2-mux-rmnet1` 和共享 `wwan0/a2-mux-rmnet0` 的 SIP 能力探测虽均超时，但随后重新建立 ModemManager IPv6 IMS bearer 成功。
+2. 最终 bearer 为 `/org/freedesktop/ModemManager1/Bearer/2`，APN `ims`、IP 类型 `ipv6`、接口 `wwan0`，获得公网 `/64` IPv6、网关和 DNS；参考成品安装 IPsec XFRM 后收到 REGISTER 200，运行态为 `registered=true`、`registration_mode=ipsec`。
+3. 因此第四节“当前阻塞仍是运营商 IPv6 prefix 分配”的结论不再成立。直接 `mmcli/qmicli` 纯 IPv6 请求曾返回 `prefix-unavailable`，但参考成品完整初始化流程在同一设备、同一网络下可以成功；后续应聚焦其前置 IMS 上下文、数据路径探测、ModemManager 重枚举等待和 bearer 创建时序。
+4. 参考成品停止后进行了 A/B bearer 复测。成品完成一次注册后，即使暂时把 CID 2 的 `$QCPDPIMSCFGE` 清零，新的纯 IPv6 bearer 仍可连接；说明成功不能只归因于单个 AT 标志，基带状态和完整初始化顺序共同参与。
+5. 当前源码候选启动时会重启 ModemManager，实测 modem 对象可从 `Modem/0` 重枚举为 `Modem/1`。旧全局 VoLTE 路径仍固定使用 modem `0`，导致 `volte_command_failed:mmcli:1`。源码已改为：先验证保存的 modem ID，失效时从 `mmcli -L --output-keyvalue` 的 `modem-list.value[1]` 解析当前 ID，并保留原 QMI 设备与 UIM slot。
+6. 同时增强 VoLTE 的 `mmcli/ip` 失败详情，记录退出码、无凭据命令参数和 stderr，便于下一次直接定位具体失败步骤；不记录 SIM、AKA、Trunk 或设备密码。
+7. 质量门：全量 Rust 测试 546/546 通过；新增 modem 重枚举解析测试通过；VoLTE 定向测试 121/121 通过；严格 Clippy 通过。
+8. 修复候选第二次真机运行仍出现一次泛化 `mmcli:1`，随后设备 SSH 与网络不可达，无法在本轮完成增强诊断版本部署和设备清理确认。该状态必须在设备恢复上线后优先审计；不得把本轮记录为当前源码已完成 IMS 注册。
+
+修正后的下一步：
+
+1. 设备恢复后先检查并停止遗留的 3103 隔离进程，删除 `/opt/simadmin/releases/cf2c639-live` 与临时 `/data`，恢复 modem online、空 bearer、`wwan0/wwan1` DOWN、XFRM 0/0、CID 2 和全部 `$QCPDPIMSCFGE` 基线。
+2. 部署包含 modem 重枚举和详细命令错误的最新提交，复验当前源码的 AT 探测、IPv6 bearer、P-CSCF、XFRM 与 REGISTER。
+3. 当前源码成功 `registered=true` 后，再继续原第 2–4 项 Trunk 呼叫、RTP、DTMF 与 ViLTE 验收。
