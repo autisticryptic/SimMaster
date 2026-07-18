@@ -1284,7 +1284,42 @@ mod tests {
     fn old_config_defaults_to_no_explicit_line_profiles() {
         let config: AppConfig = serde_json::from_str("{}").unwrap();
         assert!(config.line_profiles.is_empty());
+        assert!(config.modem_slots.is_empty());
         assert!(LineProfileConfig::for_line("line-test").enabled);
+    }
+
+    #[test]
+    fn modem_slot_reconciliation_keeps_order_across_sim_changes_and_uim_slots() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-modem-slots-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let first = manager
+            .reconcile_modem_slots(&[("imei-a".to_string(), 1), ("imei-b".to_string(), 1)])
+            .unwrap();
+        assert_eq!(first["imei-a#uim1"].order, 1);
+        assert_eq!(first["imei-b#uim1"].order, 2);
+
+        let second = manager
+            .reconcile_modem_slots(&[("imei-b".to_string(), 1), ("imei-a".to_string(), 1)])
+            .unwrap();
+        assert_eq!(second["imei-a#uim1"].order, 1);
+        assert_eq!(second["imei-b#uim1"].order, 2);
+
+        let third = manager
+            .reconcile_modem_slots(&[("imei-a".to_string(), 2)])
+            .unwrap();
+        assert_eq!(third["imei-a#uim2"].order, 3);
+        assert_eq!(third["imei-a#uim1"].order, 1);
+
+        let reloaded = ConfigManager::new(path.clone());
+        let persisted = reloaded
+            .reconcile_modem_slots(&[("imei-a".to_string(), 2)])
+            .unwrap();
+        assert_eq!(persisted["imei-a#uim2"].order, 3);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2353,6 +2388,26 @@ pub struct LineProfileConfig {
     pub trunk: TrunkProfileConfig,
 }
 
+/// Persisted identity for a physical modem slot.  ModemManager object paths
+/// and SIM-derived line IDs are intentionally excluded: both can change after
+/// a restart or SIM replacement, while the hardware key remains stable.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModemSlotConfig {
+    pub hardware_key: String,
+    /// Physical UIM slot within the modem. This keeps dual-SIM hardware from
+    /// collapsing two card slots into one display position.
+    #[serde(default = "default_uim_slot")]
+    pub uim_slot: u8,
+    #[serde(default)]
+    pub order: u32,
+    #[serde(default)]
+    pub label: String,
+}
+
+fn default_uim_slot() -> u8 {
+    1
+}
+
 fn default_line_enabled() -> bool {
     true
 }
@@ -2940,6 +2995,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub line_profiles: Vec<LineProfileConfig>,
     #[serde(default)]
+    pub modem_slots: Vec<ModemSlotConfig>,
+    #[serde(default)]
     pub vilte: VilteConfig,
     #[serde(default)]
     pub sms_path: SmsPathPolicy,
@@ -2966,6 +3023,7 @@ impl Default for AppConfig {
             vowifi: VowifiConfig::default(),
             volte: VolteConfig::default(),
             line_profiles: Vec::new(),
+            modem_slots: Vec::new(),
             vilte: VilteConfig::default(),
             sms_path: SmsPathPolicy::default(),
             voice_path: VoicePathPolicy::default(),
@@ -3232,6 +3290,112 @@ impl ConfigManager {
 
     pub fn get_line_profiles(&self) -> Vec<LineProfileConfig> {
         self.config.read().unwrap().line_profiles.clone()
+    }
+
+    /// Reconcile discovered physical hardware with persistent display slots.
+    /// Missing hardware is retained so a modem returns to its original slot
+    /// after service restart, USB re-enumeration, or a temporary disconnect.
+    pub fn reconcile_modem_slots(
+        &self,
+        hardware_slots: &[(String, u8)],
+    ) -> Result<HashMap<String, ModemSlotConfig>, String> {
+        let (slots, changed) = {
+            let mut config = self.config.write().unwrap();
+            let mut changed = false;
+
+            for slot in &mut config.modem_slots {
+                if slot.uim_slot == 0 {
+                    slot.uim_slot = 1;
+                    changed = true;
+                }
+            }
+            let original_slot_count = config.modem_slots.len();
+            let mut seen_hardware_keys = std::collections::HashSet::new();
+            config.modem_slots.retain(|slot| {
+                !slot.hardware_key.trim().is_empty()
+                    && seen_hardware_keys.insert((slot.hardware_key.clone(), slot.uim_slot))
+            });
+            changed |= config.modem_slots.len() != original_slot_count;
+            config.modem_slots.sort_by(|left, right| {
+                left.order
+                    .cmp(&right.order)
+                    .then_with(|| left.hardware_key.cmp(&right.hardware_key))
+            });
+
+            let mut next_order = config
+                .modem_slots
+                .iter()
+                .map(|slot| slot.order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            for (hardware_key, uim_slot) in hardware_slots {
+                let hardware_key = hardware_key.trim();
+                let uim_slot = (*uim_slot).max(1);
+                if hardware_key.is_empty()
+                    || config
+                        .modem_slots
+                        .iter()
+                        .any(|slot| slot.hardware_key == hardware_key && slot.uim_slot == uim_slot)
+                {
+                    continue;
+                }
+                config.modem_slots.push(ModemSlotConfig {
+                    hardware_key: hardware_key.to_string(),
+                    uim_slot,
+                    order: next_order,
+                    label: format!("基带 {next_order}"),
+                });
+                next_order = next_order.saturating_add(1);
+                changed = true;
+            }
+
+            let mut used_orders = std::collections::HashSet::new();
+            let mut repair_order = config
+                .modem_slots
+                .iter()
+                .map(|slot| slot.order)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+                .max(1);
+            for slot in &mut config.modem_slots {
+                if slot.order == 0 || !used_orders.insert(slot.order) {
+                    slot.order = repair_order;
+                    used_orders.insert(repair_order);
+                    repair_order = repair_order.saturating_add(1);
+                    changed = true;
+                }
+                let normalized_label = slot.label.trim().to_string();
+                if normalized_label != slot.label {
+                    slot.label = normalized_label;
+                    changed = true;
+                }
+                if slot.label.is_empty() {
+                    slot.label = format!("基带 {}", slot.order);
+                    changed = true;
+                }
+            }
+            config.modem_slots.sort_by(|left, right| {
+                left.order
+                    .cmp(&right.order)
+                    .then_with(|| left.hardware_key.cmp(&right.hardware_key))
+            });
+
+            let slots = config
+                .modem_slots
+                .iter()
+                .cloned()
+                .map(|slot| (format!("{}#uim{}", slot.hardware_key, slot.uim_slot), slot))
+                .collect::<HashMap<_, _>>();
+            (slots, changed)
+        };
+
+        if changed {
+            self.save()?;
+        }
+        Ok(slots)
     }
 
     pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {

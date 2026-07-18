@@ -434,6 +434,8 @@ export interface SmsMessage {
 
 export interface ModemBinding {
   line_id: string
+  display_order: number
+  slot_label: string
   modem_id: string
   modem_path: string
   manufacturer: string

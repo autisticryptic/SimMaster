@@ -104,6 +104,7 @@ pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
     seed_runtime: Arc<VolteRuntime>,
     seed_claimed: AtomicBool,
+    config_manager: Option<Arc<ConfigManager>>,
 }
 
 impl LineRuntimeRegistry {
@@ -112,6 +113,19 @@ impl LineRuntimeRegistry {
             lines: AsyncRwLock::new(BTreeMap::new()),
             seed_runtime,
             seed_claimed: AtomicBool::new(false),
+            config_manager: None,
+        }
+    }
+
+    pub fn with_config(
+        seed_runtime: Arc<VolteRuntime>,
+        config_manager: Arc<ConfigManager>,
+    ) -> Self {
+        Self {
+            lines: AsyncRwLock::new(BTreeMap::new()),
+            seed_runtime,
+            seed_claimed: AtomicBool::new(false),
+            config_manager: Some(config_manager),
         }
     }
 
@@ -119,7 +133,22 @@ impl LineRuntimeRegistry {
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
     pub async fn refresh(&self, conn: &Connection) -> zbus::Result<usize> {
-        let discovered = discover_modem_bindings(conn).await?;
+        let mut discovered = discover_modem_bindings(conn).await?;
+        if let Some(config_manager) = &self.config_manager {
+            let hardware_slots = discovered
+                .iter()
+                .map(|binding| (binding.hardware_key.clone(), binding.uim_slot))
+                .collect::<Vec<_>>();
+            if let Ok(slots) = config_manager.reconcile_modem_slots(&hardware_slots) {
+                for binding in &mut discovered {
+                    let slot_key = format!("{}#uim{}", binding.hardware_key, binding.uim_slot);
+                    if let Some(slot) = slots.get(&slot_key) {
+                        binding.display_order = slot.order;
+                        binding.slot_label = slot.label.clone();
+                    }
+                }
+            }
+        }
         let mut lines = self.lines.write().await;
         for line in lines.values() {
             line.mark_absent();
@@ -153,16 +182,29 @@ impl LineRuntimeRegistry {
     }
 
     pub async fn all(&self) -> Vec<Arc<LineRuntime>> {
-        self.lines.read().await.values().cloned().collect()
-    }
-
-    pub async fn primary(&self) -> Option<Arc<LineRuntime>> {
-        self.lines
+        let mut lines = self
+            .lines
             .read()
             .await
             .values()
-            .find(|line| line.binding().present)
             .cloned()
+            .collect::<Vec<_>>();
+        lines.sort_by(|left, right| {
+            let left = left.binding();
+            let right = right.binding();
+            left.display_order
+                .cmp(&right.display_order)
+                .then_with(|| right.present.cmp(&left.present))
+                .then_with(|| left.line_id.cmp(&right.line_id))
+        });
+        lines
+    }
+
+    pub async fn primary(&self) -> Option<Arc<LineRuntime>> {
+        self.all()
+            .await
+            .into_iter()
+            .find(|line| line.binding().present)
     }
 
     pub async fn for_modem_path(&self, modem_path: &str) -> Option<Arc<LineRuntime>> {
@@ -178,13 +220,7 @@ impl LineRuntimeRegistry {
     }
 
     pub async fn statuses(&self) -> Vec<LineRuntimeStatus> {
-        let lines = self
-            .lines
-            .read()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let lines = self.all().await;
         let mut statuses = Vec::with_capacity(lines.len());
         for line in lines {
             statuses.push(line.status().await);
@@ -216,6 +252,8 @@ mod tests {
     fn binding(line_id: &str, present: bool) -> ModemBinding {
         ModemBinding {
             line_id: line_id.to_string(),
+            display_order: 1,
+            slot_label: "基带 1".to_string(),
             modem_id: "0".to_string(),
             modem_path: "/org/freedesktop/ModemManager1/Modem/0".to_string(),
             manufacturer: "test".to_string(),

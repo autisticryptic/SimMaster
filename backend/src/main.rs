@@ -338,9 +338,10 @@ async fn main() -> Result<()> {
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
     let vowifi_runtime = Arc::new(access::vowifi::runtime::VowifiRuntime::new());
     let volte_runtime = Arc::new(access::volte::runtime::VolteRuntime::new());
-    let line_registry = Arc::new(access::line_registry::LineRuntimeRegistry::new(Arc::clone(
-        &volte_runtime,
-    )));
+    let line_registry = Arc::new(access::line_registry::LineRuntimeRegistry::with_config(
+        Arc::clone(&volte_runtime),
+        Arc::clone(&config_manager),
+    ));
     match line_registry.refresh(dbus_conn.as_ref()).await {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),
         Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),

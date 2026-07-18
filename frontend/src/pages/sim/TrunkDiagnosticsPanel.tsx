@@ -15,7 +15,7 @@ import {
 import Grid from '@mui/material/Grid'
 import { Refresh, SettingsEthernet } from '@mui/icons-material'
 import { api, type TrunkProfileResponse } from '../../api/current'
-import { shortLineId } from '../../components/modemLineFormat'
+import { modemSlotLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 
 function timestamp(value?: string) {
   return value ? new Date(value).toLocaleString() : '无'
@@ -54,7 +54,7 @@ export default function TrunkDiagnosticsPanel() {
     if (!background) setLoading(true)
     try {
       const response = await api.getTrunkLines()
-      setLines(response.data ?? [])
+      setLines(stableModemSort(response.data ?? []))
       setError(null)
     } catch (err) {
       if (!background) setError(err instanceof Error ? err.message : String(err))
@@ -88,15 +88,15 @@ export default function TrunkDiagnosticsPanel() {
       {error && <Alert severity="error">{error}</Alert>}
       {lines.length === 0 && <Alert severity="warning">当前没有可诊断的基带线路。</Alert>}
 
-      {lines.map((line) => {
+      {lines.map((line, index) => {
         const runtime = line.runtime
         const healthy = runtime.registered || runtime.phase === 'ready'
         return (
           <Card key={line.line_id} variant="outlined">
             <CardHeader
               avatar={<SettingsEthernet color={line.trunk.enabled ? 'primary' : 'disabled'} />}
-              title={`线路 ${shortLineId(line.line_id)}`}
-              subheader={`${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''} · ${line.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'}`}
+              title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · 线路 ${shortLineId(line.line_id)}`}
+              subheader={`${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''} · ${line.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'} · ${line.modem.present ? '在线' : '离线保留'}`}
               titleTypographyProps={{ variant: 'subtitle1', fontWeight: 650 }}
               action={<Chip size="small" label={phaseLabel(line)} color={healthy ? 'success' : line.trunk.enabled ? 'warning' : 'default'} />}
             />

@@ -23,7 +23,7 @@ import {
   type VolteControlResponse,
   type VolteLineControlResponse,
 } from '../../api/current'
-import { maskedIccid, shortLineId } from '../../components/modemLineFormat'
+import { maskedIccid, modemSlotLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 
 const stageLabels: Record<string, string> = {
@@ -110,8 +110,8 @@ export default function ModemLinesPanel() {
       if (controlResponse.data) {
         setControl(controlResponse.data)
       }
-      setLines(lineResponse.data ?? [])
-      setTrunkLines(trunkResponse.data ?? [])
+      setLines(stableModemSort(lineResponse.data ?? []))
+      setTrunkLines(stableModemSort(trunkResponse.data ?? []))
       setError(null)
     } catch (err) {
       if (!background) setError(err instanceof Error ? err.message : String(err))
@@ -286,8 +286,8 @@ export default function ModemLinesPanel() {
                 <Card variant="outlined" sx={{ height: '100%', opacity: line.modem.present ? 1 : 0.68 }}>
                   <CardHeader
                     avatar={<CellTower color={line.modem.present ? 'primary' : 'disabled'} />}
-                    title={`线路 ${index + 1} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
-                    subheader={`ID ${shortLineId(line.modem.line_id)} · 基带 ${line.modem.modem_id}`}
+                    title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
+                    subheader={`线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
                     titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                     action={
                       <Stack direction="row" spacing={0.75} mt={0.5}>

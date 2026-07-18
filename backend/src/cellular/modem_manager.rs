@@ -731,6 +731,10 @@ pub struct SimIdentity {
 #[derive(Debug, Clone, Default, serde::Serialize, PartialEq, Eq)]
 pub struct ModemBinding {
     pub line_id: String,
+    /// Persistent one-based position assigned to the physical modem.
+    pub display_order: u32,
+    /// Non-sensitive display name for the physical slot (for example 基带 1).
+    pub slot_label: String,
     pub modem_id: String,
     pub modem_path: String,
     pub manufacturer: String,
@@ -1167,6 +1171,8 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
 
         bindings.push(ModemBinding {
             line_id: stable_line_id(&hardware_key, sim_key),
+            display_order: 0,
+            slot_label: String::new(),
             modem_id,
             modem_path: modem_path.clone(),
             manufacturer,
@@ -1182,6 +1188,8 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             hardware_key,
         });
     }
+    // Persistent display ordering is applied by LineRuntimeRegistry once the
+    // hardware identities have been reconciled with AppConfig.
     bindings.sort_by(|left, right| left.line_id.cmp(&right.line_id));
     Ok(bindings)
 }
