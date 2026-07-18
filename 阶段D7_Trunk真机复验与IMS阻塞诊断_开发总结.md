@@ -73,6 +73,7 @@
 8. 修复候选第二次真机运行仍出现一次泛化 `mmcli:1`，随后设备 SSH 与网络不可达，无法在本轮完成增强诊断版本部署和设备清理确认。该状态必须在设备恢复上线后优先审计；不得把本轮记录为当前源码已完成 IMS 注册。
 9. 修复提交为 `f50d7de fix(volte): follow modem reenumeration`。对应 ARM64 musl 候选大小 9,518,672 bytes，SHA-256 为 `33DF08DB06B1026649EE065BD29ED654CE63F9F1D95F605DD2A4223A62A33D3D`；设备恢复后已上传并完成下一轮诊断。
 10. 设备重启恢复后已部署 `f50d7de` 并得到精确错误：AT P-CSCF 探测期间 modem 0 消失、operating mode 进入 `shutting-down`，随后纯 IPv6 `--create-bearer` 失败为 `error: couldn't find modem`。因此修复继续收敛为两点：P-CSCF 固定 IPv6 优先（与参考成品相同），且 AT 探测后、创建 bearer 前再次等待 ModemManager 恢复到 `registered/connected` 并重新解析当前 modem ID。新增 VoLTE 定向测试后为 122/122，严格 Clippy 通过。
+11. PATH 包装器追踪进一步确认：参考成品在单 modem 全局路径中始终使用 `mmcli -m any`，不持有 `/Modem/0` 这类易变编号；P-CSCF 初始化严格执行 IPv6 CID 2，并在失败时重复 `CGACT=0 -> CGDCONT IPV6,ims -> QCPDPIMSCFGE=1,1,1 -> CGACT=1`，最多三轮。本轮三轮 `CGACT=1,2` 均返回 ModemManager `MobileEquipment.Unknown`，因此没有进入后续 QMI 数据路径探测。源码已将 legacy/global binding 改为 `modem_id=any`；显式多线路 binding 仍保留实际 ID，并由重枚举等待逻辑兜底。
 
 修正后的下一步：
 

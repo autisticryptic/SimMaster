@@ -88,7 +88,10 @@ impl VolteDeviceBinding {
     fn legacy_default() -> Self {
         Self {
             line_id: "legacy-primary".to_string(),
-            modem_id: "0".to_string(),
+            // ModemManager object indexes are ephemeral across service restarts.
+            // The legacy/global path is single-modem, so use ModemManager's
+            // stable selector exactly as the reference runtime does.
+            modem_id: "any".to_string(),
             qmi_device: "/dev/wwan0qmi0".to_string(),
             uim_slot: 1,
         }
@@ -2380,6 +2383,11 @@ mod tests {
     #[test]
     fn device_binding_rejects_modem_without_qmi_control_port() {
         assert!(VolteDeviceBinding::from_modem(&ModemBinding::default()).is_err());
+    }
+
+    #[test]
+    fn legacy_binding_uses_modem_manager_any_selector() {
+        assert_eq!(VolteDeviceBinding::legacy_default().modem_id, "any");
     }
 
     #[test]
