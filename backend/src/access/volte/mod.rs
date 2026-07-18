@@ -21,6 +21,7 @@
 
 pub mod bearer;
 pub mod channel;
+pub mod data_path;
 pub mod digest_aka;
 pub mod errors;
 pub mod identity;

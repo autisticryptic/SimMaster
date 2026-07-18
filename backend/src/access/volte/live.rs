@@ -41,11 +41,12 @@ use super::{
         ensure_ims_bearer, route_pcscf, teardown_bearer_network, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
+    data_path::probe_ims_ipv6,
     digest_aka,
     errors::{code, VolteError},
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
-    pcscf::{discover_pcscf, discover_pcscf_via_at, pcscf_socket},
+    pcscf::{discover_pcscf, discover_pcscf_via_at_with_context, pcscf_socket, ImsAtContextLease},
     rtp_relay::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
     runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
     sip::{self, ImsIdentity, RequestIds},
@@ -144,6 +145,7 @@ struct VolteLiveSession {
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
+    at_context: Option<ImsAtContextLease>,
     voice_calls: HashMap<String, LiveVoiceCall>,
 }
 
@@ -491,14 +493,42 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
     disconnect_existing_ims_bearers(&device.modem_id).await?;
-    let at_pcscf = discover_pcscf_via_at(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await;
-    ensure_generation(runtime, generation)?;
-    device = resolve_device_binding(&device).await?;
+    let at_discovery =
+        discover_pcscf_via_at_with_context(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await;
+    let at_pcscf = at_discovery.candidates;
+    let mut at_context = at_discovery.context;
+    if let Err(error) = ensure_generation(runtime, generation) {
+        if let Some(context) = at_context.take() {
+            context.cleanup().await;
+        }
+        return Err(error);
+    }
+    device = match resolve_device_binding(&device).await {
+        Ok(device) => device,
+        Err(error) => {
+            if let Some(context) = at_context.take() {
+                context.cleanup().await;
+            }
+            return Err(error);
+        }
+    };
+
+    if let Err(error) = probe_ims_ipv6(&device.qmi_device, at_discovery.cid).await {
+        tracing::warn!(error = %error, "VoLTE IMS IPv6 WDS preflight failed; continuing to bearer");
+    }
 
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let mut bearer = ensure_ims_bearer(&device.modem_id, &BearerRequest::default()).await?;
+    let mut bearer = match ensure_ims_bearer(&device.modem_id, &BearerRequest::default()).await {
+        Ok(bearer) => bearer,
+        Err(error) => {
+            if let Some(context) = at_context.take() {
+                context.cleanup().await;
+            }
+            return Err(error);
+        }
+    };
     for candidate in at_pcscf {
         if !bearer.settings.pcscf.contains(&candidate) {
             bearer.settings.pcscf.push(candidate);
@@ -528,8 +558,14 @@ async fn connect_inner(
     if result.is_err() {
         teardown_bearer_network(&bearer).await;
         disconnect_bearer(&bearer.path).await;
+        if let Some(context) = at_context.take() {
+            context.cleanup().await;
+        }
     }
-    result
+    result.map(|mut session| {
+        session.at_context = at_context;
+        session
+    })
 }
 
 async fn connect_family(
@@ -631,6 +667,7 @@ async fn connect_family(
         pcscf: pcscf_socket(pcscf),
         ip_family: ip_family_name(local_addr),
         xfrm_plan: authenticator.xfrm_plan,
+        at_context: None,
         voice_calls: HashMap::new(),
     })
 }
@@ -779,6 +816,9 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
         }
         teardown_bearer_network(&session.bearer).await;
         disconnect_bearer(&session.bearer.path).await;
+        if let Some(context) = session.at_context {
+            context.cleanup().await;
+        }
     }
 }
 

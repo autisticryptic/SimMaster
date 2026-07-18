@@ -32,6 +32,33 @@ const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
 const DEFAULT_IMS_CID: u8 = 2;
 const AT_CONTEXT_SETTLE: Duration = Duration::from_secs(3);
 
+/// An IMS PDP context kept alive while the dedicated bearer is negotiated.
+///
+/// Qualcomm exposes P-CSCF PCO only while this context is active. The
+/// reference runtime retains CID 2 through WDS probing and bearer creation,
+/// then restores the original context during session teardown.
+#[derive(Debug, Clone)]
+pub struct ImsAtContextLease {
+    pub modem: String,
+    pub cid: u8,
+    restore_command: String,
+}
+
+impl ImsAtContextLease {
+    pub async fn cleanup(self) {
+        let _ = run_at(&self.modem, &format!("AT+CGACT=0,{}", self.cid)).await;
+        let _ = run_at(&self.modem, &format!("AT$QCPDPIMSCFGE={},0,0,0", self.cid)).await;
+        let _ = run_at(&self.modem, &self.restore_command).await;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AtPcscfDiscovery {
+    pub candidates: Vec<IpAddr>,
+    pub context: Option<ImsAtContextLease>,
+    pub cid: u8,
+}
+
 /// Parsed IP settings for the IMS bearer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImsIpSettings {
@@ -137,6 +164,23 @@ pub async fn discover_pcscf_via_at(
     modem: &str,
     preference: VolteIpFamilyPreference,
 ) -> Vec<IpAddr> {
+    let discovery = discover_pcscf_via_at_with_context(modem, preference).await;
+    if let Some(context) = discovery.context {
+        context.cleanup().await;
+    }
+    discovery.candidates
+}
+
+/// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
+///
+/// Keeping the context is intentional: on the 410 firmware, cleaning CID 2
+/// immediately after `+CGCONTRDP` makes the subsequent IPv6 WDS request fail
+/// with `prefix-unavailable` even though the same request succeeds in the
+/// reference runtime.
+pub async fn discover_pcscf_via_at_with_context(
+    modem: &str,
+    preference: VolteIpFamilyPreference,
+) -> AtPcscfDiscovery {
     let cid = std::env::var(ENV_IMS_CID)
         .ok()
         .and_then(|value| value.trim().parse::<u8>().ok())
@@ -144,20 +188,29 @@ pub async fn discover_pcscf_via_at(
         .unwrap_or(DEFAULT_IMS_CID);
 
     for pdp_type in ordered_pdp_types(preference) {
-        if let Ok(candidates) = probe_pcscf_context(modem, cid, pdp_type).await {
+        if let Ok((candidates, context)) = probe_pcscf_context(modem, cid, pdp_type).await {
             if !candidates.is_empty() {
-                return candidates;
+                return AtPcscfDiscovery {
+                    candidates,
+                    context: Some(context),
+                    cid,
+                };
             }
+            context.cleanup().await;
         }
     }
-    Vec::new()
+    AtPcscfDiscovery {
+        candidates: Vec::new(),
+        context: None,
+        cid,
+    }
 }
 
 async fn probe_pcscf_context(
     modem: &str,
     cid: u8,
     pdp_type: &str,
-) -> Result<Vec<IpAddr>, VolteError> {
+) -> Result<(Vec<IpAddr>, ImsAtContextLease), VolteError> {
     let restore_context = run_at(modem, "AT+CGDCONT?")
         .await
         .ok()
@@ -171,9 +224,21 @@ async fn probe_pcscf_context(
         return Err(error);
     }
     sleep(AT_CONTEXT_SETTLE).await;
-    let settings = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await;
-    cleanup_pcscf_context(modem, cid, &restore_context).await;
-    settings.map(|output| parse_cgcontrdp_pcscf(&output, cid))
+    let settings = match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
+        Ok(settings) => settings,
+        Err(error) => {
+            cleanup_pcscf_context(modem, cid, &restore_context).await;
+            return Err(error);
+        }
+    };
+    Ok((
+        parse_cgcontrdp_pcscf(&settings, cid),
+        ImsAtContextLease {
+            modem: modem.to_string(),
+            cid,
+            restore_command: restore_context,
+        },
+    ))
 }
 
 async fn cleanup_pcscf_context(modem: &str, cid: u8, restore_context: &str) {
