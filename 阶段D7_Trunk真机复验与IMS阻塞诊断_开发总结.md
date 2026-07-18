@@ -76,9 +76,13 @@
 11. PATH 包装器追踪进一步确认：参考成品在单 modem 全局路径中始终使用 `mmcli -m any`，不持有 `/Modem/0` 这类易变编号；P-CSCF 初始化严格执行 IPv6 CID 2，并在失败时重复 `CGACT=0 -> CGDCONT IPV6,ims -> QCPDPIMSCFGE=1,1,1 -> CGACT=1`，最多三轮。本轮三轮 `CGACT=1,2` 均返回 ModemManager `MobileEquipment.Unknown`，因此没有进入后续 QMI 数据路径探测。源码已将 legacy/global binding 改为 `modem_id=any`；显式多线路 binding 仍保留实际 ID，并由重枚举等待逻辑兜底。
 12. `d5cec93 fix(volte): use stable global modem selector` 已完成真机复验：启动日志正确标识该提交，legacy/global 路径不再出现 `couldn't find modem`，稳定推进到 `/Bearer/3 --connect`，当前网络仍返回 `ipv6 error: prefix-unavailable`。全量测试 548/548、VoLTE 定向测试 123/123、严格 Clippy 和 ARM64 musl 构建通过；候选大小 9,519,976 bytes，SHA-256 为 `A96EB9DBC21BCC3E0E109AB585A1E9A7B5D2C8C009ED38C88813067C134951BB`。
 13. 为捕获参考成品成功后的 QMI 数据路径命令，测试前已停用并停止 `d5cec93`、删除 bearer、恢复 CID 2/IMS 标志、清空 XFRM 和 WWAN 地址并删除隔离目录，随后受控重启 410。设备在三分钟观察窗口内未恢复 `10.0.0.116` 网络，参考成品追踪尚未重新部署；下一轮必须先人工确认设备上电和 SSH，再继续，不能假定设备当前在线。
+14. 从 `95f63ff40dc99071f836014e88c299362fe5b4d7` 建立独立 worktree 和分支 `codex/95f63ff-rebuild-test` 并重新编译。设备保留的 2026-07-15 日志确认该提交曾完成 IMS REGISTER、获取 Service-Route/P-Associated-URI，并连续接收 3 条 MT SMS 后提交 RP-ACK；但本次重编译候选在同机先收到双栈 `ipv6-only-allowed`，纯 IPv6 ModemManager 直连也返回 `prefix-unavailable`，所以未能复现注册。
+15. 对照历史成功顺序后提交 `184fc75 fix(volte): gate bearer on IMS context readiness`：AT P-CSCF 初始化改为最多三轮并保留最后一个精确错误；如果 CGACT/CGCONTRDP 没有得到 P-CSCF，本轮立即结束，不再继续扰动 WDS/bearer。保留 AT 上下文后的 bearer 若明确返回 `prefix-unavailable`，则清理上下文、等待 modem 重绑定并仅执行一次 `95f63ff` 风格的 ModemManager bearer 回退。
+16. 质量门通过：VoLTE 定向测试 127/127、后端全量测试 552/552、严格 Clippy 和 ARM64 musl release 构建通过。候选大小 9,537,296 bytes，SHA-256 `3EB181742F3E75F05EAD9558B1857B1493EEC9908EB188085B5A7FDAAFF892F3`。
+17. `184fc75` 真机只执行一次手动连接。三轮 IMS 上下文初始化均未获得 P-CSCF，最终返回 `volte_runtime_all_pcscf_failed:AT+CGCONTRDP=2:IP:no-pcscf`；新门禁确认没有继续创建 bearer，因此未进入 WDS、XFRM 或 SIP REGISTER。测试结束时自动恢复线程刚进入下一轮 AT 操作，停止候选后已显式恢复 modem online、CID 2=`IPV6,"ims"`、全部 `$QCPDPIMSCFGE=0,0,0`、空 bearer、WWAN DOWN、WDS disconnected、XFRM 0/0。
 
 修正后的下一步：
 
 1. 设备恢复后先检查并停止遗留的 3103 隔离进程，删除 `/opt/simadmin/releases/cf2c639-live` 与临时 `/data`，恢复 modem online、空 bearer、`wwan0/wwan1` DOWN、XFRM 0/0、CID 2 和全部 `$QCPDPIMSCFGE` 基线。
-2. 部署包含 modem 重枚举和详细命令错误的最新提交，复验当前源码的 AT 探测、IPv6 bearer、P-CSCF、XFRM 与 REGISTER。
+2. 当前源码已复验到严格 AT/P-CSCF 门禁；三轮仍无 P-CSCF。按用户决定暂停继续扰动基带，后续重新处理时从 IMS 上下文为什么无法稳定返回 CGCONTRDP P-CSCF 开始，而不是绕过门禁强建 bearer。
 3. 当前源码成功 `registered=true` 后，再继续原第 2–4 项 Trunk 呼叫、RTP、DTMF 与 ViLTE 验收。
