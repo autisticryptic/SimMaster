@@ -150,6 +150,7 @@
 - **retry_volte_line.bru** - 不切换开关，手动启动新的五轮 IMS 恢复批次
 - **get_vilte_control.bru** - 获取 ViLTE 视频转发开关
 - **set_vilte_feature.bru** - 开关 ViLTE 视频转发
+- **set_vilte_config.bru** - 设置 H.264 payload type 和 fmtp
 
 ### Asterisk Trunk 接口
 - **get_trunk_lines.bru** - 获取所有线路的 Trunk 配置和运行快照

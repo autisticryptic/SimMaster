@@ -1,0 +1,24 @@
+meta {
+  name: set_vilte_config
+  type: http
+  seq: 173
+}
+
+post {
+  url: http://192.168.68.1:3000/api/vilte/config
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "feature_enabled": true,
+    "codec": "h264",
+    "video_payload_type": 99,
+    "h264_fmtp": "profile-level-id=42e01f;packetization-mode=1"
+  }
+}
+
+settings {
+  encodeUrl: true
+}
