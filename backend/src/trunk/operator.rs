@@ -3,7 +3,7 @@
 use std::{
     net::IpAddr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, RwLock,
     },
 };
@@ -25,6 +25,71 @@ struct OperatorLinkInner {
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
+    metrics: Arc<OperatorMediaMetrics>,
+}
+
+#[derive(Default)]
+pub struct OperatorMediaMetrics {
+    active_relays: AtomicU64,
+    rtp_from_asterisk_packets: AtomicU64,
+    rtp_from_asterisk_bytes: AtomicU64,
+    rtp_to_asterisk_packets: AtomicU64,
+    rtp_to_asterisk_bytes: AtomicU64,
+    command_count: AtomicU64,
+    event_count: AtomicU64,
+    dtmf_events: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OperatorDiagnostics {
+    pub active_relays: u64,
+    pub rtp_from_asterisk_packets: u64,
+    pub rtp_from_asterisk_bytes: u64,
+    pub rtp_to_asterisk_packets: u64,
+    pub rtp_to_asterisk_bytes: u64,
+    pub command_count: u64,
+    pub event_count: u64,
+    pub dtmf_events: u64,
+}
+
+impl OperatorMediaMetrics {
+    pub fn relay_started(&self) {
+        self.active_relays.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn relay_stopped(&self) {
+        self.active_relays
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                Some(value.saturating_sub(1))
+            })
+            .ok();
+    }
+
+    pub fn record_rtp_from_asterisk(&self, bytes: usize) {
+        self.rtp_from_asterisk_packets
+            .fetch_add(1, Ordering::Relaxed);
+        self.rtp_from_asterisk_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_rtp_to_asterisk(&self, bytes: usize) {
+        self.rtp_to_asterisk_packets.fetch_add(1, Ordering::Relaxed);
+        self.rtp_to_asterisk_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> OperatorDiagnostics {
+        OperatorDiagnostics {
+            active_relays: self.active_relays.load(Ordering::Relaxed),
+            rtp_from_asterisk_packets: self.rtp_from_asterisk_packets.load(Ordering::Relaxed),
+            rtp_from_asterisk_bytes: self.rtp_from_asterisk_bytes.load(Ordering::Relaxed),
+            rtp_to_asterisk_packets: self.rtp_to_asterisk_packets.load(Ordering::Relaxed),
+            rtp_to_asterisk_bytes: self.rtp_to_asterisk_bytes.load(Ordering::Relaxed),
+            command_count: self.command_count.load(Ordering::Relaxed),
+            event_count: self.event_count.load(Ordering::Relaxed),
+            dtmf_events: self.dtmf_events.load(Ordering::Relaxed),
+        }
+    }
 }
 
 impl Default for OperatorLink {
@@ -39,6 +104,7 @@ impl Default for OperatorLink {
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
                 commands,
                 events,
+                metrics: Arc::new(OperatorMediaMetrics::default()),
             }),
         }
     }
@@ -106,16 +172,43 @@ impl OperatorLink {
         self.inner.events.subscribe()
     }
 
+    pub fn media_metrics(&self) -> Arc<OperatorMediaMetrics> {
+        Arc::clone(&self.inner.metrics)
+    }
+
+    pub fn diagnostics(&self) -> OperatorDiagnostics {
+        self.inner.metrics.snapshot()
+    }
+
     pub fn send_command(&self, command: OperatorCommand) -> Result<(), Box<OperatorCommand>> {
-        self.inner
+        let is_dtmf = matches!(&command, OperatorCommand::SendDtmf { .. });
+        let result = self
+            .inner
             .commands
             .send(command)
             .map(|_| ())
-            .map_err(|error| Box::new(error.0))
+            .map_err(|error| Box::new(error.0));
+        if result.is_ok() {
+            self.inner
+                .metrics
+                .command_count
+                .fetch_add(1, Ordering::Relaxed);
+            if is_dtmf {
+                self.inner
+                    .metrics
+                    .dtmf_events
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        result
     }
 
     pub fn send_event(&self, event: OperatorEvent) {
         let _ = self.inner.events.send(event);
+        self.inner
+            .metrics
+            .event_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 }
 

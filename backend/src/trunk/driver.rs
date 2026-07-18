@@ -73,6 +73,8 @@ pub(crate) async fn run(
                         snapshot.last_error = Some(error);
                         snapshot.next_retry_at = Some(next_retry_at);
                         snapshot.reconnect_count = snapshot.reconnect_count.saturating_add(1);
+                        snapshot.active_dialogs = 0;
+                        snapshot.active_calls = 0;
                     })
                     .await;
                 tokio::select! {
@@ -121,8 +123,13 @@ async fn run_session(
         .await;
     let transport = connect_any(&addresses, profile.local_port).await?;
     let peer = transport.peer_addr().to_string();
-    state.update(|snapshot| snapshot.peer = Some(peer)).await;
     let local_addr = transport.local_addr()?;
+    state
+        .update(|snapshot| {
+            snapshot.peer = Some(peer);
+            snapshot.local_endpoint = Some(local_addr.to_string());
+        })
+        .await;
     let local_aor = format!("sip:{}@{}", profile.username, profile.asterisk_host);
     let mut bridge =
         TrunkBridge::new(local_addr, local_aor).with_operator(OperatorAvailability::Unavailable);
@@ -207,13 +214,13 @@ async fn run_static_peer(
         }
         tokio::select! {
             received = transport.recv(RECEIVE_POLL) => match received {
-                Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator)).await?,
+                Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator), state).await?,
                 Err(error) if error == "trunk_udp_receive_timeout" => {}
                 Err(error) => return Err(error),
             },
             event = operator_events.recv() => {
                 if let Ok(event) = event {
-                    handle_operator_event(&transport, bridge, event).await?;
+                    handle_operator_event(&transport, bridge, event, state).await?;
                 }
             },
             changed = shutdown.changed() => {
@@ -265,13 +272,13 @@ async fn run_outbound_register(
             }
             tokio::select! {
                 received = transport.recv(RECEIVE_POLL) => match received {
-                    Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator)).await?,
+                    Ok(frame) => handle_inbound(&transport, &frame, bridge, Some(operator), state).await?,
                     Err(error) if error == "trunk_udp_receive_timeout" => {}
                     Err(error) => return Err(error),
                 },
                 event = operator_events.recv() => {
                     if let Ok(event) = event {
-                        handle_operator_event(&transport, bridge, event).await?;
+                        handle_operator_event(&transport, bridge, event, state).await?;
                     }
                 },
                 changed = shutdown.changed() => {
@@ -285,6 +292,7 @@ async fn run_outbound_register(
                             profile,
                             &mut dialog,
                             bridge,
+                            state,
                         ).await {
                             warn!(error = %error, "Asterisk trunk unregister failed during shutdown");
                         }
@@ -334,7 +342,7 @@ async fn register_transaction(
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_register_cseq_invalid".to_string())?;
         let response =
-            send_register_and_receive(transport, &request, expected_cseq, bridge).await?;
+            send_register_and_receive(transport, &request, expected_cseq, bridge, state).await?;
         let status = sip::status(&response)?;
         state
             .update(|snapshot| snapshot.last_sip_status = Some(status))
@@ -380,6 +388,7 @@ async fn unregister_transaction(
     profile: &TrunkProfileConfig,
     dialog: &mut sip::RegisterDialog,
     bridge: &mut TrunkBridge,
+    state: &TrunkStateWriter,
 ) -> Result<(), String> {
     let mut authorization = None;
     for challenge_round in 0..3u32 {
@@ -396,7 +405,7 @@ async fn unregister_transaction(
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_unregister_cseq_invalid".to_string())?;
         let response =
-            send_register_and_receive(transport, &request, expected_cseq, bridge).await?;
+            send_register_and_receive(transport, &request, expected_cseq, bridge, state).await?;
         let status = sip::status(&response)?;
         match status {
             200..=299 => {
@@ -437,10 +446,12 @@ async fn send_register_and_receive(
     request: &[u8],
     expected_cseq: u32,
     bridge: &mut TrunkBridge,
+    state: &TrunkStateWriter,
 ) -> Result<Vec<u8>, String> {
     let deadline = tokio::time::Instant::now() + REGISTER_RESPONSE_TIMEOUT;
     let mut retransmit_after = Duration::from_millis(500);
     transport.send(request).await?;
+    record_sip_tx(state, request).await;
     loop {
         let now = tokio::time::Instant::now();
         if now >= deadline {
@@ -449,9 +460,10 @@ async fn send_register_and_receive(
         let wait = (deadline - now).min(retransmit_after);
         match transport.recv(wait).await {
             Ok(frame) if sip::is_request(&frame) => {
-                handle_inbound(transport, &frame, bridge, None).await?
+                handle_inbound(transport, &frame, bridge, None, state).await?
             }
             Ok(frame) => {
+                record_sip_rx(state, &frame).await;
                 let cseq = sip_frame::header_value(&frame, "CSeq").unwrap_or_default();
                 let mut parts = cseq.split_whitespace();
                 let matching = parts.next().and_then(|value| value.parse::<u32>().ok())
@@ -468,6 +480,7 @@ async fn send_register_and_receive(
             }
             Err(error) if error == "trunk_udp_receive_timeout" => {
                 transport.send(request).await?;
+                record_sip_tx(state, request).await;
                 retransmit_after = (retransmit_after * 2).min(Duration::from_secs(2));
             }
             Err(error) => return Err(error),
@@ -480,13 +493,29 @@ async fn handle_inbound(
     frame: &[u8],
     bridge: &mut TrunkBridge,
     operator: Option<&OperatorLink>,
+    state: &TrunkStateWriter,
 ) -> Result<(), String> {
     if frame == b"\r\n" || frame == b"\r\n\r\n" {
         return Ok(());
     }
+    record_sip_rx(state, frame).await;
+    if sip_frame::is_request(frame, "INVITE") {
+        let is_reinvite =
+            crate::trunk::dialog::call_id(frame).is_some_and(|call_id| bridge.has_call(&call_id));
+        state
+            .update(|snapshot| {
+                if is_reinvite {
+                    snapshot.reinvite_count = snapshot.reinvite_count.saturating_add(1);
+                } else {
+                    snapshot.invite_count = snapshot.invite_count.saturating_add(1);
+                }
+            })
+            .await;
+    }
     if sip_frame::is_request(frame, "REGISTER") {
         let response = sip::build_response(frame, 405, "Method Not Allowed")?;
         transport.send(&response).await?;
+        record_sip_tx(state, &response).await;
         return Ok(());
     }
     let operator_available = operator.is_some_and(OperatorLink::is_available);
@@ -507,6 +536,7 @@ async fn handle_inbound(
             warn!(status, error = %error, "Rejecting invalid Asterisk trunk request");
             if let Ok(response) = sip::build_response(frame, status, reason) {
                 transport.send(&response).await?;
+                record_sip_tx(state, &response).await;
             }
             return Ok(());
         }
@@ -517,6 +547,7 @@ async fn handle_inbound(
     };
     for response in output.asterisk_frames {
         transport.send(&response).await?;
+        record_sip_tx(state, &response).await;
     }
     if !operator_available {
         return Ok(());
@@ -538,10 +569,12 @@ async fn handle_inbound(
                     .map_err(|error| error.to_string())?;
                 for response in unavailable.asterisk_frames {
                     transport.send(&response).await?;
+                    record_sip_tx(state, &response).await;
                 }
             }
         }
     }
+    sync_bridge_diagnostics(state, bridge).await;
     Ok(())
 }
 
@@ -549,6 +582,7 @@ async fn handle_operator_event(
     transport: &TrunkUdpTransport,
     bridge: &mut TrunkBridge,
     event: OperatorEvent,
+    state: &TrunkStateWriter,
 ) -> Result<(), String> {
     let output = match bridge.handle_operator_event(event) {
         Ok(output) => output,
@@ -560,8 +594,43 @@ async fn handle_operator_event(
     };
     for frame in output.asterisk_frames {
         transport.send(&frame).await?;
+        record_sip_tx(state, &frame).await;
     }
+    sync_bridge_diagnostics(state, bridge).await;
     Ok(())
+}
+
+async fn record_sip_rx(state: &TrunkStateWriter, frame: &[u8]) {
+    let is_invite = sip_frame::is_request(frame, "INVITE");
+    state
+        .update(|snapshot| {
+            snapshot.sip_rx_frames = snapshot.sip_rx_frames.saturating_add(1);
+            snapshot.sip_rx_bytes = snapshot.sip_rx_bytes.saturating_add(frame.len() as u64);
+            snapshot.last_activity_at = Some(timestamp_now());
+            if is_invite {
+                snapshot.media_negotiations = snapshot.media_negotiations.saturating_add(1);
+            }
+        })
+        .await;
+}
+
+async fn record_sip_tx(state: &TrunkStateWriter, frame: &[u8]) {
+    state
+        .update(|snapshot| {
+            snapshot.sip_tx_frames = snapshot.sip_tx_frames.saturating_add(1);
+            snapshot.sip_tx_bytes = snapshot.sip_tx_bytes.saturating_add(frame.len() as u64);
+            snapshot.last_activity_at = Some(timestamp_now());
+        })
+        .await;
+}
+
+async fn sync_bridge_diagnostics(state: &TrunkStateWriter, bridge: &TrunkBridge) {
+    state
+        .update(|snapshot| {
+            snapshot.active_dialogs = bridge.active_call_count() as u64;
+            snapshot.active_calls = bridge.confirmed_call_count() as u64;
+        })
+        .await;
 }
 
 fn validate_profile(profile: &TrunkProfileConfig) -> Result<(), String> {

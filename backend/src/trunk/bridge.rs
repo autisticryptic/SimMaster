@@ -280,9 +280,19 @@ impl TrunkBridge {
         })
     }
 
-    #[allow(dead_code)]
     pub fn active_call_count(&self) -> usize {
         self.calls.len()
+    }
+
+    pub fn confirmed_call_count(&self) -> usize {
+        self.calls
+            .values()
+            .filter(|call| call.dialog.state == InviteTransactionState::Confirmed)
+            .count()
+    }
+
+    pub fn has_call(&self, call_id: &str) -> bool {
+        self.calls.contains_key(call_id)
     }
 
     pub fn handle_asterisk(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {

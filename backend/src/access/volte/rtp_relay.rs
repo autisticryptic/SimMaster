@@ -26,6 +26,7 @@ use std::{
 use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
 
 use crate::access::vowifi::voice::RtpPacket;
+use crate::trunk::operator::OperatorMediaMetrics;
 
 /// Which leg a datagram arrived on. The relay forwards A->B and B->A.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +261,16 @@ impl PendingRtpRelay {
         internal_remote: SocketAddr,
         payload_mappings: impl IntoIterator<Item = PayloadTypeMapping>,
     ) -> ActiveRtpRelay {
+        self.activate_with_metrics(operator_remote, internal_remote, payload_mappings, None)
+    }
+
+    pub fn activate_with_metrics(
+        self,
+        operator_remote: SocketAddr,
+        internal_remote: SocketAddr,
+        payload_mappings: impl IntoIterator<Item = PayloadTypeMapping>,
+        metrics: Option<Arc<OperatorMediaMetrics>>,
+    ) -> ActiveRtpRelay {
         let mut core = RtpRelayCore::new(
             LegEndpoint::new(Some(operator_remote), true),
             LegEndpoint::new(Some(internal_remote), true),
@@ -275,11 +286,16 @@ impl PendingRtpRelay {
             core,
             stop_rx,
             first_operator_rtp,
+            metrics.clone(),
         ));
+        if let Some(metrics) = metrics.as_ref() {
+            metrics.relay_started();
+        }
         ActiveRtpRelay {
             stop,
             first_operator_rtp: first_operator_rtp_rx,
             task,
+            metrics,
         }
     }
 }
@@ -288,6 +304,7 @@ pub struct ActiveRtpRelay {
     stop: watch::Sender<bool>,
     first_operator_rtp: watch::Receiver<bool>,
     task: JoinHandle<std_io::Result<()>>,
+    metrics: Option<Arc<OperatorMediaMetrics>>,
 }
 
 impl ActiveRtpRelay {
@@ -307,6 +324,9 @@ impl Drop for ActiveRtpRelay {
     fn drop(&mut self) {
         let _ = self.stop.send(true);
         self.task.abort();
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics.relay_stopped();
+        }
     }
 }
 
@@ -316,6 +336,7 @@ async fn run_async_relay(
     mut core: RtpRelayCore,
     mut stop: watch::Receiver<bool>,
     first_operator_rtp: watch::Sender<bool>,
+    metrics: Option<Arc<OperatorMediaMetrics>>,
 ) -> std_io::Result<()> {
     let mut operator_buf = vec![0u8; 65_535];
     let mut internal_buf = vec![0u8; 65_535];
@@ -335,18 +356,25 @@ async fn run_async_relay(
                     &operator_buf[..len],
                     &internal_socket,
                 ).await {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_rtp_to_asterisk(len);
+                    }
                     let _ = first_operator_rtp.send(true);
                 }
             }
             received = internal_socket.recv_from(&mut internal_buf) => {
                 let (len, source) = received?;
-                forward_async(
+                if forward_async(
                     &mut core,
                     RelayLeg::Internal,
                     source,
                     &internal_buf[..len],
                     &operator_socket,
-                ).await;
+                ).await {
+                    if let Some(metrics) = metrics.as_ref() {
+                        metrics.record_rtp_from_asterisk(len);
+                    }
+                }
             }
         }
     }

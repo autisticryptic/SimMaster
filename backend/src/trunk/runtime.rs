@@ -84,6 +84,7 @@ pub struct TrunkSnapshot {
     pub enabled: bool,
     pub registration_mode: TrunkRegistrationMode,
     pub peer: Option<String>,
+    pub local_endpoint: Option<String>,
     pub registered: bool,
     pub last_sip_status: Option<u16>,
     pub started_at: Option<String>,
@@ -93,6 +94,16 @@ pub struct TrunkSnapshot {
     pub last_error: Option<String>,
     pub register_attempts: u64,
     pub reconnect_count: u64,
+    pub active_dialogs: u64,
+    pub active_calls: u64,
+    pub sip_rx_frames: u64,
+    pub sip_rx_bytes: u64,
+    pub sip_tx_frames: u64,
+    pub sip_tx_bytes: u64,
+    pub invite_count: u64,
+    pub reinvite_count: u64,
+    pub media_negotiations: u64,
+    pub last_activity_at: Option<String>,
 }
 
 impl Default for TrunkSnapshot {
@@ -103,6 +114,7 @@ impl Default for TrunkSnapshot {
             enabled: false,
             registration_mode: TrunkRegistrationMode::StaticPeer,
             peer: None,
+            local_endpoint: None,
             registered: false,
             last_sip_status: None,
             started_at: None,
@@ -112,6 +124,16 @@ impl Default for TrunkSnapshot {
             last_error: None,
             register_attempts: 0,
             reconnect_count: 0,
+            active_dialogs: 0,
+            active_calls: 0,
+            sip_rx_frames: 0,
+            sip_rx_bytes: 0,
+            sip_tx_frames: 0,
+            sip_tx_bytes: 0,
+            invite_count: 0,
+            reinvite_count: 0,
+            media_negotiations: 0,
+            last_activity_at: None,
         }
     }
 }
@@ -124,6 +146,8 @@ pub struct TrunkRuntimeStatus {
     pub registration_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_endpoint: Option<String>,
     pub registered: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_sip_status: Option<u16>,
@@ -139,6 +163,25 @@ pub struct TrunkRuntimeStatus {
     pub last_error: Option<String>,
     pub register_attempts: u64,
     pub reconnect_count: u64,
+    pub active_dialogs: u64,
+    pub active_calls: u64,
+    pub sip_rx_frames: u64,
+    pub sip_rx_bytes: u64,
+    pub sip_tx_frames: u64,
+    pub sip_tx_bytes: u64,
+    pub invite_count: u64,
+    pub reinvite_count: u64,
+    pub media_negotiations: u64,
+    pub operator_commands: u64,
+    pub operator_events: u64,
+    pub dtmf_events: u64,
+    pub active_media_relays: u64,
+    pub rtp_from_asterisk_packets: u64,
+    pub rtp_from_asterisk_bytes: u64,
+    pub rtp_to_asterisk_packets: u64,
+    pub rtp_to_asterisk_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity_at: Option<String>,
 }
 
 impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
@@ -149,6 +192,7 @@ impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
             enabled: snapshot.enabled,
             registration_mode: mode_name(snapshot.registration_mode).to_string(),
             peer: snapshot.peer.clone(),
+            local_endpoint: snapshot.local_endpoint.clone(),
             registered: snapshot.registered,
             last_sip_status: snapshot.last_sip_status,
             started_at: snapshot.started_at.clone(),
@@ -158,6 +202,24 @@ impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
             last_error: snapshot.last_error.clone(),
             register_attempts: snapshot.register_attempts,
             reconnect_count: snapshot.reconnect_count,
+            active_dialogs: snapshot.active_dialogs,
+            active_calls: snapshot.active_calls,
+            sip_rx_frames: snapshot.sip_rx_frames,
+            sip_rx_bytes: snapshot.sip_rx_bytes,
+            sip_tx_frames: snapshot.sip_tx_frames,
+            sip_tx_bytes: snapshot.sip_tx_bytes,
+            invite_count: snapshot.invite_count,
+            reinvite_count: snapshot.reinvite_count,
+            media_negotiations: snapshot.media_negotiations,
+            operator_commands: 0,
+            operator_events: 0,
+            dtmf_events: 0,
+            active_media_relays: 0,
+            rtp_from_asterisk_packets: 0,
+            rtp_from_asterisk_bytes: 0,
+            rtp_to_asterisk_packets: 0,
+            rtp_to_asterisk_bytes: 0,
+            last_activity_at: snapshot.last_activity_at.clone(),
         }
     }
 }
@@ -207,7 +269,17 @@ impl TrunkRuntime {
     }
 
     pub async fn status(&self) -> TrunkRuntimeStatus {
-        TrunkRuntimeStatus::from(&*self.snapshot.read().await)
+        let mut status = TrunkRuntimeStatus::from(&*self.snapshot.read().await);
+        let diagnostics = self.operator.diagnostics();
+        status.operator_commands = diagnostics.command_count;
+        status.operator_events = diagnostics.event_count;
+        status.dtmf_events = diagnostics.dtmf_events;
+        status.active_media_relays = diagnostics.active_relays;
+        status.rtp_from_asterisk_packets = diagnostics.rtp_from_asterisk_packets;
+        status.rtp_from_asterisk_bytes = diagnostics.rtp_from_asterisk_bytes;
+        status.rtp_to_asterisk_packets = diagnostics.rtp_to_asterisk_packets;
+        status.rtp_to_asterisk_bytes = diagnostics.rtp_to_asterisk_bytes;
+        status
     }
 
     pub fn generation(&self) -> u64 {
@@ -243,6 +315,7 @@ impl TrunkRuntime {
                     "{}:{}",
                     profile.asterisk_host, profile.asterisk_port
                 )),
+                local_endpoint: None,
                 reconnect_count,
                 ..TrunkSnapshot::default()
             }

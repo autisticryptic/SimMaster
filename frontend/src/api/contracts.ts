@@ -503,6 +503,7 @@ export interface TrunkRuntimeStatus {
   enabled: boolean
   registration_mode: TrunkRegistrationMode
   peer?: string
+  local_endpoint?: string
   registered: boolean
   last_sip_status?: number
   started_at?: string
@@ -512,6 +513,24 @@ export interface TrunkRuntimeStatus {
   last_error?: string
   register_attempts: number
   reconnect_count: number
+  active_dialogs: number
+  active_calls: number
+  sip_rx_frames: number
+  sip_rx_bytes: number
+  sip_tx_frames: number
+  sip_tx_bytes: number
+  invite_count: number
+  reinvite_count: number
+  media_negotiations: number
+  operator_commands: number
+  operator_events: number
+  dtmf_events: number
+  active_media_relays: number
+  rtp_from_asterisk_packets: number
+  rtp_from_asterisk_bytes: number
+  rtp_to_asterisk_packets: number
+  rtp_to_asterisk_bytes: number
+  last_activity_at?: string
 }
 
 export interface TrunkProfileResponse {

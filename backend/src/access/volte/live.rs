@@ -163,6 +163,7 @@ struct LiveVoiceCall {
     ip_answer_wait_armed: bool,
     operator_answered: bool,
     next_cseq: u32,
+    media_metrics: Option<Arc<crate::trunk::operator::OperatorMediaMetrics>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -929,6 +930,7 @@ async fn handle_operator_command_inner(
                     active_relay: None,
                     ip_answer_wait_armed: false,
                     operator_answered: false,
+                    media_metrics: Some(live.operator.media_metrics()),
                 },
             );
             frame
@@ -1619,6 +1621,7 @@ async fn begin_incoming_operator_call(
             ip_answer_wait_armed: false,
             operator_answered,
             next_cseq: 1,
+            media_metrics: Some(live.operator.media_metrics()),
         },
     );
     live.operator.send_event(OperatorEvent::Incoming {
@@ -1715,10 +1718,11 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
             .pending_relay
             .take()
             .ok_or_else(|| VolteError::new("volte_rtp_relay_missing"))?;
-        call.active_relay = Some(pending.activate(
+        call.active_relay = Some(pending.activate_with_metrics(
             operator_remote,
             call.internal_offer.audio_endpoint,
             mappings,
+            call.media_metrics.clone(),
         ));
     }
     Ok(relay_audio_sdp(
@@ -1805,10 +1809,11 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
             .pending_relay
             .take()
             .ok_or_else(|| VolteError::new("volte_rtp_relay_missing"))?;
-        call.active_relay = Some(pending.activate(
+        call.active_relay = Some(pending.activate_with_metrics(
             call.internal_offer.audio_endpoint,
             internal_remote,
             mappings,
+            call.media_metrics.clone(),
         ));
     }
     Ok(relay_audio_sdp(
@@ -2677,6 +2682,7 @@ mod tests {
             ip_answer_wait_armed: false,
             operator_answered: false,
             next_cseq: 2,
+            media_metrics: None,
         };
         let operator_sdp = format!(
             "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 96\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-16\r\na=sendrecv\r\n",
@@ -2776,6 +2782,7 @@ mod tests {
             ip_answer_wait_armed: false,
             operator_answered: false,
             next_cseq: 1,
+            media_metrics: None,
         };
         let internal_sdp = format!(
             "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na=sendrecv\r\n",
