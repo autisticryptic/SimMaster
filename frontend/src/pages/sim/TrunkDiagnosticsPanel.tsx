@@ -97,9 +97,15 @@ export default function TrunkDiagnosticsPanel() {
               avatar={<SettingsEthernet color={line.trunk.enabled ? 'primary' : 'disabled'} />}
               title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · 线路 ${shortLineId(line.line_id)}`}
               subheader={`${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''} · ${line.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'} · ${line.modem.present ? '在线' : '离线保留'} · ${modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)}`}
+              sx={{
+                alignItems: 'flex-start',
+                flexWrap: { xs: 'wrap', sm: 'nowrap' },
+                '& .MuiCardHeader-content': { minWidth: 0, flexBasis: { xs: 'calc(100% - 52px)', sm: 'auto' } },
+                '& .MuiCardHeader-action': { margin: 0, marginLeft: { xs: '52px', sm: 'auto' }, width: { xs: 'calc(100% - 52px)', sm: 'auto' } },
+              }}
               titleTypographyProps={{ variant: 'subtitle1', fontWeight: 650 }}
               action={
-                <Stack direction="row" spacing={0.75}>
+                <Stack direction="row" spacing={0.75} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                   {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
                   <Chip size="small" label={phaseLabel(line)} color={healthy ? 'success' : line.trunk.enabled ? 'warning' : 'default'} />
                 </Stack>

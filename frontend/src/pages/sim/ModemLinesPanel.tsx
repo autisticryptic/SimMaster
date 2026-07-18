@@ -288,9 +288,15 @@ export default function ModemLinesPanel() {
                     avatar={<CellTower color={line.modem.present ? 'primary' : 'disabled'} />}
                     title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
                     subheader={`线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
+                    sx={{
+                      alignItems: 'flex-start',
+                      flexWrap: { xs: 'wrap', sm: 'nowrap' },
+                      '& .MuiCardHeader-content': { minWidth: 0, flexBasis: { xs: 'calc(100% - 52px)', sm: 'auto' } },
+                      '& .MuiCardHeader-action': { margin: 0, marginLeft: { xs: '52px', sm: 'auto' }, width: { xs: 'calc(100% - 52px)', sm: 'auto' } },
+                    }}
                     titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                     action={
-                      <Stack direction="row" spacing={0.75} mt={0.5}>
+                      <Stack direction="row" spacing={0.75} mt={{ xs: 1, sm: 0.5 }} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={line.modem.present ? '在线' : '离线'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
                         {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
                         <Chip size="small" label={modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)} color={line.modem.slot_stable ? 'success' : 'warning'} variant="outlined" />
