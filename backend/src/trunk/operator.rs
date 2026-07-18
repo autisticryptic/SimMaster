@@ -20,6 +20,7 @@ pub struct OperatorLink {
 
 struct OperatorLinkInner {
     ready: AtomicBool,
+    video_enabled: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
     incoming_mode: RwLock<TrunkIncomingMode>,
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
@@ -99,6 +100,7 @@ impl Default for OperatorLink {
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
+                video_enabled: AtomicBool::new(false),
                 trunk_local_ip: RwLock::new(None),
                 incoming_mode: RwLock::new(TrunkIncomingMode::default()),
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
@@ -117,6 +119,14 @@ impl OperatorLink {
 
     pub fn is_available(&self) -> bool {
         self.inner.ready.load(Ordering::SeqCst) && self.inner.commands.receiver_count() > 0
+    }
+
+    pub fn set_video_enabled(&self, enabled: bool) {
+        self.inner.video_enabled.store(enabled, Ordering::SeqCst);
+    }
+
+    pub fn video_enabled(&self) -> bool {
+        self.inner.video_enabled.load(Ordering::SeqCst)
     }
 
     pub fn set_ip_connect_mode(&self, mode: TrunkIpConnectMode) {

@@ -96,6 +96,14 @@ pub enum OperatorCommand {
         trunk_local_ip: IpAddr,
         offer: MediaOffer,
     },
+    AcceptRenegotiation {
+        call_id: String,
+        body: Vec<u8>,
+    },
+    RejectRenegotiation {
+        call_id: String,
+        status: u16,
+    },
     ReportProvisional {
         call_id: String,
         status: u16,
@@ -128,6 +136,10 @@ pub enum OperatorEvent {
         body: Option<Vec<u8>>,
     },
     Answered {
+        call_id: String,
+        body: Vec<u8>,
+    },
+    Renegotiate {
         call_id: String,
         body: Vec<u8>,
     },
@@ -178,6 +190,7 @@ struct BridgedCall {
     dialog: SipDialog,
     operator_call_id: String,
     pending_invite: Option<Vec<u8>>,
+    operator_reinvite: Option<Vec<u8>>,
     hangup_after_ack: bool,
 }
 
@@ -271,6 +284,7 @@ impl TrunkBridge {
                 dialog,
                 operator_call_id,
                 pending_invite: None,
+                operator_reinvite: None,
                 hangup_after_ack: false,
             },
         );
@@ -336,6 +350,7 @@ impl TrunkBridge {
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { call_id, .. }
             | OperatorEvent::Answered { call_id, .. }
+            | OperatorEvent::Renegotiate { call_id, .. }
             | OperatorEvent::Rejected { call_id, .. }
             | OperatorEvent::Unavailable { call_id }
             | OperatorEvent::Ended { call_id }
@@ -399,8 +414,54 @@ impl TrunkBridge {
                 );
                 call.pending_invite = None;
             }
+            OperatorEvent::Renegotiate { body, .. } => {
+                if call.dialog.state != InviteTransactionState::Confirmed
+                    || call.pending_invite.is_some()
+                    || call.operator_reinvite.is_some()
+                {
+                    output
+                        .operator_commands
+                        .push(OperatorCommand::RejectRenegotiation {
+                            call_id: call.operator_call_id.clone(),
+                            status: 491,
+                        });
+                } else {
+                    let cseq = call
+                        .dialog
+                        .begin_local_request()
+                        .map_err(BridgeError::InvalidState)?;
+                    let reinvite = sip::build_dialog_request(&DialogRequest {
+                        method: "INVITE",
+                        request_uri: &call.dialog.remote_uri,
+                        local_addr: self.local_addr,
+                        from_uri: &call.dialog.local_uri,
+                        from_tag: &call.dialog.local_tag,
+                        to_uri: &call.dialog.remote_uri,
+                        to_tag: call.dialog.remote_tag.as_deref(),
+                        call_id: &call.dialog.call_id,
+                        cseq,
+                        contact_uri: Some(&self.local_aor),
+                        body: &body,
+                    })
+                    .map_err(BridgeError::MalformedRequest)?;
+                    call.operator_reinvite = Some(reinvite.clone());
+                    output.asterisk_frames.push(reinvite);
+                }
+            }
             OperatorEvent::Rejected { status, .. } => {
-                if call.dialog.state == InviteTransactionState::Confirmed {
+                if call.pending_invite.is_some() {
+                    output.asterisk_frames.push(
+                        sip::build_response_with_body(
+                            &response_request,
+                            status,
+                            reason(status),
+                            Some(&call.dialog.local_tag),
+                            &[],
+                            &[],
+                        )
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
+                } else if call.dialog.state == InviteTransactionState::Confirmed {
                     let cseq = call
                         .dialog
                         .begin_local_request()
@@ -542,6 +603,20 @@ impl TrunkBridge {
                     "trunk_reinvite_before_confirmed".into(),
                 ));
             }
+            if call.operator_reinvite.is_some() || call.pending_invite.is_some() {
+                return Ok(BridgeOutput {
+                    asterisk_frames: vec![sip::build_response_with_body(
+                        frame,
+                        491,
+                        "Request Pending",
+                        Some(&call.dialog.local_tag),
+                        &[],
+                        &[],
+                    )
+                    .map_err(BridgeError::MalformedRequest)?],
+                    ..BridgeOutput::default()
+                });
+            }
             let offer = parse_offer(frame)?;
             let cseq =
                 dialog::cseq_number(frame, "INVITE").map_err(BridgeError::MalformedRequest)?;
@@ -605,6 +680,7 @@ impl TrunkBridge {
                 dialog,
                 operator_call_id: call_id.clone(),
                 pending_invite: None,
+                operator_reinvite: None,
                 hangup_after_ack: false,
             },
         );
@@ -803,6 +879,29 @@ impl TrunkBridge {
             .and_then(|value| value.split_whitespace().nth(1).map(str::to_string));
         if method.as_deref() != Some("INVITE") {
             return BridgeOutput::default();
+        }
+        if let Some(reinvite) = call.operator_reinvite.clone() {
+            if (100..200).contains(&status) {
+                return BridgeOutput::default();
+            }
+            call.operator_reinvite = None;
+            if (200..300).contains(&status) {
+                let ack = sip::build_ack_for_final(&reinvite, frame).ok();
+                return BridgeOutput {
+                    asterisk_frames: ack.into_iter().collect(),
+                    operator_commands: vec![OperatorCommand::AcceptRenegotiation {
+                        call_id: call.operator_call_id.clone(),
+                        body: sip_frame::body(frame).to_vec(),
+                    }],
+                };
+            }
+            return BridgeOutput {
+                operator_commands: vec![OperatorCommand::RejectRenegotiation {
+                    call_id: call.operator_call_id.clone(),
+                    status,
+                }],
+                ..BridgeOutput::default()
+            };
         }
         if call.dialog.direction != dialog::DialogDirection::OperatorOriginated {
             return BridgeOutput::default();
@@ -1237,6 +1336,81 @@ mod tests {
         assert!(response.starts_with("SIP/2.0 200 OK"));
         assert!(response.contains("CSeq: 2 INVITE\r\n"));
         assert_eq!(bridge.active_call_count(), 1);
+    }
+
+    #[test]
+    fn operator_reinvite_round_trips_through_asterisk_dialog() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Renegotiate {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let request = &output.asterisk_frames[0];
+        assert!(request.starts_with(b"INVITE "));
+        let response = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: {}\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            sip_frame::header_value(request, "Via").unwrap(),
+            sip_frame::header_value(request, "From").unwrap(),
+            sip_frame::header_value(request, "To").unwrap(),
+            sip_frame::header_value(request, "Call-ID").unwrap(),
+            sip_frame::header_value(request, "CSeq").unwrap(),
+            sdp().len(),
+            String::from_utf8_lossy(sdp()),
+        );
+        let answered = bridge.handle_asterisk(response.as_bytes()).unwrap();
+        assert!(answered.asterisk_frames[0].starts_with(b"ACK "));
+        assert!(matches!(
+            answered.operator_commands.as_slice(),
+            [OperatorCommand::AcceptRenegotiation { call_id, body }]
+                if call_id == "call-a" && body == sdp()
+        ));
+        assert_eq!(bridge.confirmed_call_count(), 1);
+    }
+
+    #[test]
+    fn rejected_asterisk_reinvite_keeps_confirmed_call() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+        let reinvite = String::from_utf8(invite())
+            .unwrap()
+            .replace("CSeq: 1 INVITE", "CSeq: 2 INVITE");
+        bridge.handle_asterisk(reinvite.as_bytes()).unwrap();
+        let rejected = bridge
+            .handle_operator_event(OperatorEvent::Rejected {
+                call_id: "call-a".into(),
+                status: 488,
+            })
+            .unwrap();
+        assert!(rejected.asterisk_frames[0].starts_with(b"SIP/2.0 488"));
+        assert_eq!(bridge.confirmed_call_count(), 1);
     }
 
     #[test]

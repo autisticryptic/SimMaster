@@ -340,33 +340,33 @@ impl VideoRelay {
 }
 
 // ---------------------------------------------------------------------------
-// Reserved trunk seam (design phase D is undecided; keep the shape stable)
+// Trunk video seam
 // ---------------------------------------------------------------------------
 
-/// The video-side attachment point the Trunk bridge will implement once the
-/// SIP-endpoint/Asterisk strategy is chosen (design phase D). It intentionally
-/// carries no behavior yet — it just fixes the contract so ViLTE wiring can be
-/// added later without reshaping this module.
-///
-/// The intended flow: when a ViLTE call is set up, the trunk bridge supplies the
-/// internal UA's negotiated video endpoint via [`internal_video_endpoint`], and
-/// the orchestrator builds a [`VideoRelay`] pairing it with the operator side.
+/// The video-side attachment point supplied by the negotiated Asterisk SDP.
 pub trait TrunkVideoSeam {
     /// The internal SIP UA's negotiated video media endpoint (addr:port), or
     /// `None` if the UA declined video for this call.
     fn internal_video_endpoint(&self) -> Option<std::net::SocketAddr>;
 }
 
-/// A placeholder trunk seam used until the real trunk bridge lands. It always
-/// reports "no internal video endpoint", so ViLTE stays inert (relay not built)
-/// when no trunk is wired — matching the requirement that the host device never
-/// terminates calls on its own.
-#[derive(Debug, Clone, Default)]
-pub struct UnwiredTrunkVideoSeam;
+/// Concrete attachment produced by Trunk offer/answer negotiation. `None`
+/// explicitly represents an audio-only answer; a populated endpoint is paired
+/// with the operator endpoint by the dedicated asynchronous video RTP relay.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NegotiatedTrunkVideoSeam {
+    endpoint: Option<std::net::SocketAddr>,
+}
 
-impl TrunkVideoSeam for UnwiredTrunkVideoSeam {
+impl NegotiatedTrunkVideoSeam {
+    pub fn new(endpoint: Option<std::net::SocketAddr>) -> Self {
+        Self { endpoint }
+    }
+}
+
+impl TrunkVideoSeam for NegotiatedTrunkVideoSeam {
     fn internal_video_endpoint(&self) -> Option<std::net::SocketAddr> {
-        None
+        self.endpoint
     }
 }
 
@@ -497,8 +497,12 @@ mod tests {
     }
 
     #[test]
-    fn unwired_trunk_seam_reports_no_video_endpoint() {
-        let seam = UnwiredTrunkVideoSeam;
-        assert!(seam.internal_video_endpoint().is_none());
+    fn negotiated_trunk_seam_exposes_video_endpoint_or_audio_only() {
+        let endpoint = "192.0.2.50:60000".parse().unwrap();
+        let video = NegotiatedTrunkVideoSeam::new(Some(endpoint));
+        assert_eq!(video.internal_video_endpoint(), Some(endpoint));
+        assert!(NegotiatedTrunkVideoSeam::default()
+            .internal_video_endpoint()
+            .is_none());
     }
 }

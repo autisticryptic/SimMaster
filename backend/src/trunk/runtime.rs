@@ -103,6 +103,7 @@ pub struct TrunkSnapshot {
     pub invite_count: u64,
     pub reinvite_count: u64,
     pub media_negotiations: u64,
+    pub video_negotiations: u64,
     pub last_activity_at: Option<String>,
 }
 
@@ -133,6 +134,7 @@ impl Default for TrunkSnapshot {
             invite_count: 0,
             reinvite_count: 0,
             media_negotiations: 0,
+            video_negotiations: 0,
             last_activity_at: None,
         }
     }
@@ -172,6 +174,7 @@ pub struct TrunkRuntimeStatus {
     pub invite_count: u64,
     pub reinvite_count: u64,
     pub media_negotiations: u64,
+    pub video_negotiations: u64,
     pub operator_commands: u64,
     pub operator_events: u64,
     pub dtmf_events: u64,
@@ -211,6 +214,7 @@ impl From<&TrunkSnapshot> for TrunkRuntimeStatus {
             invite_count: snapshot.invite_count,
             reinvite_count: snapshot.reinvite_count,
             media_negotiations: snapshot.media_negotiations,
+            video_negotiations: snapshot.video_negotiations,
             operator_commands: 0,
             operator_events: 0,
             dtmf_events: 0,

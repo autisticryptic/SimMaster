@@ -114,7 +114,7 @@ export default function TrunkDiagnosticsPanel() {
 
                 <Grid size={{ xs: 6, md: 3 }}><Metric label="活跃对话 / 通话" value={`${runtime.active_dialogs} / ${runtime.active_calls}`} /></Grid>
                 <Grid size={{ xs: 6, md: 3 }}><Metric label="INVITE / re-INVITE" value={`${runtime.invite_count} / ${runtime.reinvite_count}`} /></Grid>
-                <Grid size={{ xs: 6, md: 3 }}><Metric label="媒体协商" value={runtime.media_negotiations} /></Grid>
+                <Grid size={{ xs: 6, md: 3 }}><Metric label="媒体 / 视频协商" value={`${runtime.media_negotiations} / ${runtime.video_negotiations}`} /></Grid>
                 <Grid size={{ xs: 6, md: 3 }}><Metric label="DTMF 事件" value={runtime.dtmf_events} /></Grid>
 
                 <Grid size={{ xs: 6, md: 3 }}><Metric label="SIP 接收" value={`${runtime.sip_rx_frames} 帧 · ${bytes(runtime.sip_rx_bytes)}`} /></Grid>

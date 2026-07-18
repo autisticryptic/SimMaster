@@ -522,6 +522,7 @@ export interface TrunkRuntimeStatus {
   invite_count: number
   reinvite_count: number
   media_negotiations: number
+  video_negotiations: number
   operator_commands: number
   operator_events: number
   dtmf_events: number

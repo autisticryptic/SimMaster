@@ -4968,13 +4968,18 @@ pub async fn set_vilte_feature_handler(
         .config_manager
         .set_vilte_feature_enabled(payload.enabled)
     {
-        Ok(_) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                VilteStatusResponse::build(&app),
-            )),
-        ),
+        Ok(_) => {
+            let status = VilteStatusResponse::build(&app);
+            for line in app.line_registry.all().await {
+                line.volte_live
+                    .operator_link()
+                    .set_video_enabled(status.enabled);
+            }
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", status)),
+            )
+        }
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::<VilteStatusResponse>::error(format!(
@@ -5167,6 +5172,11 @@ async fn start_line_volte_restore(
     if !line.begin_volte_retry() {
         return false;
     }
+    let volte = app.config_manager.get_volte_config();
+    let vilte = app.config_manager.get_vilte_config();
+    line.volte_live
+        .operator_link()
+        .set_video_enabled(volte.feature_enabled && volte.voice_enabled && vilte.feature_enabled);
     line.volte
         .update(|state| {
             state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Connecting;
@@ -5410,6 +5420,10 @@ async fn run_line_volte_restore_batch(
 
 async fn run_legacy_volte_restore_batch(app: &AppState) {
     let runtime = Arc::clone(&app.volte_runtime);
+    let volte = app.config_manager.get_volte_config();
+    let vilte = app.config_manager.get_vilte_config();
+    crate::access::volte::live::default_live_operator_link()
+        .set_video_enabled(volte.feature_enabled && volte.voice_enabled && vilte.feature_enabled);
     for attempt in 1..=VOLTE_RESTORE_MAX_ATTEMPTS {
         let config = app.config_manager.get_volte_config();
         if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
