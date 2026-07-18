@@ -735,6 +735,12 @@ pub struct ModemBinding {
     pub display_order: u32,
     /// Non-sensitive display name for the physical slot (for example 基带 1).
     pub slot_label: String,
+    /// How the physical slot was anchored (physdev, udev_path, equipment, ...).
+    pub slot_source: String,
+    /// Whether the anchor follows a physical board/port location.
+    pub slot_stable: bool,
+    /// Multiple discovered modem objects resolved to the same physical slot.
+    pub slot_conflict: bool,
     pub modem_id: String,
     pub modem_path: String,
     pub manufacturer: String,
@@ -747,10 +753,19 @@ pub struct ModemBinding {
     pub operator_id: String,
     pub state: String,
     pub present: bool,
-    /// Raw stable hardware selector. It is required for rebinding but must not
+    /// Raw physical slot selector. It is required for rebinding but must not
     /// be returned by the HTTP inventory endpoint.
     #[serde(skip)]
     pub hardware_key: String,
+    /// IMEI/MEID of the module occupying the physical slot.
+    #[serde(skip)]
+    pub equipment_identifier: String,
+    /// Selectors used by older releases, retained for config migration only.
+    #[serde(skip)]
+    pub legacy_hardware_keys: Vec<String>,
+    /// Previous line IDs that may own the current SIM's saved profile.
+    #[serde(skip)]
+    pub legacy_line_ids: Vec<String>,
 }
 
 fn stable_line_id(hardware_key: &str, sim_key: &str) -> String {
@@ -765,6 +780,119 @@ fn line_hardware_key(hardware_key: &str, uim_slot: u8) -> String {
     } else {
         format!("{hardware_key}#uim{uim_slot}")
     }
+}
+
+fn unique_non_empty(values: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut result = Vec::new();
+    for value in values {
+        let value = value.trim().to_string();
+        if !value.is_empty() && !result.contains(&value) {
+            result.push(value);
+        }
+    }
+    result
+}
+
+fn physical_device_slot_id(device: &str) -> Option<String> {
+    let device = device.trim().trim_end_matches('/');
+    if device.is_empty() || device == "/" {
+        return None;
+    }
+    if let Some(sysfs_path) = device.strip_prefix("/sys/") {
+        return Some(format!("sysfs:{sysfs_path}"));
+    }
+    Some(format!("physdev:{device}"))
+}
+
+fn udev_property(output: &str, key: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (name, value) = line.split_once('=')?;
+        (name.trim() == key)
+            .then(|| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+async fn udev_physical_slot_id(devices: &[String]) -> Option<(String, String)> {
+    for device in devices {
+        let device = device.trim();
+        if device.is_empty() {
+            continue;
+        }
+        let device = if device.starts_with("/dev/") {
+            device.to_string()
+        } else {
+            format!("/dev/{device}")
+        };
+        let args = vec![
+            "info".to_string(),
+            "--query=property".to_string(),
+            "--name".to_string(),
+            device,
+        ];
+        let Ok(output) = run_recovery_command_owned("udevadm", &args, Duration::from_secs(2)).await
+        else {
+            continue;
+        };
+        if let Some(value) = udev_property(&output, "MM_ID_PHYSDEV_UID") {
+            return Some((format!("udev-uid:{value}"), "udev_uid".to_string()));
+        }
+        if let Some(value) = udev_property(&output, "ID_PATH_TAG") {
+            return Some((format!("udev-path:{value}"), "udev_path".to_string()));
+        }
+        if let Some(value) = udev_property(&output, "ID_PATH") {
+            return Some((format!("udev-path:{value}"), "udev_path".to_string()));
+        }
+    }
+    None
+}
+
+async fn resolve_physical_slot_id(
+    device: &str,
+    primary_port: &str,
+    qmi_device: Option<&str>,
+    equipment_identifier: &str,
+    device_identifier: &str,
+    modem_path: &str,
+) -> (String, String, bool) {
+    if let Some(slot_id) = physical_device_slot_id(device) {
+        return (slot_id, "physdev".to_string(), true);
+    }
+    let udev_devices = unique_non_empty(
+        qmi_device
+            .into_iter()
+            .map(str::to_string)
+            .chain(std::iter::once(primary_port.to_string())),
+    );
+    if let Some((slot_id, source)) = udev_physical_slot_id(&udev_devices).await {
+        return (slot_id, source, true);
+    }
+    if !equipment_identifier.trim().is_empty() {
+        return (
+            format!("equipment:{}", equipment_identifier.trim()),
+            "equipment".to_string(),
+            false,
+        );
+    }
+    if !device_identifier.trim().is_empty() {
+        return (
+            format!("device-id:{}", device_identifier.trim()),
+            "device_identifier".to_string(),
+            false,
+        );
+    }
+    if !primary_port.trim().is_empty() {
+        return (
+            format!("port:{}", primary_port.trim()),
+            "primary_port".to_string(),
+            false,
+        );
+    }
+    (
+        format!("modem-path:{}", modem_path.trim()),
+        "modem_path".to_string(),
+        false,
+    )
 }
 
 fn sim_identity_keys(identity: &SimIdentity) -> Vec<String> {
@@ -1137,6 +1265,12 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
         let manufacturer = property_string(&modem_props, "Manufacturer").unwrap_or_default();
         let model = property_string(&modem_props, "Model").unwrap_or_default();
         let primary_port = property_string(&modem_props, "PrimaryPort").unwrap_or_default();
+        let device_reference = property_string(&modem_props, "Device").unwrap_or_default();
+        let device_identifier =
+            property_string(&modem_props, "DeviceIdentifier").unwrap_or_default();
+        let equipment_identifier = property_string(&modem_props, "EquipmentIdentifier")
+            .or_else(|| property_string(&gpp_props, "Imei"))
+            .unwrap_or_default();
         let state = mm_state_to_string(
             modem_props
                 .get("State")
@@ -1172,30 +1306,47 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             operator_id = property_string(&gpp_props, "OperatorCode").unwrap_or_default();
         }
 
-        let hardware_key = property_string(&modem_props, "DeviceIdentifier")
-            .or_else(|| property_string(&gpp_props, "Imei"))
-            .or_else(|| property_string(&modem_props, "Device"))
-            .or_else(|| non_empty_string(primary_port.clone()))
-            .unwrap_or_else(|| modem_path.clone());
+        let qmi_device = qmi_control_device(conn, &modem_path).await;
+        let (hardware_key, slot_source, slot_stable) = resolve_physical_slot_id(
+            &device_reference,
+            &primary_port,
+            qmi_device.as_deref(),
+            &equipment_identifier,
+            &device_identifier,
+            &modem_path,
+        )
+        .await;
         let sim_key = if sim_iccid.is_empty() {
             sim_path.as_deref().unwrap_or("no-sim")
         } else {
             sim_iccid.as_str()
         };
-        // Preserve the historical slot-1 line ID while distinguishing the
-        // same SIM when it is moved to another physical UIM slot.
-        let line_hardware_key = line_hardware_key(&hardware_key, uim_slot);
+        let legacy_hardware_keys = unique_non_empty([
+            device_identifier.clone(),
+            property_string(&gpp_props, "Imei").unwrap_or_default(),
+            device_reference.clone(),
+            primary_port.clone(),
+        ]);
+        let line_key = line_hardware_key(&hardware_key, uim_slot);
+        let legacy_line_ids = legacy_hardware_keys
+            .iter()
+            .map(|key| stable_line_id(&line_hardware_key(key, uim_slot), sim_key))
+            .filter(|line_id| line_id != &stable_line_id(&line_key, sim_key))
+            .collect::<Vec<_>>();
 
         bindings.push(ModemBinding {
-            line_id: stable_line_id(&line_hardware_key, sim_key),
+            line_id: stable_line_id(&line_key, sim_key),
             display_order: 0,
             slot_label: String::new(),
+            slot_source,
+            slot_stable,
+            slot_conflict: false,
             modem_id,
             modem_path: modem_path.clone(),
             manufacturer,
             model,
             primary_port,
-            qmi_device: qmi_control_device(conn, &modem_path).await,
+            qmi_device,
             uim_slot,
             sim_path,
             sim_iccid,
@@ -1203,6 +1354,9 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             state,
             present: true,
             hardware_key,
+            equipment_identifier,
+            legacy_hardware_keys,
+            legacy_line_ids,
         });
     }
     // Persistent display ordering is applied by LineRuntimeRegistry once the
@@ -2703,6 +2857,44 @@ mod tests {
             stable_line_id(&line_hardware_key(hardware_key, 1), "iccid:456"),
             stable_line_id(&line_hardware_key(hardware_key, 2), "iccid:456")
         );
+    }
+
+    #[test]
+    fn physical_sysfs_path_is_normalized_as_slot_anchor() {
+        assert_eq!(
+            physical_device_slot_id("/sys/devices/platform/soc/usb1/1-2/"),
+            Some("sysfs:devices/platform/soc/usb1/1-2".to_string())
+        );
+        assert_eq!(physical_device_slot_id(""), None);
+    }
+
+    #[test]
+    fn udev_slot_properties_prefer_explicit_uid_then_path() {
+        let output = "ID_PATH=pci-0000:00:14.0-usb-0:2\nMM_ID_PHYSDEV_UID=slot-2\n";
+        assert_eq!(
+            udev_property(output, "MM_ID_PHYSDEV_UID").as_deref(),
+            Some("slot-2")
+        );
+        assert_eq!(
+            udev_property(output, "ID_PATH").as_deref(),
+            Some("pci-0000:00:14.0-usb-0:2")
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_device_anchor_wins_over_shared_device_identifier() {
+        let (slot_id, source, stable) = resolve_physical_slot_id(
+            "/sys/devices/platform/soc/usb1/1-3",
+            "ttyUSB0",
+            None,
+            "same-imei",
+            "shared-device-identifier",
+            "/org/freedesktop/ModemManager1/Modem/0",
+        )
+        .await;
+        assert_eq!(slot_id, "sysfs:devices/platform/soc/usb1/1-3");
+        assert_eq!(source, "physdev");
+        assert!(stable);
     }
 
     #[test]

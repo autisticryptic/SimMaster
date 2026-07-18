@@ -5,9 +5,10 @@
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use crate::api::models::WorkMode;
@@ -1297,28 +1298,137 @@ mod tests {
         ));
         let manager = ConfigManager::new(path.clone());
         let first = manager
-            .reconcile_modem_slots(&[("imei-a".to_string(), 1), ("imei-b".to_string(), 1)])
+            .reconcile_modem_slots(&[
+                ModemSlotObservation {
+                    slot_id: "usb-path-b".to_string(),
+                    equipment_identifier: "imei-b".to_string(),
+                    uim_slot: 1,
+                    ..Default::default()
+                },
+                ModemSlotObservation {
+                    slot_id: "usb-path-a".to_string(),
+                    equipment_identifier: "imei-a".to_string(),
+                    uim_slot: 1,
+                    ..Default::default()
+                },
+            ])
             .unwrap();
-        assert_eq!(first["imei-a#uim1"].order, 1);
-        assert_eq!(first["imei-b#uim1"].order, 2);
+        assert_eq!(first["usb-path-a#uim1"].order, 1);
+        assert_eq!(first["usb-path-b#uim1"].order, 2);
 
         let second = manager
-            .reconcile_modem_slots(&[("imei-b".to_string(), 1), ("imei-a".to_string(), 1)])
+            .reconcile_modem_slots(&[
+                ModemSlotObservation {
+                    slot_id: "usb-path-b".to_string(),
+                    equipment_identifier: "imei-b".to_string(),
+                    uim_slot: 1,
+                    ..Default::default()
+                },
+                ModemSlotObservation {
+                    slot_id: "usb-path-a".to_string(),
+                    equipment_identifier: "imei-a".to_string(),
+                    uim_slot: 1,
+                    ..Default::default()
+                },
+            ])
             .unwrap();
-        assert_eq!(second["imei-a#uim1"].order, 1);
-        assert_eq!(second["imei-b#uim1"].order, 2);
+        assert_eq!(second["usb-path-a#uim1"].order, 1);
+        assert_eq!(second["usb-path-b#uim1"].order, 2);
 
         let third = manager
-            .reconcile_modem_slots(&[("imei-a".to_string(), 2)])
+            .reconcile_modem_slots(&[ModemSlotObservation {
+                slot_id: "usb-path-a".to_string(),
+                equipment_identifier: "imei-a".to_string(),
+                uim_slot: 2,
+                ..Default::default()
+            }])
             .unwrap();
-        assert_eq!(third["imei-a#uim2"].order, 3);
-        assert_eq!(third["imei-a#uim1"].order, 1);
+        assert_eq!(third["usb-path-a#uim2"].order, 3);
+        assert_eq!(third["usb-path-a#uim1"].order, 1);
 
         let reloaded = ConfigManager::new(path.clone());
         let persisted = reloaded
-            .reconcile_modem_slots(&[("imei-a".to_string(), 2)])
+            .reconcile_modem_slots(&[ModemSlotObservation {
+                slot_id: "usb-path-a".to_string(),
+                equipment_identifier: "imei-a".to_string(),
+                uim_slot: 2,
+                ..Default::default()
+            }])
             .unwrap();
-        assert_eq!(persisted["imei-a#uim2"].order, 3);
+        assert_eq!(persisted["usb-path-a#uim2"].order, 3);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_modem_slot_migrates_to_physical_anchor_without_changing_order() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-slot-migration-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        {
+            let mut config = manager.config.write().unwrap();
+            config.modem_slots.push(ModemSlotConfig {
+                hardware_key: "legacy-device-id".to_string(),
+                uim_slot: 1,
+                order: 4,
+                label: "机柜卡槽 4".to_string(),
+                ..Default::default()
+            });
+        }
+        manager.save().unwrap();
+
+        let slots = manager
+            .reconcile_modem_slots(&[ModemSlotObservation {
+                slot_id: "sysfs:devices/platform/slot-4".to_string(),
+                legacy_hardware_keys: vec!["legacy-device-id".to_string()],
+                equipment_identifier: "imei-new".to_string(),
+                uim_slot: 1,
+            }])
+            .unwrap();
+        let migrated = &slots["sysfs:devices/platform/slot-4#uim1"];
+        assert_eq!(migrated.order, 4);
+        assert_eq!(migrated.label, "机柜卡槽 4");
+        assert_eq!(migrated.equipment_identifier, "imei-new");
+
+        let reloaded = ConfigManager::new(path.clone());
+        let persisted = reloaded.config.read().unwrap().modem_slots[0].clone();
+        assert_eq!(persisted.slot_id, "sysfs:devices/platform/slot-4");
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_line_profile_is_copied_to_physical_slot_line_id() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-migration-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let legacy_line_id = "line-11111111111111111111111111111111";
+        let current_line_id = "line-22222222222222222222222222222222";
+        {
+            let mut config = manager.config.write().unwrap();
+            let mut profile = LineProfileConfig::for_line(legacy_line_id);
+            profile.volte_connection_enabled = true;
+            profile.trunk.context = "from-migrated-slot".to_string();
+            config.line_profiles.push(profile);
+        }
+        manager.save().unwrap();
+
+        assert!(manager
+            .migrate_line_profile_aliases(current_line_id, &[legacy_line_id.to_string()])
+            .unwrap());
+        let migrated = manager.get_line_profile(current_line_id);
+        assert!(migrated.volte_connection_enabled);
+        assert_eq!(migrated.trunk.context, "from-migrated-slot");
+        assert!(!manager
+            .migrate_line_profile_aliases(current_line_id, &[legacy_line_id.to_string()])
+            .unwrap());
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2388,20 +2498,39 @@ pub struct LineProfileConfig {
     pub trunk: TrunkProfileConfig,
 }
 
-/// Persisted identity for a physical modem slot.  ModemManager object paths
-/// and SIM-derived line IDs are intentionally excluded: both can change after
-/// a restart or SIM replacement, while the hardware key remains stable.
+/// A discovered physical modem slot used to reconcile the persisted slot map.
+/// `legacy_hardware_keys` contains selectors from older SimAdmin releases so
+/// existing slot orders can be migrated when the physical anchor changes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModemSlotObservation {
+    pub slot_id: String,
+    pub legacy_hardware_keys: Vec<String>,
+    pub equipment_identifier: String,
+    pub uim_slot: u8,
+}
+
+/// Persisted identity for a physical modem slot. `slot_id` is the physical
+/// anchor (udev/sysfs/board slot), while `equipment_identifier` records the
+/// current module occupying that slot. `hardware_key` is retained only as a
+/// migration alias for configurations written by the previous implementation.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModemSlotConfig {
+    #[serde(default)]
+    pub slot_id: String,
+    #[serde(default)]
     pub hardware_key: String,
-    /// Physical UIM slot within the modem. This keeps dual-SIM hardware from
-    /// collapsing two card slots into one display position.
     #[serde(default = "default_uim_slot")]
     pub uim_slot: u8,
     #[serde(default)]
     pub order: u32,
     #[serde(default)]
     pub label: String,
+    #[serde(default)]
+    pub equipment_identifier: String,
+    #[serde(default)]
+    pub last_seen_at: Option<String>,
+    #[serde(default)]
+    pub retired: bool,
 }
 
 fn default_uim_slot() -> u8 {
@@ -3159,6 +3288,7 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
 pub struct ConfigManager {
     config: Arc<RwLock<AppConfig>>,
     config_path: PathBuf,
+    save_lock: Mutex<()>,
 }
 
 impl ConfigManager {
@@ -3189,6 +3319,7 @@ impl ConfigManager {
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
             config_path,
+            save_lock: Mutex::new(()),
         };
 
         // 保存配置（如果文件不存在，或者配置模板发生了自动清理）
@@ -3297,7 +3428,7 @@ impl ConfigManager {
     /// after service restart, USB re-enumeration, or a temporary disconnect.
     pub fn reconcile_modem_slots(
         &self,
-        hardware_slots: &[(String, u8)],
+        observations: &[ModemSlotObservation],
     ) -> Result<HashMap<String, ModemSlotConfig>, String> {
         let (slots, changed) = {
             let mut config = self.config.write().unwrap();
@@ -3308,19 +3439,71 @@ impl ConfigManager {
                     slot.uim_slot = 1;
                     changed = true;
                 }
+                if slot.slot_id.trim() != slot.slot_id {
+                    slot.slot_id = slot.slot_id.trim().to_string();
+                    changed = true;
+                }
+                if slot.hardware_key.trim() != slot.hardware_key {
+                    slot.hardware_key = slot.hardware_key.trim().to_string();
+                    changed = true;
+                }
             }
             let original_slot_count = config.modem_slots.len();
-            let mut seen_hardware_keys = std::collections::HashSet::new();
+            let mut seen_slot_keys = std::collections::HashSet::new();
             config.modem_slots.retain(|slot| {
-                !slot.hardware_key.trim().is_empty()
-                    && seen_hardware_keys.insert((slot.hardware_key.clone(), slot.uim_slot))
+                let identity = if slot.slot_id.is_empty() {
+                    slot.hardware_key.clone()
+                } else {
+                    slot.slot_id.clone()
+                };
+                !identity.is_empty() && seen_slot_keys.insert((identity, slot.uim_slot))
             });
             changed |= config.modem_slots.len() != original_slot_count;
-            config.modem_slots.sort_by(|left, right| {
-                left.order
-                    .cmp(&right.order)
-                    .then_with(|| left.hardware_key.cmp(&right.hardware_key))
+
+            let mut sorted_observations = observations.to_vec();
+            sorted_observations.sort_by(|left, right| {
+                left.slot_id
+                    .cmp(&right.slot_id)
+                    .then_with(|| left.uim_slot.cmp(&right.uim_slot))
             });
+
+            for observation in &sorted_observations {
+                let uim_slot = observation.uim_slot.max(1);
+                let matching_index = config.modem_slots.iter().position(|slot| {
+                    (slot.slot_id == observation.slot_id
+                        || (slot.slot_id.is_empty()
+                            && observation
+                                .legacy_hardware_keys
+                                .iter()
+                                .any(|key| key == &slot.hardware_key)))
+                        && slot.uim_slot == uim_slot
+                });
+
+                if let Some(index) = matching_index {
+                    let slot = &mut config.modem_slots[index];
+                    if slot.slot_id != observation.slot_id {
+                        slot.slot_id = observation.slot_id.clone();
+                        changed = true;
+                    }
+                    if slot.hardware_key.is_empty() {
+                        slot.hardware_key = observation
+                            .legacy_hardware_keys
+                            .first()
+                            .cloned()
+                            .unwrap_or_default();
+                        changed = true;
+                    }
+                    if slot.equipment_identifier != observation.equipment_identifier {
+                        slot.equipment_identifier = observation.equipment_identifier.clone();
+                        slot.last_seen_at = Some(chrono::Utc::now().to_rfc3339());
+                        changed = true;
+                    }
+                    if slot.retired {
+                        slot.retired = false;
+                        changed = true;
+                    }
+                }
+            }
 
             let mut next_order = config
                 .modem_slots
@@ -3330,22 +3513,30 @@ impl ConfigManager {
                 .unwrap_or(0)
                 .saturating_add(1)
                 .max(1);
-            for (hardware_key, uim_slot) in hardware_slots {
-                let hardware_key = hardware_key.trim();
-                let uim_slot = (*uim_slot).max(1);
-                if hardware_key.is_empty()
+            for observation in &sorted_observations {
+                let slot_id = observation.slot_id.trim();
+                let uim_slot = observation.uim_slot.max(1);
+                if slot_id.is_empty()
                     || config
                         .modem_slots
                         .iter()
-                        .any(|slot| slot.hardware_key == hardware_key && slot.uim_slot == uim_slot)
+                        .any(|slot| slot.slot_id == slot_id && slot.uim_slot == uim_slot)
                 {
                     continue;
                 }
                 config.modem_slots.push(ModemSlotConfig {
-                    hardware_key: hardware_key.to_string(),
+                    slot_id: slot_id.to_string(),
+                    hardware_key: observation
+                        .legacy_hardware_keys
+                        .first()
+                        .cloned()
+                        .unwrap_or_default(),
                     uim_slot,
                     order: next_order,
                     label: format!("基带 {next_order}"),
+                    equipment_identifier: observation.equipment_identifier.clone(),
+                    last_seen_at: Some(chrono::Utc::now().to_rfc3339()),
+                    retired: false,
                 });
                 next_order = next_order.saturating_add(1);
                 changed = true;
@@ -3360,6 +3551,12 @@ impl ConfigManager {
                 .unwrap_or(0)
                 .saturating_add(1)
                 .max(1);
+            config.modem_slots.sort_by(|left, right| {
+                left.order
+                    .cmp(&right.order)
+                    .then_with(|| left.slot_id.cmp(&right.slot_id))
+                    .then_with(|| left.hardware_key.cmp(&right.hardware_key))
+            });
             for slot in &mut config.modem_slots {
                 if slot.order == 0 || !used_orders.insert(slot.order) {
                     slot.order = repair_order;
@@ -3380,6 +3577,7 @@ impl ConfigManager {
             config.modem_slots.sort_by(|left, right| {
                 left.order
                     .cmp(&right.order)
+                    .then_with(|| left.slot_id.cmp(&right.slot_id))
                     .then_with(|| left.hardware_key.cmp(&right.hardware_key))
             });
 
@@ -3387,7 +3585,8 @@ impl ConfigManager {
                 .modem_slots
                 .iter()
                 .cloned()
-                .map(|slot| (format!("{}#uim{}", slot.hardware_key, slot.uim_slot), slot))
+                .filter(|slot| !slot.slot_id.is_empty())
+                .map(|slot| (format!("{}#uim{}", slot.slot_id, slot.uim_slot), slot))
                 .collect::<HashMap<_, _>>();
             (slots, changed)
         };
@@ -3396,6 +3595,49 @@ impl ConfigManager {
             self.save()?;
         }
         Ok(slots)
+    }
+
+    /// Preserve per-SIM line settings when an older device-derived line ID is
+    /// replaced by the physical-slot-derived ID. The old profile is retained
+    /// as history; only the current line receives a copied profile.
+    pub fn migrate_line_profile_aliases(
+        &self,
+        line_id: &str,
+        legacy_line_ids: &[String],
+    ) -> Result<bool, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let migrated = {
+            let mut config = self.config.write().unwrap();
+            if config
+                .line_profiles
+                .iter()
+                .any(|profile| profile.line_id == line_id)
+            {
+                false
+            } else if let Some(source) = config
+                .line_profiles
+                .iter()
+                .find(|profile| legacy_line_ids.iter().any(|id| id == &profile.line_id))
+                .cloned()
+            {
+                config.line_profiles.push(LineProfileConfig {
+                    line_id: line_id.to_string(),
+                    ..source
+                });
+                config
+                    .line_profiles
+                    .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+                true
+            } else {
+                false
+            }
+        };
+        if migrated {
+            self.save()?;
+        }
+        Ok(migrated)
     }
 
     pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {
@@ -3766,9 +4008,12 @@ impl ConfigManager {
 
     /// 保存配置到文件
     pub fn save(&self) -> Result<(), String> {
-        let config = self.config.read().unwrap();
-        let content = serde_json::to_string_pretty(&*config)
-            .map_err(|e| format!("Failed to serialize config: {}", e))?;
+        let _save_guard = self.save_lock.lock().unwrap();
+        let content = {
+            let config = self.config.read().unwrap();
+            serde_json::to_string_pretty(&*config)
+                .map_err(|e| format!("Failed to serialize config: {}", e))?
+        };
 
         // 确保目录存在
         if let Some(parent) = self.config_path.parent() {
@@ -3776,8 +4021,49 @@ impl ConfigManager {
                 .map_err(|e| format!("Failed to create config directory: {}", e))?;
         }
 
-        fs::write(&self.config_path, content)
-            .map_err(|e| format!("Failed to write config file: {}", e))?;
+        let temp_path = self.config_path.with_extension("tmp");
+        let backup_path = self.config_path.with_extension("bak");
+        let mut temp_file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(|e| format!("Failed to open temporary config file: {e}"))?;
+        temp_file
+            .write_all(content.as_bytes())
+            .map_err(|e| format!("Failed to write temporary config file: {e}"))?;
+        temp_file
+            .sync_all()
+            .map_err(|e| format!("Failed to sync temporary config file: {e}"))?;
+        drop(temp_file);
+
+        if self.config_path.exists() {
+            fs::copy(&self.config_path, &backup_path)
+                .map_err(|e| format!("Failed to back up config file: {e}"))?;
+        }
+
+        if let Err(rename_error) = fs::rename(&temp_path, &self.config_path) {
+            // Windows does not consistently replace an existing destination.
+            // Production Linux uses the atomic rename path above; this fallback
+            // keeps local development and migration tooling functional.
+            if cfg!(windows) && self.config_path.exists() {
+                fs::copy(&temp_path, &self.config_path)
+                    .map_err(|e| format!("Failed to replace config file: {e}"))?;
+                fs::remove_file(&temp_path)
+                    .map_err(|e| format!("Failed to remove temporary config file: {e}"))?;
+            } else {
+                return Err(format!(
+                    "Failed to atomically replace config file: {rename_error}"
+                ));
+            }
+        }
+
+        #[cfg(unix)]
+        if let Some(parent) = self.config_path.parent() {
+            if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
+                let _ = directory.sync_all();
+            }
+        }
 
         Ok(())
     }

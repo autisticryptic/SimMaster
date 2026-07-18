@@ -20,7 +20,7 @@ use zbus::Connection;
 use crate::{
     access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
-    infra::config::ConfigManager,
+    infra::config::{ConfigManager, ModemSlotObservation},
     trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
 };
 
@@ -134,12 +134,28 @@ impl LineRuntimeRegistry {
     /// can tear them down and the same SIM can safely reappear after hotplug.
     pub async fn refresh(&self, conn: &Connection) -> zbus::Result<usize> {
         let mut discovered = discover_modem_bindings(conn).await?;
+        let mut physical_slot_counts = std::collections::HashMap::new();
+        for binding in &discovered {
+            *physical_slot_counts
+                .entry((binding.hardware_key.clone(), binding.uim_slot))
+                .or_insert(0usize) += 1;
+        }
+        for binding in &mut discovered {
+            binding.slot_conflict = physical_slot_counts
+                .get(&(binding.hardware_key.clone(), binding.uim_slot))
+                .is_some_and(|count| *count > 1);
+        }
         if let Some(config_manager) = &self.config_manager {
-            let hardware_slots = discovered
+            let observations = discovered
                 .iter()
-                .map(|binding| (binding.hardware_key.clone(), binding.uim_slot))
+                .map(|binding| ModemSlotObservation {
+                    slot_id: binding.hardware_key.clone(),
+                    legacy_hardware_keys: binding.legacy_hardware_keys.clone(),
+                    equipment_identifier: binding.equipment_identifier.clone(),
+                    uim_slot: binding.uim_slot,
+                })
                 .collect::<Vec<_>>();
-            if let Ok(slots) = config_manager.reconcile_modem_slots(&hardware_slots) {
+            if let Ok(slots) = config_manager.reconcile_modem_slots(&observations) {
                 for binding in &mut discovered {
                     let slot_key = format!("{}#uim{}", binding.hardware_key, binding.uim_slot);
                     if let Some(slot) = slots.get(&slot_key) {
@@ -147,6 +163,10 @@ impl LineRuntimeRegistry {
                         binding.slot_label = slot.label.clone();
                     }
                 }
+            }
+            for binding in &discovered {
+                let _ = config_manager
+                    .migrate_line_profile_aliases(&binding.line_id, &binding.legacy_line_ids);
             }
         }
         let mut lines = self.lines.write().await;
@@ -254,6 +274,9 @@ mod tests {
             line_id: line_id.to_string(),
             display_order: 1,
             slot_label: "基带 1".to_string(),
+            slot_source: "test".to_string(),
+            slot_stable: true,
+            slot_conflict: false,
             modem_id: "0".to_string(),
             modem_path: "/org/freedesktop/ModemManager1/Modem/0".to_string(),
             manufacturer: "test".to_string(),
@@ -267,6 +290,9 @@ mod tests {
             state: "registered".to_string(),
             present,
             hardware_key: "test-hardware".to_string(),
+            equipment_identifier: "test-equipment".to_string(),
+            legacy_hardware_keys: Vec::new(),
+            legacy_line_ids: Vec::new(),
         }
     }
 

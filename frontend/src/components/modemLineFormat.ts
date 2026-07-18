@@ -21,6 +21,18 @@ export function modemSlotLabel(modem: Pick<ModemBinding, 'display_order' | 'slot
     : `基带 ${(fallbackIndex ?? 0) + 1}`)
 }
 
+export function modemSlotSourceLabel(source?: string, stable?: boolean) {
+  if (stable) {
+    if (source === 'udev_uid') return 'udev 固定槽位'
+    if (source === 'udev_path') return 'udev 物理路径'
+    return '物理槽位'
+  }
+  if (source === 'equipment') return 'IMEI 临时锚点'
+  if (source === 'device_identifier') return '设备标识临时锚点'
+  if (source === 'primary_port') return '主端口临时锚点'
+  return '待确认槽位'
+}
+
 export function stableModemSort<T extends { modem: Pick<ModemBinding, 'display_order' | 'line_id' | 'present'> }>(lines: T[]) {
   return [...lines].sort((left, right) => {
     const leftOrder = left.modem.display_order || Number.MAX_SAFE_INTEGER

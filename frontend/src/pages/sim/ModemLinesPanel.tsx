@@ -23,7 +23,7 @@ import {
   type VolteControlResponse,
   type VolteLineControlResponse,
 } from '../../api/current'
-import { maskedIccid, modemSlotLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
+import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 
 const stageLabels: Record<string, string> = {
@@ -225,7 +225,7 @@ export default function ModemLinesPanel() {
       {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
 
       <Alert severity="info">
-        每条线路由“物理基带 + 当前 SIM”唯一识别。更换 SIM 会生成新的线路，不会自动继承旧线路的 IMS 或后续 Trunk 配置。
+        页面顺序绑定物理基带卡槽；每条线路由“物理槽位 + UIM 卡槽 + 当前 SIM”唯一识别。更换 SIM 会生成新的线路，不会自动继承旧线路的 IMS 或后续 Trunk 配置。
       </Alert>
 
       <Card>
@@ -292,6 +292,8 @@ export default function ModemLinesPanel() {
                     action={
                       <Stack direction="row" spacing={0.75} mt={0.5}>
                         <Chip size="small" label={line.modem.present ? '在线' : '离线'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
+                        {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
+                        <Chip size="small" label={modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)} color={line.modem.slot_stable ? 'success' : 'warning'} variant="outlined" />
                         <Chip size="small" label={runtimeLabel(line)} color={runtimeColor} />
                       </Stack>
                     }
@@ -335,6 +337,12 @@ export default function ModemLinesPanel() {
                             下次尝试：{new Date(line.runtime.next_retry_at).toLocaleString()}
                           </Typography>
                         )}
+                      </Alert>
+                    )}
+
+                    {line.modem.slot_conflict && (
+                      <Alert severity="error" sx={{ mt: 2, py: 0.25 }}>
+                        多个基带解析到同一物理槽位，请检查 udev 的 MM_ID_PHYSDEV_UID 或设备树槽位映射。
                       </Alert>
                     )}
 

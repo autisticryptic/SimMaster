@@ -15,7 +15,7 @@ import {
 import Grid from '@mui/material/Grid'
 import { Refresh, SettingsEthernet } from '@mui/icons-material'
 import { api, type TrunkProfileResponse } from '../../api/current'
-import { modemSlotLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
+import { modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 
 function timestamp(value?: string) {
   return value ? new Date(value).toLocaleString() : '无'
@@ -96,9 +96,14 @@ export default function TrunkDiagnosticsPanel() {
             <CardHeader
               avatar={<SettingsEthernet color={line.trunk.enabled ? 'primary' : 'disabled'} />}
               title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · 线路 ${shortLineId(line.line_id)}`}
-              subheader={`${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''} · ${line.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'} · ${line.modem.present ? '在线' : '离线保留'}`}
+              subheader={`${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''} · ${line.trunk.registration_mode === 'outbound_register' ? '主动注册' : '静态 Peer'} · ${line.modem.present ? '在线' : '离线保留'} · ${modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)}`}
               titleTypographyProps={{ variant: 'subtitle1', fontWeight: 650 }}
-              action={<Chip size="small" label={phaseLabel(line)} color={healthy ? 'success' : line.trunk.enabled ? 'warning' : 'default'} />}
+              action={
+                <Stack direction="row" spacing={0.75}>
+                  {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
+                  <Chip size="small" label={phaseLabel(line)} color={healthy ? 'success' : line.trunk.enabled ? 'warning' : 'default'} />
+                </Stack>
+              }
             />
             <CardContent sx={{ pt: 0 }}>
               <Grid container spacing={2}>
