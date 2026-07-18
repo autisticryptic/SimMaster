@@ -1,0 +1,15 @@
+meta {
+  name: get_vilte_control
+  type: http
+  seq: 171
+}
+
+get {
+  url: http://192.168.68.1:3000/api/vilte/control
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

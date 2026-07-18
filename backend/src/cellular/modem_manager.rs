@@ -5910,9 +5910,8 @@ pub async fn recover_missing_baseband(conn: &Connection) -> Result<String, Strin
         );
         run_recovery_command("systemctl", &["restart", "ModemManager"])
             .await
-            .map_err(|error| {
+            .inspect_err(|error| {
                 record_restart_step("恢复缺失基带", "error", Some(error.clone()));
-                error
             })?;
 
         let deadline = Instant::now() + Duration::from_secs(30);

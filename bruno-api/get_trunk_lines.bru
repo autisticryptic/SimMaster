@@ -1,0 +1,15 @@
+meta {
+  name: get_trunk_lines
+  type: http
+  seq: 161
+}
+
+get {
+  url: http://192.168.68.1:3000/api/trunk/lines
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

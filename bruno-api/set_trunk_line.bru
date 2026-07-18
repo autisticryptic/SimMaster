@@ -1,0 +1,35 @@
+meta {
+  name: set_trunk_line
+  type: http
+  seq: 163
+}
+
+post {
+  url: http://192.168.68.1:3000/api/trunk/lines/{{line_id}}
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "enabled": true,
+    "registration_mode": "outbound_register",
+    "asterisk_host": "10.0.0.3",
+    "asterisk_port": 8060,
+    "local_port": 5062,
+    "username": "41000",
+    "secret": "",
+    "context": "default",
+    "incoming_mode": "bound_pending",
+    "incoming_binding": "6108",
+    "outgoing_binding": "6108",
+    "ip_connect_mode": "first_rtp",
+    "codec_allow": ["amr-wb", "amr"],
+    "register_expiry_secs": 3600,
+    "match_host": null
+  }
+}
+
+settings {
+  encodeUrl: true
+}
