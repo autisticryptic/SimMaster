@@ -795,7 +795,13 @@ fn unique_non_empty(values: impl IntoIterator<Item = String>) -> Vec<String> {
 
 fn physical_device_slot_id(device: &str) -> Option<String> {
     let device = device.trim().trim_end_matches('/');
-    if device.is_empty() || device == "/" {
+    if device.is_empty()
+        || device == "/"
+        || device.starts_with("/dev/")
+        || device.starts_with("tty")
+        || device.starts_with("cdc-wdm")
+        || device.starts_with("wwan")
+    {
         return None;
     }
     if let Some(sysfs_path) = device.strip_prefix("/sys/") {
@@ -2866,6 +2872,8 @@ mod tests {
             Some("sysfs:devices/platform/soc/usb1/1-2".to_string())
         );
         assert_eq!(physical_device_slot_id(""), None);
+        assert_eq!(physical_device_slot_id("/dev/cdc-wdm0"), None);
+        assert_eq!(physical_device_slot_id("ttyUSB0"), None);
     }
 
     #[test]
