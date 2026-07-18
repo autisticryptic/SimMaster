@@ -652,6 +652,13 @@ class SimAdminCurrentAPI {
     )
   }
 
+  async retryVolteLine(lineId: string) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/retry`,
+      { method: 'POST', body: JSON.stringify({}) },
+    )
+  }
+
   async getTrunkLines() {
     return request<ApiResponse<TrunkProfileResponse[]>>('/trunk/lines')
   }

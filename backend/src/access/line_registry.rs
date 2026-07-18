@@ -29,6 +29,7 @@ pub struct LineRuntime {
     pub volte: Arc<VolteRuntime>,
     pub volte_live: VolteLiveHandle,
     pub volte_connect_lock: Mutex<()>,
+    pub volte_retry_running: AtomicBool,
     pub trunk: Arc<TrunkRuntime>,
 }
 
@@ -40,6 +41,7 @@ impl LineRuntime {
             volte,
             volte_live,
             volte_connect_lock: Mutex::new(()),
+            volte_retry_running: AtomicBool::new(false),
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
         }
     }
@@ -71,6 +73,22 @@ impl LineRuntime {
             volte: self.volte.status().await,
             trunk: self.trunk.status().await,
         }
+    }
+
+    /// Claim the complete VoLTE recovery workflow, not just one connect call.
+    /// This keeps automatic restore and the Web retry action from overlapping.
+    pub fn begin_volte_retry(&self) -> bool {
+        self.volte_retry_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn finish_volte_retry(&self) {
+        self.volte_retry_running.store(false, Ordering::SeqCst);
+    }
+
+    pub fn volte_retry_in_progress(&self) -> bool {
+        self.volte_retry_running.load(Ordering::SeqCst)
     }
 }
 

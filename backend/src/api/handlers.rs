@@ -83,6 +83,10 @@ const VOWIFI_PROFILE_SWITCH_RESTORE_INITIAL_DELAY_SECS: u64 = 1;
 const VOWIFI_PROFILE_SWITCH_RESTORE_ATTEMPTS: u8 = 3;
 const VOWIFI_PROFILE_SWITCH_RESTORE_RETRY_DELAY_SECS: u64 = 3;
 const VOWIFI_RESTORE_IDENTITY_GATE_ATTEMPTS: u8 = 5;
+const VOLTE_RESTORE_MAX_ATTEMPTS: u32 = 5;
+const VOLTE_MODEM_RESTART_MAX_ATTEMPTS: u32 = 3;
+const VOLTE_MODEM_MISSING_POLLS: u32 = 6;
+const VOLTE_MODEM_MISSING_POLL_DELAY_SECS: u64 = 5;
 const VOWIFI_RESTORE_IDENTITY_GATE_DELAY_SECS: u64 = 2;
 const VOWIFI_PROFILE_SWITCH_CONNECT_ATTEMPTS: u8 = 2;
 const VOWIFI_PROFILE_SWITCH_CONNECT_RETRY_DELAY_SECS: u64 = 1;
@@ -4475,37 +4479,19 @@ pub async fn set_volte_line_connection_handler(
             )
         }
     };
-    let _guard = line.volte_connect_lock.lock().await;
-    let result = if payload.enabled {
-        let device = match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
-            Ok(device) => device,
-            Err(error) => {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::error(format!("Failed: {error}"))),
-                )
-            }
+    let result: Result<crate::access::volte::VolteRuntimeStatus, crate::access::volte::VolteError> =
+        if payload.enabled {
+            start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
+            Ok(line.volte.status().await)
+        } else {
+            let _guard = line.volte_connect_lock.lock().await;
+            Ok(crate::access::volte::live::disconnect_live_for_line(
+                &line.volte_live,
+                &line.volte,
+                "volte_line_connection_disabled",
+            )
+            .await)
         };
-        let mut config = app.config_manager.get_volte_config();
-        config.connection_enabled = true;
-        crate::access::volte::live::connect_live_for_line(
-            &line.volte_live,
-            &device,
-            &line.volte,
-            &config,
-            app.config_manager.get_sms_path_policy().dedupe_enabled,
-            Arc::clone(&app.database),
-            Arc::clone(&app.notification_sender),
-        )
-        .await
-    } else {
-        Ok(crate::access::volte::live::disconnect_live_for_line(
-            &line.volte_live,
-            &line.volte,
-            "volte_line_connection_disabled",
-        )
-        .await)
-    };
     let response = VolteLineControlResponse {
         modem: line.binding(),
         profile: profile.redacted(),
@@ -4521,6 +4507,49 @@ pub async fn set_volte_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         ),
     }
+}
+
+/// Start a fresh five-attempt recovery batch without changing the persisted
+/// VoLTE switch.  The response is immediate; progress is returned by the normal
+/// line status endpoint and automatic polling.
+pub async fn retry_volte_line_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = app.config_manager.get_line_profile(&line_id);
+    let config = app.config_manager.get_volte_config();
+    if !config.feature_enabled || !config.sms_enabled || !profile.volte_connection_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("volte_line_connection_disabled")),
+        );
+    }
+    if line.volte.status().await.registered {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("volte_line_already_registered")),
+        );
+    }
+    if !start_line_volte_restore(app.clone(), Arc::clone(&line), "manual").await {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("volte_retry_already_running")),
+        );
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(ApiResponse::success_with_message(
+            "VoLTE retry started",
+            build_volte_line_response(&app, line.status().await),
+        )),
+    )
 }
 
 // ===================== Trunk handlers (stage D3b: config only) =====================
@@ -5126,8 +5155,311 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
     });
 }
 
-/// Keep an explicitly enabled VoLTE connection alive across service restarts,
-/// bearer/socket faults, and the controlled pre-expiry session rebuild.
+fn volte_next_retry_at(delay_secs: u64) -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(delay_secs as i64)).to_rfc3339()
+}
+
+async fn start_line_volte_restore(
+    app: AppState,
+    line: Arc<crate::access::line_registry::LineRuntime>,
+    source: &'static str,
+) -> bool {
+    if !line.begin_volte_retry() {
+        return false;
+    }
+    line.volte
+        .update(|state| {
+            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Connecting;
+            state.recovery_source = Some(source.to_string());
+            state.retry_attempt = 0;
+            state.retry_max = VOLTE_RESTORE_MAX_ATTEMPTS;
+            state.modem_restart_attempt = 0;
+            state.modem_restart_max = VOLTE_MODEM_RESTART_MAX_ATTEMPTS;
+            state.manual_retry_available = false;
+            state.next_retry_at = None;
+            state.last_error = None;
+        })
+        .await;
+    tokio::spawn(async move {
+        run_line_volte_restore_batch(&app, &line, source).await;
+        line.finish_volte_retry();
+    });
+    true
+}
+
+enum LineModemWait {
+    Ready,
+    Cancelled,
+    Exhausted,
+}
+
+fn line_volte_restore_enabled(
+    app: &AppState,
+    line: &crate::access::line_registry::LineRuntime,
+) -> bool {
+    let config = app.config_manager.get_volte_config();
+    let profile = app.config_manager.get_line_profile(&line.binding().line_id);
+    config.feature_enabled
+        && config.sms_enabled
+        && profile.enabled
+        && profile.volte_connection_enabled
+}
+
+async fn wait_for_line_modem(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+) -> LineModemWait {
+    for poll in 0..VOLTE_MODEM_MISSING_POLLS {
+        if !line_volte_restore_enabled(app, line) {
+            return LineModemWait::Cancelled;
+        }
+        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        if line.binding().present {
+            return LineModemWait::Ready;
+        }
+        line.volte
+            .update(|state| {
+                state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+                state.stage = crate::access::volte::runtime::VolteStage::Modem;
+                state.recovery_state =
+                    crate::access::volte::runtime::VolteRecoveryState::WaitingModem;
+                state.last_error = Some(format!(
+                    "volte_modem_missing_wait:{}/{}",
+                    poll + 1,
+                    VOLTE_MODEM_MISSING_POLLS
+                ));
+                state.next_retry_at =
+                    Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
+            })
+            .await;
+        if poll + 1 < VOLTE_MODEM_MISSING_POLLS {
+            tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+        }
+    }
+
+    for restart_attempt in 1..=VOLTE_MODEM_RESTART_MAX_ATTEMPTS {
+        if !line_volte_restore_enabled(app, line) {
+            return LineModemWait::Cancelled;
+        }
+        line.volte
+            .update(|state| {
+                state.recovery_state =
+                    crate::access::volte::runtime::VolteRecoveryState::RestartingBaseband;
+                state.modem_restart_attempt = restart_attempt;
+                state.next_retry_at = None;
+                state.last_error = Some(format!(
+                    "volte_modem_missing_recovery:{restart_attempt}/{VOLTE_MODEM_RESTART_MAX_ATTEMPTS}"
+                ));
+            })
+            .await;
+        match modem_manager::recover_missing_baseband(app.dbus_conn.as_ref()).await {
+            Ok(_) => {
+                let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+                if line.binding().present {
+                    return LineModemWait::Ready;
+                }
+            }
+            Err(error) => {
+                warn!(restart_attempt, error = %error, "VoLTE missing-baseband recovery failed");
+                line.volte
+                    .update(|state| {
+                        state.last_error = Some(format!("volte_baseband_recovery_failed:{error}"))
+                    })
+                    .await;
+            }
+        }
+    }
+
+    line.volte
+        .update(|state| {
+            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+            state.manual_retry_available = true;
+            state.next_retry_at = None;
+            state.last_error = Some("volte_baseband_recovery_exhausted".to_string());
+            state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+        })
+        .await;
+    LineModemWait::Exhausted
+}
+
+async fn run_line_volte_restore_batch(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+    source: &'static str,
+) {
+    match wait_for_line_modem(app, line).await {
+        LineModemWait::Ready => {}
+        LineModemWait::Cancelled => {
+            line.volte
+                .update(|state| {
+                    state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_source = None;
+                    state.next_retry_at = None;
+                    state.manual_retry_available = false;
+                })
+                .await;
+            return;
+        }
+        LineModemWait::Exhausted => return,
+    }
+
+    for attempt in 1..=VOLTE_RESTORE_MAX_ATTEMPTS {
+        let config = app.config_manager.get_volte_config();
+        let profile = app.config_manager.get_line_profile(&line.binding().line_id);
+        if !config.feature_enabled
+            || !config.sms_enabled
+            || !profile.enabled
+            || !profile.volte_connection_enabled
+        {
+            line.volte
+                .update(|state| {
+                    state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_source = None;
+                    state.next_retry_at = None;
+                    state.manual_retry_available = false;
+                })
+                .await;
+            return;
+        }
+        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        if !line.binding().present {
+            match wait_for_line_modem(app, line).await {
+                LineModemWait::Ready => {}
+                LineModemWait::Cancelled | LineModemWait::Exhausted => return,
+            }
+        }
+        let binding = line.binding();
+        let device = match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
+            Ok(device) => device,
+            Err(error) => {
+                line.volte
+                    .update(|state| state.last_error = Some(error.to_string()))
+                    .await;
+                continue;
+            }
+        };
+        line.volte
+            .update(|state| {
+                state.recovery_state =
+                    crate::access::volte::runtime::VolteRecoveryState::Connecting;
+                state.recovery_source = Some(source.to_string());
+                state.retry_attempt = attempt;
+                state.next_retry_at = None;
+                state.manual_retry_available = false;
+                state.reconnect_count = state.reconnect_count.saturating_add(1);
+            })
+            .await;
+
+        let mut line_config = config.clone();
+        line_config.connection_enabled = true;
+        let result = {
+            let _guard = line.volte_connect_lock.lock().await;
+            if line.volte.status().await.registered {
+                return;
+            }
+            crate::access::volte::live::connect_live_for_line(
+                &line.volte_live,
+                &device,
+                &line.volte,
+                &line_config,
+                app.config_manager.get_sms_path_policy().dedupe_enabled,
+                Arc::clone(&app.database),
+                Arc::clone(&app.notification_sender),
+            )
+            .await
+        };
+        match result {
+            Ok(_) => {
+                line.volte
+                    .update(|state| {
+                        state.recovery_state =
+                            crate::access::volte::runtime::VolteRecoveryState::Registered;
+                        state.manual_retry_available = false;
+                        state.next_retry_at = None;
+                    })
+                    .await;
+                info!(line_id = %binding.line_id, attempt, source, "VoLTE IMS restore registered");
+                return;
+            }
+            Err(error) => {
+                warn!(line_id = %binding.line_id, attempt, source, error = %error, "VoLTE IMS restore attempt failed");
+                if attempt < VOLTE_RESTORE_MAX_ATTEMPTS {
+                    let delay = config.auto_restore_retry_delay_secs.clamp(5, 180);
+                    line.volte
+                        .update(|state| state.next_retry_at = Some(volte_next_retry_at(delay)))
+                        .await;
+                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                }
+            }
+        }
+    }
+
+    line.volte
+        .update(|state| {
+            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+            state.manual_retry_available = true;
+            state.next_retry_at = None;
+            if state.last_error.is_none() {
+                state.last_error = Some("volte_restore_attempts_exhausted".to_string());
+            }
+        })
+        .await;
+}
+
+async fn run_legacy_volte_restore_batch(app: &AppState) {
+    let runtime = Arc::clone(&app.volte_runtime);
+    for attempt in 1..=VOLTE_RESTORE_MAX_ATTEMPTS {
+        let config = app.config_manager.get_volte_config();
+        if !config.feature_enabled || !config.sms_enabled || !config.connection_enabled {
+            return;
+        }
+        runtime
+            .update(|state| {
+                state.recovery_state =
+                    crate::access::volte::runtime::VolteRecoveryState::Connecting;
+                state.recovery_source = Some("automatic_legacy".to_string());
+                state.retry_attempt = attempt;
+                state.retry_max = VOLTE_RESTORE_MAX_ATTEMPTS;
+                state.manual_retry_available = false;
+                state.next_retry_at = None;
+            })
+            .await;
+        let result = {
+            let _guard = app.volte_connect_lock.lock().await;
+            crate::access::volte::live::connect_live(
+                &runtime,
+                &config,
+                app.config_manager.get_sms_path_policy().dedupe_enabled,
+                Arc::clone(&app.database),
+                Arc::clone(&app.notification_sender),
+            )
+            .await
+        };
+        if result.is_ok() {
+            return;
+        }
+        if attempt < VOLTE_RESTORE_MAX_ATTEMPTS {
+            let delay = config.auto_restore_retry_delay_secs.clamp(5, 180);
+            runtime
+                .update(|state| state.next_retry_at = Some(volte_next_retry_at(delay)))
+                .await;
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+    }
+    runtime
+        .update(|state| {
+            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+            state.manual_retry_available = true;
+            state.next_retry_at = None;
+        })
+        .await;
+}
+
+/// Keep explicitly enabled VoLTE lines alive, but stop after one bounded batch.
+/// A later registered-session failure starts a fresh batch; an exhausted batch
+/// waits for an explicit Web retry instead of looping forever.
 pub fn spawn_volte_auto_restore(app: AppState) {
     tokio::spawn(async move {
         let initial = app.config_manager.get_volte_config();
@@ -5135,94 +5467,38 @@ pub fn spawn_volte_auto_restore(app: AppState) {
             initial.auto_restore_initial_delay_secs.clamp(5, 300),
         ))
         .await;
-        let mut reconnect_attempt = 0u64;
         loop {
             let config = app.config_manager.get_volte_config();
-            if config.feature_enabled
-                && config.sms_enabled
-                && config.connection_enabled
-                && !app.volte_runtime.status().await.registered
-            {
-                let _guard = app.volte_connect_lock.lock().await;
-                if !app.volte_runtime.status().await.registered {
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
-                    match crate::access::volte::live::connect_live(
-                        &app.volte_runtime,
-                        &config,
-                        app.config_manager.get_sms_path_policy().dedupe_enabled,
-                        Arc::clone(&app.database),
-                        Arc::clone(&app.notification_sender),
-                    )
-                    .await
-                    {
-                        Ok(_) => {
-                            info!(reconnect_attempt, "VoLTE IMS auto-restore registered");
-                            reconnect_attempt = 0;
-                        }
-                        Err(error) => {
-                            warn!(reconnect_attempt, error = %error, "VoLTE IMS auto-restore failed");
-                        }
-                    }
-                }
-            } else {
-                reconnect_attempt = 0;
-            }
-
             if config.feature_enabled {
                 let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-                for profile in app
-                    .config_manager
-                    .get_line_profiles()
-                    .into_iter()
+                let profiles = app.config_manager.get_line_profiles();
+                let enabled_profiles = profiles
+                    .iter()
                     .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+                    .collect::<Vec<_>>();
+                if enabled_profiles.is_empty()
+                    && config.sms_enabled
+                    && config.connection_enabled
+                    && !app.volte_runtime.status().await.registered
+                    && !app.volte_runtime.status().await.manual_retry_available
                 {
+                    run_legacy_volte_restore_batch(&app).await;
+                }
+                for profile in enabled_profiles {
                     let Some(line) = app.line_registry.get(&profile.line_id).await else {
                         continue;
                     };
-                    let binding = line.binding();
-                    if !binding.present || line.volte.status().await.registered {
-                        continue;
-                    }
-                    let Ok(device) =
-                        crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
-                    else {
-                        continue;
-                    };
-                    let _guard = line.volte_connect_lock.lock().await;
-                    if line.volte.status().await.registered {
-                        continue;
-                    }
-                    let mut line_config = config.clone();
-                    line_config.connection_enabled = true;
-                    if let Err(error) = crate::access::volte::live::connect_live_for_line(
-                        &line.volte_live,
-                        &device,
-                        &line.volte,
-                        &line_config,
-                        app.config_manager.get_sms_path_policy().dedupe_enabled,
-                        Arc::clone(&app.database),
-                        Arc::clone(&app.notification_sender),
-                    )
-                    .await
+                    let status = line.volte.status().await;
+                    if status.registered
+                        || status.manual_retry_available
+                        || line.volte_retry_in_progress()
                     {
-                        warn!(
-                            line_id = %profile.line_id,
-                            error = %error,
-                            "Per-line VoLTE IMS auto-restore failed"
-                        );
+                        continue;
                     }
+                    start_line_volte_restore(app.clone(), line, "automatic").await;
                 }
             }
-            let retry_delay = if config.feature_enabled
-                && config.sms_enabled
-                && config.connection_enabled
-                && !app.volte_runtime.status().await.registered
-            {
-                config.auto_restore_retry_delay_secs.clamp(5, 180)
-            } else {
-                30
-            };
-            tokio::time::sleep(Duration::from_secs(retry_delay)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
     });
 }

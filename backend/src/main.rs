@@ -945,6 +945,10 @@ async fn main() -> Result<()> {
             post(set_volte_line_connection_handler).options(options_handler),
         )
         .route(
+            "/api/volte/lines/{line_id}/retry",
+            post(retry_volte_line_handler).options(options_handler),
+        )
+        .route(
             "/api/trunk/lines",
             get(get_trunk_lines_handler).options(options_handler),
         )

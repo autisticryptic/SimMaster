@@ -56,7 +56,7 @@ use super::{
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
-const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv6First;
+const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv4First;
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 
@@ -449,6 +449,9 @@ pub async fn connect_live_for_line(
                     state.pcscf = Some(pcscf);
                     state.registered_at = Some(now());
                     state.data_path_mode = Some(data_path_mode);
+                    state.recovery_state = super::runtime::VolteRecoveryState::Registered;
+                    state.manual_retry_available = false;
+                    state.next_retry_at = None;
                 })
                 .await;
             start_live_listener(

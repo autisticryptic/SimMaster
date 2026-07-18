@@ -65,6 +65,32 @@ pub enum VoltePhase {
     Stopping,
 }
 
+/// Recovery workflow state exposed to the Web UI.  Registration stages remain
+/// focused on IMS itself; this state explains why a requested connection is
+/// waiting, retrying, or deliberately stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolteRecoveryState {
+    Idle,
+    WaitingModem,
+    RestartingBaseband,
+    Connecting,
+    Registered,
+    Exhausted,
+}
+
+impl VolteRecoveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::WaitingModem => "waiting_modem",
+            Self::RestartingBaseband => "restarting_baseband",
+            Self::Connecting => "connecting",
+            Self::Registered => "registered",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
 impl VoltePhase {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -115,6 +141,13 @@ pub struct VolteSnapshot {
     pub duplicate_count: u64,
     pub reconnect_count: u64,
     pub data_path_mode: Option<String>,
+    pub recovery_state: VolteRecoveryState,
+    pub recovery_source: Option<String>,
+    pub retry_attempt: u32,
+    pub retry_max: u32,
+    pub modem_restart_attempt: u32,
+    pub modem_restart_max: u32,
+    pub manual_retry_available: bool,
 }
 
 impl Default for VolteSnapshot {
@@ -136,6 +169,13 @@ impl Default for VolteSnapshot {
             duplicate_count: 0,
             reconnect_count: 0,
             data_path_mode: None,
+            recovery_state: VolteRecoveryState::Idle,
+            recovery_source: None,
+            retry_attempt: 0,
+            retry_max: 5,
+            modem_restart_attempt: 0,
+            modem_restart_max: 3,
+            manual_retry_available: false,
         }
     }
 }
@@ -177,6 +217,14 @@ pub struct VolteRuntimeStatus {
     pub reconnect_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_path_mode: Option<String>,
+    pub recovery_state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery_source: Option<String>,
+    pub retry_attempt: u32,
+    pub retry_max: u32,
+    pub modem_restart_attempt: u32,
+    pub modem_restart_max: u32,
+    pub manual_retry_available: bool,
 }
 
 impl From<&VolteSnapshot> for VolteRuntimeStatus {
@@ -199,6 +247,13 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             duplicate_count: s.duplicate_count,
             reconnect_count: s.reconnect_count,
             data_path_mode: s.data_path_mode.clone(),
+            recovery_state: s.recovery_state.as_str().to_string(),
+            recovery_source: s.recovery_source.clone(),
+            retry_attempt: s.retry_attempt,
+            retry_max: s.retry_max,
+            modem_restart_attempt: s.modem_restart_attempt,
+            modem_restart_max: s.modem_restart_max,
+            manual_retry_available: s.manual_retry_available,
         }
     }
 }
@@ -318,6 +373,19 @@ mod tests {
     }
 
     #[test]
+    fn recovery_state_strings_are_stable() {
+        assert_eq!(VolteRecoveryState::Idle.as_str(), "idle");
+        assert_eq!(VolteRecoveryState::WaitingModem.as_str(), "waiting_modem");
+        assert_eq!(
+            VolteRecoveryState::RestartingBaseband.as_str(),
+            "restarting_baseband"
+        );
+        assert_eq!(VolteRecoveryState::Connecting.as_str(), "connecting");
+        assert_eq!(VolteRecoveryState::Registered.as_str(), "registered");
+        assert_eq!(VolteRecoveryState::Exhausted.as_str(), "exhausted");
+    }
+
+    #[test]
     fn default_snapshot_is_disabled_and_unregistered() {
         let s = VolteSnapshot::default();
         assert_eq!(s.phase, VoltePhase::Disabled);
@@ -328,6 +396,9 @@ mod tests {
         assert_eq!(status.stage, "disabled");
         assert_eq!(status.registration_mode, "");
         assert!(!status.registered);
+        assert_eq!(status.recovery_state, "idle");
+        assert_eq!(status.retry_max, 5);
+        assert_eq!(status.modem_restart_max, 3);
     }
 
     #[tokio::test]

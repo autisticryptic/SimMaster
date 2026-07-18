@@ -466,6 +466,13 @@ export interface VolteRuntimeStatus {
   duplicate_count: number
   reconnect_count: number
   data_path_mode?: string
+  recovery_state: 'idle' | 'waiting_modem' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
+  recovery_source?: string
+  retry_attempt: number
+  retry_max: number
+  modem_restart_attempt: number
+  modem_restart_max: number
+  manual_retry_available: boolean
 }
 
 export type TrunkRegistrationMode = 'static_peer' | 'outbound_register'

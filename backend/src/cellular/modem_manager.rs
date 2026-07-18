@@ -5895,6 +5895,52 @@ pub async fn restart_baseband(
     .await
 }
 
+/// Recover a modem that has disappeared from ModemManager.  A normal soft
+/// baseband restart needs a live Modem object, so the missing-device path must
+/// first restart ModemManager and wait for enumeration.  The caller bounds how
+/// often this operation is attempted.
+pub async fn recover_missing_baseband(conn: &Connection) -> Result<String, String> {
+    reset_baseband_restart_progress();
+    let _progress_guard = BasebandRestartRunGuard;
+    with_serial(async move {
+        record_restart_step(
+            "恢复缺失基带",
+            "running",
+            Some("正在重启 ModemManager 并等待基带重新枚举".to_string()),
+        );
+        run_recovery_command("systemctl", &["restart", "ModemManager"])
+            .await
+            .map_err(|error| {
+                record_restart_step("恢复缺失基带", "error", Some(error.clone()));
+                error
+            })?;
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match list_modem_paths(conn).await {
+                Ok(paths) if !paths.is_empty() => {
+                    let path = paths[0].clone();
+                    clear_modem_discovery_failure();
+                    record_restart_step("恢复缺失基带", "ok", Some(path.clone()));
+                    return Ok(path);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(error = %error, "ModemManager recovery enumeration failed");
+                }
+            }
+            if Instant::now() >= deadline {
+                let error =
+                    "ModemManager restarted but no baseband appeared within 30 seconds".to_string();
+                record_restart_step("恢复缺失基带", "error", Some(error.clone()));
+                return Err(error);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    })
+    .await
+}
+
 pub async fn power_cycle_sim_for_profile_switch(
     conn: &Connection,
     auto_connect_data: bool,

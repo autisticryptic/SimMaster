@@ -130,18 +130,22 @@ pub async fn ensure_ims_bearer(
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-            if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
-                return parse_bearer_connection(&path, &details);
-            }
-            match connect_and_read(&path).await {
-                Ok(bearer) => return Ok(bearer),
-                Err(error) => {
-                    let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
-                        .await
-                        .unwrap_or_default();
-                    required_fallback = required_ip_type_after_failure(&after);
-                    last_error = Some(error);
+            if is_dual_stack_bearer(&details) {
+                if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                    return parse_bearer_connection(&path, &details);
                 }
+                match connect_and_read(&path).await {
+                    Ok(bearer) => return Ok(bearer),
+                    Err(error) => {
+                        let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
+                            .await
+                            .unwrap_or_default();
+                        required_fallback = required_ip_type_after_failure(&after);
+                        last_error = Some(error);
+                    }
+                }
+            } else if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                disconnect_bearer(&path).await;
             }
             delete_bearer(modem, &path).await?;
             break;
@@ -168,6 +172,11 @@ pub async fn ensure_ims_bearer(
         }
     }
     Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
+}
+
+fn is_dual_stack_bearer(details: &str) -> bool {
+    value(details, "bearer.properties.ip-type")
+        .is_some_and(|ip_type| ip_type.eq_ignore_ascii_case("ipv4v6"))
 }
 
 struct BearerAttemptFailure {
@@ -532,6 +541,14 @@ mod tests {
         assert_eq!(fallback_ip_types(ipv4), vec!["ipv4"]);
         assert_eq!(fallback_ip_types(generic), vec!["ipv4", "ipv6"]);
         assert_eq!(fallback_ip_types(""), vec!["ipv4", "ipv6"]);
+    }
+
+    #[test]
+    fn only_explicit_dual_stack_bearers_are_reused() {
+        assert!(is_dual_stack_bearer("bearer.properties.ip-type: ipv4v6"));
+        assert!(is_dual_stack_bearer("bearer.properties.ip-type: IPV4V6"));
+        assert!(!is_dual_stack_bearer("bearer.properties.ip-type: ipv6"));
+        assert!(!is_dual_stack_bearer("bearer.status.connected: yes"));
     }
 
     #[test]

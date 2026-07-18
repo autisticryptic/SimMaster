@@ -16,7 +16,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, Refresh, Router, SettingsEthernet, SimCard } from '@mui/icons-material'
+import { CellTower, Refresh, Replay, Router, SettingsEthernet, SimCard } from '@mui/icons-material'
 import {
   api,
   type TrunkProfileResponse,
@@ -67,6 +67,26 @@ function trunkRuntimeLabel(line?: TrunkProfileResponse) {
   if (line.runtime.phase === 'configured') return '已配置，等待启动'
   if (line.runtime.phase === 'degraded') return '连接异常'
   return line.runtime.stage || '等待启动'
+}
+
+function recoveryMessage(line: VolteLineControlResponse) {
+  const runtime = line.runtime
+  switch (runtime.recovery_state) {
+    case 'waiting_modem':
+      return '长时间未检测到基带，正在等待设备重新出现'
+    case 'restarting_baseband':
+      return `正在恢复基带（${runtime.modem_restart_attempt}/${runtime.modem_restart_max}）`
+    case 'connecting':
+      return runtime.retry_attempt > 0
+        ? `正在执行第 ${runtime.retry_attempt}/${runtime.retry_max} 次完整 IMS 注册尝试`
+        : '正在准备 IMS 注册重试'
+    case 'exhausted':
+      return runtime.modem_restart_attempt >= runtime.modem_restart_max
+        ? `基带恢复 ${runtime.modem_restart_max} 次后仍不可用，已停止自动恢复`
+        : `连续 ${runtime.retry_max} 次完整 IMS 注册尝试均失败，已停止自动恢复`
+    default:
+      return null
+  }
 }
 
 export default function ModemLinesPanel() {
@@ -149,6 +169,27 @@ export default function ModemLinesPanel() {
     }
   }
 
+  const retryLine = async (lineId: string) => {
+    setSavingKey(`retry:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.retryVolteLine(lineId)
+      if (response.data) {
+        const updatedLine = response.data
+        setLines((current) => current.map((line) => (
+          line.modem.line_id === lineId ? updatedLine : line
+        )))
+      }
+      setSuccess(`${shortLineId(lineId)} 已开始新的五次 VoLTE 恢复批次`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
   const toggleTrunk = async (lineId: string, enabled: boolean) => {
     setSavingKey(`trunk:${lineId}`)
     setError(null)
@@ -216,8 +257,11 @@ export default function ModemLinesPanel() {
             </Alert>
           </Box>
           <Typography variant="caption" color="text.secondary" display="block" mt={1.5}>
-            每种地址族最多尝试一次，失败 Bearer 会先清理，最多三次后结束；该策略不提供自定义入口。
+            每轮先尝试双栈；信息不明确时再依次尝试 IPv4、IPv6，全部路径均失败才记为一次。默认连续五次失败后停止，可在线路旁手动重试。
           </Typography>
+          {control?.runtime.recovery_state === 'exhausted' && control.runtime.last_error && (
+            <Alert severity="warning" sx={{ mt: 1.5, py: 0.25 }}>{control.runtime.last_error}</Alert>
+          )}
         </CardContent>
       </Card>
 
@@ -227,6 +271,7 @@ export default function ModemLinesPanel() {
         <Grid container spacing={2.5}>
           {lines.map((line, index) => {
             const volteBusy = savingKey === `volte:${line.modem.line_id}`
+            const retryBusy = savingKey === `retry:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
             const trunkLine = trunkByLineId.get(line.modem.line_id)
             const runtimeColor = line.runtime.registered
@@ -234,6 +279,8 @@ export default function ModemLinesPanel() {
               : line.profile.volte_connection_enabled
                 ? 'warning'
                 : 'default'
+            const recovery = recoveryMessage(line)
+            const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
             return (
               <Grid key={line.modem.line_id} size={{ xs: 12, lg: 6 }}>
                 <Card variant="outlined" sx={{ height: '100%', opacity: line.modem.present ? 1 : 0.68 }}>
@@ -280,9 +327,14 @@ export default function ModemLinesPanel() {
                       </Grid>
                     </Grid>
 
-                    {line.runtime.last_error && (
-                      <Alert severity="warning" sx={{ mt: 2, py: 0.25 }}>
-                        {line.runtime.last_error}
+                    {(recovery || line.runtime.last_error) && (
+                      <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
+                        {recovery ?? line.runtime.last_error}
+                        {line.runtime.next_retry_at && (
+                          <Typography variant="caption" display="block">
+                            下次尝试：{new Date(line.runtime.next_retry_at).toLocaleString()}
+                          </Typography>
+                        )}
                       </Alert>
                     )}
 
@@ -294,7 +346,26 @@ export default function ModemLinesPanel() {
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
-                        {volteBusy && <CircularProgress size={18} />}
+                        {(volteBusy || retryBusy) && <CircularProgress size={18} />}
+                        <Tooltip title={recoveryRunning ? '自动恢复正在进行' : '立即开始新的五次恢复批次'}>
+                          <span>
+                            <Button
+                              size="small"
+                              variant={line.runtime.manual_retry_available ? 'contained' : 'outlined'}
+                              startIcon={<Replay />}
+                              onClick={() => void retryLine(line.modem.line_id)}
+                              disabled={
+                                !control?.feature_enabled
+                                || !line.profile.volte_connection_enabled
+                                || line.runtime.registered
+                                || recoveryRunning
+                                || savingKey !== null
+                              }
+                            >
+                              重试
+                            </Button>
+                          </span>
+                        </Tooltip>
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
