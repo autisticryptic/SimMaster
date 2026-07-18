@@ -55,7 +55,9 @@ use super::{
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
-const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv4First;
+const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv6First;
+const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
+const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
 
@@ -475,7 +477,7 @@ async fn connect_inner(
     generation: u64,
     device: &VolteDeviceBinding,
 ) -> Result<VolteLiveSession, VolteError> {
-    let device = resolve_device_binding(device).await?;
+    let mut device = resolve_device_binding(device).await?;
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
@@ -488,6 +490,7 @@ async fn connect_inner(
     disconnect_existing_ims_bearers(&device.modem_id).await?;
     let at_pcscf = discover_pcscf_via_at(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await;
     ensure_generation(runtime, generation)?;
+    device = resolve_device_binding(&device).await?;
 
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
@@ -2191,27 +2194,45 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
 async fn resolve_device_binding(
     requested: &VolteDeviceBinding,
 ) -> Result<VolteDeviceBinding, VolteError> {
-    if command_output(
-        "mmcli",
-        &["-m", requested.modem_id.as_str(), "--output-keyvalue"],
-    )
-    .await
-    .is_ok()
-    {
-        return Ok(requested.clone());
-    }
+    for attempt in 0..MM_MODEM_WAIT_ATTEMPTS {
+        if let Ok(details) = command_output(
+            "mmcli",
+            &["-m", requested.modem_id.as_str(), "--output-keyvalue"],
+        )
+        .await
+        {
+            if modem_is_ready(&details) {
+                return Ok(requested.clone());
+            }
+        }
 
-    let modem_list = command_output("mmcli", &["-L", "--output-keyvalue"]).await?;
-    let current_modem_id = primary_modem_id(&modem_list)
-        .ok_or_else(|| VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))?;
-    tracing::warn!(
-        requested_modem = %requested.modem_id,
-        current_modem = %current_modem_id,
-        "VoLTE modem object changed; using current ModemManager modem"
-    );
-    let mut resolved = requested.clone();
-    resolved.modem_id = current_modem_id;
-    Ok(resolved)
+        if let Ok(modem_list) = command_output("mmcli", &["-L", "--output-keyvalue"]).await {
+            if let Some(current_modem_id) = primary_modem_id(&modem_list) {
+                if let Ok(details) = command_output(
+                    "mmcli",
+                    &["-m", current_modem_id.as_str(), "--output-keyvalue"],
+                )
+                .await
+                {
+                    if modem_is_ready(&details) {
+                        tracing::warn!(
+                            requested_modem = %requested.modem_id,
+                            current_modem = %current_modem_id,
+                            "VoLTE modem object changed; using current ModemManager modem"
+                        );
+                        let mut resolved = requested.clone();
+                        resolved.modem_id = current_modem_id;
+                        return Ok(resolved);
+                    }
+                }
+            }
+        }
+
+        if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
+            tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
+        }
+    }
+    Err(VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))
 }
 
 fn primary_modem_id(output: &str) -> Option<String> {
@@ -2219,6 +2240,13 @@ fn primary_modem_id(output: &str) -> Option<String> {
     let modem_id = path.rsplit('/').next()?.trim();
     (!modem_id.is_empty() && modem_id.bytes().all(|byte| byte.is_ascii_digit()))
         .then(|| modem_id.to_string())
+}
+
+fn modem_is_ready(output: &str) -> bool {
+    matches!(
+        key_value(output, "modem.generic.state").as_deref(),
+        Some("registered" | "connected")
+    )
 }
 
 async fn command_output(program: &str, args: &[&str]) -> Result<String, VolteError> {
@@ -2370,6 +2398,14 @@ mod tests {
             "modem-list.length : 1\nmodem-list.value[1] : /org/freedesktop/ModemManager1/Modem/7\n";
         assert_eq!(primary_modem_id(list).as_deref(), Some("7"));
         assert_eq!(primary_modem_id("modem-list.length : 0"), None);
+    }
+
+    #[test]
+    fn modem_readiness_waits_for_registration() {
+        assert!(modem_is_ready("modem.generic.state : registered\n"));
+        assert!(modem_is_ready("modem.generic.state : connected\n"));
+        assert!(!modem_is_ready("modem.generic.state : enabling\n"));
+        assert!(!modem_is_ready("modem.generic.state : disabled\n"));
     }
 
     #[test]
