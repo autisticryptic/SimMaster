@@ -5135,6 +5135,7 @@ pub fn spawn_volte_auto_restore(app: AppState) {
             initial.auto_restore_initial_delay_secs.clamp(5, 300),
         ))
         .await;
+        let mut reconnect_attempt = 0u64;
         loop {
             let config = app.config_manager.get_volte_config();
             if config.feature_enabled
@@ -5144,33 +5145,27 @@ pub fn spawn_volte_auto_restore(app: AppState) {
             {
                 let _guard = app.volte_connect_lock.lock().await;
                 if !app.volte_runtime.status().await.registered {
-                    let attempts = config.auto_restore_attempts.clamp(1, 5);
-                    for attempt in 1..=attempts {
-                        match crate::access::volte::live::connect_live(
-                            &app.volte_runtime,
-                            &config,
-                            app.config_manager.get_sms_path_policy().dedupe_enabled,
-                            Arc::clone(&app.database),
-                            Arc::clone(&app.notification_sender),
-                        )
-                        .await
-                        {
-                            Ok(_) => {
-                                info!(attempt, "VoLTE IMS auto-restore registered");
-                                break;
-                            }
-                            Err(error) => {
-                                warn!(attempt, error = %error, "VoLTE IMS auto-restore failed");
-                                if attempt < attempts {
-                                    tokio::time::sleep(Duration::from_secs(
-                                        config.auto_restore_retry_delay_secs.clamp(5, 180),
-                                    ))
-                                    .await;
-                                }
-                            }
+                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    match crate::access::volte::live::connect_live(
+                        &app.volte_runtime,
+                        &config,
+                        app.config_manager.get_sms_path_policy().dedupe_enabled,
+                        Arc::clone(&app.database),
+                        Arc::clone(&app.notification_sender),
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            info!(reconnect_attempt, "VoLTE IMS auto-restore registered");
+                            reconnect_attempt = 0;
+                        }
+                        Err(error) => {
+                            warn!(reconnect_attempt, error = %error, "VoLTE IMS auto-restore failed");
                         }
                     }
                 }
+            } else {
+                reconnect_attempt = 0;
             }
 
             if config.feature_enabled {
@@ -5218,7 +5213,16 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                     }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            let retry_delay = if config.feature_enabled
+                && config.sms_enabled
+                && config.connection_enabled
+                && !app.volte_runtime.status().await.registered
+            {
+                config.auto_restore_retry_delay_secs.clamp(5, 180)
+            } else {
+                30
+            };
+            tokio::time::sleep(Duration::from_secs(retry_delay)).await;
         }
     });
 }
