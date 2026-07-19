@@ -15,9 +15,10 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, Refresh, Replay, SettingsEthernet, SimCard, Wifi } from '@mui/icons-material'
+import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, SimCard, Wifi } from '@mui/icons-material'
 import {
   api,
+  type LineNetworkControlsResponse,
   type TrunkProfileResponse,
   type VolteLineControlResponse,
   type VowifiLineConfigResponse,
@@ -81,7 +82,7 @@ const vowifiStageLabels: Record<string, string> = {
 }
 
 function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
-  if (!line?.config.enabled) return '未启用'
+  if (!line?.config.enabled) return 'VoWiFi未启用'
   if (line.runtime_registered) return 'VoWiFi IMS 已注册'
   const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage
   return line.runtime_error ? `${stage}失败` : stage
@@ -111,6 +112,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
+  const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
@@ -128,14 +130,16 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const load = useCallback(async (background = false) => {
     if (!background) setLoading(true)
     try {
-      const [lineResponse, trunkResponse, vowifiResponse] = await Promise.all([
+      const [lineResponse, trunkResponse, vowifiResponse, networkResponse] = await Promise.all([
         api.getVolteLines(),
         api.getTrunkLines(),
         api.getVowifiLines(),
+        api.getLineNetworkControls(),
       ])
       setLines(stableModemSort(lineResponse.data ?? []))
       setTrunkLines(stableModemSort(trunkResponse.data ?? []))
       setVowifiLines(stableModemSort(vowifiResponse.data ?? []))
+      setNetworkControls(networkResponse.data ?? [])
       setError(null)
     } catch (err) {
       if (!background) setError(err instanceof Error ? err.message : String(err))
@@ -158,6 +162,46 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const vowifiByLineId = useMemo(() => new Map(
     vowifiLines.map((line) => [line.line_id, line]),
   ), [vowifiLines])
+  const networkByLineId = useMemo(() => new Map(
+    networkControls.map((controls) => [controls.line_id, controls]),
+  ), [networkControls])
+
+  const updateNetworkControl = (updated: LineNetworkControlsResponse) => {
+    setNetworkControls((current) => current.map((item) => item.line_id === updated.line_id ? updated : item))
+  }
+
+  const toggleDataConnection = async (lineId: string, enabled: boolean) => {
+    setSavingKey(`data:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.setLineDataConnection(lineId, enabled)
+      if (response.data) updateNetworkControl(response.data)
+      setSuccess(`${shortLineId(lineId)} ${enabled ? '已建立移动数据出口' : '已关闭移动数据出口'}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  const toggleAirplaneMode = async (lineId: string, enabled: boolean) => {
+    setSavingKey(`airplane:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.setLineAirplaneMode(lineId, enabled)
+      if (response.data) updateNetworkControl(response.data)
+      await load(true)
+      setSuccess(`${shortLineId(lineId)} 飞行模式已${enabled ? '开启，线路服务已关闭' : '关闭'}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
     setSavingKey(`volte:${lineId}`)
@@ -288,8 +332,12 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
             const retryBusy = savingKey === `retry:${line.modem.line_id}`
             const vowifiBusy = savingKey === `vowifi:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
+            const dataBusy = savingKey === `data:${line.modem.line_id}`
+            const airplaneBusy = savingKey === `airplane:${line.modem.line_id}`
             const trunkLine = trunkByLineId.get(line.modem.line_id)
             const vowifiLine = vowifiByLineId.get(line.modem.line_id)
+            const network = networkByLineId.get(line.modem.line_id)
+            const airplaneEnabled = network?.airplane_mode.enabled ?? line.profile.airplane_mode_enabled
             const runtimeColor = line.runtime.registered
               ? 'success'
               : line.profile.volte_connection_enabled
@@ -343,16 +391,23 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           {line.modem.qmi_device || '未发现'} · Slot {line.modem.uim_slot}
                         </Typography>
                       </Grid>
-                      <Grid size={12}>
+                      <Grid size={{ xs: 12, sm: 6 }}>
                         <Typography variant="caption" color="text.secondary">IMS 数据路径</Typography>
-                        <Box display="flex" alignItems="baseline" gap={1.25} flexWrap="wrap" mt={0.25}>
-                          <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
-                            {line.runtime.data_path_mode || '尚未建立'}{line.runtime.pcscf ? ` · P-CSCF ${line.runtime.pcscf}` : ''}
-                          </Typography>
-                          <Typography component="button" type="button" variant="body2" color="primary" onClick={() => openDetails(line, 'basic')} sx={{ border: 0, bgcolor: 'transparent', p: 0, cursor: 'pointer', font: 'inherit' }}>
-                            SIM 卡详情
-                          </Typography>
-                        </Box>
+                        <Typography variant="body2" mt={0.25} sx={{ wordBreak: 'break-all' }}>
+                          {line.runtime.data_path_mode || '尚未建立'}{line.runtime.pcscf ? ` · P-CSCF ${line.runtime.pcscf}` : ''}
+                        </Typography>
+                      </Grid>
+                      <Grid size={{ xs: 12, sm: 6 }} display="flex" alignItems="center" justifyContent="center">
+                        <Typography
+                          component="button"
+                          type="button"
+                          variant="subtitle1"
+                          color="primary"
+                          onClick={() => openDetails(line, 'basic')}
+                          sx={{ border: 0, bgcolor: 'transparent', px: 1, py: 0.75, cursor: 'pointer', fontWeight: 600, textAlign: 'center' }}
+                        >
+                          SIM 卡详情
+                        </Typography>
                       </Grid>
                     </Grid>
 
@@ -373,7 +428,59 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                       </Alert>
                     )}
 
-                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={2} pt={1.5} borderTop={1} borderColor="divider">
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={2} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75}>
+                          <Lan color="action" fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>数据连接与代理出口</Typography>
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25} sx={{ wordBreak: 'break-word' }}>
+                          {network?.data.proxy.running && network.data.proxy.port
+                            ? `HTTP / SOCKS5 端口 ${network.data.proxy.port} · ${network.data.proxy.interface_name || '移动数据网卡'}`
+                            : network?.data.enabled
+                              ? network.data.proxy.last_error || '正在建立移动数据出口'
+                              : '关闭时不会向本机其他应用提供移动数据'}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={1}>
+                        <Chip
+                          size="small"
+                          label={network?.data.proxy.running ? `端口 ${network.data.proxy.port}` : network?.data.enabled ? '连接中' : '未启用'}
+                          color={network?.data.proxy.running ? 'success' : network?.data.enabled ? 'warning' : 'default'}
+                          variant="outlined"
+                        />
+                        {dataBusy && <CircularProgress size={18} />}
+                        <Switch
+                          checked={network?.data.enabled ?? false}
+                          onChange={(_, enabled) => void toggleDataConnection(line.modem.line_id, enabled)}
+                          disabled={!network || !line.modem.present || airplaneEnabled || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75}>
+                          <FlightTakeoff color={airplaneEnabled ? 'warning' : 'action'} fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>飞行模式</Typography>
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
+                          {airplaneEnabled ? '射频及数据、VoLTE、VoWiFi、Trunk 均已关闭' : '射频正常，可独立启用线路服务'}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={1}>
+                        <Chip size="small" label={airplaneEnabled ? '已开启' : '已关闭'} color={airplaneEnabled ? 'warning' : 'default'} variant="outlined" />
+                        {airplaneBusy && <CircularProgress size={18} />}
+                        <Switch
+                          color="warning"
+                          checked={airplaneEnabled}
+                          onChange={(_, enabled) => void toggleAirplaneMode(line.modem.line_id, enabled)}
+                          disabled={!network || !line.modem.present || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
                         <Typography variant="caption" color="text.secondary">
@@ -391,7 +498,8 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                               startIcon={<Replay />}
                               onClick={() => void retryLine(line.modem.line_id)}
                               disabled={
-                                !line.profile.volte_connection_enabled
+                                airplaneEnabled
+                                || !line.profile.volte_connection_enabled
                                 || line.runtime.registered
                                 || recoveryRunning
                                 || savingKey !== null
@@ -404,7 +512,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
-                          disabled={!line.modem.present || savingKey !== null}
+                          disabled={!line.modem.present || airplaneEnabled || savingKey !== null}
                         />
                       </Box>
                     </Box>
@@ -427,7 +535,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           size="small"
                           variant="text"
                           onClick={() => vowifiLine && setEditingVowifiLine(vowifiLine)}
-                          disabled={!vowifiLine || savingKey !== null}
+                          disabled={!vowifiLine || airplaneEnabled || savingKey !== null}
                         >
                           配置
                         </Button>
@@ -435,7 +543,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Switch
                           checked={vowifiLine?.config.enabled ?? false}
                           onChange={(_, enabled) => void toggleVowifi(line.modem.line_id, enabled)}
-                          disabled={!vowifiLine || !line.modem.present || savingKey !== null}
+                          disabled={!vowifiLine || !line.modem.present || airplaneEnabled || savingKey !== null}
                         />
                       </Box>
                     </Box>
@@ -458,7 +566,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           size="small"
                           variant="text"
                           onClick={() => trunkLine && setEditingTrunkLine(trunkLine)}
-                          disabled={!trunkLine || savingKey !== null}
+                          disabled={!trunkLine || airplaneEnabled || savingKey !== null}
                         >
                           配置
                         </Button>
@@ -466,7 +574,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Switch
                           checked={trunkLine?.trunk.enabled ?? false}
                           onChange={(_, enabled) => void toggleTrunk(line.modem.line_id, enabled)}
-                          disabled={!trunkLine || savingKey !== null}
+                          disabled={!trunkLine || airplaneEnabled || savingKey !== null}
                         />
                       </Box>
                     </Box>

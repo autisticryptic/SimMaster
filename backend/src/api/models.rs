@@ -252,11 +252,32 @@ pub struct AirplaneModeRequest {
     pub enabled: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct AirplaneModeResponse {
     pub enabled: bool,
     pub powered: bool,
     pub online: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LineDataConnectionResponse {
+    pub enabled: bool,
+    pub connected: bool,
+    pub proxy: crate::cellular::data_proxy::DataProxyStatus,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LineNetworkControlsResponse {
+    pub line_id: String,
+    pub modem_path: String,
+    pub present: bool,
+    pub data: LineDataConnectionResponse,
+    pub airplane_mode: AirplaneModeResponse,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LineNetworkToggleRequest {
+    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

@@ -23,6 +23,7 @@ import type {
   ConnectivityCheckResponse,
   DataConnectionRequest,
   DataConnectionStatus,
+  LineNetworkControlsResponse,
   DdnsConfig,
   DdnsLogsResponse,
   DdnsStatusResponse,
@@ -436,6 +437,24 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(body),
     })
+  }
+
+  async getLineNetworkControls() {
+    return request<ApiResponse<LineNetworkControlsResponse[]>>('/modem/line-controls')
+  }
+
+  async setLineDataConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
+  }
+
+  async setLineAirplaneMode(lineId: string, enabled: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/airplane-mode`,
+      { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
   }
 
   async getSystemStats() {

@@ -1,22 +1,14 @@
 import { Box, Card, CardContent, Typography, Stack, Switch, Chip } from '@mui/material'
-import { NetworkCheck, FlightTakeoff, TravelExplore, Tune } from '@mui/icons-material'
-import type { AirplaneModeResponse, RoamingResponse } from '@/api/types'
+import { TravelExplore, Tune } from '@mui/icons-material'
+import type { RoamingResponse } from '@/api/types'
 
 interface QuickControlsProps {
-  dataStatus: boolean
-  airplaneMode: AirplaneModeResponse | null
   roaming: RoamingResponse | null
-  onToggleData: () => void
-  onToggleAirplaneMode: () => void
   onToggleRoaming: () => void
 }
 
 export function QuickControls({
-  dataStatus,
-  airplaneMode,
   roaming,
-  onToggleData,
-  onToggleAirplaneMode,
   onToggleRoaming,
 }: QuickControlsProps) {
   return (
@@ -28,21 +20,6 @@ export function QuickControls({
         </Box>
 
         <Stack spacing={2}>
-          <Box display="flex" alignItems="center" justifyContent="space-between">
-            <Box display="flex" alignItems="center" gap={1}>
-              <NetworkCheck color={dataStatus ? 'success' : 'disabled'} />
-              <Typography variant="body2">数据连接</Typography>
-            </Box>
-            <Switch
-              checked={dataStatus}
-              onChange={() => {
-                void onToggleData()
-              }}
-              color="success"
-              size="small"
-            />
-          </Box>
-
           <Box display="flex" alignItems="center" justifyContent="space-between">
             <Box display="flex" alignItems="center" gap={1}>
               <TravelExplore color={roaming?.roaming_allowed ? 'info' : 'disabled'} />
@@ -57,21 +34,6 @@ export function QuickControls({
                 void onToggleRoaming()
               }}
               color="info"
-              size="small"
-            />
-          </Box>
-
-          <Box display="flex" alignItems="center" justifyContent="space-between">
-            <Box display="flex" alignItems="center" gap={1}>
-              <FlightTakeoff color={airplaneMode?.enabled ? 'warning' : 'disabled'} />
-              <Typography variant="body2">飞行模式</Typography>
-            </Box>
-            <Switch
-              checked={airplaneMode?.enabled || false}
-              onChange={() => {
-                void onToggleAirplaneMode()
-              }}
-              color="warning"
               size="small"
             />
           </Box>

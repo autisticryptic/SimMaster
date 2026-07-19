@@ -40,7 +40,10 @@ mod system;
 mod trunk;
 
 use api::handlers::*;
-use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
+use cellular::modem_manager::{
+    connect_data_via_modem, data_interface_for_modem, disconnect_data_via_modem,
+    ensure_nm_modem_profile, init_data_connection, set_airplane_mode_for_modem,
+};
 use infra::config::{get_default_config_path, ConfigManager};
 use infra::db::Database;
 use network::device_network::DdnsManager;
@@ -348,6 +351,20 @@ async fn main() -> Result<()> {
     line_registry
         .sync_trunk_profiles(config_manager.as_ref())
         .await;
+    if let Some(primary) = line_registry.primary().await {
+        let primary_profile = config_manager.get_line_profile(&primary.binding().line_id);
+        data_user_disabled.store(
+            !primary_profile.data_connection_enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        airplane_mode_requested.store(
+            primary_profile.airplane_mode_enabled,
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        if config_manager.get_data_enabled() != primary_profile.data_connection_enabled {
+            let _ = config_manager.set_data_enabled(primary_profile.data_connection_enabled);
+        }
+    }
     let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
 
     let nm_result = ensure_nm_modem_profile().await;
@@ -523,6 +540,70 @@ async fn main() -> Result<()> {
         line_registry,
         cell_monitoring_active,
     });
+
+    // Restore only explicitly enabled per-line data/airplane intents. The
+    // legacy global data switch is kept in sync for compatibility, but it no
+    // longer causes an unselected modem to become an implicit proxy route.
+    {
+        let restore_app = app_state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(tokio::time::Duration::from_secs(8)).await;
+            for line in restore_app.line_registry.all().await {
+                let binding = line.binding();
+                if !binding.present {
+                    continue;
+                }
+                let profile = restore_app
+                    .config_manager
+                    .get_line_profile(&binding.line_id);
+                if profile.airplane_mode_enabled {
+                    let _ = line.data_proxy.stop().await;
+                    let _ = disconnect_data_via_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                    )
+                    .await;
+                    let _ = set_airplane_mode_for_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                        true,
+                    )
+                    .await;
+                    continue;
+                }
+                if !profile.data_connection_enabled {
+                    continue;
+                }
+                let allow_roaming = restore_app.config_manager.get_roaming_allowed();
+                let apn = restore_app.config_manager.get_apn_config();
+                if let Err(error) = connect_data_via_modem(
+                    restore_app.dbus_conn.as_ref(),
+                    &binding.modem_path,
+                    allow_roaming,
+                    Some(&apn),
+                )
+                .await
+                {
+                    let _ = line.data_proxy.record_error(error).await;
+                    continue;
+                }
+                for _ in 0..15 {
+                    if let Ok(Some(interface)) = data_interface_for_modem(
+                        restore_app.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                    )
+                    .await
+                    {
+                        if let Err(error) = line.data_proxy.start(&interface).await {
+                            let _ = line.data_proxy.record_error(error).await;
+                        }
+                        break;
+                    }
+                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                }
+            }
+        });
+    }
 
     // Keep the line inventory synchronized with ModemManager hotplug and SIM
     // replacement events. Refresh preserves existing per-line runtime state.
@@ -761,6 +842,18 @@ async fn main() -> Result<()> {
             get(get_airplane_mode_handler)
                 .post(set_airplane_mode_handler)
                 .options(options_handler),
+        )
+        .route(
+            "/api/modem/line-controls",
+            get(get_line_network_controls_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/data",
+            post(set_line_data_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/airplane-mode",
+            post(set_line_airplane_mode_handler).options(options_handler),
         )
         .route(
             "/api/baseband/restart",

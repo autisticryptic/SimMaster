@@ -2266,6 +2266,274 @@ pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> i
     }
 }
 
+async fn build_line_network_controls(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+) -> LineNetworkControlsResponse {
+    let binding = line.binding();
+    let profile = app.config_manager.get_line_profile(&binding.line_id);
+    let connected = if binding.present {
+        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+            .await
+            .unwrap_or(None)
+            .is_some()
+    } else {
+        false
+    };
+    let mut airplane_mode = if binding.present {
+        modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+            .await
+            .unwrap_or(AirplaneModeResponse {
+                enabled: profile.airplane_mode_enabled,
+                powered: false,
+                online: false,
+            })
+    } else {
+        AirplaneModeResponse {
+            enabled: profile.airplane_mode_enabled,
+            powered: false,
+            online: false,
+        }
+    };
+    airplane_mode.enabled |= profile.airplane_mode_enabled;
+    LineNetworkControlsResponse {
+        line_id: binding.line_id,
+        modem_path: binding.modem_path,
+        present: binding.present,
+        data: LineDataConnectionResponse {
+            enabled: profile.data_connection_enabled,
+            connected,
+            proxy: line.data_proxy.status().await,
+        },
+        airplane_mode,
+    }
+}
+
+pub async fn get_line_network_controls_handler(
+    State(app): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<LineNetworkControlsResponse>>>,
+) {
+    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(format!(
+                "Failed to discover modems: {error}"
+            ))),
+        );
+    }
+    let lines = app.line_registry.all().await;
+    let mut response = Vec::with_capacity(lines.len());
+    for line in lines {
+        response.push(build_line_network_controls(&app, &line).await);
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", response)),
+    )
+}
+
+pub async fn set_line_data_connection_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<LineNetworkToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let binding = line.binding();
+    if !binding.present {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_not_present")),
+        );
+    }
+    let profile = app.config_manager.get_line_profile(&line_id);
+    if payload.enabled && profile.airplane_mode_enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
+        );
+    }
+
+    if payload.enabled {
+        let allow_roaming = app.config_manager.get_roaming_allowed();
+        let apn = app.config_manager.get_apn_config();
+        if let Err(error) = modem_manager::connect_data_via_modem(
+            app.dbus_conn.as_ref(),
+            &binding.modem_path,
+            allow_roaming,
+            Some(&apn),
+        )
+        .await
+        {
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+        let mut interface = None;
+        for _ in 0..15 {
+            interface = modem_manager::data_interface_for_modem(
+                app.dbus_conn.as_ref(),
+                &binding.modem_path,
+            )
+            .await
+            .unwrap_or(None);
+            if interface.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        let Some(interface) = interface else {
+            let error = "cellular_data_interface_unavailable".to_string();
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        };
+        if let Err(error) = line.data_proxy.start(&interface).await {
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+    } else {
+        line.data_proxy.stop().await;
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            warn!(line_id = %line_id, error = %error, "Per-line data disconnect failed");
+        }
+    }
+    if let Err(error) = app
+        .config_manager
+        .set_line_data_connection_enabled(&line_id, payload.enabled)
+    {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
+    }
+    let is_primary = app
+        .line_registry
+        .primary()
+        .await
+        .is_some_and(|primary| primary.binding().line_id == line_id);
+    if is_primary {
+        app.data_user_disabled
+            .store(!payload.enabled, Ordering::SeqCst);
+        let _ = app.config_manager.set_data_enabled(payload.enabled);
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
+    )
+}
+
+pub async fn set_line_airplane_mode_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<LineNetworkToggleRequest>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let binding = line.binding();
+    if !binding.present {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_not_present")),
+        );
+    }
+
+    if payload.enabled {
+        let profile = match app.config_manager.set_line_airplane_mode(&line_id, true) {
+            Ok(profile) => profile,
+            Err(error) => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::error(format!("Failed: {error}"))),
+                )
+            }
+        };
+        line.data_proxy.stop().await;
+        let _ =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await;
+        crate::access::volte::live::disconnect_live_for_line(
+            &line.volte_live,
+            &line.volte,
+            "line_airplane_mode_enabled",
+        )
+        .await;
+        line.trunk.reconcile_profile(&profile.trunk).await;
+        let is_primary = app
+            .line_registry
+            .primary()
+            .await
+            .is_some_and(|primary| primary.binding().line_id == line_id);
+        if is_primary {
+            let _ = app.config_manager.set_vowifi_connection_enabled(false);
+            let _ = app.config_manager.set_data_enabled(false);
+            let _ = reset_vowifi_runtime(&app, "line_airplane_mode_enabled").await;
+            app.data_user_disabled.store(true, Ordering::SeqCst);
+            app.airplane_mode_requested.store(true, Ordering::SeqCst);
+        }
+    }
+    if let Err(error) = modem_manager::set_airplane_mode_for_modem(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+        payload.enabled,
+    )
+    .await
+    {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
+    }
+    if !payload.enabled {
+        if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+        let is_primary = app
+            .line_registry
+            .primary()
+            .await
+            .is_some_and(|primary| primary.binding().line_id == line_id);
+        if is_primary {
+            app.airplane_mode_requested.store(false, Ordering::SeqCst);
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
+    )
+}
+
 // ============ 短信功能 ============
 
 use crate::infra::db::{Database, EsimProfileCacheEntry};
@@ -4577,6 +4845,17 @@ pub async fn set_vowifi_line_config_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    if payload.enabled
+        && app
+            .config_manager
+            .get_line_profile(&line_id)
+            .airplane_mode_enabled
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
+        );
+    }
     if let Err(error) = app.config_manager.set_line_vowifi_config(&line_id, payload) {
         return (
             StatusCode::OK,
@@ -4613,6 +4892,17 @@ pub async fn set_vowifi_line_connection_handler(
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::error("line_not_present")),
+        );
+    }
+    if payload.enabled
+        && app
+            .config_manager
+            .get_line_profile(&line_id)
+            .airplane_mode_enabled
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
         );
     }
     let is_primary = app
@@ -4772,6 +5062,17 @@ pub async fn set_volte_line_connection_handler(
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::error("line_not_present")),
+        );
+    }
+    if payload.enabled
+        && app
+            .config_manager
+            .get_line_profile(&line_id)
+            .airplane_mode_enabled
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
         );
     }
     let profile = match app
@@ -4951,6 +5252,17 @@ pub async fn set_line_trunk_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    if payload.enabled
+        && app
+            .config_manager
+            .get_line_profile(&line_id)
+            .airplane_mode_enabled
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
+        );
+    }
     match app.config_manager.set_line_trunk_profile(&line_id, payload) {
         Ok(profile) => {
             line.trunk.activate_profile(&profile.trunk).await;
@@ -4984,6 +5296,17 @@ pub async fn set_line_trunk_enabled_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    if payload.enabled
+        && app
+            .config_manager
+            .get_line_profile(&line_id)
+            .airplane_mode_enabled
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_airplane_mode_enabled")),
+        );
+    }
     match app
         .config_manager
         .set_line_trunk_enabled(&line_id, payload.enabled)

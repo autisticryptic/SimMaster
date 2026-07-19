@@ -1533,6 +1533,55 @@ mod tests {
     }
 
     #[test]
+    fn per_line_airplane_mode_disables_all_line_services() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-airplane-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        manager
+            .set_line_volte_connection_enabled(line_id, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line_id, true)
+            .unwrap();
+        manager
+            .set_line_trunk_profile(
+                line_id,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "pbx.example.com".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        manager
+            .set_line_data_connection_enabled(line_id, true)
+            .unwrap();
+
+        let profile = manager.set_line_airplane_mode(line_id, true).unwrap();
+        assert!(profile.airplane_mode_enabled);
+        assert!(!profile.data_connection_enabled);
+        assert!(!profile.volte_connection_enabled);
+        assert!(!profile.vowifi.enabled);
+        assert!(!profile.trunk.enabled);
+        assert_eq!(
+            manager
+                .set_line_data_connection_enabled(line_id, true)
+                .unwrap_err(),
+            "line_airplane_mode_enabled"
+        );
+
+        let profile = manager.set_line_airplane_mode(line_id, false).unwrap();
+        assert!(!profile.airplane_mode_enabled);
+        assert!(!profile.data_connection_enabled);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sms_path_policy_default_order_is_vowifi_volte_cs() {
         let policy = SmsPathPolicy::default();
         let order: Vec<AccessPathKind> = policy.enabled_layers().collect();
@@ -2668,6 +2717,12 @@ pub struct LineProfileConfig {
     pub vowifi: LineVowifiConfig,
     #[serde(default)]
     pub trunk: TrunkProfileConfig,
+    /// Whether the user explicitly enabled cellular data for this physical line.
+    #[serde(default)]
+    pub data_connection_enabled: bool,
+    /// Per-line airplane mode. Enabling it also clears all service intents.
+    #[serde(default)]
+    pub airplane_mode_enabled: bool,
 }
 
 /// A discovered physical modem slot used to reconcile the persisted slot map.
@@ -2721,6 +2776,8 @@ impl LineProfileConfig {
             volte_connection_enabled: false,
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
+            data_connection_enabled: false,
+            airplane_mode_enabled: false,
         }
     }
 
@@ -3867,6 +3924,81 @@ impl ConfigManager {
     ) -> Result<LineProfileConfig, String> {
         let current = self.get_line_profile(line_id).vowifi;
         self.set_line_vowifi_config(line_id, LineVowifiConfig { enabled, ..current })
+    }
+
+    pub fn set_line_data_connection_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            if enabled && profile.airplane_mode_enabled {
+                return Err("line_airplane_mode_enabled".to_string());
+            }
+            profile.data_connection_enabled = enabled;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|a, b| a.line_id.cmp(&b.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn set_line_airplane_mode(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            profile.airplane_mode_enabled = enabled;
+            if enabled {
+                profile.data_connection_enabled = false;
+                profile.volte_connection_enabled = false;
+                profile.vowifi.enabled = false;
+                profile.trunk.enabled = false;
+            }
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|a, b| a.line_id.cmp(&b.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
     }
 
     pub fn get_standalone_sim_slots(&self) -> Vec<StandaloneSimSlotConfig> {

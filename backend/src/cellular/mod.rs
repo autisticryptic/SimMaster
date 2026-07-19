@@ -6,5 +6,6 @@
 //!   - `serial`: low-level serial/AT port helpers
 
 pub mod cell_lock_store;
+pub mod data_proxy;
 pub mod modem_manager;
 pub mod serial;

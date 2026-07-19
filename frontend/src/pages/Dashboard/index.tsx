@@ -234,11 +234,7 @@ export default function DashboardPage() {
         <Grid container spacing={2}>
           <Grid size={{ xs: 12, md: 6, lg: 3 }}>
             <QuickControls
-              dataStatus={data.dataStatus}
-              airplaneMode={data.airplaneMode}
               roaming={data.roaming}
-              onToggleData={() => void actions.toggleData()}
-              onToggleAirplaneMode={() => void actions.toggleAirplaneMode()}
               onToggleRoaming={() => void actions.toggleRoaming()}
             />
           </Grid>

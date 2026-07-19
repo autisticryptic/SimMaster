@@ -2866,6 +2866,19 @@ mod tests {
     }
 
     #[test]
+    fn maps_networkmanager_device_to_selected_modem_object() {
+        let output = "GENERAL.DEVICE:wwan0\nGENERAL.UDI:/org/freedesktop/ModemManager1/Modem/0\n\nGENERAL.DEVICE:wwan1\nGENERAL.UDI:/org/freedesktop/ModemManager1/Modem/1\n";
+        assert_eq!(
+            parse_nm_device_for_modem(output, "/org/freedesktop/ModemManager1/Modem/1"),
+            Some("wwan1".to_string())
+        );
+        assert_eq!(
+            parse_nm_device_for_modem(output, "/org/freedesktop/ModemManager1/Modem/9"),
+            None
+        );
+    }
+
+    #[test]
     fn physical_sysfs_path_is_normalized_as_slot_anchor() {
         assert_eq!(
             physical_device_slot_id("/sys/devices/platform/soc/usb1/1-2/"),
@@ -4030,6 +4043,67 @@ pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool>
     Ok(modem_props.get("State").map(extract_i32).unwrap_or(0) >= MM_MODEM_STATE_CONNECTED)
 }
 
+/// Return the network interface belonging to a connected Internet bearer.
+/// IMS bearers are intentionally skipped because they must not become the
+/// egress path for the user-facing cellular data proxy.
+pub async fn data_interface_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<Option<String>> {
+    for bearer_path in bearer_paths_for_modem(conn, modem_path).await {
+        let props = match get_all_properties(conn, &bearer_path, MM_BEARER).await {
+            Ok(props) => props,
+            Err(_) => continue,
+        };
+        if !props.get("Connected").map(extract_bool).unwrap_or(false) {
+            continue;
+        }
+        let settings = extract_bearer_settings(&props);
+        let apn = props
+            .get("Apn")
+            .or_else(|| settings.get("apn"))
+            .map(extract_string)
+            .unwrap_or_default();
+        let interface = bearer_interface_names(&props).into_iter().next();
+        if interface.is_none() {
+            continue;
+        }
+        if !apn.eq_ignore_ascii_case("ims") {
+            return Ok(interface);
+        }
+    }
+    Ok(None)
+}
+
+pub async fn disconnect_data_via_modem(conn: &Connection, modem_path: &str) -> Result<(), String> {
+    with_serial(async {
+        for bearer_path in bearer_paths_for_modem(conn, modem_path).await {
+            let props = match get_all_properties(conn, &bearer_path, MM_BEARER).await {
+                Ok(props) => props,
+                Err(_) => continue,
+            };
+            let settings = extract_bearer_settings(&props);
+            let apn = props
+                .get("Apn")
+                .or_else(|| settings.get("apn"))
+                .map(extract_string)
+                .unwrap_or_default();
+            if apn.eq_ignore_ascii_case("ims") {
+                continue;
+            }
+            let proxy = Proxy::new(conn, MM_SERVICE, bearer_path.as_str(), MM_BEARER)
+                .await
+                .map_err(|error| error.to_string())?;
+            proxy
+                .call::<_, _, ()>("Disconnect", &())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        Ok::<(), String>(())
+    })
+    .await
+}
+
 #[allow(dead_code)]
 async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
     let mut paths = match get_property(conn, modem_path, MM_MODEM, "Bearers").await {
@@ -4264,8 +4338,9 @@ async fn simple_connect_for_baseband_restart(
     if let Err(err) = nm_update_connection(&profile, &connect_settings, allow_roaming).await {
         warn!(error = %err, "Failed to update NM connection for baseband restart");
     }
-    nm_activate_connection(&profile).await?;
-    Ok(format!("NM connection {profile} activated"))
+    let device = find_nm_device_for_modem(conn, modem_path).await?;
+    nm_activate_connection_on_device(&profile, &device).await?;
+    Ok(format!("NM connection {profile} activated on {device}"))
 }
 
 async fn run_baseband_simple_connect_step(
@@ -4379,6 +4454,32 @@ pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> Result<(), S
         Ok(())
     })
     .await
+}
+
+pub async fn set_airplane_mode_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    with_serial(async {
+        set_modem_enabled(conn, modem_path, !enabled)
+            .await
+            .map(|_| ())
+    })
+    .await
+}
+
+pub async fn get_airplane_mode_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<AirplaneModeResponse> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
+    let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
+    Ok(AirplaneModeResponse {
+        enabled: matches!(state, 3 | 4),
+        powered: state >= 3,
+        online: state >= 6,
+    })
 }
 
 pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeResponse> {
@@ -6002,6 +6103,66 @@ async fn nm_activate_connection(profile: &str) -> Result<(), String> {
             "connection".into(),
             "up".into(),
             profile.into(),
+        ],
+        Duration::from_secs(45),
+    )
+    .await?;
+    Ok(())
+}
+
+fn parse_nm_device_for_modem(output: &str, modem_path: &str) -> Option<String> {
+    let mut current_device = None;
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            current_device = None;
+            continue;
+        }
+        if let Some(device) = line.strip_prefix("GENERAL.DEVICE:") {
+            current_device = non_empty_string(device.replace("\\:", ":"));
+            continue;
+        }
+        if let Some(udi) = line.strip_prefix("GENERAL.UDI:") {
+            let udi = udi.replace("\\:", ":");
+            if udi.trim() == modem_path || udi.contains(modem_path) {
+                return current_device;
+            }
+        }
+    }
+    None
+}
+
+async fn find_nm_device_for_modem(conn: &Connection, modem_path: &str) -> Result<String, String> {
+    let output = Command::new("nmcli")
+        .args(["-t", "-f", "GENERAL.DEVICE,GENERAL.UDI", "device", "show"])
+        .output()
+        .await
+        .map_err(|error| format!("failed to run nmcli: {error}"))?;
+    if output.status.success() {
+        if let Some(device) =
+            parse_nm_device_for_modem(&String::from_utf8_lossy(&output.stdout), modem_path)
+        {
+            return Ok(device);
+        }
+    }
+    let primary_port = get_property(conn, modem_path, MM_MODEM, "PrimaryPort")
+        .await
+        .ok()
+        .map(|value| extract_string(&value))
+        .and_then(non_empty_string);
+    primary_port.ok_or_else(|| "networkmanager_device_for_modem_unavailable".to_string())
+}
+
+async fn nm_activate_connection_on_device(profile: &str, device: &str) -> Result<(), String> {
+    run_recovery_command_owned(
+        "nmcli",
+        &[
+            "--wait".into(),
+            "30".into(),
+            "connection".into(),
+            "up".into(),
+            profile.into(),
+            "ifname".into(),
+            device.into(),
         ],
         Duration::from_secs(45),
     )

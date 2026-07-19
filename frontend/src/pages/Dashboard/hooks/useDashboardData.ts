@@ -67,8 +67,6 @@ export interface DashboardData {
 }
 
 export interface DashboardActions {
-  toggleData: () => Promise<void>
-  toggleAirplaneMode: () => Promise<void>
   toggleRoaming: () => Promise<void>
   loadData: () => Promise<void>
 }
@@ -219,31 +217,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   }, [updateSpeedHistory])
 
-  const toggleData = useCallback(async () => {
-    try {
-      const nextStatus = !dataStatus
-      await api.setDataStatus(nextStatus)
-      setDataStatus(nextStatus)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [dataStatus])
-
-  const toggleAirplaneMode = useCallback(async () => {
-    const snapshot = airplaneMode
-    const nextEnabled = !snapshot?.enabled
-    if (snapshot) {
-      setAirplaneMode({ ...snapshot, enabled: nextEnabled })
-    }
-    try {
-      const response = await api.setAirplaneMode(nextEnabled)
-      if (response.data) setAirplaneMode(response.data)
-    } catch (err) {
-      if (snapshot) setAirplaneMode(snapshot)
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [airplaneMode])
-
   const toggleRoaming = useCallback(async () => {
     try {
       const nextAllowed = !roaming?.roaming_allowed
@@ -295,8 +268,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       vowifiStatus,
     } as DashboardData,
     actions: {
-      toggleData,
-      toggleAirplaneMode,
       toggleRoaming,
       loadData,
     } as DashboardActions,

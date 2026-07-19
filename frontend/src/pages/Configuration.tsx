@@ -18,7 +18,6 @@ import {
   DialogTitle,
   Divider,
   FormControl,
-  FormControlLabel,
   IconButton,
   InputBase,
   InputLabel,
@@ -36,7 +35,6 @@ import {
   AdminPanelSettings,
   Add,
   CheckCircle,
-  FlightTakeoff,
   Key,
   Memory,
   Remove,
@@ -44,7 +42,6 @@ import {
   Shield,
   SimCard,
   Timer,
-  Wifi,
 } from '@mui/icons-material'
 import type { Theme } from '@mui/material/styles'
 import { api } from '../api/current'
@@ -59,7 +56,7 @@ import {
   validatePasswordAgainstSecurity,
 } from '../lib/passwordPolicy'
 import { useWorkMode } from '../contexts/WorkModeContext'
-import type { AirplaneModeResponse, SecurityConfig, WorkMode } from '../api/types'
+import type { SecurityConfig, WorkMode } from '../api/types'
 
 interface HealthStatus {
   status: string
@@ -73,7 +70,6 @@ const primaryStatusChipSx = (theme: Theme) => ({
   fontWeight: 600,
 })
 
-const controlFollowupGap = 2
 const PASSWORD_MIN_LENGTH_MIN = 1
 const SESSION_TTL_OPTIONS = [
   { value: 24 * 60 * 60, label: '1 天' },
@@ -160,9 +156,6 @@ export default function ConfigurationPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
-  const [dataStatus, setDataStatus] = useState(false)
-  const [airplaneMode, setAirplaneMode] = useState<AirplaneModeResponse | null>(null)
-  const [airplaneSwitching, setAirplaneSwitching] = useState(false)
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
   const [pendingMode, setPendingMode] = useState<WorkMode | null>(null)
@@ -200,14 +193,7 @@ export default function ConfigurationPage() {
     setError(null)
 
     try {
-      const [dataRes, airplaneModeRes, authSettingsRes] = await Promise.all([
-        api.getDataStatus(),
-        api.getAirplaneMode(),
-        api.getAuthSettings(),
-      ])
-
-      if (dataRes.data) setDataStatus(dataRes.data.active)
-      if (airplaneModeRes.data) setAirplaneMode(airplaneModeRes.data)
+      const authSettingsRes = await api.getAuthSettings()
       if (authSettingsRes.data) {
         const loadedSecurityConfig = mergeSecurityConfig(authSettingsRes.data.settings)
         setAuthConfigured(authSettingsRes.data.configured)
@@ -237,42 +223,6 @@ export default function ConfigurationPage() {
   }, [])
 
 
-
-  const toggleDataConnection = async () => {
-    try {
-      setError(null)
-      setSuccess(null)
-      const newStatus = !dataStatus
-      await api.setDataStatus(newStatus)
-      setDataStatus(newStatus)
-      setSuccess(`数据连接已${newStatus ? '启用' : '禁用'}`)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }
-
-  const toggleAirplaneMode = async () => {
-    const snapshot = airplaneMode
-    const newEnabled = !snapshot?.enabled
-    if (snapshot) {
-      setAirplaneMode({ ...snapshot, enabled: newEnabled })
-    }
-    try {
-      setError(null)
-      setSuccess(null)
-      setAirplaneSwitching(true)
-      const response = await api.setAirplaneMode(newEnabled)
-      if (response.data) {
-        setAirplaneMode(response.data)
-        setSuccess(`飞行模式已${response.data.enabled ? '开启' : '关闭'}`)
-      }
-    } catch (err) {
-      if (snapshot) setAirplaneMode(snapshot)
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setAirplaneSwitching(false)
-    }
-  }
 
   const confirmModeSwitch = async () => {
     if (!pendingMode) return
@@ -925,7 +875,7 @@ export default function ConfigurationPage() {
             {isSecurity ? '安全性设置' : '基本配置'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            {isSecurity ? '管理账户安全及密码强度策略' : '管理设备连接和其他系统参数'}
+            {isSecurity ? '管理账户安全及密码强度策略' : '管理工作模式和系统参数'}
           </Typography>
         </Box>
         {renderHealthBadge()}
@@ -982,130 +932,6 @@ export default function ConfigurationPage() {
             </CardContent>
           </Card>
 
-          <Grid container spacing={3} alignItems="stretch">
-            <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex' }}>
-              <Card sx={{ width: 1, height: 1, display: 'flex', flexDirection: 'column' }}>
-                <CardHeader
-                  avatar={<Wifi color="primary" />}
-                  title="数据连接配置"
-                  titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
-                  action={
-                    <Chip
-                      label={dataStatus ? '已启用' : '已禁用'}
-                      color={dataStatus ? 'primary' : 'default'}
-                      variant={dataStatus ? 'outlined' : undefined}
-                      size="small"
-                      sx={dataStatus ? primaryStatusChipSx : undefined}
-                    />
-                  }
-                />
-                <CardContent sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-                  <Typography variant="body2" color="text.secondary">
-                    控制设备的数据连接状态。禁用后设备将断开移动网络连接。
-                  </Typography>
-                  <Divider sx={{ my: 2 }} />
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={dataStatus}
-                        onChange={() => void toggleDataConnection()}
-                        color="primary"
-                      />
-                    }
-                    label={
-                      <Box>
-                        <Typography variant="body1" fontWeight={600}>
-                          {dataStatus ? '数据连接已启用' : '数据连接已禁用'}
-                        </Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          立即{dataStatus ? '断开' : '启用'}移动数据连接
-                        </Typography>
-                      </Box>
-                    }
-                  />
-                  <Alert
-                    severity="info"
-                    sx={{
-                      ...compactCardAlertSx,
-                      mt: controlFollowupGap,
-                    }}
-                  >
-                    禁用数据连接将中断所有使用移动网络的应用和服务
-                  </Alert>
-                </CardContent>
-              </Card>
-            </Grid>
-
-            <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex' }}>
-              <Card sx={{ width: 1, height: 1, display: 'flex', flexDirection: 'column' }}>
-                <CardHeader
-                  avatar={<FlightTakeoff color={airplaneMode?.enabled ? 'warning' : 'primary'} />}
-                  title="飞行模式"
-                  titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
-                  action={
-                    <Chip
-                      label={airplaneMode?.enabled ? '已开启' : '已关闭'}
-                      color={airplaneMode?.enabled ? 'primary' : 'default'}
-                      variant={airplaneMode?.enabled ? 'outlined' : undefined}
-                      size="small"
-                      sx={airplaneMode?.enabled ? primaryStatusChipSx : undefined}
-                    />
-                  }
-                />
-                <CardContent sx={{ flexGrow: 1, display: 'flex', flexDirection: 'column' }}>
-                  <Typography variant="body2" color="text.secondary">
-                    开启飞行模式将关闭射频，设备将无法连接移动网络。这不会影响本机 Web 管理访问。
-                  </Typography>
-                  <Divider sx={{ my: 2 }} />
-                  <FormControlLabel
-                    control={
-                      <Switch
-                        checked={airplaneMode?.enabled || false}
-                        onChange={() => void toggleAirplaneMode()}
-                        disabled={airplaneSwitching}
-                        color="warning"
-                      />
-                    }
-                    label={
-                      <Box display="flex" alignItems="center" gap={1}>
-                        {airplaneSwitching && <CircularProgress size={16} />}
-                        <Box>
-                          <Typography variant="body1" fontWeight={600}>
-                            {airplaneMode?.enabled ? '飞行模式已开启' : '飞行模式已关闭'}
-                          </Typography>
-                          <Typography variant="caption" color="text.secondary">
-                            {airplaneMode?.enabled ? '射频已关闭，无法连接网络' : '射频正常工作'}
-                          </Typography>
-                        </Box>
-                      </Box>
-                    }
-                  />
-                  <Box mt={controlFollowupGap} mb={controlFollowupGap} p={2} sx={{ bgcolor: 'action.hover', borderRadius: 1 }}>
-                    <Typography variant="body2" color="text.secondary" gutterBottom>
-                      <strong>当前状态详情</strong>
-                    </Typography>
-                    <Box display="flex" gap={2} flexWrap="wrap">
-                      <Chip
-                        label={`Modem 电源: ${airplaneMode?.powered ? '开启' : '关闭'}`}
-                        size="small"
-                        color={airplaneMode?.powered ? 'success' : 'default'}
-                        variant="outlined"
-                      />
-                      <Chip
-                        label={`射频: ${airplaneMode?.online ? '在线' : '离线'}`}
-                        size="small"
-                        color={airplaneMode?.online ? 'success' : 'error'}
-                        variant="outlined"
-                      />
-                    </Box>
-                  </Box>
-                  <Alert severity="warning" sx={compactCardAlertSx}>
-                    飞行模式通过设置 Modem 的 Online 属性来控制射频。
-                  </Alert>
-                </CardContent>
-              </Card>
-            </Grid>
-          </Grid>
         </Box>
       )}
 

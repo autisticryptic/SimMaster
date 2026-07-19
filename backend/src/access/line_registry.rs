@@ -19,6 +19,7 @@ use zbus::Connection;
 
 use crate::{
     access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
+    cellular::data_proxy::DataProxyRuntime,
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
     infra::config::{ConfigManager, ModemSlotObservation},
     trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
@@ -31,6 +32,7 @@ pub struct LineRuntime {
     pub volte_connect_lock: Mutex<()>,
     pub volte_retry_running: AtomicBool,
     pub trunk: Arc<TrunkRuntime>,
+    pub data_proxy: Arc<DataProxyRuntime>,
 }
 
 impl LineRuntime {
@@ -43,6 +45,7 @@ impl LineRuntime {
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
+            data_proxy: Arc::new(DataProxyRuntime::default()),
         }
     }
 

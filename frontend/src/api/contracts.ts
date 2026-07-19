@@ -553,6 +553,28 @@ export interface LineProfileConfig {
   volte_connection_enabled: boolean
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
+  data_connection_enabled: boolean
+  airplane_mode_enabled: boolean
+}
+
+export interface DataProxyStatus {
+  running: boolean
+  port?: number | null
+  interface_name?: string | null
+  protocols: string[]
+  last_error?: string | null
+}
+
+export interface LineNetworkControlsResponse {
+  line_id: string
+  modem_path: string
+  present: boolean
+  data: {
+    enabled: boolean
+    connected: boolean
+    proxy: DataProxyStatus
+  }
+  airplane_mode: AirplaneModeResponse
 }
 
 export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'connect_udp_masque' | 'udp_relay'
