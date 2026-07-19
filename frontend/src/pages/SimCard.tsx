@@ -34,9 +34,7 @@ import { api } from '../api/current'
 import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
-import VowifiDiagnosticsPage from './VowifiDiagnostics'
 import ModemLinesPanel from './sim/ModemLinesPanel'
-import TrunkDiagnosticsPanel from './sim/TrunkDiagnosticsPanel'
 import StandaloneSimSlotsPanel from './sim/StandaloneSimSlotsPanel'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
@@ -560,15 +558,15 @@ export default function SimCardPage() {
   const { mode, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
 
-  let activeTab = searchParams.get('tab') || 'basic'
+  let activeTab = searchParams.get('tab') || 'lines'
 
   if (mode !== 'esim' && activeTab === 'esim') {
-    activeTab = 'basic'
+    activeTab = 'lines'
   }
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: string) => {
     const params = new URLSearchParams(searchParams)
-    if (newValue === 'basic') {
+    if (newValue === 'lines') {
       params.delete('tab')
     } else {
       params.set('tab', newValue)
@@ -594,20 +592,14 @@ export default function SimCardPage() {
 
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
-          <Tab label="基本信息" value="basic" />
           <Tab label="基带线路" value="lines" />
-          <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />
-          <Tab label="Trunk 诊断" value="trunk" />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'basic' && <SimBasicInfo />}
-        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel /><StandaloneSimSlotsPanel /></Stack>}
-        {activeTab === 'trunk' && <TrunkDiagnosticsPanel />}
+        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel primaryBasicInfo={<SimBasicInfo />} /><StandaloneSimSlotsPanel /></Stack>}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
-        {activeTab === 'vowifi' && <VowifiDiagnosticsPage />}
       </Box>
     </Box>
   )

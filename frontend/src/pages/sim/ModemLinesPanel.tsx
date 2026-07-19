@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Alert,
   Box,
@@ -25,6 +25,7 @@ import {
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
+import LineDetailsDialog, { type LineDetailTab } from './LineDetailsDialog'
 
 const stageLabels: Record<string, string> = {
   disabled: '未连接',
@@ -89,7 +90,7 @@ function recoveryMessage(line: VolteLineControlResponse) {
   }
 }
 
-export default function ModemLinesPanel() {
+export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo?: ReactNode }) {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
@@ -99,6 +100,13 @@ export default function ModemLinesPanel() {
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [detailLine, setDetailLine] = useState<VolteLineControlResponse | null>(null)
+  const [detailTab, setDetailTab] = useState<LineDetailTab>('basic')
+
+  const openDetails = (line: VolteLineControlResponse, tab: LineDetailTab) => {
+    setDetailLine(line)
+    setDetailTab(tab)
+  }
 
   const load = useCallback(async (background = false) => {
     if (!background) setLoading(true)
@@ -351,6 +359,7 @@ export default function ModemLinesPanel() {
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
+                        {line.profile.volte_connection_enabled && <Button size="small" variant="text" onClick={() => openDetails(line, 'volte')}>详细信息</Button>}
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         <Tooltip title={recoveryRunning ? '自动恢复正在进行' : '立即开始新的五次恢复批次'}>
                           <span>
@@ -392,6 +401,7 @@ export default function ModemLinesPanel() {
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>
+                        {vowifiLine?.config.enabled && <Button size="small" variant="text" onClick={() => openDetails(line, 'vowifi')}>详细信息</Button>}
                         <Button
                           size="small"
                           variant="text"
@@ -407,6 +417,10 @@ export default function ModemLinesPanel() {
                           disabled={!vowifiLine || !line.modem.present || savingKey !== null}
                         />
                       </Box>
+                    </Box>
+
+                    <Box display="flex" justifyContent="flex-end" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
+                      <Button size="small" variant="outlined" onClick={() => openDetails(line, 'basic')}>SIM 卡详情</Button>
                     </Box>
 
                     <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
@@ -463,6 +477,16 @@ export default function ModemLinesPanel() {
         line={editingVowifiLine}
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
+      />
+      <LineDetailsDialog
+        key={`${detailLine?.modem.line_id ?? 'closed'}:${detailTab}`}
+        open={detailLine !== null}
+        line={detailLine}
+        trunk={detailLine ? trunkByLineId.get(detailLine.modem.line_id) : undefined}
+        vowifi={detailLine ? vowifiByLineId.get(detailLine.modem.line_id) : undefined}
+        initialTab={detailTab}
+        primaryBasicInfo={detailLine && lines[0]?.modem.line_id === detailLine.modem.line_id ? primaryBasicInfo : undefined}
+        onClose={() => setDetailLine(null)}
       />
     </Stack>
   )

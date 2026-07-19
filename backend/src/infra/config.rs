@@ -3335,7 +3335,17 @@ impl ConfigManager {
             }
             match &task.action {
                 AutomationAction::ConsumeData { bytes, unit } => {
-                    if *bytes == 0 || !matches!(unit.as_str(), "auto" | "bytes" | "kb" | "mb") {
+                    let multiplier = match unit.as_str() {
+                        "auto" | "bytes" => Some(1u64),
+                        "kb" => Some(1024),
+                        "mb" => Some(1024 * 1024),
+                        _ => None,
+                    };
+                    if *bytes == 0
+                        || multiplier
+                            .and_then(|value| bytes.checked_mul(value))
+                            .is_none_or(|amount| amount > 1024 * 1024 * 1024)
+                    {
                         return Err("automation_consume_data_invalid".to_string());
                     }
                 }

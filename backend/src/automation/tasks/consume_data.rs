@@ -20,9 +20,13 @@ fn requested_bytes(value: u64, unit: &str) -> Result<u64> {
         "mb" => 1024 * 1024,
         _ => return Err(anyhow!("不支持的流量单位")),
     };
-    value
+    let amount = value
         .checked_mul(multiplier)
-        .ok_or_else(|| anyhow!("流量大小超出范围"))
+        .ok_or_else(|| anyhow!("流量大小超出范围"))?;
+    if amount > 1024 * 1024 * 1024 {
+        return Err(anyhow!("单次自动化流量不能超过 1 GiB"));
+    }
+    Ok(amount)
 }
 
 fn cellular_source_ip(interfaces: &[crate::api::models::NetworkInterfaceInfo]) -> Option<IpAddr> {
@@ -92,8 +96,11 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                 return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
             }
             let payload = response.bytes().await.context("读取蜂窝流量响应失败")?;
-            if payload.is_empty() {
-                return Err(anyhow!("蜂窝流量响应为空"));
+            if payload.len() as u64 != amount {
+                return Err(anyhow!(
+                    "蜂窝流量响应大小不符：期望 {amount} Byte，实际 {} Byte",
+                    payload.len()
+                ));
             }
             info!(bytes = payload.len(), source_ip = %source_ip, modem_path, "automation cellular data consumption completed");
             Ok(())
