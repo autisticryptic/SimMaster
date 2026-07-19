@@ -194,7 +194,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
       const response = await api.setLineAirplaneMode(lineId, enabled)
       if (response.data) updateNetworkControl(response.data)
       await load(true)
-      setSuccess(`${shortLineId(lineId)} 飞行模式已${enabled ? '开启，线路服务已关闭' : '关闭'}`)
+      setSuccess(`${shortLineId(lineId)} 飞行模式已${enabled ? '开启，移动射频、数据与 VoLTE 已关闭' : '关闭'}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -465,7 +465,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Typography variant="body2" fontWeight={600}>飞行模式</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {airplaneEnabled ? '射频及数据、VoLTE、VoWiFi、Trunk 均已关闭' : '射频正常，可独立启用线路服务'}
+                          {airplaneEnabled ? '移动射频、数据与 VoLTE 已关闭；VoWiFi 和 Trunk 可继续使用 Wi-Fi' : '移动射频正常，可独立启用线路服务'}
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
@@ -535,7 +535,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           size="small"
                           variant="text"
                           onClick={() => vowifiLine && setEditingVowifiLine(vowifiLine)}
-                          disabled={!vowifiLine || airplaneEnabled || savingKey !== null}
+                          disabled={!vowifiLine || savingKey !== null}
                         >
                           配置
                         </Button>
@@ -543,7 +543,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Switch
                           checked={vowifiLine?.config.enabled ?? false}
                           onChange={(_, enabled) => void toggleVowifi(line.modem.line_id, enabled)}
-                          disabled={!vowifiLine || !line.modem.present || airplaneEnabled || savingKey !== null}
+                          disabled={!vowifiLine || !line.modem.present || savingKey !== null}
                         />
                       </Box>
                     </Box>
@@ -566,7 +566,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           size="small"
                           variant="text"
                           onClick={() => trunkLine && setEditingTrunkLine(trunkLine)}
-                          disabled={!trunkLine || airplaneEnabled || savingKey !== null}
+                          disabled={!trunkLine || savingKey !== null}
                         >
                           配置
                         </Button>
@@ -574,7 +574,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Switch
                           checked={trunkLine?.trunk.enabled ?? false}
                           onChange={(_, enabled) => void toggleTrunk(line.modem.line_id, enabled)}
-                          disabled={!trunkLine || airplaneEnabled || savingKey !== null}
+                          disabled={!trunkLine || savingKey !== null}
                         />
                       </Box>
                     </Box>

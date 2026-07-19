@@ -2464,8 +2464,8 @@ pub async fn set_line_airplane_mode_handler(
     }
 
     if payload.enabled {
-        let profile = match app.config_manager.set_line_airplane_mode(&line_id, true) {
-            Ok(profile) => profile,
+        match app.config_manager.set_line_airplane_mode(&line_id, true) {
+            Ok(_) => {}
             Err(error) => {
                 return (
                     StatusCode::OK,
@@ -2483,16 +2483,13 @@ pub async fn set_line_airplane_mode_handler(
             "line_airplane_mode_enabled",
         )
         .await;
-        line.trunk.reconcile_profile(&profile.trunk).await;
         let is_primary = app
             .line_registry
             .primary()
             .await
             .is_some_and(|primary| primary.binding().line_id == line_id);
         if is_primary {
-            let _ = app.config_manager.set_vowifi_connection_enabled(false);
             let _ = app.config_manager.set_data_enabled(false);
-            let _ = reset_vowifi_runtime(&app, "line_airplane_mode_enabled").await;
             app.data_user_disabled.store(true, Ordering::SeqCst);
             app.airplane_mode_requested.store(true, Ordering::SeqCst);
         }
@@ -4908,17 +4905,6 @@ pub async fn set_vowifi_line_config_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    if payload.enabled
-        && app
-            .config_manager
-            .get_line_profile(&line_id)
-            .airplane_mode_enabled
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_airplane_mode_enabled")),
-        );
-    }
     if let Err(error) = app.config_manager.set_line_vowifi_config(&line_id, payload) {
         return (
             StatusCode::OK,
@@ -4955,17 +4941,6 @@ pub async fn set_vowifi_line_connection_handler(
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::error("line_not_present")),
-        );
-    }
-    if payload.enabled
-        && app
-            .config_manager
-            .get_line_profile(&line_id)
-            .airplane_mode_enabled
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_airplane_mode_enabled")),
         );
     }
     let is_primary = app
@@ -5315,17 +5290,6 @@ pub async fn set_line_trunk_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    if payload.enabled
-        && app
-            .config_manager
-            .get_line_profile(&line_id)
-            .airplane_mode_enabled
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_airplane_mode_enabled")),
-        );
-    }
     match app.config_manager.set_line_trunk_profile(&line_id, payload) {
         Ok(profile) => {
             line.trunk.activate_profile(&profile.trunk).await;
@@ -5359,17 +5323,6 @@ pub async fn set_line_trunk_enabled_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    if payload.enabled
-        && app
-            .config_manager
-            .get_line_profile(&line_id)
-            .airplane_mode_enabled
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_airplane_mode_enabled")),
-        );
-    }
     match app
         .config_manager
         .set_line_trunk_enabled(&line_id, payload.enabled)

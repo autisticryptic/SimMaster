@@ -1538,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn per_line_airplane_mode_disables_all_line_services() {
+    fn per_line_airplane_mode_preserves_wifi_services() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-airplane-{}-{}.json",
             std::process::id(),
@@ -1571,8 +1571,8 @@ mod tests {
         assert!(profile.airplane_mode_enabled);
         assert!(!profile.data_connection_enabled);
         assert!(!profile.volte_connection_enabled);
-        assert!(!profile.vowifi.enabled);
-        assert!(!profile.trunk.enabled);
+        assert!(profile.vowifi.enabled);
+        assert!(profile.trunk.enabled);
         assert_eq!(
             manager
                 .set_line_data_connection_enabled(line_id, true)
@@ -2725,7 +2725,8 @@ pub struct LineProfileConfig {
     /// Whether the user explicitly enabled cellular data for this physical line.
     #[serde(default)]
     pub data_connection_enabled: bool,
-    /// Per-line airplane mode. Enabling it also clears all service intents.
+    /// Per-line simulated airplane mode. It disables cellular radio services
+    /// while preserving Wi-Fi based VoWiFi and Asterisk Trunk intents.
     #[serde(default)]
     pub airplane_mode_enabled: bool,
 }
@@ -3993,8 +3994,6 @@ impl ConfigManager {
             if enabled {
                 profile.data_connection_enabled = false;
                 profile.volte_connection_enabled = false;
-                profile.vowifi.enabled = false;
-                profile.trunk.enabled = false;
             }
             let next = profile.clone();
             config
