@@ -18,6 +18,7 @@ import type {
   NotificationLogCleanupConfig,
   NotificationLogEntry,
   NotificationRule,
+  SmsChannelResponse,
 } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import NotificationChannelsTab from './notifications/NotificationChannelsTab'
@@ -65,6 +66,7 @@ export default function NotificationCenterPage() {
   const [queueItems, setQueueItems] = useState<NotificationQueueItem[]>([])
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
+  const [smsChannels, setSmsChannels] = useState<SmsChannelResponse[]>([])
   const logsLoadingRef = useRef(false)
   const lastRefreshKeyRef = useRef(refreshKey)
 
@@ -78,9 +80,13 @@ export default function NotificationCenterPage() {
     setLoading(true)
     setError(null)
     try {
-      const response = await api.getNotificationConfig()
+      const [response, smsChannelResponse] = await Promise.all([
+        api.getNotificationConfig(),
+        api.getSmsChannels(),
+      ])
       const next = normalizeConfig(response.data)
       setConfig(next)
+      setSmsChannels(smsChannelResponse.data ?? [])
       setSelectedChannelId((current) => current || next.channels[0]?.id || '')
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -426,6 +432,7 @@ export default function NotificationCenterPage() {
       {tab === 1 && (
         <NotificationRulesTab
           config={config}
+          smsChannels={smsChannels}
           selectedEventType={selectedEventType}
           saving={saving}
           onSelectedEventTypeChange={setSelectedEventType}

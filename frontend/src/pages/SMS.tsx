@@ -26,6 +26,8 @@ import {
   InputAdornment,
   Checkbox,
   Tooltip,
+  Tab,
+  Tabs,
 } from '@mui/material'
 import type { Theme } from '@mui/material/styles'
 import {
@@ -43,12 +45,14 @@ import {
   Search,
   Settings,
 } from '@mui/icons-material'
-import { api, type SmsMessage, type SmsStats, type VolteLineControlResponse } from '../api/current'
+import { api, type SmsChannelResponse, type SmsMessage, type SmsStats, type VolteLineControlResponse } from '../api/current'
 import ModemLineSelector from '../components/ModemLineSelector'
 import { shortLineId } from '../components/modemLineFormat'
 import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
 interface ConversationGroup {
+  key: string
+  channelId: string
   phoneNumber: string
   messages: SmsMessage[]
   lastMessage: SmsMessage
@@ -61,7 +65,7 @@ type ConversationSearchResult = ConversationGroup & {
 
 type DeleteTarget =
   | { type: 'batch' }
-  | { type: 'conversation'; phoneNumber: string; messageCount: number }
+  | { type: 'conversation'; phoneNumber: string; channelId: string; messageCount: number }
   | { type: 'message'; message: SmsMessage }
 
 function parseSmsTimestamp(timestamp: string): Date | null {
@@ -82,6 +86,14 @@ function compareSmsNewestFirst(a: SmsMessage, b: SmsMessage): number {
   return smsTimestampMillis(b.timestamp) - smsTimestampMillis(a.timestamp) || b.id - a.id
 }
 
+function smsChannelId(message: SmsMessage): string {
+  return message.line_id?.trim() || 'unassigned'
+}
+
+function conversationKey(channelId: string, phoneNumber: string): string {
+  return `${channelId}\u0000${phoneNumber}`
+}
+
 function smsTransportInfo(transport?: string) {
   switch (transport) {
     case 'vowifi_ims':
@@ -97,7 +109,7 @@ function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
   const groups = new Map<string, SmsMessage[]>()
 
   msgs.forEach((msg) => {
-    const key = msg.phone_number
+    const key = conversationKey(smsChannelId(msg), msg.phone_number)
     if (!groups.has(key)) {
       groups.set(key, [])
     }
@@ -105,9 +117,12 @@ function buildConversations(msgs: SmsMessage[]): ConversationGroup[] {
   })
 
   const conversationList: ConversationGroup[] = []
-  groups.forEach((groupMessages, phoneNumber) => {
+  groups.forEach((groupMessages, key) => {
     groupMessages.sort(compareSmsNewestFirst)
+    const [channelId, phoneNumber] = key.split('\u0000')
     conversationList.push({
+      key,
+      channelId,
       phoneNumber,
       messages: groupMessages,
       lastMessage: groupMessages[0],
@@ -182,11 +197,14 @@ export default function SMSPage() {
   const [newChatNumber, setNewChatNumber] = useState('')
   const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
   const [volteLines, setVolteLines] = useState<VolteLineControlResponse[]>([])
+  const [smsChannels, setSmsChannels] = useState<SmsChannelResponse[]>([])
+  const [selectedChannelId, setSelectedChannelId] = useState('')
   const [selectedLineId, setSelectedLineId] = useState('')
 
   // 对话状态
   const [conversations, setConversations] = useState<ConversationGroup[]>([])
   const [selectedConversation, setSelectedConversation] = useState<string | null>(null)
+  const [selectedConversationChannelId, setSelectedConversationChannelId] = useState('')
   const [conversationMessages, setConversationMessages] = useState<SmsMessage[]>([])
   const [conversationLoading, setConversationLoading] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
@@ -221,7 +239,11 @@ export default function SMSPage() {
       setError(null)
     }
     try {
-      const response = await api.getSmsList({ limit: 1000, offset: 0 })
+      const response = await api.getSmsList({
+        limit: 1000,
+        offset: 0,
+        channel_id: selectedChannelId || undefined,
+      })
       if (response.status === 'ok' && response.data) {
         setMessages(response.data.messages)
         setConversations(buildConversations(response.data.messages))
@@ -237,12 +259,16 @@ export default function SMSPage() {
     } finally {
       if (!isBackground) setLoading(false)
     }
-  }, [])
+  }, [selectedChannelId])
 
-  const fetchConversation = useCallback(async (phone: string, scrollTargetId?: number) => {
+  const fetchConversation = useCallback(async (phone: string, channelId = selectedChannelId, scrollTargetId?: number) => {
     setConversationLoading(true)
     try {
-      const response = await api.getSmsConversation({ phone_number: phone, limit: 1000 })
+      const response = await api.getSmsConversation({
+        phone_number: phone,
+        limit: 1000,
+        channel_id: channelId || undefined,
+      })
       if (response.status === 'ok' && response.data) {
         const sorted = [...response.data.messages].sort(compareSmsChronological)
         setConversationMessages(sorted)
@@ -255,7 +281,9 @@ export default function SMSPage() {
         }, 100)
       }
     } catch {
-      const localMsgs = messages.filter((m) => m.phone_number === phone)
+      const localMsgs = messages.filter((m) => (
+        m.phone_number === phone && (!channelId || smsChannelId(m) === channelId)
+      ))
       const sorted = [...localMsgs].sort(compareSmsChronological)
       setConversationMessages(sorted)
       setTimeout(() => {
@@ -268,18 +296,18 @@ export default function SMSPage() {
     } finally {
       setConversationLoading(false)
     }
-  }, [messages, scrollToBottom, scrollToMessage])
+  }, [messages, scrollToBottom, scrollToMessage, selectedChannelId])
 
   const fetchStats = useCallback(async () => {
     try {
-      const response = await api.getSmsStats()
+      const response = await api.getSmsStats(selectedChannelId || undefined)
       if (response.status === 'ok' && response.data) {
         setStats(response.data)
       }
     } catch (err) {
       console.error('获取短信统计失败:', err)
     }
-  }, [])
+  }, [selectedChannelId])
 
   const fetchLines = useCallback(async () => {
     try {
@@ -290,6 +318,12 @@ export default function SMSPage() {
         current && !nextLines.some((line) => line.modem.line_id === current && line.modem.present)
           ? ''
           : current
+      ))
+      const channelResponse = await api.getSmsChannels()
+      const nextChannels = channelResponse.data ?? []
+      setSmsChannels(nextChannels)
+      setSelectedChannelId((current) => (
+        current && !nextChannels.some((channel) => channel.id === current) ? '' : current
       ))
     } catch (err) {
       console.warn('Failed to load modem lines:', err)
@@ -315,10 +349,28 @@ export default function SMSPage() {
     volteLines.map((line, index) => [line.modem.line_id, `线路 ${index + 1}`]),
   ), [volteLines])
 
+  const channelById = useMemo(() => new Map(
+    smsChannels.map((channel) => [channel.id, channel]),
+  ), [smsChannels])
+  const selectedChannel = selectedChannelId ? channelById.get(selectedChannelId) : undefined
+  const channelCannotSend = Boolean(selectedChannel && selectedChannel.kind !== 'modem_line')
+
   const messageLineLabel = useCallback((lineId?: string) => {
     if (!lineId) return ''
-    return lineNameById.get(lineId) ?? `线路 ${shortLineId(lineId)}`
-  }, [lineNameById])
+    return channelById.get(lineId)?.label
+      ?? lineNameById.get(lineId)
+      ?? (lineId.startsWith('reader:') ? lineId.slice('reader:'.length) : `线路 ${shortLineId(lineId)}`)
+  }, [channelById, lineNameById])
+
+  const selectChannel = (channelId: string) => {
+    setSelectedChannelId(channelId)
+    setSelectedConversation(null)
+    setSelectedConversationChannelId('')
+    setConversationMessages([])
+    resetBatchSelection()
+    const channel = channelById.get(channelId)
+    setSelectedLineId(channel?.kind === 'modem_line' ? channelId : '')
+  }
 
   const messageById = useMemo(() => {
     const map = new Map<number, SmsMessage>()
@@ -352,33 +404,31 @@ export default function SMSPage() {
   }, [conversations, searchTerm])
 
   const batchSelection = useMemo(() => {
-    const visiblePhones = new Set(visibleConversations.map((conv) => conv.phoneNumber))
-    const phoneNumbers = Array.from(selectedConversationPhones).filter((phone) => visiblePhones.has(phone))
-    const phoneNumberSet = new Set(phoneNumbers)
-    const selectedConversationNumbers = new Set(phoneNumbers)
-    let messageCount = 0
-
+    const visibleKeys = new Set(visibleConversations.map((conv) => conv.key))
+    const selectedKeys = Array.from(selectedConversationPhones).filter((key) => visibleKeys.has(key))
+    const selectedKeySet = new Set(selectedKeys)
+    const ids = new Set<number>()
     visibleConversations.forEach((conv) => {
-      if (phoneNumberSet.has(conv.phoneNumber)) {
-        messageCount += conv.messages.length
+      if (selectedKeySet.has(conv.key)) {
+        conv.messages.forEach((msg) => ids.add(msg.id))
       }
     })
-
-    const ids = Array.from(selectedMessageIds).filter((id) => {
+    selectedMessageIds.forEach((id) => ids.add(id))
+    const extraConversationKeys = new Set(Array.from(selectedMessageIds).filter((id) => {
       const msg = messageById.get(id)
-      if (!msg || phoneNumberSet.has(msg.phone_number)) {
-        return false
-      }
-      selectedConversationNumbers.add(msg.phone_number)
-      messageCount += 1
-      return true
-    })
+      if (!msg) return false
+      const key = conversationKey(smsChannelId(msg), msg.phone_number)
+      return !selectedKeySet.has(key)
+    }).map((id) => {
+      const msg = messageById.get(id)
+      return msg ? conversationKey(smsChannelId(msg), msg.phone_number) : ''
+    }).filter(Boolean))
 
     return {
-      ids,
-      phoneNumbers,
-      conversationCount: selectedConversationNumbers.size,
-      messageCount,
+      ids: Array.from(ids),
+      phoneNumbers: [],
+      conversationCount: selectedKeys.length + extraConversationKeys.size,
+      messageCount: ids.size,
     }
   }, [visibleConversations, messageById, selectedConversationPhones, selectedMessageIds])
 
@@ -388,12 +438,12 @@ export default function SMSPage() {
   const pushCount = smsStats.pushed ?? 0
   const pushAttemptedCount = smsStats.push_attempted ?? 0
   const allConversationsSelected = visibleConversations.length > 0
-    && visibleConversations.every((conv) => selectedConversationPhones.has(conv.phoneNumber))
+    && visibleConversations.every((conv) => selectedConversationPhones.has(conv.key))
   const currentMessagesSomeSelected = conversationMessages.some(
-    (msg) => selectedConversationPhones.has(msg.phone_number) || selectedMessageIds.has(msg.id),
+    (msg) => selectedConversationPhones.has(conversationKey(smsChannelId(msg), msg.phone_number)) || selectedMessageIds.has(msg.id),
   )
   const currentMessagesAllSelected = conversationMessages.length > 0
-    && conversationMessages.every((msg) => selectedConversationPhones.has(msg.phone_number) || selectedMessageIds.has(msg.id))
+    && conversationMessages.every((msg) => selectedConversationPhones.has(conversationKey(smsChannelId(msg), msg.phone_number)) || selectedMessageIds.has(msg.id))
 
   const resetBatchSelection = () => {
     setSelectedConversationPhones(new Set())
@@ -409,14 +459,16 @@ export default function SMSPage() {
     resetBatchSelection()
   }
 
-  const handleSelectConversation = (phone: string, scrollTargetId?: number) => {
-    setSelectedConversation(phone)
-    setPhoneNumber(phone)
-    void fetchConversation(phone, scrollTargetId)
+  const handleSelectConversation = (conv: ConversationGroup, scrollTargetId?: number) => {
+    setSelectedConversation(conv.key)
+    setSelectedConversationChannelId(conv.channelId)
+    setPhoneNumber(conv.phoneNumber)
+    void fetchConversation(conv.phoneNumber, conv.channelId, scrollTargetId)
   }
 
   const handleBackToList = () => {
     setSelectedConversation(null)
+    setSelectedConversationChannelId('')
     setConversationMessages([])
   }
 
@@ -426,13 +478,18 @@ export default function SMSPage() {
       return
     }
     setNewChatDialogOpen(false)
-    setSelectedConversation(newChatNumber)
+    setSelectedConversation(conversationKey(selectedChannelId || 'draft', newChatNumber))
+    setSelectedConversationChannelId(selectedChannelId)
     setPhoneNumber(newChatNumber)
     setConversationMessages([])
     setNewChatNumber('')
   }
 
   const handleSend = async () => {
+    if (channelCannotSend) {
+      setError('当前读卡器/历史通道尚未接入短信发送运行时')
+      return
+    }
     if (!phoneNumber.trim()) {
       setError('请输入电话号码')
       return
@@ -457,7 +514,7 @@ export default function SMSPage() {
           void fetchMessages()
           void fetchStats()
           if (selectedConversation) {
-            void fetchConversation(selectedConversation)
+            void fetchConversation(phoneNumber, selectedConversationChannelId)
           }
         }, 1000)
       } else {
@@ -470,21 +527,21 @@ export default function SMSPage() {
     }
   }
 
-  const toggleConversationSelection = (phone: string) => {
-    const selected = selectedConversationPhones.has(phone)
+  const toggleConversationSelection = (conv: ConversationGroup) => {
+    const selected = selectedConversationPhones.has(conv.key)
     setSelectedConversationPhones((prev) => {
       const next = new Set(prev)
       if (selected) {
-        next.delete(phone)
+        next.delete(conv.key)
       } else {
-        next.add(phone)
+        next.add(conv.key)
       }
       return next
     })
     setSelectedMessageIds((prev) => {
       const next = new Set(prev)
       messageById.forEach((msg) => {
-        if (msg.phone_number === phone) {
+        if (conversationKey(smsChannelId(msg), msg.phone_number) === conv.key) {
           next.delete(msg.id)
         }
       })
@@ -497,18 +554,19 @@ export default function SMSPage() {
       resetBatchSelection()
       return
     }
-    setSelectedConversationPhones(new Set(visibleConversations.map((conv) => conv.phoneNumber)))
+    setSelectedConversationPhones(new Set(visibleConversations.map((conv) => conv.key)))
     setSelectedMessageIds(new Set())
   }
 
   const toggleMessageSelection = (msg: SmsMessage) => {
-    if (selectedConversationPhones.has(msg.phone_number)) {
+    const msgKey = conversationKey(smsChannelId(msg), msg.phone_number)
+    if (selectedConversationPhones.has(msgKey)) {
       const relatedMessages = Array.from(messageById.values()).filter(
-        (item) => item.phone_number === msg.phone_number,
+        (item) => conversationKey(smsChannelId(item), item.phone_number) === msgKey,
       )
       setSelectedConversationPhones((prev) => {
         const next = new Set(prev)
-        next.delete(msg.phone_number)
+        next.delete(msgKey)
         return next
       })
       setSelectedMessageIds((prev) => {
@@ -567,11 +625,11 @@ export default function SMSPage() {
   }
 
   const isMessageSelected = (msg: SmsMessage) => (
-    selectedConversationPhones.has(msg.phone_number) || selectedMessageIds.has(msg.id)
+    selectedConversationPhones.has(conversationKey(smsChannelId(msg), msg.phone_number)) || selectedMessageIds.has(msg.id)
   )
 
   const getConversationMessageSelectionState = (conv: ConversationGroup) => {
-    if (selectedConversationPhones.has(conv.phoneNumber)) {
+    if (selectedConversationPhones.has(conv.key)) {
       return { checked: true, indeterminate: false }
     }
 
@@ -590,6 +648,7 @@ export default function SMSPage() {
     setDeleteTarget({
       type: 'conversation',
       phoneNumber: conv.phoneNumber,
+      channelId: conv.channelId,
       messageCount: conv.messages.length,
     })
   }
@@ -611,7 +670,7 @@ export default function SMSPage() {
       return
     }
     if (selectedConversation) {
-      void fetchConversation(selectedConversation)
+      void fetchConversation(phoneNumber, selectedConversationChannelId)
     }
   }
 
@@ -632,29 +691,30 @@ export default function SMSPage() {
         const response = await api.deleteSmsBatch({
           ids: batchSelection.ids,
           phone_numbers: batchSelection.phoneNumbers,
+          channel_id: selectedChannelId || undefined,
         })
         deleted = response.data?.deleted ?? batchSelection.messageCount
         clearCurrentConversation = Boolean(
           selectedConversation
           && (
-            batchSelection.phoneNumbers.includes(selectedConversation)
-            || (
-              conversationMessages.length > 0
-              && conversationMessages.every((msg) => batchSelection.ids.includes(msg.id))
-            )
+            conversationMessages.length > 0
+            && conversationMessages.every((msg) => batchSelection.ids.includes(msg.id))
           ),
         )
         setSuccess(`已删除 ${deleted} 条短信`)
         handleExitBatchMode()
       } else if (deleteTarget.type === 'conversation') {
-        const response = await api.deleteSmsConversation(deleteTarget.phoneNumber)
+        const response = await api.deleteSmsConversation(deleteTarget.phoneNumber, deleteTarget.channelId || undefined)
         deleted = response.data?.deleted ?? deleteTarget.messageCount
-        clearCurrentConversation = selectedConversation === deleteTarget.phoneNumber
+        clearCurrentConversation = selectedConversation === conversationKey(deleteTarget.channelId, deleteTarget.phoneNumber)
         setSuccess(`已删除对话 ${deleteTarget.phoneNumber}（${deleted} 条短信）`)
       } else {
         const response = await api.deleteSmsMessage(deleteTarget.message.id)
         deleted = response.data?.deleted ?? 1
-        clearCurrentConversation = selectedConversation === deleteTarget.message.phone_number
+        clearCurrentConversation = selectedConversation === conversationKey(
+          smsChannelId(deleteTarget.message),
+          deleteTarget.message.phone_number,
+        )
           && conversationMessages.length <= 1
         setSuccess(deleted > 0 ? '短信已删除' : '短信不存在或已被删除')
       }
@@ -890,7 +950,7 @@ export default function SMSPage() {
             const displayMessage = conv.matchedMessage ?? conv.lastMessage
             return (
               <Box
-                key={conv.phoneNumber}
+                key={conv.key}
                 sx={{
                   '&:hover .conversation-delete, &:focus-within .conversation-delete': {
                     opacity: 1,
@@ -898,8 +958,8 @@ export default function SMSPage() {
                 }}
               >
                 <ListItemButton
-                  onClick={() => handleSelectConversation(conv.phoneNumber, conv.matchedMessage?.id)}
-                  selected={selectedConversation === conv.phoneNumber}
+                  onClick={() => handleSelectConversation(conv, conv.matchedMessage?.id)}
+                  selected={selectedConversation === conv.key}
                   sx={{ gap: 1 }}
                 >
                   {batchMode && (
@@ -909,7 +969,7 @@ export default function SMSPage() {
                       checked={selectionState.checked}
                       indeterminate={selectionState.indeterminate}
                       onClick={(event) => event.stopPropagation()}
-                      onChange={() => toggleConversationSelection(conv.phoneNumber)}
+                      onChange={() => toggleConversationSelection(conv)}
                       inputProps={{ 'aria-label': `选择对话 ${conv.phoneNumber}` }}
                     />
                   )}
@@ -985,7 +1045,7 @@ export default function SMSPage() {
           </IconButton>
         )}
         <Avatar sx={{ bgcolor: 'primary.main' }}><Person /></Avatar>
-        <Typography variant="h6" fontWeight={600}>{selectedConversation}</Typography>
+        <Typography variant="h6" fontWeight={600}>{phoneNumber}</Typography>
         {batchMode && conversationMessages.length > 0 && (
           <Box sx={{ ml: 'auto', display: 'flex', alignItems: 'center' }}>
             <Checkbox
@@ -1154,7 +1214,7 @@ export default function SMSPage() {
             lines={volteLines}
             value={selectedLineId}
             onChange={setSelectedLineId}
-            disabled={sendLoading}
+            disabled={sendLoading || channelCannotSend}
           />
           <TextField
             fullWidth
@@ -1163,7 +1223,7 @@ export default function SMSPage() {
             value={content}
             onChange={(e: ChangeEvent<HTMLInputElement>) => setContent(e.target.value)}
             placeholder="输入短信内容..."
-            disabled={sendLoading}
+            disabled={sendLoading || channelCannotSend}
             onFocus={() => { inputFocusedRef.current = true }}
             onBlur={() => { inputFocusedRef.current = false }}
             onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
@@ -1179,7 +1239,7 @@ export default function SMSPage() {
                     <IconButton
                       color="primary"
                       onClick={() => void handleSend()}
-                      disabled={sendLoading || !content.trim()}
+                      disabled={sendLoading || channelCannotSend || !content.trim()}
                     >
                       {sendLoading ? <CircularProgress size={24} /> : <Send />}
                     </IconButton>
@@ -1190,7 +1250,9 @@ export default function SMSPage() {
           />
         </Box>
         <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
-          {content.length} 字符 · {selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '按现有路径策略自动选择'} · Enter 发送，Shift+Enter 换行
+          {channelCannotSend
+            ? '当前通道仅用于查看归档，尚未接入短信发送运行时'
+            : `${content.length} 字符 · ${selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '按现有路径策略自动选择'} · Enter 发送，Shift+Enter 换行`}
         </Typography>
       </Box>
     </Box>
@@ -1221,6 +1283,25 @@ export default function SMSPage() {
         </Tooltip>
       </Box>
 
+      <Box sx={{ mb: 2, borderBottom: 1, borderColor: 'divider' }}>
+        <Tabs
+          value={selectedChannelId}
+          onChange={(_, value: string) => selectChannel(value)}
+          variant="scrollable"
+          scrollButtons="auto"
+          aria-label="SIM 短信通道"
+        >
+          <Tab value="" label="全部 SIM 通道" />
+          {smsChannels.map((channel) => (
+            <Tab
+              key={channel.id}
+              value={channel.id}
+              label={`${channel.label}${channel.available ? '' : '（不可用）'}`}
+            />
+          ))}
+        </Tabs>
+      </Box>
+
       <Snackbar open={!!error} autoHideDuration={4000} resumeHideDuration={3000} onClose={() => setError(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
         <Alert severity="error" onClose={() => setError(null)} variant="filled">{error}</Alert>
       </Snackbar>
@@ -1228,7 +1309,7 @@ export default function SMSPage() {
         <Alert severity="success" onClose={() => setSuccess(null)} variant="filled">{success}</Alert>
       </Snackbar>
 
-      <Card sx={{ height: 'calc(100% - 48px)' }}>
+      <Card sx={{ height: 'calc(100% - 96px)' }}>
         <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
           {isMobile ? (
             selectedConversation ? chatAreaContent : conversationListContent

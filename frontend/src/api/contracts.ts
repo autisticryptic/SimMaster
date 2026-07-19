@@ -633,11 +633,25 @@ export interface SmsListRequest {
   limit?: number
   offset?: number
   direction?: 'incoming' | 'outgoing'
+  channel_id?: string
 }
 
 export interface SmsConversationRequest {
   phone_number: string
   limit?: number
+  channel_id?: string
+}
+
+export interface SmsChannelResponse {
+  id: string
+  kind: 'modem_line' | 'standalone_sim_slot' | 'unassigned'
+  label: string
+  available: boolean
+  uim_slot: number
+  line_id?: string | null
+  slot_id?: string | null
+  iccid?: string | null
+  operator_id?: string | null
 }
 
 export interface SmsStats {
@@ -999,6 +1013,7 @@ export interface NotificationRule {
   enabled: boolean
   matcher: RuleMatcher
   channel_ids: string[]
+  sim_channel_ids: string[]
   event_codes: string[]
   template: string
   quiet_hours: QuietHoursSchedule[]

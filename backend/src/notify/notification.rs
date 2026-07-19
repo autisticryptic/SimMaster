@@ -1,5 +1,7 @@
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
-use crate::cellular::modem_manager::get_sim_info_data_with_cache;
+use crate::cellular::modem_manager::{
+    discover_modem_bindings, get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache,
+};
 use crate::infra::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
     LegacyNotificationConfig, MatcherOperator, MessageChannelConfig, NotificationChannel,
@@ -66,6 +68,8 @@ pub struct NotificationFanoutResult {
 struct SmsTemplateContext {
     own_number: String,
     carrier: String,
+    sim_channel_id: String,
+    sim_channel_label: String,
 }
 
 #[derive(Default)]
@@ -183,6 +187,8 @@ impl NotificationEvent<'_> {
                 "direction" => message.direction.clone(),
                 "status" => message.status.clone(),
                 "transport" | "path" => sms_transport_label(&message.transport).to_string(),
+                "sim_channel_id" => context.sim_channel_id.clone(),
+                "sim_channel" => context.sim_channel_label.clone(),
                 _ => self.summary(),
             },
             NotificationEvent::Ddns(event) => match field {
@@ -293,25 +299,73 @@ impl NotificationSender {
             .unwrap_or_default()
     }
 
-    async fn sms_template_context(&self) -> SmsTemplateContext {
-        let own_number = self.get_own_number().await;
-
-        let carrier =
-            crate::cellular::modem_manager::get_network_info_data(self.dbus_conn.as_ref())
-                .await
-                .ok()
-                .map(|net| net.operator_name)
-                .unwrap_or_default();
-
+    async fn sms_template_context(&self, message: &SmsMessage) -> SmsTemplateContext {
+        let channel_id = message
+            .line_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unassigned")
+            .to_string();
+        if let Some(slot_id) = channel_id.strip_prefix("reader:") {
+            let label = self
+                .config_manager
+                .get_standalone_sim_slots()
+                .into_iter()
+                .find(|slot| slot.id == slot_id)
+                .map(|slot| {
+                    if slot.label.trim().is_empty() {
+                        format!("读卡器 · 卡槽 {}", slot.uim_slot)
+                    } else {
+                        format!("{} · 卡槽 {}", slot.label, slot.uim_slot)
+                    }
+                })
+                .unwrap_or_else(|| channel_id.clone());
+            return SmsTemplateContext {
+                sim_channel_id: channel_id,
+                sim_channel_label: label,
+                ..Default::default()
+            };
+        }
+        if channel_id != "unassigned" {
+            if let Ok(bindings) = discover_modem_bindings(self.dbus_conn.as_ref()).await {
+                if let Some(binding) = bindings.into_iter().find(|item| item.line_id == channel_id)
+                {
+                    let sim = get_sim_info_for_modem_with_cache(
+                        self.dbus_conn.as_ref(),
+                        &binding.modem_path,
+                        Some(self.database.as_ref()),
+                    )
+                    .await
+                    .ok();
+                    return SmsTemplateContext {
+                        own_number: sim
+                            .as_ref()
+                            .map(|sim| format_own_numbers_for_template(&sim.phone_numbers))
+                            .unwrap_or_default(),
+                        carrier: sim
+                            .as_ref()
+                            .map(|sim| sim.operator_name.clone())
+                            .unwrap_or_else(|| binding.operator_id.clone()),
+                        sim_channel_id: channel_id,
+                        sim_channel_label: format!(
+                            "{} · 卡槽 {}",
+                            binding.slot_label, binding.uim_slot
+                        ),
+                    };
+                }
+            }
+        }
         SmsTemplateContext {
-            own_number,
-            carrier,
+            own_number: self.get_own_number().await,
+            sim_channel_id: channel_id,
+            sim_channel_label: "历史未归属短信".to_string(),
+            ..Default::default()
         }
     }
 
     /// Forward an incoming SMS to all enabled channels.
     pub async fn forward_sms(&self, message: &SmsMessage) -> Result<(), String> {
-        let context = self.sms_template_context().await;
+        let context = self.sms_template_context(message).await;
         let event = NotificationEvent::Sms {
             message,
             context: &context,
@@ -2160,6 +2214,21 @@ fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool 
             .iter()
             .any(|event_code| event_code == &system_event.event_code);
     }
+    if let NotificationEvent::Sms { message, .. } = event {
+        let channel_id = message
+            .line_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unassigned");
+        if !rule.sim_channel_ids.is_empty()
+            && !rule
+                .sim_channel_ids
+                .iter()
+                .any(|selected| selected == channel_id)
+        {
+            return false;
+        }
+    }
 
     let value = event.field_value(rule.matcher.field.as_str());
     let expected = rule.matcher.value.trim();
@@ -2856,6 +2925,16 @@ fn render_sms_template(
     } else {
         context.carrier.clone()
     };
+    let sim_channel_id = if escape_json {
+        escape_json_string(&context.sim_channel_id)
+    } else {
+        context.sim_channel_id.clone()
+    };
+    let sim_channel_label = if escape_json {
+        escape_json_string(&context.sim_channel_label)
+    } else {
+        context.sim_channel_label.clone()
+    };
     let timestamp = render_time_value(&message.timestamp, escape_json);
     let verification_code = extract_verification_code(&message.content).unwrap_or_default();
     let transport = sms_transport_label(&message.transport);
@@ -2890,6 +2969,11 @@ fn render_sms_template(
         .replace("{{carrier}}", &carrier)
         .replace("{{operator}}", &carrier)
         .replace("{{运营商}}", &carrier);
+    let rendered = rendered
+        .replace("{{sim_channel_id}}", &sim_channel_id)
+        .replace("{{SIM通道ID}}", &sim_channel_id)
+        .replace("{{sim_channel}}", &sim_channel_label)
+        .replace("{{SIM通道}}", &sim_channel_label);
     replace_own_number(rendered, &own_number)
 }
 
@@ -3082,6 +3166,7 @@ mod tests {
                 value: "code".to_string(),
             },
             channel_ids: Vec::new(),
+            sim_channel_ids: Vec::new(),
             event_codes: Vec::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
@@ -3091,6 +3176,12 @@ mod tests {
             device_status_sms_period: "last_24h".to_string(),
         };
         assert!(rule_matches(&contains_rule, &event));
+
+        let mut wrong_sim = contains_rule.clone();
+        wrong_sim.sim_channel_ids = vec!["line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()];
+        assert!(!rule_matches(&wrong_sim, &event));
+        wrong_sim.sim_channel_ids = vec!["unassigned".to_string()];
+        assert!(rule_matches(&wrong_sim, &event));
 
         let regex_rule = NotificationRule {
             matcher: RuleMatcher {
@@ -3112,6 +3203,7 @@ mod tests {
             enabled: true,
             matcher: RuleMatcher::default(),
             channel_ids: Vec::new(),
+            sim_channel_ids: Vec::new(),
             event_codes: Vec::new(),
             template: String::new(),
             quiet_hours: Vec::new(),
@@ -3225,6 +3317,8 @@ mod tests {
         let context = SmsTemplateContext {
             own_number: "+10001".to_string(),
             carrier: "中国联通".to_string(),
+            sim_channel_id: "unassigned".to_string(),
+            sim_channel_label: "历史未归属短信".to_string(),
         };
 
         assert_eq!(

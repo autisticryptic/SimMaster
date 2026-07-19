@@ -399,6 +399,10 @@ pub struct NotificationRule {
     pub matcher: RuleMatcher,
     #[serde(default)]
     pub channel_ids: Vec<String>,
+    /// Empty means every SIM source. Values are stable modem line IDs,
+    /// `reader:<slot_id>`, or `unassigned` for legacy rows.
+    #[serde(default)]
+    pub sim_channel_ids: Vec<String>,
     #[serde(default)]
     pub event_codes: Vec<String>,
     #[serde(default)]
@@ -1089,6 +1093,7 @@ fn push_legacy_rule(
             .into_iter()
             .map(|channel| channel.id.clone())
             .collect(),
+        sim_channel_ids: Vec::new(),
         event_codes: Vec::new(),
         template,
         quiet_hours: Vec::new(),
@@ -1129,7 +1134,7 @@ fn webhook_text_template(template: &str, fallback: &str) -> String {
 pub fn default_rule_template(event_type: NotificationEventType) -> String {
     match event_type {
         NotificationEventType::Sms => {
-            "📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}".to_string()
+            "📱 短信通知\nSIM通道: {{SIM通道}}\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}".to_string()
         }
         NotificationEventType::Ddns => {
             "DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}".to_string()

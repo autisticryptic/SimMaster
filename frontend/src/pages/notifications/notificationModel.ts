@@ -150,7 +150,7 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
 }
 
 export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
-  sms: '📱 短信通知\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}',
+  sms: '📱 短信通知\nSIM通道: {{SIM通道}}\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}',
   ddns: 'DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}',
   version_update: '🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}',
   system_event: DEFAULT_SYSTEM_EVENT_TEMPLATE,
@@ -160,6 +160,8 @@ export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
 
 export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[]> = {
   sms: [
+    { label: 'SIM 通道', token: '{{SIM通道}}' },
+    { label: 'SIM 通道 ID', token: '{{SIM通道ID}}' },
     { label: '发送方号码', token: '{{发送方号码}}' },
     { label: '本机号码', token: '{{本机号码}}' },
     { label: '短信内容', token: '{{短信内容}}' },
@@ -209,6 +211,7 @@ function normalizeRule(rule: NotificationRule): NotificationRule {
   const threshold = Number(rule.ddns_failure_threshold)
   return {
     ...rule,
+    sim_channel_ids: Array.isArray(rule.sim_channel_ids) ? rule.sim_channel_ids : [],
     event_codes: Array.isArray(rule.event_codes) ? rule.event_codes : [],
     device_status_items: Array.isArray(rule.device_status_items) ? rule.device_status_items : defaultDeviceStatusItems(),
     device_status_schedule: {
@@ -361,6 +364,7 @@ export function createRule(type: NotificationEventType, channelIds: string[]): N
     enabled: true,
     matcher: { field: 'summary', operator: 'always', value: '' },
     channel_ids: channelIds,
+    sim_channel_ids: [],
     event_codes: type === 'system_event' ? defaultSystemEventCodes() : type === 'automation' ? defaultAutomationEventCodes() : [],
     device_status_items: type === 'device_status' ? defaultDeviceStatusItems() : [],
     device_status_schedule: { mode: 'fixed', interval_minutes: 1440, weekdays: [1, 2, 3, 4, 5, 6, 7], times: ['09:00'] },

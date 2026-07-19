@@ -1119,6 +1119,10 @@ async fn main() -> Result<()> {
             post(send_sms_handler).options(options_handler),
         )
         .route(
+            "/api/sms/channels",
+            get(get_sms_channels_handler).options(options_handler),
+        )
+        .route(
             "/api/sms/list",
             get(get_sms_list_handler).options(options_handler),
         )

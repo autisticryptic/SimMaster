@@ -3407,6 +3407,61 @@ pub async fn place_call_handler(
 }
 
 /// GET /api/sms/list
+pub async fn get_sms_channels_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<Vec<SmsChannelResponse>>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let mut channels = Vec::new();
+    for line in app.line_registry.all().await {
+        let modem = line.binding();
+        channels.push(SmsChannelResponse {
+            id: modem.line_id.clone(),
+            kind: "modem_line".to_string(),
+            label: format!("{} · 卡槽 {}", modem.slot_label, modem.uim_slot),
+            available: modem.present,
+            uim_slot: modem.uim_slot,
+            line_id: Some(modem.line_id),
+            slot_id: None,
+            iccid: (!modem.sim_iccid.trim().is_empty()).then_some(modem.sim_iccid),
+            operator_id: (!modem.operator_id.trim().is_empty()).then_some(modem.operator_id),
+        });
+    }
+    for slot in app.config_manager.get_standalone_sim_slots() {
+        channels.push(SmsChannelResponse {
+            id: format!("reader:{}", slot.id),
+            kind: "standalone_sim_slot".to_string(),
+            label: if slot.label.trim().is_empty() {
+                format!("读卡器 · 卡槽 {}", slot.uim_slot)
+            } else {
+                format!("{} · 卡槽 {}", slot.label, slot.uim_slot)
+            },
+            available: slot.enabled,
+            uim_slot: slot.uim_slot,
+            line_id: None,
+            slot_id: Some(slot.id),
+            iccid: None,
+            operator_id: None,
+        });
+    }
+    if app.database.has_unassigned_sms().unwrap_or(false) {
+        channels.push(SmsChannelResponse {
+            id: "unassigned".to_string(),
+            kind: "unassigned".to_string(),
+            label: "历史未归属短信".to_string(),
+            available: true,
+            ..Default::default()
+        });
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", channels)),
+    )
+}
+
+fn sms_channel_filter(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
 pub async fn get_sms_list_handler(
     State(db): State<Arc<Database>>,
     Query(params): Query<SmsListRequest>,
@@ -3418,7 +3473,8 @@ pub async fn get_sms_list_handler(
         .as_deref()
         .filter(|value| matches!(*value, "incoming" | "outgoing"));
 
-    match db.get_sms_messages(limit, offset, direction) {
+    let channel_id = sms_channel_filter(params.channel_id.as_deref());
+    match db.get_sms_messages_for_channel(limit, offset, direction, channel_id) {
         Ok(messages) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -3442,7 +3498,8 @@ pub async fn get_sms_conversation_handler(
     Query(params): Query<SmsConversationRequest>,
 ) -> (StatusCode, Json<ApiResponse<SmsListResponse>>) {
     let limit = if params.limit > 0 { params.limit } else { 50 };
-    match db.get_sms_conversation(&params.phone_number, limit) {
+    let channel_id = sms_channel_filter(params.channel_id.as_deref());
+    match db.get_sms_conversation_for_channel(&params.phone_number, limit, channel_id) {
         Ok(messages) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -3463,8 +3520,9 @@ pub async fn get_sms_conversation_handler(
 /// GET /api/sms/stats
 pub async fn get_sms_stats_handler(
     State(db): State<Arc<Database>>,
+    Query(params): Query<SmsStatsRequest>,
 ) -> (StatusCode, Json<ApiResponse<SmsStatsResponse>>) {
-    match db.get_sms_stats() {
+    match db.get_sms_stats_for_channel(sms_channel_filter(params.channel_id.as_deref())) {
         Ok(stats) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", stats)),
@@ -3531,8 +3589,12 @@ pub async fn delete_sms_message_handler(
 pub async fn delete_sms_conversation_handler(
     State(app): State<AppState>,
     Path(phone_number): Path<String>,
+    Query(params): Query<SmsStatsRequest>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    match app.database.delete_sms_conversation(&phone_number) {
+    match app.database.delete_sms_conversation_for_channel(
+        &phone_number,
+        sms_channel_filter(params.channel_id.as_deref()),
+    ) {
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
             (
@@ -3559,10 +3621,11 @@ pub async fn delete_sms_batch_handler(
         return (StatusCode::OK, Json(ApiResponse::error("No SMS selected")));
     }
 
-    match app
-        .database
-        .delete_sms_batch(&payload.ids, &payload.phone_numbers)
-    {
+    match app.database.delete_sms_batch_for_channel(
+        &payload.ids,
+        &payload.phone_numbers,
+        sms_channel_filter(payload.channel_id.as_deref()),
+    ) {
         Ok(deleted) => {
             schedule_sms_db_maintenance(&app, deleted);
             (

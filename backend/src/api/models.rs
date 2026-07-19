@@ -972,6 +972,8 @@ pub struct SmsListRequest {
     #[serde(default)]
     pub offset: i64,
     pub direction: Option<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -979,6 +981,8 @@ pub struct SmsConversationRequest {
     pub phone_number: String,
     #[serde(default = "default_page_size")]
     pub limit: i64,
+    #[serde(default)]
+    pub channel_id: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -987,6 +991,31 @@ pub struct SmsBatchDeleteRequest {
     pub ids: Vec<i64>,
     #[serde(default)]
     pub phone_numbers: Vec<String>,
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SmsStatsRequest {
+    #[serde(default)]
+    pub channel_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SmsChannelResponse {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    pub available: bool,
+    pub uim_slot: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iccid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_id: Option<String>,
 }
 
 fn default_page_size() -> i64 {

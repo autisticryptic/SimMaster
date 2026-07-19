@@ -30,6 +30,7 @@ import type {
   NotificationConfig,
   NotificationEventType,
   NotificationRule,
+  SmsChannelResponse,
 } from '../../api/current'
 import {
   DEFAULT_TEMPLATES,
@@ -56,6 +57,7 @@ const EVENT_ICONS: Record<NotificationEventType, typeof Sms> = {
 
 type NotificationRulesTabProps = {
   config: NotificationConfig
+  smsChannels: SmsChannelResponse[]
   selectedEventType: NotificationEventType
   saving: boolean
   onSelectedEventTypeChange: (eventType: NotificationEventType) => void
@@ -67,6 +69,7 @@ type NotificationRulesTabProps = {
 
 export default function NotificationRulesTab({
   config,
+  smsChannels,
   selectedEventType,
   saving,
   onSelectedEventTypeChange,
@@ -391,6 +394,50 @@ export default function NotificationRulesTab({
                         eventCodes={rule.event_codes ?? []}
                         onChange={(eventCodes) => onPatchRule(rule.id, { event_codes: eventCodes })}
                       />
+                    )}
+
+                    {rule.type === 'sms' && (
+                      <Box mt={2}>
+                        <Typography variant="subtitle2" mb={1}>SIM 卡通道</Typography>
+                        <Box display="flex" gap={1} flexWrap="wrap">
+                          <FormControlLabel
+                            sx={{ border: 1, borderColor: rule.sim_channel_ids.length === 0 ? 'primary.main' : 'divider', borderRadius: 1, px: 1, py: 0.25, m: 0 }}
+                            control={
+                              <Checkbox
+                                checked={rule.sim_channel_ids.length === 0}
+                                onChange={() => onPatchRule(rule.id, { sim_channel_ids: [] })}
+                              />
+                            }
+                            label="全部 SIM 通道"
+                          />
+                          {smsChannels.map((channel) => {
+                            const checked = rule.sim_channel_ids.includes(channel.id)
+                            return (
+                              <FormControlLabel
+                                key={channel.id}
+                                sx={{ border: 1, borderColor: checked ? 'primary.main' : 'divider', borderRadius: 1, px: 1, py: 0.25, m: 0 }}
+                                control={
+                                  <Checkbox
+                                    checked={checked}
+                                    onChange={(event: ChangeEvent<HTMLInputElement>) => {
+                                      const ids = event.target.checked
+                                        ? [...rule.sim_channel_ids, channel.id]
+                                        : rule.sim_channel_ids.filter((id) => id !== channel.id)
+                                      onPatchRule(rule.id, { sim_channel_ids: ids })
+                                    }}
+                                  />
+                                }
+                                label={
+                                  <Box display="flex" alignItems="center" gap={0.75}>
+                                    <Typography variant="body2">{channel.label}</Typography>
+                                    {!channel.available && <Chip size="small" label="不可用" />}
+                                  </Box>
+                                }
+                              />
+                            )
+                          })}
+                        </Box>
+                      </Box>
                     )}
 
                     <Box mt={2}>

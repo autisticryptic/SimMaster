@@ -797,6 +797,43 @@ mod tests {
     }
 
     #[test]
+    fn sms_channel_filters_list_conversation_stats_and_delete() {
+        let db = test_database();
+        let line_a = "line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let line_b = "line-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        for (content, line_id) in [
+            ("from-a", Some(line_a)),
+            ("from-b", Some(line_b)),
+            ("legacy", None),
+        ] {
+            db.insert_sms_with_transport_for_line(
+                "incoming", "10086", content, "received", None, "modem", line_id,
+            )
+            .expect("insert channel sms");
+        }
+
+        let line_messages = db
+            .get_sms_messages_for_channel(10, 0, None, Some(line_a))
+            .expect("list line channel");
+        assert_eq!(line_messages.len(), 1);
+        assert_eq!(line_messages[0].content, "from-a");
+        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 1);
+        assert_eq!(
+            db.get_sms_conversation_for_channel("10086", 10, Some("unassigned"))
+                .unwrap()[0]
+                .content,
+            "legacy"
+        );
+
+        assert_eq!(
+            db.delete_sms_conversation_for_channel("10086", Some(line_a))
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.get_sms_stats().unwrap().total, 2);
+    }
+
+    #[test]
     fn vowifi_restore_and_events_are_readable_when_empty_or_present() {
         let db = test_database();
 
@@ -2427,59 +2464,61 @@ impl Database {
         offset: i64,
         direction: Option<&str>,
     ) -> Result<Vec<SmsMessage>> {
+        self.get_sms_messages_for_channel(limit, offset, direction, None)
+    }
+
+    pub fn get_sms_messages_for_channel(
+        &self,
+        limit: i64,
+        offset: i64,
+        direction: Option<&str>,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
-        match direction {
-            Some(direction) => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
-                     FROM sms_messages
-                     WHERE direction = ?1
-                     ORDER BY timestamp DESC, id DESC
-                     LIMIT ?2 OFFSET ?3",
-                )?;
-
-                let messages =
-                    stmt.query_map(params![direction, limit, offset], sms_message_from_row)?;
-
-                let mut result = Vec::new();
-                for message in messages {
-                    result.push(message?);
-                }
-
-                Ok(result)
-            }
-            None => {
-                let mut stmt = conn.prepare(
-                    "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
-                     FROM sms_messages
-                     ORDER BY timestamp DESC, id DESC
-                     LIMIT ?1 OFFSET ?2",
-                )?;
-
-                let messages = stmt.query_map(params![limit, offset], sms_message_from_row)?;
-
-                let mut result = Vec::new();
-                for message in messages {
-                    result.push(message?);
-                }
-
-                Ok(result)
-            }
+        let mut stmt = conn.prepare(
+            "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
+             FROM sms_messages
+             WHERE (?1 IS NULL OR direction = ?1)
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let messages = stmt.query_map(
+            params![direction, channel_id, limit, offset],
+            sms_message_from_row,
+        )?;
+        let mut result = Vec::new();
+        for message in messages {
+            result.push(message?);
         }
+        Ok(result)
     }
 
     /// 获取与特定号码的对话历史
     pub fn get_sms_conversation(&self, phone_number: &str, limit: i64) -> Result<Vec<SmsMessage>> {
+        self.get_sms_conversation_for_channel(phone_number, limit, None)
+    }
+
+    pub fn get_sms_conversation_for_channel(
+        &self,
+        phone_number: &str,
+        limit: i64,
+        channel_id: Option<&str>,
+    ) -> Result<Vec<SmsMessage>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, direction, phone_number, content, timestamp, status, pdu, transport, line_id
              FROM sms_messages
              WHERE phone_number = ?1
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
              ORDER BY timestamp DESC, id DESC
-             LIMIT ?2",
+             LIMIT ?3",
         )?;
 
-        let messages = stmt.query_map(params![phone_number, limit], sms_message_from_row)?;
+        let messages = stmt.query_map(
+            params![phone_number, channel_id, limit],
+            sms_message_from_row,
+        )?;
 
         let mut result = Vec::new();
         for message in messages {
@@ -2994,39 +3033,54 @@ impl Database {
     }
 
     pub fn get_sms_stats(&self) -> Result<SmsStats> {
+        self.get_sms_stats_for_channel(None)
+    }
+
+    pub fn get_sms_stats_for_channel(&self, channel_id: Option<&str>) -> Result<SmsStats> {
         let conn = self.conn.lock().unwrap();
 
-        let total: i64 =
-            conn.query_row("SELECT COUNT(*) FROM sms_messages", [], |row| row.get(0))?;
+        let channel_filter =
+            "(?1 IS NULL OR (?1 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?1)";
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM sms_messages WHERE {channel_filter}"),
+            params![channel_id],
+            |row| row.get(0),
+        )?;
 
         let incoming: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
-             WHERE direction = 'incoming' AND status = 'received'",
-            [],
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
+             WHERE direction = 'incoming' AND status = 'received' AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let outgoing: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages WHERE direction = 'outgoing'",
-            [],
+            &format!("SELECT COUNT(*) FROM sms_messages WHERE direction = 'outgoing' AND {channel_filter}"),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let pushed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
              WHERE direction = 'incoming'
                AND status = 'received'
-               AND notification_status = 'success'",
-            [],
+               AND notification_status = 'success' AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
         let push_attempted: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages
+            &format!(
+                "SELECT COUNT(*) FROM sms_messages
              WHERE direction = 'incoming'
                AND status = 'received'
-               AND notification_status IN ('success', 'failed')",
-            [],
+               AND notification_status IN ('success', 'failed') AND {channel_filter}"
+            ),
+            params![channel_id],
             |row| row.get(0),
         )?;
 
@@ -3037,6 +3091,16 @@ impl Database {
             pushed,
             push_attempted,
         })
+    }
+
+    pub fn has_unassigned_sms(&self) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sms_messages WHERE line_id IS NULL OR TRIM(line_id) = ''",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// 删除所有短信
@@ -3059,23 +3123,42 @@ impl Database {
 
     /// 删除一个对话的所有短信
     pub fn delete_sms_conversation(&self, phone_number: &str) -> Result<usize> {
+        self.delete_sms_conversation_for_channel(phone_number, None)
+    }
+
+    pub fn delete_sms_conversation_for_channel(
+        &self,
+        phone_number: &str,
+        channel_id: Option<&str>,
+    ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE vowifi_sms_delivery
              SET api_sms_id = NULL
              WHERE api_sms_id IN (
                  SELECT id FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
              )",
-            params![phone_number],
+            params![phone_number, channel_id],
         )?;
         conn.execute(
-            "DELETE FROM sms_messages WHERE phone_number = ?1",
-            params![phone_number],
+            "DELETE FROM sms_messages WHERE phone_number = ?1
+               AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+            params![phone_number, channel_id],
         )
     }
 
     /// 按短信 ID 和对话号码批量删除
     pub fn delete_sms_batch(&self, ids: &[i64], phone_numbers: &[String]) -> Result<usize> {
+        self.delete_sms_batch_for_channel(ids, phone_numbers, None)
+    }
+
+    pub fn delete_sms_batch_for_channel(
+        &self,
+        ids: &[i64],
+        phone_numbers: &[String],
+        channel_id: Option<&str>,
+    ) -> Result<usize> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
@@ -3086,12 +3169,14 @@ impl Database {
                  SET api_sms_id = NULL
                  WHERE api_sms_id IN (
                      SELECT id FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
                  )",
-                params![phone_number],
+                params![phone_number, channel_id],
             )?;
             deleted += tx.execute(
-                "DELETE FROM sms_messages WHERE phone_number = ?1",
-                params![phone_number],
+                "DELETE FROM sms_messages WHERE phone_number = ?1
+                   AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+                params![phone_number, channel_id],
             )?;
         }
 

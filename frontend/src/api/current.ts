@@ -69,6 +69,7 @@ import type {
   UpdateSimCacheRequest,
   SmsMessage,
   SmsConversationRequest,
+  SmsChannelResponse,
   SmsListRequest,
   SmsStats,
   SmsPathPolicy,
@@ -744,6 +745,7 @@ class SimAdminCurrentAPI {
     if (params?.limit) query.append('limit', params.limit.toString())
     if (params?.offset) query.append('offset', params.offset.toString())
     if (params?.direction) query.append('direction', params.direction)
+    if (params?.channel_id) query.append('channel_id', params.channel_id)
     const queryStr = query.toString() ? `?${query.toString()}` : ''
     return request<ApiResponse<SmsListResponse>>(`/sms/list${queryStr}`)
   }
@@ -752,11 +754,17 @@ class SimAdminCurrentAPI {
     const query = new URLSearchParams()
     query.append('phone_number', params.phone_number)
     if (params.limit) query.append('limit', params.limit.toString())
+    if (params.channel_id) query.append('channel_id', params.channel_id)
     return request<ApiResponse<SmsListResponse>>(`/sms/conversation?${query.toString()}`)
   }
 
-  async getSmsStats() {
-    return request<ApiResponse<SmsStats>>('/sms/stats')
+  async getSmsChannels() {
+    return request<ApiResponse<SmsChannelResponse[]>>('/sms/channels')
+  }
+
+  async getSmsStats(channelId?: string) {
+    const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
+    return request<ApiResponse<SmsStats>>(`/sms/stats${query}`)
   }
 
   async getSmsPathPolicy() {
@@ -782,16 +790,17 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async deleteSmsConversation(phoneNumber: string) {
+  async deleteSmsConversation(phoneNumber: string, channelId?: string) {
+    const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
     return request<ApiResponse<{ deleted: number }>>(
-      `/sms/conversation/${encodeURIComponent(phoneNumber)}`,
+      `/sms/conversation/${encodeURIComponent(phoneNumber)}${query}`,
       {
         method: 'DELETE',
       },
     )
   }
 
-  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[] }) {
+  async deleteSmsBatch(payload: { ids?: number[]; phone_numbers?: string[]; channel_id?: string }) {
     return request<ApiResponse<{ deleted: number }>>('/sms/batch-delete', {
       method: 'POST',
       body: JSON.stringify(payload),
