@@ -572,6 +572,11 @@ export interface VowifiLineConfigResponse {
   config: LineVowifiConfig
   is_primary: boolean
   runtime_scope: string
+  runtime_phase: string
+  runtime_stage: string
+  runtime_registered: boolean
+  runtime_error?: string | null
+  matched_profile_id?: string | null
 }
 
 export interface StandaloneSimSlotConfig {
@@ -1172,6 +1177,17 @@ export interface VowifiCarrierProfile {
 export interface VowifiProfilesResponse {
   profiles: VowifiCarrierProfile[]
   count: number
+}
+
+export interface ExternalVowifiProfile {
+  profile_id: string
+  mcc: string
+  mnc: string
+  epdg_host: string
+  epdg_port: number
+  ip_stack: string
+  apn?: string | null
+  dns_server?: string | null
 }
 
 export interface VowifiMaskedSimIdentity {
@@ -2199,6 +2215,7 @@ export interface AutomationConfig {
 export type AutomationTrigger =
   | { type: 'fixed'; config: { weekdays: number[]; times: string[] } }
   | { type: 'interval'; config: { interval_value: number; interval_unit: string } }
+  | { type: 'cron'; config: { expression: string } }
 
 export type AutomationTarget =
   | { kind: 'modem_line'; line_id: string }

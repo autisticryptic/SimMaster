@@ -8,6 +8,7 @@ import {
   type LineVowifiConfig,
   type VowifiLineConfigResponse,
   type VowifiProxyMode,
+  type ExternalVowifiProfile,
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
 
@@ -29,10 +30,15 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
   const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [externalProfiles, setExternalProfiles] = useState<ExternalVowifiProfile[]>([])
+  const [savingProfile, setSavingProfile] = useState(false)
+  const [profileSaved, setProfileSaved] = useState(false)
 
   useEffect(() => {
     if (line) setDraft({ ...line.config })
+    if (open) void api.getExternalVowifiProfiles().then((response) => setExternalProfiles(response.data ?? [])).catch(() => setExternalProfiles([]))
     setError(null)
+    setProfileSaved(false)
   }, [line, open])
 
   const validationError = useMemo(() => {
@@ -65,6 +71,34 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     }
   }
 
+  const saveAsExternalProfile = async () => {
+    if (!line || !draft || validationError) return
+    setSavingProfile(true)
+    setError(null)
+    try {
+      const matched = await api.getVowifiProfile()
+      const profile = matched.data?.profile
+      const epdg = matched.data?.epdg
+      if (!profile || !(draft.epdg_host.trim() || epdg?.host)) throw new Error('尚未匹配运营商 profile，或缺少 ePDG 主机')
+      const response = await api.setExternalVowifiProfile({
+        profile_id: line.matched_profile_id || profile.profile_id,
+        mcc: profile.mcc,
+        mnc: profile.mnc,
+        epdg_host: draft.epdg_host.trim() || epdg?.host || '',
+        epdg_port: draft.epdg_port,
+        ip_stack: epdg?.ip_stack || 'ipv6',
+        apn: epdg?.apn || 'ims',
+        dns_server: draft.dns_server.trim() || epdg?.dns_server || null,
+      })
+      setExternalProfiles(response.data ?? [])
+      setProfileSaved(true)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSavingProfile(false)
+    }
+  }
+
   if (!line || !draft) return null
 
   return (
@@ -73,8 +107,18 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
       <DialogContent dividers>
         <Stack spacing={2}>
           <Alert severity="info">
-            ePDG 默认来自运营商 MCC/MNC profile。留空时使用内置值；自定义 DNS 和 ePDG 仅覆盖本线路。
+            ePDG 默认来自运营商 MCC/MNC profile。可选择外部 profile，或把当前属性保存到设备的 vowifi-profiles.conf 自定义区。
           </Alert>
+          <FormControl fullWidth>
+            <InputLabel>外部 ePDG profile</InputLabel>
+            <Select label="外部 ePDG profile" value="" onChange={(event) => {
+              const profile = externalProfiles.find((item) => item.profile_id === event.target.value)
+              if (profile) setDraft((current) => current ? { ...current, epdg_host: profile.epdg_host, epdg_port: profile.epdg_port, dns_server: profile.dns_server || '' } : current)
+            }}>
+              <MenuItem value=""><em>不套用</em></MenuItem>
+              {externalProfiles.map((profile) => <MenuItem key={profile.profile_id} value={profile.profile_id}>{profile.profile_id} · {profile.epdg_host}</MenuItem>)}
+            </Select>
+          </FormControl>
           <TextField
             label="自定义 ePDG 主机"
             value={draft.epdg_host}
@@ -124,10 +168,12 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             当前实时 VoWiFi 执行器仍沿用主线路运行时。本页已完成每线路配置与持久化，非主线路的独立 IKE/IMS 会话需要后续运行时拆分后才会真正建立。
           </Alert>
           {validationError && <Alert severity="error">{validationError}</Alert>}
+          {profileSaved && <Alert severity="success">已写入设备的 vowifi-profiles.conf 自定义区</Alert>}
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
       </DialogContent>
       <DialogActions>
+        <Button onClick={() => void saveAsExternalProfile()} disabled={saving || savingProfile || Boolean(validationError)}>{savingProfile ? '写入中...' : '保存为外部 profile'}</Button>
         <Button onClick={onClose} disabled={saving}>取消</Button>
         <Button variant="contained" onClick={() => void save()} disabled={saving || Boolean(validationError)}>
           {saving ? '保存中...' : '保存配置'}

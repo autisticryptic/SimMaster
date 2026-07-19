@@ -3698,6 +3698,24 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
         )
         .await;
     let mut response = snapshot.profile;
+    if let (Some(profile), Some(epdg)) = (response.profile.as_ref(), response.epdg.as_mut()) {
+        if let Some(external) = app
+            .config_manager
+            .get_external_vowifi_profiles()
+            .into_iter()
+            .find(|item| {
+                item.profile_id == profile.profile_id
+                    || item.mcc == profile.mcc && item.mnc == profile.mnc
+            })
+        {
+            epdg.host = external.epdg_host;
+            epdg.port = external.epdg_port;
+            epdg.ip_stack = external.ip_stack;
+            epdg.apn = external.apn;
+            epdg.dns_server = external.dns_server;
+            epdg.source = "external_profile".to_string();
+        }
+    }
     if let Some(primary) = app.line_registry.primary().await {
         let line_config = app
             .config_manager
@@ -4277,10 +4295,28 @@ async fn connect_vowifi_with_attempts(
         return disabled_vowifi_status("vowifi_feature_disabled");
     }
     if let Some(primary) = app.line_registry.primary().await {
-        let line_config = app
+        let mut line_config = app
             .config_manager
             .get_line_profile(&primary.binding().line_id)
             .vowifi;
+        if line_config.epdg_host.is_empty() {
+            let snapshot = app.vowifi_runtime.snapshot().await;
+            if let Some(profile) = snapshot.profile.profile {
+                if let Some(external) = app
+                    .config_manager
+                    .get_external_vowifi_profiles()
+                    .into_iter()
+                    .find(|item| {
+                        item.profile_id == profile.profile_id
+                            || item.mcc == profile.mcc && item.mnc == profile.mnc
+                    })
+                {
+                    line_config.epdg_host = external.epdg_host;
+                    line_config.epdg_port = external.epdg_port;
+                    line_config.dns_server = external.dns_server.unwrap_or_default();
+                }
+            }
+        }
         if let Err(error) =
             crate::access::vowifi::live::configure_live_network_overrides(&line_config)
         {
@@ -4432,15 +4468,55 @@ pub struct VowifiLineConfigResponse {
     /// line. Per-line network settings are persisted now so the runtime can be
     /// split without another configuration migration.
     pub runtime_scope: &'static str,
+    pub runtime_phase: String,
+    pub runtime_stage: String,
+    pub runtime_registered: bool,
+    pub runtime_error: Option<String>,
+    pub matched_profile_id: Option<String>,
 }
 
-fn build_vowifi_line_response(
+async fn build_vowifi_line_response(
     app: &AppState,
     line: &crate::access::line_registry::LineRuntime,
     is_primary: bool,
 ) -> VowifiLineConfigResponse {
     let modem = line.binding();
     let config = app.config_manager.get_line_profile(&modem.line_id).vowifi;
+    let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) =
+        if is_primary {
+            let status = app.vowifi_runtime.snapshot().await.status_response();
+            let stage = if config.enabled && status.phase == "not_started" {
+                "starting".to_string()
+            } else {
+                status.phase.to_string()
+            };
+            (
+                status.phase.to_string(),
+                stage,
+                status.readiness.ims_registered,
+                status.degraded_reason,
+                status
+                    .profile
+                    .profile
+                    .map(|profile| profile.profile_id.to_string()),
+            )
+        } else if config.enabled {
+            (
+                "waiting_runtime".to_string(),
+                "configuration_only".to_string(),
+                false,
+                None,
+                None,
+            )
+        } else {
+            (
+                "disabled".to_string(),
+                "disabled".to_string(),
+                false,
+                None,
+                None,
+            )
+        };
     VowifiLineConfigResponse {
         line_id: modem.line_id.clone(),
         modem,
@@ -4451,6 +4527,11 @@ fn build_vowifi_line_response(
         } else {
             "configuration_only"
         },
+        runtime_phase,
+        runtime_stage,
+        runtime_registered,
+        runtime_error,
+        matched_profile_id,
     }
 }
 
@@ -4471,15 +4552,13 @@ pub async fn get_vowifi_lines_handler(
         .primary()
         .await
         .map(|line| line.binding().line_id);
-    let response = lines
-        .iter()
-        .map(|line| {
-            let is_primary = primary_line_id
-                .as_ref()
-                .is_some_and(|line_id| line.binding().line_id == *line_id);
-            build_vowifi_line_response(&app, line, is_primary)
-        })
-        .collect();
+    let mut response = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let is_primary = primary_line_id
+            .as_ref()
+            .is_some_and(|line_id| line.binding().line_id == *line_id);
+        response.push(build_vowifi_line_response(&app, line, is_primary).await);
+    }
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", response)),
@@ -4513,7 +4592,7 @@ pub async fn set_vowifi_line_config_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            build_vowifi_line_response(&app, &line, is_primary),
+            build_vowifi_line_response(&app, &line, is_primary).await,
         )),
     )
 }
@@ -4583,7 +4662,7 @@ pub async fn set_vowifi_line_connection_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            build_vowifi_line_response(&app, &line, is_primary),
+            build_vowifi_line_response(&app, &line, is_primary).await,
         )),
     )
 }
@@ -5250,6 +5329,40 @@ pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<Vowi
             vowifi_diagnostics::list_profiles(),
         )),
     )
+}
+
+pub async fn get_external_vowifi_profiles_handler(
+    State(app): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
+) {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_external_vowifi_profiles(),
+        )),
+    )
+}
+
+pub async fn set_external_vowifi_profile_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<crate::infra::config::ExternalVowifiProfile>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
+) {
+    match app.config_manager.set_external_vowifi_profile(payload) {
+        Ok(profiles) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", profiles)),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        ),
+    }
 }
 
 pub async fn get_vowifi_profile_handler(

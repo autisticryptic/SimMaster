@@ -36,6 +36,7 @@ import type {
   EsimLpacRepairResponse,
   EsimLpacStatusResponse,
   EsimProfilesResponse,
+  ExternalVowifiProfile,
   LoginRequest,
   LineRuntimeStatus,
   ManualRegisterRequest,
@@ -994,6 +995,17 @@ class SimAdminCurrentAPI {
   async getVowifiProfiles() {
     return request<ApiResponse<VowifiProfilesResponse>>('/vowifi/profiles', {
       timeoutMs: 10000,
+    })
+  }
+
+  async getExternalVowifiProfiles() {
+    return request<ApiResponse<ExternalVowifiProfile[]>>('/vowifi/external-profiles')
+  }
+
+  async setExternalVowifiProfile(profile: ExternalVowifiProfile) {
+    return request<ApiResponse<ExternalVowifiProfile[]>>('/vowifi/external-profiles', {
+      method: 'POST',
+      body: JSON.stringify(profile),
     })
   }
 

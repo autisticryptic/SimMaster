@@ -901,6 +901,12 @@ async fn main() -> Result<()> {
             get(get_vowifi_profiles_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/external-profiles",
+            get(get_external_vowifi_profiles_handler)
+                .post(set_external_vowifi_profile_handler)
+                .options(options_handler),
+        )
+        .route(
             "/api/vowifi/lines",
             get(get_vowifi_lines_handler).options(options_handler),
         )

@@ -91,7 +91,7 @@ export default function AutomationTaskCard({
       // Format as YYYY-MM-DD HH:MM
       const pad = (n: number) => n.toString().padStart(2, '0')
       return `${nextDate.getFullYear()}-${pad(nextDate.getMonth() + 1)}-${pad(nextDate.getDate())} ${pad(nextDate.getHours())}:${pad(nextDate.getMinutes())}`
-    } else {
+    } else if (task.trigger.type === 'interval') {
       // Interval
       const val = task.trigger.config.interval_value
       const unit = task.trigger.config.interval_unit
@@ -121,6 +121,7 @@ export default function AutomationTaskCard({
       const pad = (n: number) => n.toString().padStart(2, '0')
       return `${nextDate.getFullYear()}-${pad(nextDate.getMonth() + 1)}-${pad(nextDate.getDate())} ${pad(nextDate.getHours())}:${pad(nextDate.getMinutes())}`
     }
+    return `Cron ${task.trigger.config.expression}`
   }
 
   const nextRun = getNextRunDisplay()
@@ -192,7 +193,9 @@ export default function AutomationTaskCard({
             <Typography variant="body2">
               {task.trigger.type === 'fixed'
                 ? `每周[${task.trigger.config.weekdays.join('')}] ${task.trigger.config.times.join(',')}`
-                : `每隔 ${task.trigger.config.interval_value} ${task.trigger.config.interval_unit === 'mins' ? '分钟' : task.trigger.config.interval_unit === 'hours' ? '小时' : '天'}`}
+                : task.trigger.type === 'interval'
+                  ? `每隔 ${task.trigger.config.interval_value} ${task.trigger.config.interval_unit === 'mins' ? '分钟' : task.trigger.config.interval_unit === 'hours' ? '小时' : '天'}`
+                  : `Cron ${task.trigger.config.expression}`}
             </Typography>
           </Box>
 

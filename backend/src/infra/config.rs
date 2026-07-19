@@ -1256,6 +1256,9 @@ pub enum AutomationTrigger {
         interval_value: u64,
         interval_unit: String,
     },
+    Cron {
+        expression: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2584,6 +2587,47 @@ pub struct LineVowifiConfig {
     pub epdg_port: u16,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExternalVowifiProfile {
+    pub profile_id: String,
+    pub mcc: String,
+    pub mnc: String,
+    pub epdg_host: String,
+    #[serde(default = "default_vowifi_epdg_port")]
+    pub epdg_port: u16,
+    #[serde(default = "default_external_ip_stack")]
+    pub ip_stack: String,
+    #[serde(default)]
+    pub apn: Option<String>,
+    #[serde(default)]
+    pub dns_server: Option<String>,
+}
+
+fn default_external_ip_stack() -> String {
+    "ipv6".to_string()
+}
+
+fn serialize_external_vowifi_profiles(
+    profiles: &[ExternalVowifiProfile],
+) -> Result<String, String> {
+    let builtin = crate::access::vowifi::profiles::BUILTIN_PROFILES
+        .iter()
+        .map(|item| {
+            format!(
+                "# {} | PLMN {} | {}:{} | APN {} | {}",
+                item.meta.profile_id,
+                item.meta.plmn,
+                item.epdg.host,
+                item.epdg.port,
+                item.epdg.apn.unwrap_or(""),
+                item.epdg.ip_stack
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!("# SimAdmin VoWiFi/ePDG profile file\n# --- BUILTIN PROFILES (READ ONLY) ---\n{builtin}\n# --- CUSTOM PROFILES ---\n{}\n", serde_json::to_string_pretty(profiles).map_err(|error| error.to_string())?))
+}
+
 impl Default for LineVowifiConfig {
     fn default() -> Self {
         Self {
@@ -3299,6 +3343,12 @@ impl ConfigManager {
         if !manager.config_path.exists() || changed {
             let _ = manager.save();
         }
+        let external_path = manager.external_vowifi_profiles_path();
+        if !external_path.exists() {
+            let _ = serialize_external_vowifi_profiles(&[]).and_then(|content| {
+                fs::write(external_path, content).map_err(|error| error.to_string())
+            });
+        }
 
         manager
     }
@@ -3311,6 +3361,57 @@ impl ConfigManager {
     /// 获取自动化配置
     pub fn get_automation_config(&self) -> AutomationConfig {
         self.config.read().unwrap().automation.clone()
+    }
+
+    fn external_vowifi_profiles_path(&self) -> PathBuf {
+        self.config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("vowifi-profiles.conf")
+    }
+
+    pub fn get_external_vowifi_profiles(&self) -> Vec<ExternalVowifiProfile> {
+        let path = self.external_vowifi_profiles_path();
+        let Ok(content) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Some(json) = content.split("# --- CUSTOM PROFILES ---").nth(1) else {
+            return Vec::new();
+        };
+        serde_json::from_str(json.trim()).unwrap_or_default()
+    }
+
+    pub fn set_external_vowifi_profile(
+        &self,
+        mut profile: ExternalVowifiProfile,
+    ) -> Result<Vec<ExternalVowifiProfile>, String> {
+        profile.profile_id = profile.profile_id.trim().to_string();
+        profile.mcc = profile.mcc.trim().to_string();
+        profile.mnc = profile.mnc.trim().to_string();
+        profile.epdg_host = profile.epdg_host.trim().trim_end_matches('.').to_string();
+        if profile.profile_id.is_empty()
+            || profile.mcc.len() != 3
+            || profile.mnc.len() < 2
+            || profile.mnc.len() > 3
+            || profile.epdg_host.is_empty()
+            || profile.epdg_port == 0
+        {
+            return Err("vowifi_external_profile_invalid".to_string());
+        }
+        let mut profiles = self.get_external_vowifi_profiles();
+        if let Some(existing) = profiles
+            .iter_mut()
+            .find(|item| item.profile_id == profile.profile_id)
+        {
+            *existing = profile;
+        } else {
+            profiles.push(profile);
+        }
+        profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
+        let path = self.external_vowifi_profiles_path();
+        let content = serialize_external_vowifi_profiles(&profiles)?;
+        fs::write(path, content).map_err(|error| error.to_string())?;
+        Ok(profiles)
     }
 
     /// 更新自动化配置
@@ -3364,6 +3465,11 @@ impl ConfigManager {
                     return Err("automation_dial_call_invalid".to_string());
                 }
                 _ => {}
+            }
+            if let AutomationTrigger::Cron { expression } = &task.trigger {
+                if expression.split_whitespace().count() != 5 || expression.len() > 128 {
+                    return Err("automation_cron_expression_invalid".to_string());
+                }
             }
         }
         {

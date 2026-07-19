@@ -44,6 +44,7 @@ const stageLabels: Record<string, string> = {
 
 function runtimeLabel(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
+  if (line.profile.volte_connection_enabled && line.runtime.last_error) return `${stageLabels[line.runtime.stage] ?? line.runtime.stage}失败`
   if (line.profile.volte_connection_enabled) return stageLabels[line.runtime.stage] ?? '等待重连'
   return 'IMS 未连接'
 }
@@ -67,7 +68,23 @@ function trunkRuntimeLabel(line?: TrunkProfileResponse) {
   if (line.runtime.phase === 'ready') return '静态 Peer 已监听'
   if (line.runtime.phase === 'configured') return '已配置，等待启动'
   if (line.runtime.phase === 'degraded') return '连接异常'
+  if (line.runtime.last_error) return `${line.runtime.stage || '连接'}失败`
   return line.runtime.stage || '等待启动'
+}
+
+const vowifiStageLabels: Record<string, string> = {
+  disabled: '未启用', starting: '正在启动', identity_ready: 'SIM 身份已读取',
+  profile_matched: '运营商配置已匹配', sim_auth_ready: 'SIM AKA 已就绪',
+  epdg_ready: 'ePDG 已连接', ike_ready: 'IKE 已建立', child_sa_ready: 'CHILD SA 已建立',
+  esp_ready: 'ESP 数据通道已建立', ims_registered: 'IMS 已注册', sms_ready: '短信已就绪',
+  voice_ready: '语音已就绪', configuration_only: '等待独立运行时', not_started: '等待启动',
+}
+
+function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
+  if (!line?.config.enabled) return '未启用'
+  if (line.runtime_registered) return 'VoWiFi IMS 已注册'
+  const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage
+  return line.runtime_error ? `${stage}失败` : stage
 }
 
 function recoveryMessage(line: VolteLineControlResponse) {
@@ -173,7 +190,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         const updatedLine = response.data
         setVowifiLines((current) => current.map((line) => line.line_id === lineId ? updatedLine : line))
       }
-      setSuccess(`${shortLineId(lineId)} ${enabled ? '已开启单独 VoWiFi 配置' : '已关闭 VoWiFi'}`)
+      setSuccess(`${shortLineId(lineId)} ${enabled ? '已提交 VoWiFi 连接请求' : '已关闭 VoWiFi'}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -328,9 +345,14 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                       </Grid>
                       <Grid size={12}>
                         <Typography variant="caption" color="text.secondary">IMS 数据路径</Typography>
-                        <Typography variant="body2" mt={0.25} sx={{ wordBreak: 'break-all' }}>
-                          {line.runtime.data_path_mode || '尚未建立'}{line.runtime.pcscf ? ` · P-CSCF ${line.runtime.pcscf}` : ''}
-                        </Typography>
+                        <Box display="flex" alignItems="baseline" gap={1.25} flexWrap="wrap" mt={0.25}>
+                          <Typography variant="body2" sx={{ wordBreak: 'break-all' }}>
+                            {line.runtime.data_path_mode || '尚未建立'}{line.runtime.pcscf ? ` · P-CSCF ${line.runtime.pcscf}` : ''}
+                          </Typography>
+                          <Typography component="button" type="button" variant="body2" color="primary" onClick={() => openDetails(line, 'basic')} sx={{ border: 0, bgcolor: 'transparent', p: 0, cursor: 'pointer', font: 'inherit' }}>
+                            SIM 卡详情
+                          </Typography>
+                        </Box>
                       </Grid>
                     </Grid>
 
@@ -359,7 +381,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
-                        {line.profile.volte_connection_enabled && <Button size="small" variant="text" onClick={() => openDetails(line, 'volte')}>详细信息</Button>}
+                        <Chip size="small" label={line.profile.volte_connection_enabled ? runtimeLabel(line) : 'IMS 未连接'} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         <Tooltip title={recoveryRunning ? '自动恢复正在进行' : '立即开始新的五次恢复批次'}>
                           <span>
@@ -393,7 +415,6 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Wifi color="action" fontSize="small" />
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                           {vowifiLine?.is_primary && <Chip size="small" label="主运行线路" variant="outlined" />}
-                          {vowifiLine?.config.enabled && <Chip size="small" color="success" label="已开启" variant="outlined" />}
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
                           {vowifiLine?.config.epdg_host || '使用运营商 profile ePDG'}
@@ -401,7 +422,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>
-                        {vowifiLine?.config.enabled && <Button size="small" variant="text" onClick={() => openDetails(line, 'vowifi')}>详细信息</Button>}
+                        <Chip size="small" label={vowifiRuntimeLabel(vowifiLine)} color={vowifiLine?.runtime_registered ? 'success' : vowifiLine?.runtime_error ? 'error' : vowifiLine?.config.enabled ? 'warning' : 'default'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"
@@ -419,21 +440,11 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                       </Box>
                     </Box>
 
-                    <Box display="flex" justifyContent="flex-end" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
-                      <Button size="small" variant="outlined" onClick={() => openDetails(line, 'basic')}>SIM 卡详情</Button>
-                    </Box>
-
                     <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
                           <SettingsEthernet color="action" fontSize="small" />
                           <Typography variant="body2" fontWeight={600}>Asterisk Trunk</Typography>
-                          <Chip
-                            size="small"
-                            label={trunkRuntimeLabel(trunkLine)}
-                            color={trunkLine?.runtime.registered || trunkLine?.runtime.phase === 'ready' ? 'success' : trunkLine?.trunk.enabled ? 'warning' : 'default'}
-                            variant={trunkLine?.runtime.registered || trunkLine?.runtime.phase === 'ready' ? 'filled' : 'outlined'}
-                          />
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25} noWrap>
                           {trunkLine?.trunk.asterisk_host
@@ -442,6 +453,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>
+                        <Chip size="small" label={trunkRuntimeLabel(trunkLine)} color={trunkLine?.runtime.registered || trunkLine?.runtime.phase === 'ready' ? 'success' : trunkLine?.runtime.last_error ? 'error' : trunkLine?.trunk.enabled ? 'warning' : 'default'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"

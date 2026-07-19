@@ -41,17 +41,19 @@ export default function AutomationTaskDialog({
   const [formDataBytes, setFormDataBytes] = useState(100)
   const [formDataUnit, setFormDataUnit] = useState<'auto' | 'bytes' | 'kb' | 'mb'>('bytes')
   const [formCountryCode, setFormCountryCode] = useState('+86')
+  const [manualCountryCode, setManualCountryCode] = useState(false)
   const [formCallPhone, setFormCallPhone] = useState('')
   const [formCallDuration, setFormCallDuration] = useState(30)
   const [formTarget, setFormTarget] = useState<AutomationTarget | null>(null)
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [readerSlots, setReaderSlots] = useState<StandaloneSimSlotConfig[]>([])
 
-  const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval'>('fixed')
+  const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval' | 'cron'>('fixed')
   const [formWeekdays, setFormWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7])
   const [formTriggerTime, setFormTriggerTime] = useState('04:00')
   const [formIntervalVal, setFormIntervalVal] = useState(180)
   const [formIntervalUnit, setFormIntervalUnit] = useState('days')
+  const [formCronExpression, setFormCronExpression] = useState('*/15 * * * *')
 
   const [dialogError, setDialogError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -81,6 +83,7 @@ export default function AutomationTaskDialog({
           setFormDataBytes(editingTask.action.config.bytes)
           setFormDataUnit(editingTask.action.config.unit)
         } else if (editingTask.action.type === 'dial_call') {
+          setManualCountryCode(!['+86', '+1', '+44', '+81', '+82'].includes(editingTask.action.config.country_code))
           setFormCountryCode(editingTask.action.config.country_code)
           setFormCallPhone(editingTask.action.config.phone_number)
           setFormCallDuration(editingTask.action.config.duration_seconds)
@@ -89,9 +92,11 @@ export default function AutomationTaskDialog({
         if (editingTask.trigger.type === 'fixed') {
           setFormWeekdays(editingTask.trigger.config.weekdays || [1, 2, 3, 4, 5, 6, 7])
           setFormTriggerTime((editingTask.trigger.config.times || []).join(', '))
-        } else {
+        } else if (editingTask.trigger.type === 'interval') {
           setFormIntervalVal(editingTask.trigger.config.interval_value)
           setFormIntervalUnit(editingTask.trigger.config.interval_unit)
+        } else {
+          setFormCronExpression(editingTask.trigger.config.expression)
         }
       } else {
         setFormName('')
@@ -105,6 +110,7 @@ export default function AutomationTaskDialog({
         setFormDataBytes(100)
         setFormDataUnit('bytes')
         setFormCountryCode('+86')
+        setManualCountryCode(false)
         setFormCallPhone('')
         setFormCallDuration(30)
         setFormTarget(null)
@@ -113,6 +119,7 @@ export default function AutomationTaskDialog({
         setFormTriggerTime('04:00')
         setFormIntervalVal(180)
         setFormIntervalUnit('days')
+        setFormCronExpression('*/15 * * * *')
       }
     }
   }, [open, editingTask])
@@ -231,7 +238,7 @@ export default function AutomationTaskDialog({
           times,
         },
       }
-    } else {
+    } else if (formTriggerType === 'interval') {
       trigger = {
         type: 'interval',
         config: {
@@ -239,6 +246,13 @@ export default function AutomationTaskDialog({
           interval_unit: formIntervalUnit as 'mins' | 'hours' | 'days',
         },
       }
+    } else {
+      const expression = formCronExpression.trim()
+      if (expression.split(/\s+/).length !== 5) {
+        setDialogError('Cron 必须是 5 段表达式，例如 */15 * * * *')
+        return
+      }
+      trigger = { type: 'cron', config: { expression } }
     }
 
     const newTask: AutomationTask = {
@@ -414,9 +428,9 @@ export default function AutomationTaskDialog({
 
           {formActionType === 'dial_call' && (
             <Box display="grid" gridTemplateColumns="0.8fr 1.2fr" gap={2}>
-              <TextField select label="国家区号" value={formCountryCode} onChange={(e) => setFormCountryCode(e.target.value)}>
-                <MenuItem value="+86">中国 +86</MenuItem><MenuItem value="+1">美国/加拿大 +1</MenuItem><MenuItem value="+44">英国 +44</MenuItem><MenuItem value="+81">日本 +81</MenuItem><MenuItem value="+82">韩国 +82</MenuItem>
-              </TextField>
+              {manualCountryCode ? <TextField label="国家区号" value={formCountryCode} onChange={(e) => setFormCountryCode(e.target.value)} placeholder="例如 +61、+31" /> : <TextField select label="国家区号" value={formCountryCode} onChange={(e) => e.target.value === 'manual' ? (setManualCountryCode(true), setFormCountryCode('+61')) : setFormCountryCode(e.target.value)}>
+                <MenuItem value="+86">中国 +86</MenuItem><MenuItem value="+1">美国/加拿大 +1</MenuItem><MenuItem value="+44">英国 +44</MenuItem><MenuItem value="+81">日本 +81</MenuItem><MenuItem value="+82">韩国 +82</MenuItem><MenuItem value="manual">手动输入</MenuItem>
+              </TextField>}
               <TextField label="号码主体" value={formCallPhone} onChange={(e) => setFormCallPhone(e.target.value)} />
               <TextField label="拨号保持时间（秒）" type="number" value={formCallDuration} onChange={(e) => setFormCallDuration(Math.min(7200, Math.max(1, Number(e.target.value) || 1)))} slotProps={{ htmlInput: { min: 1, max: 7200 } }} sx={{ gridColumn: '1 / -1' }} />
             </Box>
@@ -427,10 +441,11 @@ export default function AutomationTaskDialog({
             label="触发机制"
             fullWidth
             value={formTriggerType}
-            onChange={(e) => setFormTriggerType(e.target.value as 'fixed' | 'interval')}
+            onChange={(e) => setFormTriggerType(e.target.value as 'fixed' | 'interval' | 'cron')}
           >
             <MenuItem value="fixed">定点定时</MenuItem>
             <MenuItem value="interval">时间间隔</MenuItem>
+            <MenuItem value="cron">Cron 表达式</MenuItem>
           </TextField>
 
           {/* 定点定时配置 */}
@@ -497,6 +512,9 @@ export default function AutomationTaskDialog({
                 <MenuItem value="days">天</MenuItem>
               </TextField>
             </Box>
+          )}
+          {formTriggerType === 'cron' && (
+            <TextField label="Cron 表达式（5 段）" value={formCronExpression} onChange={(e) => setFormCronExpression(e.target.value)} placeholder="*/15 * * * *" helperText="北京时间：分钟 小时 日 月 星期（星期日为 0）" />
           )}
         </Box>
       </DialogContent>
