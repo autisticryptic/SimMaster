@@ -688,88 +688,12 @@ export interface VoicePathPolicy {
   gateway_mode: boolean
 }
 
-export type CallHandlingAction = 'forward' | 'screen' | 'voicemail' | 'reject'
-export type NumberListKind = 'whitelist' | 'blacklist'
-export type NumberMatchKind = 'exact' | 'prefix' | 'suffix' | 'contains'
-
-export interface IncomingNumberRule {
-  id: string
-  name: string
-  enabled: boolean
-  list: NumberListKind
-  matcher: NumberMatchKind
-  pattern: string
-  action: CallHandlingAction
-}
-
-export interface VoiceServicesConfig {
-  feature_enabled: boolean
-  delegate_to_asterisk: boolean
-  number_rules: IncomingNumberRule[]
-  unknown_number_action: CallHandlingAction
-  verification_keywords: string[]
-  marketing_keywords: string[]
-  verification_action: CallHandlingAction
-  marketing_action: CallHandlingAction
-  ordinary_action: CallHandlingAction
-  uncertain_action: CallHandlingAction
-  screening_max_seconds: number
-  inbox_retention_days: number
-  inbox_max_entries: number
-}
-
-export type CallCategory = 'whitelisted' | 'blacklisted' | 'verification' | 'marketing' | 'ordinary' | 'unknown'
-
-export interface CallScreeningDecision {
-  phase: string
-  category: CallCategory
-  action: CallHandlingAction
-  normalized_number: string
-  matched_rule_id?: string
-  verification_code?: string
-  reason: string
-}
-
 export interface MediaIngressCapabilities {
   adapter: string
   signaling_ready: boolean
   audio_capture_ready: boolean
   browser_webrtc_ready: boolean
   reason: string
-}
-
-export interface VoiceServicesStatusResponse {
-  config: VoiceServicesConfig
-  voice_path: VoicePathPolicy
-  media_ingress: MediaIngressCapabilities
-}
-
-export interface VoiceInboxEntry {
-  id: number
-  session_id: string
-  phone_number: string
-  category: CallCategory
-  action: CallHandlingAction
-  transcript: string
-  verification_code?: string
-  recording_ref?: string
-  duration_seconds: number
-  confidence?: number
-  status: 'new' | 'read'
-  created_at: string
-  updated_at: string
-}
-
-export interface VoiceInboxStats {
-  total: number
-  waiting: number
-  verification: number
-  marketing: number
-}
-
-export interface VoiceInboxListResponse {
-  messages: VoiceInboxEntry[]
-  stats: VoiceInboxStats
 }
 
 export interface WebCallCapabilitiesResponse {

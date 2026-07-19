@@ -1633,39 +1633,15 @@ mod tests {
     }
 
     #[test]
-    fn voice_services_default_closed_and_normalizes_limits() {
-        let defaulted: VoiceServicesConfig = serde_json::from_str("{}").unwrap();
-        assert!(!defaulted.feature_enabled);
-        assert!(defaulted.delegate_to_asterisk);
-        assert_eq!(defaulted.unknown_number_action, CallHandlingAction::Screen);
-        assert_eq!(defaulted.verification_action, CallHandlingAction::Voicemail);
-        assert_eq!(defaulted.marketing_action, CallHandlingAction::Reject);
+    fn legacy_voice_services_config_is_ignored_and_not_serialized() {
+        let config: AppConfig = serde_json::from_str(
+            r#"{"voice_services":{"feature_enabled":true,"delegate_to_asterisk":true,"marketing_keywords":["推销"]}}"#,
+        )
+        .unwrap();
 
-        let normalized = VoiceServicesConfig {
-            feature_enabled: true,
-            number_rules: vec![IncomingNumberRule {
-                id: " trusted ".to_string(),
-                name: " 家人 ".to_string(),
-                enabled: true,
-                list: NumberListKind::Whitelist,
-                matcher: NumberMatchKind::Prefix,
-                pattern: " 138 ".to_string(),
-                action: CallHandlingAction::Forward,
-            }],
-            verification_keywords: vec![" 验证码 ".to_string(), "验证码".to_string()],
-            marketing_keywords: vec![" 优惠 ".to_string()],
-            screening_max_seconds: 2,
-            inbox_retention_days: 0,
-            inbox_max_entries: 1,
-            ..VoiceServicesConfig::default()
-        }
-        .normalized();
-        assert_eq!(normalized.number_rules[0].id, "trusted");
-        assert_eq!(normalized.number_rules[0].pattern, "138");
-        assert_eq!(normalized.verification_keywords, vec!["验证码"]);
-        assert_eq!(normalized.screening_max_seconds, 5);
-        assert_eq!(normalized.inbox_retention_days, 1);
-        assert_eq!(normalized.inbox_max_entries, 10);
+        assert!(config.voice_path.gateway_mode);
+        let serialized = serde_json::to_value(config).unwrap();
+        assert!(serialized.get("voice_services").is_none());
     }
 
     #[test]
@@ -2993,7 +2969,7 @@ impl SmsPathPolicy {
     }
 }
 
-// ===================== Voice routing and call screening =====================
+// ===================== Voice routing =====================
 
 fn default_voice_path_order() -> Vec<PathLayerConfig> {
     vec![
@@ -3067,214 +3043,6 @@ impl VoicePathPolicy {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CallHandlingAction {
-    /// Hand the call to an internal phone client (Linphone or a browser UA).
-    Forward,
-    /// Answer into a screening adapter and classify the first speech segment.
-    #[default]
-    Screen,
-    /// Keep the call in the voice inbox and do not ring an internal client.
-    Voicemail,
-    /// Reject or terminate the call without forwarding it.
-    Reject,
-}
-
-impl CallHandlingAction {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Forward => "forward",
-            Self::Screen => "screen",
-            Self::Voicemail => "voicemail",
-            Self::Reject => "reject",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum NumberListKind {
-    Whitelist,
-    Blacklist,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum NumberMatchKind {
-    #[default]
-    Exact,
-    Prefix,
-    Suffix,
-    Contains,
-}
-
-/// One ordered incoming-number rule. Vector order is precedence, avoiding a
-/// second priority field that can drift out of sync with the UI order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IncomingNumberRule {
-    pub id: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub list: NumberListKind,
-    #[serde(default)]
-    pub matcher: NumberMatchKind,
-    #[serde(default)]
-    pub pattern: String,
-    pub action: CallHandlingAction,
-}
-
-fn default_verification_voice_keywords() -> Vec<String> {
-    [
-        "验证码",
-        "校验码",
-        "动态码",
-        "认证码",
-        "安全码",
-        "verification code",
-        "security code",
-        "one time password",
-        "otp",
-    ]
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
-}
-
-fn default_marketing_voice_keywords() -> Vec<String> {
-    [
-        "优惠活动",
-        "贷款",
-        "保险",
-        "房产",
-        "理财",
-        "推销",
-        "营销",
-        "免费领取",
-        "限时优惠",
-    ]
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
-}
-
-fn default_voice_inbox_retention_days() -> u32 {
-    30
-}
-
-fn default_voice_inbox_max_entries() -> u32 {
-    2_000
-}
-
-fn default_screening_max_seconds() -> u16 {
-    30
-}
-
-fn default_voice_services_delegate_to_asterisk() -> bool {
-    true
-}
-
-/// Business rules above the future call/media adapter. No SIP, Asterisk,
-/// Trunk, WebRTC or speech provider is selected here; adapters only feed caller
-/// metadata and transcripts into this stable layer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VoiceServicesConfig {
-    #[serde(default)]
-    pub feature_enabled: bool,
-    /// Asterisk owns incoming-call classification. Legacy rules remain
-    /// readable for migration but are bypassed while this flag is true.
-    #[serde(default = "default_voice_services_delegate_to_asterisk")]
-    pub delegate_to_asterisk: bool,
-    #[serde(default)]
-    pub number_rules: Vec<IncomingNumberRule>,
-    #[serde(default)]
-    pub unknown_number_action: CallHandlingAction,
-    #[serde(default = "default_verification_voice_keywords")]
-    pub verification_keywords: Vec<String>,
-    #[serde(default = "default_marketing_voice_keywords")]
-    pub marketing_keywords: Vec<String>,
-    #[serde(default = "default_verification_action")]
-    pub verification_action: CallHandlingAction,
-    #[serde(default = "default_marketing_action")]
-    pub marketing_action: CallHandlingAction,
-    #[serde(default = "default_ordinary_action")]
-    pub ordinary_action: CallHandlingAction,
-    #[serde(default = "default_ordinary_action")]
-    pub uncertain_action: CallHandlingAction,
-    #[serde(default = "default_screening_max_seconds")]
-    pub screening_max_seconds: u16,
-    #[serde(default = "default_voice_inbox_retention_days")]
-    pub inbox_retention_days: u32,
-    #[serde(default = "default_voice_inbox_max_entries")]
-    pub inbox_max_entries: u32,
-}
-
-fn default_verification_action() -> CallHandlingAction {
-    CallHandlingAction::Voicemail
-}
-
-fn default_marketing_action() -> CallHandlingAction {
-    CallHandlingAction::Reject
-}
-
-fn default_ordinary_action() -> CallHandlingAction {
-    CallHandlingAction::Forward
-}
-
-impl Default for VoiceServicesConfig {
-    fn default() -> Self {
-        Self {
-            feature_enabled: false,
-            delegate_to_asterisk: default_voice_services_delegate_to_asterisk(),
-            number_rules: Vec::new(),
-            unknown_number_action: CallHandlingAction::Screen,
-            verification_keywords: default_verification_voice_keywords(),
-            marketing_keywords: default_marketing_voice_keywords(),
-            verification_action: default_verification_action(),
-            marketing_action: default_marketing_action(),
-            ordinary_action: default_ordinary_action(),
-            uncertain_action: default_ordinary_action(),
-            screening_max_seconds: default_screening_max_seconds(),
-            inbox_retention_days: default_voice_inbox_retention_days(),
-            inbox_max_entries: default_voice_inbox_max_entries(),
-        }
-    }
-}
-
-impl VoiceServicesConfig {
-    pub fn normalized(mut self) -> Self {
-        // Incoming call classification belongs to Asterisk. Keep legacy fields
-        // only so old configuration files and API clients remain compatible.
-        self.delegate_to_asterisk = true;
-        self.number_rules.retain(|rule| !rule.id.trim().is_empty());
-        for rule in &mut self.number_rules {
-            rule.id = rule.id.trim().to_string();
-            rule.name = rule.name.trim().to_string();
-            rule.pattern = rule.pattern.trim().to_string();
-        }
-        self.number_rules.retain(|rule| !rule.pattern.is_empty());
-        self.verification_keywords = normalize_keywords(self.verification_keywords);
-        self.marketing_keywords = normalize_keywords(self.marketing_keywords);
-        self.screening_max_seconds = self.screening_max_seconds.clamp(5, 120);
-        self.inbox_retention_days = self.inbox_retention_days.clamp(1, 3650);
-        self.inbox_max_entries = self.inbox_max_entries.clamp(10, 100_000);
-        self
-    }
-}
-
-fn normalize_keywords(keywords: Vec<String>) -> Vec<String> {
-    let mut normalized = Vec::new();
-    for keyword in keywords {
-        let keyword = keyword.trim().to_lowercase();
-        if !keyword.is_empty() && !normalized.contains(&keyword) {
-            normalized.push(keyword);
-        }
-    }
-    normalized
-}
-
 /// 应用配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -3317,8 +3085,6 @@ pub struct AppConfig {
     pub sms_path: SmsPathPolicy,
     #[serde(default)]
     pub voice_path: VoicePathPolicy,
-    #[serde(default)]
-    pub voice_services: VoiceServicesConfig,
 }
 
 impl Default for AppConfig {
@@ -3343,7 +3109,6 @@ impl Default for AppConfig {
             vilte: VilteConfig::default(),
             sms_path: SmsPathPolicy::default(),
             voice_path: VoicePathPolicy::default(),
-            voice_services: VoiceServicesConfig::default(),
         }
     }
 }
@@ -4119,28 +3884,6 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.voice_path = next.clone();
-        }
-        self.save()?;
-        Ok(next)
-    }
-
-    pub fn get_voice_services_config(&self) -> VoiceServicesConfig {
-        self.config
-            .read()
-            .unwrap()
-            .voice_services
-            .clone()
-            .normalized()
-    }
-
-    pub fn set_voice_services_config(
-        &self,
-        config: VoiceServicesConfig,
-    ) -> Result<VoiceServicesConfig, String> {
-        let next = config.normalized();
-        {
-            let mut c = self.config.write().unwrap();
-            c.voice_services = next.clone();
         }
         self.save()?;
         Ok(next)

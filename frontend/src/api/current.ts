@@ -84,11 +84,7 @@ import type {
   WorkMode,
   WorkModeRequest,
   WorkModeResponse,
-  VoiceInboxListResponse,
   VoicePathPolicy,
-  VoiceServicesConfig,
-  VoiceServicesStatusResponse,
-  CallScreeningDecision,
   WebCallCapabilitiesResponse,
   VilteConfig,
   VilteStatusResponse,
@@ -834,49 +830,14 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getVoiceServicesStatus() {
-    return request<ApiResponse<VoiceServicesStatusResponse>>('/voice-services/status')
-  }
-
-  async setVoiceServicesConfig(config: VoiceServicesConfig) {
-    return request<ApiResponse<VoiceServicesConfig>>('/voice-services/config', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    })
-  }
-
   async getVoicePathPolicy() {
-    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy')
+    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy')
   }
 
   async setVoicePathPolicy(policy: VoicePathPolicy) {
-    return request<ApiResponse<VoicePathPolicy>>('/voice-services/path-policy', {
+    return request<ApiResponse<VoicePathPolicy>>('/voice/path-policy', {
       method: 'POST',
       body: JSON.stringify(policy),
-    })
-  }
-
-  async screenVoiceCall(phoneNumber: string, transcript?: string) {
-    return request<ApiResponse<CallScreeningDecision>>('/voice-services/screen', {
-      method: 'POST',
-      body: JSON.stringify({ phone_number: phoneNumber, transcript }),
-    })
-  }
-
-  async getVoiceInbox(limit = 100, offset = 0) {
-    return request<ApiResponse<VoiceInboxListResponse>>(`/voice-services/inbox?limit=${limit}&offset=${offset}`)
-  }
-
-  async setVoiceInboxRead(id: number, read = true) {
-    return request<ApiResponse<{ updated: number }>>(`/voice-services/inbox/${id}/read`, {
-      method: 'POST',
-      body: JSON.stringify({ read }),
-    })
-  }
-
-  async deleteVoiceInbox(id: number) {
-    return request<ApiResponse<{ deleted: number }>>(`/voice-services/inbox/${id}`, {
-      method: 'DELETE',
     })
   }
 

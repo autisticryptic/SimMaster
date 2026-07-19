@@ -18,7 +18,6 @@ pub mod category {
     pub const SECURITY: &str = "security";
     pub const ESIM: &str = "esim";
     pub const RESOURCE: &str = "resource";
-    pub const VOICE_SERVICES: &str = "voice_services";
 }
 
 pub mod severity {
@@ -77,10 +76,6 @@ pub mod codes {
         "esim.profile_switch_baseband_recovery_failed";
     pub const ESIM_PROFILE_DOWNLOAD_SUCCEEDED: &str = "esim.profile_download_succeeded";
     pub const ESIM_PROFILE_DOWNLOAD_FAILED: &str = "esim.profile_download_failed";
-
-    pub const VOICE_VERIFICATION_CAPTURED: &str = "voice_services.verification_code_captured";
-    pub const VOICE_VOICEMAIL_RECEIVED: &str = "voice_services.voicemail_received";
-    pub const VOICE_MARKETING_FILTERED: &str = "voice_services.marketing_filtered";
 
     pub const RESOURCE_TEMPERATURE_HIGH: &str = "resource.temperature_high";
     pub const RESOURCE_TEMPERATURE_RECOVERED: &str = "resource.temperature_recovered";
@@ -346,27 +341,6 @@ pub const SYSTEM_EVENT_DEFINITIONS: &[SystemEventDefinition] = &[
         "SIM/eSIM",
         "Profile 写入失败",
         true,
-    ),
-    def(
-        codes::VOICE_VERIFICATION_CAPTURED,
-        category::VOICE_SERVICES,
-        "语音服务",
-        "提取到语音验证码",
-        true,
-    ),
-    def(
-        codes::VOICE_VOICEMAIL_RECEIVED,
-        category::VOICE_SERVICES,
-        "语音服务",
-        "收到语音留言",
-        true,
-    ),
-    def(
-        codes::VOICE_MARKETING_FILTERED,
-        category::VOICE_SERVICES,
-        "语音服务",
-        "疑似营销来电已过滤",
-        false,
     ),
     def(
         codes::RESOURCE_TEMPERATURE_HIGH,

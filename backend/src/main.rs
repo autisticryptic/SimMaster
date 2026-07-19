@@ -38,7 +38,6 @@ mod sim;
 mod state;
 mod system;
 mod trunk;
-mod voice_services;
 
 use api::handlers::*;
 use cellular::modem_manager::{ensure_nm_modem_profile, init_data_connection};
@@ -990,42 +989,10 @@ async fn main() -> Result<()> {
             post(set_volte_voice_handler).options(options_handler),
         )
         .route(
-            "/api/voicemail/status",
-            get(get_voicemail_status_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/status",
-            get(get_voice_services_status_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/config",
-            post(set_voice_services_config_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/path-policy",
+            "/api/voice/path-policy",
             get(get_voice_path_policy_handler)
                 .post(set_voice_path_policy_handler)
                 .options(options_handler),
-        )
-        .route(
-            "/api/voice-services/screen",
-            post(screen_voice_call_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/transcripts",
-            post(ingest_voice_transcript_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox",
-            get(get_voice_inbox_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox/{id}/read",
-            post(set_voice_inbox_read_handler).options(options_handler),
-        )
-        .route(
-            "/api/voice-services/inbox/{id}",
-            delete(delete_voice_inbox_handler).options(options_handler),
         )
         .route(
             "/api/web-call/capabilities",

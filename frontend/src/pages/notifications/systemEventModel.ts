@@ -99,15 +99,6 @@ export const SYSTEM_EVENT_GROUPS: SystemEventGroup[] = [
       { code: 'resource.ipv6_connectivity_recovered', label: 'IPv6 连通性恢复（连续 2 次）', defaultEnabled: false },
     ],
   },
-  {
-    key: 'voice_services',
-    label: '语音服务',
-    events: [
-      { code: 'voice_services.verification_code_captured', label: '提取到语音验证码', defaultEnabled: true },
-      { code: 'voice_services.voicemail_received', label: '收到语音留言', defaultEnabled: true },
-      { code: 'voice_services.marketing_filtered', label: '疑似营销来电已过滤', defaultEnabled: false },
-    ],
-  },
 ]
 
 export const SYSTEM_EVENT_TEMPLATE_VARIABLES = [

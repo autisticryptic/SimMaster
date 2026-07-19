@@ -3,12 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::infra::config::{VoicePathPolicy, VoiceServicesConfig};
-use crate::infra::db::{
-    CallRecord, CallStats, SmsMessage, SmsStats, VoiceInboxEntry, VoiceInboxStats,
-};
-use crate::voice_services::screening::CallScreeningDecision;
-use crate::voice_services::MediaIngressCapabilities;
+use crate::infra::db::{CallRecord, CallStats, SmsMessage, SmsStats};
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
@@ -902,61 +897,25 @@ pub struct ImsStatusResponse {
     pub sms_capable: bool,
 }
 
-#[derive(Debug, Serialize, Default)]
-pub struct VoicemailStatusResponse {
-    pub waiting: bool,
-    pub message_count: u8,
-    pub mailbox_number: String,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct MediaIngressCapabilities {
+    pub adapter: String,
+    pub signaling_ready: bool,
+    pub audio_capture_ready: bool,
+    pub browser_webrtc_ready: bool,
+    pub reason: String,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct VoiceScreenRequest {
-    pub phone_number: String,
-    #[serde(default)]
-    pub transcript: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VoiceTranscriptIngestRequest {
-    pub session_id: String,
-    pub phone_number: String,
-    pub transcript: String,
-    #[serde(default)]
-    pub recording_ref: Option<String>,
-    #[serde(default)]
-    pub duration_seconds: u32,
-    #[serde(default)]
-    pub confidence: Option<f32>,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceTranscriptIngestResponse {
-    pub entry_id: i64,
-    pub decision: CallScreeningDecision,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct VoiceInboxQuery {
-    #[serde(default = "default_page_size")]
-    pub limit: i64,
-    #[serde(default)]
-    pub offset: i64,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceInboxListResponse {
-    pub messages: Vec<VoiceInboxEntry>,
-    pub stats: VoiceInboxStats,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct VoiceInboxReadRequest {
-    #[serde(default = "default_true_value")]
-    pub read: bool,
-}
-
-fn default_true_value() -> bool {
-    true
+impl MediaIngressCapabilities {
+    pub fn unwired() -> Self {
+        Self {
+            adapter: "unwired".to_string(),
+            signaling_ready: false,
+            audio_capture_ready: false,
+            browser_webrtc_ready: false,
+            reason: "media_ingress_not_selected".to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Default)]
@@ -967,13 +926,6 @@ pub struct WebCallCapabilitiesResponse {
     pub recommended_adapter: String,
     pub required_media_security: Vec<String>,
     pub note: String,
-}
-
-#[derive(Debug, Serialize, Default)]
-pub struct VoiceServicesStatusResponse {
-    pub config: VoiceServicesConfig,
-    pub voice_path: VoicePathPolicy,
-    pub media_ingress: MediaIngressCapabilities,
 }
 
 #[derive(Debug, Deserialize)]
