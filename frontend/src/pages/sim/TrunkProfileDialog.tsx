@@ -57,6 +57,7 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
 
   const validationError = useMemo(() => {
     if (!draft) return '没有可编辑的线路'
+    if (!draft.enabled) return null
     if (!draft.asterisk_host.trim()) return '请填写 Asterisk 地址'
     if (draft.asterisk_port < 1 || draft.asterisk_port > 65535) return '端口必须在 1–65535 之间'
     if (draft.local_port < 1 || draft.local_port > 65535) {
@@ -65,7 +66,10 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
     if (draft.registration_mode === 'outbound_register' && !draft.username.trim()) {
       return '主动注册模式需要填写用户名'
     }
-    if (draft.register_expiry_secs < 60 || draft.register_expiry_secs > 86400) {
+    if (
+      draft.registration_mode === 'outbound_register'
+      && (draft.register_expiry_secs < 60 || draft.register_expiry_secs > 86400)
+    ) {
       return '注册周期必须在 60–86400 秒之间'
     }
     return null

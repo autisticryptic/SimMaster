@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert, Box, Button, Card, CardContent, Chip, CircularProgress, Divider,
   FormControl, FormControlLabel, IconButton, InputLabel, List, ListItem,
@@ -56,6 +56,18 @@ export default function VoiceServicesPanel() {
   const [testNumber, setTestNumber] = useState('')
   const [testTranscript, setTestTranscript] = useState('')
   const [testDecision, setTestDecision] = useState<CallScreeningDecision | null>(null)
+
+  const vilteValidationError = useMemo(() => {
+    if (!vilte) return null
+    if (vilte.config.codec.trim().toLowerCase() !== 'h264') return 'ViLTE 视频编码仅支持 H.264'
+    if (vilte.config.video_payload_type < 96 || vilte.config.video_payload_type > 127) {
+      return 'RTP Payload Type 必须使用 96 至 127 的动态范围'
+    }
+    if (vilte.config.feature_enabled && !volteVoice?.voice_enabled) {
+      return '启用 ViLTE 前必须先启用 VoLTE 语音网关能力'
+    }
+    return null
+  }, [vilte, volteVoice])
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -133,7 +145,7 @@ export default function VoiceServicesPanel() {
   }
 
   const saveVilte = async () => {
-    if (!vilte) return
+    if (!vilte || vilteValidationError) return
     setSaving(true); setError(null)
     try {
       const response = await api.setVilteConfig(vilte.config)
@@ -240,10 +252,39 @@ export default function VoiceServicesPanel() {
             control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.feature_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
             label={volteVoice?.feature_enabled ? 'VoLTE 语音网关能力' : '请先启用 VoLTE 总开关'}
           />
-          <FormControlLabel control={<Switch checked={vilte.config.feature_enabled} onChange={(_, feature_enabled) => setVilte({ ...vilte, config: { ...vilte.config, feature_enabled } })} />} label="启用 ViLTE 能力（要求 VoLTE 语音已启用）" />
-          <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}><TextField label="视频编码" value={vilte.config.codec} onChange={(e) => setVilte({ ...vilte, config: { ...vilte.config, codec: e.target.value } })} /><TextField type="number" label="RTP Payload Type" value={vilte.config.video_payload_type} onChange={(e) => setVilte({ ...vilte, config: { ...vilte.config, video_payload_type: Number(e.target.value) } })} /></Box>
+          <FormControlLabel
+            control={(
+              <Switch
+                checked={vilte.config.feature_enabled}
+                disabled={!volteVoice?.voice_enabled || saving}
+                onChange={(_, feature_enabled) => setVilte({ ...vilte, config: { ...vilte.config, feature_enabled } })}
+              />
+            )}
+            label="启用 ViLTE 能力（要求 VoLTE 语音已启用）"
+          />
+          <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
+            <FormControl fullWidth>
+              <InputLabel>视频编码</InputLabel>
+              <Select
+                label="视频编码"
+                value={vilte.config.codec.trim().toLowerCase() === 'h264' ? 'h264' : vilte.config.codec}
+                onChange={(event) => setVilte({ ...vilte, config: { ...vilte.config, codec: event.target.value } })}
+              >
+                <MenuItem value="h264">H.264</MenuItem>
+              </Select>
+            </FormControl>
+            <TextField
+              type="number"
+              label="RTP Payload Type"
+              value={vilte.config.video_payload_type}
+              slotProps={{ htmlInput: { min: 96, max: 127 } }}
+              helperText="动态 Payload Type 范围：96-127"
+              onChange={(e) => setVilte({ ...vilte, config: { ...vilte.config, video_payload_type: Number(e.target.value) } })}
+            />
+          </Box>
           <TextField label="H.264 fmtp" value={vilte.config.h264_fmtp} onChange={(e) => setVilte({ ...vilte, config: { ...vilte.config, h264_fmtp: e.target.value } })} />
-          <Button variant="outlined" onClick={() => void saveVilte()} disabled={saving}>保存 ViLTE 配置</Button>
+          {vilteValidationError && <Alert severity="error">{vilteValidationError}</Alert>}
+          <Button variant="outlined" onClick={() => void saveVilte()} disabled={saving || Boolean(vilteValidationError)}>保存 ViLTE 配置</Button>
         </Stack>}
       </CardContent></Card>
 

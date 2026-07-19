@@ -1749,6 +1749,25 @@ mod tests {
         assert!(vilte.feature_enabled);
         assert_eq!(vilte.codec, "h264");
 
+        assert_eq!(
+            manager
+                .set_vilte_config(VilteConfig {
+                    codec: "vp8".to_string(),
+                    ..VilteConfig::default()
+                })
+                .unwrap_err(),
+            "vilte_codec_unsupported"
+        );
+        assert_eq!(
+            manager
+                .set_vilte_config(VilteConfig {
+                    video_payload_type: 95,
+                    ..VilteConfig::default()
+                })
+                .unwrap_err(),
+            "vilte_payload_type_invalid"
+        );
+
         // set_vilte_config forces feature off when voice is off.
         manager.set_volte_voice_enabled(false).unwrap();
         assert!(!manager.get_vilte_config().feature_enabled);
@@ -3584,8 +3603,8 @@ impl ConfigManager {
             let slots = config
                 .modem_slots
                 .iter()
-                .cloned()
                 .filter(|slot| !slot.slot_id.is_empty())
+                .cloned()
                 .map(|slot| (format!("{}#uim{}", slot.slot_id, slot.uim_slot), slot))
                 .collect::<HashMap<_, _>>();
             (slots, changed)
@@ -3899,6 +3918,12 @@ impl ConfigManager {
     /// change the gating; `feature_enabled` in the incoming value is honored
     /// only if VoLTE voice is enabled, otherwise it is forced off.
     pub fn set_vilte_config(&self, vilte: VilteConfig) -> Result<VilteConfig, String> {
+        if !vilte.codec.trim().eq_ignore_ascii_case("h264") {
+            return Err("vilte_codec_unsupported".to_string());
+        }
+        if !(96..=127).contains(&vilte.video_payload_type) {
+            return Err("vilte_payload_type_invalid".to_string());
+        }
         let next = {
             let mut c = self.config.write().unwrap();
             let mut incoming = vilte;
