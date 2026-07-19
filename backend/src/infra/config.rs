@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     #[test]
-    fn per_line_volte_connection_requires_feature_and_persists() {
+    fn per_line_volte_connection_enables_hidden_capability_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-config-{}-{}.json",
             std::process::id(),
@@ -1441,20 +1441,70 @@ mod tests {
         ));
         let manager = ConfigManager::new(path.clone());
         let line_id = "line-0123456789abcdef0123456789abcdef";
-        assert_eq!(
-            manager
-                .set_line_volte_connection_enabled(line_id, true)
-                .unwrap_err(),
-            "volte_feature_disabled"
-        );
-        manager.set_volte_feature_enabled(true).unwrap();
         let profile = manager
             .set_line_volte_connection_enabled(line_id, true)
             .unwrap();
         assert!(profile.volte_connection_enabled);
+        assert!(manager.get_volte_config().feature_enabled);
 
         let reloaded = ConfigManager::new(path.clone());
         assert!(reloaded.get_line_profile(line_id).volte_connection_enabled);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn per_line_vowifi_overrides_and_standalone_slots_persist() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-vowifi-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let profile = manager
+            .set_line_vowifi_config(
+                line_id,
+                LineVowifiConfig {
+                    enabled: true,
+                    dns_server: "1.1.1.1".to_string(),
+                    epdg_host: "epdg.example.net".to_string(),
+                    ..LineVowifiConfig::default()
+                },
+            )
+            .unwrap();
+        assert!(profile.vowifi.enabled);
+        assert_eq!(profile.vowifi.epdg_host, "epdg.example.net");
+        assert!(manager.get_vowifi_config().feature_enabled);
+
+        assert_eq!(
+            manager
+                .set_line_vowifi_config(
+                    line_id,
+                    LineVowifiConfig {
+                        dns_server: "not-an-ip".to_string(),
+                        ..LineVowifiConfig::default()
+                    },
+                )
+                .unwrap_err(),
+            "vowifi_dns_server_invalid"
+        );
+
+        let slots = manager
+            .set_standalone_sim_slots(vec![StandaloneSimSlotConfig {
+                id: "reader-a".to_string(),
+                label: "外置读卡器 A".to_string(),
+                reader_path: "pcsc://Reader A".to_string(),
+                uim_slot: 1,
+                enabled: true,
+            }])
+            .unwrap();
+        assert_eq!(slots[0].id, "reader-a");
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(reloaded.get_standalone_sim_slots().len(), 1);
+        assert_eq!(
+            reloaded.get_line_profile(line_id).vowifi.dns_server,
+            "1.1.1.1"
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -1586,6 +1636,7 @@ mod tests {
     fn voice_services_default_closed_and_normalizes_limits() {
         let defaulted: VoiceServicesConfig = serde_json::from_str("{}").unwrap();
         assert!(!defaulted.feature_enabled);
+        assert!(defaulted.delegate_to_asterisk);
         assert_eq!(defaulted.unknown_number_action, CallHandlingAction::Screen);
         assert_eq!(defaulted.verification_action, CallHandlingAction::Voicemail);
         assert_eq!(defaulted.marketing_action, CallHandlingAction::Reject);
@@ -2503,6 +2554,65 @@ impl TrunkProfileConfig {
     }
 }
 
+fn default_vowifi_epdg_port() -> u16 {
+    500
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VowifiProxyMode {
+    #[default]
+    Direct,
+    Socks5UdpAssociate,
+    ConnectUdpMasque,
+    UdpRelay,
+}
+
+/// Per-SIM WiFi Calling intent and network overrides. The proxy endpoint is
+/// kept separate from the mode because ordinary HTTP CONNECT cannot carry the
+/// UDP 500/4500 traffic used by IKEv2/NAT-T.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineVowifiConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub proxy_mode: VowifiProxyMode,
+    #[serde(default)]
+    pub proxy_endpoint: String,
+    #[serde(default)]
+    pub dns_server: String,
+    #[serde(default)]
+    pub epdg_host: String,
+    #[serde(default = "default_vowifi_epdg_port")]
+    pub epdg_port: u16,
+}
+
+impl Default for LineVowifiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proxy_mode: VowifiProxyMode::Direct,
+            proxy_endpoint: String::new(),
+            dns_server: String::new(),
+            epdg_host: String::new(),
+            epdg_port: default_vowifi_epdg_port(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StandaloneSimSlotConfig {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub reader_path: String,
+    #[serde(default = "default_uim_slot")]
+    pub uim_slot: u8,
+    #[serde(default = "default_line_enabled")]
+    pub enabled: bool,
+}
+
 /// Persisted controls for one stable physical-modem + SIM line. Trunk settings
 /// extend this same profile; keeping the connection flag here makes multi-line
 /// auto-restore independent instead of relying on one global bool.
@@ -2513,6 +2623,8 @@ pub struct LineProfileConfig {
     pub enabled: bool,
     #[serde(default)]
     pub volte_connection_enabled: bool,
+    #[serde(default)]
+    pub vowifi: LineVowifiConfig,
     #[serde(default)]
     pub trunk: TrunkProfileConfig,
 }
@@ -2566,6 +2678,7 @@ impl LineProfileConfig {
             line_id: line_id.into(),
             enabled: true,
             volte_connection_enabled: false,
+            vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
         }
     }
@@ -2583,6 +2696,46 @@ fn valid_line_id(line_id: &str) -> bool {
     line_id.strip_prefix("line-").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), String> {
+    config.proxy_endpoint = config.proxy_endpoint.trim().to_string();
+    config.dns_server = config.dns_server.trim().to_string();
+    config.epdg_host = config.epdg_host.trim().trim_end_matches('.').to_string();
+
+    if !config.dns_server.is_empty() && config.dns_server.parse::<std::net::IpAddr>().is_err() {
+        return Err("vowifi_dns_server_invalid".to_string());
+    }
+    if config.epdg_port == 0 {
+        return Err("vowifi_epdg_port_invalid".to_string());
+    }
+    if config.epdg_host.chars().any(char::is_whitespace)
+        || config.epdg_host.contains('/')
+        || config.epdg_host.contains(':') && config.epdg_host.parse::<std::net::IpAddr>().is_err()
+    {
+        return Err("vowifi_epdg_host_invalid".to_string());
+    }
+    match config.proxy_mode {
+        VowifiProxyMode::Direct => config.proxy_endpoint.clear(),
+        VowifiProxyMode::Socks5UdpAssociate => {
+            if !config.proxy_endpoint.starts_with("socks5://")
+                && !config.proxy_endpoint.starts_with("socks5h://")
+            {
+                return Err("vowifi_proxy_endpoint_invalid".to_string());
+            }
+        }
+        VowifiProxyMode::ConnectUdpMasque => {
+            if !config.proxy_endpoint.starts_with("https://") {
+                return Err("vowifi_proxy_endpoint_invalid".to_string());
+            }
+        }
+        VowifiProxyMode::UdpRelay => {
+            if !config.proxy_endpoint.starts_with("udp://") {
+                return Err("vowifi_proxy_endpoint_invalid".to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 fn valid_trunk_binding(binding: &str) -> bool {
@@ -3019,6 +3172,10 @@ fn default_screening_max_seconds() -> u16 {
     30
 }
 
+fn default_voice_services_delegate_to_asterisk() -> bool {
+    true
+}
+
 /// Business rules above the future call/media adapter. No SIP, Asterisk,
 /// Trunk, WebRTC or speech provider is selected here; adapters only feed caller
 /// metadata and transcripts into this stable layer.
@@ -3026,6 +3183,10 @@ fn default_screening_max_seconds() -> u16 {
 pub struct VoiceServicesConfig {
     #[serde(default)]
     pub feature_enabled: bool,
+    /// Asterisk owns incoming-call classification. Legacy rules remain
+    /// readable for migration but are bypassed while this flag is true.
+    #[serde(default = "default_voice_services_delegate_to_asterisk")]
+    pub delegate_to_asterisk: bool,
     #[serde(default)]
     pub number_rules: Vec<IncomingNumberRule>,
     #[serde(default)]
@@ -3066,6 +3227,7 @@ impl Default for VoiceServicesConfig {
     fn default() -> Self {
         Self {
             feature_enabled: false,
+            delegate_to_asterisk: default_voice_services_delegate_to_asterisk(),
             number_rules: Vec::new(),
             unknown_number_action: CallHandlingAction::Screen,
             verification_keywords: default_verification_voice_keywords(),
@@ -3083,6 +3245,9 @@ impl Default for VoiceServicesConfig {
 
 impl VoiceServicesConfig {
     pub fn normalized(mut self) -> Self {
+        // Incoming call classification belongs to Asterisk. Keep legacy fields
+        // only so old configuration files and API clients remain compatible.
+        self.delegate_to_asterisk = true;
         self.number_rules.retain(|rule| !rule.id.trim().is_empty());
         for rule in &mut self.number_rules {
             rule.id = rule.id.trim().to_string();
@@ -3145,6 +3310,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub modem_slots: Vec<ModemSlotConfig>,
     #[serde(default)]
+    pub standalone_sim_slots: Vec<StandaloneSimSlotConfig>,
+    #[serde(default)]
     pub vilte: VilteConfig,
     #[serde(default)]
     pub sms_path: SmsPathPolicy,
@@ -3172,6 +3339,7 @@ impl Default for AppConfig {
             volte: VolteConfig::default(),
             line_profiles: Vec::new(),
             modem_slots: Vec::new(),
+            standalone_sim_slots: Vec::new(),
             vilte: VilteConfig::default(),
             sms_path: SmsPathPolicy::default(),
             voice_path: VoicePathPolicy::default(),
@@ -3680,8 +3848,8 @@ impl ConfigManager {
         }
         let next = {
             let mut config = self.config.write().unwrap();
-            if enabled && !config.volte.feature_enabled {
-                return Err("volte_feature_disabled".to_string());
+            if enabled {
+                config.volte.feature_enabled = true;
             }
             let profile = if let Some(profile) = config
                 .line_profiles
@@ -3707,6 +3875,92 @@ impl ConfigManager {
         };
         self.save()?;
         Ok(next)
+    }
+
+    pub fn set_line_vowifi_config(
+        &self,
+        line_id: &str,
+        mut vowifi: LineVowifiConfig,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        validate_line_vowifi_config(&mut vowifi)?;
+        let next = {
+            let mut config = self.config.write().unwrap();
+            if vowifi.enabled {
+                config.vowifi.feature_enabled = true;
+            }
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            if vowifi.enabled && !profile.enabled {
+                return Err("line_disabled".to_string());
+            }
+            profile.vowifi = vowifi;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn set_line_vowifi_connection_enabled(
+        &self,
+        line_id: &str,
+        enabled: bool,
+    ) -> Result<LineProfileConfig, String> {
+        let current = self.get_line_profile(line_id).vowifi;
+        self.set_line_vowifi_config(line_id, LineVowifiConfig { enabled, ..current })
+    }
+
+    pub fn get_standalone_sim_slots(&self) -> Vec<StandaloneSimSlotConfig> {
+        self.config.read().unwrap().standalone_sim_slots.clone()
+    }
+
+    pub fn set_standalone_sim_slots(
+        &self,
+        mut slots: Vec<StandaloneSimSlotConfig>,
+    ) -> Result<Vec<StandaloneSimSlotConfig>, String> {
+        if slots.len() > 64 {
+            return Err("standalone_sim_slot_limit_exceeded".to_string());
+        }
+        let mut ids = std::collections::HashSet::new();
+        for slot in &mut slots {
+            slot.id = slot.id.trim().to_string();
+            slot.label = slot.label.trim().to_string();
+            slot.reader_path = slot.reader_path.trim().to_string();
+            if slot.id.is_empty()
+                || !slot
+                    .id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+                || !ids.insert(slot.id.clone())
+            {
+                return Err("standalone_sim_slot_id_invalid".to_string());
+            }
+            if slot.label.is_empty() || slot.reader_path.is_empty() || slot.uim_slot == 0 {
+                return Err("standalone_sim_slot_invalid".to_string());
+            }
+        }
+        slots.sort_by(|left, right| left.label.cmp(&right.label).then(left.id.cmp(&right.id)));
+        {
+            self.config.write().unwrap().standalone_sim_slots = slots.clone();
+        }
+        self.save()?;
+        Ok(slots)
     }
 
     /// Replace one line's trunk settings (stage D3b). Gating mirrors the VoLTE

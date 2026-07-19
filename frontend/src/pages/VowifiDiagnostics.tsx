@@ -3,19 +3,12 @@ import { useNavigate } from 'react-router-dom'
 import {
   Alert,
   Box,
-  Button,
   Chip,
   CircularProgress,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
   Divider,
   IconButton,
   Paper,
   Stack,
-  Switch,
   // Table,
   // TableBody,
   // TableCell,
@@ -456,7 +449,6 @@ export default function VowifiDiagnosticsPage() {
 
   const navigate = useNavigate()
   const [secondsElapsed, setSecondsElapsed] = useState<number>(0)
-  const [confirmDialogOpen, setConfirmDialogOpen] = useState(false)
   const [actionLoading, setActionLoading] = useState(false)
   // const showDevTables = false
 
@@ -586,61 +578,17 @@ export default function VowifiDiagnosticsPage() {
     void navigate('/sms')
   }
 
-  const handleSwitchChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const checked = event.target.checked
-    if (checked) {
-      setConfirmDialogOpen(true)
-    } else {
-      // 乐观更新：先切换 UI，再调用 API
-      const snapshot = vowifiControl
-      if (snapshot) setVowifiControl({ ...snapshot, connection_enabled: false })
-      setActionLoading(true)
-      try {
-        await api.setVowifiConnection(false)
-        const controlRes = await api.getVowifiControl()
-        if (controlRes.data) setVowifiControl(controlRes.data)
-        await loadData(true)
-      } catch (err) {
-        if (snapshot) setVowifiControl(snapshot)
-        setError(err instanceof Error ? err.message : String(err))
-      } finally {
-        setActionLoading(false)
-      }
-    }
-  }
-
-  const handleConfirmEnable = async () => {
-    setConfirmDialogOpen(false)
-    // 乐观更新：先切换 UI
-    const snapshot = vowifiControl
-    if (snapshot) setVowifiControl({ ...snapshot, connection_enabled: true })
-    setActionLoading(true)
-    try {
-      await api.setVowifiConnection(true)
-      await api.connectVowifi()
-      await loadData(false)
-    } catch (err) {
-      if (snapshot) setVowifiControl(snapshot)
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setActionLoading(false)
-    }
-  }
-
   const handleReconnect = async () => {
     setActionLoading(true)
     try {
-      // 乐观更新：先切换 UI 为开启状态
+      const lines = await api.getVowifiLines()
+      const primaryLine = lines.data?.find((line) => line.is_primary)
+      if (!primaryLine) throw new Error('当前没有可用的主基带线路')
+
       const snapshot = vowifiControl
       if (snapshot) setVowifiControl({ ...snapshot, connection_enabled: true })
-
-      // 先强制断开连接，以释放底层资源和恢复蜂窝数据
-      await api.setVowifiConnection(false)
-      // 再重新启用连接并执行连接过程
-      await api.setVowifiConnection(true)
-      await api.connectVowifi()
-
-      // 使用后台刷新避免页面闪屏
+      await api.setVowifiLineConnection(primaryLine.line_id, false)
+      await api.setVowifiLineConnection(primaryLine.line_id, true)
       await loadData(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -724,7 +672,7 @@ export default function VowifiDiagnosticsPage() {
             <IconButton
               onClick={() => void handleReconnect()}
               disabled={actionLoading}
-              title="重新连接"
+              title="重连主线路"
               sx={{
                 border: 'none',
                 color: 'text.secondary',
@@ -733,12 +681,9 @@ export default function VowifiDiagnosticsPage() {
             >
               <Refresh fontSize="small" />
             </IconButton>
-            <Switch
-              checked={vowifiControl?.connection_enabled ?? false}
-              onChange={(e) => void handleSwitchChange(e)}
-              disabled={actionLoading}
-              color="primary"
-            />
+            <Typography variant="caption" color="text.secondary">
+              此处仅重连主线路；开关请在线路卡片中按基带和卡槽单独控制
+            </Typography>
           </Stack>
         </Box>
       </Paper>
@@ -1276,31 +1221,6 @@ export default function VowifiDiagnosticsPage() {
           </Paper>
         </Box>
       </Box>
-
-      {/* Confirmation Dialog */}
-      <Dialog
-        open={confirmDialogOpen}
-        onClose={() => setConfirmDialogOpen(false)}
-        aria-labelledby="vowifi-confirm-dialog-title"
-        aria-describedby="vowifi-confirm-dialog-description"
-      >
-        <DialogTitle id="vowifi-confirm-dialog-title" sx={{ fontWeight: 800 }}>
-          温馨提示
-        </DialogTitle>
-        <DialogContent>
-          <DialogContentText id="vowifi-confirm-dialog-description">
-            启用 WiFi Calling 会切换短信路由路径，可能需要临时调整蜂窝数据以避免原生 IMS 冲突。是否确认启用？
-          </DialogContentText>
-        </DialogContent>
-        <DialogActions sx={{ px: 3, pb: 2.5 }}>
-          <Button onClick={() => setConfirmDialogOpen(false)} variant="outlined">
-            取消
-          </Button>
-          <Button onClick={() => void handleConfirmEnable()} variant="contained" autoFocus>
-            确认
-          </Button>
-        </DialogActions>
-      </Dialog>
 
       {/* 注释掉的高级诊断数据以备日后开发调试使用 */}
       {/* showDevTables && (

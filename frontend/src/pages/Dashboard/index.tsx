@@ -237,11 +237,9 @@ export default function DashboardPage() {
               dataStatus={data.dataStatus}
               airplaneMode={data.airplaneMode}
               roaming={data.roaming}
-              vowifiControl={data.vowifiControl}
               onToggleData={() => void actions.toggleData()}
               onToggleAirplaneMode={() => void actions.toggleAirplaneMode()}
               onToggleRoaming={() => void actions.toggleRoaming()}
-              onToggleVowifiConnection={() => void actions.toggleVowifiConnection()}
             />
           </Grid>
 

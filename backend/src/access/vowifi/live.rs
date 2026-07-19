@@ -5,7 +5,7 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock as StdRwLock},
     time::{Duration, Instant},
 };
 
@@ -34,13 +34,14 @@ use super::{
         verify_usim_application_via_proxy_reason_with_retry, USIM_AID_PREFIX,
     },
     sms,
-    transport::{DnsResolver, ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
+    transport::{ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
     tun_gateway::{
         self, ImsEspFlowConfig, ImsEspPolicyConfig, TunGatewayConfig, TunGatewayRuntime,
     },
     voice,
 };
 use crate::cellular::modem_manager::{current_sim_identity, get_sim_info_data_with_cache};
+use crate::infra::config::{LineVowifiConfig, VowifiProxyMode};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpSocket, TcpStream},
@@ -94,6 +95,65 @@ static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<Option<LiveImsSecurityVerify>>> 
 static LIVE_IMS_TCP_CHANNEL: OnceLock<Mutex<Option<LiveImsTcpChannel>>> = OnceLock::new();
 static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<Mutex<Option<LiveImsRegisterSuccessVariant>>> =
     OnceLock::new();
+static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<LiveNetworkOverrides>> = OnceLock::new();
+
+#[derive(Debug, Clone, Default)]
+struct LiveNetworkOverrides {
+    epdg_host: Option<String>,
+    epdg_port: Option<u16>,
+    dns_server: Option<IpAddr>,
+}
+
+pub fn configure_live_network_overrides(config: &LineVowifiConfig) -> Result<(), String> {
+    let next = build_live_network_overrides(config)?;
+    *LIVE_NETWORK_OVERRIDES
+        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+    Ok(())
+}
+
+fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetworkOverrides, String> {
+    if config.proxy_mode != VowifiProxyMode::Direct {
+        return Err("vowifi_proxy_runtime_not_available".to_string());
+    }
+    Ok(LiveNetworkOverrides {
+        epdg_host: (!config.epdg_host.is_empty()).then(|| config.epdg_host.clone()),
+        epdg_port: (!config.epdg_host.is_empty()).then_some(config.epdg_port),
+        dns_server: if config.dns_server.is_empty() {
+            None
+        } else {
+            Some(
+                config
+                    .dns_server
+                    .parse::<IpAddr>()
+                    .map_err(|_| "vowifi_dns_server_invalid".to_string())?,
+            )
+        },
+    })
+}
+
+fn live_epdg_settings(profile: &'static CarrierProfile) -> (String, u16, Option<IpAddr>) {
+    let overrides = LIVE_NETWORK_OVERRIDES
+        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    (
+        overrides
+            .epdg_host
+            .unwrap_or_else(|| profile.epdg.host.to_string()),
+        overrides.epdg_port.unwrap_or(profile.epdg.port),
+        overrides.dns_server,
+    )
+}
+
+async fn resolve_live_epdg(
+    profile: &'static CarrierProfile,
+) -> Result<ResolvedEpdgEndpoint, TransportError> {
+    let (host, port, dns_server) = live_epdg_settings(profile);
+    epdg::resolve_epdg_with_dns_override(&profile.meta, &host, port, dns_server).await
+}
 
 #[derive(Debug, Clone)]
 struct LiveImsRegisterReady {
@@ -872,16 +932,7 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedEpdgEndpoint, LiveStageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            match tokio::time::timeout(
-                LIVE_DNS_TIMEOUT,
-                epdg::SystemDnsResolver.resolve_epdg(
-                    &profile.meta,
-                    profile.epdg.host,
-                    profile.epdg.port,
-                ),
-            )
-            .await
-            {
+            match tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile)).await {
                 Ok(Ok(endpoint)) => Ok(endpoint),
                 Ok(Err(_err)) => Err(live_stage_error("epdg_dns_resolution_failed")),
                 Err(_) => Err(live_stage_error("epdg_dns_resolution_timeout")),
@@ -1050,17 +1101,12 @@ async fn run_live_ike_until_depth(
     target: LiveIkeTarget,
     depth: LiveProbeDepth,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    info!(
-        "Resolving ePDG host: {} port: {}",
-        profile.epdg.host, profile.epdg.port
-    );
-    let endpoint = tokio::time::timeout(
-        LIVE_DNS_TIMEOUT,
-        epdg::SystemDnsResolver.resolve_epdg(&profile.meta, profile.epdg.host, profile.epdg.port),
-    )
-    .await
-    .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
-    .map_err(map_transport_error)?;
+    let (epdg_host, epdg_port, _) = live_epdg_settings(profile);
+    info!("Resolving ePDG host: {} port: {}", epdg_host, epdg_port);
+    let endpoint = tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile))
+        .await
+        .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
+        .map_err(map_transport_error)?;
     let addresses = endpoint.addresses;
     info!("Resolved ePDG endpoint addresses: {:?}", addresses);
     if addresses.is_empty() {
@@ -5603,10 +5649,6 @@ where
             match stage {
                 ExecutorStage::Epdg => {
                     let endpoint = self.epdg.resolve_epdg(profile).await?;
-                    let plan = epdg::build_connection_plan(profile, None);
-                    if endpoint.host != plan.host || endpoint.port != plan.port {
-                        return Err(live_stage_error("epdg_endpoint_mismatch"));
-                    }
                     Ok(LiveStageObservation {
                         stage: stage.as_str(),
                         ready: !endpoint.addresses.is_empty(),
@@ -5808,6 +5850,39 @@ fn stage_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn line_network_overrides_apply_custom_dns_and_epdg() {
+        let config = LineVowifiConfig {
+            dns_server: "2001:4860:4860::8888".to_string(),
+            epdg_host: "epdg.example.net".to_string(),
+            epdg_port: 4500,
+            ..LineVowifiConfig::default()
+        };
+
+        let overrides = build_live_network_overrides(&config).expect("valid network overrides");
+
+        assert_eq!(overrides.epdg_host.as_deref(), Some("epdg.example.net"));
+        assert_eq!(overrides.epdg_port, Some(4500));
+        assert_eq!(
+            overrides.dns_server,
+            Some("2001:4860:4860::8888".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn line_network_overrides_reject_unimplemented_proxy_transport() {
+        let config = LineVowifiConfig {
+            proxy_mode: VowifiProxyMode::UdpRelay,
+            proxy_endpoint: "udp://relay.example.net:4500".to_string(),
+            ..LineVowifiConfig::default()
+        };
+
+        assert_eq!(
+            build_live_network_overrides(&config).unwrap_err(),
+            "vowifi_proxy_runtime_not_available"
+        );
+    }
 
     fn register_variant(label: &str) -> LiveRegisterHeaderVariant {
         *LIVE_REGISTER_HEADER_VARIANTS

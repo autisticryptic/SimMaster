@@ -70,7 +70,6 @@ export interface DashboardActions {
   toggleData: () => Promise<void>
   toggleAirplaneMode: () => Promise<void>
   toggleRoaming: () => Promise<void>
-  toggleVowifiConnection: () => Promise<void>
   loadData: () => Promise<void>
 }
 
@@ -255,21 +254,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   }, [roaming])
 
-  const toggleVowifiConnection = useCallback(async () => {
-    if (!vowifiControl?.feature_enabled) return
-    const snapshot = vowifiControl
-    const nextEnabled = !snapshot.connection_enabled
-    setVowifiControl({ ...snapshot, connection_enabled: nextEnabled })
-    try {
-      await api.setVowifiConnection(nextEnabled)
-      const response = await api.getVowifiControl()
-      if (response.data) setVowifiControl(response.data)
-    } catch (err) {
-      setVowifiControl(snapshot)
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [vowifiControl])
-
   useEffect(() => {
     // 首次加载：background = false，错误会展示给用户
     const timeout = window.setTimeout(() => {
@@ -314,7 +298,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       toggleData,
       toggleAirplaneMode,
       toggleRoaming,
-      toggleVowifiConnection,
       loadData,
     } as DashboardActions,
   }

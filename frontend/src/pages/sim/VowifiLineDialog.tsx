@@ -1,0 +1,138 @@
+import { useEffect, useMemo, useState } from 'react'
+import {
+  Alert, Button, Dialog, DialogActions, DialogContent, DialogTitle,
+  FormControl, InputLabel, MenuItem, Select, Stack, TextField,
+} from '@mui/material'
+import {
+  api,
+  type LineVowifiConfig,
+  type VowifiLineConfigResponse,
+  type VowifiProxyMode,
+} from '../../api/current'
+import { shortLineId } from '../../components/modemLineFormat'
+
+interface Props {
+  open: boolean
+  line: VowifiLineConfigResponse | null
+  onClose: () => void
+  onSaved: (line: VowifiLineConfigResponse) => void
+}
+
+const proxyHints: Record<VowifiProxyMode, string> = {
+  direct: '不使用代理，IKEv2 直接连接 ePDG',
+  socks5_udp_associate: '示例：socks5://proxy.example.com:1080',
+  connect_udp_masque: '示例：https://masque.example.com',
+  udp_relay: '示例：udp://relay.example.com:4500',
+}
+
+export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props) {
+  const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  useEffect(() => {
+    if (line) setDraft({ ...line.config })
+    setError(null)
+  }, [line, open])
+
+  const validationError = useMemo(() => {
+    if (!draft) return null
+    if (draft.dns_server && !/^[0-9a-f:.]+$/i.test(draft.dns_server.trim())) {
+      return 'DNS 解析器必须填写 IPv4 或 IPv6 地址'
+    }
+    if (draft.epdg_host && /[\s/]/.test(draft.epdg_host)) return '自定义 ePDG 主机格式不正确'
+    if (draft.epdg_port < 1 || draft.epdg_port > 65535) return 'ePDG 端口必须在 1-65535 之间'
+    if (draft.proxy_mode !== 'direct' && !draft.proxy_endpoint.trim()) return '所选代理模式需要填写代理端点'
+    return null
+  }, [draft])
+
+  const update = <K extends keyof LineVowifiConfig>(key: K, value: LineVowifiConfig[K]) => {
+    setDraft((current) => current ? { ...current, [key]: value } : current)
+  }
+
+  const save = async () => {
+    if (!line || !draft || validationError) return
+    setSaving(true)
+    setError(null)
+    try {
+      const response = await api.setVowifiLineConfig(line.line_id, draft)
+      if (response.data) onSaved(response.data)
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (!line || !draft) return null
+
+  return (
+    <Dialog open={open} onClose={saving ? undefined : onClose} fullWidth maxWidth="sm">
+      <DialogTitle>WiFi Calling 配置 · {shortLineId(line.line_id)}</DialogTitle>
+      <DialogContent dividers>
+        <Stack spacing={2}>
+          <Alert severity="info">
+            ePDG 默认来自运营商 MCC/MNC profile。留空时使用内置值；自定义 DNS 和 ePDG 仅覆盖本线路。
+          </Alert>
+          <TextField
+            label="自定义 ePDG 主机"
+            value={draft.epdg_host}
+            placeholder="epdg.epc.mnc001.mcc460.pub.3gppnetwork.org"
+            helperText="留空时使用运营商 profile 中的 ePDG"
+            onChange={(event) => update('epdg_host', event.target.value)}
+          />
+          <TextField
+            type="number"
+            label="ePDG IKE 端口"
+            value={draft.epdg_port}
+            slotProps={{ htmlInput: { min: 1, max: 65535 } }}
+            onChange={(event) => update('epdg_port', Number(event.target.value))}
+          />
+          <TextField
+            label="专用 DNS 解析器"
+            value={draft.dns_server}
+            placeholder="例如 8.8.8.8 或 2001:4860:4860::8888"
+            helperText="留空时依次使用系统 DNS、resolv.conf 和内置公共 DNS"
+            onChange={(event) => update('dns_server', event.target.value)}
+          />
+          <FormControl fullWidth>
+            <InputLabel>代理模式</InputLabel>
+            <Select
+              label="代理模式"
+              value={draft.proxy_mode}
+              onChange={(event) => update('proxy_mode', event.target.value as VowifiProxyMode)}
+            >
+              <MenuItem value="direct">直连</MenuItem>
+              <MenuItem value="socks5_udp_associate" disabled>SOCKS5 UDP Associate（运行时待实现）</MenuItem>
+              <MenuItem value="connect_udp_masque" disabled>MASQUE CONNECT-UDP（运行时待实现）</MenuItem>
+              <MenuItem value="udp_relay" disabled>UDP Relay（运行时待实现）</MenuItem>
+            </Select>
+          </FormControl>
+          <TextField
+            label="代理端点"
+            value={draft.proxy_endpoint}
+            disabled={draft.proxy_mode === 'direct'}
+            placeholder={proxyHints[draft.proxy_mode]}
+            helperText={proxyHints[draft.proxy_mode]}
+            onChange={(event) => update('proxy_endpoint', event.target.value)}
+          />
+          <Alert severity="warning">
+            普通 HTTP CONNECT 不能转发 IKEv2 的 UDP 500/4500。代理配置结构已预留，但当前版本只允许直连；待 UDP 代理传输实现后再开放其他模式。
+          </Alert>
+          <Alert severity="warning">
+            当前实时 VoWiFi 执行器仍沿用主线路运行时。本页已完成每线路配置与持久化，非主线路的独立 IKE/IMS 会话需要后续运行时拆分后才会真正建立。
+          </Alert>
+          {validationError && <Alert severity="error">{validationError}</Alert>}
+          {error && <Alert severity="error">{error}</Alert>}
+        </Stack>
+      </DialogContent>
+      <DialogActions>
+        <Button onClick={onClose} disabled={saving}>取消</Button>
+        <Button variant="contained" onClick={() => void save()} disabled={saving || Boolean(validationError)}>
+          {saving ? '保存中...' : '保存配置'}
+        </Button>
+      </DialogActions>
+    </Dialog>
+  )
+}

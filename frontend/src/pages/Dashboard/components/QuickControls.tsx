@@ -1,27 +1,23 @@
 import { Box, Card, CardContent, Typography, Stack, Switch, Chip } from '@mui/material'
-import { NetworkCheck, FlightTakeoff, TravelExplore, Tune, PhoneInTalk } from '@mui/icons-material'
-import type { AirplaneModeResponse, RoamingResponse, VowifiConfig } from '@/api/types'
+import { NetworkCheck, FlightTakeoff, TravelExplore, Tune } from '@mui/icons-material'
+import type { AirplaneModeResponse, RoamingResponse } from '@/api/types'
 
 interface QuickControlsProps {
   dataStatus: boolean
   airplaneMode: AirplaneModeResponse | null
   roaming: RoamingResponse | null
-  vowifiControl: VowifiConfig | null
   onToggleData: () => void
   onToggleAirplaneMode: () => void
   onToggleRoaming: () => void
-  onToggleVowifiConnection: () => void
 }
 
 export function QuickControls({
   dataStatus,
   airplaneMode,
   roaming,
-  vowifiControl,
   onToggleData,
   onToggleAirplaneMode,
   onToggleRoaming,
-  onToggleVowifiConnection,
 }: QuickControlsProps) {
   return (
     <Card sx={{ height: '100%' }}>
@@ -80,36 +76,6 @@ export function QuickControls({
             />
           </Box>
 
-          {vowifiControl?.feature_enabled && (
-            <Box display="flex" alignItems="center" justifyContent="space-between">
-              <Box display="flex" alignItems="center" gap={1}>
-                <PhoneInTalk
-                  sx={{
-                    color: vowifiControl.connection_enabled ? '#2aae67' : 'text.disabled'
-                  }}
-                />
-                <Typography variant="body2">WiFi Calling</Typography>
-              </Box>
-              <Switch
-                checked={vowifiControl.connection_enabled}
-                onChange={() => {
-                  void onToggleVowifiConnection()
-                }}
-                size="small"
-                sx={{
-                  '& .MuiSwitch-switchBase.Mui-checked': {
-                    color: '#2aae67',
-                    '&:hover': {
-                      backgroundColor: 'rgba(42, 174, 103, 0.08)',
-                    },
-                  },
-                  '& .MuiSwitch-switchBase.Mui-checked + .MuiSwitch-track': {
-                    backgroundColor: '#2aae67',
-                  },
-                }}
-              />
-            </Box>
-          )}
         </Stack>
       </CardContent>
     </Card>

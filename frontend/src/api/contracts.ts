@@ -551,7 +551,35 @@ export interface LineProfileConfig {
   line_id: string
   enabled: boolean
   volte_connection_enabled: boolean
+  vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
+}
+
+export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'connect_udp_masque' | 'udp_relay'
+
+export interface LineVowifiConfig {
+  enabled: boolean
+  proxy_mode: VowifiProxyMode
+  proxy_endpoint: string
+  dns_server: string
+  epdg_host: string
+  epdg_port: number
+}
+
+export interface VowifiLineConfigResponse {
+  line_id: string
+  modem: ModemBinding
+  config: LineVowifiConfig
+  is_primary: boolean
+  runtime_scope: string
+}
+
+export interface StandaloneSimSlotConfig {
+  id: string
+  label: string
+  reader_path: string
+  uim_slot: number
+  enabled: boolean
 }
 
 export interface LineRuntimeStatus {
@@ -676,6 +704,7 @@ export interface IncomingNumberRule {
 
 export interface VoiceServicesConfig {
   feature_enabled: boolean
+  delegate_to_asterisk: boolean
   number_rules: IncomingNumberRule[]
   unknown_number_action: CallHandlingAction
   verification_keywords: string[]
@@ -1249,6 +1278,8 @@ export interface VowifiEpdgPlan {
   route_kind: string
   route_policy_id: string
   route_note: string
+  source?: string
+  proxy_endpoint_configured?: boolean
 }
 
 export interface VowifiIkeProposalPlan {

@@ -902,6 +902,18 @@ async fn main() -> Result<()> {
             get(get_vowifi_profiles_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/lines",
+            get(get_vowifi_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/lines/{line_id}",
+            post(set_vowifi_line_config_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/lines/{line_id}/connection",
+            post(set_vowifi_line_connection_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/events",
             get(get_vowifi_events_handler).options(options_handler),
         )
@@ -948,6 +960,12 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/lines/{line_id}/retry",
             post(retry_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/sim/slots",
+            get(get_standalone_sim_slots_handler)
+                .post(set_standalone_sim_slots_handler)
+                .options(options_handler),
         )
         .route(
             "/api/trunk/lines",

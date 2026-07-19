@@ -40,6 +40,9 @@ import type {
   LineRuntimeStatus,
   ManualRegisterRequest,
   TrunkProfileConfig,
+  VowifiLineConfigResponse,
+  LineVowifiConfig,
+  StandaloneSimSlotConfig,
   TrunkProfileResponse,
   VolteControlResponse,
   VolteLineControlResponse,
@@ -657,6 +660,38 @@ class SimAdminCurrentAPI {
       `/volte/lines/${encodeURIComponent(lineId)}/retry`,
       { method: 'POST', body: JSON.stringify({}) },
     )
+  }
+
+  async getVowifiLines() {
+    return request<ApiResponse<VowifiLineConfigResponse[]>>('/vowifi/lines')
+  }
+
+  async setVowifiLineConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<VowifiLineConfigResponse>>(
+      `/vowifi/lines/${encodeURIComponent(lineId)}/connection`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      },
+    )
+  }
+
+  async setVowifiLineConfig(lineId: string, config: LineVowifiConfig) {
+    return request<ApiResponse<VowifiLineConfigResponse>>(`/vowifi/lines/${encodeURIComponent(lineId)}`, {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async getStandaloneSimSlots() {
+    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots')
+  }
+
+  async setStandaloneSimSlots(slots: StandaloneSimSlotConfig[]) {
+    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots', {
+      method: 'POST',
+      body: JSON.stringify(slots),
+    })
   }
 
   async getTrunkLines() {

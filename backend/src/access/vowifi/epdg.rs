@@ -88,6 +88,41 @@ impl DnsResolver for SystemDnsResolver {
     }
 }
 
+/// Resolve an ePDG through one explicitly selected DNS server. This bypasses
+/// the host resolver so carrier geo-DNS answers remain under line control.
+pub async fn resolve_epdg_with_dns_override(
+    profile: &'static super::profiles::CarrierProfileMeta,
+    host: &str,
+    port: u16,
+    dns_server: Option<IpAddr>,
+) -> Result<ResolvedEpdgEndpoint, TransportError> {
+    let Some(dns_server) = dns_server else {
+        return SystemDnsResolver.resolve_epdg(profile, host, port).await;
+    };
+    let mut addresses = Vec::new();
+    let mut last_error = None;
+    match query_dns_records(dns_server, host, port, 1).await {
+        Ok(mut v4) => addresses.append(&mut v4),
+        Err(error) => last_error = Some(error),
+    }
+    match query_dns_records(dns_server, host, port, 28).await {
+        Ok(mut v6) => addresses.append(&mut v6),
+        Err(error) => last_error = Some(error),
+    }
+    if addresses.is_empty() {
+        return Err(last_error
+            .unwrap_or_else(|| TransportError::DnsFailed("custom_dns_empty_answer".to_string())));
+    }
+    addresses.sort();
+    addresses.dedup();
+    Ok(ResolvedEpdgEndpoint {
+        host: host.to_string(),
+        port,
+        addresses,
+        route_policy: choose_route_policy(profile, host, None),
+    })
+}
+
 async fn resolve_epdg_via_dns_fallback(
     _profile: &'static super::profiles::CarrierProfileMeta,
     host: &str,

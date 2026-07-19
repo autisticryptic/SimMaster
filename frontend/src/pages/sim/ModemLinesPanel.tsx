@@ -8,7 +8,6 @@ import {
   CardHeader,
   Chip,
   CircularProgress,
-  FormControlLabel,
   IconButton,
   Stack,
   Switch,
@@ -16,15 +15,16 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, Refresh, Replay, Router, SettingsEthernet, SimCard } from '@mui/icons-material'
+import { CellTower, Refresh, Replay, SettingsEthernet, SimCard, Wifi } from '@mui/icons-material'
 import {
   api,
   type TrunkProfileResponse,
-  type VolteControlResponse,
   type VolteLineControlResponse,
+  type VowifiLineConfigResponse,
 } from '../../api/current'
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
+import VowifiLineDialog from './VowifiLineDialog'
 
 const stageLabels: Record<string, string> = {
   disabled: '未连接',
@@ -91,9 +91,10 @@ function recoveryMessage(line: VolteLineControlResponse) {
 
 export default function ModemLinesPanel() {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
-  const [control, setControl] = useState<VolteControlResponse | null>(null)
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
+  const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
+  const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -102,16 +103,14 @@ export default function ModemLinesPanel() {
   const load = useCallback(async (background = false) => {
     if (!background) setLoading(true)
     try {
-      const [controlResponse, lineResponse, trunkResponse] = await Promise.all([
-        api.getVolteControl(),
+      const [lineResponse, trunkResponse, vowifiResponse] = await Promise.all([
         api.getVolteLines(),
         api.getTrunkLines(),
+        api.getVowifiLines(),
       ])
-      if (controlResponse.data) {
-        setControl(controlResponse.data)
-      }
       setLines(stableModemSort(lineResponse.data ?? []))
       setTrunkLines(stableModemSort(trunkResponse.data ?? []))
+      setVowifiLines(stableModemSort(vowifiResponse.data ?? []))
       setError(null)
     } catch (err) {
       if (!background) setError(err instanceof Error ? err.message : String(err))
@@ -131,22 +130,9 @@ export default function ModemLinesPanel() {
   const trunkByLineId = useMemo(() => new Map(
     trunkLines.map((line) => [line.line_id, line]),
   ), [trunkLines])
-
-  const toggleFeature = async (enabled: boolean) => {
-    setSavingKey('feature')
-    setError(null)
-    setSuccess(null)
-    try {
-      const response = await api.setVolteFeature(enabled)
-      if (response.data) setControl(response.data)
-      setSuccess(enabled ? 'VoLTE 总开关已启用' : 'VoLTE 已关闭，所有线路连接已停止')
-      await load(true)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSavingKey(null)
-    }
-  }
+  const vowifiByLineId = useMemo(() => new Map(
+    vowifiLines.map((line) => [line.line_id, line]),
+  ), [vowifiLines])
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
     setSavingKey(`volte:${lineId}`)
@@ -167,6 +153,31 @@ export default function ModemLinesPanel() {
     } finally {
       setSavingKey(null)
     }
+  }
+
+  const toggleVowifi = async (lineId: string, enabled: boolean) => {
+    setSavingKey(`vowifi:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      const response = await api.setVowifiLineConnection(lineId, enabled)
+      if (response.data) {
+        const updatedLine = response.data
+        setVowifiLines((current) => current.map((line) => line.line_id === lineId ? updatedLine : line))
+      }
+      setSuccess(`${shortLineId(lineId)} ${enabled ? '已开启单独 VoWiFi 配置' : '已关闭 VoWiFi'}`)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  const handleVowifiSaved = (updated: VowifiLineConfigResponse) => {
+    setVowifiLines((current) => current.map((line) => line.line_id === updated.line_id ? updated : line))
+    setEditingVowifiLine(updated)
+    setSuccess(`${shortLineId(updated.line_id)} 的 VoWiFi 配置已保存`)
   }
 
   const retryLine = async (lineId: string) => {
@@ -230,38 +241,16 @@ export default function ModemLinesPanel() {
 
       <Card>
         <CardHeader
-          avatar={<Router color="primary" />}
-          title="多基带与 VoLTE 总设置"
+          avatar={<CellTower color="primary" />}
+          title="基带线路"
           subheader={`${presentCount} 个基带在线 · ${registeredCount} 条线路已注册 IMS`}
           titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
-          action={
-            <Tooltip title="刷新线路状态">
-              <IconButton onClick={() => void load()} disabled={savingKey !== null}><Refresh /></IconButton>
-            </Tooltip>
-          }
+          action={<Tooltip title="刷新线路状态"><IconButton onClick={() => void load()} disabled={savingKey !== null}><Refresh /></IconButton></Tooltip>}
         />
         <CardContent sx={{ pt: 0 }}>
-          <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'minmax(220px, 1fr) minmax(320px, 2fr)' }} gap={2} alignItems="center">
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={control?.feature_enabled ?? false}
-                  onChange={(_, enabled) => void toggleFeature(enabled)}
-                  disabled={savingKey !== null}
-                />
-              }
-              label="启用 VoLTE IMS 能力"
-            />
-            <Alert severity="info" sx={{ py: 0.25 }}>
-              IMS Bearer 固定先申请 IPv4/IPv6 双栈；网络明确只允许单栈时直接回退到对应地址族，错误不明确时依次尝试 IPv4、IPv6。
-            </Alert>
-          </Box>
-          <Typography variant="caption" color="text.secondary" display="block" mt={1.5}>
-            每轮先尝试双栈；信息不明确时再依次尝试 IPv4、IPv6，全部路径均失败才记为一次。默认连续五次失败后停止，可在线路旁手动重试。
-          </Typography>
-          {control?.runtime.recovery_state === 'exhausted' && control.runtime.last_error && (
-            <Alert severity="warning" sx={{ mt: 1.5, py: 0.25 }}>{control.runtime.last_error}</Alert>
-          )}
+          <Alert severity="info" sx={{ py: 0.25 }}>
+            每个物理基带和 UIM 卡槽分别配置 VoLTE 与 VoWiFi。VoWiFi 的 DNS、代理和 ePDG 覆盖项可在线路配置中单独保存。
+          </Alert>
         </CardContent>
       </Card>
 
@@ -272,8 +261,10 @@ export default function ModemLinesPanel() {
           {lines.map((line, index) => {
             const volteBusy = savingKey === `volte:${line.modem.line_id}`
             const retryBusy = savingKey === `retry:${line.modem.line_id}`
+            const vowifiBusy = savingKey === `vowifi:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
             const trunkLine = trunkByLineId.get(line.modem.line_id)
+            const vowifiLine = vowifiByLineId.get(line.modem.line_id)
             const runtimeColor = line.runtime.registered
               ? 'success'
               : line.profile.volte_connection_enabled
@@ -369,8 +360,7 @@ export default function ModemLinesPanel() {
                               startIcon={<Replay />}
                               onClick={() => void retryLine(line.modem.line_id)}
                               disabled={
-                                !control?.feature_enabled
-                                || !line.profile.volte_connection_enabled
+                                !line.profile.volte_connection_enabled
                                 || line.runtime.registered
                                 || recoveryRunning
                                 || savingKey !== null
@@ -383,7 +373,38 @@ export default function ModemLinesPanel() {
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
-                          disabled={!control?.feature_enabled || !line.modem.present || savingKey !== null}
+                          disabled={!line.modem.present || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
+                          <Wifi color="action" fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
+                          {vowifiLine?.is_primary && <Chip size="small" label="主运行线路" variant="outlined" />}
+                          {vowifiLine?.config.enabled && <Chip size="small" color="success" label="已开启" variant="outlined" />}
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
+                          {vowifiLine?.config.epdg_host || '使用运营商 profile ePDG'}
+                          {vowifiLine?.config.dns_server ? ` · DNS ${vowifiLine.config.dns_server}` : ''}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={0.5}>
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => vowifiLine && setEditingVowifiLine(vowifiLine)}
+                          disabled={!vowifiLine || savingKey !== null}
+                        >
+                          配置
+                        </Button>
+                        {vowifiBusy && <CircularProgress size={18} />}
+                        <Switch
+                          checked={vowifiLine?.config.enabled ?? false}
+                          onChange={(_, enabled) => void toggleVowifi(line.modem.line_id, enabled)}
+                          disabled={!vowifiLine || !line.modem.present || savingKey !== null}
                         />
                       </Box>
                     </Box>
@@ -436,6 +457,12 @@ export default function ModemLinesPanel() {
         line={editingTrunkLine}
         onClose={() => setEditingTrunkLine(null)}
         onSaved={handleTrunkSaved}
+      />
+      <VowifiLineDialog
+        open={editingVowifiLine !== null}
+        line={editingVowifiLine}
+        onClose={() => setEditingVowifiLine(null)}
+        onSaved={handleVowifiSaved}
       />
     </Stack>
   )

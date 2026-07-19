@@ -14,6 +14,7 @@ import {
   TextField,
   Snackbar,
   Alert,
+  Stack,
   LinearProgress,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
@@ -36,6 +37,7 @@ import EsimManagerPage from './EsimManager'
 import VowifiDiagnosticsPage from './VowifiDiagnostics'
 import ModemLinesPanel from './sim/ModemLinesPanel'
 import TrunkDiagnosticsPanel from './sim/TrunkDiagnosticsPanel'
+import StandaloneSimSlotsPanel from './sim/StandaloneSimSlotsPanel'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
 function getSensitiveStyle(show: boolean) {
@@ -557,37 +559,10 @@ function SimBasicInfo() {
 export default function SimCardPage() {
   const { mode, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
-  const [vowifiEnabled, setVowifiEnabled] = useState(false)
-  const [configLoading, setConfigLoading] = useState(true)
-
-  useEffect(() => {
-    let active = true
-    api.getVowifiControl()
-      .then((res) => {
-        if (active && res.data) {
-          setVowifiEnabled(res.data.feature_enabled)
-        }
-      })
-      .catch((err) => {
-        console.error('Failed to load VoWiFi control config:', err)
-      })
-      .finally(() => {
-        if (active) {
-          setConfigLoading(false)
-        }
-      })
-    return () => {
-      active = false
-    }
-  }, [])
 
   let activeTab = searchParams.get('tab') || 'basic'
 
   if (mode !== 'esim' && activeTab === 'esim') {
-    activeTab = 'basic'
-  }
-
-  if (!configLoading && !vowifiEnabled && activeTab === 'vowifi') {
     activeTab = 'basic'
   }
 
@@ -601,7 +576,7 @@ export default function SimCardPage() {
     setSearchParams(params)
   }
 
-  if (loading || configLoading) {
+  if (loading) {
     return (
       <Box display="flex" justifyContent="center" alignItems="center" minHeight="50vh">
         <CircularProgress size={32} />
@@ -621,18 +596,18 @@ export default function SimCardPage() {
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基本信息" value="basic" />
           <Tab label="基带线路" value="lines" />
+          <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />
           <Tab label="Trunk 诊断" value="trunk" />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
-          {vowifiEnabled && <Tab label="WiFi Calling" value="vowifi" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'basic' && <SimBasicInfo />}
-        {activeTab === 'lines' && <ModemLinesPanel />}
+        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel /><StandaloneSimSlotsPanel /></Stack>}
         {activeTab === 'trunk' && <TrunkDiagnosticsPanel />}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
-        {activeTab === 'vowifi' && vowifiEnabled && <VowifiDiagnosticsPage />}
+        {activeTab === 'vowifi' && <VowifiDiagnosticsPage />}
       </Box>
     </Box>
   )

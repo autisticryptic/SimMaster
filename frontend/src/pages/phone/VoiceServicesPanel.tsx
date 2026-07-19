@@ -175,14 +175,16 @@ export default function VoiceServicesPanel() {
       {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
       {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
       <Alert severity="info">
-        当前完成的是规则、收件箱、转写结果处理和通知。实际取音频、转发到 Linphone 或网页接听仍等待媒体接入方式确定。
+        SimAdmin 仅负责 IMS/CS 与 Asterisk Trunk 的语音路径。广告、推销、验证码和普通来电分类统一交给 Asterisk 的拨号计划或后续语音应用处理。
       </Alert>
 
       <Card><CardContent>
         <Box display="flex" justifyContent="space-between" alignItems="center" gap={2}>
-          <Box><Typography variant="h6">来电筛选与语音信箱</Typography><Typography variant="body2" color="text.secondary">功能默认关闭；号码规则从上到下匹配</Typography></Box>
-          <Switch checked={config.feature_enabled} onChange={(_, feature_enabled) => setConfig({ ...config, feature_enabled })} />
+          <Box><Typography variant="h6">Asterisk 呼入处理</Typography><Typography variant="body2" color="text.secondary">SimAdmin 不再判断来电类别或截取验证码</Typography></Box>
+          <Switch sx={{ display: 'none' }} checked={false} disabled />
         </Box>
+        {config.delegate_to_asterisk && <Alert severity="success" sx={{ mt: 2 }}>来电分类已委托给 Asterisk；旧规则仅为配置兼容保留，不参与呼入决策。</Alert>}
+        <Box sx={{ display: config.delegate_to_asterisk ? 'none' : 'block' }}>
         <Divider sx={{ my: 2 }} />
         <Stack spacing={2}>
           {actionSelect(config.unknown_number_action, (unknown_number_action) => setConfig({ ...config, unknown_number_action }), '未知号码接通前')}
@@ -219,6 +221,7 @@ export default function VoiceServicesPanel() {
             </Box>
           ))}
         </Stack>
+        </Box>
 
         <Divider sx={{ my: 3 }} />
         <Typography variant="subtitle1" fontWeight={600}>语音线路优先级（独立于短信）</Typography>
@@ -228,7 +231,7 @@ export default function VoiceServicesPanel() {
         <Button variant="contained" onClick={() => void saveConfig()} disabled={saving} sx={{ mt: 2 }}>{saving ? '保存中…' : '保存语音策略'}</Button>
       </CardContent></Card>
 
-      <Card><CardContent>
+      <Card sx={{ display: config.delegate_to_asterisk ? 'none' : 'block' }}><CardContent>
         <Typography variant="h6" gutterBottom>规则模拟（不拨号）</Typography>
         <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 2fr auto' }} gap={1}>
           <TextField label="来电号码" value={testNumber} onChange={(e) => setTestNumber(e.target.value)} />
@@ -238,7 +241,7 @@ export default function VoiceServicesPanel() {
         {testDecision && <Alert severity="success" sx={{ mt: 2 }}>分类：{categoryLabels[testDecision.category] ?? testDecision.category}；动作：{actionLabels[testDecision.action]}{testDecision.verification_code ? `；验证码：${testDecision.verification_code}` : ''}</Alert>}
       </CardContent></Card>
 
-      <Card><CardContent>
+      <Card sx={{ display: config.delegate_to_asterisk ? 'none' : 'block' }}><CardContent>
         <Box display="flex" justifyContent="space-between" alignItems="center"><Typography variant="h6">语音收件箱</Typography><IconButton onClick={() => void load()}><Refresh /></IconButton></Box>
         <Typography variant="body2" color="text.secondary" mb={1}>未读 {inbox?.stats.waiting ?? 0}，验证码 {inbox?.stats.verification ?? 0}，疑似营销 {inbox?.stats.marketing ?? 0}</Typography>
         {!inbox?.messages.length ? <Alert severity="info">暂无语音留言或筛选记录</Alert> : <List>{inbox.messages.map((message) => <ListItem key={message.id} divider secondaryAction={<Box>{message.status === 'new' && <Tooltip title="标记已读"><IconButton onClick={() => void updateInbox(message.id, 'read')}><Done /></IconButton></Tooltip>}<Tooltip title="删除"><IconButton color="error" onClick={() => void updateInbox(message.id, 'delete')}><Delete /></IconButton></Tooltip></Box>}><ListItemText primary={<Box display="flex" gap={1} flexWrap="wrap"><Typography fontWeight={600}>{message.phone_number}</Typography><Chip size="small" label={categoryLabels[message.category] ?? message.category} color={message.category === 'verification' ? 'success' : message.category === 'marketing' ? 'warning' : 'default'} />{message.verification_code && <Chip size="small" label={`验证码 ${message.verification_code}`} color="success" />}</Box>} secondary={`${new Date(message.created_at).toLocaleString('zh-CN')} · ${message.transcript}`} /></ListItem>)}</List>}
@@ -250,7 +253,7 @@ export default function VoiceServicesPanel() {
         {vilte && <Stack spacing={2}>
           <FormControlLabel
             control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.feature_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
-            label={volteVoice?.feature_enabled ? 'VoLTE 语音网关能力' : '请先启用 VoLTE 总开关'}
+            label={volteVoice?.feature_enabled ? 'VoLTE 语音网关能力' : '请先在 SIM 卡线路中启用 VoLTE'}
           />
           <FormControlLabel
             control={(

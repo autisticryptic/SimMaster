@@ -54,14 +54,16 @@ pub struct VowifiProfileMatchResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublicEpdgPlan {
-    pub host: &'static str,
+    pub host: String,
     pub port: u16,
-    pub ip_stack: &'static str,
-    pub apn: Option<&'static str>,
-    pub dns_server: Option<&'static str>,
-    pub route_kind: &'static str,
-    pub route_policy_id: &'static str,
-    pub route_note: &'static str,
+    pub ip_stack: String,
+    pub apn: Option<String>,
+    pub dns_server: Option<String>,
+    pub route_kind: String,
+    pub route_policy_id: String,
+    pub route_note: String,
+    pub source: String,
+    pub proxy_endpoint_configured: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -941,14 +943,16 @@ impl PublicEpdgPlan {
     pub fn from_profile(profile: &'static CarrierProfile) -> Self {
         let plan = epdg::build_connection_plan(profile, None);
         Self {
-            host: plan.host,
+            host: plan.host.to_string(),
             port: plan.port,
-            ip_stack: plan.ip_stack,
-            apn: plan.apn,
-            dns_server: plan.dns_server,
-            route_kind: plan.route_policy.kind.as_str(),
-            route_policy_id: plan.route_policy.policy_id,
-            route_note: plan.route_policy.note,
+            ip_stack: plan.ip_stack.to_string(),
+            apn: plan.apn.map(str::to_string),
+            dns_server: plan.dns_server.map(str::to_string),
+            route_kind: plan.route_policy.kind.as_str().to_string(),
+            route_policy_id: plan.route_policy.policy_id.to_string(),
+            route_note: plan.route_policy.note.to_string(),
+            source: "carrier_profile".to_string(),
+            proxy_endpoint_configured: false,
         }
     }
 }
@@ -1181,7 +1185,7 @@ mod tests {
             Some("04")
         );
         assert_eq!(
-            matched.epdg.as_ref().map(|epdg| epdg.host),
+            matched.epdg.as_ref().map(|epdg| epdg.host.as_str()),
             Some("epdg.epc.mnc004.mcc204.pub.3gppnetwork.org")
         );
         assert_eq!(

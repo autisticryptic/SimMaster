@@ -52,6 +52,17 @@ pub fn decide_call(
     transcript: Option<&str>,
 ) -> CallScreeningDecision {
     let normalized_number = normalize_phone_number(phone_number);
+    if config.delegate_to_asterisk {
+        return CallScreeningDecision {
+            phase: "asterisk".to_string(),
+            category: CallCategory::Ordinary,
+            action: CallHandlingAction::Forward,
+            normalized_number,
+            matched_rule_id: None,
+            verification_code: None,
+            reason: "asterisk_delegated".to_string(),
+        };
+    }
     if !config.feature_enabled {
         return CallScreeningDecision {
             phase: "pre_answer".to_string(),
@@ -251,13 +262,32 @@ mod tests {
     fn enabled_config() -> VoiceServicesConfig {
         VoiceServicesConfig {
             feature_enabled: true,
+            delegate_to_asterisk: false,
             ..VoiceServicesConfig::default()
         }
     }
 
     #[test]
+    fn default_delegates_classification_to_asterisk() {
+        let decision = decide_call(
+            &VoiceServicesConfig::default(),
+            "10690000",
+            Some("您的验证码是 123456，限时优惠"),
+        );
+        assert_eq!(decision.phase, "asterisk");
+        assert_eq!(decision.category, CallCategory::Ordinary);
+        assert_eq!(decision.action, CallHandlingAction::Forward);
+        assert_eq!(decision.reason, "asterisk_delegated");
+        assert!(decision.verification_code.is_none());
+    }
+
+    #[test]
     fn disabled_feature_forwards_without_screening() {
-        let decision = decide_call(&VoiceServicesConfig::default(), "138 0013 8000", None);
+        let config = VoiceServicesConfig {
+            delegate_to_asterisk: false,
+            ..VoiceServicesConfig::default()
+        };
+        let decision = decide_call(&config, "138 0013 8000", None);
         assert_eq!(decision.action, CallHandlingAction::Forward);
         assert_eq!(decision.reason, "voice_services_disabled");
         assert_eq!(decision.normalized_number, "13800138000");
