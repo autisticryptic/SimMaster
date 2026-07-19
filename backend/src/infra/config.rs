@@ -1230,7 +1230,19 @@ pub struct AutomationTask {
     #[serde(default = "default_true")]
     pub enabled: bool,
     pub trigger: AutomationTrigger,
+    /// SIM-dependent actions may pin execution to a persistent modem/SIM line
+    /// or an external reader reservation. Legacy tasks without a target use
+    /// the primary modem line for compatibility.
+    #[serde(default)]
+    pub target: Option<AutomationTarget>,
     pub action: AutomationAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AutomationTarget {
+    ModemLine { line_id: String },
+    StandaloneSimSlot { slot_id: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1258,6 +1270,15 @@ pub enum AutomationAction {
         content: String,
         random_delay_seconds: Option<u32>,
         retry_limit: Option<u32>,
+    },
+    ConsumeData {
+        bytes: u64,
+        unit: String,
+    },
+    DialCall {
+        country_code: String,
+        phone_number: String,
+        duration_seconds: u32,
     },
 }
 
@@ -3294,6 +3315,47 @@ impl ConfigManager {
 
     /// 更新自动化配置
     pub fn set_automation_config(&self, automation: AutomationConfig) -> Result<(), String> {
+        let mut ids = std::collections::HashSet::new();
+        for task in &automation.tasks {
+            if task.id.trim().is_empty() || !ids.insert(task.id.clone()) {
+                return Err("automation_task_id_invalid_or_duplicate".to_string());
+            }
+            if let Some(target) = &task.target {
+                match target {
+                    AutomationTarget::ModemLine { line_id } if line_id.trim().is_empty() => {
+                        return Err("automation_target_line_id_required".to_string());
+                    }
+                    AutomationTarget::StandaloneSimSlot { slot_id }
+                        if slot_id.trim().is_empty() =>
+                    {
+                        return Err("automation_target_slot_id_required".to_string());
+                    }
+                    _ => {}
+                }
+            }
+            match &task.action {
+                AutomationAction::ConsumeData { bytes, unit } => {
+                    if *bytes == 0 || !matches!(unit.as_str(), "auto" | "bytes" | "kb" | "mb") {
+                        return Err("automation_consume_data_invalid".to_string());
+                    }
+                }
+                AutomationAction::DialCall {
+                    country_code,
+                    phone_number,
+                    duration_seconds,
+                } if !country_code.starts_with('+')
+                    || country_code.len() < 2
+                    || !country_code[1..].chars().all(|c| c.is_ascii_digit())
+                    || phone_number.trim().is_empty()
+                    || !phone_number.chars().all(|c| c.is_ascii_digit())
+                    || *duration_seconds == 0
+                    || *duration_seconds > 7_200 =>
+                {
+                    return Err("automation_dial_call_invalid".to_string());
+                }
+                _ => {}
+            }
+        }
         {
             let mut config = self.config.write().unwrap();
             config.automation = automation;

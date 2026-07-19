@@ -1,5 +1,6 @@
+use crate::automation::target::resolve_modem_path;
 use crate::automation::traits::AutomationTaskHandler;
-use crate::cellular::modem_manager::send_sms;
+use crate::cellular::modem_manager::send_sms_via_modem;
 use crate::infra::db::beijing_sms_now_string;
 use crate::state::AppState;
 use anyhow::{Context, Result};
@@ -92,6 +93,7 @@ impl AutomationTaskHandler for SendSmsHandler {
             .unwrap_or(0) as u32;
 
         async move {
+            let modem_path = resolve_modem_path(app, params).await?;
             // 1. 随机延迟机制
             if random_delay_seconds > 0 {
                 let delay = get_random_u32(random_delay_seconds);
@@ -110,7 +112,14 @@ impl AutomationTaskHandler for SendSmsHandler {
             let mut attempts = 0;
             loop {
                 attempts += 1;
-                match send_sms(&app.dbus_conn, &phone_number, &rendered_content).await {
+                match send_sms_via_modem(
+                    &app.dbus_conn,
+                    &modem_path,
+                    &phone_number,
+                    &rendered_content,
+                )
+                .await
+                {
                     Ok(_) => {
                         info!("Successfully sent automation SMS to {}", phone_number);
                         // 记录到数据库

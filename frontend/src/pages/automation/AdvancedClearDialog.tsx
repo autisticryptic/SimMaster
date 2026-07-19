@@ -126,6 +126,8 @@ export default function AdvancedClearDialog({
             <MenuItem value="restart_baseband">基带维护</MenuItem>
             <MenuItem value="reboot_device">系统操作</MenuItem>
             <MenuItem value="send_sms">短信发送</MenuItem>
+            <MenuItem value="consume_data">移动流量</MenuItem>
+            <MenuItem value="dial_call">定时拨号</MenuItem>
           </TextField>
 
           <TextField

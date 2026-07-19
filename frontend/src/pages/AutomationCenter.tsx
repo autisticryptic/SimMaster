@@ -502,6 +502,8 @@ export default function AutomationCenter() {
                 <MenuItem value="restart_baseband">基带维护</MenuItem>
                 <MenuItem value="reboot_device">系统操作</MenuItem>
                 <MenuItem value="send_sms">短信发送</MenuItem>
+                <MenuItem value="consume_data">移动流量</MenuItem>
+                <MenuItem value="dial_call">定时拨号</MenuItem>
               </TextField>
 
               <TextField
@@ -593,6 +595,8 @@ export default function AutomationCenter() {
                           {log.task_type === 'restart_baseband' && '基带维护'}
                           {log.task_type === 'reboot_device' && '系统操作'}
                           {log.task_type === 'send_sms' && '短信发送'}
+                          {log.task_type === 'consume_data' && '移动流量'}
+                          {log.task_type === 'dial_call' && '定时拨号'}
                         </TableCell>
                         <TableCell
                           sx={{

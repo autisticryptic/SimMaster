@@ -147,6 +147,8 @@ async fn execute_task(
         AutomationAction::RestartBaseband => "restart_baseband",
         AutomationAction::RebootDevice { .. } => "reboot_device",
         AutomationAction::SendSms { .. } => "send_sms",
+        AutomationAction::ConsumeData { .. } => "consume_data",
+        AutomationAction::DialCall { .. } => "dial_call",
     };
 
     let handler = match registry.get(task_type) {
@@ -181,9 +183,40 @@ async fn execute_task(
                 "retry_limit": retry_limit
             })
         }
+        AutomationAction::ConsumeData { bytes, unit } => {
+            delay_secs = 120;
+            serde_json::json!({
+                "bytes": bytes,
+                "unit": unit,
+                "target": &task.target,
+            })
+        }
+        AutomationAction::DialCall {
+            country_code,
+            phone_number,
+            duration_seconds,
+        } => {
+            delay_secs = u64::from(*duration_seconds).min(7_200);
+            serde_json::json!({
+                "country_code": country_code,
+                "phone_number": phone_number,
+                "duration_seconds": duration_seconds,
+                "target": &task.target,
+            })
+        }
     };
 
-    // 执行任务并控制超时（基准60秒 + 随机延迟时间）
+    let params = if params.get("target").is_some() {
+        params
+    } else {
+        let mut params = params;
+        if let Some(target) = &task.target {
+            params["target"] = serde_json::to_value(target)?;
+        }
+        params
+    };
+
+    // 执行任务并控制超时（基准60秒 + 动作需要的等待时间）
     let result = tokio::time::timeout(
         tokio::time::Duration::from_secs(60 + delay_secs),
         handler.execute(app, &params),

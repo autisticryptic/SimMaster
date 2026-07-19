@@ -2200,6 +2200,10 @@ export type AutomationTrigger =
   | { type: 'fixed'; config: { weekdays: number[]; times: string[] } }
   | { type: 'interval'; config: { interval_value: number; interval_unit: string } }
 
+export type AutomationTarget =
+  | { kind: 'modem_line'; line_id: string }
+  | { kind: 'standalone_sim_slot'; slot_id: string }
+
 export type AutomationAction =
   | { type: 'restart_baseband'; config: null | Record<string, never> }
   | { type: 'reboot_device'; config: { delay_seconds: number } }
@@ -2212,12 +2216,15 @@ export type AutomationAction =
         retry_limit?: number
       }
     }
+  | { type: 'consume_data'; config: { bytes: number; unit: 'auto' | 'bytes' | 'kb' | 'mb' } }
+  | { type: 'dial_call'; config: { country_code: string; phone_number: string; duration_seconds: number } }
 
 export interface AutomationTask {
   id: string
   name: string
   enabled: boolean
   trigger: AutomationTrigger
+  target?: AutomationTarget | null
   action: AutomationAction
 }
 

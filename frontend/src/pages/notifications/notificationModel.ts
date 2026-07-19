@@ -346,6 +346,10 @@ export function defaultAutomationEventCodes(): string[] {
     'restart_baseband:failed',
     'send_sms:success',
     'send_sms:failed',
+    'consume_data:success',
+    'consume_data:failed',
+    'dial_call:success',
+    'dial_call:failed',
   ]
 }
 

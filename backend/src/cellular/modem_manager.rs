@@ -3930,6 +3930,20 @@ pub async fn set_data_connection_with_apn(
     set_data_connection_inner(conn, active, allow_roaming, configured_apn).await
 }
 
+/// Activate the data profile using a selected modem's bearer settings. The
+/// profile remains NetworkManager-managed, but APN/IP settings are resolved
+/// from the selected ModemManager object instead of the primary modem.
+pub async fn connect_data_via_modem(
+    conn: &Connection,
+    modem_path: &str,
+    allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
+) -> Result<(), String> {
+    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn)
+        .await
+        .map(|_| ())
+}
+
 async fn set_data_connection_inner(
     conn: &Connection,
     active: bool,
@@ -5224,6 +5238,32 @@ pub async fn make_call(conn: &Connection, phone_number: &str) -> zbus::Result<St
     .await
 }
 
+/// Place a CS call on one persistent modem line instead of whichever modem
+/// happens to be returned by the legacy primary selector.
+pub async fn make_call_via_modem(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+) -> zbus::Result<String> {
+    with_serial(async {
+        wait_until_voice_ready(conn, modem_path).await?;
+        cleanup_finished_calls(conn, modem_path).await.ok();
+        for attempt in 0..2 {
+            match create_and_start_mm_call(conn, modem_path, phone_number).await {
+                Ok(path) => return Ok(path),
+                Err(error) if attempt == 0 && is_retryable_call_setup_error(&error) => {
+                    cleanup_finished_calls(conn, modem_path).await.ok();
+                    tokio::time::sleep(Duration::from_millis(800)).await;
+                    wait_until_voice_ready(conn, modem_path).await.ok();
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(zbus::fdo::Error::Failed("指定基带拨号失败".to_string()).into())
+    })
+    .await
+}
+
 pub async fn hangup_call(conn: &Connection, call_path: &str) -> zbus::Result<()> {
     if is_at_call_path(call_path) {
         run_direct_at_command(conn, "ATH")
@@ -6121,6 +6161,30 @@ pub async fn restart_baseband(
     with_serial(async move {
         restart_baseband_inner(
             conn,
+            None,
+            auto_connect_data,
+            allow_roaming,
+            configured_apn.as_ref(),
+        )
+        .await
+    })
+    .await
+}
+
+/// Restart one explicitly selected modem line.
+pub async fn restart_baseband_via_modem(
+    conn: &Connection,
+    modem_path: &str,
+    auto_connect_data: bool,
+    allow_roaming: bool,
+    configured_apn: Option<ApnConfig>,
+) -> Result<BasebandRestartResponse, String> {
+    reset_baseband_restart_progress();
+    let _progress_guard = BasebandRestartRunGuard;
+    with_serial(async move {
+        restart_baseband_inner(
+            conn,
+            Some(modem_path),
             auto_connect_data,
             allow_roaming,
             configured_apn.as_ref(),
@@ -6410,6 +6474,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
 
 async fn restart_baseband_inner(
     conn: &Connection,
+    preferred_modem_path: Option<&str>,
     auto_connect_data: bool,
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
@@ -6417,12 +6482,16 @@ async fn restart_baseband_inner(
     let mut steps = Vec::new();
     record_baseband_step(&mut steps, "开始重启基带（软重启）", "running", None);
 
-    let modem_path = match find_modem_path(conn).await {
-        Ok(path) => path,
-        Err(err) => {
-            let message = err.to_string();
-            record_baseband_step(&mut steps, "定位当前基带", "error", Some(message.clone()));
-            return Err(message);
+    let modem_path = if let Some(path) = preferred_modem_path {
+        path.to_string()
+    } else {
+        match find_modem_path(conn).await {
+            Ok(path) => path,
+            Err(err) => {
+                let message = err.to_string();
+                record_baseband_step(&mut steps, "定位当前基带", "error", Some(message.clone()));
+                return Err(message);
+            }
         }
     };
     record_baseband_step(&mut steps, "定位当前基带", "ok", Some(modem_path.clone()));

@@ -33,6 +33,22 @@ const AUTOMATION_EVENT_GROUPS = [
       { code: 'send_sms:failed', label: '发送失败' },
     ],
   },
+  {
+    key: 'consume_data',
+    label: '移动流量',
+    events: [
+      { code: 'consume_data:success', label: '执行成功' },
+      { code: 'consume_data:failed', label: '执行失败' },
+    ],
+  },
+  {
+    key: 'dial_call',
+    label: '定时拨号',
+    events: [
+      { code: 'dial_call:success', label: '执行成功' },
+      { code: 'dial_call:failed', label: '执行失败' },
+    ],
+  },
 ]
 
 type AutomationRuleEditorProps = {

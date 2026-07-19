@@ -7096,6 +7096,8 @@ pub async fn test_automation_task_handler(
             crate::infra::config::AutomationAction::RestartBaseband => "restart_baseband",
             crate::infra::config::AutomationAction::RebootDevice { .. } => "reboot_device",
             crate::infra::config::AutomationAction::SendSms { .. } => "send_sms",
+            crate::infra::config::AutomationAction::ConsumeData { .. } => "consume_data",
+            crate::infra::config::AutomationAction::DialCall { .. } => "dial_call",
         };
 
         let handler = match registry.get(task_type) {
@@ -7129,6 +7131,35 @@ pub async fn test_automation_task_handler(
                     "retry_limit": retry_limit
                 })
             }
+            crate::infra::config::AutomationAction::ConsumeData { bytes, unit } => {
+                delay_secs = 120;
+                serde_json::json!({ "bytes": bytes, "unit": unit, "target": &task.target })
+            }
+            crate::infra::config::AutomationAction::DialCall {
+                country_code,
+                phone_number,
+                duration_seconds,
+            } => {
+                delay_secs = u64::from(*duration_seconds).min(7_200);
+                serde_json::json!({
+                    "country_code": country_code,
+                    "phone_number": phone_number,
+                    "duration_seconds": duration_seconds,
+                    "target": &task.target,
+                })
+            }
+        };
+
+        let params = if params.get("target").is_some() {
+            params
+        } else {
+            let mut params = params;
+            if let Some(target) = &task.target {
+                if let Ok(value) = serde_json::to_value(target) {
+                    params["target"] = value;
+                }
+            }
+            params
         };
 
         let result = tokio::time::timeout(

@@ -13,7 +13,8 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import type { AutomationTask, AutomationAction, AutomationTrigger } from '../../api/contracts'
+import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget, VolteLineControlResponse, StandaloneSimSlotConfig } from '../../api/contracts'
+import { api } from '../../api/current'
 
 type AutomationTaskDialogProps = {
   open: boolean
@@ -31,12 +32,20 @@ export default function AutomationTaskDialog({
 }: AutomationTaskDialogProps) {
   const [formName, setFormName] = useState('')
   const [formEnabled, setFormEnabled] = useState(true)
-  const [formActionType, setFormActionType] = useState<'restart_baseband' | 'reboot_device' | 'send_sms'>('restart_baseband')
+  const [formActionType, setFormActionType] = useState<'restart_baseband' | 'reboot_device' | 'send_sms' | 'consume_data' | 'dial_call'>('restart_baseband')
   const [formRebootDelay, setFormRebootDelay] = useState(5)
   const [formSmsPhone, setFormSmsPhone] = useState('')
   const [formSmsContent, setFormSmsContent] = useState('')
   const [formSmsDelay, setFormSmsDelay] = useState(120)
   const [formSmsRetries, setFormSmsRetries] = useState(3)
+  const [formDataBytes, setFormDataBytes] = useState(100)
+  const [formDataUnit, setFormDataUnit] = useState<'auto' | 'bytes' | 'kb' | 'mb'>('bytes')
+  const [formCountryCode, setFormCountryCode] = useState('+86')
+  const [formCallPhone, setFormCallPhone] = useState('')
+  const [formCallDuration, setFormCallDuration] = useState(30)
+  const [formTarget, setFormTarget] = useState<AutomationTarget | null>(null)
+  const [lines, setLines] = useState<VolteLineControlResponse[]>([])
+  const [readerSlots, setReaderSlots] = useState<StandaloneSimSlotConfig[]>([])
 
   const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval'>('fixed')
   const [formWeekdays, setFormWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7])
@@ -51,11 +60,16 @@ export default function AutomationTaskDialog({
 
   useEffect(() => {
     if (open) {
+      void Promise.all([api.getVolteLines(), api.getStandaloneSimSlots()]).then(([lineResponse, slotResponse]) => {
+        if (lineResponse.data) setLines(lineResponse.data)
+        if (slotResponse.data) setReaderSlots(slotResponse.data)
+      }).catch(() => undefined)
       setDialogError(null)
       if (editingTask) {
         setFormName(editingTask.name)
         setFormEnabled(editingTask.enabled)
         setFormActionType(editingTask.action.type)
+        setFormTarget(editingTask.target ?? null)
         if (editingTask.action.type === 'reboot_device') {
           setFormRebootDelay(editingTask.action.config.delay_seconds)
         } else if (editingTask.action.type === 'send_sms') {
@@ -63,6 +77,13 @@ export default function AutomationTaskDialog({
           setFormSmsContent(editingTask.action.config.content)
           setFormSmsDelay(editingTask.action.config.random_delay_seconds ?? 0)
           setFormSmsRetries(editingTask.action.config.retry_limit ?? 0)
+        } else if (editingTask.action.type === 'consume_data') {
+          setFormDataBytes(editingTask.action.config.bytes)
+          setFormDataUnit(editingTask.action.config.unit)
+        } else if (editingTask.action.type === 'dial_call') {
+          setFormCountryCode(editingTask.action.config.country_code)
+          setFormCallPhone(editingTask.action.config.phone_number)
+          setFormCallDuration(editingTask.action.config.duration_seconds)
         }
         setFormTriggerType(editingTask.trigger.type)
         if (editingTask.trigger.type === 'fixed') {
@@ -81,6 +102,12 @@ export default function AutomationTaskDialog({
         setFormSmsContent('')
         setFormSmsDelay(120)
         setFormSmsRetries(3)
+        setFormDataBytes(100)
+        setFormDataUnit('bytes')
+        setFormCountryCode('+86')
+        setFormCallPhone('')
+        setFormCallDuration(30)
+        setFormTarget(null)
         setFormTriggerType('fixed')
         setFormWeekdays([1, 2, 3, 4, 5, 6, 7])
         setFormTriggerTime('04:00')
@@ -126,7 +153,7 @@ export default function AutomationTaskDialog({
       action = { type: 'restart_baseband', config: null }
     } else if (formActionType === 'reboot_device') {
       action = { type: 'reboot_device', config: { delay_seconds: Number(formRebootDelay) || 5 } }
-    } else {
+    } else if (formActionType === 'send_sms') {
       const phoneClean = formSmsPhone.trim()
       if (!phoneClean) {
         setDialogError('请输入接收短信的手机号码')
@@ -145,6 +172,20 @@ export default function AutomationTaskDialog({
           retry_limit: Number(formSmsRetries) || 0,
         },
       }
+    } else if (formActionType === 'consume_data') {
+      if (!Number.isInteger(Number(formDataBytes)) || Number(formDataBytes) <= 0) {
+        setDialogError('请输入大于 0 的流量大小')
+        return
+      }
+      action = { type: 'consume_data', config: { bytes: Number(formDataBytes), unit: formDataUnit } }
+    } else {
+      const country = formCountryCode.trim()
+      const phone = formCallPhone.trim()
+      if (!/^\+[0-9]+$/.test(country) || !/^[0-9]+$/.test(phone)) {
+        setDialogError('请输入合法的国家区号和号码主体')
+        return
+      }
+      action = { type: 'dial_call', config: { country_code: country, phone_number: phone, duration_seconds: Math.min(7200, Math.max(1, Number(formCallDuration) || 1)) } }
     }
 
     let trigger: AutomationTrigger
@@ -205,6 +246,7 @@ export default function AutomationTaskDialog({
       name: formName.trim(),
       enabled: formEnabled,
       trigger,
+      target: formTarget,
       action,
     }
 
@@ -257,12 +299,31 @@ export default function AutomationTaskDialog({
             label="执行动作"
             fullWidth
             value={formActionType}
-            onChange={(e) => setFormActionType(e.target.value as 'restart_baseband' | 'reboot_device' | 'send_sms')}
+            onChange={(e) => setFormActionType(e.target.value as typeof formActionType)}
           >
             <MenuItem value="restart_baseband">重启基带</MenuItem>
             <MenuItem value="reboot_device">重启设备</MenuItem>
             <MenuItem value="send_sms">发送短信</MenuItem>
+            <MenuItem value="consume_data">消耗移动流量</MenuItem>
+            <MenuItem value="dial_call">定时拨号</MenuItem>
           </TextField>
+
+          {formActionType !== 'reboot_device' && (
+            <TextField
+              select
+              label="使用的基带 / SIM 卡"
+              value={formTarget ? `${formTarget.kind}:${formTarget.kind === 'modem_line' ? formTarget.line_id : formTarget.slot_id}` : ''}
+              onChange={(e) => {
+                const [kind, ...rest] = e.target.value.split(':')
+                setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : kind === 'standalone_sim_slot' ? { kind: 'standalone_sim_slot', slot_id: rest.join(':') } : null)
+              }}
+              helperText="未选择时兼容旧任务，使用主基带；读卡器目标当前仅保存配置，运行时会明确提示尚未接入适配器"
+            >
+              <MenuItem value="">主基带（兼容模式）</MenuItem>
+              {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>基带 {line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
+              {readerSlots.map((slot) => <MenuItem key={slot.id} value={`standalone_sim_slot:${slot.id}`}>{slot.label || '读卡器'} · 卡槽 {slot.uim_slot}（暂不可执行）</MenuItem>)}
+            </TextField>
+          )}
 
           {/* 重启设备特有字段 */}
           {formActionType === 'reboot_device' && (
@@ -339,6 +400,25 @@ export default function AutomationTaskDialog({
                   helperText="发送失败后每5秒自动重试"
                 />
               </Box>
+            </Box>
+          )}
+
+          {formActionType === 'consume_data' && (
+            <Box display="grid" gridTemplateColumns="1fr 1fr" gap={2}>
+              <TextField label="流量大小" type="number" value={formDataBytes} onChange={(e) => setFormDataBytes(Math.max(1, Number(e.target.value) || 1))} slotProps={{ htmlInput: { min: 1 } }} />
+              <TextField select label="单位" value={formDataUnit} onChange={(e) => setFormDataUnit(e.target.value as typeof formDataUnit)}>
+                <MenuItem value="auto">自动</MenuItem><MenuItem value="bytes">Byte</MenuItem><MenuItem value="kb">KiB</MenuItem><MenuItem value="mb">MiB</MenuItem>
+              </TextField>
+            </Box>
+          )}
+
+          {formActionType === 'dial_call' && (
+            <Box display="grid" gridTemplateColumns="0.8fr 1.2fr" gap={2}>
+              <TextField select label="国家区号" value={formCountryCode} onChange={(e) => setFormCountryCode(e.target.value)}>
+                <MenuItem value="+86">中国 +86</MenuItem><MenuItem value="+1">美国/加拿大 +1</MenuItem><MenuItem value="+44">英国 +44</MenuItem><MenuItem value="+81">日本 +81</MenuItem><MenuItem value="+82">韩国 +82</MenuItem>
+              </TextField>
+              <TextField label="号码主体" value={formCallPhone} onChange={(e) => setFormCallPhone(e.target.value)} />
+              <TextField label="拨号保持时间（秒）" type="number" value={formCallDuration} onChange={(e) => setFormCallDuration(Math.min(7200, Math.max(1, Number(e.target.value) || 1)))} slotProps={{ htmlInput: { min: 1, max: 7200 } }} sx={{ gridColumn: '1 / -1' }} />
             </Box>
           )}
 

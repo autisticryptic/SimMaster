@@ -2607,6 +2607,8 @@ fn render_automation_template(
         "restart_baseband" => "重启基带",
         "reboot_device" => "重启设备",
         "send_sms" => "发送短信",
+        "consume_data" => "消耗移动流量",
+        "dial_call" => "定时拨号",
         other => other,
     };
     let task_type = maybe_escape(task_type_label);

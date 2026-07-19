@@ -15,6 +15,8 @@ import {
   Autorenew,
   PowerSettingsNew,
   Sms as SmsIcon,
+  Call,
+  DataUsage,
   Timer,
   CheckCircle,
   Error as ErrorIcon,
@@ -163,6 +165,12 @@ export default function AutomationTaskCard({
                   sx={{ height: 20, fontSize: '0.72rem', '& .MuiChip-label': { px: 0.75 }, '& .MuiChip-icon': { fontSize: '0.85rem' } }}
                 />
               )}
+              {task.action.type === 'consume_data' && (
+                <Chip size="small" icon={<DataUsage fontSize="small" />} label="消耗移动流量" color="info" variant="outlined" />
+              )}
+              {task.action.type === 'dial_call' && (
+                <Chip size="small" icon={<Call fontSize="small" />} label="定时拨号" color="success" variant="outlined" />
+              )}
             </Box>
           </Box>
           <Switch
@@ -216,6 +224,20 @@ export default function AutomationTaskCard({
                 {task.action.config.delay_seconds} 秒
               </Typography>
             </Box>
+          )}
+          {task.action.type !== 'reboot_device' && (
+            <Box display="flex" justifyContent="space-between" mb={0.75}>
+              <Typography variant="body2" color="text.secondary">SIM 目标:</Typography>
+              <Typography variant="body2">
+                {!task.target ? '主基带' : task.target.kind === 'modem_line' ? `基带线路 ${task.target.line_id.slice(-6)}` : `读卡器槽位 ${task.target.slot_id}`}
+              </Typography>
+            </Box>
+          )}
+          {task.action.type === 'consume_data' && (
+            <Box display="flex" justifyContent="space-between" mb={0.75}><Typography variant="body2" color="text.secondary">流量:</Typography><Typography variant="body2">{task.action.config.bytes} {task.action.config.unit}</Typography></Box>
+          )}
+          {task.action.type === 'dial_call' && (
+            <Box display="flex" justifyContent="space-between" mb={0.75}><Typography variant="body2" color="text.secondary">拨号:</Typography><Typography variant="body2">{task.action.config.country_code}{task.action.config.phone_number} / {task.action.config.duration_seconds} 秒</Typography></Box>
           )}
 
           <Box display="flex" justifyContent="space-between" mt={0.75}>
