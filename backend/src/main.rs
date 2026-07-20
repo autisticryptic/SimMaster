@@ -574,7 +574,7 @@ async fn main() -> Result<()> {
                 if !profile.data_connection_enabled {
                     continue;
                 }
-                let allow_roaming = restore_app.config_manager.get_roaming_allowed();
+                let allow_roaming = profile.roaming_allowed;
                 let apn = restore_app.config_manager.get_apn_config();
                 if let Err(error) = connect_data_via_modem(
                     restore_app.dbus_conn.as_ref(),
@@ -594,7 +594,9 @@ async fn main() -> Result<()> {
                     )
                     .await
                     {
-                        if let Err(error) = line.data_proxy.start(&interface).await {
+                        if let Err(error) =
+                            line.data_proxy.start(&interface, &profile.data_proxy).await
+                        {
                             let _ = line.data_proxy.record_error(error).await;
                         }
                         break;
@@ -850,6 +852,14 @@ async fn main() -> Result<()> {
         .route(
             "/api/modem/lines/{line_id}/data",
             post(set_line_data_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/data/config",
+            post(set_line_data_proxy_config_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/roaming",
+            post(set_line_roaming_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/airplane-mode",

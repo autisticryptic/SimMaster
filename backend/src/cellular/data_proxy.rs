@@ -10,15 +10,35 @@ use tokio::{
     task::JoinHandle,
 };
 
+use crate::infra::config::LineDataProxyConfig;
+
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct DataProxyStatus {
     pub running: bool,
+    pub phase: String,
+    pub stage: String,
+    pub listen_ip: Option<String>,
     pub port: Option<u16>,
     pub interface_name: Option<String>,
     pub protocols: Vec<String>,
     pub last_error: Option<String>,
+}
+
+impl Default for DataProxyStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            phase: "disabled".to_string(),
+            stage: "流量未启用".to_string(),
+            listen_ip: None,
+            port: None,
+            interface_name: None,
+            protocols: Vec::new(),
+            last_error: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -38,19 +58,31 @@ impl DataProxyRuntime {
         self.state.lock().await.status.clone()
     }
 
-    pub async fn start(&self, interface_name: &str) -> Result<DataProxyStatus, String> {
+    pub async fn start(
+        &self,
+        interface_name: &str,
+        config: &LineDataProxyConfig,
+    ) -> Result<DataProxyStatus, String> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() {
             return Err("cellular_data_interface_unavailable".to_string());
         }
 
         let mut state = self.state.lock().await;
-        if state.status.running && state.status.interface_name.as_deref() == Some(interface_name) {
+        if state.status.running
+            && state.status.interface_name.as_deref() == Some(interface_name)
+            && state.status.listen_ip.as_deref() == Some(config.listen_ip.as_str())
+            && (config.listen_port == 0 || state.status.port == Some(config.listen_port))
+        {
             return Ok(state.status.clone());
         }
         stop_locked(&mut state).await;
 
-        let listener = TcpListener::bind(("0.0.0.0", 0))
+        let listen_ip = config
+            .listen_ip
+            .parse::<std::net::IpAddr>()
+            .map_err(|_| "data_proxy_listen_ip_invalid".to_string())?;
+        let listener = TcpListener::bind(SocketAddr::new(listen_ip, config.listen_port))
             .await
             .map_err(|error| format!("data_proxy_bind_failed: {error}"))?;
         let port = listener
@@ -85,6 +117,9 @@ impl DataProxyRuntime {
 
         state.status = DataProxyStatus {
             running: true,
+            phase: "ready".to_string(),
+            stage: "代理出口已就绪".to_string(),
+            listen_ip: Some(listen_ip.to_string()),
             port: Some(port),
             interface_name: Some(interface_name.to_string()),
             protocols: vec!["http".to_string(), "socks5".to_string()],
@@ -103,7 +138,10 @@ impl DataProxyRuntime {
 
     pub async fn record_error(&self, error: impl Into<String>) -> DataProxyStatus {
         let mut state = self.state.lock().await;
-        state.status.last_error = Some(error.into());
+        let error = error.into();
+        state.status.phase = "failed".to_string();
+        state.status.stage = error.clone();
+        state.status.last_error = Some(error);
         state.status.clone()
     }
 }
@@ -116,9 +154,13 @@ async fn stop_locked(state: &mut ProxyState) {
         let _ = task.await;
     }
     state.status.running = false;
+    state.status.phase = "disabled".to_string();
+    state.status.stage = "流量未启用".to_string();
+    state.status.listen_ip = None;
     state.status.port = None;
     state.status.interface_name = None;
     state.status.protocols.clear();
+    state.status.last_error = None;
 }
 
 async fn serve_client(inbound: TcpStream, interface_name: &str) -> io::Result<()> {
@@ -355,6 +397,29 @@ fn bind_socket_to_device(_socket: &TcpSocket, _interface_name: &str) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn binds_configured_listener_and_reports_stage() {
+        let runtime = DataProxyRuntime::default();
+        let status = runtime
+            .start(
+                "test-interface",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(status.running);
+        assert_eq!(status.phase, "ready");
+        assert_eq!(status.listen_ip.as_deref(), Some("127.0.0.1"));
+        assert!(status.port.is_some_and(|port| port > 0));
+
+        let stopped = runtime.stop().await;
+        assert_eq!(stopped.phase, "disabled");
+        assert_eq!(stopped.stage, "流量未启用");
+    }
 
     #[test]
     fn parses_absolute_http_target() {

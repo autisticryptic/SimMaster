@@ -1587,6 +1587,82 @@ mod tests {
     }
 
     #[test]
+    fn per_line_data_proxy_and_roaming_settings_are_persisted() {
+        let dir = std::env::temp_dir().join(format!(
+            "simadmin-line-data-proxy-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let profile = manager
+            .set_line_data_proxy_config(
+                line_id,
+                LineDataProxyConfig {
+                    listen_ip: " 127.0.0.1 ".to_string(),
+                    listen_port: 1080,
+                },
+            )
+            .unwrap();
+        assert_eq!(profile.data_proxy.listen_ip, "127.0.0.1");
+        assert_eq!(profile.data_proxy.listen_port, 1080);
+        assert!(
+            !manager
+                .set_line_roaming_allowed(line_id, false)
+                .unwrap()
+                .roaming_allowed
+        );
+
+        let reloaded = ConfigManager::new(path.clone()).get_line_profile(line_id);
+        assert_eq!(reloaded.data_proxy.listen_ip, "127.0.0.1");
+        assert_eq!(reloaded.data_proxy.listen_port, 1080);
+        assert!(!reloaded.roaming_allowed);
+        assert_eq!(
+            manager
+                .set_line_data_proxy_config(
+                    line_id,
+                    LineDataProxyConfig {
+                        listen_ip: "not-an-ip".to_string(),
+                        listen_port: 0,
+                    },
+                )
+                .unwrap_err(),
+            "data_proxy_listen_ip_invalid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn external_vowifi_profiles_use_versioned_user_only_schema() {
+        let profile = ExternalVowifiProfile {
+            profile_id: "custom-au".to_string(),
+            mcc: "505".to_string(),
+            mnc: "01".to_string(),
+            epdg_host: "epdg.example.test".to_string(),
+            epdg_port: 4500,
+            ip_stack: "ipv6".to_string(),
+            apn: Some("ims".to_string()),
+            dns_server: None,
+        };
+        let serialized =
+            serialize_external_vowifi_profiles(std::slice::from_ref(&profile)).unwrap();
+        assert!(serialized.contains("\"schema_version\": 1"));
+        assert!(!serialized.contains("BUILTIN PROFILES"));
+        assert_eq!(
+            parse_external_vowifi_profiles(&serialized),
+            vec![profile.clone()]
+        );
+
+        let legacy = format!(
+            "# --- BUILTIN PROFILES (READ ONLY) ---\nignored\n# --- CUSTOM PROFILES ---\n{}",
+            serde_json::to_string(&vec![profile.clone()]).unwrap()
+        );
+        assert_eq!(parse_external_vowifi_profiles(&legacy), vec![profile]);
+    }
+
+    #[test]
     fn sms_path_policy_default_order_is_vowifi_volte_cs() {
         let policy = SmsPathPolicy::default();
         let order: Vec<AccessPathKind> = policy.enabled_layers().collect();
@@ -2661,25 +2737,45 @@ fn default_external_ip_stack() -> String {
     "ipv6".to_string()
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ExternalVowifiProfilesFile {
+    #[serde(default = "default_external_profiles_schema_version")]
+    schema_version: u32,
+    #[serde(default)]
+    profiles: Vec<ExternalVowifiProfile>,
+}
+
+fn default_external_profiles_schema_version() -> u32 {
+    1
+}
+
 fn serialize_external_vowifi_profiles(
     profiles: &[ExternalVowifiProfile],
 ) -> Result<String, String> {
-    let builtin = crate::access::vowifi::profiles::BUILTIN_PROFILES
-        .iter()
-        .map(|item| {
-            format!(
-                "# {} | PLMN {} | {}:{} | APN {} | {}",
-                item.meta.profile_id,
-                item.meta.plmn,
-                item.epdg.host,
-                item.epdg.port,
-                item.epdg.apn.unwrap_or(""),
-                item.epdg.ip_stack
-            )
+    Ok(format!(
+        "# SimAdmin custom VoWiFi/ePDG profiles\n# Built-in carrier profiles are compiled into the SimAdmin binary.\n# This file contains only user-created profiles and overrides.\n{}\n",
+        serde_json::to_string_pretty(&ExternalVowifiProfilesFile {
+            schema_version: default_external_profiles_schema_version(),
+            profiles: profiles.to_vec(),
         })
+        .map_err(|error| error.to_string())?
+    ))
+}
+
+fn parse_external_vowifi_profiles(content: &str) -> Vec<ExternalVowifiProfile> {
+    let legacy_or_current = content
+        .split("# --- CUSTOM PROFILES ---")
+        .nth(1)
+        .unwrap_or(content);
+    let json = legacy_or_current
+        .lines()
+        .filter(|line| !line.trim_start().starts_with('#'))
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(format!("# SimAdmin VoWiFi/ePDG profile file\n# --- BUILTIN PROFILES (READ ONLY) ---\n{builtin}\n# --- CUSTOM PROFILES ---\n{}\n", serde_json::to_string_pretty(profiles).map_err(|error| error.to_string())?))
+    serde_json::from_str::<ExternalVowifiProfilesFile>(json.trim())
+        .map(|file| file.profiles)
+        .or_else(|_| serde_json::from_str::<Vec<ExternalVowifiProfile>>(json.trim()))
+        .unwrap_or_default()
 }
 
 impl Default for LineVowifiConfig {
@@ -2725,10 +2821,38 @@ pub struct LineProfileConfig {
     /// Whether the user explicitly enabled cellular data for this physical line.
     #[serde(default)]
     pub data_connection_enabled: bool,
+    /// Listener configuration for the HTTP/SOCKS5 cellular data proxy.
+    #[serde(default)]
+    pub data_proxy: LineDataProxyConfig,
+    /// Whether this physical line may establish a roaming cellular data bearer.
+    #[serde(default = "default_roaming_allowed")]
+    pub roaming_allowed: bool,
     /// Per-line simulated airplane mode. It disables cellular radio services
     /// while preserving Wi-Fi based VoWiFi and Asterisk Trunk intents.
     #[serde(default)]
     pub airplane_mode_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LineDataProxyConfig {
+    #[serde(default = "default_data_proxy_listen_ip")]
+    pub listen_ip: String,
+    /// Zero asks the operating system to allocate an available port.
+    #[serde(default)]
+    pub listen_port: u16,
+}
+
+impl Default for LineDataProxyConfig {
+    fn default() -> Self {
+        Self {
+            listen_ip: default_data_proxy_listen_ip(),
+            listen_port: 0,
+        }
+    }
+}
+
+fn default_data_proxy_listen_ip() -> String {
+    "0.0.0.0".to_string()
 }
 
 /// A discovered physical modem slot used to reconcile the persisted slot map.
@@ -2783,6 +2907,8 @@ impl LineProfileConfig {
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
+            data_proxy: LineDataProxyConfig::default(),
+            roaming_allowed: default_roaming_allowed(),
             airplane_mode_enabled: false,
         }
     }
@@ -2800,6 +2926,14 @@ fn valid_line_id(line_id: &str) -> bool {
     line_id.strip_prefix("line-").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(), String> {
+    config.listen_ip = config.listen_ip.trim().to_string();
+    if config.listen_ip.parse::<std::net::IpAddr>().is_err() {
+        return Err("data_proxy_listen_ip_invalid".to_string());
+    }
+    Ok(())
 }
 
 fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), String> {
@@ -3411,6 +3545,13 @@ impl ConfigManager {
             let _ = serialize_external_vowifi_profiles(&[]).and_then(|content| {
                 fs::write(external_path, content).map_err(|error| error.to_string())
             });
+        } else if let Ok(content) = fs::read_to_string(&external_path) {
+            let profiles = parse_external_vowifi_profiles(&content);
+            if let Ok(normalized) = serialize_external_vowifi_profiles(&profiles) {
+                if normalized.trim() != content.trim() {
+                    let _ = fs::write(external_path, normalized);
+                }
+            }
         }
 
         manager
@@ -3438,10 +3579,7 @@ impl ConfigManager {
         let Ok(content) = fs::read_to_string(path) else {
             return Vec::new();
         };
-        let Some(json) = content.split("# --- CUSTOM PROFILES ---").nth(1) else {
-            return Vec::new();
-        };
-        serde_json::from_str(json.trim()).unwrap_or_default()
+        parse_external_vowifi_profiles(&content)
     }
 
     pub fn set_external_vowifi_profile(
@@ -3962,6 +4100,73 @@ impl ConfigManager {
             config
                 .line_profiles
                 .sort_by(|a, b| a.line_id.cmp(&b.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn set_line_data_proxy_config(
+        &self,
+        line_id: &str,
+        mut data_proxy: LineDataProxyConfig,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        validate_line_data_proxy_config(&mut data_proxy)?;
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            profile.data_proxy = data_proxy;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
+    pub fn set_line_roaming_allowed(
+        &self,
+        line_id: &str,
+        allowed: bool,
+    ) -> Result<LineProfileConfig, String> {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            profile.roaming_allowed = allowed;
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|left, right| left.line_id.cmp(&right.line_id));
             next
         };
         self.save()?;

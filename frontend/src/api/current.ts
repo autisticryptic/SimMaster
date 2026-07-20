@@ -24,6 +24,7 @@ import type {
   DataConnectionRequest,
   DataConnectionStatus,
   LineNetworkControlsResponse,
+  LineDataProxyConfig,
   DdnsConfig,
   DdnsLogsResponse,
   DdnsStatusResponse,
@@ -448,6 +449,20 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<LineNetworkControlsResponse>>(
       `/modem/lines/${encodeURIComponent(lineId)}/data`,
       { method: 'POST', body: JSON.stringify({ enabled }) },
+    )
+  }
+
+  async setLineDataProxyConfig(lineId: string, config: LineDataProxyConfig) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data/config`,
+      { method: 'POST', body: JSON.stringify(config) },
+    )
+  }
+
+  async setLineRoaming(lineId: string, allowed: boolean) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/roaming`,
+      { method: 'POST', body: JSON.stringify({ allowed }) },
     )
   }
 

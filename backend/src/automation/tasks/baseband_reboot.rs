@@ -20,8 +20,19 @@ impl AutomationTaskHandler for BasebandRebootHandler {
     ) -> BoxFuture<'a, Result<()>> {
         async move {
             let modem_path = resolve_modem_path(app, params).await?;
-            let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
-            let allow_roaming = app.config_manager.get_roaming_allowed();
+            let profile = app
+                .line_registry
+                .for_modem_path(&modem_path)
+                .await
+                .map(|line| app.config_manager.get_line_profile(&line.binding().line_id));
+            let auto_connect_data = profile
+                .as_ref()
+                .map(|profile| profile.data_connection_enabled)
+                .unwrap_or_else(|| !app.data_user_disabled.load(Ordering::SeqCst));
+            let allow_roaming = profile
+                .as_ref()
+                .map(|profile| profile.roaming_allowed)
+                .unwrap_or_else(|| app.config_manager.get_roaming_allowed());
             let apn_config = app.config_manager.get_apn_config();
 
             restart_baseband_via_modem(

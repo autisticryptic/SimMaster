@@ -4141,7 +4141,11 @@ async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
 /// 当前是否处于漫游注册态（与「是否允许漫游」无关，后者来自本地配置）。
 pub async fn get_is_roaming_mm(conn: &Connection) -> zbus::Result<bool> {
     let modem_path = find_modem_path(conn).await?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
+    get_is_roaming_for_modem(conn, &modem_path).await
+}
+
+pub async fn get_is_roaming_for_modem(conn: &Connection, modem_path: &str) -> zbus::Result<bool> {
+    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP).await?;
     let reg_state = gpp_props
         .get("RegistrationState")
         .map(extract_u32)

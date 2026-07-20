@@ -554,11 +554,21 @@ export interface LineProfileConfig {
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
   data_connection_enabled: boolean
+  data_proxy: LineDataProxyConfig
+  roaming_allowed: boolean
   airplane_mode_enabled: boolean
+}
+
+export interface LineDataProxyConfig {
+  listen_ip: string
+  listen_port: number
 }
 
 export interface DataProxyStatus {
   running: boolean
+  phase: string
+  stage: string
+  listen_ip?: string | null
   port?: number | null
   interface_name?: string | null
   protocols: string[]
@@ -572,9 +582,14 @@ export interface LineNetworkControlsResponse {
   data: {
     enabled: boolean
     connected: boolean
+    config: LineDataProxyConfig
     proxy: DataProxyStatus
   }
+  roaming: RoamingResponse
   airplane_mode: AirplaneModeResponse
+  airplane_mode_requested: boolean
+  airplane_phase: string
+  airplane_stage: string
 }
 
 export type VowifiProxyMode = 'direct' | 'socks5_udp_associate' | 'connect_udp_masque' | 'udp_relay'

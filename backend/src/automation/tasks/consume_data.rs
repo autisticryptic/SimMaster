@@ -68,7 +68,16 @@ impl AutomationTaskHandler for ConsumeDataHandler {
         async move {
             let amount = requested_bytes(value, unit)?;
             let modem_path = resolve_modem_path(app, &target).await?;
-            let roaming = app.config_manager.get_roaming_allowed();
+            let roaming = app
+                .line_registry
+                .for_modem_path(&modem_path)
+                .await
+                .map(|line| {
+                    app.config_manager
+                        .get_line_profile(&line.binding().line_id)
+                        .roaming_allowed
+                })
+                .unwrap_or_else(|| app.config_manager.get_roaming_allowed());
             let apn = app.config_manager.get_apn_config();
             connect_data_via_modem(&app.dbus_conn, &modem_path, roaming, Some(&apn))
                 .await

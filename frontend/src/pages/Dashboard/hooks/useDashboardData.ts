@@ -8,7 +8,6 @@ import type {
   SimInfo,
   SystemStatsResponse,
   AirplaneModeResponse,
-  RoamingResponse,
   ConnectionAddressesResponse,
   VowifiConfig,
   VowifiStatusResponse,
@@ -61,13 +60,11 @@ export interface DashboardData {
   connectivity: ConnectivityResult | null
   connectionAddresses: ConnectionAddresses
   speedHistory: Record<string, InterfaceSpeedHistory>
-  roaming: RoamingResponse | null
   vowifiControl: VowifiConfig | null
   vowifiStatus: VowifiStatusResponse | null
 }
 
 export interface DashboardActions {
-  toggleRoaming: () => Promise<void>
   loadData: () => Promise<void>
 }
 
@@ -86,7 +83,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [airplaneMode, setAirplaneMode] = useState<AirplaneModeResponse | null>(null)
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [connectionAddresses, setConnectionAddresses] = useState<ConnectionAddresses>({ ipv4: [], ipv6: [] })
-  const [roaming, setRoaming] = useState<RoamingResponse | null>(null)
   const [vowifiControl, setVowifiControl] = useState<VowifiConfig | null>(null)
   const [vowifiStatus, setVowifiStatus] = useState<VowifiStatusResponse | null>(null)
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
@@ -142,7 +138,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         requestOrNull(api.getDataStatus(), 'data'),
         requestOrNull(api.getAirplaneMode(), 'airplane-mode'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
-        requestOrNull(api.getRoamingStatus(), 'roaming'),
         requestOrNull(api.getVowifiControl(), 'vowifi-control'),
         requestOrNull(api.getCellsInfo(), 'cells'),
         requestOrNull(api.getVowifiStatus(), 'vowifi-status'),
@@ -160,7 +155,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         dataRes,
         airplaneModeRes,
         addressesRes,
-        roamingRes,
         vowifiControlRes,
         cellsRes,
         vowifiStatusRes,
@@ -172,7 +166,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       if (dataRes?.data) setDataStatus(dataRes.data.active)
       if (airplaneModeRes?.data) setAirplaneMode(airplaneModeRes.data)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
-      if (roamingRes?.data) setRoaming(roamingRes.data)
       if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
       if (cellsRes?.data) setCellsInfo(cellsRes.data)
       if (vowifiStatusRes?.data) setVowifiStatus(vowifiStatusRes.data)
@@ -217,16 +210,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     }
   }, [updateSpeedHistory])
 
-  const toggleRoaming = useCallback(async () => {
-    try {
-      const nextAllowed = !roaming?.roaming_allowed
-      const response = await api.setRoamingAllowed(nextAllowed)
-      if (response.data) setRoaming(response.data)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    }
-  }, [roaming])
-
   useEffect(() => {
     // 首次加载：background = false，错误会展示给用户
     const timeout = window.setTimeout(() => {
@@ -263,12 +246,10 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       connectivity,
       connectionAddresses,
       speedHistory,
-      roaming,
       vowifiControl,
       vowifiStatus,
     } as DashboardData,
     actions: {
-      toggleRoaming,
       loadData,
     } as DashboardActions,
   }

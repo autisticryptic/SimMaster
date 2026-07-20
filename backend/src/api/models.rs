@@ -241,7 +241,7 @@ pub struct RoamingRequest {
     pub allowed: bool,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RoamingResponse {
     pub roaming_allowed: bool,
     pub is_roaming: bool,
@@ -263,6 +263,7 @@ pub struct AirplaneModeResponse {
 pub struct LineDataConnectionResponse {
     pub enabled: bool,
     pub connected: bool,
+    pub config: crate::infra::config::LineDataProxyConfig,
     pub proxy: crate::cellular::data_proxy::DataProxyStatus,
 }
 
@@ -272,7 +273,11 @@ pub struct LineNetworkControlsResponse {
     pub modem_path: String,
     pub present: bool,
     pub data: LineDataConnectionResponse,
+    pub roaming: RoamingResponse,
     pub airplane_mode: AirplaneModeResponse,
+    pub airplane_mode_requested: bool,
+    pub airplane_phase: String,
+    pub airplane_stage: String,
 }
 
 #[derive(Debug, Deserialize)]

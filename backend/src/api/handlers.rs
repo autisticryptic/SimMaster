@@ -36,19 +36,19 @@ use crate::{
         answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
         find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
         get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
-        get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_mm,
-        get_network_info_data, get_operators_list, get_radio_mode, get_signal_strength,
-        get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache, hangup_all_calls,
-        hangup_call, list_apn_contexts, list_current_calls, make_call, nm_set_autoconnect_pub,
-        power_cycle_sim_for_profile_switch, register_operator_auto, register_operator_manual,
-        restart_baseband, scan_operators, send_sms, send_sms_via_modem, set_airplane_mode,
-        set_apn_on_bearer, set_band_lock, set_call_waiting, set_data_connection_with_apn,
-        set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
+        get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_for_modem,
+        get_is_roaming_mm, get_network_info_data, get_operators_list, get_radio_mode,
+        get_signal_strength, get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache,
+        hangup_all_calls, hangup_call, list_apn_contexts, list_current_calls, make_call,
+        nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch, register_operator_auto,
+        register_operator_manual, restart_baseband, scan_operators, send_sms, send_sms_via_modem,
+        set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
+        set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
     },
     infra::config::{
-        AccessPathKind, ApnConfig, LineProfileConfig, LineVowifiConfig, MidFlightDisablePolicy,
-        SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig, VilteConfig, VoicePathPolicy,
-        VolteConfig, VowifiConfig,
+        AccessPathKind, ApnConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
+        MidFlightDisablePolicy, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
+        VilteConfig, VoicePathPolicy, VolteConfig, VowifiConfig,
     },
     infra::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -2280,22 +2280,54 @@ async fn build_line_network_controls(
     } else {
         false
     };
-    let mut airplane_mode = if binding.present {
+    let observed_airplane = if binding.present {
         modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
             .unwrap_or(AirplaneModeResponse {
-                enabled: profile.airplane_mode_enabled,
+                enabled: false,
                 powered: false,
                 online: false,
             })
     } else {
         AirplaneModeResponse {
-            enabled: profile.airplane_mode_enabled,
+            enabled: false,
             powered: false,
             online: false,
         }
     };
-    airplane_mode.enabled |= profile.airplane_mode_enabled;
+    let airplane_mode_requested = profile.airplane_mode_enabled;
+    let airplane_phase = match (airplane_mode_requested, observed_airplane.enabled) {
+        (true, true) => "enabled",
+        (true, false) => "enabling",
+        (false, true) => "disabling",
+        (false, false) => "disabled",
+    };
+    let airplane_stage = match airplane_phase {
+        "enabled" => "移动射频已关闭",
+        "enabling" => "正在关闭移动射频",
+        "disabling" => "正在恢复移动射频",
+        _ => "移动射频正常",
+    };
+    let mut airplane_mode = observed_airplane;
+    airplane_mode.enabled |= airplane_mode_requested;
+    let is_roaming = if binding.present {
+        get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    let mut proxy_status = line.data_proxy.status().await;
+    if profile.data_connection_enabled && !proxy_status.running && proxy_status.phase == "disabled"
+    {
+        proxy_status.phase = "connecting".to_string();
+        proxy_status.stage = if connected {
+            "移动数据已连接，正在启动代理监听"
+        } else {
+            "正在建立移动数据连接"
+        }
+        .to_string();
+    }
     LineNetworkControlsResponse {
         line_id: binding.line_id,
         modem_path: binding.modem_path,
@@ -2303,9 +2335,17 @@ async fn build_line_network_controls(
         data: LineDataConnectionResponse {
             enabled: profile.data_connection_enabled,
             connected,
-            proxy: line.data_proxy.status().await,
+            config: profile.data_proxy,
+            proxy: proxy_status,
+        },
+        roaming: RoamingResponse {
+            roaming_allowed: profile.roaming_allowed,
+            is_roaming,
         },
         airplane_mode,
+        airplane_mode_requested,
+        airplane_phase: airplane_phase.to_string(),
+        airplane_stage: airplane_stage.to_string(),
     }
 }
 
@@ -2332,6 +2372,38 @@ pub async fn get_line_network_controls_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", response)),
     )
+}
+
+async fn start_line_data_runtime(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+    profile: &LineProfileConfig,
+) -> Result<(), String> {
+    let binding = line.binding();
+    let apn = app.config_manager.get_apn_config();
+    modem_manager::connect_data_via_modem(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+        profile.roaming_allowed,
+        Some(&apn),
+    )
+    .await?;
+    let mut interface = None;
+    for _ in 0..15 {
+        interface =
+            modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+                .unwrap_or(None);
+        if interface.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let interface = interface.ok_or_else(|| "cellular_data_interface_unavailable".to_string())?;
+    line.data_proxy
+        .start(&interface, &profile.data_proxy)
+        .await?;
+    Ok(())
 }
 
 pub async fn set_line_data_connection_handler(
@@ -2362,44 +2434,7 @@ pub async fn set_line_data_connection_handler(
     }
 
     if payload.enabled {
-        let allow_roaming = app.config_manager.get_roaming_allowed();
-        let apn = app.config_manager.get_apn_config();
-        if let Err(error) = modem_manager::connect_data_via_modem(
-            app.dbus_conn.as_ref(),
-            &binding.modem_path,
-            allow_roaming,
-            Some(&apn),
-        )
-        .await
-        {
-            line.data_proxy.record_error(error.clone()).await;
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
-        }
-        let mut interface = None;
-        for _ in 0..15 {
-            interface = modem_manager::data_interface_for_modem(
-                app.dbus_conn.as_ref(),
-                &binding.modem_path,
-            )
-            .await
-            .unwrap_or(None);
-            if interface.is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
-        let Some(interface) = interface else {
-            let error = "cellular_data_interface_unavailable".to_string();
-            line.data_proxy.record_error(error.clone()).await;
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
-        };
-        if let Err(error) = line.data_proxy.start(&interface).await {
+        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
             return (
                 StatusCode::OK,
@@ -2443,6 +2478,120 @@ pub async fn set_line_data_connection_handler(
     )
 }
 
+pub async fn set_line_data_proxy_config_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<LineDataProxyConfig>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_data_proxy_config(&line_id, payload)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    if profile.data_connection_enabled {
+        let binding = line.binding();
+        if !binding.present {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error("line_not_present")),
+            );
+        }
+        let Some(interface) =
+            modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+                .unwrap_or(None)
+        else {
+            let error = "cellular_data_interface_unavailable".to_string();
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        };
+        if let Err(error) = line.data_proxy.start(&interface, &profile.data_proxy).await {
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
+    )
+}
+
+pub async fn set_line_roaming_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<RoamingRequest>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_roaming_allowed(&line_id, payload.allowed)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    if profile.data_connection_enabled {
+        let binding = line.binding();
+        if !binding.present {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error("line_not_present")),
+            );
+        }
+        line.data_proxy.stop().await;
+        let _ =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await;
+        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+            line.data_proxy.record_error(error.clone()).await;
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
+    )
+}
+
 pub async fn set_line_airplane_mode_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
@@ -2456,12 +2605,18 @@ pub async fn set_line_airplane_mode_handler(
         );
     };
     let binding = line.binding();
-    if !binding.present {
+    if !binding.present && payload.enabled {
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::error("line_not_present")),
         );
     }
+    let is_primary = app
+        .line_registry
+        .all()
+        .await
+        .first()
+        .is_some_and(|primary| primary.binding().line_id == line_id);
 
     if payload.enabled {
         match app.config_manager.set_line_airplane_mode(&line_id, true) {
@@ -2483,15 +2638,20 @@ pub async fn set_line_airplane_mode_handler(
             "line_airplane_mode_enabled",
         )
         .await;
-        let is_primary = app
-            .line_registry
-            .primary()
-            .await
-            .is_some_and(|primary| primary.binding().line_id == line_id);
         if is_primary {
             let _ = app.config_manager.set_data_enabled(false);
             app.data_user_disabled.store(true, Ordering::SeqCst);
             app.airplane_mode_requested.store(true, Ordering::SeqCst);
+        }
+    } else {
+        if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
+        if is_primary {
+            app.airplane_mode_requested.store(false, Ordering::SeqCst);
         }
     }
     if let Err(error) = modem_manager::set_airplane_mode_for_modem(
@@ -2505,22 +2665,6 @@ pub async fn set_line_airplane_mode_handler(
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
-    }
-    if !payload.enabled {
-        if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
-        }
-        let is_primary = app
-            .line_registry
-            .primary()
-            .await
-            .is_some_and(|primary| primary.binding().line_id == line_id);
-        if is_primary {
-            app.airplane_mode_requested.store(false, Ordering::SeqCst);
-        }
     }
     (
         StatusCode::OK,

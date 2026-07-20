@@ -107,11 +107,11 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
       <DialogContent dividers>
         <Stack spacing={2}>
           <Alert severity="info">
-            ePDG 默认来自运营商 MCC/MNC profile。可选择外部 profile，或把当前属性保存到设备的 vowifi-profiles.conf 自定义区。
+            内置运营商 profile 已编译在 SimAdmin 中。vowifi-profiles.conf 只保存用户新增或覆盖的连接属性，可在这里套用或写入。
           </Alert>
           <FormControl fullWidth>
-            <InputLabel>外部 ePDG profile</InputLabel>
-            <Select label="外部 ePDG profile" value="" onChange={(event) => {
+            <InputLabel>自定义 ePDG profile</InputLabel>
+            <Select label="自定义 ePDG profile" value="" onChange={(event) => {
               const profile = externalProfiles.find((item) => item.profile_id === event.target.value)
               if (profile) setDraft((current) => current ? { ...current, epdg_host: profile.epdg_host, epdg_port: profile.epdg_port, dns_server: profile.dns_server || '' } : current)
             }}>
@@ -168,12 +168,12 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             当前实时 VoWiFi 执行器仍沿用主线路运行时。本页已完成每线路配置与持久化，非主线路的独立 IKE/IMS 会话需要后续运行时拆分后才会真正建立。
           </Alert>
           {validationError && <Alert severity="error">{validationError}</Alert>}
-          {profileSaved && <Alert severity="success">已写入设备的 vowifi-profiles.conf 自定义区</Alert>}
+          {profileSaved && <Alert severity="success">已写入设备的 vowifi-profiles.conf</Alert>}
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={() => void saveAsExternalProfile()} disabled={saving || savingProfile || Boolean(validationError)}>{savingProfile ? '写入中...' : '保存为外部 profile'}</Button>
+        <Button onClick={() => void saveAsExternalProfile()} disabled={saving || savingProfile || Boolean(validationError)}>{savingProfile ? '写入中...' : '保存为自定义 profile'}</Button>
         <Button onClick={onClose} disabled={saving}>取消</Button>
         <Button variant="contained" onClick={() => void save()} disabled={saving || Boolean(validationError)}>
           {saving ? '保存中...' : '保存配置'}
