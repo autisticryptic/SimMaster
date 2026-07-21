@@ -425,7 +425,9 @@ pub async fn connect_live_for_line(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
-    if !config.feature_enabled || !config.connection_enabled {
+    // Per-line connection intent is authoritative. `feature_enabled` is kept
+    // only for compatibility with older configuration files and APIs.
+    if !config.connection_enabled {
         return Err(VolteError::new(code::RUNTIME_NOT_RUNNING));
     }
     let _advance = runtime.advance_guard().await;

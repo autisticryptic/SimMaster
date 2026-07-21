@@ -420,16 +420,12 @@ async fn modem_sms_paused_for_ims(
     if modem_sms_paused_for_vowifi(config_manager) {
         return true;
     }
-    let volte = config_manager.get_volte_config();
-    if !volte.feature_enabled || !volte.sms_enabled {
-        return false;
-    }
     line_registry
         .for_modem_path(modem_path)
         .await
         .is_some_and(|line| {
             let profile = config_manager.get_line_profile(&line.binding().line_id);
-            profile.volte_connection_enabled || volte.connection_enabled
+            profile.enabled && profile.volte_connection_enabled
         })
 }
 
