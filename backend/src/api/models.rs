@@ -264,6 +264,7 @@ pub struct LineDataConnectionResponse {
     pub enabled: bool,
     pub connected: bool,
     pub config: crate::infra::config::LineDataProxyConfig,
+    pub password_set: bool,
     pub proxy: crate::cellular::data_proxy::DataProxyStatus,
 }
 

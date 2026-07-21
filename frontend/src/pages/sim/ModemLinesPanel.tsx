@@ -51,6 +51,12 @@ function runtimeLabel(line: VolteLineControlResponse) {
   return 'IMS 未连接'
 }
 
+function voiceAccessLabel(line: VolteLineControlResponse, vowifi?: VowifiLineConfigResponse) {
+  if (vowifi?.runtime_registered) return 'VoWiFi'
+  if (line.runtime.registered) return 'VoLTE'
+  return 'CS 语音'
+}
+
 function modemStateLabel(state: string) {
   const labels: Record<string, string> = {
     registered: '已驻网',
@@ -362,11 +368,6 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
             const vowifiLine = vowifiByLineId.get(line.modem.line_id)
             const network = networkByLineId.get(line.modem.line_id)
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
-            const runtimeColor = line.runtime.registered
-              ? 'success'
-              : line.profile.volte_connection_enabled
-                ? 'warning'
-                : 'default'
             const recovery = recoveryMessage(line)
             const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
             return (
@@ -388,7 +389,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Chip size="small" label={line.modem.present ? '在线' : '离线'} color={line.modem.present ? 'success' : 'default'} variant="outlined" />
                         {line.modem.slot_conflict && <Chip size="small" label="槽位冲突" color="error" />}
                         <Chip size="small" label={modemSlotSourceLabel(line.modem.slot_source, line.modem.slot_stable)} color={line.modem.slot_stable ? 'success' : 'warning'} variant="outlined" />
-                        <Chip size="small" label={runtimeLabel(line)} color={runtimeColor} />
+                        <Chip size="small" label={`主线路 · ${voiceAccessLabel(line, vowifiLine)}`} color={vowifiLine?.runtime_registered || line.runtime.registered ? 'primary' : 'default'} variant="outlined" />
                       </Stack>
                     }
                   />
@@ -568,7 +569,6 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
                           <Wifi color="action" fontSize="small" />
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
-                          {vowifiLine?.is_primary && <Chip size="small" label="主运行线路" variant="outlined" />}
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
                           {vowifiLine?.config.epdg_host || '使用运营商 profile ePDG'}

@@ -4,8 +4,9 @@ import Grid from '@mui/material/Grid'
 import { Close } from '@mui/icons-material'
 import type { TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse } from '../../api/current'
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId } from '../../components/modemLineFormat'
+import LineCellularSettings from './LineCellularSettings'
 
-export type LineDetailTab = 'basic' | 'cs' | 'volte' | 'vowifi' | 'trunk'
+export type LineDetailTab = 'basic' | 'cs' | 'volte' | 'vowifi' | 'trunk' | 'cells' | 'apn' | 'operator'
 
 type Props = {
   open: boolean
@@ -31,6 +32,9 @@ export default function LineDetailsDialog({ open, line, trunk, vowifi, initialTa
     { value: 'volte', label: 'VoLTE' },
     { value: 'vowifi', label: 'VoWiFi' },
     { value: 'trunk', label: 'Trunk' },
+    { value: 'cells', label: '小区与锁定' },
+    { value: 'apn', label: 'APN 配置' },
+    { value: 'operator', label: '运营商管理' },
   ]
 
   return (
@@ -51,6 +55,7 @@ export default function LineDetailsDialog({ open, line, trunk, vowifi, initialTa
         {tab === 'volte' && <Grid container spacing={2}><Grid size={{ xs: 12, sm: 4 }}><Field label="IMS 阶段" value={`${line.runtime.phase} / ${line.runtime.stage}`} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="注册状态" value={line.runtime.registered ? <Chip size="small" color="success" label="已注册" /> : '未注册'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="注册方式" value={line.runtime.registration_mode || '未确定'} /></Grid><Grid size={{ xs: 12, sm: 6 }}><Field label="IMS 数据路径" value={line.runtime.data_path_mode || '尚未建立'} /></Grid><Grid size={{ xs: 12, sm: 6 }}><Field label="P-CSCF" value={line.runtime.pcscf || '尚未发现'} /></Grid>{line.runtime.last_error && <Grid size={12}><Alert severity="warning">{line.runtime.last_error}</Alert></Grid>}</Grid>}
         {tab === 'vowifi' && vowifi && <Grid container spacing={2}><Grid size={{ xs: 12, sm: 4 }}><Field label="运行阶段" value={`${vowifi.runtime_phase} / ${vowifi.runtime_stage}`} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="IMS 注册" value={vowifi.runtime_registered ? '已注册' : '未注册'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="运行范围" value={vowifi.runtime_scope === 'primary_shared_runtime' ? '主线路实时运行时' : '仅保存线路配置'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="ePDG" value={vowifi.config.epdg_host || '运营商自动发现'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="DNS" value={vowifi.config.dns_server || '系统解析器'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="运营商 profile" value={vowifi.matched_profile_id || '尚未匹配'} /></Grid><Grid size={{ xs: 12, sm: 6 }}><Field label="代理模式" value={vowifi.config.proxy_mode} /></Grid><Grid size={{ xs: 12, sm: 6 }}><Field label="代理端点" value={vowifi.config.proxy_endpoint || '直连'} /></Grid>{vowifi.runtime_error && <Grid size={12}><Alert severity="warning">{vowifi.runtime_error}</Alert></Grid>}{!vowifi.is_primary && <Grid size={12}><Alert severity="info">该线路目前只完成独立配置持久化，实时 IKE/IMS 执行器仍仅接入主线路。</Alert></Grid>}</Grid>}
         {tab === 'trunk' && <Grid container spacing={2}><Grid size={{ xs: 12, sm: 4 }}><Field label="运行阶段" value={trunk ? `${trunk.runtime.phase} / ${trunk.runtime.stage}` : '未加载'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="注册状态" value={trunk?.runtime.registered ? '已注册' : '未注册'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="本地 SIP" value={trunk?.runtime.local_endpoint || '未监听'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="Asterisk Peer" value={trunk?.runtime.peer || '未解析'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="REGISTER / 重连" value={trunk ? `${trunk.runtime.register_attempts} / ${trunk.runtime.reconnect_count}` : '0 / 0'} /></Grid><Grid size={{ xs: 12, sm: 4 }}><Field label="通话 / 对话" value={trunk ? `${trunk.runtime.active_calls} / ${trunk.runtime.active_dialogs}` : '0 / 0'} /></Grid>{trunk?.runtime.last_error && <Grid size={12}><Alert severity="error">{trunk.runtime.last_error}</Alert></Grid>}</Grid>}
+        {(tab === 'cells' || tab === 'apn' || tab === 'operator') && <LineCellularSettings section={tab} lineLabel={`${modemSlotLabel(line.modem)} · 卡槽 ${line.modem.uim_slot}`} />}
       </DialogContent>
     </Dialog>
   )

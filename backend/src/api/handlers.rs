@@ -2335,7 +2335,8 @@ async fn build_line_network_controls(
         data: LineDataConnectionResponse {
             enabled: profile.data_connection_enabled,
             connected,
-            config: profile.data_proxy,
+            password_set: !profile.data_proxy.password.is_empty(),
+            config: profile.data_proxy.redacted(),
             proxy: proxy_status,
         },
         roaming: RoamingResponse {
@@ -2481,7 +2482,7 @@ pub async fn set_line_data_connection_handler(
 pub async fn set_line_data_proxy_config_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<LineDataProxyConfig>,
+    Json(mut payload): Json<LineDataProxyConfig>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
@@ -2490,6 +2491,16 @@ pub async fn set_line_data_proxy_config_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    let current = app.config_manager.get_line_profile(&line_id).data_proxy;
+    payload.username = payload.username.trim().to_string();
+    if !payload.username.is_empty()
+        && payload.password.is_empty()
+        && payload.username == current.username
+        && !current.password.is_empty()
+    {
+        // An empty password from the redacted edit form means “keep saved”.
+        payload.password = current.password;
+    }
     let profile = match app
         .config_manager
         .set_line_data_proxy_config(&line_id, payload)

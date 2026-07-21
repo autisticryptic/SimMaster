@@ -1603,11 +1603,15 @@ mod tests {
                 LineDataProxyConfig {
                     listen_ip: " 127.0.0.1 ".to_string(),
                     listen_port: 1080,
+                    username: " proxy-user ".to_string(),
+                    password: "proxy-pass".to_string(),
                 },
             )
             .unwrap();
         assert_eq!(profile.data_proxy.listen_ip, "127.0.0.1");
         assert_eq!(profile.data_proxy.listen_port, 1080);
+        assert_eq!(profile.data_proxy.username, "proxy-user");
+        assert_eq!(profile.data_proxy.password, "proxy-pass");
         assert!(
             !manager
                 .set_line_roaming_allowed(line_id, false)
@@ -1618,6 +1622,7 @@ mod tests {
         let reloaded = ConfigManager::new(path.clone()).get_line_profile(line_id);
         assert_eq!(reloaded.data_proxy.listen_ip, "127.0.0.1");
         assert_eq!(reloaded.data_proxy.listen_port, 1080);
+        assert_eq!(reloaded.data_proxy.username, "proxy-user");
         assert!(!reloaded.roaming_allowed);
         assert_eq!(
             manager
@@ -1626,10 +1631,23 @@ mod tests {
                     LineDataProxyConfig {
                         listen_ip: "not-an-ip".to_string(),
                         listen_port: 0,
+                        ..LineDataProxyConfig::default()
                     },
                 )
                 .unwrap_err(),
             "data_proxy_listen_ip_invalid"
+        );
+        assert_eq!(
+            manager
+                .set_line_data_proxy_config(
+                    line_id,
+                    LineDataProxyConfig {
+                        username: "user-only".to_string(),
+                        ..LineDataProxyConfig::default()
+                    },
+                )
+                .unwrap_err(),
+            "data_proxy_auth_credentials_incomplete"
         );
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2840,6 +2858,12 @@ pub struct LineDataProxyConfig {
     /// Zero asks the operating system to allocate an available port.
     #[serde(default)]
     pub listen_port: u16,
+    /// Optional proxy credentials. Authentication is disabled only when both
+    /// fields are empty; partial credentials are rejected during validation.
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
 }
 
 impl Default for LineDataProxyConfig {
@@ -2847,6 +2871,17 @@ impl Default for LineDataProxyConfig {
         Self {
             listen_ip: default_data_proxy_listen_ip(),
             listen_port: 0,
+            username: String::new(),
+            password: String::new(),
+        }
+    }
+}
+
+impl LineDataProxyConfig {
+    pub fn redacted(&self) -> Self {
+        Self {
+            password: String::new(),
+            ..self.clone()
         }
     }
 }
@@ -2917,6 +2952,7 @@ impl LineProfileConfig {
     pub fn redacted(&self) -> Self {
         Self {
             trunk: self.trunk.redacted(),
+            data_proxy: self.data_proxy.redacted(),
             ..self.clone()
         }
     }
@@ -2930,8 +2966,15 @@ fn valid_line_id(line_id: &str) -> bool {
 
 fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(), String> {
     config.listen_ip = config.listen_ip.trim().to_string();
+    config.username = config.username.trim().to_string();
     if config.listen_ip.parse::<std::net::IpAddr>().is_err() {
         return Err("data_proxy_listen_ip_invalid".to_string());
+    }
+    if config.username.is_empty() != config.password.is_empty() {
+        return Err("data_proxy_auth_credentials_incomplete".to_string());
+    }
+    if config.username.len() > u8::MAX as usize || config.password.len() > u8::MAX as usize {
+        return Err("data_proxy_auth_credentials_too_long".to_string());
     }
     Ok(())
 }

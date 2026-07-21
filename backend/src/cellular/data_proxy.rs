@@ -2,6 +2,7 @@
 
 use std::{io, net::SocketAddr};
 
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -23,6 +24,7 @@ pub struct DataProxyStatus {
     pub port: Option<u16>,
     pub interface_name: Option<String>,
     pub protocols: Vec<String>,
+    pub auth_required: bool,
     pub last_error: Option<String>,
 }
 
@@ -36,6 +38,7 @@ impl Default for DataProxyStatus {
             port: None,
             interface_name: None,
             protocols: Vec::new(),
+            auth_required: false,
             last_error: None,
         }
     }
@@ -44,6 +47,7 @@ impl Default for DataProxyStatus {
 #[derive(Default)]
 struct ProxyState {
     status: DataProxyStatus,
+    auth: Option<(String, String)>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -73,6 +77,8 @@ impl DataProxyRuntime {
             && state.status.interface_name.as_deref() == Some(interface_name)
             && state.status.listen_ip.as_deref() == Some(config.listen_ip.as_str())
             && (config.listen_port == 0 || state.status.port == Some(config.listen_port))
+            && state.status.auth_required == !config.username.is_empty()
+            && state.auth.as_ref() == Some(&(config.username.clone(), config.password.clone()))
         {
             return Ok(state.status.clone());
         }
@@ -91,6 +97,8 @@ impl DataProxyRuntime {
             .port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let outbound_interface = interface_name.to_string();
+        let username = config.username.clone();
+        let password = config.password.clone();
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -99,8 +107,9 @@ impl DataProxyRuntime {
                         match accepted {
                             Ok((stream, _)) => {
                                 let interface = outbound_interface.clone();
+                                let auth = ProxyAuth::new(username.clone(), password.clone());
                                 tokio::spawn(async move {
-                                    if let Err(error) = serve_client(stream, &interface).await {
+                                    if let Err(error) = serve_client(stream, &interface, &auth).await {
                                         tracing::debug!(interface = %interface, error = %error, "Cellular data proxy client closed");
                                     }
                                 });
@@ -123,10 +132,12 @@ impl DataProxyRuntime {
             port: Some(port),
             interface_name: Some(interface_name.to_string()),
             protocols: vec!["http".to_string(), "socks5".to_string()],
+            auth_required: !config.username.is_empty(),
             last_error: None,
         };
         state.shutdown = Some(shutdown_tx);
         state.task = Some(task);
+        state.auth = Some((config.username.clone(), config.password.clone()));
         Ok(state.status.clone())
     }
 
@@ -160,32 +171,66 @@ async fn stop_locked(state: &mut ProxyState) {
     state.status.port = None;
     state.status.interface_name = None;
     state.status.protocols.clear();
+    state.status.auth_required = false;
     state.status.last_error = None;
+    state.auth = None;
 }
 
-async fn serve_client(inbound: TcpStream, interface_name: &str) -> io::Result<()> {
+#[derive(Clone)]
+struct ProxyAuth {
+    username: String,
+    password: String,
+}
+
+impl ProxyAuth {
+    fn new(username: String, password: String) -> Self {
+        Self { username, password }
+    }
+
+    fn required(&self) -> bool {
+        !self.username.is_empty()
+    }
+
+    fn matches(&self, username: &[u8], password: &[u8]) -> bool {
+        username == self.username.as_bytes() && password == self.password.as_bytes()
+    }
+}
+
+async fn serve_client(
+    inbound: TcpStream,
+    interface_name: &str,
+    auth: &ProxyAuth,
+) -> io::Result<()> {
     let mut first = [0u8; 1];
     let count = inbound.peek(&mut first).await?;
     if count == 0 {
         return Ok(());
     }
     if first[0] == 0x05 {
-        serve_socks5(inbound, interface_name).await
+        serve_socks5(inbound, interface_name, auth).await
     } else {
-        serve_http_proxy(inbound, interface_name).await
+        serve_http_proxy(inbound, interface_name, auth).await
     }
 }
 
-async fn serve_socks5(mut inbound: TcpStream, interface_name: &str) -> io::Result<()> {
+async fn serve_socks5(
+    mut inbound: TcpStream,
+    interface_name: &str,
+    auth: &ProxyAuth,
+) -> io::Result<()> {
     let version = inbound.read_u8().await?;
     let method_count = inbound.read_u8().await? as usize;
     let mut methods = vec![0u8; method_count];
     inbound.read_exact(&mut methods).await?;
-    if version != 5 || !methods.contains(&0) {
+    let selected_method = if auth.required() { 2 } else { 0 };
+    if version != 5 || !methods.contains(&selected_method) {
         inbound.write_all(&[5, 0xff]).await?;
         return Ok(());
     }
-    inbound.write_all(&[5, 0]).await?;
+    inbound.write_all(&[5, selected_method]).await?;
+    if selected_method == 2 && !authenticate_socks5(&mut inbound, auth).await? {
+        return Ok(());
+    }
 
     let version = inbound.read_u8().await?;
     let command = inbound.read_u8().await?;
@@ -229,11 +274,28 @@ async fn serve_socks5(mut inbound: TcpStream, interface_name: &str) -> io::Resul
     Ok(())
 }
 
+async fn authenticate_socks5(inbound: &mut TcpStream, auth: &ProxyAuth) -> io::Result<bool> {
+    let version = inbound.read_u8().await?;
+    let username_len = inbound.read_u8().await? as usize;
+    let mut username = vec![0; username_len];
+    inbound.read_exact(&mut username).await?;
+    let password_len = inbound.read_u8().await? as usize;
+    let mut password = vec![0; password_len];
+    inbound.read_exact(&mut password).await?;
+    let accepted = version == 1 && auth.matches(&username, &password);
+    inbound.write_all(&[1, u8::from(!accepted)]).await?;
+    Ok(accepted)
+}
+
 async fn write_socks_reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
     stream.write_all(&[5, code, 0, 1, 0, 0, 0, 0, 0, 0]).await
 }
 
-async fn serve_http_proxy(mut inbound: TcpStream, interface_name: &str) -> io::Result<()> {
+async fn serve_http_proxy(
+    mut inbound: TcpStream,
+    interface_name: &str,
+    auth: &ProxyAuth,
+) -> io::Result<()> {
     let mut header = Vec::with_capacity(2048);
     let header_end = loop {
         if header.len() >= MAX_HTTP_HEADER_BYTES {
@@ -257,6 +319,11 @@ async fn serve_http_proxy(mut inbound: TcpStream, interface_name: &str) -> io::R
     let method = parts.next().unwrap_or_default();
     let target = parts.next().unwrap_or_default();
     let version = parts.next().unwrap_or("HTTP/1.1");
+
+    if auth.required() && !http_proxy_authorized(head, auth) {
+        write_http_proxy_auth_required(&mut inbound).await?;
+        return Ok(());
+    }
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(target, 443)?;
@@ -284,15 +351,66 @@ async fn serve_http_proxy(mut inbound: TcpStream, interface_name: &str) -> io::R
             return Ok(());
         }
     };
-    let rewritten = format!("{method} {origin_target} {version}\r\n");
+    let rewritten = rewrite_http_request_head(head, method, &origin_target, version);
     outbound.write_all(rewritten.as_bytes()).await?;
-    let first_line_bytes = first_line.len() + 2;
-    outbound.write_all(&header[first_line_bytes..]).await?;
     if header.len() > header_end {
         outbound.write_all(&header[header_end..]).await?;
     }
     let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
     Ok(())
+}
+
+fn http_proxy_authorized(head: &str, auth: &ProxyAuth) -> bool {
+    head.lines().skip(1).any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        if !name.eq_ignore_ascii_case("proxy-authorization") {
+            return false;
+        }
+        let Some((scheme, encoded)) = value.trim().split_once(char::is_whitespace) else {
+            return false;
+        };
+        if !scheme.eq_ignore_ascii_case("basic") {
+            return false;
+        }
+        BASE64_STANDARD
+            .decode(encoded.trim())
+            .ok()
+            .is_some_and(|decoded| auth.matches_basic_credentials(&decoded))
+    })
+}
+
+impl ProxyAuth {
+    fn matches_basic_credentials(&self, decoded: &[u8]) -> bool {
+        let Some(separator) = decoded.iter().position(|byte| *byte == b':') else {
+            return false;
+        };
+        self.matches(&decoded[..separator], &decoded[separator + 1..])
+    }
+}
+
+fn rewrite_http_request_head(head: &str, method: &str, target: &str, version: &str) -> String {
+    let mut rewritten = format!("{method} {target} {version}\r\n");
+    for line in head.lines().skip(1) {
+        let is_proxy_auth = line
+            .split_once(':')
+            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("proxy-authorization"));
+        if !line.is_empty() && !is_proxy_auth {
+            rewritten.push_str(line);
+            rewritten.push_str("\r\n");
+        }
+    }
+    rewritten.push_str("\r\n");
+    rewritten
+}
+
+async fn write_http_proxy_auth_required(stream: &mut TcpStream) -> io::Result<()> {
+    stream
+        .write_all(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"SimAdmin cellular proxy\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
 }
 
 fn find_header_end(bytes: &[u8]) -> Option<usize> {
@@ -407,6 +525,7 @@ mod tests {
                 &LineDataProxyConfig {
                     listen_ip: "127.0.0.1".to_string(),
                     listen_port: 0,
+                    ..LineDataProxyConfig::default()
                 },
             )
             .await
@@ -443,5 +562,54 @@ mod tests {
             find_header_end(b"GET / HTTP/1.1\r\nHost: x\r\n\r\nbody"),
             Some(27)
         );
+    }
+
+    #[test]
+    fn validates_http_basic_credentials_and_strips_proxy_header() {
+        let auth = ProxyAuth::new("alice".to_string(), "secret".to_string());
+        let encoded = BASE64_STANDARD.encode("alice:secret");
+        let head = format!(
+            "GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\nProxy-Authorization: Basic {encoded}\r\n\r\n"
+        );
+        assert!(http_proxy_authorized(&head, &auth));
+        let rewritten = rewrite_http_request_head(&head, "GET", "/", "HTTP/1.1");
+        assert!(!rewritten
+            .to_ascii_lowercase()
+            .contains("proxy-authorization"));
+    }
+
+    #[tokio::test]
+    async fn requires_socks5_username_password_handshake() {
+        let runtime = DataProxyRuntime::default();
+        let status = runtime
+            .start(
+                "test-interface",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                    username: "alice".to_string(),
+                    password: "secret".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(status.auth_required);
+        let mut client = TcpStream::connect(("127.0.0.1", status.port.unwrap()))
+            .await
+            .unwrap();
+        client.write_all(&[5, 1, 2]).await.unwrap();
+        let mut method = [0; 2];
+        client.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 2]);
+        client
+            .write_all(&[
+                1, 5, b'a', b'l', b'i', b'c', b'e', 6, b's', b'e', b'c', b'r', b'e', b't',
+            ])
+            .await
+            .unwrap();
+        let mut result = [0; 2];
+        client.read_exact(&mut result).await.unwrap();
+        assert_eq!(result, [1, 0]);
+        runtime.stop().await;
     }
 }

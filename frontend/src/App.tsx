@@ -13,7 +13,6 @@ const SECURITY_SETTINGS_UPDATED_EVENT = 'simadmin-security-settings-updated'
 // 路由级别代码分割 - 按需加载页面组件
 const Dashboard = lazy(() => import('./pages/Dashboard'))
 const SimCard = lazy(() => import('./pages/SimCard'))
-const Network = lazy(() => import('./pages/Network'))
 const DeviceNetwork = lazy(() => import('./pages/DeviceNetwork'))
 const SMS = lazy(() => import('./pages/SMS'))
 const NotificationCenter = lazy(() => import('./pages/NotificationCenter'))
@@ -125,12 +124,12 @@ function App() {
               <Route index element={<Suspense fallback={<PageLoading />}><Dashboard /></Suspense>} />
               <Route path="sim" element={<Suspense fallback={<PageLoading />}><SimCard /></Suspense>} />
               <Route path="esim" element={<Navigate to="/sim?tab=esim" replace />} />
-              <Route path="network" element={<Suspense fallback={<PageLoading />}><Network /></Suspense>} />
+              <Route path="network" element={<Navigate to="/device-network" replace />} />
               <Route path="device-network" element={<Suspense fallback={<PageLoading />}><DeviceNetwork /></Suspense>} />
               <Route path="vowifi" element={<Navigate to="/sim?tab=vowifi" replace />} />
               {/* 旧路由重定向到网络状态页面 */}
-              <Route path="network-interfaces" element={<Navigate to="/network" replace />} />
-              <Route path="band-lock" element={<Navigate to="/network" replace />} />
+              <Route path="network-interfaces" element={<Navigate to="/device-network" replace />} />
+              <Route path="band-lock" element={<Navigate to="/device-network" replace />} />
               <Route path="sms" element={<Suspense fallback={<PageLoading />}><SMS /></Suspense>} />
               <Route path="notifications" element={<Suspense fallback={<PageLoading />}><NotificationCenter /></Suspense>} />
               <Route path="automation" element={<Suspense fallback={<PageLoading />}><AutomationCenter /></Suspense>} />

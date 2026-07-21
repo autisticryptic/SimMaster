@@ -562,6 +562,8 @@ export interface LineProfileConfig {
 export interface LineDataProxyConfig {
   listen_ip: string
   listen_port: number
+  username?: string
+  password?: string
 }
 
 export interface DataProxyStatus {
@@ -572,6 +574,7 @@ export interface DataProxyStatus {
   port?: number | null
   interface_name?: string | null
   protocols: string[]
+  auth_required?: boolean
   last_error?: string | null
 }
 
@@ -583,6 +586,7 @@ export interface LineNetworkControlsResponse {
     enabled: boolean
     connected: boolean
     config: LineDataProxyConfig
+    password_set?: boolean
     proxy: DataProxyStatus
   }
   roaming: RoamingResponse

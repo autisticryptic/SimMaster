@@ -15,7 +15,6 @@ import {
 } from '@mui/material'
 import {
   Dashboard as DashboardIcon,
-  SignalCellularAlt as SignalIcon,
   Settings as SettingsIcon,
   Sms as SmsIcon,
   NotificationsActive as NotificationsIcon,
@@ -66,7 +65,6 @@ const menuGroups: MenuConfigItem[] = [
     type: 'group',
     label: '网络',
     items: [
-      { path: '/network', label: '蜂窝网络', icon: SignalIcon },
       { path: '/device-network', label: '设备网络', icon: RouterIcon },
     ],
   },

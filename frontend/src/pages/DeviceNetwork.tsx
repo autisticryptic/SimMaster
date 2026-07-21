@@ -45,6 +45,7 @@ import {
   Settings,
   SettingsEthernet,
   Terminal,
+  Router,
   Wifi,
   WifiOff,
 } from '@mui/icons-material'
@@ -52,6 +53,7 @@ import { api, type DdnsConfig, type DdnsLogEntry, type DdnsStatusResponse, type 
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import { useRefreshInterval } from '../contexts/RefreshContext'
 import { publicIpv6AddressEntries } from '@/utils/ip'
+import NetworkInterfacesPanel from './device-network/NetworkInterfacesPanel'
 
 const CONFIRM_CLOSE_WLAN = '确认关闭 WLAN'
 const CARD_TITLE_TYPOGRAPHY = { variant: 'subtitle1', fontWeight: 700 } as const
@@ -483,7 +485,7 @@ export default function DeviceNetworkPage() {
   }, [])
 
   useEffect(() => {
-    if (tabValue !== 1) return undefined
+    if (tabValue !== 2) return undefined
 
     let cancelled = false
     const loadDdnsRuntime = async () => {
@@ -648,7 +650,7 @@ export default function DeviceNetworkPage() {
   }, [refreshWlanProfiles])
 
   useEffect(() => {
-    if (tabValue !== 0 || !wlanStatus?.enabled) return
+    if (tabValue !== 1 || !wlanStatus?.enabled) return
     void scanWlan()
   }, [scanWlan, tabValue, wlanStatus?.enabled])
 
@@ -1025,7 +1027,7 @@ export default function DeviceNetworkPage() {
           设备网络
         </Typography>
         <Typography variant="body2" color="text.secondary">
-          管理设备 WLAN 联网、DDNS 动态解析和远程管理网络出口
+          查看设备网络接口，管理 WLAN 联网、DDNS 动态解析和远程管理网络出口
         </Typography>
       </Box>
 
@@ -1042,12 +1044,17 @@ export default function DeviceNetworkPage() {
 
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={tabValue} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
+          <Tab label="网络接口" icon={<Router />} iconPosition="start" />
           <Tab label="WLAN" icon={<Wifi />} iconPosition="start" />
           <Tab label="DDNS" icon={<Dns />} iconPosition="start" />
         </Tabs>
       </Box>
 
       <TabPanel value={tabValue} index={0}>
+        <NetworkInterfacesPanel interfaces={networkInterfaces} />
+      </TabPanel>
+
+      <TabPanel value={tabValue} index={1}>
             <Card sx={{ mb: 3 }}>
               <Toolbar sx={{ minHeight: 64, px: { xs: 2, sm: 3 }, gap: 2, flexWrap: 'wrap' }}>
                 <Box display="flex" alignItems="center" gap={1}>
@@ -1306,7 +1313,7 @@ export default function DeviceNetworkPage() {
             </Box>
           </TabPanel>
 
-      <TabPanel value={tabValue} index={1}>
+      <TabPanel value={tabValue} index={2}>
         <Box display="grid" gridTemplateColumns={{ xs: '1fr', lg: '360px minmax(0, 1fr)' }} gap={3} alignItems="stretch">
           <Card sx={{ gridColumn: { xs: 'auto', lg: '1 / span 2' }, gridRow: { xs: 'auto', lg: '1' } }}>
             <CardContent sx={{ py: 2 }}>
