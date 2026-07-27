@@ -37,9 +37,8 @@ use crate::{
 
 use super::{
     bearer::{
-        configure_bearer_network, disconnect_bearer, disconnect_existing_ims_bearers,
-        ensure_ims_bearer_observed, route_pcscf, teardown_bearer_network, BearerAttempt,
-        BearerConnection, BearerRequest,
+        configure_bearer_network, disconnect_bearer, ensure_ims_bearer_observed, route_pcscf,
+        teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
     data_slot::DataSlotMode,
@@ -48,10 +47,7 @@ use super::{
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
-    pcscf::{
-        configured_ims_cid, discover_pcscf, discover_pcscf_via_at_with_context, pcscf_socket,
-        ImsAtContextLease,
-    },
+    pcscf::{discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket},
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
     rtp_relay::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
@@ -178,7 +174,6 @@ struct VolteLiveSession {
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
-    at_context: Option<ImsAtContextLease>,
     register_ids: RequestIds,
     next_register_cseq: u32,
     sip_instance: String,
@@ -633,20 +628,16 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::ImsContext)
         .await;
-    disconnect_existing_ims_bearers(&device.modem_id).await?;
 
     // beta2-aligned P-CSCF ordering: the bearer is brought up *first*, and its
     // own P-CSCF (delivered via PCO on the ModemManager path, or read directly
     // from the QMI WDS session on the native path) is used before anything else.
-    // The AT `$QCPDPIMSCFGE` + `CGACT=1,<cid>` probe — which wedges the baseband
-    // on some Qualcomm firmware — is demoted to a *last-resort fallback* that only
-    // runs after the bearer is up and only if it delivered no P-CSCF. This mirrors
-    // beta2's discovery order (profile → bearer/WDS → AT) and means the risky AT
-    // sequence no longer runs on every connect.
-    let ims_cid = configured_ims_cid();
-    // Record the resolved IMS CID so every subsequent attempt row carries it as
-    // a structured field (auto-captured by `record_attempt`).
-    runtime.update(|state| state.at_cid = Some(ims_cid)).await;
+    // The last-resort AT fallback now reads only the active IMS context after
+    // the bearer is up. It does not activate, deactivate, or rewrite a PDP
+    // context, because ModemManager owns that lifecycle.
+    // A matching connected IMS bearer is reused by `ensure_ims_bearer`; only a
+    // stale or policy-mismatched object is recreated. Preserving the connected
+    // bearer also preserves the PCO state used for P-CSCF discovery.
     ensure_generation(runtime, generation)?;
     device = resolve_device_binding(&device).await?;
 
@@ -740,17 +731,10 @@ async fn connect_inner(
     // P-CSCF now follows the beta2 discovery order: the bearer is brought up
     // first, and its own PCO (ModemManager's bearer settings, or the native
     // QMI WDS `--wds-get-current-settings` read) is the primary source. The AT
-    // `$QCPDPIMSCFGE` + `CGACT=1,<cid>` probe — which can wedge this firmware's
-    // baseband — is demoted to a last-resort fallback that only runs when the
-    // bearer delivered no P-CSCF at all. This mirrors beta2's
-    // "discovered directly from QMI WDS" → "discovered from active IMS bearer"
-    // (AT) ordering and stops the dangerous AT sequence from running on every
-    // connect.
-    let mut at_context: Option<ImsAtContextLease> = None;
+    // The read-only AT fallback mirrors beta2's "discovered from active IMS
+    // bearer" path without disturbing the bearer that ModemManager owns.
     if bearer.settings.pcscf.is_empty() {
-        tracing::info!(
-            "VoLTE bearer delivered no P-CSCF via PCO; falling back to AT $QCPDPIMSCFGE discovery"
-        );
+        tracing::info!("VoLTE bearer delivered no P-CSCF via PCO; reading the active IMS context");
         runtime
             .record_attempt(
                 VolteStage::Pcscf,
@@ -760,7 +744,7 @@ async fn connect_inner(
                 Some("at_cgcontrdp_fallback".to_string()),
             )
             .await;
-        match discover_pcscf_via_at_with_context(&device.modem_id, &plan).await {
+        match discover_pcscf_via_active_at_context(&device.modem_id, &plan).await {
             Ok(discovery) => {
                 runtime
                     .record_attempt(
@@ -779,7 +763,6 @@ async fn connect_inner(
                         bearer.settings.pcscf.push(candidate);
                     }
                 }
-                at_context = discovery.context;
             }
             Err(error) => {
                 runtime
@@ -793,7 +776,7 @@ async fn connect_inner(
                     .await;
                 tracing::warn!(
                     error = %error,
-                    "VoLTE AT P-CSCF fallback failed; the SIP loop will still try DNS discovery"
+                    "VoLTE active-context P-CSCF fallback failed; the SIP loop will still try DNS discovery"
                 );
             }
         }
@@ -907,12 +890,8 @@ async fn connect_inner(
         if let Some(established) = native_bearer.take() {
             native_bearer::release_native_ims_bearer(established).await;
         }
-        if let Some(context) = at_context.take() {
-            context.cleanup().await;
-        }
     }
     result.map(|mut session| {
-        session.at_context = at_context;
         // Hand the session ownership of the native bearer so `cleanup_live_session`
         // can stop the WDS session and release its client id. Without this the PDP
         // context would outlive the SIP session.
@@ -1069,7 +1048,6 @@ async fn connect_family(
         pcscf: pcscf_socket(pcscf),
         ip_family: ip_family_name(local_addr),
         xfrm_plan: authenticator.xfrm_plan,
-        at_context: None,
         // Attached by `connect_inner`, which owns it until the session is known
         // to be good.
         native_bearer: None,
@@ -1417,9 +1395,6 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
         match session.native_bearer {
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
             None => disconnect_bearer(&session.bearer.path).await,
-        }
-        if let Some(context) = session.at_context {
-            context.cleanup().await;
         }
     }
 }

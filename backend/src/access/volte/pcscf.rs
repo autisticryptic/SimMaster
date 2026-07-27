@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, process::Command, time::sleep};
+use tokio::{net::UdpSocket, process::Command};
 
 use crate::infra::config::VolteIpFamilyPreference;
 
@@ -31,33 +31,10 @@ const SIP_PORT: u16 = 5060;
 const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
 const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
 const DEFAULT_IMS_CID: u8 = 2;
-const AT_CONTEXT_SETTLE: Duration = Duration::from_secs(3);
-const AT_DISCOVERY_ROUNDS: usize = 3;
-
-/// An IMS PDP context kept alive while the dedicated bearer is negotiated.
-///
-/// Qualcomm exposes P-CSCF PCO only while this context is active. The
-/// reference runtime retains CID 2 through WDS probing and bearer creation,
-/// then restores the original context during session teardown.
-#[derive(Debug, Clone)]
-pub struct ImsAtContextLease {
-    pub modem: String,
-    pub cid: u8,
-    restore_command: String,
-}
-
-impl ImsAtContextLease {
-    pub async fn cleanup(self) {
-        let _ = run_at(&self.modem, &format!("AT+CGACT=0,{}", self.cid)).await;
-        let _ = run_at(&self.modem, &format!("AT$QCPDPIMSCFGE={},0,0,0", self.cid)).await;
-        let _ = run_at(&self.modem, &self.restore_command).await;
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct AtPcscfDiscovery {
     pub candidates: Vec<IpAddr>,
-    pub context: Option<ImsAtContextLease>,
     pub cid: u8,
 }
 
@@ -159,82 +136,59 @@ pub fn configured_ims_cid() -> u8 {
         .unwrap_or(DEFAULT_IMS_CID)
 }
 
-/// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
+/// Discover P-CSCF candidates from the IMS context that ModemManager already
+/// activated for the connected bearer.
 ///
-/// Keeping the context is intentional: on the 410 firmware, cleaning CID 2
-/// immediately after `+CGCONTRDP` makes the subsequent IPv6 WDS request fail
-/// with `prefix-unavailable` even though the same request succeeds in the
-/// reference runtime.
-pub async fn discover_pcscf_via_at_with_context(
+/// This fallback is deliberately read-only. Reconfiguring or toggling a fixed
+/// CID here races ModemManager and can tear down the bearer whose PCO we are
+/// trying to inspect. `SIMADMIN_VOLTE_IMS_CID` is only a preference when more
+/// than one active IMS context exists; it never causes a context to be changed.
+pub async fn discover_pcscf_via_active_at_context(
     modem: &str,
-    plan: &ImsConnectionPlan,
+    _plan: &ImsConnectionPlan,
 ) -> Result<AtPcscfDiscovery, VolteError> {
-    let cid = configured_ims_cid();
+    let active_output = run_at(modem, "AT+CGACT?").await?;
+    let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
+    let mut active_cids = parse_active_context_cids(&active_output);
+    let configured_ims_cids = parse_ims_context_cids(&contexts_output);
+    let preferred_cid = configured_ims_cid();
+    active_cids.sort_by_key(|cid| {
+        (
+            if *cid == preferred_cid { 0 } else { 1 },
+            if configured_ims_cids.contains(cid) {
+                0
+            } else {
+                1
+            },
+        )
+    });
 
-    let mut last_error = None;
-    for _ in 0..AT_DISCOVERY_ROUNDS {
-        for pdp_type in plan.pdp_types() {
-            match probe_pcscf_context(modem, cid, pdp_type).await {
-                Ok((candidates, context)) if !candidates.is_empty() => {
-                    return Ok(AtPcscfDiscovery {
-                        candidates,
-                        context: Some(context),
-                        cid,
-                    });
+    if active_cids.is_empty() {
+        return Err(VolteError::with_detail(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+            format!("at_active_context_missing:ims={configured_ims_cids:?}"),
+        ));
+    }
+
+    let mut attempted = Vec::with_capacity(active_cids.len());
+    for cid in active_cids {
+        attempted.push(cid);
+        match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
+            Ok(settings) => {
+                let candidates = parse_cgcontrdp_pcscf(&settings, cid);
+                if !candidates.is_empty() {
+                    return Ok(AtPcscfDiscovery { candidates, cid });
                 }
-                Ok((_, context)) => {
-                    context.cleanup().await;
-                    last_error = Some(VolteError::with_detail(
-                        code::RUNTIME_ALL_PCSCF_FAILED,
-                        format!("AT+CGCONTRDP={cid}:{pdp_type}:no-pcscf"),
-                    ));
-                }
-                Err(error) => last_error = Some(error),
+            }
+            Err(error) => {
+                tracing::debug!(cid, error = %error, "VoLTE active-context CGCONTRDP query failed");
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
-}
-
-async fn probe_pcscf_context(
-    modem: &str,
-    cid: u8,
-    pdp_type: &str,
-) -> Result<(Vec<IpAddr>, ImsAtContextLease), VolteError> {
-    let restore_context = run_at(modem, "AT+CGDCONT?")
-        .await
-        .ok()
-        .and_then(|output| cgdccont_restore_command(&output, cid))
-        .unwrap_or_else(|| format!("AT+CGDCONT={cid},\"IPV4V6\",\"\""));
-    let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
-    run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await?;
-    run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},1,1,1")).await?;
-    if let Err(error) = run_at(modem, &format!("AT+CGACT=1,{cid}")).await {
-        cleanup_pcscf_context(modem, cid, &restore_context).await;
-        return Err(error);
-    }
-    sleep(AT_CONTEXT_SETTLE).await;
-    let settings = match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
-        Ok(settings) => settings,
-        Err(error) => {
-            cleanup_pcscf_context(modem, cid, &restore_context).await;
-            return Err(error);
-        }
-    };
-    Ok((
-        parse_cgcontrdp_pcscf(&settings, cid),
-        ImsAtContextLease {
-            modem: modem.to_string(),
-            cid,
-            restore_command: restore_context,
-        },
+    Err(VolteError::with_detail(
+        code::RUNTIME_ALL_PCSCF_FAILED,
+        format!("at_active_ims_context_no_pcscf:cids={attempted:?}:ims={configured_ims_cids:?}"),
     ))
-}
-
-async fn cleanup_pcscf_context(modem: &str, cid: u8, restore_context: &str) {
-    let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
-    let _ = run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},0,0,0")).await;
-    let _ = run_at(modem, restore_context).await;
 }
 
 async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
@@ -262,24 +216,46 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
     }
 }
 
-fn cgdccont_restore_command(output: &str, expected_cid: u8) -> Option<String> {
+fn parse_active_context_cids(output: &str) -> Vec<u8> {
+    let mut cids = Vec::new();
+    for line in output.lines() {
+        let Some((_, values)) = line.split_once("+CGACT:") else {
+            continue;
+        };
+        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
+        if fields.len() < 2 || fields[1].trim_matches('\'') != "1" {
+            continue;
+        }
+        if let Ok(cid) = fields[0].trim_matches('\'').parse::<u8>() {
+            if !cids.contains(&cid) {
+                cids.push(cid);
+            }
+        }
+    }
+    cids
+}
+
+fn parse_ims_context_cids(output: &str) -> Vec<u8> {
+    let mut cids = Vec::new();
     for line in output.lines() {
         let Some((_, values)) = line.split_once("+CGDCONT:") else {
             continue;
         };
         let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
-        if fields.len() < 3 || fields[0].parse::<u8>().ok() != Some(expected_cid) {
+        if fields.len() < 3
+            || !fields[2]
+                .trim_matches(['\'', '"'])
+                .eq_ignore_ascii_case("ims")
+        {
             continue;
         }
-        let pdp_type = fields[1].trim_matches('"');
-        let apn = fields[2].trim_matches('"');
-        if !pdp_type.is_empty() {
-            return Some(format!(
-                "AT+CGDCONT={expected_cid},\"{pdp_type}\",\"{apn}\""
-            ));
+        if let Ok(cid) = fields[0].trim_matches('\'').parse::<u8>() {
+            if !cids.contains(&cid) {
+                cids.push(cid);
+            }
         }
     }
-    None
+    cids
 }
 
 /// Parse the primary/secondary P-CSCF columns from a 3GPP +CGCONTRDP response.
@@ -291,7 +267,12 @@ pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8) -> Vec<IpAddr> {
             continue;
         };
         let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
-        if fields.len() < 8 || fields[0].parse::<u8>().ok() != Some(expected_cid) {
+        if fields.len() < 8
+            || fields[0].parse::<u8>().ok() != Some(expected_cid)
+            || !fields[2]
+                .trim_matches(['\'', '"'])
+                .eq_ignore_ascii_case("ims")
+        {
             continue;
         }
         for field in fields.iter().skip(7).take(2) {
@@ -360,29 +341,37 @@ pub async fn discover_pcscf(
         &settings.ipv4_dns
     };
     let pcscf_name = format!("pcscf.{home_domain}");
-    let srv_names = [
-        format!("_sip._udp.{home_domain}"),
-        format!("_sip._tcp.{home_domain}"),
-    ];
+    let srv_names = pcscf_srv_names(home_domain);
 
     for server in dns_servers {
         if server.is_ipv4() != local.is_ipv4() {
             continue;
         }
         let address_type = if local.is_ipv6() { 28 } else { 1 };
-        if let Ok(records) = query_dns(local, *server, &pcscf_name, address_type).await {
-            if let Some(address) = records
-                .addresses
-                .into_iter()
-                .find(|item| item.is_ipv4() == local.is_ipv4())
-            {
-                return Ok(address);
+        match query_dns(local, *server, &pcscf_name, address_type).await {
+            Ok(records) => {
+                if let Some(address) = records
+                    .addresses
+                    .into_iter()
+                    .find(|item| item.is_ipv4() == local.is_ipv4())
+                {
+                    tracing::info!(dns_server = %server, name = %pcscf_name, %address, "VoLTE P-CSCF discovered by DNS address query");
+                    return Ok(address);
+                }
+                tracing::debug!(dns_server = %server, name = %pcscf_name, record_type = address_type, "VoLTE P-CSCF DNS address query returned no matching address");
+            }
+            Err(error) => {
+                tracing::debug!(dns_server = %server, name = %pcscf_name, record_type = address_type, error = %error, "VoLTE P-CSCF DNS address query failed")
             }
         }
 
         for srv_name in &srv_names {
-            let Ok(records) = query_dns(local, *server, srv_name, 33).await else {
-                continue;
+            let records = match query_dns(local, *server, srv_name, 33).await {
+                Ok(records) => records,
+                Err(error) => {
+                    tracing::debug!(dns_server = %server, name = %srv_name, error = %error, "VoLTE P-CSCF DNS SRV query failed");
+                    continue;
+                }
             };
             for target in records.srv_targets {
                 if let Ok(target_records) = query_dns(local, *server, &target, address_type).await {
@@ -391,6 +380,7 @@ pub async fn discover_pcscf(
                         .into_iter()
                         .find(|item| item.is_ipv4() == local.is_ipv4())
                     {
+                        tracing::info!(dns_server = %server, name = %srv_name, target = %target, %address, "VoLTE P-CSCF discovered by DNS SRV query");
                         return Ok(address);
                     }
                 }
@@ -398,6 +388,15 @@ pub async fn discover_pcscf(
         }
     }
     Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+}
+
+fn pcscf_srv_names(home_domain: &str) -> Vec<String> {
+    vec![
+        format!("_sip._udp.pcscf.{home_domain}"),
+        format!("_sip._tcp.pcscf.{home_domain}"),
+        format!("_sip._udp.{home_domain}"),
+        format!("_sip._tcp.{home_domain}"),
+    ]
 }
 
 pub fn pcscf_socket(address: IpAddr) -> SocketAddr {
@@ -739,6 +738,9 @@ IPv4 primary DNS: 10.0.0.53";
             ]
         );
         assert!(parse_cgcontrdp_pcscf(response, 3).is_empty());
+
+        let internet_context = response.replace(",ims,", ",internet,");
+        assert!(parse_cgcontrdp_pcscf(&internet_context, 2).is_empty());
     }
 
     #[test]
@@ -763,13 +765,30 @@ IPv4 primary DNS: 10.0.0.53";
     }
 
     #[test]
-    fn temporary_at_probe_restores_original_pdp_context() {
-        let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"ctnet\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV6\",\"private-ims\",\"0.0.0.0\",0,0'";
+    fn selects_only_active_ims_contexts_for_read_only_discovery() {
+        let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"ctnet\",\"0.0.0.0\",0,0\n+CGDCONT: 3,\"IPV4V6\",\"ims\",\"0.0.0.0\",0,0\n+CGDCONT: 7,\"IPV6\",\"IMS\",\"0.0.0.0\",0,0'";
+        let active = "response: '+CGACT: 1,1\n+CGACT: 3,0\n+CGACT: 7,1'";
+        assert_eq!(parse_ims_context_cids(contexts), vec![3, 7]);
+        assert_eq!(parse_active_context_cids(active), vec![1, 7]);
+        let active_cids = parse_active_context_cids(active);
+        let selected = parse_ims_context_cids(contexts)
+            .into_iter()
+            .filter(|cid| active_cids.contains(cid))
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec![7]);
+    }
+
+    #[test]
+    fn pcscf_dns_srv_names_try_3gpp_pcscf_domain_first() {
         assert_eq!(
-            cgdccont_restore_command(contexts, 2).as_deref(),
-            Some("AT+CGDCONT=2,\"IPV6\",\"private-ims\"")
+            pcscf_srv_names("ims.mnc001.mcc001.3gppnetwork.org"),
+            vec![
+                "_sip._udp.pcscf.ims.mnc001.mcc001.3gppnetwork.org",
+                "_sip._tcp.pcscf.ims.mnc001.mcc001.3gppnetwork.org",
+                "_sip._udp.ims.mnc001.mcc001.3gppnetwork.org",
+                "_sip._tcp.ims.mnc001.mcc001.3gppnetwork.org",
+            ]
         );
-        assert!(cgdccont_restore_command(contexts, 3).is_none());
     }
 
     #[test]
