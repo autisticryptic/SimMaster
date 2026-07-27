@@ -49,7 +49,8 @@ use super::{
     native_bearer::{self, NativeImsBearer},
     pcscf::{
         discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket,
-        prepare_ims_profile_context, set_pcscf_reporting,
+        prefetch_pcscf_from_ims_profile, prepare_ims_profile_context, set_pcscf_reporting,
+        ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
@@ -178,6 +179,8 @@ struct VolteLiveSession {
     /// Qualcomm P-CSCF reporting is scoped to this session and restored during
     /// teardown. It changes PCO contents only; activation remains owned by WDS.
     pcscf_reporting_cid: Option<u8>,
+    /// beta2-style AT IMS context retained until the WDS/SIP session ends.
+    ims_profile_lease: Option<ImsProfileLease>,
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
@@ -631,12 +634,9 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::ImsContext)
         .await;
 
-    // beta2-aligned P-CSCF ordering: the bearer is brought up *first*, and its
-    // own P-CSCF (delivered via PCO on the ModemManager path, or read directly
-    // from the QMI WDS session on the native path) is used before anything else.
-    // The last-resort AT fallback now reads only the active IMS context after
-    // the bearer is up. It does not activate, deactivate, or rewrite a PDP
-    // context, because ModemManager owns that lifecycle.
+    // beta2-aligned P-CSCF ordering: pre-activate a temporary IMS profile and
+    // read its P-CSCF first, then start WDS/ModemManager with the same profile.
+    // Bearer PCO, active-context CGCONTRDP, and IMS DNS remain fallbacks.
     // A matching connected IMS bearer is reused by `ensure_ims_bearer`; only a
     // stale or policy-mismatched object is recreated. Preserving the connected
     // bearer also preserves the PCO state used for P-CSCF discovery.
@@ -646,34 +646,60 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let ims_profile = match prepare_ims_profile_context(&device.modem_id, &plan).await {
-        Ok(profile) => {
+    let mut prefetched_pcscf = Vec::new();
+    let mut ims_profile_lease = None;
+    let ims_profile = match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan).await {
+        Ok(prefetch) => {
+            let cid = prefetch.lease.cid;
+            prefetched_pcscf = prefetch.candidates;
             tracing::info!(
-                cid = profile.cid,
-                created = profile.created,
-                "Selected IMS 3GPP profile"
+                cid,
+                pcscf_count = prefetched_pcscf.len(),
+                "Prepared beta2-style IMS profile and retained its AT context"
             );
-            runtime
-                .update(|state| state.at_cid = Some(profile.cid))
-                .await;
-            Some(profile)
+            runtime.update(|state| state.at_cid = Some(cid)).await;
+            ims_profile_lease = Some(prefetch.lease);
+            Some(super::pcscf::ImsProfileContext {
+                cid,
+                created: false,
+            })
         }
-        Err(error) => {
+        Err(prefetch_error) => {
             tracing::warn!(
-                error = %error,
-                "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+                error = %prefetch_error,
+                "Native VoLTE profile P-CSCF prefetch failed; falling back to bearer discovery"
             );
-            None
+            match prepare_ims_profile_context(&device.modem_id, &plan).await {
+                Ok(profile) => {
+                    tracing::info!(
+                        cid = profile.cid,
+                        created = profile.created,
+                        "Selected fallback IMS 3GPP profile"
+                    );
+                    runtime
+                        .update(|state| state.at_cid = Some(profile.cid))
+                        .await;
+                    Some(profile)
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+                    );
+                    None
+                }
+            }
         }
     };
     let mut request = BearerRequest::ims(allow_roaming);
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
-    // P-CSCF reporting must be armed before the bearer activation so the IMS
-    // PCO contains the proxy addresses. Do not activate the AT context here:
-    // WDS/ModemManager below owns that transition and the old CGACT sequence is
-    // unsafe on the reference firmware.
-    let pcscf_reporting_cid = if let Some(profile) = ims_profile {
+    // The beta2 prefetch lease already armed reporting and activated its
+    // context. Only the compatibility fallback still needs the standalone
+    // reporting command.
+    let pcscf_reporting_cid = if ims_profile_lease.is_some() {
+        None
+    } else if let Some(profile) = ims_profile {
         match set_pcscf_reporting(&device.modem_id, profile.cid, true).await {
             Ok(()) => {
                 tracing::info!(cid = profile.cid, "Enabled IMS P-CSCF reporting");
@@ -747,6 +773,7 @@ async fn connect_inner(
                 // subsystem restart into a dead device.
                 if class.is_unsafe_to_retry() || native_required {
                     disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
+                    cleanup_ims_profile_lease(ims_profile_lease.take()).await;
                     return Err(error);
                 }
                 tracing::warn!(
@@ -769,15 +796,24 @@ async fn connect_inner(
                     native_bearer::release_native_ims_bearer(established).await;
                 }
                 disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
+                cleanup_ims_profile_lease(ims_profile_lease.take()).await;
                 return Err(error);
             }
         }
     };
-    // P-CSCF now follows the beta2 discovery order: the bearer is brought up
-    // first, and its own PCO (ModemManager's bearer settings, or the native
-    // QMI WDS `--wds-get-current-settings` read) is the primary source. The AT
-    // The read-only AT fallback mirrors beta2's "discovered from active IMS
-    // bearer" path without disturbing the bearer that ModemManager owns.
+    for candidate in prefetched_pcscf.drain(..) {
+        if !bearer.settings.pcscf.contains(&candidate) {
+            bearer.settings.pcscf.push(candidate);
+        }
+    }
+    if !bearer.settings.pcscf.is_empty() {
+        tracing::info!(
+            pcscf_count = bearer.settings.pcscf.len(),
+            "Native VoLTE using P-CSCF candidates prefetched from IMS profile"
+        );
+    }
+    // WDS PCO, the active context, and IMS DNS remain ordered fallbacks when
+    // the profile prefetch did not yield an address.
     if bearer.settings.pcscf.is_empty() {
         tracing::info!("VoLTE bearer delivered no P-CSCF via PCO; reading the active IMS context");
         runtime
@@ -936,6 +972,7 @@ async fn connect_inner(
             native_bearer::release_native_ims_bearer(established).await;
         }
         disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
+        cleanup_ims_profile_lease(ims_profile_lease.take()).await;
     }
     result.map(|mut session| {
         // Hand the session ownership of the native bearer so `cleanup_live_session`
@@ -944,6 +981,7 @@ async fn connect_inner(
         session.native_bearer = native_bearer;
         session.data_slot_mode = data_slot_mode;
         session.pcscf_reporting_cid = pcscf_reporting_cid;
+        session.ims_profile_lease = ims_profile_lease;
         session
     })
 }
@@ -1101,6 +1139,7 @@ async fn connect_family(
         native_bearer: None,
         data_slot_mode: DataSlotMode::PrimaryImsOnly,
         pcscf_reporting_cid: None,
+        ims_profile_lease: None,
         register_ids: authenticator.ids,
         next_register_cseq: 2 + u32::from(registration.auth_rounds),
         sip_instance: authenticator.sip_instance,
@@ -1447,6 +1486,13 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
             None => disconnect_bearer(&session.bearer.path).await,
         }
         disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
+        cleanup_ims_profile_lease(session.ims_profile_lease).await;
+    }
+}
+
+async fn cleanup_ims_profile_lease(lease: Option<ImsProfileLease>) {
+    if let Some(lease) = lease {
+        lease.cleanup().await;
     }
 }
 

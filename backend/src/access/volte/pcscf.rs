@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, process::Command};
+use tokio::{net::UdpSocket, process::Command, time::sleep};
 
 use crate::infra::config::VolteIpFamilyPreference;
 
@@ -31,6 +31,9 @@ const SIP_PORT: u16 = 5060;
 const ENV_PCSCF: &str = "SIMADMIN_VOLTE_PCSCF";
 const ENV_IMS_CID: &str = "SIMADMIN_VOLTE_IMS_CID";
 const DEFAULT_IMS_CID: u8 = 2;
+const PROFILE_PCSCF_READ_ROUNDS: usize = 4;
+const PROFILE_PCSCF_READ_DELAY: Duration = Duration::from_millis(750);
+const BETA2_PROFILE_CANDIDATES: [u8; 2] = [2, 1];
 
 #[derive(Debug, Clone)]
 pub struct AtPcscfDiscovery {
@@ -48,6 +51,30 @@ pub struct AtPcscfDiscovery {
 pub struct ImsProfileContext {
     pub cid: u8,
     pub created: bool,
+}
+
+/// A temporary IMS PDP definition kept alive for the lifetime of registration.
+///
+/// The beta2 runtime activates this context before starting the WDS bearer and
+/// retains it while SIP is registered. Cleanup restores the definition that was
+/// present before the attempt so an Internet profile is not permanently changed.
+#[derive(Debug)]
+pub struct ImsProfileLease {
+    modem: String,
+    pub cid: u8,
+    restore_command: String,
+}
+
+impl ImsProfileLease {
+    pub async fn cleanup(self) {
+        cleanup_profile_context(&self.modem, self.cid, &self.restore_command).await;
+    }
+}
+
+#[derive(Debug)]
+pub struct ImsProfilePrefetch {
+    pub candidates: Vec<IpAddr>,
+    pub lease: ImsProfileLease,
 }
 
 /// Parsed IP settings for the IMS bearer.
@@ -197,6 +224,118 @@ pub async fn set_pcscf_reporting(modem: &str, cid: u8, enabled: bool) -> Result<
     run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},{value}"))
         .await
         .map(|_| ())
+}
+
+/// Reproduce beta2's pre-bearer IMS profile sequence.
+///
+/// IDA shows the working binary performing, for one profile and PDP type:
+/// `CGACT=0`, `CGDCONT=<cid>,<type>,ims`, `$QCPDPIMSCFGE=<cid>,1,1,1`,
+/// `CGACT=1`, then repeated `CGCONTRDP=<cid>` reads. The resulting P-CSCF list
+/// is preferred over the later WDS/active-bearer/DNS fallbacks.
+pub async fn prefetch_pcscf_from_ims_profile(
+    modem: &str,
+    plan: &ImsConnectionPlan,
+) -> Result<ImsProfilePrefetch, VolteError> {
+    let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
+    let contexts = parse_pdp_contexts(&contexts_output);
+    let mut profile_ids = Vec::with_capacity(3);
+    push_profile_candidate(&mut profile_ids, configured_ims_cid());
+    for cid in BETA2_PROFILE_CANDIDATES {
+        push_profile_candidate(&mut profile_ids, cid);
+    }
+
+    let pdp_types = plan.pdp_types();
+    let mut last_error = None;
+    for cid in profile_ids {
+        let restore_command = restore_profile_command(&contexts, cid);
+        for pdp_type in &pdp_types {
+            let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
+            if let Err(error) =
+                run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await
+            {
+                last_error = Some(error);
+                cleanup_profile_context(modem, cid, &restore_command).await;
+                continue;
+            }
+            if let Err(error) = set_pcscf_reporting(modem, cid, true).await {
+                last_error = Some(error);
+                cleanup_profile_context(modem, cid, &restore_command).await;
+                continue;
+            }
+            match run_at(modem, &format!("AT+CGACT=1,{cid}")).await {
+                Ok(_) => {
+                    let mut candidates = Vec::new();
+                    for round in 0..PROFILE_PCSCF_READ_ROUNDS {
+                        if round > 0 {
+                            sleep(PROFILE_PCSCF_READ_DELAY).await;
+                        }
+                        match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
+                            Ok(settings) => {
+                                for candidate in parse_cgcontrdp_pcscf(&settings, cid) {
+                                    if !candidates.contains(&candidate) {
+                                        candidates.push(candidate);
+                                    }
+                                }
+                                if !candidates.is_empty() {
+                                    break;
+                                }
+                            }
+                            Err(error) => tracing::debug!(
+                                cid,
+                                round,
+                                error = %error,
+                                "IMS profile CGCONTRDP prefetch read failed"
+                            ),
+                        }
+                    }
+                    return Ok(ImsProfilePrefetch {
+                        candidates,
+                        lease: ImsProfileLease {
+                            modem: modem.to_string(),
+                            cid,
+                            restore_command,
+                        },
+                    });
+                }
+                Err(error) => {
+                    last_error = Some(error);
+                    cleanup_profile_context(modem, cid, &restore_command).await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        VolteError::with_detail(
+            code::RUNTIME_PROFILE_PCSCF_MISSING,
+            "beta2_profile_candidates_exhausted".to_string(),
+        )
+    }))
+}
+
+fn push_profile_candidate(candidates: &mut Vec<u8>, cid: u8) {
+    if (1..=16).contains(&cid) && !candidates.contains(&cid) {
+        candidates.push(cid);
+    }
+}
+
+fn restore_profile_command(contexts: &[PdpContext], cid: u8) -> String {
+    contexts
+        .iter()
+        .find(|context| context.cid == cid)
+        .map(|context| {
+            format!(
+                "AT+CGDCONT={cid},\"{}\",\"{}\"",
+                context.pdp_type, context.apn
+            )
+        })
+        .unwrap_or_else(|| format!("AT+CGDCONT={cid},\"IPV4V6\",\"\""))
+}
+
+async fn cleanup_profile_context(modem: &str, cid: u8, restore_command: &str) {
+    let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
+    let _ = set_pcscf_reporting(modem, cid, false).await;
+    let _ = run_at(modem, restore_command).await;
 }
 
 /// Discover P-CSCF candidates from the IMS context that ModemManager already
@@ -885,6 +1024,30 @@ IPv4 primary DNS: 10.0.0.53";
             ]
         );
         assert_eq!(parse_ims_context_cids(contexts), vec![2, 7]);
+    }
+
+    #[test]
+    fn beta2_profile_cleanup_restores_the_previous_definition() {
+        let contexts = parse_pdp_contexts(
+            "response: '+CGDCONT: 1,\"IPV4V6\",\"internet\"\n+CGDCONT: 2,\"IPV6\",\"private-ims\"'",
+        );
+        assert_eq!(
+            restore_profile_command(&contexts, 2),
+            "AT+CGDCONT=2,\"IPV6\",\"private-ims\""
+        );
+        assert_eq!(
+            restore_profile_command(&contexts, 3),
+            "AT+CGDCONT=3,\"IPV4V6\",\"\""
+        );
+    }
+
+    #[test]
+    fn beta2_profile_candidates_are_unique_and_bounded() {
+        let mut candidates = Vec::new();
+        for cid in [2, 2, 1, 0, 17, 3] {
+            push_profile_candidate(&mut candidates, cid);
+        }
+        assert_eq!(candidates, vec![2, 1, 3]);
     }
 
     #[test]
