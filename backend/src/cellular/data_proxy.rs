@@ -17,7 +17,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{lookup_host, TcpListener, TcpSocket, TcpStream},
     sync::{oneshot, Mutex},
-    task::JoinHandle,
+    task::{JoinHandle, JoinSet},
 };
 
 use crate::infra::config::LineDataProxyConfig;
@@ -76,6 +76,10 @@ impl DataProxyCounters {
         self.total_connections.store(0, Ordering::Relaxed);
         // `active_connections` is a live gauge, not a total — resetting it would
         // desync it from the connections that are still running.
+    }
+
+    fn clear_active_connections(&self) {
+        self.active_connections.store(0, Ordering::Relaxed);
     }
 }
 
@@ -325,16 +329,18 @@ impl DataProxyRuntime {
         let password = config.password.clone();
         let counters = Arc::clone(&self.counters);
         let task = tokio::spawn(async move {
+            let mut clients = JoinSet::new();
             loop {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
+                    _ = clients.join_next(), if !clients.is_empty() => {},
                     accepted = listener.accept() => {
                         match accepted {
                             Ok((stream, _)) => {
                                 let interface = outbound_interface.clone();
                                 let auth = ProxyAuth::new(username.clone(), password.clone());
                                 let counters = Arc::clone(&counters);
-                                tokio::spawn(async move {
+                                clients.spawn(async move {
                                     counters.connection_opened();
                                     let result = serve_client(stream, &interface, &auth, &counters).await;
                                     counters.connection_closed();
@@ -351,6 +357,9 @@ impl DataProxyRuntime {
                     }
                 }
             }
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
+            counters.clear_active_connections();
         });
 
         state.status = DataProxyStatus {
@@ -882,6 +891,35 @@ mod tests {
         assert_eq!(traffic.total_connections, 4);
         // The live gauge must come from the session, not the persisted total.
         assert_eq!(traffic.active_connections, 1);
+    }
+
+    #[tokio::test]
+    async fn stopping_proxy_terminates_clients_and_clears_active_gauge() {
+        let runtime = DataProxyRuntime::default();
+        let status = runtime
+            .start(
+                "lo",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                    ..LineDataProxyConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        let _client = TcpStream::connect(("127.0.0.1", status.port.unwrap()))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            if runtime.session_traffic().active_connections == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(runtime.session_traffic().active_connections, 1);
+
+        runtime.stop().await;
+        assert_eq!(runtime.session_traffic().active_connections, 0);
     }
 
     #[test]

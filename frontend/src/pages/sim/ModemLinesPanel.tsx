@@ -515,8 +515,8 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                       </Box>
                     </Box>
 
-                    {/* 该卡的流量用量（上下行分开统计，重启后仍累计） */}
-                    <Box order={3} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                    {/* 流量只展示当前启用会话；每次重新启用由后端自动清零。 */}
+                    {network?.data.enabled && <Box order={3} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75}>
                           <SwapVert color={network?.data.proxy.traffic_used ? 'primary' : 'disabled'} fontSize="small" />
@@ -545,7 +545,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           清零
                         </Button>
                       </Box>
-                    </Box>
+                    </Box>}
 
                     <Box order={4} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>

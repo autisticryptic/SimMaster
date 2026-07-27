@@ -122,6 +122,9 @@ pub struct LineRuntimeRegistry {
     /// Used to restore each line's cumulative proxied-traffic counters when the
     /// line is first discovered, so totals survive a restart.
     database: Option<Arc<Database>>,
+    /// Serializes periodic traffic flushes with an explicit session reset, so
+    /// an in-flight flush cannot restore the just-cleared database row.
+    traffic_persistence_lock: Mutex<()>,
 }
 
 impl LineRuntimeRegistry {
@@ -132,6 +135,7 @@ impl LineRuntimeRegistry {
             seed_claimed: AtomicBool::new(false),
             config_manager: None,
             database: None,
+            traffic_persistence_lock: Mutex::new(()),
         }
     }
 
@@ -146,6 +150,7 @@ impl LineRuntimeRegistry {
             seed_claimed: AtomicBool::new(false),
             config_manager: Some(config_manager),
             database: Some(database),
+            traffic_persistence_lock: Mutex::new(()),
         }
     }
 
@@ -306,6 +311,7 @@ impl LineRuntimeRegistry {
     /// accumulate. A crash between flushes therefore loses only the traffic
     /// since the last flush — it never double-counts.
     pub async fn flush_data_traffic(&self) {
+        let _guard = self.traffic_persistence_lock.lock().await;
         let Some(database) = &self.database else {
             return;
         };
@@ -325,6 +331,7 @@ impl LineRuntimeRegistry {
 
     /// Zero one line's traffic, in memory and on disk.
     pub async fn reset_data_traffic(&self, line_id: &str) -> Option<DataProxyTraffic> {
+        let _guard = self.traffic_persistence_lock.lock().await;
         let line = self.get(line_id).await?;
         let traffic = line.data_proxy.reset_traffic().await;
         if let Some(database) = &self.database {

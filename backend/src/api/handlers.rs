@@ -2545,6 +2545,12 @@ pub async fn set_line_data_connection_handler(
     }
 
     if payload.enabled {
+        if !profile.data_connection_enabled {
+            // Each explicit disabled -> enabled transition starts a new usage
+            // session. Clear both the in-memory counters and persisted baseline
+            // before accepting clients on the new listener.
+            app.line_registry.reset_data_traffic(&line_id).await;
+        }
         if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
             return (
