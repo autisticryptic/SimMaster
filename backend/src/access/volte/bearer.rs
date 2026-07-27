@@ -12,13 +12,14 @@
 //! `recreating IMS bearer to match roaming policy`,
 //! `Deleted stale disconnected IMS bearer`.
 
-use std::{collections::VecDeque, net::IpAddr, process::Output};
+use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
+    plan::{FailureClass, ImsConnectionPlan, IpType},
 };
 
 /// The IMS APN used for the dedicated IMS bearer.
@@ -47,10 +48,19 @@ pub struct BearerRequest {
 pub struct BearerConnection {
     pub path: String,
     pub interface: String,
+    pub ip_type: String,
     pub settings: ImsIpSettings,
     pub ipv4_prefix: Option<u8>,
     pub ipv6_prefix: Option<u8>,
     pub mtu: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BearerAttempt {
+    pub ip_type: String,
+    pub source: String,
+    pub outcome: String,
+    pub error: Option<VolteError>,
 }
 
 impl BearerConnection {
@@ -111,17 +121,52 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 }
 
 /// Create or reuse an `apn=ims` ModemManager bearer and connect it. Existing
-/// non-IMS bearers are never changed or deleted. New sessions always request
-/// dual-stack first. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response
-/// jumps directly to the required family; otherwise IPv4 then IPv6 are tried
-/// once each. Every failed temporary bearer is deleted before the next bounded
-/// attempt.
+/// non-IMS bearers are never changed or deleted. The plan determines the initial
+/// attempt type (dual-stack for `*First` modes) and the preference-ordered
+/// single-family fallbacks — so `Ipv6First` now falls back v6→v4 rather than
+/// always v4→v6. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response from
+/// the network still collapses the fallback to that one family, regardless of
+/// preference. Every failed temporary bearer is deleted before the next attempt.
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
+    plan: &ImsConnectionPlan,
 ) -> Result<BearerConnection, VolteError> {
+    ensure_ims_bearer_observed(modem, request, plan, |_| async {}).await
+}
+
+pub async fn ensure_ims_bearer_observed<F, Fut>(
+    modem: &str,
+    request: &BearerRequest,
+    plan: &ImsConnectionPlan,
+    mut observe: F,
+) -> Result<BearerConnection, VolteError>
+where
+    F: FnMut(BearerAttempt) -> Fut,
+    Fut: Future<Output = ()>,
+{
     if let Some(path) = bearer_path_override() {
-        return connect_and_read(&path).await;
+        observe(BearerAttempt {
+            ip_type: "override".to_string(),
+            source: "environment".to_string(),
+            outcome: "started".to_string(),
+            error: None,
+        })
+        .await;
+        let result = connect_and_read(&path).await;
+        observe(BearerAttempt {
+            ip_type: "override".to_string(),
+            source: "environment".to_string(),
+            outcome: if result.is_ok() {
+                "succeeded"
+            } else {
+                "failed"
+            }
+            .to_string(),
+            error: result.as_ref().err().cloned(),
+        })
+        .await;
+        return result;
     }
 
     let modem_output = run_command("mmcli", &["-m", modem, "--output-keyvalue"]).await?;
@@ -132,15 +177,57 @@ pub async fn ensure_ims_bearer(
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
             if is_dual_stack_bearer(&details) {
                 if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
-                    return parse_bearer_connection(&path, &details);
+                    let result = parse_bearer_connection(&path, &details);
+                    observe(BearerAttempt {
+                        ip_type: "ipv4v6".to_string(),
+                        source: "reused".to_string(),
+                        outcome: if result.is_ok() {
+                            "succeeded"
+                        } else {
+                            "failed"
+                        }
+                        .to_string(),
+                        error: result.as_ref().err().cloned(),
+                    })
+                    .await;
+                    return result;
                 }
+                observe(BearerAttempt {
+                    ip_type: "ipv4v6".to_string(),
+                    source: "reconnected".to_string(),
+                    outcome: "started".to_string(),
+                    error: None,
+                })
+                .await;
                 match connect_and_read(&path).await {
-                    Ok(bearer) => return Ok(bearer),
+                    Ok(bearer) => {
+                        observe(BearerAttempt {
+                            ip_type: "ipv4v6".to_string(),
+                            source: "reconnected".to_string(),
+                            outcome: "succeeded".to_string(),
+                            error: None,
+                        })
+                        .await;
+                        return Ok(bearer);
+                    }
                     Err(error) => {
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
-                        required_fallback = required_ip_type_after_failure(&after);
+                        required_fallback =
+                            FailureClass::from_details(&after)
+                                .forced_family()
+                                .map(|f| match f {
+                                    crate::access::volte::plan::IpFamily::Ipv6 => IpType::Ipv6,
+                                    crate::access::volte::plan::IpFamily::Ipv4 => IpType::Ipv4,
+                                });
+                        observe(BearerAttempt {
+                            ip_type: "ipv4v6".to_string(),
+                            source: "reconnected".to_string(),
+                            outcome: "failed".to_string(),
+                            error: Some(error.clone()),
+                        })
+                        .await;
                         last_error = Some(error);
                     }
                 }
@@ -152,21 +239,56 @@ pub async fn ensure_ims_bearer(
         }
     }
 
-    let mut pending = required_fallback
-        .map(|ip_type| VecDeque::from([ip_type]))
-        .unwrap_or_else(|| VecDeque::from(["ipv4v6"]));
-    let mut attempted = Vec::with_capacity(3);
+    // Seed the attempt queue from the plan. If an earlier reconnect already
+    // forced a single family (network told us v4-only or v6-only), collapse
+    // directly to that; otherwise start with the plan's initial type.
+    let initial: &'static str = match required_fallback {
+        Some(IpType::Ipv6) => "ipv6",
+        Some(IpType::Ipv4) => "ipv4",
+        _ => plan.initial_bearer_attempt().as_mm_str(),
+    };
+    let mut pending: VecDeque<&'static str> = VecDeque::from([initial]);
+    let mut attempted: Vec<&'static str> = Vec::with_capacity(3);
     while let Some(ip_type) = pending.pop_front() {
         if attempted.contains(&ip_type) {
             continue;
         }
         attempted.push(ip_type);
+        observe(BearerAttempt {
+            ip_type: ip_type.to_string(),
+            source: "created".to_string(),
+            outcome: "started".to_string(),
+            error: None,
+        })
+        .await;
         match create_and_connect_attempt(modem, request, ip_type).await {
-            Ok(bearer) => return Ok(bearer),
+            Ok(bearer) => {
+                observe(BearerAttempt {
+                    ip_type: ip_type.to_string(),
+                    source: "created".to_string(),
+                    outcome: "succeeded".to_string(),
+                    error: None,
+                })
+                .await;
+                return Ok(bearer);
+            }
             Err(failure) => {
+                observe(BearerAttempt {
+                    ip_type: ip_type.to_string(),
+                    source: "created".to_string(),
+                    outcome: "failed".to_string(),
+                    error: Some(failure.error.clone()),
+                })
+                .await;
                 last_error = Some(failure.error);
+                // Only fan out into single-family fallbacks after a dual-stack
+                // attempt fails. Single-family failures are terminal for that
+                // family; the plan already decided the order.
                 if ip_type == "ipv4v6" {
-                    pending.extend(fallback_ip_types(&failure.details));
+                    let class = FailureClass::from_details(&failure.details);
+                    for fallback in plan.bearer_fallbacks_after(class) {
+                        pending.push_back(fallback.as_mm_str());
+                    }
                 }
             }
         }
@@ -228,23 +350,6 @@ async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
     run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
         .await
         .map(|_| ())
-}
-
-fn required_ip_type_after_failure(details: &str) -> Option<&'static str> {
-    let error = value(details, "bearer.status.connection-error.name")?;
-    if error.ends_with(".Ipv6OnlyAllowed") {
-        Some("ipv6")
-    } else if error.ends_with(".Ipv4OnlyAllowed") {
-        Some("ipv4")
-    } else {
-        None
-    }
-}
-
-fn fallback_ip_types(details: &str) -> Vec<&'static str> {
-    required_ip_type_after_failure(details)
-        .map(|ip_type| vec![ip_type])
-        .unwrap_or_else(|| vec!["ipv4", "ipv6"])
 }
 
 /// Disconnect an IMS bearer left active by a previous process before the
@@ -309,6 +414,8 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
     Ok(BearerConnection {
         path: path.to_string(),
         interface,
+        ip_type: value(output, "bearer.properties.ip-type")
+            .unwrap_or_else(|| "unknown".to_string()),
         settings,
         ipv4_prefix,
         ipv6_prefix,
@@ -330,35 +437,74 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
     }
 
+    // Configure each available family independently. A per-family failure
+    // (e.g. the network handed out an IPv6 address but the prefix/DNS route
+    // cannot be installed) must not discard a working sibling family. Mirrors
+    // 1.7's "IPv6 data configuration failed; retaining IPv4 data" behaviour.
     let mut configured = false;
-    if let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address {
-        let prefix = bearer.ipv6_prefix.unwrap_or(64);
-        let address = format!("{address}/{prefix}");
-        run_ip(&[
-            "-6",
-            "address",
-            "replace",
-            &address,
-            "dev",
-            &bearer.interface,
-        ])
-        .await?;
-        for dns in &bearer.settings.ipv6_dns {
-            route_host(&bearer.interface, *dns).await?;
+    let mut last_error = None;
+    if bearer.settings.ipv6_address.is_some() {
+        match configure_ipv6(bearer).await {
+            Ok(()) => configured = true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    interface = %bearer.interface,
+                    "VoLTE IPv6 data configuration failed; retaining any IPv4 data"
+                );
+                last_error = Some(error);
+            }
         }
-        configured = true;
     }
-    if let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address {
-        let prefix = bearer.ipv4_prefix.unwrap_or(32);
-        let address = format!("{address}/{prefix}");
-        run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
-        for dns in &bearer.settings.ipv4_dns {
-            route_host(&bearer.interface, *dns).await?;
+    if bearer.settings.ipv4_address.is_some() {
+        match configure_ipv4(bearer).await {
+            Ok(()) => configured = true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    interface = %bearer.interface,
+                    "VoLTE IPv4 data configuration failed; retaining any IPv6 data"
+                );
+                last_error = Some(error);
+            }
         }
-        configured = true;
     }
-    if !configured {
+    if configured {
+        return Ok(());
+    }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
+}
+
+async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
+    let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    };
+    let prefix = bearer.ipv6_prefix.unwrap_or(64);
+    let address = format!("{address}/{prefix}");
+    run_ip(&[
+        "-6",
+        "address",
+        "replace",
+        &address,
+        "dev",
+        &bearer.interface,
+    ])
+    .await?;
+    for dns in &bearer.settings.ipv6_dns {
+        route_host(&bearer.interface, *dns).await?;
+    }
+    Ok(())
+}
+
+async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
+    let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address else {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    };
+    let prefix = bearer.ipv4_prefix.unwrap_or(32);
+    let address = format!("{address}/{prefix}");
+    run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
+    for dns in &bearer.settings.ipv4_dns {
+        route_host(&bearer.interface, *dns).await?;
     }
     Ok(())
 }
@@ -392,7 +538,21 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     let _ = run_ip(&["link", "set", "dev", &bearer.interface, "down"]).await;
 }
 
+/// Disconnect a ModemManager bearer.
+///
+/// A natively established bearer has no ModemManager object behind its `path`, so
+/// sending it here would fail *and* leave the real WDS session running. Those are
+/// torn down through `native_bearer::release_native_ims_bearer` instead, which
+/// owns the session handle; this guard means a caller that does not yet know the
+/// difference cannot silently leak a PDP context.
 pub async fn disconnect_bearer(path: &str) {
+    if super::native_bearer::is_native_bearer(path) {
+        tracing::debug!(
+            path = %path,
+            "Skipping mmcli disconnect for a native QMI bearer; its WDS session is released separately"
+        );
+        return;
+    }
     let _ = run_command("mmcli", &["-b", path, "--disconnect"]).await;
 }
 
@@ -531,16 +691,40 @@ mod tests {
 
     #[test]
     fn network_family_rejection_selects_required_bearer_type() {
+        use crate::access::volte::plan::{FailureClass, ImsConnectionPlan};
+        use crate::infra::config::VolteIpFamilyPreference;
+        let plan_v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
+        let plan_v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
         let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
-        assert_eq!(required_ip_type_after_failure(ipv6), Some("ipv6"));
+        assert_eq!(
+            FailureClass::from_details(ipv6),
+            FailureClass::NetworkForcedIpv6
+        );
         let ipv4 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed\n";
-        assert_eq!(required_ip_type_after_failure(ipv4), Some("ipv4"));
+        assert_eq!(
+            FailureClass::from_details(ipv4),
+            FailureClass::NetworkForcedIpv4
+        );
         let generic = "bearer.status.connection-error.name : org.example.Failed\n";
-        assert_eq!(required_ip_type_after_failure(generic), None);
-        assert_eq!(fallback_ip_types(ipv6), vec!["ipv6"]);
-        assert_eq!(fallback_ip_types(ipv4), vec!["ipv4"]);
-        assert_eq!(fallback_ip_types(generic), vec!["ipv4", "ipv6"]);
-        assert_eq!(fallback_ip_types(""), vec!["ipv4", "ipv6"]);
+        assert_eq!(FailureClass::from_details(generic), FailureClass::Other);
+        // Forced families collapse to a single type regardless of preference.
+        assert_eq!(
+            plan_v4.bearer_fallbacks_after(FailureClass::from_details(ipv6)),
+            vec![super::IpType::Ipv6]
+        );
+        assert_eq!(
+            plan_v6.bearer_fallbacks_after(FailureClass::from_details(ipv4)),
+            vec![super::IpType::Ipv4]
+        );
+        // Generic failure respects preference order.
+        assert_eq!(
+            plan_v4.bearer_fallbacks_after(FailureClass::from_details(generic)),
+            vec![super::IpType::Ipv4, super::IpType::Ipv6]
+        );
+        assert_eq!(
+            plan_v6.bearer_fallbacks_after(FailureClass::from_details(generic)),
+            vec![super::IpType::Ipv6, super::IpType::Ipv4]
+        );
     }
 
     #[test]

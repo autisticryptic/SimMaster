@@ -47,11 +47,11 @@ pub struct AppState {
     pub sms_resync: SmsResyncHandle,
     pub sms_db_maintenance_pending: Arc<AtomicBool>,
     pub active_calls: Arc<Mutex<HashMap<String, ActiveCallRecord>>>,
-    /// 小区锁定 UI 状态（底层无锁网时仅内存态）
-    pub cell_lock: Arc<Mutex<CellLockStore>>,
+    /// 小区锁定 UI 状态（底层无锁网时仅内存态），按 line_id 分开保存，
+    /// 否则一张卡的锁定会显示/覆盖到另一张卡上。
+    pub cell_lock: Arc<Mutex<HashMap<String, CellLockStore>>>,
     /// 用户在界面关闭蜂窝数据后，禁止 init/watchdog 自动再次 Connect。
     pub data_user_disabled: Arc<AtomicBool>,
-    pub airplane_mode_requested: Arc<AtomicBool>,
     pub vowifi_runtime: Arc<VowifiRuntime>,
     pub vowifi_connect_lock: Arc<Mutex<()>>,
     pub volte_runtime: Arc<VolteRuntime>,
@@ -74,7 +74,6 @@ pub struct AppStateDependencies {
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
     pub data_user_disabled: Arc<AtomicBool>,
-    pub airplane_mode_requested: Arc<AtomicBool>,
     pub vowifi_runtime: Arc<VowifiRuntime>,
     pub volte_runtime: Arc<VolteRuntime>,
     pub line_registry: Arc<LineRuntimeRegistry>,
@@ -94,7 +93,6 @@ impl AppState {
             esim_supervisor,
             sms_resync,
             data_user_disabled,
-            airplane_mode_requested,
             vowifi_runtime,
             volte_runtime,
             line_registry,
@@ -111,9 +109,8 @@ impl AppState {
             sms_resync,
             sms_db_maintenance_pending: Arc::new(AtomicBool::new(false)),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
-            cell_lock: Arc::new(Mutex::new(CellLockStore::default())),
+            cell_lock: Arc::new(Mutex::new(HashMap::new())),
             data_user_disabled,
-            airplane_mode_requested,
             vowifi_runtime,
             vowifi_connect_lock: Arc::new(Mutex::new(())),
             volte_runtime,
@@ -181,7 +178,7 @@ impl FromRef<AppState> for Arc<VolteRuntime> {
     }
 }
 
-impl FromRef<AppState> for Arc<Mutex<CellLockStore>> {
+impl FromRef<AppState> for Arc<Mutex<HashMap<String, CellLockStore>>> {
     fn from_ref(state: &AppState) -> Self {
         state.cell_lock.clone()
     }

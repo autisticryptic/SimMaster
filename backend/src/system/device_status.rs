@@ -1,8 +1,9 @@
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::cellular::modem_manager::{
-    get_airplane_mode, get_cells_data, get_data_connection_status, get_device_info_data,
-    get_is_roaming_mm, get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
+    discover_modem_bindings, get_airplane_mode_for_modem, get_cells_data,
+    get_data_connection_status, get_device_info_data, get_is_roaming_for_modem,
+    get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
 };
 use crate::infra::config::{ConfigManager, NotificationRule};
 use crate::infra::db::{Database, PeriodSmsStats};
@@ -358,22 +359,39 @@ pub async fn collect_device_status_report(
             ));
         }
     }
-    if items.contains("airplane_mode") {
-        if let Ok(status) = get_airplane_mode(&dbus_conn).await {
-            lines.push(format!(
-                "飞行模式：{}",
-                if status.enabled { "开启" } else { "关闭" }
-            ));
-        }
-    }
-    if items.contains("roaming") {
-        let allowed = config_manager.get_roaming_allowed();
-        if let Ok(is_roaming) = get_is_roaming_mm(&dbus_conn).await {
-            lines.push(format!(
-                "漫游：{}，允许漫游：{}",
-                yes_no(is_roaming),
-                yes_no(allowed)
-            ));
+    // Airplane mode and roaming are per line, so report每条在位线路 rather than
+    // whichever modem happened to be first — on a multi-SIM box a single line
+    // of text was always describing only one of the cards.
+    if items.contains("airplane_mode") || items.contains("roaming") {
+        let bindings = discover_modem_bindings(&dbus_conn)
+            .await
+            .unwrap_or_default();
+        for binding in bindings.iter().filter(|binding| binding.present) {
+            let label = format!("{} · 卡槽 {}", binding.slot_label, binding.uim_slot);
+            if items.contains("airplane_mode") {
+                if let Ok(status) =
+                    get_airplane_mode_for_modem(&dbus_conn, &binding.modem_path).await
+                {
+                    lines.push(format!(
+                        "飞行模式（{label}）：{}",
+                        if status.enabled { "开启" } else { "关闭" }
+                    ));
+                }
+            }
+            if items.contains("roaming") {
+                let allowed = config_manager
+                    .get_line_profile(&binding.line_id)
+                    .roaming_allowed;
+                if let Ok(is_roaming) =
+                    get_is_roaming_for_modem(&dbus_conn, &binding.modem_path).await
+                {
+                    lines.push(format!(
+                        "漫游（{label}）：{}，允许漫游：{}",
+                        yes_no(is_roaming),
+                        yes_no(allowed)
+                    ));
+                }
+            }
         }
     }
     if items.contains("cell_summary") {

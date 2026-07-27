@@ -3,6 +3,7 @@ use crate::api::models::{CellLockRatStatus, CellLockRequest, CellLockStatusRespo
 
 #[derive(Debug, Default, Clone)]
 pub struct CellLockStore {
+    // One instance per line; see `AppState::cell_lock`.
     pub lte: Option<(u32, u16)>,
     pub nr: Option<(u32, u16)>,
 }

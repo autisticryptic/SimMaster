@@ -11,10 +11,15 @@ const IKE_NAT_T_NON_ESP_MARKER: [u8; 4] = [0, 0, 0, 0];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Transports that can actually carry IKEv2/NAT-T (UDP 500/4500).
+///
+/// Plain HTTP CONNECT is absent by design: it tunnels TCP and cannot carry UDP.
+/// MASQUE/Connect-UDP was removed because the only widely reachable deployment
+/// (Cloudflare WARP) speaks Connect-IP into its own network and cannot target an
+/// operator ePDG at an arbitrary host:port.
 pub enum ProxyKind {
     Direct,
     Socks5UdpAssociate,
-    ConnectUdpMasque,
     UdpRelay,
 }
 
@@ -23,7 +28,6 @@ impl ProxyKind {
         match self {
             ProxyKind::Direct => "direct",
             ProxyKind::Socks5UdpAssociate => "socks5_udp_associate",
-            ProxyKind::ConnectUdpMasque => "connect_udp_masque",
             ProxyKind::UdpRelay => "udp_relay",
         }
     }
@@ -320,6 +324,139 @@ impl NatTPacketTransport for UdpSocketDatagramTransport {
     }
 }
 
+/// A datagram path to the ePDG that hides whether traffic goes out directly or
+/// through a proxy.
+///
+/// The IKE/NAT-T state machines only need "send this to that address" and
+/// "receive the next datagram", so every mode implements the same two operations
+/// and callers do not branch on the proxy setting. `DatagramPath::for_line`
+/// builds the right variant from a line's configuration.
+pub enum DatagramPath {
+    /// Straight out of a local UDP socket.
+    Direct(UdpSocketDatagramTransport),
+    /// Through a SOCKS5 proxy's UDP ASSOCIATE relay.
+    Socks5(Box<super::socks5::Socks5UdpClient>),
+}
+
+impl fmt::Debug for DatagramPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Direct(_) => f.write_str("DatagramPath::Direct"),
+            Self::Socks5(client) => write!(f, "DatagramPath::Socks5({client:?})"),
+        }
+    }
+}
+
+impl DatagramPath {
+    /// Which transport this is, for status reporting.
+    pub fn kind(&self) -> ProxyKind {
+        match self {
+            Self::Direct(_) => ProxyKind::Direct,
+            Self::Socks5(_) => ProxyKind::Socks5UdpAssociate,
+        }
+    }
+
+    /// Bind a direct path whose local family matches the peer being targeted.
+    pub async fn direct_for(peer: SocketAddr) -> Result<Self, TransportError> {
+        let local = match peer {
+            SocketAddr::V4(_) => "0.0.0.0:0".parse().expect("valid v4 bind"),
+            SocketAddr::V6(_) => "[::]:0".parse().expect("valid v6 bind"),
+        };
+        Ok(Self::Direct(UdpSocketDatagramTransport::bind(local).await?))
+    }
+
+    /// Open a SOCKS5 UDP association for reaching `peer`.
+    pub async fn socks5_for(
+        endpoint: &super::socks5::Socks5Endpoint,
+        peer: SocketAddr,
+        connect_timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        let client = super::socks5::Socks5UdpClient::connect(endpoint, peer.ip(), connect_timeout)
+            .await
+            .map_err(|err| TransportError::UnsupportedProxy(err.to_string()))?;
+        Ok(Self::Socks5(Box::new(client)))
+    }
+
+    /// Whether the path is still usable.
+    ///
+    /// A SOCKS5 association dies with its TCP control connection, and datagrams
+    /// then vanish silently — callers should re-establish rather than keep
+    /// retransmitting into a black hole.
+    pub async fn is_healthy(&self) -> bool {
+        match self {
+            Self::Direct(_) => true,
+            Self::Socks5(client) => client.is_control_alive().await,
+        }
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, TransportError> {
+        match self {
+            Self::Direct(socket) => socket.local_addr(),
+            Self::Socks5(client) => client
+                .local_addr()
+                .map_err(|err| TransportError::Io(err.to_string())),
+        }
+    }
+
+    pub async fn send_to(
+        &self,
+        destination: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        match self {
+            Self::Direct(socket) => socket
+                .send_ike_metadata(destination, payload)
+                .await
+                .map(|_| ()),
+            Self::Socks5(client) => client
+                .send_to(destination, payload)
+                .await
+                .map_err(|err| TransportError::Io(err.to_string())),
+        }
+    }
+
+    /// Receive the next datagram.
+    ///
+    /// `fallback_remote` is used when the transport cannot report an origin — a
+    /// SOCKS5 proxy may answer with a domain-typed address, which carries no
+    /// routable peer. Using the address we sent to keeps the IKE state machine's
+    /// peer bookkeeping correct.
+    pub async fn recv_from(
+        &self,
+        fallback_remote: SocketAddr,
+    ) -> Result<(SocketAddr, Vec<u8>), TransportError> {
+        match self {
+            Self::Direct(socket) => socket.recv_ike_datagram().await,
+            Self::Socks5(client) => {
+                let (origin, payload) = client
+                    .recv_from()
+                    .await
+                    .map_err(|err| TransportError::Io(err.to_string()))?;
+                Ok((origin.unwrap_or(fallback_remote), payload))
+            }
+        }
+    }
+}
+
+impl IkeDatagramTransport for DatagramPath {
+    async fn send_ike_datagram(
+        &self,
+        destination: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), TransportError> {
+        self.send_to(destination, payload).await
+    }
+
+    async fn recv_ike_datagram(&self) -> Result<(SocketAddr, Vec<u8>), TransportError> {
+        // Direct sockets always report the true origin; SOCKS5 replies normally do
+        // too, so the unspecified fallback is only a last resort.
+        let fallback = self
+            .local_addr()
+            .unwrap_or_else(|_| "0.0.0.0:0".parse().expect("valid placeholder"));
+        self.recv_from(fallback).await
+    }
+}
+
 pub fn choose_route_policy(
     profile: &'static CarrierProfileMeta,
     epdg_host: &str,
@@ -331,11 +468,6 @@ pub fn choose_route_policy(
             kind: ProxyKind::Socks5UdpAssociate,
             policy_id: "socks5_udp_by_profile",
             note: "SOCKS5 UDP ASSOCIATE path; plain HTTP CONNECT is not used for UDP",
-        },
-        ProxyKind::ConnectUdpMasque => NetworkRoutePolicy {
-            kind: ProxyKind::ConnectUdpMasque,
-            policy_id: "masque_by_profile",
-            note: "HTTP CONNECT-UDP/MASQUE path; plain HTTP CONNECT is not equivalent",
         },
         ProxyKind::UdpRelay => NetworkRoutePolicy {
             kind: ProxyKind::UdpRelay,
@@ -364,16 +496,25 @@ mod tests {
     }
 
     #[test]
-    fn masque_route_explicitly_distinguishes_connect_udp_from_plain_connect() {
-        let policy = choose_route_policy(
-            &US_ATT_310410.meta,
-            US_ATT_310410.epdg.host,
-            Some(ProxyKind::ConnectUdpMasque),
+    fn only_udp_capable_transports_are_offered() {
+        // IKEv2/NAT-T is UDP 500/4500, so every supported mode must be able to
+        // carry UDP. Plain HTTP CONNECT (TCP-only) and MASQUE/Connect-UDP (no
+        // reachable proxy that can target an arbitrary ePDG) are deliberately
+        // absent — see the ProxyKind docs.
+        for kind in [
+            ProxyKind::Direct,
+            ProxyKind::Socks5UdpAssociate,
+            ProxyKind::UdpRelay,
+        ] {
+            let policy =
+                choose_route_policy(&US_ATT_310410.meta, US_ATT_310410.epdg.host, Some(kind));
+            assert_eq!(policy.kind, kind);
+        }
+        assert_eq!(
+            ProxyKind::Socks5UdpAssociate.as_str(),
+            "socks5_udp_associate"
         );
-
-        assert_eq!(policy.kind, ProxyKind::ConnectUdpMasque);
-        assert!(policy.note.contains("CONNECT-UDP"));
-        assert!(policy.note.contains("not equivalent"));
+        assert_eq!(ProxyKind::UdpRelay.as_str(), "udp_relay");
     }
 
     #[tokio::test]

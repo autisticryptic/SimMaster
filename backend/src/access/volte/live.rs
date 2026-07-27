@@ -38,15 +38,22 @@ use crate::{
 use super::{
     bearer::{
         configure_bearer_network, disconnect_bearer, disconnect_existing_ims_bearers,
-        ensure_ims_bearer, route_pcscf, teardown_bearer_network, BearerConnection, BearerRequest,
+        ensure_ims_bearer_observed, route_pcscf, teardown_bearer_network, BearerAttempt,
+        BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
-    data_path::probe_ims_ipv6,
+    data_slot::DataSlotMode,
     digest_aka,
     errors::{code, VolteError},
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
-    pcscf::{discover_pcscf, discover_pcscf_via_at_with_context, pcscf_socket, ImsAtContextLease},
+    native_bearer::{self, NativeImsBearer},
+    pcscf::{
+        configured_ims_cid, discover_pcscf, discover_pcscf_via_at_with_context, pcscf_socket,
+        ImsAtContextLease,
+    },
+    plan::{FailureClass, ImsConnectionPlan},
+    readiness,
     rtp_relay::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
     runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
     sip::{self, ImsIdentity, RequestIds},
@@ -57,9 +64,26 @@ use super::{
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
-const FIXED_IMS_FAMILY_ORDER: VolteIpFamilyPreference = VolteIpFamilyPreference::Ipv4First;
+const NATIVE_BEARER_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+const NATIVE_BEARER_HEALTH_FAILURE_LIMIT: u8 = 3;
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
+
+/// Opt in to establishing the IMS bearer natively over QMI instead of through
+/// ModemManager. See the call site in `connect_inner` for why this is off by
+/// default: the activation step is the one part of the native flow that has not
+/// been exercised on the reference baseband, and a bad IMS activation on that
+/// firmware can restart the baseband.
+const NATIVE_IMS_BEARER_ENV: &str = "SIMADMIN_VOLTE_NATIVE_IMS_BEARER";
+
+fn native_ims_bearer_enabled() -> bool {
+    std::env::var(NATIVE_IMS_BEARER_ENV)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "1" || value == "true" || value == "yes"
+        })
+        .unwrap_or(false)
+}
 
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
 
@@ -147,10 +171,20 @@ struct VolteLiveSession {
     identity: ImsIdentity,
     service_route: Option<String>,
     bearer: BearerConnection,
+    /// Set when the bearer was established directly over QMI instead of through
+    /// ModemManager. Owns the WDS client/handle, so teardown must release it here;
+    /// `mmcli --disconnect` has no object to act on for such a bearer.
+    native_bearer: Option<NativeImsBearer>,
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
     at_context: Option<ImsAtContextLease>,
+    register_ids: RequestIds,
+    next_register_cseq: u32,
+    sip_instance: String,
+    security_binding: SecAgree,
+    device: VolteDeviceBinding,
+    aka_aid: Vec<u8>,
     voice_calls: HashMap<String, LiveVoiceCall>,
 }
 
@@ -185,6 +219,10 @@ enum LiveVoiceDirection {
 
 struct DeviceIdentity {
     ims: ImsIdentity,
+    aka_aid: Vec<u8>,
+    usim_aid: String,
+    isim_aid: Option<String>,
+    source: &'static str,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +251,9 @@ struct VolteRegisterAuthenticator {
     mode: RegistrationMode,
     xfrm_plan: Option<XfrmInstallPlan>,
     device: VolteDeviceBinding,
+    runtime: VolteRuntime,
+    reuse_security: bool,
+    aka_aid: Vec<u8>,
 }
 
 impl VolteRegisterAuthenticator {
@@ -223,6 +264,9 @@ impl VolteRegisterAuthenticator {
         offered_security_binding: SecAgree,
         route: ImsRoute,
         device: VolteDeviceBinding,
+        runtime: VolteRuntime,
+        reuse_security: bool,
+        aka_aid: Vec<u8>,
     ) -> Self {
         let offered_security = offered_security_binding.security_client_value();
         Self {
@@ -236,6 +280,9 @@ impl VolteRegisterAuthenticator {
             mode: RegistrationMode::None,
             xfrm_plan: None,
             device,
+            runtime,
+            reuse_security,
+            aka_aid,
         }
     }
 }
@@ -246,9 +293,12 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         challenge_response: &[u8],
         channel: &mut VolteSipChannel,
     ) -> Result<(), ImsError> {
+        self.runtime
+            .update(|state| state.stage = VolteStage::IdentityAka)
+            .await;
         let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
         let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
-        let aid = identity::resolve_usim_aid(None);
+        let aid = self.aka_aid.clone();
         let rand = aka_challenge.rand;
         let autn = aka_challenge.autn;
         let qmi_device = self.device.qmi_device.clone();
@@ -318,7 +368,26 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                     .ok()
                     .map(|sec| (sec, value))
             });
+        if self.reuse_security {
+            let security_verify = channel.security_verify().map(str::to_string);
+            self.mode = if security_verify.is_some() {
+                RegistrationMode::Ipsec
+            } else {
+                RegistrationMode::Udp
+            };
+            self.pending = Some(PreparedAuth {
+                authorization,
+                security_client: None,
+                security_verify: security_verify.clone(),
+                require_sec_agree: security_verify.is_some(),
+            });
+            self.route = channel.route();
+            return Ok(());
+        }
         if let Some((selected, verify)) = security_server {
+            self.runtime
+                .update(|state| state.stage = VolteStage::Ipsec)
+                .await;
             let route = channel.route();
             let plan = ipsec::build_install_plan(
                 route.local_addr.ip(),
@@ -375,12 +444,15 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         _challenge_response: &[u8],
         cseq: u32,
     ) -> Result<Vec<u8>, ImsError> {
+        self.runtime
+            .update(|state| state.stage = VolteStage::RegisterAuthenticated)
+            .await;
         let prepared = self
             .pending
             .take()
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
-        ids.cseq = cseq;
+        ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         Ok(sip::build_register_with_security_policy(
             &self.identity,
             &self.route,
@@ -425,11 +497,11 @@ pub async fn connect_live_for_line(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
-    // Per-line connection intent is authoritative. `feature_enabled` is kept
-    // only for compatibility with older configuration files and APIs.
-    if !config.connection_enabled {
-        return Err(VolteError::new(code::RUNTIME_NOT_RUNNING));
-    }
+    // Per-line connection intent is authoritative: the caller has already
+    // verified `profile.enabled && profile.volte_connection_enabled` for this
+    // physical line. The legacy global `VolteConfig::connection_enabled`
+    // (and `feature_enabled`/`sms_enabled`) are no longer consulted here; they
+    // are retained only for backward-compatible config/API serialization.
     let _advance = runtime.advance_guard().await;
     if live.session.lock().await.is_some() {
         return Ok(runtime.status().await);
@@ -441,10 +513,17 @@ pub async fn connect_live_for_line(
             state.stage = VolteStage::Starting;
             state.session_started_at = Some(now());
             state.last_error = None;
+            state.qmi_device = Some(device.qmi_device.clone());
+            state.bearer_interface = None;
+            state.bearer_ip_type = None;
+            state.bearer_path = None;
+            state.at_cid = None;
+            state.current_ip_family = None;
+            state.connection_attempts.clear();
         })
         .await;
 
-    match connect_inner(runtime, generation, device).await {
+    match connect_inner(runtime, generation, device, config.ip_family_preference).await {
         Ok(session) => {
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
@@ -452,7 +531,16 @@ pub async fn connect_live_for_line(
                 RegistrationMode::Udp
             };
             let pcscf = session.pcscf.to_string();
-            let data_path_mode = format!("dedicated_ims_bearer_{}", session.ip_family);
+            // Report the beta2 data-slot allocation rather than an ad-hoc label.
+            // The native path puts IMS on the primary port with DATA6 reserved for
+            // data (`secondary_qmi_data`); the ModemManager path runs IMS on the
+            // primary port with no dedicated data slot (`independent_wwan1`).
+            let data_slot_mode = if session.native_bearer.is_some() {
+                DataSlotMode::PrimaryImsSecondaryData
+            } else {
+                DataSlotMode::PrimaryImsOnly
+            };
+            let data_path_mode = data_slot_mode.as_str().to_string();
             *live.session.lock().await = Some(session);
             live.operator.set_ready(config.voice_enabled);
             runtime
@@ -498,89 +586,303 @@ async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
+    family_pref: VolteIpFamilyPreference,
 ) -> Result<VolteLiveSession, VolteError> {
+    // Build the canonical connection plan from the configured preference. All
+    // four family-selection consumers (AT probe order, bearer fallback, IPv6
+    // preflight hint, SIP local-address order) now derive from this one object.
+    let plan = ImsConnectionPlan::from_preference(family_pref);
     let mut device = resolve_device_binding(device).await?;
+
+    // beta2 readiness gate: wait for the QMI auto-activate marker to settle before
+    // driving the modem, so IMS setup does not race the initial UIM provisioning.
+    // This is advisory — a timeout falls through to the ordinary modem-readiness
+    // checks rather than failing (matching beta2's
+    // "continuing with modem readiness checks").
+    tracing::info!("Waiting for initial QMI UIM provisioning to settle");
+    let readiness = readiness::wait_for_qmi_ready().await;
+    match readiness {
+        readiness::ReadinessOutcome::Ready => tracing::info!("{}", readiness.log_message()),
+        readiness::ReadinessOutcome::TimedOut => tracing::warn!("{}", readiness.log_message()),
+    }
+
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
     let device_identity = load_device_identity(&device).await?;
+    runtime
+        .update(|state| {
+            state.identity_source = Some(device_identity.source.to_string());
+            state.usim_aid = Some(device_identity.usim_aid.clone());
+            state.isim_aid = device_identity.isim_aid.clone();
+        })
+        .await;
     ensure_generation(runtime, generation)?;
 
     runtime
-        .update(|state| state.stage = VolteStage::Pcscf)
+        .update(|state| state.stage = VolteStage::ImsContext)
         .await;
     disconnect_existing_ims_bearers(&device.modem_id).await?;
-    let at_discovery =
-        discover_pcscf_via_at_with_context(&device.modem_id, FIXED_IMS_FAMILY_ORDER).await?;
-    let at_pcscf = at_discovery.candidates;
-    let mut at_context = at_discovery.context;
-    if let Err(error) = ensure_generation(runtime, generation) {
-        if let Some(context) = at_context.take() {
-            context.cleanup().await;
-        }
-        return Err(error);
-    }
-    device = match resolve_device_binding(&device).await {
-        Ok(device) => device,
-        Err(error) => {
-            if let Some(context) = at_context.take() {
-                context.cleanup().await;
-            }
-            return Err(error);
-        }
-    };
 
-    if let Err(error) = probe_ims_ipv6(&device.qmi_device, at_discovery.cid).await {
-        tracing::warn!(error = %error, "VoLTE IMS IPv6 WDS preflight failed; continuing to bearer");
-    }
+    // beta2-aligned P-CSCF ordering: the bearer is brought up *first*, and its
+    // own P-CSCF (delivered via PCO on the ModemManager path, or read directly
+    // from the QMI WDS session on the native path) is used before anything else.
+    // The AT `$QCPDPIMSCFGE` + `CGACT=1,<cid>` probe — which wedges the baseband
+    // on some Qualcomm firmware — is demoted to a *last-resort fallback* that only
+    // runs after the bearer is up and only if it delivered no P-CSCF. This mirrors
+    // beta2's discovery order (profile → bearer/WDS → AT) and means the risky AT
+    // sequence no longer runs on every connect.
+    let ims_cid = configured_ims_cid();
+    // Record the resolved IMS CID so every subsequent attempt row carries it as
+    // a structured field (auto-captured by `record_attempt`).
+    runtime.update(|state| state.at_cid = Some(ims_cid)).await;
+    ensure_generation(runtime, generation)?;
+    device = resolve_device_binding(&device).await?;
 
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
     let request = BearerRequest::default();
-    let mut bearer = match ensure_ims_bearer(&device.modem_id, &request).await {
-        Ok(bearer) => bearer,
-        Err(error)
-            if at_context.is_some() && should_retry_bearer_after_at_context_cleanup(&error) =>
+
+    // Preferred path when enabled: establish the IMS bearer directly over QMI on
+    // this line's primary control port. That port is the only endpoint where a
+    // WDS client id survives across `qmicli` invocations, which the
+    // start-network → get-current-settings → P-CSCF sequence requires; sharing it
+    // with ModemManager is safe because both go through `qmi-proxy`.
+    //
+    // It is opt-in because the activation step itself has not been exercised on
+    // the reference baseband: every preceding step (proxy readiness, CID
+    // allocation, cross-process reuse, set-ip-family, settings read) is verified
+    // on hardware, but `--wds-start-network` for `apn=ims` on the primary port is
+    // not. On this firmware a bad IMS activation can restart the baseband, so the
+    // default stays on the ModemManager path until this is confirmed on a device.
+    let mut native_bearer = None;
+    if native_ims_bearer_enabled() {
+        runtime
+            .record_attempt(
+                VolteStage::Bearer,
+                None,
+                "started",
+                None,
+                Some(format!("native_qmi:{}", device.qmi_device)),
+            )
+            .await;
+        match native_bearer::establish_native_ims_bearer(&device.qmi_device, &request, &plan).await
         {
-            tracing::warn!(
-                error = %error,
-                "VoLTE IMS bearer prefix unavailable with retained AT context; retrying after legacy context cleanup"
-            );
-            if let Some(context) = at_context.take() {
-                context.cleanup().await;
+            Ok(established) => {
+                runtime
+                    .record_attempt(
+                        VolteStage::Bearer,
+                        Some(established.connection.ip_type.as_str()),
+                        "succeeded",
+                        None,
+                        Some(format!(
+                            "native_qmi:{}:netdev={}:{}",
+                            device.qmi_device,
+                            established.netdev.interface,
+                            established.netdev.method.as_str()
+                        )),
+                    )
+                    .await;
+                native_bearer = Some(established);
             }
-            device = resolve_device_binding(&device).await?;
-            ensure_ims_bearer(&device.modem_id, &request).await?
+            Err(error) => {
+                let class = FailureClass::from_details(error.detail().unwrap_or(""));
+                runtime
+                    .record_attempt(
+                        VolteStage::Bearer,
+                        None,
+                        "failed",
+                        Some(&error),
+                        Some("native_qmi".to_string()),
+                    )
+                    .await;
+                // A wedged baseband must not be handed to ModemManager for a
+                // second activation attempt: that is precisely what escalates a
+                // subsystem restart into a dead device.
+                if class.is_unsafe_to_retry() {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    error = %error,
+                    "Native QMI IMS bearer failed; falling back to the ModemManager bearer"
+                );
+            }
         }
-        Err(error) => {
-            if let Some(context) = at_context.take() {
-                context.cleanup().await;
+    }
+
+    // A native session already carries its own connection details; otherwise fall
+    // back to letting ModemManager create and connect the bearer.
+    let mut bearer = if let Some(established) = native_bearer.as_ref() {
+        established.connection.clone()
+    } else {
+        match ensure_bearer_with_runtime(runtime, &device.modem_id, &request, &plan).await {
+            Ok(bearer) => bearer,
+            Err(error) => {
+                if let Some(established) = native_bearer.take() {
+                    native_bearer::release_native_ims_bearer(established).await;
+                }
+                return Err(error);
             }
-            return Err(error);
         }
     };
-    for candidate in at_pcscf {
-        if !bearer.settings.pcscf.contains(&candidate) {
-            bearer.settings.pcscf.push(candidate);
+    // P-CSCF now follows the beta2 discovery order: the bearer is brought up
+    // first, and its own PCO (ModemManager's bearer settings, or the native
+    // QMI WDS `--wds-get-current-settings` read) is the primary source. The AT
+    // `$QCPDPIMSCFGE` + `CGACT=1,<cid>` probe — which can wedge this firmware's
+    // baseband — is demoted to a last-resort fallback that only runs when the
+    // bearer delivered no P-CSCF at all. This mirrors beta2's
+    // "discovered directly from QMI WDS" → "discovered from active IMS bearer"
+    // (AT) ordering and stops the dangerous AT sequence from running on every
+    // connect.
+    let mut at_context: Option<ImsAtContextLease> = None;
+    if bearer.settings.pcscf.is_empty() {
+        tracing::info!(
+            "VoLTE bearer delivered no P-CSCF via PCO; falling back to AT $QCPDPIMSCFGE discovery"
+        );
+        runtime
+            .record_attempt(
+                VolteStage::Pcscf,
+                None,
+                "started",
+                None,
+                Some("at_cgcontrdp_fallback".to_string()),
+            )
+            .await;
+        match discover_pcscf_via_at_with_context(&device.modem_id, &plan).await {
+            Ok(discovery) => {
+                runtime
+                    .record_attempt(
+                        VolteStage::Pcscf,
+                        None,
+                        "succeeded",
+                        None,
+                        Some(format!("at_cgcontrdp_fallback:cid={}", discovery.cid)),
+                    )
+                    .await;
+                runtime
+                    .update(|state| state.at_cid = Some(discovery.cid))
+                    .await;
+                for candidate in discovery.candidates {
+                    if !bearer.settings.pcscf.contains(&candidate) {
+                        bearer.settings.pcscf.push(candidate);
+                    }
+                }
+                at_context = discovery.context;
+            }
+            Err(error) => {
+                runtime
+                    .record_attempt(
+                        VolteStage::Pcscf,
+                        None,
+                        "failed",
+                        Some(&error),
+                        Some("at_cgcontrdp_fallback".to_string()),
+                    )
+                    .await;
+                tracing::warn!(
+                    error = %error,
+                    "VoLTE AT P-CSCF fallback failed; the SIP loop will still try DNS discovery"
+                );
+            }
         }
     }
     let result = async {
-        configure_bearer_network(&bearer).await?;
+        runtime
+            .update(|state| {
+                state.stage = VolteStage::IpConfig;
+                state.bearer_interface = Some(bearer.interface.clone());
+                state.bearer_ip_type = Some(bearer.ip_type.clone());
+                state.bearer_path = Some(bearer.path.clone());
+            })
+            .await;
+        if let Err(error) = configure_bearer_network(&bearer).await {
+            runtime
+                .record_attempt(
+                    VolteStage::IpConfig,
+                    None,
+                    "failed",
+                    Some(&error),
+                    Some(bearer.interface.clone()),
+                )
+                .await;
+            return Err(error);
+        }
+        runtime
+            .record_attempt(
+                VolteStage::IpConfig,
+                None,
+                "succeeded",
+                None,
+                Some(bearer.interface.clone()),
+            )
+            .await;
         ensure_generation(runtime, generation)?;
-        let local_addrs = bearer.settings.ordered_local_addrs(FIXED_IMS_FAMILY_ORDER);
+        let local_addrs = bearer.settings.ordered_local_addrs(&plan);
         if local_addrs.is_empty() {
-            return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+            // The bearer connected but carries no address in a family the
+            // configured preference admits (e.g. an ipv4-only preference on an
+            // IPv6-only bearer). This is a family-support mismatch, not a
+            // generic missing-settings error.
+            let has_any_addr =
+                bearer.settings.ipv4_address.is_some() || bearer.settings.ipv6_address.is_some();
+            let code = if has_any_addr {
+                code::RUNTIME_IMS_FAMILY_UNSUPPORTED
+            } else {
+                code::IP_SETTINGS_MISSING
+            };
+            return Err(VolteError::new(code));
         }
         let mut last_error = None;
         for (index, local_addr) in local_addrs.iter().copied().enumerate() {
             ensure_generation(runtime, generation)?;
+            let family = ip_family_name(local_addr);
+            runtime
+                .update(|state| state.current_ip_family = Some(family.to_string()))
+                .await;
+            runtime
+                .record_attempt(VolteStage::Pcscf, Some(family), "started", None, None)
+                .await;
             match connect_family(runtime, &bearer, &device_identity, local_addr, &device).await {
-                Ok(session) => return Ok(session),
-                Err(error) if index + 1 < local_addrs.len() && should_try_next_family(&error) => {
+                Ok(session) => {
+                    runtime
+                        .record_attempt(
+                            VolteStage::Registered,
+                            Some(family),
+                            "succeeded",
+                            None,
+                            None,
+                        )
+                        .await;
+                    return Ok(session);
+                }
+                Err(error)
+                    if index + 1 < local_addrs.len()
+                        && FailureClass::from_error(&error).is_retryable_family() =>
+                {
+                    runtime
+                        .record_attempt(
+                            VolteStage::Pcscf,
+                            Some(family),
+                            "failed",
+                            Some(&error),
+                            Some("trying_next_family".to_string()),
+                        )
+                        .await;
                     last_error = Some(error);
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    runtime
+                        .record_attempt(
+                            VolteStage::Pcscf,
+                            Some(family),
+                            "failed",
+                            Some(&error),
+                            None,
+                        )
+                        .await;
+                    return Err(error);
+                }
             }
         }
         Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
@@ -588,15 +890,70 @@ async fn connect_inner(
     .await;
     if result.is_err() {
         teardown_bearer_network(&bearer).await;
+        // `disconnect_bearer` is a no-op for a native path; the WDS session behind
+        // it is owned by the handle below and released explicitly.
         disconnect_bearer(&bearer.path).await;
+        if let Some(established) = native_bearer.take() {
+            native_bearer::release_native_ims_bearer(established).await;
+        }
         if let Some(context) = at_context.take() {
             context.cleanup().await;
         }
     }
     result.map(|mut session| {
         session.at_context = at_context;
+        // Hand the session ownership of the native bearer so `cleanup_live_session`
+        // can stop the WDS session and release its client id. Without this the PDP
+        // context would outlive the SIP session.
+        session.native_bearer = native_bearer;
         session
     })
+}
+
+fn bearer_stage(ip_type: &str) -> VolteStage {
+    match ip_type {
+        "ipv4v6" => VolteStage::BearerDual,
+        "ipv4" => VolteStage::BearerIpv4,
+        "ipv6" => VolteStage::BearerIpv6,
+        _ => VolteStage::Bearer,
+    }
+}
+
+async fn ensure_bearer_with_runtime(
+    runtime: &VolteRuntime,
+    modem_id: &str,
+    request: &BearerRequest,
+    plan: &ImsConnectionPlan,
+) -> Result<BearerConnection, VolteError> {
+    let observed_runtime = runtime.clone();
+    ensure_ims_bearer_observed(modem_id, request, plan, move |attempt: BearerAttempt| {
+        let runtime = observed_runtime.clone();
+        async move {
+            let stage = bearer_stage(&attempt.ip_type);
+            let family = match attempt.ip_type.as_str() {
+                "ipv4v6" => Some("dual"),
+                "ipv4" => Some("ipv4"),
+                "ipv6" => Some("ipv6"),
+                _ => None,
+            };
+            runtime
+                .update(|state| {
+                    state.stage = stage;
+                    state.bearer_ip_type = Some(attempt.ip_type.clone());
+                })
+                .await;
+            runtime
+                .record_attempt(
+                    stage,
+                    family,
+                    &attempt.outcome,
+                    attempt.error.as_ref(),
+                    Some(attempt.source),
+                )
+                .await;
+        }
+    })
+    .await
 }
 
 async fn connect_family(
@@ -618,7 +975,7 @@ async fn connect_family(
     route_pcscf(bearer, pcscf).await?;
     runtime
         .update(|state| {
-            state.stage = VolteStage::RegisterIpsec;
+            state.stage = VolteStage::RegisterInitial;
             state.pcscf = Some(pcscf.to_string());
         })
         .await;
@@ -660,6 +1017,9 @@ async fn connect_family(
         offered_binding,
         channel.route(),
         device.clone(),
+        runtime.clone(),
+        false,
+        device_identity.aka_aid.clone(),
     );
     let registration = match run_register(&mut channel, &initial, &mut authenticator).await {
         Ok(registration) => registration,
@@ -699,6 +1059,15 @@ async fn connect_family(
         ip_family: ip_family_name(local_addr),
         xfrm_plan: authenticator.xfrm_plan,
         at_context: None,
+        // Attached by `connect_inner`, which owns it until the session is known
+        // to be good.
+        native_bearer: None,
+        register_ids: authenticator.ids,
+        next_register_cseq: 2 + u32::from(registration.auth_rounds),
+        sip_instance: authenticator.sip_instance,
+        security_binding: authenticator.offered_security_binding,
+        device: device.clone(),
+        aka_aid: device_identity.aka_aid.clone(),
         voice_calls: HashMap::new(),
     })
 }
@@ -760,21 +1129,86 @@ async fn live_receive_loop(
 ) {
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
-    let refresh_at = tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+    let mut refresh_at =
+        tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+    let mut native_health_at = tokio::time::Instant::now() + NATIVE_BEARER_HEALTH_INTERVAL;
+    let mut native_health_failures = 0u8;
     loop {
         if runtime.generation() != generation {
             break;
         }
+        if tokio::time::Instant::now() >= native_health_at {
+            native_health_at = tokio::time::Instant::now() + NATIVE_BEARER_HEALTH_INTERVAL;
+            let health_client = {
+                let sessions = live.session.lock().await;
+                sessions
+                    .as_ref()
+                    .and_then(|session| session.native_bearer.as_ref())
+                    .map(|bearer| bearer.session.client.clone())
+            };
+            if let Some(client) = health_client {
+                match client.packet_service_status().await {
+                    Ok(crate::cellular::qmi_wds::PacketServiceStatus::Connected) => {
+                        native_health_failures = 0;
+                    }
+                    Ok(crate::cellular::qmi_wds::PacketServiceStatus::Disconnected) => {
+                        let error = VolteError::with_detail(
+                            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                            "native_ims_packet_service_disconnected".to_string(),
+                        );
+                        mark_native_bearer_unhealthy(&runtime, &error).await;
+                        cleanup_live_session(&live).await;
+                        break;
+                    }
+                    Err(error) => {
+                        let unsafe_to_retry = error.is_unsafe_to_retry();
+                        let error = native_bearer::wds_error_to_volte(error);
+                        native_health_failures = native_health_failures.saturating_add(1);
+                        tracing::warn!(
+                            attempt = native_health_failures,
+                            error = %error,
+                            "Native IMS bearer health query failed"
+                        );
+                        if unsafe_to_retry
+                            || native_health_failures >= NATIVE_BEARER_HEALTH_FAILURE_LIMIT
+                        {
+                            mark_native_bearer_unhealthy(&runtime, &error).await;
+                            cleanup_live_session(&live).await;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         if tokio::time::Instant::now() >= refresh_at {
-            runtime
-                .update(|state| {
-                    state.phase = VoltePhase::Degraded;
-                    state.last_error = Some("volte_register_refresh_due".to_string());
-                    state.reconnect_count += 1;
-                })
-                .await;
-            cleanup_live_session(&live).await;
-            break;
+            let refresh_result = {
+                let mut sessions = live.session.lock().await;
+                match sessions.as_mut() {
+                    Some(session) => refresh_live_registration(session, &runtime).await,
+                    None => break,
+                }
+            };
+            match refresh_result {
+                Ok(()) => {
+                    refresh_at = tokio::time::Instant::now()
+                        + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "VoLTE REGISTER refresh failed; rebuilding session");
+                    runtime
+                        .update(|state| {
+                            state.phase = VoltePhase::Degraded;
+                            state.last_error =
+                                Some(format!("volte_register_refresh_failed:{error}"));
+                            state.last_failure_at = Some(now());
+                            state.reconnect_count = state.reconnect_count.saturating_add(1);
+                        })
+                        .await;
+                    cleanup_live_session(&live).await;
+                    break;
+                }
+            }
         }
         let input = {
             let mut sessions = live.session.lock().await;
@@ -838,6 +1272,125 @@ async fn live_receive_loop(
     }
 }
 
+async fn mark_native_bearer_unhealthy(runtime: &VolteRuntime, error: &VolteError) {
+    runtime
+        .record_attempt(
+            VolteStage::Bearer,
+            None,
+            "failed",
+            Some(error),
+            Some("native_qmi_health".to_string()),
+        )
+        .await;
+    runtime
+        .update(|state| {
+            state.phase = VoltePhase::Degraded;
+            state.stage = VolteStage::Bearer;
+            state.last_error = Some(error.to_string());
+            state.last_failure_at = Some(now());
+            state.reconnect_count = state.reconnect_count.saturating_add(1);
+        })
+        .await;
+}
+
+async fn refresh_live_registration(
+    session: &mut VolteLiveSession,
+    runtime: &VolteRuntime,
+) -> Result<(), VolteError> {
+    runtime
+        .update(|state| state.stage = VolteStage::RegisterRefresh)
+        .await;
+    runtime
+        .record_attempt(
+            VolteStage::RegisterRefresh,
+            Some(session.ip_family),
+            "started",
+            None,
+            None,
+        )
+        .await;
+
+    let mut ids = session.register_ids.clone();
+    ids.cseq = session.next_register_cseq;
+    let security_verify = session.channel.security_verify().map(str::to_string);
+    let require_sec_agree = security_verify.is_some();
+    let initial_authorization = digest_aka::build_initial_authorization_header(
+        &session.identity.private_user,
+        &session.identity.home_domain,
+        &format!("sip:{}", session.identity.home_domain),
+    );
+    let initial = sip::build_register_with_security_policy(
+        &session.identity,
+        &session.channel.route(),
+        &ids,
+        REGISTER_EXPIRES,
+        Some(&initial_authorization),
+        None,
+        security_verify.as_deref(),
+        &session.sip_instance,
+        require_sec_agree,
+    );
+    let mut authenticator = VolteRegisterAuthenticator::new(
+        session.identity.clone(),
+        ids.clone(),
+        session.sip_instance.clone(),
+        session.security_binding.clone(),
+        session.channel.route(),
+        session.device.clone(),
+        runtime.clone(),
+        true,
+        session.aka_aid.clone(),
+    );
+    let registration = match run_register(&mut session.channel, &initial, &mut authenticator).await
+    {
+        Ok(registration) => registration,
+        Err(error) => {
+            let error = map_register_error(error);
+            runtime
+                .record_attempt(
+                    VolteStage::RegisterRefresh,
+                    Some(session.ip_family),
+                    "failed",
+                    Some(&error),
+                    None,
+                )
+                .await;
+            return Err(error);
+        }
+    };
+
+    session.next_register_cseq = ids
+        .cseq
+        .saturating_add(u32::from(registration.auth_rounds))
+        .saturating_add(1);
+    if let Some(route) = register_service_route(&registration.response) {
+        session.service_route = Some(route);
+    }
+    if let Some(uri) = register_associated_uri(&registration.response) {
+        session.identity.public_uri = uri;
+    }
+    runtime
+        .record_attempt(
+            VolteStage::RegisterRefresh,
+            Some(session.ip_family),
+            "succeeded",
+            None,
+            Some(format!("cseq={}", ids.cseq)),
+        )
+        .await;
+    runtime
+        .update(|state| {
+            state.phase = VoltePhase::Registered;
+            state.stage = VolteStage::Registered;
+            state.last_error = None;
+            state.last_register_refresh_at = Some(now());
+            state.last_tx_at = Some(now());
+            state.register_refresh_count = state.register_refresh_count.saturating_add(1);
+        })
+        .await;
+    Ok(())
+}
+
 async fn cleanup_live_session(live: &VolteLiveHandle) {
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
@@ -846,7 +1399,14 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
             ipsec::uninstall_plan(plan);
         }
         teardown_bearer_network(&session.bearer).await;
-        disconnect_bearer(&session.bearer.path).await;
+        // A native bearer has no ModemManager object: its WDS session must be
+        // stopped through the handle we kept, or the PDP context stays up on the
+        // modem after the line is disconnected. `disconnect_bearer` ignores
+        // native paths, so this is the only path that actually releases it.
+        match session.native_bearer {
+            Some(native) => native_bearer::release_native_ims_bearer(native).await,
+            None => disconnect_bearer(&session.bearer.path).await,
+        }
         if let Some(context) = session.at_context {
             context.cleanup().await;
         }
@@ -2631,8 +3191,36 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
         .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
         .ok_or_else(|| VolteError::new(code::IMSI_MISSING))?;
     let (mcc, mnc) = operator.split_at(3);
+    let applications = match command_output(
+        "qmicli",
+        &[
+            "-d",
+            device.qmi_device.as_str(),
+            "--device-open-proxy",
+            "--uim-get-card-status",
+        ],
+    )
+    .await
+    {
+        Ok(output) => identity::parse_uicc_applications(&output),
+        Err(error) => {
+            tracing::warn!(error = %error, "VoLTE UICC application discovery failed; using USIM AID fallback");
+            identity::UiccApplications::default()
+        }
+    };
+    let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
+    let usim_aid = identity::aid_hex(&aka_aid);
+    let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
     Ok(DeviceIdentity {
         ims: identity::derive_identity(&imsi, mcc, mnc),
+        aka_aid,
+        usim_aid,
+        source: if isim_aid.is_some() {
+            "imsi_fallback_isim_detected"
+        } else {
+            "imsi_fallback"
+        },
+        isim_aid,
     })
 }
 
@@ -2651,40 +3239,11 @@ async fn resolve_device_binding(
             }
         }
 
-        if let Ok(modem_list) = command_output("mmcli", &["-L", "--output-keyvalue"]).await {
-            if let Some(current_modem_id) = primary_modem_id(&modem_list) {
-                if let Ok(details) = command_output(
-                    "mmcli",
-                    &["-m", current_modem_id.as_str(), "--output-keyvalue"],
-                )
-                .await
-                {
-                    if modem_is_ready(&details) {
-                        tracing::warn!(
-                            requested_modem = %requested.modem_id,
-                            current_modem = %current_modem_id,
-                            "VoLTE modem object changed; using current ModemManager modem"
-                        );
-                        let mut resolved = requested.clone();
-                        resolved.modem_id = current_modem_id;
-                        return Ok(resolved);
-                    }
-                }
-            }
-        }
-
         if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
             tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
         }
     }
     Err(VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))
-}
-
-fn primary_modem_id(output: &str) -> Option<String> {
-    let path = key_value(output, "modem-list.value[1]")?;
-    let modem_id = path.rsplit('/').next()?.trim();
-    (!modem_id.is_empty() && modem_id.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| modem_id.to_string())
 }
 
 fn modem_is_ready(output: &str) -> bool {
@@ -2784,24 +3343,6 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
-fn should_try_next_family(error: &VolteError) -> bool {
-    matches!(
-        error.code(),
-        code::RUNTIME_ALL_PCSCF_FAILED
-            | code::PCSCF_FAMILY_MISMATCH
-            | code::IPSEC_UDP_BIND_FAILED
-            | code::REGISTER_INITIAL_UNEXPECTED_STATUS
-            | code::COMMAND_FAILED
-    )
-}
-
-fn should_retry_bearer_after_at_context_cleanup(error: &VolteError) -> bool {
-    error.code() == code::RUNTIME_MM_BEARER_CONNECT_FAILED
-        && error
-            .detail()
-            .is_some_and(|detail| detail.contains("prefix-unavailable"))
-}
-
 fn ip_family_name(address: IpAddr) -> &'static str {
     if address.is_ipv6() {
         "ipv6"
@@ -2850,14 +3391,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_current_modem_id_after_modem_manager_reenumeration() {
-        let list =
-            "modem-list.length : 1\nmodem-list.value[1] : /org/freedesktop/ModemManager1/Modem/7\n";
-        assert_eq!(primary_modem_id(list).as_deref(), Some("7"));
-        assert_eq!(primary_modem_id("modem-list.length : 0"), None);
-    }
-
-    #[test]
     fn modem_readiness_waits_for_registration() {
         assert!(modem_is_ready("modem.generic.state : registered\n"));
         assert!(modem_is_ready("modem.generic.state : connected\n"));
@@ -2866,21 +3399,35 @@ mod tests {
     }
 
     #[test]
-    fn retained_at_context_fallback_is_limited_to_ipv6_prefix_failure() {
+    fn prefix_unavailable_failure_is_classified_distinctly() {
+        // The bearer prefix-unavailable failure is classified on its own so the
+        // family-fallback logic can react to it. (The old AT-context cleanup-and-
+        // retry workaround that keyed off this was removed with the beta2 P-CSCF
+        // reordering, since AT no longer runs before the bearer.)
         let prefix = VolteError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:prefix-unavailable",
         );
-        assert!(should_retry_bearer_after_at_context_cleanup(&prefix));
-
+        assert_eq!(
+            FailureClass::from_details(prefix.detail().unwrap_or("")),
+            FailureClass::PrefixUnavailable
+        );
         let generic = VolteError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:operation-failed",
         );
-        assert!(!should_retry_bearer_after_at_context_cleanup(&generic));
-        assert!(!should_retry_bearer_after_at_context_cleanup(
-            &VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
-        ));
+        assert_ne!(
+            FailureClass::from_details(generic.detail().unwrap_or("")),
+            FailureClass::PrefixUnavailable
+        );
+        assert_ne!(
+            FailureClass::from_details(
+                VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
+                    .detail()
+                    .unwrap_or("")
+            ),
+            FailureClass::PrefixUnavailable
+        );
     }
 
     #[test]
@@ -2968,18 +3515,22 @@ mod tests {
 
     #[test]
     fn family_fallback_is_limited_to_discovery_and_initial_transport_failures() {
-        assert!(should_try_next_family(&VolteError::new(
-            code::RUNTIME_ALL_PCSCF_FAILED
-        )));
-        assert!(should_try_next_family(&VolteError::new(
+        assert!(
+            FailureClass::from_error(&VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+                .is_retryable_family()
+        );
+        assert!(FailureClass::from_error(&VolteError::new(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
-        )));
-        assert!(!should_try_next_family(&VolteError::new(
-            code::REGISTER_AUTH_UNEXPECTED_STATUS
-        )));
-        assert!(!should_try_next_family(&VolteError::new(
-            code::USIM_AKA_FAILED
-        )));
+        ))
+        .is_retryable_family());
+        assert!(
+            !FailureClass::from_error(&VolteError::new(code::REGISTER_AUTH_UNEXPECTED_STATUS))
+                .is_retryable_family()
+        );
+        assert!(
+            !FailureClass::from_error(&VolteError::new(code::USIM_AKA_FAILED))
+                .is_retryable_family()
+        );
         assert_eq!(ip_family_name("2001:db8::1".parse().unwrap()), "ipv6");
         assert_eq!(ip_family_name("192.0.2.1".parse().unwrap()), "ipv4");
     }

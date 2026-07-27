@@ -25,25 +25,25 @@ use crate::{
     access::vowifi::restore::RestorePhase,
     access::vowifi::{
         live::{
-            clear_all_live_runtime, place_live_voice_call, send_live_sms_over_ims,
-            verify_live_sim_auth_access,
+            clear_all_live_runtime, clear_live_runtime_for_line, place_live_voice_call_for_line,
+            send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
     api::models::*,
     cellular::modem_manager,
     cellular::modem_manager::{
-        answer_call, apply_roaming_policy, background_fetch_smsc, current_sim_identity,
-        find_nm_modem_connection_pub, get_airplane_mode, get_band_lock_status,
-        get_baseband_restart_progress, get_call_by_path, get_call_settings, get_cell_location,
-        get_cells_data, get_data_connection_status, get_device_info_data, get_is_roaming_for_modem,
-        get_is_roaming_mm, get_network_info_data, get_operators_list, get_radio_mode,
-        get_signal_strength, get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache,
-        hangup_all_calls, hangup_call, list_apn_contexts, list_current_calls, make_call,
-        nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch, register_operator_auto,
-        register_operator_manual, restart_baseband, scan_operators, send_sms, send_sms_via_modem,
-        set_airplane_mode, set_apn_on_bearer, set_band_lock, set_call_waiting,
-        set_data_connection_with_apn, set_radio_mode, start_cell_monitoring, stop_cell_monitoring,
+        answer_call, background_fetch_smsc, current_sim_identity, find_nm_modem_connection_pub,
+        get_band_lock_status_for_modem, get_baseband_restart_progress, get_call_by_path,
+        get_call_settings, get_cell_location, get_cells_data_for_modem, get_data_connection_status,
+        get_device_info_data, get_is_roaming_for_modem, get_network_info_data,
+        get_operators_list_for_modem, get_radio_mode_for_modem, get_signal_strength,
+        get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache, hangup_all_calls,
+        hangup_call, list_apn_contexts_for_modem, list_current_calls, make_call_on_modem,
+        nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch, register_operator_for_modem,
+        restart_baseband, scan_operators_for_modem, send_sms, send_sms_via_modem,
+        set_apn_on_bearer, set_band_lock_for_modem, set_call_waiting, set_data_connection_with_apn,
+        set_radio_mode_for_modem, start_cell_monitoring, stop_cell_monitoring,
     },
     infra::config::{
         AccessPathKind, ApnConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
@@ -487,8 +487,15 @@ pub async fn set_esim_config_handler(
 }
 
 /// GET /api/esim/euicc
-pub async fn get_esim_euicc_handler(State(app): State<AppState>) -> impl IntoResponse {
-    match app.esim_supervisor.get_euicc_info().await {
+pub async fn get_esim_euicc_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    match app
+        .esim_supervisor
+        .get_euicc_info_for_line(query.line_id.as_deref())
+        .await
+    {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -522,7 +529,8 @@ pub async fn get_esim_profiles_handler(
         };
     }
 
-    match app.esim_supervisor.get_profiles().await {
+    let line_id = query.get("line_id").map(String::as_str);
+    match app.esim_supervisor.get_profiles_for_line(line_id).await {
         Ok(mut data) => {
             hydrate_profiles_from_cache(&app.database, &mut data.profiles);
             match tokio::time::timeout(
@@ -569,8 +577,10 @@ pub async fn get_esim_profiles_handler(
 pub async fn enable_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
+    Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
     let event_entity = mask_identifier(&iccid);
+    let bg_line_id = query.line_id.clone();
     let vowifi_before_switch = app.config_manager.get_vowifi_config();
     let switch_token = new_vowifi_switch_token("profile-switch");
     if vowifi_before_switch.feature_enabled {
@@ -601,7 +611,7 @@ pub async fn enable_esim_profile_handler(
 
         match bg_app
             .esim_supervisor
-            .enable_profile(bg_iccid.clone())
+            .enable_profile(bg_line_id.as_deref(), bg_iccid.clone())
             .await
         {
             Ok(data) => {
@@ -718,6 +728,7 @@ pub async fn enable_esim_profile_handler(
 pub async fn rename_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
+    Query(query): Query<LineScopedQuery>,
     Json(payload): Json<EsimRenameRequest>,
 ) -> impl IntoResponse {
     let name = payload.name.trim().to_string();
@@ -729,7 +740,11 @@ pub async fn rename_esim_profile_handler(
             )),
         );
     }
-    match app.esim_supervisor.rename_profile(iccid, name).await {
+    match app
+        .esim_supervisor
+        .rename_profile(query.line_id.as_deref(), iccid, name)
+        .await
+    {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Profile renamed", data)),
@@ -742,8 +757,13 @@ pub async fn rename_esim_profile_handler(
 pub async fn delete_esim_profile_handler(
     State(app): State<AppState>,
     Path(iccid): Path<String>,
+    Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
-    match app.esim_supervisor.delete_profile(iccid.clone()).await {
+    match app
+        .esim_supervisor
+        .delete_profile(query.line_id.as_deref(), iccid.clone())
+        .await
+    {
         Ok(data) => {
             if esim_command_succeeded(&data) {
                 if let Err(err) = app.database.delete_esim_profile_cache(&iccid) {
@@ -791,8 +811,10 @@ fn find_and_normalize_profile(value: &serde_json::Value) -> Option<EsimProfile> 
 /// POST /api/esim/profiles
 pub async fn download_esim_profile_handler(
     State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
     Json(payload): Json<EsimDownloadRequest>,
 ) -> impl IntoResponse {
+    let line_id = query.line_id.as_deref();
     let smdp = payload.smdp.trim().to_string();
     let matching_id = payload.matching_id.trim().to_string();
     if smdp.is_empty() || matching_id.is_empty() {
@@ -805,15 +827,23 @@ pub async fn download_esim_profile_handler(
     }
 
     // 在写卡前，先异步读取一次卡上的所有 profile ICCID 集合，用于后续新卡判断
-    let initial_iccids_opt: Option<std::collections::HashSet<String>> =
-        app.esim_supervisor.get_profiles().await.ok().map(|resp| {
+    let initial_iccids_opt: Option<std::collections::HashSet<String>> = app
+        .esim_supervisor
+        .get_profiles_for_line(line_id)
+        .await
+        .ok()
+        .map(|resp| {
             resp.profiles
                 .into_iter()
                 .map(|p| crate::infra::utils::normalize_iccid(&p.iccid))
                 .collect()
         });
 
-    match app.esim_supervisor.download_profile(payload.clone()).await {
+    match app
+        .esim_supervisor
+        .download_profile(line_id, payload.clone())
+        .await
+    {
         Ok(data) => {
             if esim_command_succeeded(&data) {
                 // Attempt to recursively find the downloaded profile details in lpac's response
@@ -1171,9 +1201,54 @@ pub async fn get_network_info(State(conn): State<Arc<Connection>>) -> impl IntoR
     }
 }
 
+/// Resolve which modem a cellular request targets.
+///
+/// Named `line_id` wins; omitting it means the primary line, which keeps the
+/// single-line API contract intact. Returns `Err` when a line was named but is
+/// unknown or absent, so a request never silently reconfigures a *different*
+/// baseband than the caller asked for — that silent fallback was the bug where
+/// the UI claimed to configure line N while writing to line 1.
+async fn resolve_modem_path(app: &AppState, line_id: Option<&str>) -> Result<String, String> {
+    let line = match line_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(line_id) => app
+            .line_registry
+            .get(line_id)
+            .await
+            .ok_or_else(|| "line_not_found".to_string())?,
+        None => app
+            .line_registry
+            .primary()
+            .await
+            .ok_or_else(|| "no_modem_available".to_string())?,
+    };
+    let binding = line.binding();
+    if !binding.present {
+        return Err("line_not_present".to_string());
+    }
+    Ok(binding.modem_path)
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct LineScopedQuery {
+    #[serde(default)]
+    pub line_id: Option<String>,
+}
+
 /// GET /api/cells
-pub async fn get_cells(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_cells_data(&conn).await {
+pub async fn get_cells(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<CellsResponse>::error(reason)),
+            )
+        }
+    };
+    match get_cells_data_for_modem(&app.dbus_conn, &modem_path).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1252,8 +1327,20 @@ pub async fn stop_cell_monitor_handler(State(app): State<AppState>) -> impl Into
 }
 
 /// GET /api/radio-mode
-pub async fn get_radio_mode_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_radio_mode(&conn).await {
+pub async fn get_radio_mode_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<RadioModeResponse>::error(reason)),
+            )
+        }
+    };
+    match get_radio_mode_for_modem(&app.dbus_conn, &modem_path).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1270,10 +1357,19 @@ pub async fn get_radio_mode_handler(State(conn): State<Arc<Connection>>) -> impl
 
 /// POST /api/radio-mode
 pub async fn set_radio_mode_handler(
-    State(conn): State<Arc<Connection>>,
+    State(app): State<AppState>,
     Json(payload): Json<RadioModeRequest>,
 ) -> impl IntoResponse {
-    match set_radio_mode(&conn, payload.mode).await {
+    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
+    match set_radio_mode_for_modem(&app.dbus_conn, &modem_path, payload.mode).await {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1292,8 +1388,20 @@ pub async fn set_radio_mode_handler(
 }
 
 /// GET /api/band-lock
-pub async fn get_band_lock_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_band_lock_status(&conn).await {
+pub async fn get_band_lock_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<BandLockStatus>::error(reason)),
+            )
+        }
+    };
+    match get_band_lock_status_for_modem(&app.dbus_conn, &modem_path).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1310,10 +1418,19 @@ pub async fn get_band_lock_handler(State(conn): State<Arc<Connection>>) -> impl 
 
 /// POST /api/band-lock
 pub async fn set_band_lock_handler(
-    State(conn): State<Arc<Connection>>,
+    State(app): State<AppState>,
     Json(payload): Json<BandLockRequest>,
 ) -> impl IntoResponse {
-    match set_band_lock(&conn, &payload).await {
+    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
+    match set_band_lock_for_modem(&app.dbus_conn, &modem_path, &payload).await {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1349,8 +1466,20 @@ pub async fn get_cell_location_handler(State(conn): State<Arc<Connection>>) -> i
 }
 
 /// GET /api/network/operators
-pub async fn get_network_operators(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_operators_list(&conn).await {
+pub async fn get_network_operators(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<OperatorListResponse>::error(reason)),
+            )
+        }
+    };
+    match get_operators_list_for_modem(&app.dbus_conn, &modem_path).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1366,8 +1495,20 @@ pub async fn get_network_operators(State(conn): State<Arc<Connection>>) -> impl 
 }
 
 /// GET /api/network/operators/scan
-pub async fn scan_network_operators(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match scan_operators(&conn).await {
+pub async fn scan_network_operators(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<OperatorListResponse>::error(reason)),
+            )
+        }
+    };
+    match scan_operators_for_modem(&app.dbus_conn, &modem_path).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1384,10 +1525,19 @@ pub async fn scan_network_operators(State(conn): State<Arc<Connection>>) -> impl
 
 /// POST /api/network/register-manual
 pub async fn register_network_manual(
-    State(conn): State<Arc<Connection>>,
+    State(app): State<AppState>,
     Json(payload): Json<ManualRegisterRequest>,
 ) -> impl IntoResponse {
-    match register_operator_manual(&conn, &payload.mccmnc).await {
+    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
+    match register_operator_for_modem(&app.dbus_conn, &modem_path, &payload.mccmnc).await {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1406,8 +1556,20 @@ pub async fn register_network_manual(
 }
 
 /// POST /api/network/register-auto
-pub async fn register_network_auto(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match register_operator_auto(&conn).await {
+pub async fn register_network_auto(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
+    match register_operator_for_modem(&app.dbus_conn, &modem_path, "").await {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1426,9 +1588,24 @@ pub async fn register_network_auto(State(conn): State<Arc<Connection>>) -> impl 
 }
 
 /// GET /api/apn
-pub async fn get_apn_list_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let apn_config = app.config_manager.get_apn_config();
-    match list_apn_contexts(&app.dbus_conn, Some(&apn_config)).await {
+pub async fn get_apn_list_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<ApnListResponse>::error(reason)),
+            )
+        }
+    };
+    let apn_config = match query.line_id.as_deref() {
+        Some(line_id) => app.config_manager.get_line_apn_config(line_id),
+        None => app.config_manager.get_apn_config(),
+    };
+    match list_apn_contexts_for_modem(&app.dbus_conn, &modem_path, Some(&apn_config)).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -1448,7 +1625,15 @@ pub async fn set_apn_handler(
     State(app): State<AppState>,
     Json(payload): Json<SetApnRequest>,
 ) -> impl IntoResponse {
-    let mut apn_config = app.config_manager.get_apn_config();
+    let line_id = payload
+        .line_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut apn_config = match line_id {
+        Some(line_id) => app.config_manager.get_line_apn_config(line_id),
+        None => app.config_manager.get_apn_config(),
+    };
     if let Some(apn) = &payload.apn {
         apn_config.apn = apn.trim().to_string();
     }
@@ -1471,7 +1656,14 @@ pub async fn set_apn_handler(
         apn_config.auth_method = ApnConfig::default().auth_method;
     }
 
-    if let Err(err) = app.config_manager.set_apn_config(apn_config) {
+    let saved = match line_id {
+        Some(line_id) => app
+            .config_manager
+            .set_line_apn_config(line_id, Some(apn_config))
+            .map(|_| ()),
+        None => app.config_manager.set_apn_config(apn_config),
+    };
+    if let Err(err) = saved {
         return (
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value>::error(format!(
@@ -1511,9 +1703,21 @@ pub async fn set_apn_handler(
 }
 
 /// GET /api/cell-lock
-pub async fn get_cell_lock_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn get_cell_lock_status_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let line_id = match resolve_cell_lock_line(&app, query.line_id.as_deref()).await {
+        Ok(line_id) => line_id,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<CellLockStatusResponse>::error(reason)),
+            )
+        }
+    };
     let store = app.cell_lock.lock().await;
-    let data = store.status();
+    let data = store.get(&line_id).cloned().unwrap_or_default().status();
     drop(store);
     (
         StatusCode::OK,
@@ -1521,13 +1725,41 @@ pub async fn get_cell_lock_status_handler(State(app): State<AppState>) -> impl I
     )
 }
 
+/// The cell-lock store is keyed by line, so a request must name (or default to)
+/// exactly one line before it can read or mutate that line's lock state.
+async fn resolve_cell_lock_line(app: &AppState, line_id: Option<&str>) -> Result<String, String> {
+    match line_id.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(line_id) => app
+            .line_registry
+            .get(line_id)
+            .await
+            .map(|line| line.binding().line_id)
+            .ok_or_else(|| "line_not_found".to_string()),
+        None => app
+            .line_registry
+            .primary()
+            .await
+            .map(|line| line.binding().line_id)
+            .ok_or_else(|| "no_modem_available".to_string()),
+    }
+}
+
 /// POST /api/cell-lock
 pub async fn set_cell_lock_handler(
     State(app): State<AppState>,
     Json(payload): Json<CellLockRequest>,
 ) -> impl IntoResponse {
+    let line_id = match resolve_cell_lock_line(&app, payload.line_id.as_deref()).await {
+        Ok(line_id) => line_id,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<CellLockResult>::error(reason)),
+            )
+        }
+    };
     let mut store = app.cell_lock.lock().await;
-    match store.apply(&payload) {
+    match store.entry(line_id).or_default().apply(&payload) {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1543,9 +1775,21 @@ pub async fn set_cell_lock_handler(
 }
 
 /// POST /api/cell-lock/unlock-all
-pub async fn unlock_all_cells_handler(State(app): State<AppState>) -> impl IntoResponse {
+pub async fn unlock_all_cells_handler(
+    State(app): State<AppState>,
+    Query(query): Query<LineScopedQuery>,
+) -> impl IntoResponse {
+    let line_id = match resolve_cell_lock_line(&app, query.line_id.as_deref()).await {
+        Ok(line_id) => line_id,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<CellLockResult>::error(reason)),
+            )
+        }
+    };
     let mut store = app.cell_lock.lock().await;
-    store.unlock_all();
+    store.entry(line_id).or_default().unlock_all();
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -2106,166 +2350,6 @@ pub async fn get_baseband_restart_status_handler() -> impl IntoResponse {
     )
 }
 
-/// GET /api/roaming
-pub async fn get_roaming_status_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let roaming_allowed = app.config_manager.get_roaming_allowed();
-    match get_is_roaming_mm(&app.dbus_conn).await {
-        Ok(is_roaming) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                RoamingResponse {
-                    roaming_allowed,
-                    is_roaming,
-                },
-            )),
-        ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<RoamingResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
-/// POST /api/roaming
-pub async fn set_roaming_status_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<RoamingRequest>,
-) -> impl IntoResponse {
-    let previous_allowed = app.config_manager.get_roaming_allowed();
-    match apply_roaming_policy(&app.dbus_conn, &app.config_manager, payload.allowed).await {
-        Ok(_) => {
-            let roaming_allowed = app.config_manager.get_roaming_allowed();
-            if previous_allowed != roaming_allowed {
-                app.system_event_emitter
-                    .emit_code(
-                        system_event_codes::CELLULAR_ROAMING_ALLOWED_CHANGED,
-                        system_event_severity::INFO,
-                        system_event_status::CHANGED,
-                        "roaming",
-                        if roaming_allowed {
-                            "允许漫游已开启"
-                        } else {
-                            "允许漫游已关闭"
-                        },
-                    )
-                    .await;
-            }
-            match get_is_roaming_mm(&app.dbus_conn).await {
-                Ok(is_roaming) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message(
-                        "Success",
-                        RoamingResponse {
-                            roaming_allowed,
-                            is_roaming,
-                        },
-                    )),
-                ),
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<RoamingResponse>::error(format!(
-                        "Failed: {}",
-                        e
-                    ))),
-                ),
-            }
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<RoamingResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
-/// POST /api/airplane-mode
-pub async fn set_airplane_mode_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<AirplaneModeRequest>,
-) -> impl IntoResponse {
-    let previous_enabled = get_airplane_mode(&app.dbus_conn)
-        .await
-        .ok()
-        .map(|status| status.enabled);
-    if payload.enabled {
-        app.airplane_mode_requested.store(true, Ordering::SeqCst);
-    }
-
-    match set_airplane_mode(&app.dbus_conn, payload.enabled).await {
-        Ok(_) => {
-            app.airplane_mode_requested
-                .store(payload.enabled, Ordering::SeqCst);
-            match get_airplane_mode(&app.dbus_conn).await {
-                Ok(status) => {
-                    if previous_enabled != Some(status.enabled) {
-                        app.system_event_emitter
-                            .emit_code(
-                                system_event_codes::CELLULAR_AIRPLANE_MODE_CHANGED,
-                                system_event_severity::INFO,
-                                system_event_status::CHANGED,
-                                "airplane_mode",
-                                if status.enabled {
-                                    "飞行模式已开启"
-                                } else {
-                                    "飞行模式已关闭"
-                                },
-                            )
-                            .await;
-                    }
-                    (
-                        StatusCode::OK,
-                        Json(ApiResponse::success_with_message(
-                            if payload.enabled {
-                                "Airplane mode enabled"
-                            } else {
-                                "Airplane mode disabled"
-                            },
-                            status,
-                        )),
-                    )
-                }
-                Err(e) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<AirplaneModeResponse>::error(format!(
-                        "Failed: {}",
-                        e
-                    ))),
-                ),
-            }
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<AirplaneModeResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
-/// GET /api/airplane-mode
-pub async fn get_airplane_mode_handler(State(conn): State<Arc<Connection>>) -> impl IntoResponse {
-    match get_airplane_mode(&conn).await {
-        Ok(status) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", status)),
-        ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<AirplaneModeResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
 async fn build_line_network_controls(
     app: &AppState,
     line: &Arc<crate::access::line_registry::LineRuntime>,
@@ -2330,6 +2414,7 @@ async fn build_line_network_controls(
     }
     LineNetworkControlsResponse {
         line_id: binding.line_id,
+        slot_label: format!("{} · 卡槽 {}", binding.slot_label, binding.uim_slot),
         modem_path: binding.modem_path,
         present: binding.present,
         data: LineDataConnectionResponse {
@@ -2372,6 +2457,31 @@ pub async fn get_line_network_controls_handler(
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", response)),
+    )
+}
+
+/// POST /api/modem/lines/{line_id}/data/traffic/reset
+///
+/// Zero one line's proxied-traffic counters, in memory and on disk. Useful at
+/// the start of a billing cycle; other lines are untouched.
+pub async fn reset_line_data_traffic_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    app.line_registry.reset_data_traffic(&line_id).await;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
     )
 }
 
@@ -2652,18 +2762,12 @@ pub async fn set_line_airplane_mode_handler(
         if is_primary {
             let _ = app.config_manager.set_data_enabled(false);
             app.data_user_disabled.store(true, Ordering::SeqCst);
-            app.airplane_mode_requested.store(true, Ordering::SeqCst);
         }
-    } else {
-        if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
-        }
-        if is_primary {
-            app.airplane_mode_requested.store(false, Ordering::SeqCst);
-        }
+    } else if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
     }
     if let Err(error) = modem_manager::set_airplane_mode_for_modem(
         app.dbus_conn.as_ref(),
@@ -2956,17 +3060,19 @@ pub async fn send_sms_handler(
     State(app): State<AppState>,
     Json(payload): Json<SendSmsRequest>,
 ) -> impl IntoResponse {
-    let policy = app.config_manager.get_sms_path_policy().normalized();
+    // Each line routes by its own policy (falling back to the global one), so a
+    // VoLTE-only SIM and a VoWiFi-only SIM can coexist in one device.
+    let scope = VowifiScope::resolve(&app, payload.line_id.as_deref()).await;
+    let policy = if scope.is_bound() {
+        app.config_manager.get_line_sms_path_policy(scope.line_id())
+    } else {
+        app.config_manager.get_sms_path_policy().normalized()
+    };
     let stop_on_failure = policy.mid_flight_disable == MidFlightDisablePolicy::Fail;
     let mut failures = Vec::new();
     for path in policy.enabled_layers() {
-        if payload.line_id.is_some() && path == AccessPathKind::Vowifi {
-            // VoWiFi still has one ePDG runtime and cannot yet prove that it is
-            // using the explicitly selected physical line.
-            continue;
-        }
         let result = match path {
-            AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &payload).await,
+            AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &scope, &payload).await,
             AccessPathKind::Volte => send_sms_over_volte_path(&app, &payload).await,
             AccessPathKind::Cs => send_sms_over_cs_path(&app, &payload).await,
         };
@@ -3002,27 +3108,37 @@ pub async fn send_sms_handler(
 
 async fn send_sms_over_vowifi_path(
     app: &AppState,
+    scope: &VowifiScope,
     payload: &SendSmsRequest,
 ) -> Result<serde_json::Value, String> {
     let control = app.config_manager.get_vowifi_config();
-    if !control.feature_enabled || !control.connection_enabled {
+    if !control.feature_enabled {
         return Err("disabled".to_string());
     }
-    let mut ready = app.vowifi_runtime.snapshot().await.readiness().sms_ready;
+    if !scope.is_bound() {
+        return Err("vowifi_line_not_available".to_string());
+    }
+    if !app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .vowifi
+        .enabled
+    {
+        return Err("disabled".to_string());
+    }
+    let mut ready = scope.runtime().snapshot().await.readiness().sms_ready;
     if !ready {
-        let airplane_enabled = get_airplane_mode(&app.dbus_conn)
-            .await
-            .map(|state| state.enabled)
-            .unwrap_or(false);
+        let airplane_enabled = scope.airplane_mode_enabled(app).await;
         if airplane_enabled {
-            app.vowifi_runtime
+            scope
+                .runtime()
                 .refresh_identity_with_timeout(
                     &app.dbus_conn,
                     std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
                 )
                 .await;
-            ready = app
-                .vowifi_runtime
+            ready = scope
+                .runtime()
                 .connect_live_with_stage_timeout(
                     Some(&app.database),
                     std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
@@ -3031,8 +3147,9 @@ async fn send_sms_over_vowifi_path(
                 .readiness()
                 .sms_ready;
         } else {
-            ready = connect_vowifi_with_attempts(
+            ready = connect_vowifi_on_line(
                 app,
+                scope,
                 VOWIFI_MANUAL_CONNECT_ATTEMPTS,
                 std::time::Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
                 false,
@@ -3045,9 +3162,10 @@ async fn send_sms_over_vowifi_path(
     if !ready {
         return Err("sms_ready_not_reached".to_string());
     }
-    let send_result = send_live_sms_over_ims(&payload.phone_number, &payload.content)
-        .await
-        .map_err(|error| error.reason)?;
+    let send_result =
+        send_live_sms_over_ims_for_line(scope.line_id(), &payload.phone_number, &payload.content)
+            .await
+            .map_err(|error| error.reason)?;
     let outcome = send_result.outcome;
     let api_sms_id = app
         .database
@@ -3094,97 +3212,67 @@ async fn send_sms_over_volte_path(
     app: &AppState,
     payload: &SendSmsRequest,
 ) -> Result<serde_json::Value, String> {
-    let mut config = app.config_manager.get_volte_config();
-    if let Some(line_id) = payload.line_id.as_deref() {
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-        let line = app
-            .line_registry
-            .get(line_id)
-            .await
-            .ok_or_else(|| "line_not_found".to_string())?;
-        let binding = line.binding();
-        if !binding.present {
-            return Err("line_not_present".to_string());
-        }
-        let profile = app.config_manager.get_line_profile(line_id);
-        if !profile.enabled || !profile.volte_connection_enabled {
-            return Err("line_volte_connection_disabled".to_string());
-        }
-        config.connection_enabled = true;
-        if !line.volte.status().await.registered {
-            let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
-                .map_err(|error| error.to_string())?;
-            let _guard = line.volte_connect_lock.lock().await;
-            if !line.volte.status().await.registered {
-                crate::access::volte::live::connect_live_for_line(
-                    &line.volte_live,
-                    &device,
-                    &line.volte,
-                    &config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
+    let config = app.config_manager.get_volte_config();
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let selected_line_id = match payload.line_id.as_deref() {
+        Some(line_id) => line_id.to_string(),
+        None => {
+            let enabled = app
+                .line_registry
+                .all()
                 .await
-                .map_err(|error| error.to_string())?;
+                .into_iter()
+                .filter(|line| {
+                    let binding = line.binding();
+                    let profile = app.config_manager.get_line_profile(&binding.line_id);
+                    binding.present && profile.enabled && profile.volte_connection_enabled
+                })
+                .collect::<Vec<_>>();
+            if enabled.len() != 1 {
+                return Err("volte_line_id_required".to_string());
             }
+            enabled[0].binding().line_id
         }
-        let sim = get_sim_info_for_modem_with_cache(
-            &app.dbus_conn,
-            &binding.modem_path,
-            Some(&app.database),
-        )
+    };
+    let line_id = selected_line_id.as_str();
+    let line = app
+        .line_registry
+        .get(line_id)
         .await
-        .map_err(|error| error.to_string())?;
-        let result = crate::access::volte::live::send_live_sms_for_line(
-            &line.volte_live,
-            &line.volte,
-            &payload.phone_number,
-            &payload.content,
-            &sim.sms_center,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-        app.database
-            .insert_sms_with_transport_for_line(
-                "outgoing",
-                &payload.phone_number,
-                &payload.content,
-                "sent",
-                None,
-                "volte_ims",
-                Some(line_id),
-            )
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    if !binding.present {
+        return Err("line_not_present".to_string());
+    }
+    let profile = app.config_manager.get_line_profile(line_id);
+    if !profile.enabled || !profile.volte_connection_enabled {
+        return Err("line_volte_connection_disabled".to_string());
+    }
+    if !line.volte.status().await.registered {
+        let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
             .map_err(|error| error.to_string())?;
-        return Ok(json!({
-            "path": "volte_ims",
-            "transport": "volte_ims",
-            "line_id": line_id,
-            "message_id": result.message_id,
-            "trace_id": result.trace_id,
-            "part_count": result.part_count,
-            "sip_statuses": result.sip_statuses,
-        }));
+        let _guard = line.volte_connect_lock.lock().await;
+        if !line.volte.status().await.registered {
+            crate::access::volte::live::connect_live_for_line(
+                &line.volte_live,
+                &device,
+                &line.volte,
+                &config,
+                app.config_manager.get_sms_path_policy().dedupe_enabled,
+                Arc::clone(&app.database),
+                Arc::clone(&app.notification_sender),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        }
     }
-    if !config.connection_enabled {
-        return Err("disabled".to_string());
-    }
-    if !app.volte_runtime.status().await.registered {
-        crate::access::volte::live::connect_live(
-            &app.volte_runtime,
-            &config,
-            app.config_manager.get_sms_path_policy().dedupe_enabled,
-            Arc::clone(&app.database),
-            Arc::clone(&app.notification_sender),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    }
-    let sim = get_sim_info_data_with_cache(&app.dbus_conn, Some(&app.database))
-        .await
-        .map_err(|error| error.to_string())?;
-    let result = crate::access::volte::live::send_live_sms(
-        &app.volte_runtime,
+    let sim =
+        get_sim_info_for_modem_with_cache(&app.dbus_conn, &binding.modem_path, Some(&app.database))
+            .await
+            .map_err(|error| error.to_string())?;
+    let result = crate::access::volte::live::send_live_sms_for_line(
+        &line.volte_live,
+        &line.volte,
         &payload.phone_number,
         &payload.content,
         &sim.sms_center,
@@ -3192,22 +3280,24 @@ async fn send_sms_over_volte_path(
     .await
     .map_err(|error| error.to_string())?;
     app.database
-        .insert_sms_with_transport(
+        .insert_sms_with_transport_for_line(
             "outgoing",
             &payload.phone_number,
             &payload.content,
             "sent",
             None,
             "volte_ims",
+            Some(line_id),
         )
         .map_err(|error| error.to_string())?;
     Ok(json!({
-        "path": "volte_ims",
-        "transport": "volte_ims",
-        "message_id": result.message_id,
-        "trace_id": result.trace_id,
-        "part_count": result.part_count,
-        "sip_statuses": result.sip_statuses,
+            "path": "volte_ims",
+            "transport": "volte_ims",
+            "line_id": line_id,
+            "message_id": result.message_id,
+            "trace_id": result.trace_id,
+            "part_count": result.part_count,
+            "sip_statuses": result.sip_statuses,
     }))
 }
 
@@ -3259,197 +3349,6 @@ async fn send_sms_over_cs_path(
     Ok(json!({ "path": path, "transport": "modem", "line_id": line_id }))
 }
 
-#[allow(dead_code)]
-pub async fn send_sms_handler_legacy(
-    State(app): State<AppState>,
-    Json(payload): Json<SendSmsRequest>,
-) -> impl IntoResponse {
-    let vowifi_control = app.config_manager.get_vowifi_config();
-    let vowifi_allowed = vowifi_control.feature_enabled && vowifi_control.connection_enabled;
-    let mut vowifi_ready =
-        vowifi_allowed && app.vowifi_runtime.snapshot().await.readiness().sms_ready;
-    let mut airplane_mode = None;
-    if vowifi_allowed && !vowifi_ready {
-        let airplane_enabled = get_airplane_mode(&app.dbus_conn)
-            .await
-            .map(|state| state.enabled)
-            .unwrap_or(false);
-        airplane_mode = Some(airplane_enabled);
-        if airplane_enabled {
-            app.vowifi_runtime
-                .refresh_identity_with_timeout(
-                    &app.dbus_conn,
-                    std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
-                )
-                .await;
-            // let _ = app.database.clear_vowifi_runtime_events();
-            let current_snap = app.vowifi_runtime.snapshot().await;
-            let profile_meta = current_snap.profile.profile.as_ref();
-            let profile_id = profile_meta.map(|p| p.profile_id);
-            let _ =
-                app.database
-                    .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
-                        trace_id: Some("runtime-connect"),
-                        level: "info",
-                        phase: "connect_start",
-                        profile_id,
-                        event_type: "connect_start",
-                        detail_json: "{}",
-                    });
-            let snapshot = app
-                .vowifi_runtime
-                .connect_live_with_stage_timeout(
-                    Some(&app.database),
-                    std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
-                )
-                .await;
-            vowifi_ready = snapshot.readiness().sms_ready;
-            if !vowifi_ready {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(format!(
-                        "Failed to send SMS over VoWiFi: {}",
-                        snapshot
-                            .degraded_reason
-                            .as_deref()
-                            .unwrap_or("sms_ready_not_reached")
-                    ))),
-                );
-            }
-        } else {
-            let status = connect_vowifi_with_attempts(
-                &app,
-                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
-                std::time::Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
-                false,
-            )
-            .await;
-            vowifi_ready = status.readiness.sms_ready;
-            if !vowifi_ready {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(format!(
-                        "Failed to send SMS over VoWiFi: {}",
-                        status
-                            .degraded_reason
-                            .as_deref()
-                            .unwrap_or("sms_ready_not_reached")
-                    ))),
-                );
-            }
-        }
-    }
-    if vowifi_ready {
-        match send_live_sms_over_ims(&payload.phone_number, &payload.content).await {
-            Ok(send_result) => {
-                let outcome = send_result.outcome;
-                let api_sms_id = app
-                    .database
-                    .insert_sms_with_transport(
-                        "outgoing",
-                        &payload.phone_number,
-                        &payload.content,
-                        outcome.api_status(),
-                        None,
-                        "vowifi_ims",
-                    )
-                    .ok();
-                let _ = app
-                    .database
-                    .upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
-                        message_id: &outcome.message_id,
-                        trace_id: &outcome.trace_id,
-                        direction: "mobile_originated",
-                        state: outcome.delivery_state.as_str(),
-                        sip_state: if (200..300).contains(&outcome.sip_status) {
-                            "accepted"
-                        } else {
-                            "rejected"
-                        },
-                        rpdu_ack: outcome.rpdu_ack.as_str(),
-                        delivery_reported: false,
-                        failure_cause: outcome.failure_cause.as_deref(),
-                        retry_count: 0,
-                        api_sms_id,
-                    });
-                spawn_vowifi_sms_followup_persist(app.clone(), send_result.followup);
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message(
-                        "SMS sent",
-                        json!({
-                            "path": "vowifi_ims",
-                            "transport": "vowifi_ims",
-                            "message_id": outcome.message_id,
-                            "trace_id": outcome.trace_id,
-                            "delivery_state": outcome.delivery_state.as_str(),
-                            "rpdu_ack": outcome.rpdu_ack.as_str(),
-                            "mt_followup": "background",
-                        }),
-                    )),
-                );
-            }
-            Err(err) if vowifi_allowed => {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(format!(
-                        "Failed to send SMS over VoWiFi: {}",
-                        err.reason
-                    ))),
-                );
-            }
-            Err(err) => {
-                let airplane_mode = match airplane_mode {
-                    Some(enabled) => enabled,
-                    None => get_airplane_mode(&app.dbus_conn)
-                        .await
-                        .map(|state| state.enabled)
-                        .unwrap_or(false),
-                };
-                if airplane_mode {
-                    return (
-                        StatusCode::OK,
-                        Json(ApiResponse::<serde_json::Value>::error(format!(
-                            "Failed to send SMS over VoWiFi: {}",
-                            err.reason
-                        ))),
-                    );
-                }
-                warn!(
-                    reason = err.reason.as_str(),
-                    "VoWiFi SMS send failed; falling back to modem SMS path"
-                );
-            }
-        }
-    }
-
-    match send_sms(&app.dbus_conn, &payload.phone_number, &payload.content).await {
-        Ok(path) => {
-            let _ = app.database.insert_sms(
-                "outgoing",
-                &payload.phone_number,
-                &payload.content,
-                "sent",
-                None,
-            );
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "SMS sent",
-                    json!({ "path": path }),
-                )),
-            )
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(format!(
-                "Failed to send SMS: {}",
-                e
-            ))),
-        ),
-    }
-}
-
 /// Drain the voice call follow-up channel, logging dialog/media progress
 /// (ringing, answer, hangup). Mirrors `spawn_vowifi_sms_followup_persist`.
 fn spawn_vowifi_call_followup(
@@ -3486,8 +3385,23 @@ pub async fn place_call_handler(
     Json(payload): Json<PlaceCallRequest>,
 ) -> impl IntoResponse {
     let vowifi_control = app.config_manager.get_vowifi_config();
-    let vowifi_allowed = vowifi_control.feature_enabled && vowifi_control.connection_enabled;
-    if !vowifi_allowed {
+    let scope = VowifiScope::resolve(&app, payload.line_id.as_deref()).await;
+    if !scope.is_bound() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "line_not_found".to_string(),
+            )),
+        );
+    }
+    // The global flag is only a kill switch; whether this SIM may call is the
+    // line's own VoWiFi setting.
+    let line_vowifi_enabled = app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .vowifi
+        .enabled;
+    if !vowifi_control.feature_enabled || !line_vowifi_enabled {
         return (
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value>::error(
@@ -3496,11 +3410,11 @@ pub async fn place_call_handler(
         );
     }
 
-    let mut voice_ready = app.vowifi_runtime.snapshot().await.readiness().voice_ready;
+    let mut voice_ready = scope.runtime().snapshot().await.readiness().voice_ready;
     if !voice_ready {
         // Attempt to bring the runtime up to voice readiness once.
-        let snapshot = app
-            .vowifi_runtime
+        let snapshot = scope
+            .runtime()
             .connect_live_with_stage_timeout(
                 Some(&app.database),
                 std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
@@ -3521,7 +3435,7 @@ pub async fn place_call_handler(
         }
     }
 
-    match place_live_voice_call(&payload.phone_number).await {
+    match place_live_voice_call_for_line(scope.line_id(), &payload.phone_number).await {
         Ok(call_result) => {
             let outcome = call_result.outcome;
             spawn_vowifi_call_followup(call_result.followup);
@@ -3882,7 +3796,16 @@ pub async fn dial_call_handler(
             )),
         );
     }
-    match make_call(&app.dbus_conn, &phone_number).await {
+    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
+    match make_call_on_modem(&app.dbus_conn, &modem_path, &phone_number).await {
         Ok(path) => {
             track_call_start(&app, &path, "outgoing", &phone_number, false).await;
             (
@@ -4179,9 +4102,9 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
         .await;
     let mut response = snapshot.profile;
     if let (Some(profile), Some(epdg)) = (response.profile.as_ref(), response.epdg.as_mut()) {
-        if let Some(external) = app
-            .config_manager
-            .get_external_vowifi_profiles()
+        if let Some(external) = profile_store(&app)
+            .list_as_external()
+            .unwrap_or_default()
             .into_iter()
             .find(|item| {
                 item.profile_id == profile.profile_id
@@ -4193,7 +4116,7 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
             epdg.ip_stack = external.ip_stack;
             epdg.apn = external.apn;
             epdg.dns_server = external.dns_server;
-            epdg.source = "external_profile".to_string();
+            epdg.source = "carrier_profile_database".to_string();
         }
     }
     if let Some(primary) = app.line_registry.primary().await {
@@ -4213,7 +4136,6 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
             epdg.route_kind = match line_config.proxy_mode {
                 crate::infra::config::VowifiProxyMode::Direct => "direct",
                 crate::infra::config::VowifiProxyMode::Socks5UdpAssociate => "socks5_udp_associate",
-                crate::infra::config::VowifiProxyMode::ConnectUdpMasque => "connect_udp_masque",
                 crate::infra::config::VowifiProxyMode::UdpRelay => "udp_relay",
             }
             .to_string();
@@ -4236,17 +4158,127 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
     )
 }
 
+/// Which line a VoWiFi request acts on.
+///
+/// Every line owns its own `VowifiRuntime`, TUN device, ePDG/DNS/proxy
+/// overrides and IMS session caches, so connecting line B must never touch
+/// line A. The legacy single-line endpoints (`/api/vowifi/...`) keep working by
+/// resolving to the primary line. `AppState::vowifi_runtime` survives only as
+/// the answer for "no line present at all", which keeps status endpoints
+/// responsive during boot and hotplug instead of 404-ing.
+#[derive(Clone)]
+pub struct VowifiScope {
+    line: Option<Arc<crate::access::line_registry::LineRuntime>>,
+    runtime: Arc<crate::access::vowifi::runtime::VowifiRuntime>,
+    line_id: String,
+}
+
+impl VowifiScope {
+    async fn resolve(app: &AppState, line_id: Option<&str>) -> Self {
+        let line = match line_id {
+            Some(line_id) => app.line_registry.get(line_id).await,
+            None => app.line_registry.primary().await,
+        };
+        match line {
+            Some(line) => {
+                let line_id = line.binding().line_id;
+                let runtime = Arc::clone(&line.vowifi);
+                Self {
+                    line: Some(line),
+                    runtime,
+                    line_id,
+                }
+            }
+            None => Self {
+                line: None,
+                runtime: Arc::clone(&app.vowifi_runtime),
+                line_id: line_id.unwrap_or_default().to_string(),
+            },
+        }
+    }
+
+    async fn primary(app: &AppState) -> Self {
+        Self::resolve(app, None).await
+    }
+
+    fn line_id(&self) -> &str {
+        &self.line_id
+    }
+
+    fn runtime(&self) -> &Arc<crate::access::vowifi::runtime::VowifiRuntime> {
+        &self.runtime
+    }
+
+    fn is_bound(&self) -> bool {
+        self.line.is_some()
+    }
+
+    /// The modem this line owns, when the line is actually present. `None` means
+    /// there is nothing to act on, which callers treat as a no-op rather than
+    /// falling back to some other baseband.
+    fn modem_path(&self) -> Option<String> {
+        self.line.as_ref().map(|line| line.binding()).and_then(|b| {
+            if b.present {
+                Some(b.modem_path)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// The connect guard is per line, so two lines can dial their ePDGs at the
+    /// same time while each line still rejects a second concurrent connect.
+    fn try_connect_lock(&self) -> Option<tokio::sync::MutexGuard<'_, ()>> {
+        self.line
+            .as_ref()
+            .and_then(|line| line.vowifi_connect_lock.try_lock().ok())
+    }
+
+    async fn status(&self) -> VowifiStatusResponse {
+        self.runtime.snapshot().await.status_response()
+    }
+
+    /// Whether *this line's* radio is off. Airplane mode is per line now, so a
+    /// second SIM being powered down must not change how this line behaves.
+    async fn airplane_mode_enabled(&self, app: &AppState) -> bool {
+        let Some(modem_path) = self.modem_path() else {
+            return false;
+        };
+        modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path)
+            .await
+            .map(|state| state.enabled)
+            .unwrap_or(false)
+    }
+}
+
 async fn reset_vowifi_runtime(app: &AppState, reason: &str) -> VowifiStatusResponse {
-    clear_all_live_runtime().await;
+    let scope = VowifiScope::primary(app).await;
+    reset_vowifi_runtime_for_scope(app, &scope, reason).await
+}
+
+async fn reset_vowifi_runtime_for_scope(
+    app: &AppState,
+    scope: &VowifiScope,
+    reason: &str,
+) -> VowifiStatusResponse {
+    if scope.is_bound() {
+        clear_live_runtime_for_line(scope.line_id()).await;
+    } else {
+        clear_all_live_runtime().await;
+    }
     // let _ = app.database.clear_vowifi_runtime_events();
-    let snapshot = app.vowifi_runtime.reset_runtime(reason).await;
+    let snapshot = scope.runtime().reset_runtime(reason).await;
     let status = snapshot.status_response();
     persist_vowifi_runtime_snapshot(app, &status);
     status
 }
 
-async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> VowifiStatusResponse {
-    let current = app.vowifi_runtime.snapshot().await.status_response();
+async fn restore_cellular_and_reset_vowifi(
+    app: &AppState,
+    scope: &VowifiScope,
+    reason: &str,
+) -> VowifiStatusResponse {
+    let current = scope.status().await;
     let profile_meta = current.profile.profile.as_ref();
     let profile_id = profile_meta.map(|p| p.profile_id);
 
@@ -4262,11 +4294,11 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
             detail_json: "{}",
         });
 
-    if let Err(err) = set_vowifi_airplane_mode(app, false).await {
-        warn!(error = %err, "Failed to disable airplane mode while stopping WiFi Calling");
+    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
+        warn!(error = %err, "Failed to re-enable the line radio while stopping WiFi Calling");
     }
 
-    restore_cellular_data_after_vowifi(app).await;
+    restore_cellular_data_after_vowifi(app, scope).await;
 
     // 2. SMS Event: 短信路径已释放，成功退回到蜂窝基站数据链路。
     let _ = app
@@ -4280,7 +4312,7 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
             detail_json: "{}",
         });
 
-    let status = reset_vowifi_runtime(app, reason).await;
+    let status = reset_vowifi_runtime_for_scope(app, scope, reason).await;
 
     // 3. SYS Event: WiFi Calling 核心服务运行时已停止
     let _ = app
@@ -4299,17 +4331,37 @@ async fn restore_cellular_and_reset_vowifi(app: &AppState, reason: &str) -> Vowi
 
 async fn fallback_to_cellular_and_disable_vowifi_connection(
     app: &AppState,
+    scope: &VowifiScope,
     reason: &str,
 ) -> VowifiStatusResponse {
-    if let Err(err) = app.config_manager.set_vowifi_connection_enabled(false) {
+    if let Err(err) = disable_vowifi_connection_for_scope(app, scope) {
         warn!(error = %err, "Failed to persist WiFi Calling connection disable after fallback");
     }
-    restore_cellular_and_reset_vowifi(app, reason).await
+    restore_cellular_and_reset_vowifi(app, scope, reason).await
 }
 
-async fn stop_vowifi_and_restore_cellular(app: &AppState, reason: &str) -> VowifiStatusResponse {
-    let _ = app.config_manager.set_vowifi_connection_enabled(false);
-    restore_cellular_and_reset_vowifi(app, reason).await
+async fn stop_vowifi_and_restore_cellular(
+    app: &AppState,
+    scope: &VowifiScope,
+    reason: &str,
+) -> VowifiStatusResponse {
+    let _ = disable_vowifi_connection_for_scope(app, scope);
+    restore_cellular_and_reset_vowifi(app, scope, reason).await
+}
+
+/// Turn off the VoWiFi connection intent for one line. The legacy global flag is
+/// only touched for the primary line so the old single-line UI keeps agreeing
+/// with reality; secondary lines are purely per-line.
+fn disable_vowifi_connection_for_scope(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
+    if scope.is_bound() {
+        app.config_manager
+            .set_line_vowifi_connection_enabled(scope.line_id(), false)
+            .map(|_| ())
+    } else {
+        app.config_manager
+            .set_vowifi_connection_enabled(false)
+            .map(|_| ())
+    }
 }
 
 fn spawn_vowifi_profile_switch_restore(app: AppState, switch_token: String) {
@@ -4396,6 +4448,9 @@ impl VowifiRestoreWorkflow {
 }
 
 async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkflow) {
+    // The restore workflow is a boot/profile-switch recovery for the primary
+    // line; other lines are restored by their own per-line intent.
+    let scope = VowifiScope::primary(&app).await;
     if workflow.is_profile_switch() {
         persist_optional_vowifi_restore_phase(
             &app,
@@ -4407,7 +4462,7 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
             None,
             0,
         );
-        let _ = reset_vowifi_runtime(&app, workflow.start_reason).await;
+        let _ = reset_vowifi_runtime_for_scope(&app, &scope, workflow.start_reason).await;
     }
 
     let config = app.config_manager.get_vowifi_config();
@@ -4422,7 +4477,7 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
             Some("vowifi_connection_disabled"),
             0,
         );
-        let _ = stop_vowifi_and_restore_cellular(&app, workflow.disabled_reason).await;
+        let _ = stop_vowifi_and_restore_cellular(&app, &scope, workflow.disabled_reason).await;
         return;
     }
 
@@ -4443,7 +4498,7 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
     for attempt in 1..=attempts {
         let retry_count = attempt.saturating_sub(1);
         let identity_status =
-            wait_for_vowifi_identity_gate(&app, Some(&workflow), retry_count).await;
+            wait_for_vowifi_identity_gate(&app, &scope, Some(&workflow), retry_count).await;
         if !identity_status.readiness.identity_ready || !identity_status.readiness.profile_matched {
             last_status = identity_status;
             if attempt < attempts {
@@ -4453,7 +4508,8 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
             break;
         }
 
-        if let Err(status) = wait_for_vowifi_sim_auth_gate(&app, Some(&workflow), retry_count).await
+        if let Err(status) =
+            wait_for_vowifi_sim_auth_gate(&app, &scope, Some(&workflow), retry_count).await
         {
             last_status = status;
             if attempt < attempts {
@@ -4529,7 +4585,8 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         "WiFi Calling restore workflow failed after retries"
     );
     let _ =
-        fallback_to_cellular_and_disable_vowifi_connection(&app, workflow.fallback_reason).await;
+        fallback_to_cellular_and_disable_vowifi_connection(&app, &scope, workflow.fallback_reason)
+            .await;
 }
 
 async fn schedule_vowifi_restore_retry(
@@ -4553,14 +4610,15 @@ async fn schedule_vowifi_restore_retry(
 
 async fn wait_for_vowifi_identity_gate(
     app: &AppState,
+    scope: &VowifiScope,
     workflow: Option<&VowifiRestoreWorkflow>,
     retry_count: u8,
 ) -> VowifiStatusResponse {
     let mut last_status = disabled_vowifi_status("identity_refresh_not_attempted");
     for gate_attempt in 1..=VOWIFI_RESTORE_IDENTITY_GATE_ATTEMPTS.max(1) {
         let phase_started_at = Instant::now();
-        let snapshot = app
-            .vowifi_runtime
+        let snapshot = scope
+            .runtime()
             .refresh_identity_with_timeout(
                 &app.dbus_conn,
                 Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
@@ -4610,6 +4668,7 @@ async fn wait_for_vowifi_identity_gate(
 
 async fn wait_for_vowifi_sim_auth_gate(
     app: &AppState,
+    scope: &VowifiScope,
     workflow: Option<&VowifiRestoreWorkflow>,
     retry_count: u8,
 ) -> Result<(), VowifiStatusResponse> {
@@ -4627,8 +4686,8 @@ async fn wait_for_vowifi_sim_auth_gate(
         );
     }
 
-    if let Err(err) = verify_live_sim_auth_access().await {
-        let mut status = app.vowifi_runtime.snapshot().await.status_response();
+    if let Err(err) = verify_live_sim_auth_access_for_line(scope.line_id()).await {
+        let mut status = scope.status().await;
         status.degraded_reason = Some(err.reason);
         persist_vowifi_runtime_snapshot(app, &status);
         if let Some(workflow) = workflow {
@@ -4686,26 +4745,18 @@ fn persist_optional_vowifi_restore_phase(
     }
 }
 
-async fn set_vowifi_airplane_mode(app: &AppState, enabled: bool) -> Result<(), String> {
-    if enabled {
-        app.airplane_mode_requested.store(true, Ordering::SeqCst);
-    }
-    match set_airplane_mode(&app.dbus_conn, enabled).await {
-        Ok(()) => {
-            app.airplane_mode_requested.store(enabled, Ordering::SeqCst);
-            Ok(())
-        }
-        Err(err) => {
-            if !enabled {
-                app.airplane_mode_requested.store(false, Ordering::SeqCst);
-            }
-            Err(err)
-        }
-    }
+/// VoWiFi needs this line's modem powered on for SIM/AKA access, so make sure
+/// the line is not sitting in airplane mode. Only ever turns airplane mode off,
+/// and only for the line that is connecting — a second SIM keeps its own state.
+async fn ensure_line_radio_enabled(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
+    let Some(modem_path) = scope.modem_path() else {
+        return Ok(());
+    };
+    modem_manager::set_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path, false).await
 }
 
-async fn pause_cellular_data_for_vowifi(app: &AppState) -> Result<(), String> {
-    if let Err(err) = set_vowifi_airplane_mode(app, false).await {
+async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
+    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
         warn!(error = %err, "Failed to keep modem enabled for WiFi Calling SIM access");
     }
     if let Ok(profile) = find_nm_modem_connection_pub().await {
@@ -4713,16 +4764,21 @@ async fn pause_cellular_data_for_vowifi(app: &AppState) -> Result<(), String> {
             warn!(error = %err, profile = %profile, "Failed to disable NM autoconnect before WiFi Calling");
         }
     }
-    let allow_roaming = app.config_manager.get_roaming_allowed();
-    let apn_config = app.config_manager.get_apn_config();
-    set_data_connection_with_apn(&app.dbus_conn, false, allow_roaming, Some(&apn_config))
+    let Some(modem_path) = scope.modem_path() else {
+        return Ok(());
+    };
+    modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &modem_path)
         .await
         .map_err(|err| err.to_string())
 }
 
-async fn restore_cellular_data_after_vowifi(app: &AppState) {
-    let should_restore_data =
-        app.config_manager.get_data_enabled() && !app.data_user_disabled.load(Ordering::SeqCst);
+async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope) {
+    // Whether cellular data comes back is this line's own setting, not a global
+    // one: a second SIM that never had data enabled must not get it here.
+    let line_profile = app.config_manager.get_line_profile(scope.line_id());
+    let should_restore_data = line_profile.data_connection_enabled
+        && !line_profile.airplane_mode_enabled
+        && !app.data_user_disabled.load(Ordering::SeqCst);
     if let Ok(profile) = find_nm_modem_connection_pub().await {
         if let Err(err) = nm_set_autoconnect_pub(&profile, should_restore_data).await {
             warn!(error = %err, profile = %profile, "Failed to restore NM autoconnect after WiFi Calling");
@@ -4731,10 +4787,17 @@ async fn restore_cellular_data_after_vowifi(app: &AppState) {
     if !should_restore_data {
         return;
     }
-    let allow_roaming = app.config_manager.get_roaming_allowed();
-    let apn_config = app.config_manager.get_apn_config();
-    if let Err(err) =
-        set_data_connection_with_apn(&app.dbus_conn, true, allow_roaming, Some(&apn_config)).await
+    let Some(modem_path) = scope.modem_path() else {
+        return;
+    };
+    let apn_config = app.config_manager.get_line_apn_config(scope.line_id());
+    if let Err(err) = modem_manager::connect_data_via_modem(
+        app.dbus_conn.as_ref(),
+        &modem_path,
+        line_profile.roaming_allowed,
+        Some(&apn_config),
+    )
+    .await
     {
         warn!(error = %err, "Failed to restore cellular data after WiFi Calling");
     }
@@ -4742,18 +4805,20 @@ async fn restore_cellular_data_after_vowifi(app: &AppState) {
 
 async fn attempt_vowifi_connect_once(
     app: &AppState,
+    scope: &VowifiScope,
     refresh_identity: bool,
 ) -> VowifiStatusResponse {
     if refresh_identity {
-        app.vowifi_runtime
+        scope
+            .runtime()
             .refresh_identity_with_timeout(
                 &app.dbus_conn,
                 std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
             )
             .await;
     }
-    let snapshot = app
-        .vowifi_runtime
+    let snapshot = scope
+        .runtime()
         .connect_live_with_stage_timeout(
             Some(&app.database),
             std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
@@ -4770,21 +4835,40 @@ async fn connect_vowifi_with_attempts(
     retry_delay: std::time::Duration,
     fallback_to_cellular_on_failure: bool,
 ) -> VowifiStatusResponse {
+    let scope = VowifiScope::primary(app).await;
+    connect_vowifi_on_line(
+        app,
+        &scope,
+        attempts,
+        retry_delay,
+        fallback_to_cellular_on_failure,
+    )
+    .await
+}
+
+async fn connect_vowifi_on_line(
+    app: &AppState,
+    scope: &VowifiScope,
+    attempts: u8,
+    retry_delay: std::time::Duration,
+    fallback_to_cellular_on_failure: bool,
+) -> VowifiStatusResponse {
     let control = app.config_manager.get_vowifi_config();
     if !control.feature_enabled {
         return disabled_vowifi_status("vowifi_feature_disabled");
     }
-    if let Some(primary) = app.line_registry.primary().await {
-        let mut line_config = app
-            .config_manager
-            .get_line_profile(&primary.binding().line_id)
-            .vowifi;
+    if !scope.is_bound() {
+        return disabled_vowifi_status("vowifi_line_not_available");
+    }
+    {
+        let line_id = scope.line_id().to_string();
+        let mut line_config = app.config_manager.get_line_profile(&line_id).vowifi;
         if line_config.epdg_host.is_empty() {
-            let snapshot = app.vowifi_runtime.snapshot().await;
+            let snapshot = scope.runtime().snapshot().await;
             if let Some(profile) = snapshot.profile.profile {
-                if let Some(external) = app
-                    .config_manager
-                    .get_external_vowifi_profiles()
+                if let Some(external) = profile_store(app)
+                    .list_as_external()
+                    .unwrap_or_default()
                     .into_iter()
                     .find(|item| {
                         item.profile_id == profile.profile_id
@@ -4798,7 +4882,7 @@ async fn connect_vowifi_with_attempts(
             }
         }
         if let Err(error) =
-            crate::access::vowifi::live::configure_live_network_overrides(&line_config)
+            crate::access::vowifi::live::configure_live_network_overrides(&line_id, &line_config)
         {
             let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
             status.degraded_reason = Some(error);
@@ -4807,14 +4891,14 @@ async fn connect_vowifi_with_attempts(
         }
     }
 
-    let current = app.vowifi_runtime.snapshot().await.status_response();
+    let current = scope.status().await;
     if current.readiness.sms_ready {
         persist_vowifi_runtime_snapshot(app, &current);
         return current;
     }
 
-    let Ok(_connect_guard) = app.vowifi_connect_lock.try_lock() else {
-        let mut status = app.vowifi_runtime.snapshot().await.status_response();
+    let Some(_connect_guard) = scope.try_connect_lock() else {
+        let mut status = scope.status().await;
         if !status.readiness.sms_ready {
             status.degraded_reason = Some("vowifi_connect_already_running".to_string());
         }
@@ -4822,7 +4906,7 @@ async fn connect_vowifi_with_attempts(
         return status;
     };
 
-    let current = app.vowifi_runtime.snapshot().await.status_response();
+    let current = scope.status().await;
     if current.readiness.sms_ready {
         persist_vowifi_runtime_snapshot(app, &current);
         return current;
@@ -4843,20 +4927,20 @@ async fn connect_vowifi_with_attempts(
         });
 
     let attempts = attempts.max(1);
-    if let Err(err) = pause_cellular_data_for_vowifi(app).await {
+    if let Err(err) = pause_cellular_data_for_vowifi(app, scope).await {
         let mut status = disabled_vowifi_status("vowifi_cellular_data_pause_failed");
         status.degraded_reason = Some(format!("vowifi_cellular_data_pause_failed:{err}"));
         persist_vowifi_runtime_snapshot(app, &status);
         return status;
     }
 
-    let prepared = wait_for_vowifi_identity_gate(app, None, 0).await;
+    let prepared = wait_for_vowifi_identity_gate(app, scope, None, 0).await;
     if !prepared.readiness.identity_ready || !prepared.readiness.profile_matched {
         persist_vowifi_runtime_snapshot(app, &prepared);
         return prepared;
     }
 
-    if let Err(status) = wait_for_vowifi_sim_auth_gate(app, None, 0).await {
+    if let Err(status) = wait_for_vowifi_sim_auth_gate(app, scope, None, 0).await {
         persist_vowifi_runtime_snapshot(app, &status);
         return status;
     }
@@ -4868,7 +4952,7 @@ async fn connect_vowifi_with_attempts(
             attempts = attempts,
             "WiFi Calling connection attempt started"
         );
-        last_status = attempt_vowifi_connect_once(app, false).await;
+        last_status = attempt_vowifi_connect_once(app, scope, false).await;
         if last_status.readiness.sms_ready {
             return last_status;
         }
@@ -4888,7 +4972,7 @@ async fn connect_vowifi_with_attempts(
             "WiFi Calling connection attempts exhausted; falling back to cellular"
         );
         last_status =
-            fallback_to_cellular_and_disable_vowifi_connection(app, &fallback_reason).await;
+            fallback_to_cellular_and_disable_vowifi_connection(app, scope, &fallback_reason).await;
     }
     last_status
 }
@@ -4962,51 +5046,32 @@ async fn build_vowifi_line_response(
 ) -> VowifiLineConfigResponse {
     let modem = line.binding();
     let config = app.config_manager.get_line_profile(&modem.line_id).vowifi;
-    let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) =
-        if is_primary {
-            let status = app.vowifi_runtime.snapshot().await.status_response();
-            let stage = if config.enabled && status.phase == "not_started" {
-                "starting".to_string()
-            } else {
-                status.phase.to_string()
-            };
-            (
-                status.phase.to_string(),
-                stage,
-                status.readiness.ims_registered,
-                status.degraded_reason,
-                status
-                    .profile
-                    .profile
-                    .map(|profile| profile.profile_id.to_string()),
-            )
-        } else if config.enabled {
-            (
-                "waiting_runtime".to_string(),
-                "configuration_only".to_string(),
-                false,
-                None,
-                None,
-            )
+    // Every line has a real runtime now, so report that line's own phase instead
+    // of the old "only the primary line has a runtime" placeholder.
+    let status = line.vowifi.snapshot().await.status_response();
+    let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) = {
+        let stage = if config.enabled && status.phase == "not_started" {
+            "starting".to_string()
         } else {
-            (
-                "disabled".to_string(),
-                "disabled".to_string(),
-                false,
-                None,
-                None,
-            )
+            status.phase.to_string()
         };
+        (
+            status.phase.to_string(),
+            stage,
+            status.readiness.ims_registered,
+            status.degraded_reason,
+            status
+                .profile
+                .profile
+                .map(|profile| profile.profile_id.to_string()),
+        )
+    };
     VowifiLineConfigResponse {
         line_id: modem.line_id.clone(),
         modem,
         config,
         is_primary,
-        runtime_scope: if is_primary {
-            "primary_shared_runtime"
-        } else {
-            "configuration_only"
-        },
+        runtime_scope: "per_line_runtime",
         runtime_phase,
         runtime_stage,
         runtime_registered,
@@ -5100,15 +5165,24 @@ pub async fn set_vowifi_line_connection_handler(
         .primary()
         .await
         .is_some_and(|primary| primary.binding().line_id == line_id);
-    if payload.enabled && is_primary {
+    // Validate and publish this line's network overrides regardless of whether it
+    // is the primary line: overrides are keyed per line, so a bad proxy or DNS
+    // value must be rejected for the line it belongs to rather than only when it
+    // happens to be primary.
+    if payload.enabled {
         let mut next = app.config_manager.get_line_profile(&line_id).vowifi;
         next.enabled = true;
-        if let Err(error) = crate::access::vowifi::live::configure_live_network_overrides(&next) {
+        if let Err(error) =
+            crate::access::vowifi::live::configure_live_network_overrides(&line_id, &next)
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(ApiResponse::error(format!("Failed: {error}"))),
             );
         }
+    } else {
+        // Drop the overrides so a disabled line stops influencing anything.
+        crate::access::vowifi::live::forget_live_network_overrides(&line_id);
     }
     if let Err(error) = app
         .config_manager
@@ -5119,24 +5193,33 @@ pub async fn set_vowifi_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
-    if is_primary {
-        if payload.enabled {
-            let _ = app.config_manager.set_vowifi_feature_enabled(true);
+    // Connect/disconnect the line the request names. Lines no longer share a
+    // runtime, so a secondary SIM can hold its own VoWiFi registration while the
+    // primary one is up (or down).
+    let scope = VowifiScope::resolve(&app, Some(&line_id)).await;
+    if payload.enabled {
+        // `feature_enabled` stays a process-level kill switch; the per-line
+        // `connection_enabled` flag is what decides whether this SIM dials.
+        let _ = app.config_manager.set_vowifi_feature_enabled(true);
+        if is_primary {
             let _ = app.config_manager.set_vowifi_connection_enabled(true);
-            let connect_app = app.clone();
-            tokio::spawn(async move {
-                let _ = connect_vowifi_with_attempts(
-                    &connect_app,
-                    VOWIFI_MANUAL_CONNECT_ATTEMPTS,
-                    Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
-                    true,
-                )
-                .await;
-            });
-        } else {
-            let _ = app.config_manager.set_vowifi_connection_enabled(false);
-            let _ = reset_vowifi_runtime(&app, "vowifi_primary_line_disabled").await;
         }
+        let connect_app = app.clone();
+        tokio::spawn(async move {
+            let _ = connect_vowifi_on_line(
+                &connect_app,
+                &scope,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                true,
+            )
+            .await;
+        });
+    } else {
+        if is_primary {
+            let _ = app.config_manager.set_vowifi_connection_enabled(false);
+        }
+        let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_line_disabled").await;
     }
     (
         StatusCode::OK,
@@ -5498,15 +5581,26 @@ pub async fn set_line_trunk_enabled_handler(
 }
 
 impl VolteControlResponse {
-    fn build(config: &VolteConfig, runtime: crate::access::volte::VolteRuntimeStatus) -> Self {
+    fn build(
+        _config: &VolteConfig,
+        runtime: crate::access::volte::VolteRuntimeStatus,
+        line_enabled: bool,
+    ) -> Self {
         Self {
-            enabled: config.feature_enabled && config.sms_enabled,
-            feature_enabled: config.feature_enabled,
-            sms_enabled: config.sms_enabled,
-            connection_enabled: config.connection_enabled,
+            enabled: line_enabled,
+            feature_enabled: line_enabled,
+            sms_enabled: line_enabled,
+            connection_enabled: line_enabled,
             runtime,
         }
     }
+}
+
+fn any_volte_line_enabled(app: &AppState) -> bool {
+    app.config_manager
+        .get_line_profiles()
+        .iter()
+        .any(|profile| profile.enabled && profile.volte_connection_enabled)
 }
 
 pub async fn get_volte_control_handler(
@@ -5518,7 +5612,7 @@ pub async fn get_volte_control_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            VolteControlResponse::build(&config, runtime),
+            VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app)),
         )),
     )
 }
@@ -5535,21 +5629,13 @@ pub async fn set_volte_feature_handler(
             if !payload.enabled {
                 crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
                     .await;
-                for line in app.line_registry.all().await {
-                    crate::access::volte::live::disconnect_live_for_line(
-                        &line.volte_live,
-                        &line.volte,
-                        "volte_disabled",
-                    )
-                    .await;
-                }
             }
             let runtime = app.volte_runtime.status().await;
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
                     "Success",
-                    VolteControlResponse::build(&config, runtime),
+                    VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app)),
                 )),
             )
         }
@@ -5562,48 +5648,36 @@ pub async fn set_volte_feature_handler(
     }
 }
 
-/// Start/stop the live VoLTE IMS bearer and REGISTER session. The feature gate
-/// must be enabled first; disabling performs scoped xfrm and bearer cleanup.
+/// Legacy global endpoint. Physical IMS sessions must be controlled through a
+/// line endpoint so multi-modem systems never select an implicit modem.
 pub async fn set_volte_connection_handler(
     State(app): State<AppState>,
     Json(payload): Json<VolteControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<VolteControlResponse>>) {
+    if payload.enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("volte_line_endpoint_required")),
+        );
+    }
     let _guard = app.volte_connect_lock.lock().await;
     match app
         .config_manager
         .set_volte_connection_enabled(payload.enabled)
     {
         Ok(config) => {
-            let result = if payload.enabled {
-                crate::access::volte::live::connect_live(
-                    &app.volte_runtime,
-                    &config,
-                    app.config_manager.get_sms_path_policy().dedupe_enabled,
-                    Arc::clone(&app.database),
-                    Arc::clone(&app.notification_sender),
-                )
-                .await
-            } else {
-                Ok(crate::access::volte::live::disconnect_live(
-                    &app.volte_runtime,
-                    "volte_connection_disabled",
-                )
-                .await)
-            };
+            crate::access::volte::live::disconnect_live(
+                &app.volte_runtime,
+                "volte_connection_disabled",
+            )
+            .await;
             let runtime = app.volte_runtime.status().await;
-            let response = VolteControlResponse::build(&config, runtime);
-            match result {
-                Ok(_) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message("Success", response)),
-                ),
-                Err(error) => (
-                    StatusCode::OK,
-                    Json(ApiResponse::<VolteControlResponse>::error(format!(
-                        "Failed: {error}"
-                    ))),
-                ),
-            }
+            let response =
+                VolteControlResponse::build(&config, runtime, any_volte_line_enabled(&app));
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", response)),
+            )
         }
         Err(error) => (
             StatusCode::OK,
@@ -5628,10 +5702,10 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(config: &VolteConfig) -> Self {
+    fn build(config: &VolteConfig, line_enabled: bool) -> Self {
         Self {
-            enabled: config.feature_enabled && config.voice_enabled,
-            feature_enabled: config.feature_enabled,
+            enabled: line_enabled && config.voice_enabled,
+            feature_enabled: line_enabled,
             voice_enabled: config.voice_enabled,
             // Qualcomm 410 pocket-WiFi has no mic/speaker/PCM: relay only.
             gateway_mode: true,
@@ -5648,7 +5722,7 @@ pub async fn get_volte_call_status_handler(
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
             "Success",
-            VolteVoiceStatusResponse::build(&config),
+            VolteVoiceStatusResponse::build(&config, any_volte_line_enabled(&app)),
         )),
     )
 }
@@ -5662,7 +5736,7 @@ pub async fn set_volte_voice_handler(
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "Success",
-                VolteVoiceStatusResponse::build(&config),
+                VolteVoiceStatusResponse::build(&config, any_volte_line_enabled(&app)),
             )),
         ),
         Err(err) => (
@@ -5733,7 +5807,7 @@ impl VilteStatusResponse {
     fn build(app: &AppState) -> Self {
         let volte = app.config_manager.get_volte_config();
         let vilte = app.config_manager.get_vilte_config();
-        let voice_ready = volte.feature_enabled && volte.voice_enabled;
+        let voice_ready = any_volte_line_enabled(app) && volte.voice_enabled;
         Self {
             enabled: voice_ready && vilte.feature_enabled,
             feature_enabled: vilte.feature_enabled,
@@ -5821,29 +5895,271 @@ pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<Vowi
     )
 }
 
+// ===================== VoWiFi carrier profile database =====================
+
+fn profile_store(app: &AppState) -> crate::access::vowifi::profile_store::ProfileStore {
+    crate::access::vowifi::profile_store::ProfileStore::new(Arc::clone(&app.database))
+}
+
+/// GET /api/vowifi/carrier-profiles
+pub async fn list_vowifi_carrier_profiles_handler(
+    State(app): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::access::vowifi::profile_store::StoredProfile>>>,
+) {
+    match profile_store(&app).list() {
+        Ok(profiles) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", profiles)),
+        ),
+        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
+}
+
+/// PUT /api/vowifi/carrier-profiles
+///
+/// Insert or replace one profile. The body is the full profile document; the
+/// record is validated before it is stored so a bad edit is rejected here
+/// rather than surfacing later as a failed IKE or REGISTER exchange.
+pub async fn save_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Json(record): Json<crate::access::vowifi::profile_record::CarrierProfileRecord>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match profile_store(&app).save(&record, "manual") {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                json!({
+                    "profile_id": record.meta.profile_id,
+                    "plmn": record.meta.plmn,
+                    // Lets the UI prompt for emergency setup where it matters
+                    // without blocking carriers that do not need it.
+                    "e911_expected": record.e911_expected(),
+                }),
+            )),
+        ),
+        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
+}
+
+/// DELETE /api/vowifi/carrier-profiles/{profile_id}
+///
+/// Removing a row falls back to the built-in or derived profile for that PLMN.
+pub async fn delete_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match profile_store(&app).delete(&profile_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                json!({ "deleted": true }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("profile_not_found")),
+        ),
+        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
+}
+
+/// GET /api/vowifi/carrier-profiles/resolve?plmn=23433
+///
+/// Show which profile a PLMN actually resolves to and where it came from
+/// (database / builtin / derived).
+pub async fn resolve_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let plmn = query
+        .get("plmn")
+        .map(|value| {
+            value
+                .chars()
+                .filter(|c| c.is_ascii_digit())
+                .collect::<String>()
+        })
+        .unwrap_or_default();
+    if plmn.len() < 5 || plmn.len() > 6 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("plmn_must_be_five_or_six_digits")),
+        );
+    }
+    let (mcc, mnc) = plmn.split_at(3);
+    match profile_store(&app).resolve_by_plmn(mcc, mnc) {
+        Some(resolved) => {
+            let record = crate::access::vowifi::profile_record::CarrierProfileRecord::from_profile(
+                resolved.profile,
+            );
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    json!({
+                        "origin": resolved.origin.as_str(),
+                        "e911_expected": record.e911_expected(),
+                        "record": record,
+                    }),
+                )),
+            )
+        }
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("profile_not_resolvable")),
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct VowifiProfileImportRequest {
+    /// `aosp_apns`, `aosp_carrier_config` or `ipcc`.
+    pub format: String,
+    /// The raw document (XML for all three formats).
+    pub content: String,
+    /// Required for `aosp_carrier_config` and `ipcc`, which do not carry the
+    /// PLMN inside the document.
+    #[serde(default)]
+    pub mcc: Option<String>,
+    #[serde(default)]
+    pub mnc: Option<String>,
+    /// Preview only; nothing is written unless this is false.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// POST /api/vowifi/carrier-profiles/import
+///
+/// Import carrier facts from a public source. Imported values are overlaid on
+/// the 3GPP-derived defaults, so an import never invents an ePDG hostname or
+/// silently blanks a field the source does not cover.
+pub async fn import_vowifi_carrier_profiles_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<VowifiProfileImportRequest>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    use crate::access::vowifi::profile_import;
+
+    let facts = match payload.format.as_str() {
+        "aosp_apns" => profile_import::parse_aosp_apns(&payload.content),
+        "aosp_carrier_config" | "ipcc" => {
+            let (Some(mcc), Some(mnc)) = (payload.mcc.as_deref(), payload.mnc.as_deref()) else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(ApiResponse::error("mcc_and_mnc_required_for_this_format")),
+                );
+            };
+            let parsed = if payload.format == "ipcc" {
+                profile_import::parse_ipcc_carrier_plist(&payload.content, mcc, mnc)
+            } else {
+                profile_import::parse_aosp_carrier_config(&payload.content, mcc, mnc)
+            };
+            vec![parsed]
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("unsupported_import_format")),
+            )
+        }
+    };
+
+    let store = profile_store(&app);
+    let mut imported = Vec::new();
+    let mut skipped = Vec::new();
+    for fact in &facts {
+        let Some(record) = fact.to_record() else {
+            skipped.push(json!({ "plmn": fact.plmn(), "reason": "invalid_plmn" }));
+            continue;
+        };
+        if let Err(error) = record.validate() {
+            skipped.push(json!({ "plmn": fact.plmn(), "reason": error }));
+            continue;
+        }
+        if !payload.dry_run {
+            if let Err(error) = store.save(&record, &payload.format) {
+                skipped.push(json!({ "plmn": fact.plmn(), "reason": error }));
+                continue;
+            }
+        }
+        imported.push(json!({
+            "profile_id": record.meta.profile_id,
+            "plmn": record.meta.plmn,
+            "brand": record.meta.brand,
+            "ims_apn": record.epdg.apn,
+            "vowifi_supported": fact.vowifi_supported,
+            "e911_expected": record.e911_expected(),
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            json!({
+                "dry_run": payload.dry_run,
+                "imported": imported,
+                "skipped": skipped,
+            }),
+        )),
+    )
+}
+
+/// GET /api/vowifi/external-profiles
+///
+/// Legacy view of the carrier profile database, kept so the per-line dialog's
+/// "apply a saved ePDG" shortcut keeps working. Custom profiles are no longer a
+/// separate `vowifi-profiles.conf` file — they are rows in the database.
 pub async fn get_external_vowifi_profiles_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
     Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
 ) {
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "Success",
-            app.config_manager.get_external_vowifi_profiles(),
-        )),
-    )
+    match profile_store(&app).list_as_external() {
+        Ok(profiles) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", profiles)),
+        ),
+        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
 }
 
+/// POST /api/vowifi/external-profiles
+///
+/// Apply an ePDG override. It is expanded into a full profile row: an existing
+/// row is edited in place so any REGISTER policy already tuned there survives.
 pub async fn set_external_vowifi_profile_handler(
     State(app): State<AppState>,
-    Json(payload): Json<crate::infra::config::ExternalVowifiProfile>,
+    Json(mut payload): Json<crate::infra::config::ExternalVowifiProfile>,
 ) -> (
     StatusCode,
     Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
 ) {
-    match app.config_manager.set_external_vowifi_profile(payload) {
+    payload.profile_id = payload.profile_id.trim().to_string();
+    payload.mcc = payload.mcc.trim().to_string();
+    payload.mnc = payload.mnc.trim().to_string();
+    payload.epdg_host = payload.epdg_host.trim().trim_end_matches('.').to_string();
+    if payload.profile_id.is_empty()
+        || payload.mcc.len() != 3
+        || payload.mnc.len() < 2
+        || payload.mnc.len() > 3
+        || payload.epdg_host.is_empty()
+        || payload.epdg_port == 0
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("vowifi_external_profile_invalid")),
+        );
+    }
+    let store = profile_store(&app);
+    match store
+        .save_external(&payload)
+        .and_then(|_| store.list_as_external())
+    {
         Ok(profiles) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", profiles)),
@@ -5916,10 +6232,17 @@ pub async fn set_vowifi_feature_handler(
     {
         Ok(config) => {
             if !payload.enabled {
-                if let Err(err) = set_vowifi_airplane_mode(&app, false).await {
-                    warn!(error = %err, "Failed to disable airplane mode after WiFi Calling feature disable");
+                // This is the process-wide kill switch, so every line's runtime
+                // has to come down — not just the primary one.
+                for line in app.line_registry.all().await {
+                    let line_id = line.binding().line_id;
+                    let scope = VowifiScope::resolve(&app, Some(&line_id)).await;
+                    if let Err(err) = ensure_line_radio_enabled(&app, &scope).await {
+                        warn!(line_id = %line_id, error = %err, "Failed to re-enable the line radio after WiFi Calling feature disable");
+                    }
+                    let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_feature_disabled")
+                        .await;
                 }
-                let _ = reset_vowifi_runtime(&app, "vowifi_feature_disabled").await;
             }
             (
                 StatusCode::OK,
@@ -5947,7 +6270,9 @@ pub async fn set_vowifi_connection_handler(
     }
 
     if !payload.enabled {
-        let status = stop_vowifi_and_restore_cellular(&app, "vowifi_connection_disabled").await;
+        let scope = VowifiScope::primary(&app).await;
+        let status =
+            stop_vowifi_and_restore_cellular(&app, &scope, "vowifi_connection_disabled").await;
         return (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", status)),
@@ -6184,8 +6509,6 @@ async fn run_line_volte_restore_batch(
             })
             .await;
 
-        let mut line_config = config.clone();
-        line_config.connection_enabled = true;
         let result = {
             let _guard = line.volte_connect_lock.lock().await;
             if line.volte.status().await.registered {
@@ -6195,7 +6518,7 @@ async fn run_line_volte_restore_batch(
                 &line.volte_live,
                 &device,
                 &line.volte,
-                &line_config,
+                &config,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),
@@ -6217,6 +6540,32 @@ async fn run_line_volte_restore_batch(
             }
             Err(error) => {
                 warn!(line_id = %binding.line_id, attempt, source, error = %error, "VoLTE IMS restore attempt failed");
+                // A wedged baseband must not be retried. Re-issuing IMS PDP
+                // activation against it can escalate to a modem subsystem
+                // restart and take the whole device down, so stop the batch and
+                // wait for an explicit operator retry instead.
+                if crate::access::volte::plan::FailureClass::from_details(
+                    error.detail().unwrap_or_default(),
+                ) == crate::access::volte::plan::FailureClass::BasebandWedged
+                {
+                    warn!(
+                        line_id = %binding.line_id,
+                        error = %error,
+                        "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
+                    );
+                    line.volte
+                        .update(|state| {
+                            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+                            state.recovery_state =
+                                crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+                            state.manual_retry_available = true;
+                            state.next_retry_at = None;
+                            state.last_error = Some(format!("volte_baseband_wedged:{error}"));
+                            state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+                        })
+                        .await;
+                    return;
+                }
                 if attempt < VOLTE_RESTORE_MAX_ATTEMPTS {
                     let delay = config.auto_restore_retry_delay_secs.clamp(5, 180);
                     line.volte

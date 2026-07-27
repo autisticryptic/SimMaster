@@ -23,6 +23,7 @@ use tokio::{net::UdpSocket, process::Command, time::sleep};
 use crate::infra::config::VolteIpFamilyPreference;
 
 use super::errors::{code, VolteError};
+use super::plan::{ImsConnectionPlan, IpFamily};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const DNS_PORT: u16 = 53;
@@ -79,24 +80,15 @@ impl ImsIpSettings {
         self.ipv6_address.or(self.ipv4_address)
     }
 
-    /// Available bearer addresses in the configured attempt order.
-    pub fn ordered_local_addrs(&self, preference: VolteIpFamilyPreference) -> Vec<IpAddr> {
+    /// Available bearer addresses in the plan's family order.
+    pub fn ordered_local_addrs(&self, plan: &ImsConnectionPlan) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
-        match preference {
-            VolteIpFamilyPreference::Ipv6First => {
-                push_optional_addr(&mut addresses, self.ipv6_address);
-                push_optional_addr(&mut addresses, self.ipv4_address);
-            }
-            VolteIpFamilyPreference::Ipv4First => {
-                push_optional_addr(&mut addresses, self.ipv4_address);
-                push_optional_addr(&mut addresses, self.ipv6_address);
-            }
-            VolteIpFamilyPreference::Ipv6Only => {
-                push_optional_addr(&mut addresses, self.ipv6_address);
-            }
-            VolteIpFamilyPreference::Ipv4Only => {
-                push_optional_addr(&mut addresses, self.ipv4_address);
-            }
+        for family in plan.pcscf_order() {
+            let addr = match family {
+                IpFamily::Ipv6 => self.ipv6_address,
+                IpFamily::Ipv4 => self.ipv4_address,
+            };
+            push_optional_addr(&mut addresses, addr);
         }
         addresses
     }
@@ -155,25 +147,16 @@ pub fn parse_ip_settings(block: &str) -> ImsIpSettings {
     s
 }
 
-/// Ask a Qualcomm modem to request IMS P-CSCF PCO fields for a temporary PDP
-/// context, then read those fields through +CGCONTRDP.
-///
-/// $QCPDPIMSCFGE=<cid>,1,1,1 is the Qualcomm control that makes the missing
-/// P-CSCF address fields appear in CGCONTRDP on devices where ModemManager's
-/// QMI Get Current Settings reports PCSCF Address Using PCO: false.
-pub async fn discover_pcscf_via_at(
-    modem: &str,
-    preference: VolteIpFamilyPreference,
-) -> Vec<IpAddr> {
-    match discover_pcscf_via_at_with_context(modem, preference).await {
-        Ok(discovery) => {
-            if let Some(context) = discovery.context {
-                context.cleanup().await;
-            }
-            discovery.candidates
-        }
-        Err(_) => Vec::new(),
-    }
+/// The IMS PDP context id used for P-CSCF discovery and the IPv6 WDS preflight.
+/// Honors `SIMADMIN_VOLTE_IMS_CID` (1..=16), else falls back to CID 2. Exposed
+/// so callers that skip the AT probe (e.g. when it is non-fatal and returns no
+/// candidates) still have a stable CID hint for the preflight.
+pub fn configured_ims_cid() -> u8 {
+    std::env::var(ENV_IMS_CID)
+        .ok()
+        .and_then(|value| value.trim().parse::<u8>().ok())
+        .filter(|value| (1..=16).contains(value))
+        .unwrap_or(DEFAULT_IMS_CID)
 }
 
 /// Discover P-CSCF candidates and retain the successful Qualcomm IMS context.
@@ -184,17 +167,13 @@ pub async fn discover_pcscf_via_at(
 /// reference runtime.
 pub async fn discover_pcscf_via_at_with_context(
     modem: &str,
-    preference: VolteIpFamilyPreference,
+    plan: &ImsConnectionPlan,
 ) -> Result<AtPcscfDiscovery, VolteError> {
-    let cid = std::env::var(ENV_IMS_CID)
-        .ok()
-        .and_then(|value| value.trim().parse::<u8>().ok())
-        .filter(|value| (1..=16).contains(value))
-        .unwrap_or(DEFAULT_IMS_CID);
+    let cid = configured_ims_cid();
 
     let mut last_error = None;
     for _ in 0..AT_DISCOVERY_ROUNDS {
-        for pdp_type in ordered_pdp_types(preference) {
+        for pdp_type in plan.pdp_types() {
             match probe_pcscf_context(modem, cid, pdp_type).await {
                 Ok((candidates, context)) if !candidates.is_empty() => {
                     return Ok(AtPcscfDiscovery {
@@ -280,15 +259,6 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
                 output.status.code().unwrap_or(-1)
             ),
         ))
-    }
-}
-
-fn ordered_pdp_types(preference: VolteIpFamilyPreference) -> &'static [&'static str] {
-    match preference {
-        VolteIpFamilyPreference::Ipv6First => &["IPV6", "IP"],
-        VolteIpFamilyPreference::Ipv4First => &["IP", "IPV6"],
-        VolteIpFamilyPreference::Ipv6Only => &["IPV6"],
-        VolteIpFamilyPreference::Ipv4Only => &["IP"],
     }
 }
 
@@ -663,27 +633,36 @@ IPv4 primary DNS: 10.0.0.53";
 
     #[test]
     fn address_order_honors_preference_and_strict_modes() {
+        use crate::access::volte::plan::ImsConnectionPlan;
         let s = parse_ip_settings(SAMPLE);
         assert_eq!(
-            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6First),
+            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
+                VolteIpFamilyPreference::Ipv6First
+            )),
             vec![
                 IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
             ]
         );
         assert_eq!(
-            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4First),
+            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
+                VolteIpFamilyPreference::Ipv4First
+            )),
             vec![
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
                 IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
             ]
         );
         assert_eq!(
-            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv6Only),
+            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
+                VolteIpFamilyPreference::Ipv6Only
+            )),
             vec![IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap())]
         );
         assert_eq!(
-            s.ordered_local_addrs(VolteIpFamilyPreference::Ipv4Only),
+            s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
+                VolteIpFamilyPreference::Ipv4Only
+            )),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
     }
@@ -764,21 +743,22 @@ IPv4 primary DNS: 10.0.0.53";
 
     #[test]
     fn at_probe_family_order_matches_runtime_preference() {
+        use crate::access::volte::plan::ImsConnectionPlan;
         assert_eq!(
-            ordered_pdp_types(VolteIpFamilyPreference::Ipv6First),
-            &["IPV6", "IP"]
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First).pdp_types(),
+            vec!["IPV4V6", "IPV6", "IP"]
         );
         assert_eq!(
-            ordered_pdp_types(VolteIpFamilyPreference::Ipv4First),
-            &["IP", "IPV6"]
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First).pdp_types(),
+            vec!["IPV4V6", "IP", "IPV6"]
         );
         assert_eq!(
-            ordered_pdp_types(VolteIpFamilyPreference::Ipv6Only),
-            &["IPV6"]
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6Only).pdp_types(),
+            vec!["IPV6"]
         );
         assert_eq!(
-            ordered_pdp_types(VolteIpFamilyPreference::Ipv4Only),
-            &["IP"]
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4Only).pdp_types(),
+            vec!["IP"]
         );
     }
 

@@ -21,9 +21,8 @@ interface Props {
 
 const proxyHints: Record<VowifiProxyMode, string> = {
   direct: '不使用代理，IKEv2 直接连接 ePDG',
-  socks5_udp_associate: '示例：socks5://proxy.example.com:1080',
-  connect_udp_masque: '示例：https://masque.example.com',
-  udp_relay: '示例：udp://relay.example.com:4500',
+  socks5_udp_associate: '支持 UDP ASSOCIATE 的 SOCKS5，例：socks5://user:pass@127.0.0.1:1080（mihomo / sing-box / Xray 均可）',
+  udp_relay: '暂未实现。要自建转发请在远端跑标准 SOCKS5（sing-box / mihomo / gost），再用上面的 SOCKS5 模式',
 }
 
 export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props) {
@@ -107,7 +106,8 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
       <DialogContent dividers>
         <Stack spacing={2}>
           <Alert severity="info">
-            内置运营商 profile 已编译在 SimAdmin 中。vowifi-profiles.conf 只保存用户新增或覆盖的连接属性，可在这里套用或写入。
+            这里配置的是<strong>这条线路</strong>的覆盖值。运营商本身的 profile（ePDG、IMS、REGISTER 细节）
+            现在存在数据库里，可在「SIM 卡管理 → 运营商 Profile」页完整编辑。
           </Alert>
           <FormControl fullWidth>
             <InputLabel>自定义 ePDG profile</InputLabel>
@@ -148,9 +148,8 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
               onChange={(event) => update('proxy_mode', event.target.value as VowifiProxyMode)}
             >
               <MenuItem value="direct">直连</MenuItem>
-              <MenuItem value="socks5_udp_associate" disabled>SOCKS5 UDP Associate（运行时待实现）</MenuItem>
-              <MenuItem value="connect_udp_masque" disabled>MASQUE CONNECT-UDP（运行时待实现）</MenuItem>
-              <MenuItem value="udp_relay" disabled>UDP Relay（运行时待实现）</MenuItem>
+              <MenuItem value="socks5_udp_associate">SOCKS5 UDP Associate</MenuItem>
+              <MenuItem value="udp_relay" disabled>UDP Relay（未实现，建议自建 SOCKS5 代替）</MenuItem>
             </Select>
           </FormControl>
           <TextField
@@ -161,11 +160,9 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             helperText={proxyHints[draft.proxy_mode]}
             onChange={(event) => update('proxy_endpoint', event.target.value)}
           />
-          <Alert severity="warning">
-            普通 HTTP CONNECT 不能转发 IKEv2 的 UDP 500/4500。代理配置结构已预留，但当前版本只允许直连；待 UDP 代理传输实现后再开放其他模式。
-          </Alert>
-          <Alert severity="warning">
-            当前实时 VoWiFi 执行器仍沿用主线路运行时。本页已完成每线路配置与持久化，非主线路的独立 IKE/IMS 会话需要后续运行时拆分后才会真正建立。
+          <Alert severity="info">
+            每条线路各自持有独立的 VoWiFi 运行时、TUN 网卡与代理出口，多张不同国家的 SIM 可以同时注册，互不影响。
+            普通 HTTP CONNECT 无法转发 IKEv2 的 UDP 500/4500，所以只提供直连与 SOCKS5 两种模式。
           </Alert>
           {validationError && <Alert severity="error">{validationError}</Alert>}
           {profileSaved && <Alert severity="success">已写入设备的 vowifi-profiles.conf</Alert>}

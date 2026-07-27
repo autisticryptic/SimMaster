@@ -35,6 +35,7 @@ import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import EsimManagerPage from './EsimManager'
 import ModemLinesPanel from './sim/ModemLinesPanel'
+import CarrierProfilesPanel from './sim/CarrierProfilesPanel'
 import StandaloneSimSlotsPanel from './sim/StandaloneSimSlotsPanel'
 import { useWorkMode } from '../contexts/WorkModeContext'
 
@@ -593,12 +594,14 @@ export default function SimCardPage() {
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基带线路" value="lines" />
+          <Tab label="运营商 Profile" value="carrier-profiles" sx={{ textTransform: 'none' }} />
           {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel primaryBasicInfo={<SimBasicInfo />} /><StandaloneSimSlotsPanel /></Stack>}
+        {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
         {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
       </Box>
     </Box>

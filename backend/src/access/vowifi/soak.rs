@@ -99,6 +99,7 @@ mod tests {
             profile_id: Some("gb_ee_23433".to_string()),
             plmn: Some("23433".to_string()),
             trace_id: "trace-local".to_string(),
+            line_id: String::new(),
         };
         let result = ExecutorStageResult {
             stage: request.stage.as_str(),
@@ -164,6 +165,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "runner".to_string(),
+                line_id: String::new(),
             },
         )
         .await

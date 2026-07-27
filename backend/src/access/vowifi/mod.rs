@@ -26,10 +26,14 @@ pub mod ike_retransmit;
 pub mod ike_state;
 pub mod ims;
 pub mod live;
+pub mod profile_import;
+pub mod profile_record;
+pub mod profile_store;
 pub mod profiles;
 pub mod qmi_uim;
 pub mod restore;
 pub mod runtime;
+pub mod socks5;
 pub mod sms {
     pub use crate::ims::sms_codec::*;
 }

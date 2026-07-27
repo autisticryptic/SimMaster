@@ -18,6 +18,10 @@ use super::{
 
 const SYSTEM_DNS_TIMEOUT: Duration = Duration::from_secs(4);
 const FALLBACK_DNS_TIMEOUT: Duration = Duration::from_secs(2);
+/// Budget for standing up the SOCKS5 association used to carry a DNS query.
+/// Kept short: resolution is on the connect path and a dead proxy should surface
+/// quickly rather than stall the whole VoWiFi bring-up.
+const PROXY_DNS_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const PUBLIC_DNS_FALLBACKS: &[IpAddr] = &[
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
     IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
@@ -121,6 +125,77 @@ pub async fn resolve_epdg_with_dns_override(
         addresses,
         route_policy: choose_route_policy(profile, host, None),
     })
+}
+
+/// Resolve an ePDG with the DNS query itself sent through a SOCKS5 proxy.
+///
+/// DNS follows the proxy on purpose. Resolving directly while the IKE traffic is
+/// proxied would (a) expose the real client IP to the resolver and (b) leave the
+/// ePDG lookup subject to interception on the local network — the very things the
+/// proxy is there to avoid. Because the query egresses where the tunnel does, the
+/// answer also reflects the proxy's location, which is what geo-sensitive carrier
+/// DNS should see.
+///
+/// Falls back to `resolve_epdg_with_dns_override` when no explicit DNS server is
+/// configured, since there is then no query for us to route.
+pub async fn resolve_epdg_via_socks5(
+    profile: &'static super::profiles::CarrierProfileMeta,
+    host: &str,
+    port: u16,
+    dns_server: Option<IpAddr>,
+    proxy: &super::socks5::Socks5Endpoint,
+) -> Result<ResolvedEpdgEndpoint, TransportError> {
+    let Some(dns_server) = dns_server else {
+        // No server to query through the proxy; keep the existing behaviour.
+        return resolve_epdg_with_dns_override(profile, host, port, dns_server).await;
+    };
+
+    let client =
+        super::socks5::Socks5UdpClient::connect(proxy, dns_server, PROXY_DNS_CONNECT_TIMEOUT)
+            .await
+            .map_err(|error| TransportError::UnsupportedProxy(error.to_string()))?
+            .with_recv_timeout(FALLBACK_DNS_TIMEOUT);
+
+    let server = SocketAddr::new(dns_server, 53);
+    let mut addresses = Vec::new();
+    let mut last_error = None;
+    for qtype in [1u16, 28u16] {
+        match query_dns_via_socks5(&client, server, host, port, qtype).await {
+            Ok(mut found) => addresses.append(&mut found),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    if addresses.is_empty() {
+        return Err(last_error
+            .unwrap_or_else(|| TransportError::DnsFailed("proxied_dns_empty_answer".to_string())));
+    }
+    addresses.sort();
+    addresses.dedup();
+    Ok(ResolvedEpdgEndpoint {
+        host: host.to_string(),
+        port,
+        addresses,
+        route_policy: choose_route_policy(profile, host, Some(ProxyKind::Socks5UdpAssociate)),
+    })
+}
+
+async fn query_dns_via_socks5(
+    client: &super::socks5::Socks5UdpClient,
+    server: SocketAddr,
+    host: &str,
+    port: u16,
+    qtype: u16,
+) -> Result<Vec<SocketAddr>, TransportError> {
+    let query = build_dns_query(host, qtype)?;
+    client
+        .send_to(server, &query)
+        .await
+        .map_err(|error| TransportError::Io(error.to_string()))?;
+    let (_origin, response) = client
+        .recv_from()
+        .await
+        .map_err(|error| TransportError::DnsFailed(error.to_string()))?;
+    parse_dns_response(&response, port, qtype)
 }
 
 async fn resolve_epdg_via_dns_fallback(

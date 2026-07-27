@@ -1,11 +1,20 @@
 //! Per-line HTTP/SOCKS5 proxy bound to a cellular data interface.
 
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::SocketAddr,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    task::{Context, Poll},
+};
 
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
     net::{lookup_host, TcpListener, TcpSocket, TcpStream},
     sync::{oneshot, Mutex},
     task::JoinHandle,
@@ -14,6 +23,181 @@ use tokio::{
 use crate::infra::config::LineDataProxyConfig;
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+
+/// Live byte/connection counters for one line's proxy.
+///
+/// Counting happens as bytes flow rather than when a connection closes, so a
+/// long-lived tunnel still shows up on the web page while it is running.
+/// Direction is from the SIM's point of view: `uplink` leaves the device
+/// through this SIM, `downlink` arrives on it.
+#[derive(Debug, Default)]
+pub struct DataProxyCounters {
+    uplink_bytes: AtomicU64,
+    downlink_bytes: AtomicU64,
+    total_connections: AtomicU64,
+    active_connections: AtomicU64,
+}
+
+impl DataProxyCounters {
+    fn add_uplink(&self, bytes: u64) {
+        self.uplink_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn add_downlink(&self, bytes: u64) {
+        self.downlink_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    fn connection_opened(&self) {
+        self.total_connections.fetch_add(1, Ordering::Relaxed);
+        self.active_connections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn connection_closed(&self) {
+        // Saturating: a double-close must not wrap the gauge to u64::MAX.
+        let _ =
+            self.active_connections
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(1))
+                });
+    }
+
+    fn snapshot(&self) -> DataProxyTraffic {
+        DataProxyTraffic {
+            uplink_bytes: self.uplink_bytes.load(Ordering::Relaxed),
+            downlink_bytes: self.downlink_bytes.load(Ordering::Relaxed),
+            total_connections: self.total_connections.load(Ordering::Relaxed),
+            active_connections: self.active_connections.load(Ordering::Relaxed),
+        }
+    }
+
+    fn reset(&self) {
+        self.uplink_bytes.store(0, Ordering::Relaxed);
+        self.downlink_bytes.store(0, Ordering::Relaxed);
+        self.total_connections.store(0, Ordering::Relaxed);
+        // `active_connections` is a live gauge, not a total — resetting it would
+        // desync it from the connections that are still running.
+    }
+}
+
+/// Traffic this line's proxy has carried.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct DataProxyTraffic {
+    /// Bytes sent out through this SIM.
+    pub uplink_bytes: u64,
+    /// Bytes received on this SIM.
+    pub downlink_bytes: u64,
+    pub total_connections: u64,
+    pub active_connections: u64,
+}
+
+impl DataProxyTraffic {
+    pub fn total_bytes(&self) -> u64 {
+        self.uplink_bytes.saturating_add(self.downlink_bytes)
+    }
+
+    /// Whether this SIM has carried any proxied traffic at all — the "是否用过
+    /// 流量" question the status page asks.
+    pub fn used_any(&self) -> bool {
+        self.total_bytes() > 0
+    }
+
+    pub fn saturating_add(&self, other: &Self) -> Self {
+        Self {
+            uplink_bytes: self.uplink_bytes.saturating_add(other.uplink_bytes),
+            downlink_bytes: self.downlink_bytes.saturating_add(other.downlink_bytes),
+            total_connections: self
+                .total_connections
+                .saturating_add(other.total_connections),
+            // Active connections belong to the live session only; summing a
+            // persisted total into it would report phantom open connections.
+            active_connections: self.active_connections,
+        }
+    }
+}
+
+/// Wraps one side of a proxied connection and records the bytes that pass
+/// through it. Reads from the client are uplink; writes to the client are
+/// downlink.
+struct CountingStream<S> {
+    inner: S,
+    counters: Arc<DataProxyCounters>,
+    /// `true` for the client-facing socket, `false` for the upstream socket.
+    /// Only the client side counts, so each byte is recorded exactly once.
+    count_reads_as_uplink: bool,
+}
+
+impl<S> CountingStream<S> {
+    fn client_side(inner: S, counters: Arc<DataProxyCounters>) -> Self {
+        Self {
+            inner,
+            counters,
+            count_reads_as_uplink: true,
+        }
+    }
+
+    fn upstream_side(inner: S, counters: Arc<DataProxyCounters>) -> Self {
+        Self {
+            inner,
+            counters,
+            count_reads_as_uplink: false,
+        }
+    }
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for CountingStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &result {
+            let read = buf.filled().len().saturating_sub(before) as u64;
+            if read > 0 && self.count_reads_as_uplink {
+                self.counters.add_uplink(read);
+            }
+        }
+        result
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for CountingStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(written)) = &result {
+            if *written > 0 && self.count_reads_as_uplink {
+                self.counters.add_downlink(*written as u64);
+            }
+        }
+        result
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Pump a proxied connection while counting both directions.
+async fn relay_counted(
+    inbound: TcpStream,
+    outbound: TcpStream,
+    counters: &Arc<DataProxyCounters>,
+) -> io::Result<()> {
+    let mut client = CountingStream::client_side(inbound, Arc::clone(counters));
+    let mut upstream = CountingStream::upstream_side(outbound, Arc::clone(counters));
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .map(|_| ())
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DataProxyStatus {
@@ -26,6 +210,11 @@ pub struct DataProxyStatus {
     pub protocols: Vec<String>,
     pub auth_required: bool,
     pub last_error: Option<String>,
+    /// Traffic carried since the counters were last reset, including anything
+    /// carried before the most recent restart.
+    pub traffic: DataProxyTraffic,
+    /// Whether this SIM has carried any proxied traffic at all.
+    pub traffic_used: bool,
 }
 
 impl Default for DataProxyStatus {
@@ -40,6 +229,8 @@ impl Default for DataProxyStatus {
             protocols: Vec::new(),
             auth_required: false,
             last_error: None,
+            traffic: DataProxyTraffic::default(),
+            traffic_used: false,
         }
     }
 }
@@ -55,11 +246,44 @@ struct ProxyState {
 #[derive(Default)]
 pub struct DataProxyRuntime {
     state: Mutex<ProxyState>,
+    /// Counters for the current process lifetime. Kept outside `state` so the
+    /// serving tasks can bump them without contending on the status mutex.
+    counters: Arc<DataProxyCounters>,
+    /// Traffic carried before this process started, loaded from the database so
+    /// the reported totals survive a restart.
+    persisted: Mutex<DataProxyTraffic>,
 }
 
 impl DataProxyRuntime {
     pub async fn status(&self) -> DataProxyStatus {
-        self.state.lock().await.status.clone()
+        let mut status = self.state.lock().await.status.clone();
+        status.traffic = self.traffic().await;
+        status.traffic_used = status.traffic.used_any();
+        status
+    }
+
+    /// Persisted total plus what this process has carried.
+    pub async fn traffic(&self) -> DataProxyTraffic {
+        let persisted = *self.persisted.lock().await;
+        self.counters.snapshot().saturating_add(&persisted)
+    }
+
+    /// Traffic carried since this process started, i.e. excluding the persisted
+    /// baseline. Used when flushing the delta to the database.
+    pub fn session_traffic(&self) -> DataProxyTraffic {
+        self.counters.snapshot()
+    }
+
+    /// Seed the persisted baseline at startup.
+    pub async fn restore_persisted_traffic(&self, traffic: DataProxyTraffic) {
+        *self.persisted.lock().await = traffic;
+    }
+
+    /// Zero both the live counters and the persisted baseline.
+    pub async fn reset_traffic(&self) -> DataProxyTraffic {
+        self.counters.reset();
+        *self.persisted.lock().await = DataProxyTraffic::default();
+        self.traffic().await
     }
 
     pub async fn start(
@@ -99,6 +323,7 @@ impl DataProxyRuntime {
         let outbound_interface = interface_name.to_string();
         let username = config.username.clone();
         let password = config.password.clone();
+        let counters = Arc::clone(&self.counters);
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -108,8 +333,12 @@ impl DataProxyRuntime {
                             Ok((stream, _)) => {
                                 let interface = outbound_interface.clone();
                                 let auth = ProxyAuth::new(username.clone(), password.clone());
+                                let counters = Arc::clone(&counters);
                                 tokio::spawn(async move {
-                                    if let Err(error) = serve_client(stream, &interface, &auth).await {
+                                    counters.connection_opened();
+                                    let result = serve_client(stream, &interface, &auth, &counters).await;
+                                    counters.connection_closed();
+                                    if let Err(error) = result {
                                         tracing::debug!(interface = %interface, error = %error, "Cellular data proxy client closed");
                                     }
                                 });
@@ -134,6 +363,10 @@ impl DataProxyRuntime {
             protocols: vec!["http".to_string(), "socks5".to_string()],
             auth_required: !config.username.is_empty(),
             last_error: None,
+            // Filled in by `status()` from the live counters; restarting the
+            // listener must not zero the traffic totals.
+            traffic: DataProxyTraffic::default(),
+            traffic_used: false,
         };
         state.shutdown = Some(shutdown_tx);
         state.task = Some(task);
@@ -200,6 +433,7 @@ async fn serve_client(
     inbound: TcpStream,
     interface_name: &str,
     auth: &ProxyAuth,
+    counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
     let mut first = [0u8; 1];
     let count = inbound.peek(&mut first).await?;
@@ -207,9 +441,9 @@ async fn serve_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        serve_socks5(inbound, interface_name, auth).await
+        serve_socks5(inbound, interface_name, auth, counters).await
     } else {
-        serve_http_proxy(inbound, interface_name, auth).await
+        serve_http_proxy(inbound, interface_name, auth, counters).await
     }
 }
 
@@ -217,6 +451,7 @@ async fn serve_socks5(
     mut inbound: TcpStream,
     interface_name: &str,
     auth: &ProxyAuth,
+    counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
     let version = inbound.read_u8().await?;
     let method_count = inbound.read_u8().await? as usize;
@@ -265,9 +500,9 @@ async fn serve_socks5(
     };
     let port = inbound.read_u16().await?;
     match connect_bound(&host, port, interface_name).await {
-        Ok(mut outbound) => {
+        Ok(outbound) => {
             write_socks_reply(&mut inbound, 0).await?;
-            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+            relay_counted(inbound, outbound, counters).await?;
         }
         Err(_) => write_socks_reply(&mut inbound, 5).await?,
     }
@@ -295,6 +530,7 @@ async fn serve_http_proxy(
     mut inbound: TcpStream,
     interface_name: &str,
     auth: &ProxyAuth,
+    counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
     let mut header = Vec::with_capacity(2048);
     let header_end = loop {
@@ -328,11 +564,11 @@ async fn serve_http_proxy(
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(target, 443)?;
         match connect_bound(&host, port, interface_name).await {
-            Ok(mut outbound) => {
+            Ok(outbound) => {
                 inbound
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                     .await?;
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+                relay_counted(inbound, outbound, counters).await?;
             }
             Err(_) => write_http_error(&mut inbound, 502, "Bad Gateway").await?,
         }
@@ -353,10 +589,15 @@ async fn serve_http_proxy(
     };
     let rewritten = rewrite_http_request_head(head, method, &origin_target, version);
     outbound.write_all(rewritten.as_bytes()).await?;
+    // The request head was consumed before the counting relay took over, so
+    // account for it explicitly; otherwise plain-HTTP requests would under-report.
+    let mut head_bytes = rewritten.len();
     if header.len() > header_end {
         outbound.write_all(&header[header_end..]).await?;
+        head_bytes += header.len() - header_end;
     }
-    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await?;
+    counters.add_uplink(head_bytes as u64);
+    relay_counted(inbound, outbound, counters).await?;
     Ok(())
 }
 
@@ -538,6 +779,116 @@ mod tests {
         let stopped = runtime.stop().await;
         assert_eq!(stopped.phase, "disabled");
         assert_eq!(stopped.stage, "流量未启用");
+    }
+
+    #[tokio::test]
+    async fn socks5_relay_counts_uplink_and_downlink_separately() {
+        // An echo-ish upstream that reads a request and answers with a longer
+        // body, so uplink and downlink cannot be confused for each other.
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = upstream.accept().await.unwrap();
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            stream.write_all(b"0123456789").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let runtime = DataProxyRuntime::default();
+        let status = runtime
+            .start(
+                "lo",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                    ..LineDataProxyConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        let proxy_port = status.port.unwrap();
+
+        let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await.unwrap();
+        // SOCKS5 greeting, no auth.
+        client.write_all(&[5, 1, 0]).await.unwrap();
+        let mut greeting = [0u8; 2];
+        client.read_exact(&mut greeting).await.unwrap();
+        assert_eq!(greeting, [5, 0]);
+        // CONNECT to the upstream over IPv4.
+        let mut request = vec![5, 1, 0, 1];
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&upstream_addr.port().to_be_bytes());
+        client.write_all(&request).await.unwrap();
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[1], 0);
+
+        client.write_all(b"ping").await.unwrap();
+        let mut body = Vec::new();
+        client.read_to_end(&mut body).await.unwrap();
+        assert_eq!(body, b"0123456789");
+        drop(client);
+
+        // Give the relay task a moment to finish accounting.
+        for _ in 0..50 {
+            if runtime.session_traffic().downlink_bytes >= 10 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let traffic = runtime.traffic().await;
+        assert_eq!(traffic.uplink_bytes, 4, "client sent exactly 4 bytes");
+        assert_eq!(traffic.downlink_bytes, 10, "upstream sent exactly 10 bytes");
+        assert_eq!(traffic.total_connections, 1);
+        assert!(traffic.used_any());
+
+        let status = runtime.status().await;
+        assert!(status.traffic_used);
+        assert_eq!(status.traffic.uplink_bytes, 4);
+
+        runtime.stop().await;
+        // Stopping the listener must not discard the totals.
+        assert_eq!(runtime.traffic().await.uplink_bytes, 4);
+
+        // Reset zeroes the cumulative totals. `active_connections` is a live
+        // gauge and is deliberately left alone, so it is not asserted here.
+        let cleared = runtime.reset_traffic().await;
+        assert_eq!(cleared.uplink_bytes, 0);
+        assert_eq!(cleared.downlink_bytes, 0);
+        assert_eq!(cleared.total_connections, 0);
+        assert!(!cleared.used_any());
+    }
+
+    #[tokio::test]
+    async fn persisted_traffic_is_added_to_the_live_session() {
+        let runtime = DataProxyRuntime::default();
+        runtime
+            .restore_persisted_traffic(DataProxyTraffic {
+                uplink_bytes: 100,
+                downlink_bytes: 200,
+                total_connections: 3,
+                active_connections: 0,
+            })
+            .await;
+        runtime.counters.add_uplink(5);
+        runtime.counters.add_downlink(7);
+        runtime.counters.connection_opened();
+
+        let traffic = runtime.traffic().await;
+        assert_eq!(traffic.uplink_bytes, 105);
+        assert_eq!(traffic.downlink_bytes, 207);
+        assert_eq!(traffic.total_connections, 4);
+        // The live gauge must come from the session, not the persisted total.
+        assert_eq!(traffic.active_connections, 1);
+    }
+
+    #[test]
+    fn active_connection_gauge_never_wraps_below_zero() {
+        let counters = DataProxyCounters::default();
+        counters.connection_closed();
+        assert_eq!(counters.snapshot().active_connections, 0);
     }
 
     #[test]

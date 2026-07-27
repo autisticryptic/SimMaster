@@ -3244,6 +3244,7 @@ LTE Timing Advance: 'unavailable'"#;
             lte_tdd_bands: vec![],
             nr_fdd_bands: vec![],
             nr_tdd_bands: vec![],
+            line_id: None,
         };
 
         let mapped = accumulate_mm_ids_from_physical_bands(&req, &[31, 33, 35, 38]).unwrap();
@@ -3258,6 +3259,7 @@ LTE Timing Advance: 'unavailable'"#;
             lte_tdd_bands: vec![],
             nr_fdd_bands: vec![],
             nr_tdd_bands: vec![78],
+            line_id: None,
         };
 
         let unsupported = accumulate_mm_ids_from_physical_bands(&req, &[31]).unwrap_err();
@@ -3410,6 +3412,14 @@ async fn get_cells_data_mmcli_fallback(
 
 pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
     let modem_path = find_modem_path(conn).await?;
+    get_cells_data_for_modem(conn, &modem_path).await
+}
+
+pub async fn get_cells_data_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<CellsResponse> {
+    let modem_path = modem_path.to_string();
     if let Ok(cells) = get_cells_data_qmicli(conn, &modem_path).await {
         if !cells.cells.is_empty() {
             return Ok(cells);
@@ -3522,10 +3532,12 @@ pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
     })
 }
 
-pub async fn get_radio_mode(conn: &Connection) -> zbus::Result<RadioModeResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let current_modes = get_property(conn, &modem_path, MM_MODEM, "CurrentModes").await?;
-    let supported_modes = get_property(conn, &modem_path, MM_MODEM, "SupportedModes").await?;
+pub async fn get_radio_mode_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<RadioModeResponse> {
+    let current_modes = get_property(conn, modem_path, MM_MODEM, "CurrentModes").await?;
+    let supported_modes = get_property(conn, modem_path, MM_MODEM, "SupportedModes").await?;
     let (allowed, preferred) =
         <(u32, u32)>::try_from(current_modes).unwrap_or((MM_MODE_NONE, MM_MODE_NONE));
     let supported = extract_mode_pairs(&supported_modes);
@@ -3544,9 +3556,13 @@ pub async fn get_radio_mode(conn: &Connection) -> zbus::Result<RadioModeResponse
     })
 }
 
-pub async fn set_radio_mode(conn: &Connection, mode: RadioMode) -> zbus::Result<()> {
+pub async fn set_radio_mode_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    mode: RadioMode,
+) -> zbus::Result<()> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
+        let modem_path = modem_path.to_string();
         let supported_modes = get_property(conn, &modem_path, MM_MODEM, "SupportedModes").await?;
         let supported = extract_mode_pairs(&supported_modes);
         let selected = choose_mode_pair(&mode, &supported).ok_or_else(|| {
@@ -3679,12 +3695,14 @@ fn accumulate_mm_ids_from_physical_bands(
     Ok(out)
 }
 
-pub async fn get_band_lock_status(conn: &Connection) -> zbus::Result<BandLockStatus> {
-    let modem_path = find_modem_path(conn).await?;
+pub async fn get_band_lock_status_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<BandLockStatus> {
     let supported_bands =
-        extract_u32_array(&get_property(conn, &modem_path, MM_MODEM, "SupportedBands").await?);
+        extract_u32_array(&get_property(conn, modem_path, MM_MODEM, "SupportedBands").await?);
     let current_bands =
-        extract_u32_array(&get_property(conn, &modem_path, MM_MODEM, "CurrentBands").await?);
+        extract_u32_array(&get_property(conn, modem_path, MM_MODEM, "CurrentBands").await?);
     let mut supported_sorted = supported_bands.clone();
     let mut current_sorted = current_bands.clone();
     supported_sorted.sort_unstable();
@@ -3711,9 +3729,13 @@ pub async fn get_band_lock_status(conn: &Connection) -> zbus::Result<BandLockSta
     })
 }
 
-pub async fn set_band_lock(conn: &Connection, req: &BandLockRequest) -> zbus::Result<()> {
+pub async fn set_band_lock_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    req: &BandLockRequest,
+) -> zbus::Result<()> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
+        let modem_path = modem_path.to_string();
         let supported_bands =
             extract_u32_array(&get_property(conn, &modem_path, MM_MODEM, "SupportedBands").await?);
         let all_empty = req.lte_fdd_bands.is_empty()
@@ -3952,7 +3974,9 @@ pub async fn connect_data_via_modem(
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
 ) -> Result<(), String> {
-    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn)
+    // Per-line data connections are isolated from the host default route. The
+    // line's HTTP/SOCKS5 proxy is the only supported egress for this bearer.
+    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn, true)
         .await
         .map(|_| ())
 }
@@ -3999,8 +4023,12 @@ async fn set_data_connection_inner(
                     .unwrap_or_default()
             };
 
-            // 更新 NM profile 的 APN/漫游设置
-            if let Err(err) = nm_update_connection(&profile, &connect_settings, allow_roaming).await {
+            // 更新 NM profile 的 APN/漫游设置。
+            // 蜂窝数据一律隔离（never-default + ignore-auto-dns）：这张卡的流量
+            // 只能通过该线路的 HTTP/SOCKS5 代理出口，绝不接管系统默认路由或 DNS。
+            if let Err(err) =
+                nm_update_connection(&profile, &connect_settings, allow_roaming, true).await
+            {
                 warn!(error = %err, "Failed to update NM connection settings, proceeding with existing");
             }
 
@@ -4138,12 +4166,7 @@ async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
     }
 }
 
-/// 当前是否处于漫游注册态（与「是否允许漫游」无关，后者来自本地配置）。
-pub async fn get_is_roaming_mm(conn: &Connection) -> zbus::Result<bool> {
-    let modem_path = find_modem_path(conn).await?;
-    get_is_roaming_for_modem(conn, &modem_path).await
-}
-
+/// 当前是否处于漫游注册态（与「是否允许漫游」无关，后者来自该线路的配置）。
 pub async fn get_is_roaming_for_modem(conn: &Connection, modem_path: &str) -> zbus::Result<bool> {
     let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP).await?;
     let reg_state = gpp_props
@@ -4151,23 +4174,6 @@ pub async fn get_is_roaming_for_modem(conn: &Connection, modem_path: &str) -> zb
         .map(extract_u32)
         .unwrap_or(0);
     Ok(matches!(reg_state, 5 | 7 | 10))
-}
-
-/// 持久化「允许漫游」并若数据已连接则重连以使 Simple.Connect 的 allow-roaming 生效。
-pub async fn apply_roaming_policy(
-    conn: &Connection,
-    config: &ConfigManager,
-    allowed: bool,
-) -> zbus::Result<()> {
-    config
-        .set_roaming_allowed(allowed)
-        .map_err(zbus::fdo::Error::Failed)?;
-    if get_data_connection_status(conn).await.unwrap_or(false) {
-        let apn_config = config.get_apn_config();
-        set_data_connection_with_apn(conn, false, allowed, Some(&apn_config)).await?;
-        set_data_connection_with_apn(conn, true, allowed, Some(&apn_config)).await?;
-    }
-    Ok(())
 }
 
 fn is_invalid_transition_error(err: &zbus::Error) -> bool {
@@ -4196,6 +4202,12 @@ async fn modem_registration_state(conn: &Connection, modem_path: &str) -> zbus::
 
 fn modem_state_is_transient(state: i32) -> bool {
     matches!(state, 0 | 1 | 4 | 5 | 9 | 10)
+}
+
+/// MM_MODEM_STATE_DISABLED (3) / DISABLING (4): the radio is off. This is what
+/// per-line airplane mode leaves behind, so recovery logic must not undo it.
+fn modem_state_is_powered_down(state: i32) -> bool {
+    matches!(state, 3 | 4)
 }
 
 fn data_connection_transition_in_progress(state: i32) -> bool {
@@ -4336,10 +4348,13 @@ async fn simple_connect_for_baseband_restart(
     modem_path: &str,
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
+    isolated: bool,
 ) -> Result<String, String> {
     let profile = find_nm_modem_connection().await?;
     let connect_settings = resolve_simple_connect_settings(conn, modem_path, configured_apn).await;
-    if let Err(err) = nm_update_connection(&profile, &connect_settings, allow_roaming).await {
+    if let Err(err) =
+        nm_update_connection(&profile, &connect_settings, allow_roaming, isolated).await
+    {
         warn!(error = %err, "Failed to update NM connection for baseband restart");
     }
     let device = find_nm_device_for_modem(conn, modem_path).await?;
@@ -4370,7 +4385,11 @@ async fn run_baseband_simple_connect_step(
         "running",
         Some("ModemManager Simple.Connect".to_string()),
     );
-    match simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn).await
+    // Per-line data bearers are always isolated: a baseband-restart re-dial must
+    // never re-establish a system default route. The line's HTTP/SOCKS5 proxy is
+    // the only supported egress for this bearer.
+    match simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn, true)
+        .await
     {
         Ok(path) => record_baseband_step(steps, "触发自动驻网/拨号", "ok", Some(path)),
         Err(err) => record_baseband_step(
@@ -4451,15 +4470,6 @@ async fn recover_after_registration_failure(
     }
 }
 
-pub async fn set_airplane_mode(conn: &Connection, enabled: bool) -> Result<(), String> {
-    with_serial(async {
-        let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-        set_modem_enabled(conn, &modem_path, !enabled).await?;
-        Ok(())
-    })
-    .await
-}
-
 pub async fn set_airplane_mode_for_modem(
     conn: &Connection,
     modem_path: &str,
@@ -4483,20 +4493,6 @@ pub async fn get_airplane_mode_for_modem(
         enabled: matches!(state, 3 | 4),
         powered: state >= 3,
         online: state >= 6,
-    })
-}
-
-pub async fn get_airplane_mode(conn: &Connection) -> zbus::Result<AirplaneModeResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
-    let powered = state >= 3;
-    let online = state >= 6;
-
-    Ok(AirplaneModeResponse {
-        enabled: matches!(state, 3 | 4),
-        powered,
-        online,
     })
 }
 
@@ -4667,8 +4663,11 @@ fn parse_available_networks_value(value: &OwnedValue) -> Vec<OperatorInfo> {
     out
 }
 
-pub async fn get_operators_list(conn: &Connection) -> zbus::Result<OperatorListResponse> {
-    let modem_path = find_modem_path(conn).await?;
+pub async fn get_operators_list_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<OperatorListResponse> {
+    let modem_path = modem_path.to_string();
     let gpp = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
     let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
     let op_name = gpp
@@ -4705,8 +4704,11 @@ pub async fn get_operators_list(conn: &Connection) -> zbus::Result<OperatorListR
     Ok(OperatorListResponse { operators })
 }
 
-pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListResponse> {
-    let modem_path = find_modem_path(conn).await?;
+pub async fn scan_operators_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<OperatorListResponse> {
+    let modem_path = modem_path.to_string();
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_MODEM_3GPP).await?;
     match tokio::time::timeout(
         Duration::from_secs(OPERATOR_SCAN_REQUEST_TIMEOUT_SECS),
@@ -4728,7 +4730,9 @@ pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListRespo
         if let Ok(v) = get_property(conn, &modem_path, MM_MODEM_3GPP, "AvailableNetworks").await {
             let parsed = parse_available_networks_value(&v);
             if !parsed.is_empty() {
-                let mut base = get_operators_list(conn).await?.operators;
+                let mut base = get_operators_list_for_modem(conn, &modem_path)
+                    .await?
+                    .operators;
                 for o in parsed {
                     let key = format!("{}-{}", o.mcc, o.mnc);
                     if !base.iter().any(|b| format!("{}-{}", b.mcc, b.mnc) == key) {
@@ -4739,10 +4743,10 @@ pub async fn scan_operators(conn: &Connection) -> zbus::Result<OperatorListRespo
             }
         }
     }
-    get_operators_list(conn).await
+    get_operators_list_for_modem(conn, &modem_path).await
 }
 
-async fn register_operator_on_modem(
+pub(crate) async fn register_operator_on_modem(
     conn: &Connection,
     modem_path: &str,
     mccmnc: &str,
@@ -4766,31 +4770,23 @@ async fn register_operator_on_modem(
     }
 }
 
-pub async fn register_operator_manual(conn: &Connection, mccmnc: &str) -> Result<(), String> {
-    with_serial(async {
-        let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-        match register_operator_on_modem(conn, &modem_path, mccmnc).await {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                if is_qmi_network_selection_internal_error(&err) {
-                    recover_after_registration_failure(conn, &modem_path, err).await
-                } else {
-                    Err(err)
-                }
-            }
-        }
-    })
-    .await
+pub async fn register_operator_auto(conn: &Connection) -> Result<(), String> {
+    let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
+    register_operator_for_modem(conn, &modem_path, "").await
 }
 
-pub async fn register_operator_auto(conn: &Connection) -> Result<(), String> {
+/// Register one specific modem. An empty `mccmnc` requests automatic selection.
+pub async fn register_operator_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    mccmnc: &str,
+) -> Result<(), String> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-        match register_operator_on_modem(conn, &modem_path, "").await {
+        match register_operator_on_modem(conn, modem_path, mccmnc).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 if is_qmi_network_selection_internal_error(&err) {
-                    recover_after_registration_failure(conn, &modem_path, err).await
+                    recover_after_registration_failure(conn, modem_path, err).await
                 } else {
                     Err(err)
                 }
@@ -4841,11 +4837,12 @@ fn extract_bearer_settings(props: &InterfaceProperties) -> InterfaceProperties {
         .unwrap_or_default()
 }
 
-pub async fn list_apn_contexts(
+pub async fn list_apn_contexts_for_modem(
     conn: &Connection,
+    modem_path: &str,
     configured_apn: Option<&ApnConfig>,
 ) -> zbus::Result<ApnListResponse> {
-    let modem_path = find_modem_path(conn).await?;
+    let modem_path = modem_path.to_string();
     let bearer_paths = known_bearer_paths(conn, &modem_path).await?;
     let mut contexts = Vec::new();
     for path in bearer_paths {
@@ -5268,6 +5265,16 @@ async fn get_call_info(conn: &Connection, path: &str) -> zbus::Result<CallInfo> 
 
 pub async fn list_current_calls(conn: &Connection) -> zbus::Result<CallListResponse> {
     let modem_path = find_modem_path(conn).await?;
+    list_current_calls_for_modem(conn, &modem_path).await
+}
+
+/// Calls belonging to one modem only. A call on baseband A must not make
+/// baseband B look busy.
+pub async fn list_current_calls_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<CallListResponse> {
+    let modem_path = modem_path.to_string();
     let mut calls = Vec::new();
     if let Ok(voice_proxy) = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_VOICE).await {
         if let Ok(call_paths) = voice_proxy
@@ -5294,12 +5301,23 @@ pub async fn list_current_calls(conn: &Connection) -> zbus::Result<CallListRespo
 }
 
 pub async fn make_call(conn: &Connection, phone_number: &str) -> zbus::Result<String> {
+    let modem_path = find_modem_path(conn).await?;
+    make_call_on_modem(conn, &modem_path, phone_number).await
+}
+
+/// Dial from one specific baseband. The busy check looks only at that
+/// baseband's calls, so a second SIM can dial while the first is on a call.
+pub async fn make_call_on_modem(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+) -> zbus::Result<String> {
     with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
+        let modem_path = modem_path.to_string();
         wait_until_voice_ready(conn, &modem_path).await?;
         cleanup_finished_calls(conn, &modem_path).await?;
 
-        if let Ok(existing) = list_current_calls(conn).await {
+        if let Ok(existing) = list_current_calls_for_modem(conn, &modem_path).await {
             for call in existing.calls {
                 if matches!(
                     call.state.as_str(),
@@ -5896,60 +5914,8 @@ pub async fn send_sms_via_modem(
     .await
 }
 
-pub async fn init_data_connection(
-    conn: &Connection,
-    user_disabled: &AtomicBool,
-    allow_roaming: bool,
-    configured_apn: Option<ApnConfig>,
-) -> String {
-    // 设置 NM autoconnect 状态
-    if let Ok(profile) = find_nm_modem_connection().await {
-        let auto = !user_disabled.load(Ordering::SeqCst);
-        if let Err(err) = nm_set_autoconnect(&profile, auto).await {
-            warn!(error = %err, auto, "Failed to set NM autoconnect during init");
-        }
-    }
-
-    if user_disabled.load(Ordering::SeqCst) {
-        return match set_data_connection_with_apn(
-            conn,
-            false,
-            allow_roaming,
-            configured_apn.as_ref(),
-        )
-        .await
-        {
-            Ok(_) => "Cellular data disabled by user, disconnected".to_string(),
-            Err(err) => format!("Cellular data disabled by user; disconnect skipped: {err}"),
-        };
-    }
-
-    let modem_path = match find_modem_path(conn).await {
-        Ok(path) => path,
-        Err(err) => return format!("Failed to discover modem path: {err}"),
-    };
-
-    let state = match get_property(conn, &modem_path, MM_MODEM, "State").await {
-        Ok(value) => extract_i32(&value),
-        Err(err) => return format!("Failed to get modem state: {err}"),
-    };
-
-    let state_text = mm_state_to_string(state);
-    if state < MM_MODEM_STATE_REGISTERED {
-        return format!("Modem not registered (state: {state_text}), skipping auto-connect");
-    }
-    if state >= MM_MODEM_STATE_CONNECTED {
-        return format!("Data connection already active (state: {state_text})");
-    }
-    if data_connection_transition_in_progress(state) {
-        return format!("Data connection transition in progress (state: {state_text}), waiting");
-    }
-
-    match set_data_connection_with_apn(conn, true, allow_roaming, configured_apn.as_ref()).await {
-        Ok(_) => format!("Data connection activated (state was: {state_text})"),
-        Err(err) => format!("Failed to activate data connection: {err}"),
-    }
-}
+// (legacy global `init_data_connection` auto-connect helper removed; per-line
+// isolated data + proxy owns activation. See main.rs per-line boot supervisor.)
 
 /// 启动时确保 NM 有可用的 modem 连接 profile；同时清理旧版本遗留的 unmanaged 配置
 pub async fn ensure_nm_modem_profile() -> String {
@@ -6072,6 +6038,7 @@ async fn nm_update_connection(
     profile: &str,
     settings: &SimpleConnectSettings,
     allow_roaming: bool,
+    isolated: bool,
 ) -> Result<(), String> {
     let mut args: Vec<String> = vec!["connection".into(), "modify".into(), profile.into()];
 
@@ -6093,6 +6060,19 @@ async fn nm_update_connection(
     }
     args.push("gsm.home-only".into());
     args.push(if allow_roaming { "no" } else { "yes" }.into());
+    // Never let a per-line proxy bearer become the system's default route.
+    // Connected/interface routes remain available to sockets bound to the
+    // cellular device by DataProxyRuntime.
+    args.push("ipv4.never-default".into());
+    args.push(if isolated { "yes" } else { "no" }.into());
+    args.push("ipv6.never-default".into());
+    args.push(if isolated { "yes" } else { "no" }.into());
+    if isolated {
+        args.push("ipv4.ignore-auto-dns".into());
+        args.push("yes".into());
+        args.push("ipv6.ignore-auto-dns".into());
+        args.push("yes".into());
+    }
 
     run_recovery_command_owned("nmcli", &args, Duration::from_secs(10)).await?;
     Ok(())
@@ -6759,8 +6739,10 @@ pub async fn data_connection_watchdog(
     conn: std::sync::Arc<Connection>,
     interval_secs: u64,
     user_disabled: std::sync::Arc<AtomicBool>,
-    airplane_requested: std::sync::Arc<AtomicBool>,
-    config: std::sync::Arc<ConfigManager>,
+    // Data activation is now strictly per-line/proxy-only, so the watchdog no
+    // longer reads roaming/APN config to bring up a global bearer. Retained in
+    // the signature for call-site stability and possible future recovery use.
+    _config: std::sync::Arc<ConfigManager>,
     system_events: std::sync::Arc<SystemEventEmitter>,
 ) {
     use crate::network::iptables::get_iptables_rule_count;
@@ -6774,10 +6756,8 @@ pub async fn data_connection_watchdog(
     let mut searching_count = 0u32;
     let mut auto_register_requested_for_search = false;
     let mut last_searching_recovery_at: Option<Instant> = None;
-    let mut last_data_activation_attempt_at: Option<Instant> = None;
     let mut transition_stuck_count = 0u32;
     let mut cellular_problem_active = false;
-    let mut data_activation_failure_active = false;
     const TRANSITION_STUCK_THRESHOLD: u32 = 6;
 
     loop {
@@ -6834,17 +6814,13 @@ pub async fn data_connection_watchdog(
                     if !data_connection_transition_in_progress(state) {
                         transition_stuck_count = 0;
                     }
-                    if airplane_requested.load(Ordering::SeqCst) {
-                        if state >= 6 {
-                            match set_airplane_mode(&conn, true).await {
-                                Ok(_) => "Airplane mode requested, modem disabled".to_string(),
-                                Err(err) => {
-                                    format!("Airplane mode requested, disable failed: {err}")
-                                }
-                            }
-                        } else {
-                            "Airplane mode requested, not reconnecting".to_string()
-                        }
+                    // A disabled modem is a deliberate per-line airplane-mode
+                    // state. The watchdog must leave it alone rather than
+                    // cycling or re-enabling it — that used to be governed by a
+                    // single global flag, which was wrong the moment a second
+                    // line wanted a different answer.
+                    if modem_state_is_powered_down(state) {
+                        "Line radio is off (airplane mode), watchdog standing by".to_string()
                     } else if state == 6 {
                         match set_modem_enabled(&conn, &modem_path, false).await {
                             Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
@@ -6964,8 +6940,6 @@ pub async fn data_connection_watchdog(
                             mm_state_to_string(state)
                         )
                     } else if state >= MM_MODEM_STATE_CONNECTED {
-                        last_data_activation_attempt_at = None;
-                        data_activation_failure_active = false;
                         if cellular_problem_active {
                             system_events
                                 .emit_code(
@@ -7023,50 +6997,21 @@ pub async fn data_connection_watchdog(
                             )
                         }
                     } else if user_disabled.load(Ordering::SeqCst) {
-                        last_data_activation_attempt_at = None;
                         "User disabled cellular data, not reconnecting".to_string()
                     } else {
-                        let cooldown_active = last_data_activation_attempt_at
-                            .map(|at| {
-                                at.elapsed() < Duration::from_secs(DATA_CONNECT_RETRY_COOLDOWN_SECS)
-                            })
-                            .unwrap_or(false);
-                        if cooldown_active {
-                            format!(
-                                "Data connection inactive (state: {}), activation retry cooldown active",
-                                mm_state_to_string(state)
-                            )
-                        } else {
-                            last_data_activation_attempt_at = Some(Instant::now());
-                            let allow_roaming = config.get_roaming_allowed();
-                            let apn_config = config.get_apn_config();
-                            match set_data_connection_with_apn(
-                                &conn,
-                                true,
-                                allow_roaming,
-                                Some(&apn_config),
-                            )
-                            .await
-                            {
-                                Ok(_) => "Connection activation requested".to_string(),
-                                Err(err) => {
-                                    cellular_problem_active = true;
-                                    if !data_activation_failure_active {
-                                        system_events
-                                            .emit_code(
-                                                system_event_codes::CELLULAR_ACTIVATION_FAILED,
-                                                system_event_severity::WARNING,
-                                                system_event_status::FAILED,
-                                                modem_path.to_string(),
-                                                format!("蜂窝数据连接激活失败: {err}"),
-                                            )
-                                            .await;
-                                        data_activation_failure_active = true;
-                                    }
-                                    format!("Activation failed: {err}")
-                                }
-                            }
-                        }
+                        // Cellular data is now strictly per-line and proxy-only:
+                        // each enabled line brings up its own isolated bearer
+                        // (`connect_data_via_modem`, never-default) and exposes it
+                        // solely through that line's HTTP/SOCKS5 proxy. The
+                        // watchdog must NOT activate a global system-default
+                        // bearer on the first modem here — doing so is exactly the
+                        // implicit-routing behaviour we removed. Modem outage /
+                        // radio-cycle / registration recovery above still runs.
+                        let _ = DATA_CONNECT_RETRY_COOLDOWN_SECS;
+                        format!(
+                            "Data connection inactive (state: {}); per-line proxy owns data activation, watchdog skips global connect",
+                            mm_state_to_string(state)
+                        )
                     }
                 }
                 Err(err) => format!("Modem unavailable: {err}"),

@@ -216,6 +216,36 @@ pub struct ExecutorStageRequest {
     pub profile_id: Option<String>,
     pub plmn: Option<String>,
     pub trace_id: String,
+    /// Which line this stage runs for. Carries the per-line ePDG/DNS/proxy
+    /// overrides down to the network adapters, so two SIMs on different operators
+    /// (and different proxies) never read each other's settings. Empty means "no
+    /// line context", which falls back to carrier-profile defaults.
+    pub line_id: String,
+}
+
+impl ExecutorStageRequest {
+    /// A request with no line context, i.e. carrier-profile defaults for the
+    /// network settings.
+    pub fn unbound(
+        stage: ExecutorStage,
+        profile_id: Option<String>,
+        plmn: Option<String>,
+        trace_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            stage,
+            profile_id,
+            plmn,
+            trace_id: trace_id.into(),
+            line_id: String::new(),
+        }
+    }
+
+    /// Bind this request to a line so its network overrides apply.
+    pub fn with_line(mut self, line_id: impl Into<String>) -> Self {
+        self.line_id = line_id.into();
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -480,15 +510,19 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
         Box::pin(async move {
             let profile = profile_for_stage_request(&request);
             if request.trace_id == "runtime-status-probe" && request.stage == ExecutorStage::Ike {
-                let adapter =
-                    LiveNetworkStageAdapter::new(SystemLiveEpdgAdapter, StatusProbeDatagramAdapter);
+                let adapter = LiveNetworkStageAdapter::new(
+                    SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
+                    StatusProbeDatagramAdapter,
+                );
                 return LiveStageRunner::new(self.gate.clone(), profile, adapter)
                     .run(request)
                     .await;
             }
 
-            let adapter =
-                LiveNetworkStageAdapter::new(SystemLiveEpdgAdapter, SystemLiveDatagramAdapter);
+            let adapter = LiveNetworkStageAdapter::new(
+                SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
+                SystemLiveDatagramAdapter::for_line(request.line_id.clone()),
+            );
             LiveStageRunner::new(self.gate.clone(), profile, adapter)
                 .run(request)
                 .await
@@ -731,6 +765,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "trace-test".to_string(),
+                line_id: String::new(),
             })
             .await;
 
@@ -868,6 +903,7 @@ mod tests {
                     profile_id: Some("gb_ee_23433".to_string()),
                     plmn: Some("23433".to_string()),
                     trace_id: "dry-run".to_string(),
+                    line_id: String::new(),
                 })
                 .await;
             assert_eq!(result.status, "completed");
@@ -881,6 +917,7 @@ mod tests {
                 profile_id: None,
                 plmn: None,
                 trace_id: "dry-run".to_string(),
+                line_id: String::new(),
             })
             .await;
         assert_eq!(sim_auth.status, "skipped");
@@ -893,6 +930,7 @@ mod tests {
             profile_id: Some("nl_vodafone_20404".to_string()),
             plmn: Some("23433".to_string()),
             trace_id: "profile-id-selection".to_string(),
+            line_id: String::new(),
         });
 
         assert_eq!(profile.meta.profile_id, "nl_vodafone_20404");
@@ -906,6 +944,7 @@ mod tests {
             profile_id: None,
             plmn: Some("204-04".to_string()),
             trace_id: "plmn-selection".to_string(),
+            line_id: String::new(),
         });
 
         assert_eq!(profile.meta.profile_id, "nl_vodafone_20404");
@@ -950,6 +989,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "live-planned".to_string(),
+                line_id: String::new(),
             })
             .await;
 

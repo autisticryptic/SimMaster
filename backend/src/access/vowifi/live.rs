@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     env,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -89,34 +90,95 @@ const ENV_TUN_NAME: &str = "SIMADMIN_VOWIFI_TUN_NAME";
 const ENV_IMS_SECURITY_PORT_C: &str = "SIMADMIN_VOWIFI_IMS_SECURITY_PORT_C";
 const ENV_IMS_SECURITY_PORT_S: &str = "SIMADMIN_VOWIFI_IMS_SECURITY_PORT_S";
 
-static LIVE_TUN_GATEWAY: OnceLock<Mutex<Option<Arc<TunGatewayRuntime>>>> = OnceLock::new();
-static LIVE_IMS_REGISTER_READY: OnceLock<Mutex<Option<LiveImsRegisterReady>>> = OnceLock::new();
-static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<Option<LiveImsSecurityVerify>>> = OnceLock::new();
-static LIVE_IMS_TCP_CHANNEL: OnceLock<Mutex<Option<LiveImsTcpChannel>>> = OnceLock::new();
-static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<Mutex<Option<LiveImsRegisterSuccessVariant>>> =
+/// Live TUN gateways, keyed by `line_id`.
+///
+/// One entry per line: each VoWiFi tunnel owns its own TUN device holding the
+/// inner address that line's carrier assigned, so several SIMs can be connected
+/// at once. A single shared slot would let the second line evict the first one's
+/// gateway while its tunnel was still in use.
+static LIVE_TUN_GATEWAY: OnceLock<Mutex<HashMap<String, Arc<TunGatewayRuntime>>>> = OnceLock::new();
+// The four IMS session caches below are keyed by `line_id`.
+//
+// They were single slots, which broke on a multi-SIM host: two lines on the same
+// carrier profile shared one entry (and one TTL), and two lines on different
+// profiles evicted each other. `LIVE_IMS_TCP_CHANNEL` was the most damaging —
+// it holds a live TCP socket, so line B's REGISTER could reuse or close line A's
+// connection. The `profile_id` check inside each entry is retained as a staleness
+// guard for when a line switches carriers.
+static LIVE_IMS_REGISTER_READY: OnceLock<Mutex<HashMap<String, LiveImsRegisterReady>>> =
     OnceLock::new();
-static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<LiveNetworkOverrides>> = OnceLock::new();
+static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<HashMap<String, LiveImsSecurityVerify>>> =
+    OnceLock::new();
+static LIVE_IMS_TCP_CHANNEL: OnceLock<Mutex<HashMap<String, LiveImsTcpChannel>>> = OnceLock::new();
+static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<
+    Mutex<HashMap<String, LiveImsRegisterSuccessVariant>>,
+> = OnceLock::new();
+/// Per-line network overrides, keyed by `line_id`.
+///
+/// Deliberately a map rather than a single value: each SIM may sit on a different
+/// operator in a different country and needs its own ePDG, DNS and proxy. A global
+/// override would make configuring line A silently change line B.
+static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<HashMap<String, LiveNetworkOverrides>>> =
+    OnceLock::new();
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LiveNetworkOverrides {
     epdg_host: Option<String>,
     epdg_port: Option<u16>,
     dns_server: Option<IpAddr>,
+    /// How this line's IKE/NAT-T traffic egresses. `None` means direct.
+    proxy: Option<LiveProxySetting>,
 }
 
-pub fn configure_live_network_overrides(config: &LineVowifiConfig) -> Result<(), String> {
+/// A validated egress proxy for one line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveProxySetting {
+    Socks5(super::socks5::Socks5Endpoint),
+}
+
+fn network_overrides_map() -> &'static StdRwLock<HashMap<String, LiveNetworkOverrides>> {
+    LIVE_NETWORK_OVERRIDES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+/// Store (or clear) the overrides for one line.
+pub fn configure_live_network_overrides(
+    line_id: &str,
+    config: &LineVowifiConfig,
+) -> Result<(), String> {
     let next = build_live_network_overrides(config)?;
-    *LIVE_NETWORK_OVERRIDES
-        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+    let mut map = network_overrides_map()
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = next;
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if next == LiveNetworkOverrides::default() {
+        map.remove(line_id);
+    } else {
+        map.insert(line_id.to_string(), next);
+    }
     Ok(())
 }
 
+/// Drop a line's overrides, e.g. when the line disappears.
+pub fn forget_live_network_overrides(line_id: &str) {
+    network_overrides_map()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
+}
+
 fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetworkOverrides, String> {
-    if config.proxy_mode != VowifiProxyMode::Direct {
-        return Err("vowifi_proxy_runtime_not_available".to_string());
-    }
+    // Only transports that can actually carry UDP 500/4500 are accepted here.
+    let proxy = match config.proxy_mode {
+        VowifiProxyMode::Direct => None,
+        VowifiProxyMode::Socks5UdpAssociate => Some(LiveProxySetting::Socks5(
+            super::socks5::Socks5Endpoint::parse(&config.proxy_endpoint)
+                .map_err(|error| error.to_string())?,
+        )),
+        // Not implemented: a private relay protocol adds no value over pointing
+        // this line at a self-hosted standard SOCKS5 server.
+        VowifiProxyMode::UdpRelay => {
+            return Err("vowifi_proxy_mode_not_implemented:udp_relay".to_string())
+        }
+    };
     Ok(LiveNetworkOverrides {
         epdg_host: (!config.epdg_host.is_empty()).then(|| config.epdg_host.clone()),
         epdg_port: (!config.epdg_host.is_empty()).then_some(config.epdg_port),
@@ -130,29 +192,110 @@ fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetwork
                     .map_err(|_| "vowifi_dns_server_invalid".to_string())?,
             )
         },
+        proxy,
     })
 }
 
-fn live_epdg_settings(profile: &'static CarrierProfile) -> (String, u16, Option<IpAddr>) {
-    let overrides = LIVE_NETWORK_OVERRIDES
-        .get_or_init(|| StdRwLock::new(LiveNetworkOverrides::default()))
+fn line_overrides(line_id: &str) -> LiveNetworkOverrides {
+    network_overrides_map()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clone();
+        .get(line_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn live_epdg_settings(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> (String, u16, Option<IpAddr>) {
+    let overrides = line_overrides(line_id);
     (
         overrides
             .epdg_host
             .unwrap_or_else(|| profile.epdg.host.to_string()),
         overrides.epdg_port.unwrap_or(profile.epdg.port),
-        overrides.dns_server,
+        live_dns_candidates(line_id, profile).into_iter().next(),
     )
 }
 
+/// DNS servers to try, in order: this line's override first, then the carrier
+/// profile's list. Resolving the ePDG FQDN is a hard prerequisite for
+/// connecting at all, so a single unreachable resolver must not be fatal.
+fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<IpAddr> {
+    let mut candidates = Vec::new();
+    if let Some(server) = line_overrides(line_id).dns_server {
+        candidates.push(server);
+    }
+    for server in profile.epdg.dns_servers {
+        if let Some(addr) = super::profile_record::parse_dns_server(server) {
+            if !candidates.contains(&addr.ip()) {
+                candidates.push(addr.ip());
+            }
+        }
+    }
+    if let Some(server) = profile
+        .epdg
+        .dns_server
+        .and_then(|value| super::profile_record::parse_dns_server(value))
+    {
+        if !candidates.contains(&server.ip()) {
+            candidates.push(server.ip());
+        }
+    }
+    candidates
+}
+
 async fn resolve_live_epdg(
+    line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
-    let (host, port, dns_server) = live_epdg_settings(profile);
-    epdg::resolve_epdg_with_dns_override(&profile.meta, &host, port, dns_server).await
+    let overrides = line_overrides(line_id);
+    let host = overrides
+        .epdg_host
+        .clone()
+        .unwrap_or_else(|| profile.epdg.host.to_string());
+    let port = overrides.epdg_port.unwrap_or(profile.epdg.port);
+    // DNS follows the proxy: when this line egresses through a proxy, the lookup
+    // goes through it too, so the real client IP is not exposed to the resolver
+    // and operator DNS interception on the ePDG name is bypassed. With no proxy
+    // configured the query goes out directly to the configured server.
+    let proxy = overrides.proxy;
+    // An empty candidate list means "no explicit server": a single `None`
+    // attempt lets the resolver layer fall back to the system resolver.
+    let mut candidates: Vec<Option<IpAddr>> = live_dns_candidates(line_id, profile)
+        .into_iter()
+        .map(Some)
+        .collect();
+    if candidates.is_empty() {
+        candidates.push(None);
+    }
+    let mut last_error = None;
+    for dns_server in candidates {
+        let attempt = match &proxy {
+            Some(LiveProxySetting::Socks5(endpoint)) => {
+                epdg::resolve_epdg_via_socks5(&profile.meta, &host, port, dns_server, endpoint)
+                    .await
+            }
+            None => {
+                epdg::resolve_epdg_with_dns_override(&profile.meta, &host, port, dns_server).await
+            }
+        };
+        match attempt {
+            Ok(endpoint) => return Ok(endpoint),
+            Err(error) => {
+                warn!(
+                    line_id = %line_id,
+                    dns_server = ?dns_server,
+                    error = %error,
+                    "ePDG resolution failed on this DNS server; trying the next candidate"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error
+        .unwrap_or_else(|| TransportError::DnsFailed("no_dns_candidate_available".to_string())))
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +351,39 @@ pub struct LiveCallFollowupFrame {
     pub outcome: voice::MoCallSipOutcome,
 }
 
+/// Longest interface name the kernel accepts (`IFNAMSIZ` - 1).
+const MAX_IFNAME_LEN: usize = 15;
+
+/// Derive this line's TUN device name from the configured base name.
+///
+/// Each concurrently connected line needs its **own** TUN device: the device
+/// holds the inner address that line's carrier assigned, and two lines cannot
+/// share one interface. Deriving the name from `line_id` keeps it stable across
+/// reconnects (so a restarted tunnel reclaims its own device rather than piling
+/// up interfaces) while staying unique per line.
+///
+/// An empty `line_id` yields the base name unchanged, preserving single-line
+/// behaviour and the `SIMADMIN_VOWIFI_TUN_NAME` override.
+fn tun_name_for_line(base: &str, line_id: &str) -> String {
+    if line_id.is_empty() {
+        return base.to_string();
+    }
+    // `line_id` is `line-<md5>`; a short slice of its hex digits is enough to
+    // separate lines while leaving room inside IFNAMSIZ.
+    let suffix: String = line_id
+        .bytes()
+        .filter(|byte| byte.is_ascii_alphanumeric())
+        .rev()
+        .take(6)
+        .map(|byte| (byte as char).to_ascii_lowercase())
+        .collect();
+    let mut name = String::with_capacity(MAX_IFNAME_LEN);
+    let room = MAX_IFNAME_LEN.saturating_sub(suffix.len());
+    name.extend(base.chars().take(room));
+    name.push_str(&suffix);
+    name
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LiveRuntimeConfig {
     qmi_proxy_socket: String,
@@ -251,13 +427,104 @@ fn live_runtime_config() -> LiveRuntimeConfig {
     LiveRuntimeConfig::from_env()
 }
 
-pub async fn verify_live_sim_auth_access() -> Result<(), LiveStageError> {
-    let runtime_config = live_runtime_config();
+/// Which SIM/QMI device each line must use, keyed by `line_id`.
+///
+/// The environment-derived [`LiveRuntimeConfig`] carries a single
+/// `qmi_device`/`uim_slot` pair, which is only correct on a one-baseband host. On
+/// a multi-SIM device every line has to run SIM authentication and IKE identity
+/// against *its own* reader, otherwise line B would authenticate with line A's
+/// card. Registering each line's binding here keeps that mapping explicit.
+static LIVE_LINE_SIM_DEVICES: OnceLock<StdRwLock<HashMap<String, LiveSimDevice>>> = OnceLock::new();
+
+/// The SIM access parameters for one line.
+///
+/// `qmi_device`/`uim_slot` address the reader for QMI/UIM operations (EAP-AKA,
+/// SIM auth). `modem_path` addresses the same line through ModemManager, which is
+/// what identity lookups (IMSI) use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSimDevice {
+    pub qmi_device: String,
+    pub uim_slot: u8,
+    pub modem_path: String,
+}
+
+fn line_sim_devices() -> &'static StdRwLock<HashMap<String, LiveSimDevice>> {
+    LIVE_LINE_SIM_DEVICES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+/// Record which reader a line owns. Called when lines are discovered/refreshed.
+pub fn register_line_sim_device(line_id: &str, qmi_device: &str, uim_slot: u8, modem_path: &str) {
+    if line_id.is_empty() || qmi_device.is_empty() {
+        return;
+    }
+    line_sim_devices()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            line_id.to_string(),
+            LiveSimDevice {
+                qmi_device: qmi_device.to_string(),
+                uim_slot,
+                modem_path: modem_path.to_string(),
+            },
+        );
+}
+
+/// Resolve this line's SIM identity (IMSI etc.) through ModemManager.
+///
+/// Uses the line's own `modem_path` so a second line reports its own subscriber
+/// rather than the first modem's. Falls back to the global lookup when the line is
+/// unknown, preserving single-baseband behaviour.
+async fn line_sim_identity(
+    line_id: &str,
+    conn: &zbus::Connection,
+) -> Option<crate::cellular::modem_manager::SimIdentity> {
+    let modem_path = sim_device_for_line(line_id).modem_path;
+    if modem_path.is_empty() {
+        return current_sim_identity(conn).await;
+    }
+    crate::cellular::modem_manager::sim_identity_for_modem(conn, &modem_path).await
+}
+
+/// Forget a line's reader mapping (line removed).
+pub fn forget_line_sim_device(line_id: &str) {
+    line_sim_devices()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
+}
+
+/// Resolve the SIM device for a line, falling back to the global/env values when
+/// the line is unknown (single-baseband hosts and the legacy code paths).
+pub(crate) fn sim_device_for_line(line_id: &str) -> LiveSimDevice {
+    if !line_id.is_empty() {
+        if let Some(device) = line_sim_devices()
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(line_id)
+            .cloned()
+        {
+            return device;
+        }
+    }
+    let config = live_runtime_config();
+    LiveSimDevice {
+        qmi_device: config.qmi_device,
+        uim_slot: config.uim_slot,
+        // No line context: identity falls back to the global first-modem lookup.
+        modem_path: String::new(),
+    }
+}
+
+/// Verify SIM auth access for a specific line's reader.
+pub async fn verify_live_sim_auth_access_for_line(line_id: &str) -> Result<(), LiveStageError> {
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let device = sim_device_for_line(line_id);
     tokio::task::spawn_blocking(move || {
         verify_usim_application_via_proxy_reason_with_retry(
-            runtime_config.qmi_proxy_socket.as_str(),
-            runtime_config.qmi_device.as_str(),
-            runtime_config.uim_slot,
+            proxy_socket.as_str(),
+            device.qmi_device.as_str(),
+            device.uim_slot,
             USIM_AID_PREFIX,
             LIVE_SIM_AUTH_GATE_ATTEMPTS,
             LIVE_SIM_AUTH_GATE_TIMEOUT,
@@ -269,6 +536,10 @@ pub async fn verify_live_sim_auth_access() -> Result<(), LiveStageError> {
     .map_err(live_stage_error)?;
     info!("SIMAuth access gate passed");
     Ok(())
+}
+
+pub async fn verify_live_sim_auth_access() -> Result<(), LiveStageError> {
+    verify_live_sim_auth_access_for_line("").await
 }
 
 fn read_non_empty_config(value: Option<String>, default: &str) -> String {
@@ -922,8 +1193,23 @@ pub trait LiveDatagramAdapter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<(), LiveStageError>> + Send + 'a>>;
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemLiveEpdgAdapter;
+/// Resolves the ePDG using one line's overrides.
+///
+/// Holds the `line_id` so the lookup picks up that line's ePDG host/port, DNS
+/// server and proxy — several SIMs can resolve different operators concurrently
+/// without reading each other's settings.
+#[derive(Debug, Clone, Default)]
+pub struct SystemLiveEpdgAdapter {
+    line_id: String,
+}
+
+impl SystemLiveEpdgAdapter {
+    pub fn for_line(line_id: impl Into<String>) -> Self {
+        Self {
+            line_id: line_id.into(),
+        }
+    }
+}
 
 impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     fn resolve_epdg<'a>(
@@ -932,7 +1218,9 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedEpdgEndpoint, LiveStageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            match tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile)).await {
+            match tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(&self.line_id, profile))
+                .await
+            {
                 Ok(Ok(endpoint)) => Ok(endpoint),
                 Ok(Err(_err)) => Err(live_stage_error("epdg_dns_resolution_failed")),
                 Err(_) => Err(live_stage_error("epdg_dns_resolution_timeout")),
@@ -941,8 +1229,20 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-pub struct SystemLiveDatagramAdapter;
+/// Runs the live UDP-path stages for one line, carrying that line's ePDG/DNS/proxy
+/// overrides so concurrent lines stay independent.
+#[derive(Debug, Clone, Default)]
+pub struct SystemLiveDatagramAdapter {
+    line_id: String,
+}
+
+impl SystemLiveDatagramAdapter {
+    pub fn for_line(line_id: impl Into<String>) -> Self {
+        Self {
+            line_id: line_id.into(),
+        }
+    }
+}
 
 impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
     fn check_udp_path<'a>(
@@ -952,13 +1252,19 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<(), LiveStageError>> + Send + 'a>> {
         Box::pin(async move {
             match stage {
-                ExecutorStage::Ike => run_live_ike_until(profile, LiveIkeTarget::EapSuccess)
-                    .await
-                    .map(|_| ()),
-                ExecutorStage::ChildSa | ExecutorStage::Esp => run_live_esp_until(profile).await,
-                ExecutorStage::ImsRegister => run_live_ims_register_until(profile).await,
-                ExecutorStage::Sms => run_live_sms_until(profile).await,
-                ExecutorStage::Voice => run_live_voice_until(profile).await,
+                ExecutorStage::Ike => {
+                    run_live_ike_until(&self.line_id, profile, LiveIkeTarget::EapSuccess)
+                        .await
+                        .map(|_| ())
+                }
+                ExecutorStage::ChildSa | ExecutorStage::Esp => {
+                    run_live_esp_until(&self.line_id, profile).await
+                }
+                ExecutorStage::ImsRegister => {
+                    run_live_ims_register_until(&self.line_id, profile).await
+                }
+                ExecutorStage::Sms => run_live_sms_until(&self.line_id, profile).await,
+                ExecutorStage::Voice => run_live_voice_until(&self.line_id, profile).await,
                 _ => Err(live_stage_error("packet_transport_stage_not_implemented")),
             }
         })
@@ -1090,20 +1396,22 @@ fn live_ike_proposal_groups(
 }
 
 async fn run_live_ike_until(
+    line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    run_live_ike_until_depth(profile, target, LiveProbeDepth::FullHandshake).await
+    run_live_ike_until_depth(line_id, profile, target, LiveProbeDepth::FullHandshake).await
 }
 
 async fn run_live_ike_until_depth(
+    line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
     depth: LiveProbeDepth,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    let (epdg_host, epdg_port, _) = live_epdg_settings(profile);
+    let (epdg_host, epdg_port, _) = live_epdg_settings(line_id, profile);
     info!("Resolving ePDG host: {} port: {}", epdg_host, epdg_port);
-    let endpoint = tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(profile))
+    let endpoint = tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(line_id, profile))
         .await
         .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
         .map_err(map_transport_error)?;
@@ -1144,6 +1452,7 @@ async fn run_live_ike_until_depth(
                 destination.set_port(path.destination_port);
                 info!("Attempting connection path to destination={:?}, local_port_preferred={:?}, initial_nat_t={:?}", destination, path.preferred_local_port, path.initial_nat_t);
                 match run_live_ike_with_destination(
+                    line_id,
                     profile,
                     target,
                     destination,
@@ -1173,6 +1482,7 @@ async fn run_live_ike_until_depth(
 }
 
 async fn run_live_ike_with_destination(
+    line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
     destination: SocketAddr,
@@ -1272,7 +1582,7 @@ async fn run_live_ike_with_destination(
     machine
         .derive_session_keys(&shared_secret)
         .map_err(|_| live_stage_error("ike_session_key_derivation_failed"))?;
-    let identity = live_ike_identity(profile).await?;
+    let identity = live_ike_identity(line_id, profile).await?;
     info!(
         identity_len = identity.len(),
         "Resolved NAI identity for IKE_AUTH"
@@ -1312,15 +1622,19 @@ async fn run_live_ike_with_destination(
     let challenge = parse_challenge(&eap_challenge)
         .map_err(|_| live_stage_error("eap_aka_challenge_parse_failed"))?;
     info!("Spawning USIM Authentication via QMI proxy...");
-    let runtime_config = live_runtime_config();
+    // Authenticate against THIS line's reader. Using the global device would make
+    // a second line run EAP-AKA against the first line's card, which fails
+    // authentication (or worse, succeeds with the wrong subscriber identity).
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let sim_device = sim_device_for_line(line_id);
     let aka_result = tokio::task::spawn_blocking({
         let rand = challenge.rand.clone();
         let autn = challenge.autn.clone();
         move || {
             execute_usim_authenticate_via_proxy_reason_with_retry(
-                runtime_config.qmi_proxy_socket.as_str(),
-                runtime_config.qmi_device.as_str(),
-                runtime_config.uim_slot,
+                proxy_socket.as_str(),
+                sim_device.qmi_device.as_str(),
+                sim_device.uim_slot,
                 USIM_AID_PREFIX,
                 &rand,
                 &autn,
@@ -1489,13 +1803,16 @@ async fn run_live_ike_with_destination(
     })
 }
 
-async fn run_live_esp_until(profile: &'static CarrierProfile) -> Result<(), LiveStageError> {
-    if cached_tun_gateway_matches(profile).await {
+async fn run_live_esp_until(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Result<(), LiveStageError> {
+    if cached_tun_gateway_matches(line_id, profile).await {
         return Ok(());
     }
 
     info!("Live ESP stage check: building full ePDG IKE/EAP-AKA/CHILD_SA path...");
-    let session = run_live_ike_until(profile, LiveIkeTarget::ChildSaReady).await?;
+    let session = run_live_ike_until(line_id, profile, LiveIkeTarget::ChildSaReady).await?;
     let child_sa = session
         .child_sa
         .as_ref()
@@ -1518,19 +1835,29 @@ async fn run_live_esp_until(profile: &'static CarrierProfile) -> Result<(), Live
     if snapshot.phase != "inner_stack_ready" {
         return Err(live_stage_error("live_esp_inner_stack_not_ready"));
     }
-    ensure_live_tun_gateway(profile, &session, child_sa).await
+    ensure_live_tun_gateway(line_id, profile, &session, child_sa).await
 }
 
-async fn cached_tun_gateway_matches(profile: &'static CarrierProfile) -> bool {
-    let cache = LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().await;
-    guard
-        .as_ref()
+fn tun_gateway_cache() -> &'static Mutex<HashMap<String, Arc<TunGatewayRuntime>>> {
+    LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether this line already has a gateway for this carrier profile.
+///
+/// Both keys matter: the entry is looked up by line (so lines never share a
+/// tunnel) and then checked against the profile (so a line that switched carriers
+/// rebuilds instead of reusing a stale tunnel).
+async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProfile) -> bool {
+    tun_gateway_cache()
+        .lock()
+        .await
+        .get(line_id)
         .map(|runtime| runtime.is_for_profile(profile.meta.profile_id))
         .unwrap_or(false)
 }
 
 async fn ensure_live_tun_gateway(
+    line_id: &str,
     profile: &'static CarrierProfile,
     session: &LiveIkeSession,
     child_sa: &LiveChildSaMaterial,
@@ -1553,7 +1880,9 @@ async fn ensure_live_tun_gateway(
 
     let gateway = tun_gateway::start_gateway(TunGatewayConfig {
         profile_id: profile.meta.profile_id,
-        tun_name: live_runtime_config().tun_name,
+        // Per-line device name: two connected lines must not contend for one
+        // interface, and the name stays stable so a reconnect reclaims its own.
+        tun_name: tun_name_for_line(&live_runtime_config().tun_name, line_id),
         inner_addr,
         inner_prefix_len: configuration.assigned_ipv6_prefix_length,
         pcscf_addr,
@@ -1567,9 +1896,10 @@ async fn ensure_live_tun_gateway(
     .await
     .map_err(|error| live_stage_error(error.reason()))?;
 
-    let cache = LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
-    *guard = Some(gateway);
+    tun_gateway_cache()
+        .lock()
+        .await
+        .insert(line_id.to_string(), gateway);
     Ok(())
 }
 
@@ -1636,12 +1966,13 @@ fn pcscf_candidates(
 }
 
 async fn run_live_ims_register_until(
+    line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Result<(), LiveStageError> {
     info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS TCP path...");
-    run_live_esp_until(profile).await?;
-    let gateway = cached_tun_gateway(profile).await?;
-    let response = run_register_exchange_over_tunnel(profile, &gateway).await?;
+    run_live_esp_until(line_id, profile).await?;
+    let gateway = cached_tun_gateway(line_id, profile).await?;
+    let response = run_register_exchange_over_tunnel(line_id, profile, &gateway).await?;
     let parsed = ims::parse_sip_response(&response, profile.ims.realm)
         .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
     info!(
@@ -1658,7 +1989,7 @@ async fn run_live_ims_register_until(
 
     match parsed.status_code {
         200 => {
-            record_live_ims_register_ready(profile, true, parsed.expires_seconds).await;
+            record_live_ims_register_ready(line_id, profile, true, parsed.expires_seconds).await;
             Ok(())
         }
         401 | 407 => Err(live_stage_error("ims_register_auth_rejected")),
@@ -1666,15 +1997,18 @@ async fn run_live_ims_register_until(
     }
 }
 
-async fn run_live_sms_until(profile: &'static CarrierProfile) -> Result<(), LiveStageError> {
+async fn run_live_sms_until(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Result<(), LiveStageError> {
     info!("Live Sms stage check: verifying protected IMS registration and SMSIP readiness...");
     match profile.sms.receiver_transport {
         "tcp" | "udp" => {}
         _ => return Err(live_stage_error("sms_receiver_transport_unsupported")),
     }
 
-    if !cached_live_ims_register_ready(profile).await {
-        run_live_ims_register_until(profile).await?;
+    if !cached_live_ims_register_ready(line_id, profile).await {
+        run_live_ims_register_until(line_id, profile).await?;
     }
 
     let mut sms_state = sms::SmsRuntimeStateMachine::new(profile);
@@ -1696,14 +2030,17 @@ async fn run_live_sms_until(profile: &'static CarrierProfile) -> Result<(), Live
 ///
 /// The actual media path (RTP over the ESP inner stack) is exercised only when
 /// a call is placed; this stage only confirms signaling prerequisites.
-async fn run_live_voice_until(profile: &'static CarrierProfile) -> Result<(), LiveStageError> {
+async fn run_live_voice_until(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Result<(), LiveStageError> {
     info!("Live Voice stage check: verifying IMS registration and voice leg readiness...");
     if !profile.voice.vowifi_enabled && !profile.voice.carrier_fallback_enabled {
         return Err(live_stage_error("voice_no_leg_enabled"));
     }
 
-    if !cached_live_ims_register_ready(profile).await {
-        run_live_ims_register_until(profile).await?;
+    if !cached_live_ims_register_ready(line_id, profile).await {
+        run_live_ims_register_until(line_id, profile).await?;
     }
 
     let mut voice_state = voice::VoiceCallStateMachine::new(profile);
@@ -1739,10 +2076,23 @@ async fn run_live_voice_until(profile: &'static CarrierProfile) -> Result<(), Li
 /// [`voice::AudioSource`]/[`voice::AudioSink`] interfaces. Until a backend is
 /// bound, media flows as silence.
 pub async fn place_live_voice_call(callee: &str) -> Result<LiveCallResult, LiveStageError> {
+    place_live_voice_call_for_line("", callee).await
+}
+
+/// Place a call using one line's network overrides.
+///
+/// `line_id` selects that line's ePDG/DNS/proxy settings; an empty value falls
+/// back to carrier-profile defaults.
+pub async fn place_live_voice_call_for_line(
+    line_id: &str,
+    callee: &str,
+) -> Result<LiveCallResult, LiveStageError> {
     let conn = zbus::Connection::system()
         .await
         .map_err(|_| live_stage_error("voice_identity_unavailable"))?;
-    let identity = current_sim_identity(&conn)
+    // Resolve the carrier from THIS line's SIM, so a second line does not place
+    // the call through the first line's operator profile.
+    let identity = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("voice_identity_unavailable"))?;
     let profile_match = profiles::resolve_by_imsi(identity.imsi.trim())
@@ -1755,7 +2105,7 @@ pub async fn place_live_voice_call(callee: &str) -> Result<LiveCallResult, LiveS
 
     match tokio::time::timeout(
         LIVE_VOICE_INVITE_TOTAL_TIMEOUT,
-        place_live_voice_call_for_profile(&conn, profile, callee),
+        place_live_voice_call_for_profile(&conn, line_id, profile, callee),
     )
     .await
     {
@@ -1766,7 +2116,7 @@ pub async fn place_live_voice_call(callee: &str) -> Result<LiveCallResult, LiveS
                 timeout_ms = LIVE_VOICE_INVITE_TOTAL_TIMEOUT.as_millis() as u64,
                 "VoWiFi voice INVITE timed out; IMS session cache will be cleared"
             );
-            clear_live_ims_session(profile).await;
+            clear_live_ims_session(line_id, profile).await;
             Err(live_stage_error("voice_invite_timeout"))
         }
     }
@@ -1774,17 +2124,18 @@ pub async fn place_live_voice_call(callee: &str) -> Result<LiveCallResult, LiveS
 
 async fn place_live_voice_call_for_profile(
     _conn: &zbus::Connection,
+    line_id: &str,
     profile: &'static CarrierProfile,
     callee: &str,
 ) -> Result<LiveCallResult, LiveStageError> {
-    if !cached_live_ims_register_ready(profile).await {
+    if !cached_live_ims_register_ready(line_id, profile).await {
         info!(
             profile_id = profile.meta.profile_id,
             "VoWiFi voice call refreshing IMS registration before INVITE"
         );
-        run_live_ims_register_until(profile).await?;
+        run_live_ims_register_until(line_id, profile).await?;
     }
-    let gateway = cached_tun_gateway(profile).await?;
+    let gateway = cached_tun_gateway(line_id, profile).await?;
     let route = gateway
         .ims_client_tcp_route()
         .map_err(|error| live_stage_error(error.reason()))?;
@@ -1793,8 +2144,9 @@ async fn place_live_voice_call_for_profile(
     }
 
     let identity =
-        live_ims_register_identity(profile, LiveRegisterIdentityFormat::ImsiHomeDomain).await?;
-    let security_verify = cached_live_ims_security_verify(profile).await;
+        live_ims_register_identity(line_id, profile, LiveRegisterIdentityFormat::ImsiHomeDomain)
+            .await?;
+    let security_verify = cached_live_ims_security_verify(line_id, profile).await;
     let callee_user = sip_phone_user(callee)?;
     let request_uri = format!("sip:{callee_user}@{};user=phone", profile.ims.domain);
 
@@ -2059,21 +2411,40 @@ fn live_ims_register_cache_ttl(expires_seconds: Option<u32>) -> Duration {
     ttl.clamp(LIVE_IMS_REGISTER_DEFAULT_TTL, LIVE_IMS_REGISTER_MAX_TTL)
 }
 
+fn ims_register_ready_cache() -> &'static Mutex<HashMap<String, LiveImsRegisterReady>> {
+    LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ims_security_verify_cache() -> &'static Mutex<HashMap<String, LiveImsSecurityVerify>> {
+    LIVE_IMS_SECURITY_VERIFY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ims_tcp_channel_cache() -> &'static Mutex<HashMap<String, LiveImsTcpChannel>> {
+    LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ims_register_variant_cache() -> &'static Mutex<HashMap<String, LiveImsRegisterSuccessVariant>> {
+    LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 async fn record_live_ims_register_ready(
+    line_id: &str,
     profile: &'static CarrierProfile,
     sms_capability_advertised: bool,
     expires_seconds: Option<u32>,
 ) {
-    let cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
     let ttl = live_ims_register_cache_ttl(expires_seconds);
-    *guard = Some(LiveImsRegisterReady {
-        profile_id: profile.meta.profile_id,
-        expires_at: Instant::now() + ttl,
-        sms_capability_advertised,
-        receiver_transport: profile.sms.receiver_transport,
-    });
+    ims_register_ready_cache().lock().await.insert(
+        line_id.to_string(),
+        LiveImsRegisterReady {
+            profile_id: profile.meta.profile_id,
+            expires_at: Instant::now() + ttl,
+            sms_capability_advertised,
+            receiver_transport: profile.sms.receiver_transport,
+        },
+    );
     info!(
+        line_id,
         profile_id = profile.meta.profile_id,
         ttl_secs = ttl.as_secs(),
         expires_seconds,
@@ -2081,28 +2452,29 @@ async fn record_live_ims_register_ready(
     );
 }
 
-async fn cached_live_ims_register_ready(profile: &'static CarrierProfile) -> bool {
-    let cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().await;
-    guard
-        .as_ref()
+async fn cached_live_ims_register_ready(line_id: &str, profile: &'static CarrierProfile) -> bool {
+    ims_register_ready_cache()
+        .lock()
+        .await
+        .get(line_id)
         .filter(|ready| ready.profile_id == profile.meta.profile_id)
         .filter(|ready| ready.sms_capability_advertised)
         .filter(|ready| ready.receiver_transport == profile.sms.receiver_transport)
         .is_some_and(|ready| ready.expires_at > Instant::now())
 }
 
-async fn cached_live_ims_expires_at(profile: &'static CarrierProfile) -> Instant {
-    let cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().await;
-    guard
-        .as_ref()
+async fn cached_live_ims_expires_at(line_id: &str, profile: &'static CarrierProfile) -> Instant {
+    ims_register_ready_cache()
+        .lock()
+        .await
+        .get(line_id)
         .filter(|ready| ready.profile_id == profile.meta.profile_id)
         .map(|ready| ready.expires_at)
         .unwrap_or_else(|| Instant::now() + LIVE_IMS_REGISTER_DEFAULT_TTL)
 }
 
 async fn record_live_ims_security_verify(
+    line_id: &str,
     profile: &'static CarrierProfile,
     security_verify: Option<&str>,
     expires_seconds: Option<u32>,
@@ -2110,26 +2482,32 @@ async fn record_live_ims_security_verify(
     let Some(value) = security_verify.filter(|value| !value.trim().is_empty()) else {
         return;
     };
-    let cache = LIVE_IMS_SECURITY_VERIFY.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
-    *guard = Some(LiveImsSecurityVerify {
-        profile_id: profile.meta.profile_id,
-        expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
-        value: value.to_string(),
-    });
+    ims_security_verify_cache().lock().await.insert(
+        line_id.to_string(),
+        LiveImsSecurityVerify {
+            profile_id: profile.meta.profile_id,
+            expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
+            value: value.to_string(),
+        },
+    );
 }
 
-async fn cached_live_ims_security_verify(profile: &'static CarrierProfile) -> Option<String> {
-    let cache = LIVE_IMS_SECURITY_VERIFY.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().await;
-    guard
-        .as_ref()
+async fn cached_live_ims_security_verify(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Option<String> {
+    ims_security_verify_cache()
+        .lock()
+        .await
+        .get(line_id)
         .filter(|ready| ready.profile_id == profile.meta.profile_id)
         .filter(|ready| ready.expires_at > Instant::now())
         .map(|ready| ready.value.clone())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_live_ims_tcp_channel(
+    line_id: &str,
     profile: &'static CarrierProfile,
     local_addr: SocketAddr,
     remote_addr: SocketAddr,
@@ -2137,99 +2515,121 @@ async fn record_live_ims_tcp_channel(
     security_verify: Option<String>,
     expires_seconds: Option<u32>,
 ) {
-    let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
-    *guard = Some(LiveImsTcpChannel {
-        profile_id: profile.meta.profile_id,
-        expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
-        channel: super::channel::EpdgSipChannel::new(
-            stream,
-            Vec::new(),
-            crate::ims::context::ImsRoute {
-                local_addr,
-                pcscf_addr: remote_addr,
-                transport: crate::ims::context::SipTransport::Tcp,
-            },
-            security_verify,
-        ),
-    });
+    ims_tcp_channel_cache().lock().await.insert(
+        line_id.to_string(),
+        LiveImsTcpChannel {
+            profile_id: profile.meta.profile_id,
+            expires_at: Instant::now() + live_ims_register_cache_ttl(expires_seconds),
+            channel: super::channel::EpdgSipChannel::new(
+                stream,
+                Vec::new(),
+                crate::ims::context::ImsRoute {
+                    local_addr,
+                    pcscf_addr: remote_addr,
+                    transport: crate::ims::context::SipTransport::Tcp,
+                },
+                security_verify,
+            ),
+        },
+    );
 }
 
-async fn clear_live_ims_tcp_channel(profile: &'static CarrierProfile) {
-    let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
-    if guard
-        .as_ref()
+async fn clear_live_ims_tcp_channel(line_id: &str, profile: &'static CarrierProfile) {
+    let mut cache = ims_tcp_channel_cache().lock().await;
+    if cache
+        .get(line_id)
         .is_some_and(|channel| channel.profile_id == profile.meta.profile_id)
     {
-        *guard = None;
+        cache.remove(line_id);
     }
 }
 
+/// Tear down every line's live runtime. Process-wide shutdown only — for a single
+/// line use [`clear_live_runtime_for_line`], which leaves other lines connected.
 pub async fn clear_all_live_runtime() {
-    let tcp_cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
-    let channel = tcp_cache.lock().await.take();
-    if let Some(channel) = channel {
+    let channels: Vec<LiveImsTcpChannel> = ims_tcp_channel_cache()
+        .lock()
+        .await
+        .drain()
+        .map(|(_, channel)| channel)
+        .collect();
+    for channel in channels {
         let (stream, _) = channel.channel.into_parts();
         abort_tcp_stream(stream);
     }
 
-    let ready_cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
-    *ready_cache.lock().await = None;
+    ims_register_ready_cache().lock().await.clear();
+    ims_security_verify_cache().lock().await.clear();
+    ims_register_variant_cache().lock().await.clear();
 
-    let verify_cache = LIVE_IMS_SECURITY_VERIFY.get_or_init(|| Mutex::new(None));
-    *verify_cache.lock().await = None;
-
-    let variant_cache = LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(None));
-    *variant_cache.lock().await = None;
-
-    let gateway_cache = LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(None));
-    let gateway = gateway_cache.lock().await.take();
-    if let Some(gateway) = gateway {
+    let gateways: Vec<Arc<TunGatewayRuntime>> = tun_gateway_cache()
+        .lock()
+        .await
+        .drain()
+        .map(|(_, gateway)| gateway)
+        .collect();
+    for gateway in gateways {
         gateway.shutdown();
     }
 }
 
-async fn clear_live_ims_session(profile: &'static CarrierProfile) {
-    clear_live_ims_tcp_channel(profile).await;
+/// Tear down one line's live runtime, leaving every other line untouched.
+///
+/// Needed because resetting a single line previously went through
+/// [`clear_all_live_runtime`], which killed every other line's tunnel too.
+pub async fn clear_live_runtime_for_line(line_id: &str) {
+    if let Some(channel) = ims_tcp_channel_cache().lock().await.remove(line_id) {
+        let (stream, _) = channel.channel.into_parts();
+        abort_tcp_stream(stream);
+    }
+    ims_register_ready_cache().lock().await.remove(line_id);
+    ims_security_verify_cache().lock().await.remove(line_id);
+    ims_register_variant_cache().lock().await.remove(line_id);
+    if let Some(gateway) = tun_gateway_cache().lock().await.remove(line_id) {
+        gateway.shutdown();
+    }
+    forget_live_network_overrides(line_id);
+}
 
-    let ready_cache = LIVE_IMS_REGISTER_READY.get_or_init(|| Mutex::new(None));
-    let mut ready = ready_cache.lock().await;
+async fn clear_live_ims_session(line_id: &str, profile: &'static CarrierProfile) {
+    clear_live_ims_tcp_channel(line_id, profile).await;
+
+    let profile_id = profile.meta.profile_id;
+    let mut ready = ims_register_ready_cache().lock().await;
     if ready
-        .as_ref()
-        .is_some_and(|state| state.profile_id == profile.meta.profile_id)
+        .get(line_id)
+        .is_some_and(|state| state.profile_id == profile_id)
     {
-        *ready = None;
+        ready.remove(line_id);
     }
     drop(ready);
 
-    let verify_cache = LIVE_IMS_SECURITY_VERIFY.get_or_init(|| Mutex::new(None));
-    let mut verify = verify_cache.lock().await;
+    let mut verify = ims_security_verify_cache().lock().await;
     if verify
-        .as_ref()
-        .is_some_and(|state| state.profile_id == profile.meta.profile_id)
+        .get(line_id)
+        .is_some_and(|state| state.profile_id == profile_id)
     {
-        *verify = None;
+        verify.remove(line_id);
     }
     drop(verify);
 
-    let variant_cache = LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(None));
-    let mut variant = variant_cache.lock().await;
+    let mut variant = ims_register_variant_cache().lock().await;
     if variant
-        .as_ref()
-        .is_some_and(|state| state.profile_id == profile.meta.profile_id)
+        .get(line_id)
+        .is_some_and(|state| state.profile_id == profile_id)
     {
-        *variant = None;
+        variant.remove(line_id);
     }
 }
 
 async fn cached_tun_gateway(
+    line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Result<Arc<TunGatewayRuntime>, LiveStageError> {
-    let cache = LIVE_TUN_GATEWAY.get_or_init(|| Mutex::new(None));
-    let guard = cache.lock().await;
-    guard
-        .as_ref()
+    tun_gateway_cache()
+        .lock()
+        .await
+        .get(line_id)
         .filter(|runtime| runtime.is_for_profile(profile.meta.profile_id))
         .cloned()
         .ok_or_else(|| live_stage_error("live_tun_gateway_missing"))
@@ -2239,10 +2639,24 @@ pub async fn send_live_sms_over_ims(
     recipient: &str,
     text: &str,
 ) -> Result<LiveSmsSendResult, LiveStageError> {
+    send_live_sms_over_ims_for_line("", recipient, text).await
+}
+
+/// Send an IMS SMS using one line's network overrides.
+///
+/// `line_id` selects that line's ePDG/DNS/proxy settings; an empty value falls
+/// back to carrier-profile defaults.
+pub async fn send_live_sms_over_ims_for_line(
+    line_id: &str,
+    recipient: &str,
+    text: &str,
+) -> Result<LiveSmsSendResult, LiveStageError> {
     let conn = zbus::Connection::system()
         .await
         .map_err(|_| live_stage_error("sms_identity_unavailable"))?;
-    let identity = current_sim_identity(&conn)
+    // Resolve the carrier from THIS line's SIM, so a second line does not send
+    // through the first line's operator profile.
+    let identity = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("sms_identity_unavailable"))?;
     let profile_match = profiles::resolve_by_imsi(identity.imsi.trim())
@@ -2251,7 +2665,7 @@ pub async fn send_live_sms_over_ims(
 
     match tokio::time::timeout(
         LIVE_SMS_SEND_TOTAL_TIMEOUT,
-        send_live_sms_over_ims_for_profile(&conn, profile, recipient, text),
+        send_live_sms_over_ims_for_profile(&conn, line_id, profile, recipient, text),
     )
     .await
     {
@@ -2262,7 +2676,7 @@ pub async fn send_live_sms_over_ims(
                 timeout_ms = LIVE_SMS_SEND_TOTAL_TIMEOUT.as_millis() as u64,
                 "VoWiFi SMS send timed out; IMS session cache will be cleared"
             );
-            clear_live_ims_session(profile).await;
+            clear_live_ims_session(line_id, profile).await;
             Err(live_stage_error("sms_send_timeout"))
         }
     }
@@ -2270,18 +2684,19 @@ pub async fn send_live_sms_over_ims(
 
 async fn send_live_sms_over_ims_for_profile(
     conn: &zbus::Connection,
+    line_id: &str,
     profile: &'static CarrierProfile,
     recipient: &str,
     text: &str,
 ) -> Result<LiveSmsSendResult, LiveStageError> {
-    if !cached_live_ims_register_ready(profile).await {
+    if !cached_live_ims_register_ready(line_id, profile).await {
         info!(
             profile_id = profile.meta.profile_id,
             "VoWiFi SMS send refreshing IMS registration before MESSAGE"
         );
-        run_live_ims_register_until(profile).await?;
+        run_live_ims_register_until(line_id, profile).await?;
     }
-    let gateway = cached_tun_gateway(profile).await?;
+    let gateway = cached_tun_gateway(line_id, profile).await?;
     let route = gateway
         .ims_client_tcp_route()
         .map_err(|error| live_stage_error(error.reason()))?;
@@ -2299,8 +2714,9 @@ async fn send_live_sms_over_ims_for_profile(
     let submission = sms::build_single_part_mo_submission(recipient, text, service_center)
         .map_err(|error| live_stage_error(error.to_string()))?;
     let identity =
-        live_ims_register_identity(profile, LiveRegisterIdentityFormat::ImsiHomeDomain).await?;
-    let security_verify = cached_live_ims_security_verify(profile).await;
+        live_ims_register_identity(line_id, profile, LiveRegisterIdentityFormat::ImsiHomeDomain)
+            .await?;
+    let security_verify = cached_live_ims_security_verify(line_id, profile).await;
     let variants = live_sms_request_uri_variants(profile, recipient, service_center)?;
 
     info!(
@@ -2316,6 +2732,7 @@ async fn send_live_sms_over_ims_for_profile(
     );
 
     match send_live_sms_message_variants(
+        line_id,
         profile,
         &route,
         &identity,
@@ -2332,14 +2749,15 @@ async fn send_live_sms_over_ims_for_profile(
                 reason = err.reason.as_str(),
                 "VoWiFi MO SMS refreshing IMS session after retryable send failure"
             );
-            clear_live_ims_session(profile).await;
-            run_live_ims_register_until(profile).await?;
-            let gateway = cached_tun_gateway(profile).await?;
+            clear_live_ims_session(line_id, profile).await;
+            run_live_ims_register_until(line_id, profile).await?;
+            let gateway = cached_tun_gateway(line_id, profile).await?;
             let route = gateway
                 .ims_client_tcp_route()
                 .map_err(|error| live_stage_error(error.reason()))?;
-            let security_verify = cached_live_ims_security_verify(profile).await;
+            let security_verify = cached_live_ims_security_verify(line_id, profile).await;
             send_live_sms_message_variants(
+                line_id,
                 profile,
                 &route,
                 &identity,
@@ -2354,12 +2772,13 @@ async fn send_live_sms_over_ims_for_profile(
 }
 
 async fn run_register_exchange_over_tunnel(
+    line_id: &str,
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
     for pcscf_addr in register_pcscf_candidates(gateway) {
-        match run_register_exchange_with_pcscf(profile, gateway, pcscf_addr).await {
+        match run_register_exchange_with_pcscf(line_id, profile, gateway, pcscf_addr).await {
             Ok(response) => return Ok(response),
             Err(error) => {
                 warn!(
@@ -2383,17 +2802,21 @@ fn register_pcscf_candidates(gateway: &TunGatewayRuntime) -> Vec<IpAddr> {
 }
 
 async fn run_register_exchange_with_pcscf(
+    line_id: &str,
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
-    let variants = live_register_header_variants_for_attempt(profile).await;
+    let variants = live_register_header_variants_for_attempt(line_id, profile).await;
     for variant in variants {
-        match run_register_exchange_with_pcscf_variant(profile, gateway, pcscf_addr, variant).await
+        match run_register_exchange_with_pcscf_variant(
+            line_id, profile, gateway, pcscf_addr, variant,
+        )
+        .await
         {
             Ok(response) => {
-                record_live_ims_register_success_variant(profile, variant).await;
+                record_live_ims_register_success_variant(line_id, profile, variant).await;
                 return Ok(response);
             }
             Err(err) => {
@@ -2419,11 +2842,15 @@ fn live_register_header_variants(
 }
 
 async fn live_register_header_variants_for_attempt(
+    line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Vec<LiveRegisterHeaderVariant> {
     let variants = live_register_header_variants(profile);
-    let cache = LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(None));
-    let cached = cache.lock().await.clone();
+    let cached = ims_register_variant_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .cloned();
     let Some(cached) = cached.filter(|cached| {
         cached.profile_id == profile.meta.profile_id
             && cached.captured_at.elapsed() <= LIVE_IMS_REGISTER_MAX_TTL
@@ -2450,19 +2877,22 @@ async fn live_register_header_variants_for_attempt(
 }
 
 async fn record_live_ims_register_success_variant(
+    line_id: &str,
     profile: &'static CarrierProfile,
     variant: LiveRegisterHeaderVariant,
 ) {
-    let cache = LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(None));
-    let mut guard = cache.lock().await;
-    *guard = Some(LiveImsRegisterSuccessVariant {
-        profile_id: profile.meta.profile_id,
-        label: variant.label,
-        captured_at: Instant::now(),
-    });
+    ims_register_variant_cache().lock().await.insert(
+        line_id.to_string(),
+        LiveImsRegisterSuccessVariant {
+            profile_id: profile.meta.profile_id,
+            label: variant.label,
+            captured_at: Instant::now(),
+        },
+    );
 }
 
 async fn run_register_exchange_with_pcscf_variant(
+    line_id: &str,
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
@@ -2480,6 +2910,7 @@ async fn run_register_exchange_with_pcscf_variant(
     };
 
     match run_register_exchange_on_connected_stream(
+        line_id,
         profile,
         &mut stream,
         gateway,
@@ -2497,7 +2928,9 @@ async fn run_register_exchange_with_pcscf_variant(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_register_exchange_on_connected_stream(
+    line_id: &str,
     profile: &'static CarrierProfile,
     stream: &mut TcpStream,
     gateway: &TunGatewayRuntime,
@@ -2505,7 +2938,7 @@ async fn run_register_exchange_on_connected_stream(
     pcscf_addr: IpAddr,
     variant: LiveRegisterHeaderVariant,
 ) -> Result<String, LiveStageError> {
-    let identity = live_ims_register_identity(profile, variant.identity_format).await?;
+    let identity = live_ims_register_identity(line_id, profile, variant.identity_format).await?;
     let identity_shape = identity.shape;
     let mut context = LiveRegisterRequestContext::new(profile, identity, local_addr, pcscf_addr)?;
     info!(
@@ -2526,7 +2959,7 @@ async fn run_register_exchange_on_connected_stream(
         request_uri = variant.request_uri.label(),
         identity_format = variant.identity_format.label(),
         sec_agree_headers_present =
-            profile.ims.register.require_sec_agree_headers || variant.force_sec_agree_headers,
+            sec_agree_headers_required(profile, variant.force_sec_agree_headers),
         contact_feature_count = context.contact_feature_count(variant.header_profile),
         local_port = local_addr.port(),
         expected_header_port = profile.ims.local_port,
@@ -2577,6 +3010,7 @@ async fn run_register_exchange_on_connected_stream(
                 "IMS REGISTER digest challenge accepted"
             );
             let final_response = run_authenticated_register_after_challenge(
+                line_id,
                 profile,
                 stream,
                 gateway,
@@ -2617,7 +3051,9 @@ async fn run_register_exchange_on_connected_stream(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_authenticated_register_after_challenge(
+    line_id: &str,
     profile: &'static CarrierProfile,
     initial_stream: &mut TcpStream,
     gateway: &TunGatewayRuntime,
@@ -2627,7 +3063,7 @@ async fn run_authenticated_register_after_challenge(
 ) -> Result<String, LiveStageError> {
     let mut challenge = challenge.clone();
     let mut auth_material =
-        build_live_register_auth_material(profile, context, &challenge, variant).await?;
+        build_live_register_auth_material(line_id, profile, context, &challenge, variant).await?;
     let mut authenticated_cseq = 2;
     if let Some(auts) = auth_material.auts.take() {
         let resync_authorization = build_digest_resync_authorization_header(
@@ -2664,7 +3100,8 @@ async fn run_authenticated_register_after_challenge(
         }
         challenge = resynced_challenge;
         auth_material =
-            build_live_register_auth_material(profile, context, &challenge, variant).await?;
+            build_live_register_auth_material(line_id, profile, context, &challenge, variant)
+                .await?;
         if auth_material.auts.is_some() {
             return Err(live_stage_error("ims_aka_resync_repeated"));
         }
@@ -2680,6 +3117,7 @@ async fn run_authenticated_register_after_challenge(
             .await
             .map_err(|_| live_stage_error("ims_tcp_shutdown_failed"))?;
         run_protected_authenticated_register_candidates(
+            line_id,
             profile,
             gateway,
             context,
@@ -2706,7 +3144,9 @@ async fn run_authenticated_register_after_challenge(
 // These protocol helpers keep security/session inputs explicit. Collapsing them
 // into broad context bags would hide which values cross an authentication step.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn run_protected_authenticated_register_candidates(
+    line_id: &str,
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     context: &mut LiveRegisterRequestContext,
@@ -2803,12 +3243,14 @@ async fn run_protected_authenticated_register_candidates(
                     .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
                 if summary.status_code == 200 {
                     record_live_ims_security_verify(
+                        line_id,
                         profile,
                         security_verify,
                         summary.expires_seconds,
                     )
                     .await;
                     record_live_ims_tcp_channel(
+                        line_id,
                         profile,
                         protected_local_addr,
                         target,
@@ -2849,7 +3291,9 @@ struct LiveSmsRequestUriVariant {
     to_uri: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_live_sms_message_variants(
+    line_id: &str,
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
     identity: &LiveImsRegisterIdentity,
@@ -2860,6 +3304,7 @@ async fn send_live_sms_message_variants(
     let mut last_error = None;
     for variant in variants {
         match send_live_sms_message_variant(
+            line_id,
             profile,
             route,
             identity,
@@ -2915,7 +3360,9 @@ fn live_sms_session_refresh_retryable(reason: &str) -> bool {
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_live_sms_message_variant(
+    line_id: &str,
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
     identity: &LiveImsRegisterIdentity,
@@ -2924,6 +3371,7 @@ async fn send_live_sms_message_variant(
     security_verify: Option<&str>,
 ) -> Result<LiveSmsSendResult, LiveStageError> {
     if let Some(outcome) = send_live_sms_message_on_cached_channel(
+        line_id,
         profile,
         route,
         identity,
@@ -2956,6 +3404,7 @@ async fn send_live_sms_message_variant(
     .await
     {
         Ok(outcome) => Ok(start_live_sms_followup_task(
+            line_id,
             profile,
             *route,
             identity.clone(),
@@ -2974,7 +3423,9 @@ async fn send_live_sms_message_variant(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_live_sms_message_on_cached_channel(
+    line_id: &str,
     profile: &'static CarrierProfile,
     route: &tun_gateway::ImsClientTcpRoute,
     identity: &LiveImsRegisterIdentity,
@@ -2982,10 +3433,9 @@ async fn send_live_sms_message_on_cached_channel(
     variant: &LiveSmsRequestUriVariant,
     security_verify: Option<&str>,
 ) -> Result<Option<LiveSmsSendResult>, LiveStageError> {
-    let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
     let channel = {
-        let mut guard = cache.lock().await;
-        let Some(channel) = guard.take() else {
+        let mut guard = ims_tcp_channel_cache().lock().await;
+        let Some(channel) = guard.remove(line_id) else {
             return Ok(None);
         };
         channel
@@ -3011,6 +3461,7 @@ async fn send_live_sms_message_on_cached_channel(
     .await
     {
         Ok(outcome) => Ok(Some(start_live_sms_followup_task(
+            line_id,
             profile,
             *route,
             identity.clone(),
@@ -3090,6 +3541,7 @@ async fn send_live_sms_message_on_stream(
 
 #[allow(clippy::too_many_arguments)]
 fn start_live_sms_followup_task(
+    line_id: &str,
     profile: &'static CarrierProfile,
     route: tun_gateway::ImsClientTcpRoute,
     identity: LiveImsRegisterIdentity,
@@ -3103,6 +3555,7 @@ fn start_live_sms_followup_task(
 ) -> LiveSmsSendResult {
     let (tx, rx) = mpsc::unbounded_channel();
     let followup_seed = outcome.clone();
+    let line_id = line_id.to_string();
     tokio::spawn(async move {
         let mut followup_outcome = followup_seed.clone();
         let result = collect_live_sms_followup_frames(
@@ -3124,19 +3577,21 @@ fn start_live_sms_followup_task(
                 let _ = tx.send(LiveSmsFollowupFrame {
                     outcome: followup_outcome,
                 });
-                let expires_at = cached_live_ims_expires_at(profile).await;
-                let cache = LIVE_IMS_TCP_CHANNEL.get_or_init(|| Mutex::new(None));
-                let mut guard = cache.lock().await;
-                *guard = Some(LiveImsTcpChannel {
-                    profile_id: profile.meta.profile_id,
-                    expires_at,
-                    channel: super::channel::EpdgSipChannel::new(
-                        stream,
-                        pending,
-                        shared_vowifi_route(profile, &route, local_addr),
-                        security_verify,
-                    ),
-                });
+                let expires_at = cached_live_ims_expires_at(&line_id, profile).await;
+                let mut guard = ims_tcp_channel_cache().lock().await;
+                guard.insert(
+                    line_id.clone(),
+                    LiveImsTcpChannel {
+                        profile_id: profile.meta.profile_id,
+                        expires_at,
+                        channel: super::channel::EpdgSipChannel::new(
+                            stream,
+                            pending,
+                            shared_vowifi_route(profile, &route, local_addr),
+                            security_verify,
+                        ),
+                    },
+                );
             }
             Err(err) => {
                 warn!(
@@ -3953,7 +4408,7 @@ impl LiveRegisterRequestContext {
             profile.meta.mcc
         );
         let require_sec_agree =
-            profile.ims.register.require_sec_agree_headers || variant.force_sec_agree_headers;
+            sec_agree_headers_required(profile, variant.force_sec_agree_headers);
         let pani = match variant.header_profile.pani {
             LivePaniFormat::ProfileDefault => {
                 Some(build_p_access_network_info(profile).to_string())
@@ -3979,7 +4434,8 @@ impl LiveRegisterRequestContext {
             visited_network: visited_network_header,
             allow_header: "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
                 .to_string(),
-            expires: 3600,
+            // Carrier-configurable: some networks reject the common 3600 default.
+            expires: profile.ims.register.expires_seconds,
         };
         let mut headers = Vec::new();
         let authorization = authorization.map(str::to_string).or_else(|| {
@@ -4233,13 +4689,16 @@ impl LiveSecurityClientState {
 }
 
 async fn live_ims_register_identity(
+    line_id: &str,
     profile: &'static CarrierProfile,
     format: LiveRegisterIdentityFormat,
 ) -> Result<LiveImsRegisterIdentity, LiveStageError> {
     let conn = zbus::Connection::system()
         .await
         .map_err(|_| live_stage_error("ims_identity_unavailable"))?;
-    let sim = current_sim_identity(&conn)
+    // Register with THIS line's IMSI; the global lookup would present the first
+    // modem's subscriber for every line.
+    let sim = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("ims_identity_unavailable"))?;
     let imsi = sim.imsi.trim();
@@ -4377,6 +4836,7 @@ struct LiveRegisterAuthMaterial {
 }
 
 async fn build_live_register_auth_material(
+    line_id: &str,
     profile: &'static CarrierProfile,
     context: &LiveRegisterRequestContext,
     challenge: &LiveDigestChallenge,
@@ -4388,12 +4848,16 @@ async fn build_live_register_auth_material(
         LiveDigestNonceKind::AkaChallenge => {
             let rand = challenge.rand.clone();
             let autn = challenge.autn.clone();
-            let runtime_config = live_runtime_config();
+            let proxy_socket = live_runtime_config().qmi_proxy_socket;
+            // AKA must run against this line's own reader, never the global
+            // fallback device: a wrong card returns a valid-looking RES that the
+            // network then rejects.
+            let sim_device = sim_device_for_line(line_id);
             let aka_result = tokio::task::spawn_blocking(move || {
                 execute_usim_authenticate_via_proxy_reason_with_retry(
-                    runtime_config.qmi_proxy_socket.as_str(),
-                    runtime_config.qmi_device.as_str(),
-                    runtime_config.uim_slot,
+                    proxy_socket.as_str(),
+                    sim_device.qmi_device.as_str(),
+                    sim_device.uim_slot,
                     USIM_AID_PREFIX,
                     &rand,
                     &autn,
@@ -5383,11 +5847,38 @@ fn sip_host(ip: IpAddr) -> String {
     }
 }
 
-fn build_p_access_network_info(profile: &'static CarrierProfile) -> &'static str {
-    if profile.ims.register.include_pani_authenticated {
-        "IEEE-802.11;i-wlan-node-id=000000000000;network-provided"
+/// Decide whether this REGISTER carries sec-agree headers.
+///
+/// `sec_agree_mode` is the carrier-configurable answer and wins:
+/// - `required` — always send them.
+/// - `disabled` — never send them, even if a retry variant asks for it. Some
+///   carriers reject a REGISTER that offers sec-agree they did not ask for.
+/// - `auto` — fall back to the legacy boolean plus whatever the retry variant
+///   is currently probing.
+///
+/// A mismatch here makes REGISTER fail outright, which is why it is settable.
+fn sec_agree_headers_required(profile: &'static CarrierProfile, force_from_variant: bool) -> bool {
+    match profile.ims.register.sec_agree_mode {
+        "required" => true,
+        "disabled" => false,
+        _ => profile.ims.register.require_sec_agree_headers || force_from_variant,
+    }
+}
+
+/// Build `P-Access-Network-Info`. The access type comes from the profile
+/// because carriers that validate this header reject a wrong one, and the
+/// correct value differs per carrier (`IEEE-802.11`, `IEEE-802.11a`, …).
+fn build_p_access_network_info(profile: &'static CarrierProfile) -> String {
+    let access_type = profile.ims.register.access_network_info.trim();
+    let access_type = if access_type.is_empty() {
+        profiles::DEFAULT_ACCESS_NETWORK_INFO
     } else {
-        "IEEE-802.11;i-wlan-node-id=000000000000"
+        access_type
+    };
+    if profile.ims.register.include_pani_authenticated {
+        format!("{access_type};i-wlan-node-id=000000000000;network-provided")
+    } else {
+        format!("{access_type};i-wlan-node-id=000000000000")
     }
 }
 
@@ -5499,11 +5990,16 @@ async fn recv_ike_response_with_retransmit(
     Err(last_error.unwrap_or_else(|| live_stage_error(timeout_reason)))
 }
 
-async fn live_ike_identity(profile: &'static CarrierProfile) -> Result<String, LiveStageError> {
+async fn live_ike_identity(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Result<String, LiveStageError> {
     let conn = zbus::Connection::system()
         .await
         .map_err(|_| live_stage_error("ike_identity_unavailable"))?;
-    let sim = current_sim_identity(&conn)
+    // The IKE identity must be built from THIS line's IMSI, otherwise a second
+    // line would present the first line's subscriber to the ePDG.
+    let sim = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("ike_identity_unavailable"))?;
     build_permanent_nai(profile, &sim.imsi).map_err(map_identity_error)
@@ -5871,17 +6367,129 @@ mod tests {
     }
 
     #[test]
+    fn tun_names_are_unique_per_line_and_fit_ifnamsiz() {
+        // Two connected lines must never be handed the same interface name: they
+        // would collide in the kernel and the second tunnel would fail or hijack
+        // the first one's device.
+        let a = tun_name_for_line("sa_vwf0", "line-0123456789abcdef0123456789abcdef");
+        let b = tun_name_for_line("sa_vwf0", "line-fedcba9876543210fedcba9876543210");
+        assert_ne!(a, b, "distinct lines must get distinct devices");
+        for name in [&a, &b] {
+            assert!(
+                name.len() <= MAX_IFNAME_LEN,
+                "{name} exceeds IFNAMSIZ-1 ({} chars)",
+                name.len()
+            );
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_'),
+                "{name} has characters the kernel will reject"
+            );
+        }
+
+        // Stable across calls, so a reconnect reclaims its own device instead of
+        // leaking a new interface each time.
+        assert_eq!(
+            a,
+            tun_name_for_line("sa_vwf0", "line-0123456789abcdef0123456789abcdef")
+        );
+
+        // No line context keeps the configured base name, preserving the
+        // single-line behaviour and the SIMADMIN_VOWIFI_TUN_NAME override.
+        assert_eq!(tun_name_for_line("sa_vwf0", ""), "sa_vwf0");
+        assert_eq!(tun_name_for_line("custom", ""), "custom");
+    }
+
+    #[test]
     fn line_network_overrides_reject_unimplemented_proxy_transport() {
+        // UDP Relay has no client implementation: a private relay protocol adds
+        // nothing over pointing the line at a self-hosted standard SOCKS5 server.
         let config = LineVowifiConfig {
             proxy_mode: VowifiProxyMode::UdpRelay,
             proxy_endpoint: "udp://relay.example.net:4500".to_string(),
             ..LineVowifiConfig::default()
         };
-
         assert_eq!(
             build_live_network_overrides(&config).unwrap_err(),
-            "vowifi_proxy_runtime_not_available"
+            "vowifi_proxy_mode_not_implemented:udp_relay"
         );
+    }
+
+    #[test]
+    fn line_network_overrides_accept_socks5_and_reject_bad_endpoints() {
+        let good = LineVowifiConfig {
+            proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
+            proxy_endpoint: "socks5://user:pass@127.0.0.1:1080".to_string(),
+            ..LineVowifiConfig::default()
+        };
+        let overrides = build_live_network_overrides(&good).expect("socks5 accepted");
+        assert!(matches!(overrides.proxy, Some(LiveProxySetting::Socks5(_))));
+
+        // A malformed endpoint must be rejected at configuration time, not at
+        // connect time.
+        let bad = LineVowifiConfig {
+            proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
+            proxy_endpoint: "socks5://missing-port".to_string(),
+            ..LineVowifiConfig::default()
+        };
+        assert!(build_live_network_overrides(&bad).is_err());
+    }
+
+    #[test]
+    fn per_line_overrides_do_not_leak_between_lines() {
+        // The whole point of keying overrides by line: two SIMs on different
+        // operators, each with its own proxy and DNS, must stay independent.
+        let japan = LineVowifiConfig {
+            enabled: true,
+            proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
+            proxy_endpoint: "socks5://127.0.0.1:1080".to_string(),
+            dns_server: "1.1.1.1".to_string(),
+            epdg_host: "epdg.jp.example".to_string(),
+            epdg_port: 500,
+        };
+        let malaysia = LineVowifiConfig {
+            enabled: true,
+            proxy_mode: VowifiProxyMode::Direct,
+            proxy_endpoint: String::new(),
+            dns_server: "8.8.8.8".to_string(),
+            epdg_host: "epdg.my.example".to_string(),
+            epdg_port: 500,
+        };
+
+        configure_live_network_overrides("line-jp", &japan).expect("configure jp");
+        configure_live_network_overrides("line-my", &malaysia).expect("configure my");
+
+        let jp = line_overrides("line-jp");
+        let my = line_overrides("line-my");
+        assert_eq!(jp.epdg_host.as_deref(), Some("epdg.jp.example"));
+        assert_eq!(my.epdg_host.as_deref(), Some("epdg.my.example"));
+        assert_eq!(
+            jp.dns_server.map(|ip| ip.to_string()).as_deref(),
+            Some("1.1.1.1")
+        );
+        assert_eq!(
+            my.dns_server.map(|ip| ip.to_string()).as_deref(),
+            Some("8.8.8.8")
+        );
+        // Only the Japanese line is proxied.
+        assert!(jp.proxy.is_some());
+        assert!(my.proxy.is_none());
+
+        // An unknown line falls back to profile defaults rather than borrowing
+        // another line's settings.
+        assert_eq!(
+            line_overrides("line-unknown"),
+            LiveNetworkOverrides::default()
+        );
+
+        forget_live_network_overrides("line-jp");
+        assert_eq!(line_overrides("line-jp"), LiveNetworkOverrides::default());
+        // Forgetting one line must not disturb the other.
+        assert_eq!(
+            line_overrides("line-my").epdg_host.as_deref(),
+            Some("epdg.my.example")
+        );
+        forget_live_network_overrides("line-my");
     }
 
     fn register_variant(label: &str) -> LiveRegisterHeaderVariant {
@@ -5986,6 +6594,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "blocked".to_string(),
+                line_id: String::new(),
             })
             .await;
 
@@ -6005,6 +6614,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "mock".to_string(),
+                line_id: String::new(),
             })
             .await;
 
@@ -6037,6 +6647,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "network-mock".to_string(),
+                line_id: String::new(),
             })
             .await;
 
@@ -6049,6 +6660,7 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "network-mock".to_string(),
+                line_id: String::new(),
             })
             .await;
 
@@ -6719,8 +7331,8 @@ mod tests {
         clear_all_live_runtime().await;
         let success = ee_register_variant("gb_ee_aka_uri_first_required_sec_agree");
 
-        record_live_ims_register_success_variant(&GB_EE_23433, success).await;
-        let variants = live_register_header_variants_for_attempt(&GB_EE_23433).await;
+        record_live_ims_register_success_variant("line-test", &GB_EE_23433, success).await;
+        let variants = live_register_header_variants_for_attempt("line-test", &GB_EE_23433).await;
 
         assert_eq!(
             variants.first().map(|variant| variant.label),

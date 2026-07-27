@@ -21,13 +21,28 @@
 
 pub mod bearer;
 pub mod channel;
-pub mod data_path;
+// `data_path` (the direct-QMI IPv6 WDS preflight) was removed: it was disabled
+// by default behind an env var, hardcoded to IPv6-only, and probed
+// `a2-mux-rmnet*` MUX ports that do not exist on bam-dmux targets. It never ran,
+// and running it would have contended with ModemManager for the primary QMI
+// port.
+//
+// Moving the IMS bearer onto a dedicated secondary QMI endpoint is still the
+// intended fix, but it is not just "call `secondary_qmi::start_ims_session`":
+// that yields a WDS session and an IP configuration with no network interface
+// behind it, while everything downstream here (`configure_bearer_network`,
+// routing, socket binding) needs a real netdev. That data-path piece has to be
+// built and verified on hardware first.
+pub mod data_slot;
 pub mod digest_aka;
 pub mod errors;
 pub mod identity;
 pub mod ipsec;
 pub mod live;
+pub mod native_bearer;
 pub mod pcscf;
+pub mod plan;
+pub mod readiness;
 pub mod rtp_relay;
 pub mod runtime;
 pub mod sip;

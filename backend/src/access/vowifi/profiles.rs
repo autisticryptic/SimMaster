@@ -3,6 +3,23 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+/// REGISTER `Expires` most carriers accept.
+pub const DEFAULT_REGISTER_EXPIRES_SECONDS: u32 = 3600;
+/// Access type reported in `P-Access-Network-Info` for Wi-Fi calling.
+pub const DEFAULT_ACCESS_NETWORK_INFO: &str = "IEEE-802.11";
+/// Status codes that mean "the network is busy or unavailable, try again".
+pub const DEFAULT_TEMPORARY_STATUS_CODES: &[u16] = &[408, 429, 500, 502, 503, 504];
+/// Status codes that mean "this SIM will not be allowed to register".
+pub const DEFAULT_FORBIDDEN_STATUS_CODES: &[u16] = &[403];
+/// Status codes that should trigger the initial-reject fallback REGISTER.
+pub const DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES: &[u16] = &[400, 403, 500];
+/// Delay before retrying after a temporary rejection.
+pub const DEFAULT_TEMPORARY_RETRY_SECONDS: u16 = 60;
+/// SIP TCP keepalive that keeps NAT bindings alive on the ePDG path.
+pub const DEFAULT_IMS_TCP_KEEPALIVE_SECONDS: u16 = 30;
+/// SIP OPTIONS ping interval used to confirm the registration is still live.
+pub const DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS: u16 = 45;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CarrierProfileMeta {
     pub profile_id: &'static str,
@@ -22,6 +39,12 @@ pub struct CarrierProfileMeta {
 pub struct ProfileIdentityPolicy {
     pub device_model_hint: &'static str,
     pub spoof_imei: bool,
+    /// Whether a device identity (IMEI) is presented during IKE_AUTH. Some
+    /// carriers refuse the exchange when the identity is missing or unknown, so
+    /// this has to be settable per carrier.
+    pub device_identity_enabled: bool,
+    /// The IMEI to present. `None` means "use the modem's own IMEI".
+    pub device_identity_imei: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -30,7 +53,14 @@ pub struct EpdgPolicy {
     pub port: u16,
     pub apn: Option<&'static str>,
     pub ip_stack: &'static str,
+    /// Primary DNS override. Kept as the first entry of `dns_servers`; retained
+    /// as its own field because several call sites want a single answer.
     pub dns_server: Option<&'static str>,
+    /// Ordered DNS servers to try when resolving the ePDG. Later entries are
+    /// used when an earlier one does not answer — if the ePDG FQDN cannot be
+    /// resolved there is no connection at all, so a single server is a real
+    /// single point of failure.
+    pub dns_servers: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,9 +81,34 @@ pub struct RegisterPolicy {
     pub strict_security_server_offer: bool,
     pub enable_initial_reject_fallback: bool,
     pub use_plain_digest_placeholder: bool,
+    /// Legacy two-state sec-agree switch. `sec_agree_mode` supersedes it and is
+    /// what the runtime consults; this stays so existing profiles keep working.
     pub require_sec_agree_headers: bool,
+    /// `auto` (follow the challenge), `required` (always send Security-Client /
+    /// Security-Verify) or `disabled`. A sec-agree mismatch makes REGISTER fail
+    /// outright, and carriers genuinely differ, so this must be settable.
+    pub sec_agree_mode: &'static str,
     pub security_client_mechanisms: &'static [&'static str],
     pub live_header_variant_set: &'static str,
+    /// Value of the REGISTER `Expires` header. Some carriers reject the common
+    /// 3600 default and demand their own value.
+    pub expires_seconds: u32,
+    /// Base of the `P-Access-Network-Info` header, e.g. `IEEE-802.11` or
+    /// `IEEE-802.11a`. Carriers that validate it reject a wrong access type.
+    pub access_network_info: &'static str,
+    /// `android_default` or `legacy` — controls the shape of the Contact header.
+    pub contact_mode: &'static str,
+    /// Order of Contact header parameters. Empty means "use the built-in order
+    /// for `contact_mode`".
+    pub contact_param_order: &'static [&'static str],
+    /// SIP status codes treated as retryable-later rather than fatal.
+    pub temporary_status_codes: &'static [u16],
+    /// SIP status codes that mean "stop, this will never succeed".
+    pub forbidden_status_codes: &'static [u16],
+    /// Status codes that should trigger the initial-reject fallback path.
+    pub initial_reject_fallback_status_codes: &'static [u16],
+    /// How long to wait before retrying after a temporary rejection.
+    pub temporary_retry_seconds: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -62,10 +117,18 @@ pub struct ImsPolicy {
     pub realm: &'static str,
     pub registrar: Option<&'static str>,
     pub pcscf: Option<&'static str>,
+    /// `tcp`, `udp`, or `auto` to follow whatever the P-CSCF offers.
     pub transport: &'static str,
     pub local_port: u16,
     pub user_agent: &'static str,
     pub identity_source: &'static str,
+    /// TCP keepalive for the SIP control channel. Without it, NAT along the
+    /// path silently drops the registration and inbound calls stop arriving.
+    /// Zero disables.
+    pub tcp_keepalive_seconds: u16,
+    /// Interval for SIP OPTIONS pings that keep the registration fresh. Zero
+    /// disables.
+    pub options_ping_interval_seconds: u16,
     pub register: RegisterPolicy,
 }
 
@@ -158,6 +221,8 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "rmx3366",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.mnc033.mcc234.pub.3gppnetwork.org",
@@ -165,6 +230,7 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -197,6 +263,8 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "carrier_device_model",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -204,6 +272,15 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: false,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "ee_ims_features",
         },
@@ -242,6 +319,8 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "generic_android_class",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.mnc004.mcc204.pub.3gppnetwork.org",
@@ -249,6 +328,7 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv4v6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -268,6 +348,8 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "isim",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -275,6 +357,15 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -309,6 +400,8 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "generic_android_class",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.mnc260.mcc310.pub.3gppnetwork.org",
@@ -316,6 +409,7 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv4v6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -335,6 +429,8 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "isim",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -342,6 +438,15 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -376,6 +481,8 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "generic_android_class",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.att.net",
@@ -383,6 +490,7 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv4v6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -402,6 +510,8 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "isim",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -409,6 +519,15 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: true,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -443,6 +562,8 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "iphone15,4_like",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.mnc007.mcc262.pub.3gppnetwork.org",
@@ -450,6 +571,7 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv4v6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -469,6 +591,8 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "isim",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -476,6 +600,15 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: true,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -510,6 +643,8 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
     identity: ProfileIdentityPolicy {
         device_model_hint: "iphone15,4_like",
         spoof_imei: false,
+        device_identity_enabled: false,
+        device_identity_imei: None,
     },
     epdg: EpdgPolicy {
         host: "epdg.epc.mnc005.mcc530.pub.3gppnetwork.spark.co.nz",
@@ -517,6 +652,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         apn: Some("ims"),
         ip_stack: "ipv4v6",
         dns_server: None,
+        dns_servers: &[],
     },
     ikev2: Ikev2Policy {
         nat_keepalive_seconds: 20,
@@ -536,6 +672,8 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         local_port: 5060,
         user_agent: "SimAdmin VoWiFi",
         identity_source: "isim",
+        tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+        options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
             include_pani_authenticated: true,
@@ -543,6 +681,15 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            sec_agree_mode: "auto",
+            expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+            access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            contact_mode: "android_default",
+            contact_param_order: &[],
+            temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+            forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+            initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+            temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -612,6 +759,8 @@ pub fn generate_standard_3gpp_profile(
         identity: ProfileIdentityPolicy {
             device_model_hint: "generic_android_class",
             spoof_imei: false,
+            device_identity_enabled: false,
+            device_identity_imei: None,
         },
         epdg: EpdgPolicy {
             host: epdg_host,
@@ -619,6 +768,7 @@ pub fn generate_standard_3gpp_profile(
             apn: Some("ims"),
             ip_stack: "ipv4v6",
             dns_server: None,
+            dns_servers: &[],
         },
         ikev2: Ikev2Policy {
             nat_keepalive_seconds: 20,
@@ -655,6 +805,8 @@ pub fn generate_standard_3gpp_profile(
             local_port: 5060,
             user_agent: "SimAdmin VoWiFi",
             identity_source: "isim",
+            tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
+            options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
             register: RegisterPolicy {
                 supported_header: "path,sec-agree,gruu",
                 include_pani_authenticated: true,
@@ -662,6 +814,15 @@ pub fn generate_standard_3gpp_profile(
                 enable_initial_reject_fallback: true,
                 use_plain_digest_placeholder: false,
                 require_sec_agree_headers: true,
+                sec_agree_mode: "auto",
+                expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
+                access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+                contact_mode: "android_default",
+                contact_param_order: &[],
+                temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
+                forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
+                initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
+                temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
                 live_header_variant_set: "standard_ims_features",
             },
@@ -684,7 +845,86 @@ pub fn generate_standard_3gpp_profile(
     static_profile
 }
 
+/// Profiles published from the database, keyed by PLMN and by profile id.
+///
+/// The live matching path (`resolve_by_imsi` / `resolve_by_plmn`) is a pure
+/// function used from modules that have no database handle. Rather than thread
+/// one through the whole VoWiFi stack, `ProfileStore` publishes its rows here so
+/// an operator's edit actually takes effect on the next connection instead of
+/// only showing up in the API.
+type ProfileOverrides = (
+    HashMap<String, &'static CarrierProfile>,
+    HashMap<String, &'static CarrierProfile>,
+);
+static DB_OVERRIDES: OnceLock<std::sync::RwLock<ProfileOverrides>> = OnceLock::new();
+
+fn overrides() -> &'static std::sync::RwLock<ProfileOverrides> {
+    DB_OVERRIDES.get_or_init(|| std::sync::RwLock::new((HashMap::new(), HashMap::new())))
+}
+
+/// Replace the published override set. Called by `ProfileStore` after any change.
+pub fn publish_database_profiles(profiles: &[&'static CarrierProfile]) {
+    let mut by_plmn = HashMap::new();
+    let mut by_id = HashMap::new();
+    for profile in profiles {
+        by_plmn.insert(profile.meta.plmn.to_string(), *profile);
+        by_id.insert(profile.meta.profile_id.to_string(), *profile);
+    }
+    *overrides()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = (by_plmn, by_id);
+}
+
+fn database_profile_for_plmn(plmn: &str) -> Option<&'static CarrierProfile> {
+    overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+        .get(plmn)
+        .copied()
+}
+
+fn database_profile_for_id(profile_id: &str) -> Option<&'static CarrierProfile> {
+    overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .1
+        .get(profile_id)
+        .copied()
+}
+
+/// Longest-prefix match of an IMSI against the published database profiles.
+/// Longest first so a 3-digit MNC wins over a 2-digit one sharing its prefix.
+fn database_profile_for_imsi(imsi: &str) -> Option<CarrierMatch> {
+    let digits = imsi.trim();
+    if digits.len() < 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let guard = overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut best: Option<CarrierMatch> = None;
+    for (plmn, profile) in guard.0.iter() {
+        if digits.starts_with(plmn.as_str())
+            && best
+                .as_ref()
+                .is_none_or(|current| current.matched_prefix.len() < plmn.len())
+        {
+            best = Some(CarrierMatch {
+                profile,
+                matched_prefix: plmn.clone(),
+            });
+        }
+    }
+    best
+}
+
 pub fn resolve_by_imsi(imsi: &str) -> Option<CarrierMatch> {
+    // 0. 数据库中的运营商配置优先（用户编辑或导入的）
+    if let Some(matched) = database_profile_for_imsi(imsi) {
+        return Some(matched);
+    }
+
     // 1. 尝试匹配内置预设
     if let Some(matched) = resolve_builtin_by_imsi(imsi) {
         return Some(matched);
@@ -735,6 +975,18 @@ fn resolve_builtin_by_imsi(imsi: &str) -> Option<CarrierMatch> {
 }
 
 pub fn resolve_by_plmn(mcc: &str, mnc: &str) -> Option<&'static CarrierProfile> {
+    // 0. 数据库中的运营商配置优先
+    if let Some(profile) = database_profile_for_plmn(&format!("{mcc}{mnc}")) {
+        return Some(profile);
+    }
+    resolve_builtin_or_derived_by_plmn(mcc, mnc)
+}
+
+/// Resolution without the database overlay: built-in first, then 3GPP
+/// derivation. `ProfileStore` uses this for its fallback because it has already
+/// consulted its own rows — going back through the overlay would consult the
+/// same data twice and, worse, let one store see another's published profiles.
+pub fn resolve_builtin_or_derived_by_plmn(mcc: &str, mnc: &str) -> Option<&'static CarrierProfile> {
     // 1. 尝试匹配内置预设
     if let Some(profile) = BUILTIN_PROFILES
         .iter()
@@ -759,6 +1011,11 @@ pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile
     let normalized = profile_id.trim();
     if normalized.is_empty() {
         return None;
+    }
+
+    // 0. 数据库中的运营商配置优先
+    if let Some(profile) = database_profile_for_id(normalized) {
+        return Some(profile);
     }
 
     // 1. 尝试匹配内置预设

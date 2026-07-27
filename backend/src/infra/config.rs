@@ -1482,6 +1482,65 @@ mod tests {
     }
 
     #[test]
+    fn line_path_policies_and_apn_inherit_globals_until_overridden() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-line-policy-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+
+        // No override yet: both lines see the global policy and APN.
+        assert_eq!(
+            manager.get_line_sms_path_policy(line_a).priority,
+            manager.get_sms_path_policy().priority
+        );
+        assert_eq!(
+            manager.get_line_apn_config(line_a),
+            manager.get_apn_config()
+        );
+
+        // Overriding line A must not move line B.
+        let vowifi_enabled = |policy: SmsPathPolicy| {
+            policy
+                .priority
+                .iter()
+                .any(|layer| layer.kind == AccessPathKind::Vowifi && layer.enabled)
+        };
+        let mut only_volte = manager.get_sms_path_policy();
+        for layer in &mut only_volte.priority {
+            if layer.kind == AccessPathKind::Vowifi {
+                layer.enabled = false;
+            }
+        }
+        manager
+            .set_line_sms_path_policy(line_a, Some(only_volte))
+            .unwrap();
+        assert!(!vowifi_enabled(manager.get_line_sms_path_policy(line_a)));
+        assert!(vowifi_enabled(manager.get_line_sms_path_policy(line_b)));
+        assert!(vowifi_enabled(manager.get_sms_path_policy()));
+
+        let mut line_apn = manager.get_apn_config();
+        line_apn.apn = "line-a-apn".to_string();
+        manager.set_line_apn_config(line_a, Some(line_apn)).unwrap();
+        assert_eq!(manager.get_line_apn_config(line_a).apn, "line-a-apn");
+        assert_eq!(
+            manager.get_line_apn_config(line_b),
+            manager.get_apn_config()
+        );
+
+        // Overrides survive a reload, and clearing one falls back to the global.
+        let reloaded = ConfigManager::new(path.clone());
+        assert!(!vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
+        reloaded.set_line_sms_path_policy(line_a, None).unwrap();
+        assert!(vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn per_line_vowifi_overrides_and_standalone_slots_persist() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-vowifi-{}-{}.json",
@@ -1652,8 +1711,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Nothing writes `vowifi-profiles.conf` any more, but the parser has to keep
+    /// reading every shape that was ever written so the one-time migration into
+    /// the carrier profile database does not drop an operator's overrides.
     #[test]
-    fn external_vowifi_profiles_use_versioned_user_only_schema() {
+    fn legacy_vowifi_profiles_parser_reads_both_historical_layouts() {
         let profile = ExternalVowifiProfile {
             profile_id: "custom-au".to_string(),
             mcc: "505".to_string(),
@@ -1664,20 +1726,30 @@ mod tests {
             apn: Some("ims".to_string()),
             dns_server: None,
         };
-        let serialized =
-            serialize_external_vowifi_profiles(std::slice::from_ref(&profile)).unwrap();
-        assert!(serialized.contains("\"schema_version\": 1"));
-        assert!(!serialized.contains("BUILTIN PROFILES"));
+
+        // Versioned object form, with the comment header the writer used to emit.
+        let versioned = format!(
+            "# SimAdmin custom VoWiFi/ePDG profiles\n{}\n",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "profiles": [profile.clone()],
+            }))
+            .unwrap()
+        );
         assert_eq!(
-            parse_external_vowifi_profiles(&serialized),
+            parse_external_vowifi_profiles(&versioned),
             vec![profile.clone()]
         );
 
+        // Older split-marker form with a bare array.
         let legacy = format!(
             "# --- BUILTIN PROFILES (READ ONLY) ---\nignored\n# --- CUSTOM PROFILES ---\n{}",
             serde_json::to_string(&vec![profile.clone()]).unwrap()
         );
         assert_eq!(parse_external_vowifi_profiles(&legacy), vec![profile]);
+
+        // A missing or unreadable file yields nothing rather than failing.
+        assert!(parse_external_vowifi_profiles("").is_empty());
     }
 
     #[test]
@@ -1872,11 +1944,11 @@ mod tests {
     }
 
     #[test]
-    fn legacy_volte_ip_family_preference_is_read_but_not_serialized() {
+    fn volte_ip_family_preference_round_trips() {
         let defaulted: VolteConfig = serde_json::from_str("{}").unwrap();
         assert_eq!(
             defaulted.ip_family_preference,
-            VolteIpFamilyPreference::Ipv6First
+            VolteIpFamilyPreference::Ipv4First
         );
 
         let configured: VolteConfig =
@@ -1885,10 +1957,15 @@ mod tests {
             configured.ip_family_preference,
             VolteIpFamilyPreference::Ipv4First
         );
-        assert!(serde_json::to_value(configured)
-            .unwrap()
-            .get("ip_family_preference")
-            .is_none());
+        // The preference is now honored by the connect flow, so it must survive a
+        // serialize/deserialize round-trip and stay visible to the config UI.
+        assert_eq!(
+            serde_json::to_value(configured)
+                .unwrap()
+                .get("ip_family_preference")
+                .and_then(|value| value.as_str()),
+            Some("ipv4_first")
+        );
     }
 
     #[test]
@@ -2360,7 +2437,7 @@ fn default_lpac_path() -> String {
     "/opt/simadmin/lpac/lpac".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApnConfig {
     #[serde(default)]
     pub apn: String,
@@ -2461,14 +2538,18 @@ fn default_volte_auto_restore_retry_delay_secs() -> u64 {
     30
 }
 
-/// Legacy address-family values accepted while reading older configurations.
-/// Runtime selection is now fixed to dual-stack first with bounded IPv4/IPv6
-/// fallback, so this value is ignored and no longer serialized or exposed.
+/// IMS bearer IP address-family attempt order. The runtime always asks the
+/// modem for dual-stack first; this preference decides which single family is
+/// tried first when the network does NOT force a specific one, and the order in
+/// which the bearer's local addresses are offered to SIP/REGISTER. When the
+/// network explicitly signals `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed`, that forced
+/// family is honored regardless of this preference. Default is `Ipv4First`:
+/// on an unclear failure, IPv4 is tried before IPv6.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolteIpFamilyPreference {
-    #[default]
     Ipv6First,
+    #[default]
     Ipv4First,
     Ipv6Only,
     Ipv4Only,
@@ -2501,7 +2582,7 @@ pub struct VolteConfig {
     pub voice_enabled: bool,
     #[serde(default)]
     pub connection_enabled: bool,
-    #[serde(default, skip_serializing)]
+    #[serde(default)]
     pub ip_family_preference: VolteIpFamilyPreference,
     #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
     pub auto_restore_initial_delay_secs: u64,
@@ -2708,11 +2789,21 @@ fn default_vowifi_epdg_port() -> u16 {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+/// How this line's IKEv2/NAT-T traffic leaves the host.
+///
+/// Only transports that can actually carry UDP are offered. Plain HTTP CONNECT is
+/// absent by design — it tunnels TCP, so it cannot carry the UDP 500/4500 traffic
+/// IKEv2 and NAT-T need.
+///
+/// `ConnectUdpMasque` was removed after evaluation: the only widely reachable
+/// MASQUE deployment (Cloudflare WARP) speaks Connect-IP (RFC 9484) rather than
+/// Connect-UDP (RFC 9298), requires account and device enrollment, and only
+/// egresses into Cloudflare's own network — it cannot reach an operator ePDG at an
+/// arbitrary host:port. Re-add it only alongside a real RFC 9298 proxy.
 pub enum VowifiProxyMode {
     #[default]
     Direct,
     Socks5UdpAssociate,
-    ConnectUdpMasque,
     UdpRelay,
 }
 
@@ -2767,20 +2858,11 @@ fn default_external_profiles_schema_version() -> u32 {
     1
 }
 
-fn serialize_external_vowifi_profiles(
-    profiles: &[ExternalVowifiProfile],
-) -> Result<String, String> {
-    Ok(format!(
-        "# SimAdmin custom VoWiFi/ePDG profiles\n# Built-in carrier profiles are compiled into the SimAdmin binary.\n# This file contains only user-created profiles and overrides.\n{}\n",
-        serde_json::to_string_pretty(&ExternalVowifiProfilesFile {
-            schema_version: default_external_profiles_schema_version(),
-            profiles: profiles.to_vec(),
-        })
-        .map_err(|error| error.to_string())?
-    ))
-}
-
-fn parse_external_vowifi_profiles(content: &str) -> Vec<ExternalVowifiProfile> {
+/// Parse the legacy `vowifi-profiles.conf`.
+///
+/// Kept only so the one-time migration into the profile database can read an
+/// existing file; nothing writes this format any more.
+pub fn parse_external_vowifi_profiles(content: &str) -> Vec<ExternalVowifiProfile> {
     let legacy_or_current = content
         .split("# --- CUSTOM PROFILES ---")
         .nth(1)
@@ -2849,6 +2931,19 @@ pub struct LineProfileConfig {
     /// while preserving Wi-Fi based VoWiFi and Asterisk Trunk intents.
     #[serde(default)]
     pub airplane_mode_enabled: bool,
+    /// Per-line SMS path priority. `None` inherits the global policy, so
+    /// single-line installs and existing config files keep working unchanged.
+    /// A SIM that only has working VoLTE and a SIM that only has working VoWiFi
+    /// need different orders, which one global list cannot express.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sms_path: Option<SmsPathPolicy>,
+    /// Per-line voice path priority; same inheritance rule as `sms_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_path: Option<VoicePathPolicy>,
+    /// Per-line APN. `None` inherits the global APN, which is only correct while
+    /// every SIM is on the same carrier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apn: Option<ApnConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2945,6 +3040,9 @@ impl LineProfileConfig {
             data_proxy: LineDataProxyConfig::default(),
             roaming_allowed: default_roaming_allowed(),
             airplane_mode_enabled: false,
+            sms_path: None,
+            voice_path: None,
+            apn: None,
         }
     }
 
@@ -3002,11 +3100,6 @@ fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), Stri
             if !config.proxy_endpoint.starts_with("socks5://")
                 && !config.proxy_endpoint.starts_with("socks5h://")
             {
-                return Err("vowifi_proxy_endpoint_invalid".to_string());
-            }
-        }
-        VowifiProxyMode::ConnectUdpMasque => {
-            if !config.proxy_endpoint.starts_with("https://") {
                 return Err("vowifi_proxy_endpoint_invalid".to_string());
             }
         }
@@ -3583,19 +3676,9 @@ impl ConfigManager {
         if !manager.config_path.exists() || changed {
             let _ = manager.save();
         }
-        let external_path = manager.external_vowifi_profiles_path();
-        if !external_path.exists() {
-            let _ = serialize_external_vowifi_profiles(&[]).and_then(|content| {
-                fs::write(external_path, content).map_err(|error| error.to_string())
-            });
-        } else if let Ok(content) = fs::read_to_string(&external_path) {
-            let profiles = parse_external_vowifi_profiles(&content);
-            if let Ok(normalized) = serialize_external_vowifi_profiles(&profiles) {
-                if normalized.trim() != content.trim() {
-                    let _ = fs::write(external_path, normalized);
-                }
-            }
-        }
+        // `vowifi-profiles.conf` is no longer created or rewritten here. Custom
+        // carrier profiles live in the database; an existing file is migrated
+        // once at startup and then archived.
 
         manager
     }
@@ -3610,52 +3693,14 @@ impl ConfigManager {
         self.config.read().unwrap().automation.clone()
     }
 
-    fn external_vowifi_profiles_path(&self) -> PathBuf {
+    /// Path of the retired `vowifi-profiles.conf`. Custom carrier profiles now
+    /// live in the `vowifi_carrier_profiles` database table; this only exists so
+    /// the one-time migration knows where to look.
+    pub fn legacy_vowifi_profiles_path(&self) -> PathBuf {
         self.config_path
             .parent()
             .unwrap_or_else(|| std::path::Path::new("."))
             .join("vowifi-profiles.conf")
-    }
-
-    pub fn get_external_vowifi_profiles(&self) -> Vec<ExternalVowifiProfile> {
-        let path = self.external_vowifi_profiles_path();
-        let Ok(content) = fs::read_to_string(path) else {
-            return Vec::new();
-        };
-        parse_external_vowifi_profiles(&content)
-    }
-
-    pub fn set_external_vowifi_profile(
-        &self,
-        mut profile: ExternalVowifiProfile,
-    ) -> Result<Vec<ExternalVowifiProfile>, String> {
-        profile.profile_id = profile.profile_id.trim().to_string();
-        profile.mcc = profile.mcc.trim().to_string();
-        profile.mnc = profile.mnc.trim().to_string();
-        profile.epdg_host = profile.epdg_host.trim().trim_end_matches('.').to_string();
-        if profile.profile_id.is_empty()
-            || profile.mcc.len() != 3
-            || profile.mnc.len() < 2
-            || profile.mnc.len() > 3
-            || profile.epdg_host.is_empty()
-            || profile.epdg_port == 0
-        {
-            return Err("vowifi_external_profile_invalid".to_string());
-        }
-        let mut profiles = self.get_external_vowifi_profiles();
-        if let Some(existing) = profiles
-            .iter_mut()
-            .find(|item| item.profile_id == profile.profile_id)
-        {
-            *existing = profile;
-        } else {
-            profiles.push(profile);
-        }
-        profiles.sort_by(|left, right| left.profile_id.cmp(&right.profile_id));
-        let path = self.external_vowifi_profiles_path();
-        let content = serialize_external_vowifi_profiles(&profiles)?;
-        fs::write(path, content).map_err(|error| error.to_string())?;
-        Ok(profiles)
     }
 
     /// 更新自动化配置
@@ -4107,6 +4152,41 @@ impl ConfigManager {
         self.set_line_vowifi_config(line_id, LineVowifiConfig { enabled, ..current })
     }
 
+    /// Mutate one line's profile, creating it if this is the first setting the
+    /// line has ever had, then persist. Keeps the per-line setters from each
+    /// repeating the find-or-insert / sort / save dance.
+    fn update_line_profile<F>(&self, line_id: &str, mutate: F) -> Result<LineProfileConfig, String>
+    where
+        F: FnOnce(&mut LineProfileConfig),
+    {
+        if !valid_line_id(line_id) {
+            return Err("invalid_line_id".to_string());
+        }
+        let next = {
+            let mut config = self.config.write().unwrap();
+            let profile = if let Some(profile) = config
+                .line_profiles
+                .iter_mut()
+                .find(|profile| profile.line_id == line_id)
+            {
+                profile
+            } else {
+                config
+                    .line_profiles
+                    .push(LineProfileConfig::for_line(line_id));
+                config.line_profiles.last_mut().expect("profile inserted")
+            };
+            mutate(profile);
+            let next = profile.clone();
+            config
+                .line_profiles
+                .sort_by(|a, b| a.line_id.cmp(&b.line_id));
+            next
+        };
+        self.save()?;
+        Ok(next)
+    }
+
     pub fn set_line_data_connection_enabled(
         &self,
         line_id: &str,
@@ -4421,8 +4501,80 @@ impl ConfigManager {
         Ok(next)
     }
 
+    /// SMS path policy that applies to one line: its own override when set,
+    /// otherwise the global policy.
+    pub fn get_line_sms_path_policy(&self, line_id: &str) -> SmsPathPolicy {
+        self.get_line_profile(line_id)
+            .sms_path
+            .map(|policy| policy.normalized())
+            .unwrap_or_else(|| self.get_sms_path_policy())
+    }
+
+    /// Set or clear (`None`) one line's SMS path override.
+    pub fn set_line_sms_path_policy(
+        &self,
+        line_id: &str,
+        policy: Option<SmsPathPolicy>,
+    ) -> Result<SmsPathPolicy, String> {
+        let normalized = policy.map(|policy| policy.normalized());
+        self.update_line_profile(line_id, |profile| {
+            profile.sms_path = normalized.clone();
+        })?;
+        Ok(self.get_line_sms_path_policy(line_id))
+    }
+
     pub fn get_voice_path_policy(&self) -> VoicePathPolicy {
         self.config.read().unwrap().voice_path.clone().normalized()
+    }
+
+    /// APN that applies to one line: its own override when set, otherwise the
+    /// global APN.
+    pub fn get_line_apn_config(&self, line_id: &str) -> ApnConfig {
+        self.get_line_profile(line_id)
+            .apn
+            .unwrap_or_else(|| self.get_apn_config())
+    }
+
+    /// Set or clear (`None`) one line's APN override.
+    pub fn set_line_apn_config(
+        &self,
+        line_id: &str,
+        apn: Option<ApnConfig>,
+    ) -> Result<ApnConfig, String> {
+        self.update_line_profile(line_id, |profile| {
+            profile.apn = apn.clone();
+        })?;
+        Ok(self.get_line_apn_config(line_id))
+    }
+
+    /// Voice path policy that applies to one line; same inheritance as SMS.
+    pub fn get_line_voice_path_policy(&self, line_id: &str) -> VoicePathPolicy {
+        self.get_line_profile(line_id)
+            .voice_path
+            .map(|policy| policy.normalized())
+            .unwrap_or_else(|| self.get_voice_path_policy())
+    }
+
+    /// Set or clear (`None`) one line's voice path override.
+    pub fn set_line_voice_path_policy(
+        &self,
+        line_id: &str,
+        policy: Option<VoicePathPolicy>,
+    ) -> Result<VoicePathPolicy, String> {
+        let normalized = match policy {
+            Some(policy) => {
+                let policy = policy.normalized();
+                if !policy.gateway_mode {
+                    return Err("voice_gateway_mode_required_on_this_device".to_string());
+                }
+                Some(policy)
+            }
+            None => None,
+        };
+        self.update_line_profile(line_id, |profile| {
+            profile.voice_path = normalized.clone();
+        })?;
+        Ok(self.get_line_voice_path_policy(line_id))
     }
 
     pub fn set_voice_path_policy(

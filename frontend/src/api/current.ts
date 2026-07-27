@@ -1,6 +1,4 @@
 import type {
-  AirplaneModeRequest,
-  AirplaneModeResponse,
   ApiResponse,
   ApnListResponse,
   AutomationConfig,
@@ -13,7 +11,12 @@ import type {
   CallHistoryResponse,
   CallListResponse,
   CallSettingsResponse,
+  CarrierProfileImportRequest,
+  CarrierProfileImportResult,
+  CarrierProfileRecord,
   CellLocationResponse,
+  ResolvedCarrierProfile,
+  StoredCarrierProfile,
   CellLockRequest,
   CellLockResult,
   CellLockStatusResponse,
@@ -62,7 +65,6 @@ import type {
   RadioMode,
   RadioModeResponse,
   RoamingRequest,
-  RoamingResponse,
   SecurityConfig,
   SetApnRequest,
   SignalStrengthResponse,
@@ -195,6 +197,14 @@ async function request<T>(
   const json = (await response.json()) as T
   throwIfApiEnvelopeError(json)
   return json
+}
+
+/// Build the `?line_id=…` suffix for line-scoped cellular endpoints. Omitting
+/// the id lets the backend act on the primary line, which is what the
+/// single-line pages want.
+function lineScopeQuery(lineId?: string) {
+  const trimmed = lineId?.trim()
+  return trimmed ? `?line_id=${encodeURIComponent(trimmed)}` : ''
 }
 
 class SimAdminCurrentAPI {
@@ -362,8 +372,8 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<NetworkInfo>>('/network')
   }
 
-  async getCellsInfo() {
-    return request<ApiResponse<CellsResponse>>('/cells')
+  async getCellsInfo(lineId?: string) {
+    return request<ApiResponse<CellsResponse>>(`/cells${lineScopeQuery(lineId)}`)
   }
 
   async startCellMonitor() {
@@ -417,29 +427,10 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getRoamingStatus() {
-    return request<ApiResponse<RoamingResponse>>('/roaming')
-  }
-
-  async setRoamingAllowed(allowed: boolean) {
-    const body: RoamingRequest = { allowed }
-    return request<ApiResponse<RoamingResponse>>('/roaming', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-  }
-
-  async getAirplaneMode() {
-    return request<ApiResponse<AirplaneModeResponse>>('/airplane-mode')
-  }
-
-  async setAirplaneMode(enabled: boolean) {
-    const body: AirplaneModeRequest = { enabled }
-    return request<ApiResponse<AirplaneModeResponse>>('/airplane-mode', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-  }
+  // Roaming and airplane mode are per line only — see `setLineRoaming` and
+  // `setLineAirplaneMode`, and read state from `getLineNetworkControls`. The old
+  // global `/roaming` and `/airplane-mode` endpoints are gone: they acted on
+  // whichever modem came first while pretending to be device-wide.
 
   async getLineNetworkControls() {
     return request<ApiResponse<LineNetworkControlsResponse[]>>('/modem/line-controls')
@@ -460,9 +451,18 @@ class SimAdminCurrentAPI {
   }
 
   async setLineRoaming(lineId: string, allowed: boolean) {
+    const body: RoamingRequest = { allowed }
     return request<ApiResponse<LineNetworkControlsResponse>>(
       `/modem/lines/${encodeURIComponent(lineId)}/roaming`,
-      { method: 'POST', body: JSON.stringify({ allowed }) },
+      { method: 'POST', body: JSON.stringify(body) },
+    )
+  }
+
+  /** Zero one line's proxied-traffic counters. */
+  async resetLineDataTraffic(lineId: string) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data/traffic/reset`,
+      { method: 'POST', body: JSON.stringify({}) },
     )
   }
 
@@ -493,31 +493,31 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<CellLocationResponse>>('/location/cell-info')
   }
 
-  async getOperators() {
-    return request<ApiResponse<OperatorListResponse>>('/network/operators')
+  async getOperators(lineId?: string) {
+    return request<ApiResponse<OperatorListResponse>>(`/network/operators${lineScopeQuery(lineId)}`)
   }
 
-  async scanOperators() {
-    return request<ApiResponse<OperatorListResponse>>('/network/operators/scan')
+  async scanOperators(lineId?: string) {
+    return request<ApiResponse<OperatorListResponse>>(`/network/operators/scan${lineScopeQuery(lineId)}`)
   }
 
-  async registerOperatorManual(mccmnc: string) {
-    const body: ManualRegisterRequest = { mccmnc }
+  async registerOperatorManual(mccmnc: string, lineId?: string) {
+    const body: ManualRegisterRequest = { mccmnc, line_id: lineId }
     return request<ApiResponse<Record<string, never>>>('/network/register-manual', {
       method: 'POST',
       body: JSON.stringify(body),
     })
   }
 
-  async registerOperatorAuto() {
-    return request<ApiResponse<Record<string, never>>>('/network/register-auto', {
+  async registerOperatorAuto(lineId?: string) {
+    return request<ApiResponse<Record<string, never>>>(`/network/register-auto${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async getApnList() {
-    return request<ApiResponse<ApnListResponse>>('/apn')
+  async getApnList(lineId?: string) {
+    return request<ApiResponse<ApnListResponse>>(`/apn${lineScopeQuery(lineId)}`)
   }
 
   async setApn(config: SetApnRequest) {
@@ -527,30 +527,30 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getRadioMode() {
-    return request<ApiResponse<RadioModeResponse>>('/radio-mode')
+  async getRadioMode(lineId?: string) {
+    return request<ApiResponse<RadioModeResponse>>(`/radio-mode${lineScopeQuery(lineId)}`)
   }
 
-  async setRadioMode(mode: RadioMode) {
+  async setRadioMode(mode: RadioMode, lineId?: string) {
     return request<ApiResponse<Record<string, never>>>('/radio-mode', {
       method: 'POST',
-      body: JSON.stringify({ mode }),
+      body: JSON.stringify({ mode, line_id: lineId }),
     })
   }
 
-  async getBandLockStatus() {
-    return request<ApiResponse<BandLockStatus>>('/band-lock')
+  async getBandLockStatus(lineId?: string) {
+    return request<ApiResponse<BandLockStatus>>(`/band-lock${lineScopeQuery(lineId)}`)
   }
 
-  async setBandLock(config: BandLockRequest) {
+  async setBandLock(config: BandLockRequest, lineId?: string) {
     return request<ApiResponse<Record<string, never>>>('/band-lock', {
       method: 'POST',
-      body: JSON.stringify(config),
+      body: JSON.stringify({ ...config, line_id: lineId }),
     })
   }
 
-  async getCellLockStatus() {
-    return request<ApiResponse<CellLockStatusResponse>>('/cell-lock')
+  async getCellLockStatus(lineId?: string) {
+    return request<ApiResponse<CellLockStatusResponse>>(`/cell-lock${lineScopeQuery(lineId)}`)
   }
 
   async setCellLock(config: CellLockRequest) {
@@ -560,8 +560,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async unlockAllCells() {
-    return request<ApiResponse<CellLockResult>>('/cell-lock/unlock-all', {
+  async unlockAllCells(lineId?: string) {
+    return request<ApiResponse<CellLockResult>>(`/cell-lock/unlock-all${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify({}),
     })
@@ -1038,6 +1038,45 @@ class SimAdminCurrentAPI {
   async getVowifiProfiles() {
     return request<ApiResponse<VowifiProfilesResponse>>('/vowifi/profiles', {
       timeoutMs: 10000,
+    })
+  }
+
+  // ---- VoWiFi carrier profile database ----
+  // These replace the compiled-in carrier constants. Carriers with no row fall
+  // back to the built-ins, and finally to 3GPP-derived defaults.
+
+  async listVowifiCarrierProfiles() {
+    return request<ApiResponse<StoredCarrierProfile[]>>('/vowifi/carrier-profiles', {
+      timeoutMs: 15000,
+    })
+  }
+
+  async saveVowifiCarrierProfile(record: CarrierProfileRecord) {
+    return request<ApiResponse<{ profile_id: string; plmn: string; e911_expected: boolean }>>(
+      '/vowifi/carrier-profiles',
+      { method: 'PUT', body: JSON.stringify(record) },
+    )
+  }
+
+  async deleteVowifiCarrierProfile(profileId: string) {
+    return request<ApiResponse<{ deleted: boolean }>>(
+      `/vowifi/carrier-profiles/${encodeURIComponent(profileId)}`,
+      { method: 'DELETE' },
+    )
+  }
+
+  /** Show which profile a PLMN resolves to, and whether it is stored or derived. */
+  async resolveVowifiCarrierProfile(plmn: string) {
+    return request<ApiResponse<ResolvedCarrierProfile>>(
+      `/vowifi/carrier-profiles/resolve?plmn=${encodeURIComponent(plmn)}`,
+    )
+  }
+
+  async importVowifiCarrierProfiles(payload: CarrierProfileImportRequest) {
+    return request<ApiResponse<CarrierProfileImportResult>>('/vowifi/carrier-profiles/import', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      timeoutMs: 30000,
     })
   }
 

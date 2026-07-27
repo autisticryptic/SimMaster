@@ -236,6 +236,8 @@ pub struct DataConnectionResponse {
     pub active: bool,
 }
 
+/// Body of the per-line roaming toggle. There is no device-wide equivalent any
+/// more — roaming is decided per SIM.
 #[derive(Debug, Deserialize)]
 pub struct RoamingRequest {
     pub allowed: bool,
@@ -245,11 +247,6 @@ pub struct RoamingRequest {
 pub struct RoamingResponse {
     pub roaming_allowed: bool,
     pub is_roaming: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AirplaneModeRequest {
-    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -271,6 +268,9 @@ pub struct LineDataConnectionResponse {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LineNetworkControlsResponse {
     pub line_id: String,
+    /// Human-readable slot name, so callers can label per-line state without a
+    /// second round trip to the modem list.
+    pub slot_label: String,
     pub modem_path: String,
     pub present: bool,
     pub data: LineDataConnectionResponse,
@@ -373,6 +373,9 @@ pub struct RadioModeResponse {
 #[derive(Debug, Deserialize)]
 pub struct RadioModeRequest {
     pub mode: RadioMode,
+    /// Which physical line to act on. Omitted means the primary line.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -406,6 +409,9 @@ pub struct BandLockRequest {
     pub nr_fdd_bands: Vec<u32>,
     #[serde(default)]
     pub nr_tdd_bands: Vec<u32>,
+    /// Which physical line to act on. Omitted means the primary line.
+    #[serde(default, skip_serializing)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -435,6 +441,9 @@ pub struct CellLockRequest {
     pub pci: Option<u16>,
     #[serde(default)]
     pub arfcn: Option<u32>,
+    /// Which physical line to act on. Omitted means the primary line.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 fn default_nr_rat() -> u8 {
@@ -793,6 +802,9 @@ pub struct OperatorListResponse {
 #[derive(Debug, Deserialize)]
 pub struct ManualRegisterRequest {
     pub mccmnc: String,
+    /// Which physical line to register. Omitted means the primary line.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -822,6 +834,10 @@ pub struct SetApnRequest {
     pub username: Option<String>,
     pub password: Option<String>,
     pub auth_method: Option<String>,
+    /// Which physical line this APN belongs to. Omitted means the primary line,
+    /// and only then is the global APN config written.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]
@@ -832,6 +848,9 @@ pub struct CellLockResult {
 #[derive(Debug, Deserialize)]
 pub struct MakeCallRequest {
     pub phone_number: String,
+    /// Which physical line dials. Omitted means the primary line.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
@@ -969,6 +988,10 @@ pub struct SendSmsRequest {
 #[derive(Debug, Deserialize)]
 pub struct PlaceCallRequest {
     pub phone_number: String,
+    /// Which physical line places the call. Omitted means the primary line, so
+    /// the single-line UI keeps working without changes.
+    #[serde(default)]
+    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

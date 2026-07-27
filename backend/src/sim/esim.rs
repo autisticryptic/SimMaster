@@ -198,8 +198,15 @@ impl EsimSupervisor {
         )))
     }
 
-    async fn call_lpac(
+    /// Run an lpac command against one line's eUICC.
+    ///
+    /// `line_id` picks the reader; `None` keeps the legacy single-reader
+    /// behaviour. Without this the APDU channel was pinned to `/dev/wwan0qmi0`,
+    /// so on a multi-reader device every eSIM operation hit the first card no
+    /// matter which one the request named.
+    async fn call_lpac_on_line(
         &self,
+        line_id: Option<&str>,
         action: &str,
         args: &[&str],
         timeout_seconds: u64,
@@ -208,19 +215,28 @@ impl EsimSupervisor {
             return Err(EsimApiError::Disabled);
         }
 
+        let target = esim_target_for_line(line_id);
         let _guard = self.lpac_lock.lock().await;
         run_lpac_command(
             &self.config_manager.get_esim_config().lpac_path,
             action,
             args,
             timeout_seconds,
+            &target,
         )
         .await
     }
 
     pub async fn get_euicc_info(&self) -> Result<EsimEuiccInfo, EsimApiError> {
+        self.get_euicc_info_for_line(None).await
+    }
+
+    pub async fn get_euicc_info_for_line(
+        &self,
+        line_id: Option<&str>,
+    ) -> Result<EsimEuiccInfo, EsimApiError> {
         let response = self
-            .call_lpac("info", &["chip", "info"], ESIM_SHORT_TIMEOUT_SECS)
+            .call_lpac_on_line(line_id, "info", &["chip", "info"], ESIM_SHORT_TIMEOUT_SECS)
             .await?;
         if !command_succeeded(&response) {
             return Err(EsimApiError::Command(response.msg));
@@ -239,8 +255,20 @@ impl EsimSupervisor {
     }
 
     pub async fn get_profiles(&self) -> Result<EsimProfilesResponse, EsimApiError> {
+        self.get_profiles_for_line(None).await
+    }
+
+    pub async fn get_profiles_for_line(
+        &self,
+        line_id: Option<&str>,
+    ) -> Result<EsimProfilesResponse, EsimApiError> {
         let response = self
-            .call_lpac("profiles", &["profile", "list"], ESIM_SHORT_TIMEOUT_SECS)
+            .call_lpac_on_line(
+                line_id,
+                "profiles",
+                &["profile", "list"],
+                ESIM_SHORT_TIMEOUT_SECS,
+            )
             .await?;
         if !command_succeeded(&response) {
             return Err(EsimApiError::Command(response.msg));
@@ -248,8 +276,13 @@ impl EsimSupervisor {
         Ok(normalize_profiles(response))
     }
 
-    pub async fn enable_profile(&self, iccid: String) -> Result<EsimCommandResponse, EsimApiError> {
-        self.call_lpac(
+    pub async fn enable_profile(
+        &self,
+        line_id: Option<&str>,
+        iccid: String,
+    ) -> Result<EsimCommandResponse, EsimApiError> {
+        self.call_lpac_on_line(
+            line_id,
             "enable",
             &["profile", "enable", iccid.as_str(), "1"],
             ESIM_LONG_TIMEOUT_SECS,
@@ -259,10 +292,12 @@ impl EsimSupervisor {
 
     pub async fn rename_profile(
         &self,
+        line_id: Option<&str>,
         iccid: String,
         name: String,
     ) -> Result<EsimCommandResponse, EsimApiError> {
-        self.call_lpac(
+        self.call_lpac_on_line(
+            line_id,
             "rename",
             &["profile", "nickname", iccid.as_str(), name.as_str()],
             ESIM_LONG_TIMEOUT_SECS,
@@ -270,8 +305,13 @@ impl EsimSupervisor {
         .await
     }
 
-    pub async fn delete_profile(&self, iccid: String) -> Result<EsimCommandResponse, EsimApiError> {
-        self.call_lpac(
+    pub async fn delete_profile(
+        &self,
+        line_id: Option<&str>,
+        iccid: String,
+    ) -> Result<EsimCommandResponse, EsimApiError> {
+        self.call_lpac_on_line(
+            line_id,
             "delete",
             &["profile", "delete", iccid.as_str()],
             ESIM_LONG_TIMEOUT_SECS,
@@ -281,6 +321,7 @@ impl EsimSupervisor {
 
     pub async fn download_profile(
         &self,
+        line_id: Option<&str>,
         request: EsimDownloadRequest,
     ) -> Result<EsimCommandResponse, EsimApiError> {
         let mut args = vec![
@@ -305,7 +346,8 @@ impl EsimSupervisor {
         }
 
         // download can take up to 120 seconds
-        self.call_lpac("download", &args, 120).await
+        self.call_lpac_on_line(line_id, "download", &args, 120)
+            .await
     }
 }
 
@@ -506,7 +548,8 @@ fn parse_version_parts(value: &str) -> Vec<u32> {
 
 async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     let mut command = tokio::process::Command::new(command_path);
-    configure_lpac_environment(&mut command, command_path);
+    // The probe only checks that the binary runs, so the default reader is fine.
+    configure_lpac_environment(&mut command, command_path, &esim_target_for_line(None));
 
     let output = match tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
@@ -846,16 +889,34 @@ fn current_millis() -> u128 {
         .as_millis()
 }
 
+/// Which reader an lpac invocation talks to.
+pub struct EsimTarget {
+    pub qmi_device: String,
+    pub uim_slot: u8,
+}
+
+/// Resolve the reader for a line from the same registry the VoWiFi/VoLTE layers
+/// use, so eSIM, SIM auth and IMS all agree on which card a line owns. An empty
+/// or unknown line falls back to the configured global device.
+fn esim_target_for_line(line_id: Option<&str>) -> EsimTarget {
+    let device = crate::access::vowifi::live::sim_device_for_line(line_id.unwrap_or_default());
+    EsimTarget {
+        qmi_device: device.qmi_device,
+        uim_slot: device.uim_slot,
+    }
+}
+
 async fn run_lpac_command(
     lpac_path: &str,
     action: &str,
     args: &[&str],
     timeout_seconds: u64,
+    target: &EsimTarget,
 ) -> Result<EsimCommandResponse, EsimApiError> {
     let command_path = resolve_lpac_path(lpac_path);
     let mut command = tokio::process::Command::new(&command_path);
     command.args(args);
-    configure_lpac_environment(&mut command, &command_path);
+    configure_lpac_environment(&mut command, &command_path, target);
 
     let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
         .await
@@ -953,11 +1014,19 @@ fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
     PathBuf::from(configured)
 }
 
-fn configure_lpac_environment(command: &mut tokio::process::Command, command_path: &Path) {
+fn configure_lpac_environment(
+    command: &mut tokio::process::Command,
+    command_path: &Path,
+    target: &EsimTarget,
+) {
     set_env_default(command, "LPAC_APDU", "qmi");
     set_env_default(command, "LPAC_HTTP", "curl");
-    set_env_default(command, "LPAC_APDU_QMI_DEVICE", "/dev/wwan0qmi0");
-    set_env_default(command, "LPAC_APDU_QMI_UIM_SLOT", "1");
+    set_env_default(command, "LPAC_APDU_QMI_DEVICE", &target.qmi_device);
+    set_env_default(
+        command,
+        "LPAC_APDU_QMI_UIM_SLOT",
+        &target.uim_slot.to_string(),
+    );
     set_env_default(command, "LPAC_APDU_AT_DEVICE", "/dev/wwan0at0");
 
     if let Some(parent) = command_path

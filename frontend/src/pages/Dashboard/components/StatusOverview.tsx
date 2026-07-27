@@ -10,23 +10,25 @@ import {
 } from '@mui/icons-material'
 import { formatCarrierName, getCarrierColor, getCarrierLogo } from '@/utils/carriers'
 import { getSignalColor } from '../utils'
-import type { DeviceInfo, NetworkInfo, CellsResponse, AirplaneModeResponse, RoamingResponse } from '@/api/types'
+import type { DeviceInfo, NetworkInfo, CellsResponse, LineNetworkControlsResponse } from '@/api/types'
 
 interface StatusOverviewProps {
   deviceInfo: DeviceInfo | null
   networkInfo: NetworkInfo | null
   cellsInfo: CellsResponse | null
-  airplaneMode: AirplaneModeResponse | null
-  roaming?: RoamingResponse | null
+  /// Roaming and airplane mode are per line, so the overview summarises across
+  /// the present lines instead of reporting one device-wide value.
+  lineNetworkControls?: LineNetworkControlsResponse[]
 }
 
 export function StatusOverview({
   deviceInfo,
   networkInfo,
   cellsInfo,
-  airplaneMode,
-  roaming,
+  lineNetworkControls = [],
 }: StatusOverviewProps) {
+  const roamingLines = lineNetworkControls.filter((line) => line.roaming.is_roaming)
+  const airplaneLines = lineNetworkControls.filter((line) => line.airplane_mode_requested)
   const theme = useTheme<Theme>()
 
   // 获取网络制式显示
@@ -114,15 +116,16 @@ export function StatusOverview({
           size="small"
         />
 
-        {/* 漫游状态 */}
-        {roaming?.is_roaming && (
+        {/* 漫游状态（按线路） */}
+        {roamingLines.map((line) => (
           <Chip
+            key={`roaming-${line.line_id}`}
             icon={<TravelExplore />}
-            label={roaming.roaming_allowed ? '漫游数据已开启' : '漫游数据已关闭'}
-            color={roaming.roaming_allowed ? 'info' : 'error'}
+            label={`${line.slot_label} ${line.roaming.roaming_allowed ? '漫游数据已开启' : '漫游数据已关闭'}`}
+            color={line.roaming.roaming_allowed ? 'info' : 'error'}
             size="small"
           />
-        )}
+        ))}
 
         {/* Modem 状态 */}
         <Chip
@@ -134,10 +137,16 @@ export function StatusOverview({
 
         {/* VoLTE */}
 
-        {/* 飞行模式 */}
-        {airplaneMode?.enabled && (
-          <Chip icon={<FlightTakeoff />} label="飞行模式" color="warning" size="small" />
-        )}
+        {/* 飞行模式（按线路） */}
+        {airplaneLines.map((line) => (
+          <Chip
+            key={`airplane-${line.line_id}`}
+            icon={<FlightTakeoff />}
+            label={`${line.slot_label} 飞行模式`}
+            color="warning"
+            size="small"
+          />
+        ))}
       </Box>
     </Paper>
   )

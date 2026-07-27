@@ -236,6 +236,34 @@ pub struct VowifiRuntimeEventsResponse {
     pub total: i64,
 }
 
+/// One row of the VoWiFi carrier profile table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VowifiCarrierProfileRow {
+    pub profile_id: String,
+    pub plmn: String,
+    pub source: String,
+    pub payload_json: String,
+    pub updated_at: String,
+}
+
+fn vowifi_carrier_profile_from_row(row: &Row<'_>) -> Result<VowifiCarrierProfileRow> {
+    Ok(VowifiCarrierProfileRow {
+        profile_id: row.get(0)?,
+        plmn: row.get(1)?,
+        source: row.get(2)?,
+        payload_json: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+/// Cumulative proxied traffic for one line as stored on disk.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineDataTrafficEntry {
+    pub uplink_bytes: u64,
+    pub downlink_bytes: u64,
+    pub total_connections: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiRuntimeSnapshotEntry {
     pub phase: String,
@@ -1438,6 +1466,41 @@ impl Database {
             [],
         )?;
 
+        // VoWiFi carrier profiles. These used to be Rust constants, so adding a
+        // carrier meant a rebuild; they are now rows that can be edited and
+        // imported at runtime. `payload_json` holds the whole profile document
+        // so the schema does not have to change every time a policy field is
+        // added.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vowifi_carrier_profiles (
+                profile_id TEXT PRIMARY KEY,
+                plmn TEXT NOT NULL,
+                source TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vowifi_carrier_profiles_plmn
+             ON vowifi_carrier_profiles(plmn)",
+            [],
+        )?;
+
+        // Cumulative proxied traffic per line, so the web page can answer "has
+        // this SIM used any data" across restarts. Keyed by line_id because
+        // every SIM has its own proxy and its own quota.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS line_data_traffic (
+                line_id TEXT PRIMARY KEY,
+                uplink_bytes INTEGER NOT NULL DEFAULT 0,
+                downlink_bytes INTEGER NOT NULL DEFAULT 0,
+                total_connections INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_sms_delivery (
                 message_id TEXT PRIMARY KEY,
@@ -1745,6 +1808,146 @@ impl Database {
         }
 
         Ok(VowifiRuntimeEventsResponse { events, total })
+    }
+
+    pub fn list_vowifi_carrier_profiles(&self) -> Result<Vec<VowifiCarrierProfileRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT profile_id, plmn, source, payload_json, updated_at
+             FROM vowifi_carrier_profiles ORDER BY plmn, profile_id",
+        )?;
+        let rows = stmt.query_map([], vowifi_carrier_profile_from_row)?;
+        rows.collect()
+    }
+
+    pub fn get_vowifi_carrier_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<VowifiCarrierProfileRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT profile_id, plmn, source, payload_json, updated_at
+             FROM vowifi_carrier_profiles WHERE profile_id = ?1",
+            params![profile_id],
+            vowifi_carrier_profile_from_row,
+        )
+        .optional()
+    }
+
+    /// Look up by PLMN. A carrier can in principle have several rows (an
+    /// imported one and a hand-edited one); the most recently updated wins so
+    /// the operator's latest intent is what takes effect.
+    pub fn get_vowifi_carrier_profile_by_plmn(
+        &self,
+        plmn: &str,
+    ) -> Result<Option<VowifiCarrierProfileRow>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT profile_id, plmn, source, payload_json, updated_at
+             FROM vowifi_carrier_profiles WHERE plmn = ?1
+             ORDER BY updated_at DESC LIMIT 1",
+            params![plmn],
+            vowifi_carrier_profile_from_row,
+        )
+        .optional()
+    }
+
+    pub fn upsert_vowifi_carrier_profile(
+        &self,
+        profile_id: &str,
+        plmn: &str,
+        source: &str,
+        payload_json: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO vowifi_carrier_profiles (
+                profile_id, plmn, source, payload_json, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                plmn = excluded.plmn,
+                source = excluded.source,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at",
+            params![
+                profile_id,
+                plmn,
+                source,
+                payload_json,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_vowifi_carrier_profile(&self, profile_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM vowifi_carrier_profiles WHERE profile_id = ?1",
+            params![profile_id],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Cumulative proxied traffic for one line. Absent rows read as zero, which
+    /// is what a line that has never carried traffic should report.
+    pub fn get_line_data_traffic(&self, line_id: &str) -> Result<LineDataTrafficEntry> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT uplink_bytes, downlink_bytes, total_connections
+             FROM line_data_traffic WHERE line_id = ?1",
+            params![line_id],
+            |row| {
+                Ok(LineDataTrafficEntry {
+                    uplink_bytes: row.get::<_, i64>(0)?.max(0) as u64,
+                    downlink_bytes: row.get::<_, i64>(1)?.max(0) as u64,
+                    total_connections: row.get::<_, i64>(2)?.max(0) as u64,
+                })
+            },
+        )
+        .or_else(|error| match error {
+            rusqlite::Error::QueryReturnedNoRows => Ok(LineDataTrafficEntry::default()),
+            other => Err(other),
+        })
+    }
+
+    /// Store one line's cumulative traffic. Callers pass absolute totals (the
+    /// persisted baseline plus what this process has carried), so a crash
+    /// between flushes loses only the traffic since the last flush rather than
+    /// double-counting it.
+    pub fn set_line_data_traffic(
+        &self,
+        line_id: &str,
+        traffic: &LineDataTrafficEntry,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO line_data_traffic (
+                line_id, uplink_bytes, downlink_bytes, total_connections, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(line_id) DO UPDATE SET
+                uplink_bytes = excluded.uplink_bytes,
+                downlink_bytes = excluded.downlink_bytes,
+                total_connections = excluded.total_connections,
+                updated_at = excluded.updated_at",
+            params![
+                line_id,
+                traffic.uplink_bytes as i64,
+                traffic.downlink_bytes as i64,
+                traffic.total_connections as i64,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_line_data_traffic(&self, line_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM line_data_traffic WHERE line_id = ?1",
+            params![line_id],
+        )?;
+        Ok(())
     }
 
     pub fn upsert_vowifi_runtime_snapshot(

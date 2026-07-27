@@ -7,7 +7,7 @@ import type {
   QosInfo,
   SimInfo,
   SystemStatsResponse,
-  AirplaneModeResponse,
+  LineNetworkControlsResponse,
   ConnectionAddressesResponse,
   VowifiConfig,
   VowifiStatusResponse,
@@ -56,7 +56,8 @@ export interface DashboardData {
   dataStatus: boolean
   cellsInfo: CellsResponse | null
   qosInfo: QosInfo | null
-  airplaneMode: AirplaneModeResponse | null
+  /// Per-line network state; airplane mode and roaming live here now.
+  lineNetworkControls: LineNetworkControlsResponse[]
   connectivity: ConnectivityResult | null
   connectionAddresses: ConnectionAddresses
   speedHistory: Record<string, InterfaceSpeedHistory>
@@ -80,7 +81,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [dataStatus, setDataStatus] = useState(false)
   const [cellsInfo, setCellsInfo] = useState<CellsResponse | null>(null)
   const [qosInfo, setQosInfo] = useState<QosInfo | null>(null)
-  const [airplaneMode, setAirplaneMode] = useState<AirplaneModeResponse | null>(null)
+  const [lineNetworkControls, setLineNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [connectionAddresses, setConnectionAddresses] = useState<ConnectionAddresses>({ ipv4: [], ipv6: [] })
   const [vowifiControl, setVowifiControl] = useState<VowifiConfig | null>(null)
@@ -136,7 +137,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         requestOrNull(api.getSimInfo(), 'sim'),
         requestOrNull(api.getNetworkInfo(), 'network'),
         requestOrNull(api.getDataStatus(), 'data'),
-        requestOrNull(api.getAirplaneMode(), 'airplane-mode'),
+        // Airplane mode is per line now, so it comes from the line controls
+        // rather than a device-wide endpoint.
+        requestOrNull(api.getLineNetworkControls(), 'line-controls'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
         requestOrNull(api.getVowifiControl(), 'vowifi-control'),
         requestOrNull(api.getCellsInfo(), 'cells'),
@@ -153,7 +156,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         simRes,
         networkRes,
         dataRes,
-        airplaneModeRes,
+        lineControlsRes,
         addressesRes,
         vowifiControlRes,
         cellsRes,
@@ -164,7 +167,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       if (simRes?.data) setSimInfo(simRes.data)
       if (networkRes?.data) setNetworkInfo(networkRes.data)
       if (dataRes?.data) setDataStatus(dataRes.data.active)
-      if (airplaneModeRes?.data) setAirplaneMode(airplaneModeRes.data)
+      if (lineControlsRes?.data) setLineNetworkControls(lineControlsRes.data)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
       if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
       if (cellsRes?.data) setCellsInfo(cellsRes.data)
@@ -242,7 +245,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       dataStatus,
       cellsInfo,
       qosInfo,
-      airplaneMode,
+      lineNetworkControls,
       connectivity,
       connectionAddresses,
       speedHistory,

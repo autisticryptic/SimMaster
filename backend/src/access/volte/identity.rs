@@ -13,6 +13,62 @@ use super::errors::{code, VolteError};
 use super::sip::ImsIdentity;
 use crate::access::vowifi::qmi_uim::{UsimAkaApduResult, USIM_AID_PREFIX};
 
+pub const ISIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x04];
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UiccApplications {
+    pub usim_aid: Option<Vec<u8>>,
+    pub isim_aid: Option<Vec<u8>>,
+}
+
+/// Extract USIM/ISIM application identifiers from `qmicli
+/// --uim-get-card-status` output. qmicli formatting differs between releases,
+/// so recognition is based on the registered 3GPP RID/application prefixes
+/// instead of translated labels or line positions.
+pub fn parse_uicc_applications(output: &str) -> UiccApplications {
+    let mut applications = UiccApplications::default();
+    for line in output.lines() {
+        let compact = line
+            .bytes()
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .map(|byte| (byte as char).to_ascii_lowercase())
+            .collect::<String>();
+        for (prefix, target) in [
+            ("a0000000871002", &mut applications.usim_aid),
+            ("a0000000871004", &mut applications.isim_aid),
+        ] {
+            let Some(start) = compact.find(prefix) else {
+                continue;
+            };
+            let candidate = &compact[start..];
+            let even_len = candidate.len() - candidate.len() % 2;
+            if let Some(decoded) = decode_hex_aid(&candidate[..even_len]) {
+                if target
+                    .as_ref()
+                    .is_none_or(|current| decoded.len() > current.len())
+                {
+                    *target = Some(decoded);
+                }
+            }
+        }
+    }
+    applications
+}
+
+fn decode_hex_aid(value: &str) -> Option<Vec<u8>> {
+    if value.len() < 14 || value.len() % 2 != 0 {
+        return None;
+    }
+    (0..value.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&value[index..index + 2], 16).ok())
+        .collect()
+}
+
+pub fn aid_hex(aid: &[u8]) -> String {
+    aid.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Build the IMS home domain from MCC/MNC (TS 23.003). MNC is zero-padded to 3
 /// digits per the 3GPP domain rule (even when the operator uses a 2-digit MNC).
 pub fn home_domain(mcc: &str, mnc: &str) -> String {
@@ -156,5 +212,21 @@ mod tests {
             USIM_AID_PREFIX.to_vec()
         );
         assert_eq!(resolve_usim_aid(None), USIM_AID_PREFIX.to_vec());
+    }
+
+    #[test]
+    fn parses_qmicli_usim_and_isim_application_ids() {
+        let output = r#"
+Application type: 'usim (2)'
+Application ID: 'A0:00:00:00:87:10:02:FF:86:FF'
+Application type: 'isim (5)'
+Application ID: 'A0:00:00:00:87:10:04:FF:86:FF'
+"#;
+        let applications = parse_uicc_applications(output);
+        assert!(applications.usim_aid.as_deref().is_some_and(is_usim_aid));
+        assert!(applications
+            .isim_aid
+            .as_deref()
+            .is_some_and(|aid| aid.starts_with(ISIM_AID_PREFIX)));
     }
 }

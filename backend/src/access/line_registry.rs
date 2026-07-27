@@ -19,9 +19,11 @@ use zbus::Connection;
 
 use crate::{
     access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
-    cellular::data_proxy::DataProxyRuntime,
+    access::vowifi::runtime::VowifiRuntime,
+    cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
     infra::config::{ConfigManager, ModemSlotObservation},
+    infra::db::{Database, LineDataTrafficEntry},
     trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
 };
 
@@ -31,6 +33,12 @@ pub struct LineRuntime {
     pub volte_live: VolteLiveHandle,
     pub volte_connect_lock: Mutex<()>,
     pub volte_retry_running: AtomicBool,
+    /// This line's own VoWiFi runtime, bound to its `line_id` so its executor
+    /// stages read that line's ePDG/DNS/proxy overrides and its tunnel gets its
+    /// own TUN device. Several SIMs (different countries, different proxies) can
+    /// therefore be connected at the same time.
+    pub vowifi: Arc<VowifiRuntime>,
+    pub vowifi_connect_lock: Mutex<()>,
     pub trunk: Arc<TrunkRuntime>,
     pub data_proxy: Arc<DataProxyRuntime>,
 }
@@ -38,12 +46,15 @@ pub struct LineRuntime {
 impl LineRuntime {
     fn new(binding: ModemBinding, volte: Arc<VolteRuntime>, volte_live: VolteLiveHandle) -> Self {
         let operator = volte_live.operator_link();
+        let vowifi = Arc::new(VowifiRuntime::for_line(&binding.line_id));
         Self {
             binding: RwLock::new(binding),
             volte,
             volte_live,
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),
+            vowifi,
+            vowifi_connect_lock: Mutex::new(()),
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
             data_proxy: Arc::new(DataProxyRuntime::default()),
         }
@@ -108,6 +119,9 @@ pub struct LineRuntimeRegistry {
     seed_runtime: Arc<VolteRuntime>,
     seed_claimed: AtomicBool,
     config_manager: Option<Arc<ConfigManager>>,
+    /// Used to restore each line's cumulative proxied-traffic counters when the
+    /// line is first discovered, so totals survive a restart.
+    database: Option<Arc<Database>>,
 }
 
 impl LineRuntimeRegistry {
@@ -117,18 +131,21 @@ impl LineRuntimeRegistry {
             seed_runtime,
             seed_claimed: AtomicBool::new(false),
             config_manager: None,
+            database: None,
         }
     }
 
     pub fn with_config(
         seed_runtime: Arc<VolteRuntime>,
         config_manager: Arc<ConfigManager>,
+        database: Arc<Database>,
     ) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
             seed_runtime,
             seed_claimed: AtomicBool::new(false),
             config_manager: Some(config_manager),
+            database: Some(database),
         }
     }
 
@@ -177,6 +194,17 @@ impl LineRuntimeRegistry {
             line.mark_absent();
         }
         for binding in discovered {
+            // Tell the VoWiFi live layer which reader this line owns, so its SIM
+            // authentication and IKE identity run against that line's card rather
+            // than whichever modem happens to be first.
+            if let Some(qmi_device) = binding.qmi_device.as_deref() {
+                crate::access::vowifi::live::register_line_sim_device(
+                    &binding.line_id,
+                    qmi_device,
+                    binding.uim_slot,
+                    &binding.modem_path,
+                );
+            }
             if let Some(line) = lines.get(&binding.line_id) {
                 line.replace_binding(binding);
                 continue;
@@ -192,10 +220,23 @@ impl LineRuntimeRegistry {
             } else {
                 VolteLiveHandle::new()
             };
-            lines.insert(
-                binding.line_id.clone(),
-                Arc::new(LineRuntime::new(binding, runtime, live)),
-            );
+            let line_id = binding.line_id.clone();
+            let line = Arc::new(LineRuntime::new(binding, runtime, live));
+            // Seed the traffic counters from disk the first time we see a line,
+            // so the reported totals are cumulative rather than per-boot.
+            if let Some(database) = &self.database {
+                if let Ok(stored) = database.get_line_data_traffic(&line_id) {
+                    line.data_proxy
+                        .restore_persisted_traffic(DataProxyTraffic {
+                            uplink_bytes: stored.uplink_bytes,
+                            downlink_bytes: stored.downlink_bytes,
+                            total_connections: stored.total_connections,
+                            active_connections: 0,
+                        })
+                        .await;
+                }
+            }
+            lines.insert(line_id, line);
         }
         Ok(lines.values().filter(|line| line.binding().present).count())
     }
@@ -256,6 +297,42 @@ impl LineRuntimeRegistry {
             let profile = config_manager.get_line_profile(&line.binding().line_id);
             line.trunk.reconcile_profile(&profile.trunk).await;
         }
+    }
+
+    /// Write every line's current traffic total to the database.
+    ///
+    /// The value written is the absolute total (persisted baseline + what this
+    /// process has carried), so repeated flushes overwrite rather than
+    /// accumulate. A crash between flushes therefore loses only the traffic
+    /// since the last flush — it never double-counts.
+    pub async fn flush_data_traffic(&self) {
+        let Some(database) = &self.database else {
+            return;
+        };
+        for line in self.all().await {
+            let line_id = line.binding().line_id;
+            let traffic = line.data_proxy.traffic().await;
+            let entry = LineDataTrafficEntry {
+                uplink_bytes: traffic.uplink_bytes,
+                downlink_bytes: traffic.downlink_bytes,
+                total_connections: traffic.total_connections,
+            };
+            if let Err(error) = database.set_line_data_traffic(&line_id, &entry) {
+                tracing::warn!(line_id = %line_id, error = %error, "Failed to persist line data traffic");
+            }
+        }
+    }
+
+    /// Zero one line's traffic, in memory and on disk.
+    pub async fn reset_data_traffic(&self, line_id: &str) -> Option<DataProxyTraffic> {
+        let line = self.get(line_id).await?;
+        let traffic = line.data_proxy.reset_traffic().await;
+        if let Some(database) = &self.database {
+            if let Err(error) = database.clear_line_data_traffic(line_id) {
+                tracing::warn!(line_id = %line_id, error = %error, "Failed to clear line data traffic");
+            }
+        }
+        Some(traffic)
     }
 
     pub async fn present_count(&self) -> usize {

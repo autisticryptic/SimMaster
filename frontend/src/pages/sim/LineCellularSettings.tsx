@@ -36,7 +36,15 @@ export type CellularSettingsSection = 'cells' | 'apn' | 'operator'
 type Props = {
   section: CellularSettingsSection
   lineLabel: string
+  /**
+   * The line these settings belong to. Without it every read and write lands on
+   * whichever baseband the backend picks first, so a multi-SIM device would
+   * silently configure the wrong card while the dialog claims otherwise.
+   */
+  lineId: string
 }
+
+type SectionProps = { lineLabel: string; lineId: string }
 
 const EMPTY_BANDS: BandLockRequest = {
   lte_fdd_bands: [],
@@ -69,7 +77,7 @@ function BandGroup({ label, supported, selected, onChange, prefix }: {
   )
 }
 
-function CellsSettings({ lineLabel }: { lineLabel: string }) {
+function CellsSettings({ lineLabel, lineId }: SectionProps) {
   const [cells, setCells] = useState<CellsResponse | null>(null)
   const [bands, setBands] = useState<BandLockStatus | null>(null)
   const [selection, setSelection] = useState<BandLockRequest>(EMPTY_BANDS)
@@ -84,7 +92,7 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
     setError(null)
     try {
       const [cellsResponse, bandResponse, modeResponse] = await Promise.all([
-        api.getCellsInfo(), api.getBandLockStatus(), api.getRadioMode(),
+        api.getCellsInfo(lineId), api.getBandLockStatus(lineId), api.getRadioMode(lineId),
       ])
       setCells(cellsResponse.data ?? null)
       if (bandResponse.data) {
@@ -103,7 +111,7 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [lineId])
 
   useEffect(() => { void load() }, [load])
 
@@ -131,7 +139,7 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
         <Typography variant="subtitle1" fontWeight={700} flexGrow={1}>小区与锁定</Typography>
         <Button size="small" startIcon={<Refresh />} onClick={() => void load()} disabled={loading || busy !== null}>刷新</Button>
-        <Button size="small" color="warning" onClick={() => void run('unlock-cell', () => api.unlockAllCells(), '已解除小区锁定')} disabled={busy !== null}>解除小区锁定</Button>
+        <Button size="small" color="warning" onClick={() => void run('unlock-cell', () => api.unlockAllCells(lineId), '已解除小区锁定')} disabled={busy !== null}>解除小区锁定</Button>
       </Box>
       <TableContainer sx={{ maxHeight: 300 }}>
         <Table size="small" stickyHeader>
@@ -146,7 +154,7 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
                   <TableCell sx={{ fontFamily: 'monospace' }}>{arfcn || '-'}</TableCell>
                   <TableCell sx={{ fontFamily: 'monospace' }}>{cell.pci || '-'}</TableCell>
                   <TableCell>{cell.rsrp || cell.ssb_rsrp || '-'}</TableCell>
-                  <TableCell align="right"><Button size="small" disabled={!canLock || busy !== null} onClick={() => void run(`cell-${index}`, () => api.setCellLock({ rat: cell.tech.toLowerCase().includes('nr') ? 16 : 12, enable: true, arfcn: Number(arfcn), pci: Number(cell.pci) }), '小区锁定已提交')}>锁定</Button></TableCell>
+                  <TableCell align="right"><Button size="small" disabled={!canLock || busy !== null} onClick={() => void run(`cell-${index}`, () => api.setCellLock({ rat: cell.tech.toLowerCase().includes('nr') ? 16 : 12, enable: true, arfcn: Number(arfcn), pci: Number(cell.pci), line_id: lineId }), '小区锁定已提交')}>锁定</Button></TableCell>
                 </TableRow>
               )
             })}
@@ -158,9 +166,9 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
       <Box borderTop={1} borderColor="divider" pt={2.5}>
         <Box display="flex" alignItems="center" gap={1.5} flexWrap="wrap" mb={2}>
           <Typography variant="subtitle1" fontWeight={700} flexGrow={1}>射频与频段</Typography>
-          <FormControl size="small" sx={{ minWidth: 150 }}><InputLabel>射频模式</InputLabel><Select label="射频模式" value={radioMode} onChange={(event) => { const mode = event.target.value as RadioMode; void run('radio', () => api.setRadioMode(mode), '射频模式已更新').then(() => setRadioMode(mode)) }} disabled={busy !== null}><MenuItem value="auto">自动</MenuItem><MenuItem value="lte">仅 LTE</MenuItem><MenuItem value="nr">仅 5G NR</MenuItem></Select></FormControl>
-          <Button size="small" color="warning" onClick={() => void run('unlock-bands', () => api.setBandLock(EMPTY_BANDS), '已解除频段限制')} disabled={busy !== null}>使用全部频段</Button>
-          <Button size="small" variant="contained" onClick={() => void run('bands', () => api.setBandLock(selection), '频段配置已应用')} disabled={busy !== null}>应用频段</Button>
+          <FormControl size="small" sx={{ minWidth: 150 }}><InputLabel>射频模式</InputLabel><Select label="射频模式" value={radioMode} onChange={(event) => { const mode = event.target.value as RadioMode; void run('radio', () => api.setRadioMode(mode, lineId), '射频模式已更新').then(() => setRadioMode(mode)) }} disabled={busy !== null}><MenuItem value="auto">自动</MenuItem><MenuItem value="lte">仅 LTE</MenuItem><MenuItem value="nr">仅 5G NR</MenuItem></Select></FormControl>
+          <Button size="small" color="warning" onClick={() => void run('unlock-bands', () => api.setBandLock(EMPTY_BANDS, lineId), '已解除频段限制')} disabled={busy !== null}>使用全部频段</Button>
+          <Button size="small" variant="contained" onClick={() => void run('bands', () => api.setBandLock(selection, lineId), '频段配置已应用')} disabled={busy !== null}>应用频段</Button>
         </Box>
         <Stack spacing={2}>
           <BandGroup label="LTE FDD" prefix="B" supported={bands?.supported_lte_fdd_bands ?? []} selected={selection.lte_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_fdd_bands: next }))} />
@@ -173,7 +181,7 @@ function CellsSettings({ lineLabel }: { lineLabel: string }) {
   )
 }
 
-function ApnSettings({ lineLabel }: { lineLabel: string }) {
+function ApnSettings({ lineLabel, lineId }: SectionProps) {
   const [contexts, setContexts] = useState<ApnContext[]>([])
   const [selectedPath, setSelectedPath] = useState('')
   const [form, setForm] = useState<SetApnRequest>({ context_path: '', apn: '', protocol: 'dual', username: '', password: '', auth_method: 'chap' })
@@ -189,18 +197,18 @@ function ApnSettings({ lineLabel }: { lineLabel: string }) {
   const load = useCallback(async () => {
     setLoading(true)
     try {
-      const response = await api.getApnList()
+      const response = await api.getApnList(lineId)
       const items = response.data?.contexts ?? []
       setContexts(items)
       const next = items.find((item) => item.active) ?? items[0]
       if (next) choose(next)
     } catch (err) { setError(errorText(err)) } finally { setLoading(false) }
-  }, [choose])
+  }, [choose, lineId])
   useEffect(() => { void load() }, [load])
 
   const save = async () => {
     setSaving(true); setError(null)
-    try { await api.setApn({ ...form, context_path: selectedPath || form.context_path }); await load() } catch (err) { setError(errorText(err)) } finally { setSaving(false) }
+    try { await api.setApn({ ...form, context_path: selectedPath || form.context_path, line_id: lineId }); await load() } catch (err) { setError(errorText(err)) } finally { setSaving(false) }
   }
 
   return (
@@ -222,25 +230,25 @@ function ApnSettings({ lineLabel }: { lineLabel: string }) {
   )
 }
 
-function OperatorSettings({ lineLabel }: { lineLabel: string }) {
+function OperatorSettings({ lineLabel, lineId }: SectionProps) {
   const [data, setData] = useState<OperatorListResponse | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const load = useCallback(async () => { try { const response = await api.getOperators(); setData(response.data ?? null) } catch (err) { setError(errorText(err)) } }, [])
+  const load = useCallback(async () => { try { const response = await api.getOperators(lineId); setData(response.data ?? null) } catch (err) { setError(errorText(err)) } }, [lineId])
   useEffect(() => { void load() }, [load])
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); try { await action(); await load() } catch (err) { setError(errorText(err)) } finally { setBusy(null) } }
   return (
     <Stack spacing={2}>
       <Alert severity="warning">运营商扫描和重新注册会中断 {lineLabel} 当前驻网，通话或短信期间请勿操作。</Alert>
       {error && <Alert severity="error">{error}</Alert>}
-      <Box display="flex" gap={1} justifyContent="flex-end" flexWrap="wrap"><Button startIcon={<Refresh />} onClick={() => void load()} disabled={busy !== null}>刷新</Button><Button startIcon={<TravelExplore />} onClick={() => void run('scan', async () => { const response = await api.scanOperators(); setData(response.data ?? null) })} disabled={busy !== null}>{busy === 'scan' ? '扫描中…' : '扫描运营商'}</Button><Button variant="contained" onClick={() => void run('auto', () => api.registerOperatorAuto())} disabled={busy !== null}>自动注册</Button></Box>
-      <TableContainer><Table size="small"><TableHead><TableRow><TableCell>运营商</TableCell><TableCell>PLMN</TableCell><TableCell>制式</TableCell><TableCell>状态</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead><TableBody>{(data?.operators ?? []).map((item) => { const plmn = `${item.mcc}${item.mnc}`; return <TableRow key={`${item.path}-${plmn}`}><TableCell>{item.name || '未知运营商'}</TableCell><TableCell sx={{ fontFamily: 'monospace' }}>{plmn || '-'}</TableCell><TableCell>{item.technologies.join(' / ') || '-'}</TableCell><TableCell><Chip size="small" label={item.status === 'current' ? '当前网络' : item.status} color={item.status === 'current' ? 'success' : 'default'} variant="outlined" /></TableCell><TableCell align="right"><Button size="small" disabled={!plmn || item.status === 'current' || busy !== null} onClick={() => void run(plmn, () => api.registerOperatorManual(plmn))}>注册</Button></TableCell></TableRow>})}{(data?.operators.length ?? 0) === 0 && <TableRow><TableCell colSpan={5} align="center">暂无运营商数据</TableCell></TableRow>}</TableBody></Table></TableContainer>
+      <Box display="flex" gap={1} justifyContent="flex-end" flexWrap="wrap"><Button startIcon={<Refresh />} onClick={() => void load()} disabled={busy !== null}>刷新</Button><Button startIcon={<TravelExplore />} onClick={() => void run('scan', async () => { const response = await api.scanOperators(lineId); setData(response.data ?? null) })} disabled={busy !== null}>{busy === 'scan' ? '扫描中…' : '扫描运营商'}</Button><Button variant="contained" onClick={() => void run('auto', () => api.registerOperatorAuto(lineId))} disabled={busy !== null}>自动注册</Button></Box>
+      <TableContainer><Table size="small"><TableHead><TableRow><TableCell>运营商</TableCell><TableCell>PLMN</TableCell><TableCell>制式</TableCell><TableCell>状态</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead><TableBody>{(data?.operators ?? []).map((item) => { const plmn = `${item.mcc}${item.mnc}`; return <TableRow key={`${item.path}-${plmn}`}><TableCell>{item.name || '未知运营商'}</TableCell><TableCell sx={{ fontFamily: 'monospace' }}>{plmn || '-'}</TableCell><TableCell>{item.technologies.join(' / ') || '-'}</TableCell><TableCell><Chip size="small" label={item.status === 'current' ? '当前网络' : item.status} color={item.status === 'current' ? 'success' : 'default'} variant="outlined" /></TableCell><TableCell align="right"><Button size="small" disabled={!plmn || item.status === 'current' || busy !== null} onClick={() => void run(plmn, () => api.registerOperatorManual(plmn, lineId))}>注册</Button></TableCell></TableRow>})}{(data?.operators.length ?? 0) === 0 && <TableRow><TableCell colSpan={5} align="center">暂无运营商数据</TableCell></TableRow>}</TableBody></Table></TableContainer>
     </Stack>
   )
 }
 
-export default function LineCellularSettings({ section, lineLabel }: Props) {
-  if (section === 'cells') return <CellsSettings lineLabel={lineLabel} />
-  if (section === 'apn') return <ApnSettings lineLabel={lineLabel} />
-  return <OperatorSettings lineLabel={lineLabel} />
+export default function LineCellularSettings({ section, lineLabel, lineId }: Props) {
+  if (section === 'cells') return <CellsSettings lineLabel={lineLabel} lineId={lineId} />
+  if (section === 'apn') return <ApnSettings lineLabel={lineLabel} lineId={lineId} />
+  return <OperatorSettings lineLabel={lineLabel} lineId={lineId} />
 }

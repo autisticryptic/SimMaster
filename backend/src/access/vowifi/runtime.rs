@@ -18,7 +18,7 @@ use super::{
     identity::VowifiSimIdentity,
     restore::RestoreProgress,
 };
-use crate::cellular::modem_manager::current_sim_identity;
+use crate::cellular::modem_manager::{current_sim_identity, sim_identity_for_modem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePhase {
@@ -112,6 +112,12 @@ pub struct VowifiRuntime {
     snapshot: Arc<RwLock<RuntimeSnapshot>>,
     live_refresh: Arc<Mutex<LiveRefreshState>>,
     live_generation: Arc<AtomicU64>,
+    /// Which line this runtime serves. Threaded into every executor stage so the
+    /// stage picks up this line's ePDG/DNS/proxy overrides — two SIMs on different
+    /// operators (and different proxies) can therefore run concurrently without
+    /// reading each other's settings. Empty means "no line context", which falls
+    /// back to carrier-profile defaults.
+    line_id: Arc<str>,
 }
 
 #[derive(Debug)]
@@ -141,11 +147,48 @@ impl VowifiRuntime {
                 last_finished: None,
             })),
             live_generation: Arc::new(AtomicU64::new(0)),
+            line_id: Arc::from(""),
         }
     }
 
+    /// Build a runtime bound to one line, so its executor stages use that line's
+    /// network overrides.
+    pub fn for_line(line_id: impl AsRef<str>) -> Self {
+        Self::for_line_with_gate(line_id, LiveExecutorGateReport::from_environment())
+    }
+
+    pub fn for_line_with_gate(line_id: impl AsRef<str>, live_gate: LiveExecutorGateReport) -> Self {
+        Self {
+            line_id: Arc::from(line_id.as_ref()),
+            ..Self::with_live_gate(live_gate)
+        }
+    }
+
+    /// The line this runtime serves, or an empty string when unbound.
+    pub fn line_id(&self) -> &str {
+        &self.line_id
+    }
+
+    /// Read the SIM identity of the modem this runtime is bound to. A runtime
+    /// created with `for_line` resolves its own modem from the line registry, so
+    /// line B never matches a carrier profile from line A's card. Only the
+    /// unbound legacy runtime falls back to "whichever modem is first".
+    async fn read_bound_sim_identity(
+        &self,
+        conn: &Connection,
+    ) -> Option<crate::cellular::modem_manager::SimIdentity> {
+        if self.line_id.is_empty() {
+            return current_sim_identity(conn).await;
+        }
+        let modem_path = super::live::sim_device_for_line(&self.line_id).modem_path;
+        if modem_path.is_empty() {
+            return current_sim_identity(conn).await;
+        }
+        sim_identity_for_modem(conn, &modem_path).await
+    }
+
     pub async fn refresh_identity(&self, conn: &Connection) -> RuntimeSnapshot {
-        let next = match current_sim_identity(conn).await {
+        let next = match self.read_bound_sim_identity(conn).await {
             Some(identity) => {
                 let identity = VowifiSimIdentity::from_modem(&identity);
                 let profile = diagnostics::match_profile_from_identity(&identity);
@@ -346,6 +389,7 @@ impl VowifiRuntime {
                     LiveRefreshScope::StatusProbe => "runtime-status-probe".to_string(),
                     LiveRefreshScope::Connect => "runtime-connect".to_string(),
                 },
+                line_id: self.line_id.to_string(),
             };
 
             // LOG STAGE START TO DB
