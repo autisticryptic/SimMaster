@@ -82,6 +82,13 @@ impl Default for BearerRequest {
 }
 
 impl BearerRequest {
+    pub fn ims(allow_roaming: bool) -> Self {
+        Self {
+            allow_roaming,
+            ..Self::default()
+        }
+    }
+
     /// Build the `--wds-start-network` argument observed in the reference.
     pub fn wds_start_network_arg(&self) -> String {
         match self.profile_id {
@@ -175,6 +182,18 @@ where
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
+            if !bearer_roaming_policy_matches(&details, request.allow_roaming) {
+                tracing::info!(
+                    bearer_path = %path,
+                    allow_roaming = request.allow_roaming,
+                    "Recreating IMS bearer to match roaming policy"
+                );
+                if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
+                    disconnect_bearer(&path).await;
+                }
+                delete_bearer(modem, &path).await?;
+                continue;
+            }
             if is_dual_stack_bearer(&details) {
                 if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
                     let result = parse_bearer_connection(&path, &details);
@@ -299,6 +318,30 @@ where
 fn is_dual_stack_bearer(details: &str) -> bool {
     value(details, "bearer.properties.ip-type")
         .is_some_and(|ip_type| ip_type.eq_ignore_ascii_case("ipv4v6"))
+}
+
+fn bearer_roaming_policy_matches(details: &str, allow_roaming: bool) -> bool {
+    bearer_allows_roaming(details) == Some(allow_roaming)
+}
+
+fn bearer_allows_roaming(details: &str) -> Option<bool> {
+    for key in [
+        "bearer.properties.roaming-allowance",
+        "bearer.properties.allow-roaming",
+    ] {
+        let Some(raw) = value(details, key) else {
+            continue;
+        };
+        let normalized = raw.trim().to_ascii_lowercase();
+        let allowed = match normalized.as_str() {
+            "yes" | "true" | "1" | "allowed" | "any" => true,
+            "no" | "false" | "0" | "forbidden" | "none" | "home" => false,
+            _ if normalized.contains("partner") || normalized.contains("non-partner") => true,
+            _ => continue,
+        };
+        return Some(allowed);
+    }
+    None
 }
 
 struct BearerAttemptFailure {
@@ -687,6 +730,34 @@ mod tests {
     fn default_request_uses_ims_apn() {
         assert_eq!(BearerRequest::default().apn, "ims");
         assert!(!BearerRequest::default().allow_roaming);
+        assert!(BearerRequest::ims(true).allow_roaming);
+    }
+
+    #[test]
+    fn matches_modemmanager_roaming_policy_renderings() {
+        let allowed = "bearer.properties.roaming-allowance : allowed\n";
+        let forbidden = "bearer.properties.roaming-allowance : forbidden\n";
+        let legacy_yes = "bearer.properties.allow-roaming : yes\n";
+        let legacy_no = "bearer.properties.allow-roaming : no\n";
+
+        assert!(bearer_roaming_policy_matches(allowed, true));
+        assert!(bearer_roaming_policy_matches(forbidden, false));
+        assert!(bearer_roaming_policy_matches(legacy_yes, true));
+        assert!(bearer_roaming_policy_matches(legacy_no, false));
+        assert!(!bearer_roaming_policy_matches(allowed, false));
+        assert!(!bearer_roaming_policy_matches(forbidden, true));
+    }
+
+    #[test]
+    fn unknown_roaming_policy_requires_bearer_recreation() {
+        assert!(!bearer_roaming_policy_matches(
+            "bearer.properties.apn : ims\n",
+            true
+        ));
+        assert!(!bearer_roaming_policy_matches(
+            "bearer.properties.apn : ims\n",
+            false
+        ));
     }
 
     #[test]

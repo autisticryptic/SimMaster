@@ -481,6 +481,7 @@ pub async fn connect_live(
         &VolteDeviceBinding::legacy_default(),
         runtime,
         config,
+        false,
         dedupe_enabled,
         database,
         notification_sender,
@@ -493,6 +494,7 @@ pub async fn connect_live_for_line(
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
     config: &VolteConfig,
+    allow_roaming: bool,
     dedupe_enabled: bool,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
@@ -523,7 +525,15 @@ pub async fn connect_live_for_line(
         })
         .await;
 
-    match connect_inner(runtime, generation, device, config.ip_family_preference).await {
+    match connect_inner(
+        runtime,
+        generation,
+        device,
+        config.ip_family_preference,
+        allow_roaming,
+    )
+    .await
+    {
         Ok(session) => {
             let mode = if session.xfrm_plan.is_some() {
                 RegistrationMode::Ipsec
@@ -587,6 +597,7 @@ async fn connect_inner(
     generation: u64,
     device: &VolteDeviceBinding,
     family_pref: VolteIpFamilyPreference,
+    allow_roaming: bool,
 ) -> Result<VolteLiveSession, VolteError> {
     // Build the canonical connection plan from the configured preference. All
     // four family-selection consumers (AT probe order, bearer fallback, IPv6
@@ -642,7 +653,7 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let request = BearerRequest::default();
+    let request = BearerRequest::ims(allow_roaming);
 
     // Preferred path when enabled: establish the IMS bearer directly over QMI on
     // this line's primary control port. That port is the only endpoint where a

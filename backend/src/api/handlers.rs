@@ -2684,6 +2684,7 @@ pub async fn set_line_roaming_handler(
             )
         }
     };
+    let mut data_error = None;
     if profile.data_connection_enabled {
         let binding = line.binding();
         if !binding.present {
@@ -2698,11 +2699,30 @@ pub async fn set_line_roaming_handler(
                 .await;
         if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
+            data_error = Some(error);
         }
+    }
+    if profile.enabled && profile.volte_connection_enabled {
+        let status = line.volte.status().await;
+        if status.registered {
+            let _guard = line.volte_connect_lock.lock().await;
+            crate::access::volte::live::disconnect_live_for_line(
+                &line.volte_live,
+                &line.volte,
+                "line_roaming_policy_changed",
+            )
+            .await;
+        }
+        if !line.volte_retry_in_progress() {
+            start_line_volte_restore(app.clone(), Arc::clone(&line), "roaming_policy_changed")
+                .await;
+        }
+    }
+    if let Some(error) = data_error {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
     }
     (
         StatusCode::OK,
@@ -3258,6 +3278,7 @@ async fn send_sms_over_volte_path(
                 &device,
                 &line.volte,
                 &config,
+                profile.roaming_allowed,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),
@@ -6519,6 +6540,7 @@ async fn run_line_volte_restore_batch(
                 &device,
                 &line.volte,
                 &config,
+                profile.roaming_allowed,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),

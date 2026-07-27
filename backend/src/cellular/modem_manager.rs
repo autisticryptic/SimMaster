@@ -2935,6 +2935,12 @@ mod tests {
     }
 
     #[test]
+    fn per_line_roaming_policy_maps_to_networkmanager_home_only() {
+        assert_eq!(nm_home_only_value(true), "no");
+        assert_eq!(nm_home_only_value(false), "yes");
+    }
+
+    #[test]
     fn parses_qmicli_lte_intra_and_interfrequency_cells() {
         let output = r#"Intrafrequency LTE Info
         Tracking Area Code: '9611'
@@ -6059,7 +6065,7 @@ async fn nm_update_connection(
         args.push(password.into());
     }
     args.push("gsm.home-only".into());
-    args.push(if allow_roaming { "no" } else { "yes" }.into());
+    args.push(nm_home_only_value(allow_roaming).into());
     // Never let a per-line proxy bearer become the system's default route.
     // Connected/interface routes remain available to sockets bound to the
     // cellular device by DataProxyRuntime.
@@ -6076,6 +6082,14 @@ async fn nm_update_connection(
 
     run_recovery_command_owned("nmcli", &args, Duration::from_secs(10)).await?;
     Ok(())
+}
+
+fn nm_home_only_value(allow_roaming: bool) -> &'static str {
+    if allow_roaming {
+        "no"
+    } else {
+        "yes"
+    }
 }
 
 async fn nm_activate_connection(profile: &str) -> Result<(), String> {
