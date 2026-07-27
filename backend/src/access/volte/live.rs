@@ -1217,44 +1217,59 @@ async fn live_receive_loop(
         }
         if tokio::time::Instant::now() >= native_health_at {
             native_health_at = tokio::time::Instant::now() + NATIVE_BEARER_HEALTH_INTERVAL;
-            let health_client = {
+            let health_clients = {
                 let sessions = live.session.lock().await;
                 sessions
                     .as_ref()
                     .and_then(|session| session.native_bearer.as_ref())
-                    .map(|bearer| bearer.session.client.clone())
+                    .map(|bearer| {
+                        bearer
+                            .sessions
+                            .iter()
+                            .map(|session| session.client.clone())
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
             };
-            if let Some(client) = health_client {
-                match client.packet_service_status().await {
-                    Ok(crate::cellular::qmi_wds::PacketServiceStatus::Connected) => {
-                        native_health_failures = 0;
+            if !health_clients.is_empty() {
+                let mut health_failure = None;
+                for client in health_clients {
+                    match client.packet_service_status().await {
+                        Ok(crate::cellular::qmi_wds::PacketServiceStatus::Connected) => {}
+                        Ok(crate::cellular::qmi_wds::PacketServiceStatus::Disconnected) => {
+                            health_failure = Some((
+                                VolteError::with_detail(
+                                    code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                                    "native_ims_packet_service_disconnected".to_string(),
+                                ),
+                                true,
+                            ));
+                            break;
+                        }
+                        Err(error) => {
+                            let unsafe_to_retry = error.is_unsafe_to_retry();
+                            health_failure =
+                                Some((native_bearer::wds_error_to_volte(error), unsafe_to_retry));
+                            break;
+                        }
                     }
-                    Ok(crate::cellular::qmi_wds::PacketServiceStatus::Disconnected) => {
-                        let error = VolteError::with_detail(
-                            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
-                            "native_ims_packet_service_disconnected".to_string(),
-                        );
+                }
+                if let Some((error, stop_immediately)) = health_failure {
+                    native_health_failures = native_health_failures.saturating_add(1);
+                    tracing::warn!(
+                        attempt = native_health_failures,
+                        error = %error,
+                        "Native IMS bearer set health query failed"
+                    );
+                    if stop_immediately
+                        || native_health_failures >= NATIVE_BEARER_HEALTH_FAILURE_LIMIT
+                    {
                         mark_native_bearer_unhealthy(&runtime, &error).await;
                         cleanup_live_session(&live).await;
                         break;
                     }
-                    Err(error) => {
-                        let unsafe_to_retry = error.is_unsafe_to_retry();
-                        let error = native_bearer::wds_error_to_volte(error);
-                        native_health_failures = native_health_failures.saturating_add(1);
-                        tracing::warn!(
-                            attempt = native_health_failures,
-                            error = %error,
-                            "Native IMS bearer health query failed"
-                        );
-                        if unsafe_to_retry
-                            || native_health_failures >= NATIVE_BEARER_HEALTH_FAILURE_LIMIT
-                        {
-                            mark_native_bearer_unhealthy(&runtime, &error).await;
-                            cleanup_live_session(&live).await;
-                            break;
-                        }
-                    }
+                } else {
+                    native_health_failures = 0;
                 }
             }
         }

@@ -44,7 +44,7 @@ use super::{
     bearer::{BearerConnection, BearerRequest},
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
-    plan::{FailureClass, ImsConnectionPlan, IpFamily},
+    plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
 };
 
 /// Synthetic `path` for a natively established bearer.
@@ -74,10 +74,15 @@ pub fn native_bearer_path(device_path: &str, handle: &str) -> String {
 /// plus the session handle needed to tear it down.
 pub struct NativeImsBearer {
     pub connection: BearerConnection,
-    pub session: ImsSession,
+    /// beta2 represents a native dual-stack bearer as one WDS session per
+    /// family. Single-stack fallback contains exactly one entry.
+    pub sessions: Vec<ImsSession>,
     /// How the interface was determined. Carried so the UI/logs can distinguish
     /// an observed netdev from an assumed one.
     pub netdev: ResolvedNetdev,
+    /// Family-specific addresses and policy routes installed for the retained
+    /// WDS sessions. They must be removed without flushing the shared netdev.
+    configured_netdevs: Vec<(String, NetdevConfig)>,
 }
 
 /// Families to attempt, in the plan's order, as QMI `ip-type` values.
@@ -120,18 +125,11 @@ pub async fn establish_native_ims_bearer(
         ));
     }
 
-    let families = qmi_families_for(plan);
-    let session =
-        qmi_wds::start_ims_session(&endpoint, &request.apn, &families, request.profile_id)
-            .await
-            .map_err(wds_error_to_volte)?;
-
     // The netdev must belong to the same baseband as the control port, or a
     // multi-modem host would configure another line's interface.
     let baseband = match crate::cellular::secondary_qmi::baseband_key_for_device(primary_device) {
         Ok(baseband) => baseband,
         Err(error) => {
-            qmi_wds::stop_ims_session(session).await;
             return Err(VolteError::with_detail(
                 code::IP_SETTINGS_MISSING,
                 format!("native_ims_baseband_unresolved:{error}"),
@@ -139,8 +137,191 @@ pub async fn establish_native_ims_bearer(
         }
     };
 
+    let families = qmi_families_for(plan);
+    let mut fallback_families = families.clone();
+    if plan.initial_bearer_attempt() == IpType::Ipv4v6 && families.len() >= 2 {
+        match establish_dual_stack(
+            &endpoint,
+            &baseband,
+            primary_device,
+            request,
+            &families[..2],
+        )
+        .await
+        {
+            Ok(bearer) => return Ok(bearer),
+            Err(error) if failure_class(&error).is_unsafe_to_retry() => return Err(error),
+            Err(error) => {
+                if let Some(forced) = forced_qmi_family(failure_class(&error)) {
+                    fallback_families = vec![forced];
+                }
+                tracing::warn!(
+                    error = %error,
+                    "Native VoLTE dual-stack WDS activation failed; falling back to single-stack attempts"
+                );
+            }
+        }
+    }
+
+    let mut last_error = None;
+    for family in fallback_families {
+        match establish_one(&endpoint, &baseband, primary_device, request, family).await {
+            Ok(bearer) => return Ok(bearer),
+            Err(error) if failure_class(&error).is_unsafe_to_retry() => return Err(error),
+            Err(error) => {
+                tracing::warn!(family, error = %error, "Native VoLTE single-stack WDS attempt failed");
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        VolteError::with_detail(
+            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+            "native_ims_no_family_attempted".to_string(),
+        )
+    }))
+}
+
+async fn establish_dual_stack(
+    endpoint: &WdsEndpoint,
+    baseband: &str,
+    primary_device: &str,
+    request: &BearerRequest,
+    families: &[u8],
+) -> Result<NativeImsBearer, VolteError> {
+    let mut sessions = Vec::with_capacity(2);
+    for family in families.iter().copied() {
+        match start_session(endpoint, request, family).await {
+            Ok(session) => sessions.push(session),
+            Err(error) => {
+                release_sessions(sessions).await;
+                return Err(error);
+            }
+        }
+    }
+    let mut resolutions = Vec::with_capacity(2);
+    for session in &sessions {
+        match resolve_session_netdev(baseband, session).await {
+            Ok(resolution) => resolutions.push(resolution),
+            Err(error) => {
+                teardown_resolutions(&sessions, &resolutions).await;
+                release_sessions(sessions).await;
+                return Err(error);
+            }
+        }
+    }
+    let Some(first_resolution) = resolutions.first().cloned() else {
+        release_sessions(sessions).await;
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    };
+    if resolutions
+        .iter()
+        .any(|resolution| resolution.interface != first_resolution.interface)
+    {
+        teardown_resolutions(&sessions, &resolutions).await;
+        release_sessions(sessions).await;
+        return Err(VolteError::with_detail(
+            code::IP_SETTINGS_MISSING,
+            "native_ims_dual_stack_netdev_mismatch".to_string(),
+        ));
+    }
+    let settings = merge_session_settings(&sessions);
+    let handles = sessions
+        .iter()
+        .map(|session| session.packet_data_handle.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
+    let mut connection = match to_bearer_connection(
+        primary_device,
+        &handles,
+        &first_resolution.interface,
+        0,
+        &settings,
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            teardown_resolutions(&sessions, &resolutions).await;
+            release_sessions(sessions).await;
+            return Err(error);
+        }
+    };
+    connection.ip_type = "ipv4v6".to_string();
+    let configured_netdevs = configured_netdevs(&sessions, &resolutions);
+    Ok(NativeImsBearer {
+        connection,
+        sessions,
+        netdev: first_resolution,
+        configured_netdevs,
+    })
+}
+
+async fn establish_one(
+    endpoint: &WdsEndpoint,
+    baseband: &str,
+    primary_device: &str,
+    request: &BearerRequest,
+    family: u8,
+) -> Result<NativeImsBearer, VolteError> {
+    let (session, resolution) = establish_session(endpoint, baseband, request, family).await?;
+    let connection = match to_bearer_connection(
+        primary_device,
+        &session.packet_data_handle,
+        &resolution.interface,
+        session.ip_family,
+        &session.settings,
+    ) {
+        Ok(connection) => connection,
+        Err(error) => {
+            if let Some(config) = netdev_config_for(&session.settings, session.ip_family) {
+                qmi_netdev::teardown(&resolution.interface, &config).await;
+            }
+            qmi_wds::stop_ims_session(session).await;
+            return Err(error);
+        }
+    };
+    let configured_netdevs = netdev_config_for(&session.settings, session.ip_family)
+        .map(|config| vec![(resolution.interface.clone(), config)])
+        .unwrap_or_default();
+    Ok(NativeImsBearer {
+        connection,
+        sessions: vec![session],
+        netdev: resolution,
+        configured_netdevs,
+    })
+}
+
+async fn establish_session(
+    endpoint: &WdsEndpoint,
+    baseband: &str,
+    request: &BearerRequest,
+    family: u8,
+) -> Result<(ImsSession, ResolvedNetdev), VolteError> {
+    let session = start_session(endpoint, request, family).await?;
+    match resolve_session_netdev(baseband, &session).await {
+        Ok(resolution) => Ok((session, resolution)),
+        Err(error) => {
+            qmi_wds::stop_ims_session(session).await;
+            Err(error)
+        }
+    }
+}
+
+async fn start_session(
+    endpoint: &WdsEndpoint,
+    request: &BearerRequest,
+    family: u8,
+) -> Result<ImsSession, VolteError> {
+    qmi_wds::start_ims_session(endpoint, &request.apn, &[family], request.profile_id)
+        .await
+        .map_err(wds_error_to_volte)
+}
+
+async fn resolve_session_netdev(
+    baseband: &str,
+    session: &ImsSession,
+) -> Result<ResolvedNetdev, VolteError> {
     let resolution = match netdev_config_for(&session.settings, session.ip_family) {
-        Some(config) => qmi_netdev::resolve(&baseband, &config)
+        Some(config) => qmi_netdev::resolve(baseband, &config)
             .await
             .map_err(|error| {
                 VolteError::with_detail(
@@ -153,29 +334,83 @@ pub async fn establish_native_ims_bearer(
             "native_ims_session_has_no_address".to_string(),
         )),
     };
+    resolution
+}
 
-    let resolution = match resolution {
-        Ok(resolution) => resolution,
-        Err(error) => {
-            // A session with no reachable netdev cannot carry SIP. Tear it down
-            // rather than leaving an orphaned PDP context on the modem.
-            qmi_wds::stop_ims_session(session).await;
-            return Err(error);
+fn merge_session_settings(sessions: &[ImsSession]) -> CurrentSettings {
+    merge_current_settings(sessions.iter().map(|session| &session.settings))
+}
+
+fn merge_current_settings<'a>(
+    settings_set: impl IntoIterator<Item = &'a CurrentSettings>,
+) -> CurrentSettings {
+    let mut merged = CurrentSettings::default();
+    for settings in settings_set {
+        if settings.ipv4_address.is_some() {
+            merged.ipv4_address.clone_from(&settings.ipv4_address);
+            merged.ipv4_gateway.clone_from(&settings.ipv4_gateway);
+            merged.ipv4_prefix = settings.ipv4_prefix;
         }
-    };
+        if settings.ipv6_address.is_some() {
+            merged.ipv6_address.clone_from(&settings.ipv6_address);
+            merged.ipv6_gateway.clone_from(&settings.ipv6_gateway);
+            merged.ipv6_prefix = settings.ipv6_prefix;
+        }
+        merge_strings(&mut merged.ipv4_dns, &settings.ipv4_dns);
+        merge_strings(&mut merged.ipv6_dns, &settings.ipv6_dns);
+        merge_strings(&mut merged.pcscf, &settings.pcscf);
+        merged.mtu = match (merged.mtu, settings.mtu) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (None, value) | (value, None) => value,
+        };
+    }
+    merged.ip_family = Some("ipv4v6".to_string());
+    merged
+}
 
-    let connection = to_bearer_connection(
-        primary_device,
-        &session.packet_data_handle,
-        &resolution.interface,
-        session.ip_family,
-        &session.settings,
-    )?;
-    Ok(NativeImsBearer {
-        connection,
-        session,
-        netdev: resolution,
-    })
+fn merge_strings(target: &mut Vec<String>, source: &[String]) {
+    for item in source {
+        if !target.contains(item) {
+            target.push(item.clone());
+        }
+    }
+}
+
+fn failure_class(error: &VolteError) -> FailureClass {
+    FailureClass::from_details(error.detail().unwrap_or(""))
+}
+
+fn forced_qmi_family(class: FailureClass) -> Option<u8> {
+    match class.forced_family()? {
+        IpFamily::Ipv4 => Some(4),
+        IpFamily::Ipv6 => Some(6),
+    }
+}
+
+async fn release_sessions(sessions: Vec<ImsSession>) {
+    for session in sessions {
+        qmi_wds::stop_ims_session(session).await;
+    }
+}
+
+fn configured_netdevs(
+    sessions: &[ImsSession],
+    resolutions: &[ResolvedNetdev],
+) -> Vec<(String, NetdevConfig)> {
+    sessions
+        .iter()
+        .zip(resolutions)
+        .filter_map(|(session, resolution)| {
+            netdev_config_for(&session.settings, session.ip_family)
+                .map(|config| (resolution.interface.clone(), config))
+        })
+        .collect()
+}
+
+async fn teardown_resolutions(sessions: &[ImsSession], resolutions: &[ResolvedNetdev]) {
+    for (interface, config) in configured_netdevs(sessions, resolutions) {
+        qmi_netdev::teardown(&interface, &config).await;
+    }
 }
 
 /// Build the netdev probe configuration for the family the session came up on.
@@ -212,7 +447,10 @@ fn netdev_config_for(settings: &CurrentSettings, family: u8) -> Option<NetdevCon
 
 /// Tear down a native bearer's WDS session.
 pub async fn release_native_ims_bearer(bearer: NativeImsBearer) {
-    qmi_wds::stop_ims_session(bearer.session).await;
+    for (interface, config) in bearer.configured_netdevs {
+        qmi_netdev::teardown(&interface, &config).await;
+    }
+    release_sessions(bearer.sessions).await;
 }
 
 /// Project a WDS session's settings onto the `BearerConnection` contract.
@@ -410,6 +648,40 @@ mod tests {
         assert_eq!(qmi_families_for(&only4), vec![4]);
         let only6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6Only);
         assert_eq!(qmi_families_for(&only6), vec![6]);
+        assert_eq!(forced_qmi_family(FailureClass::NetworkForcedIpv4), Some(4));
+        assert_eq!(forced_qmi_family(FailureClass::NetworkForcedIpv6), Some(6));
+        assert_eq!(forced_qmi_family(FailureClass::PrefixUnavailable), None);
+    }
+
+    #[test]
+    fn dual_stack_settings_merge_both_families_and_deduplicate_pcscf() {
+        let ipv4 = CurrentSettings {
+            ipv4_address: Some("10.0.0.2".to_string()),
+            ipv4_gateway: Some("10.0.0.1".to_string()),
+            ipv4_prefix: Some(30),
+            ipv4_dns: vec!["10.0.0.53".to_string()],
+            pcscf: vec!["10.0.0.10".to_string()],
+            mtu: Some(1500),
+            ..Default::default()
+        };
+        let ipv6 = CurrentSettings {
+            ipv6_address: Some("2001:db8::2".to_string()),
+            ipv6_gateway: Some("2001:db8::1".to_string()),
+            ipv6_prefix: Some(64),
+            ipv6_dns: vec!["2001:db8::53".to_string()],
+            pcscf: vec!["10.0.0.10".to_string(), "2001:db8::10".to_string()],
+            mtu: Some(1428),
+            ..Default::default()
+        };
+        let merged = merge_current_settings([&ipv4, &ipv6]);
+        assert_eq!(merged.ip_family.as_deref(), Some("ipv4v6"));
+        assert_eq!(merged.ipv4_address.as_deref(), Some("10.0.0.2"));
+        assert_eq!(merged.ipv6_address.as_deref(), Some("2001:db8::2"));
+        assert_eq!(merged.mtu, Some(1428));
+        assert_eq!(
+            merged.pcscf,
+            vec!["10.0.0.10".to_string(), "2001:db8::10".to_string()]
+        );
     }
 
     #[test]
