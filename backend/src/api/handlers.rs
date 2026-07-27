@@ -2491,6 +2491,15 @@ pub(crate) async fn start_line_data_runtime(
     line: &Arc<crate::access::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
 ) -> Result<(), String> {
+    let _guard = line.bearer_operation_lock.lock().await;
+    start_line_data_runtime_locked(app, line, profile).await
+}
+
+async fn start_line_data_runtime_locked(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+    profile: &LineProfileConfig,
+) -> Result<(), String> {
     let binding = line.binding();
     if get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
         .await
@@ -2562,6 +2571,14 @@ pub(crate) async fn stop_line_data_runtime(
     app: &AppState,
     line: &Arc<crate::access::line_registry::LineRuntime>,
 ) {
+    let _guard = line.bearer_operation_lock.lock().await;
+    stop_line_data_runtime_locked(app, line).await;
+}
+
+async fn stop_line_data_runtime_locked(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+) {
     let binding = line.binding();
     line.data_proxy.stop().await;
     let had_secondary = line.secondary_data.interface().await.is_some();
@@ -2572,6 +2589,70 @@ pub(crate) async fn stop_line_data_runtime(
                 .await
         {
             warn!(line_id = %binding.line_id, error = %error, "Per-line data disconnect failed");
+        }
+    }
+}
+
+/// Prepare beta2's viable allocation on the reference hardware: normal data on
+/// DATA6 and IMS on the primary QMI endpoint. The caller must hold this line's
+/// `bearer_operation_lock` until IMS activation has completed.
+async fn prepare_line_data_slot_for_volte(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+    profile: &LineProfileConfig,
+) -> crate::access::volte::data_slot::DataSlotMode {
+    use crate::access::volte::data_slot::{select_data_slot_mode, DataSlotInputs, DataSlotMode};
+
+    if !profile.data_connection_enabled {
+        return DataSlotMode::PrimaryImsOnly;
+    }
+
+    let binding = line.binding();
+    let primary_data_active =
+        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+            .await
+            .unwrap_or(None)
+            .is_some();
+    if primary_data_active {
+        // A legacy/NetworkManager Internet bearer occupies the slot IMS needs.
+        // Disconnect only non-IMS bearers before moving data to DATA6.
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            warn!(line_id = %binding.line_id, error = %error, "Failed to release primary data slot before VoLTE");
+        }
+    }
+
+    let data_start_error = start_line_data_runtime_locked(app, line, profile)
+        .await
+        .err();
+    let secondary_data_active = line.secondary_data.interface().await.is_some();
+    if let Some(error) = data_start_error {
+        line.data_proxy.record_error(error.clone()).await;
+        if !secondary_data_active {
+            warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; continuing with IMS-only allocation");
+            return DataSlotMode::PrimaryImsOnly;
+        }
+        // The DATA6 bearer can be healthy even when the local proxy listener
+        // fails (for example, because its configured port is occupied). Keep
+        // the real slot allocation so IMS is never moved back onto MM by this
+        // unrelated listener error.
+        warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+    }
+
+    let inputs = DataSlotInputs {
+        data_requested: true,
+        primary_data_active: false,
+        secondary_data_active,
+        secondary_endpoint_available: binding.qmi_device.is_some(),
+    };
+    match select_data_slot_mode(inputs) {
+        Ok(mode) => mode,
+        Err(error) => {
+            line.data_proxy.record_error(error.to_string()).await;
+            warn!(line_id = %binding.line_id, error = %error, "VoLTE/data slot allocation failed");
+            DataSlotMode::PrimaryImsOnly
         }
     }
 }
@@ -2749,6 +2830,7 @@ pub async fn set_line_roaming_handler(
     if profile.enabled && profile.volte_connection_enabled {
         let status = line.volte.status().await;
         if status.registered {
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
             crate::access::volte::live::disconnect_live_for_line(
                 &line.volte_live,
@@ -2813,7 +2895,9 @@ pub async fn set_line_airplane_mode_handler(
                 )
             }
         };
-        stop_line_data_runtime(&app, &line).await;
+        let _bearer_guard = line.bearer_operation_lock.lock().await;
+        stop_line_data_runtime_locked(&app, &line).await;
+        let _volte_guard = line.volte_connect_lock.lock().await;
         crate::access::volte::live::disconnect_live_for_line(
             &line.volte_live,
             &line.volte,
@@ -3312,6 +3396,8 @@ async fn send_sms_over_volte_path(
     if !line.volte.status().await.registered {
         let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
             .map_err(|error| error.to_string())?;
+        let _bearer_guard = line.bearer_operation_lock.lock().await;
+        let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile).await;
         let _guard = line.volte_connect_lock.lock().await;
         if !line.volte.status().await.registered {
             crate::access::volte::live::connect_live_for_line(
@@ -3320,6 +3406,7 @@ async fn send_sms_over_volte_path(
                 &line.volte,
                 &config,
                 profile.roaming_allowed,
+                data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),
@@ -5422,6 +5509,7 @@ pub async fn set_volte_line_connection_handler(
             start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
             Ok(line.volte.status().await)
         } else {
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
             Ok(crate::access::volte::live::disconnect_live_for_line(
                 &line.volte_live,
@@ -6567,6 +6655,8 @@ async fn run_line_volte_restore_batch(
             .await;
 
         let result = {
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
+            let data_slot_mode = prepare_line_data_slot_for_volte(app, line, &profile).await;
             let _guard = line.volte_connect_lock.lock().await;
             if line.volte.status().await.registered {
                 return;
@@ -6577,6 +6667,7 @@ async fn run_line_volte_restore_batch(
                 &line.volte,
                 &config,
                 profile.roaming_allowed,
+                data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),

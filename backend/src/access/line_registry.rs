@@ -34,6 +34,10 @@ pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
     pub volte: Arc<VolteRuntime>,
     pub volte_live: VolteLiveHandle,
+    /// Serializes every PDP/bearer transition on this physical SIM line.
+    /// DATA6 and IMS use different QMI endpoints, but the baseband policy engine
+    /// still rejects or deactivates sessions when both are started concurrently.
+    pub bearer_operation_lock: Mutex<()>,
     pub volte_connect_lock: Mutex<()>,
     pub volte_retry_running: AtomicBool,
     /// This line's own VoWiFi runtime, bound to its `line_id` so its executor
@@ -58,6 +62,7 @@ impl LineRuntime {
             binding: RwLock::new(binding),
             volte,
             volte_live,
+            bearer_operation_lock: Mutex::new(()),
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),
             vowifi,

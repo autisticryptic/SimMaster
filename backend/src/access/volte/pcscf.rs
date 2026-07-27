@@ -38,6 +38,18 @@ pub struct AtPcscfDiscovery {
     pub cid: u8,
 }
 
+/// IMS PDP profile selected for this registration attempt.
+///
+/// Qualcomm's WDS `3gpp-profile` and the AT PDP context id use the same profile
+/// index on the reference firmware. Keeping the selected id explicit prevents
+/// an APN-only WDS start from attaching to the ordinary Internet profile and
+/// losing the IMS PCO options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImsProfileContext {
+    pub cid: u8,
+    pub created: bool,
+}
+
 /// Parsed IP settings for the IMS bearer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImsIpSettings {
@@ -134,6 +146,57 @@ pub fn configured_ims_cid() -> u8 {
         .and_then(|value| value.trim().parse::<u8>().ok())
         .filter(|value| (1..=16).contains(value))
         .unwrap_or(DEFAULT_IMS_CID)
+}
+
+/// Locate the modem's IMS PDP context, creating an inactive definition only
+/// when no IMS context exists. This function never activates or deactivates a
+/// context; the WDS bearer remains the sole owner of activation.
+pub async fn prepare_ims_profile_context(
+    modem: &str,
+    plan: &ImsConnectionPlan,
+) -> Result<ImsProfileContext, VolteError> {
+    let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
+    let contexts = parse_pdp_contexts(&contexts_output);
+    let preferred = configured_ims_cid();
+
+    if let Some(context) = contexts
+        .iter()
+        .filter(|context| context.apn.eq_ignore_ascii_case("ims"))
+        .min_by_key(|context| (context.cid != preferred, context.cid))
+    {
+        return Ok(ImsProfileContext {
+            cid: context.cid,
+            created: false,
+        });
+    }
+
+    let cid = if !contexts.iter().any(|context| context.cid == preferred) {
+        preferred
+    } else {
+        (1..=16)
+            .find(|candidate| !contexts.iter().any(|context| context.cid == *candidate))
+            .ok_or_else(|| {
+                VolteError::with_detail(
+                    code::RUNTIME_PROFILE_PCSCF_MISSING,
+                    "ims_profile_no_free_cid".to_string(),
+                )
+            })?
+    };
+    let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
+    run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await?;
+    Ok(ImsProfileContext { cid, created: true })
+}
+
+/// Enable or disable Qualcomm P-CSCF delivery for one IMS profile.
+///
+/// Deliberately does not issue `AT+CGACT`: that activation sequence caused a
+/// baseband restart on the reference MSM8916 firmware. The following native or
+/// ModemManager bearer activation consumes this setting safely.
+pub async fn set_pcscf_reporting(modem: &str, cid: u8, enabled: bool) -> Result<(), VolteError> {
+    let value = if enabled { "1,1,1" } else { "0,0,0" };
+    run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},{value}"))
+        .await
+        .map(|_| ())
 }
 
 /// Discover P-CSCF candidates from the IMS context that ModemManager already
@@ -236,26 +299,46 @@ fn parse_active_context_cids(output: &str) -> Vec<u8> {
 }
 
 fn parse_ims_context_cids(output: &str) -> Vec<u8> {
-    let mut cids = Vec::new();
+    parse_pdp_contexts(output)
+        .into_iter()
+        .filter(|context| context.apn.eq_ignore_ascii_case("ims"))
+        .map(|context| context.cid)
+        .collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PdpContext {
+    cid: u8,
+    pdp_type: String,
+    apn: String,
+}
+
+fn parse_pdp_contexts(output: &str) -> Vec<PdpContext> {
+    let mut contexts = Vec::new();
     for line in output.lines() {
         let Some((_, values)) = line.split_once("+CGDCONT:") else {
             continue;
         };
         let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
-        if fields.len() < 3
-            || !fields[2]
-                .trim_matches(['\'', '"'])
-                .eq_ignore_ascii_case("ims")
+        if fields.len() < 3 {
+            continue;
+        }
+        let Ok(cid) = fields[0].trim_matches(['\'', '"']).parse::<u8>() else {
+            continue;
+        };
+        if contexts
+            .iter()
+            .any(|context: &PdpContext| context.cid == cid)
         {
             continue;
         }
-        if let Ok(cid) = fields[0].trim_matches('\'').parse::<u8>() {
-            if !cids.contains(&cid) {
-                cids.push(cid);
-            }
-        }
+        contexts.push(PdpContext {
+            cid,
+            pdp_type: fields[1].trim_matches(['\'', '"']).to_string(),
+            apn: fields[2].trim_matches(['\'', '"']).to_string(),
+        });
     }
-    cids
+    contexts
 }
 
 /// Parse the primary/secondary P-CSCF columns from a 3GPP +CGCONTRDP response.
@@ -776,6 +859,32 @@ IPv4 primary DNS: 10.0.0.53";
             .filter(|cid| active_cids.contains(cid))
             .collect::<Vec<_>>();
         assert_eq!(selected, vec![7]);
+    }
+
+    #[test]
+    fn parses_pdp_profiles_for_ims_profile_selection() {
+        let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"internet\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"ims\",\"0.0.0.0\",0,0\n+CGDCONT: 7,\"IPV6\",\"IMS\",\"0.0.0.0\",0,0'";
+        assert_eq!(
+            parse_pdp_contexts(contexts),
+            vec![
+                PdpContext {
+                    cid: 1,
+                    pdp_type: "IPV4V6".to_string(),
+                    apn: "internet".to_string(),
+                },
+                PdpContext {
+                    cid: 2,
+                    pdp_type: "IPV4V6".to_string(),
+                    apn: "ims".to_string(),
+                },
+                PdpContext {
+                    cid: 7,
+                    pdp_type: "IPV6".to_string(),
+                    apn: "IMS".to_string(),
+                },
+            ]
+        );
+        assert_eq!(parse_ims_context_cids(contexts), vec![2, 7]);
     }
 
     #[test]

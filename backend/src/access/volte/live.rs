@@ -47,7 +47,10 @@ use super::{
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
-    pcscf::{discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket},
+    pcscf::{
+        discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket,
+        prepare_ims_profile_context, set_pcscf_reporting,
+    },
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
     rtp_relay::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
@@ -171,6 +174,10 @@ struct VolteLiveSession {
     /// ModemManager. Owns the WDS client/handle, so teardown must release it here;
     /// `mmcli --disconnect` has no object to act on for such a bearer.
     native_bearer: Option<NativeImsBearer>,
+    data_slot_mode: DataSlotMode,
+    /// Qualcomm P-CSCF reporting is scoped to this session and restored during
+    /// teardown. It changes PCO contents only; activation remains owned by WDS.
+    pcscf_reporting_cid: Option<u8>,
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
@@ -477,6 +484,7 @@ pub async fn connect_live(
         runtime,
         config,
         false,
+        DataSlotMode::PrimaryImsOnly,
         dedupe_enabled,
         database,
         notification_sender,
@@ -490,6 +498,7 @@ pub async fn connect_live_for_line(
     runtime: &Arc<VolteRuntime>,
     config: &VolteConfig,
     allow_roaming: bool,
+    data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
@@ -526,6 +535,7 @@ pub async fn connect_live_for_line(
         device,
         config.ip_family_preference,
         allow_roaming,
+        data_slot_mode,
     )
     .await
     {
@@ -536,16 +546,7 @@ pub async fn connect_live_for_line(
                 RegistrationMode::Udp
             };
             let pcscf = session.pcscf.to_string();
-            // Report the beta2 data-slot allocation rather than an ad-hoc label.
-            // The native path puts IMS on the primary port with DATA6 reserved for
-            // data (`secondary_qmi_data`); the ModemManager path runs IMS on the
-            // primary port with no dedicated data slot (`independent_wwan1`).
-            let data_slot_mode = if session.native_bearer.is_some() {
-                DataSlotMode::PrimaryImsSecondaryData
-            } else {
-                DataSlotMode::PrimaryImsOnly
-            };
-            let data_path_mode = data_slot_mode.as_str().to_string();
+            let data_path_mode = session.data_slot_mode.as_str().to_string();
             *live.session.lock().await = Some(session);
             live.operator.set_ready(config.voice_enabled);
             runtime
@@ -593,6 +594,7 @@ async fn connect_inner(
     device: &VolteDeviceBinding,
     family_pref: VolteIpFamilyPreference,
     allow_roaming: bool,
+    data_slot_mode: DataSlotMode,
 ) -> Result<VolteLiveSession, VolteError> {
     // Build the canonical connection plan from the configured preference. All
     // four family-selection consumers (AT probe order, bearer fallback, IPv6
@@ -644,7 +646,47 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let request = BearerRequest::ims(allow_roaming);
+    let ims_profile = match prepare_ims_profile_context(&device.modem_id, &plan).await {
+        Ok(profile) => {
+            tracing::info!(
+                cid = profile.cid,
+                created = profile.created,
+                "Selected IMS 3GPP profile"
+            );
+            runtime
+                .update(|state| state.at_cid = Some(profile.cid))
+                .await;
+            Some(profile)
+        }
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+            );
+            None
+        }
+    };
+    let mut request = BearerRequest::ims(allow_roaming);
+    request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
+
+    // P-CSCF reporting must be armed before the bearer activation so the IMS
+    // PCO contains the proxy addresses. Do not activate the AT context here:
+    // WDS/ModemManager below owns that transition and the old CGACT sequence is
+    // unsafe on the reference firmware.
+    let pcscf_reporting_cid = if let Some(profile) = ims_profile {
+        match set_pcscf_reporting(&device.modem_id, profile.cid, true).await {
+            Ok(()) => {
+                tracing::info!(cid = profile.cid, "Enabled IMS P-CSCF reporting");
+                Some(profile.cid)
+            }
+            Err(error) => {
+                tracing::warn!(cid = profile.cid, error = %error, "IMS P-CSCF reporting command failed; bearer PCO and DNS discovery remain available");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Preferred path when enabled: establish the IMS bearer directly over QMI on
     // this line's primary control port. That port is the only endpoint where a
@@ -659,7 +701,8 @@ async fn connect_inner(
     // not. On this firmware a bad IMS activation can restart the baseband, so the
     // default stays on the ModemManager path until this is confirmed on a device.
     let mut native_bearer = None;
-    if native_ims_bearer_enabled() {
+    let native_required = data_slot_mode.reserves_data_slot() && data_slot_mode.ims_on_primary();
+    if native_required || native_ims_bearer_enabled() {
         runtime
             .record_attempt(
                 VolteStage::Bearer,
@@ -702,7 +745,8 @@ async fn connect_inner(
                 // A wedged baseband must not be handed to ModemManager for a
                 // second activation attempt: that is precisely what escalates a
                 // subsystem restart into a dead device.
-                if class.is_unsafe_to_retry() {
+                if class.is_unsafe_to_retry() || native_required {
+                    disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
                     return Err(error);
                 }
                 tracing::warn!(
@@ -724,6 +768,7 @@ async fn connect_inner(
                 if let Some(established) = native_bearer.take() {
                     native_bearer::release_native_ims_bearer(established).await;
                 }
+                disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
                 return Err(error);
             }
         }
@@ -890,12 +935,15 @@ async fn connect_inner(
         if let Some(established) = native_bearer.take() {
             native_bearer::release_native_ims_bearer(established).await;
         }
+        disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
     }
     result.map(|mut session| {
         // Hand the session ownership of the native bearer so `cleanup_live_session`
         // can stop the WDS session and release its client id. Without this the PDP
         // context would outlive the SIP session.
         session.native_bearer = native_bearer;
+        session.data_slot_mode = data_slot_mode;
+        session.pcscf_reporting_cid = pcscf_reporting_cid;
         session
     })
 }
@@ -1051,6 +1099,8 @@ async fn connect_family(
         // Attached by `connect_inner`, which owns it until the session is known
         // to be good.
         native_bearer: None,
+        data_slot_mode: DataSlotMode::PrimaryImsOnly,
+        pcscf_reporting_cid: None,
         register_ids: authenticator.ids,
         next_register_cseq: 2 + u32::from(registration.auth_rounds),
         sip_instance: authenticator.sip_instance,
@@ -1396,6 +1446,16 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
             None => disconnect_bearer(&session.bearer.path).await,
         }
+        disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
+    }
+}
+
+async fn disable_pcscf_reporting(modem: &str, cid: Option<u8>) {
+    let Some(cid) = cid else {
+        return;
+    };
+    if let Err(error) = set_pcscf_reporting(modem, cid, false).await {
+        tracing::warn!(cid, error = %error, "Failed to restore IMS P-CSCF reporting state");
     }
 }
 

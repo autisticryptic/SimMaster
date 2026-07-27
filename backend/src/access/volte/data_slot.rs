@@ -10,8 +10,9 @@
 //! allocations:
 //!   - `IMS allocated to primary qmi0; DATA6 is reserved for data`
 //!   - `IMS allocated to DATA6; primary qmi0 is reserved for data`
-//! with the config-level intent serialized as one of `independent_wwan1`,
-//! `secondary_qmi_data`, or `both_data_slots_active`, and the failure cases
+//! with the data-path intent serialized as `independent_wwan1` or
+//! `secondary_qmi_data`. `both_data_slots_active` is a conflict detail, not a
+//! valid allocation, and is returned with
 //! `volte_data_slot_mode_missing` / `volte_data_slot_conflict`.
 //!
 //! Real-hardware testing (2026-07-27, Maxis 50212) established the decisive fact
@@ -63,13 +64,12 @@ impl DataSlotMode {
         }
     }
 
-    /// The config-intent token beta2 serializes this allocation as. Each of the
-    /// three beta2 tokens maps to exactly one mode, so the mapping round-trips.
+    /// The data-path token beta2 reports for this allocation.
     pub fn as_str(self) -> &'static str {
         match self {
             DataSlotMode::PrimaryImsOnly => "independent_wwan1",
             DataSlotMode::PrimaryImsSecondaryData => "secondary_qmi_data",
-            DataSlotMode::SecondaryImsPrimaryData => "both_data_slots_active",
+            DataSlotMode::SecondaryImsPrimaryData => "independent_wwan1",
         }
     }
 
@@ -215,7 +215,7 @@ mod tests {
             mode.allocation_message(),
             "IMS allocated to DATA6; primary qmi0 is reserved for data"
         );
-        assert_eq!(mode.as_str(), "both_data_slots_active");
+        assert_eq!(mode.as_str(), "independent_wwan1");
         assert!(!mode.ims_on_primary());
         assert!(mode.reserves_data_slot());
     }
