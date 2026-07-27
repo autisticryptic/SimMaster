@@ -325,10 +325,30 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
     args.extend_from_slice(&["address", "replace", &address, "dev", interface]);
     run_ip(&args).await?;
 
+    // Keep bearer traffic out of the host's main routing table. A source rule
+    // gives probes (and, for a data bearer, the proxy) a private table without
+    // replacing Wi-Fi/Ethernet defaults or another PDP context's DNS routes.
+    let table = routing_table(interface, config.address).to_string();
+    let source = source_selector(config.address);
+    let mut delete_rule = family_arg.to_vec();
+    delete_rule.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
+    let _ = run_ip(&delete_rule).await;
+    let mut add_rule = family_arg.to_vec();
+    add_rule.extend_from_slice(&["rule", "add", "from", &source, "table", &table]);
+    run_ip(&add_rule).await?;
+
     if let Some(target) = config.probe_target {
         let destination = format!("{}/{}", target, if target.is_ipv6() { 128 } else { 32 });
         let mut args = family_arg.to_vec();
-        args.extend_from_slice(&["route", "replace", &destination, "dev", interface]);
+        args.extend_from_slice(&[
+            "route",
+            "replace",
+            &destination,
+            "dev",
+            interface,
+            "table",
+            &table,
+        ]);
         // A route that will not install means this candidate cannot carry the
         // probe; report it so the candidate is skipped rather than silently
         // probed with no path.
@@ -344,13 +364,51 @@ async fn deconfigure(interface: &str, config: &NetdevConfig) {
     } else {
         &[]
     };
+    let table = routing_table(interface, config.address).to_string();
+    let source = source_selector(config.address);
     let mut args = family_arg.to_vec();
-    args.extend_from_slice(&["route", "flush", "dev", interface]);
+    args.extend_from_slice(&["route", "flush", "table", &table]);
     let _ = run_ip(&args).await;
     let mut args = family_arg.to_vec();
-    args.extend_from_slice(&["address", "flush", "dev", interface]);
+    args.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
     let _ = run_ip(&args).await;
-    let _ = run_ip(&["link", "set", "dev", interface, "down"]).await;
+    let address = format!("{}/{}", config.address, config.prefix);
+    let mut args = family_arg.to_vec();
+    args.extend_from_slice(&["address", "del", &address, "dev", interface]);
+    let _ = run_ip(&args).await;
+}
+
+/// Install the private default route used by a user-data proxy after the
+/// correct bam-dmux netdev has been observed. IMS callers do not call this and
+/// therefore remain limited to their explicit P-CSCF routes.
+pub async fn install_default_route(interface: &str, config: &NetdevConfig) -> Result<(), String> {
+    let family_arg: &[&str] = if config.address.is_ipv6() {
+        &["-6"]
+    } else {
+        &[]
+    };
+    let table = routing_table(interface, config.address).to_string();
+    let mut args = family_arg.to_vec();
+    args.extend_from_slice(&[
+        "route", "replace", "default", "dev", interface, "table", &table,
+    ]);
+    run_ip(&args).await
+}
+
+/// Remove only the address and policy routes created for this session. Never
+/// flush an entire netdev: another bearer (notably IMS) may share the same
+/// bam-dmux parent and must keep its own address and routes.
+pub async fn teardown(interface: &str, config: &NetdevConfig) {
+    deconfigure(interface, config).await;
+}
+
+fn source_selector(address: IpAddr) -> String {
+    format!("{}/{}", address, if address.is_ipv6() { 128 } else { 32 })
+}
+
+fn routing_table(interface: &str, address: IpAddr) -> u32 {
+    let suffix = trailing_number(interface).min(999);
+    12_000 + suffix * 2 + u32::from(address.is_ipv6())
 }
 
 /// Send one packet the network should answer, from the session address.
@@ -491,6 +549,17 @@ mod tests {
         // A name with no numeric suffix sorts last rather than panicking.
         assert_eq!(trailing_number("eth"), u32::MAX);
         assert_eq!(trailing_number("wwan0"), 0);
+    }
+
+    #[test]
+    fn data_policy_tables_are_stable_and_family_separated() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
+        let v6 = IpAddr::V6("2001:db8::2".parse().unwrap());
+        assert_eq!(routing_table("wwan0", v4), 12_000);
+        assert_eq!(routing_table("wwan0", v6), 12_001);
+        assert_eq!(routing_table("wwan7", v4), 12_014);
+        assert_eq!(source_selector(v4), "10.0.0.2/32");
+        assert_eq!(source_selector(v6), "2001:db8::2/128");
     }
 
     #[test]

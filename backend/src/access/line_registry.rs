@@ -20,8 +20,11 @@ use zbus::Connection;
 use crate::{
     access::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
     access::vowifi::runtime::VowifiRuntime,
-    cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
     cellular::modem_manager::{discover_modem_bindings, ModemBinding},
+    cellular::{
+        data_proxy::{DataProxyRuntime, DataProxyTraffic},
+        secondary_qmi_data::SecondaryDataRuntime,
+    },
     infra::config::{ConfigManager, ModemSlotObservation},
     infra::db::{Database, LineDataTrafficEntry},
     trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
@@ -41,6 +44,10 @@ pub struct LineRuntime {
     pub vowifi_connect_lock: Mutex<()>,
     pub trunk: Arc<TrunkRuntime>,
     pub data_proxy: Arc<DataProxyRuntime>,
+    /// Dedicated DATA6 bearer that feeds only this line's HTTP/SOCKS proxy.
+    /// It is separate from the proxy listener because the bearer must remain
+    /// alive while listeners are reconfigured.
+    pub secondary_data: Arc<SecondaryDataRuntime>,
 }
 
 impl LineRuntime {
@@ -57,6 +64,7 @@ impl LineRuntime {
             vowifi_connect_lock: Mutex::new(()),
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
             data_proxy: Arc::new(DataProxyRuntime::default()),
+            secondary_data: Arc::new(SecondaryDataRuntime::default()),
         }
     }
 

@@ -3829,6 +3829,16 @@ async fn read_bearer_simple_connect_settings(
         match get_all_properties(conn, &path, MM_BEARER).await {
             Ok(props) => {
                 let settings = simple_connect_settings_from_bearer_props(&props);
+                // IMS is a signalling bearer, never a general Internet APN.
+                // Reusing it here makes NetworkManager report success while the
+                // data proxy correctly refuses the only connected interface.
+                if settings
+                    .apn
+                    .as_deref()
+                    .is_some_and(|apn| apn.eq_ignore_ascii_case("ims"))
+                {
+                    continue;
+                }
                 if settings.has_apn() {
                     return settings;
                 }
@@ -3985,6 +3995,36 @@ pub async fn connect_data_via_modem(
     simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn, true)
         .await
         .map(|_| ())
+}
+
+/// Resolve the APN used by a normal user-data bearer. An empty per-line APN is
+/// filled from the modem's non-IMS/default-attach bearer; `ims` is never
+/// returned because routing user traffic through it would break registration.
+pub async fn resolve_data_apn_config(
+    conn: &Connection,
+    modem_path: &str,
+    configured_apn: Option<&ApnConfig>,
+) -> ApnConfig {
+    if let Some(config) = configured_apn.filter(|config| {
+        let apn = config.apn.trim();
+        !apn.is_empty() && !apn.eq_ignore_ascii_case("ims")
+    }) {
+        return config.clone();
+    }
+
+    let settings = resolve_simple_connect_settings(conn, modem_path, None).await;
+    let mut resolved = configured_apn.cloned().unwrap_or_default();
+    resolved.apn = settings
+        .apn
+        .filter(|apn| !apn.eq_ignore_ascii_case("ims"))
+        .unwrap_or_else(|| "internet".to_string());
+    if let Some(user) = settings.user {
+        resolved.username = user;
+    }
+    if let Some(password) = settings.password {
+        resolved.password = password;
+    }
+    resolved
 }
 
 async fn set_data_connection_inner(

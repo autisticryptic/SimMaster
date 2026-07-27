@@ -16,4 +16,5 @@ pub mod modem_manager;
 pub mod qmi_netdev;
 pub mod qmi_wds;
 pub mod secondary_qmi;
+pub mod secondary_qmi_data;
 pub mod serial;

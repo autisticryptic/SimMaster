@@ -40,10 +40,7 @@ mod system;
 mod trunk;
 
 use api::handlers::*;
-use cellular::modem_manager::{
-    connect_data_via_modem, data_interface_for_modem, disconnect_data_via_modem,
-    ensure_nm_modem_profile, set_airplane_mode_for_modem,
-};
+use cellular::modem_manager::{ensure_nm_modem_profile, set_airplane_mode_for_modem};
 use infra::config::{get_default_config_path, ConfigManager};
 use infra::db::Database;
 use network::device_network::DdnsManager;
@@ -722,12 +719,7 @@ async fn main() -> Result<()> {
                     .config_manager
                     .get_line_profile(&binding.line_id);
                 if profile.airplane_mode_enabled {
-                    let _ = line.data_proxy.stop().await;
-                    let _ = disconnect_data_via_modem(
-                        restore_app.dbus_conn.as_ref(),
-                        &binding.modem_path,
-                    )
-                    .await;
+                    api::handlers::stop_line_data_runtime(&restore_app, &line).await;
                     let _ = set_airplane_mode_for_modem(
                         restore_app.dbus_conn.as_ref(),
                         &binding.modem_path,
@@ -739,34 +731,10 @@ async fn main() -> Result<()> {
                 if !profile.data_connection_enabled {
                     continue;
                 }
-                let allow_roaming = profile.roaming_allowed;
-                let apn = restore_app.config_manager.get_apn_config();
-                if let Err(error) = connect_data_via_modem(
-                    restore_app.dbus_conn.as_ref(),
-                    &binding.modem_path,
-                    allow_roaming,
-                    Some(&apn),
-                )
-                .await
+                if let Err(error) =
+                    api::handlers::start_line_data_runtime(&restore_app, &line, &profile).await
                 {
                     let _ = line.data_proxy.record_error(error).await;
-                    continue;
-                }
-                for _ in 0..15 {
-                    if let Ok(Some(interface)) = data_interface_for_modem(
-                        restore_app.dbus_conn.as_ref(),
-                        &binding.modem_path,
-                    )
-                    .await
-                    {
-                        if let Err(error) =
-                            line.data_proxy.start(&interface, &profile.data_proxy).await
-                        {
-                            let _ = line.data_proxy.record_error(error).await;
-                        }
-                        break;
-                    }
-                    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                 }
             }
         });

@@ -2357,10 +2357,11 @@ async fn build_line_network_controls(
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
     let connected = if binding.present {
-        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-            .await
-            .unwrap_or(None)
-            .is_some()
+        line.secondary_data.interface().await.is_some()
+            || modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+                .unwrap_or(None)
+                .is_some()
     } else {
         false
     };
@@ -2485,13 +2486,53 @@ pub async fn reset_line_data_traffic_handler(
     )
 }
 
-async fn start_line_data_runtime(
+pub(crate) async fn start_line_data_runtime(
     app: &AppState,
     line: &Arc<crate::access::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
 ) -> Result<(), String> {
     let binding = line.binding();
-    let apn = app.config_manager.get_apn_config();
+    if get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+        .await
+        .unwrap_or(false)
+        && !profile.roaming_allowed
+    {
+        return Err("cellular_data_roaming_forbidden".to_string());
+    }
+    let configured_apn = app.config_manager.get_line_apn_config(&binding.line_id);
+    let apn = modem_manager::resolve_data_apn_config(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+        Some(&configured_apn),
+    )
+    .await;
+
+    if let Some(qmi_device) = binding.qmi_device.as_deref() {
+        match line
+            .secondary_data
+            .start(&binding.modem_id, qmi_device, &apn)
+            .await
+        {
+            Ok(interface) => {
+                line.data_proxy
+                    .start(&interface, &profile.data_proxy)
+                    .await?;
+                return Ok(());
+            }
+            Err(error) if profile.volte_connection_enabled => return Err(error),
+            Err(error) => warn!(
+                line_id = %binding.line_id,
+                error = %error,
+                "Secondary DATA unavailable; VoLTE is disabled so ModemManager fallback is allowed"
+            ),
+        }
+    } else if profile.volte_connection_enabled {
+        return Err("cellular_secondary_qmi_device_unavailable".to_string());
+    }
+
+    // Single-slot fallback. This is intentionally forbidden above while VoLTE
+    // is enabled because a normal MM bearer deactivates the IMS bearer on this
+    // firmware.
     modem_manager::connect_data_via_modem(
         app.dbus_conn.as_ref(),
         &binding.modem_path,
@@ -2515,6 +2556,24 @@ async fn start_line_data_runtime(
         .start(&interface, &profile.data_proxy)
         .await?;
     Ok(())
+}
+
+pub(crate) async fn stop_line_data_runtime(
+    app: &AppState,
+    line: &Arc<crate::access::line_registry::LineRuntime>,
+) {
+    let binding = line.binding();
+    line.data_proxy.stop().await;
+    let had_secondary = line.secondary_data.interface().await.is_some();
+    line.secondary_data.stop().await;
+    if !had_secondary {
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            warn!(line_id = %binding.line_id, error = %error, "Per-line data disconnect failed");
+        }
+    }
 }
 
 pub async fn set_line_data_connection_handler(
@@ -2559,13 +2618,7 @@ pub async fn set_line_data_connection_handler(
             );
         }
     } else {
-        line.data_proxy.stop().await;
-        if let Err(error) =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-        {
-            warn!(line_id = %line_id, error = %error, "Per-line data disconnect failed");
-        }
+        stop_line_data_runtime(&app, &line).await;
     }
     if let Err(error) = app
         .config_manager
@@ -2637,19 +2690,7 @@ pub async fn set_line_data_proxy_config_handler(
                 Json(ApiResponse::error("line_not_present")),
             );
         }
-        let Some(interface) =
-            modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-                .unwrap_or(None)
-        else {
-            let error = "cellular_data_interface_unavailable".to_string();
-            line.data_proxy.record_error(error.clone()).await;
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
-        };
-        if let Err(error) = line.data_proxy.start(&interface, &profile.data_proxy).await {
+        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
             return (
                 StatusCode::OK,
@@ -2699,10 +2740,7 @@ pub async fn set_line_roaming_handler(
                 Json(ApiResponse::error("line_not_present")),
             );
         }
-        line.data_proxy.stop().await;
-        let _ =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await;
+        stop_line_data_runtime(&app, &line).await;
         if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
             data_error = Some(error);
@@ -2775,10 +2813,7 @@ pub async fn set_line_airplane_mode_handler(
                 )
             }
         };
-        line.data_proxy.stop().await;
-        let _ =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await;
+        stop_line_data_runtime(&app, &line).await;
         crate::access::volte::live::disconnect_live_for_line(
             &line.volte_live,
             &line.volte,
@@ -4794,6 +4829,10 @@ async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> 
     let Some(modem_path) = scope.modem_path() else {
         return Ok(());
     };
+    if let Some(line) = app.line_registry.get(scope.line_id()).await {
+        stop_line_data_runtime(app, &line).await;
+        return Ok(());
+    }
     modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &modem_path)
         .await
         .map_err(|err| err.to_string())
@@ -4814,19 +4853,10 @@ async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope)
     if !should_restore_data {
         return;
     }
-    let Some(modem_path) = scope.modem_path() else {
-        return;
-    };
-    let apn_config = app.config_manager.get_line_apn_config(scope.line_id());
-    if let Err(err) = modem_manager::connect_data_via_modem(
-        app.dbus_conn.as_ref(),
-        &modem_path,
-        line_profile.roaming_allowed,
-        Some(&apn_config),
-    )
-    .await
-    {
-        warn!(error = %err, "Failed to restore cellular data after WiFi Calling");
+    if let Some(line) = app.line_registry.get(scope.line_id()).await {
+        if let Err(err) = start_line_data_runtime(app, &line, &line_profile).await {
+            warn!(error = %err, "Failed to restore cellular data after WiFi Calling");
+        }
     }
 }
 
