@@ -1,0 +1,424 @@
+name: Build-Release
+
+# 多架构发布构建：编译前端 + 后端，按架构分别打包为 .tar.gz 并发布到 GitHub Release。
+#
+# 产物结构与既有 OTA 包保持一致（meta.json + simadmin + www/），
+# 符合 deploy/install.sh 的安装约定，可直接被现有 OTA 流程消费。
+#
+# 目前支持的架构：
+#   - linux/aarch64 (ARM64) -> simadmin-aarch64.tar.gz
+#                              （并额外生成 simadmin.tar.gz 别名，兼容 install.sh 默认下载名）
+#   - linux/x86_64  (AMD64) -> simadmin-x86_64.tar.gz
+#
+# Windows 支持已预留（见下方 build.matrix 中被注释的条目与 TODO 说明）。
+# 因当前后端大量依赖 dbus 读取系统状态，Windows 端待后端适配完成后再开启。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（例如：1.0.0，auto=读取 VERSION 文件）'
+        required: false
+        type: string
+        default: 'auto'
+      use_upx:
+        description: '使用 UPX 压缩二进制'
+        required: false
+        type: boolean
+        default: true
+      release_type:
+        description: '发布类型（Release type）'
+        required: true
+        type: choice
+        default: '最新正式版（latest release）'
+        options:
+          - '最新正式版（latest release）'
+          - '预发布版（pre-release）'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+permissions:
+  contents: write
+
+jobs:
+  # ==================== 1. 版本解析 + 前端构建（架构无关，构建一次） ====================
+  prepare:
+    name: Prepare (version + frontend)
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      current_version: ${{ steps.version.outputs.current_version }}
+      version_source: ${{ steps.version.outputs.version_source }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read & validate VERSION
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
+          VERSION=$(echo "$INPUT_VERSION" | tr -d '[:space:]')
+
+          if [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
+            VERSION="$CURRENT_VERSION"
+            SOURCE="VERSION file"
+          else
+            SOURCE="workflow input"
+          fi
+
+          if [ -z "$VERSION" ]; then
+            echo "❌ 错误: 版本号不能为空"
+            exit 1
+          fi
+
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+(\.[0-9]+){1,3}([-.][0-9A-Za-z]+)*$'; then
+            echo "❌ 错误: 版本号格式不合法: $VERSION"
+            echo "示例: 1.0.0, 1.0.0-beta.1"
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "current_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "version_source=$SOURCE" >> $GITHUB_OUTPUT
+          echo "📦 当前 VERSION 文件版本: $CURRENT_VERSION"
+          echo "📦 本次打包版本号: $VERSION ($SOURCE)"
+
+      - name: Sync version (frontend)
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" frontend/package.json
+          echo "✅ frontend/package.json 版本号同步为 $VERSION"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Get pnpm store directory
+        shell: bash
+        run: |
+          echo "STORE_PATH=$(pnpm store path --silent)" >> $GITHUB_ENV
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.STORE_PATH }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: |
+            ${{ runner.os }}-pnpm-store-
+
+      - name: Build frontend
+        working-directory: frontend
+        run: |
+          echo "🎨 构建前端..."
+          pnpm install --frozen-lockfile
+          pnpm run build
+          echo "✅ 前端构建完成！"
+          ls -lh dist/
+
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  # ==================== 2. 后端构建 + 分架构打包 ====================
+  build:
+    name: Build ${{ matrix.arch }} (${{ matrix.target }})
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ARM64 (设备主力平台)：在原生 ARM runner 上用 musl-gcc 静态编译
+          - arch: aarch64
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          # x86_64：在原生 x86 runner 上用 musl-gcc 静态编译
+          - arch: x86_64
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          # ===== Windows 预留（TODO） =====
+          # 当前后端通过 dbus 读取系统状态，尚未在 Windows 上适配。
+          # 后端完成 Windows 适配后，取消下面注释并补充对应的构建步骤
+          # （Windows runner 无 apt/musl，需改用 MSVC 工具链，且打包为 simadmin.exe）：
+          # - arch: x86_64
+          #   target: x86_64-pc-windows-msvc
+          #   runner: windows-latest
+          #   os: windows
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync version (backend)
+        run: |
+          VERSION="${{ needs.prepare.outputs.version }}"
+          # 更新根目录 VERSION，确保 build.rs 注入的 APP_VERSION 与本次包一致
+          printf "%s\n" "$VERSION" > VERSION
+          sed -i "s/^version = \"[^\"]*\"/version = \"$VERSION\"/" backend/Cargo.toml
+          echo "✅ 版本号同步为 $VERSION"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          musl-gcc --version
+
+      - name: Install UPX
+        if: inputs.use_upx == true
+        run: |
+          sudo apt-get install -y upx-ucl
+          upx --version
+
+      - name: Cache Rust dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Build backend (${{ matrix.target }})
+        working-directory: backend
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          echo "🦀 构建后端 ($TARGET)..."
+
+          # 由 target 三元组推导交叉编译环境变量名：
+          #   CC_<target_下划线>            (小写)
+          #   CARGO_TARGET_<TARGET_下划线>_LINKER (大写)
+          T_LOWER=$(echo "$TARGET" | tr '-' '_')
+          T_UPPER=$(echo "$TARGET" | tr '[:lower:]-' '[:upper:]_')
+          export "CC_${T_LOWER}=musl-gcc"
+          export "CARGO_TARGET_${T_UPPER}_LINKER=musl-gcc"
+          export SQLITE3_STATIC=1
+          export LIBSQLITE3_SYS_USE_PKG_CONFIG=0
+
+          cargo build --release --target "$TARGET"
+
+          BINARY_PATH="target/$TARGET/release/simadmin"
+          echo "✅ 后端构建完成！"
+          ls -lh "$BINARY_PATH"
+          file "$BINARY_PATH"
+
+      - name: Compress binary with UPX
+        if: inputs.use_upx == true
+        run: |
+          BINARY_PATH="backend/target/${{ matrix.target }}/release/simadmin"
+          echo "🗜️  UPX 压缩中..."
+          BEFORE_SIZE=$(stat -c%s "$BINARY_PATH")
+          upx --best --lzma "$BINARY_PATH"
+          AFTER_SIZE=$(stat -c%s "$BINARY_PATH")
+          RATIO=$(echo "scale=1; 100 - ($AFTER_SIZE * 100 / $BEFORE_SIZE)" | bc)
+          echo "✅ 压缩完成！节省: ${RATIO}%"
+          ls -lh "$BINARY_PATH"
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: frontend/dist
+
+      - name: Package (.tar.gz)
+        id: package
+        env:
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          echo "=========================================="
+          echo "  打包 ${ARCH} (${TARGET})"
+          echo "=========================================="
+
+          COMMIT=$(git rev-parse --short HEAD)
+          BUILD_TIME=$(TZ=Asia/Shanghai date +"%Y-%m-%dT%H:%M:%S+08:00")
+
+          BINARY_PATH="backend/target/$TARGET/release/simadmin"
+          FRONTEND_DIR="frontend/dist"
+
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "❌ 错误: 后端二进制不存在"
+            exit 1
+          fi
+          if [ ! -d "$FRONTEND_DIR" ]; then
+            echo "❌ 错误: 前端构建产物不存在"
+            exit 1
+          fi
+
+          TMP=$(mktemp -d)
+
+          # ---- 后端二进制 ----
+          cp "$BINARY_PATH" "$TMP/simadmin"
+          chmod 755 "$TMP/simadmin"
+          BINARY_MD5=$(md5sum "$TMP/simadmin" | cut -d' ' -f1)
+
+          # ---- 前端 www ----
+          mkdir -p "$TMP/www"
+          cp -r "$FRONTEND_DIR"/* "$TMP/www/"
+          FRONTEND_MD5=$(find "$TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
+
+          # ---- meta.json ----
+          cat > "$TMP/meta.json" << EOF
+          {
+              "version": "$VERSION",
+              "commit": "$COMMIT",
+              "build_time": "$BUILD_TIME",
+              "binary_md5": "$BINARY_MD5",
+              "frontend_md5": "$FRONTEND_MD5",
+              "arch": "$TARGET"
+          }
+          EOF
+          cat "$TMP/meta.json"
+
+          mkdir -p release
+          OUT="release/simadmin-${ARCH}.tar.gz"
+
+          # 打包内容：当前仅 meta.json + 二进制 + www/
+          # 预留：后期扩展（如配置模板 / systemd unit / 附带脚本）时，
+          #       将新增文件复制到 $TMP 下，并在下面的 tar 参数列表中追加对应条目。
+          ( cd "$TMP" && tar -czf - meta.json simadmin www ) > "$OUT"
+
+          echo ""
+          echo "✅ 打包完成: $OUT"
+          ls -lh "$OUT"
+          echo "📋 包内容:"
+          tar -tzf "$OUT" | head -20
+
+          OTA_MD5=$(md5sum "$OUT" | cut -d' ' -f1)
+          OTA_SHA256=$(sha256sum "$OUT" | cut -d' ' -f1)
+          echo "📝 MD5:    $OTA_MD5"
+          echo "📝 SHA256: $OTA_SHA256"
+
+          echo "build_time=$BUILD_TIME" >> $GITHUB_OUTPUT
+          echo "ota_md5=$OTA_MD5" >> $GITHUB_OUTPUT
+          echo "ota_sha256=$OTA_SHA256" >> $GITHUB_OUTPUT
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.arch }}
+          path: release/simadmin-${{ matrix.arch }}.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  # ==================== 3. 汇总所有架构并发布 Release ====================
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: dist
+          merge-multiple: true
+
+      - name: Prepare release assets
+        id: assets
+        run: |
+          mkdir -p release
+          cp dist/*.tar.gz release/
+
+          # install.sh 默认下载 simadmin.tar.gz（设备以 ARM 为主），
+          # 生成 aarch64 兼容别名，保证现有安装/OTA 流程无缝可用。
+          if [ -f release/simadmin-aarch64.tar.gz ]; then
+            cp release/simadmin-aarch64.tar.gz release/simadmin.tar.gz
+            echo "ℹ️  已生成 install.sh 兼容别名 simadmin.tar.gz (=aarch64)"
+          fi
+
+          echo "📦 发布产物:"
+          ls -lh release/
+          ( cd release && sha256sum *.tar.gz > SHA256SUMS.txt )
+          echo ""
+          echo "📝 SHA256SUMS.txt:"
+          cat release/SHA256SUMS.txt
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: SimAdmin_v${{ needs.prepare.outputs.version }}
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS.txt
+          overwrite_files: true
+          generate_release_notes: true
+          body: |
+            ## SimAdmin 多架构发布包
+
+            ### 版本信息
+            - **版本**: ${{ needs.prepare.outputs.version }}
+            - **Commit**: ${{ github.sha }}
+            - **发布类型**: ${{ inputs.release_type }}
+            - **UPX 压缩**: ${{ inputs.use_upx }}
+
+            ### 产物（Linux）
+            | 架构 | 文件 | 说明 |
+            |------|------|------|
+            | aarch64 (ARM64) | `simadmin-aarch64.tar.gz` | ARM 设备（另有别名 `simadmin.tar.gz` 供 install.sh 默认下载） |
+            | x86_64 (AMD64)  | `simadmin-x86_64.tar.gz`  | x86 Linux |
+
+            > Windows 版本待后端 dbus 相关能力适配后再提供（已在构建流程中预留）。
+
+            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端。
+            校验值见 `SHA256SUMS.txt`。
+
+            ### 安装 / 更新
+            ```bash
+            # 通过安装脚本（自动选择 simadmin.tar.gz / aarch64）
+            curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sudo sh
+
+            # 或手动指定架构包进行 OTA
+            curl -X POST http://IP:3000/api/ota/upload -F "file=@simadmin-x86_64.tar.gz"
+            curl -X POST http://IP:3000/api/ota/apply
+            ```
+          draft: false
+          prerelease: ${{ inputs.release_type == '预发布版（pre-release）' }}
+          make_latest: ${{ inputs.release_type == '最新正式版（latest release）' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Summary
+        run: |
+          echo "## 🎉 多架构发布包构建完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "| 版本 | ${{ needs.prepare.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 版本来源 | ${{ needs.prepare.outputs.version_source }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 发布类型 | ${{ inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| UPX 压缩 | ${{ inputs.use_upx }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 产物" >> $GITHUB_STEP_SUMMARY
+          echo "- \`simadmin-aarch64.tar.gz\` (+ 兼容别名 \`simadmin.tar.gz\`)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`simadmin-x86_64.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`SHA256SUMS.txt\`" >> $GITHUB_STEP_SUMMARY

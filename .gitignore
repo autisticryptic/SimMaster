@@ -30,3 +30,9 @@ userdata/home/root/www/
 temp/
 .tmp
 .device-dump/
+# IDE 配置
+.idea/
+backend/.idea/
+
+# 临时诊断脚本
+_recon.sh

@@ -64,25 +64,18 @@ use super::{
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const REGISTER_EXPIRES: u32 = 3600;
 const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
-const NATIVE_BEARER_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
-const NATIVE_BEARER_HEALTH_FAILURE_LIMIT: u8 = 3;
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 
-/// Opt in to establishing the IMS bearer natively over QMI instead of through
-/// ModemManager. See the call site in `connect_inner` for why this is off by
-/// default: the activation step is the one part of the native flow that has not
-/// been exercised on the reference baseband, and a bad IMS activation on that
-/// firmware can restart the baseband.
-const NATIVE_IMS_BEARER_ENV: &str = "SIMADMIN_VOLTE_NATIVE_IMS_BEARER";
-
-fn native_ims_bearer_enabled() -> bool {
-    std::env::var(NATIVE_IMS_BEARER_ENV)
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            value == "1" || value == "true" || value == "yes"
-        })
-        .unwrap_or(false)
+fn native_ims_bearer_required(_data_slot_mode: DataSlotMode) -> bool {
+    // beta2 runs the IMS WDS bearer on the secondary DATA6 endpoint
+    // (`Native VoLTE secondary QMI IMS WDS bearer started`, volte.rs:1976), never
+    // on the primary port — starting a second data session on the primary port is
+    // what returns `(2,201) [internal] error`. So every mode drives the native
+    // secondary-endpoint path; the primary port stays with ModemManager. There is
+    // deliberately no fallback to the ModemManager IMS bearer: that path wedges
+    // this baseband.
+    true
 }
 
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
@@ -714,21 +707,15 @@ async fn connect_inner(
         None
     };
 
-    // Preferred path when enabled: establish the IMS bearer directly over QMI on
-    // this line's primary control port. That port is the only endpoint where a
-    // WDS client id survives across `qmicli` invocations, which the
-    // start-network → get-current-settings → P-CSCF sequence requires; sharing it
-    // with ModemManager is safe because both go through `qmi-proxy`.
-    //
-    // It is opt-in because the activation step itself has not been exercised on
-    // the reference baseband: every preceding step (proxy readiness, CID
-    // allocation, cross-process reuse, set-ip-family, settings read) is verified
-    // on hardware, but `--wds-start-network` for `apn=ims` on the primary port is
-    // not. On this firmware a bad IMS activation can restart the baseband, so the
-    // default stays on the ModemManager path until this is confirmed on a device.
+    // Establish the IMS bearer directly over QMI on this line's secondary
+    // (DATA6) endpoint, matching beta2 ("Native VoLTE secondary QMI IMS WDS
+    // bearer started", volte.rs:1976). The primary port stays with ModemManager;
+    // starting a second data session there is what returned the (2,201) internal
+    // error in the field. IP configuration and P-CSCF come from AT+CGCONTRDP, so
+    // no reusable WDS client id is needed and the session is a single start.
     let mut native_bearer = None;
-    let native_required = data_slot_mode.reserves_data_slot() && data_slot_mode.ims_on_primary();
-    if native_required || native_ims_bearer_enabled() {
+    let native_required = native_ims_bearer_required(data_slot_mode);
+    if native_required {
         runtime
             .record_attempt(
                 VolteStage::Bearer,
@@ -738,7 +725,13 @@ async fn connect_inner(
                 Some(format!("native_qmi:{}", device.qmi_device)),
             )
             .await;
-        match native_bearer::establish_native_ims_bearer(&device.qmi_device, &request, &plan).await
+        match native_bearer::establish_native_ims_bearer(
+            &device.qmi_device,
+            &device.modem_id,
+            &request,
+            &plan,
+        )
+        .await
         {
             Ok(established) => {
                 runtime
@@ -1209,69 +1202,13 @@ async fn live_receive_loop(
     let mut operator_commands = live.operator.subscribe_commands();
     let mut refresh_at =
         tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
-    let mut native_health_at = tokio::time::Instant::now() + NATIVE_BEARER_HEALTH_INTERVAL;
-    let mut native_health_failures = 0u8;
+    // The native IMS bearer now runs single-shot on the secondary QMI endpoint
+    // (beta2 alignment): there is no retained WDS client id to probe for packet
+    // status, so bearer health is observed through the REGISTER refresh cycle
+    // below rather than an independent WDS query.
     loop {
         if runtime.generation() != generation {
             break;
-        }
-        if tokio::time::Instant::now() >= native_health_at {
-            native_health_at = tokio::time::Instant::now() + NATIVE_BEARER_HEALTH_INTERVAL;
-            let health_clients = {
-                let sessions = live.session.lock().await;
-                sessions
-                    .as_ref()
-                    .and_then(|session| session.native_bearer.as_ref())
-                    .map(|bearer| {
-                        bearer
-                            .sessions
-                            .iter()
-                            .map(|session| session.client.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            if !health_clients.is_empty() {
-                let mut health_failure = None;
-                for client in health_clients {
-                    match client.packet_service_status().await {
-                        Ok(crate::cellular::qmi_wds::PacketServiceStatus::Connected) => {}
-                        Ok(crate::cellular::qmi_wds::PacketServiceStatus::Disconnected) => {
-                            health_failure = Some((
-                                VolteError::with_detail(
-                                    code::RUNTIME_MM_BEARER_CONNECT_FAILED,
-                                    "native_ims_packet_service_disconnected".to_string(),
-                                ),
-                                true,
-                            ));
-                            break;
-                        }
-                        Err(error) => {
-                            let unsafe_to_retry = error.is_unsafe_to_retry();
-                            health_failure =
-                                Some((native_bearer::wds_error_to_volte(error), unsafe_to_retry));
-                            break;
-                        }
-                    }
-                }
-                if let Some((error, stop_immediately)) = health_failure {
-                    native_health_failures = native_health_failures.saturating_add(1);
-                    tracing::warn!(
-                        attempt = native_health_failures,
-                        error = %error,
-                        "Native IMS bearer set health query failed"
-                    );
-                    if stop_immediately
-                        || native_health_failures >= NATIVE_BEARER_HEALTH_FAILURE_LIMIT
-                    {
-                        mark_native_bearer_unhealthy(&runtime, &error).await;
-                        cleanup_live_session(&live).await;
-                        break;
-                    }
-                } else {
-                    native_health_failures = 0;
-                }
-            }
         }
         if tokio::time::Instant::now() >= refresh_at {
             let refresh_result = {
@@ -1363,27 +1300,6 @@ async fn live_receive_loop(
             }
         }
     }
-}
-
-async fn mark_native_bearer_unhealthy(runtime: &VolteRuntime, error: &VolteError) {
-    runtime
-        .record_attempt(
-            VolteStage::Bearer,
-            None,
-            "failed",
-            Some(error),
-            Some("native_qmi_health".to_string()),
-        )
-        .await;
-    runtime
-        .update(|state| {
-            state.phase = VoltePhase::Degraded;
-            state.stage = VolteStage::Bearer;
-            state.last_error = Some(error.to_string());
-            state.last_failure_at = Some(now());
-            state.reconnect_count = state.reconnect_count.saturating_add(1);
-        })
-        .await;
 }
 
 async fn refresh_live_registration(

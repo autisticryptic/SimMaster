@@ -393,6 +393,21 @@ pub async fn discover_pcscf_via_active_at_context(
     ))
 }
 
+/// Read the full IP configuration (address, gateway, DNS, prefix, P-CSCF) of one
+/// IMS context via `AT+CGCONTRDP`.
+///
+/// This is beta2's IMS source of truth: after the WDS session is up, the modem
+/// describes the context here (`Native VoLTE P-CSCF candidates discovered from
+/// active IMS bearer`, `volte.rs:3671`), so the native bearer reads its addresses
+/// and P-CSCF from this rather than from `--wds-get-current-settings`.
+pub async fn read_cgcontrdp_settings(
+    modem: &str,
+    cid: u8,
+) -> Result<CgcontrdpSettings, VolteError> {
+    let output = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await?;
+    Ok(parse_cgcontrdp_settings(&output, cid))
+}
+
 async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
     let argument = format!("--command={command}");
     let output = Command::new("mmcli")
@@ -506,6 +521,157 @@ pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8) -> Vec<IpAddr> {
         }
     }
     candidates
+}
+
+/// Full IP configuration read back from `+CGCONTRDP`, matching what beta2 pulls
+/// from an active IMS bearer (`volte.rs:3671`, "P-CSCF candidates discovered from
+/// active IMS bearer").
+///
+/// The 3GPP field layout (TS 27.007) for one line is:
+/// `<cid>,<bearer_id>,<apn>,<local_addr_and_mask>,<gw>,<dns1>,<dns2>,<pcscf1>,<pcscf2>,...`
+/// Qualcomm renders the local-address-and-mask field as address octets followed
+/// by mask octets (8 decimals for IPv4, 32 for IPv6), which is where the prefix
+/// length is recovered from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CgcontrdpSettings {
+    pub ipv4_address: Option<IpAddr>,
+    pub ipv4_gateway: Option<IpAddr>,
+    pub ipv4_dns: Vec<IpAddr>,
+    pub ipv4_prefix: Option<u8>,
+    pub ipv6_address: Option<IpAddr>,
+    pub ipv6_gateway: Option<IpAddr>,
+    pub ipv6_dns: Vec<IpAddr>,
+    pub ipv6_prefix: Option<u8>,
+    pub pcscf: Vec<IpAddr>,
+}
+
+impl CgcontrdpSettings {
+    pub fn is_empty(&self) -> bool {
+        self.ipv4_address.is_none() && self.ipv6_address.is_none() && self.pcscf.is_empty()
+    }
+}
+
+/// Parse the full IP configuration (address, gateway, DNS, P-CSCF) for one CID
+/// from a `+CGCONTRDP` response. This is beta2's primary IMS source, so it reads
+/// every field, not just the P-CSCF columns.
+pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8) -> CgcontrdpSettings {
+    let mut settings = CgcontrdpSettings::default();
+    for line in output.lines() {
+        let Some((_, values)) = line.split_once("+CGCONTRDP:") else {
+            continue;
+        };
+        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
+        if fields.len() < 4
+            || fields[0].parse::<u8>().ok() != Some(expected_cid)
+            || !fields
+                .get(2)
+                .is_some_and(|apn| apn.trim_matches(['\'', '"']).eq_ignore_ascii_case("ims"))
+        {
+            continue;
+        }
+
+        // Field 3: local address and subnet mask, as concatenated octets.
+        if let Some((address, prefix)) = parse_cgcontrdp_addr_and_mask(fields[3]) {
+            match address {
+                IpAddr::V4(_) => {
+                    settings.ipv4_address.get_or_insert(address);
+                    if settings.ipv4_prefix.is_none() {
+                        settings.ipv4_prefix = prefix;
+                    }
+                }
+                IpAddr::V6(_) => {
+                    settings.ipv6_address.get_or_insert(address);
+                    if settings.ipv6_prefix.is_none() {
+                        settings.ipv6_prefix = prefix;
+                    }
+                }
+            }
+        }
+        // Field 4: gateway.
+        if let Some(gateway) = fields.get(4).and_then(|f| parse_cgcontrdp_addresses(f).into_iter().next()) {
+            match gateway {
+                IpAddr::V4(_) => settings.ipv4_gateway.get_or_insert(gateway),
+                IpAddr::V6(_) => settings.ipv6_gateway.get_or_insert(gateway),
+            };
+        }
+        // Fields 5..=6: DNS servers.
+        for field in fields.iter().skip(5).take(2) {
+            for dns in parse_cgcontrdp_addresses(field) {
+                let bucket = if dns.is_ipv6() {
+                    &mut settings.ipv6_dns
+                } else {
+                    &mut settings.ipv4_dns
+                };
+                if !bucket.contains(&dns) {
+                    bucket.push(dns);
+                }
+            }
+        }
+        // Fields 7..=8: P-CSCF.
+        for field in fields.iter().skip(7).take(2) {
+            for pcscf in parse_cgcontrdp_addresses(field) {
+                if !settings.pcscf.contains(&pcscf) {
+                    settings.pcscf.push(pcscf);
+                }
+            }
+        }
+    }
+    settings
+}
+
+/// Split the `+CGCONTRDP` local-address-and-mask field into an address and a
+/// prefix length. IPv4 arrives as 8 octets (4 address + 4 mask), IPv6 as 32
+/// octets (16 address + 16 mask); a bare address with no mask yields `None` for
+/// the prefix.
+fn parse_cgcontrdp_addr_and_mask(field: &str) -> Option<(IpAddr, Option<u8>)> {
+    let cleaned = field.trim_matches(|c| c == '\'' || c == '"').trim();
+    // A pre-formatted address (with or without an inline /prefix) short-circuits.
+    if let Some((addr, prefix)) = cleaned.split_once('/') {
+        if let Ok(address) = addr.trim().parse::<IpAddr>() {
+            return Some((address, prefix.trim().parse::<u8>().ok()));
+        }
+    }
+    if let Ok(address) = cleaned.parse::<IpAddr>() {
+        return Some((address, None));
+    }
+    let octets: Vec<u8> = cleaned
+        .split('.')
+        .map(str::parse::<u8>)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    match octets.len() {
+        4 => Some((
+            IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3])),
+            None,
+        )),
+        8 => {
+            let address = IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]));
+            let mask = u32::from_be_bytes([octets[4], octets[5], octets[6], octets[7]]);
+            Some((address, prefix_from_mask_bits(mask)))
+        }
+        16 => {
+            let bytes: [u8; 16] = octets.try_into().ok()?;
+            Some((IpAddr::V6(Ipv6Addr::from(bytes)), None))
+        }
+        32 => {
+            let addr_bytes: [u8; 16] = octets[..16].try_into().ok()?;
+            let mask_bytes: [u8; 16] = octets[16..].try_into().ok()?;
+            let ones: u32 = mask_bytes.iter().map(|b| b.count_ones()).sum();
+            let contiguous = u128::from_be_bytes(mask_bytes).leading_ones() == ones;
+            Some((
+                IpAddr::V6(Ipv6Addr::from(addr_bytes)),
+                contiguous.then_some(ones as u8),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Convert a 32-bit IPv4 netmask into a prefix length, rejecting discontiguous
+/// masks so a wrong on-link prefix is never installed.
+fn prefix_from_mask_bits(mask: u32) -> Option<u8> {
+    let ones = mask.leading_ones();
+    (mask.count_ones() == ones).then_some(ones as u8)
 }
 
 fn parse_cgcontrdp_addresses(field: &str) -> Vec<IpAddr> {

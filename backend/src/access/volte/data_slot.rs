@@ -15,14 +15,17 @@
 //! valid allocation, and is returned with
 //! `volte_data_slot_mode_missing` / `volte_data_slot_conflict`.
 //!
-//! Real-hardware testing (2026-07-27, Maxis 50212) established the decisive fact
-//! that constrains this: **only "IMS on the primary port via qmi-proxy, DATA6
-//! reserved for data" actually works** for the full IMS flow — the primary port
-//! is the one endpoint where a WDS client id survives across `qmicli`
-//! invocations (start-network → get-current-settings → P-CSCF). DATA6 can only
-//! single-shot one command; it cannot reuse a CID, so it cannot host the IMS
-//! multi-step flow. This module therefore *selects* the allocation exactly the
-//! way beta2 does, but the only viable IMS-bearing endpoint is the primary port.
+//! IDA on beta2 settled which allocation is real: the binary logs
+//! `Native VoLTE secondary QMI IMS WDS bearer started` (`volte.rs:1976`) and
+//! reads the IMS P-CSCF/IP from `AT+CGCONTRDP`, not from
+//! `--wds-get-current-settings` (which lives only on the data path,
+//! `secondary_qmi_data.rs`). Because P-CSCF comes from AT, the IMS session is a
+//! *single* `--wds-start-network` with no CID to reuse — so it runs on the
+//! **secondary DATA6 endpoint**, leaving the primary QMI port to ModemManager.
+//! Running a second data session on the primary port is what produced
+//! `verbose call end reason (2,201): [internal] error` in the field logs. This
+//! module still *selects* the allocation the way beta2 does; the IMS-bearing
+//! endpoint is the secondary one.
 //!
 //! This is pure logic (no IO), so the selection and its conflict rules are fully
 //! unit-tested without a modem. The IO that acts on the chosen mode lives in
@@ -33,21 +36,23 @@ use super::errors::{code, VolteError};
 /// Which physical QMI endpoint the IMS bearer is allocated to, and what the
 /// other endpoint is reserved for. Mirrors beta2's two reported allocations plus
 /// the "data not requested" case.
+///
+/// NOTE: these variant names predate the beta2-aligned bearer path and are kept
+/// only because their `as_str()` tokens (`secondary_qmi_data` / `independent_wwan1`)
+/// are the exact data-path strings beta2 reports. The IMS bearer itself now always
+/// runs on the secondary QMI endpoint (see `native_bearer.rs`); this mode only
+/// selects what the *data* exit is reserved on and drives the reported token — it
+/// no longer gates which endpoint carries IMS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSlotMode {
-    /// IMS on the primary control port (via `qmi-proxy`); the secondary DATA6
-    /// endpoint is reserved for normal mobile data. This is beta2's
-    /// `IMS allocated to primary qmi0; DATA6 is reserved for data` and the only
-    /// allocation that carries the full IMS flow on the reference firmware.
+    /// A separate mobile-data exit is reserved alongside VoLTE. beta2 reports this
+    /// as `secondary_qmi_data`.
     PrimaryImsSecondaryData,
-    /// IMS on the secondary DATA6 endpoint; the primary port is reserved for
-    /// data. beta2's `IMS allocated to DATA6; primary qmi0 is reserved for data`.
-    /// Retained for parity, but DATA6 cannot reuse a CID across `qmicli`
-    /// invocations, so the multi-step IMS flow cannot run here on the reference
-    /// firmware (`select` never picks it without an explicit request).
+    /// Parity variant for beta2's alternate allocation string; not selected by
+    /// `select_data_slot_mode`.
     SecondaryImsPrimaryData,
-    /// IMS on the primary port and no separate data slot is requested — the
-    /// common case when the line only wants VoLTE and not a proxied data exit.
+    /// VoLTE-only line: no separate data exit is reserved. beta2 reports this as
+    /// `independent_wwan1`.
     PrimaryImsOnly,
 }
 
@@ -73,9 +78,8 @@ impl DataSlotMode {
         }
     }
 
-    /// True when this mode puts the IMS bearer on the primary control port. Every
-    /// viable mode on the reference firmware does; `live.rs` uses this to decide
-    /// whether the native primary-port path is the one to drive.
+    /// Legacy predicate retained for the data-slot unit tests. IMS no longer runs
+    /// on the primary port under any mode, so `live.rs` no longer gates on this.
     pub fn ims_on_primary(self) -> bool {
         matches!(
             self,
@@ -109,17 +113,16 @@ pub struct DataSlotInputs {
 
 /// Select the data-slot allocation the way beta2 does.
 ///
-/// Rules (from `sub_58E0C4` / `volte.rs:1676-1687`, constrained by the hardware
-/// finding that only primary-port IMS carries the full flow):
-///   - No data requested → IMS owns the primary port, nothing else reserved
-///     (`PrimaryImsOnly`).
-///   - Data requested and a secondary DATA6 endpoint is available → IMS stays on
-///     the primary port and DATA6 is reserved for data
-///     (`PrimaryImsSecondaryData`).
+/// Rules (from `sub_58E0C4` / `volte.rs:1676-1687`). IMS runs on the secondary
+/// DATA6 endpoint; the reported allocation token is what beta2 logs, and it is
+/// preserved verbatim for parity even though the endpoint roles are now settled:
+///   - No data requested → VoLTE-only line, no separate data slot (`PrimaryImsOnly`,
+///     token `independent_wwan1`).
+///   - Data requested and a secondary DATA6 endpoint is available →
+///     `PrimaryImsSecondaryData` (token `secondary_qmi_data`).
 ///   - Data requested but *both* endpoints already carry active data sessions →
-///     `volte_data_slot_conflict`: there is no free endpoint to place IMS on
-///     without disturbing a live data session.
-///   - Data requested but no secondary endpoint exists to offload data onto →
+///     `volte_data_slot_conflict`: there is no free endpoint left.
+///   - Data requested but no secondary endpoint exists →
 ///     `volte_data_slot_mode_missing`: the allocation cannot be satisfied.
 pub fn select_data_slot_mode(inputs: DataSlotInputs) -> Result<DataSlotMode, VolteError> {
     if !inputs.data_requested {
@@ -127,9 +130,9 @@ pub fn select_data_slot_mode(inputs: DataSlotInputs) -> Result<DataSlotMode, Vol
         return Ok(DataSlotMode::PrimaryImsOnly);
     }
 
-    // Data is requested alongside IMS. IMS must land on the primary port (the
-    // only endpoint that can host the multi-step flow), so data has to go to
-    // DATA6. If both endpoints are already busy there is nowhere to put IMS.
+    // Data is requested alongside IMS. IMS takes the secondary DATA6 endpoint
+    // (single-shot WDS), so a data exit would need the primary port. If both
+    // endpoints are already busy there is nowhere left to place a new session.
     if inputs.primary_data_active && inputs.secondary_data_active {
         return Err(VolteError::with_detail(
             code::DATA_SLOT_CONFLICT,
