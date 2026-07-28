@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::infra::db::{CallRecord, CallStats, SmsMessage, SmsStats};
+use crate::platform::db::{CallRecord, CallStats, SmsMessage, SmsStats};
 
 #[derive(Debug, Serialize)]
 pub struct ApiResponse<T> {
@@ -260,9 +260,9 @@ pub struct AirplaneModeResponse {
 pub struct LineDataConnectionResponse {
     pub enabled: bool,
     pub connected: bool,
-    pub config: crate::infra::config::LineDataProxyConfig,
+    pub config: crate::platform::config::LineDataProxyConfig,
     pub password_set: bool,
-    pub proxy: crate::cellular::data_proxy::DataProxyStatus,
+    pub proxy: crate::hardware::cellular::data_proxy::DataProxyStatus,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

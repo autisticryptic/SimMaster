@@ -24,31 +24,23 @@ use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use zbus::Connection;
 
-mod access;
 mod api;
-mod automation;
-mod cellular;
-mod ims;
-mod infra;
-mod messaging;
-mod network;
-mod notify;
-mod orchestrator;
-mod sim;
+mod connectivity;
+mod hardware;
+mod platform;
+mod services;
 mod state;
-mod system;
-mod trunk;
 
 use api::handlers::*;
-use cellular::modem_manager::{ensure_nm_modem_profile, set_airplane_mode_for_modem};
-use infra::config::{get_default_config_path, ConfigManager};
-use infra::db::Database;
-use network::device_network::DdnsManager;
-use notify::notification::NotificationSender;
-use notify::notification_queue::*;
-use sim::esim::EsimSupervisor;
+use hardware::cellular::modem_manager::{ensure_nm_modem_profile, set_airplane_mode_for_modem};
+use platform::config::{get_default_config_path, ConfigManager};
+use platform::db::Database;
+use services::network::device_network::DdnsManager;
+use services::notify::notification::NotificationSender;
+use services::notify::notification_queue::*;
+use hardware::sim::esim::EsimSupervisor;
 use state::{AppState, AppStateDependencies};
-use system::system_event::{
+use services::system::system_event::{
     codes as system_event_codes, severity as system_event_severity, status as system_event_status,
     SystemEventEmitter,
 };
@@ -197,13 +189,13 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
 /// the reference firmware a secondary rpmsg endpoint cannot hold a WDS CID across
 /// processes, and the IMS flow needs exactly that (allocate CID → start-network →
 /// read P-CSCF). IMS therefore runs on the primary port through `qmi-proxy`,
-/// which multiplexes it alongside ModemManager. See `cellular::qmi_wds`.
+/// which multiplexes it alongside ModemManager. See `hardware::cellular::qmi_wds`.
 ///
 /// The udev rules cover *every* spare QMI port, not just the one bound here:
 /// the kernel module publishes one port per registered channel, and any spare
 /// left visible gets claimed by ModemManager as an extra modem port.
 async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<()> {
-    use cellular::secondary_qmi;
+    use hardware::cellular::secondary_qmi;
 
     const STATE_DIR: &str = "/run/simadmin";
     const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi.rules";
@@ -456,9 +448,9 @@ async fn main() -> Result<()> {
     }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {
         let conn = Connection::system().await?;
-        let mut bindings = cellular::modem_manager::discover_modem_bindings(&conn).await?;
+        let mut bindings = hardware::cellular::modem_manager::discover_modem_bindings(&conn).await?;
         for binding in &mut bindings {
-            binding.sim_iccid = system::system_event::mask_identifier(&binding.sim_iccid);
+            binding.sim_iccid = services::system::system_event::mask_identifier(&binding.sim_iccid);
         }
         println!("{}", serde_json::to_string_pretty(&bindings)?);
         return Ok(());
@@ -494,9 +486,9 @@ async fn main() -> Result<()> {
     let config_manager = Arc::new(ConfigManager::new(config_path));
     let data_user_disabled = Arc::new(AtomicBool::new(!config_manager.get_data_enabled()));
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
-    let vowifi_runtime = Arc::new(access::vowifi::runtime::VowifiRuntime::new());
-    let volte_runtime = Arc::new(access::volte::runtime::VolteRuntime::new());
-    let line_registry = Arc::new(access::line_registry::LineRuntimeRegistry::with_config(
+    let vowifi_runtime = Arc::new(connectivity::modems::softstack::vowifi::runtime::VowifiRuntime::new());
+    let volte_runtime = Arc::new(connectivity::modems::softstack::volte::runtime::VolteRuntime::new());
+    let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
         Arc::clone(&volte_runtime),
         Arc::clone(&config_manager),
         Arc::clone(&app_db),
@@ -521,7 +513,7 @@ async fn main() -> Result<()> {
     // Copy the compiled-in VoWiFi carrier profiles into the database so they can
     // be edited without a rebuild. Existing rows are left alone.
     {
-        let profile_store = access::vowifi::profile_store::ProfileStore::new(Arc::clone(&app_db));
+        let profile_store = connectivity::modems::softstack::vowifi::profile_store::ProfileStore::new(Arc::clone(&app_db));
         match profile_store.seed_builtins() {
             Ok(0) => {}
             Ok(inserted) => info!(inserted, "Seeded built-in VoWiFi carrier profiles"),
@@ -555,7 +547,7 @@ async fn main() -> Result<()> {
         Arc::clone(&app_db),
     ));
     let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
-    let (sms_resync, sms_resync_rx) = messaging::sms_listener::sms_resync_channel();
+    let (sms_resync, sms_resync_rx) = services::messaging::sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
     {
         let notification_queue_worker = Arc::clone(&notification_sender);
@@ -563,11 +555,11 @@ async fn main() -> Result<()> {
             notification_queue_worker.run_queue_worker().await;
         });
     }
-    system::system_event_monitor::spawn_system_event_monitor(
+    services::system::system_event_monitor::spawn_system_event_monitor(
         Arc::clone(&system_event_emitter),
         Arc::clone(&dbus_conn),
     );
-    system::device_status::spawn_device_status_scheduler(
+    services::system::device_status::spawn_device_status_scheduler(
         Arc::clone(&config_manager),
         Arc::clone(&notification_sender),
         Arc::clone(&app_db),
@@ -602,10 +594,10 @@ async fn main() -> Result<()> {
         let notification_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(crate::system::ota::duration_until_next_update_check()).await;
+                tokio::time::sleep(crate::services::system::ota::duration_until_next_update_check()).await;
                 let config = config_clone.get_version_update_notifications();
                 if config.enabled {
-                    if let Err(err) = crate::system::ota::check_and_notify_version_update(
+                    if let Err(err) = crate::services::system::ota::check_and_notify_version_update(
                         Arc::clone(&config_clone),
                         Arc::clone(&notification_clone),
                     )
@@ -627,7 +619,7 @@ async fn main() -> Result<()> {
         let sms_line_registry = Arc::clone(&line_registry);
         let resync_rx = sms_resync_rx;
         tokio::spawn(async move {
-            let _ = messaging::sms_listener::start_sms_listener(
+            let _ = services::messaging::sms_listener::start_sms_listener(
                 conn_clone,
                 db_clone,
                 notification_clone,
@@ -659,7 +651,7 @@ async fn main() -> Result<()> {
             // 初始延迟 5 秒，等待系统稳定
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             tracing::info!(interval = 15, "Watchdog started");
-            cellular::modem_manager::data_connection_watchdog(
+            hardware::cellular::modem_manager::data_connection_watchdog(
                 conn_clone,
                 15,
                 user_off,
@@ -766,7 +758,7 @@ async fn main() -> Result<()> {
     }
 
     // 启动自动化中心后台调度引擎
-    automation::spawn_automation_scheduler(app_state.clone());
+    services::automation::spawn_automation_scheduler(app_state.clone());
 
     // Flush each line's proxied-traffic counters to disk periodically. Counting
     // is in memory for speed; this is what makes the totals survive a restart.

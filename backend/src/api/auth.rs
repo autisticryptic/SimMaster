@@ -21,10 +21,10 @@ use serde_json::Value;
 
 use crate::{
     api::models::ApiResponse,
-    infra::config::SecurityConfig,
-    infra::db::Database,
+    platform::config::SecurityConfig,
+    platform::db::Database,
     state::AppState,
-    system::system_event::{
+    services::system::system_event::{
         codes as system_event_codes, severity as system_event_severity,
         status as system_event_status,
     },

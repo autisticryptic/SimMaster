@@ -18,12 +18,12 @@ use tracing::{error, info, warn};
 use zbus::Connection;
 
 use crate::{
-    access::vowifi::diagnostics::{
+    connectivity::modems::softstack::vowifi::diagnostics::{
         self as vowifi_diagnostics, VowifiDiagnosticsResponse, VowifiProfileMatchResponse,
         VowifiProfilesResponse, VowifiStatusResponse,
     },
-    access::vowifi::restore::RestorePhase,
-    access::vowifi::{
+    connectivity::modems::softstack::vowifi::restore::RestorePhase,
+    connectivity::modems::softstack::vowifi::{
         live::{
             clear_all_live_runtime, clear_live_runtime_for_line, place_live_voice_call_for_line,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
@@ -31,8 +31,8 @@ use crate::{
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
     api::models::*,
-    cellular::modem_manager,
-    cellular::modem_manager::{
+    hardware::cellular::modem_manager,
+    hardware::cellular::modem_manager::{
         answer_call, background_fetch_smsc, current_sim_identity, find_nm_modem_connection_pub,
         get_band_lock_status_for_modem, get_baseband_restart_progress, get_call_by_path,
         get_call_settings, get_cell_location, get_cells_data_for_modem, get_data_connection_status,
@@ -45,23 +45,23 @@ use crate::{
         set_apn_on_bearer, set_band_lock_for_modem, set_call_waiting, set_data_connection_with_apn,
         set_radio_mode_for_modem, start_cell_monitoring, stop_cell_monitoring,
     },
-    infra::config::{
+    platform::config::{
         AccessPathKind, ApnConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
         MidFlightDisablePolicy, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
         VilteConfig, VoicePathPolicy, VolteConfig, VowifiConfig,
     },
-    infra::db::{
+    platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
         VowifiRuntimeEventsResponse, VowifiSmsDeliveriesResponse, VowifiSoakRunsResponse,
     },
-    infra::utils::{
+    platform::utils::{
         connection_addresses_from_interfaces, format_uptime, get_active_interfaces, read_cpu_info,
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
     },
-    sim::esim::EsimApiError,
+    hardware::sim::esim::EsimApiError,
     state::AppState,
-    system::system_event::{
+    services::system::system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
@@ -102,7 +102,7 @@ pub async fn get_modem_lines_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::access::line_registry::LineRuntimeStatus>>>,
+    Json<ApiResponse<Vec<crate::services::line_registry::LineRuntimeStatus>>>,
 ) {
     match app.line_registry.refresh(app.dbus_conn.as_ref()).await {
         Ok(_) => (
@@ -209,7 +209,7 @@ fn split_profile_operator_code(code: &str) -> (String, String) {
 
 fn enrich_profiles_with_current_identity(
     profiles: &mut [EsimProfile],
-    identity: &crate::cellular::modem_manager::SimIdentity,
+    identity: &crate::hardware::cellular::modem_manager::SimIdentity,
 ) {
     let current_index = profiles
         .iter()
@@ -469,7 +469,7 @@ pub async fn get_esim_config_handler(State(app): State<AppState>) -> impl IntoRe
 /// POST /api/esim/config
 pub async fn set_esim_config_handler(
     State(app): State<AppState>,
-    Json(payload): Json<crate::infra::config::EsimConfig>,
+    Json(payload): Json<crate::platform::config::EsimConfig>,
 ) -> impl IntoResponse {
     match app.config_manager.set_esim_config(payload) {
         Ok(_) => (
@@ -791,7 +791,7 @@ pub async fn delete_esim_profile_handler(
 fn find_and_normalize_profile(value: &serde_json::Value) -> Option<EsimProfile> {
     if let Some(obj) = value.as_object() {
         if obj.contains_key("iccid") || obj.contains_key("ICCID") {
-            return Some(crate::sim::esim::normalize_profile(value));
+            return Some(crate::hardware::sim::esim::normalize_profile(value));
         }
         for (_, val) in obj {
             if let Some(p) = find_and_normalize_profile(val) {
@@ -835,7 +835,7 @@ pub async fn download_esim_profile_handler(
         .map(|resp| {
             resp.profiles
                 .into_iter()
-                .map(|p| crate::infra::utils::normalize_iccid(&p.iccid))
+                .map(|p| crate::platform::utils::normalize_iccid(&p.iccid))
                 .collect()
         });
 
@@ -921,7 +921,7 @@ pub async fn download_esim_profile_handler(
                     if let Some(resp) = profiles_resp {
                         if let Some(ref init_iccids) = initial_iccids_opt {
                             for p in resp.profiles {
-                                let norm_iccid = crate::infra::utils::normalize_iccid(&p.iccid);
+                                let norm_iccid = crate::platform::utils::normalize_iccid(&p.iccid);
                                 let is_new_profile = !init_iccids.contains(&norm_iccid);
 
                                 if is_new_profile {
@@ -1156,7 +1156,7 @@ pub async fn update_sim_cache_handler(
     };
 
     if let Some(sms_center) = &payload.sms_center {
-        crate::cellular::modem_manager::cache_smsc_for_identity(
+        crate::hardware::cellular::modem_manager::cache_smsc_for_identity(
             &app.database,
             &identity,
             sms_center,
@@ -1165,7 +1165,7 @@ pub async fn update_sim_cache_handler(
     }
 
     if let Some(phone_number) = &payload.phone_number {
-        crate::cellular::modem_manager::cache_own_numbers_for_identity(
+        crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
             &app.database,
             &identity,
             std::slice::from_ref(phone_number),
@@ -1865,7 +1865,7 @@ pub async fn get_device_ddns_config_handler(State(app): State<AppState>) -> impl
 /// POST /api/device-network/ddns/config
 pub async fn set_device_ddns_config_handler(
     State(app): State<AppState>,
-    Json(mut payload): Json<crate::infra::config::DdnsConfig>,
+    Json(mut payload): Json<crate::platform::config::DdnsConfig>,
 ) -> impl IntoResponse {
     let current = app.config_manager.get_ddns_config();
     if is_masked_secret(&payload.access_id) {
@@ -1903,7 +1903,7 @@ pub async fn set_device_ddns_config_handler(
 }
 
 fn ddns_config_response(
-    mut config: crate::infra::config::DdnsConfig,
+    mut config: crate::platform::config::DdnsConfig,
     access_secret_set: bool,
 ) -> serde_json::Value {
     config.access_id = mask_secret(&config.access_id);
@@ -1985,7 +1985,7 @@ pub async fn clear_device_ddns_logs_handler(State(app): State<AppState>) -> impl
 
 /// GET /api/device-network/wlan/status
 pub async fn get_device_wlan_status_handler() -> impl IntoResponse {
-    match crate::network::device_network::wlan_status().await {
+    match crate::services::network::device_network::wlan_status().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -2004,7 +2004,7 @@ pub async fn get_device_wlan_status_handler() -> impl IntoResponse {
 pub async fn set_device_wlan_enabled_handler(
     Json(payload): Json<WlanEnabledRequest>,
 ) -> impl IntoResponse {
-    match crate::network::device_network::wlan_set_enabled(payload).await {
+    match crate::services::network::device_network::wlan_set_enabled(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -2024,7 +2024,7 @@ pub async fn set_device_wlan_enabled_handler(
 
 /// POST /api/device-network/wlan/scan
 pub async fn scan_device_wlan_handler() -> impl IntoResponse {
-    match crate::network::device_network::wlan_scan().await {
+    match crate::services::network::device_network::wlan_scan().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -2041,7 +2041,7 @@ pub async fn scan_device_wlan_handler() -> impl IntoResponse {
 
 /// GET /api/device-network/wlan/profiles
 pub async fn get_device_wlan_profiles_handler() -> impl IntoResponse {
-    match crate::network::device_network::wlan_profiles().await {
+    match crate::services::network::device_network::wlan_profiles().await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -2060,7 +2060,7 @@ pub async fn get_device_wlan_profiles_handler() -> impl IntoResponse {
 pub async fn forget_device_wlan_handler(
     Json(payload): Json<WlanForgetRequest>,
 ) -> impl IntoResponse {
-    match crate::network::device_network::wlan_forget(payload).await {
+    match crate::services::network::device_network::wlan_forget(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -2084,8 +2084,8 @@ pub async fn connect_device_wlan_handler(
     Json(payload): Json<WlanConnectRequest>,
 ) -> impl IntoResponse {
     let target_ssid = payload.ssid.clone();
-    let previous = crate::network::device_network::wlan_status().await.ok();
-    match crate::network::device_network::wlan_connect(payload).await {
+    let previous = crate::services::network::device_network::wlan_status().await.ok();
+    match crate::services::network::device_network::wlan_connect(payload).await {
         Ok(data) => {
             if data.connected {
                 app.system_event_emitter
@@ -2138,8 +2138,8 @@ pub async fn connect_device_wlan_handler(
 
 /// POST /api/device-network/wlan/disconnect
 pub async fn disconnect_device_wlan_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let previous = crate::network::device_network::wlan_status().await.ok();
-    match crate::network::device_network::wlan_disconnect().await {
+    let previous = crate::services::network::device_network::wlan_status().await.ok();
+    match crate::services::network::device_network::wlan_disconnect().await {
         Ok(data) => {
             if previous
                 .as_ref()
@@ -2176,7 +2176,7 @@ pub async fn disconnect_device_wlan_handler(State(app): State<AppState>) -> impl
 pub async fn save_device_wlan_profile_handler(
     Json(payload): Json<WlanProfileRequest>,
 ) -> impl IntoResponse {
-    match crate::network::device_network::wlan_save_profile(payload).await {
+    match crate::services::network::device_network::wlan_save_profile(payload).await {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -2352,7 +2352,7 @@ pub async fn get_baseband_restart_status_handler() -> impl IntoResponse {
 
 async fn build_line_network_controls(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
 ) -> LineNetworkControlsResponse {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
@@ -2488,7 +2488,7 @@ pub async fn reset_line_data_traffic_handler(
 
 pub(crate) async fn start_line_data_runtime(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
 ) -> Result<(), String> {
     let _guard = line.bearer_operation_lock.lock().await;
@@ -2497,7 +2497,7 @@ pub(crate) async fn start_line_data_runtime(
 
 async fn start_line_data_runtime_locked(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
 ) -> Result<(), String> {
     let binding = line.binding();
@@ -2569,7 +2569,7 @@ async fn start_line_data_runtime_locked(
 
 pub(crate) async fn stop_line_data_runtime(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
 ) {
     let _guard = line.bearer_operation_lock.lock().await;
     stop_line_data_runtime_locked(app, line).await;
@@ -2577,7 +2577,7 @@ pub(crate) async fn stop_line_data_runtime(
 
 async fn stop_line_data_runtime_locked(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
 ) {
     let binding = line.binding();
     line.data_proxy.stop().await;
@@ -2598,10 +2598,10 @@ async fn stop_line_data_runtime_locked(
 /// `bearer_operation_lock` until IMS activation has completed.
 async fn prepare_line_data_slot_for_volte(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
-) -> crate::access::volte::data_slot::DataSlotMode {
-    use crate::access::volte::data_slot::{select_data_slot_mode, DataSlotInputs, DataSlotMode};
+) -> crate::connectivity::modems::softstack::volte::data_slot::DataSlotMode {
+    use crate::connectivity::modems::softstack::volte::data_slot::{select_data_slot_mode, DataSlotInputs, DataSlotMode};
 
     if !profile.data_connection_enabled {
         return DataSlotMode::PrimaryImsOnly;
@@ -2832,7 +2832,7 @@ pub async fn set_line_roaming_handler(
         if status.registered {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
-            crate::access::volte::live::disconnect_live_for_line(
+            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
                 &line.volte_live,
                 &line.volte,
                 "line_roaming_policy_changed",
@@ -2898,7 +2898,7 @@ pub async fn set_line_airplane_mode_handler(
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         stop_line_data_runtime_locked(&app, &line).await;
         let _volte_guard = line.volte_connect_lock.lock().await;
-        crate::access::volte::live::disconnect_live_for_line(
+        crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
             &line.volte_live,
             &line.volte,
             "line_airplane_mode_enabled",
@@ -2937,7 +2937,7 @@ pub async fn set_line_airplane_mode_handler(
 
 // ============ 短信功能 ============
 
-use crate::infra::db::{Database, EsimProfileCacheEntry};
+use crate::platform::db::{Database, EsimProfileCacheEntry};
 
 fn schedule_sms_db_maintenance(app: &AppState, deleted: usize) {
     if deleted < SMS_DB_MAINTENANCE_DELETE_THRESHOLD {
@@ -3031,7 +3031,7 @@ fn persist_vowifi_mt_deliveries(db: &Database, outcome: &MoSmsSipOutcome) -> Vec
             let storage_marker = format!("vowifi-mt:{storage_key}");
             api_sms_id = db.sms_id_by_pdu(&storage_marker).unwrap_or(None);
             if api_sms_id.is_none() {
-                let timestamp = crate::infra::db::beijing_sms_now_string();
+                let timestamp = crate::platform::db::beijing_sms_now_string();
                 api_sms_id = db
                     .insert_sms_at_with_transport(
                         "incoming",
@@ -3092,7 +3092,7 @@ fn persist_vowifi_mt_deliveries(db: &Database, outcome: &MoSmsSipOutcome) -> Vec
 fn spawn_vowifi_sms_followup_persist(
     app: AppState,
     mut followup: tokio::sync::mpsc::UnboundedReceiver<
-        crate::access::vowifi::live::LiveSmsFollowupFrame,
+        crate::connectivity::modems::softstack::vowifi::live::LiveSmsFollowupFrame,
     >,
 ) {
     tokio::spawn(async move {
@@ -3186,7 +3186,7 @@ fn persist_vowifi_restore_phase(
 ) {
     if let Err(err) =
         app.database
-            .upsert_vowifi_esim_restore(crate::infra::db::NewVowifiEsimRestore {
+            .upsert_vowifi_esim_restore(crate::platform::db::NewVowifiEsimRestore {
                 switch_token: Some(switch_token),
                 switch_phase: Some(switch_phase),
                 phase_ms: Some(phase_started_at.elapsed().as_millis().min(i64::MAX as u128) as i64),
@@ -3394,13 +3394,13 @@ async fn send_sms_over_volte_path(
         return Err("line_volte_connection_disabled".to_string());
     }
     if !line.volte.status().await.registered {
-        let device = crate::access::volte::live::VolteDeviceBinding::from_modem(&binding)
+        let device = crate::connectivity::modems::softstack::volte::live::VolteDeviceBinding::from_modem(&binding)
             .map_err(|error| error.to_string())?;
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile).await;
         let _guard = line.volte_connect_lock.lock().await;
         if !line.volte.status().await.registered {
-            crate::access::volte::live::connect_live_for_line(
+            crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
                 &line.volte_live,
                 &device,
                 &line.volte,
@@ -3419,7 +3419,7 @@ async fn send_sms_over_volte_path(
         get_sim_info_for_modem_with_cache(&app.dbus_conn, &binding.modem_path, Some(&app.database))
             .await
             .map_err(|error| error.to_string())?;
-    let result = crate::access::volte::live::send_live_sms_for_line(
+    let result = crate::connectivity::modems::softstack::volte::live::send_live_sms_for_line(
         &line.volte_live,
         &line.volte,
         &payload.phone_number,
@@ -3502,7 +3502,7 @@ async fn send_sms_over_cs_path(
 /// (ringing, answer, hangup). Mirrors `spawn_vowifi_sms_followup_persist`.
 fn spawn_vowifi_call_followup(
     mut followup: tokio::sync::mpsc::UnboundedReceiver<
-        crate::access::vowifi::live::LiveCallFollowupFrame,
+        crate::connectivity::modems::softstack::vowifi::live::LiveCallFollowupFrame,
     >,
 ) {
     tokio::spawn(async move {
@@ -4283,9 +4283,9 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
                 epdg.dns_server = Some(line_config.dns_server);
             }
             epdg.route_kind = match line_config.proxy_mode {
-                crate::infra::config::VowifiProxyMode::Direct => "direct",
-                crate::infra::config::VowifiProxyMode::Socks5UdpAssociate => "socks5_udp_associate",
-                crate::infra::config::VowifiProxyMode::UdpRelay => "udp_relay",
+                crate::platform::config::VowifiProxyMode::Direct => "direct",
+                crate::platform::config::VowifiProxyMode::Socks5UdpAssociate => "socks5_udp_associate",
+                crate::platform::config::VowifiProxyMode::UdpRelay => "udp_relay",
             }
             .to_string();
             epdg.proxy_endpoint_configured = !line_config.proxy_endpoint.is_empty();
@@ -4317,8 +4317,8 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
 /// responsive during boot and hotplug instead of 404-ing.
 #[derive(Clone)]
 pub struct VowifiScope {
-    line: Option<Arc<crate::access::line_registry::LineRuntime>>,
-    runtime: Arc<crate::access::vowifi::runtime::VowifiRuntime>,
+    line: Option<Arc<crate::services::line_registry::LineRuntime>>,
+    runtime: Arc<crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime>,
     line_id: String,
 }
 
@@ -4354,7 +4354,7 @@ impl VowifiScope {
         &self.line_id
     }
 
-    fn runtime(&self) -> &Arc<crate::access::vowifi::runtime::VowifiRuntime> {
+    fn runtime(&self) -> &Arc<crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime> {
         &self.runtime
     }
 
@@ -4434,7 +4434,7 @@ async fn restore_cellular_and_reset_vowifi(
     // 1. IPSEC Event: 发送 IKEv2 INFORMATIONAL 报文，拆除全部 ESP 安全关联并注销会话
     let _ = app
         .database
-        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+        .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
             trace_id: Some("runtime-stop"),
             level: "info",
             phase: "connection_stop",
@@ -4452,7 +4452,7 @@ async fn restore_cellular_and_reset_vowifi(
     // 2. SMS Event: 短信路径已释放，成功退回到蜂窝基站数据链路。
     let _ = app
         .database
-        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+        .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
             trace_id: Some("runtime-stop"),
             level: "info",
             phase: "connection_stop",
@@ -4466,7 +4466,7 @@ async fn restore_cellular_and_reset_vowifi(
     // 3. SYS Event: WiFi Calling 核心服务运行时已停止
     let _ = app
         .database
-        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+        .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
             trace_id: Some("runtime-stop"),
             level: "info",
             phase: "connection_stop",
@@ -5026,7 +5026,7 @@ async fn connect_vowifi_on_line(
             }
         }
         if let Err(error) =
-            crate::access::vowifi::live::configure_live_network_overrides(&line_id, &line_config)
+            crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(&line_id, &line_config)
         {
             let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
             status.degraded_reason = Some(error);
@@ -5061,7 +5061,7 @@ async fn connect_vowifi_on_line(
     let profile_id = profile_meta.map(|p| p.profile_id);
     let _ = app
         .database
-        .insert_vowifi_runtime_event(crate::infra::db::NewVowifiRuntimeEvent {
+        .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
             trace_id: Some("runtime-connect"),
             level: "info",
             phase: "connect_start",
@@ -5156,20 +5156,20 @@ pub struct VolteControlResponse {
     pub feature_enabled: bool,
     pub sms_enabled: bool,
     pub connection_enabled: bool,
-    pub runtime: crate::access::volte::VolteRuntimeStatus,
+    pub runtime: crate::connectivity::modems::softstack::volte::VolteRuntimeStatus,
 }
 
 #[derive(Debug, serde::Serialize, Default)]
 pub struct VolteLineControlResponse {
-    pub modem: crate::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
     pub profile: LineProfileConfig,
-    pub runtime: crate::access::volte::VolteRuntimeStatus,
+    pub runtime: crate::connectivity::modems::softstack::volte::VolteRuntimeStatus,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
 pub struct VowifiLineConfigResponse {
     pub line_id: String,
-    pub modem: crate::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
     pub config: LineVowifiConfig,
     pub is_primary: bool,
     /// The current live VoWiFi executor is still shared by the legacy primary
@@ -5185,7 +5185,7 @@ pub struct VowifiLineConfigResponse {
 
 async fn build_vowifi_line_response(
     app: &AppState,
-    line: &crate::access::line_registry::LineRuntime,
+    line: &crate::services::line_registry::LineRuntime,
     is_primary: bool,
 ) -> VowifiLineConfigResponse {
     let modem = line.binding();
@@ -5317,7 +5317,7 @@ pub async fn set_vowifi_line_connection_handler(
         let mut next = app.config_manager.get_line_profile(&line_id).vowifi;
         next.enabled = true;
         if let Err(error) =
-            crate::access::vowifi::live::configure_live_network_overrides(&line_id, &next)
+            crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(&line_id, &next)
         {
             return (
                 StatusCode::CONFLICT,
@@ -5326,7 +5326,7 @@ pub async fn set_vowifi_line_connection_handler(
         }
     } else {
         // Drop the overrides so a disabled line stops influencing anything.
-        crate::access::vowifi::live::forget_live_network_overrides(&line_id);
+        crate::connectivity::modems::softstack::vowifi::live::forget_live_network_overrides(&line_id);
     }
     if let Err(error) = app
         .config_manager
@@ -5404,7 +5404,7 @@ pub async fn set_standalone_sim_slots_handler(
 
 fn build_volte_line_response(
     app: &AppState,
-    status: crate::access::line_registry::LineRuntimeStatus,
+    status: crate::services::line_registry::LineRuntimeStatus,
 ) -> VolteLineControlResponse {
     VolteLineControlResponse {
         // Redacted: the embedded trunk settings carry a Digest secret that must
@@ -5504,14 +5504,14 @@ pub async fn set_volte_line_connection_handler(
             )
         }
     };
-    let result: Result<crate::access::volte::VolteRuntimeStatus, crate::access::volte::VolteError> =
+    let result: Result<crate::connectivity::modems::softstack::volte::VolteRuntimeStatus, crate::connectivity::modems::softstack::volte::VolteError> =
         if payload.enabled {
             start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
             Ok(line.volte.status().await)
         } else {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
-            Ok(crate::access::volte::live::disconnect_live_for_line(
+            Ok(crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
                 &line.volte_live,
                 &line.volte,
                 "volte_line_connection_disabled",
@@ -5585,16 +5585,16 @@ pub async fn retry_volte_line_handler(
 #[derive(Debug, Default, serde::Serialize)]
 pub struct TrunkProfileResponse {
     pub line_id: String,
-    pub modem: crate::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
     pub trunk: TrunkProfileConfig,
     pub secret_set: bool,
-    pub runtime: crate::trunk::runtime::TrunkRuntimeStatus,
+    pub runtime: crate::services::trunk::runtime::TrunkRuntimeStatus,
 }
 
 impl TrunkProfileResponse {
     async fn from_line(
         profile: &LineProfileConfig,
-        line: &crate::access::line_registry::LineRuntime,
+        line: &crate::services::line_registry::LineRuntime,
     ) -> Self {
         Self {
             line_id: profile.line_id.clone(),
@@ -5728,7 +5728,7 @@ pub async fn set_line_trunk_enabled_handler(
 impl VolteControlResponse {
     fn build(
         _config: &VolteConfig,
-        runtime: crate::access::volte::VolteRuntimeStatus,
+        runtime: crate::connectivity::modems::softstack::volte::VolteRuntimeStatus,
         line_enabled: bool,
     ) -> Self {
         Self {
@@ -5772,7 +5772,7 @@ pub async fn set_volte_feature_handler(
     {
         Ok(config) => {
             if !payload.enabled {
-                crate::access::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
+                crate::connectivity::modems::softstack::volte::live::disconnect_live(&app.volte_runtime, "volte_disabled")
                     .await;
             }
             let runtime = app.volte_runtime.status().await;
@@ -5811,7 +5811,7 @@ pub async fn set_volte_connection_handler(
         .set_volte_connection_enabled(payload.enabled)
     {
         Ok(config) => {
-            crate::access::volte::live::disconnect_live(
+            crate::connectivity::modems::softstack::volte::live::disconnect_live(
                 &app.volte_runtime,
                 "volte_connection_disabled",
             )
@@ -6042,8 +6042,8 @@ pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<Vowi
 
 // ===================== VoWiFi carrier profile database =====================
 
-fn profile_store(app: &AppState) -> crate::access::vowifi::profile_store::ProfileStore {
-    crate::access::vowifi::profile_store::ProfileStore::new(Arc::clone(&app.database))
+fn profile_store(app: &AppState) -> crate::connectivity::modems::softstack::vowifi::profile_store::ProfileStore {
+    crate::connectivity::modems::softstack::vowifi::profile_store::ProfileStore::new(Arc::clone(&app.database))
 }
 
 /// GET /api/vowifi/carrier-profiles
@@ -6051,7 +6051,7 @@ pub async fn list_vowifi_carrier_profiles_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::access::vowifi::profile_store::StoredProfile>>>,
+    Json<ApiResponse<Vec<crate::connectivity::modems::softstack::vowifi::profile_store::StoredProfile>>>,
 ) {
     match profile_store(&app).list() {
         Ok(profiles) => (
@@ -6069,7 +6069,7 @@ pub async fn list_vowifi_carrier_profiles_handler(
 /// rather than surfacing later as a failed IKE or REGISTER exchange.
 pub async fn save_vowifi_carrier_profile_handler(
     State(app): State<AppState>,
-    Json(record): Json<crate::access::vowifi::profile_record::CarrierProfileRecord>,
+    Json(record): Json<crate::connectivity::modems::softstack::vowifi::profile_record::CarrierProfileRecord>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match profile_store(&app).save(&record, "manual") {
         Ok(()) => (
@@ -6138,7 +6138,7 @@ pub async fn resolve_vowifi_carrier_profile_handler(
     let (mcc, mnc) = plmn.split_at(3);
     match profile_store(&app).resolve_by_plmn(mcc, mnc) {
         Some(resolved) => {
-            let record = crate::access::vowifi::profile_record::CarrierProfileRecord::from_profile(
+            let record = crate::connectivity::modems::softstack::vowifi::profile_record::CarrierProfileRecord::from_profile(
                 resolved.profile,
             );
             (
@@ -6186,7 +6186,7 @@ pub async fn import_vowifi_carrier_profiles_handler(
     State(app): State<AppState>,
     Json(payload): Json<VowifiProfileImportRequest>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    use crate::access::vowifi::profile_import;
+    use crate::connectivity::modems::softstack::vowifi::profile_import;
 
     let facts = match payload.format.as_str() {
         "aosp_apns" => profile_import::parse_aosp_apns(&payload.content),
@@ -6262,7 +6262,7 @@ pub async fn get_external_vowifi_profiles_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
+    Json<ApiResponse<Vec<crate::platform::config::ExternalVowifiProfile>>>,
 ) {
     match profile_store(&app).list_as_external() {
         Ok(profiles) => (
@@ -6279,10 +6279,10 @@ pub async fn get_external_vowifi_profiles_handler(
 /// row is edited in place so any REGISTER policy already tuned there survives.
 pub async fn set_external_vowifi_profile_handler(
     State(app): State<AppState>,
-    Json(mut payload): Json<crate::infra::config::ExternalVowifiProfile>,
+    Json(mut payload): Json<crate::platform::config::ExternalVowifiProfile>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::infra::config::ExternalVowifiProfile>>>,
+    Json<ApiResponse<Vec<crate::platform::config::ExternalVowifiProfile>>>,
 ) {
     payload.profile_id = payload.profile_id.trim().to_string();
     payload.mcc = payload.mcc.trim().to_string();
@@ -6467,7 +6467,7 @@ fn volte_next_retry_at(delay_secs: u64) -> String {
 
 async fn start_line_volte_restore(
     app: AppState,
-    line: Arc<crate::access::line_registry::LineRuntime>,
+    line: Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) -> bool {
     if !line.begin_volte_retry() {
@@ -6480,7 +6480,7 @@ async fn start_line_volte_restore(
         .set_video_enabled(volte.voice_enabled && vilte.feature_enabled);
     line.volte
         .update(|state| {
-            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Connecting;
+            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Connecting;
             state.recovery_source = Some(source.to_string());
             state.retry_attempt = 0;
             state.retry_max = VOLTE_RESTORE_MAX_ATTEMPTS;
@@ -6506,7 +6506,7 @@ enum LineModemWait {
 
 fn line_volte_restore_enabled(
     app: &AppState,
-    line: &crate::access::line_registry::LineRuntime,
+    line: &crate::services::line_registry::LineRuntime,
 ) -> bool {
     let profile = app.config_manager.get_line_profile(&line.binding().line_id);
     profile.enabled && profile.volte_connection_enabled
@@ -6514,7 +6514,7 @@ fn line_volte_restore_enabled(
 
 async fn wait_for_line_modem(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
 ) -> LineModemWait {
     for poll in 0..VOLTE_MODEM_MISSING_POLLS {
         if !line_volte_restore_enabled(app, line) {
@@ -6526,10 +6526,10 @@ async fn wait_for_line_modem(
         }
         line.volte
             .update(|state| {
-                state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
-                state.stage = crate::access::volte::runtime::VolteStage::Modem;
+                state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
+                state.stage = crate::connectivity::modems::softstack::volte::runtime::VolteStage::Modem;
                 state.recovery_state =
-                    crate::access::volte::runtime::VolteRecoveryState::WaitingModem;
+                    crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::WaitingModem;
                 state.last_error = Some(format!(
                     "volte_modem_missing_wait:{}/{}",
                     poll + 1,
@@ -6551,7 +6551,7 @@ async fn wait_for_line_modem(
         line.volte
             .update(|state| {
                 state.recovery_state =
-                    crate::access::volte::runtime::VolteRecoveryState::RestartingBaseband;
+                    crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::RestartingBaseband;
                 state.modem_restart_attempt = restart_attempt;
                 state.next_retry_at = None;
                 state.last_error = Some(format!(
@@ -6579,8 +6579,8 @@ async fn wait_for_line_modem(
 
     line.volte
         .update(|state| {
-            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
-            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Exhausted;
             state.manual_retry_available = true;
             state.next_retry_at = None;
             state.last_error = Some("volte_baseband_recovery_exhausted".to_string());
@@ -6592,7 +6592,7 @@ async fn wait_for_line_modem(
 
 async fn run_line_volte_restore_batch(
     app: &AppState,
-    line: &Arc<crate::access::line_registry::LineRuntime>,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) {
     match wait_for_line_modem(app, line).await {
@@ -6600,7 +6600,7 @@ async fn run_line_volte_restore_batch(
         LineModemWait::Cancelled => {
             line.volte
                 .update(|state| {
-                    state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -6617,7 +6617,7 @@ async fn run_line_volte_restore_batch(
         if !profile.enabled || !profile.volte_connection_enabled {
             line.volte
                 .update(|state| {
-                    state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -6633,7 +6633,7 @@ async fn run_line_volte_restore_batch(
             }
         }
         let binding = line.binding();
-        let device = match crate::access::volte::live::VolteDeviceBinding::from_modem(&binding) {
+        let device = match crate::connectivity::modems::softstack::volte::live::VolteDeviceBinding::from_modem(&binding) {
             Ok(device) => device,
             Err(error) => {
                 line.volte
@@ -6645,7 +6645,7 @@ async fn run_line_volte_restore_batch(
         line.volte
             .update(|state| {
                 state.recovery_state =
-                    crate::access::volte::runtime::VolteRecoveryState::Connecting;
+                    crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Connecting;
                 state.recovery_source = Some(source.to_string());
                 state.retry_attempt = attempt;
                 state.next_retry_at = None;
@@ -6661,7 +6661,7 @@ async fn run_line_volte_restore_batch(
             if line.volte.status().await.registered {
                 return;
             }
-            crate::access::volte::live::connect_live_for_line(
+            crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
                 &line.volte_live,
                 &device,
                 &line.volte,
@@ -6679,7 +6679,7 @@ async fn run_line_volte_restore_batch(
                 line.volte
                     .update(|state| {
                         state.recovery_state =
-                            crate::access::volte::runtime::VolteRecoveryState::Registered;
+                            crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Registered;
                         state.manual_retry_available = false;
                         state.next_retry_at = None;
                     })
@@ -6693,9 +6693,9 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if crate::access::volte::plan::FailureClass::from_details(
+                if crate::connectivity::modems::softstack::volte::plan::FailureClass::from_details(
                     error.detail().unwrap_or_default(),
-                ) == crate::access::volte::plan::FailureClass::BasebandWedged
+                ) == crate::connectivity::modems::softstack::volte::plan::FailureClass::BasebandWedged
                 {
                     warn!(
                         line_id = %binding.line_id,
@@ -6704,9 +6704,9 @@ async fn run_line_volte_restore_batch(
                     );
                     line.volte
                         .update(|state| {
-                            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
+                            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
                             state.recovery_state =
-                                crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+                                crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Exhausted;
                             state.manual_retry_available = true;
                             state.next_retry_at = None;
                             state.last_error = Some(format!("volte_baseband_wedged:{error}"));
@@ -6728,8 +6728,8 @@ async fn run_line_volte_restore_batch(
 
     line.volte
         .update(|state| {
-            state.phase = crate::access::volte::runtime::VoltePhase::Degraded;
-            state.recovery_state = crate::access::volte::runtime::VolteRecoveryState::Exhausted;
+            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Exhausted;
             state.manual_retry_available = true;
             state.next_retry_at = None;
             if state.last_error.is_none() {
@@ -6810,7 +6810,7 @@ fn persist_vowifi_runtime_snapshot(app: &AppState, status: &VowifiStatusResponse
     let profile_meta = status.profile.profile.as_ref();
     if let Err(err) =
         app.database
-            .upsert_vowifi_runtime_snapshot(crate::infra::db::NewVowifiRuntimeSnapshot {
+            .upsert_vowifi_runtime_snapshot(crate::platform::db::NewVowifiRuntimeSnapshot {
                 phase: status.phase,
                 profile_id: profile_meta.map(|profile| profile.profile_id),
                 plmn: profile_meta.map(|profile| profile.plmn),
@@ -6982,7 +6982,7 @@ pub async fn get_vowifi_sms_delivery_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Option<crate::infra::db::VowifiSmsDeliveryEntry>>>,
+    Json<ApiResponse<Option<crate::platform::db::VowifiSmsDeliveryEntry>>>,
 ) {
     match app.database.get_vowifi_sms_delivery(&message_id) {
         Ok(delivery) => (
@@ -7458,7 +7458,7 @@ pub async fn system_reboot(
 
 pub async fn run_safe_os_reboot_sequence(
     delay_seconds: u32,
-    system_events: Arc<crate::system::system_event::SystemEventEmitter>,
+    system_events: Arc<crate::services::system::system_event::SystemEventEmitter>,
 ) {
     if delay_seconds > 0 {
         tokio::time::sleep(tokio::time::Duration::from_secs(delay_seconds as u64)).await;
@@ -7651,8 +7651,8 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
     )
 }
 
-use crate::infra::config::ConfigManager;
-use crate::notify::notification::NotificationSender;
+use crate::platform::config::ConfigManager;
+use crate::services::notify::notification::NotificationSender;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NotificationLogQuery {
@@ -7693,7 +7693,7 @@ pub async fn get_notification_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::infra::config::NotificationConfig>>,
+    Json<ApiResponse<crate::platform::config::NotificationConfig>>,
 ) {
     let config = config_manager.get_notifications();
     (
@@ -7705,7 +7705,7 @@ pub async fn get_notification_config_handler(
 /// POST /api/notifications/config
 pub async fn set_notification_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
-    Json(notification_config): Json<crate::infra::config::NotificationConfig>,
+    Json(notification_config): Json<crate::platform::config::NotificationConfig>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match config_manager.set_notifications(notification_config) {
         Ok(_) => (
@@ -7762,7 +7762,7 @@ pub async fn get_notification_logs_handler(
     State(database): State<Arc<Database>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::infra::db::NotificationLogsResponse>>,
+    Json<ApiResponse<crate::platform::db::NotificationLogsResponse>>,
 ) {
     match database.get_notification_logs(
         &query.event_type,
@@ -7812,7 +7812,7 @@ pub async fn clear_notification_logs_handler(
 
 /// GET /api/ota/status
 pub async fn get_ota_status_handler() -> impl IntoResponse {
-    let status = crate::system::ota::get_ota_status();
+    let status = crate::services::system::ota::get_ota_status();
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message("Success", status)),
@@ -7821,7 +7821,7 @@ pub async fn get_ota_status_handler() -> impl IntoResponse {
 
 /// POST /api/ota/upload
 pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
-    match crate::system::ota::handle_ota_upload(&body) {
+    match crate::services::system::ota::handle_ota_upload(&body) {
         Ok(response) => {
             let message = if response.validation.valid {
                 "OTA uploaded and validated"
@@ -7852,10 +7852,10 @@ pub async fn get_latest_ota_release_handler(
             .as_ref()
             .map(|prefix| !prefix.trim().is_empty())
             .unwrap_or(false);
-        let proxy_prefix = crate::system::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = crate::system::ota::build_ota_http_client()?;
+        let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let client = crate::services::system::ota::build_ota_http_client()?;
 
-        crate::system::ota::fetch_latest_github_release(
+        crate::services::system::ota::fetch_latest_github_release(
             &client,
             &proxy_prefix,
             include_builtin_proxies,
@@ -7889,28 +7889,28 @@ pub async fn prepare_online_ota_handler(
             .as_ref()
             .map(|prefix| !prefix.trim().is_empty())
             .unwrap_or(false);
-        let proxy_prefix = crate::system::ota::normalize_proxy_prefix(req.proxy_prefix);
-        let client = crate::system::ota::build_ota_http_client()?;
+        let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let client = crate::services::system::ota::build_ota_http_client()?;
 
-        let release = crate::system::ota::fetch_latest_github_release(
+        let release = crate::services::system::ota::fetch_latest_github_release(
             &client,
             &proxy_prefix,
             include_builtin_proxies,
         )
         .await?;
 
-        let asset = crate::system::ota::supported_release_asset(&release)
+        let asset = crate::services::system::ota::supported_release_asset(&release)
             .ok_or_else(|| "No supported OTA asset found in latest release".to_string())?;
 
-        if asset.size > crate::system::ota::MAX_OTA_BYTES {
+        if asset.size > crate::services::system::ota::MAX_OTA_BYTES {
             return Err(format!(
                 "OTA asset is too large: {} bytes exceeds {} bytes",
                 asset.size,
-                crate::system::ota::MAX_OTA_BYTES
+                crate::services::system::ota::MAX_OTA_BYTES
             ));
         }
 
-        let bytes = crate::system::ota::download_ota_asset_bytes(
+        let bytes = crate::services::system::ota::download_ota_asset_bytes(
             &client,
             &proxy_prefix,
             include_builtin_proxies,
@@ -7918,7 +7918,7 @@ pub async fn prepare_online_ota_handler(
         )
         .await?;
 
-        crate::system::ota::handle_ota_upload(&bytes)
+        crate::services::system::ota::handle_ota_upload(&bytes)
     }
     .await;
 
@@ -7947,7 +7947,7 @@ pub async fn prepare_online_ota_handler(
 pub async fn apply_ota_handler(
     Json(req): Json<crate::api::models::OtaApplyRequest>,
 ) -> impl IntoResponse {
-    match crate::system::ota::apply_ota_update(req.restart_now) {
+    match crate::services::system::ota::apply_ota_update(req.restart_now) {
         Ok(message) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -7967,7 +7967,7 @@ pub async fn apply_ota_handler(
 
 /// POST /api/ota/cancel
 pub async fn cancel_ota_handler() -> impl IntoResponse {
-    match crate::system::ota::cancel_pending_update() {
+    match crate::services::system::ota::cancel_pending_update() {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -8024,7 +8024,7 @@ pub async fn get_automation_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::infra::config::AutomationConfig>>,
+    Json<ApiResponse<crate::platform::config::AutomationConfig>>,
 ) {
     let config = config_manager.get_automation_config();
     (
@@ -8036,7 +8036,7 @@ pub async fn get_automation_config_handler(
 /// POST /api/automation/config
 pub async fn set_automation_config_handler(
     State(config_manager): State<Arc<ConfigManager>>,
-    Json(config): Json<crate::infra::config::AutomationConfig>,
+    Json(config): Json<crate::platform::config::AutomationConfig>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     match config_manager.set_automation_config(config) {
         Ok(_) => (
@@ -8059,7 +8059,7 @@ pub async fn get_automation_logs_handler(
     State(database): State<Arc<Database>>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<crate::infra::db::AutomationLogsResponse>>,
+    Json<ApiResponse<crate::platform::db::AutomationLogsResponse>>,
 ) {
     match database.get_automation_logs(
         &query.task_type,
@@ -8120,13 +8120,13 @@ pub async fn test_automation_task_handler(
     };
 
     tokio::spawn(async move {
-        let registry = crate::automation::tasks::TaskRegistry::new();
+        let registry = crate::services::automation::tasks::TaskRegistry::new();
         let task_type = match &task.action {
-            crate::infra::config::AutomationAction::RestartBaseband => "restart_baseband",
-            crate::infra::config::AutomationAction::RebootDevice { .. } => "reboot_device",
-            crate::infra::config::AutomationAction::SendSms { .. } => "send_sms",
-            crate::infra::config::AutomationAction::ConsumeData { .. } => "consume_data",
-            crate::infra::config::AutomationAction::DialCall { .. } => "dial_call",
+            crate::platform::config::AutomationAction::RestartBaseband => "restart_baseband",
+            crate::platform::config::AutomationAction::RebootDevice { .. } => "reboot_device",
+            crate::platform::config::AutomationAction::SendSms { .. } => "send_sms",
+            crate::platform::config::AutomationAction::ConsumeData { .. } => "consume_data",
+            crate::platform::config::AutomationAction::DialCall { .. } => "dial_call",
         };
 
         let handler = match registry.get(task_type) {
@@ -8142,11 +8142,11 @@ pub async fn test_automation_task_handler(
 
         let mut delay_secs = 0u64;
         let params = match &task.action {
-            crate::infra::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
-            crate::infra::config::AutomationAction::RebootDevice { delay_seconds } => {
+            crate::platform::config::AutomationAction::RestartBaseband => serde_json::Value::Null,
+            crate::platform::config::AutomationAction::RebootDevice { delay_seconds } => {
                 serde_json::json!({ "delay_seconds": delay_seconds })
             }
-            crate::infra::config::AutomationAction::SendSms {
+            crate::platform::config::AutomationAction::SendSms {
                 phone_number,
                 content,
                 random_delay_seconds,
@@ -8160,11 +8160,11 @@ pub async fn test_automation_task_handler(
                     "retry_limit": retry_limit
                 })
             }
-            crate::infra::config::AutomationAction::ConsumeData { bytes, unit } => {
+            crate::platform::config::AutomationAction::ConsumeData { bytes, unit } => {
                 delay_secs = 120;
                 serde_json::json!({ "bytes": bytes, "unit": unit, "target": &task.target })
             }
-            crate::infra::config::AutomationAction::DialCall {
+            crate::platform::config::AutomationAction::DialCall {
                 country_code,
                 phone_number,
                 duration_seconds,
@@ -8207,13 +8207,13 @@ pub async fn test_automation_task_handler(
             .database
             .insert_automation_log(&task.id, &task.name, task_type, status, &detail);
 
-        let event = crate::notify::notification::AutomationEvent {
+        let event = crate::services::notify::notification::AutomationEvent {
             task_id: task.id.clone(),
             task_name: task.name.clone(),
             task_type: task_type.to_string(),
             status: status.to_string(),
             message: detail.clone(),
-            timestamp: crate::infra::db::beijing_sms_now_string(),
+            timestamp: crate::platform::db::beijing_sms_now_string(),
         };
 
         let _ = app_state
@@ -8234,7 +8234,7 @@ pub async fn test_automation_task_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cellular::modem_manager::SimIdentity;
+    use crate::hardware::cellular::modem_manager::SimIdentity;
 
     #[test]
     fn enriches_enabled_esim_profile_from_current_sim_identity() {
@@ -8283,12 +8283,12 @@ mod tests {
 
     #[test]
     fn vowifi_mt_storage_key_preserves_repeated_identical_replies() {
-        let first = crate::access::vowifi::sms::MoSmsSipOutcome {
+        let first = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-a".to_string(),
             message_id: "mo-a".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::access::vowifi::sms::RpduAckState::None,
-            delivery_state: crate::access::vowifi::sms::SmsDeliveryState::Accepted,
+            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::None,
+            delivery_state: crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Accepted,
             failure_cause: None,
             mt_deliveries: Vec::new(),
         };
@@ -8305,15 +8305,15 @@ mod tests {
 
     #[test]
     fn vowifi_mt_complete_group_count_collapses_segments() {
-        let outcome = crate::access::vowifi::sms::MoSmsSipOutcome {
+        let outcome = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-a".to_string(),
             message_id: "mo-a".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::access::vowifi::sms::RpduAckState::None,
-            delivery_state: crate::access::vowifi::sms::SmsDeliveryState::Accepted,
+            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::None,
+            delivery_state: crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Accepted,
             failure_cause: None,
             mt_deliveries: vec![
-                crate::access::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 1,
                     originator: "10086".to_string(),
                     text: "part1".to_string(),
@@ -8323,7 +8323,7 @@ mod tests {
                     segment_sequence: 1,
                     segment_total: 2,
                 },
-                crate::access::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 2,
                     originator: "10086".to_string(),
                     text: "part2".to_string(),

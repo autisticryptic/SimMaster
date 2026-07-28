@@ -9,17 +9,17 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
-use crate::access::line_registry::LineRuntimeRegistry;
-use crate::access::volte::runtime::VolteRuntime;
-use crate::access::vowifi::runtime::VowifiRuntime;
-use crate::cellular::cell_lock_store::CellLockStore;
-use crate::infra::config::ConfigManager;
-use crate::infra::db::Database;
-use crate::messaging::sms_listener::SmsResyncHandle;
-use crate::network::device_network::DdnsManager;
-use crate::notify::notification::NotificationSender;
-use crate::sim::esim::EsimSupervisor;
-use crate::system::system_event::SystemEventEmitter;
+use crate::services::line_registry::LineRuntimeRegistry;
+use crate::connectivity::modems::softstack::volte::runtime::VolteRuntime;
+use crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime;
+use crate::hardware::cellular::cell_lock_store::CellLockStore;
+use crate::platform::config::ConfigManager;
+use crate::platform::db::Database;
+use crate::services::messaging::sms_listener::SmsResyncHandle;
+use crate::services::network::device_network::DdnsManager;
+use crate::services::notify::notification::NotificationSender;
+use crate::hardware::sim::esim::EsimSupervisor;
+use crate::services::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
