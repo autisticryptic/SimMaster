@@ -185,11 +185,9 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
 /// speaks QMI (`wds` present). Endpoint state is published under `/run/simadmin/`
 /// so the service can pick it up without re-probing.
 ///
-/// Note on roles: the secondary endpoint is for the *data* bearer, not IMS. On
-/// the reference firmware a secondary rpmsg endpoint cannot hold a WDS CID across
-/// processes, and the IMS flow needs exactly that (allocate CID → start-network →
-/// read P-CSCF). IMS therefore runs on the primary port through `qmi-proxy`,
-/// which multiplexes it alongside ModemManager. See `hardware::cellular::qmi_wds`.
+/// The allocator can place either ordinary data or IMS on DATA6. The other
+/// bearer remains on qmi0, so both functions coexist without sharing one WDS
+/// slot.
 ///
 /// The udev rules cover *every* spare QMI port, not just the one bound here:
 /// the kernel module publishes one port per registered channel, and any spare
@@ -285,6 +283,7 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
                     "channel": endpoint.channel,
                     "port_name": endpoint.port_name,
                     "device_path": endpoint.device_path,
+                    "netdev": endpoint.netdev,
                     "driver": endpoint.driver,
                 })
             })
@@ -295,11 +294,38 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         eprintln!("could not write {}: {error}", state_file.display());
     }
 
+    // Beta8 also publishes a singular state file consumed by the DATA6 runtime.
+    // Qualcomm 410 has one baseband, but keep the JSON map above for hosts with
+    // more than one modem.
+    if let Some(endpoint) = prepared.first() {
+        let state = serde_json::to_string_pretty(&serde_json::json!({
+            "qmi_device": endpoint.device_path,
+            "netdev": endpoint.netdev,
+            "channel": endpoint.channel,
+            "rpmsg_device": endpoint.rpmsg_device,
+        }))?;
+        if let Err(error) = std::fs::write(secondary_qmi::SECONDARY_QMI_STATE_FILE, state) {
+            eprintln!(
+                "could not write {}: {error}",
+                secondary_qmi::SECONDARY_QMI_STATE_FILE
+            );
+        }
+    }
+
     // The systemd unit is Type=notify; tell it we are up so ModemManager can
     // start. Harmless when run by hand outside systemd.
     if std::env::var_os("NOTIFY_SOCKET").is_some() {
         let _ = tokio::process::Command::new("systemd-notify")
-            .arg("--ready")
+            .args([
+                "--ready",
+                &format!(
+                    "--status=DATA6 stock RPMSG initialized at {}",
+                    prepared
+                        .first()
+                        .map(|endpoint| endpoint.device_path.as_str())
+                        .unwrap_or("unavailable")
+                ),
+            ])
             .status()
             .await;
     }
@@ -309,7 +335,23 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         prepared.len(),
         primaries.len()
     );
-    Ok(())
+    if prepared.is_empty() {
+        anyhow::bail!("stock RPMSG driver did not expose a DATA6 WWAN port");
+    }
+
+    // Type=notify service remains alive and verifies that the endpoint is still
+    // the same character node. A disappearance/replacement makes systemd retry
+    // initialization instead of letting ModemManager run against stale state.
+    let mut monitors = tokio::task::JoinSet::new();
+    for endpoint in prepared {
+        monitors.spawn(async move { secondary_qmi::hold_endpoint(&endpoint).await });
+    }
+    match monitors.join_next().await {
+        Some(Ok(Err(error))) => Err(anyhow::anyhow!(error)),
+        Some(Err(error)) => Err(anyhow::anyhow!("secondary QMI monitor failed: {error}")),
+        Some(Ok(Ok(()))) => Err(anyhow::anyhow!("secondary QMI monitor exited unexpectedly")),
+        None => Err(anyhow::anyhow!("secondary QMI monitor was not started")),
+    }
 }
 
 fn run_extract_zip(archive: &str, target: &str) -> Result<()> {

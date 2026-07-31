@@ -55,38 +55,20 @@ use std::{
 };
 
 use tokio::{process::Command, time::sleep};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
-/// Drivers that can turn a Qualcomm SMD control channel into a WWAN port, in
-/// preference order.
-///
-/// `rpmsg_wwan_ctrl_multi` ships with this project (see
-/// `kernel/rpmsg_wwan_ctrl_multi/`) and registers the spare `DATA<n>_CNTL`
-/// channels with the correct `WWAN_PORT_QMI` type, so they surface as real QMI
-/// ports (`wwan0qmi1`, …).
-///
-/// The in-tree `rpmsg_wwan_ctrl` is the fallback. It only matches
-/// `DATA1`/`DATA4`/`DATA5_CNTL`; a spare channel forced onto it via
-/// `driver_override` gets `driver_data == 0` (`WWAN_PORT_UNKNOWN`) and is
-/// published as an AT-typed port whose data path is incomplete — CTL queries
-/// answer, but WDS client allocation is unreliable and `--wds-start-network` can
-/// wedge the baseband. It is still attempted last so a host without the custom
-/// module degrades to "probe and reject" rather than silently doing nothing.
-const RPMSG_WWAN_DRIVERS: &[&str] = &["rpmsg_wwan_ctrl_multi", "rpmsg_wwan_ctrl"];
+/// Beta8 deliberately migrated DATA6 away from the kernel-specific multi-port
+/// module and binds exactly one channel through the in-tree driver. On MSM8916,
+/// trying DATA7/8/9 after DATA6 fails can tear down the primary modem inventory,
+/// so this list must remain singular.
+const RPMSG_WWAN_DRIVER: &str = "rpmsg_wwan_ctrl";
+const LEGACY_RPMSG_WWAN_DRIVER: &str = "rpmsg_wwan_ctrl_multi";
+const SECONDARY_CHANNEL: &str = "DATA6_CNTL";
 const RPMSG_DEVICES_DIR: &str = "/sys/bus/rpmsg/devices";
 const RPMSG_DRIVERS_DIR: &str = "/sys/bus/rpmsg/drivers";
 const WWAN_CLASS_DIR: &str = "/sys/class/wwan";
-
-/// Ordering hint for which spare SMD channel to try first. Not a whitelist: any
-/// `DATA*_CNTL` channel on the same baseband is eligible, these are just tried
-/// first because they are the conventional data channels.
-const PREFERRED_CHANNELS: &[&str] = &[
-    "DATA6_CNTL",
-    "DATA7_CNTL",
-    "DATA8_CNTL",
-    "DATA9_CNTL",
-    "DATA5_CNTL",
-];
+const NET_CLASS_DIR: &str = "/sys/class/net";
+pub const SECONDARY_QMI_STATE_FILE: &str = "/run/simadmin/secondary-qmi-device";
 
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
@@ -115,10 +97,11 @@ impl QmiOpenMode {
         }
     }
 
-    /// Probe order. `ForceQmi` first because a dedicated secondary endpoint is
-    /// held exclusively by us and may be mislabeled; `Proxy` covers USB stacks.
-    pub fn probe_order() -> [Self; 2] {
-        [Self::ForceQmi, Self::Proxy]
+    /// Beta8's boot probe is direct and forces QMI because the stock driver
+    /// advertises DATA6 as an UNKNOWN/AT-style port. Proxy sharing starts only
+    /// for the retained runtime WDS client.
+    pub fn probe_order() -> [Self; 1] {
+        [Self::ForceQmi]
     }
 }
 
@@ -161,6 +144,8 @@ pub struct SecondaryQmiEndpoint {
     pub port_name: String,
     /// Node to pass to `qmicli -d`, e.g. `/dev/wwan0at2`.
     pub device_path: String,
+    /// Data-plane interface paired with DATA6, e.g. `wwan1`.
+    pub netdev: Option<String>,
     /// Open mode proven to work by the capability probe.
     pub open_mode: QmiOpenMode,
     /// rpmsg driver backing this endpoint. Empty for pre-existing endpoints.
@@ -182,6 +167,9 @@ pub enum SecondaryQmiError {
     BindFailed(String),
     /// A port appeared but no open mode could speak QMI/`wds` on it.
     ProbeFailed(String),
+    /// A prepared endpoint disappeared or was replaced while the initializer
+    /// was holding it for ModemManager.
+    EndpointLost(String),
 }
 
 impl std::fmt::Display for SecondaryQmiError {
@@ -192,6 +180,7 @@ impl std::fmt::Display for SecondaryQmiError {
             Self::NoChannelAvailable(d) => write!(f, "secondary_qmi_no_channel:{d}"),
             Self::BindFailed(d) => write!(f, "secondary_qmi_bind_failed:{d}"),
             Self::ProbeFailed(d) => write!(f, "secondary_qmi_probe_failed:{d}"),
+            Self::EndpointLost(d) => write!(f, "secondary_qmi_endpoint_lost:{d}"),
         }
     }
 }
@@ -352,17 +341,10 @@ fn enumerate_channels() -> Result<Vec<RpmsgChannel>, SecondaryQmiError> {
     Ok(channels)
 }
 
-/// Any `DATA<n>_CNTL` channel qualifies; the preferred list only orders probing.
+/// Beta8 only allocates DATA6. Other DATA channels can belong to firmware or
+/// recovery paths and must not be used as speculative fallbacks.
 pub fn is_spare_data_channel(channel: &str) -> bool {
-    channel.starts_with("DATA") && channel.ends_with("_CNTL")
-}
-
-/// Rank a channel for probe order: lower is tried first.
-fn channel_rank(channel: &str) -> usize {
-    PREFERRED_CHANNELS
-        .iter()
-        .position(|preferred| *preferred == channel)
-        .unwrap_or(PREFERRED_CHANNELS.len())
+    channel == SECONDARY_CHANNEL
 }
 
 /// Ports currently published for a baseband, with their advertised type.
@@ -433,18 +415,6 @@ pub fn udev_ignore_rule(port_name: &str) -> String {
     format!("SUBSYSTEM==\"wwan\", KERNEL==\"{port_name}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\"")
 }
 
-/// Probe-order hint for a discovered port: prefer names that advertise QMI, then
-/// anything else. Naming is only a hint — the capability probe decides.
-fn port_rank(port: &str, port_type: Option<&str>) -> usize {
-    let name_says_qmi = port.contains("qmi");
-    let type_says_qmi = port_type.is_some_and(|t| t.eq_ignore_ascii_case("QMI"));
-    match (type_says_qmi, name_says_qmi) {
-        (true, _) => 0,
-        (_, true) => 1,
-        _ => 2,
-    }
-}
-
 fn driver_bind_path(driver: &str) -> PathBuf {
     PathBuf::from(RPMSG_DRIVERS_DIR).join(driver).join("bind")
 }
@@ -455,17 +425,13 @@ fn driver_unbind_path(driver: &str) -> PathBuf {
 
 /// Drivers present on this host, in preference order. The custom multi driver is
 /// preferred because it types spare channels as real QMI ports.
-fn available_drivers() -> Vec<&'static str> {
-    RPMSG_WWAN_DRIVERS
-        .iter()
-        .copied()
-        .filter(|driver| driver_bind_path(driver).exists())
-        .collect()
+fn stock_driver_available() -> bool {
+    driver_bind_path(RPMSG_WWAN_DRIVER).exists()
 }
 
 /// Is this driver one of ours (i.e. safe to rebind a channel away from)?
 fn is_wwan_ctrl_driver(driver: &str) -> bool {
-    RPMSG_WWAN_DRIVERS.contains(&driver)
+    driver == RPMSG_WWAN_DRIVER || driver == LEGACY_RPMSG_WWAN_DRIVER
 }
 
 /// Does this device actually speak QMI with the `wds` service, and in which mode?
@@ -521,11 +487,9 @@ async fn run_qmicli(args: &[&str]) -> Option<Output> {
 /// Ensure a secondary QMI endpoint exists for the baseband owning
 /// `primary_device`, and return it.
 ///
-/// Order of preference:
-///   1. an already-published extra port on this baseband that passes the probe
-///      (covers kernels/platforms that expose a second QMI port natively, and
-///      re-attach after a restart),
-///   2. otherwise bind a spare `DATA*_CNTL` channel and probe the port it creates.
+/// The MSM8916/Beta8 contract is intentionally narrow: locate DATA6 on the same
+/// baseband as `primary_device`, reuse it only when it is already bound to the
+/// stock driver, or bind that one channel and verify the one port it creates.
 pub async fn ensure_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
@@ -536,91 +500,34 @@ pub async fn ensure_endpoint(
         .unwrap_or(primary_device)
         .to_string();
 
-    // 1. Reuse any extra port already present on this baseband.
-    let mut existing: Vec<(String, Option<String>)> = ports_for_baseband(&baseband)
-        .into_iter()
-        .filter(|(name, _)| *name != primary_port && !is_boot_port(name))
-        .collect();
-    existing.sort_by_key(|(name, port_type)| port_rank(name, port_type.as_deref()));
-    for (port, _) in existing {
-        let device_path = format!("/dev/{port}");
-        if !Path::new(&device_path).exists() {
-            continue;
-        }
-        if let Some(open_mode) = probe_qmi_capability(&device_path).await {
-            info!(
-                baseband = %baseband,
-                port = %port,
-                mode = ?open_mode,
-                "Reusing existing secondary QMI endpoint"
-            );
-            return Ok(SecondaryQmiEndpoint {
-                remoteproc: baseband,
-                rpmsg_device: String::new(),
-                channel: String::from("preexisting"),
-                port_name: port,
-                device_path,
-                open_mode,
-                driver: String::new(),
-                owned: false,
-            });
-        }
-    }
-
-    // 2. Bind a spare channel on this baseband.
-    let drivers = available_drivers();
-    if drivers.is_empty() {
+    if !stock_driver_available() {
         return Err(SecondaryQmiError::Unsupported(format!(
-            "none of {RPMSG_WWAN_DRIVERS:?} is loaded and no probe-capable port exists"
+            "stock RPMSG WWAN driver {RPMSG_WWAN_DRIVER} is unavailable"
         )));
     }
     let channels = enumerate_channels()?;
-    let mut mine: Vec<&RpmsgChannel> = channels
+    let candidate = channels
         .iter()
         .filter(|channel| channel.baseband == baseband)
-        .filter(|channel| {
-            // Free, or already held by one of our drivers (safe to rebind).
-            channel
-                .bound_driver
-                .as_deref()
-                .is_none_or(is_wwan_ctrl_driver)
-        })
-        .collect();
-    if mine.is_empty() {
-        return Err(SecondaryQmiError::NoChannelAvailable(format!(
-            "no free DATA*_CNTL channel under {baseband}"
-        )));
-    }
-    mine.sort_by_key(|channel| channel_rank(&channel.channel));
+        .find(|channel| channel.channel == SECONDARY_CHANNEL)
+        .ok_or_else(|| {
+            SecondaryQmiError::NoChannelAvailable(format!(
+                "{SECONDARY_CHANNEL} RPMSG device is unavailable under {baseband}"
+            ))
+        })?;
 
-    let before: Vec<String> = ports_for_baseband(&baseband)
-        .into_iter()
-        .map(|(name, _)| name)
-        .collect();
-    let mut last_error = None;
-    // Prefer the driver that types spare channels correctly; only fall back to
-    // the in-tree driver (which mistypes them) if the custom one is absent.
-    for driver in &drivers {
-        for candidate in &mine {
-            match bind_and_probe(candidate, driver, &baseband, &before).await {
-                Ok(endpoint) => return Ok(endpoint),
-                Err(error) => {
-                    warn!(
-                        channel = %candidate.channel,
-                        driver = %driver,
-                        error = %error,
-                        "Secondary QMI attempt failed; trying next candidate"
-                    );
-                    last_error = Some(error);
-                }
-            }
+    if let Some(bound) = candidate.bound_driver.as_deref() {
+        if !is_wwan_ctrl_driver(bound) {
+            return Err(SecondaryQmiError::NoChannelAvailable(format!(
+                "{SECONDARY_CHANNEL} is already bound to unrelated driver {bound}"
+            )));
+        }
+        if bound == RPMSG_WWAN_DRIVER {
+            return reuse_bound_data6(candidate, &baseband, &primary_port).await;
         }
     }
-    Err(last_error.unwrap_or_else(|| {
-        SecondaryQmiError::NoChannelAvailable(format!(
-            "no DATA*_CNTL channel under {baseband} yielded a QMI-capable port"
-        ))
-    }))
+
+    bind_and_probe(candidate, &baseband, &primary_port).await
 }
 
 /// Boot-time ports that are never the secondary endpoint (the modem's own AT
@@ -629,42 +536,210 @@ fn is_boot_port(port: &str) -> bool {
     port.ends_with("at0") || port.ends_with("at1")
 }
 
+fn ports_for_rpmsg_device(device_id: &str) -> Vec<String> {
+    let device = PathBuf::from(RPMSG_DEVICES_DIR).join(device_id);
+    let Ok(device) = std::fs::canonicalize(device) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(WWAN_CLASS_DIR) else {
+        return Vec::new();
+    };
+    let mut ports = entries
+        .flatten()
+        .filter_map(|entry| {
+            let resolved = std::fs::canonicalize(entry.path()).ok()?;
+            resolved.starts_with(&device).then(|| entry.file_name().to_string_lossy().to_string())
+        })
+        .collect::<Vec<_>>();
+    ports.sort();
+    ports
+}
+
+fn netdevs_for_baseband(baseband: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(NET_CLASS_DIR) else {
+        return Vec::new();
+    };
+    let mut netdevs = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" {
+                return None;
+            }
+            let resolved = std::fs::canonicalize(entry.path()).ok()?;
+            (remoteproc_of_path(&resolved.to_string_lossy()).as_deref() == Some(baseband))
+                .then_some(name)
+        })
+        .collect::<Vec<_>>();
+    netdevs.sort();
+    netdevs
+}
+
+fn choose_data6_netdev(
+    netdevs: &[String],
+    netdevs_before: &[String],
+    primary_port: &str,
+) -> Option<String> {
+    let primary_netdev = primary_port.split("qmi").next().unwrap_or(primary_port);
+    netdevs
+        .iter()
+        .find(|name| !netdevs_before.contains(name) && name.as_str() != primary_netdev)
+        .or_else(|| netdevs.iter().find(|name| name.as_str() != primary_netdev))
+        .cloned()
+}
+
+async fn prepare_data6_netdev(
+    baseband: &str,
+    primary_port: &str,
+    netdevs_before: &[String],
+) -> Result<String, SecondaryQmiError> {
+    let netdev = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            choose_data6_netdev(
+                &netdevs_for_baseband(baseband),
+                netdevs_before,
+                primary_port,
+            )
+        })
+        .ok_or_else(|| {
+            SecondaryQmiError::BindFailed(format!(
+                "no DATA6 netdev appeared under {baseband}"
+            ))
+        })?;
+
+    let output = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        Command::new("ip")
+            .args(["link", "set", netdev.as_str(), "up"])
+            .output(),
+    )
+    .await
+    .map_err(|_| SecondaryQmiError::BindFailed(format!("ip link set {netdev} up timed out")))?
+    .map_err(|error| {
+        SecondaryQmiError::BindFailed(format!("failed to run ip for {netdev}: {error}"))
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(SecondaryQmiError::BindFailed(format!(
+            "ip link set {netdev} up failed ({}): {detail}",
+            output.status.code().unwrap_or(-1)
+        )));
+    }
+    Ok(netdev)
+}
+
+async fn reuse_bound_data6(
+    candidate: &RpmsgChannel,
+    baseband: &str,
+    primary_port: &str,
+) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    let mut ports = ports_for_rpmsg_device(&candidate.device_id);
+    if ports.is_empty() {
+        ports = ports_for_baseband(baseband)
+            .into_iter()
+            .map(|(name, _)| name)
+            .filter(|name| name != primary_port && !is_boot_port(name))
+            .collect();
+    }
+    if ports.len() != 1 {
+        return Err(SecondaryQmiError::BindFailed(format!(
+            "DATA6 is bound to the stock driver but its WWAN port is {}",
+            if ports.is_empty() {
+                "unknown".to_string()
+            } else {
+                format!("ambiguous ({})", ports.join(","))
+            }
+        )));
+    }
+    let port = ports.remove(0);
+    let device_path = format!("/dev/{port}");
+    if !Path::new(&device_path).exists() {
+        return Err(SecondaryQmiError::BindFailed(format!(
+            "DATA6 WWAN node is absent: {device_path}"
+        )));
+    }
+    let netdev = prepare_data6_netdev(baseband, primary_port, &[]).await?;
+    let open_mode = probe_qmi_capability(&device_path).await.ok_or_else(|| {
+        SecondaryQmiError::ProbeFailed(format!(
+            "{port} bound to {RPMSG_WWAN_DRIVER} does not expose the wds service"
+        ))
+    })?;
+    Ok(SecondaryQmiEndpoint {
+        remoteproc: baseband.to_string(),
+        rpmsg_device: candidate.device_id.clone(),
+        channel: candidate.channel.clone(),
+        port_name: port,
+        device_path,
+        netdev: Some(netdev),
+        open_mode,
+        driver: RPMSG_WWAN_DRIVER.to_string(),
+        owned: false,
+    })
+}
+
 async fn bind_and_probe(
     candidate: &RpmsgChannel,
-    driver: &str,
     baseband: &str,
-    ports_before: &[String],
+    primary_port: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
-    // If the channel is currently held by the other wwan-ctrl driver, detach it
-    // first so driver_override can steer it to the one we want.
-    if candidate
-        .bound_driver
-        .as_deref()
-        .is_some_and(|bound| bound != driver)
-    {
+    if candidate.bound_driver.as_deref() == Some(LEGACY_RPMSG_WWAN_DRIVER) {
+        let old_ports = ports_for_rpmsg_device(&candidate.device_id);
         if let Some(bound) = candidate.bound_driver.as_deref() {
             let _ = std::fs::write(driver_unbind_path(bound), &candidate.device_id);
+        }
+        let deadline = tokio::time::Instant::now() + PORT_APPEAR_TIMEOUT;
+        while tokio::time::Instant::now() < deadline
+            && old_ports.iter().any(|port| Path::new(&format!("/dev/{port}")).exists())
+        {
             sleep(PORT_POLL_INTERVAL).await;
         }
+        if old_ports
+            .iter()
+            .any(|port| Path::new(&format!("/dev/{port}")).exists())
+        {
+            return Err(SecondaryQmiError::BindFailed(format!(
+                "old secondary QMI endpoint did not disappear: {}",
+                old_ports.join(",")
+            )));
+        }
     }
+
+    let ports_before: Vec<String> = ports_for_baseband(baseband)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let netdevs_before = netdevs_for_baseband(baseband);
     let device_dir = PathBuf::from(RPMSG_DEVICES_DIR).join(&candidate.device_id);
-    std::fs::write(device_dir.join("driver_override"), driver).map_err(|e| {
+    std::fs::write(device_dir.join("driver_override"), RPMSG_WWAN_DRIVER).map_err(|e| {
         SecondaryQmiError::BindFailed(format!("driver_override {}: {e}", candidate.channel))
     })?;
-    if let Err(error) = std::fs::write(driver_bind_path(driver), &candidate.device_id) {
-        // EBUSY means it is already bound — that is fine, the port may exist.
+    if let Err(error) = std::fs::write(
+        driver_bind_path(RPMSG_WWAN_DRIVER),
+        &candidate.device_id,
+    ) {
         debug!(channel = %candidate.channel, error = %error, "bind write returned an error");
     }
 
     let deadline = tokio::time::Instant::now() + PORT_APPEAR_TIMEOUT;
-    let mut discovered: Option<(String, Option<String>)> = None;
+    let mut discovered = None;
     while tokio::time::Instant::now() < deadline {
-        let mut fresh: Vec<(String, Option<String>)> = ports_for_baseband(baseband)
+        let exact = ports_for_rpmsg_device(&candidate.device_id);
+        let fresh: Vec<(String, Option<String>)> = ports_for_baseband(baseband)
             .into_iter()
             .filter(|(name, _)| !ports_before.contains(name))
             .collect();
-        if !fresh.is_empty() {
-            fresh.sort_by_key(|(name, port_type)| port_rank(name, port_type.as_deref()));
+        if exact.len() == 1 {
+            let port = exact[0].clone();
+            let port_type = fresh
+                .iter()
+                .find(|(name, _)| *name == port)
+                .and_then(|(_, kind)| kind.clone());
+            discovered = Some((port, port_type));
+            break;
+        }
+        if exact.is_empty() && fresh.len() == 1 {
             discovered = fresh.into_iter().next();
             break;
         }
@@ -672,10 +747,11 @@ async fn bind_and_probe(
     }
 
     let Some((port, port_type)) = discovered else {
-        release_endpoint_by_device(&candidate.device_id, driver).await;
+        release_endpoint_by_device(&candidate.device_id, RPMSG_WWAN_DRIVER).await;
         return Err(SecondaryQmiError::BindFailed(format!(
-            "{} bound via {driver} but no new port appeared under {baseband}",
-            candidate.channel
+            "{} bound via {} but no unique new port appeared under {baseband}",
+            candidate.channel,
+            RPMSG_WWAN_DRIVER,
         )));
     };
 
@@ -688,13 +764,22 @@ async fn bind_and_probe(
         sleep(PORT_POLL_INTERVAL).await;
     }
 
+    let netdev = match prepare_data6_netdev(baseband, primary_port, &netdevs_before).await {
+        Ok(netdev) => netdev,
+        Err(error) => {
+            release_endpoint_by_device(&candidate.device_id, RPMSG_WWAN_DRIVER).await;
+            return Err(error);
+        }
+    };
+
     match probe_qmi_capability(&device_path).await {
         Some(open_mode) => {
             info!(
                 baseband = %baseband,
                 channel = %candidate.channel,
-                driver = %driver,
+                driver = %RPMSG_WWAN_DRIVER,
                 port = %port,
+                netdev = %netdev,
                 advertised_type = ?port_type,
                 mode = ?open_mode,
                 "Secondary QMI endpoint ready"
@@ -705,15 +790,16 @@ async fn bind_and_probe(
                 channel: candidate.channel.clone(),
                 port_name: port,
                 device_path,
+                netdev: Some(netdev),
                 open_mode,
-                driver: driver.to_string(),
+                driver: RPMSG_WWAN_DRIVER.to_string(),
                 owned: true,
             })
         }
         None => {
-            release_endpoint_by_device(&candidate.device_id, driver).await;
+            release_endpoint_by_device(&candidate.device_id, RPMSG_WWAN_DRIVER).await;
             Err(SecondaryQmiError::ProbeFailed(format!(
-                "{port} (type {port_type:?}, driver {driver}) does not expose the wds service"
+                "{port} (type {port_type:?}, driver {RPMSG_WWAN_DRIVER}) does not expose the wds service"
             )))
         }
     }
@@ -742,6 +828,75 @@ pub async fn release_endpoint(endpoint: &SecondaryQmiEndpoint) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EndpointIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(not(unix))]
+    canonical_path: PathBuf,
+    file_type: std::fs::FileType,
+}
+
+fn endpoint_identity(path: &Path) -> std::io::Result<EndpointIdentity> {
+    let metadata = std::fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(EndpointIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            file_type: metadata.file_type(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(EndpointIdentity {
+            canonical_path: std::fs::canonicalize(path)?,
+            file_type: metadata.file_type(),
+        })
+    }
+}
+
+/// Keep the boot initializer alive after DATA6 is ready. Beta8 records the
+/// device identity and polls it; ModemManager is allowed to start only while the
+/// same character node remains present.
+pub async fn hold_endpoint(endpoint: &SecondaryQmiEndpoint) -> Result<(), SecondaryQmiError> {
+    let path = Path::new(&endpoint.device_path);
+    let expected = endpoint_identity(path).map_err(|error| {
+        SecondaryQmiError::EndpointLost(format!(
+            "failed to inspect secondary QMI endpoint {}: {error}",
+            endpoint.device_path
+        ))
+    })?;
+
+    loop {
+        sleep(Duration::from_secs(3)).await;
+        match endpoint_identity(path) {
+            Ok(current) if current == expected => {}
+            Ok(_) => {
+                return Err(SecondaryQmiError::EndpointLost(format!(
+                    "secondary QMI endpoint was replaced: {}",
+                    endpoint.device_path
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(SecondaryQmiError::EndpointLost(format!(
+                    "secondary QMI endpoint disappeared: {}",
+                    endpoint.device_path
+                )));
+            }
+            Err(error) => {
+                return Err(SecondaryQmiError::EndpointLost(format!(
+                    "failed to inspect secondary QMI endpoint {}: {error}",
+                    endpoint.device_path
+                )));
+            }
+        }
+    }
+}
+
 /// Start the IMS data session on this endpoint for one address family.
 ///
 /// `family` is the QMI `ip-type` value: `4` or `6`. On success the session's IP
@@ -762,7 +917,8 @@ pub async fn start_ims_session(
     let output = run_qmicli(&[
         "-d",
         &endpoint.device_path,
-        endpoint.open_mode.as_arg(),
+        "--device-open-qmi",
+        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         "--client-no-release-cid",
         &start,
@@ -802,7 +958,8 @@ pub async fn stop_ims_session(endpoint: &SecondaryQmiEndpoint, handle: &str) {
     let _ = run_qmicli(&[
         "-d",
         &endpoint.device_path,
-        endpoint.open_mode.as_arg(),
+        "--device-open-qmi",
+        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         &stop,
     ])
@@ -827,7 +984,8 @@ async fn read_current_settings(endpoint: &SecondaryQmiEndpoint) -> Option<Curren
     let output = run_qmicli(&[
         "-d",
         &endpoint.device_path,
-        endpoint.open_mode.as_arg(),
+        "--device-open-qmi",
+        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         "--wds-get-current-settings",
     ])
@@ -925,33 +1083,27 @@ mod tests {
     }
 
     #[test]
-    fn any_data_cntl_channel_is_eligible() {
-        // Not restricted to DATA6 — portability across firmware channel layouts.
+    fn only_data6_cntl_is_eligible() {
         assert!(is_spare_data_channel("DATA6_CNTL"));
-        assert!(is_spare_data_channel("DATA5_CNTL"));
-        assert!(is_spare_data_channel("DATA40_CNTL"));
+        assert!(!is_spare_data_channel("DATA5_CNTL"));
+        assert!(!is_spare_data_channel("DATA7_CNTL"));
+        assert!(!is_spare_data_channel("DATA40_CNTL"));
         assert!(!is_spare_data_channel("DIAG_CNTL"));
         assert!(!is_spare_data_channel("DATA1"));
     }
 
     #[test]
-    fn preferred_channels_are_probed_first_but_others_still_rank() {
-        assert_eq!(channel_rank("DATA6_CNTL"), 0);
-        assert!(channel_rank("DATA7_CNTL") < channel_rank("DATA40_CNTL"));
-        // Unlisted channels are still eligible, just last.
-        assert_eq!(channel_rank("DATA40_CNTL"), PREFERRED_CHANNELS.len());
-    }
-
-    #[test]
-    fn port_ranking_prefers_declared_qmi_then_qmi_names_then_anything() {
-        // A port whose type says QMI wins.
-        assert_eq!(port_rank("wwan0at2", Some("QMI")), 0);
-        // Then a qmi-looking name.
-        assert_eq!(port_rank("wwan0qmi1", Some("AT")), 1);
-        // The reference device: AT-named, AT-typed, yet carries QMI — still a
-        // candidate, just probed last.
-        assert_eq!(port_rank("wwan0at2", Some("AT")), 2);
-        assert!(port_rank("wwan0qmi1", None) < port_rank("wwan0at2", None));
+    fn data6_netdev_prefers_a_fresh_non_primary_interface() {
+        let all = vec!["wwan0".to_string(), "wwan1".to_string(), "wwan2".to_string()];
+        let before = vec!["wwan0".to_string(), "wwan1".to_string()];
+        assert_eq!(
+            choose_data6_netdev(&all, &before, "wwan0qmi0").as_deref(),
+            Some("wwan2")
+        );
+        assert_eq!(
+            choose_data6_netdev(&all[..2], &before, "wwan0qmi0").as_deref(),
+            Some("wwan1")
+        );
     }
 
     #[test]
@@ -982,16 +1134,14 @@ mod tests {
         assert_eq!(QmiOpenMode::Proxy.as_arg(), "--device-open-proxy");
         assert_eq!(
             QmiOpenMode::probe_order(),
-            [QmiOpenMode::ForceQmi, QmiOpenMode::Proxy]
+            [QmiOpenMode::ForceQmi]
         );
     }
 
     #[test]
-    fn custom_multi_driver_is_preferred_over_intree() {
-        // The in-tree driver mistypes spare channels as AT, so the module that
-        // types them as QMI must be tried first.
-        assert_eq!(RPMSG_WWAN_DRIVERS[0], "rpmsg_wwan_ctrl_multi");
-        assert_eq!(RPMSG_WWAN_DRIVERS[1], "rpmsg_wwan_ctrl");
+    fn beta8_uses_stock_driver_and_only_migrates_the_legacy_driver() {
+        assert_eq!(RPMSG_WWAN_DRIVER, "rpmsg_wwan_ctrl");
+        assert_eq!(LEGACY_RPMSG_WWAN_DRIVER, "rpmsg_wwan_ctrl_multi");
         assert!(is_wwan_ctrl_driver("rpmsg_wwan_ctrl_multi"));
         assert!(is_wwan_ctrl_driver("rpmsg_wwan_ctrl"));
         // A channel held by an unrelated driver must not be stolen.

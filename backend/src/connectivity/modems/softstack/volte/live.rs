@@ -67,15 +67,8 @@ const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 
-fn native_ims_bearer_required(_data_slot_mode: DataSlotMode) -> bool {
-    // beta2 runs the IMS WDS bearer on the secondary DATA6 endpoint
-    // (`Native VoLTE secondary QMI IMS WDS bearer started`, volte.rs:1976), never
-    // on the primary port — starting a second data session on the primary port is
-    // what returns `(2,201) [internal] error`. So every mode drives the native
-    // secondary-endpoint path; the primary port stays with ModemManager. There is
-    // deliberately no fallback to the ModemManager IMS bearer: that path wedges
-    // this baseband.
-    true
+fn native_ims_bearer_required(data_slot_mode: DataSlotMode) -> bool {
+    !data_slot_mode.ims_on_primary()
 }
 
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
@@ -717,12 +710,8 @@ async fn connect_inner(
         None
     };
 
-    // Establish the IMS bearer directly over QMI on this line's secondary
-    // (DATA6) endpoint, matching beta2 ("Native VoLTE secondary QMI IMS WDS
-    // bearer started", volte.rs:1976). The primary port stays with ModemManager;
-    // starting a second data session there is what returned the (2,201) internal
-    // error in the field. IP configuration and P-CSCF come from AT+CGCONTRDP, so
-    // no reusable WDS client id is needed and the session is a single start.
+    // When qmi0 already carries ordinary data, establish IMS directly on DATA6.
+    // Otherwise the ModemManager path below establishes IMS on primary qmi0.
     let mut native_bearer = None;
     let native_required = native_ims_bearer_required(data_slot_mode);
     if native_required {
@@ -3387,6 +3376,19 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bearer_backend_follows_the_selected_ims_endpoint() {
+        assert!(!native_ims_bearer_required(
+            DataSlotMode::PrimaryImsOnly
+        ));
+        assert!(!native_ims_bearer_required(
+            DataSlotMode::PrimaryImsSecondaryData
+        ));
+        assert!(native_ims_bearer_required(
+            DataSlotMode::SecondaryImsPrimaryData
+        ));
+    }
 
     #[test]
     fn device_binding_uses_discovered_modem_qmi_and_slot() {
