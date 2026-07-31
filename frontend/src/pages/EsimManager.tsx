@@ -61,17 +61,25 @@ type EsimPageSnapshot = {
   lpacStatus: EsimLpacStatusResponse | null
 }
 
-let esimPageSnapshot: EsimPageSnapshot | null = null
+// Cache the last-seen state per line so re-opening a line's eSIM dialog renders
+// instantly from memory while the fresh lpac read runs. Keyed by line id; the
+// empty string keeps the legacy single-scope behaviour for callers without a
+// line context.
+const esimPageSnapshots = new Map<string, EsimPageSnapshot>()
 
-function updateEsimPageSnapshot(partial: Partial<EsimPageSnapshot>) {
-  esimPageSnapshot = {
+function getEsimPageSnapshot(scope: string): EsimPageSnapshot | null {
+  return esimPageSnapshots.get(scope) ?? null
+}
+
+function updateEsimPageSnapshot(scope: string, partial: Partial<EsimPageSnapshot>) {
+  esimPageSnapshots.set(scope, {
     euicc: null,
     profiles: [],
     selectedIccid: '',
     lpacStatus: null,
-    ...esimPageSnapshot,
+    ...esimPageSnapshots.get(scope),
     ...partial,
-  }
+  })
 }
 
 const LPAC_PROXY_PREFIX_OPTIONS = [
@@ -559,8 +567,9 @@ function InfoCell({
   )
 }
 
-export default function EsimManagerPage() {
-  const initialSnapshot = esimPageSnapshot
+export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
+  const scope = lineId ?? ''
+  const initialSnapshot = getEsimPageSnapshot(scope)
   const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(initialSnapshot?.euicc ?? null)
   const [profiles, setProfiles] = useState<EsimProfile[]>(initialSnapshot?.profiles ?? [])
   const [selectedIccid, setSelectedIccid] = useState<string>(initialSnapshot?.selectedIccid ?? '')
@@ -837,7 +846,7 @@ export default function EsimManagerPage() {
           setProfiles(cachedProfiles)
           setSelectedIccid((current) => {
             const nextSelectedIccid = preferredProfileIccid(cachedProfiles, current)
-            updateEsimPageSnapshot({
+            updateEsimPageSnapshot(scope, {
               profiles: cachedProfiles,
               selectedIccid: nextSelectedIccid,
             })
@@ -856,12 +865,12 @@ export default function EsimManagerPage() {
 
       const nextLpacStatus = statusRes.data ?? null
       setLpacStatus(nextLpacStatus)
-      updateEsimPageSnapshot({ lpacStatus: nextLpacStatus })
+      updateEsimPageSnapshot(scope, { lpacStatus: nextLpacStatus })
       if (!nextLpacStatus?.usable) {
         setEuicc(null)
         setProfiles([])
         setSelectedIccid('')
-        updateEsimPageSnapshot({
+        updateEsimPageSnapshot(scope, {
           euicc: null,
           profiles: [],
           selectedIccid: '',
@@ -872,14 +881,14 @@ export default function EsimManagerPage() {
       // Keep lpac calls sequential because they share the physical eUICC channel,
       // but commit each result as soon as it arrives so the shell renders first.
       setProfilesLoading(true)
-      const profilesRes = await requestOrNull(api.getEsimProfiles(), 'profiles')
+      const profilesRes = await requestOrNull(api.getEsimProfiles(lineId), 'profiles')
       setProfilesLoading(false)
       if (profilesRes?.data) {
         const nextProfiles = profilesRes.data.profiles ?? []
         setProfiles(nextProfiles)
         setSelectedIccid((current) => {
           const nextSelectedIccid = preferredProfileIccid(nextProfiles, current)
-          updateEsimPageSnapshot({
+          updateEsimPageSnapshot(scope, {
             profiles: nextProfiles,
             selectedIccid: nextSelectedIccid,
           })
@@ -888,11 +897,11 @@ export default function EsimManagerPage() {
       }
 
       setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(), 'euicc')
+      const euiccRes = await requestOrNull(api.getEsimEuicc(lineId), 'euicc')
       setEuiccLoading(false)
       if (euiccRes?.data) {
         setEuicc(euiccRes.data)
-        updateEsimPageSnapshot({ euicc: euiccRes.data })
+        updateEsimPageSnapshot(scope, { euicc: euiccRes.data })
       }
 
       if (failures.length > 0) {
@@ -1003,8 +1012,8 @@ export default function EsimManagerPage() {
     setSuccess(null)
     try {
       const response = confirmAction === 'enable'
-        ? await api.enableEsimProfile(selectedProfile.iccid)
-        : await api.deleteEsimProfile(selectedProfile.iccid)
+        ? await api.enableEsimProfile(selectedProfile.iccid, lineId)
+        : await api.deleteEsimProfile(selectedProfile.iccid, lineId)
       if (!commandSucceeded(response.data)) {
         throw new Error(response.data?.msg || 'eSIM 操作失败')
       }
@@ -1017,7 +1026,7 @@ export default function EsimManagerPage() {
         // Immediately update the UI optimistically and open the recovery progress dialog.
         setSuccess('Profile 启用指令成功，基带正在恢复...')
         setSelectedIccid(targetIccid)
-        updateEsimPageSnapshot({ selectedIccid: targetIccid })
+        updateEsimPageSnapshot(scope, { selectedIccid: targetIccid })
         setProfiles((current) => {
           const nextProfiles = current.map((profile) => (
             profile.iccid === targetIccid
@@ -1026,7 +1035,7 @@ export default function EsimManagerPage() {
                 ? { ...profile, state: 'disabled' }
                 : profile
           ))
-          updateEsimPageSnapshot({ profiles: nextProfiles })
+          updateEsimPageSnapshot(scope, { profiles: nextProfiles })
           return nextProfiles
         })
         startBasebandRecoveryPolling()
@@ -1034,12 +1043,12 @@ export default function EsimManagerPage() {
         setSuccess('Profile 删除完成')
         setProfiles((current) => {
           const nextProfiles = current.filter((profile) => profile.iccid !== targetIccid)
-          updateEsimPageSnapshot({ profiles: nextProfiles })
+          updateEsimPageSnapshot(scope, { profiles: nextProfiles })
           return nextProfiles
         })
         setSelectedIccid((current) => {
           const nextSelectedIccid = current === targetIccid ? '' : current
-          updateEsimPageSnapshot({ selectedIccid: nextSelectedIccid })
+          updateEsimPageSnapshot(scope, { selectedIccid: nextSelectedIccid })
           return nextSelectedIccid
         })
         void loadData(true)
@@ -1070,7 +1079,7 @@ export default function EsimManagerPage() {
     setError(null)
     setSuccess(null)
     try {
-      const response = await api.renameEsimProfile(selectedProfile.iccid, name)
+      const response = await api.renameEsimProfile(selectedProfile.iccid, name, lineId)
       if (!commandSucceeded(response.data)) {
         throw new Error(response.data?.msg || 'Profile 重命名失败')
       }
@@ -1080,7 +1089,7 @@ export default function EsimManagerPage() {
         const nextProfiles = current.map((profile) => (
           profile.iccid === selectedProfile.iccid ? { ...profile, name } : profile
         ))
-        updateEsimPageSnapshot({ profiles: nextProfiles })
+        updateEsimPageSnapshot(scope, { profiles: nextProfiles })
         return nextProfiles
       })
       void loadData(true)

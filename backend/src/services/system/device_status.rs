@@ -274,10 +274,6 @@ pub async fn collect_device_status_report(
             lines.push(format!("运行时长：{}", format_uptime(uptime)));
         }
     }
-    if items.contains("work_mode") {
-        lines.push(format!("工作模式：{}", config_manager.get_work_mode()));
-    }
-
     if any(
         &items,
         &[

@@ -43,3 +43,6 @@ backend/testerrs.json
 backend/testres.txt
 backend/errs.json
 backend/build_out.txt
+
+# Claude Code session/memory data
+.claude/

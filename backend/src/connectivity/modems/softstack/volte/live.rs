@@ -479,6 +479,7 @@ pub async fn connect_live(
         &VolteDeviceBinding::legacy_default(),
         runtime,
         config,
+        None,
         false,
         DataSlotMode::PrimaryImsOnly,
         dedupe_enabled,
@@ -493,6 +494,7 @@ pub async fn connect_live_for_line(
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
     config: &VolteConfig,
+    line_ip_families: Option<&[crate::platform::config::VolteIpFamily]>,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
@@ -525,11 +527,19 @@ pub async fn connect_live_for_line(
         })
         .await;
 
+    // A per-line ordered family list wins; an empty or absent list falls back to
+    // the legacy global single-select preference so existing installs are
+    // unchanged.
+    let plan = match line_ip_families {
+        Some(families) if !families.is_empty() => ImsConnectionPlan::from_families(families),
+        _ => ImsConnectionPlan::from_preference(config.ip_family_preference),
+    };
+
     match connect_inner(
         runtime,
         generation,
         device,
-        config.ip_family_preference,
+        plan,
         allow_roaming,
         data_slot_mode,
     )
@@ -588,14 +598,14 @@ async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
-    family_pref: VolteIpFamilyPreference,
+    plan: ImsConnectionPlan,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
 ) -> Result<VolteLiveSession, VolteError> {
-    // Build the canonical connection plan from the configured preference. All
-    // four family-selection consumers (AT probe order, bearer fallback, IPv6
-    // preflight hint, SIP local-address order) now derive from this one object.
-    let plan = ImsConnectionPlan::from_preference(family_pref);
+    // The canonical connection plan is built by the caller (per-line ordered
+    // families when set, else the global preference). All four family-selection
+    // consumers (AT probe order, bearer fallback, IPv6 preflight hint, SIP
+    // local-address order) derive from this one object.
     let mut device = resolve_device_binding(device).await?;
 
     // beta2 readiness gate: wait for the QMI auto-activate marker to settle before

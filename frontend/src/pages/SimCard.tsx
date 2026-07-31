@@ -33,11 +33,9 @@ import { useSearchParams } from 'react-router-dom'
 import { api } from '../api/current'
 import type { SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
-import EsimManagerPage from './EsimManager'
 import ModemLinesPanel from './sim/ModemLinesPanel'
 import CarrierProfilesPanel from './sim/CarrierProfilesPanel'
 import StandaloneSimSlotsPanel from './sim/StandaloneSimSlotsPanel'
-import { useWorkMode } from '../contexts/WorkModeContext'
 
 function getSensitiveStyle(show: boolean) {
   return {
@@ -48,20 +46,13 @@ function getSensitiveStyle(show: boolean) {
   } as const
 }
 
-function formatSimType(simType?: string, esimStatus?: string, workMode?: string) {
+function formatSimType(simType?: string, esimStatus?: string) {
   // 1. 优先取 simType (如果明确是 physical 或 esim)
   if (simType === 'physical') return '物理 SIM 卡';
   if (simType === 'esim') return 'eSIM 卡';
 
-  // 2. 其次根据有没有 euicc 芯片判断 (esimStatus 有明确 of eUICC 状态)
+  // 2. 其次根据有没有 eUICC 芯片判断 (esimStatus 有明确的 eUICC 状态)
   if (esimStatus && esimStatus !== 'unknown') {
-    return 'eSIM 卡';
-  }
-
-  // 3. 最后根据工作模式兜底
-  if (workMode === 'sim') {
-    return '物理 SIM 卡';
-  } else if (workMode === 'esim') {
     return 'eSIM 卡';
   }
 
@@ -179,7 +170,6 @@ function SmsCapacityProgress({ used, total }: { used?: number, total?: number })
 }
 
 function SimBasicInfo() {
-  const { mode } = useWorkMode()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSensitive, setShowSensitive] = useState(false)
@@ -319,7 +309,7 @@ function SimBasicInfo() {
                   <Grid size={6}>
                     <InfoField
                       label="SIM 卡类型"
-                      value={formatSimType(simInfo?.sim_type, simInfo?.esim_status, mode)}
+                      value={formatSimType(simInfo?.sim_type, simInfo?.esim_status)}
                     />
                   </Grid>
                   <Grid size={6}>
@@ -556,14 +546,9 @@ function SimBasicInfo() {
 }
 
 export default function SimCardPage() {
-  const { mode, loading } = useWorkMode()
   const [searchParams, setSearchParams] = useSearchParams()
 
-  let activeTab = searchParams.get('tab') || 'lines'
-
-  if (mode !== 'esim' && activeTab === 'esim') {
-    activeTab = 'lines'
-  }
+  const activeTab = searchParams.get('tab') === 'carrier-profiles' ? 'carrier-profiles' : 'lines'
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: string) => {
     const params = new URLSearchParams(searchParams)
@@ -573,14 +558,6 @@ export default function SimCardPage() {
       params.set('tab', newValue)
     }
     setSearchParams(params)
-  }
-
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="50vh">
-        <CircularProgress size={32} />
-      </Box>
-    )
   }
 
   return (
@@ -595,14 +572,12 @@ export default function SimCardPage() {
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="基带线路" value="lines" />
           <Tab label="运营商 Profile" value="carrier-profiles" sx={{ textTransform: 'none' }} />
-          {mode === 'esim' && <Tab label="eSIM 管理" value="esim" sx={{ textTransform: 'none' }} />}
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel primaryBasicInfo={<SimBasicInfo />} /><StandaloneSimSlotsPanel /></Stack>}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
-        {activeTab === 'esim' && mode === 'esim' && <EsimManagerPage />}
       </Box>
     </Box>
   )

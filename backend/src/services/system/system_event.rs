@@ -66,7 +66,6 @@ pub mod codes {
     pub const SECURITY_POLICY_CHANGED: &str = "security.policy_changed";
     pub const SECURITY_LOGIN_FAILED_THRESHOLD: &str = "security.login_failed_threshold";
 
-    pub const ESIM_WORK_MODE_CHANGED: &str = "esim.work_mode_changed";
     pub const ESIM_LPAC_REPAIR_SUCCEEDED: &str = "esim.lpac_repair_succeeded";
     pub const ESIM_LPAC_REPAIR_FAILED: &str = "esim.lpac_repair_failed";
     pub const ESIM_PROFILE_ENABLE_SUCCEEDED: &str = "esim.profile_enable_succeeded";
@@ -277,13 +276,6 @@ pub const SYSTEM_EVENT_DEFINITIONS: &[SystemEventDefinition] = &[
         category::SECURITY,
         "安全审计",
         "连续登录失败达到阈值（5 分钟内 5 次）",
-        true,
-    ),
-    def(
-        codes::ESIM_WORK_MODE_CHANGED,
-        category::ESIM,
-        "SIM/eSIM",
-        "工作模式切换",
         true,
     ),
     def(

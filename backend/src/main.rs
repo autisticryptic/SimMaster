@@ -1013,11 +1013,11 @@ async fn main() -> Result<()> {
             "/api/baseband/restart/status",
             get(get_baseband_restart_status_handler).options(options_handler),
         )
-        // ========== 工作模式 / eSIM 管理 ==========
+        // ========== eSIM 管理 ==========
         .route(
-            "/api/work-mode",
-            get(get_work_mode_handler)
-                .post(set_work_mode_handler)
+            "/api/modem/lines/{line_id}/esim-control",
+            get(get_line_esim_control_handler)
+                .post(set_line_esim_control_handler)
                 .options(options_handler),
         )
         .route(
@@ -1229,6 +1229,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/lines/{line_id}/retry",
             post(retry_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/ip-families",
+            post(set_volte_line_ip_families_handler).options(options_handler),
         )
         .route(
             "/api/sim/slots",

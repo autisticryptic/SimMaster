@@ -1038,6 +1038,42 @@ pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile
     None
 }
 
+/// Resolve a profile pinned to a line by `profile_id`, honoring only profiles
+/// that actually exist in the database overlay.
+///
+/// A per-line pin is an operator's explicit "use exactly this carrier profile"
+/// choice, so it must not silently resolve to a built-in or a 3GPP-derived
+/// profile that merely shares the id — those are reachable through automatic
+/// matching already. Returning `None` here means "the pin no longer resolves",
+/// which the caller treats as "fall back to automatic IMSI matching" so a
+/// deleted profile never strands a line.
+pub fn resolve_pinned_database_profile(profile_id: &str) -> Option<&'static CarrierProfile> {
+    let normalized = profile_id.trim();
+    if normalized.is_empty() {
+        return None;
+    }
+    database_profile_for_id(normalized)
+}
+
+/// Resolve the carrier profile for one line: an explicit database pin wins, then
+/// the automatic IMSI path (database → built-in → 3GPP-derived).
+///
+/// `pinned_profile_id` is this line's `LineVowifiConfig.profile_id`. A pin that
+/// no longer resolves in the database degrades to automatic matching rather than
+/// failing, matching the documented "deleting a profile can never strand a line"
+/// rule.
+pub fn resolve_for_line(pinned_profile_id: Option<&str>, imsi: &str) -> Option<CarrierMatch> {
+    if let Some(profile_id) = pinned_profile_id {
+        if let Some(profile) = resolve_pinned_database_profile(profile_id) {
+            return Some(CarrierMatch {
+                profile,
+                matched_prefix: profile.meta.plmn.to_string(),
+            });
+        }
+    }
+    resolve_by_imsi(imsi)
+}
+
 pub fn validate_builtin_profiles() -> Result<(), String> {
     for profile in BUILTIN_PROFILES {
         if profile.meta.mcc.len() != 3 || !profile.meta.mcc.chars().all(|c| c.is_ascii_digit()) {
@@ -1166,5 +1202,52 @@ mod tests {
         let profile_by_id =
             resolve_by_profile_id("dynamic_3gpp_26201").expect("should resolve dynamically");
         assert_eq!(profile_by_id.meta.plmn, "26201");
+    }
+
+    #[test]
+    fn line_pin_falls_back_to_imsi_when_unset_or_unresolvable() {
+        // No pin: behaves exactly like automatic IMSI matching.
+        let auto = resolve_for_line(None, "234331234567890").expect("imsi should match");
+        assert_eq!(auto.profile.meta.profile_id, "gb_ee_23433");
+
+        // A pin that resolves to nothing in the database degrades to the IMSI
+        // path rather than failing, so deleting a profile never strands a line.
+        let stale =
+            resolve_for_line(Some("no_such_db_profile"), "234331234567890").expect("fallback");
+        assert_eq!(stale.profile.meta.profile_id, "gb_ee_23433");
+    }
+
+    #[test]
+    fn line_pin_does_not_resolve_builtin_or_derived_ids() {
+        // A built-in id is reachable through automatic matching, but a per-line
+        // pin only honors database profiles: it must not silently resolve here.
+        assert!(resolve_pinned_database_profile("gb_ee_23433").is_none());
+        assert!(resolve_pinned_database_profile("dynamic_3gpp_26201").is_none());
+        assert!(resolve_pinned_database_profile("   ").is_none());
+    }
+
+    #[test]
+    fn line_pin_selects_the_published_database_profile_over_imsi() {
+        // Publish one database profile, then pin a line whose SIM IMSI would
+        // otherwise match a *different* carrier. The pin must win.
+        // Use a PLMN no other test's IMSI matches, so publishing into the shared
+        // global overlay cannot perturb concurrent `resolve_by_imsi` tests.
+        let mut record =
+            super::super::profile_record::CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.meta.profile_id = "pin_test_db_profile".to_string();
+        record.meta.mcc = "999".to_string();
+        record.meta.mnc = "99".to_string();
+        record.meta.plmn = "99999".to_string();
+        let leaked: &'static CarrierProfile = record.intern();
+        publish_database_profiles(&[leaked]);
+
+        // The SIM IMSI (234-33) would auto-match EE, but the pin to the database
+        // profile must win.
+        let pinned = resolve_for_line(Some("pin_test_db_profile"), "234331234567890")
+            .expect("pin should resolve");
+        assert_eq!(pinned.profile.meta.profile_id, "pin_test_db_profile");
+
+        // Clear the overlay so other tests see a clean slate.
+        publish_database_profiles(&[]);
     }
 }

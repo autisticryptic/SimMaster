@@ -753,6 +753,20 @@ pub struct ModemBinding {
     pub operator_id: String,
     pub state: String,
     pub present: bool,
+    /// ModemManager `SimType`: "physical", "esim", or "unknown". Used by the
+    /// per-line eSIM auto-detection so plain SIM lines never issue lpac calls.
+    #[serde(default)]
+    pub sim_type: String,
+    /// ModemManager `EsimStatus`: "none", "no-profiles", "with-profiles", or
+    /// "unknown". A eUICC chip is present when this is not "none"/"unknown".
+    #[serde(default)]
+    pub esim_status: String,
+    /// What kind of line this is: "baseband" for a real ModemManager modem that
+    /// can register on a cell and run VoLTE, or "reader" for a standalone SIM
+    /// reader that only backs user-space VoWiFi + eSIM management. Empty is
+    /// treated as "baseband" for backwards compatibility.
+    #[serde(default)]
+    pub line_kind: String,
     /// Raw physical slot selector. It is required for rebinding but must not
     /// be returned by the HTTP inventory endpoint.
     #[serde(skip)]
@@ -779,6 +793,57 @@ fn line_hardware_key(hardware_key: &str, uim_slot: u8) -> String {
         hardware_key.to_string()
     } else {
         format!("{hardware_key}#uim{uim_slot}")
+    }
+}
+
+/// Build the stable line identity for a standalone SIM reader.
+///
+/// Readers are not backed by a ModemManager object, so their line identity is
+/// anchored on the reader's persisted config `id` (plus its slot) rather than a
+/// hardware key + ICCID. This keeps the line stable across restarts and across
+/// SIM swaps in the reader, matching how the reader is configured by the user.
+pub fn reader_line_id(reader_id: &str, uim_slot: u8) -> String {
+    stable_line_id(&format!("reader:{}", reader_id.trim()), &format!("uim:{uim_slot}"))
+}
+
+/// Synthesize a `ModemBinding` for a standalone SIM reader line. Readers only
+/// participate in VoWiFi and eSIM management (no cellular baseband), so cellular
+/// fields are left empty and `line_kind` is "reader". `present` reflects whether
+/// a live reader path/QMI device has been resolved for the slot.
+pub fn reader_binding(
+    reader_id: &str,
+    label: &str,
+    reader_path: &str,
+    uim_slot: u8,
+    qmi_device: Option<String>,
+    present: bool,
+) -> ModemBinding {
+    ModemBinding {
+        line_id: reader_line_id(reader_id, uim_slot),
+        display_order: 0,
+        slot_label: label.trim().to_string(),
+        slot_source: "reader".to_string(),
+        slot_stable: true,
+        slot_conflict: false,
+        modem_id: format!("reader:{}", reader_id.trim()),
+        modem_path: String::new(),
+        manufacturer: "SIM 读卡器".to_string(),
+        model: reader_path.trim().to_string(),
+        primary_port: String::new(),
+        qmi_device,
+        uim_slot,
+        sim_path: None,
+        sim_iccid: String::new(),
+        operator_id: String::new(),
+        state: String::new(),
+        present,
+        sim_type: String::new(),
+        esim_status: String::new(),
+        hardware_key: format!("reader:{}", reader_id.trim()),
+        equipment_identifier: String::new(),
+        legacy_hardware_keys: Vec::new(),
+        legacy_line_ids: Vec::new(),
+        line_kind: "reader".to_string(),
     }
 }
 
@@ -1306,6 +1371,17 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             &property_string(&sim_props, "SimIdentifier").unwrap_or_default(),
         );
         let imsi = property_string(&sim_props, "Imsi").unwrap_or_default();
+        let sim_type = match sim_props.get("SimType").map(extract_u32).unwrap_or(0) {
+            1 => "physical".to_string(),
+            2 => "esim".to_string(),
+            _ => "unknown".to_string(),
+        };
+        let esim_status = match sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0) {
+            1 => "none".to_string(),
+            2 => "no-profiles".to_string(),
+            3 => "with-profiles".to_string(),
+            _ => "unknown".to_string(),
+        };
         let mut operator_id = property_string(&sim_props, "OperatorIdentifier")
             .unwrap_or_else(|| operator_code_from_imsi(&imsi));
         if operator_id.is_empty() {
@@ -1356,6 +1432,9 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             uim_slot,
             sim_path,
             sim_iccid,
+            sim_type,
+            esim_status,
+            line_kind: "baseband".to_string(),
             operator_id,
             state,
             present: true,

@@ -207,6 +207,32 @@ impl LineRuntimeRegistry {
                     .migrate_line_profile_aliases(&binding.line_id, &binding.legacy_line_ids);
             }
         }
+        // Synthesize a line for each enabled standalone SIM reader. Readers are
+        // not backed by a ModemManager object, so they never appear in the
+        // discovered set; they only participate in VoWiFi and eSIM management.
+        if let Some(config_manager) = &self.config_manager {
+            for slot in config_manager.get_standalone_sim_slots() {
+                if !slot.enabled {
+                    continue;
+                }
+                let reader_path = slot.reader_path.trim();
+                // A reader is addressable for QMI/lpac only when its path is a
+                // concrete device node; abstract identifiers (e.g. "pcsc://...")
+                // are persisted but not yet resolvable, so the line stays offline.
+                let qmi_device = reader_path
+                    .starts_with("/dev/")
+                    .then(|| reader_path.to_string());
+                let present = qmi_device.is_some();
+                discovered.push(crate::hardware::cellular::modem_manager::reader_binding(
+                    &slot.id,
+                    &slot.label,
+                    reader_path,
+                    slot.uim_slot,
+                    qmi_device,
+                    present,
+                ));
+            }
+        }
         let mut lines = self.lines.write().await;
         for line in lines.values() {
             line.mark_absent();
@@ -386,6 +412,9 @@ mod tests {
             uim_slot: 1,
             sim_path: Some("/org/freedesktop/ModemManager1/SIM/0".to_string()),
             sim_iccid: "8986000000000000000".to_string(),
+            sim_type: "physical".to_string(),
+            esim_status: "unknown".to_string(),
+            line_kind: "baseband".to_string(),
             operator_id: "46000".to_string(),
             state: "registered".to_string(),
             present,

@@ -8,7 +8,7 @@ import {
   type LineVowifiConfig,
   type VowifiLineConfigResponse,
   type VowifiProxyMode,
-  type ExternalVowifiProfile,
+  type StoredCarrierProfile,
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
 
@@ -29,15 +29,12 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
   const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [externalProfiles, setExternalProfiles] = useState<ExternalVowifiProfile[]>([])
-  const [savingProfile, setSavingProfile] = useState(false)
-  const [profileSaved, setProfileSaved] = useState(false)
+  const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
 
   useEffect(() => {
     if (line) setDraft({ ...line.config })
-    if (open) void api.getExternalVowifiProfiles().then((response) => setExternalProfiles(response.data ?? [])).catch(() => setExternalProfiles([]))
+    if (open) void api.listVowifiCarrierProfiles().then((response) => setProfiles(response.data ?? [])).catch(() => setProfiles([]))
     setError(null)
-    setProfileSaved(false)
   }, [line, open])
 
   const validationError = useMemo(() => {
@@ -45,8 +42,6 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     if (draft.dns_server && !/^[0-9a-f:.]+$/i.test(draft.dns_server.trim())) {
       return 'DNS 解析器必须填写 IPv4 或 IPv6 地址'
     }
-    if (draft.epdg_host && /[\s/]/.test(draft.epdg_host)) return '自定义 ePDG 主机格式不正确'
-    if (draft.epdg_port < 1 || draft.epdg_port > 65535) return 'ePDG 端口必须在 1-65535 之间'
     if (draft.proxy_mode !== 'direct' && !draft.proxy_endpoint.trim()) return '所选代理模式需要填写代理端点'
     return null
   }, [draft])
@@ -70,34 +65,6 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     }
   }
 
-  const saveAsExternalProfile = async () => {
-    if (!line || !draft || validationError) return
-    setSavingProfile(true)
-    setError(null)
-    try {
-      const matched = await api.getVowifiProfile()
-      const profile = matched.data?.profile
-      const epdg = matched.data?.epdg
-      if (!profile || !(draft.epdg_host.trim() || epdg?.host)) throw new Error('尚未匹配运营商 profile，或缺少 ePDG 主机')
-      const response = await api.setExternalVowifiProfile({
-        profile_id: line.matched_profile_id || profile.profile_id,
-        mcc: profile.mcc,
-        mnc: profile.mnc,
-        epdg_host: draft.epdg_host.trim() || epdg?.host || '',
-        epdg_port: draft.epdg_port,
-        ip_stack: epdg?.ip_stack || 'ipv6',
-        apn: epdg?.apn || 'ims',
-        dns_server: draft.dns_server.trim() || epdg?.dns_server || null,
-      })
-      setExternalProfiles(response.data ?? [])
-      setProfileSaved(true)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSavingProfile(false)
-    }
-  }
-
   if (!line || !draft) return null
 
   return (
@@ -107,32 +74,27 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
         <Stack spacing={2}>
           <Alert severity="info">
             这里配置的是<strong>这条线路</strong>的覆盖值。运营商本身的 profile（ePDG、IMS、REGISTER 细节）
-            现在存在数据库里，可在「SIM 卡管理 → 运营商 Profile」页完整编辑。
+            存在数据库里，可在「SIM 卡管理 → 运营商 Profile」页完整编辑。
           </Alert>
           <FormControl fullWidth>
-            <InputLabel>自定义 ePDG profile</InputLabel>
-            <Select label="自定义 ePDG profile" value="" onChange={(event) => {
-              const profile = externalProfiles.find((item) => item.profile_id === event.target.value)
-              if (profile) setDraft((current) => current ? { ...current, epdg_host: profile.epdg_host, epdg_port: profile.epdg_port, dns_server: profile.dns_server || '' } : current)
-            }}>
-              <MenuItem value=""><em>不套用</em></MenuItem>
-              {externalProfiles.map((profile) => <MenuItem key={profile.profile_id} value={profile.profile_id}>{profile.profile_id} · {profile.epdg_host}</MenuItem>)}
+            <InputLabel>指定运营商 profile</InputLabel>
+            <Select
+              label="指定运营商 profile"
+              value={draft.profile_id ?? ''}
+              onChange={(event) => update('profile_id', event.target.value ? event.target.value : null)}
+            >
+              <MenuItem value=""><em>自动（按 SIM 卡 IMSI 匹配）</em></MenuItem>
+              {profiles.map((profile) => (
+                <MenuItem key={profile.profile_id} value={profile.profile_id}>
+                  {profile.record.meta.brand || profile.profile_id} · {profile.plmn} · {profile.record.epdg.host}
+                </MenuItem>
+              ))}
             </Select>
           </FormControl>
-          <TextField
-            label="自定义 ePDG 主机"
-            value={draft.epdg_host}
-            placeholder="epdg.epc.mnc001.mcc460.pub.3gppnetwork.org"
-            helperText="留空时使用运营商 profile 中的 ePDG"
-            onChange={(event) => update('epdg_host', event.target.value)}
-          />
-          <TextField
-            type="number"
-            label="ePDG IKE 端口"
-            value={draft.epdg_port}
-            slotProps={{ htmlInput: { min: 1, max: 65535 } }}
-            onChange={(event) => update('epdg_port', Number(event.target.value))}
-          />
+          <Alert severity="info">
+            留空时按 SIM 卡 IMSI 自动匹配运营商（先查数据库，未命中则按 3GPP 标准推算连接域名）。
+            指定后强制使用所选数据库 profile 的全部连接参数。
+          </Alert>
           <TextField
             label="专用 DNS 解析器"
             value={draft.dns_server}
@@ -165,12 +127,10 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             普通 HTTP CONNECT 无法转发 IKEv2 的 UDP 500/4500，所以只提供直连与 SOCKS5 两种模式。
           </Alert>
           {validationError && <Alert severity="error">{validationError}</Alert>}
-          {profileSaved && <Alert severity="success">已写入设备的 vowifi-profiles.conf</Alert>}
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={() => void saveAsExternalProfile()} disabled={saving || savingProfile || Boolean(validationError)}>{savingProfile ? '写入中...' : '保存为自定义 profile'}</Button>
         <Button onClick={onClose} disabled={saving}>取消</Button>
         <Button variant="contained" onClick={() => void save()} disabled={saving || Boolean(validationError)}>
           {saving ? '保存中...' : '保存配置'}

@@ -11,11 +11,6 @@ import {
   CardHeader,
   Chip,
   CircularProgress,
-  Dialog,
-  DialogActions,
-  DialogContent,
-  DialogContentText,
-  DialogTitle,
   Divider,
   FormControl,
   IconButton,
@@ -34,16 +29,13 @@ import Grid from '@mui/material/Grid'
 import {
   AdminPanelSettings,
   Add,
-  CheckCircle,
   Key,
-  Memory,
   Remove,
   Save,
   Shield,
   SimCard,
   Timer,
 } from '@mui/icons-material'
-import type { Theme } from '@mui/material/styles'
 import { api } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import { LAYOUT_BOTTOM_ACTION_BAR_ID } from '../components/Layout/layoutConstants'
@@ -55,20 +47,12 @@ import {
   passwordPolicyHelperText,
   validatePasswordAgainstSecurity,
 } from '../lib/passwordPolicy'
-import { useWorkMode } from '../contexts/WorkModeContext'
-import type { SecurityConfig, WorkMode } from '../api/types'
+import type { SecurityConfig } from '../api/types'
 
 interface HealthStatus {
   status: string
   timestamp?: string
 }
-
-const primaryStatusChipSx = (theme: Theme) => ({
-  bgcolor: theme.palette.mode === 'light' ? 'rgba(25, 118, 210, 0.06)' : 'rgba(144, 202, 249, 0.14)',
-  borderColor: theme.palette.primary.light,
-  color: theme.palette.primary.main,
-  fontWeight: 600,
-})
 
 const PASSWORD_MIN_LENGTH_MIN = 1
 const SESSION_TTL_OPTIONS = [
@@ -104,10 +88,6 @@ const compactCardAlertSx = {
 }
 
 
-
-function modeLabel(mode: WorkMode) {
-  return mode === 'esim' ? 'eSIM 卡' : '普通 SIM 卡'
-}
 
 function mergeSecurityConfig(config?: Partial<SecurityConfig>): SecurityConfig {
   return {
@@ -150,7 +130,6 @@ function validateSecurityConfig(config: SecurityConfig) {
 
 
 export default function ConfigurationPage() {
-  const { mode, refreshWorkMode } = useWorkMode()
   const location = useLocation()
   const isSecurity = location.pathname === '/config/security'
   const [loading, setLoading] = useState(true)
@@ -158,8 +137,6 @@ export default function ConfigurationPage() {
   const [success, setSuccess] = useState<string | null>(null)
   const [healthStatus, setHealthStatus] = useState<HealthStatus | null>(null)
   const [healthLoading, setHealthLoading] = useState(false)
-  const [pendingMode, setPendingMode] = useState<WorkMode | null>(null)
-  const [modeSwitching, setModeSwitching] = useState(false)
   const [authConfigured, setAuthConfigured] = useState(false)
   const [securityConfig, setSecurityConfig] = useState<SecurityConfig>(() => DEFAULT_SECURITY_CONFIG)
   const [savedSecurityConfig, setSavedSecurityConfig] = useState<SecurityConfig>(() => DEFAULT_SECURITY_CONFIG)
@@ -223,23 +200,6 @@ export default function ConfigurationPage() {
   }, [])
 
 
-
-  const confirmModeSwitch = async () => {
-    if (!pendingMode) return
-    setModeSwitching(true)
-    setError(null)
-    setSuccess(null)
-    try {
-      await api.setWorkMode(pendingMode)
-      await refreshWorkMode()
-      setSuccess(`工作模式已切换为${modeLabel(pendingMode)}`)
-      setPendingMode(null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setModeSwitching(false)
-    }
-  }
 
   const patchSecurityConfig = (patch: Partial<SecurityConfig>) => {
     setSecurityConfig((prev) => ({ ...prev, ...patch }))
@@ -445,56 +405,6 @@ export default function ConfigurationPage() {
           </ButtonBase>
         </Box>
       </Tooltip>
-    )
-  }
-
-  const renderModeOption = (targetMode: WorkMode) => {
-    const selected = mode === targetMode
-    const Icon = targetMode === 'esim' ? Memory : SimCard
-    return (
-      <Box
-        role="button"
-        tabIndex={0}
-        onClick={() => {
-          if (!modeSwitching && !selected) setPendingMode(targetMode)
-        }}
-        onKeyDown={(event) => {
-          if ((event.key === 'Enter' || event.key === ' ') && !modeSwitching && !selected) {
-            setPendingMode(targetMode)
-          }
-        }}
-        sx={{
-          position: 'relative',
-          cursor: selected || modeSwitching ? 'default' : 'pointer',
-          height: '100%',
-          minHeight: 92,
-          p: 1.5,
-          borderRadius: 1,
-          border: '1px solid',
-          borderColor: selected ? 'primary.main' : 'divider',
-          bgcolor: selected ? 'rgba(25, 118, 210, 0.06)' : 'background.paper',
-          boxShadow: selected ? '0 0 0 1px rgba(25, 118, 210, 0.28) inset' : 'none',
-          color: 'text.primary',
-          transition: 'border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease, transform 150ms ease',
-          '&:hover': selected || modeSwitching ? {} : {
-            borderColor: 'primary.light',
-            bgcolor: 'action.hover',
-            transform: 'translateY(-1px)',
-          },
-        }}
-      >
-        <Box display="flex" alignItems="center" gap={1.25} mb={1}>
-          <Icon color="primary" fontSize="small" />
-          <Typography fontWeight={700}>{modeLabel(targetMode)}</Typography>
-          <Box flexGrow={1} />
-          {selected && <CheckCircle color="primary" fontSize="small" />}
-        </Box>
-        <Typography variant="body2" color="text.secondary">
-          {targetMode === 'esim'
-            ? '开放 eUICC Profile 管理能力，用于管理插入设备的实体 eSIM 卡。'
-            : '隐藏 eSIM 管理模块，并阻止 eSIM Profile 管理接口。'}
-        </Typography>
-      </Box>
     )
   }
 
@@ -905,66 +815,20 @@ export default function ConfigurationPage() {
           <Card>
             <CardHeader
               avatar={<SimCard color="primary" />}
-              title="工作模式"
+              title="SIM / eSIM 管理"
               titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
-              action={
-                <Chip
-                  label={mode === 'esim' ? 'eSIM 已启用' : '普通 SIM 已启用'}
-                  color="primary"
-                  variant="outlined"
-                  size="small"
-                  sx={primaryStatusChipSx}
-                />
-              }
             />
             <CardContent>
               <Typography variant="body2" color="text.secondary" paragraph>
-                工作模式只控制 eSIM 管理功能是否开放，不切换设备硬件。普通 SIM 模式下不会加载 eSIM 管理页面，也不会调用 lpac。
+                eSIM 管理已下沉到每条线路。请在「SIM 卡 · 基带线路」中，为对应的基带卡槽或读卡器单独开启并管理 eSIM。
               </Typography>
-              <Grid container spacing={2}>
-                <Grid size={{ xs: 12, md: 6 }}>
-                  {renderModeOption('sim')}
-                </Grid>
-                <Grid size={{ xs: 12, md: 6 }}>
-                  {renderModeOption('esim')}
-                </Grid>
-              </Grid>
+              <Typography variant="body2" color="text.secondary">
+                读取到 eUICC 芯片信息的线路会自动提供 eSIM 管理入口；未探测到的线路可手动开启 eSIM 控制，通过外置 lpac 管理。
+              </Typography>
             </CardContent>
           </Card>
-
         </Box>
       )}
-
-      <Dialog open={!!pendingMode} onClose={() => !modeSwitching && setPendingMode(null)} maxWidth="sm" fullWidth>
-        <DialogTitle>确认切换工作模式</DialogTitle>
-        <DialogContent>
-          <DialogContentText>
-            确定要切换为{pendingMode ? modeLabel(pendingMode) : ''}吗？
-          </DialogContentText>
-          {pendingMode === 'sim' && (
-            <Alert severity="info" sx={{ mt: 2 }}>
-              切换后将隐藏 eSIM 管理模块，并阻止 eSIM Profile 管理接口。
-            </Alert>
-          )}
-          {pendingMode === 'esim' && (
-            <Alert severity="info" sx={{ mt: 2 }}>
-              切换后将显示 eSIM 管理模块，打开页面或执行操作时才会按需调用 lpac。
-            </Alert>
-          )}
-        </DialogContent>
-        <DialogActions>
-          <Button onClick={() => setPendingMode(null)} disabled={modeSwitching}>取消</Button>
-          <Button
-            variant="contained"
-            color="primary"
-            onClick={() => void confirmModeSwitch()}
-            disabled={modeSwitching}
-            startIcon={modeSwitching ? <CircularProgress size={16} /> : undefined}
-          >
-            确认切换
-          </Button>
-        </DialogActions>
-      </Dialog>
     </Box>
   )
 }

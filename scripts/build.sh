@@ -7,7 +7,11 @@ set -euo pipefail
 # 切换到项目根目录
 cd "$(dirname "$0")/.."
 
-TARGET="aarch64-unknown-linux-musl"
+# 目标平台。默认高通 410 等 aarch64 Debian 设备（musl 静态链接，不依赖设备 glibc 版本）。
+# 借助 zig 可交叉编译到其他平台，例如：
+#   TARGET=x86_64-unknown-linux-musl ./scripts/build.sh
+#   TARGET=armv7-unknown-linux-musleabihf ./scripts/build.sh
+TARGET="${TARGET:-aarch64-unknown-linux-musl}"
 
 is_macos() {
     [[ "${OSTYPE:-}" == darwin* ]]
@@ -175,36 +179,46 @@ if [ "$BUILD_BACKEND" = true ]; then
         fi
     fi
 
-    # 检查交叉编译器
-    if ! command -v aarch64-unknown-linux-musl-gcc &> /dev/null; then
-        echo "❌ 错误: 未找到 aarch64-unknown-linux-musl-gcc"
+    # 选择交叉编译后端：优先 zig (cargo-zigbuild)，回退到 musl-gcc 工具链。
+    # zig 自带各平台 libc/musl sysroot，一套工具即可跨全平台交叉编译，
+    # 无需为每个目标单独安装 *-musl-gcc。
+    BUILD_TOOL=""
+    if command -v cargo-zigbuild >/dev/null 2>&1 && command -v zig >/dev/null 2>&1; then
+        BUILD_TOOL="zig"
+    elif command -v aarch64-unknown-linux-musl-gcc >/dev/null 2>&1; then
+        BUILD_TOOL="musl-gcc"
+    else
+        echo "❌ 错误: 未找到可用的交叉编译后端。"
         echo ""
-        echo "请安装 aarch64 Linux musl 交叉编译工具链。"
+        echo "推荐 (全平台，一次安装)："
+        echo "  1) 安装 zig:            https://ziglang.org/download/ (解压后放入 PATH)"
+        echo "  2) 安装 cargo-zigbuild: cargo install cargo-zigbuild"
+        echo ""
+        echo "或安装传统 musl 交叉工具链，提供 aarch64-unknown-linux-musl-gcc。"
         if is_windows_bash; then
             echo "Windows 原生环境不建议直接构建后端 OTA 包，推荐使用 WSL2 Ubuntu。"
         fi
-        echo ""
-        echo "macOS 可参考:"
-        echo "  brew tap messense/macos-cross-toolchains"
-        echo "  brew install aarch64-unknown-linux-musl"
-        echo ""
-        echo "WSL/Linux 请安装可提供 aarch64-unknown-linux-musl-gcc 的交叉工具链，"
-        echo "或使用 GitHub Actions 的 OTA 打包工作流。"
         exit 1
     fi
-    
+
     cd backend
 
-    # 设置交叉编译环境变量
-    export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
-    export CXX_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-g++
-    export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
-    export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
     export SQLITE3_STATIC=1
     export LIBSQLITE3_SYS_USE_PKG_CONFIG=0
 
-    # 构建
-    cargo build --release --target "$TARGET"
+    if [ "$BUILD_TOOL" = "zig" ]; then
+        echo "🔧 使用 zig (cargo-zigbuild) 交叉编译"
+        cargo zigbuild --release --target "$TARGET"
+    else
+        echo "🔧 使用 musl-gcc 工具链交叉编译"
+        # 设置交叉编译环境变量
+        export CC_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-gcc
+        export CXX_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-g++
+        export AR_aarch64_unknown_linux_musl=aarch64-unknown-linux-musl-ar
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-unknown-linux-musl-gcc
+
+        cargo build --release --target "$TARGET"
+    fi
 
     cd ..
 

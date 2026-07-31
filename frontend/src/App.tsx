@@ -3,7 +3,6 @@ import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-route
 import { QueryClientProvider } from '@tanstack/react-query'
 import { Box, CircularProgress } from '@mui/material'
 import { ThemeProvider } from './contexts/ThemeContext'
-import { WorkModeProvider } from './contexts/WorkModeContext'
 import { queryClient } from './lib/queryClient'
 import MainLayout from './components/Layout/MainLayout'
 import { api, type AuthStatusResponse } from './api/current'
@@ -106,11 +105,7 @@ function ProtectedShell() {
     return <Navigate to={next === '/' ? '/login' : `/login?next=${encodeURIComponent(next)}`} replace />
   }
 
-  return (
-    <WorkModeProvider>
-      <MainLayout />
-    </WorkModeProvider>
-  )
+  return <MainLayout />
 }
 
 function App() {

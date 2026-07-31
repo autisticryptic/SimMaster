@@ -1110,23 +1110,42 @@ pub fn list_profiles() -> VowifiProfilesResponse {
     }
 }
 
+/// Build the full plan response for one resolved carrier profile.
+fn matched_response(
+    profile: &'static profiles::CarrierProfile,
+    matched_prefix: String,
+    sim: MaskedSimIdentity,
+) -> VowifiProfileMatchResponse {
+    VowifiProfileMatchResponse {
+        matched: true,
+        matched_prefix: Some(matched_prefix),
+        profile: Some(PublicCarrierProfile::from_profile(profile)),
+        sim_auth: Some(PublicAkaAdapterPlan::from_profile(profile)),
+        epdg: Some(PublicEpdgPlan::from_profile(profile)),
+        ike: Some(PublicIkePlan::from_profile(profile)),
+        dataplane: Some(PublicDataplanePlan::from_profile(profile)),
+        ims: Some(PublicImsPlan::from_profile(profile)),
+        sim,
+    }
+}
+
 fn match_profile_from_parts(
     sim: MaskedSimIdentity,
+    pinned_profile_id: Option<&str>,
     imsi_for_matching: &str,
     operator_id_for_matching: &str,
 ) -> VowifiProfileMatchResponse {
+    // A per-line pin to a database profile is the operator's explicit choice and
+    // wins over automatic matching. A pin that no longer resolves degrades to the
+    // automatic path below, so deleting a profile never strands a line.
+    if let Some(profile_id) = pinned_profile_id {
+        if let Some(profile) = profiles::resolve_pinned_database_profile(profile_id) {
+            return matched_response(profile, profile.meta.plmn.to_string(), sim);
+        }
+    }
+
     if let Some(matched) = profiles::resolve_by_imsi(imsi_for_matching) {
-        return VowifiProfileMatchResponse {
-            matched: true,
-            matched_prefix: Some(matched.matched_prefix),
-            profile: Some(PublicCarrierProfile::from_profile(matched.profile)),
-            sim_auth: Some(PublicAkaAdapterPlan::from_profile(matched.profile)),
-            epdg: Some(PublicEpdgPlan::from_profile(matched.profile)),
-            ike: Some(PublicIkePlan::from_profile(matched.profile)),
-            dataplane: Some(PublicDataplanePlan::from_profile(matched.profile)),
-            ims: Some(PublicImsPlan::from_profile(matched.profile)),
-            sim,
-        };
+        return matched_response(matched.profile, matched.matched_prefix, sim);
     }
 
     let operator_digits: String = operator_id_for_matching
@@ -1137,17 +1156,7 @@ fn match_profile_from_parts(
         let mcc = &operator_digits[..3];
         let mnc = &operator_digits[3..];
         if let Some(profile) = profiles::resolve_by_plmn(mcc, mnc) {
-            return VowifiProfileMatchResponse {
-                matched: true,
-                matched_prefix: Some(operator_digits),
-                profile: Some(PublicCarrierProfile::from_profile(profile)),
-                sim_auth: Some(PublicAkaAdapterPlan::from_profile(profile)),
-                epdg: Some(PublicEpdgPlan::from_profile(profile)),
-                ike: Some(PublicIkePlan::from_profile(profile)),
-                dataplane: Some(PublicDataplanePlan::from_profile(profile)),
-                ims: Some(PublicImsPlan::from_profile(profile)),
-                sim,
-            };
+            return matched_response(profile, operator_digits, sim);
         }
     }
 
@@ -1158,7 +1167,21 @@ fn match_profile_from_parts(
 }
 
 pub fn match_profile_from_identity(identity: &VowifiSimIdentity) -> VowifiProfileMatchResponse {
-    match_profile_from_parts(identity.masked(), identity.imsi(), identity.operator_id())
+    match_profile_from_parts(identity.masked(), None, identity.imsi(), identity.operator_id())
+}
+
+/// Match honoring this line's pinned carrier `profile_id` (from
+/// `LineVowifiConfig.profile_id`). `None` is exactly [`match_profile_from_identity`].
+pub fn match_profile_for_line(
+    identity: &VowifiSimIdentity,
+    pinned_profile_id: Option<&str>,
+) -> VowifiProfileMatchResponse {
+    match_profile_from_parts(
+        identity.masked(),
+        pinned_profile_id,
+        identity.imsi(),
+        identity.operator_id(),
+    )
 }
 
 #[cfg(test)]
@@ -1173,7 +1196,7 @@ mod tests {
             ..Default::default()
         };
 
-        let matched = match_profile_from_parts(sim, "", "20404");
+        let matched = match_profile_from_parts(sim, None, "", "20404");
 
         assert!(matched.matched);
         assert_eq!(

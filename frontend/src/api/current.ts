@@ -52,6 +52,7 @@ import type {
   TrunkProfileResponse,
   VolteControlResponse,
   VolteLineControlResponse,
+  VolteIpFamily,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -87,9 +88,7 @@ import type {
   VowifiSoakRunsResponse,
   VowifiStatusResponse,
   WebhookTestResponse,
-  WorkMode,
-  WorkModeRequest,
-  WorkModeResponse,
+  LineEsimControlResponse,
   VoicePathPolicy,
   WebCallCapabilitiesResponse,
   VilteConfig,
@@ -265,17 +264,21 @@ class SimAdminCurrentAPI {
     return request<{ status: string; message: string; version: string }>('/health')
   }
 
-  async getWorkMode() {
-    return request<ApiResponse<WorkModeResponse>>('/work-mode')
+  async getLineEsimControl(lineId: string) {
+    return request<ApiResponse<LineEsimControlResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/esim-control`,
+    )
   }
 
-  async setWorkMode(mode: WorkMode) {
-    const body: WorkModeRequest = { mode, confirm: true }
-    return request<ApiResponse<WorkModeResponse>>('/work-mode', {
-      method: 'POST',
-      body: JSON.stringify(body),
-      timeoutMs: 10000,
-    })
+  async setLineEsimControl(lineId: string, esimControl: boolean | null) {
+    return request<ApiResponse<LineEsimControlResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/esim-control`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ esim_control: esimControl }),
+        timeoutMs: 10000,
+      },
+    )
   }
 
   async getEsimConfig() {
@@ -289,14 +292,14 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getEsimEuicc() {
-    return request<ApiResponse<EsimEuiccInfo>>('/esim/euicc', {
+  async getEsimEuicc(lineId?: string) {
+    return request<ApiResponse<EsimEuiccInfo>>(`/esim/euicc${lineScopeQuery(lineId)}`, {
       timeoutMs: 30000,
     })
   }
 
-  async getEsimProfiles() {
-    return request<ApiResponse<EsimProfilesResponse>>('/esim/profiles', {
+  async getEsimProfiles(lineId?: string) {
+    return request<ApiResponse<EsimProfilesResponse>>(`/esim/profiles${lineScopeQuery(lineId)}`, {
       timeoutMs: 30000,
     })
   }
@@ -321,8 +324,8 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async enableEsimProfile(iccid: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/enable`, {
+  async enableEsimProfile(iccid: string, lineId?: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/enable${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify({}),
       timeoutMs: 10000,
@@ -330,23 +333,23 @@ class SimAdminCurrentAPI {
   }
 
 
-  async renameEsimProfile(iccid: string, name: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/rename`, {
+  async renameEsimProfile(iccid: string, name: string, lineId?: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}/rename${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify({ name }),
       timeoutMs: 60000,
     })
   }
 
-  async deleteEsimProfile(iccid: string) {
-    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}`, {
+  async deleteEsimProfile(iccid: string, lineId?: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles/${encodeURIComponent(iccid)}${lineScopeQuery(lineId)}`, {
       method: 'DELETE',
       timeoutMs: 60000,
     })
   }
 
-  async downloadEsimProfile(requestData: EsimDownloadRequest) {
-    return request<ApiResponse<EsimCommandResponse>>('/esim/profiles', {
+  async downloadEsimProfile(requestData: EsimDownloadRequest, lineId?: string) {
+    return request<ApiResponse<EsimCommandResponse>>(`/esim/profiles${lineScopeQuery(lineId)}`, {
       method: 'POST',
       body: JSON.stringify(requestData),
       timeoutMs: 180000, // 3 minutes timeout
@@ -691,6 +694,13 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VolteLineControlResponse>>(
       `/volte/lines/${encodeURIComponent(lineId)}/retry`,
       { method: 'POST', body: JSON.stringify({}) },
+    )
+  }
+
+  async setVolteLineIpFamilies(lineId: string, families: VolteIpFamily[] | null) {
+    return request<ApiResponse<VolteLineControlResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/ip-families`,
+      { method: 'POST', body: JSON.stringify({ families }) },
     )
   }
 

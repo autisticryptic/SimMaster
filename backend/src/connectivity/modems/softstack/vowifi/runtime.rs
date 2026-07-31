@@ -191,10 +191,13 @@ impl VowifiRuntime {
         let next = match self.read_bound_sim_identity(conn).await {
             Some(identity) => {
                 let identity = VowifiSimIdentity::from_modem(&identity);
-                let profile = diagnostics::match_profile_from_identity(&identity);
+                let pinned = super::live::line_pinned_profile_id(&self.line_id);
+                let profile =
+                    diagnostics::match_profile_for_line(&identity, pinned.as_deref());
                 let previous = self.snapshot().await;
                 let same_profile = same_matched_profile(&previous.profile, &profile);
-                let live_readiness = previous.live_readiness_for_profile(&identity);
+                let live_readiness =
+                    previous.live_readiness_for_profile(&identity, pinned.as_deref());
                 RuntimeSnapshot {
                     phase: if profile.matched {
                         RuntimePhase::ProfileMatched
@@ -591,7 +594,11 @@ fn reset_identity_preserving_runtime(previous: RuntimeSnapshot) -> RuntimeSnapsh
 }
 
 impl RuntimeSnapshot {
-    fn live_readiness_for_profile(&self, identity: &VowifiSimIdentity) -> RuntimeLiveReadiness {
+    fn live_readiness_for_profile(
+        &self,
+        identity: &VowifiSimIdentity,
+        pinned_profile_id: Option<&str>,
+    ) -> RuntimeLiveReadiness {
         if !identity.present() {
             return RuntimeLiveReadiness::default();
         }
@@ -601,7 +608,7 @@ impl RuntimeSnapshot {
             .profile
             .as_ref()
             .map(|profile| profile.profile_id);
-        let current_profile = diagnostics::match_profile_from_identity(identity);
+        let current_profile = diagnostics::match_profile_for_line(identity, pinned_profile_id);
         let current_profile_id = current_profile
             .profile
             .as_ref()

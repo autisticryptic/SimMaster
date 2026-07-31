@@ -147,42 +147,58 @@ pub async fn establish_native_ims_bearer(
 
     let cid = ims_context_cid(request);
     let families = qmi_families_for(plan);
-    let mut fallback_families = families.clone();
-    if plan.initial_bearer_attempt() == IpType::Ipv4v6 && families.len() >= 2 {
-        match establish_dual_stack(&endpoint, &baseband, modem_id, request, cid, &families[..2])
-            .await
-        {
+    // Walk the plan's attempts in order. Dual-stack is an ordinary entry, so a
+    // per-line list may place it after a single family or omit it entirely — the
+    // configured order is what runs, not "dual-stack first" hardcoded here.
+    let mut last_error = None;
+    let mut forced_single: Option<u8> = None;
+    for attempt in plan.bearer_attempts() {
+        let result = match attempt {
+            IpType::Ipv4v6 => {
+                if families.len() < 2 {
+                    // Dual-stack needs both families admitted by this plan.
+                    continue;
+                }
+                establish_dual_stack(&endpoint, &baseband, modem_id, request, cid, &families[..2])
+                    .await
+            }
+            IpType::Ipv4 => establish_one(&endpoint, &baseband, modem_id, request, cid, 4).await,
+            IpType::Ipv6 => establish_one(&endpoint, &baseband, modem_id, request, cid, 6).await,
+        };
+        match result {
             Ok(bearer) => return Ok(bearer),
             Err(error) if failure_class(&error).is_unsafe_to_retry() => {
                 secondary_qmi::release_endpoint(&endpoint).await;
                 return Err(error);
             }
             Err(error) => {
-                if let Some(forced) = forced_qmi_family(failure_class(&error)) {
-                    fallback_families = vec![forced];
-                }
+                let class = failure_class(&error);
                 tracing::warn!(
+                    attempt = attempt.as_mm_str(),
                     error = %error,
-                    "Native VoLTE dual-stack WDS activation failed; falling back to single-stack attempts"
+                    "Native VoLTE WDS activation failed; trying the next planned attempt"
                 );
+                last_error = Some(error);
+                // The network told us only one family is allowed. Nothing later in
+                // the plan can succeed, so stop and try exactly that family.
+                if let Some(forced) = forced_qmi_family(class) {
+                    forced_single = Some(forced);
+                    break;
+                }
             }
         }
     }
 
-    let mut last_error = None;
-    for family in fallback_families {
-        match establish_one(&endpoint, &baseband, modem_id, request, cid, family).await {
+    if let Some(forced) = forced_single {
+        match establish_one(&endpoint, &baseband, modem_id, request, cid, forced).await {
             Ok(bearer) => return Ok(bearer),
-            Err(error) if failure_class(&error).is_unsafe_to_retry() => {
-                secondary_qmi::release_endpoint(&endpoint).await;
-                return Err(error);
-            }
             Err(error) => {
-                tracing::warn!(family, error = %error, "Native VoLTE single-stack WDS attempt failed");
+                tracing::warn!(family = forced, error = %error, "Native VoLTE network-forced family WDS attempt failed");
                 last_error = Some(error);
             }
         }
     }
+
     secondary_qmi::release_endpoint(&endpoint).await;
     Err(last_error.unwrap_or_else(|| {
         VolteError::with_detail(

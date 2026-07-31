@@ -15,7 +15,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, SimCard, SwapVert, TravelExplore, Wifi } from '@mui/icons-material'
+import { CellTower, FlightTakeoff, Lan, Memory, Refresh, Replay, SettingsEthernet, SimCard, SwapVert, TravelExplore, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -26,8 +26,10 @@ import {
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
+import VolteLineDialog from './VolteLineDialog'
 import LineDetailsDialog, { type LineDetailTab } from './LineDetailsDialog'
 import DataProxyDialog from './DataProxyDialog'
+import EsimLineDialog from './EsimLineDialog'
 import { formatBytes } from '../Dashboard/utils'
 
 const stageLabels: Record<string, string> = {
@@ -126,6 +128,40 @@ function recoveryMessage(line: VolteLineControlResponse) {
   }
 }
 
+/** Whether the line's SIM advertises a eUICC chip, without paying an lpac probe. */
+function lineReportsEuicc(line: VolteLineControlResponse) {
+  return line.modem.sim_type === 'esim'
+    || line.modem.esim_status === 'no-profiles'
+    || line.modem.esim_status === 'with-profiles'
+}
+
+/** Effective eSIM management state: explicit override, else auto-detection. */
+function esimActive(line: VolteLineControlResponse) {
+  const control = line.profile.esim_control
+  if (control === true) return true
+  if (control === false) return false
+  return lineReportsEuicc(line)
+}
+
+/** One-line hint describing why eSIM management is on or off for this line. */
+function esimStatusHint(line: VolteLineControlResponse) {
+  const control = line.profile.esim_control
+  if (control === false) return '已按普通 SIM 处理（手动关闭）'
+  if (control === true) return lineReportsEuicc(line) ? 'eSIM 控制已手动开启' : '手动开启，将通过外置 lpac 管理'
+  return lineReportsEuicc(line) ? '已自动探测到 eUICC' : '未探测到 eUICC，按普通 SIM 处理'
+}
+
+/** Chip label reflecting the card's reported eUICC profile state, else on/off. */
+function esimChipLabel(line: VolteLineControlResponse) {
+  const status = line.modem.esim_status
+  if (esimActive(line)) {
+    if (status === 'with-profiles') return '有 Profile'
+    if (status === 'no-profiles') return '无 Profile'
+    return '已启用'
+  }
+  return '未启用'
+}
+
 export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo?: ReactNode }) {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
@@ -133,6 +169,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
+  const [editingVolteLine, setEditingVolteLine] = useState<VolteLineControlResponse | null>(null)
   const [editingDataLineId, setEditingDataLineId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [savingKey, setSavingKey] = useState<string | null>(null)
@@ -140,6 +177,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
   const [success, setSuccess] = useState<string | null>(null)
   const [detailLine, setDetailLine] = useState<VolteLineControlResponse | null>(null)
   const [detailTab, setDetailTab] = useState<LineDetailTab>('basic')
+  const [esimDialogModem, setEsimDialogModem] = useState<VolteLineControlResponse['modem'] | null>(null)
 
   const openDetails = (line: VolteLineControlResponse, tab: LineDetailTab) => {
     setDetailLine(line)
@@ -300,6 +338,12 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
     setSuccess(`${shortLineId(updated.line_id)} 的 VoWiFi 配置已保存`)
   }
 
+  const handleVolteSaved = (updated: VolteLineControlResponse) => {
+    setLines((current) => current.map((line) => line.modem.line_id === updated.modem.line_id ? updated : line))
+    setEditingVolteLine(updated)
+    setSuccess(`${shortLineId(updated.modem.line_id)} 的 VoLTE 地址族已保存`)
+  }
+
   const retryLine = async (lineId: string) => {
     setSavingKey(`retry:${lineId}`)
     setError(null)
@@ -344,6 +388,43 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
     setTrunkLines((current) => current.map((line) => line.line_id === updated.line_id ? updated : line))
     setEditingTrunkLine(updated)
     setSuccess(`${shortLineId(updated.line_id)} 的 Asterisk Trunk 配置已保存`)
+  }
+
+  // Set the line's eSIM management override. `null` returns it to automatic
+  // detection (managed only when the SIM reports a eUICC), while `true`/`false`
+  // force the lpac controls on/off. The backend echoes the resolved profile, so
+  // we patch the line's `esim_control` locally from the request value.
+  const applyEsimControl = async (lineId: string, control: boolean | null) => {
+    setSavingKey(`esim:${lineId}`)
+    setError(null)
+    setSuccess(null)
+    try {
+      await api.setLineEsimControl(lineId, control)
+      setLines((current) => current.map((line) => (
+        line.modem.line_id === lineId
+          ? { ...line, profile: { ...line.profile, esim_control: control } }
+          : line
+      )))
+      setSuccess(
+        control === null
+          ? `${shortLineId(lineId)} eSIM 控制已恢复自动`
+          : `${shortLineId(lineId)} 已${control ? '开启' : '关闭'} eSIM 控制`,
+      )
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      await load(true)
+    } finally {
+      setSavingKey(null)
+    }
+  }
+
+  // Toggling the switch on returns the line to automatic detection when the SIM
+  // already reports a eUICC (so the "auto" state is preserved); otherwise it is a
+  // manual force-on. Turning it off always writes an explicit disable so a plain
+  // SIM never gets probed by lpac.
+  const toggleEsimControl = (line: VolteLineControlResponse, enabled: boolean) => {
+    if (!enabled) return applyEsimControl(line.modem.line_id, false)
+    return applyEsimControl(line.modem.line_id, lineReportsEuicc(line) ? null : true)
   }
 
   const handleDataProxySaved = (updated: LineNetworkControlsResponse) => {
@@ -398,13 +479,21 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
             const recovery = recoveryMessage(line)
             const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
+            // A standalone reader has no cellular baseband: it only participates
+            // in VoWiFi and eSIM management, so the cellular controls (VoLTE,
+            // data, roaming, airplane, Trunk) are hidden for it.
+            const isReader = line.modem.line_kind === 'reader'
             return (
               <Grid key={line.modem.line_id} size={{ xs: 12, lg: 6 }}>
                 <Card variant="outlined" sx={{ height: '100%', opacity: line.modem.present ? 1 : 0.68 }}>
                   <CardHeader
-                    avatar={<CellTower color={line.modem.present ? 'primary' : 'disabled'} />}
-                    title={`${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
-                    subheader={`线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
+                    avatar={isReader ? <Usb color={line.modem.present ? 'primary' : 'disabled'} /> : <CellTower color={line.modem.present ? 'primary' : 'disabled'} />}
+                    title={isReader
+                      ? `读卡器 ${line.modem.slot_label || ''} · 卡槽 ${line.modem.uim_slot}`.trim()
+                      : `${modemSlotLabel(line.modem, index)} · 卡槽 ${line.modem.uim_slot} · ${line.modem.manufacturer || '未知厂商'} ${line.modem.model || ''}`}
+                    subheader={isReader
+                      ? `线路 ${shortLineId(line.modem.line_id)} · ${line.modem.model || '独立读卡器'}`
+                      : `线路 ${shortLineId(line.modem.line_id)} · ModemManager ${line.modem.modem_id}`}
                     sx={{
                       alignItems: 'flex-start',
                       flexWrap: { xs: 'wrap', sm: 'nowrap' },
@@ -430,26 +519,26 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Typography variant="body2">{maskedIccid(line.modem.sim_iccid)}</Typography>
                         </Box>
                       </Grid>
-                      <Grid size={6}>
+                      {!isReader && <Grid size={6}>
                         <Typography variant="caption" color="text.secondary">驻网状态</Typography>
                         <Typography variant="body2" mt={0.25}>{modemStateLabel(line.modem.state)}</Typography>
-                      </Grid>
-                      <Grid size={6}>
+                      </Grid>}
+                      {!isReader && <Grid size={6}>
                         <Typography variant="caption" color="text.secondary">运营商 PLMN</Typography>
                         <Typography variant="body2" mt={0.25}>{line.modem.operator_id || '未读取'}</Typography>
-                      </Grid>
+                      </Grid>}
                       <Grid size={6}>
-                        <Typography variant="caption" color="text.secondary">QMI / UIM</Typography>
+                        <Typography variant="caption" color="text.secondary">{isReader ? '读卡器 / UIM' : 'QMI / UIM'}</Typography>
                         <Typography variant="body2" mt={0.25} sx={{ wordBreak: 'break-all' }}>
-                          {line.modem.qmi_device || '未发现'} · Slot {line.modem.uim_slot}
+                          {(isReader ? line.modem.model : line.modem.qmi_device) || '未发现'} · Slot {line.modem.uim_slot}
                         </Typography>
                       </Grid>
-                      <Grid size={{ xs: 12, sm: 6 }}>
+                      {!isReader && <Grid size={{ xs: 12, sm: 6 }}>
                         <Typography variant="caption" color="text.secondary">IMS 数据路径</Typography>
                         <Typography variant="body2" mt={0.25} sx={{ wordBreak: 'break-all' }}>
                           {line.runtime.data_path_mode || '尚未建立'}{line.runtime.pcscf ? ` · P-CSCF ${line.runtime.pcscf}` : ''}
                         </Typography>
-                      </Grid>
+                      </Grid>}
                       <Grid size={{ xs: 12, sm: 6 }} display="flex" alignItems="center" justifyContent="center">
                         <Typography
                           component="button"
@@ -482,6 +571,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                     )}
 
                     <Box display="flex" flexDirection="column">
+                    {!isReader && (<>
                     <Box order={3} display="flex" justifyContent="space-between" alignItems="center" mt={2} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75}>
@@ -616,6 +706,14 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                             </span>
                           </Tooltip>
                         )}
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => setEditingVolteLine(line)}
+                          disabled={savingKey !== null}
+                        >
+                          地址族
+                        </Button>
                         <Switch
                           checked={line.profile.volte_connection_enabled}
                           onChange={(_, enabled) => void toggleLine(line.modem.line_id, enabled)}
@@ -623,6 +721,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         />
                       </Box>
                     </Box>
+                    </>)}
 
                     <Box order={1} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
@@ -631,7 +730,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {vowifiLine?.config.epdg_host || '使用运营商 profile ePDG'}
+                          {vowifiLine?.config.profile_id ? `指定 profile ${vowifiLine.config.profile_id}` : '自动匹配运营商 profile'}
                           {vowifiLine?.config.dns_server ? ` · DNS ${vowifiLine.config.dns_server}` : ''}
                         </Typography>
                       </Box>
@@ -655,6 +754,36 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                     </Box>
 
                     <Box order={6} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
+                      <Box minWidth={0}>
+                        <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
+                          <Memory color={esimActive(line) ? 'primary' : 'action'} fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>eSIM 管理</Typography>
+                        </Box>
+                        <Typography variant="caption" color="text.secondary" display="block" mt={0.25} sx={{ wordBreak: 'break-word' }}>
+                          {esimStatusHint(line)}
+                        </Typography>
+                      </Box>
+                      <Box display="flex" alignItems="center" gap={0.5}>
+                        <Chip size="small" label={esimChipLabel(line)} color={esimActive(line) ? 'primary' : 'default'} variant="outlined" />
+                        <Button
+                          size="small"
+                          variant="text"
+                          onClick={() => setEsimDialogModem(line.modem)}
+                          disabled={!esimActive(line) || savingKey !== null}
+                        >
+                          管理
+                        </Button>
+                        {savingKey === `esim:${line.modem.line_id}` && <CircularProgress size={18} />}
+                        <Switch
+                          checked={esimActive(line)}
+                          onChange={(_, enabled) => void toggleEsimControl(line, enabled)}
+                          disabled={savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    {!isReader && (
+                    <Box order={7} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
                           <SettingsEthernet color="action" fontSize="small" />
@@ -684,6 +813,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
                         />
                       </Box>
                     </Box>
+                    )}
                     </Box>
                   </CardContent>
                 </Card>
@@ -705,12 +835,24 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
       />
+      <VolteLineDialog
+        open={editingVolteLine !== null}
+        lineId={editingVolteLine?.modem.line_id ?? null}
+        families={editingVolteLine?.profile.volte_ip_families ?? null}
+        onClose={() => setEditingVolteLine(null)}
+        onSaved={handleVolteSaved}
+      />
       <DataProxyDialog
         open={editingDataLineId !== null}
         lineId={editingDataLineId}
         controls={editingDataLineId ? networkByLineId.get(editingDataLineId) ?? null : null}
         onClose={() => setEditingDataLineId(null)}
         onSaved={handleDataProxySaved}
+      />
+      <EsimLineDialog
+        open={esimDialogModem !== null}
+        modem={esimDialogModem}
+        onClose={() => setEsimDialogModem(null)}
       />
       <LineDetailsDialog
         key={`${detailLine?.modem.line_id ?? 'closed'}:${detailTab}`}

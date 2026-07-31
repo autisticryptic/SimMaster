@@ -16,8 +16,7 @@ use tokio::sync::Mutex;
 
 use crate::api::models::{
     EsimCommandResponse, EsimDownloadRequest, EsimEuiccInfo, EsimLpacRepairRequest,
-    EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse, WorkMode,
-    WorkModeResponse,
+    EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse,
 };
 use crate::platform::config::ConfigManager;
 
@@ -50,7 +49,7 @@ pub enum EsimApiError {
 impl EsimApiError {
     pub fn message(&self) -> String {
         match self {
-            Self::Disabled => "eSIM module is disabled in current work mode".to_string(),
+            Self::Disabled => "eSIM management is disabled for this line".to_string(),
             Self::Unavailable(message) | Self::Command(message) => message.clone(),
         }
     }
@@ -69,26 +68,10 @@ impl EsimSupervisor {
         }
     }
 
-    pub async fn worker_running(&self) -> bool {
-        self.config_manager.get_work_mode() == WorkMode::Esim
-    }
-
-    pub async fn switch_mode(&self, target: WorkMode) -> Result<WorkModeResponse, String> {
-        self.config_manager.set_work_mode(target)?;
-        let mode = self.config_manager.get_work_mode();
-        Ok(WorkModeResponse {
-            mode,
-            // Kept for API compatibility with v1.0.5 clients. There is no
-            // worker after the simplification; true means eSIM APIs are enabled.
-            worker_running: mode == WorkMode::Esim,
-        })
-    }
-
     pub async fn get_lpac_status(&self) -> Result<EsimLpacStatusResponse, EsimApiError> {
-        if self.config_manager.get_work_mode() != WorkMode::Esim {
-            return Err(EsimApiError::Disabled);
-        }
-
+        // lpac availability is a device-wide fact (one private binary), so it is
+        // no longer gated by a global work mode. Per-line eSIM eligibility is
+        // decided by the handler before any card operation runs.
         let _guard = self.lpac_lock.lock().await;
         let raw_arch = detect_machine_arch()
             .await
@@ -124,10 +107,6 @@ impl EsimSupervisor {
         &self,
         request: EsimLpacRepairRequest,
     ) -> Result<EsimLpacRepairResponse, EsimApiError> {
-        if self.config_manager.get_work_mode() != WorkMode::Esim {
-            return Err(EsimApiError::Disabled);
-        }
-
         let _guard = self.lpac_lock.lock().await;
         let raw_arch = detect_machine_arch()
             .await
@@ -211,8 +190,16 @@ impl EsimSupervisor {
         args: &[&str],
         timeout_seconds: u64,
     ) -> Result<EsimCommandResponse, EsimApiError> {
-        if self.config_manager.get_work_mode() != WorkMode::Esim {
-            return Err(EsimApiError::Disabled);
+        // A line whose owner explicitly opted out of eSIM control is treated as a
+        // plain SIM, so no lpac command ever reaches its reader. The automatic
+        // "only when a eUICC is detected" policy is enforced by the API layer,
+        // which can see the line's discovered `esim_status`; this defensive check
+        // covers the explicit `Some(false)` override the supervisor can see on its
+        // own.
+        if let Some(line_id) = line_id.filter(|value| !value.is_empty()) {
+            if self.config_manager.get_line_profile(line_id).esim_control == Some(false) {
+                return Err(EsimApiError::Disabled);
+            }
         }
 
         let target = esim_target_for_line(line_id);

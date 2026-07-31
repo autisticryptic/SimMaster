@@ -123,8 +123,11 @@ static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<HashMap<String, LiveNetworkOve
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LiveNetworkOverrides {
-    epdg_host: Option<String>,
-    epdg_port: Option<u16>,
+    /// Pin this line to a specific carrier profile by `profile_id`. `None`
+    /// resolves the profile automatically from the SIM's IMSI. A pinned id that
+    /// no longer resolves falls back to automatic matching, so deleting a
+    /// profile never strands a line.
+    profile_id: Option<String>,
     dns_server: Option<IpAddr>,
     /// How this line's IKE/NAT-T traffic egresses. `None` means direct.
     proxy: Option<LiveProxySetting>,
@@ -180,8 +183,6 @@ fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetwork
         }
     };
     Ok(LiveNetworkOverrides {
-        epdg_host: (!config.epdg_host.is_empty()).then(|| config.epdg_host.clone()),
-        epdg_port: (!config.epdg_host.is_empty()).then_some(config.epdg_port),
         dns_server: if config.dns_server.is_empty() {
             None
         } else {
@@ -193,6 +194,11 @@ fn build_live_network_overrides(config: &LineVowifiConfig) -> Result<LiveNetwork
             )
         },
         proxy,
+        profile_id: config
+            .profile_id
+            .as_ref()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     })
 }
 
@@ -205,16 +211,37 @@ fn line_overrides(line_id: &str) -> LiveNetworkOverrides {
         .unwrap_or_default()
 }
 
+/// The carrier profile a line is pinned to, if any. Empty `line_id`, an unknown
+/// line, or a line with no pin all return `None`.
+pub fn line_pinned_profile_id(line_id: &str) -> Option<String> {
+    if line_id.is_empty() {
+        return None;
+    }
+    line_overrides(line_id).profile_id
+}
+
+/// Resolve the carrier profile for a line, honoring a per-line pin.
+///
+/// A pinned `profile_id` is tried first, and only against database-published
+/// profiles; if it no longer resolves (the profile was deleted, or the id was
+/// never valid) we fall back to matching by IMSI, so a stale pin degrades to the
+/// automatic behaviour instead of stranding the line. With no pin this is
+/// exactly `resolve_by_imsi`.
+pub fn resolve_profile_for_line(line_id: &str, imsi: &str) -> Option<profiles::CarrierMatch> {
+    let pinned = line_pinned_profile_id(line_id);
+    profiles::resolve_for_line(pinned.as_deref(), imsi.trim())
+}
+
 fn live_epdg_settings(
     line_id: &str,
     profile: &'static CarrierProfile,
 ) -> (String, u16, Option<IpAddr>) {
-    let overrides = line_overrides(line_id);
+    // The ePDG host/port now come solely from the carrier profile; a line can
+    // pick which profile via its `profile_id` pin, but no longer hand-overrides
+    // the endpoint. DNS remains a per-line override.
     (
-        overrides
-            .epdg_host
-            .unwrap_or_else(|| profile.epdg.host.to_string()),
-        overrides.epdg_port.unwrap_or(profile.epdg.port),
+        profile.epdg.host.to_string(),
+        profile.epdg.port,
         live_dns_candidates(line_id, profile).into_iter().next(),
     )
 }
@@ -251,11 +278,8 @@ async fn resolve_live_epdg(
     profile: &'static CarrierProfile,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
     let overrides = line_overrides(line_id);
-    let host = overrides
-        .epdg_host
-        .clone()
-        .unwrap_or_else(|| profile.epdg.host.to_string());
-    let port = overrides.epdg_port.unwrap_or(profile.epdg.port);
+    let host = profile.epdg.host.to_string();
+    let port = profile.epdg.port;
     // DNS follows the proxy: when this line egresses through a proxy, the lookup
     // goes through it too, so the real client IP is not exposed to the resolver
     // and operator DNS interception on the ePDG name is bypassed. With no proxy
@@ -2095,7 +2119,7 @@ pub async fn place_live_voice_call_for_line(
     let identity = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("voice_identity_unavailable"))?;
-    let profile_match = profiles::resolve_by_imsi(identity.imsi.trim())
+    let profile_match = resolve_profile_for_line(line_id, identity.imsi.trim())
         .ok_or_else(|| live_stage_error("voice_profile_unmatched"))?;
     let profile = profile_match.profile;
 
@@ -2659,7 +2683,7 @@ pub async fn send_live_sms_over_ims_for_line(
     let identity = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("sms_identity_unavailable"))?;
-    let profile_match = profiles::resolve_by_imsi(identity.imsi.trim())
+    let profile_match = resolve_profile_for_line(line_id, identity.imsi.trim())
         .ok_or_else(|| live_stage_error("sms_profile_unmatched"))?;
     let profile = profile_match.profile;
 
@@ -6348,18 +6372,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn line_network_overrides_apply_custom_dns_and_epdg() {
+    fn line_network_overrides_apply_custom_dns_and_profile_pin() {
         let config = LineVowifiConfig {
             dns_server: "2001:4860:4860::8888".to_string(),
-            epdg_host: "epdg.example.net".to_string(),
-            epdg_port: 4500,
+            profile_id: Some("gb_ee_23433".to_string()),
             ..LineVowifiConfig::default()
         };
 
         let overrides = build_live_network_overrides(&config).expect("valid network overrides");
 
-        assert_eq!(overrides.epdg_host.as_deref(), Some("epdg.example.net"));
-        assert_eq!(overrides.epdg_port, Some(4500));
+        assert_eq!(overrides.profile_id.as_deref(), Some("gb_ee_23433"));
         assert_eq!(
             overrides.dns_server,
             Some("2001:4860:4860::8888".parse().unwrap())
@@ -6444,16 +6466,16 @@ mod tests {
             proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
             proxy_endpoint: "socks5://127.0.0.1:1080".to_string(),
             dns_server: "1.1.1.1".to_string(),
-            epdg_host: "epdg.jp.example".to_string(),
-            epdg_port: 500,
+            profile_id: Some("jp_carrier".to_string()),
+            ..LineVowifiConfig::default()
         };
         let malaysia = LineVowifiConfig {
             enabled: true,
             proxy_mode: VowifiProxyMode::Direct,
             proxy_endpoint: String::new(),
             dns_server: "8.8.8.8".to_string(),
-            epdg_host: "epdg.my.example".to_string(),
-            epdg_port: 500,
+            profile_id: Some("my_carrier".to_string()),
+            ..LineVowifiConfig::default()
         };
 
         configure_live_network_overrides("line-jp", &japan).expect("configure jp");
@@ -6461,8 +6483,8 @@ mod tests {
 
         let jp = line_overrides("line-jp");
         let my = line_overrides("line-my");
-        assert_eq!(jp.epdg_host.as_deref(), Some("epdg.jp.example"));
-        assert_eq!(my.epdg_host.as_deref(), Some("epdg.my.example"));
+        assert_eq!(jp.profile_id.as_deref(), Some("jp_carrier"));
+        assert_eq!(my.profile_id.as_deref(), Some("my_carrier"));
         assert_eq!(
             jp.dns_server.map(|ip| ip.to_string()).as_deref(),
             Some("1.1.1.1")
@@ -6486,8 +6508,8 @@ mod tests {
         assert_eq!(line_overrides("line-jp"), LiveNetworkOverrides::default());
         // Forgetting one line must not disturb the other.
         assert_eq!(
-            line_overrides("line-my").epdg_host.as_deref(),
-            Some("epdg.my.example")
+            line_overrides("line-my").profile_id.as_deref(),
+            Some("my_carrier")
         );
         forget_live_network_overrides("line-my");
     }

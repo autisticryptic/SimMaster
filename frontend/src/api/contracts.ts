@@ -33,16 +33,17 @@ export interface ChangePasswordRequest {
   new_password: string
 }
 
-export type WorkMode = 'sim' | 'esim'
-
-export interface WorkModeResponse {
-  mode: WorkMode
-  worker_running: boolean
-}
-
-export interface WorkModeRequest {
-  mode: WorkMode
-  confirm: boolean
+/** Per-line eSIM (eUICC) management control and detection state. */
+export interface LineEsimControlResponse {
+  line_id: string
+  /** `null` = auto (follow detection); `true`/`false` = explicit override. */
+  esim_control: boolean | null
+  sim_type: string
+  esim_status: string
+  /** Whether the discovered SIM advertises a eUICC chip. */
+  euicc_detected: boolean
+  /** Effective result: may this line run lpac eSIM operations right now? */
+  esim_enabled: boolean
 }
 
 export interface EsimCommandResponse {
@@ -450,6 +451,12 @@ export interface ModemBinding {
   operator_id: string
   state: string
   present: boolean
+  /** ModemManager SimType: "physical" | "esim" | "unknown". */
+  sim_type?: string
+  /** ModemManager EsimStatus: "none" | "no-profiles" | "with-profiles" | "unknown". */
+  esim_status?: string
+  /** "baseband" for a cellular modem line, "reader" for a standalone SIM reader. */
+  line_kind?: string
 }
 
 export interface VolteConnectionAttempt {
@@ -586,6 +593,13 @@ export interface TrunkProfileResponse {
   runtime: TrunkRuntimeStatus
 }
 
+/** A single IMS bearer address family. */
+/**
+ * One IMS bearer attempt: dual-stack (`ipv4v6`) or a single family. Dual-stack is
+ * an ordinary orderable entry, so a line may try single families before it.
+ */
+export type VolteIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
+
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
@@ -596,6 +610,18 @@ export interface LineProfileConfig {
   data_proxy: LineDataProxyConfig
   roaming_allowed: boolean
   airplane_mode_enabled: boolean
+  /**
+   * Ordered IMS address-family attempt list. `null` inherits the global VoLTE
+   * preference. Order is the attempt/fallback order; a one-element list means
+   * "only that family".
+   */
+  volte_ip_families?: VolteIpFamily[] | null
+  /**
+   * Per-line eSIM management override. `null`/undefined = auto (managed only
+   * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
+   * `false` = treat as a plain SIM (no lpac calls).
+   */
+  esim_control?: boolean | null
 }
 
 export interface LineDataProxyConfig {
@@ -816,8 +842,13 @@ export interface LineVowifiConfig {
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
   dns_server: string
-  epdg_host: string
-  epdg_port: number
+  /**
+   * Pin this line to a specific carrier profile by `profile_id`. `null`/omitted
+   * resolves the profile automatically from the SIM's IMSI. The dropdown only
+   * offers database profiles; a pinned id that no longer resolves falls back to
+   * automatic matching so deleting a profile never strands a line.
+   */
+  profile_id?: string | null
 }
 
 export interface VowifiLineConfigResponse {

@@ -36,35 +36,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum WorkMode {
-    #[default]
-    Sim,
-    Esim,
-}
-
-impl std::fmt::Display for WorkMode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WorkMode::Sim => write!(f, "sim"),
-            WorkMode::Esim => write!(f, "esim"),
-        }
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub struct WorkModeRequest {
-    pub mode: WorkMode,
-    #[serde(default)]
-    pub confirm: bool,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct WorkModeResponse {
-    pub mode: WorkMode,
-    pub worker_running: bool,
-}
 
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct EsimCommandResponse {

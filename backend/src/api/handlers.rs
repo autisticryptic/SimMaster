@@ -143,6 +143,51 @@ fn esim_error_response<T: Default>(error: EsimApiError) -> (StatusCode, Json<Api
     (status, Json(ApiResponse::<T>::error(error.message())))
 }
 
+/// Decide whether a line may run eSIM/lpac operations.
+///
+/// `Some(false)` on the profile forces the line to behave as a plain SIM, so no
+/// lpac command is ever issued. `Some(true)` force-enables management even when
+/// the SIM cannot advertise a eUICC (e.g. a bare reader). `None` is the auto
+/// policy: management is offered only when the line's SIM reports a eUICC chip
+/// through ModemManager (`sim_type`/`esim_status`), which is a cheap signal that
+/// costs no extra lpac probe.
+fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemBinding) -> bool {
+    binding.sim_type == "esim"
+        || matches!(binding.esim_status.as_str(), "no-profiles" | "with-profiles")
+}
+
+/// Returns `Ok(())` when the named line is allowed to run eSIM operations, or an
+/// `EsimApiError::Disabled` describing why not. A missing `line_id` keeps the
+/// legacy single-reader behaviour (allowed) so older clients still work.
+async fn resolve_line_esim_gate(app: &AppState, line_id: Option<&str>) -> Result<(), EsimApiError> {
+    let Some(line_id) = line_id.filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    match app.config_manager.get_line_profile(line_id).esim_control {
+        Some(false) => Err(EsimApiError::Disabled),
+        Some(true) => Ok(()),
+        None => {
+            // The registry is the only place that knows what the card reported.
+            // Refresh when the line is not yet known (first call after boot, a
+            // hotplug, or a newly configured standalone reader) so the automatic
+            // policy does not deny a line that actually holds a eUICC.
+            let mut line = app.line_registry.get(line_id).await;
+            if line.is_none() {
+                let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+                line = app.line_registry.get(line_id).await;
+            }
+            let reports_euicc = line
+                .map(|line| line_reports_euicc(&line.binding()))
+                .unwrap_or(false);
+            if reports_euicc {
+                Ok(())
+            } else {
+                Err(EsimApiError::Disabled)
+            }
+        }
+    }
+}
+
 fn esim_command_succeeded(response: &EsimCommandResponse) -> bool {
     response.code == 0
         && (response.status.is_empty()
@@ -351,63 +396,7 @@ fn cached_profiles_requested(query: &std::collections::HashMap<String, String>) 
         .unwrap_or(false)
 }
 
-// ============ 工作模式 / eSIM ============
-
-/// GET /api/work-mode
-pub async fn get_work_mode_handler(State(app): State<AppState>) -> impl IntoResponse {
-    let mode = app.config_manager.get_work_mode();
-    let worker_running = app.esim_supervisor.worker_running().await;
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "Success",
-            WorkModeResponse {
-                mode,
-                worker_running,
-            },
-        )),
-    )
-}
-
-/// POST /api/work-mode
-pub async fn set_work_mode_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<WorkModeRequest>,
-) -> impl IntoResponse {
-    if !payload.confirm {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::<WorkModeResponse>::error(
-                "Changing work mode requires confirm=true",
-            )),
-        );
-    }
-
-    let previous_mode = app.config_manager.get_work_mode();
-    match app.esim_supervisor.switch_mode(payload.mode).await {
-        Ok(data) => {
-            if previous_mode != data.mode {
-                app.system_event_emitter
-                    .emit_code(
-                        system_event_codes::ESIM_WORK_MODE_CHANGED,
-                        system_event_severity::INFO,
-                        system_event_status::CHANGED,
-                        "work_mode",
-                        format!("工作模式从 {} 切换为 {}", previous_mode, data.mode),
-                    )
-                    .await;
-            }
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message("Work mode updated", data)),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<WorkModeResponse>::error(err)),
-        ),
-    }
-}
+// ============ eSIM ============
 
 /// GET /api/esim/lpac/status
 pub async fn get_esim_lpac_status_handler(State(app): State<AppState>) -> impl IntoResponse {
@@ -491,6 +480,9 @@ pub async fn get_esim_euicc_handler(
     State(app): State<AppState>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimEuiccInfo>(err);
+    }
     match app
         .esim_supervisor
         .get_euicc_info_for_line(query.line_id.as_deref())
@@ -530,6 +522,9 @@ pub async fn get_esim_profiles_handler(
     }
 
     let line_id = query.get("line_id").map(String::as_str);
+    if let Err(err) = resolve_line_esim_gate(&app, line_id).await {
+        return esim_error_response::<EsimProfilesResponse>(err);
+    }
     match app.esim_supervisor.get_profiles_for_line(line_id).await {
         Ok(mut data) => {
             hydrate_profiles_from_cache(&app.database, &mut data.profiles);
@@ -579,6 +574,9 @@ pub async fn enable_esim_profile_handler(
     Path(iccid): Path<String>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err).into_response();
+    }
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = query.line_id.clone();
     let vowifi_before_switch = app.config_manager.get_vowifi_config();
@@ -722,6 +720,7 @@ pub async fn enable_esim_profile_handler(
             success_resp,
         )),
     )
+        .into_response()
 }
 
 /// POST /api/esim/profiles/{iccid}/rename
@@ -731,6 +730,9 @@ pub async fn rename_esim_profile_handler(
     Query(query): Query<LineScopedQuery>,
     Json(payload): Json<EsimRenameRequest>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     let name = payload.name.trim().to_string();
     if name.is_empty() {
         return (
@@ -759,6 +761,9 @@ pub async fn delete_esim_profile_handler(
     Path(iccid): Path<String>,
     Query(query): Query<LineScopedQuery>,
 ) -> impl IntoResponse {
+    if let Err(err) = resolve_line_esim_gate(&app, query.line_id.as_deref()).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     match app
         .esim_supervisor
         .delete_profile(query.line_id.as_deref(), iccid.clone())
@@ -815,6 +820,9 @@ pub async fn download_esim_profile_handler(
     Json(payload): Json<EsimDownloadRequest>,
 ) -> impl IntoResponse {
     let line_id = query.line_id.as_deref();
+    if let Err(err) = resolve_line_esim_gate(&app, line_id).await {
+        return esim_error_response::<EsimCommandResponse>(err);
+    }
     let smdp = payload.smdp.trim().to_string();
     let matching_id = payload.matching_id.trim().to_string();
     if smdp.is_empty() || matching_id.is_empty() {
@@ -3405,6 +3413,7 @@ async fn send_sms_over_volte_path(
                 &device,
                 &line.volte,
                 &config,
+                profile.volte_ip_families.as_deref(),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
@@ -4274,11 +4283,6 @@ async fn current_vowifi_profile_match(app: &AppState) -> VowifiProfileMatchRespo
             .get_line_profile(&primary.binding().line_id)
             .vowifi;
         if let Some(epdg) = response.epdg.as_mut() {
-            if !line_config.epdg_host.is_empty() {
-                epdg.host = line_config.epdg_host;
-                epdg.port = line_config.epdg_port;
-                epdg.source = "line_override".to_string();
-            }
             if !line_config.dns_server.is_empty() {
                 epdg.dns_server = Some(line_config.dns_server);
             }
@@ -5006,25 +5010,10 @@ async fn connect_vowifi_on_line(
     }
     {
         let line_id = scope.line_id().to_string();
-        let mut line_config = app.config_manager.get_line_profile(&line_id).vowifi;
-        if line_config.epdg_host.is_empty() {
-            let snapshot = scope.runtime().snapshot().await;
-            if let Some(profile) = snapshot.profile.profile {
-                if let Some(external) = profile_store(app)
-                    .list_as_external()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|item| {
-                        item.profile_id == profile.profile_id
-                            || item.mcc == profile.mcc && item.mnc == profile.mnc
-                    })
-                {
-                    line_config.epdg_host = external.epdg_host;
-                    line_config.epdg_port = external.epdg_port;
-                    line_config.dns_server = external.dns_server.unwrap_or_default();
-                }
-            }
-        }
+        // The ePDG endpoint now comes solely from the resolved carrier profile
+        // (auto-matched or pinned via `profile_id`); the line only carries DNS and
+        // proxy overrides, so this is applied as-is.
+        let line_config = app.config_manager.get_line_profile(&line_id).vowifi;
         if let Err(error) =
             crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(&line_id, &line_config)
         {
@@ -5402,6 +5391,103 @@ pub async fn set_standalone_sim_slots_handler(
     }
 }
 
+/// One line's eSIM management state: the persisted override plus whether the
+/// hardware actually reports a eUICC, so the UI can render the "auto" case
+/// without paying for an lpac probe on every refresh.
+#[derive(Debug, Default, serde::Serialize)]
+pub struct LineEsimControlResponse {
+    pub line_id: String,
+    /// `None` = auto (follow detection), `Some(true/false)` = explicit override.
+    pub esim_control: Option<bool>,
+    /// ModemManager's view of the card: "physical" / "esim" / "unknown".
+    pub sim_type: String,
+    /// "none" / "no-profiles" / "with-profiles" / "unknown".
+    pub esim_status: String,
+    /// Whether the discovered SIM advertises a eUICC chip.
+    pub euicc_detected: bool,
+    /// Effective result: may this line run lpac eSIM operations right now?
+    pub esim_enabled: bool,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct LineEsimControlRequest {
+    /// Omit or send `null` to return the line to automatic detection.
+    #[serde(default)]
+    pub esim_control: Option<bool>,
+}
+
+fn build_line_esim_control_response(
+    line_id: &str,
+    esim_control: Option<bool>,
+    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+) -> LineEsimControlResponse {
+    let euicc_detected = line_reports_euicc(binding);
+    LineEsimControlResponse {
+        line_id: line_id.to_string(),
+        esim_control,
+        sim_type: binding.sim_type.clone(),
+        esim_status: binding.esim_status.clone(),
+        euicc_detected,
+        esim_enabled: esim_control.unwrap_or(euicc_detected),
+    }
+}
+
+/// GET /api/modem/lines/{line_id}/esim-control
+pub async fn get_line_esim_control_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let esim_control = app.config_manager.get_line_profile(&line_id).esim_control;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_esim_control_response(&line_id, esim_control, &line.binding()),
+        )),
+    )
+}
+
+/// POST /api/modem/lines/{line_id}/esim-control
+pub async fn set_line_esim_control_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<LineEsimControlRequest>,
+) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_esim_control(&line_id, payload.esim_control)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "eSIM control updated",
+            build_line_esim_control_response(&line_id, profile.esim_control, &line.binding()),
+        )),
+    )
+}
+
 fn build_volte_line_response(
     app: &AppState,
     status: crate::services::line_registry::LineRuntimeStatus,
@@ -5533,6 +5619,71 @@ pub async fn set_volte_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         ),
     }
+}
+
+/// Body for `PUT /api/volte/lines/{line_id}/ip-families`.
+///
+/// `families` is the ordered attempt list (`["ipv4","ipv6"]`, `["ipv6"]`, …).
+/// `null` (or an absent field) clears the per-line override so the line follows
+/// the global `ip_family_preference` default again.
+#[derive(Debug, serde::Deserialize)]
+pub struct SetVolteIpFamiliesRequest {
+    #[serde(default)]
+    pub families: Option<Vec<crate::platform::config::VolteIpFamily>>,
+}
+
+/// PUT /api/volte/lines/{line_id}/ip-families
+///
+/// Persist this line's ordered IMS address-family list. If the line is currently
+/// connected, restart it so the new order takes effect immediately.
+pub async fn set_volte_line_ip_families_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<SetVolteIpFamiliesRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let profile = match app
+        .config_manager
+        .set_line_volte_ip_families(&line_id, payload.families)
+    {
+        Ok(profile) => profile,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    // The family order is only consulted when a session is (re)established, so an
+    // already-registered line has to be restarted for the change to take effect.
+    if profile.volte_connection_enabled && line.volte.status().await.registered {
+        {
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
+            let _guard = line.volte_connect_lock.lock().await;
+            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+                &line.volte_live,
+                &line.volte,
+                "volte_ip_families_changed",
+            )
+            .await;
+        }
+        start_line_volte_restore(app.clone(), Arc::clone(&line), "ip_families_changed").await;
+    }
+    let response = VolteLineControlResponse {
+        modem: line.binding(),
+        profile: profile.redacted(),
+        runtime: line.volte.status().await,
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", response)),
+    )
 }
 
 /// Start a fresh five-attempt recovery batch without changing the persisted
@@ -6666,6 +6817,7 @@ async fn run_line_volte_restore_batch(
                 &device,
                 &line.volte,
                 &config,
+                profile.volte_ip_families.as_deref(),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager.get_sms_path_policy().dedupe_enabled,
