@@ -1,30 +1,25 @@
 //! Native-QMI IMS bearer: the seam between a raw WDS session and the rest of
 //! the VoLTE stack.
 //!
-//! # Why this exists, and where the IMS session actually runs (beta2 alignment)
+//! # Why this exists, and where the IMS session actually runs (beta8 alignment)
 //!
-//! beta2 does not run the IMS bearer on the primary QMI control port. The binary
+//! beta8 does not run the IMS bearer on the primary QMI control port when qmi0
+//! already carries ordinary data. The binary
 //! logs `Native VoLTE secondary QMI IMS WDS bearer started` (`volte.rs:1976`) and
-//! keeps `--wds-get-current-settings` strictly on the *data* path
-//! (`secondary_qmi_data.rs`). The IMS path instead reads its IP configuration and
-//! P-CSCF from **`AT+CGCONTRDP`** on the active IMS context
+//! retains one WDS CID per family for set-family, start, settings and teardown.
+//! The IMS path also reads its authoritative IP configuration and P-CSCF from
+//! **`AT+CGCONTRDP`** on the active IMS context
 //! (`Native VoLTE P-CSCF candidates discovered from active IMS bearer`,
 //! `volte.rs:3671`).
 //!
-//! That matters because it removes the one reason the earlier implementation had
-//! to run IMS on the primary port: it believed it needed a WDS client id that
-//! survives across `qmicli` invocations
-//! (`--wds-start-network → --wds-get-current-settings`) to read the P-CSCF from
-//! PCO. It does not. With P-CSCF coming from AT, the IMS session is a *single*
-//! `--wds-start-network`, which can — and on this firmware must — run on a
-//! dedicated secondary endpoint (DATA6), leaving the primary port to
-//! ModemManager. Running a second data session on the primary port is exactly
-//! what produced `verbose call end reason (2,201): [internal] error` on both
-//! families in the field logs.
+//! This keeps the IMS bearer on the dedicated secondary endpoint (DATA6),
+//! leaving the primary port to ModemManager. Running a second data session on
+//! the primary port is what produced `verbose call end reason (2,201):
+//! [internal] error` on both families in the field logs.
 //!
 //! This module therefore does three things and nothing else:
 //!   1. bring up the IMS session on the line's secondary QMI endpoint with a
-//!      single `--wds-start-network` (no CID reuse, no bind commands),
+//!      retained WDS CID (without runtime bind commands),
 //!   2. read the session's IP configuration and P-CSCF from `AT+CGCONTRDP`,
 //!   3. resolve which bam-dmux netdev carries it and present the result as a
 //!      [`BearerConnection`] so no downstream code has to know which path
@@ -74,9 +69,9 @@ pub struct NativeImsBearer {
     /// Secondary QMI endpoint the session runs on. Held so teardown can stop the
     /// session and release the endpoint if this module bound it.
     endpoint: SecondaryQmiEndpoint,
-    /// WDS packet data handles to stop on teardown. One per family for a
-    /// dual-stack bearer; exactly one for a single-family bearer.
-    handles: Vec<String>,
+    /// Retained WDS clients to stop and release on teardown. One per family for
+    /// a dual-stack bearer; exactly one for a single-family bearer.
+    sessions: Vec<ImsSession>,
     /// How the interface was determined. Carried so the UI/logs can distinguish
     /// an observed netdev from an assumed one.
     pub netdev: ResolvedNetdev,
@@ -140,7 +135,7 @@ pub async fn establish_native_ims_bearer(
         }
     };
 
-    let endpoint = match secondary_qmi::ensure_endpoint(primary_device).await {
+    let endpoint = match secondary_qmi::runtime_endpoint(primary_device).await {
         Ok(endpoint) => endpoint,
         Err(error) => return Err(endpoint_error_to_volte(error)),
     };
@@ -216,30 +211,30 @@ async fn establish_dual_stack(
     cid: u8,
     families: &[u8],
 ) -> Result<NativeImsBearer, VolteError> {
-    let mut handles = Vec::with_capacity(2);
+    let mut sessions = Vec::with_capacity(2);
     for family in families.iter().copied() {
         match start_session(endpoint, request, family).await {
-            Ok(session) => handles.push(session.packet_data_handle),
+            Ok(session) => sessions.push(session),
             Err(error) => {
-                stop_handles(endpoint, &handles).await;
+                stop_sessions(endpoint, &sessions).await;
                 return Err(error);
             }
         }
     }
 
-    // Both single-shot sessions are up; the modem now describes the merged
-    // context. Read it once from AT — that is beta2's IMS source of truth.
+    // Both retained sessions are up; the modem now describes the merged
+    // context. Read it once from AT, which is beta8's IMS source of truth.
     let settings = match read_ims_settings(modem_id, cid).await {
         Ok(settings) => settings,
         Err(error) => {
-            stop_handles(endpoint, &handles).await;
+            stop_sessions(endpoint, &sessions).await;
             return Err(error);
         }
     };
 
     let netdev_family = if settings.ipv6_address.is_some() { 6 } else { 4 };
     let Some(config) = netdev_config_for(&settings, netdev_family) else {
-        stop_handles(endpoint, &handles).await;
+        stop_sessions(endpoint, &sessions).await;
         return Err(VolteError::with_detail(
             code::IP_SETTINGS_MISSING,
             "native_ims_session_has_no_address".to_string(),
@@ -248,14 +243,19 @@ async fn establish_dual_stack(
     let resolution = match resolve_netdev(baseband, &config).await {
         Ok(resolution) => resolution,
         Err(error) => {
-            stop_handles(endpoint, &handles).await;
+            stop_sessions(endpoint, &sessions).await;
             return Err(error);
         }
     };
 
+    let joined_handles = sessions
+        .iter()
+        .map(|session| session.packet_data_handle.as_str())
+        .collect::<Vec<_>>()
+        .join("+");
     let mut connection = match to_bearer_connection(
         &endpoint.device_path,
-        &handles.join("+"),
+        &joined_handles,
         &resolution.interface,
         0,
         &settings,
@@ -263,7 +263,7 @@ async fn establish_dual_stack(
         Ok(connection) => connection,
         Err(error) => {
             qmi_netdev::teardown(&resolution.interface, &config).await;
-            stop_handles(endpoint, &handles).await;
+            stop_sessions(endpoint, &sessions).await;
             return Err(error);
         }
     };
@@ -271,7 +271,7 @@ async fn establish_dual_stack(
     Ok(NativeImsBearer {
         connection,
         endpoint: endpoint.clone(),
-        handles,
+        sessions,
         netdev: resolution.clone(),
         configured_netdevs: vec![(resolution.interface, config)],
     })
@@ -286,17 +286,17 @@ async fn establish_one(
     family: u8,
 ) -> Result<NativeImsBearer, VolteError> {
     let session = start_session(endpoint, request, family).await?;
-    let handle = session.packet_data_handle;
+    let handle = session.packet_data_handle.clone();
 
     let settings = match read_ims_settings(modem_id, cid).await {
         Ok(settings) => settings,
         Err(error) => {
-            stop_handles(endpoint, std::slice::from_ref(&handle)).await;
+            secondary_qmi::stop_ims_session(endpoint, &session).await;
             return Err(error);
         }
     };
     let Some(config) = netdev_config_for(&settings, family) else {
-        stop_handles(endpoint, std::slice::from_ref(&handle)).await;
+        secondary_qmi::stop_ims_session(endpoint, &session).await;
         return Err(VolteError::with_detail(
             code::IP_SETTINGS_MISSING,
             "native_ims_session_has_no_address".to_string(),
@@ -305,7 +305,7 @@ async fn establish_one(
     let resolution = match resolve_netdev(baseband, &config).await {
         Ok(resolution) => resolution,
         Err(error) => {
-            stop_handles(endpoint, std::slice::from_ref(&handle)).await;
+            secondary_qmi::stop_ims_session(endpoint, &session).await;
             return Err(error);
         }
     };
@@ -319,25 +319,22 @@ async fn establish_one(
         Ok(connection) => connection,
         Err(error) => {
             qmi_netdev::teardown(&resolution.interface, &config).await;
-            stop_handles(endpoint, std::slice::from_ref(&handle)).await;
+            secondary_qmi::stop_ims_session(endpoint, &session).await;
             return Err(error);
         }
     };
     Ok(NativeImsBearer {
         connection,
         endpoint: endpoint.clone(),
-        handles: vec![handle],
+        sessions: vec![session],
         netdev: resolution.clone(),
         configured_netdevs: vec![(resolution.interface, config)],
     })
 }
 
-/// Start one single-shot IMS WDS session on the secondary endpoint.
-///
-/// beta2 issues a single `--wds-start-network` per family; there is no CID reuse
-/// and never a bind command. A `(2,201) [internal] error` here is a normal
-/// per-family rejection and stays retryable, while a genuine wedge signature is
-/// classified as unsafe so the family loop aborts instead of hammering the modem.
+/// Start one retained IMS WDS session on the secondary endpoint. Beta8 allocates
+/// a CID with `wds-noop`, sets the family, starts the network and keeps that CID
+/// for settings and teardown.
 async fn start_session(
     endpoint: &SecondaryQmiEndpoint,
     request: &BearerRequest,
@@ -357,7 +354,7 @@ async fn start_session(
 
 /// Read the IMS context's IP configuration and P-CSCF from `AT+CGCONTRDP`.
 ///
-/// This is beta2's IMS source of truth (`volte.rs:3671`). A context that reports
+/// This is beta8's IMS source of truth (`volte.rs:3671`). A context that reports
 /// neither an address nor a P-CSCF is treated as missing so the caller does not
 /// build an unusable bearer.
 async fn read_ims_settings(modem_id: &str, cid: u8) -> Result<CgcontrdpSettings, VolteError> {
@@ -400,9 +397,9 @@ fn endpoint_error_to_volte(error: SecondaryQmiError) -> VolteError {
     VolteError::with_detail(code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE, error.to_string())
 }
 
-async fn stop_handles(endpoint: &SecondaryQmiEndpoint, handles: &[String]) {
-    for handle in handles {
-        secondary_qmi::stop_ims_session(endpoint, handle).await;
+async fn stop_sessions(endpoint: &SecondaryQmiEndpoint, sessions: &[ImsSession]) {
+    for session in sessions {
+        secondary_qmi::stop_ims_session(endpoint, session).await;
     }
 }
 
@@ -438,7 +435,7 @@ pub async fn release_native_ims_bearer(bearer: NativeImsBearer) {
     for (interface, config) in &bearer.configured_netdevs {
         qmi_netdev::teardown(interface, config).await;
     }
-    stop_handles(&bearer.endpoint, &bearer.handles).await;
+    stop_sessions(&bearer.endpoint, &bearer.sessions).await;
     secondary_qmi::release_endpoint(&bearer.endpoint).await;
 }
 
@@ -567,7 +564,7 @@ mod tests {
 
     #[test]
     fn a_wedge_signature_from_the_secondary_start_is_classified_unsafe() {
-        // A single-shot start that returns a wedge signature must abort the family
+        // A retained-client start that returns a wedge signature must abort the family
         // loop; an ordinary internal call-end reason must not.
         assert_eq!(
             FailureClass::from_details("secondary_qmi_start_failed:endpoint hangup"),

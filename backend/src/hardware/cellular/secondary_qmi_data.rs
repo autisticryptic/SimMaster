@@ -17,7 +17,7 @@ use crate::platform::config::ApnConfig;
 use super::{
     qmi_netdev::{self, NetdevConfig, ResolvedNetdev},
     qmi_wds,
-    secondary_qmi::{self, SecondaryQmiEndpoint, QMI_OPEN_NET_ARG},
+    secondary_qmi::{self, SecondaryQmiEndpoint},
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(65);
@@ -61,7 +61,7 @@ impl SecondaryDataRuntime {
             stop_session(session).await;
         }
 
-        let endpoint = secondary_qmi::ensure_endpoint(primary_qmi)
+        let endpoint = secondary_qmi::runtime_endpoint(primary_qmi)
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
         let apn_name = normalized_data_apn(&apn.apn)?;
@@ -154,68 +154,101 @@ async fn start_retained_session(
 ) -> Result<RetainedSession, String> {
     let action = start_action(apn, apn_name, family)?;
     let family_action = format!("--wds-set-ip-family={family}");
-    let output = run_qmicli_with_timeout(
-        &retained_start_args(
-            endpoint.device_path.as_str(),
-            family_action.as_str(),
-            action.as_str(),
-        ),
-        START_TIMEOUT,
-    )
-    .await?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        return Err(format!("secondary_qmi_data_start_failed:{}", compact(&text)));
+    let allocation = run_qmicli(&retained_allocate_args(endpoint.device_path.as_str())).await?;
+    let allocation_text = output_text(&allocation);
+    if !allocation.status.success() {
+        return Err(format!(
+            "secondary_qmi_data_cid_allocate_failed:{}",
+            compact(&allocation_text)
+        ));
     }
-    let client_id = text
-        .lines()
-        .find_map(parse_verbose_wds_client_id)
-        .ok_or_else(|| format!("secondary_qmi_data_cid_missing:{}", compact(&text)))?;
+    let client_id = secondary_qmi::parse_wds_client_id(&allocation_text).ok_or_else(|| {
+        format!(
+            "secondary_qmi_data_cid_missing:{}",
+            compact(&allocation_text)
+        )
+    })?;
+
+    if let Err(error) = run_retained_action(
+        endpoint,
+        &client_id,
+        &family_action,
+        Duration::from_secs(20),
+    )
+    .await
+    {
+        release_retained_client(endpoint, &client_id).await;
+        return Err(error);
+    }
+    let output = match run_retained_action(endpoint, &client_id, &action, START_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => {
+            release_retained_client(endpoint, &client_id).await;
+            return Err(error);
+        }
+    };
+    let text = output_text(&output);
     let packet_data_handle = qmi_wds::parse_packet_data_handle(&text)
-        .ok_or_else(|| format!("secondary_qmi_data_handle_missing:{}", compact(&text)))?;
+        .ok_or_else(|| format!("secondary_qmi_data_handle_missing:{}", compact(&text)));
+    let packet_data_handle = match packet_data_handle {
+        Ok(handle) => handle,
+        Err(error) => {
+            release_retained_client(endpoint, &client_id).await;
+            return Err(error);
+        }
+    };
     Ok(RetainedSession {
         client_id,
         packet_data_handle,
     })
 }
 
-fn retained_start_args<'a>(
-    device: &'a str,
-    family_action: &'a str,
-    start_action: &'a str,
-) -> Vec<&'a str> {
+fn retained_allocate_args(device: &str) -> Vec<&str> {
     vec![
         "--verbose",
         "-d",
         device,
         "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         "--client-no-release-cid",
-        family_action,
-        start_action,
+        "--wds-noop",
     ]
 }
 
-fn parse_verbose_wds_client_id(line: &str) -> Option<String> {
-    let marker = "client with ID '";
-    if line.contains("registered 'wds'") {
-        let value = line.split_once(marker)?.1.split_once('\'')?.0;
-        if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
-            return Some(value.to_string());
-        }
+fn retained_action_args<'a>(device: &'a str, cid: &'a str, action: &'a str) -> Vec<&'a str> {
+    vec![
+        "-d",
+        device,
+        "--device-open-qmi",
+        "--device-open-proxy",
+        secondary_qmi::QMI_OPEN_NET_ARG,
+        cid,
+        "--client-no-release-cid",
+        action,
+    ]
+}
+
+async fn run_retained_action(
+    endpoint: &SecondaryQmiEndpoint,
+    client_id: &str,
+    action: &str,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
+    let cid = format!("--client-cid={client_id}");
+    let output = run_qmicli_with_timeout(
+        &retained_action_args(endpoint.device_path.as_str(), cid.as_str(), action),
+        timeout,
+    )
+    .await?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!(
+            "secondary_qmi_data_action_failed:{}",
+            compact(&output_text(&output))
+        ))
     }
-    if line.contains("service = 'wds'") {
-        let value = line.split_once("cid = '")?.1.split_once('\'')?.0;
-        if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
-            return Some(value.to_string());
-        }
-    }
-    None
 }
 
 async fn wait_for_current_settings(
@@ -252,7 +285,7 @@ async fn read_current_settings(
         endpoint.device_path.as_str(),
         "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
         "--wds-get-current-settings",
@@ -366,19 +399,24 @@ async fn stop_retained_session(endpoint: &SecondaryQmiEndpoint, session: &Retain
         endpoint.device_path.as_str(),
         "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
         stop.as_str(),
     ])
     .await;
+    release_retained_client(endpoint, &session.client_id).await;
+}
+
+async fn release_retained_client(endpoint: &SecondaryQmiEndpoint, client_id: &str) {
+    let cid = format!("--client-cid={client_id}");
     // Omitting --client-no-release-cid makes qmicli return the retained WDS CID.
     let _ = run_qmicli(&[
         "-d",
         endpoint.device_path.as_str(),
         "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--wds-noop",
     ])
@@ -392,7 +430,7 @@ async fn retained_session_is_active(session: &SecondaryDataSession) -> bool {
         session.endpoint.device_path.as_str(),
         "--device-open-qmi",
         "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
+        secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
         "--wds-get-packet-service-status",
@@ -433,6 +471,14 @@ fn compact(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn output_text(output: &std::process::Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,11 +486,18 @@ mod tests {
     #[test]
     fn parses_reference_wds_client_id() {
         let line = "[Debug] [/dev/wwan0qmi1] registered 'wds' (version unknown) client with ID '5'";
-        assert_eq!(parse_verbose_wds_client_id(line).as_deref(), Some("5"));
+        assert_eq!(
+            secondary_qmi::parse_wds_client_id(line).as_deref(),
+            Some("5")
+        );
         let allocation = "translated = [ service = 'wds' cid = '17' ]";
         assert_eq!(
-            parse_verbose_wds_client_id(allocation).as_deref(),
+            secondary_qmi::parse_wds_client_id(allocation).as_deref(),
             Some("17")
+        );
+        assert_eq!(
+            secondary_qmi::parse_wds_client_id("CID: '23'").as_deref(),
+            Some("23")
         );
     }
 
@@ -475,14 +528,23 @@ mod tests {
         };
         let action = start_action(&apn, "internet", 4).unwrap();
         let family = "--wds-set-ip-family=4";
-        let args = retained_start_args("/dev/wwan0at2", family, &action);
+        let allocation = retained_allocate_args("/dev/wwan0at2");
+        let cid = "--client-cid=17";
+        let family_args = retained_action_args("/dev/wwan0at2", cid, family);
+        let start_args = retained_action_args("/dev/wwan0at2", cid, &action);
         assert!(action.contains("--wds-start-network=apn=internet,ip-type=4"));
         assert!(action.contains(",auth=CHAP"));
-        assert!(args.contains(&"--device-open-qmi"));
-        assert!(args.contains(&"--device-open-proxy"));
-        assert!(args.contains(&QMI_OPEN_NET_ARG));
-        assert!(args.contains(&"--client-no-release-cid"));
-        assert!(args.contains(&family));
-        assert!(!args.contains(&"--wds-follow-network"));
+        assert!(allocation.contains(&"--wds-noop"));
+        assert!(allocation.contains(&"--client-no-release-cid"));
+        assert!(allocation.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(family_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(start_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(family_args.contains(&family));
+        assert!(family_args.contains(&cid));
+        assert!(!family_args.contains(&action.as_str()));
+        assert!(start_args.contains(&action.as_str()));
+        assert!(start_args.contains(&cid));
+        assert!(!start_args.contains(&family));
+        assert!(!start_args.contains(&"--wds-follow-network"));
     }
 }

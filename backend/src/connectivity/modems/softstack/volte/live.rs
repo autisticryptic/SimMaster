@@ -71,6 +71,10 @@ fn native_ims_bearer_required(data_slot_mode: DataSlotMode) -> bool {
     !data_slot_mode.ims_on_primary()
 }
 
+fn active_ims_profile_prefetch_required(data_slot_mode: DataSlotMode) -> bool {
+    native_ims_bearer_required(data_slot_mode)
+}
+
 static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
 
 /// Device-specific inputs formerly hard-coded to modem 0, `/dev/wwan0qmi0`
@@ -630,12 +634,10 @@ async fn connect_inner(
         .update(|state| state.stage = VolteStage::ImsContext)
         .await;
 
-    // beta2-aligned P-CSCF ordering: pre-activate a temporary IMS profile and
-    // read its P-CSCF first, then start WDS/ModemManager with the same profile.
-    // Bearer PCO, active-context CGCONTRDP, and IMS DNS remain fallbacks.
-    // A matching connected IMS bearer is reused by `ensure_ims_bearer`; only a
-    // stale or policy-mismatched object is recreated. Preserving the connected
-    // bearer also preserves the PCO state used for P-CSCF discovery.
+    // Beta8 only pre-activates the IMS AT profile when IMS itself uses the
+    // native DATA6 WDS path. On primary qmi0, ModemManager must remain the sole
+    // PDP activation owner; activating the same CID here first makes its bearer
+    // connect fail with an internal error.
     ensure_generation(runtime, generation)?;
     device = resolve_device_binding(&device).await?;
 
@@ -644,46 +646,70 @@ async fn connect_inner(
         .await;
     let mut prefetched_pcscf = Vec::new();
     let mut ims_profile_lease = None;
-    let ims_profile = match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan).await {
-        Ok(prefetch) => {
-            let cid = prefetch.lease.cid;
-            prefetched_pcscf = prefetch.candidates;
-            tracing::info!(
-                cid,
-                pcscf_count = prefetched_pcscf.len(),
-                "Prepared beta2-style IMS profile and retained its AT context"
-            );
-            runtime.update(|state| state.at_cid = Some(cid)).await;
-            ims_profile_lease = Some(prefetch.lease);
-            Some(super::pcscf::ImsProfileContext {
-                cid,
-                created: false,
-            })
+    let native_required = native_ims_bearer_required(data_slot_mode);
+    let ims_profile = if active_ims_profile_prefetch_required(data_slot_mode) {
+        match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan).await {
+            Ok(prefetch) => {
+                let cid = prefetch.lease.cid;
+                prefetched_pcscf = prefetch.candidates;
+                tracing::info!(
+                    cid,
+                    pcscf_count = prefetched_pcscf.len(),
+                    "Prepared Beta8 native IMS profile and retained its AT context"
+                );
+                runtime.update(|state| state.at_cid = Some(cid)).await;
+                ims_profile_lease = Some(prefetch.lease);
+                Some(super::pcscf::ImsProfileContext {
+                    cid,
+                    created: false,
+                })
+            }
+            Err(prefetch_error) => {
+                tracing::warn!(
+                    error = %prefetch_error,
+                    "Native VoLTE profile P-CSCF prefetch failed; falling back to bearer discovery"
+                );
+                match prepare_ims_profile_context(&device.modem_id, &plan).await {
+                    Ok(profile) => {
+                        tracing::info!(
+                            cid = profile.cid,
+                            created = profile.created,
+                            "Selected fallback IMS 3GPP profile"
+                        );
+                        runtime
+                            .update(|state| state.at_cid = Some(profile.cid))
+                            .await;
+                        Some(profile)
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            error = %error,
+                            "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+                        );
+                        None
+                    }
+                }
+            }
         }
-        Err(prefetch_error) => {
-            tracing::warn!(
-                error = %prefetch_error,
-                "Native VoLTE profile P-CSCF prefetch failed; falling back to bearer discovery"
-            );
-            match prepare_ims_profile_context(&device.modem_id, &plan).await {
-                Ok(profile) => {
-                    tracing::info!(
-                        cid = profile.cid,
-                        created = profile.created,
-                        "Selected fallback IMS 3GPP profile"
-                    );
-                    runtime
-                        .update(|state| state.at_cid = Some(profile.cid))
-                        .await;
-                    Some(profile)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
-                    );
-                    None
-                }
+    } else {
+        match prepare_ims_profile_context(&device.modem_id, &plan).await {
+            Ok(profile) => {
+                tracing::info!(
+                    cid = profile.cid,
+                    created = profile.created,
+                    "Prepared inactive IMS profile for ModemManager activation"
+                );
+                runtime
+                    .update(|state| state.at_cid = Some(profile.cid))
+                    .await;
+                Some(profile)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
+                );
+                None
             }
         }
     };
@@ -713,7 +739,6 @@ async fn connect_inner(
     // When qmi0 already carries ordinary data, establish IMS directly on DATA6.
     // Otherwise the ModemManager path below establishes IMS on primary qmi0.
     let mut native_bearer = None;
-    let native_required = native_ims_bearer_required(data_slot_mode);
     if native_required {
         runtime
             .record_attempt(
@@ -1201,10 +1226,9 @@ async fn live_receive_loop(
     let mut operator_commands = live.operator.subscribe_commands();
     let mut refresh_at =
         tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
-    // The native IMS bearer now runs single-shot on the secondary QMI endpoint
-    // (beta2 alignment): there is no retained WDS client id to probe for packet
-    // status, so bearer health is observed through the REGISTER refresh cycle
-    // below rather than an independent WDS query.
+    // The native IMS bearer retains its WDS CID on the secondary QMI endpoint.
+    // REGISTER refresh remains the end-to-end bearer health signal because it
+    // covers the IMS IP path and SIP service, not only WDS packet status.
     loop {
         if runtime.generation() != generation {
             break;
@@ -3203,16 +3227,38 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
     )
     .await?;
-    let operator = key_value(&modem, "modem.3gpp.operator-code")
-        .filter(|value| value.len() == 5 || value.len() == 6)
-        .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
+    let operator = key_value(&modem, "modem.3gpp.operator-code");
     let sim_path = key_value(&modem, "modem.generic.sim")
         .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
     let sim = command_output("mmcli", &["-i", &sim_path, "--output-keyvalue"]).await?;
-    let imsi = key_value(&sim, "sim.properties.imsi")
-        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
-        .ok_or_else(|| VolteError::new(code::IMSI_MISSING))?;
-    let (mcc, mnc) = operator.split_at(3);
+    let sim_imsi = key_value(&sim, "sim.properties.imsi").filter(|value| {
+        value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let cimi_argument = "--command=AT+CIMI";
+    let (imsi, imsi_source) = match command_output(
+        "mmcli",
+        &["-m", device.modem_id.as_str(), cimi_argument],
+    )
+    .await
+    {
+        Ok(output) => match identity::parse_cimi_response(&output) {
+            Some(imsi) => (imsi, "at_cimi"),
+            None => {
+                tracing::warn!("Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback");
+                (
+                    sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
+                    "sim_imsi_fallback",
+                )
+            }
+        },
+        Err(error) => {
+            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM IMSI fallback");
+            (
+                sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
+                "sim_imsi_fallback",
+            )
+        }
+    };
     let applications = match command_output(
         "qmicli",
         &[
@@ -3233,14 +3279,38 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
     let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
     let usim_aid = identity::aid_hex(&aka_aid);
     let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
+    let ef_ad_mnc_length = match command_output(
+        "qmicli",
+        &[
+            "-d",
+            device.qmi_device.as_str(),
+            "--device-open-proxy",
+            "--uim-read-transparent=0x3F00,0x7FFF,0x6FAD",
+        ],
+    )
+    .await
+    {
+        Ok(output) => identity::parse_ef_ad_mnc_length(&output),
+        Err(error) => {
+            tracing::warn!(error = %error, "Native VoLTE runtime SIM EF_AD MNC length lookup failed");
+            None
+        }
+    };
+    let home = identity::resolve_home_plmn(&imsi, operator.as_deref(), ef_ad_mnc_length)?;
+    tracing::info!(
+        mnc_length = home.mnc.len(),
+        mnc_length_source = home.mnc_length_source,
+        "Resolved native VoLTE IMS home PLMN"
+    );
     Ok(DeviceIdentity {
-        ims: identity::derive_identity(&imsi, mcc, mnc),
+        ims: identity::derive_identity(&imsi, &home.mcc, &home.mnc),
         aka_aid,
         usim_aid,
-        source: if isim_aid.is_some() {
-            "imsi_fallback_isim_detected"
-        } else {
-            "imsi_fallback"
+        source: match (imsi_source, isim_aid.is_some()) {
+            ("at_cimi", true) => "at_cimi_isim_detected",
+            ("at_cimi", false) => "at_cimi",
+            (_, true) => "sim_imsi_fallback_isim_detected",
+            (_, false) => "sim_imsi_fallback",
         },
         isim_aid,
     })
@@ -3386,6 +3456,20 @@ mod tests {
             DataSlotMode::PrimaryImsSecondaryData
         ));
         assert!(native_ims_bearer_required(
+            DataSlotMode::SecondaryImsPrimaryData
+        ));
+    }
+
+    #[test]
+    fn primary_ims_with_secondary_data_does_not_pre_activate_the_profile() {
+        assert!(!active_ims_profile_prefetch_required(
+            DataSlotMode::PrimaryImsSecondaryData
+        ));
+    }
+
+    #[test]
+    fn secondary_ims_with_primary_data_keeps_native_profile_prefetch() {
+        assert!(active_ims_profile_prefetch_required(
             DataSlotMode::SecondaryImsPrimaryData
         ));
     }

@@ -182,11 +182,16 @@ where
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
         if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
-            if !bearer_roaming_policy_matches(&details, request.allow_roaming) {
+            let roaming_matches = bearer_roaming_policy_matches(&details, request.allow_roaming);
+            let profile_matches = bearer_profile_matches(&details, request.profile_id);
+            if !roaming_matches || !profile_matches {
                 tracing::info!(
                     bearer_path = %path,
                     allow_roaming = request.allow_roaming,
-                    "Recreating IMS bearer to match roaming policy"
+                    profile_id = ?request.profile_id,
+                    roaming_matches,
+                    profile_matches,
+                    "Recreating IMS bearer to match requested properties"
                 );
                 if value(&details, "bearer.status.connected").as_deref() == Some("yes") {
                     disconnect_bearer(&path).await;
@@ -321,7 +326,7 @@ fn is_dual_stack_bearer(details: &str) -> bool {
 }
 
 fn bearer_roaming_policy_matches(details: &str, allow_roaming: bool) -> bool {
-    bearer_allows_roaming(details) == Some(allow_roaming)
+    bearer_allows_roaming(details).map_or(true, |actual| actual == allow_roaming)
 }
 
 fn bearer_allows_roaming(details: &str) -> Option<bool> {
@@ -344,6 +349,25 @@ fn bearer_allows_roaming(details: &str) -> Option<bool> {
     None
 }
 
+fn bearer_profile_matches(details: &str, expected: Option<u32>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    number_value::<u32>(details, "bearer.properties.profile-id") == Some(expected)
+}
+
+fn create_bearer_properties(request: &BearerRequest, ip_type: &str) -> String {
+    let mut properties = match request.profile_id {
+        Some(profile_id) => format!("profile-id={profile_id},apn={}", request.apn),
+        None => format!("apn={}", request.apn),
+    };
+    properties.push_str(&format!(
+        ",ip-type={ip_type},allow-roaming={}",
+        if request.allow_roaming { "yes" } else { "no" }
+    ));
+    properties
+}
+
 struct BearerAttemptFailure {
     error: VolteError,
     details: String,
@@ -354,11 +378,7 @@ async fn create_and_connect_attempt(
     request: &BearerRequest,
     ip_type: &str,
 ) -> Result<BearerConnection, BearerAttemptFailure> {
-    let properties = format!(
-        "apn={},ip-type={ip_type},allow-roaming={}",
-        request.apn,
-        if request.allow_roaming { "yes" } else { "no" }
-    );
+    let properties = create_bearer_properties(request, ip_type);
     let created = run_command(
         "mmcli",
         &["-m", modem, &format!("--create-bearer={properties}")],
@@ -711,6 +731,34 @@ mod tests {
     }
 
     #[test]
+    fn modemmanager_properties_include_requested_3gpp_profile() {
+        let mut request = BearerRequest::ims(true);
+        request.profile_id = Some(2);
+        assert_eq!(
+            create_bearer_properties(&request, "ipv4v6"),
+            "profile-id=2,apn=ims,ip-type=ipv4v6,allow-roaming=yes"
+        );
+
+        request.profile_id = None;
+        assert_eq!(
+            create_bearer_properties(&request, "ipv4"),
+            "apn=ims,ip-type=ipv4,allow-roaming=yes"
+        );
+    }
+
+    #[test]
+    fn requested_profile_rejects_unbound_or_different_bearers() {
+        let exact = "bearer.properties.profile-id : 2\n";
+        let different = "bearer.properties.profile-id : 1\n";
+        let unbound = "bearer.properties.profile-id : --\n";
+
+        assert!(bearer_profile_matches(exact, Some(2)));
+        assert!(!bearer_profile_matches(different, Some(2)));
+        assert!(!bearer_profile_matches(unbound, Some(2)));
+        assert!(bearer_profile_matches(unbound, None));
+    }
+
+    #[test]
     fn matches_modemmanager_roaming_policy_renderings() {
         let allowed = "bearer.properties.roaming-allowance : allowed\n";
         let forbidden = "bearer.properties.roaming-allowance : forbidden\n";
@@ -726,12 +774,12 @@ mod tests {
     }
 
     #[test]
-    fn unknown_roaming_policy_requires_bearer_recreation() {
-        assert!(!bearer_roaming_policy_matches(
+    fn unknown_roaming_policy_does_not_churn_a_profile_bound_bearer() {
+        assert!(bearer_roaming_policy_matches(
             "bearer.properties.apn : ims\n",
             true
         ));
-        assert!(!bearer_roaming_policy_matches(
+        assert!(bearer_roaming_policy_matches(
             "bearer.properties.apn : ims\n",
             false
         ));
@@ -739,7 +787,9 @@ mod tests {
 
     #[test]
     fn network_family_rejection_selects_required_bearer_type() {
-        use crate::connectivity::modems::softstack::volte::plan::{FailureClass, ImsConnectionPlan};
+        use crate::connectivity::modems::softstack::volte::plan::{
+            FailureClass, ImsConnectionPlan,
+        };
         use crate::platform::config::VolteIpFamilyPreference;
         let plan_v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
         let plan_v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);

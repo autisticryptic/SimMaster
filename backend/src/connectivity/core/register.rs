@@ -10,6 +10,7 @@ use super::{access::ImsChannel, sip_frame, ImsError};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_AUTH_ROUNDS: u8 = 2;
+const MAX_PROVISIONAL_RESPONSES: u8 = 4;
 
 pub trait RegisterAuthenticator<C>: Send
 where
@@ -56,14 +57,17 @@ where
         .send_sip(initial_request)
         .await
         .map_err(|_| ImsError::new("ims_register_initial_send_failed"))?;
-    let mut response = channel
-        .recv_sip(REGISTER_TIMEOUT)
-        .await
-        .map_err(|_| ImsError::new("ims_register_initial_receive_failed"))?;
+    let mut response = recv_final_register_response(
+        channel,
+        "ims_register_initial_receive_failed",
+        "ims_register_initial_unexpected_status",
+    )
+    .await?;
     let mut auth_rounds = 0u8;
 
     loop {
-        match sip_frame::parse_status(&response)? {
+        let status = sip_frame::parse_status(&response)?;
+        match status {
             200..=299 => {
                 return Ok(RegisterResult {
                     response,
@@ -83,22 +87,59 @@ where
                     .send_sip(&request)
                     .await
                     .map_err(|_| ImsError::new("ims_register_authenticated_send_failed"))?;
-                response = channel
-                    .recv_sip(REGISTER_TIMEOUT)
-                    .await
-                    .map_err(|_| ImsError::new("ims_register_authenticated_receive_failed"))?;
+                response = recv_final_register_response(
+                    channel,
+                    "ims_register_authenticated_receive_failed",
+                    "ims_register_authenticated_unexpected_status",
+                )
+                .await?;
             }
             401 | 407 => return Err(ImsError::new("ims_register_auth_rejected")),
             _ if auth_rounds == 0 => {
-                return Err(ImsError::new("ims_register_initial_unexpected_status"))
+                tracing::warn!(
+                    sip_status = status,
+                    "IMS REGISTER received unexpected final response"
+                );
+                return Err(ImsError::new("ims_register_initial_unexpected_status"));
             }
             _ => {
+                tracing::warn!(
+                    sip_status = status,
+                    auth_rounds,
+                    "IMS REGISTER received unexpected authenticated response"
+                );
                 return Err(ImsError::new(
                     "ims_register_authenticated_unexpected_status",
-                ))
+                ));
             }
         }
     }
+}
+
+async fn recv_final_register_response<C>(
+    channel: &mut C,
+    receive_error: &'static str,
+    provisional_exhausted_error: &'static str,
+) -> Result<Vec<u8>, ImsError>
+where
+    C: ImsChannel,
+{
+    for provisional_count in 0..MAX_PROVISIONAL_RESPONSES {
+        let response = channel
+            .recv_sip(REGISTER_TIMEOUT)
+            .await
+            .map_err(|_| ImsError::new(receive_error))?;
+        let status = sip_frame::parse_status(&response)?;
+        if !(100..=199).contains(&status) {
+            return Ok(response);
+        }
+        tracing::debug!(
+            sip_status = status,
+            provisional_count = provisional_count + 1,
+            "IMS REGISTER provisional response received"
+        );
+    }
+    Err(ImsError::new(provisional_exhausted_error))
 }
 
 #[cfg(test)]
@@ -192,6 +233,54 @@ mod tests {
         assert_eq!(result.auth_rounds, 1);
         assert_eq!(channel.sends.len(), 2);
         assert!(String::from_utf8_lossy(&channel.sends[1]).contains("CSeq: 2 REGISTER"));
+    }
+
+    #[tokio::test]
+    async fn provisional_responses_are_skipped_for_each_register_transaction() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response(100, "Trying"),
+                response(401, "Unauthorized"),
+                response(100, "Trying"),
+                response(200, "OK"),
+            ]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let result = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap();
+
+        assert!(result.authenticated);
+        assert_eq!(result.auth_rounds, 1);
+        assert_eq!(channel.sends.len(), 2);
+        assert!(channel.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provisional_response_loop_is_bounded() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response(100, "Trying"),
+                response(100, "Trying"),
+                response(100, "Trying"),
+                response(100, "Trying"),
+                response(401, "Unauthorized"),
+            ]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let error = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "ims_register_initial_unexpected_status");
+        assert_eq!(channel.responses.len(), 1);
+        assert_eq!(channel.sends.len(), 1);
     }
 
     #[tokio::test]

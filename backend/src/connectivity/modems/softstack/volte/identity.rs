@@ -21,6 +21,85 @@ pub struct UiccApplications {
     pub isim_aid: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomePlmn {
+    pub mcc: String,
+    pub mnc: String,
+    pub mnc_length_source: &'static str,
+}
+
+/// Extract the IMSI from ModemManager's `--command=AT+CIMI` response without
+/// depending on its translated `response:` label or quote style.
+pub fn parse_cimi_response(output: &str) -> Option<String> {
+    output
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|candidate| (14..=16).contains(&candidate.len()))
+        .map(str::to_string)
+}
+
+/// EF_AD byte four is the authoritative MNC length for a USIM when it is 2 or
+/// 3 (3GPP TS 31.102). `qmicli` renders the transparent file as colon-separated
+/// octets below a `Read result:` marker.
+pub fn parse_ef_ad_mnc_length(output: &str) -> Option<usize> {
+    let (_, payload) = output.split_once("Read result:")?;
+    for line in payload.lines().take(3) {
+        let candidate = line.trim().trim_matches('\'');
+        if candidate.is_empty() {
+            continue;
+        }
+        let octets = candidate
+            .split(':')
+            .map(|octet| octet.trim().trim_matches('\''))
+            .collect::<Vec<_>>();
+        if octets.len() < 4
+            || !octets
+                .iter()
+                .all(|octet| {
+                    octet.len() == 2 && octet.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            continue;
+        }
+        let length = usize::from_str_radix(octets[3], 16).ok()?;
+        return matches!(length, 2 | 3).then_some(length);
+    }
+    None
+}
+
+/// Resolve the IMS home PLMN. The currently registered operator is usable only
+/// when it is a prefix of the IMSI; otherwise it is a visited network. EF_AD is
+/// the next source, followed by beta8's three-digit default and China two-digit
+/// compatibility fallback.
+pub fn resolve_home_plmn(
+    imsi: &str,
+    registered_operator: Option<&str>,
+    ef_ad_mnc_length: Option<usize>,
+) -> Result<HomePlmn, VolteError> {
+    let matching_operator_length = registered_operator
+        .filter(|operator| {
+            matches!(operator.len(), 5 | 6)
+                && operator.bytes().all(|byte| byte.is_ascii_digit())
+                && imsi.starts_with(*operator)
+        })
+        .map(|operator| operator.len() - 3);
+
+    let (mnc_length, source) = if let Some(length) = matching_operator_length {
+        (length, "modemmanager_home_operator")
+    } else if let Some(length @ (2 | 3)) = ef_ad_mnc_length {
+        (length, "sim_ef_ad")
+    } else if imsi.starts_with("460") {
+        (2, "china_compatibility_fallback")
+    } else {
+        (3, "three_digit_fallback")
+    };
+    let (mcc, mnc) = split_imsi(imsi, mnc_length)?;
+    Ok(HomePlmn {
+        mcc,
+        mnc,
+        mnc_length_source: source,
+    })
+}
+
 /// Extract USIM/ISIM application identifiers from `qmicli
 /// --uim-get-card-status` output. qmicli formatting differs between releases,
 /// so recognition is based on the registered 3GPP RID/application prefixes
@@ -199,6 +278,58 @@ mod tests {
             split_imsi("46zzz", 2).unwrap_err().code(),
             code::IMSI_MISSING
         );
+    }
+
+    #[test]
+    fn parses_modemmanager_cimi_response() {
+        assert_eq!(
+            parse_cimi_response("response: '460001234567890'\n").as_deref(),
+            Some("460001234567890")
+        );
+        assert_eq!(parse_cimi_response("error: command rejected"), None);
+    }
+
+    #[test]
+    fn parses_qmicli_ef_ad_mnc_length() {
+        assert_eq!(
+            parse_ef_ad_mnc_length("Read result:\n\t00:00:01:02\n"),
+            Some(2)
+        );
+        assert_eq!(
+            parse_ef_ad_mnc_length("Read result: '00:00:01:03'\n"),
+            Some(3)
+        );
+        assert_eq!(
+            parse_ef_ad_mnc_length("Read result:\n\t00:00:01:04\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn visited_operator_does_not_replace_imsi_home_plmn() {
+        let home = resolve_home_plmn("460001234567890", Some("46011"), Some(2)).unwrap();
+        assert_eq!(home.mcc, "460");
+        assert_eq!(home.mnc, "00");
+        assert_eq!(home.mnc_length_source, "sim_ef_ad");
+    }
+
+    #[test]
+    fn matching_registered_operator_can_supply_mnc_length() {
+        let home = resolve_home_plmn("310260123456789", Some("310260"), Some(2)).unwrap();
+        assert_eq!(home.mcc, "310");
+        assert_eq!(home.mnc, "260");
+        assert_eq!(home.mnc_length_source, "modemmanager_home_operator");
+    }
+
+    #[test]
+    fn home_plmn_fallback_matches_beta8_policy() {
+        let china = resolve_home_plmn("460001234567890", None, None).unwrap();
+        assert_eq!(china.mnc, "00");
+        assert_eq!(china.mnc_length_source, "china_compatibility_fallback");
+
+        let global = resolve_home_plmn("310260123456789", None, None).unwrap();
+        assert_eq!(global.mnc, "260");
+        assert_eq!(global.mnc_length_source, "three_digit_fallback");
     }
 
     #[test]

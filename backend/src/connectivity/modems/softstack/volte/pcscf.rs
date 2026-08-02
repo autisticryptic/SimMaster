@@ -175,43 +175,43 @@ pub fn configured_ims_cid() -> u8 {
         .unwrap_or(DEFAULT_IMS_CID)
 }
 
-/// Locate the modem's IMS PDP context, creating an inactive definition only
-/// when no IMS context exists. This function never activates or deactivates a
-/// context; the WDS bearer remains the sole owner of activation.
+/// Locate the modem's IMS PDP context, rewriting the configured inactive slot
+/// only when no IMS context exists. This function never activates or
+/// deactivates a context; the following bearer remains the sole activation
+/// owner.
 pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
 ) -> Result<ImsProfileContext, VolteError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
-    let preferred = configured_ims_cid();
+    let profile = select_ims_profile_context(&contexts, configured_ims_cid());
+    if !profile.created {
+        return Ok(profile);
+    }
 
-    if let Some(context) = contexts
+    let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
+    run_at(
+        modem,
+        &format!("AT+CGDCONT={},\"{pdp_type}\",\"ims\"", profile.cid),
+    )
+    .await?;
+    Ok(profile)
+}
+
+fn select_ims_profile_context(contexts: &[PdpContext], preferred: u8) -> ImsProfileContext {
+    contexts
         .iter()
         .filter(|context| context.apn.eq_ignore_ascii_case("ims"))
         .min_by_key(|context| (context.cid != preferred, context.cid))
-    {
-        return Ok(ImsProfileContext {
+        .map(|context| ImsProfileContext {
             cid: context.cid,
             created: false,
-        });
-    }
-
-    let cid = if !contexts.iter().any(|context| context.cid == preferred) {
-        preferred
-    } else {
-        (1..=16)
-            .find(|candidate| !contexts.iter().any(|context| context.cid == *candidate))
-            .ok_or_else(|| {
-                VolteError::with_detail(
-                    code::RUNTIME_PROFILE_PCSCF_MISSING,
-                    "ims_profile_no_free_cid".to_string(),
-                )
-            })?
-    };
-    let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
-    run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await?;
-    Ok(ImsProfileContext { cid, created: true })
+        })
+        .unwrap_or(ImsProfileContext {
+            cid: preferred,
+            created: true,
+        })
 }
 
 /// Enable or disable Qualcomm P-CSCF delivery for one IMS profile.
@@ -1190,6 +1190,20 @@ IPv4 primary DNS: 10.0.0.53";
             ]
         );
         assert_eq!(parse_ims_context_cids(contexts), vec![2, 7]);
+    }
+
+    #[test]
+    fn ims_profile_rewrites_fixed_cid_instead_of_allocating_unsupported_cid() {
+        let contexts = parse_pdp_contexts(
+            "response: '+CGDCONT: 1,\"IPV4V6\",\"\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0\",0,0'",
+        );
+        assert_eq!(
+            select_ims_profile_context(&contexts, 2),
+            ImsProfileContext {
+                cid: 2,
+                created: true,
+            }
+        );
     }
 
     #[test]

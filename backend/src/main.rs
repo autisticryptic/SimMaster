@@ -196,7 +196,11 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     use hardware::cellular::secondary_qmi;
 
     const STATE_DIR: &str = "/run/simadmin";
-    const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi.rules";
+    // Keep a distinct basename from the packaged /etc fallback rule. udev gives
+    // /etc precedence over /run for duplicate basenames, which would otherwise
+    // hide the runtime DATA6-specific rule completely.
+    const UDEV_RULE_PATH: &str =
+        "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
 
     // Discovering modems needs ModemManager, which by design is not up yet. Fall
     // back to enumerating the primary QMI control ports straight from sysfs.
@@ -294,17 +298,15 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         eprintln!("could not write {}: {error}", state_file.display());
     }
 
-    // Beta8 also publishes a singular state file consumed by the DATA6 runtime.
-    // Qualcomm 410 has one baseband, but keep the JSON map above for hosts with
-    // more than one modem.
+    // Beta8 publishes the singular state file as the plain device path. Its
+    // qmicli command builder reads this file directly, so JSON here would turn
+    // the complete document into an invalid `-d` argument. Keep the richer JSON
+    // map above for multi-baseband diagnostics.
     if let Some(endpoint) = prepared.first() {
-        let state = serde_json::to_string_pretty(&serde_json::json!({
-            "qmi_device": endpoint.device_path,
-            "netdev": endpoint.netdev,
-            "channel": endpoint.channel,
-            "rpmsg_device": endpoint.rpmsg_device,
-        }))?;
-        if let Err(error) = std::fs::write(secondary_qmi::SECONDARY_QMI_STATE_FILE, state) {
+        if let Err(error) = std::fs::write(
+            secondary_qmi::SECONDARY_QMI_STATE_FILE,
+            &endpoint.device_path,
+        ) {
             eprintln!(
                 "could not write {}: {error}",
                 secondary_qmi::SECONDARY_QMI_STATE_FILE

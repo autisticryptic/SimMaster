@@ -1,27 +1,18 @@
 [Unit]
-# Prepares each baseband's dedicated QMI endpoint for IMS/VoLTE before
-# ModemManager starts, so ModemManager keeps the primary port for normal mobile
-# data and the IMS session does not contend with it.
-Description=SimAdmin secondary QMI endpoint initializer (IMS/VoLTE)
+Description=SimAdmin DATA6 stock RPMSG QMI initializer and holder
 After=systemd-udevd.service systemd-modules-load.service
 Before=ModemManager.service simadmin.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
-# Load the module that exposes spare DATA*_CNTL channels as real QMI ports, then
-# wait for at least one spare channel to be visible before initializing.
-ExecStartPre=/bin/sh -c 'modprobe rpmsg_wwan_ctrl_multi >/dev/null 2>&1 || true; \
-  i=0; while test "$i" -lt 20; do \
-    for d in /sys/bus/rpmsg/devices/*; do \
-      test -e "$d/name" || continue; \
-      case "$(cat "$d/name" 2>/dev/null)" in DATA*_CNTL) exit 0;; esac; \
-    done; \
-    i=$((i + 1)); sleep 1; done; exit 0'
+Type=notify
+NotifyAccess=all
+# Qualcomm 410 uses the stock single-channel driver. The initializer binds
+# DATA6_CNTL itself, opens the resulting character device and keeps it open.
+ExecCondition=/bin/sh -c 'modprobe rpmsg_wwan_ctrl >/dev/null 2>&1 || true; i=0; while test "$i" -lt 20; do if test -e /sys/bus/rpmsg/drivers/rpmsg_wwan_ctrl/bind; then for d in /sys/bus/rpmsg/devices/*; do test -e "$d/driver_override" && test "$(cat "$d/name" 2>/dev/null)" = DATA6_CNTL && exit 0; done; fi; i=$((i + 1)); sleep 1; done; exit 1'
 ExecStart=/opt/simadmin/simadmin secondary-qmi-init
 Restart=on-failure
 RestartSec=2
-TimeoutStartSec=90
+TimeoutStartSec=75
 
 [Install]
 WantedBy=multi-user.target

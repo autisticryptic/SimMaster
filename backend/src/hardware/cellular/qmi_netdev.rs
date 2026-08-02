@@ -30,7 +30,11 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, process::Command, time::sleep};
+use tokio::{
+    net::UdpSocket,
+    process::Command,
+    time::{sleep, timeout},
+};
 use tracing::{debug, info, warn};
 
 /// How long to wait for a probe reply before moving to the next candidate.
@@ -249,15 +253,15 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
         sleep(LINK_SETTLE).await;
 
         let before = read_counters(candidate);
-        send_probe(config).await;
-        sleep(PROBE_REPLY_WAIT).await;
+        let socket_replied = send_probe(config).await;
         let after = read_counters(candidate);
 
-        if after.received_since(before) {
+        if probe_observed(socket_replied, before, after) {
             let rx_packets = after.rx_delta(before);
             info!(
                 interface = %candidate,
                 rx_packets,
+                socket_replied,
                 "Data netdev resolved: candidate answered the probe"
             );
             return Ok(ResolvedNetdev {
@@ -415,17 +419,17 @@ fn routing_table(interface: &str, address: IpAddr) -> u32 {
 ///
 /// A DNS query is used because it is a plain UDP datagram that needs no
 /// privileges (unlike ICMP) and gets a reply from any resolver. The reply content
-/// is irrelevant — only that *some* bytes come back on the interface, which the
-/// counters report. Failures are ignored: an unreachable target simply means this
-/// candidate does not answer, which is the information being gathered.
-async fn send_probe(config: &NetdevConfig) {
+/// is irrelevant — only that *some* bytes come back on the source-bound socket
+/// (or, as a fallback, move the interface RX counter). Failures are ignored: an
+/// unreachable target simply means this candidate does not answer.
+async fn send_probe(config: &NetdevConfig) -> bool {
     let Some(target) = config.probe_target else {
-        return;
+        return false;
     };
     let bind = SocketAddr::new(config.address, 0);
     let Ok(socket) = UdpSocket::bind(bind).await else {
         debug!(?bind, "Probe socket could not bind to the session address");
-        return;
+        return false;
     };
     // Minimal DNS query for `.` NS — smallest well-formed request that draws a
     // reply.
@@ -438,9 +442,26 @@ async fn send_probe(config: &NetdevConfig) {
         0x00, 0x02, // NS
         0x00, 0x01, // IN
     ];
-    let _ = socket
+    if socket
         .send_to(&query, SocketAddr::new(target, DNS_PORT))
-        .await;
+        .await
+        .is_err()
+    {
+        return false;
+    }
+
+    // Some bam-dmux kernels deliver packets correctly but never update the
+    // per-netdev RX/TX counters. A reply on this source-bound socket is the
+    // authoritative signal; counters remain a fallback for unusual responders.
+    let mut response = [0u8; 2048];
+    matches!(
+        timeout(PROBE_REPLY_WAIT, socket.recv_from(&mut response)).await,
+        Ok(Ok((length, _))) if length > 0
+    )
+}
+
+fn probe_observed(socket_replied: bool, before: LinkCounters, after: LinkCounters) -> bool {
+    socket_replied || after.received_since(before)
 }
 
 async fn run_ip(args: &[&str]) -> Result<(), String> {
@@ -481,6 +502,16 @@ mod tests {
         };
         assert!(rx_moved.received_since(before));
         assert_eq!(rx_moved.rx_delta(before), 2);
+    }
+
+    #[test]
+    fn socket_reply_verifies_a_link_with_static_driver_counters() {
+        let unchanged = LinkCounters {
+            rx_packets: 0,
+            tx_packets: 0,
+        };
+        assert!(probe_observed(true, unchanged, unchanged));
+        assert!(!probe_observed(false, unchanged, unchanged));
     }
 
     #[test]

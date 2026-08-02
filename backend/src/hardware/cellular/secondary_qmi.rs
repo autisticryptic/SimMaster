@@ -117,6 +117,9 @@ pub const QMI_OPEN_NET_ARG: &str = "--device-open-net=net-raw-ip|net-no-qos-head
 /// Result of bringing up an IMS data session on a secondary endpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImsSession {
+    /// Retained WDS client id. DATA6 requires every follow-up operation to use
+    /// the same CID that started the packet-data session.
+    pub client_id: String,
     /// WDS packet data handle, needed to stop the session.
     pub packet_data_handle: String,
     /// Family actually established.
@@ -355,6 +358,9 @@ fn ports_for_baseband(baseband: &str) -> Vec<(String, Option<String>)> {
     let mut ports = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
+        if !is_wwan_port_entry(&entry, &name) {
+            continue;
+        }
         let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
             continue;
         };
@@ -530,10 +536,117 @@ pub async fn ensure_endpoint(
     bind_and_probe(candidate, &baseband, &primary_port).await
 }
 
+/// Resolve the DATA6 endpoint published by the boot initializer.
+///
+/// Beta8 reads `SIMADMIN_SECONDARY_QMI_DEVICE` first and otherwise treats
+/// `/run/simadmin/secondary-qmi-device` as a plain device path. Runtime bearer
+/// activation must prefer that held endpoint instead of rebinding/probing
+/// DATA6 while the initializer and ModemManager are already running.
+pub async fn runtime_endpoint(
+    primary_device: &str,
+) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    if let Some(endpoint) = endpoint_from_runtime_state(primary_device)? {
+        return Ok(endpoint);
+    }
+    ensure_endpoint(primary_device).await
+}
+
+fn endpoint_from_runtime_state(
+    primary_device: &str,
+) -> Result<Option<SecondaryQmiEndpoint>, SecondaryQmiError> {
+    let configured = match std::env::var("SIMADMIN_SECONDARY_QMI_DEVICE") {
+        Ok(value) if !value.trim().is_empty() => Some((value, None)),
+        _ => match std::fs::read_to_string(SECONDARY_QMI_STATE_FILE) {
+            Ok(value) => {
+                // Accept the short-lived JSON format written by older Codex
+                // builds so an in-place upgrade can recover without a reboot.
+                let trimmed = value.trim();
+                if trimmed.starts_with('{') {
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(trimmed).map_err(|error| {
+                            SecondaryQmiError::ProbeFailed(format!(
+                                "invalid {SECONDARY_QMI_STATE_FILE}: {error}"
+                            ))
+                        })?;
+                    let device = parsed
+                        .get("qmi_device")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let netdev = parsed
+                        .get("netdev")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    Some((device, netdev))
+                } else {
+                    Some((trimmed.to_string(), None))
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(SecondaryQmiError::ProbeFailed(format!(
+                    "failed to read {SECONDARY_QMI_STATE_FILE}: {error}"
+                )))
+            }
+        },
+    };
+    let Some((device_path, state_netdev)) = configured else {
+        return Ok(None);
+    };
+    let device_path = device_path.trim().to_string();
+    if !device_path.starts_with("/dev/") || !Path::new(&device_path).exists() {
+        return Err(SecondaryQmiError::ProbeFailed(format!(
+            "configured secondary QMI endpoint is unavailable: {device_path}"
+        )));
+    }
+
+    let primary_baseband = baseband_key_for_device(primary_device)?;
+    let secondary_baseband = baseband_key_for_device(&device_path)?;
+    if secondary_baseband != primary_baseband {
+        return Err(SecondaryQmiError::ProbeFailed(format!(
+            "configured secondary QMI endpoint belongs to {secondary_baseband}, expected {primary_baseband}"
+        )));
+    }
+    let port_name = device_path
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let netdev = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or(state_netdev);
+    Ok(Some(SecondaryQmiEndpoint {
+        remoteproc: primary_baseband,
+        rpmsg_device: String::new(),
+        channel: SECONDARY_CHANNEL.to_string(),
+        port_name,
+        device_path,
+        netdev,
+        open_mode: QmiOpenMode::ForceQmi,
+        driver: RPMSG_WWAN_DRIVER.to_string(),
+        owned: false,
+    }))
+}
+
 /// Boot-time ports that are never the secondary endpoint (the modem's own AT
 /// consoles). Everything else is a candidate and gets probed.
 fn is_boot_port(port: &str) -> bool {
     port.ends_with("at0") || port.ends_with("at1")
+}
+
+fn uevent_marks_wwan_port(uevent: &str) -> bool {
+    uevent
+        .lines()
+        .any(|line| line.trim() == "DEVTYPE=wwan_port")
+}
+
+fn is_wwan_port_entry(entry: &std::fs::DirEntry, name: &str) -> bool {
+    std::fs::read_to_string(entry.path().join("uevent"))
+        .map(|uevent| uevent_marks_wwan_port(&uevent))
+        // Older WWAN class implementations may omit DEVTYPE. A real control
+        // port still has a matching character node; the parent wwan_dev does not.
+        .unwrap_or_else(|_| PathBuf::from("/dev").join(name).exists())
 }
 
 fn ports_for_rpmsg_device(device_id: &str) -> Vec<String> {
@@ -547,8 +660,12 @@ fn ports_for_rpmsg_device(device_id: &str) -> Vec<String> {
     let mut ports = entries
         .flatten()
         .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_wwan_port_entry(&entry, &name) {
+                return None;
+            }
             let resolved = std::fs::canonicalize(entry.path()).ok()?;
-            resolved.starts_with(&device).then(|| entry.file_name().to_string_lossy().to_string())
+            resolved.starts_with(&device).then_some(name)
         })
         .collect::<Vec<_>>();
     ports.sort();
@@ -864,6 +981,34 @@ fn endpoint_identity(path: &Path) -> std::io::Result<EndpointIdentity> {
 /// same character node remains present.
 pub async fn hold_endpoint(endpoint: &SecondaryQmiEndpoint) -> Result<(), SecondaryQmiError> {
     let path = Path::new(&endpoint.device_path);
+    // Keeping the character device open is part of Beta8's DATA6 contract. The
+    // stock rpmsg_wwan_ctrl driver tears down retained QMI client ids when its
+    // last file descriptor closes, even when qmicli used
+    // --client-no-release-cid. A passive metadata monitor is therefore not
+    // enough: one long-lived O_RDWR descriptor must survive across all qmicli
+    // invocations made by the runtime.
+    #[cfg(unix)]
+    let _held_device = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let _held_device = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path);
+    let _held_device = _held_device.map_err(|error| {
+        SecondaryQmiError::EndpointLost(format!(
+            "failed to hold secondary QMI endpoint {} open: {error}",
+            endpoint.device_path
+        ))
+    })?;
+
     let expected = endpoint_identity(path).map_err(|error| {
         SecondaryQmiError::EndpointLost(format!(
             "failed to inspect secondary QMI endpoint {}: {error}",
@@ -914,32 +1059,41 @@ pub async fn start_ims_session(
     }
     start.push_str(&format!(",ip-type={family}"));
 
-    let output = run_qmicli(&[
-        "-d",
-        &endpoint.device_path,
-        "--device-open-qmi",
-        "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
-        "--client-no-release-cid",
-        &start,
-    ])
-    .await
-    .ok_or_else(|| "secondary_qmi_start_spawn_failed".to_string())?;
+    let client_id = allocate_wds_client(endpoint).await?;
+    let family_action = format!("--wds-set-ip-family={family}");
+    if let Err(error) = run_retained_wds_action(endpoint, &client_id, &family_action).await {
+        release_wds_client(endpoint, &client_id).await;
+        return Err(error);
+    }
+    let output = match run_retained_wds_action(endpoint, &client_id, &start).await {
+        Ok(output) => output,
+        Err(error) => {
+            release_wds_client(endpoint, &client_id).await;
+            return Err(error);
+        }
+    };
 
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let handle = parse_packet_data_handle(&text).ok_or_else(|| {
-        // Surface the modem's own verbose reason: it distinguishes "network wants
-        // the other family" from a real failure.
-        let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
-        format!("secondary_qmi_start_failed:{reason}")
-    })?;
+    let handle = match parse_packet_data_handle(&text) {
+        Some(handle) => handle,
+        None => {
+            // Surface the modem's own verbose reason: it distinguishes "network wants
+            // the other family" from a real failure.
+            let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
+            release_wds_client(endpoint, &client_id).await;
+            return Err(format!("secondary_qmi_start_failed:{reason}"));
+        }
+    };
 
-    let settings = read_current_settings(endpoint).await.unwrap_or_default();
+    let settings = read_current_settings(endpoint, &client_id)
+        .await
+        .unwrap_or_default();
     Ok(ImsSession {
+        client_id,
         packet_data_handle: handle,
         ip_family: settings.ip_family.unwrap_or_else(|| format!("ipv{family}")),
         ipv4_address: settings.ipv4_address,
@@ -952,18 +1106,79 @@ pub async fn start_ims_session(
     })
 }
 
-/// Tear down an IMS session started by [`start_ims_session`].
-pub async fn stop_ims_session(endpoint: &SecondaryQmiEndpoint, handle: &str) {
-    let stop = format!("--wds-stop-network={handle}");
+async fn allocate_wds_client(endpoint: &SecondaryQmiEndpoint) -> Result<String, String> {
+    let output = run_qmicli(&[
+        "--verbose",
+        "-d",
+        &endpoint.device_path,
+        "--device-open-qmi",
+        "--device-open-proxy",
+        QMI_OPEN_NET_ARG,
+        "--client-no-release-cid",
+        "--wds-noop",
+    ])
+    .await
+    .ok_or_else(|| "secondary_qmi_cid_allocate_spawn_failed".to_string())?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if !output.status.success() {
+        return Err(format!("secondary_qmi_cid_allocate_failed:{}", text.trim()));
+    }
+    parse_wds_client_id(&text).ok_or_else(|| format!("secondary_qmi_cid_missing:{}", text.trim()))
+}
+
+async fn run_retained_wds_action(
+    endpoint: &SecondaryQmiEndpoint,
+    client_id: &str,
+    action: &str,
+) -> Result<Output, String> {
+    let cid = format!("--client-cid={client_id}");
+    let output = run_qmicli(&[
+        "-d",
+        &endpoint.device_path,
+        "--device-open-qmi",
+        "--device-open-proxy",
+        QMI_OPEN_NET_ARG,
+        &cid,
+        "--client-no-release-cid",
+        action,
+    ])
+    .await
+    .ok_or_else(|| "secondary_qmi_action_spawn_failed".to_string())?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Err(format!("secondary_qmi_action_failed:{}", text.trim()))
+    }
+}
+
+async fn release_wds_client(endpoint: &SecondaryQmiEndpoint, client_id: &str) {
+    let cid = format!("--client-cid={client_id}");
     let _ = run_qmicli(&[
         "-d",
         &endpoint.device_path,
         "--device-open-qmi",
         "--device-open-proxy",
         QMI_OPEN_NET_ARG,
-        &stop,
+        &cid,
+        "--wds-noop",
     ])
     .await;
+}
+
+/// Tear down an IMS session and release the retained WDS CID.
+pub async fn stop_ims_session(endpoint: &SecondaryQmiEndpoint, session: &ImsSession) {
+    let stop = format!("--wds-stop-network={}", session.packet_data_handle);
+    let _ = run_retained_wds_action(endpoint, &session.client_id, &stop).await;
+    release_wds_client(endpoint, &session.client_id).await;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -980,22 +1195,55 @@ pub struct CurrentSettings {
     pub pcscf: Vec<String>,
 }
 
-async fn read_current_settings(endpoint: &SecondaryQmiEndpoint) -> Option<CurrentSettings> {
-    let output = run_qmicli(&[
-        "-d",
-        &endpoint.device_path,
-        "--device-open-qmi",
-        "--device-open-proxy",
-        QMI_OPEN_NET_ARG,
-        "--wds-get-current-settings",
-    ])
-    .await?;
+async fn read_current_settings(
+    endpoint: &SecondaryQmiEndpoint,
+    client_id: &str,
+) -> Option<CurrentSettings> {
+    let output = run_retained_wds_action(endpoint, client_id, "--wds-get-current-settings")
+        .await
+        .ok()?;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     Some(parse_current_settings(&text))
+}
+
+/// Parse the WDS CID printed by qmicli's retained-client output or verbose log.
+pub fn parse_wds_client_id(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("registered 'wds'") {
+            if let Some(value) = line
+                .split_once("client with ID '")
+                .and_then(|(_, rest)| rest.split_once('\''))
+                .map(|(value, _)| value)
+            {
+                if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        if lower.contains("service = 'wds'") {
+            if let Some(value) = line
+                .split_once("cid = '")
+                .and_then(|(_, rest)| rest.split_once('\''))
+                .map(|(value, _)| value)
+            {
+                if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+                    return Some(value.to_string());
+                }
+            }
+        }
+        if let Some(index) = lower.find("cid:") {
+            let value = line[index + 4..].trim().trim_matches('\'').trim();
+            if !value.is_empty() && value.chars().all(|character| character.is_ascii_digit()) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 /// Parse `qmicli --wds-start-network` output for the packet data handle.
@@ -1115,6 +1363,14 @@ mod tests {
         // Multi-baseband naming is handled by the suffix rule too.
         assert!(is_boot_port("wwan1at0"));
         assert!(!is_boot_port("wwan1at2"));
+    }
+
+    #[test]
+    fn wwan_parent_is_not_a_control_port() {
+        assert!(!uevent_marks_wwan_port("DEVTYPE=wwan_dev\n"));
+        assert!(uevent_marks_wwan_port(
+            "MAJOR=242\nMINOR=3\nDEVNAME=wwan0at2\nDEVTYPE=wwan_port\n"
+        ));
     }
 
     #[test]
