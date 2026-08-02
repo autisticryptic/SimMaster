@@ -2223,6 +2223,42 @@ pub async fn get_signal_strength_handler(State(conn): State<Arc<Connection>>) ->
 
 /// GET /api/data
 pub async fn get_data_status(State(app): State<AppState>) -> impl IntoResponse {
+    // The per-line runtime owns DATA6 and the proxy when VoLTE is enabled.
+    // ModemManager's legacy global data state only sees qmi0, so prefer the
+    // primary line here or a healthy DATA6 session would be reported inactive.
+    if let Some(line) = app.line_registry.primary().await {
+        let binding = line.binding();
+        let profile = app.config_manager.get_line_profile(&binding.line_id);
+        if !profile.data_connection_enabled {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    DataConnectionResponse { active: false },
+                )),
+            );
+        }
+        let connected = line.secondary_data.interface().await.is_some()
+            || (binding.present
+                && modem_manager::data_interface_for_modem(
+                    app.dbus_conn.as_ref(),
+                    &binding.modem_path,
+                )
+                .await
+                .unwrap_or(None)
+                .is_some());
+        let proxy_running = line.data_proxy.status().await.running;
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                DataConnectionResponse {
+                    active: connected || proxy_running,
+                },
+            )),
+        );
+    }
+
     if app.data_user_disabled.load(Ordering::SeqCst) {
         return (
             StatusCode::OK,
@@ -2256,6 +2292,87 @@ pub async fn set_data_status(
     State(app): State<AppState>,
     Json(payload): Json<DataConnectionRequest>,
 ) -> impl IntoResponse {
+    // Keep the legacy device-wide endpoint as an alias for the primary line.
+    // Calling the old global NM activation path here bypasses DATA6 and never
+    // starts the per-line proxy, while also risking an IMS bearer reset.
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if let Some(line) = app.line_registry.primary().await {
+        let binding = line.binding();
+        let previous_profile = app.config_manager.get_line_profile(&binding.line_id);
+        if payload.active && previous_profile.airplane_mode_enabled {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<DataConnectionResponse>::error(
+                    "Failed: line_airplane_mode_enabled",
+                )),
+            );
+        }
+        if payload.active {
+            if !previous_profile.data_connection_enabled {
+                app.line_registry.reset_data_traffic(&binding.line_id).await;
+            }
+            if let Err(error) = start_line_data_runtime(&app, &line, &previous_profile).await {
+                line.data_proxy.record_error(error.clone()).await;
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::<DataConnectionResponse>::error(format!(
+                        "Failed: {error}"
+                    ))),
+                );
+            }
+        } else {
+            stop_line_data_runtime(&app, &line).await;
+        }
+        if let Err(error) = app
+            .config_manager
+            .set_line_data_connection_enabled(&binding.line_id, payload.active)
+        {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<DataConnectionResponse>::error(format!(
+                    "Failed to save data switch state: {error}"
+                ))),
+            );
+        }
+        app.data_user_disabled
+            .store(!payload.active, Ordering::SeqCst);
+        if let Err(error) = app.config_manager.set_data_enabled(payload.active) {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<DataConnectionResponse>::error(format!(
+                    "Failed to save data switch state: {error}"
+                ))),
+            );
+        }
+        let previous_active = previous_profile.data_connection_enabled;
+        if previous_active != payload.active {
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::CELLULAR_DATA_ENABLED_CHANGED,
+                    system_event_severity::INFO,
+                    system_event_status::CHANGED,
+                    "cellular_data",
+                    if payload.active {
+                        "蜂窝数据开关已开启"
+                    } else {
+                        "蜂窝数据开关已关闭"
+                    },
+                )
+                .await;
+        }
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Data connection updated",
+                DataConnectionResponse {
+                    active: payload.active,
+                },
+            )),
+        );
+    }
+
+    // No discovered line: preserve the legacy behavior for installations
+    // which expose only a global ModemManager modem.
     let previous_active = !app.data_user_disabled.load(Ordering::SeqCst);
     let allow_roaming = app.config_manager.get_roaming_allowed();
     let apn_config = app.config_manager.get_apn_config();
