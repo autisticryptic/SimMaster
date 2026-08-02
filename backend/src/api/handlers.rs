@@ -2517,6 +2517,17 @@ async fn start_line_data_runtime_locked(
         return Err("cellular_data_roaming_forbidden".to_string());
     }
 
+    // A DATA6 session is the dedicated user-data bearer. Prefer it whenever it
+    // is already alive, especially when IMS was restored first and qmi0 now
+    // exposes an IMS bearer to ModemManager. Reusing this interface keeps the
+    // proxy on the data path and avoids allocating a duplicate WDS session.
+    if let Some(interface) = line.secondary_data.interface().await {
+        line.data_proxy
+            .start(&interface, &profile.data_proxy)
+            .await?;
+        return Ok(());
+    }
+
     // Preserve an ordinary-data bearer that is already active on qmi0. Beta8
     // moves IMS to DATA6 in this case; replacing the data bearer would discard
     // the observed slot state before the VoLTE allocator can act on it.
