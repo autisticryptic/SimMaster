@@ -334,9 +334,6 @@ pub struct RadioModeResponse {
 #[derive(Debug, Deserialize)]
 pub struct RadioModeRequest {
     pub mode: RadioMode,
-    /// Which physical line to act on. Omitted means the primary line.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -370,9 +367,6 @@ pub struct BandLockRequest {
     pub nr_fdd_bands: Vec<u32>,
     #[serde(default)]
     pub nr_tdd_bands: Vec<u32>,
-    /// Which physical line to act on. Omitted means the primary line.
-    #[serde(default, skip_serializing)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -402,9 +396,6 @@ pub struct CellLockRequest {
     pub pci: Option<u16>,
     #[serde(default)]
     pub arfcn: Option<u32>,
-    /// Which physical line to act on. Omitted means the primary line.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 fn default_nr_rat() -> u8 {
@@ -763,9 +754,6 @@ pub struct OperatorListResponse {
 #[derive(Debug, Deserialize)]
 pub struct ManualRegisterRequest {
     pub mccmnc: String,
-    /// Which physical line to register. Omitted means the primary line.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -795,10 +783,6 @@ pub struct SetApnRequest {
     pub username: Option<String>,
     pub password: Option<String>,
     pub auth_method: Option<String>,
-    /// Which physical line this APN belongs to. Omitted means the primary line,
-    /// and only then is the global APN config written.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Clone)]

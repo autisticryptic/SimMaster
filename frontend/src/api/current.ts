@@ -204,6 +204,10 @@ function lineScopeQuery(lineId?: string) {
   return trimmed ? `?line_id=${encodeURIComponent(trimmed)}` : ''
 }
 
+function modemLinePath(lineId: string, suffix: string) {
+  return `/modem/lines/${encodeURIComponent(lineId)}${suffix}`
+}
+
 class SimAdminCurrentAPI {
   async getAuthStatus() {
     return request<ApiResponse<AuthStatusResponse>>('/auth/status', {
@@ -373,8 +377,8 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<NetworkInfo>>('/network')
   }
 
-  async getCellsInfo(lineId?: string) {
-    return request<ApiResponse<CellsResponse>>(`/cells${lineScopeQuery(lineId)}`)
+  async getCellsInfo(lineId: string) {
+    return request<ApiResponse<CellsResponse>>(modemLinePath(lineId, '/cells'))
   }
 
   async startCellMonitor() {
@@ -488,75 +492,75 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<CellLocationResponse>>('/location/cell-info')
   }
 
-  async getOperators(lineId?: string) {
-    return request<ApiResponse<OperatorListResponse>>(`/network/operators${lineScopeQuery(lineId)}`)
+  async getOperators(lineId: string) {
+    return request<ApiResponse<OperatorListResponse>>(modemLinePath(lineId, '/network/operators'))
   }
 
-  async scanOperators(lineId?: string) {
-    return request<ApiResponse<OperatorListResponse>>(`/network/operators/scan${lineScopeQuery(lineId)}`)
+  async scanOperators(lineId: string) {
+    return request<ApiResponse<OperatorListResponse>>(modemLinePath(lineId, '/network/operators/scan'))
   }
 
-  async registerOperatorManual(mccmnc: string, lineId?: string) {
-    const body: ManualRegisterRequest = { mccmnc, line_id: lineId }
-    return request<ApiResponse<Record<string, never>>>('/network/register-manual', {
+  async registerOperatorManual(mccmnc: string, lineId: string) {
+    const body: ManualRegisterRequest = { mccmnc }
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/network/register-manual'), {
       method: 'POST',
       body: JSON.stringify(body),
     })
   }
 
-  async registerOperatorAuto(lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>(`/network/register-auto${lineScopeQuery(lineId)}`, {
+  async registerOperatorAuto(lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/network/register-auto'), {
       method: 'POST',
       body: JSON.stringify({}),
     })
   }
 
-  async getApnList(lineId?: string) {
-    return request<ApiResponse<ApnListResponse>>(`/apn${lineScopeQuery(lineId)}`)
+  async getApnList(lineId: string) {
+    return request<ApiResponse<ApnListResponse>>(modemLinePath(lineId, '/apn'))
   }
 
-  async setApn(config: SetApnRequest) {
-    return request<ApiResponse<Record<string, unknown>>>('/apn', {
+  async setApn(lineId: string, config: SetApnRequest) {
+    return request<ApiResponse<Record<string, unknown>>>(modemLinePath(lineId, '/apn'), {
       method: 'POST',
       body: JSON.stringify(config),
     })
   }
 
-  async getRadioMode(lineId?: string) {
-    return request<ApiResponse<RadioModeResponse>>(`/radio-mode${lineScopeQuery(lineId)}`)
+  async getRadioMode(lineId: string) {
+    return request<ApiResponse<RadioModeResponse>>(modemLinePath(lineId, '/radio-mode'))
   }
 
-  async setRadioMode(mode: RadioMode, lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>('/radio-mode', {
+  async setRadioMode(mode: RadioMode, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/radio-mode'), {
       method: 'POST',
-      body: JSON.stringify({ mode, line_id: lineId }),
+      body: JSON.stringify({ mode }),
     })
   }
 
-  async getBandLockStatus(lineId?: string) {
-    return request<ApiResponse<BandLockStatus>>(`/band-lock${lineScopeQuery(lineId)}`)
+  async getBandLockStatus(lineId: string) {
+    return request<ApiResponse<BandLockStatus>>(modemLinePath(lineId, '/band-lock'))
   }
 
-  async setBandLock(config: BandLockRequest, lineId?: string) {
-    return request<ApiResponse<Record<string, never>>>('/band-lock', {
-      method: 'POST',
-      body: JSON.stringify({ ...config, line_id: lineId }),
-    })
-  }
-
-  async getCellLockStatus(lineId?: string) {
-    return request<ApiResponse<CellLockStatusResponse>>(`/cell-lock${lineScopeQuery(lineId)}`)
-  }
-
-  async setCellLock(config: CellLockRequest) {
-    return request<ApiResponse<CellLockResult>>('/cell-lock', {
+  async setBandLock(config: BandLockRequest, lineId: string) {
+    return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/band-lock'), {
       method: 'POST',
       body: JSON.stringify(config),
     })
   }
 
-  async unlockAllCells(lineId?: string) {
-    return request<ApiResponse<CellLockResult>>(`/cell-lock/unlock-all${lineScopeQuery(lineId)}`, {
+  async getCellLockStatus(lineId: string) {
+    return request<ApiResponse<CellLockStatusResponse>>(modemLinePath(lineId, '/cell-lock'))
+  }
+
+  async setCellLock(lineId: string, config: CellLockRequest) {
+    return request<ApiResponse<CellLockResult>>(modemLinePath(lineId, '/cell-lock'), {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  async unlockAllCells(lineId: string) {
+    return request<ApiResponse<CellLockResult>>(modemLinePath(lineId, '/cell-lock/unlock-all'), {
       method: 'POST',
       body: JSON.stringify({}),
     })

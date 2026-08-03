@@ -3329,7 +3329,6 @@ LTE Timing Advance: 'unavailable'"#;
             lte_tdd_bands: vec![],
             nr_fdd_bands: vec![],
             nr_tdd_bands: vec![],
-            line_id: None,
         };
 
         let mapped = accumulate_mm_ids_from_physical_bands(&req, &[31, 33, 35, 38]).unwrap();
@@ -3344,7 +3343,6 @@ LTE Timing Advance: 'unavailable'"#;
             lte_tdd_bands: vec![],
             nr_fdd_bands: vec![],
             nr_tdd_bands: vec![78],
-            line_id: None,
         };
 
         let unsupported = accumulate_mm_ids_from_physical_bands(&req, &[31]).unwrap_err();

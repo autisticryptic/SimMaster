@@ -141,7 +141,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         requestOrNull(api.getLineNetworkControls(), 'line-controls'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
         requestOrNull(api.getVowifiControl(), 'vowifi-control'),
-        requestOrNull(api.getCellsInfo(), 'cells'),
         requestOrNull(api.getVowifiStatus(), 'vowifi-status'),
       ])
 
@@ -157,7 +156,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         lineControlsRes,
         addressesRes,
         vowifiControlRes,
-        cellsRes,
         vowifiStatusRes,
       ] = await fastPromise
 
@@ -172,7 +170,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       setLineNetworkControls(controls)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
       if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
-      if (cellsRes?.data) setCellsInfo(cellsRes.data)
+      // Cell measurements are line-scoped and are shown in each line's detail
+      // panel; the dashboard must not silently select a primary modem.
+      setCellsInfo(null)
       if (vowifiStatusRes?.data) setVowifiStatus(vowifiStatusRes.data)
 
       // 快速数据就绪，立即解除 loading

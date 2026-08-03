@@ -1252,12 +1252,12 @@ pub struct LineScopedQuery {
     pub line_id: Option<String>,
 }
 
-/// GET /api/cells
+/// GET /api/modem/lines/{line_id}/cells
 pub async fn get_cells(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1344,12 +1344,12 @@ pub async fn stop_cell_monitor_handler(State(app): State<AppState>) -> impl Into
     }
 }
 
-/// GET /api/radio-mode
+/// GET /api/modem/lines/{line_id}/radio-mode
 pub async fn get_radio_mode_handler(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1373,12 +1373,13 @@ pub async fn get_radio_mode_handler(
     }
 }
 
-/// POST /api/radio-mode
+/// POST /api/modem/lines/{line_id}/radio-mode
 pub async fn set_radio_mode_handler(
     State(app): State<AppState>,
+    Path(line_id): Path<String>,
     Json(payload): Json<RadioModeRequest>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1405,12 +1406,12 @@ pub async fn set_radio_mode_handler(
     }
 }
 
-/// GET /api/band-lock
+/// GET /api/modem/lines/{line_id}/band-lock
 pub async fn get_band_lock_handler(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1434,12 +1435,13 @@ pub async fn get_band_lock_handler(
     }
 }
 
-/// POST /api/band-lock
+/// POST /api/modem/lines/{line_id}/band-lock
 pub async fn set_band_lock_handler(
     State(app): State<AppState>,
+    Path(line_id): Path<String>,
     Json(payload): Json<BandLockRequest>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1483,12 +1485,12 @@ pub async fn get_cell_location_handler(State(conn): State<Arc<Connection>>) -> i
     }
 }
 
-/// GET /api/network/operators
+/// GET /api/modem/lines/{line_id}/network/operators
 pub async fn get_network_operators(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1512,12 +1514,12 @@ pub async fn get_network_operators(
     }
 }
 
-/// GET /api/network/operators/scan
+/// GET /api/modem/lines/{line_id}/network/operators/scan
 pub async fn scan_network_operators(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1541,12 +1543,13 @@ pub async fn scan_network_operators(
     }
 }
 
-/// POST /api/network/register-manual
+/// POST /api/modem/lines/{line_id}/network/register-manual
 pub async fn register_network_manual(
     State(app): State<AppState>,
+    Path(line_id): Path<String>,
     Json(payload): Json<ManualRegisterRequest>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, payload.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1573,12 +1576,12 @@ pub async fn register_network_manual(
     }
 }
 
-/// POST /api/network/register-auto
+/// POST /api/modem/lines/{line_id}/network/register-auto
 pub async fn register_network_auto(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1605,12 +1608,12 @@ pub async fn register_network_auto(
     }
 }
 
-/// GET /api/apn
+/// GET /api/modem/lines/{line_id}/apn
 pub async fn get_apn_list_handler(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, query.line_id.as_deref()).await {
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
         Ok(path) => path,
         Err(reason) => {
             return (
@@ -1619,10 +1622,7 @@ pub async fn get_apn_list_handler(
             )
         }
     };
-    let apn_config = match query.line_id.as_deref() {
-        Some(line_id) => app.config_manager.get_line_apn_config(line_id),
-        None => app.config_manager.get_apn_config(),
-    };
+    let apn_config = app.config_manager.get_line_apn_config(&line_id);
     match list_apn_contexts_for_modem(&app.dbus_conn, &modem_path, Some(&apn_config)).await {
         Ok(data) => (
             StatusCode::OK,
@@ -1638,20 +1638,48 @@ pub async fn get_apn_list_handler(
     }
 }
 
-/// POST /api/apn
+/// POST /api/modem/lines/{line_id}/apn
 pub async fn set_apn_handler(
     State(app): State<AppState>,
+    Path(line_id): Path<String>,
     Json(payload): Json<SetApnRequest>,
 ) -> impl IntoResponse {
-    let line_id = payload
-        .line_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let mut apn_config = match line_id {
-        Some(line_id) => app.config_manager.get_line_apn_config(line_id),
-        None => app.config_manager.get_apn_config(),
+    let modem_path = match resolve_modem_path(&app, Some(&line_id)).await {
+        Ok(path) => path,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
     };
+
+    let context_path = payload.context_path.trim();
+    let updates_existing_bearer =
+        !context_path.is_empty() && !context_path.ends_with("/bearer/default");
+    if updates_existing_bearer {
+        let contexts = match list_apn_contexts_for_modem(&app.dbus_conn, &modem_path, None).await {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ApiResponse::<serde_json::Value>::error(format!(
+                        "Failed to verify APN context ownership: {error}"
+                    ))),
+                )
+            }
+        };
+        if !apn_context_belongs_to_line(context_path, &contexts) {
+            return (
+                StatusCode::CONFLICT,
+                Json(ApiResponse::<serde_json::Value>::error(
+                    "apn_context_not_owned_by_line",
+                )),
+            );
+        }
+    }
+
+    let mut apn_config = app.config_manager.get_line_apn_config(&line_id);
     if let Some(apn) = &payload.apn {
         apn_config.apn = apn.trim().to_string();
     }
@@ -1674,13 +1702,10 @@ pub async fn set_apn_handler(
         apn_config.auth_method = ApnConfig::default().auth_method;
     }
 
-    let saved = match line_id {
-        Some(line_id) => app
-            .config_manager
-            .set_line_apn_config(line_id, Some(apn_config))
-            .map(|_| ()),
-        None => app.config_manager.set_apn_config(apn_config),
-    };
+    let saved = app
+        .config_manager
+        .set_line_apn_config(&line_id, Some(apn_config))
+        .map(|_| ());
     if let Err(err) = saved {
         return (
             StatusCode::OK,
@@ -1691,8 +1716,7 @@ pub async fn set_apn_handler(
         );
     }
 
-    let context_path = payload.context_path.trim();
-    if context_path.is_empty() || context_path.ends_with("/bearer/default") {
+    if !updates_existing_bearer {
         return (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -1720,12 +1744,19 @@ pub async fn set_apn_handler(
     }
 }
 
-/// GET /api/cell-lock
+fn apn_context_belongs_to_line(context_path: &str, contexts: &ApnListResponse) -> bool {
+    contexts
+        .contexts
+        .iter()
+        .any(|context| context.path == context_path)
+}
+
+/// GET /api/modem/lines/{line_id}/cell-lock
 pub async fn get_cell_lock_status_handler(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let line_id = match resolve_cell_lock_line(&app, query.line_id.as_deref()).await {
+    let line_id = match resolve_cell_lock_line(&app, Some(&line_id)).await {
         Ok(line_id) => line_id,
         Err(reason) => {
             return (
@@ -1762,12 +1793,13 @@ async fn resolve_cell_lock_line(app: &AppState, line_id: Option<&str>) -> Result
     }
 }
 
-/// POST /api/cell-lock
+/// POST /api/modem/lines/{line_id}/cell-lock
 pub async fn set_cell_lock_handler(
     State(app): State<AppState>,
+    Path(line_id): Path<String>,
     Json(payload): Json<CellLockRequest>,
 ) -> impl IntoResponse {
-    let line_id = match resolve_cell_lock_line(&app, payload.line_id.as_deref()).await {
+    let line_id = match resolve_cell_lock_line(&app, Some(&line_id)).await {
         Ok(line_id) => line_id,
         Err(reason) => {
             return (
@@ -1792,12 +1824,12 @@ pub async fn set_cell_lock_handler(
     }
 }
 
-/// POST /api/cell-lock/unlock-all
+/// POST /api/modem/lines/{line_id}/cell-lock/unlock-all
 pub async fn unlock_all_cells_handler(
     State(app): State<AppState>,
-    Query(query): Query<LineScopedQuery>,
+    Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let line_id = match resolve_cell_lock_line(&app, query.line_id.as_deref()).await {
+    let line_id = match resolve_cell_lock_line(&app, Some(&line_id)).await {
         Ok(line_id) => line_id,
         Err(reason) => {
             return (
@@ -8340,6 +8372,25 @@ pub async fn test_automation_task_handler(
 mod tests {
     use super::*;
     use crate::hardware::cellular::modem_manager::SimIdentity;
+
+    #[test]
+    fn apn_context_ownership_requires_exact_line_bearer_path() {
+        let contexts = ApnListResponse {
+            contexts: vec![ApnContext {
+                path: "/org/freedesktop/ModemManager1/Bearer/6".to_string(),
+                ..Default::default()
+            }],
+        };
+
+        assert!(apn_context_belongs_to_line(
+            "/org/freedesktop/ModemManager1/Bearer/6",
+            &contexts
+        ));
+        assert!(!apn_context_belongs_to_line(
+            "/org/freedesktop/ModemManager1/Bearer/7",
+            &contexts
+        ));
+    }
 
     #[test]
     fn enriches_enabled_esim_profile_from_current_sim_identity() {

@@ -154,7 +154,7 @@ function CellsSettings({ lineLabel, lineId }: SectionProps) {
                   <TableCell sx={{ fontFamily: 'monospace' }}>{arfcn || '-'}</TableCell>
                   <TableCell sx={{ fontFamily: 'monospace' }}>{cell.pci || '-'}</TableCell>
                   <TableCell>{cell.rsrp || cell.ssb_rsrp || '-'}</TableCell>
-                  <TableCell align="right"><Button size="small" disabled={!canLock || busy !== null} onClick={() => void run(`cell-${index}`, () => api.setCellLock({ rat: cell.tech.toLowerCase().includes('nr') ? 16 : 12, enable: true, arfcn: Number(arfcn), pci: Number(cell.pci), line_id: lineId }), '小区锁定已提交')}>锁定</Button></TableCell>
+                  <TableCell align="right"><Button size="small" disabled={!canLock || busy !== null} onClick={() => void run(`cell-${index}`, () => api.setCellLock(lineId, { rat: cell.tech.toLowerCase().includes('nr') ? 16 : 12, enable: true, arfcn: Number(arfcn), pci: Number(cell.pci) }), '小区锁定已提交')}>锁定</Button></TableCell>
                 </TableRow>
               )
             })}
@@ -208,7 +208,7 @@ function ApnSettings({ lineLabel, lineId }: SectionProps) {
 
   const save = async () => {
     setSaving(true); setError(null)
-    try { await api.setApn({ ...form, context_path: selectedPath || form.context_path, line_id: lineId }); await load() } catch (err) { setError(errorText(err)) } finally { setSaving(false) }
+    try { await api.setApn(lineId, { ...form, context_path: selectedPath || form.context_path }); await load() } catch (err) { setError(errorText(err)) } finally { setSaving(false) }
   }
 
   return (

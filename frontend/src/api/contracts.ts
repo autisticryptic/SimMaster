@@ -398,8 +398,6 @@ export interface CellLockRequest {
   lock_type?: number
   pci?: number
   arfcn?: number
-  /** Omitted means the primary line. */
-  line_id?: string
 }
 
 export interface CellLockResult {
@@ -1063,8 +1061,6 @@ export interface OperatorListResponse {
 
 export interface ManualRegisterRequest {
   mccmnc: string
-  /** Omitted means the primary line. */
-  line_id?: string
 }
 
 export interface ApnContext {
@@ -1090,8 +1086,6 @@ export interface SetApnRequest {
   username?: string
   password?: string
   auth_method?: string
-  /** Omitted means the primary line, and only then is the global APN written. */
-  line_id?: string
 }
 
 export interface PingResult {

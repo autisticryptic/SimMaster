@@ -892,7 +892,10 @@ async fn main() -> Result<()> {
             "/api/network",
             get(get_network_info).options(options_handler),
         )
-        .route("/api/cells", get(get_cells).options(options_handler))
+        .route(
+            "/api/modem/lines/{line_id}/cells",
+            get(get_cells).options(options_handler),
+        )
         .route(
             "/api/cell-monitor/start",
             post(start_cell_monitor_handler).options(options_handler),
@@ -902,13 +905,13 @@ async fn main() -> Result<()> {
             post(stop_cell_monitor_handler).options(options_handler),
         )
         .route(
-            "/api/radio-mode",
+            "/api/modem/lines/{line_id}/radio-mode",
             get(get_radio_mode_handler)
                 .post(set_radio_mode_handler)
                 .options(options_handler),
         )
         .route(
-            "/api/band-lock",
+            "/api/modem/lines/{line_id}/band-lock",
             get(get_band_lock_handler)
                 .post(set_band_lock_handler)
                 .options(options_handler),
@@ -984,35 +987,35 @@ async fn main() -> Result<()> {
             get(get_cell_location_handler).options(options_handler),
         )
         .route(
-            "/api/network/operators",
+            "/api/modem/lines/{line_id}/network/operators",
             get(get_network_operators).options(options_handler),
         )
         .route(
-            "/api/network/operators/scan",
+            "/api/modem/lines/{line_id}/network/operators/scan",
             get(scan_network_operators).options(options_handler),
         )
         .route(
-            "/api/network/register-manual",
+            "/api/modem/lines/{line_id}/network/register-manual",
             post(register_network_manual).options(options_handler),
         )
         .route(
-            "/api/network/register-auto",
+            "/api/modem/lines/{line_id}/network/register-auto",
             post(register_network_auto).options(options_handler),
         )
         .route(
-            "/api/apn",
+            "/api/modem/lines/{line_id}/apn",
             get(get_apn_list_handler)
                 .post(set_apn_handler)
                 .options(options_handler),
         )
         .route(
-            "/api/cell-lock",
+            "/api/modem/lines/{line_id}/cell-lock",
             get(get_cell_lock_status_handler)
                 .post(set_cell_lock_handler)
                 .options(options_handler),
         )
         .route(
-            "/api/cell-lock/unlock-all",
+            "/api/modem/lines/{line_id}/cell-lock/unlock-all",
             post(unlock_all_cells_handler).options(options_handler),
         )
         // Cellular data, roaming and airplane mode are per-line only. The old global
