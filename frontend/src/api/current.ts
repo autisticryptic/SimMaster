@@ -24,8 +24,6 @@ import type {
   CellsResponse,
   ConnectionAddressesResponse,
   ConnectivityCheckResponse,
-  DataConnectionRequest,
-  DataConnectionStatus,
   LineNetworkControlsResponse,
   LineDataProxyConfig,
   DdnsConfig,
@@ -393,18 +391,6 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getDataStatus() {
-    return request<ApiResponse<DataConnectionStatus>>('/data')
-  }
-
-  async setDataStatus(active: boolean) {
-    const body: DataConnectionRequest = { active }
-    return request<ApiResponse<DataConnectionStatus>>('/data', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    })
-  }
-
   async restartBaseband() {
     return request<ApiResponse<BasebandRestartResponse>>('/baseband/restart', {
       method: 'POST',
@@ -437,6 +423,12 @@ class SimAdminCurrentAPI {
 
   async getLineNetworkControls() {
     return request<ApiResponse<LineNetworkControlsResponse[]>>('/modem/line-controls')
+  }
+
+  async getLineDataConnection(lineId: string) {
+    return request<ApiResponse<LineNetworkControlsResponse>>(
+      `/modem/lines/${encodeURIComponent(lineId)}/data`,
+    )
   }
 
   async setLineDataConnection(lineId: string, enabled: boolean) {

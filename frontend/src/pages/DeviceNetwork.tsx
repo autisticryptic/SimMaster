@@ -434,13 +434,13 @@ export default function DeviceNetworkPage() {
     setError(null)
     setWlanProfileOpen(false)
     try {
-      const [ddnsConfigRes, ddnsStatusRes, ddnsLogsRes, wlanStatusRes, wlanProfilesRes, dataRes, interfacesRes] = await Promise.allSettled([
+      const [ddnsConfigRes, ddnsStatusRes, ddnsLogsRes, wlanStatusRes, wlanProfilesRes, lineControlsRes, interfacesRes] = await Promise.allSettled([
         api.getDdnsConfig(),
         api.getDdnsStatus(),
         api.getDdnsLogs(),
         api.getWlanStatus(),
         api.getWlanProfiles(),
-        api.getDataStatus(),
+        api.getLineNetworkControls(),
         api.getNetworkInterfaces(),
       ])
       const loadedInterfaces = interfacesRes.status === 'fulfilled' ? interfacesRes.value.data?.interfaces ?? [] : []
@@ -468,8 +468,11 @@ export default function DeviceNetworkPage() {
       if (wlanProfilesRes.status === 'fulfilled' && wlanProfilesRes.value.data) {
         setSavedNetworks(wlanProfilesRes.value.data.profiles)
       }
-      if (dataRes.status === 'fulfilled' && dataRes.value.data) {
-        setDataActive(dataRes.value.data.active)
+      if (lineControlsRes.status === 'fulfilled' && lineControlsRes.value.data) {
+        const controls = lineControlsRes.value.data
+        setDataActive(controls.some((line) => line.data.enabled && (line.data.connected || line.data.proxy.running)))
+      } else {
+        setDataActive(false)
       }
       setDdnsDirty(false)
     } catch (err) {

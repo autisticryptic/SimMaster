@@ -136,9 +136,8 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         requestOrNull(api.getDeviceInfo(), 'device'),
         requestOrNull(api.getSimInfo(), 'sim'),
         requestOrNull(api.getNetworkInfo(), 'network'),
-        requestOrNull(api.getDataStatus(), 'data'),
-        // Airplane mode is per line now, so it comes from the line controls
-        // rather than a device-wide endpoint.
+        // Data, roaming and airplane mode are all per-line. Dashboard-level
+        // summaries are derived from these controls instead of a primary SIM.
         requestOrNull(api.getLineNetworkControls(), 'line-controls'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
         requestOrNull(api.getVowifiControl(), 'vowifi-control'),
@@ -155,7 +154,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         deviceRes,
         simRes,
         networkRes,
-        dataRes,
         lineControlsRes,
         addressesRes,
         vowifiControlRes,
@@ -166,8 +164,12 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       if (deviceRes?.data) setDeviceInfo(deviceRes.data)
       if (simRes?.data) setSimInfo(simRes.data)
       if (networkRes?.data) setNetworkInfo(networkRes.data)
-      if (dataRes?.data) setDataStatus(dataRes.data.active)
-      if (lineControlsRes?.data) setLineNetworkControls(lineControlsRes.data)
+      const controls = lineControlsRes?.data ?? []
+      const dataActive = controls.some(
+        (line) => line.data.enabled && (line.data.connected || line.data.proxy.running),
+      )
+      setDataStatus(dataActive)
+      setLineNetworkControls(controls)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
       if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
       if (cellsRes?.data) setCellsInfo(cellsRes.data)
@@ -185,7 +187,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       }
       if (connectivityRes?.data) setConnectivity(connectivityRes.data)
 
-      const dataActive = dataRes?.data?.active ?? false
       if (statsRes?.data) {
         setQosInfo(qosFromWwanInterface(statsRes.data, dataActive))
       } else {

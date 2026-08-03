@@ -528,7 +528,7 @@ async fn main() -> Result<()> {
     let config_path = get_default_config_path();
     info!(path = ?config_path, "Loading config");
     let config_manager = Arc::new(ConfigManager::new(config_path));
-    let data_user_disabled = Arc::new(AtomicBool::new(!config_manager.get_data_enabled()));
+    let data_user_disabled = Arc::new(AtomicBool::new(true));
     let cell_monitoring_active = Arc::new(AtomicBool::new(false));
     let vowifi_runtime = Arc::new(connectivity::modems::softstack::vowifi::runtime::VowifiRuntime::new());
     let volte_runtime = Arc::new(connectivity::modems::softstack::volte::runtime::VolteRuntime::new());
@@ -544,16 +544,19 @@ async fn main() -> Result<()> {
     line_registry
         .sync_trunk_profiles(config_manager.as_ref())
         .await;
-    if let Some(primary) = line_registry.primary().await {
-        let primary_profile = config_manager.get_line_profile(&primary.binding().line_id);
-        data_user_disabled.store(
-            !primary_profile.data_connection_enabled,
-            std::sync::atomic::Ordering::SeqCst,
-        );
-        if config_manager.get_data_enabled() != primary_profile.data_connection_enabled {
-            let _ = config_manager.set_data_enabled(primary_profile.data_connection_enabled);
-        }
-    }
+    // `data_user_disabled` is retained only as an internal aggregate for
+    // legacy recovery workers. It must never select a primary SIM: any line
+    // with an explicit data intent keeps the aggregate enabled.
+    let any_line_data_enabled = line_registry
+        .all()
+        .await
+        .into_iter()
+        .any(|line| config_manager.get_line_profile(&line.binding().line_id).data_connection_enabled);
+    data_user_disabled.store(
+        !any_line_data_enabled,
+        std::sync::atomic::Ordering::SeqCst,
+    );
+    let _ = config_manager.set_data_enabled(any_line_data_enabled);
     // Copy the compiled-in VoWiFi carrier profiles into the database so they can
     // be edited without a rebuild. Existing rows are left alone.
     {
@@ -1012,11 +1015,14 @@ async fn main() -> Result<()> {
             "/api/cell-lock/unlock-all",
             post(unlock_all_cells_handler).options(options_handler),
         )
-        // ========== 数据连接接口 ==========
+        // Cellular data, roaming and airplane mode are per-line only. The old global
+        // `/api/data` endpoint acted on whichever modem came first while
+        // pretending to be device-wide, so it is intentionally gone; use
+        // `/api/modem/lines/{line_id}/data` and `/api/modem/line-controls`.
         .route(
-            "/api/data",
-            get(get_data_status)
-                .post(set_data_status)
+            "/api/modem/lines/{line_id}/data",
+            get(get_line_data_connection_handler)
+                .post(set_line_data_connection_handler)
                 .options(options_handler),
         )
         // Roaming and airplane mode are per-line only. The old global
@@ -1028,10 +1034,6 @@ async fn main() -> Result<()> {
         .route(
             "/api/modem/line-controls",
             get(get_line_network_controls_handler).options(options_handler),
-        )
-        .route(
-            "/api/modem/lines/{line_id}/data",
-            post(set_line_data_connection_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/data/config",

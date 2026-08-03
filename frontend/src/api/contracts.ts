@@ -221,14 +221,6 @@ export interface ThermalZone {
   temperature: number
 }
 
-export interface DataConnectionStatus {
-  active: boolean
-}
-
-export interface DataConnectionRequest {
-  active: boolean
-}
-
 export interface RoamingResponse {
   roaming_allowed: boolean
   is_roaming: boolean

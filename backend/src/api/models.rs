@@ -197,16 +197,6 @@ pub struct DeviceInfoResponse {
     pub powered: bool,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct DataConnectionRequest {
-    pub active: bool,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct DataConnectionResponse {
-    pub active: bool,
-}
-
 /// Body of the per-line roaming toggle. There is no device-wide equivalent any
 /// more — roaming is decided per SIM.
 #[derive(Debug, Deserialize)]

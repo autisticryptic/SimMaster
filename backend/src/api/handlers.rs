@@ -33,16 +33,16 @@ use crate::{
     api::models::*,
     hardware::cellular::modem_manager,
     hardware::cellular::modem_manager::{
-        answer_call, background_fetch_smsc, current_sim_identity, find_nm_modem_connection_pub,
+        answer_call, background_fetch_smsc, current_sim_identity,
         get_band_lock_status_for_modem, get_baseband_restart_progress, get_call_by_path,
-        get_call_settings, get_cell_location, get_cells_data_for_modem, get_data_connection_status,
+        get_call_settings, get_cell_location, get_cells_data_for_modem,
         get_device_info_data, get_is_roaming_for_modem, get_network_info_data,
         get_operators_list_for_modem, get_radio_mode_for_modem, get_signal_strength,
         get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache, hangup_all_calls,
         hangup_call, list_apn_contexts_for_modem, list_current_calls, make_call_on_modem,
-        nm_set_autoconnect_pub, power_cycle_sim_for_profile_switch, register_operator_for_modem,
+        power_cycle_sim_for_profile_switch, register_operator_for_modem,
         restart_baseband, scan_operators_for_modem, send_sms, send_sms_via_modem,
-        set_apn_on_bearer, set_band_lock_for_modem, set_call_waiting, set_data_connection_with_apn,
+        set_apn_on_bearer, set_band_lock_for_modem, set_call_waiting,
         set_radio_mode_for_modem, start_cell_monitoring, stop_cell_monitoring,
     },
     platform::config::{
@@ -615,9 +615,19 @@ pub async fn enable_esim_profile_handler(
             Ok(data) => {
                 if esim_command_succeeded(&data) {
                     modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
-                    let auto_connect_data = !bg_app.data_user_disabled.load(Ordering::SeqCst);
-                    let allow_roaming = bg_app.config_manager.get_roaming_allowed();
-                    let apn_config = bg_app.config_manager.get_apn_config();
+                    let line_profile = bg_line_id
+                        .as_deref()
+                        .map(|line_id| bg_app.config_manager.get_line_profile(line_id));
+                    let auto_connect_data = line_profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.data_connection_enabled);
+                    let allow_roaming = line_profile
+                        .as_ref()
+                        .is_some_and(|profile| profile.roaming_allowed);
+                    let apn_config = bg_line_id
+                        .as_deref()
+                        .map(|line_id| bg_app.config_manager.get_line_apn_config(line_id))
+                        .unwrap_or_default();
                     match power_cycle_sim_for_profile_switch(
                         &bg_app.dbus_conn,
                         auto_connect_data,
@@ -2219,224 +2229,6 @@ pub async fn get_signal_strength_handler(State(conn): State<Arc<Connection>>) ->
     }
 }
 
-// ============ 数据连接 ============
-
-/// GET /api/data
-pub async fn get_data_status(State(app): State<AppState>) -> impl IntoResponse {
-    // The per-line runtime owns DATA6 and the proxy when VoLTE is enabled.
-    // ModemManager's legacy global data state only sees qmi0, so prefer the
-    // primary line here or a healthy DATA6 session would be reported inactive.
-    if let Some(line) = app.line_registry.primary().await {
-        let binding = line.binding();
-        let profile = app.config_manager.get_line_profile(&binding.line_id);
-        if !profile.data_connection_enabled {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    DataConnectionResponse { active: false },
-                )),
-            );
-        }
-        let connected = line.secondary_data.interface().await.is_some()
-            || (binding.present
-                && modem_manager::data_interface_for_modem(
-                    app.dbus_conn.as_ref(),
-                    &binding.modem_path,
-                )
-                .await
-                .unwrap_or(None)
-                .is_some());
-        let proxy_running = line.data_proxy.status().await.running;
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                DataConnectionResponse {
-                    active: connected || proxy_running,
-                },
-            )),
-        );
-    }
-
-    if app.data_user_disabled.load(Ordering::SeqCst) {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                DataConnectionResponse { active: false },
-            )),
-        );
-    }
-
-    match get_data_connection_status(&app.dbus_conn).await {
-        Ok(active) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                DataConnectionResponse { active },
-            )),
-        ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
-/// POST /api/data
-pub async fn set_data_status(
-    State(app): State<AppState>,
-    Json(payload): Json<DataConnectionRequest>,
-) -> impl IntoResponse {
-    // Keep the legacy device-wide endpoint as an alias for the primary line.
-    // Calling the old global NM activation path here bypasses DATA6 and never
-    // starts the per-line proxy, while also risking an IMS bearer reset.
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-    if let Some(line) = app.line_registry.primary().await {
-        let binding = line.binding();
-        let previous_profile = app.config_manager.get_line_profile(&binding.line_id);
-        if payload.active && previous_profile.airplane_mode_enabled {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<DataConnectionResponse>::error(
-                    "Failed: line_airplane_mode_enabled",
-                )),
-            );
-        }
-        if payload.active {
-            if !previous_profile.data_connection_enabled {
-                app.line_registry.reset_data_traffic(&binding.line_id).await;
-            }
-            if let Err(error) = start_line_data_runtime(&app, &line, &previous_profile).await {
-                line.data_proxy.record_error(error.clone()).await;
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                        "Failed: {error}"
-                    ))),
-                );
-            }
-        } else {
-            stop_line_data_runtime(&app, &line).await;
-        }
-        if let Err(error) = app
-            .config_manager
-            .set_line_data_connection_enabled(&binding.line_id, payload.active)
-        {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                    "Failed to save data switch state: {error}"
-                ))),
-            );
-        }
-        app.data_user_disabled
-            .store(!payload.active, Ordering::SeqCst);
-        if let Err(error) = app.config_manager.set_data_enabled(payload.active) {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                    "Failed to save data switch state: {error}"
-                ))),
-            );
-        }
-        let previous_active = previous_profile.data_connection_enabled;
-        if previous_active != payload.active {
-            app.system_event_emitter
-                .emit_code(
-                    system_event_codes::CELLULAR_DATA_ENABLED_CHANGED,
-                    system_event_severity::INFO,
-                    system_event_status::CHANGED,
-                    "cellular_data",
-                    if payload.active {
-                        "蜂窝数据开关已开启"
-                    } else {
-                        "蜂窝数据开关已关闭"
-                    },
-                )
-                .await;
-        }
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Data connection updated",
-                DataConnectionResponse {
-                    active: payload.active,
-                },
-            )),
-        );
-    }
-
-    // No discovered line: preserve the legacy behavior for installations
-    // which expose only a global ModemManager modem.
-    let previous_active = !app.data_user_disabled.load(Ordering::SeqCst);
-    let allow_roaming = app.config_manager.get_roaming_allowed();
-    let apn_config = app.config_manager.get_apn_config();
-    match set_data_connection_with_apn(
-        &app.dbus_conn,
-        payload.active,
-        allow_roaming,
-        Some(&apn_config),
-    )
-    .await
-    {
-        Ok(_) => {
-            if let Err(err) = app.config_manager.set_data_enabled(payload.active) {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                        "Failed to save data switch state: {}",
-                        err
-                    ))),
-                );
-            }
-            app.data_user_disabled
-                .store(!payload.active, Ordering::SeqCst);
-            if previous_active != payload.active {
-                app.system_event_emitter
-                    .emit_code(
-                        system_event_codes::CELLULAR_DATA_ENABLED_CHANGED,
-                        system_event_severity::INFO,
-                        system_event_status::CHANGED,
-                        "cellular_data",
-                        if payload.active {
-                            "蜂窝数据开关已开启"
-                        } else {
-                            "蜂窝数据开关已关闭"
-                        },
-                    )
-                    .await;
-            }
-            // 同步 NM autoconnect 状态，防止用户关闭数据后 NM 自动重连
-            tokio::spawn(async move {
-                if let Ok(profile) = find_nm_modem_connection_pub().await {
-                    let _ = nm_set_autoconnect_pub(&profile, payload.active).await;
-                }
-            });
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Data connection updated",
-                    DataConnectionResponse {
-                        active: payload.active,
-                    },
-                )),
-            )
-        }
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<DataConnectionResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
 pub async fn restart_baseband_handler(State(app): State<AppState>) -> impl IntoResponse {
     let auto_connect_data = !app.data_user_disabled.load(Ordering::SeqCst);
     let allow_roaming = app.config_manager.get_roaming_allowed();
@@ -2718,6 +2510,31 @@ async fn start_line_data_runtime_locked(
     Ok(())
 }
 
+/// GET /api/modem/lines/{line_id}/data
+///
+/// Every cellular data status is scoped to a physical SIM line. The bulk
+/// `/api/modem/line-controls` endpoint remains useful for dashboards, while
+/// this endpoint gives controllers an unambiguous per-line read path.
+pub async fn get_line_data_connection_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            build_line_network_controls(&app, &line).await,
+        )),
+    )
+}
+
 pub(crate) async fn stop_line_data_runtime(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
@@ -2865,16 +2682,21 @@ pub async fn set_line_data_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
-    let is_primary = app
+    // Keep the legacy recovery flag as an aggregate only. A secondary line
+    // must not be hidden behind a primary-line data switch.
+    let any_line_data_enabled = app
         .line_registry
-        .primary()
+        .all()
         .await
-        .is_some_and(|primary| primary.binding().line_id == line_id);
-    if is_primary {
-        app.data_user_disabled
-            .store(!payload.enabled, Ordering::SeqCst);
-        let _ = app.config_manager.set_data_enabled(payload.enabled);
-    }
+        .into_iter()
+        .any(|candidate| {
+            app.config_manager
+                .get_line_profile(&candidate.binding().line_id)
+                .data_connection_enabled
+        });
+    app.data_user_disabled
+        .store(!any_line_data_enabled, Ordering::SeqCst);
+    let _ = app.config_manager.set_data_enabled(any_line_data_enabled);
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -3033,13 +2855,6 @@ pub async fn set_line_airplane_mode_handler(
             Json(ApiResponse::error("line_not_present")),
         );
     }
-    let is_primary = app
-        .line_registry
-        .all()
-        .await
-        .first()
-        .is_some_and(|primary| primary.binding().line_id == line_id);
-
     if payload.enabled {
         match app.config_manager.set_line_airplane_mode(&line_id, true) {
             Ok(_) => {}
@@ -3059,10 +2874,6 @@ pub async fn set_line_airplane_mode_handler(
             "line_airplane_mode_enabled",
         )
         .await;
-        if is_primary {
-            let _ = app.config_manager.set_data_enabled(false);
-            app.data_user_disabled.store(true, Ordering::SeqCst);
-        }
     } else if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
         return (
             StatusCode::OK,
@@ -5061,11 +4872,6 @@ async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> 
     if let Err(err) = ensure_line_radio_enabled(app, scope).await {
         warn!(error = %err, "Failed to keep modem enabled for WiFi Calling SIM access");
     }
-    if let Ok(profile) = find_nm_modem_connection_pub().await {
-        if let Err(err) = nm_set_autoconnect_pub(&profile, false).await {
-            warn!(error = %err, profile = %profile, "Failed to disable NM autoconnect before WiFi Calling");
-        }
-    }
     let Some(modem_path) = scope.modem_path() else {
         return Ok(());
     };
@@ -5083,13 +4889,7 @@ async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope)
     // one: a second SIM that never had data enabled must not get it here.
     let line_profile = app.config_manager.get_line_profile(scope.line_id());
     let should_restore_data = line_profile.data_connection_enabled
-        && !line_profile.airplane_mode_enabled
-        && !app.data_user_disabled.load(Ordering::SeqCst);
-    if let Ok(profile) = find_nm_modem_connection_pub().await {
-        if let Err(err) = nm_set_autoconnect_pub(&profile, should_restore_data).await {
-            warn!(error = %err, profile = %profile, "Failed to restore NM autoconnect after WiFi Calling");
-        }
-    }
+        && !line_profile.airplane_mode_enabled;
     if !should_restore_data {
         return;
     }
