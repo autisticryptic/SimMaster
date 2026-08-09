@@ -44,6 +44,26 @@ pub struct RegisterResult {
     pub auth_rounds: u8,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisterFailure {
+    pub error: ImsError,
+    /// Last complete SIP response seen before the transaction failed. Secret
+    /// challenge values remain in this buffer, so callers must only emit
+    /// redacted metadata derived from it.
+    pub response: Option<Vec<u8>>,
+    pub auth_rounds: u8,
+}
+
+impl RegisterFailure {
+    fn new(error: ImsError, response: Option<Vec<u8>>, auth_rounds: u8) -> Self {
+        Self {
+            error,
+            response,
+            auth_rounds,
+        }
+    }
+}
+
 pub async fn run_register<C, A>(
     channel: &mut C,
     initial_request: &[u8],
@@ -53,20 +73,40 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    channel
-        .send_sip(initial_request)
+    run_register_observed(channel, initial_request, authenticator)
         .await
-        .map_err(|_| ImsError::new("ims_register_initial_send_failed"))?;
+        .map_err(|failure| failure.error)
+}
+
+/// Run REGISTER while preserving the last complete response on failure.
+///
+/// This is intended for access-leg diagnostics and bounded interoperability
+/// fallbacks. The response may contain nonce/security material and must never
+/// be logged or serialized verbatim.
+pub async fn run_register_observed<C, A>(
+    channel: &mut C,
+    initial_request: &[u8],
+    authenticator: &mut A,
+) -> Result<RegisterResult, RegisterFailure>
+where
+    C: ImsChannel,
+    A: RegisterAuthenticator<C>,
+{
+    channel.send_sip(initial_request).await.map_err(|_| {
+        RegisterFailure::new(ImsError::new("ims_register_initial_send_failed"), None, 0)
+    })?;
     let mut response = recv_final_register_response(
         channel,
         "ims_register_initial_receive_failed",
         "ims_register_initial_unexpected_status",
     )
-    .await?;
+    .await
+    .map_err(|error| RegisterFailure::new(error, None, 0))?;
     let mut auth_rounds = 0u8;
 
     loop {
-        let status = sip_frame::parse_status(&response)?;
+        let status = sip_frame::parse_status(&response)
+            .map_err(|error| RegisterFailure::new(error, Some(response.clone()), auth_rounds))?;
         match status {
             200..=299 => {
                 return Ok(RegisterResult {
@@ -79,28 +119,48 @@ where
                 auth_rounds += 1;
                 authenticator
                     .prepare_authenticated_channel(&response, channel)
-                    .await?;
+                    .await
+                    .map_err(|error| {
+                        RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                    })?;
                 let request = authenticator
                     .authenticated_request(&response, u32::from(auth_rounds) + 1)
-                    .await?;
-                channel
-                    .send_sip(&request)
                     .await
-                    .map_err(|_| ImsError::new("ims_register_authenticated_send_failed"))?;
+                    .map_err(|error| {
+                        RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                    })?;
+                channel.send_sip(&request).await.map_err(|_| {
+                    RegisterFailure::new(
+                        ImsError::new("ims_register_authenticated_send_failed"),
+                        Some(response.clone()),
+                        auth_rounds,
+                    )
+                })?;
                 response = recv_final_register_response(
                     channel,
                     "ims_register_authenticated_receive_failed",
                     "ims_register_authenticated_unexpected_status",
                 )
-                .await?;
+                .await
+                .map_err(|error| RegisterFailure::new(error, None, auth_rounds))?;
             }
-            401 | 407 => return Err(ImsError::new("ims_register_auth_rejected")),
+            401 | 407 => {
+                return Err(RegisterFailure::new(
+                    ImsError::new("ims_register_auth_rejected"),
+                    Some(response),
+                    auth_rounds,
+                ))
+            }
             _ if auth_rounds == 0 => {
                 tracing::warn!(
                     sip_status = status,
                     "IMS REGISTER received unexpected final response"
                 );
-                return Err(ImsError::new("ims_register_initial_unexpected_status"));
+                return Err(RegisterFailure::new(
+                    ImsError::new("ims_register_initial_unexpected_status"),
+                    Some(response),
+                    auth_rounds,
+                ));
             }
             _ => {
                 tracing::warn!(
@@ -108,8 +168,10 @@ where
                     auth_rounds,
                     "IMS REGISTER received unexpected authenticated response"
                 );
-                return Err(ImsError::new(
-                    "ims_register_authenticated_unexpected_status",
+                return Err(RegisterFailure::new(
+                    ImsError::new("ims_register_authenticated_unexpected_status"),
+                    Some(response),
+                    auth_rounds,
                 ));
             }
         }
@@ -333,6 +395,29 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code(), "ims_register_initial_receive_failed");
+        assert_eq!(channel.sends.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn observed_failure_retains_terminal_response_without_changing_legacy_api() {
+        let terminal = b"SIP/2.0 400 Bad Request\r\nWarning: 399 pcscf \"redacted\"\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([terminal.clone()]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let failure = run_register_observed(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            failure.error.code(),
+            "ims_register_initial_unexpected_status"
+        );
+        assert_eq!(failure.response.as_deref(), Some(terminal.as_slice()));
+        assert_eq!(failure.auth_rounds, 0);
         assert_eq!(channel.sends.len(), 1);
     }
 

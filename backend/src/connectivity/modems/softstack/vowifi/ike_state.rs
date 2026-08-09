@@ -1508,6 +1508,19 @@ impl IkeStateMachine {
             && payloads
                 .iter()
                 .any(|payload| payload.payload_type == IkePayloadType::TrafficSelectorResponder);
+        let responder_selectors = payloads
+            .iter()
+            .find(|payload| payload.payload_type == IkePayloadType::TrafficSelectorResponder)
+            .and_then(|payload| summarize_traffic_selectors(&payload.body));
+        let initiator_selectors = payloads
+            .iter()
+            .find(|payload| payload.payload_type == IkePayloadType::TrafficSelectorInitiator)
+            .and_then(|payload| summarize_traffic_selectors(&payload.body));
+        tracing::info!(
+            responder_selectors = ?responder_selectors,
+            initiator_selectors = ?initiator_selectors,
+            "IKEv2 CHILD SA traffic selectors negotiated"
+        );
 
         self.private.child_sa_material = Some(IkeChildSaMaterial {
             inbound_sa_identifier,
@@ -1785,6 +1798,59 @@ fn summarize_configuration_reply(body: &[u8]) -> Result<ConfigurationReplySummar
         input = &input[4 + len..];
     }
     Ok(summary)
+}
+
+/// Summarize an IKEv2 Traffic Selector payload body (RFC 7296 §3.13) for
+/// diagnostics. The negotiated selectors decide what inner traffic the ePDG is
+/// allowed to carry; a responder that only permits SIP ports would silently
+/// drop the ipsec-3gpp ESP flow to the P-CSCF protected ports.
+fn summarize_traffic_selectors(body: &[u8]) -> Option<Vec<String>> {
+    if body.len() < 4 {
+        return None;
+    }
+    let count = usize::from(body[0]);
+    let mut input = &body[4..];
+    let mut selectors = Vec::new();
+    for _ in 0..count {
+        if input.len() < 8 {
+            return Some(selectors);
+        }
+        let ts_type = input[0];
+        let protocol = input[1];
+        let length = usize::from(u16::from_be_bytes([input[2], input[3]]));
+        let start_port = u16::from_be_bytes([input[4], input[5]]);
+        let end_port = u16::from_be_bytes([input[6], input[7]]);
+        if length < 4 || input.len() < 8 + length {
+            return Some(selectors);
+        }
+        let address_bytes = &input[8..8 + (length - 4)];
+        let half = address_bytes.len() / 2;
+        let start = format_address(&address_bytes[..half], ts_type);
+        let end = format_address(&address_bytes[address_bytes.len() / 2..], ts_type);
+        selectors.push(format!(
+            "type={ts_type} proto={protocol} ports={start_port}-{end_port} addrs={start}-{end}"
+        ));
+        input = &input[8 + length..];
+    }
+    Some(selectors)
+}
+
+fn format_address(bytes: &[u8], ts_type: u8) -> String {
+    if ts_type == 7 && bytes.len() >= 4 {
+        format!(
+            "{}.{}.{}.{}",
+            bytes[0], bytes[1], bytes[2], bytes[3]
+        )
+    } else if ts_type == 8 && bytes.len() >= 16 {
+        let octets = bytes[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(":");
+        format!("[{octets}]")
+    } else {
+        format!("{} bytes", bytes.len())
+    }
 }
 
 fn parse_ipv4_config_value(value: &[u8]) -> Option<Ipv4Addr> {

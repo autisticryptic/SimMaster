@@ -19,7 +19,7 @@
 //! transcode; `codec`/`fmtp` values are what we *advertise*, carried through the
 //! offer/answer verbatim.
 //!
-//! ## Scope (phase F: offline layer + reserved trunk seam)
+//! ## Scope (phase F: media model and Trunk adapter)
 //!
 //! Implemented and unit-tested offline:
 //!   - [`VideoMediaDescription`]: an H.264 `m=video` section model + serializer.
@@ -31,10 +31,9 @@
 //!   - [`VideoRelay`]: a second [`RtpRelayCore`] instance dedicated to the video
 //!     stream (audio and video are separate RTP flows on separate ports).
 //!
-//! Reserved for later (needs the Trunk/Asterisk decision — design phase D):
-//!   - [`TrunkVideoSeam`]: the interface the trunk bridge will call to wire the
-//!     internal-UA video endpoint to the relay. It is defined here so the shape
-//!     is stable, but the concrete trunk implementation is deferred.
+//! [`TrunkVideoSeam`] is the small negotiated-endpoint adapter used by the live
+//! VoLTE/Trunk media path; the concrete SIP dialog and RTP relay lifecycle live
+//! in the voice and Trunk services.
 
 use crate::connectivity::modems::softstack::vowifi::voice::{
     MediaDirection, MediaTransportKind, SdpAddrType, SdpAudioDescription, VoiceEncodingError,
@@ -51,13 +50,17 @@ const MEDIA_VIDEO: &str = "video";
 /// video description and to drive the video RTP relay.
 ///
 /// This mirrors [`SdpAudioDescription`] but for the video stream. The two are
-/// composed by [`build_av_sdp`] into one SDP body; they share the session-level
-/// `o=`/`c=` lines (a call has one connection address) but each has its own
-/// `m=` line and port.
+/// composed by [`build_av_sdp`] into one SDP body. Video normally inherits the
+/// session-level `c=` address, but a media-level override is retained because
+/// SIP peers may place audio and video on different hosts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoMediaDescription {
     /// Media port for the video RTP stream (distinct from the audio port).
     pub media_port: u16,
+    /// Effective video connection address. A media-level `c=` overrides the
+    /// session-level address when the two RTP streams use different hosts.
+    pub connection_addr: Option<String>,
+    pub addr_type: Option<SdpAddrType>,
     pub transport: MediaTransportKind,
     /// Dynamic RTP payload type advertised for H.264.
     pub payload_type: u8,
@@ -82,6 +85,15 @@ impl VideoMediaDescription {
             self.transport.sdp_proto(),
             self.payload_type,
         ));
+        if let (Some(connection_addr), Some(addr_type)) =
+            (self.connection_addr.as_deref(), self.addr_type)
+        {
+            let addr_type = match addr_type {
+                SdpAddrType::Ip4 => "IP4",
+                SdpAddrType::Ip6 => "IP6",
+            };
+            out.push_str(&format!("c=IN {addr_type} {connection_addr}\r\n"));
+        }
         out.push_str(&format!(
             "a=rtpmap:{} {}/{}\r\n",
             self.payload_type, self.encoding, H264_CLOCK_RATE
@@ -100,6 +112,8 @@ impl VideoMediaDescription {
 pub fn build_video_offer(config: &VilteConfig, media_port: u16) -> VideoMediaDescription {
     VideoMediaDescription {
         media_port,
+        connection_addr: None,
+        addr_type: None,
         transport: MediaTransportKind::RtpAvp,
         payload_type: config.video_payload_type,
         encoding: encoding_for_codec(&config.codec),
@@ -152,6 +166,9 @@ pub fn parse_video_sdp(body: &[u8]) -> Result<VideoMediaDescription, VideoSdpErr
     let text = std::str::from_utf8(body).map_err(|_| VideoSdpError::Malformed)?;
 
     let mut media_port = 0u16;
+    let mut origin_connection: Option<(SdpAddrType, String)> = None;
+    let mut session_connection: Option<(SdpAddrType, String)> = None;
+    let mut video_connection: Option<(SdpAddrType, String)> = None;
     let mut transport = MediaTransportKind::RtpAvp;
     let mut payload_order: Vec<u8> = Vec::new();
     let mut direction = MediaDirection::SendRecv;
@@ -159,6 +176,7 @@ pub fn parse_video_sdp(body: &[u8]) -> Result<VideoMediaDescription, VideoSdpErr
     let mut fmtp: Option<(u8, String)> = None;
     let mut in_video = false;
     let mut saw_video = false;
+    let mut saw_any_media = false;
 
     for raw_line in text.split('\n') {
         let line = raw_line.trim_end_matches('\r').trim_end();
@@ -169,8 +187,36 @@ pub fn parse_video_sdp(body: &[u8]) -> Result<VideoMediaDescription, VideoSdpErr
             continue;
         };
         match kind {
+            "o" => {
+                let parts = value.split_whitespace().collect::<Vec<_>>();
+                if parts.len() >= 6 {
+                    let addr_type = if parts[4].eq_ignore_ascii_case("IP6") {
+                        SdpAddrType::Ip6
+                    } else {
+                        SdpAddrType::Ip4
+                    };
+                    origin_connection = Some((addr_type, parts[5].to_string()));
+                }
+            }
+            "c" => {
+                let parts = value.split_whitespace().collect::<Vec<_>>();
+                if parts.len() >= 3 {
+                    let addr_type = if parts[1].eq_ignore_ascii_case("IP6") {
+                        SdpAddrType::Ip6
+                    } else {
+                        SdpAddrType::Ip4
+                    };
+                    let connection = (addr_type, parts[2].to_string());
+                    if !saw_any_media {
+                        session_connection = Some(connection);
+                    } else if in_video {
+                        video_connection = Some(connection);
+                    }
+                }
+            }
             "m" => {
                 let parts = value.split_whitespace().collect::<Vec<_>>();
+                saw_any_media = true;
                 in_video = parts.first().copied() == Some(MEDIA_VIDEO);
                 if in_video {
                     saw_video = true;
@@ -230,9 +276,14 @@ pub fn parse_video_sdp(body: &[u8]) -> Result<VideoMediaDescription, VideoSdpErr
     let fmtp = fmtp
         .filter(|(pt, _)| *pt == payload_type)
         .map(|(_, params)| params);
+    let connection = video_connection
+        .or(session_connection)
+        .or(origin_connection);
 
     Ok(VideoMediaDescription {
         media_port,
+        connection_addr: connection.as_ref().map(|(_, address)| address.clone()),
+        addr_type: connection.map(|(addr_type, _)| addr_type),
         transport,
         payload_type,
         encoding: enc_name,
@@ -416,10 +467,23 @@ mod tests {
         assert_eq!(parsed.payload_type, 99);
         assert_eq!(parsed.encoding, "H264");
         assert_eq!(parsed.direction, MediaDirection::SendRecv);
+        assert_eq!(parsed.connection_addr.as_deref(), Some("192.0.2.1"));
+        assert_eq!(parsed.addr_type, Some(SdpAddrType::Ip4));
         assert_eq!(
             parsed.fmtp.as_deref(),
             Some("profile-level-id=42e01f;packetization-mode=1")
         );
+    }
+
+    #[test]
+    fn media_level_video_connection_overrides_session_address() {
+        let body = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=x\r\nc=IN IP4 192.0.2.1\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\nm=video 50000 RTP/AVP 99\r\nc=IN IP4 198.51.100.20\r\na=rtpmap:99 H264/90000\r\na=sendrecv\r\n";
+        let parsed = parse_video_sdp(body).unwrap();
+        assert_eq!(parsed.connection_addr.as_deref(), Some("198.51.100.20"));
+        assert_eq!(parsed.addr_type, Some(SdpAddrType::Ip4));
+        assert!(parsed
+            .media_lines()
+            .contains("c=IN IP4 198.51.100.20\r\n"));
     }
 
     #[test]

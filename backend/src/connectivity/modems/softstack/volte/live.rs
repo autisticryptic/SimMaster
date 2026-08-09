@@ -7,7 +7,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::{Arc, OnceLock},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,21 +15,24 @@ use chrono::Utc;
 use tokio::{process::Command, sync::Mutex};
 
 use crate::{
-    hardware::cellular::modem_manager::ModemBinding,
     connectivity::core::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
-        register::{run_register, RegisterAuthenticator},
+        register::{run_register, run_register_observed, RegisterAuthenticator, RegisterFailure},
         voice::{parse_audio_sdp, SdpAddrType, SdpAudioDescription},
         ImsError,
     },
-    platform::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteConfig, VolteIpFamilyPreference},
+    connectivity::modems::softstack::vowifi::{
+        carrier_catalog::CatalogAccessKind, profile_store::ProfileStore, profiles::CarrierProfile,
+    },
+    hardware::cellular::modem_manager::ModemBinding,
+    platform::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily},
     platform::db::{Database, SmsMessage},
     services::notify::notification::NotificationSender,
     services::trunk::{
         bridge::{
-            DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
-            RtpTelephoneEvent, VideoOffer,
+            parse_rtp_telephone_event, DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand,
+            OperatorEvent, RtpTelephoneEvent, VideoOffer,
         },
         operator::OperatorLink,
     },
@@ -62,10 +65,9 @@ use super::{
 };
 
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
-const REGISTER_EXPIRES: u32 = 3600;
-const REGISTER_REFRESH_AFTER_SECS: u64 = 3300;
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
+const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 
 fn native_ims_bearer_required(data_slot_mode: DataSlotMode) -> bool {
     !data_slot_mode.ims_on_primary()
@@ -74,8 +76,6 @@ fn native_ims_bearer_required(data_slot_mode: DataSlotMode) -> bool {
 fn active_ims_profile_prefetch_required(data_slot_mode: DataSlotMode) -> bool {
     native_ims_bearer_required(data_slot_mode)
 }
-
-static DEFAULT_LIVE_HANDLE: OnceLock<VolteLiveHandle> = OnceLock::new();
 
 /// Device-specific inputs formerly hard-coded to modem 0, `/dev/wwan0qmi0`
 /// and UIM slot 1. A distinct value is injected for every discovered line.
@@ -100,18 +100,6 @@ impl VolteDeviceBinding {
             uim_slot: binding.uim_slot,
         })
     }
-
-    fn legacy_default() -> Self {
-        Self {
-            line_id: "legacy-primary".to_string(),
-            // ModemManager object indexes are ephemeral across service restarts.
-            // The legacy/global path is single-modem, so use ModemManager's
-            // stable selector exactly as the reference runtime does.
-            modem_id: "any".to_string(),
-            qmi_device: "/dev/wwan0qmi0".to_string(),
-            uim_slot: 1,
-        }
-    }
 }
 
 /// One independently owned protected SIP session/listener pair. The handle is
@@ -120,6 +108,7 @@ impl VolteDeviceBinding {
 #[derive(Clone)]
 pub struct VolteLiveHandle {
     session: Arc<Mutex<Option<VolteLiveSession>>>,
+    failed_bearer: Arc<Mutex<Option<RetainedFailedBearer>>>,
     listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     operator: OperatorLink,
 }
@@ -134,26 +123,14 @@ impl VolteLiveHandle {
     pub fn new() -> Self {
         Self {
             session: Arc::new(Mutex::new(None)),
+            failed_bearer: Arc::new(Mutex::new(None)),
             listener: Arc::new(Mutex::new(None)),
             operator: OperatorLink::default(),
         }
     }
-
-    pub fn legacy_shared() -> Self {
-        default_live_handle().clone()
-    }
-
     pub fn operator_link(&self) -> OperatorLink {
         self.operator.clone()
     }
-}
-
-fn default_live_handle() -> &'static VolteLiveHandle {
-    DEFAULT_LIVE_HANDLE.get_or_init(VolteLiveHandle::new)
-}
-
-pub fn default_live_operator_link() -> OperatorLink {
-    default_live_handle().operator_link()
 }
 
 struct VolteLiveSession {
@@ -178,9 +155,20 @@ struct VolteLiveSession {
     next_register_cseq: u32,
     sip_instance: String,
     security_binding: SecAgree,
+    register_variant: VolteRegisterVariant,
     device: VolteDeviceBinding,
     aka_aid: Vec<u8>,
+    profile: &'static CarrierProfile,
     voice_calls: HashMap<String, LiveVoiceCall>,
+}
+
+struct RetainedFailedBearer {
+    bearer: BearerConnection,
+    native_bearer: Option<NativeImsBearer>,
+    modem_id: String,
+    pcscf_reporting_cid: Option<u8>,
+    ims_profile_lease: Option<ImsProfileLease>,
+    retained_at: tokio::time::Instant,
 }
 
 struct LiveVoiceCall {
@@ -214,6 +202,7 @@ enum LiveVoiceDirection {
 
 struct DeviceIdentity {
     ims: ImsIdentity,
+    profile: &'static CarrierProfile,
     aka_aid: Vec<u8>,
     usim_aid: String,
     isim_aid: Option<String>,
@@ -235,6 +224,276 @@ struct PreparedAuth {
     require_sec_agree: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolteInitialAuthorization {
+    UriFirstEmptyAka,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolteSecurityClientOffer {
+    Full,
+    FullSpaced,
+    Compact,
+}
+
+impl VolteSecurityClientOffer {
+    fn build(self, binding: SecAgree, profile: &CarrierProfile) -> String {
+        let mechanism = profile
+            .ims
+            .register
+            .security_client_mechanisms
+            .first()
+            .copied()
+            .unwrap_or_default();
+        let mut parts = mechanism.split('/');
+        let integrity = parts.next().unwrap_or_default();
+        let encryption = parts.next().unwrap_or_default();
+        let protocol = parts.next().unwrap_or_default();
+        let mode = parts.next().unwrap_or_default();
+        let separator = if self == Self::FullSpaced { "; " } else { ";" };
+        // Field-tested against the Maxis P-CSCF: unquoted `mod=trans` (the
+        // form real Android UEs send) is accepted; the quoted RFC-ABNF form
+        // is rejected with "400 Bad header field: security-client".
+        let mut fields = vec![
+            "ipsec-3gpp".to_string(),
+            format!("alg={integrity}"),
+            format!("ealg={encryption}"),
+        ];
+        if self != Self::Compact {
+            fields.push(format!("prot={protocol}"));
+            fields.push(format!("mod={mode}"));
+        }
+        fields.extend([
+            format!("spi-c={}", binding.spi_c),
+            format!("spi-s={}", binding.spi_s),
+            format!("port-c={}", binding.port_c),
+            format!("port-s={}", binding.port_s),
+        ]);
+        fields.join(separator)
+    }
+}
+
+impl VolteInitialAuthorization {
+    fn label(self) -> &'static str {
+        match self {
+            Self::UriFirstEmptyAka => "aka_empty_uri_first",
+            Self::None => "none",
+        }
+    }
+
+    fn build(
+        self,
+        profile: &CarrierProfile,
+        identity: &ImsIdentity,
+        request_uri: &str,
+    ) -> Option<String> {
+        match self {
+            Self::UriFirstEmptyAka => {
+                Some(digest_aka::build_initial_authorization_header_uri_first(
+                    &identity.private_user,
+                    profile.ims.realm,
+                    request_uri,
+                ))
+            }
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VolteRegisterVariant {
+    label: &'static str,
+    authorization: VolteInitialAuthorization,
+    policy: sip::RegisterRequestPolicy,
+    server_required_sec_agree: bool,
+    security_client_offer: VolteSecurityClientOffer,
+}
+
+impl VolteRegisterVariant {
+    #[cfg(test)]
+    fn requiring_sec_agree(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_sec_agree_required"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_sec_agree_required"
+            }
+        };
+        Self {
+            label,
+            policy: sip::RegisterRequestPolicy {
+                advertise_sec_agree: true,
+                require_sec_agree: true,
+                proxy_require_sec_agree: true,
+                ..self.policy
+            },
+            server_required_sec_agree: true,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn requiring_sec_agree_without_proxy(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_sec_agree_require_only"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_sec_agree_require_only"
+            }
+        };
+        Self {
+            label,
+            policy: sip::RegisterRequestPolicy {
+                require_sec_agree: true,
+                proxy_require_sec_agree: false,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn with_compact_security_client(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_sec_agree_compact_security"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_sec_agree_compact_security"
+            }
+        };
+        Self {
+            label,
+            security_client_offer: VolteSecurityClientOffer::Compact,
+            ..self
+        }
+    }
+
+    #[cfg(test)]
+    fn with_spaced_security_client(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_sec_agree_spaced_security"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_sec_agree_spaced_security"
+            }
+        };
+        Self {
+            label,
+            security_client_offer: VolteSecurityClientOffer::FullSpaced,
+            ..self
+        }
+    }
+}
+
+#[cfg(test)]
+const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
+    // This request shape completed AKA/IPsec registration on the target
+    // Qualcomm/Maxis deployment. Keep it first so exploratory carrier variants
+    // cannot alter P-CSCF transaction state before the proven form.
+    VolteRegisterVariant {
+        label: "reference_sms_sec_agree",
+        authorization: VolteInitialAuthorization::None,
+        policy: sip::RegisterRequestPolicy::LEGACY,
+        server_required_sec_agree: false,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    },
+    VolteRegisterVariant {
+        label: "ims_features_aka_uri_first",
+        authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+        policy: sip::RegisterRequestPolicy {
+            advertise_sec_agree: true,
+            require_sec_agree: false,
+            proxy_require_sec_agree: false,
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+        },
+        server_required_sec_agree: false,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    },
+    VolteRegisterVariant {
+        label: "ims_features_no_initial_authorization",
+        authorization: VolteInitialAuthorization::None,
+        policy: sip::RegisterRequestPolicy {
+            advertise_sec_agree: true,
+            require_sec_agree: false,
+            proxy_require_sec_agree: false,
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+        },
+        server_required_sec_agree: false,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    },
+];
+
+fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
+    let authorization = match profile.ims.register.initial_authorization {
+        "aka_empty" | "digest_empty" | "implementation_variant" => {
+            VolteInitialAuthorization::UriFirstEmptyAka
+        }
+        _ => VolteInitialAuthorization::None,
+    };
+    let disabled = profile.ims.register.sec_agree_mode == "disabled";
+    let required = !disabled
+        && (profile.ims.register.sec_agree_mode == "required"
+            || profile.ims.register.require_sec_agree_headers);
+    let advertise = !disabled
+        && profile
+            .ims
+            .register
+            .supported_header
+            .split(',')
+            .any(|token| token.trim().eq_ignore_ascii_case("sec-agree"));
+    vec![VolteRegisterVariant {
+        label: profile.ims.register.live_header_variant_set,
+        authorization,
+        policy: sip::RegisterRequestPolicy {
+            advertise_sec_agree: advertise,
+            require_sec_agree: required,
+            proxy_require_sec_agree: profile.ims.register.proxy_require_sec_agree_headers,
+            include_mmtel_features: profile.ims.register.include_mmtel_features,
+            include_route_header: profile.ims.register.include_route_header,
+            include_visited_network: profile.ims.register.include_visited_network,
+        },
+        server_required_sec_agree: required,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    }]
+}
+
+fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
+    let mut parameters = HashMap::new();
+    for part in value.split(';').skip(1) {
+        if let Some((name, raw)) = part.split_once('=') {
+            parameters.insert(
+                name.trim().to_ascii_lowercase(),
+                raw.trim().trim_matches('"').to_ascii_lowercase(),
+            );
+        }
+    }
+    profile
+        .ims
+        .register
+        .security_client_mechanisms
+        .iter()
+        .any(|mechanism| {
+            let mut expected = mechanism.split('/');
+            ["alg", "ealg", "prot", "mod"]
+                .into_iter()
+                .zip(&mut expected)
+                .all(|(name, expected)| {
+                    parameters
+                        .get(name)
+                        .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                })
+        })
+}
+
 struct VolteRegisterAuthenticator {
     identity: ImsIdentity,
     ids: RequestIds,
@@ -249,6 +508,8 @@ struct VolteRegisterAuthenticator {
     runtime: VolteRuntime,
     reuse_security: bool,
     aka_aid: Vec<u8>,
+    register_policy: sip::RegisterRequestPolicy,
+    profile: &'static CarrierProfile,
 }
 
 impl VolteRegisterAuthenticator {
@@ -257,13 +518,15 @@ impl VolteRegisterAuthenticator {
         ids: RequestIds,
         sip_instance: String,
         offered_security_binding: SecAgree,
+        offered_security: String,
         route: ImsRoute,
         device: VolteDeviceBinding,
         runtime: VolteRuntime,
         reuse_security: bool,
         aka_aid: Vec<u8>,
+        register_policy: sip::RegisterRequestPolicy,
+        profile: &'static CarrierProfile,
     ) -> Self {
-        let offered_security = offered_security_binding.security_client_value();
         Self {
             identity,
             ids,
@@ -278,6 +541,8 @@ impl VolteRegisterAuthenticator {
             runtime,
             reuse_security,
             aka_aid,
+            register_policy,
+            profile,
         }
     }
 }
@@ -315,8 +580,16 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
         .map_err(to_ims_error)?;
 
-        let request_uri = format!("sip:{}", self.identity.home_domain);
         if let Some(auts) = aka.auts.as_deref() {
+            self.route = channel.route();
+            let request_uri = sip::register_request_uri(self.profile, &self.route);
+            let security_enabled = self.profile.ims.register.sec_agree_mode != "disabled"
+                && !self
+                    .profile
+                    .ims
+                    .register
+                    .security_client_mechanisms
+                    .is_empty();
             self.pending = Some(PreparedAuth {
                 authorization: digest_aka::build_resync_authorization_header(
                     &challenge,
@@ -324,72 +597,47 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                     &request_uri,
                     auts,
                 ),
-                security_client: Some(self.offered_security.clone()),
+                security_client: security_enabled.then(|| self.offered_security.clone()),
                 security_verify: None,
-                require_sec_agree: true,
+                require_sec_agree: security_enabled
+                    && self.profile.ims.register.require_sec_agree_headers,
             });
-            self.route = channel.route();
             return Ok(());
         }
 
-        let cnonce = sip::hex_token(8);
-        let nc = "00000001";
-        let proof = digest_aka::compute_aka_response(
-            &self.identity.private_user,
-            &challenge.realm,
-            &aka,
-            &challenge.algorithm,
-            "REGISTER",
-            &request_uri,
-            &challenge.nonce,
-            challenge.qop.as_deref(),
-            &cnonce,
-            nc,
-        )
-        .map_err(to_ims_error)?;
-        let authorization = digest_aka::build_authorization_header(
-            &challenge,
-            &self.identity.private_user,
-            &request_uri,
-            &proof,
-            &cnonce,
-            nc,
-        );
-
-        let security_server = sip::header_values(challenge_response, "Security-Server")
-            .into_iter()
-            .find_map(|value| {
-                ipsec::parse_security_server(&value)
-                    .ok()
-                    .map(|sec| (sec, value))
-            });
-        if self.reuse_security {
+        let security_server_values = sip::header_values(challenge_response, "Security-Server");
+        let security_server = security_server_values.iter().find_map(|value| {
+            if self.profile.ims.register.strict_security_server_offer
+                && !security_server_matches_profile(self.profile, value)
+            {
+                return None;
+            }
+            ipsec::parse_security_server(&value)
+                .ok()
+                .map(|sec| (sec, value.clone()))
+        });
+        let (security_client, security_verify, require_sec_agree) = if self.reuse_security {
             let security_verify = channel.security_verify().map(str::to_string);
             self.mode = if security_verify.is_some() {
                 RegistrationMode::Ipsec
             } else {
                 RegistrationMode::Udp
             };
-            self.pending = Some(PreparedAuth {
-                authorization,
-                security_client: None,
-                security_verify: security_verify.clone(),
-                require_sec_agree: security_verify.is_some(),
-            });
-            self.route = channel.route();
-            return Ok(());
-        }
-        if let Some((selected, verify)) = security_server {
+            (None, security_verify.clone(), security_verify.is_some())
+        } else if let Some((selected, verify)) = security_server {
             self.runtime
                 .update(|state| state.stage = VolteStage::Ipsec)
                 .await;
             let route = channel.route();
-            let plan = ipsec::build_install_plan(
+            let algs = ipsec::xfrm_algs_from_security_server(&verify).map_err(to_ims_error)?;
+            let plan = ipsec::build_install_plan_with_algs(
                 route.local_addr.ip(),
                 route.pcscf_addr.ip(),
                 &self.offered_security_binding,
                 &selected,
                 &aka.ik,
+                &aka.ck,
+                algs,
             )
             .map_err(to_ims_error)?;
             ipsec::install_plan(&plan).map_err(to_ims_error)?;
@@ -415,22 +663,47 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             }
             self.xfrm_plan = Some(plan);
             self.mode = RegistrationMode::Ipsec;
-            self.pending = Some(PreparedAuth {
-                authorization,
-                security_client: Some(self.offered_security.clone()),
-                security_verify: Some(verify),
-                require_sec_agree: true,
-            });
+            (Some(self.offered_security.clone()), Some(verify), true)
+        } else if self.profile.ims.register.sec_agree_mode == "required"
+            || (self.profile.ims.register.strict_security_server_offer
+                && !security_server_values.is_empty())
+        {
+            return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         } else {
             self.mode = RegistrationMode::Udp;
-            self.pending = Some(PreparedAuth {
-                authorization,
-                security_client: None,
-                security_verify: None,
-                require_sec_agree: false,
-            });
-        }
+            (None, None, false)
+        };
         self.route = channel.route();
+        let request_uri = sip::register_request_uri(self.profile, &self.route);
+        let cnonce = sip::hex_token(8);
+        let nc = "00000001";
+        let proof = digest_aka::compute_aka_response(
+            &self.identity.private_user,
+            &challenge.realm,
+            &aka,
+            &challenge.algorithm,
+            "REGISTER",
+            &request_uri,
+            &challenge.nonce,
+            challenge.qop.as_deref(),
+            &cnonce,
+            nc,
+        )
+        .map_err(to_ims_error)?;
+        let authorization = digest_aka::build_authorization_header(
+            &challenge,
+            &self.identity.private_user,
+            &request_uri,
+            &proof,
+            &cnonce,
+            nc,
+        );
+        self.pending = Some(PreparedAuth {
+            authorization,
+            security_client,
+            security_verify,
+            require_sec_agree,
+        });
         Ok(())
     }
 
@@ -448,65 +721,46 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
-        Ok(sip::build_register_with_security_policy(
+        Ok(sip::build_register_from_profile(
+            self.profile,
+            sip::RegisterPhase::Authenticated,
             &self.identity,
             &self.route,
             &ids,
-            REGISTER_EXPIRES,
+            self.profile.ims.register.expires_seconds,
             Some(&prepared.authorization),
             prepared.security_client.as_deref(),
             prepared.security_verify.as_deref(),
             &self.sip_instance,
-            prepared.require_sec_agree,
+            sip::RegisterRequestPolicy {
+                require_sec_agree: prepared.require_sec_agree,
+                ..self.register_policy
+            },
         ))
     }
-}
-
-/// Establish the dedicated IMS bearer and REGISTER session. This is serialized
-/// by the runtime guard and is safe to call repeatedly.
-pub async fn connect_live(
-    runtime: &Arc<VolteRuntime>,
-    config: &VolteConfig,
-    dedupe_enabled: bool,
-    database: Arc<Database>,
-    notification_sender: Arc<NotificationSender>,
-) -> Result<VolteRuntimeStatus, VolteError> {
-    connect_live_for_line(
-        default_live_handle(),
-        &VolteDeviceBinding::legacy_default(),
-        runtime,
-        config,
-        None,
-        false,
-        DataSlotMode::PrimaryImsOnly,
-        dedupe_enabled,
-        database,
-        notification_sender,
-    )
-    .await
 }
 
 pub async fn connect_live_for_line(
     live: &VolteLiveHandle,
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
-    config: &VolteConfig,
-    line_ip_families: Option<&[crate::platform::config::VolteIpFamily]>,
+    voice_enabled: bool,
+    line_ip_families: &[VolteIpFamily],
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
+    profile_store: ProfileStore,
+    pinned_profile_id: Option<String>,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
-    // Per-line connection intent is authoritative: the caller has already
-    // verified `profile.enabled && profile.volte_connection_enabled` for this
-    // physical line. The legacy global `VolteConfig::connection_enabled`
-    // (and `feature_enabled`/`sms_enabled`) are no longer consulted here; they
-    // are retained only for backward-compatible config/API serialization.
+    // Connection, media and address-family intent are all supplied for this
+    // physical line.
     let _advance = runtime.advance_guard().await;
     if live.session.lock().await.is_some() {
         return Ok(runtime.status().await);
     }
+    cleanup_retained_failed_bearer(live).await;
     let generation = runtime.generation();
     runtime
         .update(|state| {
@@ -524,21 +778,18 @@ pub async fn connect_live_for_line(
         })
         .await;
 
-    // A per-line ordered family list wins; an empty or absent list falls back to
-    // the legacy global single-select preference so existing installs are
-    // unchanged.
-    let plan = match line_ip_families {
-        Some(families) if !families.is_empty() => ImsConnectionPlan::from_families(families),
-        _ => ImsConnectionPlan::from_preference(config.ip_family_preference),
-    };
+    let plan = ImsConnectionPlan::from_families(line_ip_families);
 
     match connect_inner(
+        live,
         runtime,
         generation,
         device,
         plan,
         allow_roaming,
         data_slot_mode,
+        &profile_store,
+        pinned_profile_id.as_deref(),
     )
     .await
     {
@@ -551,7 +802,7 @@ pub async fn connect_live_for_line(
             let pcscf = session.pcscf.to_string();
             let data_path_mode = session.data_slot_mode.as_str().to_string();
             *live.session.lock().await = Some(session);
-            live.operator.set_ready(config.voice_enabled);
+            live.operator.set_ready(voice_enabled);
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Registered;
@@ -592,17 +843,20 @@ pub async fn connect_live_for_line(
 }
 
 async fn connect_inner(
+    live: &VolteLiveHandle,
     runtime: &VolteRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
     plan: ImsConnectionPlan,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
+    profile_store: &ProfileStore,
+    pinned_profile_id: Option<&str>,
 ) -> Result<VolteLiveSession, VolteError> {
-    // The canonical connection plan is built by the caller (per-line ordered
-    // families when set, else the global preference). All four family-selection
-    // consumers (AT probe order, bearer fallback, IPv6 preflight hint, SIP
-    // local-address order) derive from this one object.
+    // The canonical connection plan is built by the caller from this line's
+    // explicit ordered families. All family-selection consumers (AT probe
+    // order, bearer fallback, IPv6 preflight hint, SIP local-address order)
+    // derive from this one object.
     let mut device = resolve_device_binding(device).await?;
 
     // beta2 readiness gate: wait for the QMI auto-activate marker to settle before
@@ -620,7 +874,14 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity = load_device_identity(&device).await?;
+    let device_identity = load_device_identity(&device, profile_store, pinned_profile_id).await?;
+    let ims_apn = device_identity
+        .profile
+        .epdg
+        .apn
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| VolteError::new(code::CARRIER_IMS_APN_MISSING))?;
     runtime
         .update(|state| {
             state.identity_source = Some(device_identity.source.to_string());
@@ -648,7 +909,7 @@ async fn connect_inner(
     let mut ims_profile_lease = None;
     let native_required = native_ims_bearer_required(data_slot_mode);
     let ims_profile = if active_ims_profile_prefetch_required(data_slot_mode) {
-        match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan).await {
+        match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan, ims_apn).await {
             Ok(prefetch) => {
                 let cid = prefetch.lease.cid;
                 prefetched_pcscf = prefetch.candidates;
@@ -669,7 +930,7 @@ async fn connect_inner(
                     error = %prefetch_error,
                     "Native VoLTE profile P-CSCF prefetch failed; falling back to bearer discovery"
                 );
-                match prepare_ims_profile_context(&device.modem_id, &plan).await {
+                match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
                     Ok(profile) => {
                         tracing::info!(
                             cid = profile.cid,
@@ -692,7 +953,7 @@ async fn connect_inner(
             }
         }
     } else {
-        match prepare_ims_profile_context(&device.modem_id, &plan).await {
+        match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
             Ok(profile) => {
                 tracing::info!(
                     cid = profile.cid,
@@ -713,7 +974,7 @@ async fn connect_inner(
             }
         }
     };
-    let mut request = BearerRequest::ims(allow_roaming);
+    let mut request = BearerRequest::for_apn(ims_apn, allow_roaming);
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
     // The beta2 prefetch lease already armed reporting and activated its
@@ -842,7 +1103,7 @@ async fn connect_inner(
                 Some("at_cgcontrdp_fallback".to_string()),
             )
             .await;
-        match discover_pcscf_via_active_at_context(&device.modem_id, &plan).await {
+        match discover_pcscf_via_active_at_context(&device.modem_id, &plan, ims_apn).await {
             Ok(discovery) => {
                 runtime
                     .record_attempt(
@@ -980,7 +1241,24 @@ async fn connect_inner(
         Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
     }
     .await;
-    if result.is_err() {
+    if let Err(error) = &result {
+        if should_retain_failed_bearer(error) {
+            tracing::warn!(
+                error = %error,
+                bearer_path = %bearer.path,
+                retention_secs = FAILED_BEARER_MIN_RETENTION.as_secs(),
+                "Retaining failed IMS bearer to avoid an immediate firmware disconnect race"
+            );
+            *live.failed_bearer.lock().await = Some(RetainedFailedBearer {
+                bearer: bearer.clone(),
+                native_bearer: native_bearer.take(),
+                modem_id: device.modem_id.clone(),
+                pcscf_reporting_cid,
+                ims_profile_lease: ims_profile_lease.take(),
+                retained_at: tokio::time::Instant::now(),
+            });
+            return Err(error.clone());
+        }
         teardown_bearer_network(&bearer).await;
         // `disconnect_bearer` is a no-op for a native path; the WDS session behind
         // it is owned by the handle below and released explicitly.
@@ -1062,6 +1340,7 @@ async fn connect_family(
     let pcscf = discover_pcscf(
         &bearer.settings,
         &device_identity.ims.home_domain,
+        device_identity.profile.ims.pcscf,
         local_addr,
     )
     .await?;
@@ -1078,98 +1357,209 @@ async fn connect_family(
         pcscf_addr: pcscf_socket(pcscf),
         transport: SipTransport::Udp,
     };
-    let mut channel =
-        VolteSipChannel::bind(route, Some(&bearer.interface), None).map_err(map_channel_error)?;
-    let receive_port = channel
-        .reserve_security_receive_port()
-        .map_err(map_channel_error)?;
-    let ids = RequestIds::fresh(1);
     let sip_instance = new_sip_instance();
-    let offered_binding = offered_security(channel.route().local_addr.port(), receive_port);
-    let offered = offered_binding.security_client_value();
-    let initial_authorization = digest_aka::build_initial_authorization_header(
-        &device_identity.ims.private_user,
-        &device_identity.ims.home_domain,
-        &format!("sip:{}", device_identity.ims.home_domain),
-    );
-    let initial = sip::build_register_with_security_policy(
-        &device_identity.ims,
-        &channel.route(),
-        &ids,
-        REGISTER_EXPIRES,
-        Some(&initial_authorization),
-        Some(&offered),
-        None,
-        &sip_instance,
-        true,
-    );
-    let mut authenticator = VolteRegisterAuthenticator::new(
-        device_identity.ims.clone(),
-        ids,
-        sip_instance,
-        offered_binding,
-        channel.route(),
-        device.clone(),
-        runtime.clone(),
-        false,
-        device_identity.aka_aid.clone(),
-    );
-    let registration = match run_register(&mut channel, &initial, &mut authenticator).await {
-        Ok(registration) => registration,
-        Err(error) => {
-            if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-                ipsec::uninstall_plan(plan);
-            }
-            return Err(map_register_error(error));
-        }
-    };
-    let service_route = register_service_route(&registration.response);
-    let associated_uri = register_associated_uri(&registration.response);
-    let mut registered_identity = device_identity.ims.clone();
-    if let Some(uri) = associated_uri.as_deref() {
-        // The network-provided default public user identity is authoritative
-        // after REGISTER.  In particular, operators commonly authenticate
-        // with the IMSI-derived IMPU but require subsequent MESSAGE requests
-        // to use the MSISDN-associated IMPU in From/P-Preferred-Identity.
-        registered_identity.public_uri = uri.to_string();
-    }
-    tracing::info!(
-        service_route_present = service_route.is_some(),
-        associated_uri_present = associated_uri.is_some(),
-        "VoLTE IMS registration routing identities captured"
-    );
-    if authenticator.mode == RegistrationMode::Udp {
+    let profile = device_identity.profile;
+    let mut register_variants = register_variants(profile).into_iter().peekable();
+    #[cfg(test)]
+    let mut last_error = None;
+    #[cfg(not(test))]
+    let last_error: Option<VolteError> = None;
+    let mut pending_variant = None;
+    while pending_variant.is_some() || register_variants.peek().is_some() {
+        let variant = match pending_variant.take() {
+            Some(variant) => variant,
+            None => register_variants
+                .next()
+                .expect("REGISTER variant iterator was checked before use"),
+        };
+        let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
+            .map_err(map_channel_error)?;
+        let receive_port = channel
+            .reserve_security_receive_port()
+            .map_err(map_channel_error)?;
+        let ids = RequestIds::fresh(1);
+        let offered_binding = offered_security(channel.route().local_addr.port(), receive_port);
+        // TS 24.229 / RFC 3329: the initial REGISTER already advertises the
+        // full ipsec-3gpp offer (alg/ealg/prot/mod + client SPI/ports). The
+        // 401 then supplies the server binding; the authenticated REGISTER
+        // repeats the identical Security-Client and mirrors Security-Server in
+        // Security-Verify. A bare "Security-Client: ipsec-3gpp" is rejected by
+        // strict P-CSCFs ("400 Bad header field: security-client").
+        let negotiated_security = variant
+            .security_client_offer
+            .build(offered_binding, profile);
+        let request_uri = sip::register_request_uri(profile, &channel.route());
+        let initial_authorization =
+            variant
+                .authorization
+                .build(profile, &device_identity.ims, &request_uri);
+        let initial_security_client = (profile.ims.register.sec_agree_mode != "disabled"
+            && !profile.ims.register.security_client_mechanisms.is_empty())
+            .then_some(negotiated_security.as_str());
+        let initial = sip::build_register_from_profile(
+            profile,
+            sip::RegisterPhase::Initial,
+            &device_identity.ims,
+            &channel.route(),
+            &ids,
+            profile.ims.register.expires_seconds,
+            initial_authorization.as_deref(),
+            initial_security_client,
+            None,
+            &sip_instance,
+            variant.policy,
+        );
+        log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
-            .update(|state| state.stage = VolteStage::RegisterUdp)
+            .record_attempt(
+                VolteStage::RegisterInitial,
+                Some(ip_family_name(local_addr)),
+                "started",
+                None,
+                Some(format!("register_variant={}", variant.label)),
+            )
             .await;
-    }
-    Ok(VolteLiveSession {
-        channel,
-        identity: registered_identity,
-        service_route,
-        bearer: bearer.clone(),
-        pcscf: pcscf_socket(pcscf),
-        ip_family: ip_family_name(local_addr),
-        xfrm_plan: authenticator.xfrm_plan,
-        // Attached by `connect_inner`, which owns it until the session is known
-        // to be good.
-        native_bearer: None,
-        data_slot_mode: DataSlotMode::PrimaryImsOnly,
-        pcscf_reporting_cid: None,
-        ims_profile_lease: None,
-        register_ids: authenticator.ids,
-        next_register_cseq: 2 + u32::from(registration.auth_rounds),
-        sip_instance: authenticator.sip_instance,
-        security_binding: authenticator.offered_security_binding,
-        device: device.clone(),
-        aka_aid: device_identity.aka_aid.clone(),
-        voice_calls: HashMap::new(),
-    })
-}
+        let mut authenticator = VolteRegisterAuthenticator::new(
+            device_identity.ims.clone(),
+            ids,
+            sip_instance.clone(),
+            offered_binding,
+            negotiated_security,
+            channel.route(),
+            device.clone(),
+            runtime.clone(),
+            false,
+            device_identity.aka_aid.clone(),
+            variant.policy,
+            profile,
+        );
+        let registration =
+            match run_register_observed(&mut channel, &initial, &mut authenticator).await {
+                Ok(registration) => registration,
+                Err(failure) => {
+                    log_volte_register_failure_metadata(variant, &failure);
+                    if let Some(plan) = authenticator.xfrm_plan.as_ref() {
+                        ipsec::uninstall_plan(plan);
+                    }
+                    let error = map_register_failure(&failure);
+                    runtime
+                        .record_attempt(
+                            VolteStage::RegisterInitial,
+                            Some(ip_family_name(local_addr)),
+                            "failed",
+                            Some(&error),
+                            Some(format!("register_variant={}", variant.label)),
+                        )
+                        .await;
+                    #[cfg(not(test))]
+                    return Err(error);
 
-/// Tear down only resources owned by the current VoLTE session.
-pub async fn disconnect_live(runtime: &Arc<VolteRuntime>, reason: &str) -> VolteRuntimeStatus {
-    disconnect_live_for_line(default_live_handle(), runtime, reason).await
+                    #[cfg(test)]
+                    {
+                        let next_variant_available = register_variants.peek().is_some();
+                        if let Some(upgraded_variant) = sec_agree_retry_variant(variant, &failure) {
+                            last_error = Some(error);
+                            pending_variant = Some(upgraded_variant);
+                            continue;
+                        }
+                        if let Some(spaced_security_variant) =
+                            sec_agree_spaced_security_retry_variant(variant, &failure)
+                        {
+                            last_error = Some(error);
+                            pending_variant = Some(spaced_security_variant);
+                            continue;
+                        }
+                        if let Some(compact_security_variant) =
+                            sec_agree_compact_security_retry_variant(variant, &failure)
+                        {
+                            last_error = Some(error);
+                            pending_variant = Some(compact_security_variant);
+                            continue;
+                        }
+                        if let Some(require_only_variant) =
+                            sec_agree_require_only_retry_variant(variant, &failure)
+                        {
+                            last_error = Some(error);
+                            pending_variant = Some(require_only_variant);
+                            continue;
+                        }
+                        if next_variant_available
+                            && sec_agree_require_only_was_rejected(variant, &failure)
+                        {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        if next_variant_available
+                            && failure.auth_rounds == 0
+                            && register_failure_status(&failure) == Some(400)
+                        {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+        runtime
+            .record_attempt(
+                VolteStage::Registered,
+                Some(ip_family_name(local_addr)),
+                "succeeded",
+                None,
+                Some(format!("register_variant={}", variant.label)),
+            )
+            .await;
+        let service_route = register_service_route(&registration.response);
+        let associated_uri = register_associated_uri(&registration.response);
+        let mut registered_identity = device_identity.ims.clone();
+        if let Some(uri) = associated_uri.as_deref() {
+            // The network-provided default public user identity is authoritative
+            // after REGISTER. In particular, operators commonly authenticate
+            // with the IMSI-derived IMPU but require later requests to use the
+            // MSISDN-associated IMPU.
+            registered_identity.public_uri = uri.to_string();
+        }
+        tracing::info!(
+            register_variant = variant.label,
+            service_route_present = service_route.is_some(),
+            associated_uri_present = associated_uri.is_some(),
+            "VoLTE IMS registration routing identities captured"
+        );
+        if authenticator.mode == RegistrationMode::Udp {
+            runtime
+                .update(|state| state.stage = VolteStage::RegisterUdp)
+                .await;
+        }
+        return Ok(VolteLiveSession {
+            channel,
+            identity: registered_identity,
+            service_route,
+            bearer: bearer.clone(),
+            pcscf: pcscf_socket(pcscf),
+            ip_family: ip_family_name(local_addr),
+            xfrm_plan: authenticator.xfrm_plan,
+            // Attached by `connect_inner`, which owns it until the session is known
+            // to be good.
+            native_bearer: None,
+            data_slot_mode: DataSlotMode::PrimaryImsOnly,
+            pcscf_reporting_cid: None,
+            ims_profile_lease: None,
+            register_ids: authenticator.ids.clone(),
+            next_register_cseq: authenticator
+                .ids
+                .cseq
+                .saturating_add(u32::from(registration.auth_rounds))
+                .saturating_add(1),
+            sip_instance: authenticator.sip_instance,
+            security_binding: authenticator.offered_security_binding,
+            register_variant: variant,
+            device: device.clone(),
+            aka_aid: device_identity.aka_aid.clone(),
+            profile,
+            voice_calls: HashMap::new(),
+        });
+    }
+    Err(last_error.unwrap_or_else(|| VolteError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)))
 }
 
 pub async fn disconnect_live_for_line(
@@ -1224,8 +1614,14 @@ async fn live_receive_loop(
 ) {
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
-    let mut refresh_at =
-        tokio::time::Instant::now() + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+    let refresh_after = {
+        let sessions = live.session.lock().await;
+        sessions
+            .as_ref()
+            .map(|session| register_refresh_after(session.profile))
+            .unwrap_or(Duration::from_secs(60))
+    };
+    let mut refresh_at = tokio::time::Instant::now() + refresh_after;
     // The native IMS bearer retains its WDS CID on the secondary QMI endpoint.
     // REGISTER refresh remains the end-to-end bearer health signal because it
     // covers the IMS IP path and SIP service, not only WDS packet status.
@@ -1243,8 +1639,7 @@ async fn live_receive_loop(
             };
             match refresh_result {
                 Ok(()) => {
-                    refresh_at = tokio::time::Instant::now()
-                        + Duration::from_secs(REGISTER_REFRESH_AFTER_SECS);
+                    refresh_at = tokio::time::Instant::now() + refresh_after;
                     continue;
                 }
                 Err(error) => {
@@ -1346,32 +1741,44 @@ async fn refresh_live_registration(
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
     let require_sec_agree = security_verify.is_some();
-    let initial_authorization = digest_aka::build_initial_authorization_header(
-        &session.identity.private_user,
-        &session.identity.home_domain,
-        &format!("sip:{}", session.identity.home_domain),
+    let initial_authorization = session.register_variant.authorization.build(
+        session.profile,
+        &session.identity,
+        &sip::register_request_uri(session.profile, &session.channel.route()),
     );
-    let initial = sip::build_register_with_security_policy(
+    let register_policy = sip::RegisterRequestPolicy {
+        require_sec_agree,
+        ..session.register_variant.policy
+    };
+    let initial = sip::build_register_from_profile(
+        session.profile,
+        sip::RegisterPhase::Refresh,
         &session.identity,
         &session.channel.route(),
         &ids,
-        REGISTER_EXPIRES,
-        Some(&initial_authorization),
+        session.profile.ims.register.expires_seconds,
+        initial_authorization.as_deref(),
         None,
         security_verify.as_deref(),
         &session.sip_instance,
-        require_sec_agree,
+        register_policy,
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
         ids.clone(),
         session.sip_instance.clone(),
         session.security_binding.clone(),
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile),
         session.channel.route(),
         session.device.clone(),
         runtime.clone(),
         true,
         session.aka_aid.clone(),
+        register_policy,
+        session.profile,
     );
     let registration = match run_register(&mut session.channel, &initial, &mut authenticator).await
     {
@@ -1442,6 +1849,24 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
         disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
         cleanup_ims_profile_lease(session.ims_profile_lease).await;
     }
+    cleanup_retained_failed_bearer(live).await;
+}
+
+async fn cleanup_retained_failed_bearer(live: &VolteLiveHandle) {
+    let Some(retained) = live.failed_bearer.lock().await.take() else {
+        return;
+    };
+    let elapsed = retained.retained_at.elapsed();
+    if elapsed < FAILED_BEARER_MIN_RETENTION {
+        tokio::time::sleep(FAILED_BEARER_MIN_RETENTION - elapsed).await;
+    }
+    teardown_bearer_network(&retained.bearer).await;
+    match retained.native_bearer {
+        Some(native) => native_bearer::release_native_ims_bearer(native).await,
+        None => disconnect_bearer(&retained.bearer.path).await,
+    }
+    disable_pcscf_reporting(&retained.modem_id, retained.pcscf_reporting_cid).await;
+    cleanup_ims_profile_lease(retained.ims_profile_lease).await;
 }
 
 async fn cleanup_ims_profile_lease(lease: Option<ImsProfileLease>) {
@@ -1984,6 +2409,12 @@ fn relay_media_sdp(
     if let (Some(video), Some(local)) = (offer.video.as_ref(), video_local) {
         let mut description = video.description.clone();
         description.media_port = local.port();
+        description.connection_addr = Some(local.ip().to_string());
+        description.addr_type = Some(if local.is_ipv4() {
+            SdpAddrType::Ip4
+        } else {
+            SdpAddrType::Ip6
+        });
         output.push_str(&description.media_lines());
     }
     output
@@ -2076,7 +2507,7 @@ async fn handle_operator_sip_frame(
         } else {
             (None, None, None)
         };
-        let operator_dtmf = parse_telephone_event(sip::sip_body(frame));
+        let operator_dtmf = parse_rtp_telephone_event(sip::sip_body(frame));
         let offer = MediaOffer {
             audio: operator_audio,
             audio_endpoint: operator_remote,
@@ -2193,6 +2624,22 @@ async fn handle_operator_sip_frame(
         live.operator.send_event(OperatorEvent::Ended {
             call_id: trunk_call_id,
         });
+        runtime.update(|state| state.last_tx_at = Some(now())).await;
+        return Ok(true);
+    }
+    if sip::is_request(frame, "INFO") {
+        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        session
+            .channel
+            .send_sip(&response)
+            .await
+            .map_err(map_channel_error)?;
+        if let Some(signal) = crate::services::trunk::bridge::parse_operator_dtmf_info(frame) {
+            live.operator.send_event(OperatorEvent::Dtmf {
+                call_id: trunk_call_id,
+                signal,
+            });
+        }
         runtime.update(|state| state.last_tx_at = Some(now())).await;
         return Ok(true);
     }
@@ -2466,7 +2913,7 @@ async fn begin_incoming_operator_call(
     } else {
         (None, None, None)
     };
-    let operator_dtmf = parse_telephone_event(sip::sip_body(frame));
+    let operator_dtmf = parse_rtp_telephone_event(sip::sip_body(frame));
     let media_offer = MediaOffer {
         audio: operator_audio.clone(),
         audio_endpoint: operator_remote,
@@ -2600,7 +3047,7 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
     if internal_answer.codecs.is_empty() {
         return Err(VolteError::new("volte_voice_no_common_codec"));
     }
-    let operator_dtmf = parse_telephone_event(body);
+    let operator_dtmf = parse_rtp_telephone_event(body);
     let internal_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
     let mut mappings = operator_audio
         .codecs
@@ -2668,9 +3115,16 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         }
         let mut trunk_video = operator_video;
         trunk_video.media_port = internal_local.port();
+        trunk_video.connection_addr = Some(internal_local.ip().to_string());
+        trunk_video.addr_type = Some(if internal_local.is_ipv4() {
+            SdpAddrType::Ip4
+        } else {
+            SdpAddrType::Ip6
+        });
         answer.push_str(&trunk_video.media_lines());
     } else {
         call.pending_video_relay = None;
+        call.active_video_relay = None;
     }
     Ok(answer)
 }
@@ -2724,7 +3178,7 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         return Err(VolteError::new("volte_voice_no_common_codec"));
     }
     let operator_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
-    let internal_dtmf = parse_telephone_event(body);
+    let internal_dtmf = parse_rtp_telephone_event(body);
     let mut mappings = operator_answer
         .codecs
         .iter()
@@ -2788,9 +3242,16 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         }
         let mut ims_video = operator_video.description.clone();
         ims_video.media_port = operator_local.port();
+        ims_video.connection_addr = Some(operator_local.ip().to_string());
+        ims_video.addr_type = Some(if operator_local.is_ipv4() {
+            SdpAddrType::Ip4
+        } else {
+            SdpAddrType::Ip6
+        });
         answer.push_str(&ims_video.media_lines());
     } else {
         call.pending_video_relay = None;
+        call.active_video_relay = None;
     }
     Ok(answer)
 }
@@ -2799,8 +3260,10 @@ fn media_endpoint_for_video(
     audio: &SdpAudioDescription,
     video: &super::vilte::VideoMediaDescription,
 ) -> Result<SocketAddr, VolteError> {
-    let ip = audio
+    let ip = video
         .connection_addr
+        .as_deref()
+        .unwrap_or(&audio.connection_addr)
         .parse::<IpAddr>()
         .map_err(|_| VolteError::new("vilte_video_address_invalid"))?;
     if video.media_port == 0 {
@@ -2856,36 +3319,6 @@ fn response_to_tag(frame: &[u8]) -> Option<String> {
         .find_map(|parameter| parameter.trim().strip_prefix("tag=").map(ToOwned::to_owned))
 }
 
-fn parse_telephone_event(body: &[u8]) -> Option<RtpTelephoneEvent> {
-    let text = std::str::from_utf8(body).ok()?;
-    let mut event = None;
-    let mut fmtps = HashMap::new();
-    for line in text.lines().map(|line| line.trim_end_matches('\r')) {
-        if let Some(value) = line.strip_prefix("a=rtpmap:") {
-            let mut fields = value.split_whitespace();
-            let payload_type = fields.next()?.parse::<u8>().ok()?;
-            let encoding = fields.next()?;
-            let mut encoding_fields = encoding.split('/');
-            if encoding_fields
-                .next()?
-                .eq_ignore_ascii_case("telephone-event")
-            {
-                let clock_rate = encoding_fields.next()?.parse::<u32>().ok()?;
-                event = Some((payload_type, clock_rate));
-            }
-        } else if let Some(value) = line.strip_prefix("a=fmtp:") {
-            let (payload_type, events) = value.split_once(char::is_whitespace)?;
-            fmtps.insert(payload_type.parse::<u8>().ok()?, events.trim().to_string());
-        }
-    }
-    let (payload_type, clock_rate) = event?;
-    Some(RtpTelephoneEvent {
-        payload_type,
-        clock_rate,
-        events: fmtps.remove(&payload_type),
-    })
-}
-
 async fn handle_live_frame(
     context: LiveFrameContext<'_>,
     reassembler: &mut MtReassembler,
@@ -2923,7 +3356,8 @@ async fn handle_live_frame(
 
     let deliver = crate::connectivity::core::sms_codec::parse_mt_rp_data(sip::sip_body(frame))
         .map_err(|_| VolteError::new("volte_mt_rp_data_invalid"))?;
-    let rp_ack_body = crate::connectivity::core::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
+    let rp_ack_body =
+        crate::connectivity::core::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
     let rp_ack = {
         let sessions = live.session.lock().await;
         let session = sessions
@@ -2960,7 +3394,7 @@ async fn handle_live_frame(
                     },
                 );
                 let claimed = database
-                    .claim_sms_dedup(&fingerprint, TRANSPORT_TAG)
+                    .claim_sms_dedup(line_id, &fingerprint, TRANSPORT_TAG)
                     .map_err(|error| {
                         VolteError::with_detail("volte_sms_db_failed", error.to_string())
                     })?;
@@ -2970,7 +3404,7 @@ async fn handle_live_frame(
                 }
             }
             if database
-                .sms_exists_by_pdu(&message.dedup_marker)
+                .sms_exists_by_pdu_for_line(line_id, &message.dedup_marker)
                 .map_err(|error| {
                     VolteError::with_detail("volte_sms_db_failed", error.to_string())
                 })?
@@ -3050,25 +3484,6 @@ async fn send_live_frame(
     Ok(())
 }
 
-/// Send one single- or multipart MO SMS over the registered protected IMS
-/// channel. Holding the session lock across each MESSAGE transaction prevents
-/// the background MT listener from consuming the corresponding SIP response.
-pub async fn send_live_sms(
-    runtime: &Arc<VolteRuntime>,
-    recipient: &str,
-    text: &str,
-    service_center: &str,
-) -> Result<VolteSmsSendResult, VolteError> {
-    send_live_sms_for_line(
-        default_live_handle(),
-        runtime,
-        recipient,
-        text,
-        service_center,
-    )
-    .await
-}
-
 pub async fn send_live_sms_for_line(
     live: &VolteLiveHandle,
     runtime: &Arc<VolteRuntime>,
@@ -3082,10 +3497,12 @@ pub async fn send_live_sms_for_line(
     if service_center.trim().is_empty() {
         return Err(VolteError::new("volte_smsc_missing"));
     }
-    let submissions =
-        crate::connectivity::modems::softstack::volte::sms::build_mo_submissions(recipient, text, service_center).map_err(
-            |error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()),
-        )?;
+    let submissions = crate::connectivity::modems::softstack::volte::sms::build_mo_submissions(
+        recipient,
+        text,
+        service_center,
+    )
+    .map_err(|error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()))?;
     let first = submissions
         .first()
         .ok_or_else(|| VolteError::new("volte_sms_encode_failed"))?;
@@ -3221,19 +3638,21 @@ fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, V
     Err(VolteError::new(code::DIGEST_CHALLENGE_MISSING))
 }
 
-async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdentity, VolteError> {
+async fn load_device_identity(
+    device: &VolteDeviceBinding,
+    profile_store: &ProfileStore,
+    pinned_profile_id: Option<&str>,
+) -> Result<DeviceIdentity, VolteError> {
     let modem = command_output(
         "mmcli",
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
     )
     .await?;
-    let operator = key_value(&modem, "modem.3gpp.operator-code");
     let sim_path = key_value(&modem, "modem.generic.sim")
         .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
     let sim = command_output("mmcli", &["-i", &sim_path, "--output-keyvalue"]).await?;
-    let sim_imsi = key_value(&sim, "sim.properties.imsi").filter(|value| {
-        value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit())
-    });
+    let sim_imsi = key_value(&sim, "sim.properties.imsi")
+        .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     let cimi_argument = "--command=AT+CIMI";
     let (imsi, imsi_source) = match command_output(
         "mmcli",
@@ -3244,7 +3663,9 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
         Ok(output) => match identity::parse_cimi_response(&output) {
             Some(imsi) => (imsi, "at_cimi"),
             None => {
-                tracing::warn!("Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback");
+                tracing::warn!(
+                    "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback"
+                );
                 (
                     sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
                     "sim_imsi_fallback",
@@ -3259,6 +3680,14 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
             )
         }
     };
+    let home_plmn = [
+        key_value(&sim, "sim.properties.operator-id"),
+        key_value(&sim, "sim.properties.operator-identifier"),
+        key_value(&modem, "modem.3gpp.operator-code"),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| valid_home_plmn(&imsi, candidate));
     let applications = match command_output(
         "qmicli",
         &[
@@ -3279,31 +3708,25 @@ async fn load_device_identity(device: &VolteDeviceBinding) -> Result<DeviceIdent
     let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
     let usim_aid = identity::aid_hex(&aka_aid);
     let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
-    let ef_ad_mnc_length = match command_output(
-        "qmicli",
-        &[
-            "-d",
-            device.qmi_device.as_str(),
-            "--device-open-proxy",
-            "--uim-read-transparent=0x3F00,0x7FFF,0x6FAD",
-        ],
-    )
-    .await
-    {
-        Ok(output) => identity::parse_ef_ad_mnc_length(&output),
-        Err(error) => {
-            tracing::warn!(error = %error, "Native VoLTE runtime SIM EF_AD MNC length lookup failed");
-            None
-        }
-    };
-    let home = identity::resolve_home_plmn(&imsi, operator.as_deref(), ef_ad_mnc_length)?;
+    let resolved = profile_store
+        .resolve_for_imsi_access(
+            pinned_profile_id,
+            &imsi,
+            home_plmn.as_deref(),
+            CatalogAccessKind::LteEpc,
+        )
+        .map_err(|detail| VolteError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
+        .ok_or_else(|| VolteError::new(code::CARRIER_PROFILE_MISSING))?;
+    let profile = resolved.profile;
     tracing::info!(
-        mnc_length = home.mnc.len(),
-        mnc_length_source = home.mnc_length_source,
-        "Resolved native VoLTE IMS home PLMN"
+        profile_id = profile.meta.profile_id,
+        profile_origin = resolved.origin.as_str(),
+        ims_domain = profile.ims.domain,
+        "Resolved native VoLTE carrier profile"
     );
     Ok(DeviceIdentity {
-        ims: identity::derive_identity(&imsi, &home.mcc, &home.mnc),
+        ims: identity::derive_identity_with_domain(&imsi, profile.ims.domain),
+        profile,
         aka_aid,
         usim_aid,
         source: match (imsi_source, isim_aid.is_some()) {
@@ -3378,10 +3801,22 @@ fn key_value(output: &str, key: &str) -> Option<String> {
     })
 }
 
+fn valid_home_plmn(imsi: &str, candidate: &str) -> bool {
+    matches!(candidate.len(), 5 | 6)
+        && candidate.bytes().all(|byte| byte.is_ascii_digit())
+        && imsi.starts_with(candidate)
+}
+
 fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
     let spi = || {
         u32::from_str_radix(&sip::hex_token(4), 16)
             .ok()
+            .filter(|value| *value != 0)
+            // Keep the wire value inside RFC 3329 `1*8HEXDIG`. An 8-digit
+            // decimal value parses identically as decimal or hex, so a strict
+            // P-CSCF cannot reject it and a decimal-parsing peer cannot
+            // misread the SPI (which would break the installed xfrm SA).
+            .map(|value| value % 100_000_000)
             .filter(|value| *value != 0)
             .unwrap_or(1)
     };
@@ -3413,6 +3848,11 @@ fn ensure_generation(runtime: &VolteRuntime, expected: u64) -> Result<(), VolteE
     }
 }
 
+fn register_refresh_after(profile: &CarrierProfile) -> Duration {
+    let expires = u64::from(profile.ims.register.expires_seconds.max(1));
+    Duration::from_secs((expires.saturating_mul(11) / 12).max(1))
+}
+
 fn now() -> String {
     Utc::now().to_rfc3339()
 }
@@ -3435,6 +3875,193 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
+fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
+    failure
+        .response
+        .as_deref()
+        .and_then(|response| sip::parse_status(response).ok())
+}
+
+#[cfg(test)]
+fn sec_agree_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    if variant.policy.require_sec_agree
+        || failure.auth_rounds != 0
+        || register_failure_status(failure) != Some(421)
+    {
+        return None;
+    }
+    let response = failure.response.as_deref()?;
+    response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
+}
+
+#[cfg(test)]
+fn sec_agree_require_only_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    (variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && variant.security_client_offer == VolteSecurityClientOffer::Compact
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(400))
+    .then(|| variant.requiring_sec_agree_without_proxy())
+}
+
+#[cfg(test)]
+fn sec_agree_require_only_was_rejected(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> bool {
+    variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && !variant.policy.proxy_require_sec_agree
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(421)
+        && failure
+            .response
+            .as_deref()
+            .is_some_and(|response| response_requires_only_extension(response, "sec-agree"))
+}
+
+#[cfg(test)]
+fn sec_agree_compact_security_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    (variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && variant.security_client_offer == VolteSecurityClientOffer::FullSpaced
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(400))
+    .then(|| variant.with_compact_security_client())
+}
+
+#[cfg(test)]
+fn sec_agree_spaced_security_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    (variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && variant.security_client_offer == VolteSecurityClientOffer::Full
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(400))
+    .then(|| variant.with_spaced_security_client())
+}
+
+fn response_requires_only_extension(response: &[u8], supported_extension: &str) -> bool {
+    let mut found = false;
+    for value in sip::header_values(response, "Require") {
+        for extension in value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            found = true;
+            if !extension.eq_ignore_ascii_case(supported_extension) {
+                return false;
+            }
+        }
+    }
+    found
+}
+
+fn terminal_register_failure_status(failure: &RegisterFailure) -> Option<u16> {
+    matches!(
+        failure.error.code(),
+        "ims_register_initial_unexpected_status"
+            | "ims_register_authenticated_unexpected_status"
+            | "ims_register_auth_rejected"
+    )
+    .then(|| register_failure_status(failure))
+    .flatten()
+}
+
+fn map_register_failure(failure: &RegisterFailure) -> VolteError {
+    let mapped = map_register_error(failure.error);
+    match terminal_register_failure_status(failure) {
+        Some(status) => VolteError::with_detail(
+            mapped.code(),
+            format!("{}:sip_status={status}", failure.error.code()),
+        ),
+        None => mapped,
+    }
+}
+
+fn should_retain_failed_bearer(error: &VolteError) -> bool {
+    matches!(
+        error.code(),
+        code::REGISTER_INITIAL_UNEXPECTED_STATUS | code::REGISTER_AUTH_UNEXPECTED_STATUS
+    ) && error
+        .detail()
+        .is_some_and(|detail| detail.contains("sip_status="))
+}
+
+fn log_volte_register_request_metadata(
+    variant: VolteRegisterVariant,
+    channel: &VolteSipChannel,
+    request: &[u8],
+) {
+    let route = channel.route();
+    tracing::info!(
+        register_variant = variant.label,
+        initial_authorization = variant.authorization.label(),
+        request_uri = "home_registrar",
+        local_family = ip_family_name(route.local_addr.ip()),
+        local_port = route.local_addr.port(),
+        pcscf = %route.pcscf_addr,
+        route_header_present = !sip::header_values(request, "Route").is_empty(),
+        authorization_present = !sip::header_values(request, "Authorization").is_empty(),
+        security_client_present = !sip::header_values(request, "Security-Client").is_empty(),
+        negotiated_security_client_offer = ?variant.security_client_offer,
+        p_preferred_identity_present =
+            !sip::header_values(request, "P-Preferred-Identity").is_empty(),
+        pani_present = !sip::header_values(request, "P-Access-Network-Info").is_empty(),
+        visited_network_present = !sip::header_values(request, "P-Visited-Network-ID").is_empty(),
+        sec_agree_advertised = variant.policy.advertise_sec_agree,
+        sec_agree_required = variant.policy.require_sec_agree,
+        proxy_sec_agree_required = variant.policy.proxy_require_sec_agree,
+        mmtel_features_present = variant.policy.include_mmtel_features,
+        accept_contact_count = sip::header_values(request, "Accept-Contact").len(),
+        request_bytes = request.len(),
+        sensitive_values = "redacted",
+        "VoLTE IMS REGISTER request metadata prepared"
+    );
+}
+
+fn log_volte_register_failure_metadata(variant: VolteRegisterVariant, failure: &RegisterFailure) {
+    let Some(response) = failure.response.as_deref() else {
+        tracing::warn!(
+            register_variant = variant.label,
+            error = failure.error.code(),
+            auth_rounds = failure.auth_rounds,
+            "VoLTE IMS REGISTER failed before a complete response"
+        );
+        return;
+    };
+    tracing::warn!(
+        register_variant = variant.label,
+        error = failure.error.code(),
+        sip_status = ?register_failure_status(failure),
+        auth_rounds = failure.auth_rounds,
+        digest_challenge_present = !sip::header_values(response, "WWW-Authenticate").is_empty()
+            || !sip::header_values(response, "Proxy-Authenticate").is_empty(),
+        security_server_count = sip::header_values(response, "Security-Server").len(),
+        warning_present = !sip::header_values(response, "Warning").is_empty(),
+        unsupported_present = !sip::header_values(response, "Unsupported").is_empty(),
+        require_present = !sip::header_values(response, "Require").is_empty(),
+        proxy_require_present = !sip::header_values(response, "Proxy-Require").is_empty(),
+        sensitive_values = "redacted",
+        "VoLTE IMS REGISTER terminal response metadata received"
+    );
+}
+
 fn ip_family_name(address: IpAddr) -> &'static str {
     if address.is_ipv6() {
         "ipv6"
@@ -3447,11 +4074,26 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 mod tests {
     use super::*;
 
+    fn register_variant(label: &str) -> VolteRegisterVariant {
+        *VOLTE_REGISTER_VARIANTS
+            .iter()
+            .find(|variant| variant.label == label)
+            .unwrap_or_else(|| panic!("missing REGISTER variant: {label}"))
+    }
+
+    #[test]
+    fn reference_sms_sec_agree_variant_is_attempted_first() {
+        let first = VOLTE_REGISTER_VARIANTS[0];
+
+        assert_eq!(first.label, "reference_sms_sec_agree");
+        assert_eq!(first.authorization, VolteInitialAuthorization::None);
+        assert_eq!(first.policy, sip::RegisterRequestPolicy::LEGACY);
+        assert_eq!(first.security_client_offer, VolteSecurityClientOffer::Full);
+    }
+
     #[test]
     fn bearer_backend_follows_the_selected_ims_endpoint() {
-        assert!(!native_ims_bearer_required(
-            DataSlotMode::PrimaryImsOnly
-        ));
+        assert!(!native_ims_bearer_required(DataSlotMode::PrimaryImsOnly));
         assert!(!native_ims_bearer_required(
             DataSlotMode::PrimaryImsSecondaryData
         ));
@@ -3492,11 +4134,6 @@ mod tests {
     #[test]
     fn device_binding_rejects_modem_without_qmi_control_port() {
         assert!(VolteDeviceBinding::from_modem(&ModemBinding::default()).is_err());
-    }
-
-    #[test]
-    fn legacy_binding_uses_modem_manager_any_selector() {
-        assert_eq!(VolteDeviceBinding::legacy_default().modem_id, "any");
     }
 
     #[test]
@@ -3615,6 +4252,217 @@ mod tests {
     }
 
     #[test]
+    fn sec_agree_421_upgrades_the_same_ims_register_variant() {
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 421 Extension Required\r\nRequire: SEC-AGREE\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            ),
+            auth_rounds: 0,
+        };
+        let base = register_variant("ims_features_aka_uri_first");
+        let upgraded = sec_agree_retry_variant(base, &failure).unwrap();
+
+        assert_eq!(
+            upgraded.label,
+            "ims_features_aka_uri_first_sec_agree_required"
+        );
+        assert_eq!(upgraded.authorization, base.authorization);
+        assert_eq!(
+            upgraded.policy,
+            sip::RegisterRequestPolicy {
+                advertise_sec_agree: true,
+                require_sec_agree: true,
+                proxy_require_sec_agree: true,
+                ..base.policy
+            }
+        );
+
+        let identity = ImsIdentity {
+            private_user: "460001234567890@ims.example".to_string(),
+            public_uri: "sip:460001234567890@ims.example".to_string(),
+            contact_user: "460001234567890".to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        };
+        let route = ImsRoute {
+            local_addr: "192.0.2.2:5060".parse().unwrap(),
+            pcscf_addr: "192.0.2.1:5060".parse().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let authorization = upgraded
+            .authorization
+            .build(
+                &crate::connectivity::modems::softstack::vowifi::profiles::GB_EE_23433,
+                &identity,
+                "sip:ims.example",
+            )
+            .unwrap();
+        let request = sip::build_register_with_policy(
+            &identity,
+            &route,
+            &RequestIds::fresh(1),
+            3600,
+            Some(&authorization),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=5060;port-s=5062"),
+            None,
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            upgraded.policy,
+        );
+
+        assert!(sip::header_value(&request, "Authorization")
+            .is_some_and(|value| value.starts_with("Digest uri=\"sip:ims.example\",username=")));
+        assert!(sip::header_value(&request, "Contact")
+            .is_some_and(|value| value.contains(";+g.3gpp.icsi-ref=")));
+        assert!(sip::header_values(&request, "Accept-Contact").is_empty());
+        assert_eq!(
+            sip::header_value(&request, "Route").as_deref(),
+            Some("<sip:192.0.2.1:5060;lr>")
+        );
+        assert_eq!(
+            sip::header_value(&request, "P-Visited-Network-ID").as_deref(),
+            Some("\"ims.example\"")
+        );
+        assert_eq!(
+            sip::header_value(&request, "Require").as_deref(),
+            Some("sec-agree")
+        );
+        assert_eq!(
+            sip::header_value(&request, "Proxy-Require").as_deref(),
+            Some("sec-agree")
+        );
+    }
+
+    #[test]
+    fn server_required_sec_agree_400_retries_formats_then_without_proxy_require() {
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        let base = register_variant("ims_features_aka_uri_first");
+        assert!(sec_agree_require_only_retry_variant(base, &failure).is_none());
+        assert!(sec_agree_spaced_security_retry_variant(base, &failure).is_none());
+        assert!(sec_agree_compact_security_retry_variant(base, &failure).is_none());
+
+        let require_and_proxy = base.requiring_sec_agree();
+        assert!(sec_agree_require_only_retry_variant(require_and_proxy, &failure).is_none());
+        assert!(sec_agree_compact_security_retry_variant(require_and_proxy, &failure).is_none());
+        let spaced_security =
+            sec_agree_spaced_security_retry_variant(require_and_proxy, &failure).unwrap();
+        assert_eq!(
+            spaced_security.label,
+            "ims_features_aka_uri_first_sec_agree_spaced_security"
+        );
+        assert_eq!(
+            spaced_security.security_client_offer,
+            VolteSecurityClientOffer::FullSpaced
+        );
+        let compact_security =
+            sec_agree_compact_security_retry_variant(spaced_security, &failure).unwrap();
+        assert_eq!(
+            compact_security.label,
+            "ims_features_aka_uri_first_sec_agree_compact_security"
+        );
+        assert_eq!(
+            compact_security.security_client_offer,
+            VolteSecurityClientOffer::Compact
+        );
+        let require_only =
+            sec_agree_require_only_retry_variant(compact_security, &failure).unwrap();
+        assert_eq!(
+            require_only.label,
+            "ims_features_aka_uri_first_sec_agree_require_only"
+        );
+        assert_eq!(require_only.authorization, base.authorization);
+        assert!(require_only.policy.require_sec_agree);
+        assert!(!require_only.policy.proxy_require_sec_agree);
+        assert!(require_only.policy.include_mmtel_features);
+        assert!(require_only.policy.include_route_header);
+
+        let require_only_rejection = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            ),
+            auth_rounds: 0,
+        };
+        assert!(sec_agree_require_only_was_rejected(
+            require_only,
+            &require_only_rejection
+        ));
+        assert!(!sec_agree_require_only_was_rejected(
+            base,
+            &require_only_rejection
+        ));
+
+        let identity = ImsIdentity {
+            private_user: "460001234567890@ims.example".to_string(),
+            public_uri: "sip:460001234567890@ims.example".to_string(),
+            contact_user: "460001234567890".to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        };
+        let request = sip::build_register_with_policy(
+            &identity,
+            &ImsRoute {
+                local_addr: "192.0.2.2:5060".parse().unwrap(),
+                pcscf_addr: "192.0.2.1:5060".parse().unwrap(),
+                transport: SipTransport::Udp,
+            },
+            &RequestIds::fresh(1),
+            3600,
+            require_only
+                .authorization
+                .build(
+                    &crate::connectivity::modems::softstack::vowifi::profiles::GB_EE_23433,
+                    &identity,
+                    "sip:ims.example",
+                )
+                .as_deref(),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=5060;port-s=5062"),
+            None,
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            require_only.policy,
+        );
+        assert_eq!(
+            sip::header_value(&request, "Require").as_deref(),
+            Some("sec-agree")
+        );
+        assert!(sip::header_value(&request, "Proxy-Require").is_none());
+        assert!(sip::header_value(&request, "Authorization")
+            .is_some_and(|value| value.starts_with("Digest uri=\"sip:ims.example\",username=")));
+        assert_eq!(
+            sip::header_value(&request, "Route").as_deref(),
+            Some("<sip:192.0.2.1:5060;lr>")
+        );
+    }
+
+    #[test]
+    fn other_421_requirements_do_not_select_a_retry_variant() {
+        for require in ["timer", "sec-agree, timer"] {
+            let failure = RegisterFailure {
+                error: ImsError::new("ims_register_initial_unexpected_status"),
+                response: Some(
+                    format!(
+                        "SIP/2.0 421 Extension Required\r\nRequire: {require}\r\nContent-Length: 0\r\n\r\n"
+                    )
+                    .into_bytes(),
+                ),
+                auth_rounds: 0,
+            };
+
+            assert!(sec_agree_retry_variant(
+                register_variant("ims_features_aka_uri_first"),
+                &failure
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
     fn register_transport_errors_preserve_initial_vs_authenticated_stage() {
         let initial = map_register_error(ImsError::new("ims_register_initial_receive_failed"));
         assert_eq!(initial.code(), code::REGISTER_INITIAL_UNEXPECTED_STATUS);
@@ -3630,6 +4478,31 @@ mod tests {
             authenticated.detail(),
             Some("ims_register_authenticated_receive_failed")
         );
+    }
+
+    #[test]
+    fn bearer_retention_requires_a_terminal_register_response() {
+        let terminal = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        let terminal_error = map_register_failure(&terminal);
+        assert!(should_retain_failed_bearer(&terminal_error));
+        assert!(terminal_error
+            .detail()
+            .is_some_and(|detail| detail.contains("sip_status=400")));
+
+        let local_auth_failure = RegisterFailure {
+            error: ImsError::new(code::USIM_AKA_FAILED),
+            response: Some(b"SIP/2.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 1,
+        };
+        let local_error = map_register_failure(&local_auth_failure);
+        assert!(!should_retain_failed_bearer(&local_error));
+        assert!(!local_error
+            .detail()
+            .is_some_and(|detail| detail.contains("sip_status=")));
     }
 
     #[test]
@@ -3688,6 +4561,37 @@ mod tests {
         assert!(sdp.contains("m=audio 32000 RTP/AVP 0 101\r\n"));
         assert!(sdp.contains("a=rtpmap:101 telephone-event/8000\r\n"));
         assert!(sdp.contains("a=fmtp:101 0-16\r\n"));
+    }
+
+    #[test]
+    fn relay_sdp_preserves_independent_video_addressing() {
+        let source = b"v=0\r\no=- 1 1 IN IP4 10.0.0.3\r\ns=call\r\nc=IN IP4 10.0.0.3\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\nm=video 50000 RTP/AVP 99\r\nc=IN IP4 10.0.0.4\r\na=rtpmap:99 H264/90000\r\na=sendrecv\r\n";
+        let audio = parse_audio_sdp(source).unwrap();
+        let video = parse_video_sdp(source).unwrap();
+        assert_eq!(
+            media_endpoint_for_video(&audio, &video).unwrap(),
+            "10.0.0.4:50000".parse().unwrap()
+        );
+        let offer = MediaOffer {
+            audio_endpoint: "10.0.0.3:40000".parse().unwrap(),
+            audio,
+            video: Some(VideoOffer {
+                description: video,
+                endpoint: "10.0.0.4:50000".parse().unwrap(),
+            }),
+            dtmf: DtmfCapabilities {
+                rtp_event: None,
+                sip_info: true,
+                preferred: DtmfSource::SipInfo,
+            },
+        };
+        let sdp = relay_media_sdp(
+            &offer,
+            "192.0.2.10:32000".parse().unwrap(),
+            Some("198.51.100.20:33000".parse().unwrap()),
+        );
+        assert!(sdp.contains("c=IN IP4 192.0.2.10\r\n"));
+        assert!(sdp.contains("m=video 33000 RTP/AVP 99\r\nc=IN IP4 198.51.100.20\r\n"));
     }
 
     #[tokio::test]

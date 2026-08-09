@@ -83,19 +83,21 @@ pub fn build_register(
         headers.push(SipHeader::new(name.trim(), value.trim()));
     }
     let cseq = dialog.next_cseq();
-    Ok(crate::connectivity::core::sip_message::build_register(&SipRequest {
-        method: "REGISTER",
-        request_uri: &request_uri,
-        route,
-        branch: &branch,
-        from_uri: &identity_uri,
-        from_tag: &dialog.from_tag,
-        to_value: &format!("<{identity_uri}>"),
-        call_id: &dialog.call_id,
-        cseq,
-        headers: &headers,
-        body: &[],
-    }))
+    Ok(crate::connectivity::core::sip_message::build_register(
+        &SipRequest {
+            method: "REGISTER",
+            request_uri: &request_uri,
+            route,
+            branch: &branch,
+            from_uri: &identity_uri,
+            from_tag: &dialog.from_tag,
+            to_value: &format!("<{identity_uri}>"),
+            call_id: &dialog.call_id,
+            cseq,
+            headers: &headers,
+            body: &[],
+        },
+    ))
 }
 
 pub fn build_response(request: &[u8], status: u16, reason: &str) -> Result<Vec<u8>, String> {
@@ -161,6 +163,14 @@ pub struct DialogRequest<'a> {
 }
 
 pub fn build_dialog_request(request: &DialogRequest<'_>) -> Result<Vec<u8>, String> {
+    let content_type = (!request.body.is_empty()).then_some("application/sdp");
+    build_dialog_request_with_content_type(request, content_type)
+}
+
+pub fn build_dialog_request_with_content_type(
+    request: &DialogRequest<'_>,
+    content_type: Option<&str>,
+) -> Result<Vec<u8>, String> {
     validate_token(request.method, "trunk_dialog_method_invalid")?;
     if !request.request_uri.starts_with("sip:")
         || !request.from_uri.starts_with("sip:")
@@ -193,13 +203,89 @@ pub fn build_dialog_request(request: &DialogRequest<'_>) -> Result<Vec<u8>, Stri
     }
     frame.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
     frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, OPTIONS\r\n");
-    if !request.body.is_empty() {
-        frame.push_str("Content-Type: application/sdp\r\n");
+    if let Some(content_type) = content_type.filter(|_| !request.body.is_empty()) {
+        frame.push_str(&format!("Content-Type: {content_type}\r\n"));
     }
     frame.push_str(&format!("Content-Length: {}\r\n\r\n", request.body.len()));
     let mut bytes = frame.into_bytes();
     bytes.extend_from_slice(request.body);
     Ok(bytes)
+}
+
+/// Rebuild a challenged outbound INVITE as a new client transaction while
+/// preserving its dialog identifiers and body. RFC 3261 requires a fresh Via
+/// branch and a larger CSeq when retrying with Digest credentials.
+pub fn build_authenticated_invite_retry(
+    invite: &[u8],
+    authorization: &str,
+) -> Result<Vec<u8>, String> {
+    if !sip_frame::is_request(invite, "INVITE") {
+        return Err("trunk_digest_request_not_invite".to_string());
+    }
+    if authorization.contains(['\r', '\n'])
+        || (!authorization.starts_with("Authorization: Digest ")
+            && !authorization.starts_with("Proxy-Authorization: Digest "))
+    {
+        return Err("trunk_digest_authorization_invalid".to_string());
+    }
+    let header_end = invite
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "trunk_request_headers_incomplete".to_string())?;
+    let headers = std::str::from_utf8(&invite[..header_end])
+        .map_err(|_| "trunk_request_headers_invalid".to_string())?;
+    let mut lines = headers.split("\r\n");
+    let request_line = lines
+        .next()
+        .filter(|line| line.starts_with("INVITE sip:") && line.ends_with(" SIP/2.0"))
+        .ok_or_else(|| "trunk_request_line_invalid".to_string())?;
+    let mut rebuilt = format!("{request_line}\r\n");
+    let mut saw_via = false;
+    let mut saw_cseq = false;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err("trunk_request_header_invalid".to_string());
+        };
+        if name.eq_ignore_ascii_case("Via") {
+            rebuilt.push_str(&format!("Via: {}\r\n", via_with_new_branch(value.trim())));
+            saw_via = true;
+        } else if name.eq_ignore_ascii_case("CSeq") {
+            let mut parts = value.split_whitespace();
+            let cseq = parts
+                .next()
+                .and_then(|part| part.parse::<u32>().ok())
+                .ok_or_else(|| "trunk_cseq_invalid".to_string())?;
+            if !parts
+                .next()
+                .is_some_and(|method| method.eq_ignore_ascii_case("INVITE"))
+            {
+                return Err("trunk_cseq_method_mismatch".to_string());
+            }
+            rebuilt.push_str(&format!("CSeq: {} INVITE\r\n", cseq.saturating_add(1)));
+            saw_cseq = true;
+        } else if name.eq_ignore_ascii_case("Authorization")
+            || name.eq_ignore_ascii_case("Proxy-Authorization")
+            || name.eq_ignore_ascii_case("Content-Length")
+        {
+            continue;
+        } else {
+            rebuilt.push_str(line);
+            rebuilt.push_str("\r\n");
+        }
+    }
+    if !saw_via {
+        return Err("trunk_request_via_missing".to_string());
+    }
+    if !saw_cseq {
+        return Err("trunk_cseq_missing".to_string());
+    }
+    let body = sip_frame::body(invite);
+    rebuilt.push_str(authorization);
+    rebuilt.push_str("\r\n");
+    rebuilt.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    let mut frame = rebuilt.into_bytes();
+    frame.extend_from_slice(body);
+    Ok(frame)
 }
 
 #[allow(dead_code)]
@@ -221,9 +307,18 @@ pub fn build_cancel(invite: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 pub fn build_ack_for_final(invite: &[u8], response: &[u8]) -> Result<Vec<u8>, String> {
-    let request_uri = request_uri(invite)?;
-    let via = sip_frame::header_value(invite, "Via")
+    let response_status = status(response)?;
+    let original_request_uri = request_uri(invite)?;
+    let original_via = sip_frame::header_value(invite, "Via")
         .ok_or_else(|| "trunk_request_via_missing".to_string())?;
+    let (request_uri, via) = if (200..300).contains(&response_status) {
+        (
+            sip_frame::header_uri(response, "Contact").unwrap_or(original_request_uri),
+            via_with_new_branch(&original_via),
+        )
+    } else {
+        (original_request_uri, original_via)
+    };
     let from = sip_frame::header_value(invite, "From")
         .ok_or_else(|| "trunk_request_from_missing".to_string())?;
     let to = sip_frame::header_value(response, "To")
@@ -236,6 +331,24 @@ pub fn build_ack_for_final(invite: &[u8], response: &[u8]) -> Result<Vec<u8>, St
         "ACK {request_uri} SIP/2.0\r\nVia: {via}\r\nMax-Forwards: 70\r\nFrom: {from}\r\nTo: {to}\r\nCall-ID: {call_id}\r\nCSeq: {cseq} ACK\r\nUser-Agent: {USER_AGENT}\r\nContent-Length: 0\r\n\r\n"
     )
     .into_bytes())
+}
+
+fn via_with_new_branch(via: &str) -> String {
+    let lower = via.to_ascii_lowercase();
+    if let Some(start) = lower.find("branch=") {
+        let value_start = start + "branch=".len();
+        let value_end = via[value_start..]
+            .find([';', ' ', '\t'])
+            .map(|offset| value_start + offset)
+            .unwrap_or(via.len());
+        return format!(
+            "{}z9hG4bK{}{}",
+            &via[..value_start],
+            token(12),
+            &via[value_end..]
+        );
+    }
+    format!("{via};branch=z9hG4bK{}", token(12))
 }
 
 fn request_uri(frame: &[u8]) -> Result<String, String> {
@@ -393,16 +506,28 @@ mod tests {
     }
 
     #[test]
-    fn cancel_and_ack_reuse_invite_transaction_identity() {
+    fn cancel_reuses_invite_transaction_and_non_2xx_ack_does_too() {
         let invite = b"INVITE sip:6108@pbx SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bKsame\r\nFrom: <sip:41000@simadmin>;tag=local\r\nTo: <sip:6108@pbx>\r\nCall-ID: call-a\r\nCSeq: 9 INVITE\r\nContent-Length: 0\r\n\r\n";
         let cancel = String::from_utf8(build_cancel(invite).unwrap()).unwrap();
         assert!(cancel.contains("branch=z9hG4bKsame"));
         assert!(cancel.contains("CSeq: 9 CANCEL"));
         let response =
-            b"SIP/2.0 200 OK\r\nTo: <sip:6108@pbx>;tag=remote\r\nContent-Length: 0\r\n\r\n";
+            b"SIP/2.0 486 Busy Here\r\nTo: <sip:6108@pbx>;tag=remote\r\nContent-Length: 0\r\n\r\n";
         let ack = String::from_utf8(build_ack_for_final(invite, response).unwrap()).unwrap();
+        assert!(ack.starts_with("ACK sip:6108@pbx SIP/2.0"));
+        assert!(ack.contains("branch=z9hG4bKsame"));
         assert!(ack.contains("To: <sip:6108@pbx>;tag=remote"));
         assert!(ack.contains("CSeq: 9 ACK"));
+    }
+
+    #[test]
+    fn two_xx_ack_uses_contact_and_a_fresh_transaction_branch() {
+        let invite = b"INVITE sip:6108@pbx SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.2:5062;branch=z9hG4bKoriginal;rport\r\nFrom: <sip:41000@simadmin>;tag=local\r\nTo: <sip:6108@pbx>\r\nCall-ID: call-a\r\nCSeq: 9 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let response = b"SIP/2.0 200 OK\r\nTo: <sip:6108@pbx>;tag=remote\r\nContact: <sip:6108@192.0.2.20:5080>\r\nContent-Length: 0\r\n\r\n";
+        let ack = String::from_utf8(build_ack_for_final(invite, response).unwrap()).unwrap();
+        assert!(ack.starts_with("ACK sip:6108@192.0.2.20:5080 SIP/2.0"));
+        assert!(!ack.contains("branch=z9hG4bKoriginal"));
+        assert!(ack.contains(";rport"));
     }
 
     #[test]

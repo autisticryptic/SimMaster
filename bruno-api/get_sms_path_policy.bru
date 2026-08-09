@@ -1,0 +1,15 @@
+meta {
+  name: get_sms_path_policy
+  type: http
+  seq: 109
+}
+
+get {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/sms/path-policy
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

@@ -14,7 +14,7 @@ use super::{
         LiveNetworkStageAdapter, LiveStageRunner, StatusProbeDatagramAdapter,
         SystemLiveDatagramAdapter, SystemLiveEpdgAdapter,
     },
-    profiles::{self, CarrierProfile, GB_EE_23433},
+    profiles::{self, CarrierProfile},
     restore::EsimRestorePublicState,
     sms::SmsRuntimePublicState,
     voice::VoiceRuntimePublicState,
@@ -340,10 +340,11 @@ pub struct DryRunRuntimeExecutor {
     profile: &'static CarrierProfile,
 }
 
+#[cfg(test)]
 impl Default for DryRunRuntimeExecutor {
     fn default() -> Self {
         Self {
-            profile: &GB_EE_23433,
+            profile: &super::profiles::GB_EE_23433,
         }
     }
 }
@@ -508,9 +509,18 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
 
     fn run_stage<'a>(&'a self, request: ExecutorStageRequest) -> ExecutorFuture<'a> {
         Box::pin(async move {
-            let profile = profile_for_stage_request(&request);
+            let Some(profile) = profile_for_stage_request(&request) else {
+                return ExecutorStageResult {
+                    stage: request.stage.as_str(),
+                    status: ExecutorStageStatus::Failed.as_str(),
+                    readiness_key: readiness_key_for_stage(request.stage),
+                    reason: Some("carrier_profile_not_found_in_database".to_string()),
+                    soak_observation: None,
+                };
+            };
             if request.trace_id == "runtime-status-probe" && request.stage == ExecutorStage::Ike {
-                let adapter = LiveNetworkStageAdapter::new(
+                let adapter = LiveNetworkStageAdapter::for_line(
+                    request.line_id.clone(),
                     SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
                     StatusProbeDatagramAdapter,
                 );
@@ -519,7 +529,8 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
                     .await;
             }
 
-            let adapter = LiveNetworkStageAdapter::new(
+            let adapter = LiveNetworkStageAdapter::for_line(
+                request.line_id.clone(),
                 SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
                 SystemLiveDatagramAdapter::for_line(request.line_id.clone()),
             );
@@ -575,13 +586,12 @@ fn live_stage_reason(stage: ExecutorStage, gate: &LiveExecutorGateReport) -> &'s
     gate_blocker_for_stage(stage, gate).unwrap_or("live_stage_available")
 }
 
-fn profile_for_stage_request(request: &ExecutorStageRequest) -> &'static CarrierProfile {
+fn profile_for_stage_request(request: &ExecutorStageRequest) -> Option<&'static CarrierProfile> {
     request
         .profile_id
         .as_deref()
         .and_then(profiles::resolve_by_profile_id)
         .or_else(|| request.plmn.as_deref().and_then(profile_for_plmn))
-        .unwrap_or(&GB_EE_23433)
 }
 
 fn profile_for_plmn(plmn: &str) -> Option<&'static CarrierProfile> {
@@ -931,7 +941,8 @@ mod tests {
             plmn: Some("23433".to_string()),
             trace_id: "profile-id-selection".to_string(),
             line_id: String::new(),
-        });
+        })
+        .expect("profile should resolve");
 
         assert_eq!(profile.meta.profile_id, "nl_vodafone_20404");
         assert_eq!(profile.meta.plmn, "20404");
@@ -945,7 +956,8 @@ mod tests {
             plmn: Some("204-04".to_string()),
             trace_id: "plmn-selection".to_string(),
             line_id: String::new(),
-        });
+        })
+        .expect("profile should resolve");
 
         assert_eq!(profile.meta.profile_id, "nl_vodafone_20404");
     }

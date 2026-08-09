@@ -15,8 +15,11 @@ use std::net::IpAddr;
 
 use super::errors::VolteError;
 use crate::connectivity::core::sip_message::{SipHeader, SipRequest};
+use crate::connectivity::modems::softstack::vowifi::profiles::CarrierProfile;
 
-pub use crate::connectivity::core::context::{ImsIdentity, ImsRegisterParams, ImsRoute as SipRoute, SipTransport};
+pub use crate::connectivity::core::context::{
+    ImsIdentity, ImsRegisterParams, ImsRoute as SipRoute, SipTransport,
+};
 
 /// 3GPP SMS-over-IP ICSI service identifier (TS 24.341).
 pub const SMS_ICSI: &str = "urn:urn-7:3gpp-service.ims.icsi.sms";
@@ -73,6 +76,39 @@ pub struct RequestIds {
     pub cseq: u32,
 }
 
+/// Carrier-facing REGISTER header policy. The transaction/authentication
+/// sequence stays shared, while a few P-CSCFs differ on whether the first
+/// unauthenticated REGISTER may advertise sec-agree and MMTel features.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegisterRequestPolicy {
+    pub advertise_sec_agree: bool,
+    pub require_sec_agree: bool,
+    pub proxy_require_sec_agree: bool,
+    pub include_mmtel_features: bool,
+    pub include_route_header: bool,
+    pub include_visited_network: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterPhase {
+    Initial,
+    Authenticated,
+    Refresh,
+}
+
+impl RegisterRequestPolicy {
+    pub const LEGACY: Self = Self {
+        // The proven Maxis request requires sec-agree but does not advertise it
+        // in Supported on the initial transaction.
+        advertise_sec_agree: false,
+        require_sec_agree: true,
+        proxy_require_sec_agree: true,
+        include_mmtel_features: false,
+        include_route_header: false,
+        include_visited_network: false,
+    };
+}
+
 impl RequestIds {
     pub fn fresh(cseq: u32) -> Self {
         Self {
@@ -127,28 +163,174 @@ pub fn build_register_with_security_policy(
     sip_instance: &str,
     require_sec_agree: bool,
 ) -> Vec<u8> {
+    build_register_with_policy(
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        RegisterRequestPolicy {
+            advertise_sec_agree: require_sec_agree,
+            require_sec_agree,
+            proxy_require_sec_agree: require_sec_agree,
+            ..RegisterRequestPolicy::LEGACY
+        },
+    )
+}
+
+/// Build a REGISTER with explicit carrier header policy.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_with_policy(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+) -> Vec<u8> {
+    build_register_internal(
+        None,
+        RegisterPhase::Authenticated,
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        policy,
+    )
+}
+
+/// Build REGISTER using the carrier catalog's IMS and SIP policy.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_from_profile(
+    profile: &CarrierProfile,
+    phase: RegisterPhase,
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+) -> Vec<u8> {
+    build_register_internal(
+        Some(profile),
+        phase,
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        policy,
+    )
+}
+
+/// Resolve the REGISTER Request-URI from the same carrier policy and route the
+/// request builder uses. Digest AKA must sign this exact value.
+pub fn register_request_uri(profile: &CarrierProfile, route: &SipRoute) -> String {
+    match profile.ims.register.request_uri_policy {
+        "home_domain" => format!("sip:{}", profile.ims.domain),
+        "pcscf" => format!(
+            "sip:{}:{}",
+            sip_host(route.pcscf_addr.ip()),
+            route.pcscf_addr.port()
+        ),
+        "registrar" | "configured" => {
+            let registrar = profile.ims.registrar.unwrap_or(profile.ims.domain);
+            if registrar.starts_with("sip:") || registrar.starts_with("sips:") {
+                registrar.to_string()
+            } else {
+                format!("sip:{registrar}")
+            }
+        }
+        _ => format!("sip:{}", profile.ims.domain),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_register_internal(
+    profile: Option<&CarrierProfile>,
+    phase: RegisterPhase,
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
-    let params = ImsRegisterParams {
-        realm: identity.home_domain.clone(),
-        domain: identity.home_domain.clone(),
-        registrar: None,
-        supported_header: if require_sec_agree {
-            "path, gruu, sec-agree"
-        } else {
-            "path, gruu"
+    let include_pani = profile.is_none_or(|profile| match phase {
+        RegisterPhase::Initial => profile.ims.register.include_pani_initial,
+        RegisterPhase::Authenticated | RegisterPhase::Refresh => {
+            profile.ims.register.include_pani_authenticated
         }
-        .to_string(),
-        require_sec_agree,
-        user_agent: USER_AGENT.to_string(),
-        pani: Some(PANI_EUTRAN.to_string()),
+    });
+    let access_network_info = profile
+        .map(|profile| profile.ims.register.access_network_info)
+        .unwrap_or(PANI_EUTRAN);
+    let params = ImsRegisterParams {
+        realm: profile
+            .map(|profile| profile.ims.realm)
+            .unwrap_or(identity.home_domain.as_str())
+            .to_string(),
+        domain: profile
+            .map(|profile| profile.ims.domain)
+            .unwrap_or(identity.home_domain.as_str())
+            .to_string(),
+        registrar: profile.and_then(|profile| profile.ims.registrar.map(str::to_string)),
+        supported_header: profile.map_or_else(
+            || {
+                if policy.advertise_sec_agree {
+                    "path, gruu, sec-agree"
+                } else {
+                    "path, gruu"
+                }
+                .to_string()
+            },
+            |profile| profile.ims.register.supported_header.to_string(),
+        ),
+        require_sec_agree: policy.require_sec_agree,
+        user_agent: profile
+            .map(|profile| profile.ims.user_agent)
+            .unwrap_or(USER_AGENT)
+            .to_string(),
+        pani: include_pani.then(|| access_network_info.to_string()),
         visited_network: None,
-        allow_header: "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+        allow_header: profile
+            .and_then(|profile| profile.ims.register.allow_methods)
+            .unwrap_or_else(|| {
+                if profile.is_some() {
+                    ""
+                } else {
+                    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+                }
+            })
             .to_string(),
         expires,
     };
-    let request_uri = params.request_uri();
+    let request_uri = profile.map_or_else(
+        || params.request_uri(),
+        |profile| register_request_uri(profile, route),
+    );
     let to_value = format!("<{}>", identity.public_uri);
     let mut headers = Vec::new();
     if let Some(auth) = authorization {
@@ -156,35 +338,76 @@ pub fn build_register_with_security_policy(
             headers.push(SipHeader::new(name.trim(), value.trim()));
         }
     }
-    // Contact with 3GPP access type + smsip feature tag + sip.instance.
-    headers.push(SipHeader::new(
-        "Contact",
-        format!(
-        "<sip:{}@{}:{};transport={}>;+g.3gpp.accesstype=\"{}\";+g.3gpp.smsip;+sip.instance=\"<{}>\";expires={}",
+    let mut contact = format!(
+        "<sip:{}@{}:{};transport={}>",
         identity.contact_user,
         local_host,
         local_port,
         route.transport.as_param(),
-        PANI_EUTRAN,
-        sip_instance,
-        expires,
-    ),
-    ));
+    );
+    if let Some(profile) =
+        profile.filter(|profile| !profile.ims.register.contact_param_order.is_empty())
+    {
+        for parameter in profile.ims.register.contact_param_order {
+            contact.push(';');
+            contact.push_str(parameter);
+        }
+    } else if profile.is_none() {
+        contact.push_str(&format!(";+g.3gpp.accesstype=\"{access_network_info}\""));
+        if policy.include_mmtel_features {
+            contact.push_str(";audio");
+        }
+        contact.push_str(";+g.3gpp.smsip");
+        if policy.include_mmtel_features {
+            contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
+        }
+        contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
+        contact.push_str(&format!(";expires={expires}"));
+    }
+    headers.push(SipHeader::new("Contact", contact));
+    if policy.include_route_header {
+        headers.push(SipHeader::new(
+            "Route",
+            format!(
+                "<sip:{}:{};lr>",
+                sip_host(route.pcscf_addr.ip()),
+                route.pcscf_addr.port()
+            ),
+        ));
+    }
     headers.push(SipHeader::new("Expires", expires.to_string()));
-    headers.push(SipHeader::new("Supported", &params.supported_header));
-    if require_sec_agree {
+    if !params.supported_header.trim().is_empty() {
+        headers.push(SipHeader::new("Supported", &params.supported_header));
+    }
+    if policy.require_sec_agree {
         headers.push(SipHeader::new("Require", "sec-agree"));
+    }
+    if policy.proxy_require_sec_agree {
         headers.push(SipHeader::new("Proxy-Require", "sec-agree"));
     }
-    headers.push(SipHeader::new("Allow", &params.allow_header));
-    headers.push(SipHeader::new(
-        "P-Preferred-Identity",
-        format!("<{}>", identity.public_uri),
-    ));
-    headers.push(SipHeader::new(
-        "P-Access-Network-Info",
-        params.pani.as_deref().unwrap_or(PANI_EUTRAN),
-    ));
+    if !params.allow_header.trim().is_empty() {
+        headers.push(SipHeader::new("Allow", &params.allow_header));
+    }
+    if profile.is_none_or(|profile| profile.ims.register.include_p_preferred_identity) {
+        headers.push(SipHeader::new(
+            "P-Preferred-Identity",
+            format!("<{}>", identity.public_uri),
+        ));
+    }
+    if let Some(value) = profile
+        .and_then(|profile| profile.ims.register.visited_network_header)
+        .or_else(|| (profile.is_none() && policy.include_visited_network).then(|| ""))
+    {
+        let value = if value.is_empty() {
+            format!("\"{}\"", identity.home_domain)
+        } else {
+            value.to_string()
+        };
+        headers.push(SipHeader::new("P-Visited-Network-ID", value));
+    }
+    if let Some(pani) = params.pani.as_deref() {
+        headers.push(SipHeader::new("P-Access-Network-Info", pani));
+    }
     if let Some(sc) = security_client {
         headers.push(SipHeader::new("Security-Client", sc));
     }
@@ -323,6 +546,32 @@ pub fn build_invite(
     sdp_offer: &[u8],
     security_verify: Option<&str>,
 ) -> Vec<u8> {
+    build_invite_for_access(
+        identity,
+        route,
+        dialog,
+        callee_uri,
+        sdp_offer,
+        security_verify,
+        PANI_EUTRAN,
+        USER_AGENT,
+    )
+}
+
+/// Build an initial INVITE with access-specific PANI and User-Agent values.
+/// VoLTE uses [`build_invite`]; VoWiFi supplies its carrier profile's IEEE
+/// 802.11 PANI while retaining the same stable dialog identifiers.
+#[allow(clippy::too_many_arguments)]
+pub fn build_invite_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    sdp_offer: &[u8],
+    security_verify: Option<&str>,
+    pani: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
@@ -345,7 +594,7 @@ pub fn build_invite(
             ),
         ),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
-        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("P-Access-Network-Info", pani),
         SipHeader::new("P-Preferred-Service", MMTEL_ICSI),
         SipHeader::new(
             "Accept-Contact",
@@ -360,7 +609,7 @@ pub fn build_invite(
     if let Some(sv) = security_verify {
         headers.push(SipHeader::new("Security-Verify", sv));
     }
-    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    headers.push(SipHeader::new("User-Agent", user_agent));
     headers.push(SipHeader::new("Content-Type", "application/sdp"));
     crate::connectivity::core::sip_message::build_invite(&SipRequest {
         method: "INVITE",
@@ -402,6 +651,29 @@ pub fn build_reinvite(
     sdp_offer: &[u8],
     security_verify: Option<&str>,
 ) -> Vec<u8> {
+    build_reinvite_for_access(
+        identity,
+        route,
+        dialog,
+        callee_uri,
+        sdp_offer,
+        security_verify,
+        PANI_EUTRAN,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_reinvite_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    sdp_offer: &[u8],
+    security_verify: Option<&str>,
+    pani: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
@@ -429,7 +701,7 @@ pub fn build_reinvite(
             ),
         ),
         SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
-        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("P-Access-Network-Info", pani),
         SipHeader::new("P-Preferred-Service", MMTEL_ICSI),
         SipHeader::new(
             "Accept-Contact",
@@ -444,7 +716,7 @@ pub fn build_reinvite(
     if let Some(sv) = security_verify {
         headers.push(SipHeader::new("Security-Verify", sv));
     }
-    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    headers.push(SipHeader::new("User-Agent", user_agent));
     headers.push(SipHeader::new("Content-Type", "application/sdp"));
     crate::connectivity::core::sip_message::build_invite(&SipRequest {
         method: "INVITE",
@@ -595,6 +867,31 @@ pub fn build_dtmf_info(
     digit: char,
     duration_ms: u16,
 ) -> Result<Vec<u8>, VolteError> {
+    build_dtmf_info_for_access(
+        identity,
+        route,
+        dialog,
+        callee_uri,
+        cseq,
+        digit,
+        duration_ms,
+        PANI_EUTRAN,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_dtmf_info_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    digit: char,
+    duration_ms: u16,
+    pani: &str,
+    user_agent: &str,
+) -> Result<Vec<u8>, VolteError> {
     let digit = digit.to_ascii_uppercase();
     if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D') {
         return Err(VolteError::new("volte_dtmf_digit_invalid"));
@@ -629,8 +926,8 @@ pub fn build_dtmf_info(
     h.push_str(&format!("To: {to}\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {cseq} INFO\r\n"));
-    h.push_str(&format!("P-Access-Network-Info: {PANI_EUTRAN}\r\n"));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("P-Access-Network-Info: {pani}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     h.push_str(&format!("Content-Type: {DTMF_RELAY_CONTENT_TYPE}\r\n"));
     h.push_str("Content-Disposition: signal;handling=optional\r\n");
     h.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
@@ -811,6 +1108,28 @@ mod tests {
     }
 
     #[test]
+    fn catalog_register_request_uri_policy_uses_the_actual_route() {
+        let route = route_udp();
+        let mut profile = crate::connectivity::modems::softstack::vowifi::profiles::GB_EE_23433;
+
+        profile.ims.register.request_uri_policy = "home_domain";
+        assert_eq!(
+            register_request_uri(&profile, &route),
+            format!("sip:{}", profile.ims.domain)
+        );
+
+        profile.ims.register.request_uri_policy = "registrar";
+        profile.ims.registrar = Some("sip:registrar.example:5070");
+        assert_eq!(
+            register_request_uri(&profile, &route),
+            "sip:registrar.example:5070"
+        );
+
+        profile.ims.register.request_uri_policy = "pcscf";
+        assert_eq!(register_request_uri(&profile, &route), "sip:10.0.0.1:5060");
+    }
+
+    #[test]
     fn register_contains_mandatory_headers_and_sms_feature_tag() {
         let ids = RequestIds::fresh(1);
         let frame = build_register(
@@ -831,7 +1150,68 @@ mod tests {
         assert!(text.contains("Require: sec-agree\r\n"));
         assert!(text.contains("Security-Client: ipsec-3gpp"));
         assert!(text.contains("P-Access-Network-Info: 3GPP-E-UTRAN-FDD\r\n"));
+        assert!(!text.contains("P-Preferred-Service:"));
+        assert!(!text.contains("\r\nAccept: application/vnd.3gpp.sms\r\n"));
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn legacy_register_matches_the_reference_sms_sec_agree_headers() {
+        let frame = build_register_with_policy(
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            3600,
+            None,
+            Some("ipsec-3gpp"),
+            None,
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            RegisterRequestPolicy::LEGACY,
+        );
+        let text = String::from_utf8(frame).unwrap();
+
+        assert!(text.contains("Supported: path, gruu\r\n"));
+        assert!(!text.contains("Supported: path, gruu, sec-agree\r\n"));
+        assert!(text.contains("Require: sec-agree\r\n"));
+        assert!(text.contains("Proxy-Require: sec-agree\r\n"));
+        assert!(!text.contains("Accept-Contact:"));
+        assert!(!text.contains("P-Preferred-Service:"));
+        assert!(!text.contains("\r\nAccept: application/vnd.3gpp.sms\r\n"));
+        assert!(text.contains("Security-Client: ipsec-3gpp\r\n"));
+    }
+
+    #[test]
+    fn ims_feature_policy_adds_mmtel_routing_without_forcing_sec_agree() {
+        let ids = RequestIds::fresh(1);
+        let frame = build_register_with_policy(
+            &ident(),
+            &route_udp(),
+            &ids,
+            3600,
+            None,
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001"),
+            None,
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            RegisterRequestPolicy {
+                advertise_sec_agree: true,
+                require_sec_agree: false,
+                proxy_require_sec_agree: false,
+                include_mmtel_features: true,
+                include_route_header: true,
+                include_visited_network: true,
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+
+        assert!(text.contains(";audio;+g.3gpp.smsip;+g.3gpp.icsi-ref=\""));
+        assert!(text.contains(";+sip.instance=\"<urn:uuid:"));
+        assert!(!text.contains("Accept-Contact:"));
+        assert!(text.contains("Route: <sip:10.0.0.1:5060;lr>\r\n"));
+        assert!(text.contains("P-Visited-Network-ID: \"ims.mnc000.mcc460.3gppnetwork.org\"\r\n"));
+        assert!(text.contains("Supported: path, gruu, sec-agree\r\n"));
+        assert!(!text.contains("Require: sec-agree\r\n"));
+        assert!(!text.contains("Proxy-Require: sec-agree\r\n"));
+        assert!(!text.contains("Authorization:"));
     }
 
     #[test]

@@ -1,19 +1,31 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
 
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
+
+/// Inner IP packets larger than this (after the IMS ESP transform) are
+/// fragmented in software before the outer tunnel encapsulation, so every
+/// physical packet stays below the 1500-byte path MTU. 1356 bytes of inner
+/// IP yields an outer ESP-in-UDP packet of ~1456 bytes with margin.
+const AUTO_FRAGMENT_INNER_IP_MAX: usize = 1356;
+
+/// Identification counter for IPv6 fragment headers (RFC 8200 §4.5). A
+/// monotonic counter guarantees distinct values across fragmented packets,
+/// which is all the receiver needs to disambiguate reassembly buffers.
+static INNER_FRAGMENT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone)]
 pub(crate) struct TunGatewayConfig {
@@ -158,6 +170,13 @@ pub(crate) struct ImsEspFlowConfig {
     pub outbound_sa_identifier: u32,
     pub inbound_sa_identifier: u32,
     pub secrets: ChildSaSecretPair,
+    /// RFC 4303 §3.3.2 includes the explicit IV in the ICV. Some IMS
+    /// stacks omit it; candidates carry this flag for interop probing.
+    pub icv_include_iv: bool,
+    /// Wrap the ESP frame in a UDP header (RFC 3948 style) instead of raw
+    /// ESP (IP protocol 50). Some P-CSCF deployments negotiate ipsec-3gpp
+    /// but expect the UDP-encapsulated variant on the protected ports.
+    pub udp_encapsulate: bool,
 }
 
 #[derive(Clone)]
@@ -180,6 +199,8 @@ struct ImsEspRuntimeFlow {
     outbound_sa_identifier: u32,
     inbound_sa_identifier: u32,
     secrets: ChildSaSecretPair,
+    icv_include_iv: bool,
+    udp_encapsulate: bool,
     next_outbound_sequence: u64,
     inbound_replay: super::dataplane::AntiReplayWindow,
     outbound_logged: bool,
@@ -239,6 +260,8 @@ impl ImsEspRuntimeFlow {
             outbound_sa_identifier: config.outbound_sa_identifier,
             inbound_sa_identifier: config.inbound_sa_identifier,
             secrets: config.secrets,
+            icv_include_iv: config.icv_include_iv,
+            udp_encapsulate: config.udp_encapsulate,
             next_outbound_sequence: 1,
             inbound_replay: super::dataplane::AntiReplayWindow::new(64),
             outbound_logged: false,
@@ -309,7 +332,11 @@ mod imp {
     use tracing::{debug, info, warn};
 
     use crate::connectivity::modems::softstack::vowifi::dataplane::{
-        protect_inner_packet_for_esp, unprotect_inner_packet_from_esp, AntiReplayWindow,
+        protect_inner_packet_for_esp,
+        protect_inner_packet_for_esp_with_mode,
+        unprotect_inner_packet_from_esp,
+        unprotect_inner_packet_from_esp_with_mode,
+        AntiReplayWindow,
     };
 
     #[cfg(target_env = "musl")]
@@ -320,7 +347,334 @@ mod imp {
     const IFF_NO_PI: i16 = 0x1000;
     const IFREQ_BYTES: usize = 40;
     const IFNAMSIZ: usize = 16;
-    const DEFAULT_TUN_MTU: u16 = 1360;
+    // The inner SIP REGISTER (with Security-Client/Verify + Authorization +
+    // contact features) routinely exceeds 1400 bytes. Keeping the TUN MTU at
+    // 1360 made the kernel fragment it, and the gateway shipped the fragments
+    // as separate ESP packets, which the P-CSCF could not reassemble. 1600
+    // lets a full REGISTER through as one datagram; the outer ESP packet is
+    // then fragmented at the physical link (IP_MTU_DISCOVER=DONT) and
+    // reassembled by the ePDG.
+    const DEFAULT_TUN_MTU: u16 = 1600;
+
+    #[derive(Debug, Clone, Copy)]
+    struct Ipv4FragmentInfo {
+        identification: u32,
+        offset_bytes: usize,
+        more_fragments: bool,
+    }
+
+    fn ipv4_fragment_info(packet: &[u8]) -> Option<Ipv4FragmentInfo> {
+        if packet.first().map(|byte| byte >> 4) != Some(4) || packet.len() < 20 {
+            return None;
+        }
+        let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
+        let more_fragments = flags_and_offset & 0x2000 != 0;
+        let offset_bytes = usize::from(flags_and_offset & 0x1fff) * 8;
+        if !more_fragments && offset_bytes == 0 {
+            return None;
+        }
+        Some(Ipv4FragmentInfo {
+            identification: u32::from_be_bytes([0, 0, packet[4], packet[5]]),
+            offset_bytes,
+            more_fragments,
+        })
+    }
+
+    struct Ipv4FragmentBuffer {
+        header: Vec<u8>,
+        payload: Vec<u8>,
+        created_at: Instant,
+    }
+
+    #[derive(Debug)]
+    enum FragmentReassemblyOutcome {
+        Forward(Vec<u8>),
+        Buffered,
+        Dropped,
+    }
+
+    /// Reassemble an IPv4 fragment stream before the ipsec-3gpp transform.
+    ///
+    /// The kernel fragments an oversized SIP datagram at the TUN MTU. Shipping
+    /// the fragments separately would make the P-CSCF concatenate two ESP
+    /// frames into one bogus payload, so the gateway waits for the full set and
+    /// re-emits one complete IP packet. The outer ESP packet then carries the
+    /// whole REGISTER; the physical link fragments it and the ePDG reassembles.
+    fn reassemble_outbound_ip_fragment(
+        packet: Vec<u8>,
+        buffers: &mut HashMap<(IpAddr, IpAddr, u32), Ipv4FragmentBuffer>,
+    ) -> FragmentReassemblyOutcome {
+        let Some(fragment) = ipv4_fragment_info(&packet) else {
+            return FragmentReassemblyOutcome::Forward(packet);
+        };
+        if packet.len() < 20 {
+            return FragmentReassemblyOutcome::Dropped;
+        }
+        let src = IpAddr::V4(Ipv4Addr::new(
+            packet[12], packet[13], packet[14], packet[15],
+        ));
+        let dst = IpAddr::V4(Ipv4Addr::new(
+            packet[16], packet[17], packet[18], packet[19],
+        ));
+        let key = (src, dst, fragment.identification);
+
+        let now = Instant::now();
+        if buffers.len() >= 32 {
+            buffers.retain(|_, buffer| {
+                now.duration_since(buffer.created_at) < Duration::from_secs(3)
+            });
+        }
+
+        if fragment.offset_bytes == 0 {
+            let ihl = usize::from(packet[0] & 0x0f) * 4;
+            buffers.insert(
+                key,
+                Ipv4FragmentBuffer {
+                    header: packet[..ihl].to_vec(),
+                    payload: packet[ihl..].to_vec(),
+                    created_at: now,
+                },
+            );
+            return FragmentReassemblyOutcome::Buffered;
+        }
+
+        let Some(buffer) = buffers.get_mut(&key) else {
+            warn!(
+                src = %src,
+                dst = %dst,
+                identification = fragment.identification,
+                offset_bytes = fragment.offset_bytes,
+                "IMS TUN outbound continuation fragment without fragment 0; dropping"
+            );
+            return FragmentReassemblyOutcome::Dropped;
+        };
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        buffer.payload.extend_from_slice(&packet[ihl..]);
+        if fragment.more_fragments {
+            return FragmentReassemblyOutcome::Buffered;
+        }
+
+        let mut header = buffer.header.clone();
+        let payload = std::mem::take(&mut buffer.payload);
+        buffers.remove(&key);
+        let total_len = header.len().checked_add(payload.len());
+        let Some(total_len) = total_len.filter(|len| *len <= usize::from(u16::MAX)) else {
+            return FragmentReassemblyOutcome::Dropped;
+        };
+        header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+        header[6..8].copy_from_slice(&[0, 0]);
+        header[10] = 0;
+        header[11] = 0;
+        let checksum = ipv4_header_checksum(&header);
+        header[10..12].copy_from_slice(&checksum.to_be_bytes());
+        let mut reassembled = header;
+        reassembled.extend_from_slice(&payload);
+        FragmentReassemblyOutcome::Forward(reassembled)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    struct InboundFragmentKey {
+        src: IpAddr,
+        dst: IpAddr,
+        identification: u32,
+    }
+
+    #[derive(Clone)]
+    struct InboundFragmentPiece {
+        offset_bytes: usize,
+        payload: Vec<u8>,
+    }
+
+    struct InboundFragmentBuffer {
+        /// IPv4: complete first-fragment IP header (flags/offset cleared and
+        /// total length set on reassembly). IPv6: 40-byte base header with
+        /// the original next header (the Fragment Header's next header)
+        /// restored in byte 6. None until fragment 0 arrives (continuation
+        /// fragments may arrive first on the network).
+        base_header: Option<Vec<u8>>,
+        pieces: Vec<InboundFragmentPiece>,
+        expected_len: Option<usize>,
+        created_at: Instant,
+    }
+
+    struct InboundFragmentInfo {
+        src: IpAddr,
+        dst: IpAddr,
+        identification: u32,
+        offset_bytes: usize,
+        more_fragments: bool,
+        base_header: Vec<u8>,
+        payload: Vec<u8>,
+    }
+
+    /// Extract fragment metadata for an inbound IP packet. IPv4 fragments
+    /// use the MF/offset fields in the base header; IPv6 fragments carry a
+    /// Fragment Header (RFC 8200 §4.5). Non-fragmented packets return None.
+    fn inbound_fragment_info(packet: &[u8]) -> Option<InboundFragmentInfo> {
+        match packet.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                if packet.len() < 20 {
+                    return None;
+                }
+                let flags_and_offset = u16::from_be_bytes([packet[6], packet[7]]);
+                let more_fragments = flags_and_offset & 0x2000 != 0;
+                let offset_bytes = usize::from(flags_and_offset & 0x1fff) * 8;
+                if !more_fragments && offset_bytes == 0 {
+                    return None;
+                }
+                let ihl = usize::from(packet[0] & 0x0f) * 4;
+                Some(InboundFragmentInfo {
+                    src: IpAddr::V4(Ipv4Addr::new(
+                        packet[12], packet[13], packet[14], packet[15],
+                    )),
+                    dst: IpAddr::V4(Ipv4Addr::new(
+                        packet[16], packet[17], packet[18], packet[19],
+                    )),
+                    identification: u32::from_be_bytes([0, 0, packet[4], packet[5]]),
+                    offset_bytes,
+                    more_fragments,
+                    base_header: packet[..ihl].to_vec(),
+                    payload: packet[ihl..].to_vec(),
+                })
+            }
+            Some(6) => {
+                if packet.len() < 48 || packet[6] != 44 {
+                    return None;
+                }
+                let offset_m = u16::from_be_bytes([packet[42], packet[43]]);
+                let offset_bytes = usize::from(offset_m >> 3) * 8;
+                let more_fragments = offset_m & 1 == 1;
+                let mut base_header = packet[..40].to_vec();
+                base_header[6] = packet[40]; // restore the original next header
+                Some(InboundFragmentInfo {
+                    src: IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).ok()?)),
+                    dst: IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).ok()?)),
+                    identification: u32::from_be_bytes([
+                        packet[44], packet[45], packet[46], packet[47],
+                    ]),
+                    offset_bytes,
+                    more_fragments,
+                    base_header,
+                    payload: packet[48..].to_vec(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Reassemble inbound IP fragments (from the P-CSCF) before the
+    /// ipsec-3gpp inbound transform. The P-CSCF may split a large protected
+    /// response (e.g. an INVITE carrying SDP) into several ESP packets; the
+    /// IP layer must reassemble them into one ESP frame before ICV/decrypt.
+    /// Handles IPv4 fragments and IPv6 Fragment Headers, including
+    /// out-of-order arrival and basic overlap rejection.
+    fn reassemble_inbound_ip_fragment(
+        packet: Vec<u8>,
+        buffers: &mut HashMap<InboundFragmentKey, InboundFragmentBuffer>,
+    ) -> FragmentReassemblyOutcome {
+        let Some(info) = inbound_fragment_info(&packet) else {
+            return FragmentReassemblyOutcome::Forward(packet);
+        };
+        let key = InboundFragmentKey {
+            src: info.src,
+            dst: info.dst,
+            identification: info.identification,
+        };
+        let now = Instant::now();
+        if buffers.len() >= 32 {
+            buffers.retain(|_, buffer| {
+                now.duration_since(buffer.created_at) < Duration::from_secs(3)
+            });
+        }
+        let piece = InboundFragmentPiece {
+            offset_bytes: info.offset_bytes,
+            payload: info.payload,
+        };
+        let last = !info.more_fragments;
+        let buffer = buffers
+            .entry(key)
+            .or_insert_with(|| InboundFragmentBuffer {
+                base_header: None,
+                pieces: Vec::new(),
+                expected_len: None,
+                created_at: now,
+            });
+        // Reject overlapping fragments (RFC 8200 §4.5.4 / classic reassembly
+        // hardening): ranges must be disjoint.
+        let start = piece.offset_bytes;
+        let end = start + piece.payload.len();
+        if buffer.pieces.iter().any(|piece| {
+            let piece_end = piece.offset_bytes + piece.payload.len();
+            start < piece_end && piece.offset_bytes < end
+        }) {
+            warn!(
+                src = %info.src,
+                dst = %info.dst,
+                identification = info.identification,
+                "IMS ESP inbound overlapping fragment; dropping"
+            );
+            buffers.remove(&key);
+            return FragmentReassemblyOutcome::Dropped;
+        }
+        if info.offset_bytes == 0 {
+            // Fragment 0 carries the base header; replace any stale piece at
+            // offset 0 and record the header for final assembly.
+            buffer.base_header = Some(info.base_header);
+            buffer.pieces.retain(|piece| piece.offset_bytes != 0);
+        }
+        let piece_end = piece.offset_bytes + piece.payload.len();
+        buffer.pieces.push(piece);
+        if last {
+            buffer.expected_len = Some(piece_end);
+        }
+        let Some(expected) = buffer.expected_len else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+        let Some(header) = &buffer.base_header else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+        let mut pieces = buffer.pieces.clone();
+        pieces.sort_by_key(|piece| piece.offset_bytes);
+        let mut cursor = 0usize;
+        for piece in &pieces {
+            if piece.offset_bytes > cursor {
+                return FragmentReassemblyOutcome::Buffered;
+            }
+            cursor = cursor.max(piece.offset_bytes + piece.payload.len());
+        }
+        if cursor != expected {
+            return FragmentReassemblyOutcome::Buffered;
+        }
+        let mut header = header.clone();
+        match header.first().map(|byte| byte >> 4) {
+            Some(4) => {
+                let ihl = usize::from(header[0] & 0x0f) * 4;
+                let total_len = ihl + expected;
+                if total_len > usize::from(u16::MAX) {
+                    return FragmentReassemblyOutcome::Dropped;
+                }
+                header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
+                header[6..8].copy_from_slice(&[0, 0]);
+                header[10] = 0;
+                header[11] = 0;
+                let checksum = ipv4_header_checksum(&header[..ihl]);
+                header[10..12].copy_from_slice(&checksum.to_be_bytes());
+            }
+            Some(6) => {
+                if expected > usize::from(u16::MAX) {
+                    return FragmentReassemblyOutcome::Dropped;
+                }
+                header[4..6].copy_from_slice(&(expected as u16).to_be_bytes());
+            }
+            _ => return FragmentReassemblyOutcome::Dropped,
+        }
+        let mut reassembled = header;
+        for piece in &pieces {
+            reassembled.extend_from_slice(&piece.payload);
+        }
+        buffers.remove(&key);
+        FragmentReassemblyOutcome::Forward(reassembled)
+    }
 
     pub(crate) async fn start_gateway(
         config: TunGatewayConfig,
@@ -389,6 +743,12 @@ mod imp {
             .args(["link", "set", "dev", tun_name, "down"])
             .output();
         let _ = Command::new("ifconfig").args([tun_name, "down"]).output();
+        // The interface name is stable per line (see tun_name_for_line), so a
+        // reconnect must be able to recreate it. TUNSETIFF fails with EEXIST
+        // while the old device is still around, so delete it best-effort.
+        let _ = Command::new("ip")
+            .args(["link", "del", "dev", tun_name])
+            .output();
     }
 
     fn open_tun(name: &str) -> Result<File, TunGatewayError> {
@@ -523,10 +883,19 @@ mod imp {
         let outbound_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut sequence_number = 1u64;
+            let mut fragment_buffers =
+                HashMap::<(IpAddr, IpAddr, u32), Ipv4FragmentBuffer>::new();
             while let Some(packet) = inner_rx.recv().await {
                 if outbound_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
+                let packet = match reassemble_outbound_ip_fragment(packet, &mut fragment_buffers)
+                {
+                    FragmentReassemblyOutcome::Forward(packet) => packet,
+                    FragmentReassemblyOutcome::Buffered => continue,
+                    FragmentReassemblyOutcome::Dropped => continue,
+                };
+                log_tun_outbound_packet(&packet);
                 let packet =
                     match protect_ims_esp_outbound_if_needed(packet, &outbound_ims_esp_policy) {
                         Ok(packet) => packet,
@@ -535,32 +904,95 @@ mod imp {
                             continue;
                         }
                     };
-                let Some(next_header) = inner_next_header(&packet) else {
-                    continue;
-                };
-                let current_sequence = sequence_number;
-                sequence_number = sequence_number.saturating_add(1);
-                match protect_inner_packet_for_esp(
-                    outbound_spi,
-                    current_sequence,
-                    &packet,
-                    next_header,
-                    &outbound_secrets,
-                ) {
-                    Ok((frame, _summary)) => {
-                        if let Err(err) = outbound_transport
-                            .send_esp_nat_t_metadata(outbound_remote, &frame)
-                            .await
-                        {
-                            warn!(reason = %err, "VoWiFi ESP outbound send failed");
-                        }
+                // Software fragmentation is the default: it keeps the full
+                // REGISTER headers while guaranteeing every physical packet
+                // stays under the path MTU. Set SIMADMIN_AUTO_FRAGMENT=0 to
+                // disable (then either the packet must fit, or the carrier
+                // must handle IP-layer fragmentation of the outer ESP).
+                let auto_fragment = std::env::var("SIMADMIN_AUTO_FRAGMENT")
+                    .map(|value| value != "0")
+                    .unwrap_or(true);
+                let outbound_fragments = if auto_fragment {
+                    let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+                    if fragments.len() > 1 {
+                        info!(
+                            inner_packet_bytes = packet.len(),
+                            fragment_count = fragments.len(),
+                            "IMS ESP inner packet software-fragmented for outer tunnel MTU"
+                        );
                     }
-                    Err(err) => {
-                        warn!(reason = %err, "VoWiFi ESP outbound protection failed");
+                    fragments
+                } else {
+                    vec![packet]
+                };
+                for fragment in outbound_fragments {
+                    let Some(next_header) = inner_next_header(&fragment) else {
+                        continue;
+                    };
+                    let current_sequence = sequence_number;
+                    sequence_number = sequence_number.saturating_add(1);
+                    match protect_inner_packet_for_esp(
+                        outbound_spi,
+                        current_sequence,
+                        &fragment,
+                        next_header,
+                        &outbound_secrets,
+                    ) {
+                        Ok((frame, summary)) => {
+                            info!(
+                                outer_sequence = current_sequence,
+                                outer_frame_bytes = summary.outer_frame_bytes,
+                                inner_packet_bytes = summary.inner_packet_bytes,
+                                "IMS ESP outbound frame sent through outer tunnel"
+                            );
+                            if let Err(err) = outbound_transport
+                                .send_esp_nat_t_metadata(outbound_remote, &frame)
+                                .await
+                            {
+                                warn!(reason = %err, "VoWiFi ESP outbound send failed");
+                            }
+                        }
+                        Err(err) => {
+                            warn!(reason = %err, "VoWiFi ESP outbound protection failed");
+                        }
                     }
                 }
             }
         });
+
+        fn log_tun_outbound_packet(packet: &[u8]) {
+            let Ok(parsed) = ParsedIpPacket::parse(packet) else {
+                return;
+            };
+            if parsed.next_header == 50 {
+                info!(
+                    ip_proto = 50,
+                    packet_bytes = packet.len(),
+                    src = %parsed.src,
+                    dst = %parsed.dst,
+                    "IMS ESP-wrapped packet re-entered TUN for outer tunnel"
+                );
+                return;
+            }
+            if parsed.next_header == 17 {
+                let payload = parsed.payload(packet);
+                if payload.len() >= 4 {
+                    let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+                    let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+                    if src_port != 5060 || dst_port != 5060 {
+                        info!(
+                            ip_proto = 17,
+                            packet_bytes = packet.len(),
+                            src = %parsed.src,
+                            dst = %parsed.dst,
+                            src_port,
+                            dst_port,
+                            "IMS TUN outbound UDP packet on non-5060 ports"
+                        );
+                    }
+                }
+            }
+        }
 
         let inbound_transport = config
             .transport
@@ -573,6 +1005,8 @@ mod imp {
         let inbound_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut replay = AntiReplayWindow::new(64);
+            let mut inbound_fragment_buffers =
+                HashMap::<InboundFragmentKey, InboundFragmentBuffer>::new();
             loop {
                 if inbound_shutdown.load(Ordering::SeqCst) {
                     break;
@@ -601,6 +1035,15 @@ mod imp {
                         if !replay.accept(sequence).accepted {
                             continue;
                         }
+                        let inner =
+                            match reassemble_inbound_ip_fragment(
+                                inner,
+                                &mut inbound_fragment_buffers,
+                            ) {
+                                FragmentReassemblyOutcome::Forward(inner) => inner,
+                                FragmentReassemblyOutcome::Buffered => continue,
+                                FragmentReassemblyOutcome::Dropped => continue,
+                            };
                         let inner = match unprotect_ims_esp_inbound_if_needed(
                             inner,
                             &inbound_ims_esp_policy,
@@ -635,27 +1078,44 @@ mod imp {
         let Some(policy) = guard.as_mut() else {
             return Ok(packet);
         };
-        let Some(flow_index) = ims_outbound_tcp_flow_index(&packet, policy) else {
+        let Some(matched) = ims_outbound_flow_index(&packet, policy) else {
             return Ok(packet);
         };
-        let flow = &mut policy.flows[flow_index];
+        let flow = &mut policy.flows[matched.flow_index];
         let sequence = flow.allocate_outbound_sequence()?;
         let parsed = ParsedIpPacket::parse(&packet)?;
         let payload = parsed.payload(&packet);
-        let (esp, summary) = protect_inner_packet_for_esp(
+        let (esp, summary) = protect_inner_packet_for_esp_with_mode(
             flow.outbound_sa_identifier,
             sequence,
             payload,
-            6,
+            matched.next_header,
             &flow.secrets,
+            flow.icv_include_iv,
         )
         .map_err(|_| tun_error("ims_esp_protect_failed"))?;
+        if std::env::var("SIMADMIN_DEBUG_ESP_FRAMES").is_ok() {
+            tracing::info!(
+                profile_id = policy.profile_id,
+                flow = flow.label,
+                outbound_sa_identifier = flow.outbound_sa_identifier,
+                sequence_number = summary.sequence_number,
+                icv_include_iv = flow.icv_include_iv,
+                udp_encapsulate = flow.udp_encapsulate,
+                inner_ip_packet_hex = hex_bytes(&packet),
+                esp_frame_hex = hex_bytes(&esp),
+                "IMS ESP frame debug dump (SIMADMIN_DEBUG_ESP_FRAMES)"
+            );
+        }
         if !flow.outbound_logged {
             info!(
                 profile_id = policy.profile_id,
                 flow = flow.label,
+                outbound_sa_identifier = flow.outbound_sa_identifier,
                 sequence_number = summary.sequence_number,
                 protected_bytes = summary.protected_bytes,
+                icv_include_iv = flow.icv_include_iv,
+                udp_encapsulate = flow.udp_encapsulate,
                 "IMS ESP outbound packet protected"
             );
             flow.outbound_logged = true;
@@ -665,10 +1125,30 @@ mod imp {
                 flow = flow.label,
                 sequence_number = summary.sequence_number,
                 protected_bytes = summary.protected_bytes,
+                icv_include_iv = flow.icv_include_iv,
+                udp_encapsulate = flow.udp_encapsulate,
                 "IMS ESP outbound packet protected"
             );
         }
-        parsed.rebuild_with_payload(&packet, 50, &esp)
+        if flow.udp_encapsulate {
+            // RFC 3948 ESP-in-UDP: insert an 8-byte UDP header between the
+            // IP header and the ESP frame. Source/destination are the flow's
+            // protected client/server ports; the checksum is computed over
+            // the pseudo-header so both IPv4 and IPv6 receivers accept it.
+            let mut encapsulated = Vec::with_capacity(8 + esp.len());
+            encapsulated.extend_from_slice(&flow.local_port.to_be_bytes());
+            encapsulated.extend_from_slice(&flow.remote_port.to_be_bytes());
+            let udp_len = u16::try_from(8 + esp.len())
+                .map_err(|_| tun_error("ims_esp_udp_length_invalid"))?;
+            encapsulated.extend_from_slice(&udp_len.to_be_bytes());
+            encapsulated.extend_from_slice(&[0, 0]);
+            encapsulated.extend_from_slice(&esp);
+            let checksum = udp_checksum(parsed.src, parsed.dst, &encapsulated);
+            encapsulated[6..8].copy_from_slice(&checksum.to_be_bytes());
+            parsed.rebuild_with_payload(&packet, 17, &encapsulated)
+        } else {
+            parsed.rebuild_with_payload(&packet, 50, &esp)
+        }
     }
 
     fn unprotect_ims_esp_inbound_if_needed(
@@ -687,9 +1167,38 @@ mod imp {
         let flow = &mut policy.flows[flow_index];
         let parsed = ParsedIpPacket::parse(&packet)?;
         let payload = parsed.payload(&packet);
-        let sequence = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as u64;
-        let (transport_payload, summary) = unprotect_inner_packet_from_esp(payload, &flow.secrets)
-            .map_err(|_| tun_error("ims_esp_unprotect_failed"))?;
+        let esp_payload = if flow.udp_encapsulate {
+            if payload.len() < 8 {
+                return Err(tun_error("ims_esp_udp_short"));
+            }
+            &payload[8..]
+        } else {
+            payload
+        };
+        if esp_payload.len() < 8 {
+            return Err(tun_error("ims_esp_packet_short"));
+        }
+        let sequence =
+            u32::from_be_bytes([esp_payload[4], esp_payload[5], esp_payload[6], esp_payload[7]])
+                as u64;
+        let unprotect_result = unprotect_inner_packet_from_esp_with_mode(
+            esp_payload,
+            &flow.secrets,
+            flow.icv_include_iv,
+        );
+        if unprotect_result.is_err() && std::env::var("SIMADMIN_DEBUG_ESP_FRAMES").is_ok() {
+            tracing::warn!(
+                profile_id = policy.profile_id,
+                flow = flow.label,
+                inbound_sa_identifier = flow.inbound_sa_identifier,
+                udp_encapsulate = flow.udp_encapsulate,
+                icv_include_iv = flow.icv_include_iv,
+                esp_packet_hex = hex_bytes(esp_payload),
+                "IMS ESP inbound frame debug dump (SIMADMIN_DEBUG_ESP_FRAMES)"
+            );
+        }
+        let (transport_payload, summary) =
+            unprotect_result.map_err(|_| tun_error("ims_esp_unprotect_failed"))?;
         if !flow.inbound_replay.accept(sequence).accepted {
             return Err(tun_error("ims_esp_replay_rejected"));
         }
@@ -714,44 +1223,80 @@ mod imp {
         parsed.rebuild_with_payload(&packet, summary.next_header, &transport_payload)
     }
 
-    fn ims_outbound_tcp_flow_index(packet: &[u8], policy: &ImsEspRuntimePolicy) -> Option<usize> {
+    struct ImsOutboundFlowMatch {
+        flow_index: usize,
+        next_header: u8,
+    }
+
+    /// Match an inner packet that carries IMS SIP traffic to the negotiated
+    /// ipsec-3gpp flow. Both TCP (protocol 6) and UDP (protocol 17) are valid
+    /// inside the tunnel; the outer ESP header must record which one so the
+    /// peer can rebuild the inner packet.
+    fn ims_outbound_flow_index(
+        packet: &[u8],
+        policy: &ImsEspRuntimePolicy,
+    ) -> Option<ImsOutboundFlowMatch> {
         let Ok(parsed) = ParsedIpPacket::parse(packet) else {
             return None;
         };
-        if parsed.next_header != 6
+        if !matches!(parsed.next_header, 6 | 17)
             || parsed.src != policy.local_addr
             || parsed.dst != policy.remote_addr
         {
             return None;
         }
         let payload = parsed.payload(packet);
-        let (src, dst) = tcp_ports(payload)?;
+        let (src, dst) = transport_ports(payload)?;
         policy
             .flows
             .iter()
             .position(|flow| src == flow.local_port && dst == flow.remote_port)
+            .map(|flow_index| ImsOutboundFlowMatch {
+                flow_index,
+                next_header: parsed.next_header,
+            })
     }
 
     fn ims_inbound_esp_flow_index(packet: &[u8], policy: &ImsEspRuntimePolicy) -> Option<usize> {
         let Ok(parsed) = ParsedIpPacket::parse(packet) else {
             return None;
         };
-        if parsed.next_header != 50
-            || parsed.src != policy.remote_addr
-            || parsed.dst != policy.local_addr
-        {
+        if parsed.src != policy.remote_addr || parsed.dst != policy.local_addr {
             return None;
         }
         let payload = parsed.payload(packet);
-        if payload.len() < 8 {
-            return None;
+        match parsed.next_header {
+            50 => {
+                if payload.len() < 8 {
+                    return None;
+                }
+                let inbound_sa_identifier =
+                    u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                policy.flows.iter().position(|flow| {
+                    !flow.udp_encapsulate
+                        && inbound_sa_identifier == flow.inbound_sa_identifier
+                })
+            }
+            17 => {
+                // UDP-encapsulated ESP (RFC 3948): 8-byte UDP header then
+                // the ESP frame. Match the flow on the protected ports plus
+                // the inbound SPI carried in the ESP header.
+                if payload.len() < 16 {
+                    return None;
+                }
+                let src_port = u16::from_be_bytes([payload[0], payload[1]]);
+                let dst_port = u16::from_be_bytes([payload[2], payload[3]]);
+                let inbound_sa_identifier =
+                    u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]);
+                policy.flows.iter().position(|flow| {
+                    flow.udp_encapsulate
+                        && flow.local_port == dst_port
+                        && flow.remote_port == src_port
+                        && inbound_sa_identifier == flow.inbound_sa_identifier
+                })
+            }
+            _ => None,
         }
-        let inbound_sa_identifier =
-            u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
-        policy
-            .flows
-            .iter()
-            .position(|flow| inbound_sa_identifier == flow.inbound_sa_identifier)
     }
 
     #[derive(Debug, Clone)]
@@ -887,13 +1432,58 @@ mod imp {
         }
     }
 
-    fn tcp_ports(payload: &[u8]) -> Option<(u16, u16)> {
+    fn transport_ports(payload: &[u8]) -> Option<(u16, u16)> {
         (payload.len() >= 4).then(|| {
             (
                 u16::from_be_bytes([payload[0], payload[1]]),
                 u16::from_be_bytes([payload[2], payload[3]]),
             )
         })
+    }
+
+    fn hex_bytes(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            use std::fmt::Write;
+            let _ = write!(out, "{byte:02x}");
+        }
+        out
+    }
+
+    fn udp_checksum(src: IpAddr, dst: IpAddr, udp_packet: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        let mut accumulate = |data: &[u8]| {
+            let mut chunks = data.chunks_exact(2);
+            for chunk in &mut chunks {
+                sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+            }
+            if let [last] = chunks.remainder() {
+                sum = sum.wrapping_add(u32::from(*last) << 8);
+            }
+        };
+        match src {
+            IpAddr::V4(src) => {
+                if let IpAddr::V4(dst) = dst {
+                    accumulate(&src.octets());
+                    accumulate(&dst.octets());
+                    accumulate(&[0, 17]);
+                    accumulate(&(udp_packet.len() as u16).to_be_bytes());
+                }
+            }
+            IpAddr::V6(src) => {
+                if let IpAddr::V6(dst) = dst {
+                    accumulate(&src.octets());
+                    accumulate(&dst.octets());
+                    accumulate(&(udp_packet.len() as u32).to_be_bytes());
+                    accumulate(&[0, 0, 0, 0, 0, 0, 0, 17]);
+                }
+            }
+        }
+        accumulate(udp_packet);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        (!(sum as u16)).to_be()
     }
 
     fn ipv4_header_checksum(header: &[u8]) -> u16 {
@@ -910,6 +1500,98 @@ mod imp {
             sum = (sum & 0xffff) + (sum >> 16);
         }
         !(sum as u16)
+    }
+
+    /// Fragment an inner IP packet (IPv4 or IPv6) in software so each
+    /// fragment's total IP length is at most `max_ip_bytes`. IPv4 keeps the
+    /// id and clears DF; IPv6 emits a Fragment Header (RFC 8200 §4.5) with
+    /// offset/M and a per-packet identification. Already-small packets pass
+    /// through unchanged.
+    fn fragment_inner_packet(packet: &[u8], max_ip_bytes: usize) -> Vec<Vec<u8>> {
+        if packet.len() <= max_ip_bytes {
+            return vec![packet.to_vec()];
+        }
+        match packet.first().map(|byte| byte >> 4) {
+            Some(4) => fragment_ipv4_packet(packet, max_ip_bytes),
+            Some(6) => fragment_ipv6_packet(packet, max_ip_bytes),
+            _ => vec![packet.to_vec()],
+        }
+    }
+
+    fn fragment_ipv4_packet(packet: &[u8], max_ip_bytes: usize) -> Vec<Vec<u8>> {
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        if ihl < 20 || packet.len() < ihl {
+            return vec![packet.to_vec()];
+        }
+        let payload = &packet[ihl..];
+        let chunk = ((max_ip_bytes.saturating_sub(ihl)) / 8) * 8;
+        if chunk == 0 {
+            return vec![packet.to_vec()];
+        }
+        let mut fragments = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + chunk).min(payload.len());
+            let last = end == payload.len();
+            let mut fragment = packet[..ihl].to_vec();
+            fragment[2..4].copy_from_slice(&((ihl + end - offset) as u16).to_be_bytes());
+            // Preserve the id, clear DF (0x4000), keep MF on non-last.
+            let id = u16::from_be_bytes([packet[4], packet[5]]);
+            let flags_offset = u16::from((offset / 8) as u16) | if last { 0 } else { 0x2000 };
+            fragment[4..6].copy_from_slice(&id.to_be_bytes());
+            fragment[6..8].copy_from_slice(&flags_offset.to_be_bytes());
+            fragment[10] = 0;
+            fragment[11] = 0;
+            let checksum = ipv4_header_checksum(&fragment[..ihl]);
+            fragment[10..12].copy_from_slice(&checksum.to_be_bytes());
+            fragment.extend_from_slice(&payload[offset..end]);
+            fragments.push(fragment);
+            if last {
+                break;
+            }
+            offset = end;
+        }
+        fragments
+    }
+
+    fn fragment_ipv6_packet(packet: &[u8], max_ip_bytes: usize) -> Vec<Vec<u8>> {
+        if packet.len() < 40 {
+            return vec![packet.to_vec()];
+        }
+        let payload = &packet[40..];
+        // The Fragment Header (8 bytes) rides in every fragment, so the
+        // fragmentable payload chunk leaves room for it under the cap.
+        let chunk = ((max_ip_bytes.saturating_sub(48)) / 8) * 8;
+        if chunk == 0 {
+            return vec![packet.to_vec()];
+        }
+        let identification = INNER_FRAGMENT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let original_next_header = packet[6];
+        let mut fragments = Vec::new();
+        let mut offset = 0usize;
+        loop {
+            let end = (offset + chunk).min(payload.len());
+            let last = end == payload.len();
+            let mut fragment = Vec::with_capacity(40 + 8 + (end - offset));
+            fragment.extend_from_slice(&packet[..40]);
+            fragment[4..6].copy_from_slice(&((8 + end - offset) as u16).to_be_bytes());
+            fragment[6] = 44; // Fragment Header
+            let mut fragment_header = [0u8; 8];
+            fragment_header[0] = original_next_header;
+            // 13-bit offset (8-octet units) in the high bits, M flag in the
+            // low bit (RFC 8200 §4.5).
+            let offset_m = (((offset / 8) as u16) << 3) | if last { 0 } else { 1 };
+            fragment_header[2..4].copy_from_slice(&offset_m.to_be_bytes());
+            fragment_header[4..8].copy_from_slice(&identification.to_be_bytes());
+            fragment.extend_from_slice(&fragment_header);
+            fragment.extend_from_slice(&payload[offset..end]);
+            fragments.push(fragment);
+            if last {
+                break;
+            }
+            offset = end;
+        }
+        fragments
     }
 
     fn spawn_tun_reader(mut file: File, tx: mpsc::Sender<Vec<u8>>, shutdown: Arc<AtomicBool>) {
@@ -949,6 +1631,315 @@ mod imp {
         match addr {
             IpAddr::V4(_) => "ipv4",
             IpAddr::V6(_) => "ipv6",
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn build_ipv4_udp_packet(payload: &[u8]) -> Vec<u8> {
+            let mut packet = vec![0u8; 20 + 8 + payload.len()];
+            packet[0] = 0x45;
+            let total_len = packet.len() as u16;
+            packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+            packet[4] = 0x12;
+            packet[5] = 0x34;
+            packet[8] = 64;
+            packet[9] = 17;
+            packet[12..16].copy_from_slice(&[2, 31, 105, 44]);
+            packet[16..20].copy_from_slice(&[172, 20, 110, 221]);
+            packet[20..22].copy_from_slice(&5064u16.to_be_bytes());
+            packet[22..24].copy_from_slice(&7777u16.to_be_bytes());
+            packet[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+            packet[26..28].copy_from_slice(&[0, 0]);
+            packet[28..].copy_from_slice(payload);
+            let checksum = ipv4_header_checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            packet
+        }
+
+        fn fragment_packet(packet: &[u8], mtu: usize) -> Vec<Vec<u8>> {
+            let ihl = usize::from(packet[0] & 0x0f) * 4;
+            let payload = &packet[ihl..];
+            let first_len = (mtu - ihl) & !7;
+            let mut fragments = Vec::new();
+            let mut offset = 0usize;
+            loop {
+                let end = (offset + first_len).min(payload.len());
+                let last = end == payload.len();
+                let mut frag = packet[..ihl].to_vec();
+                frag[2..4].copy_from_slice(&((ihl + end - offset) as u16).to_be_bytes());
+                let flags_and_offset =
+                    u16::from((offset / 8) as u16) | if last { 0 } else { 0x2000 };
+                frag[6..8].copy_from_slice(&flags_and_offset.to_be_bytes());
+                let checksum = ipv4_header_checksum(&frag[..ihl]);
+                frag[10..12].copy_from_slice(&checksum.to_be_bytes());
+                frag.extend_from_slice(&payload[offset..end]);
+                fragments.push(frag);
+                if last {
+                    break;
+                }
+                offset = end;
+            }
+            fragments
+        }
+
+        #[test]
+        fn outbound_fragment_stream_reassembles_before_esp() {
+            let sip = vec![b'R'; 1535];
+            let original = build_ipv4_udp_packet(&sip);
+            let fragments = fragment_packet(&original, 1360);
+            assert!(fragments.len() >= 2, "REGISTER-sized packet must fragment");
+            eprintln!(
+                "original len={} fragments={} sizes={:?} offsets={:?}",
+                original.len(),
+                fragments.len(),
+                fragments.iter().map(|f| f.len()).collect::<Vec<_>>(),
+                fragments
+                    .iter()
+                    .map(|f| u16::from_be_bytes([f[6], f[7]]) & 0x1fff)
+                    .collect::<Vec<_>>(),
+            );
+
+            let mut buffers = HashMap::new();
+            let mut reassembled = None;
+            for fragment in fragments {
+                match reassemble_outbound_ip_fragment(fragment, &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => reassembled = Some(packet),
+                    FragmentReassemblyOutcome::Buffered | FragmentReassemblyOutcome::Dropped => {}
+                }
+            }
+
+            let reassembled = reassembled.expect("last fragment must yield a complete packet");
+            eprintln!(
+                "reassembled len={} total_len_field={}",
+                reassembled.len(),
+                u16::from_be_bytes([reassembled[2], reassembled[3]])
+            );
+            // The IP header checksum is recomputed on reassembly (total length
+            // and fragment fields change), so compare header fields except the
+            // checksum and require the payload to be byte-identical.
+            assert_eq!(reassembled.len(), original.len());
+            assert_eq!(reassembled[..10], original[..10]);
+            assert_eq!(reassembled[12..], original[12..]);
+            let mut header_without_checksum = reassembled[..20].to_vec();
+            header_without_checksum[10] = 0;
+            header_without_checksum[11] = 0;
+            let computed = ipv4_header_checksum(&header_without_checksum);
+            assert_eq!(
+                computed.to_be_bytes(),
+                [reassembled[10], reassembled[11]],
+                "reassembled header checksum must validate"
+            );
+        }
+
+        #[test]
+        fn software_fragment_ipv4_packet_preserves_id_offsets_and_checksums() {
+            // Build an inner IMS-ESP-sized packet: IPv4 header + 1588 bytes
+            // of ESP frame (mimics the full REGISTER after the transform).
+            let mut packet = vec![0u8; 20 + 1588];
+            packet[0] = 0x45;
+            let total_len = packet.len() as u16;
+            packet[2..4].copy_from_slice(&total_len.to_be_bytes());
+            packet[4..6].copy_from_slice(&0xabcd_u16.to_be_bytes());
+            packet[8] = 64;
+            packet[9] = 50; // ESP
+            packet[12..16].copy_from_slice(&[2, 30, 238, 251]);
+            packet[16..20].copy_from_slice(&[172, 20, 110, 221]);
+            let checksum = ipv4_header_checksum(&packet[..20]);
+            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+            let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+            assert!(fragments.len() >= 2, "1608B packet must fragment");
+            let mut offsets = Vec::new();
+            for (index, fragment) in fragments.iter().enumerate() {
+                let ihl = usize::from(fragment[0] & 0x0f) * 4;
+                let flags_offset = u16::from_be_bytes([fragment[6], fragment[7]]);
+                offsets.push((flags_offset & 0x1fff, flags_offset & 0x2000 != 0));
+                // Every fragment validates its own header checksum.
+                let mut header = fragment[..ihl].to_vec();
+                header[10] = 0;
+                header[11] = 0;
+                let computed = ipv4_header_checksum(&header);
+                assert_eq!(
+                    computed.to_be_bytes(),
+                    [fragment[10], fragment[11]],
+                    "fragment {index} checksum"
+                );
+                // IP id preserved.
+                assert_eq!(&fragment[4..6], &[0xab, 0xcd]);
+                // Fragment payload multiple of 8 except the last.
+                let payload_len = fragment.len() - ihl;
+                if index + 1 < fragments.len() {
+                    assert_eq!(payload_len % 8, 0, "non-last fragment payload");
+                }
+            }
+            let last = fragments.last().expect("has last fragment");
+            assert_eq!(last.len() % 8, 0, "last fragment also ends at 8-boundary payload");
+            assert!(!offsets.last().map(|(_, mf)| *mf).unwrap_or(true));
+            assert_eq!(offsets.first().map(|(o, _)| *o), Some(0));
+            assert_eq!(offsets[0].1, true, "first fragment must set MF");
+
+            // Reassemble through the existing buffer and compare payloads.
+            let mut buffers = HashMap::new();
+            let mut reassembled = None;
+            for fragment in fragments {
+                match reassemble_outbound_ip_fragment(fragment, &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => reassembled = Some(packet),
+                    FragmentReassemblyOutcome::Buffered | FragmentReassemblyOutcome::Dropped => {}
+                }
+            }
+            let reassembled = reassembled.expect("reassembles");
+            assert_eq!(reassembled, packet);
+        }
+
+        #[test]
+        fn software_fragment_ipv6_packet_emits_rfc8200_fragment_headers() {
+            // Build an inner IPv6 packet: 40-byte base header (next header =
+            // 50 ESP) + 1588-byte ESP frame.
+            let mut packet = vec![0u8; 40 + 1588];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&(1588u16).to_be_bytes());
+            packet[6] = 50; // ESP
+            packet[8..24].copy_from_slice(b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01");
+            packet[24..40].copy_from_slice(b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02");
+
+            let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+            assert!(fragments.len() >= 2, "1628B IPv6 packet must fragment");
+            let mut seen_offsets = Vec::new();
+            let mut identification = None;
+            for (index, fragment) in fragments.iter().enumerate() {
+                assert_eq!(fragment[0] >> 4, 6, "fragment stays IPv6");
+                assert_eq!(fragment[6], 44, "base header next header must be Fragment Header");
+                let next_header = fragment[40];
+                assert_eq!(next_header, 50, "Fragment Header next header preserves ESP");
+                let offset_m = u16::from_be_bytes([fragment[42], fragment[43]]);
+                let offset = (offset_m >> 3) as usize;
+                let m_flag = offset_m & 1 == 1;
+                seen_offsets.push((offset, m_flag));
+                let payload_len = u16::from_be_bytes([fragment[4], fragment[5]]) as usize;
+                assert_eq!(payload_len, 8 + fragment.len() - 48);
+                let id = u32::from_be_bytes([
+                    fragment[44], fragment[45], fragment[46], fragment[47],
+                ]);
+                match identification {
+                    Some(prev) => assert_eq!(prev, id, "same identification across fragments"),
+                    None => identification = Some(id),
+                }
+                // Fragmentable payload multiple of 8 except the last.
+                let frag_payload = fragment.len() - 48;
+                if index + 1 < fragments.len() {
+                    assert_eq!(frag_payload % 8, 0, "non-last IPv6 fragment payload");
+                    assert!(m_flag, "non-last must set M");
+                }
+            }
+            assert_eq!(seen_offsets.first().map(|(o, _)| *o), Some(0));
+            assert!(!seen_offsets.last().map(|(_, m)| *m).unwrap_or(true));
+            let total_frag_payload: usize = fragments
+                .iter()
+                .map(|f| f.len() - 48)
+                .sum();
+            assert_eq!(total_frag_payload, 1588, "all fragment payloads concatenate to the ESP frame");
+        }
+
+        fn build_ipv6_esp_packet() -> Vec<u8> {
+            let mut packet = vec![0u8; 40 + 1588];
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&(1588u16).to_be_bytes());
+            packet[6] = 50; // ESP
+            packet[8..24].copy_from_slice(b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01");
+            packet[24..40].copy_from_slice(b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02");
+            packet
+        }
+
+        #[test]
+        fn inbound_ipv4_fragments_reassemble_out_of_order() {
+            let mut original = vec![0u8; 20 + 1588];
+            original[0] = 0x45;
+            let total_len = original.len() as u16;
+            original[2..4].copy_from_slice(&total_len.to_be_bytes());
+            original[4..6].copy_from_slice(&0xbeef_u16.to_be_bytes());
+            original[8] = 64;
+            original[9] = 50;
+            original[12..16].copy_from_slice(&[172, 20, 110, 221]);
+            original[16..20].copy_from_slice(&[2, 30, 238, 251]);
+            let checksum = ipv4_header_checksum(&original[..20]);
+            original[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            assert!(fragments.len() >= 2);
+            let mut buffers = HashMap::new();
+            let mut forwards = Vec::new();
+            for fragment in fragments.iter().rev() {
+                match reassemble_inbound_ip_fragment(fragment.clone(), &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => forwards.push(packet),
+                    FragmentReassemblyOutcome::Buffered => {}
+                    FragmentReassemblyOutcome::Dropped => panic!("IPv4 fragment dropped"),
+                }
+            }
+            assert_eq!(forwards.len(), 1, "out-of-order IPv4 fragments reassemble once");
+            assert_eq!(forwards[0], original);
+        }
+
+        #[test]
+        fn inbound_ipv6_fragments_reassemble_out_of_order() {
+            let original = build_ipv6_esp_packet();
+            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            assert!(fragments.len() >= 2);
+            let mut buffers = HashMap::new();
+            let mut forwards = Vec::new();
+            for fragment in fragments.iter().rev() {
+                match reassemble_inbound_ip_fragment(fragment.clone(), &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => forwards.push(packet),
+                    FragmentReassemblyOutcome::Buffered => {}
+                    FragmentReassemblyOutcome::Dropped => panic!("IPv6 fragment dropped"),
+                }
+            }
+            assert_eq!(forwards.len(), 1, "out-of-order IPv6 fragments reassemble once");
+            assert_eq!(forwards[0], original);
+        }
+
+        #[test]
+        fn inbound_overlapping_ipv4_fragments_are_rejected() {
+            // Fragment 0: offset 0, MF=1, 100 payload bytes.
+            let mut first = vec![0u8; 20 + 100];
+            first[0] = 0x45;
+            first[2..4].copy_from_slice(&120u16.to_be_bytes());
+            first[4..6].copy_from_slice(&0x1234_u16.to_be_bytes());
+            first[6] = 0x20; // MF
+            first[8] = 64;
+            first[9] = 50;
+            first[12..16].copy_from_slice(&[172, 20, 110, 221]);
+            first[16..20].copy_from_slice(&[2, 30, 238, 251]);
+            let checksum = ipv4_header_checksum(&first[..20]);
+            first[10..12].copy_from_slice(&checksum.to_be_bytes());
+            first[20..].fill(0xaa);
+
+            // Overlapping continuation: offset 8, MF=0, 100 payload bytes
+            // overlaps [0,100).
+            let mut second = vec![0u8; 20 + 100];
+            second[0] = 0x45;
+            second[2..4].copy_from_slice(&120u16.to_be_bytes());
+            second[4..6].copy_from_slice(&0x1234_u16.to_be_bytes());
+            second[6..8].copy_from_slice(&8u16.to_be_bytes()); // offset 8
+            second[8] = 64;
+            second[9] = 50;
+            second[12..16].copy_from_slice(&[172, 20, 110, 221]);
+            second[16..20].copy_from_slice(&[2, 30, 238, 251]);
+            let checksum = ipv4_header_checksum(&second[..20]);
+            second[10..12].copy_from_slice(&checksum.to_be_bytes());
+            second[20..].fill(0xbb);
+
+            let mut buffers = HashMap::new();
+            match reassemble_inbound_ip_fragment(first, &mut buffers) {
+                FragmentReassemblyOutcome::Buffered => {}
+                other => panic!("expected buffered, got {other:?}"),
+            }
+            match reassemble_inbound_ip_fragment(second, &mut buffers) {
+                FragmentReassemblyOutcome::Dropped => {}
+                other => panic!("expected dropped for overlap, got {other:?}"),
+            }
         }
     }
 }

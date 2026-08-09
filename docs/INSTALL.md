@@ -1,125 +1,218 @@
-# 安装与部署指南
+# 手动安装与部署指南
 
+> 当前仅支持手动安装。一键安装、自动卸载、Release 下载、在线升级和 OTA 应用流程正在
+> 重构，仓库中的 `install_latest.sh`、`uninstall.sh`、`scripts/pack-ota.sh` 及相关代码暂不
+> 作为可用发布渠道。不要运行来自原仓库或其他未知地址的安装脚本。
 
-## 设备侧一键安装 / 升级
+<!-- TODO: 仓库地址、发布制品和 OTA 契约稳定后，重新编写并审核自动安装/升级文档。 -->
 
-在目标设备上以 root 执行：
+## 1. 准备环境
+
+目标设备需要 Debian/Linux、systemd、root 权限、system D-Bus、ModemManager、
+NetworkManager、QMI 工具和与目标能力匹配的内核驱动。详细要求见
+[运行环境与系统管理](./ENVIRONMENT.md)。
+
+构建机需要：
+
+- Rust stable 与 Cargo。
+- Node.js、pnpm。
+- 交叉构建 aarch64 musl 时需要 Zig 与 cargo-zigbuild，或等价的 musl 工具链。
+- 一个由 `carrier_Bundles` 生成、已封存且契约兼容的 schema v7
+  `carrier-bundles.sqlite3`。当前仓库不会自动下载该文件。
+
+## 2. 手动构建
+
+### 前端
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sh
+cd frontend
+pnpm install --frozen-lockfile
+pnpm build
+cd ..
 ```
 
-### 国内网络环境
+产物位于 `frontend/dist/`。
+
+### 后端：在目标架构原生构建
 
 ```bash
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sh
+cd backend
+cargo build --release
+cd ..
 ```
 
-### 可选环境变量
+产物位于 `backend/target/release/simadmin`。
+
+### 后端：交叉构建 aarch64 musl
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh \
-  | REPO=3899/SimAdmin INSTALL_DIR=/opt/simadmin SERVICE_NAME=simadmin sh
+rustup target add aarch64-unknown-linux-musl
+cargo install cargo-zigbuild
+cd backend
+SQLITE3_STATIC=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=0 \
+  cargo zigbuild --release --target aarch64-unknown-linux-musl
+cd ..
 ```
 
-### 安装脚本动作说明
+产物位于 `backend/target/aarch64-unknown-linux-musl/release/simadmin`。请使用适合实际目标
+设备架构的二进制，不要把 x86_64 构建产物安装到 aarch64 设备。
 
-- 从 GitHub Release 下载 `simadmin.tar.gz`。
-- 安装后端二进制到 `/opt/simadmin/simadmin`。
-- 安装前端到 `/opt/simadmin/www`。
-- 安装并启用 `simadmin.service`。
-- 安装并启用 `simadmin-modem-recovery.service`。
-- 配置 NetworkManager 忽略 `wwan*` 接口，避免与 SimAdmin 抢占蜂窝连接管理。
+## 3. 将产物传到目标设备
 
----
+以下示例使用文档专用地址 `192.0.2.10`，执行前替换成真实设备地址：
 
-## 访问管理后台
+```bash
+scp backend/target/aarch64-unknown-linux-musl/release/simadmin \
+  root@192.0.2.10:/tmp/simadmin.new
+scp -r frontend/dist root@192.0.2.10:/tmp/simadmin-www
+scp /path/to/carrier-bundles.sqlite3 \
+  root@192.0.2.10:/tmp/carrier-bundles.sqlite3
+scp scripts/simadmin.service root@192.0.2.10:/tmp/simadmin.service
+```
 
-安装成功并运行服务后，您可以通过浏览器访问管理后台：
+也可以使用 ADB、U 盘或其他可信方式传输，但最终至少需要以下四项：
 
-- **访问地址**：`http://<设备IP>:3000`
-- **密码设定**：SimAdmin **未设默认初始密码**。首次访问时将自动跳转到 `/login` 的“设置管理员密码”页面，设定强密码后会自动登录并进入系统。
+```text
+simadmin                 后端可执行文件
+frontend/dist/           前端静态资源
+carrier-bundles.sqlite3  只读运营商 catalog
+simadmin.service         systemd 主服务单元
+```
 
-SimAdmin 采用单管理员登录模式，不包含多用户和权限细分系统。首次运行配置要求如下：
+## 4. 安装主服务
 
-### 密码规则
+SSH 登录目标设备，以 `root` 执行：
 
-- 8-64 个字符。
+```bash
+install -d -m 0755 /opt/simadmin /opt/simadmin/www
+install -m 0755 /tmp/simadmin.new /opt/simadmin/simadmin
+cp -a /tmp/simadmin-www/. /opt/simadmin/www/
+install -m 0644 /tmp/carrier-bundles.sqlite3 \
+  /opt/simadmin/carrier-bundles.sqlite3
+install -m 0644 /tmp/simadmin.service \
+  /etc/systemd/system/simadmin.service
+systemctl daemon-reload
+systemctl enable --now simadmin.service
+```
+
+检查服务与启动日志：
+
+```bash
+systemctl status simadmin --no-pager
+journalctl -u simadmin -n 100 --no-pager
+```
+
+后端默认从可执行文件同目录读取 `carrier-bundles.sqlite3`。如果使用其他位置，需要在
+systemd 单元中增加 `SIMADMIN_CARRIER_CATALOG` 环境变量或修改 `ExecStart` 参数。
+
+## 5. 可选：安装副 QMI/VoLTE 服务
+
+只有目标硬件、内核和 RPMSG 布局符合要求时才执行本节。先在设备上验证：
+
+```bash
+/opt/simadmin/simadmin secondary-qmi-init --dry-run
+```
+
+在构建机上传文件：
+
+```bash
+scp deploy/system/99-simadmin-secondary-qmi.rules \
+  root@192.0.2.10:/tmp/99-simadmin-secondary-qmi.rules
+scp deploy/system/simadmin-secondary-qmi.service \
+  root@192.0.2.10:/tmp/simadmin-secondary-qmi.service
+```
+
+在目标设备安装：
+
+```bash
+install -d -m 0755 /etc/udev/rules.d
+install -m 0644 /tmp/99-simadmin-secondary-qmi.rules \
+  /etc/udev/rules.d/99-simadmin-secondary-qmi.rules
+install -m 0644 /tmp/simadmin-secondary-qmi.service \
+  /etc/systemd/system/simadmin-secondary-qmi.service
+udevadm control --reload-rules
+systemctl daemon-reload
+systemctl enable simadmin-secondary-qmi.service
+```
+
+该服务必须在 ModemManager 之前准备 DATA6 端点。启用后建议在维护窗口重启设备，再检查：
+
+```bash
+systemctl status simadmin-secondary-qmi --no-pager
+journalctl -u simadmin-secondary-qmi -n 100 --no-pager
+ls -l /dev/wwan*
+```
+
+## 6. 可选：手动安装 lpac
+
+eSIM/eUICC 管理需要与设备架构和 libc 兼容的 `lpac`。请从可信来源自行取得，审核后复制：
+
+```bash
+install -d -m 0755 /opt/simadmin/lpac
+install -m 0755 /path/to/lpac /opt/simadmin/lpac/lpac
+```
+
+如果该构建还附带动态库，应一并放入 `/opt/simadmin/lpac/lib/`。普通 SIM、蜂窝网络和不依赖
+eSIM 管理的功能不要求安装 `lpac`。
+
+## 7. 访问管理后台
+
+服务正常启动后访问：
+
+```text
+http://设备IP:3000
+```
+
+SimAdmin 没有默认初始密码。首次访问会进入管理员密码设置页面：
+
+- 默认要求 8–64 个字符。
 - 只能使用英文字母、数字和符号，不允许空格或中文。
-- 至少包含两类字符，例如字母 + 数字、字母 + 符号或数字 + 符号。
+- 至少包含两类字符。
 
-### 关闭与调整密码保护
-
-系统默认开启密码安全保护。如果您希望在局域网内免密直接使用，或需要修改密码的强度规则：
-
-1. **关闭密码保护**：登录后台后，前往 「系统配置 - 安全性设置」 页面，将“密码保护”开关关闭并保存。在此之后，访问 Web 后台将不再要求输入密码。
-2. **调整强度规则**：在 「系统配置 - 安全性设置」 页面中，可以自定义设置密码的最小长度（1-64 位）以及是否强制要求包含英文字母、数字和符号等强度校验规则。
-
-### 忘记/清空密码
-
-忘记密码时，可通过 SSH 登录目标设备后执行交互式重置：
+忘记密码时，可通过 SSH 执行：
 
 ```bash
 /opt/simadmin/simadmin auth reset-password
 ```
 
-如需清除管理员密码并让 Web UI 下次重新进入首次设置：
+如需清除密码并重新进入首次设置：
 
 ```bash
 /opt/simadmin/simadmin auth clear
 ```
 
-如果使用了自定义安装目录，请将 `/opt/simadmin/simadmin` 替换为实际后端二进制路径。
+## 8. 手动升级
 
----
-
-## 设备侧一键卸载
-
-默认彻底卸载，删除服务、程序文件、前端文件、OTA 临时目录、NetworkManager 配置以及用户数据：
+当前不要使用 OTA 或在线升级。升级前先停止服务并备份用户数据：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh | sh
+systemctl stop simadmin.service
+install -d -m 0700 /opt/simadmin/manual-backup
+cp -a /opt/simadmin/data.db* /opt/simadmin/manual-backup/
+cp -a /opt/simadmin/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /data/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
 ```
 
-### 国内网络环境
+然后按第 3、4 节重新传输并覆盖后端、前端和经过审核的 catalog，最后启动并检查日志：
 
 ```bash
-curl -fsSL https://gh-proxy.com/https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh | sh
+systemctl start simadmin.service
+systemctl status simadmin --no-pager
+journalctl -u simadmin -n 100 --no-pager
 ```
 
-### 保留用户数据卸载
+`data.db` 和配置文件是用户数据，不要用发布包中的同名文件覆盖。catalog 是独立只读制品，
+升级时需要同时验证 schema、config contract 与 sealed 状态。
 
-如需保留短信数据库和配置文件：
+## 9. 暂停使用的功能
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh \
-  | sh -s -- --keep-user-data
-```
+在新的仓库地址、制品命名、签名/校验、catalog 分发和回滚契约完成前，以下入口均视为
+不可用：
 
-### 自定义环境卸载
+- `install_latest.sh` 一键安装或升级。
+- `uninstall.sh` 自动卸载。
+- `scripts/build.sh` 生成的旧式 OTA 发布流程。
+- `scripts/pack-ota.sh`。
+- Web 页面中的在线检查、在线下载、OTA 上传和应用功能。
 
-自定义安装路径或服务名时，需要和安装时保持一致：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/uninstall.sh \
-  | INSTALL_DIR=/opt/simadmin SERVICE_NAME=simadmin sh -s -- --keep-user-data
-```
-
-### 卸载脚本参数说明
-
-| 参数 | 说明 |
-|------|------|
-| `--purge` | 删除全部 SimAdmin 文件和用户数据，默认行为 |
-| `--keep-user-data` | 保留 `/opt/simadmin/data.db`、SQLite sidecar 文件和配置文件 |
-| `--install-dir PATH` | 指定安装目录，默认 `/opt/simadmin` |
-| `--service-name NAME` | 指定主服务名，默认 `simadmin` |
-
-### 卸载脚本动作说明
-
-- 停止并禁用 `simadmin.service`。
-- 停止并禁用 `simadmin-modem-recovery.service`。
-- 删除 systemd 单元文件并执行 `daemon-reload` / `reset-failed`。
-- 删除 `/usr/local/bin/simadmin-modem-recovery.sh`。
-- 删除 `/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf`，并在 NetworkManager 运行时重启它。
-- 删除 `/tmp/ota_staging`。
-- 默认删除 `/opt/simadmin` 和 `/data/config.json`；使用 `--keep-user-data` 时保留用户数据。
+相关文件暂时保留是为了后续重构和历史对照，不表示当前已获得发布支持。

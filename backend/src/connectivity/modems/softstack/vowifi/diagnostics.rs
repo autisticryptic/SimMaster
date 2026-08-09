@@ -295,6 +295,7 @@ pub struct VowifiDiagnosticsTimelineEntry {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct VowifiDiagnosticsResponse {
+    pub line_id: Option<String>,
     pub status: VowifiStatusResponse,
     pub persisted_snapshot: Option<VowifiRuntimeSnapshotEntry>,
     pub events: VowifiRuntimeEventsResponse,
@@ -310,6 +311,7 @@ pub struct VowifiDiagnosticsResponse {
 impl Default for VowifiDiagnosticsResponse {
     fn default() -> Self {
         Self {
+            line_id: None,
             status: VowifiStatusResponse::default(),
             persisted_snapshot: None,
             events: VowifiRuntimeEventsResponse::default(),
@@ -346,6 +348,7 @@ impl Default for VowifiDiagnosticsResponse {
 }
 
 pub fn build_diagnostics_response(
+    line_id: Option<String>,
     status: VowifiStatusResponse,
     persisted_snapshot: Option<VowifiRuntimeSnapshotEntry>,
     events: VowifiRuntimeEventsResponse,
@@ -366,6 +369,7 @@ pub fn build_diagnostics_response(
     let m10_audit = stability::build_readiness_audit_report(&status.executor);
 
     VowifiDiagnosticsResponse {
+        line_id,
         status,
         persisted_snapshot,
         events,
@@ -1100,8 +1104,8 @@ impl PublicAkaAdapterPlan {
 }
 
 pub fn list_profiles() -> VowifiProfilesResponse {
-    let profiles = profiles::BUILTIN_PROFILES
-        .iter()
+    let profiles = profiles::published_database_profiles()
+        .into_iter()
         .map(PublicCarrierProfile::from_profile)
         .collect::<Vec<_>>();
     VowifiProfilesResponse {
@@ -1135,7 +1139,7 @@ fn match_profile_from_parts(
     imsi_for_matching: &str,
     operator_id_for_matching: &str,
 ) -> VowifiProfileMatchResponse {
-    // A per-line pin to a database profile is the operator's explicit choice and
+    // A per-line pin to a published profile is the operator's explicit choice and
     // wins over automatic matching. A pin that no longer resolves degrades to the
     // automatic path below, so deleting a profile never strands a line.
     if let Some(profile_id) = pinned_profile_id {
@@ -1144,20 +1148,20 @@ fn match_profile_from_parts(
         }
     }
 
-    if let Some(matched) = profiles::resolve_by_imsi(imsi_for_matching) {
-        return matched_response(matched.profile, matched.matched_prefix, sim);
-    }
-
     let operator_digits: String = operator_id_for_matching
         .chars()
         .filter(|ch| ch.is_ascii_digit())
         .collect();
     if operator_digits.len() == 5 || operator_digits.len() == 6 {
-        let mcc = &operator_digits[..3];
-        let mnc = &operator_digits[3..];
-        if let Some(profile) = profiles::resolve_by_plmn(mcc, mnc) {
-            return matched_response(profile, operator_digits, sim);
+        if let Some(matched) =
+            profiles::resolve_for_line(None, imsi_for_matching, Some(&operator_digits))
+        {
+            return matched_response(matched.profile, matched.matched_prefix, sim);
         }
+    }
+
+    if let Some(matched) = profiles::resolve_by_imsi(imsi_for_matching) {
+        return matched_response(matched.profile, matched.matched_prefix, sim);
     }
 
     VowifiProfileMatchResponse {
@@ -1167,7 +1171,12 @@ fn match_profile_from_parts(
 }
 
 pub fn match_profile_from_identity(identity: &VowifiSimIdentity) -> VowifiProfileMatchResponse {
-    match_profile_from_parts(identity.masked(), None, identity.imsi(), identity.operator_id())
+    match_profile_from_parts(
+        identity.masked(),
+        None,
+        identity.imsi(),
+        identity.operator_id(),
+    )
 }
 
 /// Match honoring this line's pinned carrier `profile_id` (from
@@ -1196,7 +1205,7 @@ mod tests {
             ..Default::default()
         };
 
-        let matched = match_profile_from_parts(sim, None, "", "20404");
+        let matched = match_profile_from_parts(sim, None, "204041234567890", "20404");
 
         assert!(matched.matched);
         assert_eq!(

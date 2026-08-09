@@ -1,0 +1,22 @@
+meta {
+  name: Send Call DTMF
+  type: http
+  seq: 105
+}
+
+post {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/calls/dtmf
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "path": "/ril_0/voicecall01",
+    "digit": "5"
+  }
+}
+
+settings {
+  encodeUrl: true
+}

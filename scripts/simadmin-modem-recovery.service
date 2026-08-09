@@ -1,11 +1,13 @@
 [Unit]
-Description=SimAdmin Modem Recovery
-After=network.target ModemManager.service
+Description=SimAdmin safe cold-start modem recovery
+After=ModemManager.service simadmin-secondary-qmi.service
+Wants=ModemManager.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/simadmin-modem-recovery.sh
 RemainAfterExit=yes
+TimeoutStartSec=420
 
 [Install]
 WantedBy=multi-user.target

@@ -567,8 +567,8 @@ function InfoCell({
   )
 }
 
-export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
-  const scope = lineId ?? ''
+export default function EsimManagerPage({ lineId }: { lineId: string }) {
+  const scope = lineId
   const initialSnapshot = getEsimPageSnapshot(scope)
   const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(initialSnapshot?.euicc ?? null)
   const [profiles, setProfiles] = useState<EsimProfile[]>(initialSnapshot?.profiles ?? [])
@@ -756,7 +756,7 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
         { time: '[00:04]', text: '运营商 SM-DP+ 服务器端身份授权认证开始...', type: 'info' },
       ])
 
-      const response = await api.downloadEsimProfile({
+      const response = await api.downloadEsimProfile(scope, {
         smdp: addForm.smdp.trim(),
         matching_id: addForm.matchingId.trim(),
         confirmation_code: addForm.confirmationCode.trim() || undefined,
@@ -832,9 +832,9 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
     }
 
     try {
-      void api.getVowifiControl().then((res) => {
+      void api.getVowifiLine(lineId).then((res) => {
         if (res.data) {
-          setVowifiEnabled(res.data.connection_enabled)
+          setVowifiEnabled(res.data.config.enabled)
         }
       }).catch(() => { /* ignore */ })
 
@@ -881,7 +881,7 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
       // Keep lpac calls sequential because they share the physical eUICC channel,
       // but commit each result as soon as it arrives so the shell renders first.
       setProfilesLoading(true)
-      const profilesRes = await requestOrNull(api.getEsimProfiles(lineId), 'profiles')
+      const profilesRes = await requestOrNull(api.getEsimProfiles(scope), 'profiles')
       setProfilesLoading(false)
       if (profilesRes?.data) {
         const nextProfiles = profilesRes.data.profiles ?? []
@@ -897,7 +897,7 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
       }
 
       setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(lineId), 'euicc')
+      const euiccRes = await requestOrNull(api.getEsimEuicc(scope), 'euicc')
       setEuiccLoading(false)
       if (euiccRes?.data) {
         setEuicc(euiccRes.data)
@@ -946,7 +946,7 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
 
   const loadBasebandRecoveryStatus = async () => {
     try {
-      const res = await api.getBasebandRestartStatus()
+      const res = await api.getBasebandRestartStatus(lineId)
       const data = res.data
       if (data) {
         setBasebandRecoverySteps(data.steps ?? [])
@@ -963,9 +963,9 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
     setBasebandRecoverySteps([])
     setBasebandRecoveryRegistration(null)
 
-    void api.getVowifiControl().then((res) => {
+    void api.getVowifiLine(lineId).then((res) => {
       if (res.data) {
-        setVowifiEnabled(res.data.connection_enabled)
+        setVowifiEnabled(res.data.config.enabled)
       }
     }).catch(() => { /* ignore */ })
 
@@ -1012,8 +1012,8 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
     setSuccess(null)
     try {
       const response = confirmAction === 'enable'
-        ? await api.enableEsimProfile(selectedProfile.iccid, lineId)
-        : await api.deleteEsimProfile(selectedProfile.iccid, lineId)
+        ? await api.enableEsimProfile(scope, selectedProfile.iccid)
+        : await api.deleteEsimProfile(scope, selectedProfile.iccid)
       if (!commandSucceeded(response.data)) {
         throw new Error(response.data?.msg || 'eSIM 操作失败')
       }
@@ -1079,7 +1079,7 @@ export default function EsimManagerPage({ lineId }: { lineId?: string } = {}) {
     setError(null)
     setSuccess(null)
     try {
-      const response = await api.renameEsimProfile(selectedProfile.iccid, name, lineId)
+      const response = await api.renameEsimProfile(scope, selectedProfile.iccid, name)
       if (!commandSucceeded(response.data)) {
         throw new Error(response.data?.msg || 'Profile 重命名失败')
       }

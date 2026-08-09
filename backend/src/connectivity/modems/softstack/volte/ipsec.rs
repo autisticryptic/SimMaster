@@ -38,6 +38,20 @@ impl SecAgree {
             self.spi_c, self.spi_s, self.port_c, self.port_s
         )
     }
+
+    pub fn spaced_security_client_value(self) -> String {
+        format!(
+            "ipsec-3gpp; alg=hmac-md5-96; ealg=null; prot=esp; mod=trans; spi-c={}; spi-s={}; port-c={}; port-s={}",
+            self.spi_c, self.spi_s, self.port_c, self.port_s
+        )
+    }
+
+    pub fn compact_security_client_value(self) -> String {
+        format!(
+            "ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c={};spi-s={};port-c={};port-s={}",
+            self.spi_c, self.spi_s, self.port_c, self.port_s
+        )
+    }
 }
 
 /// Parse the selected `Security-Server: ipsec-3gpp;...` value. Unknown
@@ -115,6 +129,7 @@ pub struct XfrmSa {
     pub spi: u32,
     /// Integrity key (from CK/IK-derived material). Hex-encoded on the wire.
     pub auth_key: Vec<u8>,
+    pub enc_key: Vec<u8>,
     pub algs: XfrmAlgs,
     pub sport: u16,
     pub dport: u16,
@@ -155,7 +170,11 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         sa.algs.auth_trunc_bits.to_string(),
         "enc".into(),
         sa.algs.enc.into(),
-        String::new(),
+        if sa.enc_key.is_empty() {
+            String::new()
+        } else {
+            hex_key(&sa.enc_key)
+        },
     ]
 }
 
@@ -239,6 +258,27 @@ pub fn build_install_plan(
     pcscf_sec: &SecAgree,
     auth_key: &[u8],
 ) -> Result<XfrmInstallPlan, VolteError> {
+    build_install_plan_with_algs(
+        ue,
+        pcscf,
+        ue_sec,
+        pcscf_sec,
+        auth_key,
+        &[],
+        XfrmAlgs::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_install_plan_with_algs(
+    ue: IpAddr,
+    pcscf: IpAddr,
+    ue_sec: &SecAgree,
+    pcscf_sec: &SecAgree,
+    auth_key: &[u8],
+    encryption_key: &[u8],
+    algs: XfrmAlgs,
+) -> Result<XfrmInstallPlan, VolteError> {
     // IMS IPsec requires IPv6 in most deployments (observed
     // `volte_ipsec_requires_ipv6`); we allow v4 for lab use but both ends must
     // match family.
@@ -248,7 +288,9 @@ pub fn build_install_plan(
     if auth_key.is_empty() {
         return Err(VolteError::new(code::IPSEC_IK_INVALID));
     }
-    let algs = XfrmAlgs::default();
+    if algs.enc != "cipher_null" && encryption_key.is_empty() {
+        return Err(VolteError::new(code::IPSEC_IK_INVALID));
+    }
     // `-c` identifies packets sent by the client; `-s` identifies packets
     // sent by the server. Each endpoint advertises its own ports/SPIs, so the
     // two directions deliberately use values from different headers.
@@ -258,6 +300,7 @@ pub fn build_install_plan(
         dst: pcscf,
         spi: pcscf_sec.spi_s,
         auth_key: auth_key.to_vec(),
+        enc_key: encryption_key.to_vec(),
         algs,
         sport: ue_sec.port_c,
         dport: pcscf_sec.port_s,
@@ -268,6 +311,7 @@ pub fn build_install_plan(
         dst: ue,
         spi: ue_sec.spi_s,
         auth_key: auth_key.to_vec(),
+        enc_key: encryption_key.to_vec(),
         algs,
         sport: pcscf_sec.port_c,
         dport: ue_sec.port_s,
@@ -279,6 +323,38 @@ pub fn build_install_plan(
     Ok(XfrmInstallPlan {
         states: vec![out_sa, in_sa],
         policies,
+    })
+}
+
+/// Translate the negotiated Security-Server algorithms into Linux xfrm names.
+pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, VolteError> {
+    let mut integrity = None;
+    let mut encryption = None;
+    for part in value.split(';').skip(1) {
+        let Some((name, raw)) = part.split_once('=') else {
+            continue;
+        };
+        let value = raw.trim().trim_matches('"').to_ascii_lowercase();
+        match name.trim().to_ascii_lowercase().as_str() {
+            "alg" => integrity = Some(value),
+            "ealg" => encryption = Some(value),
+            _ => {}
+        }
+    }
+    let (auth, auth_trunc_bits) = match integrity.as_deref() {
+        Some("hmac-md5-96") => ("hmac(md5)", 96),
+        Some("hmac-sha-1-96" | "hmac-sha1-96") => ("hmac(sha1)", 96),
+        _ => return Err(VolteError::new(code::SECURITY_SERVER_MISSING)),
+    };
+    let enc = match encryption.as_deref() {
+        Some("null") => "cipher_null",
+        Some("aes-cbc") => "cbc(aes)",
+        _ => return Err(VolteError::new(code::SECURITY_SERVER_MISSING)),
+    };
+    Ok(XfrmAlgs {
+        auth,
+        auth_trunc_bits,
+        enc,
     })
 }
 
@@ -396,6 +472,7 @@ mod tests {
             dst: v6(1),
             spi: 0x0000_1234,
             auth_key: vec![0xaa, 0xbb, 0xcc],
+            enc_key: Vec::new(),
             algs: XfrmAlgs::default(),
             sport: 6000,
             dport: 6001,
@@ -497,6 +574,14 @@ mod tests {
         };
         let parsed = parse_security_server(&offered.security_client_value()).unwrap();
         assert_eq!(parsed, offered);
+        let spaced = offered.spaced_security_client_value();
+        assert!(spaced.contains("; alg="));
+        assert!(spaced.contains("; prot=esp; mod=trans;"));
+        assert_eq!(parse_security_server(&spaced).unwrap(), offered);
+        let compact = offered.compact_security_client_value();
+        assert!(!compact.contains("prot="));
+        assert!(!compact.contains("mod="));
+        assert_eq!(parse_security_server(&compact).unwrap(), offered);
         let hex = parse_security_server(
             "ipsec-3gpp;alg=hmac-md5-96;spi-c=0x10203040;spi-s=0x50607080;port-c=5062;port-s=5064",
         )

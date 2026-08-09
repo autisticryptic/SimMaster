@@ -15,6 +15,26 @@ use std::sync::{Arc, Mutex};
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
+fn required_line_id(line_id: &str) -> Result<&str> {
+    let line_id = line_id.trim();
+    if line_id.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "line_id must not be empty".to_string(),
+        ));
+    }
+    Ok(line_id)
+}
+
+fn required_sms_channel_id(channel_id: &str) -> Result<&str> {
+    let channel_id = channel_id.trim();
+    if channel_id.is_empty() {
+        return Err(rusqlite::Error::InvalidParameterName(
+            "channel_id must not be empty".to_string(),
+        ));
+    }
+    Ok(channel_id)
+}
+
 /// 短信记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmsMessage {
@@ -39,6 +59,8 @@ fn default_sms_transport() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallRecord {
     pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
     pub direction: String,        // "incoming" / "outgoing" / "missed"
     pub phone_number: String,     // 电话号码
     pub duration: i64,            // 通话时长（秒）
@@ -62,6 +84,8 @@ pub struct SmsStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationLogEntry {
     pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
     pub event_type: String,
     pub status: String,
     pub summary: String,
@@ -82,6 +106,8 @@ pub struct NotificationLogsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationLogEntry {
     pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
     pub task_id: String,
     pub task_name: String,
     pub task_type: String,
@@ -112,6 +138,7 @@ pub struct PeriodSmsStats {
 }
 
 pub struct NewNotificationLog<'a> {
+    pub line_id: Option<&'a str>,
     pub event_type: &'a str,
     pub status: &'a str,
     pub summary: &'a str,
@@ -123,6 +150,7 @@ pub struct NewNotificationLog<'a> {
 }
 
 pub struct NewNotificationQueueItem<'a> {
+    pub line_id: Option<&'a str>,
     pub status: &'a str,
     pub event_type: &'a str,
     pub event_label: &'a str,
@@ -142,6 +170,8 @@ pub struct NewNotificationQueueItem<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NotificationQueueEntry {
     pub id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
     pub status: String,
     pub event_type: String,
     pub event_label: String,
@@ -212,6 +242,7 @@ pub struct EsimProfileCacheEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiRuntimeEventEntry {
     pub id: i64,
+    pub line_id: Option<String>,
     pub trace_id: Option<String>,
     pub level: String,
     pub phase: String,
@@ -222,6 +253,7 @@ pub struct VowifiRuntimeEventEntry {
 }
 
 pub struct NewVowifiRuntimeEvent<'a> {
+    pub line_id: &'a str,
     pub trace_id: Option<&'a str>,
     pub level: &'a str,
     pub phase: &'a str,
@@ -266,6 +298,7 @@ pub struct LineDataTrafficEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiRuntimeSnapshotEntry {
+    pub line_id: Option<String>,
     pub phase: String,
     pub profile_id: Option<String>,
     pub plmn: Option<String>,
@@ -283,6 +316,7 @@ pub struct VowifiRuntimeSnapshotEntry {
 }
 
 pub struct NewVowifiRuntimeSnapshot<'a> {
+    pub line_id: &'a str,
     pub phase: &'a str,
     pub profile_id: Option<&'a str>,
     pub plmn: Option<&'a str>,
@@ -309,6 +343,7 @@ pub struct VowifiSmsPartEntry {
 }
 
 pub struct NewVowifiSmsPart<'a> {
+    pub line_id: &'a str,
     pub message_id: &'a str,
     pub reference: i64,
     pub sequence: i64,
@@ -319,6 +354,7 @@ pub struct NewVowifiSmsPart<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiSmsDeliveryEntry {
     pub message_id: String,
+    pub line_id: Option<String>,
     pub trace_id: String,
     pub direction: String,
     pub state: String,
@@ -335,6 +371,7 @@ pub struct VowifiSmsDeliveryEntry {
 
 pub struct NewVowifiSmsDelivery<'a> {
     pub message_id: &'a str,
+    pub line_id: &'a str,
     pub trace_id: &'a str,
     pub direction: &'a str,
     pub state: &'a str,
@@ -354,6 +391,7 @@ pub struct VowifiSmsDeliveriesResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiEsimRestoreEntry {
+    pub line_id: Option<String>,
     pub switch_token: Option<String>,
     pub switch_phase: Option<String>,
     pub phase_ms: Option<i64>,
@@ -365,6 +403,7 @@ pub struct VowifiEsimRestoreEntry {
 }
 
 pub struct NewVowifiEsimRestore<'a> {
+    pub line_id: &'a str,
     pub switch_token: Option<&'a str>,
     pub switch_phase: Option<&'a str>,
     pub phase_ms: Option<i64>,
@@ -386,6 +425,7 @@ pub struct VowifiSoakSampleEntry {
 }
 
 pub struct NewVowifiSoakSample<'a> {
+    pub line_id: &'a str,
     pub run_id: &'a str,
     pub sample_kind: &'a str,
     pub metric_name: &'a str,
@@ -396,6 +436,7 @@ pub struct NewVowifiSoakSample<'a> {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiSoakRunEntry {
     pub run_id: String,
+    pub line_id: Option<String>,
     pub scenario_id: String,
     pub profile_id: Option<String>,
     pub plmn: Option<String>,
@@ -412,6 +453,7 @@ pub struct VowifiSoakRunEntry {
 
 pub struct NewVowifiSoakRun<'a> {
     pub run_id: &'a str,
+    pub line_id: &'a str,
     pub scenario_id: &'a str,
     pub profile_id: Option<&'a str>,
     pub plmn: Option<&'a str>,
@@ -524,15 +566,176 @@ mod tests {
     }
 
     #[test]
+    fn call_history_and_stats_are_isolated_by_line() {
+        let db = test_database();
+        let first = db
+            .insert_call(Some("line-a"), "outgoing", "+601112023012", true)
+            .expect("insert line-a call");
+        db.update_call_end(first, 12, true)
+            .expect("finish line-a call");
+        db.insert_call(Some("line-b"), "missed", "+60222222222", false)
+            .expect("insert line-b call");
+        db.insert_call(None, "incoming", "+60333333333", false)
+            .expect("insert legacy call");
+
+        assert_eq!(db.get_call_history(10, 0).unwrap().len(), 3);
+        let line_a = db.get_call_history_for_line("line-a", 10, 0).unwrap();
+        assert_eq!(line_a.len(), 1);
+        assert_eq!(line_a[0].line_id.as_deref(), Some("line-a"));
+        assert_eq!(line_a[0].phone_number, "+601112023012");
+
+        let line_a_stats = db.get_call_stats_for_line("line-a").unwrap();
+        assert_eq!(line_a_stats.total, 1);
+        assert_eq!(line_a_stats.outgoing, 1);
+        assert_eq!(line_a_stats.total_duration, 12);
+
+        assert_eq!(db.clear_calls_for_line("line-a").unwrap(), 1);
+        assert!(db
+            .get_call_history_for_line("line-a", 10, 0)
+            .unwrap()
+            .is_empty());
+        assert_eq!(db.get_call_stats().unwrap().total, 2);
+    }
+
+    #[test]
+    fn automation_logs_persist_and_filter_target_line() {
+        let db = test_database();
+        db.insert_automation_log(
+            Some("line-a"),
+            "task-a",
+            "Line A task",
+            "send_sms",
+            "success",
+            "done-a",
+        )
+        .unwrap();
+        db.insert_automation_log(
+            Some("line-b"),
+            "task-b",
+            "Line B task",
+            "send_sms",
+            "failed",
+            "done-b",
+        )
+        .unwrap();
+        db.insert_automation_log(
+            None,
+            "task-device",
+            "Device task",
+            "reboot_device",
+            "success",
+            "done-device",
+        )
+        .unwrap();
+
+        let line_a = db
+            .get_automation_logs("", "", "line-a", "", "", "", 10, 0)
+            .unwrap();
+        assert_eq!(line_a.total, 1);
+        assert_eq!(line_a.logs[0].line_id.as_deref(), Some("line-a"));
+        let device = db
+            .get_automation_logs("reboot_device", "", "", "", "", "", 10, 0)
+            .unwrap();
+        assert_eq!(device.total, 1);
+        assert!(device.logs[0].line_id.is_none());
+        assert_eq!(
+            db.get_last_log_for_task("task-b")
+                .unwrap()
+                .unwrap()
+                .line_id
+                .as_deref(),
+            Some("line-b")
+        );
+
+        assert_eq!(db.clear_automation_logs("", "", "line-a", "", "").unwrap(), 1);
+        let remaining = db
+            .get_automation_logs("", "", "", "", "", "", 10, 0)
+            .unwrap();
+        assert_eq!(remaining.total, 2);
+        assert!(remaining
+            .logs
+            .iter()
+            .all(|log| log.line_id.as_deref() != Some("line-a")));
+    }
+
+    #[test]
+    fn notification_history_and_queue_preserve_line_scope() {
+        let db = test_database();
+        for (line_id, summary) in [
+            (Some("line-a"), "line A SMS"),
+            (Some("line-b"), "line B automation"),
+            (None, "device event"),
+        ] {
+            db.insert_notification_log(NewNotificationLog {
+                line_id,
+                event_type: "sms",
+                status: "success",
+                summary,
+                rule_id: "rule",
+                rule_name: "Rule",
+                channel_id: "channel",
+                channel_name: "Channel",
+                message: "sent",
+            })
+            .unwrap();
+        }
+
+        let line_a = db
+            .get_notification_logs("", "", "line-a", "", "", "", 10, 0)
+            .unwrap();
+        assert_eq!(line_a.total, 1);
+        assert_eq!(line_a.logs[0].line_id.as_deref(), Some("line-a"));
+        assert_eq!(
+            db.clear_notification_logs("", "", "line-a", "", "")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.get_notification_logs("", "", "", "", "", "", 10, 0)
+                .unwrap()
+                .total,
+            2
+        );
+
+        for line_id in [Some("line-a"), Some("line-b"), None] {
+            db.insert_notification_queue_item(NewNotificationQueueItem {
+                line_id,
+                status: "pending",
+                event_type: "sms",
+                event_label: "SMS",
+                summary: "queued",
+                reason: "rate limit",
+                rule_id: "rule",
+                rule_name: "Rule",
+                channel_id: "channel",
+                channel_name: "Channel",
+                channel_type: "webhook",
+                title: "Title",
+                body: "Body",
+                next_attempt_at: "2099-01-01 00:00:00",
+                max_attempts: 5,
+            })
+            .unwrap();
+        }
+
+        let line_b = db.get_notification_queue("line-b", 10).unwrap();
+        assert_eq!(line_b.total, 1);
+        assert_eq!(line_b.items[0].line_id.as_deref(), Some("line-b"));
+        assert_eq!(db.get_notification_queue("device", 10).unwrap().total, 1);
+        assert_eq!(db.get_notification_queue("", 10).unwrap().total, 3);
+    }
+
+    #[test]
     fn vowifi_runtime_snapshot_round_trips_without_sensitive_identity() {
         let db = test_database();
 
         assert!(db
-            .get_vowifi_runtime_snapshot()
+            .get_vowifi_runtime_snapshot_for_line("line-test")
             .expect("read empty snapshot")
             .is_none());
 
         db.upsert_vowifi_runtime_snapshot(NewVowifiRuntimeSnapshot {
+            line_id: "line-test",
             phase: "profile_matched",
             profile_id: Some("gb_ee_23433"),
             plmn: Some("23433"),
@@ -550,7 +753,7 @@ mod tests {
         .expect("write snapshot");
 
         let snapshot = db
-            .get_vowifi_runtime_snapshot()
+            .get_vowifi_runtime_snapshot_for_line("line-test")
             .expect("read snapshot")
             .expect("snapshot exists");
         assert_eq!(snapshot.phase, "profile_matched");
@@ -562,43 +765,536 @@ mod tests {
     }
 
     #[test]
+    fn new_vowifi_diagnostic_writes_reject_empty_line_ids() {
+        let db = test_database();
+
+        assert!(db
+            .insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+                line_id: " ",
+                trace_id: None,
+                level: "info",
+                phase: "starting",
+                profile_id: None,
+                event_type: "test",
+                detail_json: "{}",
+            })
+            .is_err());
+        assert!(db
+            .upsert_vowifi_runtime_snapshot(NewVowifiRuntimeSnapshot {
+                line_id: "",
+                phase: "starting",
+                profile_id: None,
+                plmn: None,
+                identity_ready: false,
+                sim_auth_ready: false,
+                profile_matched: false,
+                epdg_ready: false,
+                ike_ready: false,
+                child_sa_ready: false,
+                esp_ready: false,
+                ims_registered: false,
+                sms_ready: false,
+                degraded_reason: None,
+            })
+            .is_err());
+        assert!(db
+            .upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+                message_id: "msg-empty-line",
+                line_id: "",
+                trace_id: "trace-empty-line",
+                direction: "mo",
+                state: "accepted",
+                sip_state: "accepted",
+                rpdu_ack: "acked",
+                delivery_reported: false,
+                failure_cause: None,
+                retry_count: 0,
+                api_sms_id: None,
+            })
+            .is_err());
+        assert!(db
+            .upsert_vowifi_sms_part(NewVowifiSmsPart {
+                line_id: " ",
+                message_id: "msg-empty-line",
+                reference: 1,
+                sequence: 1,
+                total: 1,
+                received: true,
+            })
+            .is_err());
+        assert!(db
+            .upsert_vowifi_esim_restore(NewVowifiEsimRestore {
+                line_id: "",
+                switch_token: None,
+                switch_phase: None,
+                phase_ms: None,
+                identity_ready: false,
+                sim_auth_ready: false,
+                degraded_reason: None,
+                retry_count: 0,
+            })
+            .is_err());
+        assert!(db
+            .insert_vowifi_soak_sample(NewVowifiSoakSample {
+                line_id: "",
+                run_id: "run-empty-line",
+                sample_kind: "counter",
+                metric_name: "attempts",
+                metric_value: 1,
+                state: "ok",
+            })
+            .is_err());
+        assert!(db
+            .upsert_vowifi_soak_run(NewVowifiSoakRun {
+                run_id: "run-empty-line",
+                line_id: "",
+                scenario_id: "test",
+                profile_id: None,
+                plmn: None,
+                status: "running",
+                duration_seconds: 0,
+                sample_count: 0,
+                failure_count: 0,
+                last_error: None,
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn vowifi_diagnostics_storage_is_isolated_by_line() {
+        let db = test_database();
+
+        for (line_id, phase, trace_id, message_id, run_id, retry_count) in [
+            ("line-a", "identity_ready", "trace-a", "msg-a", "run-a", 1),
+            ("line-b", "sms_ready", "trace-b", "msg-b", "run-b", 2),
+        ] {
+            db.upsert_vowifi_runtime_snapshot(NewVowifiRuntimeSnapshot {
+                line_id,
+                phase,
+                profile_id: Some("profile-test"),
+                plmn: Some("00101"),
+                identity_ready: true,
+                sim_auth_ready: phase == "sms_ready",
+                profile_matched: true,
+                epdg_ready: phase == "sms_ready",
+                ike_ready: phase == "sms_ready",
+                child_sa_ready: phase == "sms_ready",
+                esp_ready: phase == "sms_ready",
+                ims_registered: phase == "sms_ready",
+                sms_ready: phase == "sms_ready",
+                degraded_reason: None,
+            })
+            .expect("write line snapshot");
+            db.insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+                line_id,
+                trace_id: Some(trace_id),
+                level: "info",
+                phase,
+                profile_id: Some("profile-test"),
+                event_type: "line_event",
+                detail_json: r#"{"ready":true}"#,
+            })
+            .expect("write line event");
+            db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+                message_id,
+                line_id,
+                trace_id,
+                direction: "mo",
+                state: "accepted",
+                sip_state: "accepted",
+                rpdu_ack: "acked",
+                delivery_reported: false,
+                failure_cause: None,
+                retry_count: 0,
+                api_sms_id: None,
+            })
+            .expect("write line delivery");
+            db.upsert_vowifi_esim_restore(NewVowifiEsimRestore {
+                line_id,
+                switch_token: None,
+                switch_phase: Some(phase),
+                phase_ms: Some(100),
+                identity_ready: true,
+                sim_auth_ready: phase == "sms_ready",
+                degraded_reason: None,
+                retry_count,
+            })
+            .expect("write line restore");
+            db.upsert_vowifi_soak_run(NewVowifiSoakRun {
+                run_id,
+                line_id,
+                scenario_id: "line-isolation",
+                profile_id: Some("profile-test"),
+                plmn: Some("00101"),
+                status: "running",
+                duration_seconds: 1,
+                sample_count: 0,
+                failure_count: 0,
+                last_error: None,
+            })
+            .expect("write line soak run");
+        }
+
+        for (line_id, phase, trace_id, message_id, run_id, retry_count) in [
+            ("line-a", "identity_ready", "trace-a", "msg-a", "run-a", 1),
+            ("line-b", "sms_ready", "trace-b", "msg-b", "run-b", 2),
+        ] {
+            let snapshot = db
+                .get_vowifi_runtime_snapshot_for_line(line_id)
+                .expect("read line snapshot")
+                .expect("line snapshot exists");
+            assert_eq!(snapshot.line_id.as_deref(), Some(line_id));
+            assert_eq!(snapshot.phase, phase);
+
+            let events = db
+                .get_vowifi_runtime_events_for_line(line_id, 10, 0, None)
+                .expect("read line events");
+            assert_eq!(events.total, 1);
+            assert_eq!(events.events[0].line_id.as_deref(), Some(line_id));
+            assert_eq!(events.events[0].trace_id.as_deref(), Some(trace_id));
+
+            let deliveries = db
+                .get_vowifi_sms_deliveries_for_line(line_id, 10, 0)
+                .expect("read line deliveries");
+            assert_eq!(deliveries.total, 1);
+            assert_eq!(deliveries.deliveries[0].message_id, message_id);
+            assert_eq!(deliveries.deliveries[0].line_id.as_deref(), Some(line_id));
+
+            let restore = db
+                .get_vowifi_esim_restore_for_line(line_id)
+                .expect("read line restore")
+                .expect("line restore exists");
+            assert_eq!(restore.line_id.as_deref(), Some(line_id));
+            assert_eq!(restore.retry_count, retry_count);
+
+            let runs = db
+                .get_vowifi_soak_runs_for_line(line_id, 10, 0)
+                .expect("read line soak runs");
+            assert_eq!(runs.total, 1);
+            assert_eq!(runs.runs[0].run_id, run_id);
+            assert_eq!(runs.runs[0].line_id.as_deref(), Some(line_id));
+        }
+    }
+
+    #[test]
+    fn legacy_vowifi_singletons_migrate_to_unscoped_rows() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-vowifi-migration-{}-{nonce}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("create legacy database");
+            conn.execute_batch(
+                "CREATE TABLE vowifi_runtime_snapshots (
+                    singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+                    phase TEXT NOT NULL,
+                    profile_id TEXT,
+                    plmn TEXT,
+                    identity_ready INTEGER NOT NULL,
+                    sim_auth_ready INTEGER NOT NULL,
+                    profile_matched INTEGER NOT NULL,
+                    epdg_ready INTEGER NOT NULL,
+                    ike_ready INTEGER NOT NULL,
+                    child_sa_ready INTEGER NOT NULL,
+                    esp_ready INTEGER NOT NULL,
+                    ims_registered INTEGER NOT NULL,
+                    sms_ready INTEGER NOT NULL,
+                    degraded_reason TEXT,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_runtime_snapshots VALUES (
+                    1, 'legacy_phase', 'legacy_profile', '00101',
+                    1, 0, 1, 0, 0, 0, 0, 0, 0, 'legacy_reason',
+                    '2026-08-04 22:00:00'
+                 );
+                 CREATE TABLE vowifi_esim_restore (
+                    singleton_key INTEGER PRIMARY KEY CHECK(singleton_key = 1),
+                    switch_token TEXT,
+                    switch_phase TEXT,
+                    phase_ms INTEGER,
+                    identity_ready INTEGER NOT NULL,
+                    sim_auth_ready INTEGER NOT NULL,
+                    degraded_reason TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_esim_restore VALUES (
+                    1, 'legacy_token', 'legacy_restore', 250, 1, 0,
+                    'legacy_reason', 3, '2026-08-04 22:00:00'
+                 );",
+            )
+            .expect("seed legacy tables");
+        }
+
+        let db = Database::new(path.clone()).expect("migrate legacy database");
+        let snapshot = db
+            .get_vowifi_runtime_snapshot_scoped(None)
+            .expect("read migrated snapshot")
+            .expect("migrated snapshot exists");
+        assert_eq!(snapshot.line_id, None);
+        assert_eq!(snapshot.phase, "legacy_phase");
+        let restore = db
+            .get_vowifi_esim_restore_scoped(None)
+            .expect("read migrated restore")
+            .expect("migrated restore exists");
+        assert_eq!(restore.line_id, None);
+        assert_eq!(restore.switch_phase.as_deref(), Some("legacy_restore"));
+
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(table_has_column(&conn, "vowifi_runtime_snapshots", "line_id").unwrap());
+            assert!(!table_has_column(&conn, "vowifi_runtime_snapshots", "singleton_key").unwrap());
+            assert!(table_has_column(&conn, "vowifi_esim_restore", "line_id").unwrap());
+            assert!(!table_has_column(&conn, "vowifi_esim_restore", "singleton_key").unwrap());
+        }
+        drop(db);
+        std::fs::remove_file(path).expect("remove migration database");
+    }
+
+    #[test]
+    fn legacy_vowifi_child_tables_migrate_to_line_scoped_keys() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-vowifi-line-key-migration-{}-{nonce}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("create legacy database");
+            conn.execute_batch(
+                "CREATE TABLE vowifi_sms_delivery (
+                    message_id TEXT PRIMARY KEY,
+                    line_id TEXT,
+                    trace_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    sip_state TEXT NOT NULL,
+                    rpdu_ack TEXT NOT NULL,
+                    delivery_reported INTEGER NOT NULL,
+                    failure_cause TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    api_sms_id INTEGER,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_sms_delivery VALUES (
+                    'shared-message', 'line-a', 'legacy-trace', 'mo', 'accepted',
+                    'accepted', 'acked', 1, NULL, 0, NULL,
+                    '2026-08-04 22:00:00', '2026-08-04 22:00:00'
+                 );
+                 CREATE TABLE vowifi_sms_parts (
+                    message_id TEXT NOT NULL,
+                    reference INTEGER NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    total INTEGER NOT NULL,
+                    received INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY(message_id, reference, sequence)
+                 );
+                 INSERT INTO vowifi_sms_parts VALUES (
+                    'shared-message', 7, 1, 1, 1, '2026-08-04 22:00:00'
+                 );
+                 CREATE TABLE vowifi_soak_runs (
+                    run_id TEXT PRIMARY KEY,
+                    line_id TEXT,
+                    scenario_id TEXT NOT NULL,
+                    profile_id TEXT,
+                    plmn TEXT,
+                    status TEXT NOT NULL,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    sample_count INTEGER NOT NULL DEFAULT 0,
+                    failure_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT
+                 );
+                 INSERT INTO vowifi_soak_runs VALUES (
+                    'shared-run', 'line-a', 'legacy-scenario', NULL, NULL, 'running',
+                    '2026-08-04 22:00:00', NULL, 1, 1, 0, NULL
+                 );
+                 CREATE TABLE vowifi_soak_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL,
+                    sample_kind TEXT NOT NULL,
+                    metric_name TEXT NOT NULL,
+                    metric_value INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_soak_samples (
+                    run_id, sample_kind, metric_name, metric_value, state, created_at
+                 ) VALUES (
+                    'shared-run', 'counter', 'legacy-attempts', 3, 'ok',
+                    '2026-08-04 22:00:00'
+                 );",
+            )
+            .expect("seed legacy line-key tables");
+        }
+
+        let db = Database::new(path.clone()).expect("migrate legacy line-key tables");
+        let delivery = db
+            .get_vowifi_sms_delivery_for_line("line-a", "shared-message")
+            .expect("read migrated delivery")
+            .expect("migrated delivery exists");
+        assert_eq!(delivery.trace_id, "legacy-trace");
+        assert_eq!(delivery.parts.len(), 1);
+        assert_eq!(delivery.parts[0].reference, 7);
+
+        let runs = db
+            .get_vowifi_soak_runs_for_line("line-a", 10, 0)
+            .expect("read migrated soak run");
+        assert_eq!(runs.total, 1);
+        assert_eq!(runs.runs[0].scenario_id, "legacy-scenario");
+        assert_eq!(runs.runs[0].samples.len(), 1);
+        assert_eq!(runs.runs[0].samples[0].metric_name, "legacy-attempts");
+
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(table_primary_key_is(
+                &conn,
+                "vowifi_sms_delivery",
+                &["line_id", "message_id"]
+            )
+            .unwrap());
+            assert!(table_primary_key_is(
+                &conn,
+                "vowifi_sms_parts",
+                &["line_id", "message_id", "reference", "sequence"]
+            )
+            .unwrap());
+            assert!(table_primary_key_is(
+                &conn,
+                "vowifi_soak_runs",
+                &["line_id", "run_id"]
+            )
+            .unwrap());
+            assert!(table_has_column(&conn, "vowifi_soak_samples", "line_id").unwrap());
+        }
+
+        drop(db);
+        std::fs::remove_file(path).expect("remove migration database");
+    }
+
+    #[test]
     fn sms_dedup_claim_is_idempotent_across_transports() {
         let db = test_database();
         let fp = "volte-mt:single:+123:2026-07-14 10:00:00:abcdef";
 
-        // First leg claims it → true (proceed to store).
-        assert!(db.claim_sms_dedup(fp, "volte_ims").expect("claim 1"));
-        assert!(db.sms_dedup_exists(fp).expect("exists after claim"));
-        // Second leg (different transport) sees it already claimed → false (drop).
-        assert!(!db.claim_sms_dedup(fp, "modem").expect("claim 2"));
-        // A different fingerprint is independent.
         assert!(db
-            .claim_sms_dedup("other-fp", "vowifi_ims")
+            .claim_sms_dedup("line-a", fp, "volte_ims")
+            .expect("claim line-a"));
+        assert!(db
+            .sms_dedup_exists("line-a", fp)
+            .expect("exists after claim"));
+        assert!(!db
+            .claim_sms_dedup("line-a", fp, "modem")
+            .expect("duplicate on line-a"));
+        assert!(db
+            .claim_sms_dedup("line-b", fp, "modem")
+            .expect("same fingerprint on line-b"));
+        assert!(db
+            .claim_sms_dedup("line-a", "other-fp", "vowifi_ims")
             .expect("claim other"));
-        assert_eq!(db.sms_dedup_count().expect("count"), 2);
+        assert_eq!(db.sms_dedup_count("line-a").expect("line-a count"), 2);
+        assert_eq!(db.sms_dedup_count("line-b").expect("line-b count"), 1);
     }
 
     #[test]
     fn sms_dedup_cleanup_prunes_expired_rows() {
         let db = test_database();
-        db.claim_sms_dedup("fresh", "modem").expect("claim fresh");
+        db.claim_sms_dedup("line-a", "fresh", "modem")
+            .expect("claim fresh");
 
-        // Backdate one row well beyond any retention window.
         {
             let conn = db.conn.lock().unwrap();
             conn.execute(
-                "INSERT INTO sms_dedup (fingerprint, transport, created_at)
-                 VALUES ('stale', 'modem', '2000-01-01 00:00:00')",
+                "INSERT INTO sms_dedup (line_id, fingerprint, transport, created_at)
+                 VALUES ('line-a', 'stale', 'modem', '2000-01-01 00:00:00')",
                 [],
             )
-            .expect("insert stale");
+            .expect("insert stale line-a");
+            conn.execute(
+                "INSERT INTO sms_dedup (line_id, fingerprint, transport, created_at)
+                 VALUES ('line-b', 'stale', 'modem', '2000-01-01 00:00:00')",
+                [],
+            )
+            .expect("insert stale line-b");
         }
-        assert_eq!(db.sms_dedup_count().expect("count before"), 2);
+        assert_eq!(db.sms_dedup_count("line-a").expect("count before"), 2);
 
-        let deleted = db.cleanup_sms_dedup(30).expect("cleanup");
-        assert_eq!(deleted, 1, "only the stale row is pruned");
-        assert!(db.sms_dedup_exists("fresh").expect("fresh survives"));
-        assert!(!db.sms_dedup_exists("stale").expect("stale pruned"));
+        let deleted = db.cleanup_sms_dedup("line-a", 30).expect("cleanup");
+        assert_eq!(deleted, 1, "only line-a's stale row is pruned");
+        assert!(db
+            .sms_dedup_exists("line-a", "fresh")
+            .expect("fresh survives"));
+        assert!(!db
+            .sms_dedup_exists("line-a", "stale")
+            .expect("line-a stale pruned"));
+        assert!(db
+            .sms_dedup_exists("line-b", "stale")
+            .expect("line-b stale survives"));
+    }
+
+    #[test]
+    fn legacy_sms_dedup_table_migrates_to_line_scoped_unique_key() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-sms-dedup-line-migration-{}-{nonce}.db",
+            std::process::id()
+        ));
+        {
+            let conn = Connection::open(&path).expect("create legacy database");
+            conn.execute_batch(
+                "CREATE TABLE sms_dedup (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    transport TEXT NOT NULL DEFAULT 'modem',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                 );
+                 INSERT INTO sms_dedup (fingerprint, transport, created_at)
+                 VALUES ('legacy-fingerprint', 'modem', '2026-08-04 22:00:00');",
+            )
+            .expect("seed legacy dedup table");
+        }
+
+        let db = Database::new(path.clone()).expect("migrate legacy dedup table");
+        {
+            let conn = db.conn.lock().unwrap();
+            assert!(table_has_column(&conn, "sms_dedup", "line_id").unwrap());
+            assert!(table_has_unique_index(
+                &conn,
+                "sms_dedup",
+                &["line_id", "fingerprint"]
+            )
+            .unwrap());
+            assert!(!table_has_unique_index(&conn, "sms_dedup", &["fingerprint"]).unwrap());
+            let legacy_scope: String = conn
+                .query_row(
+                    "SELECT line_id FROM sms_dedup WHERE fingerprint = 'legacy-fingerprint'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(legacy_scope, "");
+        }
+        assert!(db
+            .claim_sms_dedup("line-a", "legacy-fingerprint", "modem")
+            .expect("legacy compatibility row must not block line-a"));
+        assert!(db
+            .claim_sms_dedup("line-b", "legacy-fingerprint", "volte_ims")
+            .expect("line-a must not block line-b"));
+
+        drop(db);
+        std::fs::remove_file(path).expect("remove migration database");
     }
 
     #[test]
@@ -607,6 +1303,7 @@ mod tests {
 
         db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
             message_id: "msg-1",
+            line_id: "line-test",
             trace_id: "trace-1",
             direction: "mo",
             state: "accepted",
@@ -619,6 +1316,7 @@ mod tests {
         })
         .expect("write delivery");
         db.upsert_vowifi_sms_part(NewVowifiSmsPart {
+            line_id: "line-test",
             message_id: "msg-1",
             reference: 7,
             sequence: 1,
@@ -627,6 +1325,7 @@ mod tests {
         })
         .expect("write first part");
         db.upsert_vowifi_sms_part(NewVowifiSmsPart {
+            line_id: "line-test",
             message_id: "msg-1",
             reference: 7,
             sequence: 2,
@@ -636,7 +1335,7 @@ mod tests {
         .expect("write second part");
 
         let delivery = db
-            .get_vowifi_sms_delivery("msg-1")
+            .get_vowifi_sms_delivery_for_line("line-test", "msg-1")
             .expect("read delivery")
             .expect("delivery exists");
         assert_eq!(delivery.state, "accepted");
@@ -644,10 +1343,62 @@ mod tests {
         assert_eq!(delivery.parts.len(), 2);
 
         let deliveries = db
-            .get_vowifi_sms_deliveries(10, 0)
+            .get_vowifi_sms_deliveries_for_line("line-test", 10, 0)
             .expect("list deliveries");
         assert_eq!(deliveries.total, 1);
         assert_eq!(deliveries.deliveries[0].parts.len(), 2);
+    }
+
+    #[test]
+    fn vowifi_sms_delivery_ids_and_parts_are_isolated_by_line() {
+        let db = test_database();
+
+        for (line_id, trace_id, total, received) in [
+            ("line-a", "trace-a", 1, true),
+            ("line-b", "trace-b", 2, false),
+        ] {
+            db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
+                message_id: "shared-message",
+                line_id,
+                trace_id,
+                direction: "mobile_terminated",
+                state: "received",
+                sip_state: "accepted",
+                rpdu_ack: "acked",
+                delivery_reported: received,
+                failure_cause: None,
+                retry_count: 0,
+                api_sms_id: None,
+            })
+            .expect("write line delivery");
+            db.upsert_vowifi_sms_part(NewVowifiSmsPart {
+                line_id,
+                message_id: "shared-message",
+                reference: 9,
+                sequence: 1,
+                total,
+                received,
+            })
+            .expect("write line part");
+        }
+
+        let line_a = db
+            .get_vowifi_sms_delivery_for_line("line-a", "shared-message")
+            .expect("read line-a delivery")
+            .expect("line-a delivery exists");
+        let line_b = db
+            .get_vowifi_sms_delivery_for_line("line-b", "shared-message")
+            .expect("read line-b delivery")
+            .expect("line-b delivery exists");
+
+        assert_eq!(line_a.trace_id, "trace-a");
+        assert_eq!(line_a.parts.len(), 1);
+        assert_eq!(line_a.parts[0].total, 1);
+        assert!(line_a.parts[0].received);
+        assert_eq!(line_b.trace_id, "trace-b");
+        assert_eq!(line_b.parts.len(), 1);
+        assert_eq!(line_b.parts[0].total, 2);
+        assert!(!line_b.parts[0].received);
     }
 
     #[test]
@@ -665,6 +1416,7 @@ mod tests {
 
         db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
             message_id: "msg-delete",
+            line_id: "line-test",
             trace_id: "trace-delete",
             direction: "mobile_terminated",
             state: "received",
@@ -677,9 +1429,13 @@ mod tests {
         })
         .expect("write delivery");
 
-        assert_eq!(db.delete_sms(sms_id).expect("delete sms"), 1);
+        assert_eq!(
+            db.delete_sms_for_channel(sms_id, "unassigned")
+                .expect("delete sms"),
+            1
+        );
         let delivery = db
-            .get_vowifi_sms_delivery("msg-delete")
+            .get_vowifi_sms_delivery_for_line("line-test", "msg-delete")
             .expect("read delivery")
             .expect("delivery remains for diagnostics");
         assert_eq!(delivery.api_sms_id, None);
@@ -691,18 +1447,36 @@ mod tests {
         let mut ids = Vec::new();
         for index in 0..5 {
             ids.push(
-                db.insert_sms(
+                db.insert_sms_with_transport_for_line(
                     "incoming",
                     "10086",
                     &format!("message-{index}"),
                     "received",
                     Some(&format!("marker-{index}")),
+                    "modem",
+                    Some("line-test"),
+                )
+                .unwrap(),
+            );
+        }
+        let mut other_line_ids = Vec::new();
+        for index in 0..4 {
+            other_line_ids.push(
+                db.insert_sms_with_transport_for_line(
+                    "incoming",
+                    "10010",
+                    &format!("other-message-{index}"),
+                    "received",
+                    Some(&format!("other-marker-{index}")),
+                    "modem",
+                    Some("line-other"),
                 )
                 .unwrap(),
             );
         }
         db.upsert_vowifi_sms_delivery(NewVowifiSmsDelivery {
             message_id: "msg-pruned",
+            line_id: "line-test",
             trace_id: "trace-pruned",
             direction: "mobile_terminated",
             state: "received",
@@ -715,17 +1489,26 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(db.prune_sms_messages(3).unwrap(), 2);
+        assert_eq!(db.prune_sms_messages_for_line("line-test", 3).unwrap(), 2);
         let messages = db.get_sms_messages(10, 0, None).unwrap();
         assert_eq!(
             messages
                 .iter()
+                .filter(|message| message.line_id.as_deref() == Some("line-test"))
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
             vec![ids[4], ids[3], ids[2]]
         );
         assert_eq!(
-            db.get_vowifi_sms_delivery("msg-pruned")
+            messages
+                .iter()
+                .filter(|message| message.line_id.as_deref() == Some("line-other"))
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            other_line_ids.into_iter().rev().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            db.get_vowifi_sms_delivery_for_line("line-test", "msg-pruned")
                 .unwrap()
                 .unwrap()
                 .api_sms_id,
@@ -825,40 +1608,127 @@ mod tests {
     }
 
     #[test]
+    fn sms_identity_checks_do_not_match_another_line() {
+        let db = test_database();
+        let line_a = "line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let line_b = "line-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let timestamp = "2026-08-04 21:30:00";
+        let marker = "mmfp:shared-marker";
+        let id = db
+            .insert_sms_at_with_transport_for_line(
+                "incoming",
+                "10086",
+                "same message",
+                timestamp,
+                "received",
+                Some(marker),
+                "modem",
+                Some(line_a),
+            )
+            .expect("insert line-a SMS");
+
+        assert!(db.sms_exists_by_pdu_for_line(line_a, marker).unwrap());
+        assert!(!db.sms_exists_by_pdu_for_line(line_b, marker).unwrap());
+        assert_eq!(db.sms_id_by_pdu_for_line(line_a, marker).unwrap(), Some(id));
+        assert_eq!(db.sms_id_by_pdu_for_line(line_b, marker).unwrap(), None);
+        assert!(db
+            .incoming_sms_exists_by_timestamp_for_line(
+                line_a,
+                "10086",
+                "same message",
+                timestamp,
+            )
+            .unwrap());
+        assert!(!db
+            .incoming_sms_exists_by_timestamp_for_line(
+                line_b,
+                "10086",
+                "same message",
+                timestamp,
+            )
+            .unwrap());
+
+        db.insert_sms_at_with_transport_for_line(
+            "incoming",
+            "10010",
+            "legacy message",
+            timestamp,
+            "received",
+            None,
+            "modem",
+            Some(line_a),
+        )
+        .expect("insert legacy line-a SMS");
+        assert!(db
+            .incoming_sms_exists_by_legacy_content_for_line(
+                line_a,
+                "10010",
+                "legacy message",
+            )
+            .unwrap());
+        assert!(!db
+            .incoming_sms_exists_by_legacy_content_for_line(
+                line_b,
+                "10010",
+                "legacy message",
+            )
+            .unwrap());
+    }
+
+    #[test]
     fn sms_channel_filters_list_conversation_stats_and_delete() {
         let db = test_database();
         let line_a = "line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let line_b = "line-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        for (content, line_id) in [
-            ("from-a", Some(line_a)),
-            ("from-b", Some(line_b)),
-            ("legacy", None),
-        ] {
+        let insert = |phone_number: &str, content: &str, line_id: Option<&str>| {
             db.insert_sms_with_transport_for_line(
-                "incoming", "10086", content, "received", None, "modem", line_id,
+                "incoming",
+                phone_number,
+                content,
+                "received",
+                None,
+                "modem",
+                line_id,
             )
-            .expect("insert channel sms");
-        }
+            .expect("insert channel sms")
+        };
+        let line_a_id = insert("10086", "from-a", Some(line_a));
+        let line_b_id = insert("10086", "from-b", Some(line_b));
+        insert("10010", "conversation-a", Some(line_a));
+        insert("10010", "conversation-b", Some(line_b));
+        insert("10000", "legacy", None);
 
         let line_messages = db
             .get_sms_messages_for_channel(10, 0, None, Some(line_a))
             .expect("list line channel");
-        assert_eq!(line_messages.len(), 1);
-        assert_eq!(line_messages[0].content, "from-a");
-        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 1);
+        assert_eq!(line_messages.len(), 2);
+        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 2);
         assert_eq!(
-            db.get_sms_conversation_for_channel("10086", 10, Some("unassigned"))
+            db.get_sms_conversation_for_channel("10000", 10, Some("unassigned"))
                 .unwrap()[0]
                 .content,
             "legacy"
         );
 
+        assert_eq!(db.delete_sms_for_channel(line_b_id, line_a).unwrap(), 0);
+        assert_eq!(db.get_sms_stats().unwrap().total, 5);
         assert_eq!(
-            db.delete_sms_conversation_for_channel("10086", Some(line_a))
+            db.delete_sms_batch_for_channel(&[line_a_id, line_b_id], &[], line_a)
                 .unwrap(),
             1
         );
+        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 2);
+        assert_eq!(
+            db.delete_sms_conversation_for_channel("10010", line_a)
+                .unwrap(),
+            1
+        );
+        assert_eq!(db.get_sms_stats_for_channel(Some(line_b)).unwrap().total, 2);
+        assert_eq!(db.clear_sms_for_channel("unassigned").unwrap(), 1);
         assert_eq!(db.get_sms_stats().unwrap().total, 2);
+        assert_eq!(db.clear_sms_for_channel(line_a).unwrap(), 0);
+        assert_eq!(db.clear_sms_for_channel(line_b).unwrap(), 2);
+        assert_eq!(db.get_sms_stats().unwrap().total, 0);
     }
 
     #[test]
@@ -866,17 +1736,18 @@ mod tests {
         let db = test_database();
 
         assert!(db
-            .get_vowifi_esim_restore()
+            .get_vowifi_esim_restore_for_line("line-test")
             .expect("empty restore")
             .is_none());
         assert_eq!(
-            db.get_vowifi_runtime_events(10, 0)
+            db.get_vowifi_runtime_events_for_line("line-test", 10, 0, None)
                 .expect("empty events")
                 .total,
             0
         );
 
         db.upsert_vowifi_esim_restore(NewVowifiEsimRestore {
+            line_id: "line-test",
             switch_token: Some("switch-redacted"),
             switch_phase: Some("retry_scheduled"),
             phase_ms: Some(1500),
@@ -887,6 +1758,7 @@ mod tests {
         })
         .expect("write restore");
         db.insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+            line_id: "line-test",
             trace_id: Some("trace-redacted"),
             level: "info",
             phase: "profile_matched",
@@ -897,13 +1769,15 @@ mod tests {
         .expect("write event");
 
         let restore = db
-            .get_vowifi_esim_restore()
+            .get_vowifi_esim_restore_for_line("line-test")
             .expect("read restore")
             .expect("restore exists");
         assert_eq!(restore.switch_phase.as_deref(), Some("retry_scheduled"));
         assert_eq!(restore.retry_count, 1);
 
-        let events = db.get_vowifi_runtime_events(10, 0).expect("read events");
+        let events = db
+            .get_vowifi_runtime_events_for_line("line-test", 10, 0, None)
+            .expect("read events");
         assert_eq!(events.total, 1);
         assert_eq!(events.events[0].event_type, "identity_refresh");
     }
@@ -913,6 +1787,7 @@ mod tests {
         let db = test_database();
 
         db.insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+            line_id: "line-test",
             trace_id: Some("trace-a"),
             level: "info",
             phase: "identity_ready",
@@ -922,6 +1797,7 @@ mod tests {
         })
         .expect("write event a");
         db.insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+            line_id: "line-test",
             trace_id: Some("trace-b"),
             level: "warning",
             phase: "sim_auth_gate",
@@ -932,14 +1808,14 @@ mod tests {
         .expect("write event b");
 
         let trace_a = db
-            .get_vowifi_runtime_events_filtered(10, 0, Some("trace-a"))
+            .get_vowifi_runtime_events_for_line("line-test", 10, 0, Some("trace-a"))
             .expect("filter trace a");
         assert_eq!(trace_a.total, 1);
         assert_eq!(trace_a.events[0].trace_id.as_deref(), Some("trace-a"));
         assert_eq!(trace_a.events[0].detail_json, r#"{"identity_ready":true}"#);
 
         let trace_b = db
-            .get_vowifi_runtime_events_filtered(10, 0, Some("trace-b"))
+            .get_vowifi_runtime_events_for_line("line-test", 10, 0, Some("trace-b"))
             .expect("filter trace b");
         assert_eq!(trace_b.total, 1);
         assert!(trace_b.events[0].detail_json.contains("redacted"));
@@ -953,10 +1829,16 @@ mod tests {
     fn vowifi_soak_runs_round_trip_with_counter_samples() {
         let db = test_database();
 
-        assert_eq!(db.get_vowifi_soak_runs(10, 0).expect("empty soak").total, 0);
+        assert_eq!(
+            db.get_vowifi_soak_runs_for_line("line-test", 10, 0)
+                .expect("empty soak")
+                .total,
+            0
+        );
 
         db.upsert_vowifi_soak_run(NewVowifiSoakRun {
             run_id: "soak-1",
+            line_id: "line-test",
             scenario_id: "rekey_dpd_nat_t_soak",
             profile_id: Some("gb_ee_23433"),
             plmn: Some("23433"),
@@ -968,6 +1850,7 @@ mod tests {
         })
         .expect("write soak run");
         db.insert_vowifi_soak_sample(NewVowifiSoakSample {
+            line_id: "line-test",
             run_id: "soak-1",
             sample_kind: "counter",
             metric_name: "dpd_requests",
@@ -976,7 +1859,9 @@ mod tests {
         })
         .expect("write sample");
 
-        let runs = db.get_vowifi_soak_runs(10, 0).expect("read soak runs");
+        let runs = db
+            .get_vowifi_soak_runs_for_line("line-test", 10, 0)
+            .expect("read soak runs");
         assert_eq!(runs.total, 1);
         assert!(runs.read_only);
         assert_eq!(runs.runs[0].scenario_id, "rekey_dpd_nat_t_soak");
@@ -1001,19 +1886,68 @@ mod tests {
             assert!(!lower.contains(&format!("\"{forbidden_key}\"")));
         }
     }
+
+    #[test]
+    fn vowifi_soak_run_ids_and_samples_are_isolated_by_line() {
+        let db = test_database();
+
+        for (line_id, scenario_id, metric_value) in
+            [("line-a", "scenario-a", 11), ("line-b", "scenario-b", 22)]
+        {
+            db.upsert_vowifi_soak_run(NewVowifiSoakRun {
+                run_id: "shared-run",
+                line_id,
+                scenario_id,
+                profile_id: None,
+                plmn: None,
+                status: "running",
+                duration_seconds: 1,
+                sample_count: 1,
+                failure_count: 0,
+                last_error: None,
+            })
+            .expect("write line soak run");
+            db.insert_vowifi_soak_sample(NewVowifiSoakSample {
+                line_id,
+                run_id: "shared-run",
+                sample_kind: "counter",
+                metric_name: "attempts",
+                metric_value,
+                state: "ok",
+            })
+            .expect("write line soak sample");
+        }
+
+        let line_a = db
+            .get_vowifi_soak_runs_for_line("line-a", 10, 0)
+            .expect("read line-a runs");
+        let line_b = db
+            .get_vowifi_soak_runs_for_line("line-b", 10, 0)
+            .expect("read line-b runs");
+
+        assert_eq!(line_a.total, 1);
+        assert_eq!(line_a.runs[0].scenario_id, "scenario-a");
+        assert_eq!(line_a.runs[0].samples.len(), 1);
+        assert_eq!(line_a.runs[0].samples[0].metric_value, 11);
+        assert_eq!(line_b.total, 1);
+        assert_eq!(line_b.runs[0].scenario_id, "scenario-b");
+        assert_eq!(line_b.runs[0].samples.len(), 1);
+        assert_eq!(line_b.runs[0].samples[0].metric_value, 22);
+    }
 }
 
 fn vowifi_runtime_event_from_row(row: &Row<'_>) -> Result<VowifiRuntimeEventEntry> {
-    let detail_json: String = row.get(6)?;
+    let detail_json: String = row.get(7)?;
     Ok(VowifiRuntimeEventEntry {
         id: row.get(0)?,
-        trace_id: row.get(1)?,
-        level: row.get(2)?,
-        phase: row.get(3)?,
-        profile_id: row.get(4)?,
-        event_type: row.get(5)?,
+        line_id: row.get(1)?,
+        trace_id: row.get(2)?,
+        level: row.get(3)?,
+        phase: row.get(4)?,
+        profile_id: row.get(5)?,
+        event_type: row.get(6)?,
         detail_json: redact_vowifi_event_detail(&detail_json),
-        created_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -1049,16 +1983,17 @@ fn redact_vowifi_event_detail(detail_json: &str) -> String {
 fn vowifi_soak_run_from_row(row: &Row<'_>) -> Result<VowifiSoakRunEntry> {
     Ok(VowifiSoakRunEntry {
         run_id: row.get(0)?,
-        scenario_id: row.get(1)?,
-        profile_id: row.get(2)?,
-        plmn: row.get(3)?,
-        status: row.get(4)?,
-        started_at: row.get(5)?,
-        finished_at: row.get(6)?,
-        duration_seconds: row.get(7)?,
-        sample_count: row.get(8)?,
-        failure_count: row.get(9)?,
-        last_error: row.get(10)?,
+        line_id: row.get(1)?,
+        scenario_id: row.get(2)?,
+        profile_id: row.get(3)?,
+        plmn: row.get(4)?,
+        status: row.get(5)?,
+        started_at: row.get(6)?,
+        finished_at: row.get(7)?,
+        duration_seconds: row.get(8)?,
+        sample_count: row.get(9)?,
+        failure_count: row.get(10)?,
+        last_error: row.get(11)?,
         sensitive_values_policy: "counters_and_state_names_only_no_payload_or_secret_values"
             .to_string(),
         samples: Vec::new(),
@@ -1097,6 +2032,43 @@ fn sms_message_from_row(row: &Row<'_>) -> Result<SmsMessage> {
         pdu: row.get(6)?,
         transport: row.get(7)?,
         line_id: row.get(8)?,
+    })
+}
+
+fn notification_queue_entry_from_row(row: &Row<'_>) -> Result<NotificationQueueEntry> {
+    Ok(NotificationQueueEntry {
+        id: row.get(0)?,
+        line_id: row.get(1)?,
+        status: row.get(2)?,
+        event_type: row.get(3)?,
+        event_label: row.get(4)?,
+        summary: row.get(5)?,
+        reason: row.get(6)?,
+        channel_id: row.get(7)?,
+        channel_name: row.get(8)?,
+        channel_type: row.get(9)?,
+        rule_id: row.get(10)?,
+        rule_name: row.get(11)?,
+        title: row.get(12)?,
+        body: row.get(13)?,
+        next_attempt_at: row.get(14)?,
+        attempt_count: row.get(15)?,
+        max_attempts: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+    })
+}
+
+fn call_record_from_row(row: &Row<'_>) -> Result<CallRecord> {
+    Ok(CallRecord {
+        id: row.get(0)?,
+        line_id: row.get(1)?,
+        direction: row.get(2)?,
+        phone_number: row.get(3)?,
+        duration: row.get(4)?,
+        start_time: row.get(5)?,
+        end_time: row.get(6)?,
+        answered: row.get::<_, i32>(7)? != 0,
     })
 }
 
@@ -1153,6 +2125,242 @@ fn table_has_column(conn: &Connection, table_name: &str, column_name: &str) -> R
     }
 
     Ok(false)
+}
+
+fn table_primary_key_is(
+    conn: &Connection,
+    table_name: &str,
+    expected_columns: &[&str],
+) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table_name})"))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(1)?, row.get::<_, i64>(5)?))
+    })?;
+    let mut columns = Vec::new();
+    for row in rows {
+        let (name, position) = row?;
+        if position > 0 {
+            columns.push((position, name));
+        }
+    }
+    columns.sort_by_key(|(position, _)| *position);
+
+    Ok(columns
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .eq(expected_columns.iter().copied()))
+}
+
+fn table_has_unique_index(
+    conn: &Connection,
+    table_name: &str,
+    expected_columns: &[&str],
+) -> Result<bool> {
+    let indexes = {
+        let mut stmt = conn.prepare(&format!("PRAGMA index_list({table_name})"))?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+        })?;
+        rows.collect::<Result<Vec<_>>>()?
+    };
+
+    for (index_name, unique) in indexes {
+        if !unique {
+            continue;
+        }
+        let escaped_name = index_name.replace('"', "\"\"");
+        let mut stmt = conn.prepare(&format!("PRAGMA index_info(\"{escaped_name}\")"))?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(2))?;
+        let columns = rows.collect::<Result<Vec<_>>>()?;
+        if columns
+            .iter()
+            .map(String::as_str)
+            .eq(expected_columns.iter().copied())
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn migrate_sms_dedup_for_line_scope(conn: &Connection) -> Result<()> {
+    let has_line_id = table_has_column(conn, "sms_dedup", "line_id")?;
+    if has_line_id
+        && table_has_unique_index(conn, "sms_dedup", &["line_id", "fingerprint"])?
+        && !table_has_unique_index(conn, "sms_dedup", &["fingerprint"])?
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let migration = (|| -> Result<()> {
+        conn.execute("ALTER TABLE sms_dedup RENAME TO sms_dedup_legacy", [])?;
+        conn.execute_batch(
+            "CREATE TABLE sms_dedup (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
+                transport TEXT NOT NULL DEFAULT 'modem',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(line_id, fingerprint)
+            )",
+        )?;
+        let line_id_expression = if has_line_id {
+            "COALESCE(NULLIF(TRIM(line_id), ''), '')"
+        } else {
+            "''"
+        };
+        conn.execute(
+            &format!(
+                "INSERT OR IGNORE INTO sms_dedup (
+                    id, line_id, fingerprint, transport, created_at
+                 )
+                 SELECT id, {line_id_expression}, fingerprint, transport, created_at
+                 FROM sms_dedup_legacy"
+            ),
+            [],
+        )?;
+        conn.execute("DROP TABLE sms_dedup_legacy", [])?;
+        Ok(())
+    })();
+
+    match migration {
+        Ok(()) => conn.execute_batch("COMMIT"),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn migrate_vowifi_sms_tables_for_line_scope(conn: &Connection) -> Result<()> {
+    if table_primary_key_is(conn, "vowifi_sms_delivery", &["line_id", "message_id"])?
+        && table_primary_key_is(
+            conn,
+            "vowifi_sms_parts",
+            &["line_id", "message_id", "reference", "sequence"],
+        )?
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE vowifi_sms_parts RENAME TO vowifi_sms_parts_legacy;
+         ALTER TABLE vowifi_sms_delivery RENAME TO vowifi_sms_delivery_legacy;
+         CREATE TABLE vowifi_sms_delivery (
+            line_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            trace_id TEXT NOT NULL,
+            direction TEXT NOT NULL,
+            state TEXT NOT NULL,
+            sip_state TEXT NOT NULL,
+            rpdu_ack TEXT NOT NULL,
+            delivery_reported INTEGER NOT NULL,
+            failure_cause TEXT,
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            api_sms_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(line_id, message_id),
+            FOREIGN KEY(api_sms_id) REFERENCES sms_messages(id) ON DELETE SET NULL
+         );
+         INSERT INTO vowifi_sms_delivery (
+            line_id, message_id, trace_id, direction, state, sip_state, rpdu_ack,
+            delivery_reported, failure_cause, retry_count, api_sms_id, created_at, updated_at
+         )
+         SELECT COALESCE(NULLIF(TRIM(line_id), ''), ''), message_id, trace_id, direction,
+            state, sip_state, rpdu_ack, delivery_reported, failure_cause, retry_count,
+            api_sms_id, created_at, updated_at
+         FROM vowifi_sms_delivery_legacy;
+         CREATE TABLE vowifi_sms_parts (
+            line_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            reference INTEGER NOT NULL,
+            sequence INTEGER NOT NULL,
+            total INTEGER NOT NULL,
+            received INTEGER NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(line_id, message_id, reference, sequence),
+            FOREIGN KEY(line_id, message_id)
+                REFERENCES vowifi_sms_delivery(line_id, message_id)
+         );
+         INSERT INTO vowifi_sms_parts (
+            line_id, message_id, reference, sequence, total, received, updated_at
+         )
+         SELECT COALESCE(NULLIF(TRIM(delivery.line_id), ''), ''), part.message_id,
+            part.reference, part.sequence, part.total, part.received, part.updated_at
+         FROM vowifi_sms_parts_legacy AS part
+         JOIN vowifi_sms_delivery_legacy AS delivery
+           ON delivery.message_id = part.message_id;
+         DROP TABLE vowifi_sms_parts_legacy;
+         DROP TABLE vowifi_sms_delivery_legacy;
+         COMMIT;",
+    )?;
+
+    Ok(())
+}
+
+fn migrate_vowifi_soak_tables_for_line_scope(conn: &Connection) -> Result<()> {
+    if table_primary_key_is(conn, "vowifi_soak_runs", &["line_id", "run_id"])?
+        && table_has_column(conn, "vowifi_soak_samples", "line_id")?
+    {
+        return Ok(());
+    }
+
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         ALTER TABLE vowifi_soak_samples RENAME TO vowifi_soak_samples_legacy;
+         ALTER TABLE vowifi_soak_runs RENAME TO vowifi_soak_runs_legacy;
+         CREATE TABLE vowifi_soak_runs (
+            line_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            scenario_id TEXT NOT NULL,
+            profile_id TEXT,
+            plmn TEXT,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_seconds INTEGER NOT NULL DEFAULT 0,
+            sample_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            PRIMARY KEY(line_id, run_id)
+         );
+         INSERT INTO vowifi_soak_runs (
+            line_id, run_id, scenario_id, profile_id, plmn, status, started_at, finished_at,
+            duration_seconds, sample_count, failure_count, last_error
+         )
+         SELECT COALESCE(NULLIF(TRIM(line_id), ''), ''), run_id, scenario_id, profile_id,
+            plmn, status, started_at, finished_at, duration_seconds, sample_count,
+            failure_count, last_error
+         FROM vowifi_soak_runs_legacy;
+         CREATE TABLE vowifi_soak_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            line_id TEXT NOT NULL,
+            run_id TEXT NOT NULL,
+            sample_kind TEXT NOT NULL,
+            metric_name TEXT NOT NULL,
+            metric_value INTEGER NOT NULL,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(line_id, run_id) REFERENCES vowifi_soak_runs(line_id, run_id)
+         );
+         INSERT INTO vowifi_soak_samples (
+            id, line_id, run_id, sample_kind, metric_name, metric_value, state, created_at
+         )
+         SELECT sample.id, COALESCE(NULLIF(TRIM(run.line_id), ''), ''), sample.run_id,
+            sample.sample_kind, sample.metric_name, sample.metric_value, sample.state,
+            sample.created_at
+         FROM vowifi_soak_samples_legacy AS sample
+         JOIN vowifi_soak_runs_legacy AS run ON run.run_id = sample.run_id;
+         DROP TABLE vowifi_soak_samples_legacy;
+         DROP TABLE vowifi_soak_runs_legacy;
+         COMMIT;",
+    )?;
+
+    Ok(())
 }
 
 impl Database {
@@ -1219,32 +2427,38 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_sms_line_id ON sms_messages(line_id)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sms_line_pdu ON sms_messages(line_id, pdu)",
+            [],
+        )?;
         normalize_existing_sms_timestamps(&conn)?;
 
-        // Phase C: cross-transport SMS dedup fingerprints.
-        //
-        // Kept in a dedicated table (rather than the user-visible sms_messages
-        // rows) so the dedup index stays bounded and can be pruned on a schedule
-        // without ever deleting stored messages. `fingerprint` is UNIQUE so a
-        // duplicate MT delivery arriving on a second access leg is rejected at
-        // insert time. `created_at` drives the retention-based cleanup.
+        // Cross-transport SMS dedup fingerprints are isolated by line. Legacy
+        // rows are retained under the empty compatibility scope because their
+        // originating line cannot be reconstructed safely.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS sms_dedup (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                fingerprint TEXT NOT NULL UNIQUE,
+                line_id TEXT NOT NULL,
+                fingerprint TEXT NOT NULL,
                 transport TEXT NOT NULL DEFAULT 'modem',
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(line_id, fingerprint)
             )",
             [],
         )?;
+        migrate_sms_dedup_for_line_scope(&conn)?;
+        conn.execute("DROP INDEX IF EXISTS idx_sms_dedup_created_at", [])?;
         conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_sms_dedup_created_at ON sms_dedup(created_at)",
+            "CREATE INDEX IF NOT EXISTS idx_sms_dedup_line_created_at
+             ON sms_dedup(line_id, created_at)",
             [],
         )?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS notification_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 event_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 summary TEXT NOT NULL,
@@ -1257,6 +2471,9 @@ impl Database {
             )",
             [],
         )?;
+        if !table_has_column(&conn, "notification_logs", "line_id")? {
+            conn.execute("ALTER TABLE notification_logs ADD COLUMN line_id TEXT", [])?;
+        }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notification_logs_created_at ON notification_logs(created_at DESC)",
             [],
@@ -1265,11 +2482,17 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_notification_logs_type_status ON notification_logs(event_type, status)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_logs_line_created_at
+             ON notification_logs(line_id, created_at DESC)",
+            [],
+        )?;
 
-        // 创建通话记录表（如果不存在）
+        // Notification retries retain the originating line after rendering.
         conn.execute(
             "CREATE TABLE IF NOT EXISTS notification_queue (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 status TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 event_label TEXT NOT NULL,
@@ -1292,6 +2515,9 @@ impl Database {
             )",
             [],
         )?;
+        if !table_has_column(&conn, "notification_queue", "line_id")? {
+            conn.execute("ALTER TABLE notification_queue ADD COLUMN line_id TEXT", [])?;
+        }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_notification_queue_status_next_attempt
              ON notification_queue(status, next_attempt_at, id)",
@@ -1302,10 +2528,16 @@ impl Database {
              ON notification_queue(channel_id, status, next_attempt_at)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_notification_queue_line_status
+             ON notification_queue(line_id, status, next_attempt_at)",
+            [],
+        )?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS call_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 direction TEXT NOT NULL,
                 phone_number TEXT NOT NULL,
                 duration INTEGER DEFAULT 0,
@@ -1317,6 +2549,10 @@ impl Database {
             [],
         )?;
 
+        if !table_has_column(&conn, "call_history", "line_id")? {
+            conn.execute("ALTER TABLE call_history ADD COLUMN line_id TEXT", [])?;
+        }
+
         // 创建通话记录索引
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_start_time ON call_history(start_time DESC)",
@@ -1325,6 +2561,12 @@ impl Database {
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_call_phone ON call_history(phone_number)",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_call_line_start_time
+             ON call_history(line_id, start_time DESC)",
             [],
         )?;
 
@@ -1406,6 +2648,7 @@ impl Database {
         conn.execute(
             "CREATE TABLE IF NOT EXISTS automation_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 task_id TEXT NOT NULL,
                 task_name TEXT NOT NULL,
                 task_type TEXT NOT NULL,
@@ -1415,15 +2658,24 @@ impl Database {
             )",
             [],
         )?;
+        if !table_has_column(&conn, "automation_logs", "line_id")? {
+            conn.execute("ALTER TABLE automation_logs ADD COLUMN line_id TEXT", [])?;
+        }
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_automation_logs_created_at ON automation_logs(created_at DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_automation_logs_line_created_at
+             ON automation_logs(line_id, created_at DESC)",
             [],
         )?;
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_runtime_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT,
                 trace_id TEXT,
                 level TEXT NOT NULL,
                 phase TEXT NOT NULL,
@@ -1434,6 +2686,12 @@ impl Database {
             )",
             [],
         )?;
+        if !table_has_column(&conn, "vowifi_runtime_events", "line_id")? {
+            conn.execute(
+                "ALTER TABLE vowifi_runtime_events ADD COLUMN line_id TEXT",
+                [],
+            )?;
+        }
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vowifi_runtime_events_created_at
              ON vowifi_runtime_events(created_at DESC, id DESC)",
@@ -1444,10 +2702,55 @@ impl Database {
              ON vowifi_runtime_events(trace_id, id DESC)",
             [],
         )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_vowifi_runtime_events_line_created
+             ON vowifi_runtime_events(line_id, created_at DESC, id DESC)",
+            [],
+        )?;
 
+        if table_has_column(&conn, "vowifi_runtime_snapshots", "singleton_key")?
+            && !table_has_column(&conn, "vowifi_runtime_snapshots", "line_id")?
+        {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE vowifi_runtime_snapshots
+                   RENAME TO vowifi_runtime_snapshots_legacy;
+                 CREATE TABLE vowifi_runtime_snapshots (
+                    line_id TEXT PRIMARY KEY,
+                    phase TEXT NOT NULL,
+                    profile_id TEXT,
+                    plmn TEXT,
+                    identity_ready INTEGER NOT NULL,
+                    sim_auth_ready INTEGER NOT NULL,
+                    profile_matched INTEGER NOT NULL,
+                    epdg_ready INTEGER NOT NULL,
+                    ike_ready INTEGER NOT NULL,
+                    child_sa_ready INTEGER NOT NULL,
+                    esp_ready INTEGER NOT NULL,
+                    ims_registered INTEGER NOT NULL,
+                    sms_ready INTEGER NOT NULL,
+                    degraded_reason TEXT,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_runtime_snapshots (
+                    line_id, phase, profile_id, plmn,
+                    identity_ready, sim_auth_ready, profile_matched,
+                    epdg_ready, ike_ready, child_sa_ready, esp_ready,
+                    ims_registered, sms_ready, degraded_reason, updated_at
+                 )
+                 SELECT '', phase, profile_id, plmn,
+                    identity_ready, sim_auth_ready, profile_matched,
+                    epdg_ready, ike_ready, child_sa_ready, esp_ready,
+                    ims_registered, sms_ready, degraded_reason, updated_at
+                 FROM vowifi_runtime_snapshots_legacy
+                 WHERE singleton_key = 1;
+                 DROP TABLE vowifi_runtime_snapshots_legacy;
+                 COMMIT;",
+            )?;
+        }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_runtime_snapshots (
-                singleton_key INTEGER PRIMARY KEY CHECK (singleton_key = 1),
+                line_id TEXT PRIMARY KEY,
                 phase TEXT NOT NULL,
                 profile_id TEXT,
                 plmn TEXT,
@@ -1503,7 +2806,8 @@ impl Database {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_sms_delivery (
-                message_id TEXT PRIMARY KEY,
+                line_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
                 trace_id TEXT NOT NULL,
                 direction TEXT NOT NULL,
                 state TEXT NOT NULL,
@@ -1515,10 +2819,33 @@ impl Database {
                 api_sms_id INTEGER,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
+                PRIMARY KEY(line_id, message_id),
                 FOREIGN KEY(api_sms_id) REFERENCES sms_messages(id) ON DELETE SET NULL
             )",
             [],
         )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vowifi_sms_parts (
+                line_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                reference INTEGER NOT NULL,
+                sequence INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                received INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(line_id, message_id, reference, sequence),
+                FOREIGN KEY(line_id, message_id)
+                    REFERENCES vowifi_sms_delivery(line_id, message_id)
+            )",
+            [],
+        )?;
+        if !table_has_column(&conn, "vowifi_sms_delivery", "line_id")? {
+            conn.execute(
+                "ALTER TABLE vowifi_sms_delivery ADD COLUMN line_id TEXT",
+                [],
+            )?;
+        }
+        migrate_vowifi_sms_tables_for_line_scope(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vowifi_sms_delivery_trace
              ON vowifi_sms_delivery(trace_id)",
@@ -1529,24 +2856,44 @@ impl Database {
              ON vowifi_sms_delivery(updated_at DESC)",
             [],
         )?;
-
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS vowifi_sms_parts (
-                message_id TEXT NOT NULL,
-                reference INTEGER NOT NULL,
-                sequence INTEGER NOT NULL,
-                total INTEGER NOT NULL,
-                received INTEGER NOT NULL,
-                updated_at TEXT NOT NULL,
-                PRIMARY KEY(message_id, reference, sequence),
-                FOREIGN KEY(message_id) REFERENCES vowifi_sms_delivery(message_id)
-            )",
+            "CREATE INDEX IF NOT EXISTS idx_vowifi_sms_delivery_line_updated
+             ON vowifi_sms_delivery(line_id, updated_at DESC)",
             [],
         )?;
 
+        if table_has_column(&conn, "vowifi_esim_restore", "singleton_key")?
+            && !table_has_column(&conn, "vowifi_esim_restore", "line_id")?
+        {
+            conn.execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE vowifi_esim_restore RENAME TO vowifi_esim_restore_legacy;
+                 CREATE TABLE vowifi_esim_restore (
+                    line_id TEXT PRIMARY KEY,
+                    switch_token TEXT,
+                    switch_phase TEXT,
+                    phase_ms INTEGER,
+                    identity_ready INTEGER NOT NULL,
+                    sim_auth_ready INTEGER NOT NULL,
+                    degraded_reason TEXT,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO vowifi_esim_restore (
+                    line_id, switch_token, switch_phase, phase_ms,
+                    identity_ready, sim_auth_ready, degraded_reason, retry_count, updated_at
+                 )
+                 SELECT '', switch_token, switch_phase, phase_ms,
+                    identity_ready, sim_auth_ready, degraded_reason, retry_count, updated_at
+                 FROM vowifi_esim_restore_legacy
+                 WHERE singleton_key = 1;
+                 DROP TABLE vowifi_esim_restore_legacy;
+                 COMMIT;",
+            )?;
+        }
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_esim_restore (
-                singleton_key INTEGER PRIMARY KEY CHECK (singleton_key = 1),
+                line_id TEXT PRIMARY KEY,
                 switch_token TEXT,
                 switch_phase TEXT,
                 phase_ms INTEGER,
@@ -1561,7 +2908,8 @@ impl Database {
 
         conn.execute(
             "CREATE TABLE IF NOT EXISTS vowifi_soak_runs (
-                run_id TEXT PRIMARY KEY,
+                line_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
                 scenario_id TEXT NOT NULL,
                 profile_id TEXT,
                 plmn TEXT,
@@ -1571,10 +2919,29 @@ impl Database {
                 duration_seconds INTEGER NOT NULL DEFAULT 0,
                 sample_count INTEGER NOT NULL DEFAULT 0,
                 failure_count INTEGER NOT NULL DEFAULT 0,
-                last_error TEXT
+                last_error TEXT,
+                PRIMARY KEY(line_id, run_id)
             )",
             [],
         )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS vowifi_soak_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                line_id TEXT NOT NULL,
+                run_id TEXT NOT NULL,
+                sample_kind TEXT NOT NULL,
+                metric_name TEXT NOT NULL,
+                metric_value INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(line_id, run_id) REFERENCES vowifi_soak_runs(line_id, run_id)
+            )",
+            [],
+        )?;
+        if !table_has_column(&conn, "vowifi_soak_runs", "line_id")? {
+            conn.execute("ALTER TABLE vowifi_soak_runs ADD COLUMN line_id TEXT", [])?;
+        }
+        migrate_vowifi_soak_tables_for_line_scope(&conn)?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vowifi_soak_runs_started
              ON vowifi_soak_runs(started_at DESC, run_id DESC)",
@@ -1585,23 +2952,14 @@ impl Database {
              ON vowifi_soak_runs(scenario_id, started_at DESC)",
             [],
         )?;
-
         conn.execute(
-            "CREATE TABLE IF NOT EXISTS vowifi_soak_samples (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL,
-                sample_kind TEXT NOT NULL,
-                metric_name TEXT NOT NULL,
-                metric_value INTEGER NOT NULL,
-                state TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(run_id) REFERENCES vowifi_soak_runs(run_id)
-            )",
+            "CREATE INDEX IF NOT EXISTS idx_vowifi_soak_runs_line_started
+             ON vowifi_soak_runs(line_id, started_at DESC, run_id DESC)",
             [],
         )?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_vowifi_soak_samples_run
-             ON vowifi_soak_samples(run_id, id DESC)",
+             ON vowifi_soak_samples(line_id, run_id, id DESC)",
             [],
         )?;
 
@@ -1725,11 +3083,13 @@ impl Database {
     pub fn insert_vowifi_runtime_event(&self, event: NewVowifiRuntimeEvent<'_>) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let created_at = beijing_sms_now_string();
+        let line_id = required_line_id(event.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_runtime_events (
-                trace_id, level, phase, profile_id, event_type, detail_json, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                line_id, trace_id, level, phase, profile_id, event_type, detail_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
+                line_id,
                 event.trace_id,
                 event.level,
                 event.phase,
@@ -1742,69 +3102,53 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn clear_vowifi_runtime_events(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM vowifi_runtime_events", [])?;
-        Ok(())
-    }
-
-    pub fn get_vowifi_runtime_events(
+    pub fn get_vowifi_runtime_events_for_line(
         &self,
+        line_id: &str,
         limit: i64,
         offset: i64,
+        trace_id: Option<&str>,
     ) -> Result<VowifiRuntimeEventsResponse> {
-        self.get_vowifi_runtime_events_filtered(limit, offset, None)
+        self.get_vowifi_runtime_events_scoped(limit, offset, Some(line_id), trace_id)
     }
 
-    pub fn get_vowifi_runtime_events_filtered(
+    fn get_vowifi_runtime_events_scoped(
         &self,
         limit: i64,
         offset: i64,
+        line_id: Option<&str>,
         trace_id: Option<&str>,
     ) -> Result<VowifiRuntimeEventsResponse> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
         let trace_id = trace_id.map(str::trim).filter(|value| !value.is_empty());
 
-        let total = match trace_id {
-            Some(trace_id) => conn.query_row(
-                "SELECT COUNT(*) FROM vowifi_runtime_events WHERE trace_id = ?1",
-                params![trace_id],
-                |row| row.get(0),
-            )?,
-            None => conn.query_row("SELECT COUNT(*) FROM vowifi_runtime_events", [], |row| {
-                row.get(0)
-            })?,
-        };
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM vowifi_runtime_events
+             WHERE (?1 IS NULL OR line_id = ?1)
+               AND (?2 IS NULL OR trace_id = ?2)",
+            params![line_id, trace_id],
+            |row| row.get(0),
+        )?;
 
         let mut events = Vec::new();
-        if let Some(trace_id) = trace_id {
-            let mut stmt = conn.prepare(
-                "SELECT id, trace_id, level, phase, profile_id, event_type, detail_json, created_at
-                 FROM vowifi_runtime_events
-                 WHERE trace_id = ?1
-                 ORDER BY id DESC
-                 LIMIT ?2 OFFSET ?3",
-            )?;
-            let rows = stmt.query_map(
-                params![trace_id, limit, offset],
-                vowifi_runtime_event_from_row,
-            )?;
-            for row in rows {
-                events.push(row?);
-            }
-        } else {
-            let mut stmt = conn.prepare(
-                "SELECT id, trace_id, level, phase, profile_id, event_type, detail_json, created_at
-                 FROM vowifi_runtime_events
-                 ORDER BY id DESC
-                 LIMIT ?1 OFFSET ?2",
-            )?;
-            let rows = stmt.query_map(params![limit, offset], vowifi_runtime_event_from_row)?;
-            for row in rows {
-                events.push(row?);
-            }
+        let mut stmt = conn.prepare(
+            "SELECT id, line_id, trace_id, level, phase, profile_id, event_type,
+                    detail_json, created_at
+             FROM vowifi_runtime_events
+             WHERE (?1 IS NULL OR line_id = ?1)
+               AND (?2 IS NULL OR trace_id = ?2)
+             ORDER BY id DESC
+             LIMIT ?3 OFFSET ?4",
+        )?;
+        let rows = stmt.query_map(
+            params![line_id, trace_id, limit, offset],
+            vowifi_runtime_event_from_row,
+        )?;
+        for row in rows {
+            events.push(row?);
         }
 
         Ok(VowifiRuntimeEventsResponse { events, total })
@@ -1889,6 +3233,14 @@ impl Database {
         Ok(affected > 0)
     }
 
+    pub fn delete_vowifi_carrier_profiles_by_source(&self, source: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM vowifi_carrier_profiles WHERE source = ?1",
+            params![source],
+        )
+    }
+
     /// Cumulative proxied traffic for one line. Absent rows read as zero, which
     /// is what a line that has never carried traffic should report.
     pub fn get_line_data_traffic(&self, line_id: &str) -> Result<LineDataTrafficEntry> {
@@ -1956,14 +3308,15 @@ impl Database {
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let updated_at = beijing_sms_now_string();
+        let line_id = required_line_id(snapshot.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_runtime_snapshots (
-                singleton_key, phase, profile_id, plmn,
+                line_id, phase, profile_id, plmn,
                 identity_ready, sim_auth_ready, profile_matched,
                 epdg_ready, ike_ready, child_sa_ready, esp_ready,
                 ims_registered, sms_ready, degraded_reason, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
-             ON CONFLICT(singleton_key) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+             ON CONFLICT(line_id) DO UPDATE SET
                 phase = excluded.phase,
                 profile_id = excluded.profile_id,
                 plmn = excluded.plmn,
@@ -1979,6 +3332,7 @@ impl Database {
                 degraded_reason = excluded.degraded_reason,
                 updated_at = excluded.updated_at",
             params![
+                line_id,
                 snapshot.phase,
                 snapshot.profile_id,
                 snapshot.plmn,
@@ -1998,32 +3352,47 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_vowifi_runtime_snapshot(&self) -> Result<Option<VowifiRuntimeSnapshotEntry>> {
+    pub fn get_vowifi_runtime_snapshot_for_line(
+        &self,
+        line_id: &str,
+    ) -> Result<Option<VowifiRuntimeSnapshotEntry>> {
+        self.get_vowifi_runtime_snapshot_scoped(Some(line_id))
+    }
+
+    fn get_vowifi_runtime_snapshot_scoped(
+        &self,
+        line_id: Option<&str>,
+    ) -> Result<Option<VowifiRuntimeSnapshotEntry>> {
         let conn = self.conn.lock().unwrap();
+        let line_id = line_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
         conn.query_row(
-            "SELECT phase, profile_id, plmn,
+            "SELECT NULLIF(line_id, ''), phase, profile_id, plmn,
                     identity_ready, sim_auth_ready, profile_matched,
                     epdg_ready, ike_ready, child_sa_ready, esp_ready,
                     ims_registered, sms_ready, degraded_reason, updated_at
              FROM vowifi_runtime_snapshots
-             WHERE singleton_key = 1",
-            [],
+             WHERE line_id = ?1",
+            params![line_id],
             |row| {
                 Ok(VowifiRuntimeSnapshotEntry {
-                    phase: row.get(0)?,
-                    profile_id: row.get(1)?,
-                    plmn: row.get(2)?,
-                    identity_ready: row.get::<_, i64>(3)? != 0,
-                    sim_auth_ready: row.get::<_, i64>(4)? != 0,
-                    profile_matched: row.get::<_, i64>(5)? != 0,
-                    epdg_ready: row.get::<_, i64>(6)? != 0,
-                    ike_ready: row.get::<_, i64>(7)? != 0,
-                    child_sa_ready: row.get::<_, i64>(8)? != 0,
-                    esp_ready: row.get::<_, i64>(9)? != 0,
-                    ims_registered: row.get::<_, i64>(10)? != 0,
-                    sms_ready: row.get::<_, i64>(11)? != 0,
-                    degraded_reason: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    line_id: row.get(0)?,
+                    phase: row.get(1)?,
+                    profile_id: row.get(2)?,
+                    plmn: row.get(3)?,
+                    identity_ready: row.get::<_, i64>(4)? != 0,
+                    sim_auth_ready: row.get::<_, i64>(5)? != 0,
+                    profile_matched: row.get::<_, i64>(6)? != 0,
+                    epdg_ready: row.get::<_, i64>(7)? != 0,
+                    ike_ready: row.get::<_, i64>(8)? != 0,
+                    child_sa_ready: row.get::<_, i64>(9)? != 0,
+                    esp_ready: row.get::<_, i64>(10)? != 0,
+                    ims_registered: row.get::<_, i64>(11)? != 0,
+                    sms_ready: row.get::<_, i64>(12)? != 0,
+                    degraded_reason: row.get(13)?,
+                    updated_at: row.get(14)?,
                 })
             },
         )
@@ -2033,13 +3402,14 @@ impl Database {
     pub fn upsert_vowifi_sms_delivery(&self, delivery: NewVowifiSmsDelivery<'_>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = beijing_sms_now_string();
+        let line_id = required_line_id(delivery.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_sms_delivery (
-                message_id, trace_id, direction, state, sip_state, rpdu_ack,
+                line_id, message_id, trace_id, direction, state, sip_state, rpdu_ack,
                 delivery_reported, failure_cause, retry_count, api_sms_id,
                 created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)
-             ON CONFLICT(message_id) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)
+             ON CONFLICT(line_id, message_id) DO UPDATE SET
                 trace_id = excluded.trace_id,
                 direction = excluded.direction,
                 state = excluded.state,
@@ -2051,6 +3421,7 @@ impl Database {
                 api_sms_id = excluded.api_sms_id,
                 updated_at = excluded.updated_at",
             params![
+                line_id,
                 delivery.message_id,
                 delivery.trace_id,
                 delivery.direction,
@@ -2070,15 +3441,17 @@ impl Database {
     pub fn upsert_vowifi_sms_part(&self, part: NewVowifiSmsPart<'_>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let updated_at = beijing_sms_now_string();
+        let line_id = required_line_id(part.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_sms_parts (
-                message_id, reference, sequence, total, received, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-             ON CONFLICT(message_id, reference, sequence) DO UPDATE SET
+                line_id, message_id, reference, sequence, total, received, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(line_id, message_id, reference, sequence) DO UPDATE SET
                 total = excluded.total,
                 received = excluded.received,
                 updated_at = excluded.updated_at",
             params![
+                line_id,
                 part.message_id,
                 part.reference,
                 part.sequence,
@@ -2090,41 +3463,57 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_vowifi_sms_deliveries(
+    pub fn get_vowifi_sms_deliveries_for_line(
+        &self,
+        line_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<VowifiSmsDeliveriesResponse> {
+        self.get_vowifi_sms_deliveries_scoped(limit, offset, Some(line_id))
+    }
+
+    fn get_vowifi_sms_deliveries_scoped(
         &self,
         limit: i64,
         offset: i64,
+        line_id: Option<&str>,
     ) -> Result<VowifiSmsDeliveriesResponse> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 200);
         let offset = offset.max(0);
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
 
-        let total = conn.query_row("SELECT COUNT(*) FROM vowifi_sms_delivery", [], |row| {
-            row.get(0)
-        })?;
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM vowifi_sms_delivery
+             WHERE (?1 IS NULL OR line_id = ?1)",
+            params![line_id],
+            |row| row.get(0),
+        )?;
         let mut stmt = conn.prepare(
-            "SELECT message_id, trace_id, direction, state, sip_state, rpdu_ack,
+            "SELECT message_id, NULLIF(line_id, ''), trace_id, direction, state, sip_state, rpdu_ack,
                     delivery_reported, failure_cause, retry_count, api_sms_id,
                     created_at, updated_at
              FROM vowifi_sms_delivery
+             WHERE (?1 IS NULL OR line_id = ?1)
              ORDER BY updated_at DESC, message_id DESC
-             LIMIT ?1 OFFSET ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![limit, offset], |row| {
+        let rows = stmt.query_map(params![line_id, limit, offset], |row| {
             Ok(VowifiSmsDeliveryEntry {
                 message_id: row.get(0)?,
-                trace_id: row.get(1)?,
-                direction: row.get(2)?,
-                state: row.get(3)?,
-                sip_state: row.get(4)?,
-                rpdu_ack: row.get(5)?,
-                delivery_reported: row.get::<_, i64>(6)? != 0,
-                failure_cause: row.get(7)?,
-                retry_count: row.get(8)?,
-                api_sms_id: row.get(9)?,
+                line_id: row.get(1)?,
+                trace_id: row.get(2)?,
+                direction: row.get(3)?,
+                state: row.get(4)?,
+                sip_state: row.get(5)?,
+                rpdu_ack: row.get(6)?,
+                delivery_reported: row.get::<_, i64>(7)? != 0,
+                failure_cause: row.get(8)?,
+                retry_count: row.get(9)?,
+                api_sms_id: row.get(10)?,
                 parts: Vec::new(),
-                created_at: row.get(10)?,
-                updated_at: row.get(11)?,
+                created_at: row.get(11)?,
+                updated_at: row.get(12)?,
             })
         })?;
 
@@ -2135,47 +3524,67 @@ impl Database {
         drop(stmt);
 
         for delivery in &mut deliveries {
-            delivery.parts = Self::vowifi_sms_parts_for_conn(&conn, &delivery.message_id)?;
+            delivery.parts = Self::vowifi_sms_parts_for_conn(
+                &conn,
+                delivery.line_id.as_deref().unwrap_or(""),
+                &delivery.message_id,
+            )?;
         }
 
         Ok(VowifiSmsDeliveriesResponse { deliveries, total })
     }
 
-    pub fn get_vowifi_sms_delivery(
+    pub fn get_vowifi_sms_delivery_for_line(
         &self,
+        line_id: &str,
         message_id: &str,
     ) -> Result<Option<VowifiSmsDeliveryEntry>> {
+        self.get_vowifi_sms_delivery_scoped(message_id, Some(line_id))
+    }
+
+    fn get_vowifi_sms_delivery_scoped(
+        &self,
+        message_id: &str,
+        line_id: Option<&str>,
+    ) -> Result<Option<VowifiSmsDeliveryEntry>> {
         let conn = self.conn.lock().unwrap();
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
         let mut delivery = conn
             .query_row(
-                "SELECT message_id, trace_id, direction, state, sip_state, rpdu_ack,
+                "SELECT message_id, NULLIF(line_id, ''), trace_id, direction, state, sip_state, rpdu_ack,
                         delivery_reported, failure_cause, retry_count, api_sms_id,
                         created_at, updated_at
                  FROM vowifi_sms_delivery
-                 WHERE message_id = ?1",
-                params![message_id],
+                 WHERE message_id = ?1
+                   AND (?2 IS NULL OR line_id = ?2)",
+                params![message_id, line_id],
                 |row| {
                     Ok(VowifiSmsDeliveryEntry {
                         message_id: row.get(0)?,
-                        trace_id: row.get(1)?,
-                        direction: row.get(2)?,
-                        state: row.get(3)?,
-                        sip_state: row.get(4)?,
-                        rpdu_ack: row.get(5)?,
-                        delivery_reported: row.get::<_, i64>(6)? != 0,
-                        failure_cause: row.get(7)?,
-                        retry_count: row.get(8)?,
-                        api_sms_id: row.get(9)?,
+                        line_id: row.get(1)?,
+                        trace_id: row.get(2)?,
+                        direction: row.get(3)?,
+                        state: row.get(4)?,
+                        sip_state: row.get(5)?,
+                        rpdu_ack: row.get(6)?,
+                        delivery_reported: row.get::<_, i64>(7)? != 0,
+                        failure_cause: row.get(8)?,
+                        retry_count: row.get(9)?,
+                        api_sms_id: row.get(10)?,
                         parts: Vec::new(),
-                        created_at: row.get(10)?,
-                        updated_at: row.get(11)?,
+                        created_at: row.get(11)?,
+                        updated_at: row.get(12)?,
                     })
                 },
             )
             .optional()?;
 
         if let Some(delivery) = delivery.as_mut() {
-            delivery.parts = Self::vowifi_sms_parts_for_conn(&conn, &delivery.message_id)?;
+            delivery.parts = Self::vowifi_sms_parts_for_conn(
+                &conn,
+                delivery.line_id.as_deref().unwrap_or(""),
+                &delivery.message_id,
+            )?;
         }
 
         Ok(delivery)
@@ -2183,15 +3592,16 @@ impl Database {
 
     fn vowifi_sms_parts_for_conn(
         conn: &Connection,
+        line_id: &str,
         message_id: &str,
     ) -> Result<Vec<VowifiSmsPartEntry>> {
         let mut stmt = conn.prepare(
             "SELECT message_id, reference, sequence, total, received, updated_at
              FROM vowifi_sms_parts
-             WHERE message_id = ?1
+             WHERE line_id = ?1 AND message_id = ?2
              ORDER BY reference ASC, sequence ASC",
         )?;
-        let rows = stmt.query_map(params![message_id], |row| {
+        let rows = stmt.query_map(params![line_id, message_id], |row| {
             Ok(VowifiSmsPartEntry {
                 message_id: row.get(0)?,
                 reference: row.get(1)?,
@@ -2212,12 +3622,13 @@ impl Database {
     pub fn upsert_vowifi_esim_restore(&self, restore: NewVowifiEsimRestore<'_>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let updated_at = beijing_sms_now_string();
+        let line_id = required_line_id(restore.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_esim_restore (
-                singleton_key, switch_token, switch_phase, phase_ms,
+                line_id, switch_token, switch_phase, phase_ms,
                 identity_ready, sim_auth_ready, degraded_reason, retry_count, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(singleton_key) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+             ON CONFLICT(line_id) DO UPDATE SET
                 switch_token = excluded.switch_token,
                 switch_phase = excluded.switch_phase,
                 phase_ms = excluded.phase_ms,
@@ -2227,6 +3638,7 @@ impl Database {
                 retry_count = excluded.retry_count,
                 updated_at = excluded.updated_at",
             params![
+                line_id,
                 restore.switch_token,
                 restore.switch_phase,
                 restore.phase_ms,
@@ -2240,24 +3652,39 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_vowifi_esim_restore(&self) -> Result<Option<VowifiEsimRestoreEntry>> {
+    pub fn get_vowifi_esim_restore_for_line(
+        &self,
+        line_id: &str,
+    ) -> Result<Option<VowifiEsimRestoreEntry>> {
+        self.get_vowifi_esim_restore_scoped(Some(line_id))
+    }
+
+    fn get_vowifi_esim_restore_scoped(
+        &self,
+        line_id: Option<&str>,
+    ) -> Result<Option<VowifiEsimRestoreEntry>> {
         let conn = self.conn.lock().unwrap();
+        let line_id = line_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("");
         conn.query_row(
-            "SELECT switch_token, switch_phase, phase_ms,
+            "SELECT NULLIF(line_id, ''), switch_token, switch_phase, phase_ms,
                     identity_ready, sim_auth_ready, degraded_reason, retry_count, updated_at
              FROM vowifi_esim_restore
-             WHERE singleton_key = 1",
-            [],
+             WHERE line_id = ?1",
+            params![line_id],
             |row| {
                 Ok(VowifiEsimRestoreEntry {
-                    switch_token: row.get(0)?,
-                    switch_phase: row.get(1)?,
-                    phase_ms: row.get(2)?,
-                    identity_ready: row.get::<_, i64>(3)? != 0,
-                    sim_auth_ready: row.get::<_, i64>(4)? != 0,
-                    degraded_reason: row.get(5)?,
-                    retry_count: row.get(6)?,
-                    updated_at: row.get(7)?,
+                    line_id: row.get(0)?,
+                    switch_token: row.get(1)?,
+                    switch_phase: row.get(2)?,
+                    phase_ms: row.get(3)?,
+                    identity_ready: row.get::<_, i64>(4)? != 0,
+                    sim_auth_ready: row.get::<_, i64>(5)? != 0,
+                    degraded_reason: row.get(6)?,
+                    retry_count: row.get(7)?,
+                    updated_at: row.get(8)?,
                 })
             },
         )
@@ -2267,14 +3694,15 @@ impl Database {
     pub fn upsert_vowifi_soak_run(&self, run: NewVowifiSoakRun<'_>) -> Result<()> {
         let conn = self.conn.lock().unwrap();
         let now = beijing_sms_now_string();
+        let line_id = required_line_id(run.line_id)?;
         let finished_at =
             matches!(run.status, "passed" | "failed" | "aborted").then_some(now.as_str());
         conn.execute(
             "INSERT INTO vowifi_soak_runs (
-                run_id, scenario_id, profile_id, plmn, status, started_at, finished_at,
+                line_id, run_id, scenario_id, profile_id, plmn, status, started_at, finished_at,
                 duration_seconds, sample_count, failure_count, last_error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(run_id) DO UPDATE SET
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(line_id, run_id) DO UPDATE SET
                 scenario_id = excluded.scenario_id,
                 profile_id = excluded.profile_id,
                 plmn = excluded.plmn,
@@ -2285,6 +3713,7 @@ impl Database {
                 failure_count = excluded.failure_count,
                 last_error = excluded.last_error",
             params![
+                line_id,
                 run.run_id,
                 run.scenario_id,
                 run.profile_id,
@@ -2304,11 +3733,13 @@ impl Database {
     pub fn insert_vowifi_soak_sample(&self, sample: NewVowifiSoakSample<'_>) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let created_at = beijing_sms_now_string();
+        let line_id = required_line_id(sample.line_id)?;
         conn.execute(
             "INSERT INTO vowifi_soak_samples (
-                run_id, sample_kind, metric_name, metric_value, state, created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                line_id, run_id, sample_kind, metric_name, metric_value, state, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
+                line_id,
                 sample.run_id,
                 sample.sample_kind,
                 sample.metric_name,
@@ -2320,22 +3751,41 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    pub fn get_vowifi_soak_runs(&self, limit: i64, offset: i64) -> Result<VowifiSoakRunsResponse> {
+    pub fn get_vowifi_soak_runs_for_line(
+        &self,
+        line_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<VowifiSoakRunsResponse> {
+        self.get_vowifi_soak_runs_scoped(limit, offset, Some(line_id))
+    }
+
+    fn get_vowifi_soak_runs_scoped(
+        &self,
+        limit: i64,
+        offset: i64,
+        line_id: Option<&str>,
+    ) -> Result<VowifiSoakRunsResponse> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 100);
         let offset = offset.max(0);
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
 
-        let total = conn.query_row("SELECT COUNT(*) FROM vowifi_soak_runs", [], |row| {
-            row.get(0)
-        })?;
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM vowifi_soak_runs
+             WHERE (?1 IS NULL OR line_id = ?1)",
+            params![line_id],
+            |row| row.get(0),
+        )?;
         let mut stmt = conn.prepare(
-            "SELECT run_id, scenario_id, profile_id, plmn, status, started_at, finished_at,
+            "SELECT run_id, NULLIF(line_id, ''), scenario_id, profile_id, plmn, status, started_at, finished_at,
                     duration_seconds, sample_count, failure_count, last_error
              FROM vowifi_soak_runs
+             WHERE (?1 IS NULL OR line_id = ?1)
              ORDER BY started_at DESC, run_id DESC
-             LIMIT ?1 OFFSET ?2",
+             LIMIT ?2 OFFSET ?3",
         )?;
-        let rows = stmt.query_map(params![limit, offset], vowifi_soak_run_from_row)?;
+        let rows = stmt.query_map(params![line_id, limit, offset], vowifi_soak_run_from_row)?;
 
         let mut runs = Vec::new();
         for row in rows {
@@ -2344,7 +3794,11 @@ impl Database {
         drop(stmt);
 
         for run in &mut runs {
-            run.samples = Self::vowifi_soak_samples_for_conn(&conn, &run.run_id)?;
+            run.samples = Self::vowifi_soak_samples_for_conn(
+                &conn,
+                run.line_id.as_deref().unwrap_or(""),
+                &run.run_id,
+            )?;
         }
 
         Ok(VowifiSoakRunsResponse {
@@ -2356,16 +3810,17 @@ impl Database {
 
     fn vowifi_soak_samples_for_conn(
         conn: &Connection,
+        line_id: &str,
         run_id: &str,
     ) -> Result<Vec<VowifiSoakSampleEntry>> {
         let mut stmt = conn.prepare(
             "SELECT id, run_id, sample_kind, metric_name, metric_value, state, created_at
              FROM vowifi_soak_samples
-             WHERE run_id = ?1
+             WHERE line_id = ?1 AND run_id = ?2
              ORDER BY id DESC
              LIMIT 50",
         )?;
-        let rows = stmt.query_map(params![run_id], vowifi_soak_sample_from_row)?;
+        let rows = stmt.query_map(params![line_id, run_id], vowifi_soak_sample_from_row)?;
 
         let mut samples = Vec::new();
         for row in rows {
@@ -2511,22 +3966,26 @@ impl Database {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Check whether an SMS marker has already been stored.
-    pub fn sms_exists_by_pdu(&self, pdu: &str) -> Result<bool> {
+    /// Check whether an SMS marker has already been stored on one line.
+    pub fn sms_exists_by_pdu_for_line(&self, line_id: &str, pdu: &str) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_messages WHERE pdu = ?1",
-            params![pdu],
+            "SELECT COUNT(*) FROM sms_messages WHERE line_id = ?1 AND pdu = ?2",
+            params![line_id, pdu],
             |row| row.get(0),
         )?;
         Ok(count > 0)
     }
 
-    pub fn sms_id_by_pdu(&self, pdu: &str) -> Result<Option<i64>> {
+    pub fn sms_id_by_pdu_for_line(&self, line_id: &str, pdu: &str) -> Result<Option<i64>> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id FROM sms_messages WHERE pdu = ?1 ORDER BY id DESC LIMIT 1",
-            params![pdu],
+            "SELECT id FROM sms_messages
+             WHERE line_id = ?1 AND pdu = ?2
+             ORDER BY id DESC LIMIT 1",
+            params![line_id, pdu],
             |row| row.get(0),
         )
         .optional()
@@ -2542,30 +4001,41 @@ impl Database {
     // pruned by `cleanup_sms_dedup` on a retention window so the DB does not
     // grow without limit over long uptimes.
 
-    /// Atomically claim a dedup fingerprint. Returns `true` if this is the
+    /// Atomically claim a line-local dedup fingerprint. Returns `true` if this is the
     /// first time we've seen `fingerprint` (caller should proceed to store the
     /// SMS), or `false` if it was already claimed (caller should drop it as a
     /// duplicate). `transport` is recorded for observability/debugging only.
     ///
-    /// The claim is a single `INSERT OR IGNORE` on a UNIQUE column, so it is
-    /// race-free even if two legs call it concurrently: exactly one insert
-    /// affects a row.
-    pub fn claim_sms_dedup(&self, fingerprint: &str, transport: &str) -> Result<bool> {
+    /// The claim is a single `INSERT OR IGNORE` on `(line_id, fingerprint)`, so
+    /// it is race-free across access legs without coupling separate SIM lines.
+    pub fn claim_sms_dedup(
+        &self,
+        line_id: &str,
+        fingerprint: &str,
+        transport: &str,
+    ) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let changed = conn.execute(
-            "INSERT OR IGNORE INTO sms_dedup (fingerprint, transport, created_at)
-             VALUES (?1, ?2, ?3)",
-            params![fingerprint, transport, beijing_sms_now_string()],
+            "INSERT OR IGNORE INTO sms_dedup (line_id, fingerprint, transport, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                line_id,
+                fingerprint,
+                transport,
+                beijing_sms_now_string()
+            ],
         )?;
         Ok(changed > 0)
     }
 
     /// Whether a dedup fingerprint has already been claimed (non-mutating).
-    pub fn sms_dedup_exists(&self, fingerprint: &str) -> Result<bool> {
+    pub fn sms_dedup_exists(&self, line_id: &str, fingerprint: &str) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sms_dedup WHERE fingerprint = ?1",
-            params![fingerprint],
+            "SELECT COUNT(*) FROM sms_dedup WHERE line_id = ?1 AND fingerprint = ?2",
+            params![line_id, fingerprint],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -2574,7 +4044,8 @@ impl Database {
     /// Prune dedup fingerprints older than `retention_days`. Returns the number
     /// of rows deleted. A retention of 0 is treated as "keep nothing older than
     /// now" (still bounded). Intended to be called from a daily task.
-    pub fn cleanup_sms_dedup(&self, retention_days: u32) -> Result<usize> {
+    pub fn cleanup_sms_dedup(&self, line_id: &str, retention_days: u32) -> Result<usize> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let cutoff = Utc::now()
             .with_timezone(&beijing_offset())
@@ -2583,8 +4054,8 @@ impl Database {
             .format(SMS_TIMESTAMP_FORMAT)
             .to_string();
         let deleted = conn.execute(
-            "DELETE FROM sms_dedup WHERE created_at < ?1",
-            params![cutoff],
+            "DELETE FROM sms_dedup WHERE line_id = ?1 AND created_at < ?2",
+            params![line_id, cutoff],
         )?;
         Ok(deleted)
     }
@@ -2592,7 +4063,8 @@ impl Database {
     /// Keep only the newest `max_messages` user-visible SMS rows. Diagnostic
     /// delivery rows are retained, but their API foreign-key-like reference is
     /// cleared before the corresponding SMS row is removed.
-    pub fn prune_sms_messages(&self, max_messages: u32) -> Result<usize> {
+    pub fn prune_sms_messages_for_line(&self, line_id: &str, max_messages: u32) -> Result<usize> {
+        let line_id = required_line_id(line_id)?;
         let max_messages = i64::from(max_messages.max(1));
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -2600,61 +4072,82 @@ impl Database {
             "UPDATE vowifi_sms_delivery
              SET api_sms_id = NULL
              WHERE api_sms_id IN (
-                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+                 SELECT id FROM sms_messages
+                 WHERE line_id = ?1
+                 ORDER BY id DESC LIMIT -1 OFFSET ?2
              )",
-            params![max_messages],
+            params![line_id, max_messages],
         )?;
         let deleted = tx.execute(
             "DELETE FROM sms_messages
              WHERE id IN (
-                 SELECT id FROM sms_messages ORDER BY id DESC LIMIT -1 OFFSET ?1
+                 SELECT id FROM sms_messages
+                 WHERE line_id = ?1
+                 ORDER BY id DESC LIMIT -1 OFFSET ?2
              )",
-            params![max_messages],
+            params![line_id, max_messages],
         )?;
         tx.commit()?;
         Ok(deleted)
     }
 
-    /// Number of live dedup fingerprints (for status/metrics).
-    pub fn sms_dedup_count(&self) -> Result<i64> {
+    /// Number of live dedup fingerprints for one line (for status/metrics).
+    pub fn sms_dedup_count(&self, line_id: &str) -> Result<i64> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM sms_dedup", [], |row| row.get(0))
+        conn.query_row(
+            "SELECT COUNT(*) FROM sms_dedup WHERE line_id = ?1",
+            params![line_id],
+            |row| row.get(0),
+        )
     }
 
-    pub fn incoming_sms_exists_by_timestamp(
+    pub fn incoming_sms_exists_by_timestamp_for_line(
         &self,
+        line_id: &str,
         phone_number: &str,
         content: &str,
         timestamp: &str,
     ) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let normalized_timestamp = normalize_sms_timestamp_for_display(timestamp)
             .unwrap_or_else(|| timestamp.trim().to_string());
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sms_messages
-             WHERE direction = 'incoming'
-               AND phone_number = ?1
-               AND content = ?2
-               AND (timestamp = ?3 OR timestamp = ?4)",
-            params![phone_number, content, timestamp, normalized_timestamp],
+             WHERE line_id = ?1
+               AND direction = 'incoming'
+               AND phone_number = ?2
+               AND content = ?3
+               AND (timestamp = ?4 OR timestamp = ?5)",
+            params![
+                line_id,
+                phone_number,
+                content,
+                timestamp,
+                normalized_timestamp
+            ],
             |row| row.get(0),
         )?;
         Ok(count > 0)
     }
 
-    pub fn incoming_sms_exists_by_legacy_content(
+    pub fn incoming_sms_exists_by_legacy_content_for_line(
         &self,
+        line_id: &str,
         phone_number: &str,
         content: &str,
     ) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM sms_messages
-             WHERE direction = 'incoming'
-               AND phone_number = ?1
-               AND content = ?2
+             WHERE line_id = ?1
+               AND direction = 'incoming'
+               AND phone_number = ?2
+               AND content = ?3
                AND (pdu IS NULL OR pdu NOT LIKE 'mmfp:%')",
-            params![phone_number, content],
+            params![line_id, phone_number, content],
             |row| row.get(0),
         )?;
         Ok(count > 0)
@@ -2745,10 +4238,11 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO notification_logs (
-                event_type, status, summary, rule_id, rule_name,
+                line_id, event_type, status, summary, rule_id, rule_name,
                 channel_id, channel_name, message, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
+                log.line_id,
                 log.event_type,
                 log.status,
                 log.summary,
@@ -2770,11 +4264,12 @@ impl Database {
         let now = beijing_sms_now_string();
         conn.execute(
             "INSERT INTO notification_queue (
-                status, event_type, event_label, summary, reason,
+                line_id, status, event_type, event_label, summary, reason,
                 rule_id, rule_name, channel_id, channel_name, channel_type,
                 title, body, next_attempt_at, max_attempts, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
             params![
+                item.line_id,
                 item.status,
                 item.event_type,
                 item.event_label,
@@ -2817,6 +4312,7 @@ impl Database {
         &self,
         event_type: &str,
         status: &str,
+        line_id: &str,
         query: &str,
         start_date: &str,
         end_date: &str,
@@ -2828,6 +4324,7 @@ impl Database {
         let offset = offset.max(0);
         let event_type = event_type.trim();
         let status = status.trim();
+        let line_id = line_id.trim();
         let query = query.trim();
         let start_at = notification_log_start_bound(start_date);
         let end_at = notification_log_end_bound(end_date);
@@ -2836,52 +4333,57 @@ impl Database {
             "SELECT COUNT(*) FROM notification_logs
              WHERE (?1 = '' OR event_type = ?1)
                AND (?2 = '' OR status = ?2)
+               AND (?3 = '' OR (?3 = 'device' AND line_id IS NULL) OR line_id = ?3)
                AND (
-                    ?3 = ''
-                    OR summary LIKE '%' || ?3 || '%'
-                    OR rule_name LIKE '%' || ?3 || '%'
-                    OR channel_name LIKE '%' || ?3 || '%'
-                    OR message LIKE '%' || ?3 || '%'
+                    ?4 = ''
+                    OR summary LIKE '%' || ?4 || '%'
+                    OR rule_name LIKE '%' || ?4 || '%'
+                    OR channel_name LIKE '%' || ?4 || '%'
+                    OR message LIKE '%' || ?4 || '%'
                )
-               AND (?4 = '' OR created_at >= ?4)
-               AND (?5 = '' OR created_at <= ?5)",
-            params![event_type, status, query, start_at, end_at],
+               AND (?5 = '' OR created_at >= ?5)
+               AND (?6 = '' OR created_at <= ?6)",
+            params![event_type, status, line_id, query, start_at, end_at],
             |row| row.get(0),
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, event_type, status, summary, rule_id, rule_name,
+            "SELECT id, line_id, event_type, status, summary, rule_id, rule_name,
                     channel_id, channel_name, message, created_at
              FROM notification_logs
              WHERE (?1 = '' OR event_type = ?1)
                AND (?2 = '' OR status = ?2)
+               AND (?3 = '' OR (?3 = 'device' AND line_id IS NULL) OR line_id = ?3)
                AND (
-                    ?3 = ''
-                    OR summary LIKE '%' || ?3 || '%'
-                    OR rule_name LIKE '%' || ?3 || '%'
-                    OR channel_name LIKE '%' || ?3 || '%'
-                    OR message LIKE '%' || ?3 || '%'
+                    ?4 = ''
+                    OR summary LIKE '%' || ?4 || '%'
+                    OR rule_name LIKE '%' || ?4 || '%'
+                    OR channel_name LIKE '%' || ?4 || '%'
+                    OR message LIKE '%' || ?4 || '%'
                )
-               AND (?4 = '' OR created_at >= ?4)
-               AND (?5 = '' OR created_at <= ?5)
+               AND (?5 = '' OR created_at >= ?5)
+               AND (?6 = '' OR created_at <= ?6)
              ORDER BY id DESC
-             LIMIT ?6 OFFSET ?7",
+             LIMIT ?7 OFFSET ?8",
         )?;
 
         let rows = stmt.query_map(
-            params![event_type, status, query, start_at, end_at, limit, offset],
+            params![
+                event_type, status, line_id, query, start_at, end_at, limit, offset
+            ],
             |row| {
                 Ok(NotificationLogEntry {
                     id: row.get(0)?,
-                    event_type: row.get(1)?,
-                    status: row.get(2)?,
-                    summary: row.get(3)?,
-                    rule_id: row.get(4)?,
-                    rule_name: row.get(5)?,
-                    channel_id: row.get(6)?,
-                    channel_name: row.get(7)?,
-                    message: row.get(8)?,
-                    created_at: row.get(9)?,
+                    line_id: row.get(1)?,
+                    event_type: row.get(2)?,
+                    status: row.get(3)?,
+                    summary: row.get(4)?,
+                    rule_id: row.get(5)?,
+                    rule_name: row.get(6)?,
+                    channel_id: row.get(7)?,
+                    channel_name: row.get(8)?,
+                    message: row.get(9)?,
+                    created_at: row.get(10)?,
                 })
             },
         )?;
@@ -2898,68 +4400,57 @@ impl Database {
         &self,
         event_type: &str,
         status: &str,
+        line_id: &str,
         start_date: &str,
         end_date: &str,
     ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let event_type = event_type.trim();
         let status = status.trim();
+        let line_id = line_id.trim();
         let start_at = notification_log_start_bound(start_date);
         let end_at = notification_log_end_bound(end_date);
         conn.execute(
             "DELETE FROM notification_logs
              WHERE (?1 = '' OR event_type = ?1)
                AND (?2 = '' OR status = ?2)
-               AND (?3 = '' OR created_at >= ?3)
-               AND (?4 = '' OR created_at <= ?4)",
-            params![event_type, status, start_at, end_at],
+               AND (?3 = '' OR (?3 = 'device' AND line_id IS NULL) OR line_id = ?3)
+               AND (?4 = '' OR created_at >= ?4)
+               AND (?5 = '' OR created_at <= ?5)",
+            params![event_type, status, line_id, start_at, end_at],
         )
     }
 
-    pub fn get_notification_queue(&self, limit: i64) -> Result<NotificationQueueResponse> {
+    pub fn get_notification_queue(
+        &self,
+        line_id: &str,
+        limit: i64,
+    ) -> Result<NotificationQueueResponse> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.clamp(1, 500);
+        let line_id = line_id.trim();
 
         let total = conn.query_row(
             "SELECT COUNT(*) FROM notification_queue
-             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')",
-            [],
+             WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')
+               AND (?1 = '' OR (?1 = 'device' AND line_id IS NULL) OR line_id = ?1)",
+            params![line_id],
             |row| row.get(0),
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, status, event_type, event_label, summary,
+            "SELECT id, line_id, status, event_type, event_label, summary,
                     COALESCE(NULLIF(last_error, ''), reason) AS display_reason,
                     channel_id, channel_name, channel_type, rule_id, rule_name,
                     title, body, next_attempt_at,
                     attempt_count, max_attempts, created_at, updated_at
              FROM notification_queue
              WHERE status IN ('pending', 'scheduled', 'retrying', 'sending', 'failed')
+               AND (?1 = '' OR (?1 = 'device' AND line_id IS NULL) OR line_id = ?1)
              ORDER BY next_attempt_at ASC, id ASC
-             LIMIT ?1",
+             LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(NotificationQueueEntry {
-                id: row.get(0)?,
-                status: row.get(1)?,
-                event_type: row.get(2)?,
-                event_label: row.get(3)?,
-                summary: row.get(4)?,
-                reason: row.get(5)?,
-                channel_id: row.get(6)?,
-                channel_name: row.get(7)?,
-                channel_type: row.get(8)?,
-                rule_id: row.get(9)?,
-                rule_name: row.get(10)?,
-                title: row.get(11)?,
-                body: row.get(12)?,
-                next_attempt_at: row.get(13)?,
-                attempt_count: row.get(14)?,
-                max_attempts: row.get(15)?,
-                created_at: row.get(16)?,
-                updated_at: row.get(17)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![line_id, limit], notification_queue_entry_from_row)?;
 
         let mut items = Vec::new();
         for row in rows {
@@ -3031,7 +4522,7 @@ impl Database {
         let now = beijing_sms_now_string();
         let limit = limit.clamp(1, 100);
         let mut stmt = conn.prepare(
-            "SELECT id, status, event_type, event_label, summary,
+            "SELECT id, line_id, status, event_type, event_label, summary,
                     COALESCE(NULLIF(last_error, ''), reason) AS display_reason,
                     channel_id, channel_name, channel_type, rule_id, rule_name,
                     title, body, next_attempt_at,
@@ -3042,28 +4533,7 @@ impl Database {
              ORDER BY next_attempt_at ASC, id ASC
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![now, limit], |row| {
-            Ok(NotificationQueueEntry {
-                id: row.get(0)?,
-                status: row.get(1)?,
-                event_type: row.get(2)?,
-                event_label: row.get(3)?,
-                summary: row.get(4)?,
-                reason: row.get(5)?,
-                channel_id: row.get(6)?,
-                channel_name: row.get(7)?,
-                channel_type: row.get(8)?,
-                rule_id: row.get(9)?,
-                rule_name: row.get(10)?,
-                title: row.get(11)?,
-                body: row.get(12)?,
-                next_attempt_at: row.get(13)?,
-                attempt_count: row.get(14)?,
-                max_attempts: row.get(15)?,
-                created_at: row.get(16)?,
-                updated_at: row.get(17)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![now, limit], notification_queue_entry_from_row)?;
 
         let mut items = Vec::new();
         for row in rows {
@@ -3306,62 +4776,89 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// 删除所有短信
-    pub fn clear_all_sms(&self) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE vowifi_sms_delivery SET api_sms_id = NULL", [])?;
-        conn.execute("DELETE FROM sms_messages", [])?;
-        Ok(())
-    }
-
-    /// 删除单条短信
-    pub fn delete_sms(&self, id: i64) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE vowifi_sms_delivery SET api_sms_id = NULL WHERE api_sms_id = ?1",
-            params![id],
+    /// Delete every SMS belonging to one explicit channel.
+    pub fn clear_sms_for_channel(&self, channel_id: &str) -> Result<usize> {
+        let channel_id = required_sms_channel_id(channel_id)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE vowifi_sms_delivery
+             SET api_sms_id = NULL
+             WHERE api_sms_id IN (
+                 SELECT id FROM sms_messages
+                 WHERE (?1 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = ''))
+                    OR line_id = ?1
+             )",
+            params![channel_id],
         )?;
-        conn.execute("DELETE FROM sms_messages WHERE id = ?1", params![id])
+        let deleted = tx.execute(
+            "DELETE FROM sms_messages
+             WHERE (?1 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = ''))
+                OR line_id = ?1",
+            params![channel_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
-    /// 删除一个对话的所有短信
-    pub fn delete_sms_conversation(&self, phone_number: &str) -> Result<usize> {
-        self.delete_sms_conversation_for_channel(phone_number, None)
+    /// Delete one SMS only when it belongs to the requested channel.
+    pub fn delete_sms_for_channel(&self, id: i64, channel_id: &str) -> Result<usize> {
+        let channel_id = required_sms_channel_id(channel_id)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE vowifi_sms_delivery
+             SET api_sms_id = NULL
+             WHERE api_sms_id IN (
+                 SELECT id FROM sms_messages
+                 WHERE id = ?1
+                   AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+             )",
+            params![id, channel_id],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM sms_messages
+             WHERE id = ?1
+               AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)",
+            params![id, channel_id],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn delete_sms_conversation_for_channel(
         &self,
         phone_number: &str,
-        channel_id: Option<&str>,
+        channel_id: &str,
     ) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let channel_id = required_sms_channel_id(channel_id)?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE vowifi_sms_delivery
              SET api_sms_id = NULL
              WHERE api_sms_id IN (
                  SELECT id FROM sms_messages WHERE phone_number = ?1
-                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+                   AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
              )",
             params![phone_number, channel_id],
         )?;
-        conn.execute(
+        let deleted = tx.execute(
             "DELETE FROM sms_messages WHERE phone_number = ?1
-               AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+               AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)",
             params![phone_number, channel_id],
-        )
-    }
-
-    /// 按短信 ID 和对话号码批量删除
-    pub fn delete_sms_batch(&self, ids: &[i64], phone_numbers: &[String]) -> Result<usize> {
-        self.delete_sms_batch_for_channel(ids, phone_numbers, None)
+        )?;
+        tx.commit()?;
+        Ok(deleted)
     }
 
     pub fn delete_sms_batch_for_channel(
         &self,
         ids: &[i64],
         phone_numbers: &[String],
-        channel_id: Option<&str>,
+        channel_id: &str,
     ) -> Result<usize> {
+        let channel_id = required_sms_channel_id(channel_id)?;
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let mut deleted = 0usize;
@@ -3372,23 +4869,34 @@ impl Database {
                  SET api_sms_id = NULL
                  WHERE api_sms_id IN (
                      SELECT id FROM sms_messages WHERE phone_number = ?1
-                   AND (?2 IS NULL OR (?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+                   AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
                  )",
                 params![phone_number, channel_id],
             )?;
             deleted += tx.execute(
                 "DELETE FROM sms_messages WHERE phone_number = ?1
-                   AND (?2 IS NULL OR (?2 = 'unassigned' AND line_id IS NULL) OR line_id = ?2)",
+                   AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)",
                 params![phone_number, channel_id],
             )?;
         }
 
         for id in ids {
             tx.execute(
-                "UPDATE vowifi_sms_delivery SET api_sms_id = NULL WHERE api_sms_id = ?1",
-                params![id],
+                "UPDATE vowifi_sms_delivery
+                 SET api_sms_id = NULL
+                 WHERE api_sms_id IN (
+                     SELECT id FROM sms_messages
+                     WHERE id = ?1
+                       AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)
+                 )",
+                params![id, channel_id],
             )?;
-            deleted += tx.execute("DELETE FROM sms_messages WHERE id = ?1", params![id])?;
+            deleted += tx.execute(
+                "DELETE FROM sms_messages
+                 WHERE id = ?1
+                   AND ((?2 = 'unassigned' AND (line_id IS NULL OR TRIM(line_id) = '')) OR line_id = ?2)",
+                params![id, channel_id],
+            )?;
         }
 
         tx.commit()?;
@@ -3686,14 +5194,21 @@ impl Database {
     // ==================== 通话记录相关方法 ====================
 
     /// 插入新通话记录
-    pub fn insert_call(&self, direction: &str, phone_number: &str, answered: bool) -> Result<i64> {
+    pub fn insert_call(
+        &self,
+        line_id: Option<&str>,
+        direction: &str,
+        phone_number: &str,
+        answered: bool,
+    ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let start_time = Utc::now().to_rfc3339();
+        let line_id = non_empty_option(line_id);
 
         conn.execute(
-            "INSERT INTO call_history (direction, phone_number, duration, start_time, answered)
-             VALUES (?1, ?2, 0, ?3, ?4)",
-            params![direction, phone_number, start_time, answered as i32],
+            "INSERT INTO call_history (line_id, direction, phone_number, duration, start_time, answered)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5)",
+            params![line_id, direction, phone_number, start_time, answered as i32],
         )?;
 
         Ok(conn.last_insert_rowid())
@@ -3723,27 +5238,47 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_call_by_id(&self, id: i64) -> Result<Option<CallRecord>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered
+             FROM call_history WHERE id = ?1",
+            params![id],
+            call_record_from_row,
+        )
+        .optional()
+    }
+
     /// 获取通话记录（分页）
     pub fn get_call_history(&self, limit: i64, offset: i64) -> Result<Vec<CallRecord>> {
+        self.get_call_history_filtered(None, limit, offset)
+    }
+
+    pub fn get_call_history_for_line(
+        &self,
+        line_id: &str,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CallRecord>> {
+        self.get_call_history_filtered(Some(line_id), limit, offset)
+    }
+
+    fn get_call_history_filtered(
+        &self,
+        line_id: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<CallRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, direction, phone_number, duration, start_time, end_time, answered
+            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered
              FROM call_history
+             WHERE (?3 IS NULL OR line_id = ?3)
              ORDER BY start_time DESC
              LIMIT ?1 OFFSET ?2",
         )?;
 
-        let records = stmt.query_map(params![limit, offset], |row| {
-            Ok(CallRecord {
-                id: row.get(0)?,
-                direction: row.get(1)?,
-                phone_number: row.get(2)?,
-                duration: row.get(3)?,
-                start_time: row.get(4)?,
-                end_time: row.get(5)?,
-                answered: row.get::<_, i32>(6)? != 0,
-            })
-        })?;
+        let records = stmt.query_map(params![limit, offset, line_id], call_record_from_row)?;
 
         let mut result = Vec::new();
         for record in records {
@@ -3755,56 +5290,50 @@ impl Database {
 
     /// 获取通话统计
     pub fn get_call_stats(&self) -> Result<CallStats> {
-        let conn = self.conn.lock().unwrap();
-
-        let total: i64 =
-            conn.query_row("SELECT COUNT(*) FROM call_history", [], |row| row.get(0))?;
-
-        let incoming: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM call_history WHERE direction = 'incoming'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let outgoing: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM call_history WHERE direction = 'outgoing'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let missed: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM call_history WHERE direction = 'missed'",
-            [],
-            |row| row.get(0),
-        )?;
-
-        let total_duration: i64 = conn.query_row(
-            "SELECT COALESCE(SUM(duration), 0) FROM call_history WHERE answered = 1",
-            [],
-            |row| row.get(0),
-        )?;
-
-        Ok(CallStats {
-            total,
-            incoming,
-            outgoing,
-            missed,
-            total_duration,
-        })
+        self.get_call_stats_filtered(None)
     }
 
-    /// 删除单条通话记录
-    pub fn delete_call(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM call_history WHERE id = ?1", params![id])?;
-        Ok(())
+    pub fn get_call_stats_for_line(&self, line_id: &str) -> Result<CallStats> {
+        self.get_call_stats_filtered(Some(line_id))
     }
 
-    /// 删除所有通话记录
-    pub fn clear_all_calls(&self) -> Result<()> {
+    fn get_call_stats_filtered(&self, line_id: Option<&str>) -> Result<CallStats> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM call_history", [])?;
-        Ok(())
+        conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(CASE WHEN direction = 'incoming' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN direction = 'outgoing' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN direction = 'missed' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN answered = 1 THEN duration ELSE 0 END), 0)
+             FROM call_history
+             WHERE (?1 IS NULL OR line_id = ?1)",
+            params![line_id],
+            |row| {
+                Ok(CallStats {
+                    total: row.get(0)?,
+                    incoming: row.get(1)?,
+                    outgoing: row.get(2)?,
+                    missed: row.get(3)?,
+                    total_duration: row.get(4)?,
+                })
+            },
+        )
+    }
+
+    pub fn delete_call_for_line(&self, line_id: &str, id: i64) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM call_history WHERE id = ?1 AND line_id = ?2",
+            params![id, line_id],
+        )
+    }
+
+    pub fn clear_calls_for_line(&self, line_id: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM call_history WHERE line_id = ?1",
+            params![line_id],
+        )
     }
 
     // ==================== 自动化运行日志相关方法 ====================
@@ -3812,6 +5341,7 @@ impl Database {
     /// 插入新自动化执行日志
     pub fn insert_automation_log(
         &self,
+        line_id: Option<&str>,
         task_id: &str,
         task_name: &str,
         task_type: &str,
@@ -3820,10 +5350,20 @@ impl Database {
     ) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
         let created_at = beijing_sms_now_string();
+        let line_id = non_empty_option(line_id);
         conn.execute(
-            "INSERT INTO automation_logs (task_id, task_name, task_type, status, detail, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task_id, task_name, task_type, status, detail, created_at],
+            "INSERT INTO automation_logs (
+                line_id, task_id, task_name, task_type, status, detail, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                line_id,
+                task_id,
+                task_name,
+                task_type,
+                status,
+                detail,
+                created_at
+            ],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -3834,6 +5374,7 @@ impl Database {
         &self,
         task_type: &str,
         status: &str,
+        line_id: &str,
         query: &str,
         start_date: &str,
         end_date: &str,
@@ -3845,6 +5386,7 @@ impl Database {
         let offset = offset.max(0);
         let task_type = task_type.trim();
         let status = status.trim();
+        let line_id = line_id.trim();
         let query = query.trim();
 
         let start_at = notification_log_start_bound(start_date);
@@ -3854,48 +5396,55 @@ impl Database {
             "SELECT COUNT(*) FROM automation_logs
              WHERE (?1 = '' OR task_type = ?1)
                AND (?2 = '' OR status = ?2)
+               AND (?3 = '' OR line_id = ?3)
                AND (
-                    ?3 = ''
-                    OR task_name LIKE '%' || ?3 || '%'
-                    OR detail LIKE '%' || ?3 || '%'
+                    ?4 = ''
+                    OR task_name LIKE '%' || ?4 || '%'
+                    OR detail LIKE '%' || ?4 || '%'
+                    OR line_id LIKE '%' || ?4 || '%'
                )
-               AND (?4 = '' OR created_at >= ?4)
-               AND (?5 = '' OR created_at <= ?5)",
-            params![task_type, status, query, start_at, end_at],
+               AND (?5 = '' OR created_at >= ?5)
+               AND (?6 = '' OR created_at <= ?6)",
+            params![task_type, status, line_id, query, start_at, end_at],
             |row| row.get(0),
         )?;
 
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, task_name, task_type, status, detail, created_at
+            "SELECT id, line_id, task_id, task_name, task_type, status, detail, created_at
              FROM automation_logs
              WHERE (?1 = '' OR task_type = ?1)
                AND (?2 = '' OR status = ?2)
+               AND (?3 = '' OR line_id = ?3)
                AND (
-                    ?3 = ''
-                    OR task_name LIKE '%' || ?3 || '%'
-                    OR detail LIKE '%' || ?3 || '%'
+                    ?4 = ''
+                    OR task_name LIKE '%' || ?4 || '%'
+                    OR detail LIKE '%' || ?4 || '%'
+                    OR line_id LIKE '%' || ?4 || '%'
                )
-               AND (?4 = '' OR created_at >= ?4)
-               AND (?5 = '' OR created_at <= ?5)
+               AND (?5 = '' OR created_at >= ?5)
+               AND (?6 = '' OR created_at <= ?6)
              ORDER BY created_at DESC
-             LIMIT ?6 OFFSET ?7",
+             LIMIT ?7 OFFSET ?8",
         )?;
 
         let rows = stmt.query_map(
-            params![task_type, status, query, start_at, end_at, limit, offset],
+            params![
+                task_type, status, line_id, query, start_at, end_at, limit, offset
+            ],
             |row| {
-                let mut detail: String = row.get(5)?;
+                let mut detail: String = row.get(6)?;
                 if detail == "执行成功 (0)" || detail.starts_with("执行成功 (0)") {
                     detail = "执行成功".to_string();
                 }
                 Ok(AutomationLogEntry {
                     id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    task_name: row.get(2)?,
-                    task_type: row.get(3)?,
-                    status: row.get(4)?,
+                    line_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    task_name: row.get(3)?,
+                    task_type: row.get(4)?,
+                    status: row.get(5)?,
                     detail,
-                    created_at: row.get(6)?,
+                    created_at: row.get(7)?,
                 })
             },
         )?;
@@ -3912,25 +5461,26 @@ impl Database {
     pub fn get_last_log_for_task(&self, task_id: &str) -> Result<Option<AutomationLogEntry>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, task_id, task_name, task_type, status, detail, created_at
+            "SELECT id, line_id, task_id, task_name, task_type, status, detail, created_at
              FROM automation_logs
              WHERE task_id = ?1
              ORDER BY created_at DESC
              LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![task_id], |row| {
-            let mut detail: String = row.get(5)?;
+            let mut detail: String = row.get(6)?;
             if detail == "执行成功 (0)" || detail.starts_with("执行成功 (0)") {
                 detail = "执行成功".to_string();
             }
             Ok(AutomationLogEntry {
                 id: row.get(0)?,
-                task_id: row.get(1)?,
-                task_name: row.get(2)?,
-                task_type: row.get(3)?,
-                status: row.get(4)?,
+                line_id: row.get(1)?,
+                task_id: row.get(2)?,
+                task_name: row.get(3)?,
+                task_type: row.get(4)?,
+                status: row.get(5)?,
                 detail,
-                created_at: row.get(6)?,
+                created_at: row.get(7)?,
             })
         })?;
         if let Some(row) = rows.next() {
@@ -3945,12 +5495,14 @@ impl Database {
         &self,
         task_type: &str,
         status: &str,
+        line_id: &str,
         start_date: &str,
         end_date: &str,
     ) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
         let task_type = task_type.trim();
         let status = status.trim();
+        let line_id = line_id.trim();
 
         let start_at = notification_log_start_bound(start_date);
         let end_at = notification_log_end_bound(end_date);
@@ -3959,9 +5511,10 @@ impl Database {
             "DELETE FROM automation_logs
              WHERE (?1 = '' OR task_type = ?1)
                AND (?2 = '' OR status = ?2)
-               AND (?3 = '' OR created_at >= ?3)
-               AND (?4 = '' OR created_at <= ?4)",
-            params![task_type, status, start_at, end_at],
+               AND (?3 = '' OR line_id = ?3)
+               AND (?4 = '' OR created_at >= ?4)
+               AND (?5 = '' OR created_at <= ?5)",
+            params![task_type, status, line_id, start_at, end_at],
         )
     }
 

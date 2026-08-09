@@ -5,7 +5,7 @@ meta {
 }
 
 get {
-  url: http://192.168.68.1:3000/api/vowifi/diagnostics?live=true&limit=100
+  url: {{base_url}}/api/vowifi/lines/{{line_id}}/diagnostics?live=true&limit=100
   body: none
   auth: inherit
 }

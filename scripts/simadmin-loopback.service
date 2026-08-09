@@ -1,0 +1,18 @@
+[Unit]
+Description=SimAdmin Backend Service (loopback test deployment)
+After=network-online.target ModemManager.service simadmin-secondary-qmi.service
+Wants=network-online.target ModemManager.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/simadmin-codex
+ExecStart=/root/simadmin-codex/simadmin serve --host 127.0.0.1 --port 3300
+Restart=always
+RestartSec=5
+Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

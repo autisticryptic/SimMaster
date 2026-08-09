@@ -34,7 +34,8 @@ import {
 import { useTheme } from '../../contexts/ThemeContext'
 import { useRefreshInterval } from '../../contexts/RefreshContext'
 import { api } from '../../api/current'
-import type { BasebandRestartResponse, BasebandRestartStep } from '../../api/types'
+import type { BasebandRestartResponse, BasebandRestartStep, LineRuntimeStatus } from '../../api/types'
+import ModemLineSelector from '../ModemLineSelector'
 
 const TOPBAR_TRANSITION = '300ms cubic-bezier(0.4, 0, 0.2, 1)'
 
@@ -77,6 +78,9 @@ export default function TopBar({
   const [basebandProgressOpen, setBasebandProgressOpen] = useState(false)
   const [basebandSteps, setBasebandSteps] = useState<BasebandRestartStep[]>([])
   const [basebandCurrentRegistration, setBasebandCurrentRegistration] = useState<string | null>(null)
+  const [basebandLines, setBasebandLines] = useState<LineRuntimeStatus[]>([])
+  const [selectedBasebandLineId, setSelectedBasebandLineId] = useState('')
+  const [basebandLineLoading, setBasebandLineLoading] = useState(false)
   const [systemActionLoading, setSystemActionLoading] = useState<'service' | 'device' | null>(null)
   const [systemActionMessage, setSystemActionMessage] = useState<string | null>(null)
   const [systemActionSeverity, setSystemActionSeverity] = useState<'info' | 'success' | 'error'>('info')
@@ -121,14 +125,36 @@ export default function TopBar({
     return '正在执行系统重启...'
   }
 
-  const loadBasebandProgress = async () => {
-    const response = await api.getBasebandRestartStatus()
+  const loadBasebandProgress = async (lineId: string) => {
+    const response = await api.getBasebandRestartStatus(lineId)
     applyBasebandProgress(response.data)
   }
 
+  const openBasebandRestartConfirm = async () => {
+    setRestartConfirmTarget('baseband')
+    setBasebandLineLoading(true)
+    try {
+      const response = await api.getModemLines()
+      const lines = (response.data ?? []).filter((line) =>
+        line.modem.present
+        && (line.modem.line_kind === '' || line.modem.line_kind === 'baseband')
+        && Boolean(line.modem.modem_path),
+      )
+      setBasebandLines(lines)
+      setSelectedBasebandLineId((current) => {
+        if (lines.some((line) => line.modem.line_id === current)) return current
+        return lines.length === 1 ? lines[0].modem.line_id : ''
+      })
+    } catch (err) {
+      setRestartConfirmTarget(null)
+      setSystemActionSeverity('error')
+      setSystemActionMessage(err instanceof Error ? err.message : '加载基带线路失败')
+    } finally {
+      setBasebandLineLoading(false)
+    }
+  }
 
-
-  const handleRestartBaseband = async () => {
+  const handleRestartBaseband = async (lineId: string) => {
     if (basebandRestarting) return
     setBasebandRestarting(true)
     setBasebandProgressOpen(true)
@@ -136,19 +162,19 @@ export default function TopBar({
     setBasebandCurrentRegistration(null)
     let progressTimer: number | undefined
     try {
-      progressTimer = window.setInterval(() => void loadBasebandProgress(), 1000)
-      const response = await api.restartBaseband()
+      progressTimer = window.setInterval(() => void loadBasebandProgress(lineId), 1000)
+      const response = await api.restartBaseband(lineId)
       applyBasebandProgress(response.data)
       triggerRefresh()
     } catch (err) {
-      await loadBasebandProgress().catch(() => undefined)
+      await loadBasebandProgress(lineId).catch(() => undefined)
       setBasebandSteps((steps) => {
         if (steps.some((step) => step.status === 'error')) return steps
         return [...steps, { step: '重启基带失败', status: 'error', detail: err instanceof Error ? err.message : '未知错误' }]
       })
     } finally {
       if (progressTimer) window.clearInterval(progressTimer)
-      await loadBasebandProgress().catch(() => undefined)
+      await loadBasebandProgress(lineId).catch(() => undefined)
       setBasebandRestarting(false)
     }
   }
@@ -176,7 +202,7 @@ export default function TopBar({
     setDeviceRebootProgressOpen(true)
     setDeviceRebootSteps([
       { step: '提交安全重启请求', status: 'running', detail: '等待后端接管重启序列' },
-      { step: '关闭射频模块', status: 'running', detail: 'mmcli -m 0 -d' },
+      { step: '关闭全部基带射频', status: 'running', detail: '通过 ModemManager 枚举当前全部基带' },
       { step: '停止 ModemManager', status: 'running', detail: '切断 D-Bus / QMI 通信链路' },
       { step: '停止 qmi-proxy', status: 'running', detail: '释放底层 QMI 代理进程' },
       { step: '清理 ModemManager 缓存', status: 'running', detail: '删除 /var/lib/ModemManager 残留状态' },
@@ -230,7 +256,7 @@ export default function TopBar({
 
     setRestartConfirmTarget(null)
     if (target === 'baseband') {
-      void handleRestartBaseband()
+      if (selectedBasebandLineId) void handleRestartBaseband(selectedBasebandLineId)
     } else if (target === 'service') {
       void handleRestartService()
     } else {
@@ -299,7 +325,7 @@ export default function TopBar({
           </Tooltip>
           <Tooltip title="重启基带">
             <span>
-              <IconButton size="small" color="default" onClick={() => setRestartConfirmTarget('baseband')} disabled={basebandRestarting || systemActionLoading !== null} sx={{ p: 0.75 }}>
+              <IconButton size="small" color="default" onClick={() => void openBasebandRestartConfirm()} disabled={basebandRestarting || systemActionLoading !== null} sx={{ p: 0.75 }}>
                 {basebandRestarting ? <CircularProgress size={18} color="inherit" /> : <RouterIcon sx={{ fontSize: 22 }} />}
               </IconButton>
             </span>
@@ -408,7 +434,20 @@ export default function TopBar({
         <Dialog open={!!restartConfirmTarget} onClose={() => setRestartConfirmTarget(null)}>
           <DialogTitle>{restartConfirmTitle}</DialogTitle>
           <DialogContent>
-            <Typography>{restartConfirmContent}</Typography>
+            <Stack spacing={2} sx={{ pt: 1 }}>
+              <Typography>{restartConfirmContent}</Typography>
+              {restartConfirmTarget === 'baseband' && (
+                basebandLineLoading
+                  ? <Box sx={{ display: 'flex', justifyContent: 'center', py: 1 }}><CircularProgress size={24} /></Box>
+                  : <ModemLineSelector
+                      lines={basebandLines}
+                      value={selectedBasebandLineId}
+                      onChange={setSelectedBasebandLineId}
+                      label="重启线路"
+                      includeAutomatic={false}
+                    />
+              )}
+            </Stack>
           </DialogContent>
           <DialogActions>
             <Button onClick={() => setRestartConfirmTarget(null)}>取消</Button>
@@ -416,6 +455,7 @@ export default function TopBar({
               onClick={handleConfirmRestart}
               color="error"
               variant="contained"
+              disabled={restartConfirmTarget === 'baseband' && (basebandLineLoading || !selectedBasebandLineId)}
             >
               确认重启
             </Button>

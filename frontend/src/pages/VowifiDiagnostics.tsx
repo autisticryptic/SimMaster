@@ -26,9 +26,9 @@ import {
 import { api } from '../api/current'
 import type {
   VowifiCarrierProfile,
-  VowifiConfig,
   VowifiDiagnosticsResponse,
   VowifiEsimRestoreEntry,
+  VowifiLineConfigResponse,
   VowifiProfileMatchResponse,
   VowifiProfilesResponse,
   VowifiRuntimeEventsResponse,
@@ -38,6 +38,7 @@ import type {
   VowifiStatusResponse,
 } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
+import ModemLineSelector from '../components/ModemLineSelector'
 import { useRefreshInterval } from '../contexts/RefreshContext'
 
 type LoadState = {
@@ -354,7 +355,9 @@ export default function VowifiDiagnosticsPage() {
   const [error, setError] = useState<string | null>(null)
   const [state, setState] = useState<LoadState>(EMPTY_STATE)
   const traceFilter = ''
-  const [vowifiControl, setVowifiControl] = useState<VowifiConfig | null>(null)
+  const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
+  const [selectedLineId, setSelectedLineId] = useState('')
+  const loadSequenceRef = useRef(0)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const [containerHeight, setContainerHeight] = useState<string | number>('calc(100vh - 220px)')
@@ -378,18 +381,35 @@ export default function VowifiDiagnosticsPage() {
 
   useEffect(() => {
     updateHeight()
-  }, [state, vowifiControl, updateHeight])
+  }, [state, vowifiLines, updateHeight])
 
   const loadData = useCallback(async (background = false) => {
+    const loadSequence = ++loadSequenceRef.current
     if (!background) setLoading(true)
     setError(null)
 
     try {
-      const [diagnosticsRes, profilesRes, controlRes] = await Promise.all([
-        api.getVowifiDiagnostics({ limit: 50, traceId: traceFilter }),
+      const linesRes = await api.getVowifiLines()
+      if (loadSequence !== loadSequenceRef.current) return
+      const lines = linesRes.data ?? []
+      const selectedLine = lines.find((line) => line.line_id === selectedLineId)
+        ?? lines.find((line) => line.modem.present)
+        ?? lines[0]
+      const lineId = selectedLine?.line_id ?? ''
+      setVowifiLines(lines)
+      if (lineId !== selectedLineId) setSelectedLineId(lineId)
+
+      if (!lineId) {
+        const profilesRes = await api.getVowifiProfiles()
+        if (loadSequence !== loadSequenceRef.current) return
+        setState({ ...EMPTY_STATE, profiles: profilesRes.data ?? null })
+        return
+      }
+      const [diagnosticsRes, profilesRes] = await Promise.all([
+        api.getVowifiDiagnostics({ lineId, limit: 50, traceId: traceFilter }),
         api.getVowifiProfiles(),
-        api.getVowifiControl(),
       ])
+      if (loadSequence !== loadSequenceRef.current) return
       const diagnostics = diagnosticsRes.data ?? null
 
       setState({
@@ -402,13 +422,13 @@ export default function VowifiDiagnosticsPage() {
         soakRuns: diagnostics?.soak_runs ?? null,
         restore: diagnostics?.restore ?? null,
       })
-      if (controlRes.data) setVowifiControl(controlRes.data)
     } catch (err) {
+      if (loadSequence !== loadSequenceRef.current) return
       setError(err instanceof Error ? err.message : String(err))
     } finally {
-      setLoading(false)
+      if (loadSequence === loadSequenceRef.current) setLoading(false)
     }
-  }, [traceFilter])
+  }, [selectedLineId, traceFilter])
 
   useEffect(() => {
     void loadData(false)
@@ -426,7 +446,12 @@ export default function VowifiDiagnosticsPage() {
   // const ike = currentIke(state)
   // const dataplane = currentDataplane(state)
   const ims = currentIms(state)
-  const steps = useMemo(() => deriveSteps(state, vowifiControl?.connection_enabled ?? false), [state, vowifiControl])
+  const selectedLine = useMemo(
+    () => vowifiLines.find((line) => line.line_id === selectedLineId) ?? null,
+    [selectedLineId, vowifiLines],
+  )
+  const connectionEnabled = selectedLine?.config.enabled ?? false
+  const steps = useMemo(() => deriveSteps(state, connectionEnabled), [connectionEnabled, state])
   // const registry = state.profiles?.profiles ?? []
   const diagnostics = state.diagnostics
   // const diagnosticsSummary = diagnostics?.summary
@@ -488,7 +513,7 @@ export default function VowifiDiagnosticsPage() {
 
   // 格式化时间为 hh:mm:ss
   const formattedRuntime = useMemo(() => {
-    if (vowifiControl && !vowifiControl.connection_enabled) return '未启用'
+    if (!connectionEnabled) return '未启用'
     if (!isConnected) return '未启动'
     if (state.status?.phase === 'failed') return '连接失败'
     if (!smsReady) return '连接中...'
@@ -496,10 +521,10 @@ export default function VowifiDiagnosticsPage() {
     const mins = Math.floor((secondsElapsed % 3600) / 60).toString().padStart(2, '0')
     const secs = (secondsElapsed % 60).toString().padStart(2, '0')
     return `${hrs}:${mins}:${secs}`
-  }, [secondsElapsed, isConnected, smsReady, state.status?.phase, vowifiControl])
+  }, [connectionEnabled, secondsElapsed, isConnected, smsReady, state.status?.phase])
 
   const getStatusIndicator = () => {
-    if (!isConnected || (vowifiControl && !vowifiControl.connection_enabled)) {
+    if (!isConnected || !connectionEnabled) {
       return {
         label: 'WiFi Calling：未启用',
         color: 'text.disabled',
@@ -581,14 +606,14 @@ export default function VowifiDiagnosticsPage() {
   const handleReconnect = async () => {
     setActionLoading(true)
     try {
-      const lines = await api.getVowifiLines()
-      const primaryLine = lines.data?.find((line) => line.is_primary)
-      if (!primaryLine) throw new Error('当前没有可用的主基带线路')
-
-      const snapshot = vowifiControl
-      if (snapshot) setVowifiControl({ ...snapshot, connection_enabled: true })
-      await api.setVowifiLineConnection(primaryLine.line_id, false)
-      await api.setVowifiLineConnection(primaryLine.line_id, true)
+      if (!selectedLineId) throw new Error('当前没有可用的基带线路')
+      setVowifiLines((lines) => lines.map((line) => (
+        line.line_id === selectedLineId
+          ? { ...line, config: { ...line.config, enabled: true } }
+          : line
+      )))
+      await api.setVowifiLineConnection(selectedLineId, false)
+      await api.setVowifiLineConnection(selectedLineId, true)
       await loadData(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -668,11 +693,21 @@ export default function VowifiDiagnosticsPage() {
           <Divider orientation="vertical" flexItem sx={{ display: { xs: 'none', md: 'block' } }} />
 
           <Stack direction="row" spacing={1.5} alignItems="center">
+            <Box sx={{ width: { xs: 210, sm: 250 } }}>
+              <ModemLineSelector
+                lines={vowifiLines}
+                value={selectedLineId}
+                onChange={setSelectedLineId}
+                disabled={actionLoading}
+                label="诊断线路"
+                includeAutomatic={false}
+              />
+            </Box>
             {/* Reconnect Icon Button without border */}
             <IconButton
               onClick={() => void handleReconnect()}
-              disabled={actionLoading}
-              title="重连主线路"
+              disabled={actionLoading || !selectedLineId || !selectedLine?.modem.present}
+              title="重连所选线路"
               sx={{
                 border: 'none',
                 color: 'text.secondary',
@@ -682,7 +717,7 @@ export default function VowifiDiagnosticsPage() {
               <Refresh fontSize="small" />
             </IconButton>
             <Typography variant="caption" color="text.secondary">
-              此处仅重连主线路；开关请在线路卡片中按基带和卡槽单独控制
+              此处仅重连所选线路；开关请在线路卡片中按基带和卡槽单独控制
             </Typography>
           </Stack>
         </Box>

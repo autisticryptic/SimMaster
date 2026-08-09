@@ -11,9 +11,9 @@
 //! call `volte::digest_aka::*` with `VolteError` semantics, while the crypto is
 //! implemented and vector-tested exactly once in the shared core.
 
-use crate::connectivity::modems::softstack::vowifi::qmi_uim::UsimAkaApduResult;
 use crate::connectivity::core::digest_aka as core;
 use crate::connectivity::core::ImsError;
+use crate::connectivity::modems::softstack::vowifi::qmi_uim::UsimAkaApduResult;
 
 use super::errors::{code, VolteError};
 
@@ -21,7 +21,8 @@ use super::errors::{code, VolteError};
 // no error type, so they need no adaptation.
 pub use core::{
     build_authorization_header, build_initial_authorization_header,
-    build_resync_authorization_header, DigestChallenge,
+    build_initial_authorization_header_uri_first, build_resync_authorization_header,
+    DigestChallenge,
 };
 
 /// RAND/AUTN pair extracted from a decoded AKA nonce.

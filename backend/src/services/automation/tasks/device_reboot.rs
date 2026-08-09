@@ -22,11 +22,12 @@ impl AutomationTaskHandler for DeviceRebootHandler {
             .unwrap_or(5) as u32;
 
         let system_events = app.system_event_emitter.clone();
+        let dbus_conn = app.dbus_conn.clone();
 
         async move {
             // 启动安全重启序列，它在后台异步执行（带有延迟）
             tokio::spawn(async move {
-                run_safe_os_reboot_sequence(delay_seconds, system_events).await;
+                run_safe_os_reboot_sequence(delay_seconds, dbus_conn, system_events).await;
             });
 
             Ok(())

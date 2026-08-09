@@ -1,6 +1,6 @@
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
 use crate::hardware::cellular::modem_manager::{
-    discover_modem_bindings, get_sim_info_data_with_cache, get_sim_info_for_modem_with_cache,
+    discover_modem_bindings, get_sim_info_for_modem_with_cache, ModemBinding,
 };
 use crate::platform::config::{
     BarkConfig, ConfigManager, DingtalkAppConfig, DingtalkRobotConfig, FeishuRobotConfig,
@@ -34,6 +34,14 @@ use zbus::Connection;
 
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const NOTIFICATION_TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+fn modem_path_for_line<'a>(bindings: &'a [ModemBinding], line_id: &str) -> Option<&'a str> {
+    let line_id = line_id.trim();
+    bindings
+        .iter()
+        .find(|binding| binding.present && binding.line_id == line_id)
+        .map(|binding| binding.modem_path.as_str())
+}
 
 /// Notification sender for all configured notification channels.
 pub struct NotificationSender {
@@ -87,6 +95,8 @@ enum ChannelDeliveryResult {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutomationEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<String>,
     pub task_id: String,
     pub task_name: String,
     pub task_type: String,
@@ -100,6 +110,7 @@ enum NotificationEvent<'a> {
         message: &'a SmsMessage,
         context: &'a SmsTemplateContext,
     },
+    Call(&'a CallRecord),
     Ddns(&'a DdnsEvent),
     VersionUpdate(&'a VersionUpdateEvent),
     SystemEvent(&'a SystemEvent),
@@ -120,9 +131,34 @@ struct PendingNotification<'a, 'event> {
 }
 
 impl NotificationEvent<'_> {
+    fn line_id(&self) -> Option<&str> {
+        match self {
+            NotificationEvent::Sms { message, .. } => Some(
+                message
+                    .line_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("unassigned"),
+            ),
+            NotificationEvent::Call(call) => Some(
+                call.line_id
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("unassigned"),
+            ),
+            NotificationEvent::Automation(event, _) => event
+                .line_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty()),
+            _ => None,
+        }
+    }
+
     fn event_type(&self) -> NotificationEventType {
         match self {
             NotificationEvent::Sms { .. } => NotificationEventType::Sms,
+            NotificationEvent::Call(_) => NotificationEventType::Call,
             NotificationEvent::Ddns(_) => NotificationEventType::Ddns,
             NotificationEvent::VersionUpdate(_) => NotificationEventType::VersionUpdate,
             NotificationEvent::SystemEvent(_) => NotificationEventType::SystemEvent,
@@ -134,6 +170,7 @@ impl NotificationEvent<'_> {
     fn title(&self) -> String {
         match self {
             NotificationEvent::Sms { .. } => "SimAdmin 短信通知".to_string(),
+            NotificationEvent::Call(_) => "SimAdmin 通话通知".to_string(),
             NotificationEvent::Ddns(_) => "SimAdmin DDNS 通知".to_string(),
             NotificationEvent::VersionUpdate(_) => "SimAdmin 版本更新".to_string(),
             NotificationEvent::SystemEvent(event) => {
@@ -154,6 +191,13 @@ impl NotificationEvent<'_> {
                 message.phone_number,
                 message.content
             )),
+            NotificationEvent::Call(call) => compact_summary(&format!(
+                "[{}][{}] {} {}s",
+                call.line_id.as_deref().unwrap_or("unassigned"),
+                call.direction,
+                call.phone_number,
+                call.duration
+            )),
             NotificationEvent::Ddns(event) => compact_summary(&format!(
                 "{} {} {}",
                 event.domains.join(", "),
@@ -169,9 +213,12 @@ impl NotificationEvent<'_> {
                 event.event_label, event.status_label, event.message
             )),
             NotificationEvent::DeviceStatus(_) => "设备状态定时报表".to_string(),
-            NotificationEvent::Automation(event, _) => {
-                compact_summary(&format!("[{}] {}", event.task_name, event.message))
-            }
+            NotificationEvent::Automation(event, _) => compact_summary(&format!(
+                "[{}][{}] {}",
+                event.task_name,
+                event.line_id.as_deref().unwrap_or("device"),
+                event.message
+            )),
         }
     }
 
@@ -189,6 +236,25 @@ impl NotificationEvent<'_> {
                 "transport" | "path" => sms_transport_label(&message.transport).to_string(),
                 "sim_channel_id" => context.sim_channel_id.clone(),
                 "sim_channel" => context.sim_channel_label.clone(),
+                _ => self.summary(),
+            },
+            NotificationEvent::Call(call) => match field {
+                "line_id" | "sim_channel_id" => call
+                    .line_id
+                    .clone()
+                    .unwrap_or_else(|| "unassigned".to_string()),
+                "phone_number" | "caller" => call.phone_number.clone(),
+                "direction" => call.direction.clone(),
+                "direction_cn" => call_direction_label(&call.direction).to_string(),
+                "duration" => call.duration.to_string(),
+                "answered" => call.answered.to_string(),
+                "answered_cn" => call_answered_label(call.answered).to_string(),
+                "start_time" | "timestamp" => format_notification_time(&call.start_time),
+                "end_time" => call
+                    .end_time
+                    .as_deref()
+                    .map(format_notification_time)
+                    .unwrap_or_default(),
                 _ => self.summary(),
             },
             NotificationEvent::Ddns(event) => match field {
@@ -228,6 +294,7 @@ impl NotificationEvent<'_> {
                 _ => self.summary(),
             },
             NotificationEvent::Automation(event, own_number) => match field {
+                "line_id" => event.line_id.clone().unwrap_or_default(),
                 "task_id" => event.task_id.clone(),
                 "task_name" => event.task_name.clone(),
                 "task_type" => event.task_type.clone(),
@@ -250,6 +317,7 @@ impl NotificationEvent<'_> {
             NotificationEvent::Sms { message, context } => {
                 render_sms_template(&template, message, context, false)
             }
+            NotificationEvent::Call(call) => render_call_template(&template, call, false),
             NotificationEvent::Ddns(event) => render_ddns_template(&template, event, false),
             NotificationEvent::VersionUpdate(event) => {
                 render_version_update_template(&template, event, false)
@@ -292,11 +360,46 @@ impl NotificationSender {
     }
 
     pub async fn get_own_number(&self) -> String {
-        get_sim_info_data_with_cache(self.dbus_conn.as_ref(), Some(self.database.as_ref()))
+        let mut numbers = Vec::new();
+        for binding in discover_modem_bindings(self.dbus_conn.as_ref())
             .await
-            .ok()
-            .map(|sim| format_own_numbers_for_template(&sim.phone_numbers))
             .unwrap_or_default()
+            .into_iter()
+            .filter(|binding| binding.present)
+        {
+            if let Ok(sim) = get_sim_info_for_modem_with_cache(
+                self.dbus_conn.as_ref(),
+                &binding.modem_path,
+                Some(self.database.as_ref()),
+            )
+            .await
+            {
+                numbers.extend(sim.phone_numbers);
+            }
+        }
+        numbers.sort();
+        numbers.dedup();
+        format_own_numbers_for_template(&numbers)
+    }
+
+    async fn get_own_number_for_line(&self, line_id: Option<&str>) -> String {
+        let Some(line_id) = line_id.filter(|value| !value.trim().is_empty()) else {
+            return self.get_own_number().await;
+        };
+        let Ok(bindings) = discover_modem_bindings(self.dbus_conn.as_ref()).await else {
+            return String::new();
+        };
+        let Some(modem_path) = modem_path_for_line(&bindings, line_id) else {
+            return String::new();
+        };
+        get_sim_info_for_modem_with_cache(
+            self.dbus_conn.as_ref(),
+            modem_path,
+            Some(self.database.as_ref()),
+        )
+        .await
+        .map(|sim| format_own_numbers_for_template(&sim.phone_numbers))
+        .unwrap_or_default()
     }
 
     async fn sms_template_context(&self, message: &SmsMessage) -> SmsTemplateContext {
@@ -355,10 +458,19 @@ impl NotificationSender {
                 }
             }
         }
+        let unassigned = channel_id == "unassigned";
         SmsTemplateContext {
-            own_number: self.get_own_number().await,
+            own_number: if unassigned {
+                self.get_own_number().await
+            } else {
+                String::new()
+            },
+            sim_channel_label: if unassigned {
+                "历史未归属短信".to_string()
+            } else {
+                channel_id.clone()
+            },
             sim_channel_id: channel_id,
-            sim_channel_label: "历史未归属短信".to_string(),
             ..Default::default()
         }
     }
@@ -409,10 +521,16 @@ impl NotificationSender {
         }
     }
 
-    /// Forward a call record to all enabled channels.
-    #[allow(dead_code)]
-    pub async fn forward_call(&self, _call: &CallRecord) -> Result<(), String> {
-        Ok(())
+    /// Forward a completed call record through the line-aware notification rules.
+    pub async fn forward_call(&self, call: &CallRecord) -> Result<(), String> {
+        let event = NotificationEvent::Call(call);
+        let result = self.route_event(&event).await;
+
+        if result.errors.is_empty() || result.delivered {
+            Ok(())
+        } else {
+            Err(result.errors.join("; "))
+        }
     }
 
     /// Forward a DDNS update/failure event to all enabled channels.
@@ -429,7 +547,9 @@ impl NotificationSender {
 
     /// Forward an automation task execution event to all enabled channels.
     pub async fn forward_automation_event(&self, event: &AutomationEvent) -> Result<(), String> {
-        let own_number = self.get_own_number().await;
+        let own_number = self
+            .get_own_number_for_line(event.line_id.as_deref())
+            .await;
         let event = NotificationEvent::Automation(event, own_number);
         let result = self.route_event(&event).await;
 
@@ -584,7 +704,7 @@ impl NotificationSender {
 
             if rule.channel_ids.is_empty() {
                 self.record_notification_log(
-                    event.event_type(),
+                    event,
                     "no_available_channel",
                     log_summary,
                     Some(rule),
@@ -600,7 +720,7 @@ impl NotificationSender {
                 let channel = config.channels.iter().find(|item| item.id == *channel_id);
                 let Some(channel) = channel else {
                     self.record_notification_log(
-                        event.event_type(),
+                        event,
                         "no_available_channel",
                         log_summary,
                         Some(rule),
@@ -612,7 +732,7 @@ impl NotificationSender {
 
                 if quiet {
                     self.record_notification_log(
-                        event.event_type(),
+                        event,
                         "quiet_hours",
                         log_summary,
                         Some(rule),
@@ -624,7 +744,7 @@ impl NotificationSender {
 
                 if !channel.enabled {
                     self.record_notification_log(
-                        event.event_type(),
+                        event,
                         "no_available_channel",
                         log_summary,
                         Some(rule),
@@ -649,7 +769,7 @@ impl NotificationSender {
                     Ok(ChannelDeliveryResult::Sent(message)) => {
                         result.delivered = true;
                         self.record_notification_log(
-                            event.event_type(),
+                            event,
                             "success",
                             log_summary,
                             Some(rule),
@@ -661,7 +781,7 @@ impl NotificationSender {
                         result.has_failures = true;
                         result.errors.push(format!("{}: {}", channel.name, message));
                         self.record_notification_log(
-                            event.event_type(),
+                            event,
                             "failed",
                             log_summary,
                             Some(rule),
@@ -673,7 +793,7 @@ impl NotificationSender {
                         result.has_failures = true;
                         result.errors.push(format!("{}: {}", channel.name, err));
                         self.record_notification_log(
-                            event.event_type(),
+                            event,
                             "failed",
                             log_summary,
                             Some(rule),
@@ -690,7 +810,7 @@ impl NotificationSender {
             && target_rule_id.is_none()
         {
             self.record_notification_log(
-                event.event_type(),
+                event,
                 "unmatched",
                 &summary,
                 None,
@@ -704,7 +824,7 @@ impl NotificationSender {
 
     fn record_notification_log(
         &self,
-        event_type: NotificationEventType,
+        event: &NotificationEvent<'_>,
         status: &str,
         summary: &str,
         rule: Option<&NotificationRule>,
@@ -718,7 +838,8 @@ impl NotificationSender {
             .map(|channel| (channel.id.as_str(), channel.name.as_str()))
             .unwrap_or(("", ""));
         self.record_notification_log_raw(NewNotificationLog {
-            event_type: notification_event_type_key(event_type),
+            line_id: event.line_id(),
+            event_type: notification_event_type_key(event.event_type()),
             status,
             summary,
             rule_id,
@@ -869,6 +990,7 @@ impl NotificationSender {
         } = pending;
         self.database
             .insert_notification_queue_item(NewNotificationQueueItem {
+                line_id: event.line_id(),
                 status,
                 event_type: notification_event_type_key(event.event_type()),
                 event_label: event.event_type().label(),
@@ -952,6 +1074,7 @@ impl NotificationSender {
                     warn!(error = %err, id = item.id, "Failed to mark notification queue item sent");
                 }
                 self.record_notification_log_raw(NewNotificationLog {
+                    line_id: item.line_id.as_deref(),
                     event_type: &item.event_type,
                     status: "success",
                     summary: &item.summary,
@@ -985,6 +1108,7 @@ impl NotificationSender {
             warn!(error = %db_err, id = item.id, "Failed to mark notification queue item failed");
         }
         self.record_notification_log_raw(NewNotificationLog {
+            line_id: item.line_id.as_deref(),
             event_type: &item.event_type,
             status: "failed",
             summary: &item.summary,
@@ -2214,17 +2338,14 @@ fn rule_matches(rule: &NotificationRule, event: &NotificationEvent<'_>) -> bool 
             .iter()
             .any(|event_code| event_code == &system_event.event_code);
     }
-    if let NotificationEvent::Sms { message, .. } = event {
-        let channel_id = message
-            .line_id
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or("unassigned");
-        if !rule.sim_channel_ids.is_empty()
-            && !rule
-                .sim_channel_ids
-                .iter()
-                .any(|selected| selected == channel_id)
+    if !rule.sim_channel_ids.is_empty() {
+        let Some(channel_id) = event.line_id() else {
+            return false;
+        };
+        if !rule
+            .sim_channel_ids
+            .iter()
+            .any(|selected| selected == channel_id)
         {
             return false;
         }
@@ -2319,6 +2440,7 @@ fn parse_hhmm(value: &str) -> Option<u16> {
 fn notification_event_type_key(event_type: NotificationEventType) -> &'static str {
     match event_type {
         NotificationEventType::Sms => "sms",
+        NotificationEventType::Call => "call",
         NotificationEventType::Ddns => "ddns",
         NotificationEventType::VersionUpdate => "version_update",
         NotificationEventType::SystemEvent => "system_event",
@@ -2331,6 +2453,7 @@ impl NotificationEventType {
     fn label(self) -> &'static str {
         match self {
             NotificationEventType::Sms => "短信",
+            NotificationEventType::Call => "通话",
             NotificationEventType::Ddns => "DDNS",
             NotificationEventType::VersionUpdate => "版本更新",
             NotificationEventType::SystemEvent => "系统事件",
@@ -2671,6 +2794,7 @@ fn render_automation_template(
 
     let task_id = maybe_escape(&event.task_id);
     let task_name = maybe_escape(&event.task_name);
+    let line_id = maybe_escape(event.line_id.as_deref().unwrap_or_default());
 
     let task_type_label = match event.task_type.as_str() {
         "restart_baseband" => "重启基带",
@@ -2694,6 +2818,8 @@ fn render_automation_template(
     let own_number = maybe_escape(own_number);
 
     let rendered = template
+        .replace("{{line_id}}", &line_id)
+        .replace("{{线路ID}}", &line_id)
         .replace("{{task_id}}", &task_id)
         .replace("{{task_name}}", &task_name)
         .replace("{{任务名称}}", &task_name)
@@ -3022,36 +3148,65 @@ fn format_own_number_for_template(number: &str) -> String {
 }
 
 fn render_call_template(template: &str, call: &CallRecord, escape_json: bool) -> String {
+    let maybe_escape = |value: &str| {
+        if escape_json {
+            escape_json_string(value)
+        } else {
+            value.to_string()
+        }
+    };
+    let line_id = maybe_escape(call.line_id.as_deref().unwrap_or("unassigned"));
+    let phone_number = maybe_escape(&call.phone_number);
+    let direction = maybe_escape(&call.direction);
+    let direction_cn = maybe_escape(call_direction_label(&call.direction));
     let start_time = render_time_value(&call.start_time, escape_json);
     let end_time = call
         .end_time
         .as_deref()
         .map(|value| render_time_value(value, escape_json))
         .unwrap_or_default();
-    let answered_str = if call.answered { "是" } else { "否" };
-    let answered_value = if escape_json {
-        escape_json_string(answered_str)
-    } else {
-        answered_str.to_string()
-    };
-    let direction_cn = if call.direction == "incoming" {
-        "来电"
-    } else {
-        "去电"
-    };
+    let answered_value = maybe_escape(call_answered_label(call.answered));
+    let answered_bool = maybe_escape(&call.answered.to_string());
+    let duration = maybe_escape(&call.duration.to_string());
 
     template
         .replace("{{id}}", &call.id.to_string())
-        .replace("{{phone_number}}", &call.phone_number)
-        .replace("{{direction}}", &call.direction)
-        .replace("{{direction_cn}}", direction_cn)
-        .replace("{{duration}}", &call.duration.to_string())
+        .replace("{{line_id}}", &line_id)
+        .replace("{{线路ID}}", &line_id)
+        .replace("{{phone_number}}", &phone_number)
+        .replace("{{电话号码}}", &phone_number)
+        .replace("{{caller}}", &phone_number)
+        .replace("{{direction}}", &direction)
+        .replace("{{方向}}", &direction_cn)
+        .replace("{{direction_cn}}", &direction_cn)
+        .replace("{{duration}}", &duration)
+        .replace("{{时长}}", &duration)
         .replace("{{start_time}}", &start_time)
+        .replace("{{开始时间}}", &start_time)
         .replace("{{end_time}}", &end_time)
+        .replace("{{结束时间}}", &end_time)
         .replace("{{answered}}", &answered_value)
-        .replace("{{answered_bool}}", &call.answered.to_string())
-        .replace("{{caller}}", &call.phone_number)
+        .replace("{{已接听}}", &answered_value)
+        .replace("{{answered_bool}}", &answered_bool)
+        .replace("{{是否接通}}", &answered_bool)
         .replace("{{time}}", &start_time)
+        .replace("{{时间}}", &start_time)
+}
+
+fn call_direction_label(direction: &str) -> &'static str {
+    match direction {
+        "incoming" => "来电",
+        "missed" => "未接",
+        _ => "去电",
+    }
+}
+
+fn call_answered_label(answered: bool) -> &'static str {
+    if answered {
+        "是"
+    } else {
+        "否"
+    }
 }
 
 fn render_time_value(value: &str, escape_json: bool) -> String {
@@ -3154,6 +3309,7 @@ mod tests {
             message: &message,
             context: &context,
         };
+        assert_eq!(event.line_id(), Some("unassigned"));
 
         let contains_rule = NotificationRule {
             id: "rule-1".to_string(),
@@ -3415,9 +3571,62 @@ mod tests {
     }
 
     #[test]
+    fn automation_template_renders_target_line_variables() {
+        let event = AutomationEvent {
+            line_id: Some("line-target".to_string()),
+            task_id: "task-1".to_string(),
+            task_name: "Line task".to_string(),
+            task_type: "send_sms".to_string(),
+            status: "success".to_string(),
+            message: "done".to_string(),
+            timestamp: "2026-08-05 12:00:00".to_string(),
+        };
+
+        assert_eq!(
+            render_automation_template(
+                "{{line_id}}|{{线路ID}}|{{own_number}}|{{本机号码}}",
+                &event,
+                "+60123456789",
+                false,
+            ),
+            "line-target|line-target|+60123456789|+60123456789"
+        );
+        assert_eq!(
+            NotificationEvent::Automation(&event, String::new()).line_id(),
+            Some("line-target")
+        );
+    }
+
+    #[test]
+    fn target_line_modem_lookup_never_falls_back_to_another_line() {
+        let bindings = vec![
+            ModemBinding {
+                line_id: "line-offline".to_string(),
+                modem_path: "/modem/offline".to_string(),
+                present: false,
+                ..Default::default()
+            },
+            ModemBinding {
+                line_id: "line-other".to_string(),
+                modem_path: "/modem/other".to_string(),
+                present: true,
+                ..Default::default()
+            },
+        ];
+
+        assert_eq!(
+            modem_path_for_line(&bindings, "line-other"),
+            Some("/modem/other")
+        );
+        assert_eq!(modem_path_for_line(&bindings, "line-offline"), None);
+        assert_eq!(modem_path_for_line(&bindings, "line-missing"), None);
+    }
+
+    #[test]
     fn renders_call_time_variables_as_beijing_time() {
         let call = CallRecord {
             id: 9,
+            line_id: Some("line-test".to_string()),
             direction: "incoming".to_string(),
             phone_number: "+10000".to_string(),
             duration: 12,
@@ -3430,6 +3639,52 @@ mod tests {
             render_call_template("{{start_time}}|{{end_time}}|{{time}}", &call, false),
             "2026-05-15 00:30:45|2026-05-15 00:31:45|2026-05-15 00:30:45"
         );
+        assert_eq!(
+            render_call_template(
+                "{{线路ID}}|{{电话号码}}|{{方向}}|{{时长}}|{{已接听}}",
+                &call,
+                false,
+            ),
+            "line-test|+10000|来电|12|是"
+        );
+    }
+
+    #[test]
+    fn call_notification_rules_are_line_scoped() {
+        let call = CallRecord {
+            id: 10,
+            line_id: Some("line-a".to_string()),
+            direction: "missed".to_string(),
+            phone_number: "+601112023012".to_string(),
+            duration: 0,
+            start_time: "2026-08-06 12:00:00".to_string(),
+            end_time: Some("2026-08-06 12:00:05".to_string()),
+            answered: false,
+        };
+        let event = NotificationEvent::Call(&call);
+        let mut rule = NotificationRule {
+            id: "call-line-a".to_string(),
+            event_type: NotificationEventType::Call,
+            name: "线路 A 通话".to_string(),
+            enabled: true,
+            matcher: RuleMatcher::default(),
+            channel_ids: Vec::new(),
+            sim_channel_ids: vec!["line-a".to_string()],
+            event_codes: Vec::new(),
+            template: String::new(),
+            quiet_hours: Vec::new(),
+            ddns_failure_threshold: 1,
+            device_status_items: crate::platform::config::default_device_status_items(),
+            device_status_schedule: crate::platform::config::DeviceStatusSchedule::default(),
+            device_status_sms_period: "last_24h".to_string(),
+        };
+
+        assert_eq!(event.line_id(), Some("line-a"));
+        assert!(rule_matches(&rule, &event));
+        assert_eq!(event.field_value("direction_cn"), "未接");
+
+        rule.sim_channel_ids = vec!["line-b".to_string()];
+        assert!(!rule_matches(&rule, &event));
     }
 
     #[test]

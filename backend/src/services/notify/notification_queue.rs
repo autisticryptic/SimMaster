@@ -12,6 +12,8 @@ use crate::platform::db::Database;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct NotificationQueueQuery {
+    #[serde(default)]
+    pub line_id: String,
     #[serde(default = "default_notification_queue_limit")]
     pub limit: i64,
 }
@@ -28,7 +30,7 @@ pub async fn get_notification_queue_handler(
     StatusCode,
     Json<ApiResponse<crate::platform::db::NotificationQueueResponse>>,
 ) {
-    match database.get_notification_queue(query.limit) {
+    match database.get_notification_queue(&query.line_id, query.limit) {
         Ok(queue) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", queue)),

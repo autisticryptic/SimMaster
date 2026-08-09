@@ -17,11 +17,13 @@ import {
   Replay,
   Send,
 } from '@mui/icons-material'
+import { shortLineId } from '../../components/modemLineFormat'
 
 export type NotificationQueueItemStatus = 'pending' | 'scheduled' | 'retrying' | 'sending' | 'failed'
 
 export type NotificationQueueItem = {
   id: number | string
+  line_id?: string | null
   status: NotificationQueueItemStatus
   event_type: string
   event_label: string
@@ -31,6 +33,13 @@ export type NotificationQueueItem = {
   next_attempt_at: string
   attempt_count: number
   max_attempts: number
+}
+
+function queueLineLabel(lineId?: string | null) {
+  if (!lineId) return '设备级事件'
+  if (lineId === 'unassigned') return '历史未归属'
+  if (lineId.startsWith('reader:')) return `读卡器 ${lineId.slice('reader:'.length)}`
+  return `线路 ${shortLineId(lineId)}`
 }
 
 type NotificationQueueIndicatorProps = {
@@ -191,9 +200,14 @@ function NotificationQueueTimelineItem({
           <Divider sx={{ mt: 1.3, mb: 0.9 }} />
 
           <Stack direction="row" alignItems="center" justifyContent="space-between" spacing={1}>
-            <Typography variant="caption" color="text.secondary" sx={{ minWidth: 0, wordBreak: 'break-word' }}>
-              通道：{item.channel_name || '-'}
-            </Typography>
+            <Stack spacing={0.15} sx={{ minWidth: 0 }}>
+              <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>
+                归属：{queueLineLabel(item.line_id)}
+              </Typography>
+              <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>
+                通道：{item.channel_name || '-'}
+              </Typography>
+            </Stack>
             <Typography variant="caption" color="text.secondary" sx={{ flexShrink: 0 }}>
               下次：{formatQueueTime(item.next_attempt_at)}
             </Typography>

@@ -1,9 +1,10 @@
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::hardware::cellular::modem_manager::{
-    discover_modem_bindings, get_airplane_mode_for_modem, get_cells_data,
-    get_data_connection_status, get_device_info_data, get_is_roaming_for_modem,
-    get_network_info_data, get_signal_strength, get_sim_info_data_with_cache,
+    discover_modem_bindings, get_airplane_mode_for_modem, get_cells_data_for_modem,
+    get_data_connection_status_for_modem, get_device_info_for_modem, get_is_roaming_for_modem,
+    get_network_info_for_modem, get_signal_strength_for_modem, get_sim_info_for_modem_with_cache,
+    ModemBinding,
 };
 use crate::platform::config::{ConfigManager, NotificationRule};
 use crate::platform::db::{Database, PeriodSmsStats};
@@ -64,27 +65,27 @@ impl DeviceStatusReport {
 }
 
 fn status_line_category(line: &str) -> &'static str {
-    if line.starts_with("设备：")
-        || line.starts_with("型号：")
-        || line.starts_with("系统：")
-        || line.starts_with("运行时长：")
+    if status_field(line, "设备")
+        || status_field(line, "型号")
+        || status_field(line, "系统")
+        || status_field(line, "运行时长")
     {
         "设备概览"
-    } else if line.starts_with("工作模式：")
-        || line.starts_with("SIM：")
-        || line.starts_with("MCC/MNC：")
-        || line.starts_with("号码：")
-        || line.starts_with("ICCID：")
+    } else if status_field(line, "工作模式")
+        || status_field(line, "SIM")
+        || status_field(line, "MCC/MNC")
+        || status_field(line, "号码")
+        || status_field(line, "ICCID")
     {
         "SIM/eSIM"
-    } else if line.starts_with("注册状态：")
-        || line.starts_with("运营商：")
-        || line.starts_with("网络：")
-        || line.starts_with("信号：")
-        || line.starts_with("数据连接：")
-        || line.starts_with("飞行模式：")
-        || line.starts_with("漫游：")
-        || line.starts_with("小区：")
+    } else if status_field(line, "注册状态")
+        || status_field(line, "运营商")
+        || status_field(line, "网络")
+        || status_field(line, "信号")
+        || status_field(line, "数据连接")
+        || status_field(line, "飞行模式")
+        || status_field(line, "漫游")
+        || status_field(line, "小区")
     {
         "蜂窝网络"
     } else if line.starts_with("IPv4：")
@@ -125,6 +126,15 @@ fn status_line_category(line: &str) -> &'static str {
     }
 }
 
+fn status_field(line: &str, field: &str) -> bool {
+    line.strip_prefix(field)
+        .is_some_and(|suffix| suffix.starts_with('：') || suffix.starts_with('（'))
+}
+
+fn cellular_line_label(binding: &ModemBinding) -> String {
+    format!("{} · 卡槽 {}", binding.slot_label, binding.uim_slot)
+}
+
 #[derive(Default)]
 struct ScheduleState {
     last_interval_sent: HashMap<String, Instant>,
@@ -148,7 +158,8 @@ pub fn spawn_device_status_scheduler(
             let config = config_manager.get_notifications();
             for rule in config.rules.iter().filter(|rule| {
                 rule.enabled
-                    && rule.event_type == crate::platform::config::NotificationEventType::DeviceStatus
+                    && rule.event_type
+                        == crate::platform::config::NotificationEventType::DeviceStatus
             }) {
                 if !device_status_due(rule, &mut state) {
                     continue;
@@ -242,11 +253,46 @@ pub async fn collect_device_status_report(
         .collect::<HashSet<_>>();
     let mut lines = Vec::new();
 
+    let needs_cellular_lines = any(
+        &items,
+        &[
+            "device_power",
+            "device_model",
+            "sim_present",
+            "sim_operator",
+            "phone_number",
+            "sim_identifiers",
+            "cellular_registration",
+            "cellular_operator",
+            "cellular_technology",
+            "signal_strength",
+            "data_connection",
+            "airplane_mode",
+            "roaming",
+            "cell_summary",
+        ],
+    );
+    let bindings = if needs_cellular_lines {
+        discover_modem_bindings(&dbus_conn)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|binding| binding.present)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     if any(&items, &["device_power", "device_model"]) {
-        if let Ok(device) = get_device_info_data(&dbus_conn).await {
+        for binding in &bindings {
+            let Ok(device) = get_device_info_for_modem(&dbus_conn, &binding.modem_path).await
+            else {
+                continue;
+            };
+            let label = cellular_line_label(binding);
             if items.contains("device_power") {
                 lines.push(format!(
-                    "设备：{}，{}",
+                    "设备（{label}）：{}，{}",
                     if device.online { "在线" } else { "离线" },
                     if device.powered {
                         "上电"
@@ -257,7 +303,7 @@ pub async fn collect_device_status_report(
             }
             if items.contains("device_model") {
                 lines.push(format!(
-                    "型号：{}，厂商：{}",
+                    "型号（{label}）：{}，厂商：{}",
                     device.model, device.manufacturer
                 ));
             }
@@ -283,10 +329,17 @@ pub async fn collect_device_status_report(
             "sim_identifiers",
         ],
     ) {
-        if let Ok(sim) = get_sim_info_data_with_cache(&dbus_conn, Some(&database)).await {
+        for binding in &bindings {
+            let Ok(sim) =
+                get_sim_info_for_modem_with_cache(&dbus_conn, &binding.modem_path, Some(&database))
+                    .await
+            else {
+                continue;
+            };
+            let label = cellular_line_label(binding);
             if items.contains("sim_present") {
                 lines.push(format!(
-                    "SIM：{}",
+                    "SIM（{label}）：{}",
                     if sim.present {
                         "已识别"
                     } else {
@@ -295,7 +348,11 @@ pub async fn collect_device_status_report(
                 ));
             }
             if items.contains("sim_operator") {
-                lines.push(format!("MCC/MNC：{}/{}", dash(&sim.mcc), dash(&sim.mnc)));
+                lines.push(format!(
+                    "MCC/MNC（{label}）：{}/{}",
+                    dash(&sim.mcc),
+                    dash(&sim.mnc)
+                ));
             }
             if items.contains("phone_number") {
                 let number = sim
@@ -304,11 +361,11 @@ pub async fn collect_device_status_report(
                     .find(|item| !item.trim().is_empty())
                     .map(|item| mask_suffix(item, 4))
                     .unwrap_or_else(|| "-".to_string());
-                lines.push(format!("号码：{number}"));
+                lines.push(format!("号码（{label}）：{number}"));
             }
             if items.contains("sim_identifiers") {
                 lines.push(format!(
-                    "ICCID：{}，IMSI：{}",
+                    "ICCID（{label}）：{}，IMSI：{}",
                     mask_suffix(&sim.iccid, 6),
                     mask_suffix(&sim.imsi, 6)
                 ));
@@ -325,45 +382,55 @@ pub async fn collect_device_status_report(
             "signal_strength",
         ],
     ) {
-        if let Ok(network) = get_network_info_data(&dbus_conn).await {
-            if items.contains("cellular_registration") {
-                lines.push(format!(
-                    "注册状态：{}",
-                    registration_label(&network.registration_status)
-                ));
-            }
-            if items.contains("cellular_operator") {
-                lines.push(format!("运营商：{}", dash(&network.operator_name)));
-            }
-            if items.contains("cellular_technology") {
-                lines.push(format!("网络：{}", dash(&network.technology_preference)));
-            }
-            if items.contains("signal_strength") {
-                lines.push(format!("信号：{}%", network.signal_strength));
-            }
-        } else if items.contains("signal_strength") {
-            if let Ok(signal) = get_signal_strength(&dbus_conn).await {
-                lines.push(format!("信号：{}%", signal.strength));
+        for binding in &bindings {
+            let label = cellular_line_label(binding);
+            if let Ok(network) = get_network_info_for_modem(&dbus_conn, &binding.modem_path).await {
+                if items.contains("cellular_registration") {
+                    lines.push(format!(
+                        "注册状态（{label}）：{}",
+                        registration_label(&network.registration_status)
+                    ));
+                }
+                if items.contains("cellular_operator") {
+                    lines.push(format!(
+                        "运营商（{label}）：{}",
+                        dash(&network.operator_name)
+                    ));
+                }
+                if items.contains("cellular_technology") {
+                    lines.push(format!(
+                        "网络（{label}）：{}",
+                        dash(&network.technology_preference)
+                    ));
+                }
+                if items.contains("signal_strength") {
+                    lines.push(format!("信号（{label}）：{}%", network.signal_strength));
+                }
+            } else if items.contains("signal_strength") {
+                if let Ok(signal) =
+                    get_signal_strength_for_modem(&dbus_conn, &binding.modem_path).await
+                {
+                    lines.push(format!("信号（{label}）：{}%", signal.strength));
+                }
             }
         }
     }
     if items.contains("data_connection") {
-        if let Ok(active) = get_data_connection_status(&dbus_conn).await {
-            lines.push(format!(
-                "数据连接：{}",
-                if active { "已连接" } else { "未连接" }
-            ));
+        for binding in &bindings {
+            if let Ok(active) =
+                get_data_connection_status_for_modem(&dbus_conn, &binding.modem_path).await
+            {
+                let label = cellular_line_label(binding);
+                lines.push(format!(
+                    "数据连接（{label}）：{}",
+                    if active { "已连接" } else { "未连接" }
+                ));
+            }
         }
     }
-    // Airplane mode and roaming are per line, so report每条在位线路 rather than
-    // whichever modem happened to be first — on a multi-SIM box a single line
-    // of text was always describing only one of the cards.
     if items.contains("airplane_mode") || items.contains("roaming") {
-        let bindings = discover_modem_bindings(&dbus_conn)
-            .await
-            .unwrap_or_default();
-        for binding in bindings.iter().filter(|binding| binding.present) {
-            let label = format!("{} · 卡槽 {}", binding.slot_label, binding.uim_slot);
+        for binding in &bindings {
+            let label = cellular_line_label(binding);
             if items.contains("airplane_mode") {
                 if let Ok(status) =
                     get_airplane_mode_for_modem(&dbus_conn, &binding.modem_path).await
@@ -391,11 +458,15 @@ pub async fn collect_device_status_report(
         }
     }
     if items.contains("cell_summary") {
-        if let Ok(cells) = get_cells_data(&dbus_conn).await {
+        for binding in &bindings {
+            let Ok(cells) = get_cells_data_for_modem(&dbus_conn, &binding.modem_path).await else {
+                continue;
+            };
             let serving = cells.cells.iter().find(|cell| cell.is_serving);
             if let Some(cell) = serving {
+                let label = cellular_line_label(binding);
                 lines.push(format!(
-                    "小区：{}，PCI {}，频点 {}",
+                    "小区（{label}）：{}，PCI {}，频点 {}",
                     dash(&cell.tech),
                     dash(&cell.pci),
                     dash(&cell.arfcn)
@@ -810,12 +881,14 @@ fn top_temperatures(mut sensors: Vec<ThermalZone>, limit: usize) -> Vec<String> 
 async fn collect_ota_status(config_manager: Arc<ConfigManager>) -> String {
     let current = crate::services::system::ota::CURRENT_VERSION.to_string();
     let update_config = config_manager.get_version_update_notifications();
-    let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(Some(update_config.proxy_prefix));
+    let proxy_prefix =
+        crate::services::system::ota::normalize_proxy_prefix(Some(update_config.proxy_prefix));
     let latest = fetch_latest_release_tag(&proxy_prefix).await;
     match latest {
         Ok(release) => {
             let latest_version = release.tag_name.trim_start_matches('v').to_string();
-            let updatable = crate::services::system::ota::compare_versions(&release.tag_name, &current);
+            let updatable =
+                crate::services::system::ota::compare_versions(&release.tag_name, &current);
             format!(
                 "OTA：{}，当前 {}，最新 {}",
                 if updatable {
@@ -833,8 +906,12 @@ async fn collect_ota_status(config_manager: Arc<ConfigManager>) -> String {
 
 async fn fetch_latest_release_tag(proxy_prefix: &str) -> Result<OtaLatestReleaseResponse, String> {
     let client = crate::services::system::ota::build_ota_http_client()?;
-    crate::services::system::ota::fetch_latest_github_release(&client, proxy_prefix, !proxy_prefix.is_empty())
-        .await
+    crate::services::system::ota::fetch_latest_github_release(
+        &client,
+        proxy_prefix,
+        !proxy_prefix.is_empty(),
+    )
+    .await
 }
 
 fn period_since(period: &str) -> Option<String> {
@@ -891,5 +968,40 @@ fn format_duration_seconds(seconds: i64) -> String {
         format!("{} 分钟", seconds / 60)
     } else {
         format!("{} 秒", seconds)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scoped_cellular_fields_keep_their_notification_categories() {
+        assert_eq!(
+            status_line_category("设备（基带 2 · 卡槽 1）：在线，上电"),
+            "设备概览"
+        );
+        assert_eq!(
+            status_line_category("SIM（基带 2 · 卡槽 1）：已识别"),
+            "SIM/eSIM"
+        );
+        assert_eq!(
+            status_line_category("注册状态（基带 2 · 卡槽 1）：已注册"),
+            "蜂窝网络"
+        );
+        assert_eq!(
+            status_line_category("小区（基带 2 · 卡槽 1）：LTE，PCI 1，频点 3"),
+            "蜂窝网络"
+        );
+    }
+
+    #[test]
+    fn cellular_line_labels_include_slot_identity() {
+        let binding = ModemBinding {
+            slot_label: "基带 3".to_string(),
+            uim_slot: 2,
+            ..ModemBinding::default()
+        };
+        assert_eq!(cellular_line_label(&binding), "基带 3 · 卡槽 2");
     }
 }

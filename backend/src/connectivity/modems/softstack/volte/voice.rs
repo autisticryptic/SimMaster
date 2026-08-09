@@ -14,7 +14,7 @@
 //! Reuse policy: the pure signaling layer (`VoiceCallStateMachine`, SDP
 //! offer/answer, RTP/AMR framing) is reused from `vowifi::voice` via its neutral
 //! `VoiceParams` entry points. This module only supplies VoLTE-specific voice
-//! parameters (from `VolteConfig`) and wires the call state machine to the VoLTE
+//! parameters for the selected line and wires the call state machine to the VoLTE
 //! IMS session established in `runtime`/`register`.
 
 use crate::connectivity::modems::softstack::volte::vilte::{build_av_sdp, build_video_offer, VideoMediaDescription};
@@ -23,31 +23,31 @@ use crate::connectivity::core::voice::{
     CallEndReason, CallState, SdpAddrType, SdpAudioDescription, VoiceCallStateMachine,
     VoiceLegKind, VoiceParams, VoiceRuntimeError,
 };
-use crate::platform::config::{VilteConfig, VolteConfig};
+use crate::platform::config::VilteConfig;
 
 /// Default codec preference for a VoLTE voice offer. AMR-WB first (HD voice),
 /// then narrowband AMR, then G.711 fallbacks. Matches typical operator IMS
-/// media policy (TS 26.114). Kept here (not in VolteConfig) until the user
+/// media policy (TS 26.114). Kept here until the user
 /// exposes per-codec tuning.
 pub const DEFAULT_VOICE_CODECS: &[&str] = &["amr-wb", "amr", "pcmu", "pcma"];
 
 /// Default packetization time (ms) for the audio offer.
 pub const DEFAULT_PTIME_MS: u16 = 20;
 
-/// Build the neutral voice params for the VoLTE leg from persisted config.
+/// Build the neutral voice params for one line's VoLTE leg.
 ///
 /// VoLTE is an IMS-over-LTE leg, so `vowifi_enabled` maps to "is the VoLTE voice
 /// leg enabled" from the leg's own perspective (the shared state machine only
 /// needs to know an IMS leg is available); the carrier/USB-audio fallback leg is
 /// off (the target device has no audio hardware).
-pub fn volte_voice_params(config: &VolteConfig) -> VoiceParams {
+pub fn volte_voice_params(voice_enabled: bool) -> VoiceParams {
     VoiceParams {
         preferred_codecs: DEFAULT_VOICE_CODECS.iter().map(|s| s.to_string()).collect(),
         ptime_ms: DEFAULT_PTIME_MS,
         amr_octet_align: false,
         // From the shared state machine's viewpoint the VoLTE leg *is* the IMS
         // voice leg; enable it when the VoLTE voice feature is on.
-        vowifi_enabled: config.voice_enabled,
+        vowifi_enabled: voice_enabled,
         carrier_fallback_enabled: false,
         ims_transport: "udp",
         profile_id: "volte_ims",
@@ -170,8 +170,8 @@ impl VolteVoiceCall {
     /// Create a new orchestrator bound to the local media relay endpoint.
     /// Audio-only (VoLTE); video is disabled unless [`with_vilte`](Self::with_vilte)
     /// supplies a ViLTE config + a local video media endpoint.
-    pub fn new(config: &VolteConfig, local_media: MediaEndpoint) -> Self {
-        let params = volte_voice_params(config);
+    pub fn new(voice_enabled: bool, local_media: MediaEndpoint) -> Self {
+        let params = volte_voice_params(voice_enabled);
         Self {
             machine: VoiceCallStateMachine::with_params(params.clone()),
             params,
@@ -390,16 +390,6 @@ impl VolteVoiceCall {
 mod tests {
     use super::*;
 
-    fn config_voice_on() -> VolteConfig {
-        VolteConfig {
-            feature_enabled: true,
-            sms_enabled: true,
-            voice_enabled: true,
-            connection_enabled: true,
-            ..VolteConfig::default()
-        }
-    }
-
     fn local_media() -> MediaEndpoint {
         MediaEndpoint {
             addr: "10.0.0.2".to_string(),
@@ -410,19 +400,19 @@ mod tests {
 
     #[test]
     fn params_reflect_voice_enabled() {
-        let on = volte_voice_params(&config_voice_on());
+        let on = volte_voice_params(true);
         assert!(on.vowifi_enabled);
         assert!(
             !on.carrier_fallback_enabled,
             "no audio hardware -> no carrier leg"
         );
-        let off = volte_voice_params(&VolteConfig::default());
+        let off = volte_voice_params(false);
         assert!(!off.vowifi_enabled);
     }
 
     #[test]
     fn mo_offer_advertises_preferred_codecs_at_local_media() {
-        let mut call = VolteVoiceCall::new(&config_voice_on(), local_media());
+        let mut call = VolteVoiceCall::new(true, local_media());
         let offer = call.build_mo_offer();
         assert_eq!(offer.connection_addr, "10.0.0.2");
         assert_eq!(offer.media_port, 40000);
@@ -439,7 +429,7 @@ mod tests {
 
     #[test]
     fn negotiate_answer_intersects_codecs() {
-        let call = VolteVoiceCall::new(&config_voice_on(), local_media());
+        let call = VolteVoiceCall::new(true, local_media());
         // Remote offers PCMU (PT 0) + AMR (PT 96). We support both; answer keeps
         // the offerer's PT numbering.
         let remote = concat!(
@@ -459,7 +449,7 @@ mod tests {
 
     #[test]
     fn full_mo_call_reaches_active_then_ends() {
-        let mut call = VolteVoiceCall::new(&config_voice_on(), local_media());
+        let mut call = VolteVoiceCall::new(true, local_media());
         call.mark_registration_ready();
         let offer = call.build_mo_offer();
         call.on_invite_sent(offer.codecs.len());
@@ -474,7 +464,7 @@ mod tests {
 
     #[test]
     fn rejected_call_is_error() {
-        let mut call = VolteVoiceCall::new(&config_voice_on(), local_media());
+        let mut call = VolteVoiceCall::new(true, local_media());
         call.mark_registration_ready();
         let _ = call.build_mo_offer();
         call.on_invite_sent(2);
@@ -501,7 +491,7 @@ mod tests {
 
     /// Bring a call to the Active state so media re-negotiation is allowed.
     fn active_call(vilte: bool) -> VolteVoiceCall {
-        let mut call = VolteVoiceCall::new(&config_voice_on(), local_media());
+        let mut call = VolteVoiceCall::new(true, local_media());
         if vilte {
             call = call.with_vilte(&vilte_on(), video_media());
         }
@@ -561,7 +551,7 @@ mod tests {
 
     #[test]
     fn cannot_upgrade_before_call_is_active() {
-        let mut call = VolteVoiceCall::new(&config_voice_on(), local_media())
+        let mut call = VolteVoiceCall::new(true, local_media())
             .with_vilte(&vilte_on(), video_media());
         call.mark_registration_ready();
         let _ = call.build_mo_offer();

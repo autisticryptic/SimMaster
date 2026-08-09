@@ -96,6 +96,7 @@ export const CHANNEL_DEFS: ChannelDef[] = [
 
 export const EVENT_TYPES: { key: NotificationEventType; label: string }[] = [
   { key: 'sms', label: '短信' },
+  { key: 'call', label: '通话' },
   { key: 'ddns', label: 'DDNS' },
   { key: 'version_update', label: '版本更新' },
   { key: 'system_event', label: '系统事件' },
@@ -129,6 +130,15 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
     { value: 'verification_code', label: '验证码' },
     { value: 'own_number', label: '本机号码' },
   ],
+  call: [
+    { value: 'summary', label: '内容摘要' },
+    { value: 'phone_number', label: '电话号码' },
+    { value: 'direction', label: '方向编码' },
+    { value: 'direction_cn', label: '通话方向' },
+    { value: 'duration', label: '通话时长' },
+    { value: 'answered', label: '接通状态' },
+    { value: 'line_id', label: '线路 ID' },
+  ],
   ddns: [
     { value: 'summary', label: '内容摘要' },
     { value: 'domains', label: '域名' },
@@ -151,6 +161,7 @@ export const MATCH_FIELDS: Record<NotificationEventType, { value: string; label:
 
 export const DEFAULT_TEMPLATES: Record<NotificationEventType, string> = {
   sms: '📱 短信通知\nSIM通道: {{SIM通道}}\n号码: {{发送方号码}}\n内容: {{短信内容}}\n时间: {{时间}}\n路径: {{短信途径}}\n来源: {{本机号码}}',
+  call: '📞 通话通知\n线路: {{线路ID}}\n号码: {{电话号码}}\n方向: {{方向}}\n时间: {{开始时间}}\n时长: {{时长}} 秒\n已接听: {{已接听}}',
   ddns: 'DDNS 通知\n域名: {{域名}}\nIP 类型: {{IP类型}}\n新 IP: {{新IP}}\n旧 IP: {{旧IP}}\n服务商: {{服务商}}\n记录类型: {{记录类型}}\n状态: {{状态}}\n消息: {{消息}}\n更新时间: {{更新时间}}',
   version_update: '🚀 SimAdmin 发现新版本\n固件包: {{固件包}}\n版本号: {{版本号}}\nCommit: {{Commit}}\n时间: {{时间}}\n来源: {{本机号码}}',
   system_event: DEFAULT_SYSTEM_EVENT_TEMPLATE,
@@ -171,6 +182,16 @@ export const TEMPLATE_VARIABLES: Record<NotificationEventType, TemplateVariable[
     { label: '短信方向', token: '{{短信方向}}' },
     { label: '短信状态', token: '{{短信状态}}' },
     { label: '短信途径', token: '{{短信途径}}' },
+  ],
+  call: [
+    { label: '线路 ID', token: '{{线路ID}}' },
+    { label: '电话号码', token: '{{电话号码}}' },
+    { label: '通话方向', token: '{{方向}}' },
+    { label: '方向编码', token: '{{direction}}' },
+    { label: '通话时长', token: '{{时长}}' },
+    { label: '开始时间', token: '{{开始时间}}' },
+    { label: '结束时间', token: '{{结束时间}}' },
+    { label: '已接听', token: '{{已接听}}' },
   ],
   ddns: [
     { label: '域名', token: '{{域名}}' },

@@ -2,30 +2,32 @@
 //! 统一管理应用的共享状态
 
 use axum::extract::FromRef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
-use crate::services::line_registry::LineRuntimeRegistry;
-use crate::connectivity::modems::softstack::volte::runtime::VolteRuntime;
-use crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime;
+use crate::connectivity::modems::softstack::vowifi::carrier_catalog::CarrierCatalog;
 use crate::hardware::cellular::cell_lock_store::CellLockStore;
+use crate::hardware::sim::esim::EsimSupervisor;
 use crate::platform::config::ConfigManager;
 use crate::platform::db::Database;
+use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::messaging::sms_listener::SmsResyncHandle;
 use crate::services::network::device_network::DdnsManager;
 use crate::services::notify::notification::NotificationSender;
-use crate::hardware::sim::esim::EsimSupervisor;
 use crate::services::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
 pub struct ActiveCallRecord {
     pub id: i64,
+    pub line_id: String,
+    pub direction: String,
     pub answered_at: Option<Instant>,
     pub answered: bool,
+    pub missing_polls: u8,
 }
 
 /// 应用全局状态
@@ -47,20 +49,19 @@ pub struct AppState {
     pub sms_resync: SmsResyncHandle,
     pub sms_db_maintenance_pending: Arc<AtomicBool>,
     pub active_calls: Arc<Mutex<HashMap<String, ActiveCallRecord>>>,
+    /// Running automation task and target scopes. A standard mutex is used
+    /// because reservations are tiny synchronous critical sections and must
+    /// be acquired before spawning background work.
+    pub automation_running_scopes: Arc<std::sync::Mutex<HashSet<String>>>,
     /// 小区锁定 UI 状态（底层无锁网时仅内存态），按 line_id 分开保存，
     /// 否则一张卡的锁定会显示/覆盖到另一张卡上。
     pub cell_lock: Arc<Mutex<HashMap<String, CellLockStore>>>,
-    /// 用户在界面关闭蜂窝数据后，禁止 init/watchdog 自动再次 Connect。
-    pub data_user_disabled: Arc<AtomicBool>,
-    pub vowifi_runtime: Arc<VowifiRuntime>,
-    pub vowifi_connect_lock: Arc<Mutex<()>>,
-    pub volte_runtime: Arc<VolteRuntime>,
-    pub volte_connect_lock: Arc<Mutex<()>>,
-    /// Per physical-modem + active-SIM runtime registry. Legacy handlers still
-    /// use `volte_runtime`, which is also the seed runtime of the first line.
+    /// Per physical-modem + active-SIM runtime registry.
     pub line_registry: Arc<LineRuntimeRegistry>,
-    /// 小区/信号轮询是否已按需唤醒。
-    pub cell_monitoring_active: Arc<AtomicBool>,
+    /// Lines whose ModemManager location/signal polling has been enabled.
+    pub cell_monitoring_active: Arc<Mutex<HashSet<String>>>,
+    /// Immutable carrier access/IMS/SIP configuration catalog.
+    pub carrier_catalog: Arc<CarrierCatalog>,
 }
 
 /// Named startup dependencies prevent positional mix-ups as application state grows.
@@ -73,11 +74,9 @@ pub struct AppStateDependencies {
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
-    pub data_user_disabled: Arc<AtomicBool>,
-    pub vowifi_runtime: Arc<VowifiRuntime>,
-    pub volte_runtime: Arc<VolteRuntime>,
     pub line_registry: Arc<LineRuntimeRegistry>,
-    pub cell_monitoring_active: Arc<AtomicBool>,
+    pub cell_monitoring_active: Arc<Mutex<HashSet<String>>>,
+    pub carrier_catalog: Arc<CarrierCatalog>,
 }
 
 impl AppState {
@@ -92,11 +91,9 @@ impl AppState {
             ddns_manager,
             esim_supervisor,
             sms_resync,
-            data_user_disabled,
-            vowifi_runtime,
-            volte_runtime,
             line_registry,
             cell_monitoring_active,
+            carrier_catalog,
         } = dependencies;
         Self {
             dbus_conn,
@@ -109,14 +106,11 @@ impl AppState {
             sms_resync,
             sms_db_maintenance_pending: Arc::new(AtomicBool::new(false)),
             active_calls: Arc::new(Mutex::new(HashMap::new())),
+            automation_running_scopes: Arc::new(std::sync::Mutex::new(HashSet::new())),
             cell_lock: Arc::new(Mutex::new(HashMap::new())),
-            data_user_disabled,
-            vowifi_runtime,
-            vowifi_connect_lock: Arc::new(Mutex::new(())),
-            volte_runtime,
-            volte_connect_lock: Arc::new(Mutex::new(())),
             line_registry,
             cell_monitoring_active,
+            carrier_catalog,
         }
     }
 }
@@ -163,18 +157,6 @@ impl FromRef<AppState> for Arc<DdnsManager> {
 impl FromRef<AppState> for Arc<EsimSupervisor> {
     fn from_ref(state: &AppState) -> Self {
         state.esim_supervisor.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<VowifiRuntime> {
-    fn from_ref(state: &AppState) -> Self {
-        state.vowifi_runtime.clone()
-    }
-}
-
-impl FromRef<AppState> for Arc<VolteRuntime> {
-    fn from_ref(state: &AppState) -> Self {
-        state.volte_runtime.clone()
     }
 }
 

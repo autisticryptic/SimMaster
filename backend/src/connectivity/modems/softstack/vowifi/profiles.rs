@@ -1,7 +1,10 @@
+#[cfg(test)]
 use chrono::NaiveDate;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+#[cfg(test)]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 /// REGISTER `Expires` most carriers accept.
 pub const DEFAULT_REGISTER_EXPIRES_SECONDS: u32 = 3600;
@@ -19,6 +22,13 @@ pub const DEFAULT_TEMPORARY_RETRY_SECONDS: u16 = 60;
 pub const DEFAULT_IMS_TCP_KEEPALIVE_SECONDS: u16 = 30;
 /// SIP OPTIONS ping interval used to confirm the registration is still live.
 pub const DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS: u16 = 45;
+
+#[cfg(test)]
+const TEST_ALLOW_METHODS: &str =
+    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS";
+
+#[cfg(test)]
+const TEST_VISITED_NETWORK_HEADER: &str = "\"legacy-test-profile\"";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct CarrierProfileMeta {
@@ -77,13 +87,24 @@ pub struct Ikev2Policy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RegisterPolicy {
     pub supported_header: &'static str,
+    pub request_uri_policy: &'static str,
+    pub include_pani_initial: bool,
     pub include_pani_authenticated: bool,
+    /// `none`, `aka_empty`, `digest_empty`, or `implementation_variant`.
+    pub initial_authorization: &'static str,
+    pub include_mmtel_features: bool,
+    pub include_route_header: bool,
+    pub include_visited_network: bool,
+    pub include_p_preferred_identity: bool,
+    pub visited_network_header: Option<&'static str>,
+    pub allow_methods: Option<&'static str>,
     pub strict_security_server_offer: bool,
     pub enable_initial_reject_fallback: bool,
     pub use_plain_digest_placeholder: bool,
     /// Legacy two-state sec-agree switch. `sec_agree_mode` supersedes it and is
     /// what the runtime consults; this stays so existing profiles keep working.
     pub require_sec_agree_headers: bool,
+    pub proxy_require_sec_agree_headers: bool,
     /// `auto` (follow the challenge), `required` (always send Security-Client /
     /// Security-Verify) or `disabled`. A sec-agree mismatch makes REGISTER fail
     /// outright, and carriers genuinely differ, so this must be settable.
@@ -101,6 +122,12 @@ pub struct RegisterPolicy {
     /// Order of Contact header parameters. Empty means "use the built-in order
     /// for `contact_mode`".
     pub contact_param_order: &'static [&'static str],
+    /// Always add `+sip.instance="<urn:uuid:...>"` and `;reg-id=1` to the
+    /// REGISTER Contact (RFC 5626). Mirrors `sip.common.register.always_add_sip_instance`.
+    pub always_add_sip_instance: bool,
+    /// Send a `Cellular-Network-Info` header with the REGISTER. Mirrors
+    /// `sip.common.register.enable_cellular_network_info`.
+    pub enable_cellular_network_info: bool,
     /// SIP status codes treated as retryable-later rather than fatal.
     pub temporary_status_codes: &'static [u16],
     /// SIP status codes that mean "stop, this will never succeed".
@@ -171,7 +198,8 @@ pub struct VoicePolicy {
 
 /// A sensible default voice policy: VoWiFi leg on, carrier fallback allowed
 /// (gated by USB-Audio at runtime), AMR + AMR-WB + G.711 offered, no outward
-/// SIP endpoint. Used by every builtin and dynamic profile until tuned.
+/// SIP endpoint. Used only by the explicit profiles compiled for tests.
+#[cfg(test)]
 pub const DEFAULT_VOICE_POLICY: VoicePolicy = VoicePolicy {
     vowifi_enabled: true,
     carrier_fallback_enabled: true,
@@ -199,6 +227,8 @@ pub struct CarrierMatch {
     pub matched_prefix: String,
 }
 
+#[cfg(test)]
+#[cfg(test)]
 pub static GB_EE_23433: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "gb_ee_23433",
@@ -267,11 +297,21 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: false,
+            proxy_require_sec_agree_headers: false,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -281,6 +321,8 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "ee_ims_features",
         },
@@ -298,6 +340,8 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
+#[cfg(test)]
 pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "nl_vodafone_20404",
@@ -352,11 +396,21 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            proxy_require_sec_agree_headers: true,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -366,6 +420,8 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -383,6 +439,8 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
+#[cfg(test)]
 pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "us_tmobile_310260",
@@ -433,11 +491,21 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            proxy_require_sec_agree_headers: true,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -447,6 +515,8 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -464,6 +534,8 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
+#[cfg(test)]
 pub static US_ATT_310410: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "us_att_310410",
@@ -514,11 +586,21 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: true,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            proxy_require_sec_agree_headers: true,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -528,6 +610,8 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -545,6 +629,8 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
+#[cfg(test)]
 pub static DE_O2_26207: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "de_o2_26207",
@@ -595,11 +681,21 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: true,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            proxy_require_sec_agree_headers: true,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -609,6 +705,8 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -626,6 +724,8 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
+#[cfg(test)]
 pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
         profile_id: "nz_spark_53005",
@@ -676,11 +776,21 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
         register: RegisterPolicy {
             supported_header: "path,sec-agree,gruu",
+            request_uri_policy: "home_domain",
+            include_pani_initial: true,
             include_pani_authenticated: true,
+            initial_authorization: "aka_empty",
+            include_mmtel_features: true,
+            include_route_header: true,
+            include_visited_network: true,
+            include_p_preferred_identity: true,
+            visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+            allow_methods: Some(TEST_ALLOW_METHODS),
             strict_security_server_offer: true,
             enable_initial_reject_fallback: false,
             use_plain_digest_placeholder: false,
             require_sec_agree_headers: true,
+            proxy_require_sec_agree_headers: true,
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -690,6 +800,8 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
             forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
             initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
             temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+            always_add_sip_instance: false,
+            enable_cellular_network_info: false,
             security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
             live_header_variant_set: "standard_ims_features",
         },
@@ -707,6 +819,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
     },
 };
 
+#[cfg(test)]
 pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
     GB_EE_23433,
     NL_VODAFONE_20404,
@@ -716,10 +829,12 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
     NZ_SPARK_53005,
 ];
 
+#[cfg(test)]
 static DYNAMIC_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
 /// 动态生成标准的 3GPP 运营商配置，并将其转化为静态生命周期的引用
+#[cfg(test)]
 pub fn generate_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
@@ -809,11 +924,21 @@ pub fn generate_standard_3gpp_profile(
             options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
             register: RegisterPolicy {
                 supported_header: "path,sec-agree,gruu",
+                request_uri_policy: "home_domain",
+                include_pani_initial: true,
                 include_pani_authenticated: true,
+                initial_authorization: "aka_empty",
+                include_mmtel_features: true,
+                include_route_header: true,
+                include_visited_network: true,
+                include_p_preferred_identity: true,
+                visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
+                allow_methods: Some(TEST_ALLOW_METHODS),
                 strict_security_server_offer: false,
                 enable_initial_reject_fallback: true,
                 use_plain_digest_placeholder: false,
                 require_sec_agree_headers: true,
+                proxy_require_sec_agree_headers: true,
                 sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
@@ -823,6 +948,8 @@ pub fn generate_standard_3gpp_profile(
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
+                always_add_sip_instance: false,
+                enable_cellular_network_info: false,
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
                 live_header_variant_set: "standard_ims_features",
             },
@@ -852,34 +979,136 @@ pub fn generate_standard_3gpp_profile(
 /// one through the whole VoWiFi stack, `ProfileStore` publishes its rows here so
 /// an operator's edit actually takes effect on the next connection instead of
 /// only showing up in the API.
-type ProfileOverrides = (
-    HashMap<String, &'static CarrierProfile>,
-    HashMap<String, &'static CarrierProfile>,
-);
+struct PublishedProfileMatch {
+    match_prefix: String,
+    profile: &'static CarrierProfile,
+}
+
+struct ProfileOverrides {
+    by_plmn: HashMap<String, &'static CarrierProfile>,
+    by_id: HashMap<String, &'static CarrierProfile>,
+    imsi_matches: Vec<PublishedProfileMatch>,
+}
 static DB_OVERRIDES: OnceLock<std::sync::RwLock<ProfileOverrides>> = OnceLock::new();
+static AMBIGUOUS_PLMN_PREFIXES: OnceLock<std::sync::RwLock<std::collections::HashSet<String>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+static PROFILE_RESOLVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+pub(crate) struct ProfileResolverTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl Drop for ProfileResolverTestGuard {
+    fn drop(&mut self) {
+        publish_database_profiles(&[]);
+        publish_ambiguous_plmn_prefixes(&[]);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn profile_resolver_test_guard() -> ProfileResolverTestGuard {
+    let lock = PROFILE_RESOLVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    publish_database_profiles(&[]);
+    publish_ambiguous_plmn_prefixes(&[]);
+    ProfileResolverTestGuard { _lock: lock }
+}
 
 fn overrides() -> &'static std::sync::RwLock<ProfileOverrides> {
-    DB_OVERRIDES.get_or_init(|| std::sync::RwLock::new((HashMap::new(), HashMap::new())))
+    DB_OVERRIDES.get_or_init(|| {
+        std::sync::RwLock::new(ProfileOverrides {
+            by_plmn: HashMap::new(),
+            by_id: HashMap::new(),
+            imsi_matches: Vec::new(),
+        })
+    })
 }
 
 /// Replace the published override set. Called by `ProfileStore` after any change.
 pub fn publish_database_profiles(profiles: &[&'static CarrierProfile]) {
+    let matches = profiles
+        .iter()
+        .map(|profile| (profile.meta.plmn.to_string(), *profile))
+        .collect::<Vec<_>>();
+    publish_resolver_profiles(profiles, &matches);
+}
+
+/// Publish the complete profile-id index and the narrower set of automatic
+/// public-identity matches. Match order is significant for equal prefixes, so
+/// callers put local overrides before catalog rules.
+pub fn publish_resolver_profiles(
+    profiles: &[&'static CarrierProfile],
+    matches: &[(String, &'static CarrierProfile)],
+) {
     let mut by_plmn = HashMap::new();
     let mut by_id = HashMap::new();
     for profile in profiles {
-        by_plmn.insert(profile.meta.plmn.to_string(), *profile);
         by_id.insert(profile.meta.profile_id.to_string(), *profile);
+    }
+    let mut imsi_matches = Vec::new();
+    for (match_prefix, profile) in matches {
+        by_plmn
+            .entry(profile.meta.plmn.to_string())
+            .or_insert(*profile);
+        imsi_matches.push(PublishedProfileMatch {
+            match_prefix: match_prefix.clone(),
+            profile,
+        });
     }
     *overrides()
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = (by_plmn, by_id);
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = ProfileOverrides {
+        by_plmn,
+        by_id,
+        imsi_matches,
+    };
+}
+
+pub fn publish_ambiguous_plmn_prefixes(prefixes: &[String]) {
+    let prefixes = prefixes.iter().cloned().collect();
+    *AMBIGUOUS_PLMN_PREFIXES
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = prefixes;
+}
+
+fn imsi_has_ambiguous_plmn(imsi: &str) -> bool {
+    AMBIGUOUS_PLMN_PREFIXES
+        .get_or_init(|| std::sync::RwLock::new(std::collections::HashSet::new()))
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|prefix| imsi.starts_with(prefix))
+}
+
+/// Snapshot all profiles currently published from database sources. Runtime
+/// diagnostics use this instead of compiling a second carrier list into the
+/// binary.
+pub fn published_database_profiles() -> Vec<&'static CarrierProfile> {
+    let profiles = overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .by_id
+        .values()
+        .copied()
+        .collect::<Vec<_>>();
+    #[cfg(test)]
+    if profiles.is_empty() {
+        return BUILTIN_PROFILES.iter().collect();
+    }
+    profiles
 }
 
 fn database_profile_for_plmn(plmn: &str) -> Option<&'static CarrierProfile> {
     overrides()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .0
+        .by_plmn
         .get(plmn)
         .copied()
 }
@@ -888,7 +1117,7 @@ fn database_profile_for_id(profile_id: &str) -> Option<&'static CarrierProfile> 
     overrides()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .1
+        .by_id
         .get(profile_id)
         .copied()
 }
@@ -900,19 +1129,43 @@ fn database_profile_for_imsi(imsi: &str) -> Option<CarrierMatch> {
     if digits.len() < 5 || !digits.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
+    if imsi_has_ambiguous_plmn(digits) {
+        return None;
+    }
     let guard = overrides()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut best: Option<CarrierMatch> = None;
-    for (plmn, profile) in guard.0.iter() {
-        if digits.starts_with(plmn.as_str())
+    for candidate in &guard.imsi_matches {
+        if digits.starts_with(candidate.match_prefix.as_str())
             && best
                 .as_ref()
-                .is_none_or(|current| current.matched_prefix.len() < plmn.len())
+                .is_none_or(|current| current.matched_prefix.len() < candidate.match_prefix.len())
         {
             best = Some(CarrierMatch {
-                profile,
-                matched_prefix: plmn.clone(),
+                profile: candidate.profile,
+                matched_prefix: candidate.match_prefix.clone(),
+            });
+        }
+    }
+    best
+}
+
+fn database_profile_for_home_plmn(imsi: &str, plmn: &str) -> Option<CarrierMatch> {
+    let guard = overrides()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut best: Option<CarrierMatch> = None;
+    for candidate in &guard.imsi_matches {
+        if candidate.profile.meta.plmn == plmn
+            && imsi.starts_with(&candidate.match_prefix)
+            && best
+                .as_ref()
+                .is_none_or(|current| current.matched_prefix.len() < candidate.match_prefix.len())
+        {
+            best = Some(CarrierMatch {
+                profile: candidate.profile,
+                matched_prefix: candidate.match_prefix.clone(),
             });
         }
     }
@@ -920,91 +1173,32 @@ fn database_profile_for_imsi(imsi: &str) -> Option<CarrierMatch> {
 }
 
 pub fn resolve_by_imsi(imsi: &str) -> Option<CarrierMatch> {
-    // 0. 数据库中的运营商配置优先（用户编辑或导入的）
-    if let Some(matched) = database_profile_for_imsi(imsi) {
-        return Some(matched);
-    }
-
-    // 1. 尝试匹配内置预设
-    if let Some(matched) = resolve_builtin_by_imsi(imsi) {
-        return Some(matched);
-    }
-
-    // 2. 尝试动态生成 3GPP 标准预设
-    let digits = imsi.trim();
-    if digits.len() >= 5 && digits.chars().all(|c| c.is_ascii_digit()) {
-        let mcc = &digits[..3];
-        let mnc_len = if digits.starts_with("310") || digits.starts_with("405") {
-            3
-        } else {
-            2
-        };
-        if digits.len() >= 3 + mnc_len {
-            let mnc = &digits[3..3 + mnc_len];
-            let profile = generate_standard_3gpp_profile(mcc, mnc, mnc_len as u8);
-            return Some(CarrierMatch {
-                profile,
-                matched_prefix: format!("{}{}", mcc, mnc),
-            });
-        }
-    }
-    None
-}
-
-fn resolve_builtin_by_imsi(imsi: &str) -> Option<CarrierMatch> {
-    BUILTIN_PROFILES.iter().find_map(|profile| {
-        if profile.meta.mcc.is_empty() || profile.meta.mnc.is_empty() {
-            return None;
-        }
-        let prefix_len = 3 + profile.meta.mnc_len as usize;
+    let resolved = database_profile_for_imsi(imsi);
+    #[cfg(test)]
+    if resolved.is_none() {
         let digits = imsi.trim();
-        if digits.len() < prefix_len || !digits.chars().all(|c| c.is_ascii_digit()) {
-            return None;
-        }
-        let prefix = &digits[..prefix_len];
-        let expected = format!("{}{}", profile.meta.mcc, profile.meta.mnc);
-        if prefix == expected {
-            Some(CarrierMatch {
+        return BUILTIN_PROFILES
+            .iter()
+            .filter(|profile| digits.starts_with(profile.meta.plmn))
+            .max_by_key(|profile| profile.meta.plmn.len())
+            .map(|profile| CarrierMatch {
                 profile,
-                matched_prefix: expected,
-            })
-        } else {
-            None
-        }
-    })
+                matched_prefix: profile.meta.plmn.to_string(),
+            });
+    }
+    resolved
 }
 
 pub fn resolve_by_plmn(mcc: &str, mnc: &str) -> Option<&'static CarrierProfile> {
-    // 0. 数据库中的运营商配置优先
-    if let Some(profile) = database_profile_for_plmn(&format!("{mcc}{mnc}")) {
-        return Some(profile);
+    let plmn = format!("{mcc}{mnc}");
+    let resolved = database_profile_for_plmn(&plmn);
+    #[cfg(test)]
+    if resolved.is_none() {
+        return BUILTIN_PROFILES
+            .iter()
+            .find(|profile| profile.meta.plmn == plmn);
     }
-    resolve_builtin_or_derived_by_plmn(mcc, mnc)
-}
-
-/// Resolution without the database overlay: built-in first, then 3GPP
-/// derivation. `ProfileStore` uses this for its fallback because it has already
-/// consulted its own rows — going back through the overlay would consult the
-/// same data twice and, worse, let one store see another's published profiles.
-pub fn resolve_builtin_or_derived_by_plmn(mcc: &str, mnc: &str) -> Option<&'static CarrierProfile> {
-    // 1. 尝试匹配内置预设
-    if let Some(profile) = BUILTIN_PROFILES
-        .iter()
-        .find(|profile| profile.meta.mcc == mcc && profile.meta.mnc == mnc)
-    {
-        return Some(profile);
-    }
-
-    // 2. 尝试动态生成 3GPP 预设
-    if mcc.len() == 3
-        && mcc.chars().all(|c| c.is_ascii_digit())
-        && !mnc.is_empty()
-        && mnc.chars().all(|c| c.is_ascii_digit())
-    {
-        return Some(generate_standard_3gpp_profile(mcc, mnc, mnc.len() as u8));
-    }
-
-    None
+    resolved
 }
 
 pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile> {
@@ -1013,38 +1207,22 @@ pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile
         return None;
     }
 
-    // 0. 数据库中的运营商配置优先
-    if let Some(profile) = database_profile_for_id(normalized) {
-        return Some(profile);
+    let resolved = database_profile_for_id(normalized);
+    #[cfg(test)]
+    if resolved.is_none() {
+        return BUILTIN_PROFILES
+            .iter()
+            .find(|profile| profile.meta.profile_id == normalized);
     }
-
-    // 1. 尝试匹配内置预设
-    if let Some(profile) = BUILTIN_PROFILES
-        .iter()
-        .find(|profile| profile.meta.profile_id == normalized)
-    {
-        return Some(profile);
-    }
-
-    // 2. 尝试解析动态预设 ID
-    if let Some(plmn) = normalized.strip_prefix("dynamic_3gpp_") {
-        if plmn.len() >= 5 && plmn.len() <= 6 && plmn.chars().all(|c| c.is_ascii_digit()) {
-            let mcc = &plmn[..3];
-            let mnc = &plmn[3..];
-            return Some(generate_standard_3gpp_profile(mcc, mnc, mnc.len() as u8));
-        }
-    }
-
-    None
+    resolved
 }
 
 /// Resolve a profile pinned to a line by `profile_id`, honoring only profiles
-/// that actually exist in the database overlay.
+/// actually published from the catalog or local override database.
 ///
 /// A per-line pin is an operator's explicit "use exactly this carrier profile"
-/// choice, so it must not silently resolve to a built-in or a 3GPP-derived
-/// profile that merely shares the id — those are reachable through automatic
-/// matching already. Returning `None` here means "the pin no longer resolves",
+/// choice, so it must not silently derive a replacement. Returning `None` here
+/// means "the pin no longer resolves",
 /// which the caller treats as "fall back to automatic IMSI matching" so a
 /// deleted profile never strands a line.
 pub fn resolve_pinned_database_profile(profile_id: &str) -> Option<&'static CarrierProfile> {
@@ -1055,14 +1233,18 @@ pub fn resolve_pinned_database_profile(profile_id: &str) -> Option<&'static Carr
     database_profile_for_id(normalized)
 }
 
-/// Resolve the carrier profile for one line: an explicit database pin wins, then
-/// the automatic IMSI path (database → built-in → 3GPP-derived).
+/// Resolve the carrier profile for one line: an explicit published profile pin
+/// wins, then the catalog/local-override public-identity path.
 ///
 /// `pinned_profile_id` is this line's `LineVowifiConfig.profile_id`. A pin that
-/// no longer resolves in the database degrades to automatic matching rather than
+/// no longer resolves in the published set degrades to automatic matching rather than
 /// failing, matching the documented "deleting a profile can never strand a line"
 /// rule.
-pub fn resolve_for_line(pinned_profile_id: Option<&str>, imsi: &str) -> Option<CarrierMatch> {
+pub fn resolve_for_line(
+    pinned_profile_id: Option<&str>,
+    imsi: &str,
+    home_plmn: Option<&str>,
+) -> Option<CarrierMatch> {
     if let Some(profile_id) = pinned_profile_id {
         if let Some(profile) = resolve_pinned_database_profile(profile_id) {
             return Some(CarrierMatch {
@@ -1071,9 +1253,19 @@ pub fn resolve_for_line(pinned_profile_id: Option<&str>, imsi: &str) -> Option<C
             });
         }
     }
+    if let Some(plmn) = home_plmn.map(str::trim).filter(|plmn| {
+        matches!(plmn.len(), 5 | 6)
+            && plmn.bytes().all(|byte| byte.is_ascii_digit())
+            && imsi.trim().starts_with(*plmn)
+    }) {
+        if let Some(profile) = database_profile_for_home_plmn(imsi.trim(), plmn) {
+            return Some(profile);
+        }
+    }
     resolve_by_imsi(imsi)
 }
 
+#[cfg(test)]
 pub fn validate_builtin_profiles() -> Result<(), String> {
     for profile in BUILTIN_PROFILES {
         if profile.meta.mcc.len() != 3 || !profile.meta.mcc.chars().all(|c| c.is_ascii_digit()) {
@@ -1148,11 +1340,13 @@ mod tests {
 
     #[test]
     fn validates_builtin_profile_metadata() {
+        let _resolver_guard = profile_resolver_test_guard();
         validate_builtin_profiles().expect("builtin profiles should validate");
     }
 
     #[test]
     fn resolves_gb_ee_profile_by_imsi_prefix() {
+        let _resolver_guard = profile_resolver_test_guard();
         let match_result = resolve_by_imsi("234331234567890").expect("should match");
         assert_eq!(match_result.profile.meta.profile_id, "gb_ee_23433");
         assert_eq!(match_result.matched_prefix, "23433");
@@ -1160,12 +1354,14 @@ mod tests {
 
     #[test]
     fn resolves_nl_vodafone_profile_by_plmn() {
+        let _resolver_guard = profile_resolver_test_guard();
         let profile = resolve_by_plmn("204", "04").expect("should match");
         assert_eq!(profile.meta.profile_id, "nl_vodafone_20404");
     }
 
     #[test]
     fn resolves_profile_by_clean_room_profile_id() {
+        let _resolver_guard = profile_resolver_test_guard();
         let profile = resolve_by_profile_id("nl_vodafone_20404").expect("should match");
         assert_eq!(profile.meta.plmn, "20404");
         assert!(resolve_by_profile_id(" CTEUK_23433 ").is_none());
@@ -1173,6 +1369,7 @@ mod tests {
 
     #[test]
     fn gb_ee_prioritizes_observed_successful_ike_proposal() {
+        let _resolver_guard = profile_resolver_test_guard();
         assert_eq!(GB_EE_23433.ikev2.ike_proposals[0], "aes128-sha256-modp2048");
         assert!(GB_EE_23433
             .ikev2
@@ -1181,44 +1378,42 @@ mod tests {
     }
 
     #[test]
-    fn resolves_dynamic_3gpp_profile_by_imsi_and_plmn() {
-        // 测试通过未内置的 Telekom DE (262-01) IMSI 动态解析
-        let match_result = resolve_by_imsi("262011234567890").expect("should resolve dynamically");
-        assert_eq!(match_result.profile.meta.profile_id, "dynamic_3gpp_26201");
-        assert_eq!(
-            match_result.profile.epdg.host,
-            "epdg.epc.mnc001.mcc262.pub.3gppnetwork.org"
-        );
-        assert_eq!(
-            match_result.profile.ims.domain,
-            "ims.mnc001.mcc262.3gppnetwork.org"
-        );
+    fn unknown_plmn_is_not_dynamically_derived() {
+        let _resolver_guard = profile_resolver_test_guard();
+        assert!(resolve_by_imsi("262011234567890").is_none());
+        assert!(resolve_by_plmn("262", "01").is_none());
+        assert!(resolve_by_profile_id("dynamic_3gpp_26201").is_none());
+    }
 
-        // 测试通过 PLMN 动态解析
-        let profile = resolve_by_plmn("262", "01").expect("should resolve dynamically");
-        assert_eq!(profile.meta.profile_id, "dynamic_3gpp_26201");
+    #[test]
+    fn published_catalog_match_keeps_its_full_imsi_prefix() {
+        let _resolver_guard = profile_resolver_test_guard();
+        let matches = vec![("20404123".to_string(), &NL_VODAFONE_20404)];
+        publish_resolver_profiles(&[&NL_VODAFONE_20404], &matches);
 
-        // 测试通过 Profile ID 动态解析
-        let profile_by_id =
-            resolve_by_profile_id("dynamic_3gpp_26201").expect("should resolve dynamically");
-        assert_eq!(profile_by_id.meta.plmn, "26201");
+        let matched = database_profile_for_imsi("204041234567890").expect("prefix match");
+        assert_eq!(matched.profile.meta.profile_id, "nl_vodafone_20404");
+        assert_eq!(matched.matched_prefix, "20404123");
+        assert!(database_profile_for_imsi("204049994567890").is_none());
     }
 
     #[test]
     fn line_pin_falls_back_to_imsi_when_unset_or_unresolvable() {
+        let _resolver_guard = profile_resolver_test_guard();
         // No pin: behaves exactly like automatic IMSI matching.
-        let auto = resolve_for_line(None, "234331234567890").expect("imsi should match");
+        let auto = resolve_for_line(None, "234331234567890", None).expect("imsi should match");
         assert_eq!(auto.profile.meta.profile_id, "gb_ee_23433");
 
         // A pin that resolves to nothing in the database degrades to the IMSI
         // path rather than failing, so deleting a profile never strands a line.
-        let stale =
-            resolve_for_line(Some("no_such_db_profile"), "234331234567890").expect("fallback");
+        let stale = resolve_for_line(Some("no_such_db_profile"), "234331234567890", None)
+            .expect("fallback");
         assert_eq!(stale.profile.meta.profile_id, "gb_ee_23433");
     }
 
     #[test]
     fn line_pin_does_not_resolve_builtin_or_derived_ids() {
+        let _resolver_guard = profile_resolver_test_guard();
         // A built-in id is reachable through automatic matching, but a per-line
         // pin only honors database profiles: it must not silently resolve here.
         assert!(resolve_pinned_database_profile("gb_ee_23433").is_none());
@@ -1228,6 +1423,7 @@ mod tests {
 
     #[test]
     fn line_pin_selects_the_published_database_profile_over_imsi() {
+        let _resolver_guard = profile_resolver_test_guard();
         // Publish one database profile, then pin a line whose SIM IMSI would
         // otherwise match a *different* carrier. The pin must win.
         // Use a PLMN no other test's IMSI matches, so publishing into the shared
@@ -1243,7 +1439,7 @@ mod tests {
 
         // The SIM IMSI (234-33) would auto-match EE, but the pin to the database
         // profile must win.
-        let pinned = resolve_for_line(Some("pin_test_db_profile"), "234331234567890")
+        let pinned = resolve_for_line(Some("pin_test_db_profile"), "234331234567890", None)
             .expect("pin should resolve");
         assert_eq!(pinned.profile.meta.profile_id, "pin_test_db_profile");
 

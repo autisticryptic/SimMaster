@@ -103,8 +103,10 @@ pub fn build_encrypted_payload_plan(
         other => return Err(EncryptedPayloadError::UnsupportedCipher(other.to_string())),
     };
     let icv_bytes = match key_schedule.integrity {
+        "hmac_md5_96" => 12,
         "hmac_sha1_96" => 12,
         "hmac_sha256_128" => 16,
+        "hmac_sha384_192" => 24,
         "hmac_sha512_256" => 32,
         other => {
             return Err(EncryptedPayloadError::UnsupportedIntegrity(
@@ -361,8 +363,10 @@ fn cipher_shape(plan: &IkeKeySchedulePlan) -> Result<(usize, usize), EncryptedPa
 
 fn integrity_len(plan: &IkeKeySchedulePlan) -> Result<usize, EncryptedPayloadError> {
     match plan.integrity {
+        "hmac_md5_96" => Ok(12),
         "hmac_sha1_96" => Ok(12),
         "hmac_sha256_128" => Ok(16),
+        "hmac_sha384_192" => Ok(24),
         "hmac_sha512_256" => Ok(32),
         other => Err(EncryptedPayloadError::UnsupportedIntegrity(
             other.to_string(),
@@ -413,8 +417,10 @@ fn integrity_tag(
     icv_bytes: usize,
 ) -> Result<Vec<u8>, EncryptedPayloadError> {
     let algorithm = match plan.integrity {
+        "hmac_md5_96" => IkeIntegrityAlgorithm::HmacMd5_96,
         "hmac_sha1_96" => IkeIntegrityAlgorithm::HmacSha1_96,
         "hmac_sha256_128" => IkeIntegrityAlgorithm::HmacSha256_128,
+        "hmac_sha384_192" => IkeIntegrityAlgorithm::HmacSha384_192,
         "hmac_sha512_256" => IkeIntegrityAlgorithm::HmacSha512_256,
         other => {
             return Err(EncryptedPayloadError::UnsupportedIntegrity(
@@ -423,14 +429,45 @@ fn integrity_tag(
         }
     };
     let ring_algorithm = match algorithm {
-        IkeIntegrityAlgorithm::HmacSha1_96 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-        IkeIntegrityAlgorithm::HmacSha256_128 => hmac::HMAC_SHA256,
-        IkeIntegrityAlgorithm::HmacSha512_256 => hmac::HMAC_SHA512,
+        IkeIntegrityAlgorithm::HmacMd5_96 => None,
+        IkeIntegrityAlgorithm::HmacSha1_96 => Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY),
+        IkeIntegrityAlgorithm::HmacSha256_128 => Some(hmac::HMAC_SHA256),
+        IkeIntegrityAlgorithm::HmacSha384_192 => Some(hmac::HMAC_SHA384),
+        IkeIntegrityAlgorithm::HmacSha512_256 => Some(hmac::HMAC_SHA512),
     };
-    let key = hmac::Key::new(ring_algorithm, key);
-    let mut tag = hmac::sign(&key, message_without_icv).as_ref().to_vec();
+    let mut tag = match ring_algorithm {
+        Some(algorithm) => {
+            let key = hmac::Key::new(algorithm, key);
+            hmac::sign(&key, message_without_icv).as_ref().to_vec()
+        }
+        None => hmac_md5(key, message_without_icv),
+    };
     tag.truncate(icv_bytes);
     Ok(tag)
+}
+
+fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 64;
+    let mut key = key.to_vec();
+    if key.len() > BLOCK_SIZE {
+        key = (*md5::compute(&key)).to_vec();
+    }
+    key.resize(BLOCK_SIZE, 0);
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+
+    let mut inner_input = ipad.to_vec();
+    inner_input.extend_from_slice(data);
+    let inner = md5::compute(&inner_input);
+
+    let mut outer_input = opad.to_vec();
+    outer_input.extend_from_slice(inner.as_ref());
+    (*md5::compute(&outer_input)).to_vec()
 }
 
 fn strip_padding(plaintext: &[u8]) -> Result<&[u8], EncryptedPayloadError> {
@@ -745,5 +782,43 @@ mod tests {
             .unwrap_err(),
             EncryptedPayloadError::IntegrityMismatch
         );
+    }
+
+    #[test]
+    fn encrypts_and_decrypts_sk_payload_with_md5_integrity() {
+        let proposal =
+            ike_proposal_from_profile_string("aes128-md5-modp2048", 1).expect("proposal");
+        let bundle =
+            derive_ike_secret_bundle(&proposal, &[0x11; 32], &[0x22; 32], 1, 2, &[0x33; 256])
+                .expect("derive bundle");
+        let inner_payloads = vec![IkePayload {
+            payload_type: IkePayloadType::IdentificationInitiator,
+            critical: false,
+            body: b"md5-integrity".to_vec(),
+        }];
+        let encrypted = build_encrypted_payload(
+            &bundle,
+            IkeSkDirection::InitiatorToResponder,
+            &inner_payloads,
+        )
+        .expect("encrypt payload");
+        let message =
+            encrypted_message_from_payload(1, 2, IkeExchangeType::IkeAuth, true, 1, encrypted);
+        let encoded = encode_encrypted_message(
+            &message,
+            IkePayloadType::IdentificationInitiator,
+            &bundle,
+            IkeSkDirection::InitiatorToResponder,
+        )
+        .expect("encode encrypted message");
+        let decoded = decrypt_encrypted_payload_from_message(
+            &encoded,
+            &bundle,
+            IkeSkDirection::InitiatorToResponder,
+        )
+        .expect("decrypt payload");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].body, b"md5-integrity");
     }
 }

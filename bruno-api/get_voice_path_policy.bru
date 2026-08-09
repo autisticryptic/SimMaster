@@ -1,0 +1,15 @@
+meta {
+  name: get_voice_path_policy
+  type: http
+  seq: 157
+}
+
+get {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/voice/path-policy
+  body: none
+  auth: inherit
+}
+
+settings {
+  encodeUrl: true
+}

@@ -1,5 +1,23 @@
 # 版本更新记录
 
+## 未发布
+
+以下内容对应当前开发分支，尚未绑定正式版本号：
+
+- 暂停旧仓库的一键安装、在线升级和 OTA 发布入口；当前仅提供手动构建与部署文档，相关
+  脚本和 OTA 契约将在重构完成后重新设计。
+- 将 modem/SIM 建模为独立 `line_id`，蜂窝控制、数据代理、流量、eSIM、VoLTE、VoWiFi、
+  通话和短信 API 全面改为线路级寻址与持久化。
+- 重构后端为 `connectivity`、`hardware`、`services`、`platform`、`api` 五个领域，并抽取
+  VoLTE/VoWiFi 共用的 IMS、SIP、Digest-AKA、短信与语音核心。
+- 新增每基带独立 IMS QMI 端点、VoLTE bearer/注册恢复、VoWiFi 多运行时与每线路代理能力。
+- 新增 VoWiFi/VoLTE IMS 语音选路、VoWiFi/VoLTE/CS 短信路径策略、接收腿选举、跨传输
+  去重和每线路 SIP Trunk。
+- eSIM 管理由全局工作模式下沉到每条基带/读卡器线路，支持自动探测与手动启停。
+- 引入只读、已封存的 schema v7 carrier catalog，并支持本地覆盖及 AOSP/IPCC 配置事实导入。
+- 扩展自动化任务、系统事件、通知队列、真机诊断和 Bruno 线路级 API 集合。
+- 重写项目总览、开发与运行环境文档，归并过时的前后端子目录 README。
+
 ### 📌 v1.1.3
 
 #### ✨ 新增功能

@@ -48,6 +48,7 @@ import type {
   NotificationConfig,
 } from '../api/contracts'
 import ErrorSnackbar from '../components/ErrorSnackbar'
+import { shortLineId } from '../components/modemLineFormat'
 
 // 导入拆分后的子组件
 import DateRangePicker from '../components/DateRangePicker'
@@ -124,6 +125,7 @@ export default function AutomationCenter() {
   const [pageInput, setPageInput] = useState(() => String(logPage + 1))
   const [filterType, setFilterType] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  const [filterLineId, setFilterLineId] = useState('')
   const [logStartDate, setLogStartDate] = useState('')
   const [logEndDate, setLogEndDate] = useState('')
   const [searchQuery, setSearchQuery] = useState('')
@@ -145,6 +147,12 @@ export default function AutomationCenter() {
 
   // Log cleanup settings from notification center
   const [notificationConfig, setNotificationConfig] = useState<NotificationConfig | null>(null)
+  const automationLineIds = useMemo(
+    () => Array.from(new Set(config.tasks.flatMap((task) => (
+      task.target?.kind === 'modem_line' ? [task.target.line_id] : []
+    )))).sort(),
+    [config.tasks],
+  )
 
   // Load configuration and latest logs
   const loadData = useCallback(async () => {
@@ -191,6 +199,7 @@ export default function AutomationCenter() {
       const res = await api.getAutomationLogs({
         type: filterType,
         status: filterStatus,
+        line_id: filterLineId,
         start_date: logStartDate,
         end_date: logEndDate,
         q: searchQuery,
@@ -204,7 +213,7 @@ export default function AutomationCenter() {
     } finally {
       setLogsLoading(false)
     }
-  }, [filterType, filterStatus, logStartDate, logEndDate, searchQuery, logPage])
+  }, [filterType, filterStatus, filterLineId, logStartDate, logEndDate, searchQuery, logPage])
 
   const pageCount = Math.max(1, Math.ceil(logTotal / LOG_PAGE_SIZE))
   const startRecord = logTotal === 0 ? 0 : logPage * LOG_PAGE_SIZE + 1
@@ -361,7 +370,7 @@ export default function AutomationCenter() {
     end_date: string
   }) => {
     try {
-      const res = await api.clearAutomationLogs(filters)
+      const res = await api.clearAutomationLogs({ ...filters, line_id: filterLineId })
       if (res.status === 'ok') {
         setSuccess(`已清理 ${res.data?.deleted ?? 0} 条日志`)
         setLogPage(0)
@@ -522,6 +531,23 @@ export default function AutomationCenter() {
                 <MenuItem value="failed">失败</MenuItem>
               </TextField>
 
+              <TextField
+                select
+                size="small"
+                label="目标线路"
+                value={filterLineId}
+                onChange={(e) => {
+                  setFilterLineId(e.target.value)
+                  setLogPage(0)
+                }}
+                sx={[{ minWidth: 140 }, filterTextFieldSx]}
+              >
+                <MenuItem value="">所有线路</MenuItem>
+                {automationLineIds.map((lineId) => (
+                  <MenuItem key={lineId} value={lineId}>线路 {shortLineId(lineId)}</MenuItem>
+                ))}
+              </TextField>
+
               <DateRangePicker
                 startDate={logStartDate}
                 endDate={logEndDate}
@@ -568,6 +594,7 @@ export default function AutomationCenter() {
                   <TableRow>
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>时间</TableCell>
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>任务名称</TableCell>
+                    <TableCell sx={{ width: 110, fontWeight: 400 }}>目标线路</TableCell>
                     <TableCell sx={{ width: 120, fontWeight: 400 }}>任务类型</TableCell>
                     <TableCell sx={{ width: 100, fontWeight: 400 }}>执行结果</TableCell>
                     <TableCell sx={{ fontWeight: 400 }}>执行详情</TableCell>
@@ -576,13 +603,13 @@ export default function AutomationCenter() {
                 <TableBody>
                   {logsLoading ? (
                     <TableRow>
-                      <TableCell colSpan={5} align="center" sx={{ py: 5 }}>
+                      <TableCell colSpan={6} align="center" sx={{ py: 5 }}>
                         <CircularProgress size={24} />
                       </TableCell>
                     </TableRow>
                   ) : logs.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={5} align="center" sx={{ py: 5, color: 'text.secondary' }}>
+                      <TableCell colSpan={6} align="center" sx={{ py: 5, color: 'text.secondary' }}>
                         暂无运行日志记录
                       </TableCell>
                     </TableRow>
@@ -591,6 +618,9 @@ export default function AutomationCenter() {
                       <TableRow key={log.id} sx={{ height: 40, '& .MuiTableCell-root': { py: 0.5 } }}>
                         <TableCell sx={{ width: 150, whiteSpace: 'nowrap', fontWeight: 400 }}>{log.created_at}</TableCell>
                         <TableCell sx={{ width: 150, fontWeight: 400 }}>{log.task_name}</TableCell>
+                        <TableCell sx={{ width: 110, fontWeight: 400 }} title={log.line_id ?? ''}>
+                          {log.line_id ? `线路 ${shortLineId(log.line_id)}` : '设备'}
+                        </TableCell>
                         <TableCell sx={{ width: 120, fontWeight: 400 }}>
                           {log.task_type === 'restart_baseband' && '基带维护'}
                           {log.task_type === 'reboot_device' && '系统操作'}

@@ -121,7 +121,8 @@ impl EsimSupervisor {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(request.proxy_prefix);
+        let proxy_prefix =
+            crate::services::system::ota::normalize_proxy_prefix(request.proxy_prefix);
         let candidates = match requested_asset_url {
             Some(asset_url) => vec![LpacAssetCandidate {
                 name: asset_url
@@ -179,13 +180,11 @@ impl EsimSupervisor {
 
     /// Run an lpac command against one line's eUICC.
     ///
-    /// `line_id` picks the reader; `None` keeps the legacy single-reader
-    /// behaviour. Without this the APDU channel was pinned to `/dev/wwan0qmi0`,
-    /// so on a multi-reader device every eSIM operation hit the first card no
-    /// matter which one the request named.
+    /// `line_id` picks the exact reader. Missing or unknown mappings fail before
+    /// lpac starts, so an operation can never reach another line's eUICC.
     async fn call_lpac_on_line(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
         action: &str,
         args: &[&str],
         timeout_seconds: u64,
@@ -196,13 +195,14 @@ impl EsimSupervisor {
         // which can see the line's discovered `esim_status`; this defensive check
         // covers the explicit `Some(false)` override the supervisor can see on its
         // own.
-        if let Some(line_id) = line_id.filter(|value| !value.is_empty()) {
-            if self.config_manager.get_line_profile(line_id).esim_control == Some(false) {
-                return Err(EsimApiError::Disabled);
-            }
+        if line_id.trim().is_empty() {
+            return Err(EsimApiError::Unavailable("line_id_required".to_string()));
+        }
+        if self.config_manager.get_line_profile(line_id).esim_control == Some(false) {
+            return Err(EsimApiError::Disabled);
         }
 
-        let target = esim_target_for_line(line_id);
+        let target = esim_target_for_line(line_id)?;
         let _guard = self.lpac_lock.lock().await;
         run_lpac_command(
             &self.config_manager.get_esim_config().lpac_path,
@@ -214,13 +214,9 @@ impl EsimSupervisor {
         .await
     }
 
-    pub async fn get_euicc_info(&self) -> Result<EsimEuiccInfo, EsimApiError> {
-        self.get_euicc_info_for_line(None).await
-    }
-
     pub async fn get_euicc_info_for_line(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
     ) -> Result<EsimEuiccInfo, EsimApiError> {
         let response = self
             .call_lpac_on_line(line_id, "info", &["chip", "info"], ESIM_SHORT_TIMEOUT_SECS)
@@ -241,13 +237,9 @@ impl EsimSupervisor {
         Ok(info)
     }
 
-    pub async fn get_profiles(&self) -> Result<EsimProfilesResponse, EsimApiError> {
-        self.get_profiles_for_line(None).await
-    }
-
     pub async fn get_profiles_for_line(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
     ) -> Result<EsimProfilesResponse, EsimApiError> {
         let response = self
             .call_lpac_on_line(
@@ -265,7 +257,7 @@ impl EsimSupervisor {
 
     pub async fn enable_profile(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
         iccid: String,
     ) -> Result<EsimCommandResponse, EsimApiError> {
         self.call_lpac_on_line(
@@ -279,7 +271,7 @@ impl EsimSupervisor {
 
     pub async fn rename_profile(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
         iccid: String,
         name: String,
     ) -> Result<EsimCommandResponse, EsimApiError> {
@@ -294,7 +286,7 @@ impl EsimSupervisor {
 
     pub async fn delete_profile(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
         iccid: String,
     ) -> Result<EsimCommandResponse, EsimApiError> {
         self.call_lpac_on_line(
@@ -308,7 +300,7 @@ impl EsimSupervisor {
 
     pub async fn download_profile(
         &self,
-        line_id: Option<&str>,
+        line_id: &str,
         request: EsimDownloadRequest,
     ) -> Result<EsimCommandResponse, EsimApiError> {
         let mut args = vec![
@@ -535,8 +527,15 @@ fn parse_version_parts(value: &str) -> Vec<u32> {
 
 async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     let mut command = tokio::process::Command::new(command_path);
-    // The probe only checks that the binary runs, so the default reader is fine.
-    configure_lpac_environment(&mut command, command_path, &esim_target_for_line(None));
+    // The probe only checks that the binary runs and must not select a reader.
+    configure_lpac_environment(
+        &mut command,
+        command_path,
+        &EsimTarget {
+            qmi_device: String::new(),
+            uim_slot: 0,
+        },
+    );
 
     let output = match tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
@@ -877,20 +876,29 @@ fn current_millis() -> u128 {
 }
 
 /// Which reader an lpac invocation talks to.
+#[derive(Debug)]
 pub struct EsimTarget {
     pub qmi_device: String,
     pub uim_slot: u8,
 }
 
 /// Resolve the reader for a line from the same registry the VoWiFi/VoLTE layers
-/// use, so eSIM, SIM auth and IMS all agree on which card a line owns. An empty
-/// or unknown line falls back to the configured global device.
-fn esim_target_for_line(line_id: Option<&str>) -> EsimTarget {
-    let device = crate::connectivity::modems::softstack::vowifi::live::sim_device_for_line(line_id.unwrap_or_default());
-    EsimTarget {
+/// use, so eSIM, SIM auth and IMS all agree on which card a line owns.
+fn esim_target_for_line(line_id: &str) -> Result<EsimTarget, EsimApiError> {
+    let line_id = line_id.trim();
+    if line_id.is_empty() {
+        return Err(EsimApiError::Unavailable("line_id_required".to_string()));
+    }
+    let device = crate::connectivity::modems::softstack::vowifi::live::sim_device_for_line(line_id);
+    if device.qmi_device.trim().is_empty() || device.uim_slot == 0 {
+        return Err(EsimApiError::Unavailable(
+            "esim_line_reader_not_found".to_string(),
+        ));
+    }
+    Ok(EsimTarget {
         qmi_device: device.qmi_device,
         uim_slot: device.uim_slot,
-    }
+    })
 }
 
 async fn run_lpac_command(
@@ -1006,15 +1014,11 @@ fn configure_lpac_environment(
     command_path: &Path,
     target: &EsimTarget,
 ) {
-    set_env_default(command, "LPAC_APDU", "qmi");
+    command.env("LPAC_APDU", "qmi");
     set_env_default(command, "LPAC_HTTP", "curl");
-    set_env_default(command, "LPAC_APDU_QMI_DEVICE", &target.qmi_device);
-    set_env_default(
-        command,
-        "LPAC_APDU_QMI_UIM_SLOT",
-        &target.uim_slot.to_string(),
-    );
-    set_env_default(command, "LPAC_APDU_AT_DEVICE", "/dev/wwan0at0");
+    command.env("LPAC_APDU_QMI_DEVICE", &target.qmi_device);
+    command.env("LPAC_APDU_QMI_UIM_SLOT", target.uim_slot.to_string());
+    command.env_remove("LPAC_APDU_AT_DEVICE");
 
     if let Some(parent) = command_path
         .parent()
@@ -1541,6 +1545,69 @@ fn policy_allows(value: &Value, deny_markers: &[&str]) -> Option<bool> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn configured_command_env(
+        command: &tokio::process::Command,
+        key: &str,
+    ) -> Option<Option<String>> {
+        command
+            .as_std()
+            .get_envs()
+            .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+            .map(|(_, value)| value.map(|value| value.to_string_lossy().into_owned()))
+    }
+
+    #[test]
+    fn esim_target_requires_an_explicit_registered_line() {
+        assert_eq!(
+            esim_target_for_line("").unwrap_err().message(),
+            "line_id_required"
+        );
+        assert_eq!(
+            esim_target_for_line("line-unknown").unwrap_err().message(),
+            "esim_line_reader_not_found"
+        );
+
+        let line_id = "line-esim-target-test";
+        crate::connectivity::modems::softstack::vowifi::live::register_line_sim_device(
+            line_id,
+            "/dev/wwan-test-qmi",
+            2,
+            "/org/freedesktop/ModemManager1/Modem/9",
+        );
+        let target = esim_target_for_line(line_id).expect("registered eSIM target");
+        assert_eq!(target.qmi_device, "/dev/wwan-test-qmi");
+        assert_eq!(target.uim_slot, 2);
+        crate::connectivity::modems::softstack::vowifi::live::forget_line_sim_device(line_id);
+    }
+
+    #[test]
+    fn lpac_environment_is_pinned_to_the_lines_qmi_reader() {
+        let target = EsimTarget {
+            qmi_device: "/dev/cdc-wdm-test".to_string(),
+            uim_slot: 2,
+        };
+        let mut command = tokio::process::Command::new("lpac");
+
+        configure_lpac_environment(&mut command, Path::new("lpac"), &target);
+
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU"),
+            Some(Some("qmi".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_QMI_DEVICE"),
+            Some(Some("/dev/cdc-wdm-test".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_QMI_UIM_SLOT"),
+            Some(Some("2".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_AT_DEVICE"),
+            Some(None)
+        );
+    }
 
     #[test]
     fn parses_lpac_chip_info_aliases() {

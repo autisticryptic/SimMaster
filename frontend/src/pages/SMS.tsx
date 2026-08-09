@@ -314,11 +314,12 @@ export default function SMSPage() {
       const response = await api.getVolteLines()
       const nextLines = response.data ?? []
       setVolteLines(nextLines)
-      setSelectedLineId((current) => (
-        current && !nextLines.some((line) => line.modem.line_id === current && line.modem.present)
-          ? ''
-          : current
-      ))
+      setSelectedLineId((current) => {
+        const available = nextLines.filter((line) => line.modem.present)
+        return available.some((line) => line.modem.line_id === current)
+          ? current
+          : (available[0]?.modem.line_id ?? '')
+      })
       const channelResponse = await api.getSmsChannels()
       const nextChannels = channelResponse.data ?? []
       setSmsChannels(nextChannels)
@@ -498,13 +499,17 @@ export default function SMSPage() {
       setError('请输入短信内容')
       return
     }
+    if (!selectedLineId) {
+      setError('请选择可用的发送线路')
+      return
+    }
 
     setSendLoading(true)
     setError(null)
     setSuccess(null)
 
     try {
-      const response = await api.sendSms(phoneNumber, content, selectedLineId || undefined)
+      const response = await api.sendSms(selectedLineId, phoneNumber, content)
       if (response.status === 'ok') {
         const path = smsTransportInfo(response.data?.transport ?? response.data?.path).label
         const usedLine = response.data?.line_id ? `（${messageLineLabel(response.data.line_id)}）` : ''
@@ -688,12 +693,24 @@ export default function SMSPage() {
       let clearCurrentConversation = false
 
       if (deleteTarget.type === 'batch') {
-        const response = await api.deleteSmsBatch({
-          ids: batchSelection.ids,
-          phone_numbers: batchSelection.phoneNumbers,
-          channel_id: selectedChannelId || undefined,
+        const idsByChannel = new Map<string, number[]>()
+        batchSelection.ids.forEach((id) => {
+          const message = messageById.get(id)
+          if (!message) {
+            throw new Error(`找不到待删除短信：${id}`)
+          }
+          const channelId = smsChannelId(message)
+          idsByChannel.set(channelId, [...(idsByChannel.get(channelId) ?? []), id])
         })
-        deleted = response.data?.deleted ?? batchSelection.messageCount
+        const responses = await Promise.all(Array.from(idsByChannel, ([channelId, ids]) => (
+          api.deleteSmsBatch({ ids, phone_numbers: [], channel_id: channelId })
+        )))
+        responses.forEach((response) => {
+          if (response.status !== 'ok') {
+            throw new Error(response.message)
+          }
+          deleted += response.data?.deleted ?? 0
+        })
         clearCurrentConversation = Boolean(
           selectedConversation
           && (
@@ -704,12 +721,15 @@ export default function SMSPage() {
         setSuccess(`已删除 ${deleted} 条短信`)
         handleExitBatchMode()
       } else if (deleteTarget.type === 'conversation') {
-        const response = await api.deleteSmsConversation(deleteTarget.phoneNumber, deleteTarget.channelId || undefined)
+        const response = await api.deleteSmsConversation(deleteTarget.phoneNumber, deleteTarget.channelId)
         deleted = response.data?.deleted ?? deleteTarget.messageCount
         clearCurrentConversation = selectedConversation === conversationKey(deleteTarget.channelId, deleteTarget.phoneNumber)
         setSuccess(`已删除对话 ${deleteTarget.phoneNumber}（${deleted} 条短信）`)
       } else {
-        const response = await api.deleteSmsMessage(deleteTarget.message.id)
+        const response = await api.deleteSmsMessage(
+          deleteTarget.message.id,
+          smsChannelId(deleteTarget.message),
+        )
         deleted = response.data?.deleted ?? 1
         clearCurrentConversation = selectedConversation === conversationKey(
           smsChannelId(deleteTarget.message),
@@ -1215,6 +1235,7 @@ export default function SMSPage() {
             value={selectedLineId}
             onChange={setSelectedLineId}
             disabled={sendLoading || channelCannotSend}
+            includeAutomatic={false}
           />
           <TextField
             fullWidth
@@ -1239,7 +1260,7 @@ export default function SMSPage() {
                     <IconButton
                       color="primary"
                       onClick={() => void handleSend()}
-                      disabled={sendLoading || channelCannotSend || !content.trim()}
+                      disabled={sendLoading || channelCannotSend || !selectedLineId || !content.trim()}
                     >
                       {sendLoading ? <CircularProgress size={24} /> : <Send />}
                     </IconButton>
@@ -1252,7 +1273,7 @@ export default function SMSPage() {
         <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
           {channelCannotSend
             ? '当前通道仅用于查看归档，尚未接入短信发送运行时'
-            : `${content.length} 字符 · ${selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '按现有路径策略自动选择'} · Enter 发送，Shift+Enter 换行`}
+            : `${content.length} 字符 · ${selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '未选择发送线路'} · Enter 发送，Shift+Enter 换行`}
         </Typography>
       </Box>
     </Box>
@@ -1276,10 +1297,12 @@ export default function SMSPage() {
         <Typography variant="h5" fontWeight={700}>
           短信管理
         </Typography>
-        <Tooltip title="短信路径策略">
-          <IconButton sx={{ ml: 'auto' }} onClick={() => setPathPolicyOpen(true)}>
-            <Settings />
-          </IconButton>
+        <Tooltip title={selectedLineId ? '短信路径策略' : '请先选择发送线路'}>
+          <span style={{ marginLeft: 'auto' }}>
+            <IconButton onClick={() => setPathPolicyOpen(true)} disabled={!selectedLineId}>
+              <Settings />
+            </IconButton>
+          </span>
         </Tooltip>
       </Box>
 
@@ -1374,7 +1397,11 @@ export default function SMSPage() {
           <Button onClick={handleStartNewChat} variant="contained">开始对话</Button>
         </DialogActions>
       </Dialog>
-      <SmsPathPolicyDialog open={pathPolicyOpen} onClose={() => setPathPolicyOpen(false)} />
+      <SmsPathPolicyDialog
+        open={pathPolicyOpen}
+        lineId={selectedLineId}
+        onClose={() => setPathPolicyOpen(false)}
+      />
     </Box>
   )
 }

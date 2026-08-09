@@ -22,7 +22,9 @@ use super::{
     plan::{FailureClass, ImsConnectionPlan, IpType},
 };
 
-/// The IMS APN used for the dedicated IMS bearer.
+/// Test default only. Production registration receives the IMS APN from the
+/// carrier catalog.
+#[cfg(test)]
 pub const IMS_APN: &str = "ims";
 
 /// Environment override for the bearer object path (matches the reference's
@@ -71,6 +73,7 @@ impl BearerConnection {
     }
 }
 
+#[cfg(test)]
 impl Default for BearerRequest {
     fn default() -> Self {
         Self {
@@ -82,10 +85,19 @@ impl Default for BearerRequest {
 }
 
 impl BearerRequest {
+    #[cfg(test)]
     pub fn ims(allow_roaming: bool) -> Self {
         Self {
             allow_roaming,
             ..Self::default()
+        }
+    }
+
+    pub fn for_apn(apn: impl Into<String>, allow_roaming: bool) -> Self {
+        Self {
+            apn: apn.into(),
+            allow_roaming,
+            profile_id: None,
         }
     }
 
@@ -181,7 +193,10 @@ where
     let mut last_error = None;
     for path in parse_bearer_paths(&modem_output) {
         let details = run_command("mmcli", &["-b", &path, "--output-keyvalue"]).await?;
-        if value(&details, "bearer.properties.apn").as_deref() == Some(IMS_APN) {
+        if value(&details, "bearer.properties.apn")
+            .as_deref()
+            .is_some_and(|apn| apn.eq_ignore_ascii_case(&request.apn))
+        {
             let roaming_matches = bearer_roaming_policy_matches(&details, request.allow_roaming);
             let profile_matches = bearer_profile_matches(&details, request.profile_id);
             if !roaming_matches || !profile_matches {

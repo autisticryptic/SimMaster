@@ -162,7 +162,7 @@ function esimChipLabel(line: VolteLineControlResponse) {
   return '未启用'
 }
 
-export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo?: ReactNode }) {
+export default function ModemLinesPanel({ basicInfoForLine }: { basicInfoForLine?: (lineId: string) => ReactNode }) {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
@@ -835,13 +835,15 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
       />
-      <VolteLineDialog
-        open={editingVolteLine !== null}
-        lineId={editingVolteLine?.modem.line_id ?? null}
-        families={editingVolteLine?.profile.volte_ip_families ?? null}
-        onClose={() => setEditingVolteLine(null)}
-        onSaved={handleVolteSaved}
-      />
+      {editingVolteLine && (
+        <VolteLineDialog
+          open
+          lineId={editingVolteLine.modem.line_id}
+          families={editingVolteLine.profile.volte_ip_families}
+          onClose={() => setEditingVolteLine(null)}
+          onSaved={handleVolteSaved}
+        />
+      )}
       <DataProxyDialog
         open={editingDataLineId !== null}
         lineId={editingDataLineId}
@@ -861,7 +863,7 @@ export default function ModemLinesPanel({ primaryBasicInfo }: { primaryBasicInfo
         trunk={detailLine ? trunkByLineId.get(detailLine.modem.line_id) : undefined}
         vowifi={detailLine ? vowifiByLineId.get(detailLine.modem.line_id) : undefined}
         initialTab={detailTab}
-        primaryBasicInfo={detailLine && lines[0]?.modem.line_id === detailLine.modem.line_id ? primaryBasicInfo : undefined}
+        basicInfo={detailLine ? basicInfoForLine?.(detailLine.modem.line_id) : undefined}
         onClose={() => setDetailLine(null)}
       />
     </Stack>

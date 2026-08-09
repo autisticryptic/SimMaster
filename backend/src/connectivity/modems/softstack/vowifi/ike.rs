@@ -168,7 +168,7 @@ fn parse_ike_proposal(proposal: &'static str) -> IkeProposalPlan {
         proposal,
         encryption: first_token(&tokens, |token| token.starts_with("aes")).unwrap_or("unknown"),
         integrity: first_token(&tokens, |token| {
-            token.starts_with("sha") || token.starts_with("hmac")
+            token.starts_with("sha") || token.starts_with("hmac") || token.starts_with("md5")
         })
         .unwrap_or("profile_default"),
         prf: first_token(&tokens, |token| token.starts_with("prf"))
@@ -187,7 +187,7 @@ fn parse_esp_proposal(proposal: &'static str) -> EspProposalPlan {
         proposal,
         encryption: first_token(&tokens, |token| token.starts_with("aes")).unwrap_or("unknown"),
         integrity: first_token(&tokens, |token| {
-            token.starts_with("sha") || token.starts_with("hmac")
+            token.starts_with("sha") || token.starts_with("hmac") || token.starts_with("md5")
         })
         .unwrap_or("profile_default"),
         mode: "tunnel",
@@ -201,7 +201,9 @@ fn first_token(tokens: &[&'static str], predicate: impl Fn(&str) -> bool) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::modems::softstack::vowifi::profiles::{GB_EE_23433, NL_VODAFONE_20404};
+    use crate::connectivity::modems::softstack::vowifi::profiles::{
+        GB_EE_23433, NL_VODAFONE_20404,
+    };
 
     #[test]
     fn builds_gb_ee_plan_from_profile_policy() {

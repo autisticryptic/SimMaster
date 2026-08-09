@@ -18,7 +18,7 @@ use super::{
     identity::VowifiSimIdentity,
     restore::RestoreProgress,
 };
-use crate::hardware::cellular::modem_manager::{current_sim_identity, sim_identity_for_modem};
+use crate::hardware::cellular::modem_manager::sim_identity_for_modem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePhase {
@@ -115,8 +115,7 @@ pub struct VowifiRuntime {
     /// Which line this runtime serves. Threaded into every executor stage so the
     /// stage picks up this line's ePDG/DNS/proxy overrides — two SIMs on different
     /// operators (and different proxies) can therefore run concurrently without
-    /// reading each other's settings. Empty means "no line context", which falls
-    /// back to carrier-profile defaults.
+    /// reading each other's settings.
     line_id: Arc<str>,
 }
 
@@ -125,18 +124,16 @@ struct LiveRefreshState {
     last_finished: Option<Instant>,
 }
 
-impl Default for VowifiRuntime {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl VowifiRuntime {
-    pub fn new() -> Self {
-        Self::with_live_gate(LiveExecutorGateReport::from_environment())
+    /// Build a runtime bound to one line, so its executor stages use that line's
+    /// network overrides.
+    pub fn for_line(line_id: impl AsRef<str>) -> Self {
+        Self::for_line_with_gate(line_id, LiveExecutorGateReport::from_environment())
     }
 
-    pub fn with_live_gate(live_gate: LiveExecutorGateReport) -> Self {
+    pub fn for_line_with_gate(line_id: impl AsRef<str>, live_gate: LiveExecutorGateReport) -> Self {
+        let line_id = line_id.as_ref().trim();
+        assert!(!line_id.is_empty(), "VoWiFi runtime requires a line_id");
         let snapshot = RuntimeSnapshot {
             executor: LiveRuntimeExecutor::from_gate(live_gate).describe(),
             ..Default::default()
@@ -147,42 +144,25 @@ impl VowifiRuntime {
                 last_finished: None,
             })),
             live_generation: Arc::new(AtomicU64::new(0)),
-            line_id: Arc::from(""),
+            line_id: Arc::from(line_id),
         }
     }
 
-    /// Build a runtime bound to one line, so its executor stages use that line's
-    /// network overrides.
-    pub fn for_line(line_id: impl AsRef<str>) -> Self {
-        Self::for_line_with_gate(line_id, LiveExecutorGateReport::from_environment())
-    }
-
-    pub fn for_line_with_gate(line_id: impl AsRef<str>, live_gate: LiveExecutorGateReport) -> Self {
-        Self {
-            line_id: Arc::from(line_id.as_ref()),
-            ..Self::with_live_gate(live_gate)
-        }
-    }
-
-    /// The line this runtime serves, or an empty string when unbound.
+    /// The line this runtime serves.
     pub fn line_id(&self) -> &str {
         &self.line_id
     }
 
     /// Read the SIM identity of the modem this runtime is bound to. A runtime
     /// created with `for_line` resolves its own modem from the line registry, so
-    /// line B never matches a carrier profile from line A's card. Only the
-    /// unbound legacy runtime falls back to "whichever modem is first".
+    /// line B never matches a carrier profile from line A's card.
     async fn read_bound_sim_identity(
         &self,
         conn: &Connection,
     ) -> Option<crate::hardware::cellular::modem_manager::SimIdentity> {
-        if self.line_id.is_empty() {
-            return current_sim_identity(conn).await;
-        }
         let modem_path = super::live::sim_device_for_line(&self.line_id).modem_path;
         if modem_path.is_empty() {
-            return current_sim_identity(conn).await;
+            return None;
         }
         sim_identity_for_modem(conn, &modem_path).await
     }
@@ -192,8 +172,7 @@ impl VowifiRuntime {
             Some(identity) => {
                 let identity = VowifiSimIdentity::from_modem(&identity);
                 let pinned = super::live::line_pinned_profile_id(&self.line_id);
-                let profile =
-                    diagnostics::match_profile_for_line(&identity, pinned.as_deref());
+                let profile = diagnostics::match_profile_for_line(&identity, pinned.as_deref());
                 let previous = self.snapshot().await;
                 let same_profile = same_matched_profile(&previous.profile, &profile);
                 let live_readiness =
@@ -410,6 +389,7 @@ impl VowifiRuntime {
                     if !event_type.is_empty() {
                         let _ = database.insert_vowifi_runtime_event(
                             crate::platform::db::NewVowifiRuntimeEvent {
+                                line_id: self.line_id.as_ref(),
                                 trace_id: Some("runtime-connect"),
                                 level,
                                 phase,
@@ -460,6 +440,7 @@ impl VowifiRuntime {
                         for (event_type, phase, level) in events {
                             let _ = database.insert_vowifi_runtime_event(
                                 crate::platform::db::NewVowifiRuntimeEvent {
+                                    line_id: self.line_id.as_ref(),
                                     trace_id: Some("runtime-connect"),
                                     level,
                                     phase,
@@ -493,6 +474,7 @@ impl VowifiRuntime {
                             };
                             let _ = database.insert_vowifi_runtime_event(
                                 crate::platform::db::NewVowifiRuntimeEvent {
+                                    line_id: self.line_id.as_ref(),
                                     trace_id: Some("runtime-connect"),
                                     level: "error",
                                     phase,
@@ -507,7 +489,7 @@ impl VowifiRuntime {
             }
 
             if self.live_generation.load(Ordering::SeqCst) != generation {
-                super::live::clear_all_live_runtime().await;
+                super::live::clear_live_runtime_for_line(self.line_id()).await;
                 return self.snapshot().await;
             }
             let terminal = result.status != "completed";
@@ -518,7 +500,7 @@ impl VowifiRuntime {
         }
 
         if self.live_generation.load(Ordering::SeqCst) != generation {
-            super::live::clear_all_live_runtime().await;
+            super::live::clear_live_runtime_for_line(self.line_id()).await;
             return self.snapshot().await;
         }
         *self.snapshot.write().await = next.clone();
@@ -744,17 +726,20 @@ mod tests {
 
     #[tokio::test]
     async fn live_gate_authorization_does_not_enable_unimplemented_runtime() {
-        let runtime = VowifiRuntime::with_live_gate(LiveExecutorGateReport {
-            live_network_authorized: true,
-            device_state_changes_authorized: true,
-            adb_path_configured: true,
-            device_admin_url_configured: true,
-            implementation_ready: false,
-            effective_live_network_allowed: false,
-            effective_device_state_changes_allowed: false,
-            blockers: vec!["live_runtime_executor_not_implemented"],
-            sensitive_values_policy: "presence_flags_only_no_paths_or_urls_serialized",
-        });
+        let runtime = VowifiRuntime::for_line_with_gate(
+            "line-test",
+            LiveExecutorGateReport {
+                live_network_authorized: true,
+                device_state_changes_authorized: true,
+                adb_path_configured: true,
+                device_admin_url_configured: true,
+                implementation_ready: false,
+                effective_live_network_allowed: false,
+                effective_device_state_changes_allowed: false,
+                blockers: vec!["live_runtime_executor_not_implemented"],
+                sensitive_values_policy: "presence_flags_only_no_paths_or_urls_serialized",
+            },
+        );
 
         let snapshot = runtime.snapshot().await;
         assert!(snapshot.executor.live_gate.live_network_authorized);

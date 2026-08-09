@@ -38,6 +38,7 @@ import {
 import type { NotificationLogCleanupConfig, NotificationLogEntry } from '../../api/current'
 import { EVENT_TYPES, eventLabel, statusLabel } from './notificationModel'
 import DateRangePicker from '../../components/DateRangePicker'
+import { shortLineId } from '../../components/modemLineFormat'
 
 const LOG_STATUS_OPTIONS = [
   { value: 'success', label: '成功' },
@@ -89,6 +90,7 @@ function collapsedSummaryText(lines: string[]) {
 type NotificationLogClearFilters = {
   type: string
   status: string
+  line_id: string
   start_date: string
   end_date: string
 }
@@ -99,6 +101,8 @@ type NotificationLogsTabProps = {
   logsLoading: boolean
   logType: string
   logStatus: string
+  logLineId: string
+  lineOptions: Array<{ id: string; label: string }>
   logStartDate: string
   logEndDate: string
   logCleanup: NotificationLogCleanupConfig
@@ -108,6 +112,7 @@ type NotificationLogsTabProps = {
   logPageSize: number
   onLogTypeChange: (value: string) => void
   onLogStatusChange: (value: string) => void
+  onLogLineIdChange: (value: string) => void
   onLogDateRangeChange: (startDate: string, endDate: string) => void
   onLogQueryChange: (value: string) => void
   onLogPageChange: (page: number) => void
@@ -121,6 +126,8 @@ export default function NotificationLogsTab({
   logsLoading,
   logType,
   logStatus,
+  logLineId,
+  lineOptions,
   logStartDate,
   logEndDate,
   logCleanup,
@@ -130,6 +137,7 @@ export default function NotificationLogsTab({
   logPageSize,
   onLogTypeChange,
   onLogStatusChange,
+  onLogLineIdChange,
   onLogDateRangeChange,
   onLogQueryChange,
   onLogPageChange,
@@ -145,6 +153,7 @@ export default function NotificationLogsTab({
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
   const [clearType, setClearType] = useState(logType)
   const [clearStatus, setClearStatus] = useState(logStatus)
+  const [clearLineId, setClearLineId] = useState(logLineId)
   const [clearStartDate, setClearStartDate] = useState(logStartDate)
   const [clearEndDate, setClearEndDate] = useState(logEndDate)
   const [autoDialogOpen, setAutoDialogOpen] = useState(false)
@@ -191,6 +200,7 @@ export default function NotificationLogsTab({
   const openClearDialog = () => {
     setClearType(logType)
     setClearStatus(logStatus)
+    setClearLineId(logLineId)
     setClearStartDate(logStartDate)
     setClearEndDate(logEndDate)
     setClearDialogOpen(true)
@@ -224,6 +234,7 @@ export default function NotificationLogsTab({
     onClearLogs({
       type: clearType,
       status: clearStatus,
+      line_id: clearLineId,
       start_date: clearStartDate,
       end_date: clearEndDate,
     })
@@ -256,6 +267,17 @@ export default function NotificationLogsTab({
             <MenuItem value="">所有状态</MenuItem>
             {LOG_STATUS_OPTIONS.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
           </TextField>
+          <TextField
+            select
+            size="small"
+            label="事件归属"
+            value={logLineId}
+            onChange={(event: ChangeEvent<HTMLInputElement>) => onLogLineIdChange(event.target.value)}
+            sx={[{ minWidth: 150 }, filterTextFieldSx]}
+          >
+            <MenuItem value="">全部归属</MenuItem>
+            {lineOptions.map((line) => <MenuItem key={line.id} value={line.id}>{line.label}</MenuItem>)}
+          </TextField>
           <DateRangePicker startDate={logStartDate} endDate={logEndDate} onChange={onLogDateRangeChange} minWidth={280} />
           <TextField
             size="small"
@@ -281,6 +303,7 @@ export default function NotificationLogsTab({
               <TableRow>
                 <TableCell sx={{ width: 150, fontWeight: 400 }}>时间</TableCell>
                 <TableCell sx={{ width: 96, fontWeight: 400 }}>类型</TableCell>
+                <TableCell sx={{ width: 120, fontWeight: 400 }}>归属</TableCell>
                 <TableCell sx={{ width: 88, fontWeight: 400 }}>状态</TableCell>
                 <TableCell sx={{ width: '42%', minWidth: 360, fontWeight: 400 }}>内容摘要</TableCell>
                 <TableCell sx={{ width: 160, fontWeight: 400 }}>转发规则</TableCell>
@@ -300,6 +323,11 @@ export default function NotificationLogsTab({
                   <TableRow key={log.id} sx={{ height: 40, '& .MuiTableCell-root': { py: 0.5 } }}>
                   <TableCell sx={{ width: 150, whiteSpace: 'nowrap', fontWeight: 400 }}>{log.created_at}</TableCell>
                   <TableCell sx={{ width: 96, fontWeight: 400 }}>{eventLabel(log.event_type)}</TableCell>
+                  <TableCell sx={{ width: 120, fontWeight: 400 }} title={log.line_id ?? ''}>
+                    {log.line_id
+                      ? lineOptions.find((line) => line.id === log.line_id)?.label ?? `线路 ${shortLineId(log.line_id)}`
+                      : '设备级事件'}
+                  </TableCell>
                   <TableCell
                     sx={{
                       width: 88,
@@ -342,7 +370,7 @@ export default function NotificationLogsTab({
               })}
               {logs.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={6} align="center" sx={{ py: 4, color: 'text.secondary' }}>暂无转发日志</TableCell>
+                  <TableCell colSpan={7} align="center" sx={{ py: 4, color: 'text.secondary' }}>暂无转发日志</TableCell>
                 </TableRow>
               )}
             </TableBody>
@@ -449,6 +477,18 @@ export default function NotificationLogsTab({
             >
               <MenuItem value="">所有状态 (不限)</MenuItem>
               {LOG_STATUS_OPTIONS.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
+            </TextField>
+            <TextField
+              select
+              size="small"
+              label="事件归属"
+              value={clearLineId}
+              onChange={(event: ChangeEvent<HTMLInputElement>) => setClearLineId(event.target.value)}
+              fullWidth
+              sx={filterTextFieldSx}
+            >
+              <MenuItem value="">全部归属 (不限)</MenuItem>
+              {lineOptions.map((line) => <MenuItem key={line.id} value={line.id}>{line.label}</MenuItem>)}
             </TextField>
             <Box>
               <Typography variant="body2" color="text.secondary" mb={1}>时间范围 (按日计算)</Typography>

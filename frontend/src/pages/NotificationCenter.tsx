@@ -39,6 +39,7 @@ const LOG_PAGE_SIZE = 15
 type NotificationLogClearFilters = {
   type: string
   status: string
+  line_id: string
   start_date: string
   end_date: string
 }
@@ -53,6 +54,7 @@ export default function NotificationCenterPage() {
   const [logTotal, setLogTotal] = useState(0)
   const [logType, setLogType] = useState('')
   const [logStatus, setLogStatus] = useState('')
+  const [logLineId, setLogLineId] = useState('')
   const [logStartDate, setLogStartDate] = useState('')
   const [logEndDate, setLogEndDate] = useState('')
   const [logQuery, setLogQuery] = useState('')
@@ -74,6 +76,17 @@ export default function NotificationCenterPage() {
     () => config.channels.find((channel) => channel.id === selectedChannelId) ?? config.channels[0],
     [config.channels, selectedChannelId],
   )
+  const notificationLineOptions = useMemo(() => {
+    const seen = new Set<string>(['device'])
+    return [
+      { id: 'device', label: '设备级事件' },
+      ...smsChannels.flatMap((channel) => {
+        if (seen.has(channel.id)) return []
+        seen.add(channel.id)
+        return [{ id: channel.id, label: channel.label }]
+      }),
+    ]
+  }, [smsChannels])
   const notificationQueueItems = queueItems
 
   const loadConfig = useCallback(async () => {
@@ -103,6 +116,7 @@ export default function NotificationCenterPage() {
       const response = await api.getNotificationLogs({
         type: logType,
         status: logStatus,
+        line_id: logLineId,
         start_date: logStartDate,
         end_date: logEndDate,
         q: logQuery,
@@ -117,7 +131,7 @@ export default function NotificationCenterPage() {
       logsLoadingRef.current = false
       if (!silent) setLogsLoading(false)
     }
-  }, [logEndDate, logPage, logQuery, logStartDate, logStatus, logType])
+  }, [logEndDate, logLineId, logPage, logQuery, logStartDate, logStatus, logType])
 
   const loadQueue = useCallback(async (silent = true) => {
     try {
@@ -125,6 +139,7 @@ export default function NotificationCenterPage() {
       const items = response.data?.items ?? []
       setQueueItems(items.map((item) => ({
           id: item.id,
+          line_id: item.line_id,
           status: item.status,
           event_type: item.event_type,
           event_label: item.event_label,
@@ -352,6 +367,11 @@ export default function NotificationCenterPage() {
     setLogPage(0)
   }
 
+  const handleLogLineIdChange = (value: string) => {
+    setLogLineId(value)
+    setLogPage(0)
+  }
+
   const handleLogDateRangeChange = (startDate: string, endDate: string) => {
     setLogStartDate(startDate)
     setLogEndDate(endDate)
@@ -413,6 +433,8 @@ export default function NotificationCenterPage() {
           logsLoading={logsLoading}
           logType={logType}
           logStatus={logStatus}
+          logLineId={logLineId}
+          lineOptions={notificationLineOptions}
           logStartDate={logStartDate}
           logEndDate={logEndDate}
           logCleanup={config.log_cleanup}
@@ -422,6 +444,7 @@ export default function NotificationCenterPage() {
           logPageSize={LOG_PAGE_SIZE}
           onLogTypeChange={handleLogTypeChange}
           onLogStatusChange={handleLogStatusChange}
+          onLogLineIdChange={handleLogLineIdChange}
           onLogDateRangeChange={handleLogDateRangeChange}
           onLogQueryChange={handleLogQueryChange}
           onLogPageChange={setLogPage}

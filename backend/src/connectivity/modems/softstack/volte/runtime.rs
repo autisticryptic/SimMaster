@@ -270,9 +270,7 @@ impl VolteSnapshot {
     }
 }
 
-/// Serializable projection of the snapshot for the `/api/volte/control` body.
-/// Field order/names align with the observed `volte.rs` serialization and the
-/// frontend consumer.
+/// Serializable per-line runtime projection returned by the VoLTE line APIs.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct VolteRuntimeStatus {
     pub phase: String,

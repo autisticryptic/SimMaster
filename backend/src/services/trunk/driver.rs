@@ -52,7 +52,15 @@ pub(crate) async fn run(
         if !state.is_current() || *shutdown.borrow() {
             return;
         }
-        match run_session(&profile, &state, &mut shutdown, &operator).await {
+        match run_session(
+            &profile,
+            &state,
+            &mut shutdown,
+            &operator,
+            failure_count as usize,
+        )
+        .await
+        {
             Ok(()) => return,
             Err(error) if state.is_current() => {
                 failure_count = failure_count.saturating_add(1);
@@ -103,6 +111,7 @@ async fn run_session(
     state: &TrunkStateWriter,
     shutdown: &mut watch::Receiver<bool>,
     operator: &OperatorLink,
+    address_offset: usize,
 ) -> Result<(), String> {
     validate_profile(profile)?;
     state
@@ -121,7 +130,7 @@ async fn run_session(
     state
         .update(|snapshot| snapshot.stage = TrunkStage::Connecting)
         .await;
-    let transport = connect_any(&addresses, profile.local_port).await?;
+    let transport = connect_any(&addresses, profile.local_port, address_offset).await?;
     let peer = transport.peer_addr().to_string();
     let local_addr = transport.local_addr()?;
     state
@@ -130,7 +139,7 @@ async fn run_session(
             snapshot.local_endpoint = Some(local_addr.to_string());
         })
         .await;
-    let local_aor = format!("sip:{}@{}", profile.username, profile.asterisk_host);
+    let local_aor = format!("sip:{}@{}", profile.username, local_addr);
     let mut bridge =
         TrunkBridge::new(local_addr, local_aor).with_operator(OperatorAvailability::Unavailable);
     if !profile.outgoing_binding.trim().is_empty() {
@@ -171,15 +180,28 @@ async fn run_session(
 async fn connect_any(
     addresses: &[SocketAddr],
     local_port: u16,
+    start_index: usize,
 ) -> Result<TrunkUdpTransport, String> {
     let mut last_error = None;
-    for address in addresses {
-        match TrunkUdpTransport::connect(*address, local_port).await {
+    for address in address_attempt_order(addresses, start_index) {
+        match TrunkUdpTransport::connect(address, local_port).await {
             Ok(transport) => return Ok(transport),
             Err(error) => last_error = Some(error),
         }
     }
     Err(last_error.unwrap_or_else(|| "trunk_peer_unreachable".to_string()))
+}
+
+fn address_attempt_order(addresses: &[SocketAddr], start_index: usize) -> Vec<SocketAddr> {
+    if addresses.is_empty() {
+        return Vec::new();
+    }
+    let start = start_index % addresses.len();
+    addresses[start..]
+        .iter()
+        .chain(addresses[..start].iter())
+        .copied()
+        .collect()
 }
 
 async fn run_static_peer(
@@ -243,7 +265,8 @@ async fn run_outbound_register(
     let mut dialog = sip::RegisterDialog::fresh();
     let mut operator_events = operator.subscribe_events();
     loop {
-        let expiry = register_transaction(&transport, profile, state, &mut dialog, bridge).await?;
+        let expiry =
+            register_transaction(&transport, profile, state, &mut dialog, bridge, operator).await?;
         let refresh_after = Duration::from_secs((u64::from(expiry) * 85 / 100).max(30));
         let registered_at = timestamp_now();
         let expires_at = timestamp_after(Duration::from_secs(u64::from(expiry)));
@@ -317,6 +340,7 @@ async fn register_transaction(
     state: &TrunkStateWriter,
     dialog: &mut sip::RegisterDialog,
     bridge: &mut TrunkBridge,
+    operator: &OperatorLink,
 ) -> Result<u32, String> {
     let mut authorization = None;
     let mut expires = profile.register_expiry_secs.clamp(60, 86_400);
@@ -341,8 +365,15 @@ async fn register_transaction(
         let expected_cseq = sip_frame::header_value(&request, "CSeq")
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_register_cseq_invalid".to_string())?;
-        let response =
-            send_register_and_receive(transport, &request, expected_cseq, bridge, state).await?;
+        let response = send_register_and_receive(
+            transport,
+            &request,
+            expected_cseq,
+            bridge,
+            Some(operator),
+            state,
+        )
+        .await?;
         let status = sip::status(&response)?;
         state
             .update(|snapshot| snapshot.last_sip_status = Some(status))
@@ -405,7 +436,8 @@ async fn unregister_transaction(
             .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
             .ok_or_else(|| "trunk_unregister_cseq_invalid".to_string())?;
         let response =
-            send_register_and_receive(transport, &request, expected_cseq, bridge, state).await?;
+            send_register_and_receive(transport, &request, expected_cseq, bridge, None, state)
+                .await?;
         let status = sip::status(&response)?;
         match status {
             200..=299 => {
@@ -446,6 +478,7 @@ async fn send_register_and_receive(
     request: &[u8],
     expected_cseq: u32,
     bridge: &mut TrunkBridge,
+    operator: Option<&OperatorLink>,
     state: &TrunkStateWriter,
 ) -> Result<Vec<u8>, String> {
     let deadline = tokio::time::Instant::now() + REGISTER_RESPONSE_TIMEOUT;
@@ -460,7 +493,7 @@ async fn send_register_and_receive(
         let wait = (deadline - now).min(retransmit_after);
         match transport.recv(wait).await {
             Ok(frame) if sip::is_request(&frame) => {
-                handle_inbound(transport, &frame, bridge, None, state).await?
+                handle_inbound(transport, &frame, bridge, operator, state).await?
             }
             Ok(frame) => {
                 record_sip_rx(state, &frame).await;
@@ -500,8 +533,8 @@ async fn handle_inbound(
     }
     record_sip_rx(state, frame).await;
     if sip_frame::is_request(frame, "INVITE") {
-        let is_reinvite =
-            crate::services::trunk::dialog::call_id(frame).is_some_and(|call_id| bridge.has_call(&call_id));
+        let is_reinvite = crate::services::trunk::dialog::call_id(frame)
+            .is_some_and(|call_id| bridge.has_call(&call_id));
         state
             .update(|snapshot| {
                 if is_reinvite {
@@ -558,14 +591,16 @@ async fn handle_inbound(
             .send_command(command);
         if let Err(command) = result {
             let call_id = match *command {
-                crate::services::trunk::bridge::OperatorCommand::StartCall { call_id, .. } => Some(call_id),
+                crate::services::trunk::bridge::OperatorCommand::StartCall { call_id, .. } => {
+                    Some(call_id)
+                }
                 _ => None,
             };
             if let Some(call_id) = call_id {
                 let unavailable = bridge
-                    .handle_operator_event(crate::services::trunk::bridge::OperatorEvent::Unavailable {
-                        call_id,
-                    })
+                    .handle_operator_event(
+                        crate::services::trunk::bridge::OperatorEvent::Unavailable { call_id },
+                    )
                     .map_err(|error| error.to_string())?;
                 for response in unavailable.asterisk_frames {
                     transport.send(&response).await?;
@@ -602,8 +637,11 @@ async fn handle_operator_event(
 
 async fn record_sip_rx(state: &TrunkStateWriter, frame: &[u8]) {
     let is_invite = sip_frame::is_request(frame, "INVITE");
-    let has_video =
-        is_invite && crate::connectivity::modems::softstack::volte::vilte::parse_video_sdp(sip_frame::body(frame)).is_ok();
+    let has_video = is_invite
+        && crate::connectivity::modems::softstack::volte::vilte::parse_video_sdp(sip_frame::body(
+            frame,
+        ))
+        .is_ok();
     state
         .update(|snapshot| {
             snapshot.sip_rx_frames = snapshot.sip_rx_frames.saturating_add(1);
@@ -679,7 +717,7 @@ fn timestamp_after(duration: Duration) -> String {
 mod tests {
     use super::*;
     use crate::services::trunk::{
-        bridge::{OperatorCommand, OperatorEvent},
+        bridge::{DtmfSignal, DtmfSource, OperatorCommand, OperatorEvent},
         operator::OperatorLink,
         runtime::TrunkRuntime,
     };
@@ -858,6 +896,7 @@ mod tests {
                 asterisk_host: server_addr.ip().to_string(),
                 asterisk_port: server_addr.port(),
                 local_port,
+                username: "41000".into(),
                 ..TrunkProfileConfig::default()
             })
             .await;
@@ -901,6 +940,10 @@ mod tests {
         let (read, _) = server.recv_from(&mut frame).await.unwrap();
         let answer = String::from_utf8_lossy(&frame[..read]);
         assert!(answer.starts_with("SIP/2.0 200 OK"));
+        assert_eq!(
+            sip_frame::header_value(&frame[..read], "Contact").as_deref(),
+            Some(format!("<sip:41000@{peer}>").as_str())
+        );
         let to = sip_frame::header_value(&frame[..read], "To").unwrap();
         let tag = to.split(";tag=").nth(1).unwrap();
         let ack = format!(
@@ -989,10 +1032,306 @@ mod tests {
         assert_eq!(operator.trunk_local_ip(), None);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires live Asterisk and an externally triggered Linphone call"]
+    async fn live_asterisk_digest_register_and_linphone_call() {
+        fn required_env(name: &str) -> String {
+            std::env::var(name).unwrap_or_else(|_| {
+                panic!("{name} must be set for the live Asterisk integration test")
+            })
+        }
+
+        fn parse_port(name: &str) -> u16 {
+            required_env(name)
+                .parse()
+                .unwrap_or_else(|_| panic!("{name} must be a valid UDP port"))
+        }
+
+        let host = required_env("SIMADMIN_ASTERISK_TEST_HOST");
+        let port = parse_port("SIMADMIN_ASTERISK_TEST_PORT");
+        let local_port = parse_port("SIMADMIN_ASTERISK_TEST_LOCAL_PORT");
+        let username = required_env("SIMADMIN_ASTERISK_TEST_USERNAME");
+        let secret = required_env("SIMADMIN_ASTERISK_TEST_SECRET");
+        let operator = OperatorLink::default();
+        let mut commands = operator.subscribe_commands();
+        operator.set_ready(true);
+        let runtime = TrunkRuntime::with_operator(operator.clone());
+        runtime
+            .activate_profile(&TrunkProfileConfig {
+                enabled: true,
+                registration_mode: TrunkRegistrationMode::OutboundRegister,
+                asterisk_host: host,
+                asterisk_port: port,
+                local_port,
+                username,
+                secret,
+                incoming_binding: "6108".into(),
+                outgoing_binding: "6108".into(),
+                register_expiry_secs: 60,
+                ..TrunkProfileConfig::default()
+            })
+            .await;
+
+        let registered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let status = runtime.status().await;
+                if status.phase == "registered" {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        let status = match registered {
+            Ok(status) => status,
+            Err(_) => panic!(
+                "live Asterisk registration timed out: {:?}",
+                runtime.status().await
+            ),
+        };
+        assert!(status.registered);
+        assert_eq!(status.last_sip_status, Some(200));
+        assert_eq!(status.register_attempts, 2);
+        let local_endpoint: SocketAddr = status
+            .local_endpoint
+            .as_deref()
+            .expect("registered trunk must expose its local endpoint")
+            .parse()
+            .expect("trunk local endpoint must be a socket address");
+        assert_eq!(local_endpoint.port(), local_port);
+
+        let command = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match commands.recv().await {
+                    Ok(command @ OperatorCommand::StartCall { .. }) => return command,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("operator command channel closed before the Linphone call")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("dial extension 41000 from the lab Linphone within 30 seconds");
+        let OperatorCommand::StartCall {
+            call_id,
+            caller,
+            callee,
+            trunk_local_ip,
+            ..
+        } = command
+        else {
+            unreachable!()
+        };
+        assert!(
+            caller.starts_with("sip:6108@"),
+            "unexpected caller: {caller}"
+        );
+        assert!(
+            callee.starts_with("sip:41000@"),
+            "unexpected callee: {callee}"
+        );
+
+        let answer = format!(
+            "v=0\r\no=- 1 1 IN IP4 {trunk_local_ip}\r\ns=SimAdmin live test\r\nc=IN IP4 {trunk_local_ip}\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n"
+        )
+        .into_bytes();
+        operator.send_event(OperatorEvent::Provisional {
+            call_id: call_id.clone(),
+            status: 180,
+            body: None,
+        });
+        operator.send_event(OperatorEvent::Answered {
+            call_id: call_id.clone(),
+            body: answer.clone(),
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.status().await.active_calls == 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Asterisk did not ACK the answered call");
+
+        // Leave enough time for the external Linphone probe to observe StreamsRunning.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        operator.send_event(OperatorEvent::Renegotiate {
+            call_id: call_id.clone(),
+            body: answer.clone(),
+        });
+        let renegotiation = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match commands.recv().await {
+                    Ok(command @ OperatorCommand::AcceptRenegotiation { .. }) => return command,
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        panic!("operator command channel closed during live re-INVITE")
+                    }
+                }
+            }
+        })
+        .await
+        .expect("Asterisk/Linphone did not answer the operator-originated re-INVITE");
+        assert!(matches!(
+            renegotiation,
+            OperatorCommand::AcceptRenegotiation {
+                call_id: accepted_call_id,
+                body,
+            } if accepted_call_id == call_id
+                && crate::connectivity::core::voice::parse_audio_sdp(&body).is_ok()
+        ));
+
+        let rx_before_dtmf = runtime.status().await.sip_rx_frames;
+        operator.send_event(OperatorEvent::Dtmf {
+            call_id: call_id.clone(),
+            signal: DtmfSignal {
+                digit: '5',
+                duration_ms: 160,
+                source: DtmfSource::SipInfo,
+            },
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = runtime.status().await;
+                if status.dtmf_events >= 1 && status.sip_rx_frames > rx_before_dtmf {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("Asterisk did not respond to operator-originated SIP INFO DTMF");
+
+        operator.send_event(OperatorEvent::Ended {
+            call_id: call_id.clone(),
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if runtime.status().await.active_dialogs == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("operator-originated BYE did not close the Asterisk dialog");
+
+        if std::env::var("SIMADMIN_ASTERISK_TEST_OPERATOR_INCOMING").as_deref() == Ok("1") {
+            let incoming_call_id = "live-operator-incoming-1".to_string();
+            operator.send_event(OperatorEvent::Incoming {
+                call_id: incoming_call_id.clone(),
+                caller: "sip:+15555550100@ims.test".into(),
+                body: answer,
+            });
+
+            let mut saw_provisional = false;
+            let accepted_body = tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match commands.recv().await {
+                        Ok(OperatorCommand::ReportProvisional {
+                            call_id, status, ..
+                        }) if call_id == incoming_call_id => {
+                            saw_provisional = true;
+                            assert!((100..200).contains(&status));
+                        }
+                        Ok(OperatorCommand::AcceptCall { call_id, body })
+                            if call_id == incoming_call_id =>
+                        {
+                            return body;
+                        }
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            panic!("operator command channel closed during live incoming call")
+                        }
+                    }
+                }
+            })
+            .await
+            .expect("auto-answer the operator-originated call on the lab Linphone");
+            assert!(saw_provisional);
+            assert!(
+                crate::connectivity::core::voice::parse_audio_sdp(&accepted_body).is_ok(),
+                "Asterisk/Linphone returned invalid audio SDP"
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if runtime.status().await.active_calls == 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("operator-originated live call did not become active");
+
+            let status_before_dtmf = runtime.status().await;
+            operator.send_event(OperatorEvent::Dtmf {
+                call_id: incoming_call_id.clone(),
+                signal: DtmfSignal {
+                    digit: '7',
+                    duration_ms: 180,
+                    source: DtmfSource::SipInfo,
+                },
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let status = runtime.status().await;
+                    if status.dtmf_events > status_before_dtmf.dtmf_events
+                        && status.sip_rx_frames > status_before_dtmf.sip_rx_frames
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("Asterisk did not answer incoming-call SIP INFO DTMF");
+
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            operator.send_event(OperatorEvent::Ended {
+                call_id: incoming_call_id,
+            });
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if runtime.status().await.active_dialogs == 0 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("operator-originated incoming call did not close cleanly");
+        }
+
+        runtime
+            .activate_profile(&TrunkProfileConfig::default())
+            .await;
+        assert_eq!(runtime.status().await.phase, "disabled");
+        assert_eq!(operator.trunk_local_ip(), None);
+    }
+
     #[test]
     fn backoff_is_bounded() {
         assert_eq!(backoff_duration(1), Duration::from_secs(5));
         assert_eq!(backoff_duration(3), Duration::from_secs(20));
         assert!(backoff_duration(100) <= Duration::from_secs(MAX_BACKOFF_SECS));
+    }
+
+    #[test]
+    fn peer_addresses_rotate_after_session_failures() {
+        let addresses = vec![
+            "192.0.2.10:5060".parse().unwrap(),
+            "[2001:db8::10]:5060".parse().unwrap(),
+            "192.0.2.11:5060".parse().unwrap(),
+        ];
+        assert_eq!(
+            address_attempt_order(&addresses, 1),
+            vec![addresses[1], addresses[2], addresses[0]]
+        );
+        assert_eq!(address_attempt_order(&addresses, 3), addresses);
     }
 }

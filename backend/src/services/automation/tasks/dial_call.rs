@@ -1,6 +1,6 @@
-use crate::services::automation::target::resolve_modem_path;
+use crate::hardware::cellular::modem_manager::{hangup_call_on_modem, make_call_via_modem};
+use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
-use crate::hardware::cellular::modem_manager::{hangup_call, make_call, make_call_via_modem};
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -51,17 +51,15 @@ impl AutomationTaskHandler for DialCallHandler {
         let target = params.clone();
         async move {
             let phone = normalize_phone(&country, &number)?;
-            let call_path = if target.get("target").is_some() {
-                let modem_path = resolve_modem_path(app, &target).await?;
-                make_call_via_modem(&app.dbus_conn, &modem_path, &phone).await
-            } else {
-                make_call(&app.dbus_conn, &phone).await
-            }
-            .context("定时拨号失败")?;
+            let target = resolve_modem_target(app, &target).await?;
+            let call_path = make_call_via_modem(&app.dbus_conn, &target.modem_path, &phone)
+                .await
+                .context("定时拨号失败")?;
             let connection = app.dbus_conn.clone();
+            let hangup_modem_path = target.modem_path.clone();
             let hangup = tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
-                hangup_call(&connection, &call_path).await
+                hangup_call_on_modem(&connection, &hangup_modem_path, &call_path).await
             });
             hangup
                 .await

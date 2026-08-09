@@ -1,12 +1,15 @@
 use crate::services::automation::tasks::TaskRegistry;
-use crate::platform::config::{AutomationAction, AutomationTask, AutomationTrigger};
+use crate::services::automation::target::target_line_id;
+use crate::platform::config::{
+    AutomationAction, AutomationTarget, AutomationTask, AutomationTrigger,
+};
 use crate::platform::db::beijing_sms_now_string;
 use crate::services::notify::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Duration, FixedOffset, NaiveDateTime, TimeZone, Timelike, Utc};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 use tracing::{error, info, warn};
 
 fn beijing_offset() -> FixedOffset {
@@ -48,6 +51,81 @@ fn cron_matches(expression: &str, now: DateTime<FixedOffset>) -> bool {
         && cron_field_matches(fields[2], now.day(), 1, 31)
         && cron_field_matches(fields[3], now.month(), 1, 12)
         && cron_field_matches(fields[4], now.weekday().number_from_sunday() - 1, 0, 6)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutomationStartResult {
+    Started,
+    AlreadyRunning,
+}
+
+struct AutomationRunGuard {
+    active: Arc<Mutex<HashSet<String>>>,
+    keys: Vec<String>,
+}
+
+impl AutomationRunGuard {
+    fn try_acquire(
+        active: Arc<Mutex<HashSet<String>>>,
+        task: &AutomationTask,
+    ) -> Option<Self> {
+        let keys = automation_run_keys(task);
+        let mut running = active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if keys.iter().any(|key| running.contains(key)) {
+            return None;
+        }
+        running.extend(keys.iter().cloned());
+        drop(running);
+        Some(Self { active, keys })
+    }
+}
+
+impl Drop for AutomationRunGuard {
+    fn drop(&mut self) {
+        let mut running = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for key in &self.keys {
+            running.remove(key);
+        }
+    }
+}
+
+fn automation_run_keys(task: &AutomationTask) -> Vec<String> {
+    let mut keys = vec![format!("task:{}", task.id.trim())];
+    let target_key = match task.target.as_ref() {
+        Some(AutomationTarget::ModemLine { line_id }) => {
+            format!("line:{}", line_id.trim())
+        }
+        Some(AutomationTarget::StandaloneSimSlot { slot_id }) => {
+            format!("reader:{}", slot_id.trim())
+        }
+        None => "device".to_string(),
+    };
+    keys.push(target_key);
+    keys
+}
+
+pub fn spawn_automation_task(
+    app: AppState,
+    registry: Arc<TaskRegistry>,
+    task: AutomationTask,
+) -> AutomationStartResult {
+    let Some(run_guard) = AutomationRunGuard::try_acquire(
+        Arc::clone(&app.automation_running_scopes),
+        &task,
+    ) else {
+        return AutomationStartResult::AlreadyRunning;
+    };
+
+    tokio::spawn(async move {
+        let _run_guard = run_guard;
+        if let Err(error) = execute_task(&app, registry.as_ref(), &task).await {
+            error!(task_id = %task.id, ?error, "Automation task failed");
+        }
+    });
+    AutomationStartResult::Started
 }
 
 pub fn spawn_automation_scheduler(app: AppState) {
@@ -148,16 +226,15 @@ pub fn spawn_automation_scheduler(app: AppState) {
                 };
 
                 if should_trigger {
-                    let registry_clone = registry.clone();
-                    let app_clone = app.clone();
-                    let task_clone = task.clone();
-
-                    tokio::spawn(async move {
-                        if let Err(e) = execute_task(&app_clone, &registry_clone, &task_clone).await
-                        {
-                            error!("Automation task {} failed: {:?}", task_clone.id, e);
-                        }
-                    });
+                    if spawn_automation_task(app.clone(), registry.clone(), task.clone())
+                        == AutomationStartResult::AlreadyRunning
+                    {
+                        info!(
+                            task_id = %task.id,
+                            line_id = target_line_id(task.target.as_ref()).unwrap_or("device"),
+                            "Skipped automation trigger because its task or target is already running"
+                        );
+                    }
                 }
             }
 
@@ -204,7 +281,14 @@ async fn execute_task(
             let err_msg = format!("No handler found for task type: {}", task_type);
             let _ = app
                 .database
-                .insert_automation_log(&task.id, &task.name, task_type, "failed", &err_msg);
+                .insert_automation_log(
+                    target_line_id(task.target.as_ref()),
+                    &task.id,
+                    &task.name,
+                    task_type,
+                    "failed",
+                    &err_msg,
+                );
             return Err(anyhow::anyhow!(err_msg));
         }
     };
@@ -279,10 +363,18 @@ async fn execute_task(
     // 1. 写入 SQLite 日志表
     let _ = app
         .database
-        .insert_automation_log(&task.id, &task.name, task_type, status, &detail);
+        .insert_automation_log(
+            target_line_id(task.target.as_ref()),
+            &task.id,
+            &task.name,
+            task_type,
+            status,
+            &detail,
+        );
 
     // 2. 发出通知事件
     let event = AutomationEvent {
+        line_id: target_line_id(task.target.as_ref()).map(str::to_string),
         task_id: task.id.clone(),
         task_name: task.name.clone(),
         task_type: task_type.to_string(),
@@ -303,8 +395,24 @@ async fn execute_task(
 }
 
 #[cfg(test)]
-mod cron_tests {
+mod tests {
     use super::*;
+
+    fn line_task(task_id: &str, line_id: &str) -> AutomationTask {
+        AutomationTask {
+            id: task_id.to_string(),
+            name: task_id.to_string(),
+            enabled: true,
+            trigger: AutomationTrigger::Interval {
+                interval_value: 1,
+                interval_unit: "hours".to_string(),
+            },
+            target: Some(AutomationTarget::ModemLine {
+                line_id: line_id.to_string(),
+            }),
+            action: AutomationAction::RestartBaseband,
+        }
+    }
 
     #[test]
     fn matches_five_field_cron_with_steps_and_ranges() {
@@ -314,5 +422,45 @@ mod cron_tests {
         assert!(cron_matches("*/15 18 * * 0", now));
         assert!(cron_matches("30 18 19 7 0", now));
         assert!(!cron_matches("31 18 * * *", now));
+    }
+
+    #[test]
+    fn automation_run_guard_serializes_each_task_and_target_only() {
+        let active = Arc::new(Mutex::new(HashSet::new()));
+        let line_a = AutomationRunGuard::try_acquire(
+            Arc::clone(&active),
+            &line_task("task-a", "line-a"),
+        )
+        .expect("first task reserves line A");
+
+        assert!(AutomationRunGuard::try_acquire(
+            Arc::clone(&active),
+            &line_task("task-a", "line-b"),
+        )
+        .is_none());
+        assert!(AutomationRunGuard::try_acquire(
+            Arc::clone(&active),
+            &line_task("task-b", "line-a"),
+        )
+        .is_none());
+
+        let line_b = AutomationRunGuard::try_acquire(
+            Arc::clone(&active),
+            &line_task("task-b", "line-b"),
+        )
+        .expect("a different line can run concurrently");
+        drop(line_a);
+        let line_a_again = AutomationRunGuard::try_acquire(
+            Arc::clone(&active),
+            &line_task("task-c", "line-a"),
+        )
+        .expect("line A is reusable after completion");
+
+        drop(line_a_again);
+        drop(line_b);
+        assert!(active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty());
     }
 }

@@ -1,11 +1,11 @@
 meta {
-  name: Clear All SMS
+  name: Clear SMS Channel
   type: http
   seq: 113
 }
 
 post {
-  url: http://192.168.68.1:3000/api/sms/clear
+  url: {{base_url}}/api/sms/clear?channel_id={{line_id}}
   body: none
   auth: inherit
 }
@@ -13,4 +13,3 @@ post {
 settings {
   encodeUrl: true
 }
-

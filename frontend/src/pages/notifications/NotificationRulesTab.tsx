@@ -24,7 +24,7 @@ import {
   useMediaQuery,
 } from '@mui/material'
 import { alpha, type Theme } from '@mui/material/styles'
-import { Add, DeleteOutline, Dns, ExpandMore, NotificationsActive, QueryStats, Save, Sms, SystemUpdateAlt, AutoMode } from '@mui/icons-material'
+import { Add, AutoMode, Call, DeleteOutline, Dns, ExpandMore, NotificationsActive, QueryStats, Save, Sms, SystemUpdateAlt } from '@mui/icons-material'
 import type {
   MatcherOperator,
   NotificationConfig,
@@ -48,6 +48,7 @@ import AutomationRuleEditor from './AutomationRuleEditor'
 
 const EVENT_ICONS: Record<NotificationEventType, typeof Sms> = {
   sms: Sms,
+  call: Call,
   ddns: Dns,
   version_update: SystemUpdateAlt,
   system_event: NotificationsActive,
@@ -396,9 +397,9 @@ export default function NotificationRulesTab({
                       />
                     )}
 
-                    {rule.type === 'sms' && (
+                    {(rule.type === 'sms' || rule.type === 'call') && (
                       <Box mt={2}>
-                        <Typography variant="subtitle2" mb={1}>SIM 卡通道</Typography>
+                        <Typography variant="subtitle2" mb={1}>{rule.type === 'call' ? '线路' : 'SIM 卡通道'}</Typography>
                         <Box display="flex" gap={1} flexWrap="wrap">
                           <FormControlLabel
                             sx={{ border: 1, borderColor: rule.sim_channel_ids.length === 0 ? 'primary.main' : 'divider', borderRadius: 1, px: 1, py: 0.25, m: 0 }}
@@ -408,9 +409,11 @@ export default function NotificationRulesTab({
                                 onChange={() => onPatchRule(rule.id, { sim_channel_ids: [] })}
                               />
                             }
-                            label="全部 SIM 通道"
+                            label={rule.type === 'call' ? '全部线路' : '全部 SIM 通道'}
                           />
-                          {smsChannels.map((channel) => {
+                          {smsChannels
+                            .filter((channel) => rule.type !== 'call' || channel.kind === 'modem_line' || channel.kind === 'unassigned')
+                            .map((channel) => {
                             const checked = rule.sim_channel_ids.includes(channel.id)
                             return (
                               <FormControlLabel

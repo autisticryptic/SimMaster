@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert, Box, Button, Card, CardContent, CircularProgress, FormControl,
   FormControlLabel, IconButton, InputLabel, List, ListItem, ListItemText,
@@ -7,20 +7,24 @@ import {
 import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
 import {
   api,
-  type AccessPathKind,
   type VilteStatusResponse,
   type VolteVoiceStatusResponse,
+  type VoiceAccessPathKind,
   type VoicePathPolicy,
   type WebCallCapabilitiesResponse,
 } from '../../api/current'
 
-const pathLabels: Record<AccessPathKind, string> = {
+const pathLabels: Record<VoiceAccessPathKind, string> = {
   vowifi: 'VoWiFi',
   volte: 'VoLTE',
-  cs: 'CS 基带',
 }
 
-export default function VoiceRoutingPanel() {
+type Props = { lineId: string }
+
+export default function VoiceRoutingPanel({ lineId }: Props) {
+  const activeLineId = useRef(lineId)
+  const loadGeneration = useRef(0)
+  activeLineId.current = lineId
   const [voicePath, setVoicePath] = useState<VoicePathPolicy | null>(null)
   const [webCall, setWebCall] = useState<WebCallCapabilitiesResponse | null>(null)
   const [vilte, setVilte] = useState<VilteStatusResponse | null>(null)
@@ -31,25 +35,47 @@ export default function VoiceRoutingPanel() {
   const [success, setSuccess] = useState<string | null>(null)
 
   const load = useCallback(async () => {
+    const generation = ++loadGeneration.current
+    if (!lineId) {
+      setVoicePath(null)
+      setWebCall(null)
+      setVilte(null)
+      setVolteVoice(null)
+      setLoading(false)
+      return
+    }
     setLoading(true)
     setError(null)
+    setSuccess(null)
+    setVoicePath(null)
+    setWebCall(null)
+    setVilte(null)
+    setVolteVoice(null)
     try {
       const [pathResponse, webResponse, vilteResponse, volteVoiceResponse] = await Promise.all([
-        api.getVoicePathPolicy(),
+        api.getVoicePathPolicy(lineId),
         api.getWebCallCapabilities(),
-        api.getVilteStatus(),
-        api.getVolteVoiceStatus(),
+        api.getVilteStatus(lineId),
+        api.getVolteVoiceStatus(lineId),
       ])
+      if (generation !== loadGeneration.current || activeLineId.current !== lineId) return
+      if (vilteResponse.data?.line_id !== lineId || volteVoiceResponse.data?.line_id !== lineId) {
+        throw new Error('线路媒体状态响应与当前线路不匹配')
+      }
       setVoicePath(pathResponse.data ?? null)
       setWebCall(webResponse.data ?? null)
       setVilte(vilteResponse.data ?? null)
       setVolteVoice(volteVoiceResponse.data ?? null)
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      if (generation === loadGeneration.current && activeLineId.current === lineId) {
+        setError(err instanceof Error ? err.message : String(err))
+      }
     } finally {
-      setLoading(false)
+      if (generation === loadGeneration.current && activeLineId.current === lineId) {
+        setLoading(false)
+      }
     }
-  }, [])
+  }, [lineId])
 
   useEffect(() => { void load() }, [load])
 
@@ -79,7 +105,7 @@ export default function VoiceRoutingPanel() {
     setSaving(true)
     setError(null)
     try {
-      const response = await api.setVoicePathPolicy(voicePath)
+      const response = await api.setVoicePathPolicy(lineId, voicePath)
       if (response.data) setVoicePath(response.data)
       setSuccess('语音路径策略已保存')
     } catch (err) {
@@ -94,9 +120,11 @@ export default function VoiceRoutingPanel() {
     setSaving(true)
     setError(null)
     try {
-      const response = await api.setVilteConfig(vilte.config)
-      if (response.data) setVilte(response.data)
-      setSuccess('ViLTE 配置已保存')
+      const response = await api.setVilteConfig(lineId, vilte.config)
+      if (activeLineId.current !== lineId) return
+      if (response.data?.line_id !== lineId) throw new Error('ViLTE 配置响应线路不匹配')
+      setVilte(response.data)
+      setSuccess('当前线路 ViLTE 配置已保存')
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -108,11 +136,15 @@ export default function VoiceRoutingPanel() {
     setSaving(true)
     setError(null)
     try {
-      const response = await api.setVolteVoice(enabled)
-      if (response.data) setVolteVoice(response.data)
+      const response = await api.setVolteVoice(lineId, enabled)
+      if (activeLineId.current !== lineId) return
+      if (response.data?.line_id !== lineId) throw new Error('VoLTE 语音响应线路不匹配')
+      setVolteVoice(response.data)
       if (!enabled) {
-        const refreshed = await api.getVilteStatus()
-        if (refreshed.data) setVilte(refreshed.data)
+        const refreshed = await api.getVilteStatus(lineId)
+        if (activeLineId.current !== lineId) return
+        if (refreshed.data?.line_id !== lineId) throw new Error('ViLTE 状态响应线路不匹配')
+        setVilte(refreshed.data)
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -121,14 +153,18 @@ export default function VoiceRoutingPanel() {
     }
   }
 
+  if (!lineId) return <Alert severity="info">请选择电话线路后查看语音路由。</Alert>
   if (loading || !voicePath) return <Box display="flex" justifyContent="center" py={6}><CircularProgress /></Box>
 
   return (
     <Stack spacing={2}>
       {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
       {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
+      {volteVoice && !volteVoice.registered && (
+        <Alert severity="warning">当前线路 IMS 尚未注册，VoLTE/ViLTE 媒体中继不可用。</Alert>
+      )}
       <Alert severity="info">
-        SimAdmin 只负责 IMS/CS 语音路径、媒体协商和 Asterisk Trunk 对接。来电广告、推销、验证码及其他分类由 Asterisk 拨号计划处理。
+        此处只配置当前线路的 IMS 语音路径和 Asterisk Trunk。CS 基带通话由电话页的线路通话控制直接处理，不参与 Trunk 路由。
       </Alert>
 
       <Card><CardContent>
@@ -143,7 +179,7 @@ export default function VoiceRoutingPanel() {
                 <Switch checked={layer.enabled} onChange={(_, enabled) => setVoicePath({ ...voicePath, priority: voicePath.priority.map((item, i) => i === index ? { ...item, enabled } : item) })} />
               </Box>
             )}>
-              <ListItemText primary={`${index + 1}. ${pathLabels[layer.kind]}`} secondary="网关模式；实际接通由对应 IMS/CS 运行时和 Trunk 驱动" />
+              <ListItemText primary={`${index + 1}. ${pathLabels[layer.kind]}`} secondary="网关模式；实际接通由对应 IMS 运行时和 Trunk 驱动" />
             </ListItem>
           ))}
         </List>
@@ -152,15 +188,15 @@ export default function VoiceRoutingPanel() {
 
       <Card><CardContent>
         <Typography variant="h6">ViLTE 视频能力</Typography>
-        <Alert severity="warning" sx={{ my: 2 }}>这里只配置 H.264 中继参数，不会启动摄像头或发起视频呼叫。通话内视频切换需媒体入口接线后才可使用。</Alert>
+        <Alert severity="warning" sx={{ my: 2 }}>这里只配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。通话内音频/视频切换通过当前线路的 IMS 与 Trunk 媒体中继完成。</Alert>
         {vilte && <Stack spacing={2}>
           <FormControlLabel
-            control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.feature_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
-            label={volteVoice?.feature_enabled ? 'VoLTE 语音网关能力' : '请先在 SIM 卡线路中启用 VoLTE'}
+            control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.ims_connection_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
+            label={volteVoice?.ims_connection_enabled ? '当前线路 VoLTE 语音网关能力' : '请先启用当前线路的 VoLTE IMS 连接'}
           />
           <FormControlLabel
             control={<Switch checked={vilte.config.feature_enabled} disabled={!volteVoice?.voice_enabled || saving} onChange={(_, feature_enabled) => setVilte({ ...vilte, config: { ...vilte.config, feature_enabled } })} />}
-            label="启用 ViLTE 能力（要求 VoLTE 语音已启用）"
+            label="启用当前线路 ViLTE 能力（要求该线路 VoLTE 语音已启用）"
           />
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
             <FormControl fullWidth>

@@ -189,6 +189,21 @@ pub fn build_initial_authorization_header(username: &str, realm: &str, digest_ur
     )
 }
 
+/// Empty-AKA Authorization using the parameter order accepted by stricter IMS
+/// parsers found in some carrier P-CSCFs.
+pub fn build_initial_authorization_header_uri_first(
+    username: &str,
+    realm: &str,
+    digest_uri: &str,
+) -> String {
+    format!(
+        "Authorization: Digest uri=\"{}\",username=\"{}\",algorithm=AKAv1-MD5,response=\"\",realm=\"{}\",nonce=\"\"",
+        quote(digest_uri),
+        quote(username),
+        quote(realm),
+    )
+}
+
 /// Build a resync Authorization header carrying AUTS (base64) after an AKA
 /// synchronization failure.
 pub fn build_resync_authorization_header(

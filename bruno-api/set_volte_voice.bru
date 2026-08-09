@@ -1,11 +1,11 @@
 meta {
-  name: set_vowifi_feature
+  name: set_volte_voice
   type: http
-  seq: 142
+  seq: 156
 }
 
 post {
-  url: http://192.168.68.1:3000/api/vowifi/feature
+  url: {{base_url}}/api/modem/lines/{{line_id}}/volte/voice
   body: json
   auth: inherit
 }

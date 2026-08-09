@@ -105,8 +105,8 @@ pub fn build_readiness_audit_report(
 ) -> VowifiReadinessAuditReport {
     let live_network_allowed = executor.live_network_allowed;
     let device_state_changes_allowed = executor.device_state_changes_allowed;
-    let profile_audits = profiles::BUILTIN_PROFILES
-        .iter()
+    let profile_audits = profiles::published_database_profiles()
+        .into_iter()
         .map(|profile| audit_profile(profile, live_network_allowed, device_state_changes_allowed))
         .collect::<Vec<_>>();
 
@@ -361,13 +361,13 @@ fn long_run_gates(
     vec![
         VowifiLongRunGate {
             gate_id: "clean_room_profile_registry",
-            status: if profiles::validate_builtin_profiles().is_ok() {
+            status: if profile_count > 0 && profiles_ready == profile_count {
                 "pass"
             } else {
                 "fail"
             },
-            target: "all_builtin_profiles_have_structured_public_metadata",
-            evidence: "compile_time_registry_validation",
+            target: "all_database_profiles_have_structured_public_metadata",
+            evidence: "runtime_database_profile_validation",
             blocker: None,
         },
         VowifiLongRunGate {

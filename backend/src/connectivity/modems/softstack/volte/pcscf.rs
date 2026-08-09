@@ -182,10 +182,11 @@ pub fn configured_ims_cid() -> u8 {
 pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
+    apn: &str,
 ) -> Result<ImsProfileContext, VolteError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
-    let profile = select_ims_profile_context(&contexts, configured_ims_cid());
+    let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn);
     if !profile.created {
         return Ok(profile);
     }
@@ -193,16 +194,20 @@ pub async fn prepare_ims_profile_context(
     let pdp_type = plan.pdp_types().into_iter().next().unwrap_or("IPV4V6");
     run_at(
         modem,
-        &format!("AT+CGDCONT={},\"{pdp_type}\",\"ims\"", profile.cid),
+        &format!("AT+CGDCONT={},\"{pdp_type}\",\"{apn}\"", profile.cid),
     )
     .await?;
     Ok(profile)
 }
 
-fn select_ims_profile_context(contexts: &[PdpContext], preferred: u8) -> ImsProfileContext {
+fn select_ims_profile_context(
+    contexts: &[PdpContext],
+    preferred: u8,
+    apn: &str,
+) -> ImsProfileContext {
     contexts
         .iter()
-        .filter(|context| context.apn.eq_ignore_ascii_case("ims"))
+        .filter(|context| context.apn.eq_ignore_ascii_case(apn))
         .min_by_key(|context| (context.cid != preferred, context.cid))
         .map(|context| ImsProfileContext {
             cid: context.cid,
@@ -235,6 +240,7 @@ pub async fn set_pcscf_reporting(modem: &str, cid: u8, enabled: bool) -> Result<
 pub async fn prefetch_pcscf_from_ims_profile(
     modem: &str,
     plan: &ImsConnectionPlan,
+    apn: &str,
 ) -> Result<ImsProfilePrefetch, VolteError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
@@ -251,7 +257,7 @@ pub async fn prefetch_pcscf_from_ims_profile(
         for pdp_type in &pdp_types {
             let _ = run_at(modem, &format!("AT+CGACT=0,{cid}")).await;
             if let Err(error) =
-                run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"ims\"")).await
+                run_at(modem, &format!("AT+CGDCONT={cid},\"{pdp_type}\",\"{apn}\"")).await
             {
                 last_error = Some(error);
                 cleanup_profile_context(modem, cid, &restore_command).await;
@@ -271,7 +277,7 @@ pub async fn prefetch_pcscf_from_ims_profile(
                         }
                         match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
                             Ok(settings) => {
-                                for candidate in parse_cgcontrdp_pcscf(&settings, cid) {
+                                for candidate in parse_cgcontrdp_pcscf(&settings, cid, apn) {
                                     if !candidates.contains(&candidate) {
                                         candidates.push(candidate);
                                     }
@@ -348,11 +354,12 @@ async fn cleanup_profile_context(modem: &str, cid: u8, restore_command: &str) {
 pub async fn discover_pcscf_via_active_at_context(
     modem: &str,
     _plan: &ImsConnectionPlan,
+    apn: &str,
 ) -> Result<AtPcscfDiscovery, VolteError> {
     let active_output = run_at(modem, "AT+CGACT?").await?;
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let mut active_cids = parse_active_context_cids(&active_output);
-    let configured_ims_cids = parse_ims_context_cids(&contexts_output);
+    let configured_ims_cids = parse_ims_context_cids(&contexts_output, apn);
     let preferred_cid = configured_ims_cid();
     active_cids.sort_by_key(|cid| {
         (
@@ -377,7 +384,7 @@ pub async fn discover_pcscf_via_active_at_context(
         attempted.push(cid);
         match run_at(modem, &format!("AT+CGCONTRDP={cid}")).await {
             Ok(settings) => {
-                let candidates = parse_cgcontrdp_pcscf(&settings, cid);
+                let candidates = parse_cgcontrdp_pcscf(&settings, cid, apn);
                 if !candidates.is_empty() {
                     return Ok(AtPcscfDiscovery { candidates, cid });
                 }
@@ -403,9 +410,10 @@ pub async fn discover_pcscf_via_active_at_context(
 pub async fn read_cgcontrdp_settings(
     modem: &str,
     cid: u8,
+    apn: &str,
 ) -> Result<CgcontrdpSettings, VolteError> {
     let output = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await?;
-    Ok(parse_cgcontrdp_settings(&output, cid))
+    Ok(parse_cgcontrdp_settings(&output, cid, apn))
 }
 
 async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
@@ -452,10 +460,10 @@ fn parse_active_context_cids(output: &str) -> Vec<u8> {
     cids
 }
 
-fn parse_ims_context_cids(output: &str) -> Vec<u8> {
+fn parse_ims_context_cids(output: &str, apn: &str) -> Vec<u8> {
     parse_pdp_contexts(output)
         .into_iter()
-        .filter(|context| context.apn.eq_ignore_ascii_case("ims"))
+        .filter(|context| context.apn.eq_ignore_ascii_case(apn))
         .map(|context| context.cid)
         .collect()
 }
@@ -497,7 +505,7 @@ fn parse_pdp_contexts(output: &str) -> Vec<PdpContext> {
 
 /// Parse the primary/secondary P-CSCF columns from a 3GPP +CGCONTRDP response.
 /// Qualcomm renders IPv6 values as 16 dot-separated decimal octets.
-pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8) -> Vec<IpAddr> {
+pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8, apn: &str) -> Vec<IpAddr> {
     let mut candidates = Vec::new();
     for line in output.lines() {
         let Some((_, values)) = line.split_once("+CGCONTRDP:") else {
@@ -508,7 +516,7 @@ pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8) -> Vec<IpAddr> {
             || fields[0].parse::<u8>().ok() != Some(expected_cid)
             || !fields[2]
                 .trim_matches(['\'', '"'])
-                .eq_ignore_ascii_case("ims")
+                .eq_ignore_ascii_case(apn)
         {
             continue;
         }
@@ -554,7 +562,11 @@ impl CgcontrdpSettings {
 /// Parse the full IP configuration (address, gateway, DNS, P-CSCF) for one CID
 /// from a `+CGCONTRDP` response. This is beta2's primary IMS source, so it reads
 /// every field, not just the P-CSCF columns.
-pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8) -> CgcontrdpSettings {
+pub fn parse_cgcontrdp_settings(
+    output: &str,
+    expected_cid: u8,
+    apn: &str,
+) -> CgcontrdpSettings {
     let mut settings = CgcontrdpSettings::default();
     for line in output.lines() {
         let Some((_, values)) = line.split_once("+CGCONTRDP:") else {
@@ -565,7 +577,7 @@ pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8) -> CgcontrdpSett
             || fields[0].parse::<u8>().ok() != Some(expected_cid)
             || !fields
                 .get(2)
-                .is_some_and(|apn| apn.trim_matches(['\'', '"']).eq_ignore_ascii_case("ims"))
+                .is_some_and(|value| value.trim_matches(['\'', '"']).eq_ignore_ascii_case(apn))
         {
             continue;
         }
@@ -709,6 +721,7 @@ fn parse_cgcontrdp_address(value: &str) -> Option<IpAddr> {
 pub async fn discover_pcscf(
     settings: &ImsIpSettings,
     home_domain: &str,
+    configured_pcscf: Option<&str>,
     local: IpAddr,
 ) -> Result<IpAddr, VolteError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
@@ -728,6 +741,35 @@ pub async fn discover_pcscf(
     } else {
         &settings.ipv4_dns
     };
+    if let Some(configured) = configured_pcscf.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(address) = parse_pcscf_override(configured)
+            .into_iter()
+            .find(|candidate| same_family(local, *candidate))
+        {
+            return settings.ensure_family_match(local, address);
+        }
+        let configured_host = configured
+            .trim_start_matches("sip:")
+            .trim_start_matches("sips:")
+            .trim_matches(['[', ']'])
+            .split([';', ':'])
+            .next()
+            .unwrap_or(configured);
+        let address_type = if local.is_ipv6() { 28 } else { 1 };
+        for server in dns_servers {
+            if server.is_ipv4() == local.is_ipv4() {
+                if let Ok(records) = query_dns(local, *server, configured_host, address_type).await {
+                    if let Some(address) = records
+                        .addresses
+                        .into_iter()
+                        .find(|item| item.is_ipv4() == local.is_ipv4())
+                    {
+                        return Ok(address);
+                    }
+                }
+            }
+        }
+    }
     let pcscf_name = format!("pcscf.{home_domain}");
     let srv_names = pcscf_srv_names(home_domain);
 
@@ -1119,16 +1161,16 @@ IPv4 primary DNS: 10.0.0.53";
     fn parses_qualcomm_cgcontrdp_pcscf_columns() {
         let response = "response: '+CGCONTRDP: 2,5,ims,36.14.87.128.10.128.45.91.1.2.3.4.5.6.7.8,36.14.87.128.10.128.45.91.8.7.6.5.4.3.2.1,36.14.0.90.0.0.0.0.0.0.0.0.0.102.102.36,36.14.0.91.0.0.0.0.0.0.0.0.0.102.102.254,36.14.0.46.130.1.192.0.0.9.0.0.0.0.0.1,36.14.0.46.130.1.192.0.0.9.0.0.0.0.0.2'";
         assert_eq!(
-            parse_cgcontrdp_pcscf(response, 2),
+            parse_cgcontrdp_pcscf(response, 2, "ims"),
             vec![
                 "240e:2e:8201:c000:9::1".parse::<IpAddr>().unwrap(),
                 "240e:2e:8201:c000:9::2".parse::<IpAddr>().unwrap(),
             ]
         );
-        assert!(parse_cgcontrdp_pcscf(response, 3).is_empty());
+        assert!(parse_cgcontrdp_pcscf(response, 3, "ims").is_empty());
 
         let internet_context = response.replace(",ims,", ",internet,");
-        assert!(parse_cgcontrdp_pcscf(&internet_context, 2).is_empty());
+        assert!(parse_cgcontrdp_pcscf(&internet_context, 2, "ims").is_empty());
     }
 
     #[test]
@@ -1156,10 +1198,10 @@ IPv4 primary DNS: 10.0.0.53";
     fn selects_only_active_ims_contexts_for_read_only_discovery() {
         let contexts = "response: '+CGDCONT: 1,\"IPV4V6\",\"ctnet\",\"0.0.0.0\",0,0\n+CGDCONT: 3,\"IPV4V6\",\"ims\",\"0.0.0.0\",0,0\n+CGDCONT: 7,\"IPV6\",\"IMS\",\"0.0.0.0\",0,0'";
         let active = "response: '+CGACT: 1,1\n+CGACT: 3,0\n+CGACT: 7,1'";
-        assert_eq!(parse_ims_context_cids(contexts), vec![3, 7]);
+        assert_eq!(parse_ims_context_cids(contexts, "ims"), vec![3, 7]);
         assert_eq!(parse_active_context_cids(active), vec![1, 7]);
         let active_cids = parse_active_context_cids(active);
-        let selected = parse_ims_context_cids(contexts)
+        let selected = parse_ims_context_cids(contexts, "ims")
             .into_iter()
             .filter(|cid| active_cids.contains(cid))
             .collect::<Vec<_>>();
@@ -1189,7 +1231,7 @@ IPv4 primary DNS: 10.0.0.53";
                 },
             ]
         );
-        assert_eq!(parse_ims_context_cids(contexts), vec![2, 7]);
+        assert_eq!(parse_ims_context_cids(contexts, "ims"), vec![2, 7]);
     }
 
     #[test]
@@ -1198,7 +1240,7 @@ IPv4 primary DNS: 10.0.0.53";
             "response: '+CGDCONT: 1,\"IPV4V6\",\"\",\"0.0.0.0\",0,0\n+CGDCONT: 2,\"IPV4V6\",\"\",\"0.0.0.0\",0,0'",
         );
         assert_eq!(
-            select_ims_profile_context(&contexts, 2),
+            select_ims_profile_context(&contexts, 2, "ims"),
             ImsProfileContext {
                 cid: 2,
                 created: true,

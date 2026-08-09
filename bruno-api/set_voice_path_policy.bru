@@ -1,0 +1,26 @@
+meta {
+  name: set_voice_path_policy
+  type: http
+  seq: 158
+}
+
+post {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/voice/path-policy
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "priority": [
+      { "kind": "vowifi", "enabled": true },
+      { "kind": "volte", "enabled": true },
+      { "kind": "cs", "enabled": true }
+    ],
+    "gateway_mode": true
+  }
+}
+
+settings {
+  encodeUrl: true
+}

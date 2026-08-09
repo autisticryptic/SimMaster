@@ -1,8 +1,7 @@
 //! Pure voice-leg route planning.
 //!
-//! The planner is usable before a SIP/PBX/WebRTC choice is made. It only says
-//! which access leg could carry a call and why another leg was rejected; the
-//! future gateway adapter owns actual INVITE and media IO.
+//! The planner selects the IMS access leg that can carry a call and records why
+//! another leg was rejected. The per-line Trunk bridge owns SIP and media IO.
 
 use crate::platform::config::{AccessPathKind, VoicePathPolicy};
 use serde::{Deserialize, Serialize};
@@ -113,7 +112,6 @@ mod tests {
             &[
                 state(AccessPathKind::Vowifi, true, true, false),
                 state(AccessPathKind::Volte, true, true, true),
-                state(AccessPathKind::Cs, true, false, true),
             ],
         );
         assert_eq!(plan.candidates, vec![AccessPathKind::Volte]);
@@ -121,7 +119,6 @@ mod tests {
             plan.rejected[0].reason,
             VoiceRouteRejection::MediaGatewayUnavailable
         );
-        assert_eq!(plan.rejected[1].reason, VoiceRouteRejection::NotRegistered);
     }
 
     #[test]
@@ -129,7 +126,7 @@ mod tests {
         let policy = VoicePathPolicy {
             priority: vec![
                 PathLayerConfig {
-                    kind: AccessPathKind::Cs,
+                    kind: AccessPathKind::Vowifi,
                     enabled: false,
                 },
                 PathLayerConfig {

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import {
   Box,
   Typography,
@@ -169,7 +169,7 @@ function SmsCapacityProgress({ used, total }: { used?: number, total?: number })
   );
 }
 
-function SimBasicInfo() {
+function SimBasicInfo({ lineId }: { lineId: string }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSensitive, setShowSensitive] = useState(false)
@@ -197,18 +197,18 @@ function SimBasicInfo() {
 
   const validatePhoneStr = (val: string) => /^\+?\d+$/.test(val.trim())
 
-  const loadData = async () => {
+  const loadData = useCallback(async () => {
     setLoading(true)
     setError(null)
     try {
-      const simRes = await api.getSimInfo()
+      const simRes = await api.getSimInfo(lineId)
       if (simRes.data) setSimInfo(simRes.data)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
       setLoading(false)
     }
-  }
+  }, [lineId])
 
   const handleSavePhone = async () => {
     if (!phoneInput.trim()) {
@@ -221,7 +221,7 @@ function SimBasicInfo() {
     }
     setSavingPhone(true)
     try {
-      await api.updateSimCache({ phone_number: phoneInput.trim() })
+      await api.updateSimCache(lineId, { phone_number: phoneInput.trim() })
       showMsg('号码缓存已更新', 'success')
       setEditingPhone(false)
       void loadData()
@@ -243,7 +243,7 @@ function SimBasicInfo() {
     }
     setSavingSmsc(true)
     try {
-      await api.updateSimCache({ sms_center: smscInput.trim() })
+      await api.updateSimCache(lineId, { sms_center: smscInput.trim() })
       showMsg('短信中心缓存已更新', 'success')
       setEditingSmsc(false)
       void loadData()
@@ -256,7 +256,7 @@ function SimBasicInfo() {
 
   useEffect(() => {
     void loadData()
-  }, [])
+  }, [loadData])
 
   if (loading) {
     return (
@@ -576,7 +576,7 @@ export default function SimCardPage() {
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel primaryBasicInfo={<SimBasicInfo />} /><StandaloneSimSlotsPanel /></Stack>}
+        {activeTab === 'lines' && <Stack spacing={2.5}><ModemLinesPanel basicInfoForLine={(lineId) => <SimBasicInfo lineId={lineId} />} /><StandaloneSimSlotsPanel /></Stack>}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>

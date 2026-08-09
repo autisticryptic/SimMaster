@@ -5,7 +5,7 @@ meta {
 }
 
 post {
-  url: http://192.168.68.1:3000/api/roaming
+  url: {{base_url}}/api/modem/lines/{{line_id}}/roaming
   body: json
   auth: inherit
 }

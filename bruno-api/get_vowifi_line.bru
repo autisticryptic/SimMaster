@@ -1,11 +1,11 @@
 meta {
-  name: get_vowifi_profile
+  name: get_vowifi_line
   type: http
-  seq: 145
+  seq: 141
 }
 
 get {
-  url: http://192.168.68.1:3000/api/vowifi/profile
+  url: {{base_url}}/api/vowifi/lines/{{line_id}}
   body: none
   auth: inherit
 }

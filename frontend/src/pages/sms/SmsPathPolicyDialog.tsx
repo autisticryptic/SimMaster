@@ -13,23 +13,24 @@ const pathLabels: Record<AccessPathKind, string> = {
   cs: 'CS/基带短信',
 }
 
-type Props = { open: boolean; onClose: () => void }
+type Props = { open: boolean; lineId: string; onClose: () => void }
 
-export default function SmsPathPolicyDialog({ open, onClose }: Props) {
+export default function SmsPathPolicyDialog({ open, lineId, onClose }: Props) {
   const [policy, setPolicy] = useState<SmsPathPolicy | null>(null)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    if (!open) return
+    if (!open || !lineId) return
     setLoading(true)
     setError(null)
-    void api.getSmsPathPolicy()
+    setPolicy(null)
+    void api.getSmsPathPolicy(lineId)
       .then((response) => setPolicy(response.data ?? null))
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false))
-  }, [open])
+  }, [lineId, open])
 
   const move = (index: number, delta: -1 | 1) => {
     setPolicy((current) => {
@@ -47,7 +48,7 @@ export default function SmsPathPolicyDialog({ open, onClose }: Props) {
     setSaving(true)
     setError(null)
     try {
-      const response = await api.setSmsPathPolicy(policy)
+      const response = await api.setSmsPathPolicy(lineId, policy)
       if (response.data) setPolicy(response.data)
       onClose()
     } catch (err) {

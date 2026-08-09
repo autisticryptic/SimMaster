@@ -231,8 +231,8 @@ export default function AutomationTaskCard({
           {task.action.type !== 'reboot_device' && (
             <Box display="flex" justifyContent="space-between" mb={0.75}>
               <Typography variant="body2" color="text.secondary">SIM 目标:</Typography>
-              <Typography variant="body2">
-                {!task.target ? '主基带' : task.target.kind === 'modem_line' ? `基带线路 ${task.target.line_id.slice(-6)}` : `读卡器槽位 ${task.target.slot_id}`}
+              <Typography variant="body2" color={!task.target ? 'error.main' : undefined}>
+                {!task.target ? '未配置' : task.target.kind === 'modem_line' ? `基带线路 ${task.target.line_id.slice(-6)}` : `读卡器槽位 ${task.target.slot_id}`}
               </Typography>
             </Box>
           )}

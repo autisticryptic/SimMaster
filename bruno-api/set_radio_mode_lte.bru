@@ -5,7 +5,7 @@ meta {
 }
 
 post {
-  url: http://192.168.68.1:3000/api/radio-mode
+  url: {{base_url}}/api/modem/lines/{{line_id}}/radio-mode
   body: json
   auth: inherit
 }

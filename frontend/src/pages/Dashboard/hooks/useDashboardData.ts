@@ -3,14 +3,12 @@ import { api } from '@/api/current'
 import type {
   DeviceInfo,
   NetworkInfo,
-  CellsResponse,
   QosInfo,
   SimInfo,
+  LineRuntimeStatus,
   SystemStatsResponse,
   LineNetworkControlsResponse,
   ConnectionAddressesResponse,
-  VowifiConfig,
-  VowifiStatusResponse,
 } from '@/api/types'
 import { isTransientModemError, createThrottledWarner } from '@/utils/modemErrors'
 
@@ -48,21 +46,23 @@ export interface ConnectivityResult {
 
 export type ConnectionAddresses = ConnectionAddressesResponse
 
-export interface DashboardData {
+export interface DashboardLineInfo {
+  modem: LineRuntimeStatus['modem']
   deviceInfo: DeviceInfo | null
   simInfo: SimInfo | null
-  systemStats: SystemStatsResponse | null
   networkInfo: NetworkInfo | null
+}
+
+export interface DashboardData {
+  lines: DashboardLineInfo[]
+  systemStats: SystemStatsResponse | null
   dataStatus: boolean
-  cellsInfo: CellsResponse | null
   qosInfo: QosInfo | null
   /// Per-line network state; airplane mode and roaming live here now.
   lineNetworkControls: LineNetworkControlsResponse[]
   connectivity: ConnectivityResult | null
   connectionAddresses: ConnectionAddresses
   speedHistory: Record<string, InterfaceSpeedHistory>
-  vowifiControl: VowifiConfig | null
-  vowifiStatus: VowifiStatusResponse | null
 }
 
 export interface DashboardActions {
@@ -74,18 +74,13 @@ const throttledWarn = createThrottledWarner(10_000)
 export function useDashboardData(refreshInterval: number, refreshKey: number) {
   const [initialLoading, setInitialLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-  const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
-  const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
+  const [lines, setLines] = useState<DashboardLineInfo[]>([])
   const [systemStats, setSystemStats] = useState<SystemStatsResponse | null>(null)
-  const [networkInfo, setNetworkInfo] = useState<NetworkInfo | null>(null)
   const [dataStatus, setDataStatus] = useState(false)
-  const [cellsInfo, setCellsInfo] = useState<CellsResponse | null>(null)
   const [qosInfo, setQosInfo] = useState<QosInfo | null>(null)
   const [lineNetworkControls, setLineNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [connectivity, setConnectivity] = useState<ConnectivityResult | null>(null)
   const [connectionAddresses, setConnectionAddresses] = useState<ConnectionAddresses>({ ipv4: [], ipv6: [] })
-  const [vowifiControl, setVowifiControl] = useState<VowifiConfig | null>(null)
-  const [vowifiStatus, setVowifiStatus] = useState<VowifiStatusResponse | null>(null)
   const [speedHistory, setSpeedHistory] = useState<Record<string, InterfaceSpeedHistory>>({})
   const speedHistoryRef = useRef<Record<string, InterfaceSpeedHistory>>({})
 
@@ -133,15 +128,11 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     try {
       // 快速请求：决定 initialLoading，通常 <200ms 即可全部返回
       const fastPromise = Promise.all([
-        requestOrNull(api.getDeviceInfo(), 'device'),
-        requestOrNull(api.getSimInfo(), 'sim'),
-        requestOrNull(api.getNetworkInfo(), 'network'),
+        requestOrNull(api.getModemLines(), 'modem-lines'),
         // Data, roaming and airplane mode are all per-line. Dashboard-level
         // summaries are derived from these controls instead of a primary SIM.
         requestOrNull(api.getLineNetworkControls(), 'line-controls'),
         requestOrNull(api.getNetworkConnectionAddresses(), 'connection-addresses'),
-        requestOrNull(api.getVowifiControl(), 'vowifi-control'),
-        requestOrNull(api.getVowifiStatus(), 'vowifi-status'),
       ])
 
       // 慢速请求：不阻塞页面渲染，异步填充数据
@@ -150,18 +141,29 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
 
       // 等待快速请求完成即可渲染页面
       const [
-        deviceRes,
-        simRes,
-        networkRes,
+        modemLinesRes,
         lineControlsRes,
         addressesRes,
-        vowifiControlRes,
-        vowifiStatusRes,
       ] = await fastPromise
 
-      if (deviceRes?.data) setDeviceInfo(deviceRes.data)
-      if (simRes?.data) setSimInfo(simRes.data)
-      if (networkRes?.data) setNetworkInfo(networkRes.data)
+      const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem }) => {
+        const hasCellularModem = modem.present && modem.line_kind !== 'reader' && Boolean(modem.modem_path)
+        if (!hasCellularModem) {
+          return { modem, deviceInfo: null, simInfo: null, networkInfo: null }
+        }
+        const [deviceRes, simRes, networkRes] = await Promise.all([
+          requestOrNull(api.getDeviceInfo(modem.line_id), `device:${modem.line_id}`),
+          requestOrNull(api.getSimInfo(modem.line_id), `sim:${modem.line_id}`),
+          requestOrNull(api.getNetworkInfo(modem.line_id), `network:${modem.line_id}`),
+        ])
+        return {
+          modem,
+          deviceInfo: deviceRes?.data ?? null,
+          simInfo: simRes?.data ?? null,
+          networkInfo: networkRes?.data ?? null,
+        }
+      }))
+      setLines(lineDetails)
       const controls = lineControlsRes?.data ?? []
       const dataActive = controls.some(
         (line) => line.data.enabled && (line.data.connected || line.data.proxy.running),
@@ -169,11 +171,6 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       setDataStatus(dataActive)
       setLineNetworkControls(controls)
       if (addressesRes?.data) setConnectionAddresses(addressesRes.data)
-      if (vowifiControlRes?.data) setVowifiControl(vowifiControlRes.data)
-      // Cell measurements are line-scoped and are shown in each line's detail
-      // panel; the dashboard must not silently select a primary modem.
-      setCellsInfo(null)
-      if (vowifiStatusRes?.data) setVowifiStatus(vowifiStatusRes.data)
 
       // 快速数据就绪，立即解除 loading
       setInitialLoading(false)
@@ -239,19 +236,14 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
     error,
     setError,
     data: {
-      deviceInfo,
-      simInfo,
+      lines,
       systemStats,
-      networkInfo,
       dataStatus,
-      cellsInfo,
       qosInfo,
       lineNetworkControls,
       connectivity,
       connectionAddresses,
       speedHistory,
-      vowifiControl,
-      vowifiStatus,
     } as DashboardData,
     actions: {
       loadData,

@@ -69,10 +69,12 @@ pub struct ImsRegisterParams {
 
 impl ImsRegisterParams {
     pub fn request_uri(&self) -> String {
-        format!(
-            "sip:{}",
-            self.registrar.as_deref().unwrap_or(self.domain.as_str())
-        )
+        let target = self.registrar.as_deref().unwrap_or(self.domain.as_str());
+        if target.starts_with("sip:") || target.starts_with("sips:") {
+            target.to_string()
+        } else {
+            format!("sip:{target}")
+        }
     }
 }
 

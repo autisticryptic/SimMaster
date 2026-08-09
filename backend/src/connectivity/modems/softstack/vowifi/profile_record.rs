@@ -85,8 +85,26 @@ pub struct Ikev2PolicyRecord {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisterPolicyRecord {
     pub supported_header: String,
+    #[serde(default = "default_request_uri_policy")]
+    pub request_uri_policy: String,
+    #[serde(default = "default_true")]
+    pub include_pani_initial: bool,
     #[serde(default)]
     pub include_pani_authenticated: bool,
+    #[serde(default = "default_initial_authorization")]
+    pub initial_authorization: String,
+    #[serde(default)]
+    pub include_mmtel_features: bool,
+    #[serde(default)]
+    pub include_route_header: bool,
+    #[serde(default)]
+    pub include_visited_network: bool,
+    #[serde(default = "default_true")]
+    pub include_p_preferred_identity: bool,
+    #[serde(default)]
+    pub visited_network_header: Option<String>,
+    #[serde(default)]
+    pub allow_methods: Option<String>,
     #[serde(default)]
     pub strict_security_server_offer: bool,
     #[serde(default)]
@@ -95,6 +113,8 @@ pub struct RegisterPolicyRecord {
     pub use_plain_digest_placeholder: bool,
     #[serde(default)]
     pub require_sec_agree_headers: bool,
+    #[serde(default)]
+    pub proxy_require_sec_agree_headers: bool,
     /// `auto` | `required` | `disabled`.
     #[serde(default = "default_sec_agree_mode")]
     pub sec_agree_mode: String,
@@ -109,6 +129,10 @@ pub struct RegisterPolicyRecord {
     pub contact_mode: String,
     #[serde(default)]
     pub contact_param_order: Vec<String>,
+    #[serde(default)]
+    pub always_add_sip_instance: bool,
+    #[serde(default)]
+    pub enable_cellular_network_info: bool,
     #[serde(default = "default_temporary_status_codes")]
     pub temporary_status_codes: Vec<u16>,
     #[serde(default = "default_forbidden_status_codes")]
@@ -121,6 +145,18 @@ pub struct RegisterPolicyRecord {
 
 fn default_sec_agree_mode() -> String {
     "auto".to_string()
+}
+
+fn default_request_uri_policy() -> String {
+    "registrar".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_initial_authorization() -> String {
+    "none".to_string()
 }
 
 fn default_expires_seconds() -> u32 {
@@ -342,7 +378,18 @@ impl CarrierProfileRecord {
                 options_ping_interval_seconds: self.ims.options_ping_interval_seconds,
                 register: RegisterPolicy {
                     supported_header: intern_str(&self.ims.register.supported_header),
+                    request_uri_policy: intern_str(&self.ims.register.request_uri_policy),
+                    include_pani_initial: self.ims.register.include_pani_initial,
                     include_pani_authenticated: self.ims.register.include_pani_authenticated,
+                    initial_authorization: intern_str(&self.ims.register.initial_authorization),
+                    include_mmtel_features: self.ims.register.include_mmtel_features,
+                    include_route_header: self.ims.register.include_route_header,
+                    include_visited_network: self.ims.register.include_visited_network,
+                    include_p_preferred_identity: self.ims.register.include_p_preferred_identity,
+                    visited_network_header: intern_opt(
+                        self.ims.register.visited_network_header.as_ref(),
+                    ),
+                    allow_methods: intern_opt(self.ims.register.allow_methods.as_ref()),
                     strict_security_server_offer: self.ims.register.strict_security_server_offer,
                     enable_initial_reject_fallback: self
                         .ims
@@ -350,6 +397,10 @@ impl CarrierProfileRecord {
                         .enable_initial_reject_fallback,
                     use_plain_digest_placeholder: self.ims.register.use_plain_digest_placeholder,
                     require_sec_agree_headers: self.ims.register.require_sec_agree_headers,
+                    proxy_require_sec_agree_headers: self
+                        .ims
+                        .register
+                        .proxy_require_sec_agree_headers,
                     sec_agree_mode: intern_str(&self.ims.register.sec_agree_mode),
                     security_client_mechanisms: intern_list(
                         &self.ims.register.security_client_mechanisms,
@@ -359,6 +410,8 @@ impl CarrierProfileRecord {
                     access_network_info: intern_str(&self.ims.register.access_network_info),
                     contact_mode: intern_str(&self.ims.register.contact_mode),
                     contact_param_order: intern_list(&self.ims.register.contact_param_order),
+                    always_add_sip_instance: self.ims.register.always_add_sip_instance,
+                    enable_cellular_network_info: self.ims.register.enable_cellular_network_info,
                     temporary_status_codes: intern_u16_list(
                         &self.ims.register.temporary_status_codes,
                     ),
@@ -447,7 +500,20 @@ impl CarrierProfileRecord {
                 options_ping_interval_seconds: profile.ims.options_ping_interval_seconds,
                 register: RegisterPolicyRecord {
                     supported_header: profile.ims.register.supported_header.to_string(),
+                    request_uri_policy: profile.ims.register.request_uri_policy.to_string(),
+                    include_pani_initial: profile.ims.register.include_pani_initial,
                     include_pani_authenticated: profile.ims.register.include_pani_authenticated,
+                    initial_authorization: profile.ims.register.initial_authorization.to_string(),
+                    include_mmtel_features: profile.ims.register.include_mmtel_features,
+                    include_route_header: profile.ims.register.include_route_header,
+                    include_visited_network: profile.ims.register.include_visited_network,
+                    include_p_preferred_identity: profile.ims.register.include_p_preferred_identity,
+                    visited_network_header: profile
+                        .ims
+                        .register
+                        .visited_network_header
+                        .map(str::to_string),
+                    allow_methods: profile.ims.register.allow_methods.map(str::to_string),
                     strict_security_server_offer: profile.ims.register.strict_security_server_offer,
                     enable_initial_reject_fallback: profile
                         .ims
@@ -455,6 +521,10 @@ impl CarrierProfileRecord {
                         .enable_initial_reject_fallback,
                     use_plain_digest_placeholder: profile.ims.register.use_plain_digest_placeholder,
                     require_sec_agree_headers: profile.ims.register.require_sec_agree_headers,
+                    proxy_require_sec_agree_headers: profile
+                        .ims
+                        .register
+                        .proxy_require_sec_agree_headers,
                     sec_agree_mode: profile.ims.register.sec_agree_mode.to_string(),
                     security_client_mechanisms: to_owned_list(
                         profile.ims.register.security_client_mechanisms,
@@ -468,6 +538,8 @@ impl CarrierProfileRecord {
                     access_network_info: profile.ims.register.access_network_info.to_string(),
                     contact_mode: profile.ims.register.contact_mode.to_string(),
                     contact_param_order: to_owned_list(profile.ims.register.contact_param_order),
+                    always_add_sip_instance: profile.ims.register.always_add_sip_instance,
+                    enable_cellular_network_info: profile.ims.register.enable_cellular_network_info,
                     temporary_status_codes: profile.ims.register.temporary_status_codes.to_vec(),
                     forbidden_status_codes: profile.ims.register.forbidden_status_codes.to_vec(),
                     initial_reject_fallback_status_codes: profile
@@ -502,6 +574,34 @@ impl CarrierProfileRecord {
     /// Reject records that would produce an unusable profile. Called before
     /// anything is written to the database or handed to the runtime.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_ims_only()?;
+        if self.epdg.host.trim().is_empty() {
+            return Err("epdg_host_required".to_string());
+        }
+        if self.epdg.port == 0 {
+            return Err("epdg_port_invalid".to_string());
+        }
+        if self.ikev2.ike_proposals.is_empty() {
+            return Err("ike_proposals_required".to_string());
+        }
+        if self.ikev2.esp_proposals.is_empty() {
+            return Err("esp_proposals_required".to_string());
+        }
+        if !matches!(self.epdg.ip_stack.as_str(), "ipv4" | "ipv6" | "ipv4v6") {
+            return Err("epdg_ip_stack_invalid".to_string());
+        }
+        for server in &self.epdg.dns_servers {
+            if parse_dns_server(server).is_none() {
+                return Err(format!("dns_server_invalid:{server}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate the shared IMS/SIP portion of a catalog profile. LTE profiles
+    /// do not require an ePDG or IKE row, while VoWiFi profiles call the stricter
+    /// [`Self::validate`] above.
+    pub fn validate_ims_only(&self) -> Result<(), String> {
         let meta = &self.meta;
         if meta.profile_id.trim().is_empty() {
             return Err("profile_id_required".to_string());
@@ -521,26 +621,11 @@ impl CarrierProfileRecord {
         if meta.plmn != format!("{}{}", meta.mcc, meta.mnc) {
             return Err("plmn_mismatch".to_string());
         }
-        if self.epdg.host.trim().is_empty() {
-            return Err("epdg_host_required".to_string());
-        }
-        if self.epdg.port == 0 {
-            return Err("epdg_port_invalid".to_string());
-        }
         if self.ims.domain.trim().is_empty() || self.ims.realm.trim().is_empty() {
             return Err("ims_domain_and_realm_required".to_string());
         }
-        if self.ikev2.ike_proposals.is_empty() {
-            return Err("ike_proposals_required".to_string());
-        }
-        if self.ikev2.esp_proposals.is_empty() {
-            return Err("esp_proposals_required".to_string());
-        }
         if !matches!(self.ims.transport.as_str(), "tcp" | "udp") {
             return Err("ims_transport_must_be_tcp_or_udp".to_string());
-        }
-        if !matches!(self.epdg.ip_stack.as_str(), "ipv4" | "ipv6" | "ipv4v6") {
-            return Err("epdg_ip_stack_invalid".to_string());
         }
         if !matches!(
             self.ims.register.sec_agree_mode.as_str(),
@@ -549,18 +634,70 @@ impl CarrierProfileRecord {
             return Err("sec_agree_mode_invalid".to_string());
         }
         if !matches!(
+            self.ims.register.initial_authorization.as_str(),
+            "none" | "aka_empty" | "digest_empty" | "implementation_variant"
+        ) {
+            return Err("initial_authorization_invalid".to_string());
+        }
+        if !matches!(
+            self.ims.register.request_uri_policy.as_str(),
+            "home_domain" | "registrar" | "pcscf" | "configured"
+        ) {
+            return Err("request_uri_policy_invalid".to_string());
+        }
+        if matches!(
+            self.ims.register.request_uri_policy.as_str(),
+            "registrar" | "configured"
+        ) && self
+            .ims
+            .registrar
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("registrar_required_for_request_uri_policy".to_string());
+        }
+        if self.ims.register.include_visited_network
+            && self
+                .ims
+                .register
+                .visited_network_header
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("visited_network_header_required".to_string());
+        }
+        if !matches!(
             self.ims.register.contact_mode.as_str(),
-            "android_default" | "legacy"
+            "standard" | "android_default" | "legacy" | "custom"
         ) {
             return Err("contact_mode_invalid".to_string());
         }
         if self.ims.register.expires_seconds == 0 {
             return Err("register_expires_must_be_positive".to_string());
         }
-        for server in &self.epdg.dns_servers {
-            if parse_dns_server(server).is_none() {
-                return Err(format!("dns_server_invalid:{server}"));
-            }
+        if self.ims.user_agent.trim().is_empty() {
+            return Err("register_user_agent_required".to_string());
+        }
+        if (self.ims.register.include_pani_initial || self.ims.register.include_pani_authenticated)
+            && self.ims.register.access_network_info.trim().is_empty()
+        {
+            return Err("access_network_info_required".to_string());
+        }
+        if (self.ims.register.sec_agree_mode == "required"
+            || self.ims.register.require_sec_agree_headers
+            || self.ims.register.proxy_require_sec_agree_headers)
+            && self.ims.register.security_client_mechanisms.is_empty()
+        {
+            return Err("security_client_mechanism_required".to_string());
+        }
+        if self
+            .ims
+            .register
+            .security_client_mechanisms
+            .iter()
+            .any(|mechanism| mechanism.split('/').count() != 4)
+        {
+            return Err("security_client_mechanism_invalid".to_string());
         }
         if let Some(imei) = self
             .identity
@@ -573,9 +710,9 @@ impl CarrierProfileRecord {
                 return Err("device_identity_imei_must_be_15_digits".to_string());
             }
         }
-        if self.e911.enabled && self.e911.websheet_host_policy.is_none() {
-            return Err("e911_websheet_host_policy_required_when_enabled".to_string());
-        }
+        // E911 is catalogued but deliberately not executed yet. Do not reject
+        // an otherwise usable IMS profile because the product-side address
+        // provisioning flow is still undecided.
         Ok(())
     }
 
@@ -613,7 +750,9 @@ pub fn parse_dns_server(value: &str) -> Option<std::net::SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::modems::softstack::vowifi::profiles::{generate_standard_3gpp_profile, GB_EE_23433};
+    use crate::connectivity::modems::softstack::vowifi::profiles::{
+        generate_standard_3gpp_profile, GB_EE_23433,
+    };
 
     #[test]
     fn round_trips_a_builtin_profile_without_loss() {
@@ -682,6 +821,10 @@ mod tests {
 
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         record.ims.register.contact_mode = "custom".to_string();
+        record
+            .validate()
+            .expect("custom contact mode is catalog-valid");
+        record.ims.register.contact_mode = "guessed".to_string();
         assert_eq!(record.validate().unwrap_err(), "contact_mode_invalid");
     }
 
@@ -721,18 +864,17 @@ mod tests {
     }
 
     #[test]
-    fn e911_requires_a_host_policy_and_is_only_expected_in_north_america() {
+    fn e911_is_read_only_metadata_and_is_only_expected_in_north_america() {
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         // UK carrier: emergency configuration is optional.
         assert!(!record.e911_expected());
         record.e911.enabled = true;
         record.e911.websheet_host_policy = None;
-        assert_eq!(
-            record.validate().unwrap_err(),
-            "e911_websheet_host_policy_required_when_enabled"
-        );
+        record
+            .validate()
+            .expect("E911 provisioning metadata must not block registration");
         record.e911.websheet_host_policy = Some("public_https".to_string());
-        record.validate().expect("valid once the policy is present");
+        record.validate().expect("display metadata remains valid");
 
         // A US carrier is expected to carry emergency configuration.
         let mut us = CarrierProfileRecord::from_profile(&GB_EE_23433);

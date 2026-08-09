@@ -1,4 +1,4 @@
-//! Per-line Trunk runtime state shared by the API and the future SIP driver.
+//! Per-line Trunk runtime state shared by the API and the active SIP driver.
 
 use std::sync::{
     atomic::{AtomicU64, Ordering},

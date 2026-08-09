@@ -1,9 +1,9 @@
 import { FormControl, InputLabel, MenuItem, Select, type SelectChangeEvent } from '@mui/material'
-import type { VolteLineControlResponse } from '../api/current'
+import type { ModemBinding } from '../api/current'
 import { modemLineLabel } from './modemLineFormat'
 
 interface ModemLineSelectorProps {
-  lines: VolteLineControlResponse[]
+  lines: Array<{ modem: ModemBinding }>
   value: string
   onChange: (lineId: string) => void
   disabled?: boolean

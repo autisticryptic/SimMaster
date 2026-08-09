@@ -1057,20 +1057,53 @@ pub fn protect_inner_packet_for_esp(
     next_header: u8,
     secrets: &ChildSaSecretPair,
 ) -> Result<(Vec<u8>, EspProtectedPacketSummary), DataplaneStateError> {
+    protect_inner_packet_for_esp_with_mode(
+        sa_identifier,
+        sequence_number,
+        inner_packet,
+        next_header,
+        secrets,
+        true,
+    )
+}
+
+/// Encrypt/authenticate an inner packet into an ESP transport-mode frame.
+///
+/// `icv_include_iv` selects whether the integrity check value covers the
+/// explicit IV in addition to SPI + sequence + ciphertext (RFC 4303 §3.3.2,
+/// the standard) or skips the IV (a non-standard variant seen in some IMS
+/// stacks). Most P-CSCFs implement the RFC 4303 rule; the alternate is kept
+/// as a wire-format candidate for interop.
+pub fn protect_inner_packet_for_esp_with_mode(
+    sa_identifier: u32,
+    sequence_number: u64,
+    inner_packet: &[u8],
+    next_header: u8,
+    secrets: &ChildSaSecretPair,
+    icv_include_iv: bool,
+) -> Result<(Vec<u8>, EspProtectedPacketSummary), DataplaneStateError> {
     let _metadata = build_esp_frame_metadata(sa_identifier, sequence_number, inner_packet.len())?;
     let plan = secrets.summary();
-    let iv = random_esp_iv()?;
+    let iv = if esp_iv_bytes(plan.encryption)? == 0 {
+        Vec::new()
+    } else {
+        random_esp_iv()?.to_vec()
+    };
     let mut plaintext = Vec::from(inner_packet);
     let pad_len = esp_pad_len(plaintext.len(), 16);
     plaintext.extend((1..=pad_len).map(|value| value as u8));
     plaintext.push(pad_len as u8);
     plaintext.push(next_header);
-    let ciphertext = esp_encrypt_cbc(
-        plan.encryption,
-        secrets.outbound_encryption.expose_for_protocol(),
-        &iv,
-        &plaintext,
-    )?;
+    let ciphertext = if plan.encryption == "null" {
+        plaintext.clone()
+    } else {
+        esp_encrypt_cbc(
+            plan.encryption,
+            secrets.outbound_encryption.expose_for_protocol(),
+            &iv,
+            &plaintext,
+        )?
+    };
 
     let mut frame = Vec::with_capacity(
         ESP_HEADER_BYTES as usize + iv.len() + ciphertext.len() + plan.integrity_key_bytes,
@@ -1079,10 +1112,20 @@ pub fn protect_inner_packet_for_esp(
     frame.extend_from_slice(&(sequence_number as u32).to_be_bytes());
     frame.extend_from_slice(&iv);
     frame.extend_from_slice(&ciphertext);
+    let icv_input = if icv_include_iv {
+        frame.clone()
+    } else {
+        // SPI | seq | ciphertext -- explicit IV is not covered by the ICV.
+        let mut input = Vec::with_capacity(8 + ciphertext.len());
+        input.extend_from_slice(&sa_identifier.to_be_bytes());
+        input.extend_from_slice(&(sequence_number as u32).to_be_bytes());
+        input.extend_from_slice(&ciphertext);
+        input
+    };
     let icv = esp_integrity_tag(
         plan.integrity,
         secrets.outbound_integrity.expose_for_protocol(),
-        &frame,
+        &icv_input,
     )?;
     frame.extend_from_slice(&icv);
 
@@ -1104,33 +1147,59 @@ pub fn unprotect_inner_packet_from_esp(
     frame: &[u8],
     secrets: &ChildSaSecretPair,
 ) -> Result<(Vec<u8>, EspProtectedPacketSummary), DataplaneStateError> {
+    unprotect_inner_packet_from_esp_with_mode(frame, secrets, true)
+}
+
+/// Inbound counterpart of [`protect_inner_packet_for_esp_with_mode`]; the
+/// `icv_include_iv` flag must match the mode used by the peer.
+pub fn unprotect_inner_packet_from_esp_with_mode(
+    frame: &[u8],
+    secrets: &ChildSaSecretPair,
+    icv_include_iv: bool,
+) -> Result<(Vec<u8>, EspProtectedPacketSummary), DataplaneStateError> {
     let metadata = parse_esp_frame_metadata(frame)?;
     let plan = secrets.summary();
     let icv_len = esp_integrity_len(plan.integrity)?;
-    let min_len = ESP_HEADER_BYTES as usize + AES_CBC_IV_BYTES as usize + icv_len;
+    let iv_bytes = esp_iv_bytes(plan.encryption)?;
+    let min_len = ESP_HEADER_BYTES as usize + iv_bytes + icv_len;
     if frame.len() < min_len {
         return Err(DataplaneStateError::EspPacketTooShort);
     }
     let signed_len = frame.len() - icv_len;
     let (signed, received_icv) = frame.split_at(signed_len);
+    let expected_input = if icv_include_iv {
+        signed.to_vec()
+    } else {
+        // SPI | seq | ciphertext; skip the explicit IV between seq and
+        // ciphertext when verifying against the non-standard convention.
+        let iv_end = ESP_HEADER_BYTES as usize + iv_bytes;
+        let mut input = Vec::with_capacity(8 + (signed_len - iv_end));
+        input.extend_from_slice(&signed[..ESP_HEADER_BYTES as usize]);
+        input.extend_from_slice(&signed[iv_end..]);
+        input
+    };
     let expected_icv = esp_integrity_tag(
         plan.integrity,
         secrets.inbound_integrity.expose_for_protocol(),
-        signed,
+        &expected_input,
     )?;
     if !constant_time_eq(&expected_icv, received_icv) {
         return Err(DataplaneStateError::EspIntegrityMismatch);
     }
     let iv_start = ESP_HEADER_BYTES as usize;
-    let iv_end = iv_start + AES_CBC_IV_BYTES as usize;
+    let iv_end = iv_start + iv_bytes;
     let iv = &frame[iv_start..iv_end];
     let ciphertext = &frame[iv_end..signed_len];
-    let plaintext = esp_decrypt_cbc(
-        plan.encryption,
-        secrets.inbound_encryption.expose_for_protocol(),
-        iv,
-        ciphertext,
-    )?;
+    let plaintext = if plan.encryption == "null" {
+        ciphertext.to_vec()
+    } else {
+        esp_decrypt_cbc(
+            plan.encryption,
+            secrets.inbound_encryption.expose_for_protocol(),
+            iv,
+            ciphertext,
+        )?
+    };
     let (inner_packet, next_header) = strip_esp_padding(&plaintext)?;
     let inner_packet = inner_packet.to_vec();
 
@@ -1215,8 +1284,10 @@ fn esp_pad_len(payload_len: usize, block_bytes: usize) -> usize {
 
 fn esp_integrity_len(integrity: &str) -> Result<usize, DataplaneStateError> {
     match integrity {
+        "hmac_md5_96" => Ok(12),
         "hmac_sha1_96" => Ok(12),
         "hmac_sha256_128" => Ok(16),
+        "hmac_sha384_192" => Ok(24),
         "hmac_sha512_256" => Ok(32),
         _ => Err(DataplaneStateError::EspUnsupportedIntegrity),
     }
@@ -1228,15 +1299,54 @@ fn esp_integrity_tag(
     message_without_icv: &[u8],
 ) -> Result<Vec<u8>, DataplaneStateError> {
     let (algorithm, icv_len) = match integrity {
-        "hmac_sha1_96" => (hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, 12),
-        "hmac_sha256_128" => (hmac::HMAC_SHA256, 16),
-        "hmac_sha512_256" => (hmac::HMAC_SHA512, 32),
+        "hmac_md5_96" => (None, 12),
+        "hmac_sha1_96" => (Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY), 12),
+        "hmac_sha256_128" => (Some(hmac::HMAC_SHA256), 16),
+        "hmac_sha384_192" => (Some(hmac::HMAC_SHA384), 24),
+        "hmac_sha512_256" => (Some(hmac::HMAC_SHA512), 32),
         _ => return Err(DataplaneStateError::EspUnsupportedIntegrity),
     };
-    let key = hmac::Key::new(algorithm, key);
-    let mut tag = hmac::sign(&key, message_without_icv).as_ref().to_vec();
+    let mut tag = match algorithm {
+        Some(algorithm) => {
+            let key = hmac::Key::new(algorithm, key);
+            hmac::sign(&key, message_without_icv).as_ref().to_vec()
+        }
+        None => hmac_md5(key, message_without_icv),
+    };
     tag.truncate(icv_len);
     Ok(tag)
+}
+
+fn esp_iv_bytes(encryption: &str) -> Result<usize, DataplaneStateError> {
+    match encryption {
+        "aes_cbc" => Ok(usize::try_from(AES_CBC_IV_BYTES).unwrap_or(16)),
+        "null" => Ok(0),
+        _ => Err(DataplaneStateError::EspUnsupportedCipher),
+    }
+}
+
+fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 64;
+    let mut key = key.to_vec();
+    if key.len() > BLOCK_SIZE {
+        key = (*md5::compute(&key)).to_vec();
+    }
+    key.resize(BLOCK_SIZE, 0);
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+
+    let mut inner_input = ipad.to_vec();
+    inner_input.extend_from_slice(data);
+    let inner = md5::compute(&inner_input);
+
+    let mut outer_input = opad.to_vec();
+    outer_input.extend_from_slice(inner.as_ref());
+    (*md5::compute(&outer_input)).to_vec()
 }
 
 fn esp_encrypt_cbc(
@@ -1246,6 +1356,7 @@ fn esp_encrypt_cbc(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, DataplaneStateError> {
     match (encryption, key.len()) {
+        ("null", 0) => Ok(plaintext.to_vec()),
         ("aes_cbc", 16) => Ok(cbc::Encryptor::<Aes128>::new_from_slices(key, iv)
             .map_err(|_| DataplaneStateError::EspUnsupportedCipher)?
             .encrypt_padded_vec_mut::<NoPadding>(plaintext)),
@@ -1263,6 +1374,7 @@ fn esp_decrypt_cbc(
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, DataplaneStateError> {
     match (encryption, key.len()) {
+        ("null", 0) => Ok(ciphertext.to_vec()),
         ("aes_cbc", 16) => cbc::Decryptor::<Aes128>::new_from_slices(key, iv)
             .map_err(|_| DataplaneStateError::EspUnsupportedCipher)?
             .decrypt_padded_vec_mut::<NoPadding>(ciphertext)
@@ -1312,10 +1424,23 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
 mod tests {
     use super::*;
     use crate::connectivity::modems::softstack::vowifi::{
-        ike_keys::{derive_child_sa_secret_pair, derive_ike_secret_bundle, ChildSaSecretPair},
+        ike_keys::{
+            derive_child_sa_secret_pair, derive_ike_secret_bundle, ChildSaKeySchedulePlan,
+            ChildSaSecretPair,
+        },
         ike_payloads::{child_sa_proposal_from_profile_string, ike_proposal_from_profile_string},
         profiles::{GB_EE_23433, NL_VODAFONE_20404},
     };
+
+    #[test]
+    fn esp_md5_integrity_tag_matches_hmac_md5_vector() {
+        assert_eq!(esp_integrity_len("hmac_md5_96").expect("len"), 12);
+        let tag = esp_integrity_tag("hmac_md5_96", &[0x0bu8; 16], b"Hi There").expect("md5 tag");
+        assert_eq!(
+            tag,
+            [0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8,]
+        );
+    }
 
     fn ipv6_packet(len: usize) -> Vec<u8> {
         let mut packet = vec![0u8; len];
@@ -1535,6 +1660,74 @@ mod tests {
         let err =
             unprotect_inner_packet_from_esp(&tampered, &inbound_secrets).expect_err("tamper fails");
         assert_eq!(err, DataplaneStateError::EspIntegrityMismatch);
+    }
+
+    #[test]
+    fn esp_icv_excludes_iv_mode_round_trips_and_is_distinct_from_standard() {
+        let secrets = test_child_sa_secrets();
+        let inbound_secrets = reverse_secret_pair_for_test(&secrets);
+        let inner = ipv6_packet(96);
+
+        let (frame, _) = protect_inner_packet_for_esp_with_mode(
+            0x0102_0304,
+            7,
+            &inner,
+            59,
+            &secrets,
+            false,
+        )
+        .expect("protect with ICV excluding IV");
+        let (decoded, _) = unprotect_inner_packet_from_esp_with_mode(
+            &frame,
+            &inbound_secrets,
+            false,
+        )
+        .expect("unprotect with ICV excluding IV");
+        assert_eq!(decoded, inner);
+
+        // The alternate mode must not verify under the standard convention.
+        let err = unprotect_inner_packet_from_esp(&frame, &inbound_secrets)
+            .expect_err("standard ICV check rejects alternate mode frame");
+        assert_eq!(err, DataplaneStateError::EspIntegrityMismatch);
+    }
+
+    #[test]
+    fn esp_null_encryption_round_trips_without_iv_or_cipher_key() {
+        let plan = ChildSaKeySchedulePlan {
+            encryption: "null",
+            integrity: "hmac_sha1_96",
+            encryption_key_bytes: 0,
+            integrity_key_bytes: 20,
+            direction_secret_bytes: 20,
+            total_secret_bytes: 40,
+            exported_secret_values: false,
+            sensitive_values_policy: "test_null_encryption",
+        };
+        let secrets = ChildSaSecretPair::from_test_parts(
+            plan,
+            Vec::new(),
+            vec![0x44; 20],
+            Vec::new(),
+            vec![0x55; 20],
+        );
+        let inbound = ChildSaSecretPair::from_test_parts(
+            secrets.summary(),
+            Vec::new(),
+            vec![0x55; 20],
+            Vec::new(),
+            vec![0x44; 20],
+        );
+        let inner = ipv6_packet(64);
+
+        let (frame, protected) = protect_inner_packet_for_esp(0x0102_0304, 3, &inner, 59, &secrets)
+            .expect("protect null-encrypted packet");
+        let (decoded, _) = unprotect_inner_packet_from_esp(&frame, &inbound).expect("unprotect");
+
+        assert_eq!(decoded, inner);
+        assert_eq!(protected.inner_packet_bytes, 64);
+        assert_eq!(protected.icv_bytes, 12);
+        assert_eq!(esp_iv_bytes("null").expect("null iv bytes"), 0);
+        assert_eq!(esp_iv_bytes("aes_cbc").expect("aes iv bytes"), 16);
     }
 
     #[test]

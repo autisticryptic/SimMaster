@@ -4,7 +4,7 @@ target/
 .cargo-target*/
 
 # 前端依赖和构建文件
-frontend/node_modules/
+frontend/node_modules*/
 frontend/dist/
 frontend/.vite/
 # 保留 pnpm-lock.yaml，移除其他包管理器的 lockfile
@@ -20,6 +20,18 @@ frontend/package-lock.json
 # Release 包
 release/
 release/*
+
+# 本地测试数据、日志和 Codex 临时文件
+*.db
+*.sqlite
+*.sqlite3
+*.log
+.codex-*
+
+# 本地环境变量（示例模板可以提交）
+.env
+.env.*
+!.env.example
 
 # userdata 目录 - 仅保留必要的配置文件
 

@@ -1,9 +1,7 @@
 //! Per-modem/SIM runtime registry.
 //!
-//! Legacy SimAdmin selected the first ModemManager object and stored one global
-//! VoLTE runtime. This registry keeps one independent runtime per stable
-//! hardware+SIM line while retaining a seed runtime for backwards-compatible
-//! single-line API handlers.
+//! Each stable hardware+SIM line owns one independent runtime. API handlers must
+//! resolve a line before touching modem, IMS, data, or trunk state.
 
 use std::{
     collections::BTreeMap,
@@ -11,6 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
+    time::Instant,
 };
 
 use serde::Serialize;
@@ -18,17 +17,41 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use zbus::Connection;
 
 use crate::{
-    connectivity::modems::softstack::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
+    connectivity::modems::softstack::volte::{
+        live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus,
+    },
     connectivity::modems::softstack::vowifi::runtime::VowifiRuntime,
     hardware::cellular::modem_manager::{discover_modem_bindings, ModemBinding},
     hardware::cellular::{
         data_proxy::{DataProxyRuntime, DataProxyTraffic},
         secondary_qmi_data::SecondaryDataRuntime,
     },
-    platform::config::{ConfigManager, ModemSlotObservation},
+    platform::config::{
+        AccessPathKind, ConfigManager, ModemSlotObservation, TrunkProfileConfig, VoicePathPolicy,
+    },
     platform::db::{Database, LineDataTrafficEntry},
-    services::trunk::runtime::{TrunkRuntime, TrunkRuntimeStatus},
+    services::trunk::{
+        access_router::VoiceAccessRouter,
+        runtime::{TrunkRuntime, TrunkRuntimeStatus},
+    },
 };
+
+/// Independent recovery bookkeeping for one physical line. Keeping this on
+/// `LineRuntime` prevents a slow or unhealthy modem from consuming another
+/// line's retry counters or cooldowns.
+#[derive(Debug, Default)]
+pub struct LineDataWatchdogState {
+    pub searching_polls: u32,
+    pub missing_data_polls: u32,
+    pub last_register_attempt: Option<Instant>,
+    pub last_connect_attempt: Option<Instant>,
+}
+
+impl LineDataWatchdogState {
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
 
 pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
@@ -46,8 +69,14 @@ pub struct LineRuntime {
     /// therefore be connected at the same time.
     pub vowifi: Arc<VowifiRuntime>,
     pub vowifi_connect_lock: Mutex<()>,
+    vowifi_restore_running: AtomicBool,
+    pub voice_access: VoiceAccessRouter,
     pub trunk: Arc<TrunkRuntime>,
     pub data_proxy: Arc<DataProxyRuntime>,
+    /// Serializes and records the background data-health workflow for this line.
+    /// The scheduler uses `try_lock`, so overlapping ticks are dropped instead
+    /// of queuing repeated registration or bearer operations.
+    pub data_watchdog: Mutex<LineDataWatchdogState>,
     /// Dedicated DATA6 bearer that feeds only this line's HTTP/SOCKS proxy.
     /// It is separate from the proxy listener because the bearer must remain
     /// alive while listeners are reconfigured.
@@ -55,8 +84,24 @@ pub struct LineRuntime {
 }
 
 impl LineRuntime {
-    fn new(binding: ModemBinding, volte: Arc<VolteRuntime>, volte_live: VolteLiveHandle) -> Self {
-        let operator = volte_live.operator_link();
+    fn new(
+        binding: ModemBinding,
+        volte: Arc<VolteRuntime>,
+        volte_live: VolteLiveHandle,
+        voice_policy: VoicePathPolicy,
+    ) -> Self {
+        let vowifi_operator =
+            crate::connectivity::modems::softstack::vowifi::operator::operator_link_for_line(
+                &binding.line_id,
+            );
+        let voice_access = VoiceAccessRouter::new(
+            voice_policy,
+            vec![
+                (AccessPathKind::Vowifi, vowifi_operator),
+                (AccessPathKind::Volte, volte_live.operator_link()),
+            ],
+        );
+        let operator = voice_access.operator_link();
         let vowifi = Arc::new(VowifiRuntime::for_line(&binding.line_id));
         Self {
             binding: RwLock::new(binding),
@@ -67,8 +112,11 @@ impl LineRuntime {
             volte_retry_running: AtomicBool::new(false),
             vowifi,
             vowifi_connect_lock: Mutex::new(()),
+            vowifi_restore_running: AtomicBool::new(false),
+            voice_access,
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
             data_proxy: Arc::new(DataProxyRuntime::default()),
+            data_watchdog: Mutex::new(LineDataWatchdogState::default()),
             secondary_data: Arc::new(SecondaryDataRuntime::default()),
         }
     }
@@ -117,6 +165,46 @@ impl LineRuntime {
     pub fn volte_retry_in_progress(&self) -> bool {
         self.volte_retry_running.load(Ordering::SeqCst)
     }
+
+    /// Claim a complete VoWiFi restore workflow, including its settle and
+    /// identity-gate delays. The connect mutex alone is too narrow because two
+    /// reconcilers could otherwise sleep and probe the same SIM concurrently.
+    pub fn begin_vowifi_restore(&self) -> bool {
+        self.vowifi_restore_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn finish_vowifi_restore(&self) {
+        self.vowifi_restore_running.store(false, Ordering::SeqCst);
+    }
+
+    pub fn vowifi_restore_in_progress(&self) -> bool {
+        self.vowifi_restore_running.load(Ordering::SeqCst)
+    }
+
+    fn effective_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkProfileConfig {
+        let mut effective = profile.clone();
+        if !self.binding().present {
+            effective.enabled = false;
+        }
+        effective
+    }
+
+    pub async fn activate_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkRuntimeStatus {
+        let effective = self.effective_trunk_profile(profile);
+        self.trunk.activate_profile(&effective).await;
+        self.trunk.status().await
+    }
+
+    pub async fn reconcile_trunk_profile(
+        &self,
+        profile: &TrunkProfileConfig,
+    ) -> TrunkRuntimeStatus {
+        let effective = self.effective_trunk_profile(profile);
+        self.trunk.reconcile_profile(&effective).await;
+        self.trunk.status().await
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,8 +217,6 @@ pub struct LineRuntimeStatus {
 #[derive(Default)]
 pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
-    seed_runtime: Arc<VolteRuntime>,
-    seed_claimed: AtomicBool,
     config_manager: Option<Arc<ConfigManager>>,
     /// Used to restore each line's cumulative proxied-traffic counters when the
     /// line is first discovered, so totals survive a restart.
@@ -141,26 +227,18 @@ pub struct LineRuntimeRegistry {
 }
 
 impl LineRuntimeRegistry {
-    pub fn new(seed_runtime: Arc<VolteRuntime>) -> Self {
+    pub fn new() -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
-            seed_runtime,
-            seed_claimed: AtomicBool::new(false),
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
         }
     }
 
-    pub fn with_config(
-        seed_runtime: Arc<VolteRuntime>,
-        config_manager: Arc<ConfigManager>,
-        database: Arc<Database>,
-    ) -> Self {
+    pub fn with_config(config_manager: Arc<ConfigManager>, database: Arc<Database>) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
-            seed_runtime,
-            seed_claimed: AtomicBool::new(false),
             config_manager: Some(config_manager),
             database: Some(database),
             traffic_persistence_lock: Mutex::new(()),
@@ -232,40 +310,54 @@ impl LineRuntimeRegistry {
                     present,
                 ));
             }
+
+            let mut migration_lines = discovered.iter().collect::<Vec<_>>();
+            migration_lines.sort_by(|left, right| {
+                left.display_order
+                    .cmp(&right.display_order)
+                    .then_with(|| left.line_id.cmp(&right.line_id))
+            });
+            let line_ids = migration_lines
+                .into_iter()
+                .map(|binding| binding.line_id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = config_manager.reconcile_line_profiles(&line_ids) {
+                tracing::warn!(error = %error, "Failed to reconcile discovered line profiles");
+            }
         }
         let mut lines = self.lines.write().await;
         for line in lines.values() {
+            crate::connectivity::modems::softstack::vowifi::live::forget_line_sim_device(
+                &line.binding().line_id,
+            );
             line.mark_absent();
         }
         for binding in discovered {
-            // Tell the VoWiFi live layer which reader this line owns, so its SIM
-            // authentication and IKE identity run against that line's card rather
-            // than whichever modem happens to be first.
-            if let Some(qmi_device) = binding.qmi_device.as_deref() {
-                crate::connectivity::modems::softstack::vowifi::live::register_line_sim_device(
-                    &binding.line_id,
-                    qmi_device,
-                    binding.uim_slot,
-                    &binding.modem_path,
-                );
-            }
+            // Tell the VoWiFi live layer which SIM device this line owns, so its
+            // identity and authentication never use another modem's card.
+            crate::connectivity::modems::softstack::vowifi::live::register_line_sim_device(
+                &binding.line_id,
+                binding.qmi_device.as_deref().unwrap_or_default(),
+                binding.uim_slot,
+                &binding.modem_path,
+            );
             if let Some(line) = lines.get(&binding.line_id) {
+                if let Some(config_manager) = &self.config_manager {
+                    line.voice_access
+                        .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
+                }
                 line.replace_binding(binding);
                 continue;
             }
-            let is_seed = !self.seed_claimed.swap(true, Ordering::SeqCst);
-            let runtime = if is_seed {
-                Arc::clone(&self.seed_runtime)
-            } else {
-                Arc::new(VolteRuntime::new())
-            };
-            let live = if is_seed {
-                VolteLiveHandle::legacy_shared()
-            } else {
-                VolteLiveHandle::new()
-            };
+            let runtime = Arc::new(VolteRuntime::new());
+            let live = VolteLiveHandle::new();
             let line_id = binding.line_id.clone();
-            let line = Arc::new(LineRuntime::new(binding, runtime, live));
+            let voice_policy = self
+                .config_manager
+                .as_ref()
+                .map(|config| config.get_line_voice_path_policy(&line_id))
+                .unwrap_or_default();
+            let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
             // Seed the traffic counters from disk the first time we see a line,
             // so the reported totals are cumulative rather than per-boot.
             if let Some(database) = &self.database {
@@ -308,13 +400,6 @@ impl LineRuntimeRegistry {
         lines
     }
 
-    pub async fn primary(&self) -> Option<Arc<LineRuntime>> {
-        self.all()
-            .await
-            .into_iter()
-            .find(|line| line.binding().present)
-    }
-
     pub async fn for_modem_path(&self, modem_path: &str) -> Option<Arc<LineRuntime>> {
         self.lines
             .read()
@@ -339,7 +424,9 @@ impl LineRuntimeRegistry {
     pub async fn sync_trunk_profiles(&self, config_manager: &ConfigManager) {
         for line in self.all().await {
             let profile = config_manager.get_line_profile(&line.binding().line_id);
-            line.trunk.reconcile_profile(&profile.trunk).await;
+            line.voice_access
+                .set_policy(config_manager.get_line_voice_path_policy(&line.binding().line_id));
+            line.reconcile_trunk_profile(&profile.trunk).await;
         }
     }
 
@@ -428,19 +515,120 @@ mod tests {
     #[tokio::test]
     async fn line_status_keeps_runtime_and_binding_together() {
         let runtime = Arc::new(VolteRuntime::new());
-        let line = LineRuntime::new(binding("line-a", true), runtime, VolteLiveHandle::new());
+        let line = LineRuntime::new(
+            binding("line-a", true),
+            runtime,
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
         let status = line.status().await;
         assert_eq!(status.modem.line_id, "line-a");
+        assert_eq!(line.vowifi.line_id(), "line-a");
         assert_eq!(status.volte.phase, "disabled");
         assert_eq!(status.trunk.phase, "disabled");
     }
 
-    #[test]
-    fn absent_transition_does_not_change_stable_identity() {
+    #[tokio::test]
+    async fn absent_transition_does_not_change_stable_identity() {
         let runtime = Arc::new(VolteRuntime::new());
-        let line = LineRuntime::new(binding("line-a", true), runtime, VolteLiveHandle::new());
+        let line = LineRuntime::new(
+            binding("line-a", true),
+            runtime,
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
         line.mark_absent();
         assert_eq!(line.binding().line_id, "line-a");
         assert!(!line.binding().present);
+    }
+
+    #[test]
+    fn absent_line_forces_only_the_runtime_trunk_profile_off() {
+        let runtime = Arc::new(VolteRuntime::new());
+        let line = LineRuntime::new(
+            binding("line-a", false),
+            runtime,
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        let requested = TrunkProfileConfig {
+            enabled: true,
+            ..Default::default()
+        };
+
+        let effective = line.effective_trunk_profile(&requested);
+
+        assert!(requested.enabled);
+        assert!(!effective.enabled);
+    }
+
+    #[test]
+    fn vowifi_restore_claim_is_exclusive_and_reusable() {
+        let runtime = Arc::new(VolteRuntime::new());
+        let line = LineRuntime::new(
+            binding("line-a", true),
+            runtime,
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+
+        assert!(line.begin_vowifi_restore());
+        assert!(line.vowifi_restore_in_progress());
+        assert!(!line.begin_vowifi_restore());
+        line.finish_vowifi_restore();
+        assert!(line.begin_vowifi_restore());
+    }
+
+    #[tokio::test]
+    async fn data_watchdog_state_is_independent_per_line() {
+        let line_a = LineRuntime::new(
+            binding("line-a", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        let line_b = LineRuntime::new(
+            binding("line-b", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+
+        {
+            let mut state = line_a.data_watchdog.lock().await;
+            state.searching_polls = 4;
+            state.missing_data_polls = 2;
+            state.last_connect_attempt = Some(Instant::now());
+        }
+
+        let state_b = line_b.data_watchdog.lock().await;
+        assert_eq!(state_b.searching_polls, 0);
+        assert_eq!(state_b.missing_data_polls, 0);
+        assert!(state_b.last_connect_attempt.is_none());
+    }
+
+    #[test]
+    fn volte_runtime_and_operator_channels_are_independent_per_line() {
+        let line_a = LineRuntime::new(
+            binding("line-a", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        let line_b = LineRuntime::new(
+            binding("line-b", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        assert!(!Arc::ptr_eq(&line_a.volte, &line_b.volte));
+
+        let operator_a = line_a.volte_live.operator_link();
+        let operator_b = line_b.volte_live.operator_link();
+        let _commands_a = operator_a.subscribe_commands();
+        operator_a.set_ready(true);
+
+        assert!(operator_a.is_available());
+        assert!(!operator_b.is_available());
     }
 }

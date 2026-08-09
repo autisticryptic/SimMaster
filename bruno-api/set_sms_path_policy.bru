@@ -1,0 +1,30 @@
+meta {
+  name: set_sms_path_policy
+  type: http
+  seq: 109
+}
+
+post {
+  url: {{base_url}}/api/modem/lines/{{line_id}}/sms/path-policy
+  body: json
+  auth: inherit
+}
+
+body:json {
+  {
+    "priority": [
+      { "kind": "vowifi", "enabled": true },
+      { "kind": "volte", "enabled": true },
+      { "kind": "cs", "enabled": true }
+    ],
+    "dedupe_enabled": true,
+    "cs_fallback_receiver": true,
+    "mid_flight_disable": "auto_switch",
+    "dedup_retention_days": 30,
+    "message_retention_limit": 10000
+  }
+}
+
+settings {
+  encodeUrl: true
+}

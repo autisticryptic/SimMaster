@@ -91,6 +91,19 @@ impl OperatorMediaMetrics {
             dtmf_events: self.dtmf_events.load(Ordering::Relaxed),
         }
     }
+
+    fn replace_relay_counters(&self, diagnostics: OperatorDiagnostics) {
+        self.active_relays
+            .store(diagnostics.active_relays, Ordering::Relaxed);
+        self.rtp_from_asterisk_packets
+            .store(diagnostics.rtp_from_asterisk_packets, Ordering::Relaxed);
+        self.rtp_from_asterisk_bytes
+            .store(diagnostics.rtp_from_asterisk_bytes, Ordering::Relaxed);
+        self.rtp_to_asterisk_packets
+            .store(diagnostics.rtp_to_asterisk_packets, Ordering::Relaxed);
+        self.rtp_to_asterisk_bytes
+            .store(diagnostics.rtp_to_asterisk_bytes, Ordering::Relaxed);
+    }
 }
 
 impl Default for OperatorLink {
@@ -119,6 +132,10 @@ impl OperatorLink {
 
     pub fn is_available(&self) -> bool {
         self.inner.ready.load(Ordering::SeqCst) && self.inner.commands.receiver_count() > 0
+    }
+
+    pub(crate) fn has_command_consumer(&self) -> bool {
+        self.inner.commands.receiver_count() > 0
     }
 
     pub fn set_video_enabled(&self, enabled: bool) {
@@ -190,6 +207,12 @@ impl OperatorLink {
         self.inner.metrics.snapshot()
     }
 
+    /// Replace only relay/RTP counters. Command, event, and DTMF counters belong
+    /// to this link itself and must not be double-counted by an access router.
+    pub(crate) fn replace_relay_diagnostics(&self, diagnostics: OperatorDiagnostics) {
+        self.inner.metrics.replace_relay_counters(diagnostics);
+    }
+
     pub fn send_command(&self, command: OperatorCommand) -> Result<(), Box<OperatorCommand>> {
         let is_dtmf = matches!(&command, OperatorCommand::SendDtmf { .. });
         let result = self
@@ -214,11 +237,18 @@ impl OperatorLink {
     }
 
     pub fn send_event(&self, event: OperatorEvent) {
+        let is_dtmf = matches!(&event, OperatorEvent::Dtmf { .. });
         let _ = self.inner.events.send(event);
         self.inner
             .metrics
             .event_count
             .fetch_add(1, Ordering::Relaxed);
+        if is_dtmf {
+            self.inner
+                .metrics
+                .dtmf_events
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -277,6 +307,19 @@ mod tests {
             commands.recv().await.unwrap(),
             OperatorCommand::CancelCall { .. }
         ));
+        link.send_command(OperatorCommand::SendDtmf {
+            call_id: "call-a".into(),
+            signal: crate::services::trunk::bridge::DtmfSignal {
+                digit: '4',
+                duration_ms: 120,
+                source: crate::services::trunk::bridge::DtmfSource::SipInfo,
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            commands.recv().await.unwrap(),
+            OperatorCommand::SendDtmf { .. }
+        ));
         link.send_event(OperatorEvent::Ended {
             call_id: "call-a".into(),
         });
@@ -284,5 +327,19 @@ mod tests {
             events.recv().await.unwrap(),
             OperatorEvent::Ended { .. }
         ));
+
+        link.send_event(OperatorEvent::Dtmf {
+            call_id: "call-a".into(),
+            signal: crate::services::trunk::bridge::DtmfSignal {
+                digit: '5',
+                duration_ms: 160,
+                source: crate::services::trunk::bridge::DtmfSource::SipInfo,
+            },
+        });
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            OperatorEvent::Dtmf { .. }
+        ));
+        assert_eq!(link.diagnostics().dtmf_events, 2);
     }
 }

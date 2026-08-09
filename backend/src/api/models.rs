@@ -36,7 +36,6 @@ where
     }
 }
 
-
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct EsimCommandResponse {
     #[serde(default)]
@@ -793,14 +792,13 @@ pub struct CellLockResult {
 #[derive(Debug, Deserialize)]
 pub struct MakeCallRequest {
     pub phone_number: String,
-    /// Which physical line dials. Omitted means the primary line.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone, Default)]
 pub struct CallInfo {
     pub path: String,
+    #[serde(default)]
+    pub line_id: String,
     pub phone_number: String,
     pub state: String,
     pub direction: String,
@@ -818,6 +816,12 @@ pub struct HangupCallRequest {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct SendCallDtmfRequest {
+    pub path: String,
+    pub digit: String,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub struct CallHistoryRequest {
     #[serde(default = "default_page_size")]
@@ -828,6 +832,7 @@ pub struct CallHistoryRequest {
 
 #[derive(Debug, Serialize, Default)]
 pub struct CallHistoryResponse {
+    pub line_id: String,
     pub records: Vec<CallRecord>,
     pub stats: CallStats,
 }
@@ -923,20 +928,12 @@ pub struct WebCallCapabilitiesResponse {
 pub struct SendSmsRequest {
     pub phone_number: String,
     pub content: String,
-    /// Optional stable modem+SIM line. Omitted requests preserve the legacy
-    /// primary-line behavior.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 /// Request body for placing a VoWiFi voice call.
 #[derive(Debug, Deserialize)]
 pub struct PlaceCallRequest {
     pub phone_number: String,
-    /// Which physical line places the call. Omitted means the primary line, so
-    /// the single-line UI keeps working without changes.
-    #[serde(default)]
-    pub line_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -960,13 +957,19 @@ pub struct SmsConversationRequest {
 }
 
 #[derive(Debug, Default, Deserialize)]
+pub struct SmsMutationRequest {
+    #[serde(default)]
+    pub channel_id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 pub struct SmsBatchDeleteRequest {
     #[serde(default)]
     pub ids: Vec<i64>,
     #[serde(default)]
     pub phone_numbers: Vec<String>,
     #[serde(default)]
-    pub channel_id: Option<String>,
+    pub channel_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]

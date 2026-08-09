@@ -26,11 +26,12 @@ import type { SimInfo } from '@/api/types'
 import { api } from '@/api/current'
 
 interface SimCardInfoProps {
+  lineId: string
   simInfo: SimInfo | null
   onRefresh?: () => void
 }
 
-export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
+export function SimCardInfo({ lineId, simInfo, onRefresh }: SimCardInfoProps) {
   const [showInfo, setShowInfo] = useState(false)
   const [editingPhone, setEditingPhone] = useState(false)
   const [editingSmsc, setEditingSmsc] = useState(false)
@@ -65,7 +66,7 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
 
     setSavingPhone(true)
     try {
-      await api.updateSimCache({ phone_number: phoneInput.trim() })
+      await api.updateSimCache(lineId, { phone_number: phoneInput.trim() })
       showMsg('号码缓存已更新', 'success')
       setEditingPhone(false)
       if (onRefresh) onRefresh()
@@ -88,7 +89,7 @@ export function SimCardInfo({ simInfo, onRefresh }: SimCardInfoProps) {
 
     setSavingSmsc(true)
     try {
-      await api.updateSimCache({ sms_center: smscInput.trim() })
+      await api.updateSimCache(lineId, { sms_center: smscInput.trim() })
       showMsg('短信中心缓存已更新', 'success')
       setEditingSmsc(false)
       if (onRefresh) onRefresh()

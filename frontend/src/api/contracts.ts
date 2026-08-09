@@ -590,10 +590,19 @@ export interface TrunkProfileResponse {
  */
 export type VolteIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
 
+export interface AutoRestoreConfig {
+  initial_delay_secs: number
+  attempts: number
+  retry_delay_secs: number
+}
+
 export interface LineProfileConfig {
   line_id: string
   enabled: boolean
   volte_connection_enabled: boolean
+  volte_auto_restore: AutoRestoreConfig
+  volte_voice_enabled: boolean
+  vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
   data_connection_enabled: boolean
@@ -601,11 +610,10 @@ export interface LineProfileConfig {
   roaming_allowed: boolean
   airplane_mode_enabled: boolean
   /**
-   * Ordered IMS address-family attempt list. `null` inherits the global VoLTE
-   * preference. Order is the attempt/fallback order; a one-element list means
+   * Ordered IMS address-family attempt list. Order is the attempt/fallback order; a one-element list means
    * "only that family".
    */
-  volte_ip_families?: VolteIpFamily[] | null
+  volte_ip_families: VolteIpFamily[]
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,
@@ -839,14 +847,13 @@ export interface LineVowifiConfig {
    * automatic matching so deleting a profile never strands a line.
    */
   profile_id?: string | null
+  auto_restore: AutoRestoreConfig
 }
 
 export interface VowifiLineConfigResponse {
   line_id: string
   modem: ModemBinding
   config: LineVowifiConfig
-  is_primary: boolean
-  runtime_scope: string
   runtime_phase: string
   runtime_stage: string
   runtime_registered: boolean
@@ -871,14 +878,6 @@ export interface LineRuntimeStatus {
 export interface VolteLineControlResponse {
   modem: ModemBinding
   profile: LineProfileConfig
-  runtime: VolteRuntimeStatus
-}
-
-export interface VolteControlResponse {
-  enabled: boolean
-  feature_enabled: boolean
-  sms_enabled: boolean
-  connection_enabled: boolean
   runtime: VolteRuntimeStatus
 }
 
@@ -917,6 +916,7 @@ export interface SmsStats {
 
 export interface CallInfo {
   path: string
+  line_id: string
   phone_number: string
   state: string
   direction: string
@@ -929,6 +929,7 @@ export interface CallListResponse {
 
 export interface CallRecord {
   id: number
+  line_id?: string
   direction: string
   phone_number: string
   duration: number
@@ -946,6 +947,7 @@ export interface CallStats {
 }
 
 export interface CallHistoryResponse {
+  line_id: string
   records: CallRecord[]
   stats: CallStats
 }
@@ -977,8 +979,15 @@ export interface SmsPathPolicy {
   message_retention_limit: number
 }
 
+export type VoiceAccessPathKind = 'vowifi' | 'volte'
+
+export interface VoicePathLayerConfig {
+  kind: VoiceAccessPathKind
+  enabled: boolean
+}
+
 export interface VoicePathPolicy {
-  priority: PathLayerConfig[]
+  priority: VoicePathLayerConfig[]
   gateway_mode: boolean
 }
 
@@ -1007,17 +1016,21 @@ export interface VilteConfig {
 }
 
 export interface VilteStatusResponse {
+  line_id: string
   enabled: boolean
   feature_enabled: boolean
+  registered: boolean
   gateway_mode: boolean
   local_video_capable: boolean
   config: VilteConfig
 }
 
 export interface VolteVoiceStatusResponse {
+  line_id: string
   enabled: boolean
-  feature_enabled: boolean
+  ims_connection_enabled: boolean
   voice_enabled: boolean
+  registered: boolean
   gateway_mode: boolean
   local_audio_capable: boolean
 }
@@ -1126,7 +1139,7 @@ export type NotificationChannelKey =
   | 'feishu_robot'
   | 'telegram'
 
-export type NotificationEventType = 'sms' | 'ddns' | 'version_update' | 'system_event' | 'device_status' | 'automation'
+export type NotificationEventType = 'sms' | 'call' | 'ddns' | 'version_update' | 'system_event' | 'device_status' | 'automation'
 export type NotificationLogStatus = 'success' | 'failed' | 'no_available_channel' | 'quiet_hours' | 'unmatched'
 export type MatcherOperator = 'always' | 'contains' | 'not_contains' | 'equals' | 'regex'
 
@@ -1278,6 +1291,7 @@ export interface NotificationRule {
 
 export interface NotificationLogEntry {
   id: number
+  line_id?: string | null
   event_type: NotificationEventType
   status: NotificationLogStatus
   summary: string
@@ -1298,6 +1312,7 @@ export type NotificationQueueItemStatus = 'pending' | 'scheduled' | 'retrying' |
 
 export interface NotificationQueueEntry {
   id: number
+  line_id?: string | null
   status: NotificationQueueItemStatus
   event_type: NotificationEventType
   event_label: string
@@ -1438,14 +1453,6 @@ export interface OtaLatestReleaseResponse {
   body?: string
   html_url?: string
   assets?: OtaReleaseAsset[]
-}
-
-export interface VowifiConfig {
-  feature_enabled: boolean
-  connection_enabled: boolean
-  auto_restore_initial_delay_secs: number
-  auto_restore_attempts: number
-  auto_restore_retry_delay_secs: number
 }
 
 export interface VowifiCarrierProfile {
@@ -2144,6 +2151,7 @@ export interface VowifiStatusResponse {
   switch_retry_count: number
 }
 export interface VowifiRuntimeSnapshotEntry {
+  line_id?: string | null
   phase: string
   profile_id?: string | null
   plmn?: string | null
@@ -2276,6 +2284,7 @@ export interface VowifiReadinessAuditReport {
   sensitive_values_policy: string
 }
 export interface VowifiDiagnosticsResponse {
+  line_id?: string | null
   status: VowifiStatusResponse
   persisted_snapshot?: VowifiRuntimeSnapshotEntry | null
   events: VowifiRuntimeEventsResponse
@@ -2291,6 +2300,7 @@ export interface VowifiDiagnosticsResponse {
 
 export interface VowifiRuntimeEventEntry {
   id: number
+  line_id?: string | null
   trace_id?: string | null
   level: string
   phase: string
@@ -2316,6 +2326,7 @@ export interface VowifiSmsPartEntry {
 
 export interface VowifiSmsDeliveryEntry {
   message_id: string
+  line_id?: string | null
   trace_id: string
   direction: string
   state: string
@@ -2347,6 +2358,7 @@ export interface VowifiSoakSampleEntry {
 
 export interface VowifiSoakRunEntry {
   run_id: string
+  line_id?: string | null
   scenario_id: string
   profile_id?: string | null
   plmn?: string | null
@@ -2368,6 +2380,7 @@ export interface VowifiSoakRunsResponse {
 }
 
 export interface VowifiEsimRestoreEntry {
+  line_id?: string | null
   switch_token?: string | null
   switch_phase?: string | null
   phase_ms?: number | null
@@ -2537,6 +2550,7 @@ export interface AutomationTask {
 
 export interface AutomationLogEntry {
   id: number
+  line_id?: string | null
   task_id: string
   task_name: string
   task_type: string

@@ -1,36 +1,25 @@
-<a href="https://github.com/3899/SimAdmin">
-  <img src="https://socialify.git.ci/3899/SimAdmin/image?description=1&descriptionEditable=%E9%9D%A2%E5%90%91%20Debian%20%E5%B9%B3%E5%8F%B0%E6%94%AF%E6%8C%81%20SIM%2FeSIM%20%E8%9C%82%E7%AA%9D%E8%AE%BE%E5%A4%87%E7%9A%84%E5%BC%80%E6%BA%90%20Web%20%E7%AE%A1%E7%90%86%E7%B3%BB%E7%BB%9F&font=Source%20Code%20Pro&logo=https%3A%2F%2Fgithub.com%2F3899%2FSimAdmin%2Fblob%2Fmain%2Ffrontend%2Fpublic%2Fsimadmin-logo.svg%3Fraw%3Dtrue&name=1&owner=1&pattern=Floating%20Cogs&theme=Auto" alt="SimAdmin" />
-</a>
-
 <div align="center">
+  <img src="./frontend/public/simadmin-logo.svg" width="96" alt="SimAdmin" />
   <br/>
 
   <div>
-    <a href="https://github.com/3899/SimAdmin/releases">
-      <img 
-        alt="Debian"
-        src="https://img.shields.io/badge/Debian-%23D70A53?logo=debian&logoColor=white&style=flat-square" 
-      />
-    </a >
+    <img
+      alt="Debian"
+      src="https://img.shields.io/badge/Debian-%23D70A53?logo=debian&logoColor=white&style=flat-square"
+    />
     <a href="./LICENSE">
       <img
-        src="https://img.shields.io/github/license/3899/SimAdmin?style=flat-square"
+        alt="GPLv3"
+        src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square"
       />
-    </a >
-    <a href="https://github.com/3899/SimAdmin/releases">
-      <img
-        src="https://img.shields.io/github/v/release/3899/SimAdmin?style=flat-square"
-      />
-    </a >
-    <a href="https://github.com/3899/SimAdmin/releases">
-      <img
-        src="https://img.shields.io/github/downloads/3899/SimAdmin/total?style=flat-square"
-      />  
     </a >
   </div>
 
   <br/>
 
+  <details>
+    <summary>查看 v1.1.3 界面截图（当前开发分支界面可能不同）</summary>
+    <br/>
   <picture>
     <img src="./static/Dashboard.png" width="100%" alt="Dashboard" />
 	<br/><br/>
@@ -60,35 +49,107 @@
 	<br/><br/>
 	<img src="./static/Security_Settings.png" width="100%" alt="Security_Settings" />
 	<br/><br/>
-	<img src="./static/OTA.png" width="100%" alt="OTA" />
-	<br/><br/>
+	<!-- OTA 页面截图将在新的 OTA 流程完成后重新补充。 -->
 	<img src="./static/Dashboard_Dark.png" width="100%" alt="Dashboard_Dark" />
 	<br/><br/>
   </picture>
+  </details>
   
 </div>
 
-# SimAdmin - SIM/eSIM 中枢
+# SimAdmin - 多线路 SIM/eSIM 与 IMS 管理中枢
 
-SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的 SIM/eSIM、蜂窝网络、短信、WiFi Calling(VoWiFi)、DDNS 和系统状态管理系统。
+SimAdmin 是面向 Debian 蜂窝 CPE、随身 WiFi 和软路由设备的 Web 管理系统。它把每个
+“基带 + 卡槽”建模为独立线路，在同一服务中管理 SIM/eSIM、蜂窝数据、短信、通话、
+VoLTE、VoWiFi、SIP Trunk、设备网络、通知和自动化。
 
-**💡 核心亮点 —— 支持 WiFi Calling (VoWiFi)**：原生实现 IKEv2/IPsec 全链路能力，无第三方程序依赖；依托 SIM 硬件鉴权搭建加密隧道，无蜂窝信号、飞行模式下仍可通过无线网络完成 IMS 注册与加密短信收发。
+项目由 Rust + Axum 后端与 React + TypeScript 前端组成。后端主要通过 ModemManager
+D-Bus 管理 modem，并按场景使用 QMI、AT、`mmcli`、`qmicli`、NetworkManager 和 Linux
+网络栈；生产环境由同一个后端进程托管前端 SPA，默认安装到 `/opt/simadmin` 并通过
+systemd 运行。
 
-当前项目由 Rust 后端和 React 前端组成：
+> 当前 IMS、多基带和 eSIM 能力与 modem 固件、内核驱动、运营商配置及 SIM 权限高度相关。
+> “代码中提供能力”不等于所有设备均可直接使用，请在目标硬件上按真机清单验收。
 
-- 后端：Rust + Axum + zbus，主要通过 ModemManager D-Bus 接口管理 modem，并在部分场景使用 `mmcli`、`qmicli` 或 AT 直连兜底。
-- 前端：React + Vite + Material UI，提供仪表盘、SIM 卡管理、蜂窝网络、设备网络、短信管理、通知中心、自动化中心和 OTA 更新页面。
-- 部署形态：后端二进制同进程托管前端 SPA，默认安装到 `/opt/simadmin`，通过 systemd 运行。
+## 核心能力
 
-健康检查整体按支持 ModemManager 的 Linux 蜂窝设备组织，不同 modem 固件、内核、ModemManager 版本暴露的能力不同，具体功能以实际设备为准。
+- **多线路隔离**：设备信息、SIM、APN、数据、漫游、飞行模式、射频/频段、运营商注册、
+  VoLTE、VoWiFi、eSIM、短信和语音策略均按稳定 `line_id` 寻址与持久化。
+- **多路径 IMS**：共享 SIP、Digest-AKA、短信编解码与语音核心；VoWiFi 使用内置的
+  IKEv2/ESP over ePDG 用户态协议栈，VoLTE 使用独立 IMS bearer 与 Linux `ip xfrm`。
+- **语音与短信编排**：短信可按线路在 VoWiFi、VoLTE、CS 之间排序与回退，IMS 语音可在
+  VoWiFi、VoLTE 之间选路；同时包含接收腿选举、跨通道去重、投递记录和线路级通话控制。
+- **SIP Trunk**：将线路的语音能力桥接到 Asterisk 等 SIP 端点，提供每线路配置、鉴权、
+  运行状态和诊断信息。
+- **eSIM/eUICC**：自动探测或按线路启停 eSIM 控制，通过私有 `lpac` 按需读取 EID、下载、
+  启用、重命名和删除 Profile；支持配置独立 QMI 读卡器线路。
+- **运营商 Profile**：加载只读、已封存的 carrier catalog，并允许本地覆盖；支持 AOSP APN、
+  CarrierConfig 与 Apple IPCC 配置事实的导入和匹配。
+- **蜂窝与设备网络**：线路级数据代理与流量统计、基带恢复、WLAN 客户端、网络接口诊断，
+  以及 DNSPod、AliDNS、Cloudflare 的 IPv4/IPv6 DDNS。
+- **设备运维**：短信持久化与通知转发、通知失败队列、定时/周期自动化任务、系统事件、
+  单管理员认证和 SSH 密码恢复。
 
-## 📖 文档导航
+> 一键安装、在线升级和 OTA 发布流程正在重构，当前不提供任何远程脚本安装入口。
+> 仓库中的相关脚本仅作为历史实现保留，请使用下方手动安装流程。
 
-*   🚀 **[安装与部署指南 (docs/INSTALL.md)](./docs/INSTALL.md)**：设备一键安装/卸载、后台默认访问地址及首次管理员密码设置。
-*   📜 **[版本更新记录 (docs/CHANGELOG.md)](./docs/CHANGELOG.md)**：历史版本详细的更新说明日志。
-*   ⚙️ **[运行环境与系统管理 (docs/ENVIRONMENT.md)](./docs/ENVIRONMENT.md)**：目标设备硬件与依赖指令要求、默认安装路径、eSIM/VoWiFi 管理机制、systemd 服务维护及数据持久化。
-*   🛠️ **[开发者指南 (docs/DEVELOPER.md)](./docs/DEVELOPER.md)**：项目工程结构、前端与后端开发编译、OTA 构建、ADB 部署调试及 D-Bus 接口说明。
-*   🔌 **[REST API 接口文档 (bruno-api/README.md)](./bruno-api/README.md)**：详细的 REST API 路由映射表、请求/响应报文规约与 Bruno API 调试集合。
+## 软件结构
+
+```text
+SimAdmin/
+├── backend/          Rust 后端、硬件接入、IMS 协议栈和业务服务
+├── frontend/         React 19 + TypeScript + MUI 管理界面
+├── bruno-api/        可直接执行的 Bruno REST API 集合
+├── docs/             安装、运维、开发、变更记录与专题资料
+├── deploy/           设备安装资源、udev 规则和辅助 systemd 单元
+├── scripts/          构建、实验室测试及待重构的部署/打包脚本
+├── install_latest.sh 待重构的一键安装脚本（当前不使用）
+└── uninstall.sh      待重构的卸载脚本（当前不使用）
+```
+
+后端依赖方向为 `api/services -> connectivity/hardware -> platform`：
+
+- `connectivity/core`：与传输无关的 IMS、SIP、AKA、短信与语音核心。
+- `connectivity/modems/softstack/{volte,vowifi}`：VoLTE 与 VoWiFi 接入实现。
+- `hardware/{cellular,sim}`：ModemManager、QMI、AT、数据代理与 eSIM 设备操作。
+- `services/{orchestrator,trunk,...}`：跨接入选路、Trunk、短信、通知、自动化、网络和 OTA。
+- `platform`：配置、SQLite 与通用系统能力。
+
+更完整的目录职责和开发流程见[开发者指南](./docs/DEVELOPER.md)。
+
+## 手动安装
+
+当前只支持手动部署。完成前后端构建并准备兼容的 `carrier-bundles.sqlite3` 后，将它们安装到
+目标设备：
+
+```bash
+install -d -m 0755 /opt/simadmin /opt/simadmin/www
+install -m 0755 /path/to/simadmin /opt/simadmin/simadmin
+cp -a /path/to/frontend-dist/. /opt/simadmin/www/
+install -m 0644 /path/to/carrier-bundles.sqlite3 /opt/simadmin/carrier-bundles.sqlite3
+install -m 0644 /path/to/simadmin.service /etc/systemd/system/simadmin.service
+systemctl daemon-reload
+systemctl enable --now simadmin.service
+```
+
+以上命令需在目标设备以 `root` 执行，并将 `/path/to/...` 换成实际产物路径。完整的依赖、
+构建、文件传输、副 QMI 服务和升级步骤见[手动安装指南](./docs/INSTALL.md)。安装完成后访问
+`http://<设备 IP>:3000`，首次打开时设置管理员密码。
+
+## 文档导航
+
+| 文档 | 用途 | 是否应独立维护 |
+|------|------|----------------|
+| [手动安装与部署](./docs/INSTALL.md) | 构建产物、手动安装、升级和登录恢复 | 是，面向最终用户 |
+| [运行环境与系统管理](./docs/ENVIRONMENT.md) | 依赖、路径、systemd、数据与硬件约束 | 是，面向设备运维 |
+| [开发者指南](./docs/DEVELOPER.md) | 架构、前后端开发、构建、测试、ADB 调试 | 是，前后端子 README 已归并于此 |
+| [Bruno API 集合](./bruno-api/README.md) | API 调试方法、环境变量和线路级请求说明 | 是，可执行请求以 `.bru` 文件为准 |
+| [真机测试清单](./真机测试清单.md) | 多 SIM、多读卡器、VoLTE/VoWiFi 与路由回归 | 是，属于发布验收资料 |
+| [版本更新记录](./docs/CHANGELOG.md) | 已发布版本的用户可见变化 | 是，不与开发计划混写 |
+| [运营商 Profile 来源说明](./docs/CARRIER_PROFILES.md) | catalog、AOSP/IPCC 来源、限制与维护边界 | 是，保留为专题背景 |
+
+已完成的 VoLTE / VoWiFi 逆向、重构和阶段性开发记录已移至同级归档仓库
+`SimAdmin-Enhance`；它们不再作为本仓库的现行使用说明。
 
 ---
 
@@ -145,53 +206,6 @@ SimAdmin 是一套面向 Debian 蜂窝 CPE、随身 WiFi、软路由类设备的
     </tr>
   </tbody>
 </table>
-
----
-
-## 核心功能
-
-### Web 管理页面
-
-| 页面 | 路由 | 说明 |
-|------|------|------|
-| 登录认证 | `/login` | 首次设置管理员密码、登录后台 |
-| 仪表盘 | `/` | 包含在线状态、运营商、信号、网络延迟、数据/漫游/飞行模式快捷开关、系统资源、温度、流量，以及设备信息 |
-| SIM 卡管理 | `/sim` | 全面展示卡状态、标识信息、解锁次数及存储路径，支持号码与短信中心行内修改；在 eSIM 模式下集成管理与写卡功能，在开启 WiFi Calling 时提供连接状态与耗时时序图诊断看板 |
-| 蜂窝网络 | `/network` | 网络注册、服务小区和邻区、运营商扫描、APN、射频模式、频段锁定、小区锁定状态 |
-| 设备网络 | `/device-network` | WLAN 客户端联网、无线网络扫描和连接、DDNS 动态解析配置和同步日志 |
-| 短信管理 | `/sms` | 接收短信、发送短信、短信列表、会话、统计、删除对话、删除短信 |
-| 通知中心 | `/notifications` | 转发日志、转发规则、转发通道、多通道测试发送 |
-| 自动化中心 | `/automation` | 管理自动化任务，以及检索、筛选和清理任务执行日志 |
-| 系统配置 | `/config` | 基本系统配置，包含设备运行模式设置、数据连接、漫游、飞行模式等 |
-| 安全性设置 | `/config/security` | 管理员密码修改、密码策略、登录保护及会话超时等安全配置 |
-| OTA 更新 | `/ota` | 上传 OTA 包、在线获取 Release、验证、应用或取消更新 |
-
-### 后端能力
-
-- 单管理员密码登录，支持首次设置、会话 Cookie、受保护 API 拦截 and SSH 本机恢复。
-- 设备信息、SIM 信息、网络注册信息读取。
-- 数据连接开关和漫游策略持久化。
-- 飞行模式控制。
-- 基带重启流程和进度查询。
-- 数据连接 watchdog，每 15 秒检查连接状态、iptables 规则数量和 modem 可用性；检测到宿主机防火墙规则时仅记录诊断日志，不自动清空规则。
-- ModemManager 丢失时触发 `mmcli --scan-modems`，连续失败后重启 ModemManager。
-- NetworkManager `wwan*` unmanaged 配置。
-- 设备侧 WLAN 客户端连接管理，通过 NetworkManager/nmcli 扫描和连接无线局域网，WLAN 在线时优先作为设备默认出口。
-- 原生 DDNS 同步，支持腾讯云 DNSPod、阿里云 AliDNS 和 Cloudflare，支持 IPv4/IPv6 独立配置、API/网卡取 IP 和变更/失败事件通知；默认通过网卡取 IP，可切换为内置多接口 API fallback。
-- 短信发送、接收监听、SQLite 持久化和多渠道通知转发。
-- 自动化中心双轨任务调度引擎：支持在后台并行执行自动化任务，提供`定点定时`（周几 + 具体时间，如每周二 03:00）和`间隔周期`（按分钟/小时/天，如每 180 天）调度模式。
-- 多种自动化动作支持：支持`重启基带`、`安全重启系统`（支持延时）和`发送短信`（支持随机延迟、自动生成随机字符防止拦截、发送失败自动重试）。
-- 自动化事件通知与运行日志管理：任务执行后写入本地 SQLite 日志表（支持关键词检索、日期筛选、手动/自动清理策略），并可将执行结果（成功/失败）作为事件实时推送至通知通道。
-- APN 列表读取和 APN 修改。
-- 运营商列表、扫描、手动注册、自动注册。
-- eSIM 模式下按需调用 `lpac` 管理实体 eUICC SIM 卡 Profiles；普通 SIM 模式下不调用 eSIM 能力。
-- 安装脚本按设备架构自动准备私有 `lpac`；OTA 包本身不绑定 `lpac` 架构或版本。
-- OTA 上传、在线下载、校验、替换二进制和前端资源。
-- 实现用户态 IKEv2 协议协商与 IPsec/ESP 安全报文加解密，提供零外部依赖的 VoWiFi 运行环境。
-- 集成 QMI UIM D-Bus 接口直连硬件，利用实体/eSIM卡的物理硬件鉴权能力，支持 3GPP 规范的 EAP-AKA 鉴权。
-- 支持 3GPP 动态运营商配置预设生成，自动解析 MCC/MNC 推导 ePDG 网关并原生支持大部分标准网络运营商。
-- 落地用户态虚拟 TUN 路由转发与 IMS 注册，集成 SMS over IPsec 安全短信收发机制。
-- 细化的 VoWiFi 错误诊断系统与连接状态时序图，支持连接中断后智能退避重试与自动恢复。
 
 ---
 

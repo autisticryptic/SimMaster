@@ -16,16 +16,14 @@
 //!   ships or downloads them — an operator points the importer at a bundle they
 //!   already have.
 //!
-//! Notably absent from *all* of them is the ePDG hostname, because it is not
-//! configuration: 3GPP TS 23.003 §19.4.2.4 defines it as a function of the
-//! IMSI. The derivation layer computes it instead.
+//! These partial sources never create a runnable profile by themselves. They
+//! can only overlay a complete profile already loaded from `carrier_Bundles`.
 
 use std::collections::BTreeMap;
 
 use serde::Serialize;
 
 use super::profile_record::CarrierProfileRecord;
-use super::profiles::generate_standard_3gpp_profile;
 
 /// The subset of a profile a public source can actually populate. Everything
 /// else keeps the derived or existing value, so importing never silently
@@ -49,9 +47,8 @@ impl ImportedCarrierFacts {
         format!("{}{}", self.mcc, self.mnc)
     }
 
-    /// Build a full profile record: start from the 3GPP-derived defaults for
-    /// this PLMN, then overlay whatever the source actually told us.
-    pub fn to_record(&self) -> Option<CarrierProfileRecord> {
+    /// Overlay these partial facts on a complete database-backed profile.
+    pub fn to_record(&self, base: &CarrierProfileRecord) -> Option<CarrierProfileRecord> {
         if self.mcc.len() != 3 || self.mnc.is_empty() || self.mnc.len() > 3 {
             return None;
         }
@@ -60,9 +57,10 @@ impl ImportedCarrierFacts {
         {
             return None;
         }
-        let derived = generate_standard_3gpp_profile(&self.mcc, &self.mnc, self.mnc.len() as u8);
-        let mut record = CarrierProfileRecord::from_profile(derived);
-        record.meta.profile_id = format!("imported_{}", self.plmn());
+        if base.meta.plmn != self.plmn() {
+            return None;
+        }
+        let mut record = base.clone();
         if let Some(brand) = self.brand.as_ref().filter(|value| !value.trim().is_empty()) {
             record.meta.brand = brand.trim().to_string();
             record.meta.operator_legal_name = brand.trim().to_string();
@@ -316,6 +314,18 @@ fn decode_xml_entities(value: &str) -> String {
 mod tests {
     use super::*;
 
+    fn catalog_base(mcc: &str, mnc: &str) -> CarrierProfileRecord {
+        let mut record = CarrierProfileRecord::from_profile(&super::super::profiles::GB_EE_23433);
+        record.meta.profile_id = format!("catalog_{}{}", mcc, mnc);
+        record.meta.mcc = mcc.to_string();
+        record.meta.mnc = mnc.to_string();
+        record.meta.mnc_len = mnc.len() as u8;
+        record.meta.plmn = format!("{mcc}{mnc}");
+        record.ims.domain = "catalog.ims.example".to_string();
+        record.ims.realm = "catalog.realm.example".to_string();
+        record
+    }
+
     const APNS_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 <apns version="8">
   <apn carrier="EE Internet" mcc="234" mnc="33" apn="everywhere" type="default,supl" />
@@ -335,7 +345,7 @@ mod tests {
     }
 
     #[test]
-    fn imported_facts_start_from_the_derived_profile() {
+    fn imported_facts_overlay_a_catalog_profile_without_deriving_fields() {
         let facts = ImportedCarrierFacts {
             mcc: "460".to_string(),
             mnc: "01".to_string(),
@@ -344,14 +354,12 @@ mod tests {
             vowifi_supported: Some(true),
             entitlement_url: None,
         };
-        let record = facts.to_record().expect("record");
+        let record = facts
+            .to_record(&catalog_base("460", "01"))
+            .expect("record");
         record.validate().expect("valid");
-        // ePDG and IMS names come from derivation, not from the import.
-        assert_eq!(
-            record.epdg.host,
-            "epdg.epc.mnc001.mcc460.pub.3gppnetwork.org"
-        );
-        assert_eq!(record.ims.domain, "ims.mnc001.mcc460.3gppnetwork.org");
+        assert_eq!(record.epdg.host, "epdg.epc.mnc033.mcc234.pub.3gppnetwork.org");
+        assert_eq!(record.ims.domain, "catalog.ims.example");
         // The APN and brand come from the import.
         assert_eq!(record.epdg.apn.as_deref(), Some("cmims"));
         assert_eq!(record.meta.brand, "China Unicom");
@@ -365,7 +373,7 @@ mod tests {
             mnc: "01".to_string(),
             ..ImportedCarrierFacts::default()
         };
-        assert!(facts.to_record().is_none());
+        assert!(facts.to_record(&catalog_base("460", "01")).is_none());
     }
 
     #[test]
@@ -403,7 +411,9 @@ mod tests {
 
         // An entitlement URL implies E911 is in play, and the host policy is
         // auto-filled so the value is actionable.
-        let record = facts.to_record().expect("record");
+        let record = facts
+            .to_record(&catalog_base("310", "260"))
+            .expect("record");
         assert!(record.e911.enabled);
         assert_eq!(
             record.e911.websheet_host_policy.as_deref(),

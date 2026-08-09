@@ -224,7 +224,7 @@ async fn establish_dual_stack(
 
     // Both retained sessions are up; the modem now describes the merged
     // context. Read it once from AT, which is beta8's IMS source of truth.
-    let settings = match read_ims_settings(modem_id, cid).await {
+    let settings = match read_ims_settings(modem_id, cid, &request.apn).await {
         Ok(settings) => settings,
         Err(error) => {
             stop_sessions(endpoint, &sessions).await;
@@ -288,7 +288,7 @@ async fn establish_one(
     let session = start_session(endpoint, request, family).await?;
     let handle = session.packet_data_handle.clone();
 
-    let settings = match read_ims_settings(modem_id, cid).await {
+    let settings = match read_ims_settings(modem_id, cid, &request.apn).await {
         Ok(settings) => settings,
         Err(error) => {
             secondary_qmi::stop_ims_session(endpoint, &session).await;
@@ -357,8 +357,12 @@ async fn start_session(
 /// This is beta8's IMS source of truth (`volte.rs:3671`). A context that reports
 /// neither an address nor a P-CSCF is treated as missing so the caller does not
 /// build an unusable bearer.
-async fn read_ims_settings(modem_id: &str, cid: u8) -> Result<CgcontrdpSettings, VolteError> {
-    let settings = pcscf::read_cgcontrdp_settings(modem_id, cid).await?;
+async fn read_ims_settings(
+    modem_id: &str,
+    cid: u8,
+    apn: &str,
+) -> Result<CgcontrdpSettings, VolteError> {
+    let settings = pcscf::read_cgcontrdp_settings(modem_id, cid, apn).await?;
     if settings.ipv4_address.is_none() && settings.ipv6_address.is_none() {
         return Err(VolteError::with_detail(
             code::IP_SETTINGS_MISSING,

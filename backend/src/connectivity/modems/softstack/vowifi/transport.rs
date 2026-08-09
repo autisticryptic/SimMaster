@@ -138,6 +138,7 @@ impl UdpSocketDatagramTransport {
         let socket = UdpSocket::bind(local)
             .await
             .map_err(|err| TransportError::Io(err.kind().to_string()))?;
+        allow_udp_fragmentation(&socket);
         Ok(Self::from_socket(socket))
     }
 
@@ -291,6 +292,33 @@ impl UdpSocketDatagramTransport {
         }
     }
 }
+
+/// Allow the kernel to fragment large outer ESP datagrams.
+///
+/// Linux defaults UDP to PMTU discovery (DF=1). A full IMS REGISTER plus the
+/// ipsec-3gpp ESP and the outer ePDG ESP encapsulation routinely exceeds the
+/// 1500-byte access MTU, and the operator ePDG reassembles IP fragments before
+/// decapsulation. Disabling DF keeps `send_to` from failing with EMSGSIZE.
+#[cfg(target_os = "linux")]
+fn allow_udp_fragmentation(socket: &UdpSocket) {
+    use std::os::fd::AsRawFd;
+
+    let fd = socket.as_raw_fd();
+    let value: libc::c_int = libc::IP_PMTUDISC_DONT;
+    // Best-effort: sockets without the option simply keep the platform default.
+    unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            &value as *const libc::c_int as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn allow_udp_fragmentation(_socket: &UdpSocket) {}
 
 impl IkeDatagramTransport for UdpSocketDatagramTransport {
     async fn send_ike_datagram(

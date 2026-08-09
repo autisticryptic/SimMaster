@@ -1,6 +1,4 @@
-//! Network domain: dynamic DNS management and firewall (iptables) control.
+//! Network domain: dynamic DNS and device network management.
 //!
 //!   - `device_network`: DDNS provider integration + device network config
-//!   - `iptables`: firewall rule management
 pub mod device_network;
-pub mod iptables;

@@ -25,6 +25,8 @@ pub mod code {
     // Identity / AKA.
     pub const IMSI_MISSING: &str = "volte_imsi_missing";
     pub const MM_IMSI_MISSING: &str = "volte_mm_imsi_missing";
+    pub const CARRIER_PROFILE_MISSING: &str = "volte_carrier_profile_missing";
+    pub const CARRIER_IMS_APN_MISSING: &str = "volte_carrier_ims_apn_missing";
     pub const USIM_AID_MISSING: &str = "volte_usim_aid_missing";
     pub const USIM_AID_NOT_USIM: &str = "volte_usim_aid_not_usim";
     pub const USIM_AKA_FAILED: &str = "volte_usim_aka_failed";

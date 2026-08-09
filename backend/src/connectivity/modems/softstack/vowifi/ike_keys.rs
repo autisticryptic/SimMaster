@@ -6,8 +6,9 @@ use ring::hmac;
 use serde::Serialize;
 
 use super::ike_payloads::{
-    ProposalSpec, TransformAttribute, TransformSpec, TransformType, AUTH_HMAC_SHA1_96,
-    AUTH_HMAC_SHA2_256_128, AUTH_HMAC_SHA2_512_256, ENCR_AES_CBC, PRF_HMAC_SHA1, PRF_HMAC_SHA2_256,
+    ProposalSpec, TransformAttribute, TransformSpec, TransformType, AUTH_HMAC_MD5_96,
+    AUTH_HMAC_SHA1_96, AUTH_HMAC_SHA2_256_128, AUTH_HMAC_SHA2_384_192, AUTH_HMAC_SHA2_512_256,
+    ENCR_AES_CBC, PRF_HMAC_MD5, PRF_HMAC_SHA1, PRF_HMAC_SHA2_256, PRF_HMAC_SHA2_384,
     PRF_HMAC_SHA2_512,
 };
 
@@ -54,16 +55,20 @@ impl fmt::Debug for SecretBytes {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IkePrfAlgorithm {
+    HmacMd5,
     HmacSha1,
     HmacSha256,
+    HmacSha384,
     HmacSha512,
 }
 
 impl IkePrfAlgorithm {
     pub fn from_transform_id(transform_id: u16) -> Option<Self> {
         match transform_id {
+            PRF_HMAC_MD5 => Some(Self::HmacMd5),
             PRF_HMAC_SHA1 => Some(Self::HmacSha1),
             PRF_HMAC_SHA2_256 => Some(Self::HmacSha256),
+            PRF_HMAC_SHA2_384 => Some(Self::HmacSha384),
             PRF_HMAC_SHA2_512 => Some(Self::HmacSha512),
             _ => None,
         }
@@ -71,25 +76,31 @@ impl IkePrfAlgorithm {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::HmacMd5 => "hmac_md5",
             Self::HmacSha1 => "hmac_sha1",
             Self::HmacSha256 => "hmac_sha256",
+            Self::HmacSha384 => "hmac_sha384",
             Self::HmacSha512 => "hmac_sha512",
         }
     }
 
     pub fn output_len(self) -> usize {
         match self {
+            Self::HmacMd5 => 16,
             Self::HmacSha1 => 20,
             Self::HmacSha256 => 32,
+            Self::HmacSha384 => 48,
             Self::HmacSha512 => 64,
         }
     }
 
-    fn ring_algorithm(self) -> hmac::Algorithm {
+    fn ring_algorithm(self) -> Option<hmac::Algorithm> {
         match self {
-            Self::HmacSha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
-            Self::HmacSha256 => hmac::HMAC_SHA256,
-            Self::HmacSha512 => hmac::HMAC_SHA512,
+            Self::HmacMd5 => None,
+            Self::HmacSha1 => Some(hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY),
+            Self::HmacSha256 => Some(hmac::HMAC_SHA256),
+            Self::HmacSha384 => Some(hmac::HMAC_SHA384),
+            Self::HmacSha512 => Some(hmac::HMAC_SHA512),
         }
     }
 }
@@ -111,16 +122,20 @@ impl IkeEncryptionAlgorithm {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IkeIntegrityAlgorithm {
+    HmacMd5_96,
     HmacSha1_96,
     HmacSha256_128,
+    HmacSha384_192,
     HmacSha512_256,
 }
 
 impl IkeIntegrityAlgorithm {
     pub fn from_transform_id(transform_id: u16) -> Option<Self> {
         match transform_id {
+            AUTH_HMAC_MD5_96 => Some(Self::HmacMd5_96),
             AUTH_HMAC_SHA1_96 => Some(Self::HmacSha1_96),
             AUTH_HMAC_SHA2_256_128 => Some(Self::HmacSha256_128),
+            AUTH_HMAC_SHA2_384_192 => Some(Self::HmacSha384_192),
             AUTH_HMAC_SHA2_512_256 => Some(Self::HmacSha512_256),
             _ => None,
         }
@@ -128,16 +143,20 @@ impl IkeIntegrityAlgorithm {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::HmacMd5_96 => "hmac_md5_96",
             Self::HmacSha1_96 => "hmac_sha1_96",
             Self::HmacSha256_128 => "hmac_sha256_128",
+            Self::HmacSha384_192 => "hmac_sha384_192",
             Self::HmacSha512_256 => "hmac_sha512_256",
         }
     }
 
     pub fn key_len(self) -> usize {
         match self {
+            Self::HmacMd5_96 => 16,
             Self::HmacSha1_96 => 20,
             Self::HmacSha256_128 => 32,
+            Self::HmacSha384_192 => 48,
             Self::HmacSha512_256 => 64,
         }
     }
@@ -484,17 +503,52 @@ fn encryption_key_bits(transform: &TransformSpec) -> Option<usize> {
 }
 
 fn prf_once(prf: IkePrfAlgorithm, key: &[u8], data: &[u8]) -> SecretBytes {
-    let key = hmac::Key::new(prf.ring_algorithm(), key);
-    SecretBytes::new(hmac::sign(&key, data).as_ref().to_vec())
+    SecretBytes::new(prf_digest(prf, key, data))
 }
 
 fn prf_from_plan(plan: &IkeKeySchedulePlan) -> Result<IkePrfAlgorithm, IkeKeyError> {
     match plan.prf {
+        "hmac_md5" => Ok(IkePrfAlgorithm::HmacMd5),
         "hmac_sha1" => Ok(IkePrfAlgorithm::HmacSha1),
         "hmac_sha256" => Ok(IkePrfAlgorithm::HmacSha256),
+        "hmac_sha384" => Ok(IkePrfAlgorithm::HmacSha384),
         "hmac_sha512" => Ok(IkePrfAlgorithm::HmacSha512),
         other => Err(IkeKeyError::UnsupportedPrfName(other.to_string())),
     }
+}
+
+fn prf_digest(prf: IkePrfAlgorithm, key: &[u8], data: &[u8]) -> Vec<u8> {
+    match prf.ring_algorithm() {
+        Some(algorithm) => {
+            let key = hmac::Key::new(algorithm, key);
+            hmac::sign(&key, data).as_ref().to_vec()
+        }
+        None => hmac_md5(key, data),
+    }
+}
+
+fn hmac_md5(key: &[u8], data: &[u8]) -> Vec<u8> {
+    const BLOCK_SIZE: usize = 64;
+    let mut key = key.to_vec();
+    if key.len() > BLOCK_SIZE {
+        key = (*md5::compute(&key)).to_vec();
+    }
+    key.resize(BLOCK_SIZE, 0);
+
+    let mut ipad = [0x36u8; BLOCK_SIZE];
+    let mut opad = [0x5cu8; BLOCK_SIZE];
+    for i in 0..BLOCK_SIZE {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+
+    let mut inner_input = ipad.to_vec();
+    inner_input.extend_from_slice(data);
+    let inner = md5::compute(&inner_input);
+
+    let mut outer_input = opad.to_vec();
+    outer_input.extend_from_slice(inner.as_ref());
+    (*md5::compute(&outer_input)).to_vec()
 }
 
 fn prf_plus(
@@ -507,7 +561,6 @@ fn prf_plus(
         return Err(IkeKeyError::OutputTooLarge(output_len));
     }
 
-    let key = hmac::Key::new(prf.ring_algorithm(), key);
     let mut out = Vec::with_capacity(output_len);
     let mut previous = Vec::new();
     let mut counter = 1u8;
@@ -516,7 +569,7 @@ fn prf_plus(
         input.extend_from_slice(&previous);
         input.extend_from_slice(seed);
         input.push(counter);
-        previous = hmac::sign(&key, &input).as_ref().to_vec();
+        previous = prf_digest(prf, key, &input);
         out.extend_from_slice(&previous);
         counter = counter.saturating_add(1);
     }
@@ -552,6 +605,58 @@ mod tests {
         assert_eq!(plan.integrity_key_bytes, 32);
         assert_eq!(plan.total_secret_bytes, 192);
         assert!(!plan.exported_secret_values);
+    }
+
+    #[test]
+    fn hmac_md5_matches_rfc2202_test_vector() {
+        let key = [0x0bu8; 16];
+        let tag = hmac_md5(&key, b"Hi There");
+        assert_eq!(
+            tag,
+            [
+                0x92, 0x94, 0x72, 0x7a, 0x36, 0x38, 0xbb, 0x1c, 0x13, 0xf4, 0x8e, 0xf8, 0x15, 0x8b,
+                0xfc, 0x9d,
+            ]
+        );
+    }
+
+    #[test]
+    fn derives_key_schedule_with_md5_prf_and_integrity() {
+        let proposal =
+            ike_proposal_from_profile_string("aes128-md5-prfmd5-modp2048", 1).expect("proposal");
+        let plan = build_key_schedule_plan(&proposal).expect("plan");
+
+        assert_eq!(plan.prf, "hmac_md5");
+        assert_eq!(plan.integrity, "hmac_md5_96");
+        assert_eq!(plan.prf_output_bytes, 16);
+        assert_eq!(plan.integrity_key_bytes, 16);
+        assert_eq!(plan.total_secret_bytes, 16 * 3 + 16 * 2 + 16 * 2);
+
+        let bundle =
+            derive_ike_secret_bundle(&proposal, &[0x11; 32], &[0x22; 32], 1, 2, &[0x33; 256])
+                .expect("derive md5 keys");
+        assert_eq!(bundle.sk_d.len(), 16);
+        assert_eq!(bundle.sk_ai.len(), 16);
+        assert_eq!(bundle.sk_pr.len(), 16);
+    }
+
+    #[test]
+    fn derives_key_schedule_with_sha384_prf_and_integrity() {
+        let proposal = ike_proposal_from_profile_string("aes128-sha384-prfsha384-modp2048", 1)
+            .expect("proposal");
+        let plan = build_key_schedule_plan(&proposal).expect("plan");
+
+        assert_eq!(plan.prf, "hmac_sha384");
+        assert_eq!(plan.integrity, "hmac_sha384_192");
+        assert_eq!(plan.prf_output_bytes, 48);
+        assert_eq!(plan.integrity_key_bytes, 48);
+
+        let bundle =
+            derive_ike_secret_bundle(&proposal, &[0x11; 32], &[0x22; 32], 1, 2, &[0x33; 256])
+                .expect("derive sha384 keys");
+        assert_eq!(bundle.sk_d.len(), 48);
+        assert_eq!(bundle.sk_ai.len(), 48);
+        assert_eq!(bundle.sk_pr.len(), 48);
     }
 
     #[test]

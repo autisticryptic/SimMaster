@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Alert,
   Avatar,
@@ -43,7 +43,9 @@ import {
   PhoneMissed,
   Refresh,
 } from '@mui/icons-material'
-import { api, type CallInfo, type CallRecord, type CallStats } from '../api/current'
+import { api, type CallInfo, type CallRecord, type CallStats, type LineRuntimeStatus } from '../api/current'
+import ModemLineSelector from '../components/ModemLineSelector'
+import { modemLineLabel } from '../components/modemLineFormat'
 import VoiceRoutingPanel from './phone/VoiceRoutingPanel'
 
 const dialpadButtons = [
@@ -79,6 +81,10 @@ function directionLabel(direction: string): string {
   if (direction === 'outgoing') return '拨出'
   if (direction === 'missed') return '未接'
   return '未知'
+}
+
+function isDtmfCapableCall(call: CallInfo): boolean {
+  return call.state === 'active' || call.state === 'held'
 }
 
 function formatDuration(seconds: number): string {
@@ -120,49 +126,123 @@ export default function PhonePage() {
   const [callStats, setCallStats] = useState<CallStats>(emptyStats)
   const [historyLoading, setHistoryLoading] = useState(false)
   const [clearDialogOpen, setClearDialogOpen] = useState(false)
+  const [lines, setLines] = useState<LineRuntimeStatus[]>([])
+  const [selectedLineId, setSelectedLineId] = useState('')
+  const activeLineId = useRef(selectedLineId)
+  const callsGeneration = useRef(0)
+  const historyGeneration = useRef(0)
+  activeLineId.current = selectedLineId
+
+  const fetchLines = useCallback(async () => {
+    try {
+      const response = await api.getModemLines()
+      const available = (response.data ?? []).filter((line) => (
+        line.modem.present
+        && line.modem.line_kind !== 'reader'
+        && Boolean(line.modem.modem_path)
+      ))
+      setLines(available)
+      setSelectedLineId((current) => (
+        available.some((line) => line.modem.line_id === current)
+          ? current
+          : available[0]?.modem.line_id ?? ''
+      ))
+    } catch (err) {
+      console.warn('获取通话线路失败:', err)
+      setLines([])
+      setSelectedLineId('')
+    }
+  }, [])
 
   const fetchCalls = useCallback(async () => {
+    const lineId = selectedLineId
+    const generation = ++callsGeneration.current
+    if (!lineId) {
+      setCalls([])
+      return
+    }
     setCallsLoading(true)
     try {
-      const response = await api.getCalls()
-      setCalls(response.data?.calls ?? [])
+      const response = await api.getCalls(lineId)
+      if (generation === callsGeneration.current && activeLineId.current === lineId) {
+        setCalls((response.data?.calls ?? []).filter((call) => call.line_id === lineId))
+      }
     } catch (err) {
       console.warn('获取通话列表失败:', err)
     } finally {
-      setCallsLoading(false)
+      if (generation === callsGeneration.current && activeLineId.current === lineId) {
+        setCallsLoading(false)
+      }
     }
-  }, [])
+  }, [selectedLineId])
 
   const fetchCallHistory = useCallback(async () => {
+    const lineId = selectedLineId
+    const generation = ++historyGeneration.current
+    if (!lineId) {
+      setCallHistory([])
+      setCallStats(emptyStats)
+      return
+    }
     setHistoryLoading(true)
     try {
-      const response = await api.getCallHistory({ limit: 100, offset: 0 })
-      setCallHistory(response.data?.records ?? [])
-      setCallStats(response.data?.stats ?? emptyStats)
+      const response = await api.getCallHistory({ lineId, limit: 100, offset: 0 })
+      if (generation === historyGeneration.current && activeLineId.current === lineId) {
+        setCallHistory((response.data?.records ?? []).filter((record) => record.line_id === lineId))
+        setCallStats(response.data?.stats ?? emptyStats)
+      }
     } catch (err) {
       console.warn('获取通话记录失败:', err)
     } finally {
-      setHistoryLoading(false)
+      if (generation === historyGeneration.current && activeLineId.current === lineId) {
+        setHistoryLoading(false)
+      }
     }
-  }, [])
+  }, [selectedLineId])
 
   useEffect(() => {
+    setCalls([])
+    setCallHistory([])
+    setCallStats(emptyStats)
+  }, [selectedLineId])
+
+  useEffect(() => {
+    void fetchLines()
     void fetchCalls()
     void fetchCallHistory()
     const timer = window.setInterval(() => {
       void fetchCalls()
     }, 3000)
-    return () => window.clearInterval(timer)
-  }, [fetchCalls, fetchCallHistory])
+    const lineTimer = window.setInterval(() => {
+      void fetchLines()
+    }, 15000)
+    return () => {
+      window.clearInterval(timer)
+      window.clearInterval(lineTimer)
+    }
+  }, [fetchCalls, fetchCallHistory, fetchLines])
 
   const handleDialpadPress = (digit: string) => {
+    const activeCall = calls.length === 1 && isDtmfCapableCall(calls[0]) ? calls[0] : null
+    if (activeCall) {
+      void api.sendCallDtmf(activeCall.path, digit, activeCall.line_id).catch((err) => {
+        setError(err instanceof Error ? err.message : '发送 DTMF 失败')
+      })
+      return
+    }
     setDialNumber((prev) => prev + digit)
   }
 
-  const handleDial = async (number = dialNumber) => {
+  const handleDial = async (number = dialNumber, requestedLineId?: string) => {
     const target = number.trim()
     if (!target) {
       setError('请输入电话号码')
+      return
+    }
+    const lineId = requestedLineId || selectedLineId
+    const selectedLine = lines.find((line) => line.modem.line_id === lineId)
+    if (!selectedLine) {
+      setError('请选择可用的基带线路')
       return
     }
 
@@ -170,15 +250,16 @@ export default function PhonePage() {
     setError(null)
     setSuccess(null)
     try {
-      const response = await api.dialCall(target)
+      const response = await api.dialCall(target, lineId)
       const path = response.data?.path
       if (path) {
         setCalls((prev) => (
           prev.some((call) => call.path === path)
             ? prev
-            : [{ path, phone_number: target, state: 'dialing', direction: 'outgoing' }, ...prev]
+            : [{ path, line_id: lineId, phone_number: target, state: 'dialing', direction: 'outgoing' }, ...prev]
         ))
       }
+      setSelectedLineId(lineId)
       setSuccess(`正在拨打 ${target}`)
       setDialNumber('')
       void fetchCallHistory()
@@ -192,15 +273,33 @@ export default function PhonePage() {
   const handleHangupAll = async () => {
     setError(null)
     setSuccess(null)
+    if (!selectedLineId) {
+      setError('请选择可用的基带线路')
+      return
+    }
     const currentCalls = calls
     try {
       if (currentCalls.length === 1) {
-        await api.hangupCall(currentCalls[0].path)
+        await api.hangupCall(currentCalls[0].path, currentCalls[0].line_id)
       } else {
-        await api.hangupAllCalls()
+        await api.hangupAllCalls(selectedLineId)
       }
       setCalls([])
       setSuccess('已挂断所有通话')
+      void fetchCalls()
+      void fetchCallHistory()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '挂断失败')
+    }
+  }
+
+  const handleHangup = async (call: CallInfo) => {
+    setError(null)
+    setSuccess(null)
+    try {
+      await api.hangupCall(call.path, call.line_id)
+      setCalls((current) => current.filter((item) => item.path !== call.path))
+      setSuccess(`已挂断 ${call.phone_number || '通话'}`)
       void fetchCalls()
       void fetchCallHistory()
     } catch (err) {
@@ -212,7 +311,7 @@ export default function PhonePage() {
     setError(null)
     setSuccess(null)
     try {
-      await api.answerCall(call.path)
+      await api.answerCall(call.path, call.line_id)
       setSuccess(`已接听 ${call.phone_number || '来电'}`)
       void fetchCalls()
     } catch (err) {
@@ -220,10 +319,14 @@ export default function PhonePage() {
     }
   }
 
-  const handleDeleteRecord = async (id: number) => {
+  const handleDeleteRecord = async (record: CallRecord) => {
     setError(null)
+    if (!selectedLineId) {
+      setError('请选择可用的基带线路')
+      return
+    }
     try {
-      await api.deleteCallRecord(id)
+      await api.deleteCallRecord(record.id, selectedLineId)
       setSuccess('记录已删除')
       void fetchCallHistory()
     } catch (err) {
@@ -234,26 +337,48 @@ export default function PhonePage() {
   const handleClearHistory = async () => {
     setClearDialogOpen(false)
     setError(null)
+    if (!selectedLineId) {
+      setError('请选择可用的基带线路')
+      return
+    }
     try {
-      await api.clearCallHistory()
-      setSuccess('所有通话记录已清空')
+      await api.clearCallHistory(selectedLineId)
+      setSuccess('当前线路的通话记录已清空')
       void fetchCallHistory()
     } catch (err) {
       setError(err instanceof Error ? err.message : '清空记录失败')
     }
   }
 
-  const handleFillFromHistory = (phoneNumber: string) => {
-    setDialNumber(phoneNumber)
+  const handleFillFromHistory = (record: CallRecord) => {
+    setDialNumber(record.phone_number)
+    if (record.line_id && lines.some((line) => line.modem.line_id === record.line_id)) {
+      setSelectedLineId(record.line_id)
+    }
     setTabValue(0)
   }
 
   const singleCall = calls.length === 1 ? calls[0] : null
+  const activeDtmfCall = singleCall && isDtmfCapableCall(singleCall) ? singleCall : null
+  const getLineLabel = (lineId?: string) => {
+    const index = lines.findIndex((line) => line.modem.line_id === lineId)
+    return index >= 0 ? modemLineLabel(lines[index], index) : '未知线路'
+  }
 
   return (
     <Box>
-      <Box display="flex" alignItems="center" gap={1} mb={2}>
+      <Box display="flex" alignItems="center" justifyContent="space-between" gap={2} mb={2} flexWrap="wrap">
         <Typography variant="h5" fontWeight={700}>电话管理</Typography>
+        <Box width={{ xs: '100%', sm: 320 }}>
+          <ModemLineSelector
+            lines={lines}
+            value={selectedLineId}
+            onChange={setSelectedLineId}
+            label="电话线路"
+            includeAutomatic={false}
+            disabled={dialLoading}
+          />
+        </Box>
       </Box>
 
       <Snackbar open={!!error} autoHideDuration={4000} resumeHideDuration={3000} onClose={() => setError(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
@@ -283,7 +408,7 @@ export default function PhonePage() {
                 </Typography>
                 {singleCall && (
                   <Typography variant="body2" sx={{ opacity: 0.9 }}>
-                    {getStateLabel(singleCall.state)} - {directionLabel(singleCall.direction)}
+                    {getStateLabel(singleCall.state)} - {directionLabel(singleCall.direction)} - {getLineLabel(singleCall.line_id)}
                   </Typography>
                 )}
               </Box>
@@ -305,6 +430,49 @@ export default function PhonePage() {
               </Button>
             </Box>
           </Box>
+          {!singleCall && (
+            <Box mt={1.5} borderTop="1px solid rgba(255,255,255,0.3)">
+              {calls.map((call) => (
+                <Box
+                  key={call.path}
+                  display="flex"
+                  alignItems="center"
+                  justifyContent="space-between"
+                  gap={2}
+                  py={1}
+                >
+                  <Box minWidth={0}>
+                    <Typography fontWeight={600} noWrap>{call.phone_number || '未知号码'}</Typography>
+                    <Typography variant="caption" sx={{ opacity: 0.9 }}>
+                      {getStateLabel(call.state)} - {getLineLabel(call.line_id)}
+                    </Typography>
+                  </Box>
+                  <Box display="flex" gap={0.5}>
+                    {(call.state === 'incoming' || call.state === 'waiting') && (
+                      <Tooltip title="接听">
+                        <IconButton
+                          size="small"
+                          onClick={() => void handleAnswer(call)}
+                          sx={{ color: 'success.main', bgcolor: 'white' }}
+                        >
+                          <Call fontSize="small" />
+                        </IconButton>
+                      </Tooltip>
+                    )}
+                    <Tooltip title="挂断">
+                      <IconButton
+                        size="small"
+                        onClick={() => void handleHangup(call)}
+                        sx={{ color: 'error.main', bgcolor: 'white' }}
+                      >
+                        <CallEnd fontSize="small" />
+                      </IconButton>
+                    </Tooltip>
+                  </Box>
+                </Box>
+              ))}
+            </Box>
+          )}
         </Paper>
       </Fade>
 
@@ -321,12 +489,13 @@ export default function PhonePage() {
               <TextField
                 fullWidth
                 variant="standard"
-                value={dialNumber}
+                value={activeDtmfCall ? '' : dialNumber}
                 onChange={(event) => setDialNumber(event.target.value)}
-                placeholder="输入电话号码"
+                placeholder={activeDtmfCall ? '通话中' : '输入电话号码'}
+                disabled={Boolean(activeDtmfCall)}
                 inputProps={{ inputMode: 'tel', style: { textAlign: 'center', fontSize: '1.5rem' } }}
                 InputProps={{
-                  endAdornment: dialNumber ? (
+                  endAdornment: !activeDtmfCall && dialNumber ? (
                     <IconButton size="small" onClick={() => setDialNumber((prev) => prev.slice(0, -1))}>
                       <Backspace />
                     </IconButton>
@@ -358,7 +527,7 @@ export default function PhonePage() {
                 size="large"
                 startIcon={dialLoading ? <CircularProgress size={20} color="inherit" /> : <PhoneIcon />}
                 onClick={() => void handleDial()}
-                disabled={dialLoading || !dialNumber.trim()}
+                disabled={dialLoading || Boolean(activeDtmfCall) || !dialNumber.trim() || !selectedLineId}
                 sx={{ mt: 2, width: 160, height: 56, borderRadius: 28 }}
               >
                 {dialLoading ? '拨号中' : '拨打'}
@@ -424,6 +593,7 @@ export default function PhonePage() {
                         <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
                           <Typography variant="body1" fontWeight={600}>{record.phone_number || '未知号码'}</Typography>
                           <Chip label={directionLabel(record.direction)} size="small" variant="outlined" />
+                          <Chip label={getLineLabel(record.line_id)} size="small" variant="outlined" />
                           {record.duration > 0 && <Chip label={formatDuration(record.duration)} size="small" variant="outlined" />}
                         </Box>
                       }
@@ -432,17 +602,22 @@ export default function PhonePage() {
                     <ListItemSecondaryAction>
                       <Box display="flex" gap={0.5}>
                         <Tooltip title="重拨">
-                          <IconButton size="small" color="primary" onClick={() => void handleDial(record.phone_number)} disabled={dialLoading || !record.phone_number}>
+                          <IconButton
+                            size="small"
+                            color="primary"
+                            onClick={() => void handleDial(record.phone_number, record.line_id)}
+                            disabled={dialLoading || !record.phone_number || (!record.line_id && !selectedLineId)}
+                          >
                             <Call fontSize="small" />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="填入拨号盘">
-                          <IconButton size="small" color="info" onClick={() => handleFillFromHistory(record.phone_number)} disabled={!record.phone_number}>
+                          <IconButton size="small" color="info" onClick={() => handleFillFromHistory(record)} disabled={!record.phone_number}>
                             <AddCircleOutline fontSize="small" />
                           </IconButton>
                         </Tooltip>
                         <Tooltip title="删除">
-                          <IconButton size="small" color="error" onClick={() => void handleDeleteRecord(record.id)}>
+                          <IconButton size="small" color="error" onClick={() => void handleDeleteRecord(record)}>
                             <Delete fontSize="small" />
                           </IconButton>
                         </Tooltip>
@@ -456,12 +631,12 @@ export default function PhonePage() {
         </Card>
       )}
 
-      {tabValue === 2 && <VoiceRoutingPanel />}
+      {tabValue === 2 && <VoiceRoutingPanel lineId={selectedLineId} />}
 
       <Dialog open={clearDialogOpen} onClose={() => setClearDialogOpen(false)}>
         <DialogTitle>确认清空</DialogTitle>
         <DialogContent>
-          <Typography>确定要清空所有通话记录吗？此操作不可撤销。</Typography>
+          <Typography>确定要清空当前线路的全部通话记录吗？此操作不可撤销。</Typography>
         </DialogContent>
         <DialogActions>
           <Button onClick={() => setClearDialogOpen(false)}>取消</Button>

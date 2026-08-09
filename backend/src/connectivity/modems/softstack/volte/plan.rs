@@ -150,6 +150,13 @@ impl FailureClass {
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &VolteError) -> Self {
         match error.code() {
+            code::REGISTER_INITIAL_UNEXPECTED_STATUS
+                if error
+                    .detail()
+                    .is_some_and(|detail| detail.contains("sip_status=")) =>
+            {
+                FailureClass::Other
+            }
             code::RUNTIME_ALL_PCSCF_FAILED
             | code::PCSCF_FAMILY_MISMATCH
             | code::IPSEC_UDP_BIND_FAILED
@@ -468,10 +475,7 @@ mod tests {
         // Single family first, dual-stack as the fallback.
         let v4_then_dual = ImsConnectionPlan::from_families(&[F::Ipv4, F::Ipv4v6]);
         assert_eq!(v4_then_dual.initial_bearer_attempt(), IpType::Ipv4);
-        assert_eq!(
-            v4_then_dual.single_family_fallbacks(),
-            vec![IpType::Ipv4v6]
-        );
+        assert_eq!(v4_then_dual.single_family_fallbacks(), vec![IpType::Ipv4v6]);
 
         // Dual-stack omitted: only single families are ever requested.
         let no_dual = ImsConnectionPlan::from_families(&[F::Ipv6, F::Ipv4]);
@@ -554,5 +558,20 @@ mod tests {
         assert!(FailureClass::PcscfFailed.is_retryable_family());
         assert!(!FailureClass::NetworkForcedIpv6.is_retryable_family());
         assert!(!FailureClass::Other.is_retryable_family());
+    }
+
+    #[test]
+    fn terminal_sip_status_is_not_retried_as_an_ip_family_failure() {
+        let rejection = VolteError::with_detail(
+            code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+            "ims_register_initial_unexpected_status:sip_status=400",
+        );
+        assert_eq!(FailureClass::from_error(&rejection), FailureClass::Other);
+
+        let timeout = VolteError::with_detail(
+            code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+            "ims_register_initial_receive_failed",
+        );
+        assert!(FailureClass::from_error(&timeout).is_retryable_family());
     }
 }

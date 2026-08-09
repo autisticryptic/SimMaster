@@ -13,7 +13,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget, VolteLineControlResponse, StandaloneSimSlotConfig } from '../../api/contracts'
+import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget, VolteLineControlResponse } from '../../api/contracts'
 import { api } from '../../api/current'
 
 type AutomationTaskDialogProps = {
@@ -46,7 +46,6 @@ export default function AutomationTaskDialog({
   const [formCallDuration, setFormCallDuration] = useState(30)
   const [formTarget, setFormTarget] = useState<AutomationTarget | null>(null)
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
-  const [readerSlots, setReaderSlots] = useState<StandaloneSimSlotConfig[]>([])
 
   const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval' | 'cron'>('fixed')
   const [formWeekdays, setFormWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7])
@@ -62,16 +61,16 @@ export default function AutomationTaskDialog({
 
   useEffect(() => {
     if (open) {
-      void Promise.all([api.getVolteLines(), api.getStandaloneSimSlots()]).then(([lineResponse, slotResponse]) => {
-        if (lineResponse.data) setLines(lineResponse.data)
-        if (slotResponse.data) setReaderSlots(slotResponse.data)
+      setLines([])
+      void api.getVolteLines().then((response) => {
+        if (response.data) setLines(response.data)
       }).catch(() => undefined)
       setDialogError(null)
       if (editingTask) {
         setFormName(editingTask.name)
         setFormEnabled(editingTask.enabled)
         setFormActionType(editingTask.action.type)
-        setFormTarget(editingTask.target ?? null)
+        setFormTarget(editingTask.target?.kind === 'modem_line' ? editingTask.target : null)
         if (editingTask.action.type === 'reboot_device') {
           setFormRebootDelay(editingTask.action.config.delay_seconds)
         } else if (editingTask.action.type === 'send_sms') {
@@ -152,6 +151,11 @@ export default function AutomationTaskDialog({
 
     if (!formName.trim()) {
       setDialogError('请输入任务名称')
+      return
+    }
+
+    if (formActionType !== 'reboot_device' && formTarget?.kind !== 'modem_line') {
+      setDialogError('请选择执行该任务的基带线路')
       return
     }
 
@@ -260,7 +264,7 @@ export default function AutomationTaskDialog({
       name: formName.trim(),
       enabled: formEnabled,
       trigger,
-      target: formTarget,
+      target: formActionType === 'reboot_device' ? null : formTarget,
       action,
     }
 
@@ -313,7 +317,11 @@ export default function AutomationTaskDialog({
             label="执行动作"
             fullWidth
             value={formActionType}
-            onChange={(e) => setFormActionType(e.target.value as typeof formActionType)}
+            onChange={(e) => {
+              const actionType = e.target.value as typeof formActionType
+              setFormActionType(actionType)
+              if (actionType === 'reboot_device') setFormTarget(null)
+            }}
           >
             <MenuItem value="restart_baseband">重启基带</MenuItem>
             <MenuItem value="reboot_device">重启设备</MenuItem>
@@ -325,17 +333,18 @@ export default function AutomationTaskDialog({
           {formActionType !== 'reboot_device' && (
             <TextField
               select
+              required
               label="使用的基带 / SIM 卡"
               value={formTarget ? `${formTarget.kind}:${formTarget.kind === 'modem_line' ? formTarget.line_id : formTarget.slot_id}` : ''}
               onChange={(e) => {
                 const [kind, ...rest] = e.target.value.split(':')
-                setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : kind === 'standalone_sim_slot' ? { kind: 'standalone_sim_slot', slot_id: rest.join(':') } : null)
+                setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : null)
+                setDialogError(null)
               }}
-              helperText="未选择时兼容旧任务，使用主基带；读卡器目标当前仅保存配置，运行时会明确提示尚未接入适配器"
+              helperText="任务始终绑定到所选线路，不会自动回退到其他基带"
             >
-              <MenuItem value="">主基带（兼容模式）</MenuItem>
+              <MenuItem value="" disabled>请选择基带线路</MenuItem>
               {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>基带 {line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
-              {readerSlots.map((slot) => <MenuItem key={slot.id} value={`standalone_sim_slot:${slot.id}`}>{slot.label || '读卡器'} · 卡槽 {slot.uim_slot}（暂不可执行）</MenuItem>)}
             </TextField>
           )}
 

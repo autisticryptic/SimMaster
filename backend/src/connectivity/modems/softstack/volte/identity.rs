@@ -178,11 +178,16 @@ pub fn split_imsi(imsi: &str, mnc_len: usize) -> Result<(String, String), VolteE
 /// Derive the full IMS identity set from an IMSI and its MCC/MNC.
 pub fn derive_identity(imsi: &str, mcc: &str, mnc: &str) -> ImsIdentity {
     let domain = home_domain(mcc, mnc);
+    derive_identity_with_domain(imsi, &domain)
+}
+
+/// Build IMS identities using the catalog's authoritative home domain.
+pub fn derive_identity_with_domain(imsi: &str, domain: &str) -> ImsIdentity {
     ImsIdentity {
         private_user: format!("{imsi}@{domain}"),
         public_uri: format!("sip:{imsi}@{domain}"),
         contact_user: imsi.to_string(),
-        home_domain: domain,
+        home_domain: domain.to_string(),
         contact_user_phone: false,
     }
 }

@@ -15,13 +15,19 @@ pub fn persist_stage_observation(
     let Some(observation) = result.soak_observation.as_ref() else {
         return Ok(None);
     };
-    let run_id = format!("{}-{}", request.trace_id, observation.scenario_id);
+    let line_id = request.line_id.trim();
+    let run_id = if line_id.is_empty() {
+        format!("{}-{}", request.trace_id, observation.scenario_id)
+    } else {
+        format!("{line_id}-{}-{}", request.trace_id, observation.scenario_id)
+    };
     let failure_count = i64::from(result.status == "failed");
 
     let last_error = result.reason.as_deref().filter(|_| failure_count > 0);
 
     db.upsert_vowifi_soak_run(NewVowifiSoakRun {
         run_id: &run_id,
+        line_id,
         scenario_id: observation.scenario_id,
         profile_id: request.profile_id.as_deref(),
         plmn: request.plmn.as_deref(),
@@ -32,6 +38,7 @@ pub fn persist_stage_observation(
         last_error,
     })?;
     db.insert_vowifi_soak_sample(NewVowifiSoakSample {
+        line_id,
         run_id: &run_id,
         sample_kind: observation.sample_kind,
         metric_name: observation.metric_name,
@@ -99,7 +106,7 @@ mod tests {
             profile_id: Some("gb_ee_23433".to_string()),
             plmn: Some("23433".to_string()),
             trace_id: "trace-local".to_string(),
-            line_id: String::new(),
+            line_id: "line-test".to_string(),
         };
         let result = ExecutorStageResult {
             stage: request.stage.as_str(),
@@ -113,8 +120,10 @@ mod tests {
             .expect("persist observation")
             .expect("run id");
 
-        assert_eq!(run_id, "trace-local-rekey_dpd_nat_t_soak");
-        let runs = db.get_vowifi_soak_runs(10, 0).expect("read runs");
+        assert_eq!(run_id, "line-test-trace-local-rekey_dpd_nat_t_soak");
+        let runs = db
+            .get_vowifi_soak_runs_for_line("line-test", 10, 0)
+            .expect("read runs");
         assert_eq!(runs.total, 1);
         assert_eq!(runs.runs[0].scenario_id, "rekey_dpd_nat_t_soak");
         assert_eq!(runs.runs[0].samples[0].metric_name, "ike_stage_attempts");
@@ -165,15 +174,20 @@ mod tests {
                 profile_id: Some("gb_ee_23433".to_string()),
                 plmn: Some("23433".to_string()),
                 trace_id: "runner".to_string(),
-                line_id: String::new(),
+                line_id: "line-test".to_string(),
             },
         )
         .await
         .expect("run and persist");
 
         assert_eq!(result.status, "completed");
-        assert_eq!(run_id.as_deref(), Some("runner-network_path_recovery_soak"));
-        let runs = db.get_vowifi_soak_runs(10, 0).expect("read runs");
+        assert_eq!(
+            run_id.as_deref(),
+            Some("line-test-runner-network_path_recovery_soak")
+        );
+        let runs = db
+            .get_vowifi_soak_runs_for_line("line-test", 10, 0)
+            .expect("read runs");
         assert_eq!(runs.total, 1);
         assert_eq!(
             runs.runs[0].samples[0].metric_name,

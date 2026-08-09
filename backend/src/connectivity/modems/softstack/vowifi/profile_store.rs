@@ -1,21 +1,20 @@
 //! Database-backed VoWiFi carrier profile store.
 //!
-//! Profiles used to be `static` constants, so adding a carrier meant editing
-//! Rust and rebuilding. They now live in SQLite and can be edited, imported and
-//! extended at runtime. Resolution order for a given PLMN:
+//! Carrier defaults come from the normalized, read-only `carrier_Bundles`
+//! catalog. SimAdmin's own SQLite table is retained only for operator-created
+//! overrides. Resolution order for a given SIM is:
 //!
-//! 1. **Database** — operator-edited or imported profiles win.
-//! 2. **Built-ins** — the shipped, hand-verified profiles.
-//! 3. **Derivation** — ePDG/IMS names computed from MCC/MNC per 3GPP TS 23.003.
+//! 1. **Local database override** — explicit operator intent wins.
+//! 2. **Carrier catalog** — firmware-derived access/IMS/SIP configuration.
 //!
-//! The derivation step is what lets a SIM from a carrier nobody has ever tested
-//! still come up: the ePDG FQDN and IMS domain are not carrier secrets, they are
-//! a documented function of the IMSI.
+//! There is deliberately no Rust built-in or code-derived fallback. Missing
+//! carrier data is reported before network registration starts.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use super::carrier_catalog::{CarrierCatalog, CatalogAccessKind};
 use super::profile_record::CarrierProfileRecord;
-use super::profiles::{self, CarrierProfile, BUILTIN_PROFILES};
+use super::profiles::{self, CarrierProfile};
 use crate::platform::db::Database;
 
 /// Where a resolved profile came from. Surfaced to the UI so an operator can
@@ -24,16 +23,14 @@ use crate::platform::db::Database;
 #[serde(rename_all = "snake_case")]
 pub enum ProfileOrigin {
     Database,
-    Builtin,
-    Derived,
+    Catalog,
 }
 
 impl ProfileOrigin {
     pub fn as_str(self) -> &'static str {
         match self {
             ProfileOrigin::Database => "database",
-            ProfileOrigin::Builtin => "builtin",
-            ProfileOrigin::Derived => "derived",
+            ProfileOrigin::Catalog => "carrier_catalog",
         }
     }
 }
@@ -47,49 +44,23 @@ pub struct ResolvedProfile {
 #[derive(Clone)]
 pub struct ProfileStore {
     database: Arc<Database>,
+    catalog: Option<Arc<CarrierCatalog>>,
 }
 
 impl ProfileStore {
-    pub fn new(database: Arc<Database>) -> Self {
-        Self { database }
-    }
-
-    /// Copy the compiled-in profiles into the database the first time the store
-    /// is used. Existing rows are never overwritten, so operator edits survive
-    /// upgrades; a built-in that gains a new carrier still gets inserted.
-    pub fn seed_builtins(&self) -> Result<usize, String> {
-        let mut inserted = 0;
-        for profile in BUILTIN_PROFILES {
-            let record = CarrierProfileRecord::from_profile(profile);
-            let exists = self
-                .database
-                .get_vowifi_carrier_profile(&record.meta.profile_id)
-                .map_err(|error| error.to_string())?
-                .is_some();
-            if exists {
-                continue;
-            }
-            let json = serde_json::to_string(&record).map_err(|error| error.to_string())?;
-            self.database
-                .upsert_vowifi_carrier_profile(
-                    &record.meta.profile_id,
-                    &record.meta.plmn,
-                    ProfileOrigin::Builtin.as_str(),
-                    &json,
-                )
-                .map_err(|error| error.to_string())?;
-            inserted += 1;
+    pub fn with_catalog(database: Arc<Database>, catalog: Arc<CarrierCatalog>) -> Self {
+        Self {
+            database,
+            catalog: Some(catalog),
         }
-        Ok(inserted)
     }
 
     /// One-time migration of the legacy `vowifi-profiles.conf` file.
     ///
     /// That file held user-created ePDG overrides, which the profile database
-    /// now supersedes. Each entry is expanded into a full profile: start from
-    /// the 3GPP-derived defaults for its PLMN, then overlay the fields the file
-    /// actually carried. The file is renamed rather than deleted so an operator
-    /// can still inspect it if a migration looks wrong.
+    /// now supersedes. A legacy entry can only be migrated when the carrier
+    /// catalog already supplies a complete profile for its PLMN; partial facts
+    /// are never expanded from guessed IMS/ePDG defaults.
     pub fn migrate_legacy_profiles_file(&self, path: &std::path::Path) -> Result<usize, String> {
         let Ok(content) = std::fs::read_to_string(path) else {
             return Ok(0);
@@ -97,13 +68,18 @@ impl ProfileStore {
         let legacy = crate::platform::config::parse_external_vowifi_profiles(&content);
         let mut migrated = 0;
         for entry in legacy {
+            let Some(base) = self.resolve_by_plmn(&entry.mcc, &entry.mnc) else {
+                tracing::warn!(profile_id = %entry.profile_id, "Skipping legacy VoWiFi profile because the carrier catalog has no matching baseline");
+                continue;
+            };
+            let base = CarrierProfileRecord::from_profile(base.profile);
             let Some(mut record) = super::profile_import::ImportedCarrierFacts {
                 mcc: entry.mcc.clone(),
                 mnc: entry.mnc.clone(),
                 ims_apn: entry.apn.clone(),
                 ..Default::default()
             }
-            .to_record() else {
+            .to_record(&base) else {
                 tracing::warn!(profile_id = %entry.profile_id, "Skipping legacy VoWiFi profile with an invalid PLMN");
                 continue;
             };
@@ -173,14 +149,7 @@ impl ProfileStore {
     ) -> Result<(), String> {
         let mut record = match self.get(&entry.profile_id)? {
             Some(existing) => existing,
-            None => super::profile_import::ImportedCarrierFacts {
-                mcc: entry.mcc.clone(),
-                mnc: entry.mnc.clone(),
-                ims_apn: entry.apn.clone(),
-                ..Default::default()
-            }
-            .to_record()
-            .ok_or_else(|| "vowifi_external_profile_invalid".to_string())?,
+            None => return Err("full_carrier_profile_required".to_string()),
         };
         record.meta.profile_id = entry.profile_id.clone();
         record.epdg.host = entry.epdg_host.clone();
@@ -205,6 +174,29 @@ impl ProfileStore {
     }
 
     pub fn list(&self) -> Result<Vec<StoredProfile>, String> {
+        let mut merged = BTreeMap::new();
+        if let Some(catalog) = &self.catalog {
+            for profile in catalog.list(CatalogAccessKind::WifiEpdg)? {
+                let profile_id = profile.record.meta.profile_id.clone();
+                merged.insert(
+                    profile_id.clone(),
+                    StoredProfile {
+                        profile_id,
+                        plmn: profile.record.meta.plmn.clone(),
+                        source: format!("carrier_catalog:{}", profile.release.release_id),
+                        updated_at: profile.release.generated_at,
+                        record: profile.record,
+                    },
+                );
+            }
+        }
+        for profile in self.local_list()? {
+            merged.insert(profile.profile_id.clone(), profile);
+        }
+        Ok(merged.into_values().collect())
+    }
+
+    fn local_list(&self) -> Result<Vec<StoredProfile>, String> {
         let rows = self
             .database
             .list_vowifi_carrier_profiles()
@@ -234,16 +226,20 @@ impl ProfileStore {
     }
 
     pub fn get(&self, profile_id: &str) -> Result<Option<CarrierProfileRecord>, String> {
-        let Some(row) = self
+        if let Some(row) = self
             .database
             .get_vowifi_carrier_profile(profile_id)
             .map_err(|error| error.to_string())?
-        else {
-            return Ok(None);
-        };
-        serde_json::from_str(&row.payload_json)
-            .map(Some)
-            .map_err(|error| error.to_string())
+        {
+            return serde_json::from_str(&row.payload_json)
+                .map(Some)
+                .map_err(|error| error.to_string());
+        }
+        self.catalog
+            .as_ref()
+            .map(|catalog| catalog.get(profile_id, CatalogAccessKind::WifiEpdg))
+            .transpose()
+            .map(|profile| profile.flatten().map(|profile| profile.record))
     }
 
     /// Insert or replace a profile. The record is validated first so a bad edit
@@ -279,14 +275,83 @@ impl ProfileStore {
     /// connect time goes through the pure `profiles::resolve_*` functions, which
     /// have no database handle of their own.
     pub fn publish(&self) {
-        match self.list() {
-            Ok(stored) => {
-                let interned = stored
-                    .iter()
-                    .filter(|entry| entry.record.validate().is_ok())
-                    .map(|entry| entry.record.intern())
-                    .collect::<Vec<_>>();
-                profiles::publish_database_profiles(&interned);
+        let published = (|| -> Result<_, String> {
+            let mut catalog_profiles = BTreeMap::new();
+            let mut catalog_matches = Vec::new();
+            if let Some(catalog) = &self.catalog {
+                for entry in catalog.list(CatalogAccessKind::WifiEpdg)? {
+                    entry.record.validate()?;
+                    let profile = entry.record.intern();
+                    catalog_profiles.insert(profile.meta.profile_id.to_string(), profile);
+                }
+                for matched in catalog.public_identity_matches(CatalogAccessKind::WifiEpdg)? {
+                    let profile_id = matched.profile.record.meta.profile_id.clone();
+                    let profile = catalog_profiles
+                        .get(&profile_id)
+                        .copied()
+                        .unwrap_or_else(|| matched.profile.record.intern());
+                    catalog_matches.push((matched.match_prefix, profile));
+                }
+            }
+
+            let mut local_profiles = Vec::new();
+            for entry in self.local_list()? {
+                match entry.record.validate() {
+                    Ok(()) => local_profiles.push(entry.record.intern()),
+                    Err(error) => tracing::warn!(
+                        profile_id = %entry.profile_id,
+                        error = %error,
+                        "Skipping invalid local VoWiFi profile during resolver publication"
+                    ),
+                }
+            }
+            let local_ids = local_profiles
+                .iter()
+                .map(|profile| profile.meta.profile_id)
+                .collect::<std::collections::HashSet<_>>();
+            let local_plmns = local_profiles
+                .iter()
+                .map(|profile| profile.meta.plmn)
+                .collect::<std::collections::HashSet<_>>();
+
+            let mut all_profiles = catalog_profiles;
+            for profile in &local_profiles {
+                all_profiles.insert(profile.meta.profile_id.to_string(), *profile);
+            }
+            let mut resolver_matches = local_profiles
+                .iter()
+                .map(|profile| (profile.meta.plmn.to_string(), *profile))
+                .collect::<Vec<_>>();
+            resolver_matches.extend(catalog_matches.into_iter().filter(|(_, profile)| {
+                !local_ids.contains(profile.meta.profile_id)
+                    && !local_plmns.contains(profile.meta.plmn)
+            }));
+            Ok((
+                all_profiles.values().copied().collect::<Vec<_>>(),
+                resolver_matches,
+            ))
+        })();
+
+        match published {
+            Ok((all_profiles, resolver_matches)) => {
+                profiles::publish_resolver_profiles(&all_profiles, &resolver_matches);
+                match self
+                    .catalog
+                    .as_ref()
+                    .map(|catalog| catalog.ambiguous_plmn_prefixes())
+                    .transpose()
+                {
+                    Ok(prefixes) => {
+                        profiles::publish_ambiguous_plmn_prefixes(&prefixes.unwrap_or_default())
+                    }
+                    Err(error) => {
+                        profiles::publish_ambiguous_plmn_prefixes(&[]);
+                        tracing::warn!(
+                            error = %error,
+                            "Failed to publish ambiguous carrier PLMN prefixes"
+                        );
+                    }
+                }
             }
             Err(error) => {
                 tracing::warn!(error = %error, "Failed to publish VoWiFi carrier profiles to the resolver");
@@ -294,7 +359,8 @@ impl ProfileStore {
         }
     }
 
-    /// Resolve the profile for a PLMN, following database → built-in → derived.
+    /// Resolve the VoWiFi profile for a PLMN. Both possible sources are
+    /// databases; no generated or compiled-in answer is returned.
     pub fn resolve_by_plmn(&self, mcc: &str, mnc: &str) -> Option<ResolvedProfile> {
         let plmn = format!("{mcc}{mnc}");
         if let Ok(Some(row)) = self.database.get_vowifi_carrier_profile_by_plmn(&plmn) {
@@ -307,37 +373,111 @@ impl ProfileStore {
                 }
             }
         }
-        // The database was already consulted above, so fall back without the
-        // overlay: re-entering it would consult the same rows twice.
-        profiles::resolve_builtin_or_derived_by_plmn(mcc, mnc).map(|profile| ResolvedProfile {
-            profile,
-            // Derivation tags its generated ids, which is how the two are told
-            // apart here.
-            origin: if profile.meta.profile_id.starts_with("dynamic_3gpp_") {
-                ProfileOrigin::Derived
-            } else {
-                ProfileOrigin::Builtin
-            },
-        })
+        self.catalog
+            .as_ref()?
+            .unique_for_plmn(&plmn, CatalogAccessKind::WifiEpdg)
+            .ok()?
+            .map(|entry| ResolvedProfile {
+                profile: entry.record.intern(),
+                origin: ProfileOrigin::Catalog,
+            })
     }
 
-    pub fn resolve_by_profile_id(&self, profile_id: &str) -> Option<ResolvedProfile> {
-        if let Ok(Some(record)) = self.get(profile_id) {
-            if record.validate().is_ok() {
-                return Some(ResolvedProfile {
+    /// Resolve a profile for one registration access. Local full-profile rows
+    /// can override either leg; otherwise the catalog access row (`wifi_epdg`
+    /// or `lte_epc`) is loaded for this attempt.
+    pub fn resolve_for_imsi_access(
+        &self,
+        pinned_profile_id: Option<&str>,
+        imsi: &str,
+        home_plmn: Option<&str>,
+        access: CatalogAccessKind,
+    ) -> Result<Option<ResolvedProfile>, String> {
+        if let Some(profile_id) = pinned_profile_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(row) = self
+                .database
+                .get_vowifi_carrier_profile(profile_id)
+                .map_err(|error| error.to_string())?
+            {
+                let record = serde_json::from_str::<CarrierProfileRecord>(&row.payload_json)
+                    .map_err(|error| {
+                        format!("local_carrier_profile_invalid:{profile_id}:{error}")
+                    })?;
+                match access {
+                    CatalogAccessKind::WifiEpdg => record.validate()?,
+                    CatalogAccessKind::LteEpc => record.validate_ims_only()?,
+                }
+                return Ok(Some(ResolvedProfile {
                     profile: record.intern(),
                     origin: ProfileOrigin::Database,
-                });
+                }));
             }
+            if let Some(catalog) = &self.catalog {
+                let profile = catalog.get(profile_id, access)?.ok_or_else(|| {
+                    format!(
+                        "carrier_catalog_profile_not_found:{profile_id}:{}",
+                        access.as_str()
+                    )
+                })?;
+                return Ok(Some(ResolvedProfile {
+                    profile: profile.record.intern(),
+                    origin: ProfileOrigin::Catalog,
+                }));
+            }
+            return Err(format!(
+                "carrier_profile_not_found:{profile_id}:{}",
+                access.as_str()
+            ));
         }
-        profiles::resolve_by_profile_id(profile_id).map(|profile| ResolvedProfile {
+
+        let digits = imsi.trim();
+        let home_plmn = home_plmn.map(str::trim).filter(|plmn| {
+            matches!(plmn.len(), 5 | 6)
+                && plmn.bytes().all(|byte| byte.is_ascii_digit())
+                && digits.starts_with(*plmn)
+        });
+        if home_plmn.is_none()
+            && self
+                .catalog
+                .as_ref()
+                .map(|catalog| catalog.imsi_has_ambiguous_plmn(digits))
+                .transpose()?
+                .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let local = self.local_list()?.into_iter().filter(|entry| {
+            home_plmn.map_or_else(
+                || digits.starts_with(&entry.record.meta.plmn),
+                |plmn| entry.record.meta.plmn == plmn,
+            ) && match access {
+                CatalogAccessKind::WifiEpdg => entry.record.validate().is_ok(),
+                CatalogAccessKind::LteEpc => entry.record.validate_ims_only().is_ok(),
+            }
+        });
+        if let Some(entry) = local.max_by_key(|entry| entry.record.meta.plmn.len()) {
+            return Ok(Some(ResolvedProfile {
+                profile: entry.record.intern(),
+                origin: ProfileOrigin::Database,
+            }));
+        }
+        let Some(catalog) = &self.catalog else {
+            return Ok(None);
+        };
+        let profile = catalog
+            .resolve_for_imsi(digits, home_plmn, access)?
+            .map(|profile| profile.record.intern())
+            .map(ResolvedProfile::from);
+        Ok(profile)
+    }
+}
+
+impl From<&'static CarrierProfile> for ResolvedProfile {
+    fn from(profile: &'static CarrierProfile) -> Self {
+        Self {
             profile,
-            origin: if profile.meta.profile_id.starts_with("dynamic_3gpp_") {
-                ProfileOrigin::Derived
-            } else {
-                ProfileOrigin::Builtin
-            },
-        })
+            origin: ProfileOrigin::Catalog,
+        }
     }
 }
 
@@ -345,7 +485,8 @@ impl ProfileStore {
 pub struct StoredProfile {
     pub profile_id: String,
     pub plmn: String,
-    /// Where the row came from: `builtin`, `manual`, `aosp`, `ipcc`, …
+    /// Where the row came from, such as a sealed catalog release or a local
+    /// operator override source.
     pub source: String,
     pub updated_at: String,
     pub record: CarrierProfileRecord,
@@ -356,63 +497,118 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn store() -> ProfileStore {
+    fn store_with_catalog() -> (ProfileStore, PathBuf) {
         let database = Arc::new(Database::new(PathBuf::from(":memory:")).expect("db"));
-        ProfileStore::new(database)
+        let (catalog, path) = super::super::carrier_catalog::test_catalog_fixture();
+        (
+            ProfileStore::with_catalog(database, Arc::new(catalog)),
+            path,
+        )
     }
 
     #[test]
-    fn seeding_is_idempotent_and_covers_every_builtin() {
-        let store = store();
-        let first = store.seed_builtins().expect("seed");
-        assert_eq!(first, BUILTIN_PROFILES.len());
-        let second = store.seed_builtins().expect("reseed");
-        assert_eq!(second, 0, "existing rows must not be rewritten");
-        assert_eq!(store.list().expect("list").len(), BUILTIN_PROFILES.len());
+    fn catalog_is_listed_and_unknown_carriers_are_not_derived() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+
+        let listed = store.list().expect("list");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].profile_id, "test-v7-23433");
+        assert_eq!(listed[1].profile_id, "test-v7-23434");
+        assert!(listed[0].source.starts_with("carrier_catalog:"));
+        assert!(store.resolve_by_plmn("460", "01").is_none());
+        assert!(store
+            .resolve_for_imsi_access(None, "460011234567890", None, CatalogAccessKind::LteEpc)
+            .expect("unknown profile query")
+            .is_none());
+        store.publish();
+        let published = profiles::resolve_for_line(None, "234330123456789", Some("23433"))
+            .expect("published catalog match");
+        assert_eq!(published.profile.meta.profile_id, "test-v7-23433");
+        assert_eq!(published.matched_prefix, "234330");
+
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]
-    fn database_profile_wins_over_the_builtin() {
-        let store = store();
-        store.seed_builtins().expect("seed");
-
-        let baseline = store
-            .resolve_by_plmn("234", "33")
-            .expect("EE resolves from the seeded database");
-        assert_eq!(baseline.origin, ProfileOrigin::Database);
-
+    fn local_override_wins_and_delete_restores_catalog() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
         let mut record = store
-            .get("gb_ee_23433")
+            .get("test-v7-23433")
             .expect("read")
-            .expect("seeded row present");
-        record.epdg.host = "epdg.example.test".to_string();
-        store.save(&record, "manual").expect("save edit");
+            .expect("catalog profile");
+        record.epdg.host = "epdg.override.test".to_string();
+        store.save(&record, "manual").expect("save override");
 
-        let resolved = store.resolve_by_plmn("234", "33").expect("resolve");
+        let resolved = store
+            .resolve_by_plmn("234", "33")
+            .expect("resolve override");
         assert_eq!(resolved.origin, ProfileOrigin::Database);
-        assert_eq!(resolved.profile.epdg.host, "epdg.example.test");
+        assert_eq!(resolved.profile.epdg.host, "epdg.override.test");
+
+        assert!(store.delete("test-v7-23433").expect("delete override"));
+        let restored = store.resolve_by_plmn("234", "33").expect("resolve catalog");
+        assert_eq!(restored.origin, ProfileOrigin::Catalog);
+        assert_eq!(restored.profile.epdg.host, "epdg.mnc033.mcc234.example");
+
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]
-    fn unknown_carrier_falls_back_to_derivation() {
-        let store = store();
-        store.seed_builtins().expect("seed");
-        // 46001 (China Unicom) has no builtin profile.
-        let resolved = store.resolve_by_plmn("460", "01").expect("resolve");
-        assert_eq!(resolved.origin, ProfileOrigin::Derived);
-        assert_eq!(
-            resolved.profile.epdg.host,
-            "epdg.epc.mnc001.mcc460.pub.3gppnetwork.org"
-        );
-        assert_eq!(
-            resolved.profile.ims.domain,
-            "ims.mnc001.mcc460.3gppnetwork.org"
-        );
+    fn access_specific_resolution_keeps_lte_and_wifi_apns_separate() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+
+        let wifi = store
+            .resolve_for_imsi_access(None, "234330123456789", None, CatalogAccessKind::WifiEpdg)
+            .expect("wifi query")
+            .expect("wifi profile");
+        let lte = store
+            .resolve_for_imsi_access(None, "234330123456789", None, CatalogAccessKind::LteEpc)
+            .expect("lte query")
+            .expect("lte profile");
+        assert_eq!(wifi.profile.epdg.apn, Some("wifi-ims"));
+        assert_eq!(lte.profile.epdg.apn, Some("lte-ims"));
+        assert_eq!(lte.profile.ims.register.expires_seconds, 1800);
+
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]
-    fn legacy_profiles_file_is_folded_into_the_database_and_archived() {
-        let store = store();
+    fn pinned_non_ready_catalog_profile_returns_its_configuration_error() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open catalog fixture");
+            conn.execute(
+                "UPDATE carrier_profiles SET lte_ims_status = 'partial'
+                 WHERE profile_id = 'test-v7-23433'",
+                [],
+            )
+            .expect("mark pinned profile partial");
+        }
+
+        let error = store
+            .resolve_for_imsi_access(
+                Some("test-v7-23433"),
+                "234330123456789",
+                Some("23433"),
+                CatalogAccessKind::LteEpc,
+            )
+            .expect_err("pinned partial profile must not fall back to auto matching");
+        assert_eq!(
+            error,
+            "carrier_catalog_profile_not_ready:test-v7-23433:lte_epc:partial"
+        );
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn legacy_override_requires_and_preserves_a_catalog_baseline() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, catalog_path) = store_with_catalog();
         let path = std::env::temp_dir().join(format!(
             "simadmin-legacy-vowifi-{}-{}.conf",
             std::process::id(),
@@ -425,9 +621,9 @@ mod tests {
   "schema_version": 1,
   "profiles": [
     {
-      "profile_id": "my_unicom",
-      "mcc": "460",
-      "mnc": "01",
+      "profile_id": "my_test_override",
+      "mcc": "234",
+      "mnc": "33",
       "epdg_host": "epdg.custom.test",
       "epdg_port": 4500,
       "ip_stack": "ipv4",
@@ -436,6 +632,7 @@ mod tests {
     }
   ]
 }
+
 "#,
         )
         .expect("write legacy file");
@@ -445,17 +642,21 @@ mod tests {
             1
         );
 
-        // The override survived, and the rest of the profile came from derivation.
-        let resolved = store.resolve_by_plmn("460", "01").expect("resolve");
+        // The override survived, and fields absent from the legacy file still
+        // come from the catalog rather than from generated defaults.
+        let resolved = store.resolve_by_plmn("234", "33").expect("resolve");
         assert_eq!(resolved.origin, ProfileOrigin::Database);
         assert_eq!(resolved.profile.epdg.host, "epdg.custom.test");
         assert_eq!(resolved.profile.epdg.port, 4500);
         assert_eq!(resolved.profile.epdg.ip_stack, "ipv4");
         assert_eq!(resolved.profile.epdg.apn, Some("cmims"));
         assert_eq!(resolved.profile.epdg.dns_servers, &["8.8.8.8"]);
+        let published = profiles::resolve_for_line(None, "234330123456789", Some("23433"))
+            .expect("published local override");
+        assert_eq!(published.profile.meta.profile_id, "my_test_override");
         assert_eq!(
-            resolved.profile.ims.domain, "ims.mnc001.mcc460.3gppnetwork.org",
-            "fields the file never carried still come from 3GPP derivation"
+            resolved.profile.ims.domain, "ims.mnc033.mcc234.example",
+            "fields the file never carried still come from the catalog"
         );
 
         // The file is archived, so a restart does not migrate it twice.
@@ -465,110 +666,6 @@ mod tests {
         assert_eq!(store.migrate_legacy_profiles_file(&path).expect("rerun"), 0);
 
         let _ = std::fs::remove_file(archived);
-    }
-
-    /// The API returning an edited profile is not enough — the live matcher
-    /// (`profiles::resolve_by_imsi`, used from modules with no database handle)
-    /// has to see it too, otherwise an edit silently does nothing at connect time.
-    #[test]
-    fn database_edits_reach_the_live_imsi_matcher() {
-        // Deliberately not seeded: the override table is process-global, so this
-        // test publishes only its own row and clears it again at the end.
-        let store = store();
-
-        // 46001 has no builtin profile; after publishing it must win over the
-        // derived answer for an IMSI carrying that PLMN.
-        let mut record = super::super::profile_import::ImportedCarrierFacts {
-            mcc: "460".to_string(),
-            mnc: "01".to_string(),
-            ..Default::default()
-        }
-        .to_record()
-        .expect("derived record");
-        record.meta.profile_id = "unicom_live_test".to_string();
-        record.epdg.host = "epdg.live.test".to_string();
-        store.save(&record, "manual").expect("save");
-
-        let matched = profiles::resolve_by_imsi("460010123456789").expect("imsi match");
-        assert_eq!(matched.profile.epdg.host, "epdg.live.test");
-        assert_eq!(matched.matched_prefix, "46001");
-
-        // Deleting it puts the derived answer back.
-        assert!(store.delete("unicom_live_test").expect("delete"));
-        let matched = profiles::resolve_by_imsi("460010123456789").expect("imsi match");
-        assert_eq!(
-            matched.profile.epdg.host,
-            "epdg.epc.mnc001.mcc460.pub.3gppnetwork.org"
-        );
-
-        // Leave the global override table empty so other tests are unaffected.
-        profiles::publish_database_profiles(&[]);
-    }
-
-    #[test]
-    fn external_shaped_edit_preserves_the_tuned_register_policy() {
-        let store = store();
-        store.seed_builtins().expect("seed");
-        // Tune something the legacy shape cannot express.
-        let mut record = store.get("gb_ee_23433").expect("read").expect("present");
-        record.ims.register.sec_agree_mode = "required".to_string();
-        store.save(&record, "manual").expect("save");
-
-        store
-            .save_external(&crate::platform::config::ExternalVowifiProfile {
-                profile_id: "gb_ee_23433".to_string(),
-                mcc: "234".to_string(),
-                mnc: "33".to_string(),
-                epdg_host: "epdg.new.test".to_string(),
-                epdg_port: 4500,
-                ip_stack: "ipv4v6".to_string(),
-                apn: Some("ims".to_string()),
-                dns_server: Some("1.1.1.1".to_string()),
-            })
-            .expect("save external");
-
-        let updated = store.get("gb_ee_23433").expect("read").expect("present");
-        assert_eq!(updated.epdg.host, "epdg.new.test");
-        assert_eq!(
-            updated.ims.register.sec_agree_mode, "required",
-            "an ePDG-only edit must not reset the REGISTER policy"
-        );
-    }
-
-    #[test]
-    fn invalid_records_are_rejected_before_they_reach_the_database() {
-        let store = store();
-        let mut record = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
-        record.meta.plmn = "00000".to_string();
-        let error = store.save(&record, "manual").unwrap_err();
-        assert_eq!(error, "plmn_mismatch");
-        assert!(store.list().expect("list").is_empty());
-    }
-
-    #[test]
-    fn deleting_a_row_restores_the_builtin_answer() {
-        let store = store();
-        store.seed_builtins().expect("seed");
-        let mut record = store.get("gb_ee_23433").expect("read").expect("present");
-        record.epdg.host = "epdg.override.test".to_string();
-        store.save(&record, "manual").expect("save");
-        assert_eq!(
-            store
-                .resolve_by_plmn("234", "33")
-                .unwrap()
-                .profile
-                .epdg
-                .host,
-            "epdg.override.test"
-        );
-
-        assert!(store.delete("gb_ee_23433").expect("delete"));
-        let resolved = store.resolve_by_plmn("234", "33").expect("resolve");
-        assert_eq!(resolved.origin, ProfileOrigin::Builtin);
-        assert_eq!(
-            resolved.profile.epdg.host,
-            profiles::GB_EE_23433.epdg.host,
-            "removing the row must fall back to the compiled-in profile"
-        );
+        std::fs::remove_file(catalog_path).expect("remove fixture");
     }
 }

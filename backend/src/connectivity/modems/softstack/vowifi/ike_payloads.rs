@@ -5,14 +5,23 @@ use std::fmt;
 use super::ike_codec::{IkePayload, IkePayloadType};
 
 pub const ENCR_AES_CBC: u16 = 12;
+pub const PRF_HMAC_MD5: u16 = 1;
 pub const PRF_HMAC_SHA1: u16 = 2;
 pub const PRF_HMAC_SHA2_256: u16 = 5;
+pub const PRF_HMAC_SHA2_384: u16 = 6;
 pub const PRF_HMAC_SHA2_512: u16 = 7;
+pub const AUTH_HMAC_MD5_96: u16 = 1;
 pub const AUTH_HMAC_SHA1_96: u16 = 2;
 pub const AUTH_HMAC_SHA2_256_128: u16 = 12;
+pub const AUTH_HMAC_SHA2_384_192: u16 = 13;
 pub const AUTH_HMAC_SHA2_512_256: u16 = 14;
+pub const DH_MODP_768: u16 = 1;
 pub const DH_MODP_1024: u16 = 2;
+pub const DH_MODP_1536: u16 = 5;
 pub const DH_MODP_2048: u16 = 14;
+pub const DH_MODP_3072: u16 = 15;
+pub const DH_MODP_4096: u16 = 16;
+pub const DH_MODP_8192: u16 = 18;
 pub const ESN_NO_EXTENDED_SEQUENCE_NUMBERS: u16 = 0;
 pub const NOTIFY_NAT_DETECTION_SOURCE_IP: u16 = 16_388;
 pub const NOTIFY_NAT_DETECTION_DESTINATION_IP: u16 = 16_389;
@@ -453,6 +462,13 @@ pub fn child_sa_proposal_from_profile_string(
                     attributes: vec![TransformAttribute::KeyLength(256)],
                 });
             }
+            "md5" => {
+                integrity = Some(TransformSpec {
+                    transform_type: TransformType::Integrity,
+                    transform_id: AUTH_HMAC_MD5_96,
+                    attributes: Vec::new(),
+                });
+            }
             "sha1" => {
                 integrity = Some(TransformSpec {
                     transform_type: TransformType::Integrity,
@@ -464,6 +480,13 @@ pub fn child_sa_proposal_from_profile_string(
                 integrity = Some(TransformSpec {
                     transform_type: TransformType::Integrity,
                     transform_id: AUTH_HMAC_SHA2_256_128,
+                    attributes: Vec::new(),
+                });
+            }
+            "sha384" => {
+                integrity = Some(TransformSpec {
+                    transform_type: TransformType::Integrity,
+                    transform_id: AUTH_HMAC_SHA2_384_192,
                     attributes: Vec::new(),
                 });
             }
@@ -528,6 +551,13 @@ pub fn ike_proposal_from_profile_string(
                     attributes: vec![TransformAttribute::KeyLength(256)],
                 });
             }
+            "md5" => {
+                integrity = Some(TransformSpec {
+                    transform_type: TransformType::Integrity,
+                    transform_id: AUTH_HMAC_MD5_96,
+                    attributes: Vec::new(),
+                });
+            }
             "sha1" => {
                 integrity = Some(TransformSpec {
                     transform_type: TransformType::Integrity,
@@ -542,10 +572,24 @@ pub fn ike_proposal_from_profile_string(
                     attributes: Vec::new(),
                 });
             }
+            "sha384" => {
+                integrity = Some(TransformSpec {
+                    transform_type: TransformType::Integrity,
+                    transform_id: AUTH_HMAC_SHA2_384_192,
+                    attributes: Vec::new(),
+                });
+            }
             "sha512" => {
                 integrity = Some(TransformSpec {
                     transform_type: TransformType::Integrity,
                     transform_id: AUTH_HMAC_SHA2_512_256,
+                    attributes: Vec::new(),
+                });
+            }
+            "prfmd5" => {
+                prf = Some(TransformSpec {
+                    transform_type: TransformType::Prf,
+                    transform_id: PRF_HMAC_MD5,
                     attributes: Vec::new(),
                 });
             }
@@ -563,10 +607,24 @@ pub fn ike_proposal_from_profile_string(
                     attributes: Vec::new(),
                 });
             }
+            "prfsha384" => {
+                prf = Some(TransformSpec {
+                    transform_type: TransformType::Prf,
+                    transform_id: PRF_HMAC_SHA2_384,
+                    attributes: Vec::new(),
+                });
+            }
             "prfsha512" => {
                 prf = Some(TransformSpec {
                     transform_type: TransformType::Prf,
                     transform_id: PRF_HMAC_SHA2_512,
+                    attributes: Vec::new(),
+                });
+            }
+            "modp768" => {
+                dh_group = Some(TransformSpec {
+                    transform_type: TransformType::DiffieHellmanGroup,
+                    transform_id: DH_MODP_768,
                     attributes: Vec::new(),
                 });
             }
@@ -577,10 +635,38 @@ pub fn ike_proposal_from_profile_string(
                     attributes: Vec::new(),
                 });
             }
+            "modp1536" => {
+                dh_group = Some(TransformSpec {
+                    transform_type: TransformType::DiffieHellmanGroup,
+                    transform_id: DH_MODP_1536,
+                    attributes: Vec::new(),
+                });
+            }
             "modp2048" => {
                 dh_group = Some(TransformSpec {
                     transform_type: TransformType::DiffieHellmanGroup,
                     transform_id: DH_MODP_2048,
+                    attributes: Vec::new(),
+                });
+            }
+            "modp3072" => {
+                dh_group = Some(TransformSpec {
+                    transform_type: TransformType::DiffieHellmanGroup,
+                    transform_id: DH_MODP_3072,
+                    attributes: Vec::new(),
+                });
+            }
+            "modp4096" => {
+                dh_group = Some(TransformSpec {
+                    transform_type: TransformType::DiffieHellmanGroup,
+                    transform_id: DH_MODP_4096,
+                    attributes: Vec::new(),
+                });
+            }
+            "modp8192" => {
+                dh_group = Some(TransformSpec {
+                    transform_type: TransformType::DiffieHellmanGroup,
+                    transform_id: DH_MODP_8192,
                     attributes: Vec::new(),
                 });
             }
@@ -625,8 +711,10 @@ fn default_prf_for_integrity(
     integrity: &TransformSpec,
 ) -> Result<TransformSpec, ProposalParseError> {
     let transform_id = match integrity.transform_id {
+        AUTH_HMAC_MD5_96 => PRF_HMAC_MD5,
         AUTH_HMAC_SHA1_96 => PRF_HMAC_SHA1,
         AUTH_HMAC_SHA2_256_128 => PRF_HMAC_SHA2_256,
+        AUTH_HMAC_SHA2_384_192 => PRF_HMAC_SHA2_384,
         AUTH_HMAC_SHA2_512_256 => PRF_HMAC_SHA2_512,
         _ => return Err(ProposalParseError::MissingPrf),
     };
@@ -840,7 +928,9 @@ fn encode_transform(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::modems::softstack::vowifi::ike_codec::{IkeExchangeType, IkeMessage, IkePayloadType};
+    use crate::connectivity::modems::softstack::vowifi::ike_codec::{
+        IkeExchangeType, IkeMessage, IkePayloadType,
+    };
 
     #[test]
     fn builds_sa_payload_with_aes128_sha256_modp2048_transforms() {
@@ -904,6 +994,36 @@ mod tests {
             ike_proposal_dh_group_from_profile_string("aes128-sha256-modp1024").expect("dh group"),
             DH_MODP_1024
         );
+    }
+
+    #[test]
+    fn parses_md5_sha384_and_extended_modp_proposals() {
+        let md5 =
+            ike_proposal_from_profile_string("aes128-md5-modp768", 1).expect("parse md5 proposal");
+        assert_eq!(md5.transforms[1].transform_id, PRF_HMAC_MD5);
+        assert_eq!(md5.transforms[2].transform_id, AUTH_HMAC_MD5_96);
+        assert_eq!(md5.transforms[3].transform_id, DH_MODP_768);
+
+        let sha384 = ike_proposal_from_profile_string("aes256-sha384-prfsha384-modp4096", 2)
+            .expect("parse sha384 proposal");
+        assert_eq!(sha384.transforms[1].transform_id, PRF_HMAC_SHA2_384);
+        assert_eq!(sha384.transforms[2].transform_id, AUTH_HMAC_SHA2_384_192);
+        assert_eq!(sha384.transforms[3].transform_id, DH_MODP_4096);
+
+        for (proposal, expected_group) in [
+            ("aes128-sha256-modp1536", DH_MODP_1536),
+            ("aes128-sha256-modp3072", DH_MODP_3072),
+            ("aes128-sha256-modp8192", DH_MODP_8192),
+        ] {
+            assert_eq!(
+                ike_proposal_dh_group_from_profile_string(proposal).expect("dh group"),
+                expected_group
+            );
+        }
+
+        let esp = child_sa_proposal_from_profile_string("aes128-md5", 1, &[1, 2, 3, 4])
+            .expect("parse md5 esp proposal");
+        assert_eq!(esp.transforms[1].transform_id, AUTH_HMAC_MD5_96);
     }
 
     #[test]

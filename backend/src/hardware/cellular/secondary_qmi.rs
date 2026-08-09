@@ -69,6 +69,7 @@ const RPMSG_DRIVERS_DIR: &str = "/sys/bus/rpmsg/drivers";
 const WWAN_CLASS_DIR: &str = "/sys/class/wwan";
 const NET_CLASS_DIR: &str = "/sys/class/net";
 pub const SECONDARY_QMI_STATE_FILE: &str = "/run/simadmin/secondary-qmi-device";
+pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qmi-endpoints.json";
 
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
@@ -155,6 +156,22 @@ pub struct SecondaryQmiEndpoint {
     pub driver: String,
     /// Whether this module bound the channel (and so should unbind it).
     pub owned: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct RuntimeEndpointState {
+    baseband: String,
+    channel: String,
+    port_name: String,
+    device_path: String,
+    netdev: Option<String>,
+    driver: String,
+}
+
+enum RuntimeEndpointMapLookup {
+    Missing,
+    NoMatch,
+    Found(RuntimeEndpointState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -554,45 +571,119 @@ pub async fn runtime_endpoint(
 fn endpoint_from_runtime_state(
     primary_device: &str,
 ) -> Result<Option<SecondaryQmiEndpoint>, SecondaryQmiError> {
+    let primary_baseband = baseband_key_for_device(primary_device)?;
     let configured = match std::env::var("SIMADMIN_SECONDARY_QMI_DEVICE") {
-        Ok(value) if !value.trim().is_empty() => Some((value, None)),
-        _ => match std::fs::read_to_string(SECONDARY_QMI_STATE_FILE) {
-            Ok(value) => {
-                // Accept the short-lived JSON format written by older Codex
-                // builds so an in-place upgrade can recover without a reboot.
-                let trimmed = value.trim();
-                if trimmed.starts_with('{') {
-                    let parsed: serde_json::Value =
-                        serde_json::from_str(trimmed).map_err(|error| {
-                            SecondaryQmiError::ProbeFailed(format!(
-                                "invalid {SECONDARY_QMI_STATE_FILE}: {error}"
-                            ))
-                        })?;
-                    let device = parsed
-                        .get("qmi_device")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let netdev = parsed
-                        .get("netdev")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string);
-                    Some((device, netdev))
-                } else {
-                    Some((trimmed.to_string(), None))
-                }
+        Ok(value) if !value.trim().is_empty() => Some(legacy_runtime_endpoint_state(value, None)),
+        _ => match endpoint_from_runtime_map(&primary_baseband)? {
+            RuntimeEndpointMapLookup::Found(endpoint) => {
+                return configured_runtime_endpoint(primary_baseband, endpoint);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(SecondaryQmiError::ProbeFailed(format!(
-                    "failed to read {SECONDARY_QMI_STATE_FILE}: {error}"
-                )))
+            RuntimeEndpointMapLookup::NoMatch => return Ok(None),
+            RuntimeEndpointMapLookup::Missing => {
+                match std::fs::read_to_string(SECONDARY_QMI_STATE_FILE) {
+                    Ok(value) => {
+                        // Accept the short-lived JSON format written by older Codex
+                        // builds so an in-place upgrade can recover without a reboot.
+                        let trimmed = value.trim();
+                        if trimmed.starts_with('{') {
+                            let parsed: serde_json::Value =
+                                serde_json::from_str(trimmed).map_err(|error| {
+                                    SecondaryQmiError::ProbeFailed(format!(
+                                        "invalid {SECONDARY_QMI_STATE_FILE}: {error}"
+                                    ))
+                                })?;
+                            let device = parsed
+                                .get("qmi_device")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default()
+                                .to_string();
+                            let netdev = parsed
+                                .get("netdev")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
+                            Some(legacy_runtime_endpoint_state(device, netdev))
+                        } else {
+                            Some(legacy_runtime_endpoint_state(trimmed.to_string(), None))
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => {
+                        return Err(SecondaryQmiError::ProbeFailed(format!(
+                            "failed to read {SECONDARY_QMI_STATE_FILE}: {error}"
+                        )))
+                    }
+                }
             }
         },
     };
-    let Some((device_path, state_netdev)) = configured else {
+    let Some(state) = configured else {
         return Ok(None);
     };
+    configured_runtime_endpoint(primary_baseband, state)
+}
+
+fn legacy_runtime_endpoint_state(
+    device_path: String,
+    netdev: Option<String>,
+) -> RuntimeEndpointState {
+    RuntimeEndpointState {
+        baseband: String::new(),
+        channel: SECONDARY_CHANNEL.to_string(),
+        port_name: String::new(),
+        device_path,
+        netdev,
+        driver: RPMSG_WWAN_DRIVER.to_string(),
+    }
+}
+
+fn endpoint_from_runtime_map(
+    primary_baseband: &str,
+) -> Result<RuntimeEndpointMapLookup, SecondaryQmiError> {
+    let payload = match std::fs::read_to_string(SECONDARY_QMI_ENDPOINTS_STATE_FILE) {
+        Ok(payload) => payload,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RuntimeEndpointMapLookup::Missing)
+        }
+        Err(error) => {
+            return Err(SecondaryQmiError::ProbeFailed(format!(
+                "failed to read {SECONDARY_QMI_ENDPOINTS_STATE_FILE}: {error}"
+            )))
+        }
+    };
+    Ok(
+        match runtime_endpoint_for_baseband(&payload, primary_baseband)? {
+            Some(endpoint) => RuntimeEndpointMapLookup::Found(endpoint),
+            None => RuntimeEndpointMapLookup::NoMatch,
+        },
+    )
+}
+
+fn runtime_endpoint_for_baseband(
+    payload: &str,
+    primary_baseband: &str,
+) -> Result<Option<RuntimeEndpointState>, SecondaryQmiError> {
+    let endpoints: Vec<RuntimeEndpointState> = serde_json::from_str(payload).map_err(|error| {
+        SecondaryQmiError::ProbeFailed(format!(
+            "invalid {SECONDARY_QMI_ENDPOINTS_STATE_FILE}: {error}"
+        ))
+    })?;
+    Ok(endpoints
+        .into_iter()
+        .find(|endpoint| endpoint.baseband == primary_baseband))
+}
+
+fn configured_runtime_endpoint(
+    primary_baseband: String,
+    state: RuntimeEndpointState,
+) -> Result<Option<SecondaryQmiEndpoint>, SecondaryQmiError> {
+    let RuntimeEndpointState {
+        channel,
+        port_name,
+        device_path,
+        netdev,
+        driver,
+        ..
+    } = state;
     let device_path = device_path.trim().to_string();
     if !device_path.starts_with("/dev/") || !Path::new(&device_path).exists() {
         return Err(SecondaryQmiError::ProbeFailed(format!(
@@ -600,31 +691,34 @@ fn endpoint_from_runtime_state(
         )));
     }
 
-    let primary_baseband = baseband_key_for_device(primary_device)?;
     let secondary_baseband = baseband_key_for_device(&device_path)?;
     if secondary_baseband != primary_baseband {
         return Err(SecondaryQmiError::ProbeFailed(format!(
             "configured secondary QMI endpoint belongs to {secondary_baseband}, expected {primary_baseband}"
         )));
     }
-    let port_name = device_path
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_string();
+    let port_name = if port_name.trim().is_empty() {
+        device_path
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    } else {
+        port_name
+    };
     let netdev = std::env::var("SIMADMIN_SECONDARY_QMI_NETDEV")
         .ok()
         .filter(|value| !value.trim().is_empty())
-        .or(state_netdev);
+        .or(netdev);
     Ok(Some(SecondaryQmiEndpoint {
         remoteproc: primary_baseband,
         rpmsg_device: String::new(),
-        channel: SECONDARY_CHANNEL.to_string(),
+        channel,
         port_name,
         device_path,
         netdev,
         open_mode: QmiOpenMode::ForceQmi,
-        driver: RPMSG_WWAN_DRIVER.to_string(),
+        driver,
         owned: false,
     }))
 }
@@ -721,9 +815,7 @@ async fn prepare_data6_netdev(
             )
         })
         .ok_or_else(|| {
-            SecondaryQmiError::BindFailed(format!(
-                "no DATA6 netdev appeared under {baseband}"
-            ))
+            SecondaryQmiError::BindFailed(format!("no DATA6 netdev appeared under {baseband}"))
         })?;
 
     let output = tokio::time::timeout(
@@ -808,7 +900,9 @@ async fn bind_and_probe(
         }
         let deadline = tokio::time::Instant::now() + PORT_APPEAR_TIMEOUT;
         while tokio::time::Instant::now() < deadline
-            && old_ports.iter().any(|port| Path::new(&format!("/dev/{port}")).exists())
+            && old_ports
+                .iter()
+                .any(|port| Path::new(&format!("/dev/{port}")).exists())
         {
             sleep(PORT_POLL_INTERVAL).await;
         }
@@ -832,10 +926,7 @@ async fn bind_and_probe(
     std::fs::write(device_dir.join("driver_override"), RPMSG_WWAN_DRIVER).map_err(|e| {
         SecondaryQmiError::BindFailed(format!("driver_override {}: {e}", candidate.channel))
     })?;
-    if let Err(error) = std::fs::write(
-        driver_bind_path(RPMSG_WWAN_DRIVER),
-        &candidate.device_id,
-    ) {
+    if let Err(error) = std::fs::write(driver_bind_path(RPMSG_WWAN_DRIVER), &candidate.device_id) {
         debug!(channel = %candidate.channel, error = %error, "bind write returned an error");
     }
 
@@ -867,8 +958,7 @@ async fn bind_and_probe(
         release_endpoint_by_device(&candidate.device_id, RPMSG_WWAN_DRIVER).await;
         return Err(SecondaryQmiError::BindFailed(format!(
             "{} bound via {} but no unique new port appeared under {baseband}",
-            candidate.channel,
-            RPMSG_WWAN_DRIVER,
+            candidate.channel, RPMSG_WWAN_DRIVER,
         )));
     };
 
@@ -1331,6 +1421,31 @@ mod tests {
     }
 
     #[test]
+    fn runtime_endpoint_map_selects_matching_baseband() {
+        let payload = r#"[
+            {"baseband":"4080000.remoteproc","channel":"DATA6_CNTL","port_name":"wwan0qmi1","device_path":"/dev/wwan0qmi1","netdev":"wwan1","driver":"rpmsg_wwan_ctrl"},
+            {"baseband":"6080000.remoteproc","channel":"DATA6_CNTL","port_name":"wwan2qmi1","device_path":"/dev/wwan2qmi1","netdev":"wwan3","driver":"rpmsg_wwan_ctrl"}
+        ]"#;
+
+        let endpoint = runtime_endpoint_for_baseband(payload, "6080000.remoteproc")
+            .unwrap()
+            .unwrap();
+        assert_eq!(endpoint.device_path, "/dev/wwan2qmi1");
+        assert_eq!(endpoint.netdev.as_deref(), Some("wwan3"));
+    }
+
+    #[test]
+    fn runtime_endpoint_map_does_not_fall_back_to_first_baseband() {
+        let payload = r#"[
+            {"baseband":"4080000.remoteproc","channel":"DATA6_CNTL","port_name":"wwan0qmi1","device_path":"/dev/wwan0qmi1","netdev":null,"driver":"rpmsg_wwan_ctrl"}
+        ]"#;
+
+        assert!(runtime_endpoint_for_baseband(payload, "6080000.remoteproc")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn only_data6_cntl_is_eligible() {
         assert!(is_spare_data_channel("DATA6_CNTL"));
         assert!(!is_spare_data_channel("DATA5_CNTL"));
@@ -1342,7 +1457,11 @@ mod tests {
 
     #[test]
     fn data6_netdev_prefers_a_fresh_non_primary_interface() {
-        let all = vec!["wwan0".to_string(), "wwan1".to_string(), "wwan2".to_string()];
+        let all = vec![
+            "wwan0".to_string(),
+            "wwan1".to_string(),
+            "wwan2".to_string(),
+        ];
         let before = vec!["wwan0".to_string(), "wwan1".to_string()];
         assert_eq!(
             choose_data6_netdev(&all, &before, "wwan0qmi0").as_deref(),
@@ -1388,10 +1507,7 @@ mod tests {
     fn open_mode_args_and_probe_order() {
         assert_eq!(QmiOpenMode::ForceQmi.as_arg(), "--device-open-qmi");
         assert_eq!(QmiOpenMode::Proxy.as_arg(), "--device-open-proxy");
-        assert_eq!(
-            QmiOpenMode::probe_order(),
-            [QmiOpenMode::ForceQmi]
-        );
+        assert_eq!(QmiOpenMode::probe_order(), [QmiOpenMode::ForceQmi]);
     }
 
     #[test]

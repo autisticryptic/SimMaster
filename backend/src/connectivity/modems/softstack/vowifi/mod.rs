@@ -5,6 +5,7 @@
 //! metadata, not on any third-party binary or private preset naming.
 
 pub mod aka;
+pub mod carrier_catalog;
 pub mod channel;
 pub mod dataplane;
 pub mod diagnostics;
@@ -26,6 +27,7 @@ pub mod ike_retransmit;
 pub mod ike_state;
 pub mod ims;
 pub mod live;
+pub mod operator;
 pub mod profile_import;
 pub mod profile_record;
 pub mod profile_store;

@@ -1,0 +1,19 @@
+[Unit]
+Description=Asterisk SimAdmin lab PBX
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=asterisk
+Group=asterisk
+RuntimeDirectory=asterisk
+RuntimeDirectoryMode=0755
+ExecStart=/usr/sbin/asterisk -f -C /etc/asterisk/asterisk.conf -vvv
+ExecReload=/usr/sbin/asterisk -rx "core reload"
+ExecStop=/usr/sbin/asterisk -rx "core stop now"
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

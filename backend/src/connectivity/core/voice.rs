@@ -48,7 +48,7 @@ fn unix_millis() -> u128 {
 ///
 /// Extracting it lets both the VoWiFi path (which builds it from a
 /// `&'static CarrierProfile`) and the VoLTE path (which builds it from its own
-/// `VolteConfig`/runtime) reuse the exact same SDP/state-machine logic without
+/// runtime) reuse the exact same SDP/state-machine logic without
 /// depending on the VoWiFi-specific `CarrierProfile` type.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VoiceParams {
@@ -563,8 +563,9 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     let mut origin_username = String::from("-");
     let mut session_id = 0u64;
     let mut session_version = 0u64;
-    let mut connection_addr = String::new();
-    let mut addr_type = SdpAddrType::Ip4;
+    let mut origin_connection: Option<(SdpAddrType, String)> = None;
+    let mut session_connection: Option<(SdpAddrType, String)> = None;
+    let mut audio_connection: Option<(SdpAddrType, String)> = None;
     let mut media_port = 0u16;
     let mut transport = MediaTransportKind::RtpAvp;
     let mut payload_order: Vec<u8> = Vec::new();
@@ -574,6 +575,7 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     let mut fmtps: Vec<(u8, String)> = Vec::new();
     let mut in_audio_media = false;
     let mut saw_audio_media = false;
+    let mut saw_any_media = false;
 
     for raw_line in text.split('\n') {
         let line = raw_line.trim_end_matches('\r').trim_end();
@@ -590,28 +592,34 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
                     origin_username = parts[0].to_string();
                     session_id = parts[1].parse().unwrap_or(0);
                     session_version = parts[2].parse().unwrap_or(0);
-                    addr_type = if parts[5].contains("IP6") {
+                    let addr_type = if parts[4].eq_ignore_ascii_case("IP6") {
                         SdpAddrType::Ip6
                     } else {
                         SdpAddrType::Ip4
                     };
-                    connection_addr = parts[5].to_string();
+                    origin_connection = Some((addr_type, parts[5].to_string()));
                 }
             }
             "c" => {
                 let parts = value.split_whitespace().collect::<Vec<_>>();
                 if parts.len() >= 3 {
-                    addr_type = if parts[1].eq_ignore_ascii_case("IP6") {
+                    let addr_type = if parts[1].eq_ignore_ascii_case("IP6") {
                         SdpAddrType::Ip6
                     } else {
                         SdpAddrType::Ip4
                     };
-                    connection_addr = parts[2].to_string();
+                    let connection = (addr_type, parts[2].to_string());
+                    if !saw_any_media {
+                        session_connection = Some(connection);
+                    } else if in_audio_media {
+                        audio_connection = Some(connection);
+                    }
                 }
             }
             "m" => {
                 // m=<media> <port> <proto> <fmt list>
                 let parts = value.split_whitespace().collect::<Vec<_>>();
+                saw_any_media = true;
                 in_audio_media = parts.first().copied() == Some("audio");
                 if in_audio_media {
                     saw_audio_media = true;
@@ -691,6 +699,11 @@ pub fn parse_audio_sdp(body: &[u8]) -> Result<SdpAudioDescription, VoiceEncoding
     if codecs.is_empty() {
         return Err(VoiceEncodingError::UnsupportedCodec);
     }
+
+    let (addr_type, connection_addr) = audio_connection
+        .or(session_connection)
+        .or(origin_connection)
+        .ok_or(VoiceEncodingError::SdpMalformed)?;
 
     Ok(SdpAudioDescription {
         session_id,
@@ -1649,6 +1662,23 @@ mod tests {
         assert!(!parsed.codecs.is_empty());
         // The first offered codec should survive the round trip.
         assert_eq!(parsed.codecs[0].codec, offer.codecs[0].codec);
+    }
+
+    #[test]
+    fn audio_parser_uses_audio_connection_and_ignores_video_connection() {
+        let body = b"v=0\r\no=- 1 1 IN IP4 192.0.2.1\r\ns=call\r\nc=IN IP4 192.0.2.2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\nc=IN IP4 192.0.2.10\r\na=rtpmap:0 PCMU/8000\r\nm=video 40002 RTP/AVP 96\r\nc=IN IP4 192.0.2.20\r\na=rtpmap:96 H264/90000\r\n";
+        let parsed = parse_audio_sdp(body).unwrap();
+        assert_eq!(parsed.connection_addr, "192.0.2.10");
+        assert_eq!(parsed.addr_type, SdpAddrType::Ip4);
+        assert_eq!(parsed.media_port, 40000);
+    }
+
+    #[test]
+    fn audio_parser_uses_session_connection_without_audio_override() {
+        let body = b"v=0\r\no=- 1 1 IN IP6 2001:db8::1\r\ns=call\r\nc=IN IP6 2001:db8::2\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\nm=video 40002 RTP/AVP 96\r\nc=IN IP6 2001:db8::20\r\na=rtpmap:96 H264/90000\r\n";
+        let parsed = parse_audio_sdp(body).unwrap();
+        assert_eq!(parsed.connection_addr, "2001:db8::2");
+        assert_eq!(parsed.addr_type, SdpAddrType::Ip6);
     }
 
     #[test]

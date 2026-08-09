@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::future::Future;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
 use tokio::process::Command;
 use tracing::{info, warn};
 use zbus::{
@@ -21,16 +23,9 @@ use crate::{
         DeviceInfoResponse, NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode,
         RadioModeResponse, ServingCell, SetApnRequest, SignalStrengthResponse, SimInfoResponse,
     },
-    hardware::cellular::serial::with_serial,
-    services::system::system_event::{
-        codes as system_event_codes, severity as system_event_severity,
-        status as system_event_status, SystemEventEmitter,
-    },
+    hardware::cellular::serial::with_serial_for,
 };
-use crate::{
-    platform::config::{ApnConfig, ConfigManager},
-    platform::db::Database,
-};
+use crate::{platform::config::ApnConfig, platform::db::Database};
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
 const MM_ROOT_PATH: &str = "/org/freedesktop/ModemManager1";
@@ -53,21 +48,10 @@ const MM_MODE_3G: u32 = 1 << 2;
 const MM_MODE_4G: u32 = 1 << 3;
 const MM_MODE_5G: u32 = 1 << 4;
 const MM_MODE_ANY: u32 = u32::MAX;
-const MODEM_SCAN_THRESHOLD: u32 = 3;
-const MODEM_RESTART_THRESHOLD: u32 = 5;
-const MODEM_RECOVERY_COOLDOWN_SECS: u64 = 300;
-const MODEM_DISCOVERY_TIMEOUT_SECS: u64 = 5;
-const MODEM_DISCOVERY_FAILURE_CACHE_SECS: u64 = 30;
 const OPERATOR_SCAN_REQUEST_TIMEOUT_SECS: u64 = 45;
 const OPERATOR_SCAN_CACHE_POLL_SECS: u64 = 20;
 const NETWORK_REGISTER_TIMEOUT_SECS: u64 = 45;
-const SEARCHING_REGISTER_THRESHOLD: u32 = 4;
-const SEARCHING_RADIO_RESET_THRESHOLD: u32 = 8;
-const DATA_CONNECT_RETRY_COOLDOWN_SECS: u64 = 120;
 const NM_CREATED_PROFILE_NAME: &str = "simadmin-modem";
-const MM_MODEM_STATE_REGISTERED: i32 = 8;
-const MM_MODEM_STATE_DISCONNECTING: i32 = 9;
-const MM_MODEM_STATE_CONNECTING: i32 = 10;
 const MM_MODEM_STATE_CONNECTED: i32 = 11;
 const MM_MODEM_PORT_TYPE_AT: u32 = 3;
 const MM_MODEM_PORT_TYPE_QMI: u32 = 6;
@@ -76,20 +60,25 @@ const MODEM_HELPER_COMMAND_TIMEOUT_SECS: u64 = 3;
 const MODEM_AT_COMMAND_TIMEOUT_SECS: u64 = 2;
 const SMSC_HELPER_FALLBACK_TIMEOUT_SECS: u64 = 4;
 const SMSC_BACKGROUND_AT_TIMEOUT_SECS: u64 = 10;
-
-static SMSC_BACKGROUND_RUNNING: AtomicBool = AtomicBool::new(false);
+const MM_LOGGING_SERIAL_KEY: &str = "modemmanager-global-logging";
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
 type ManagedObjects = HashMap<OwnedObjectPath, HashMap<String, InterfaceProperties>>;
 
-static MODEM_DISCOVERY_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-static MODEM_DISCOVERY_FAILURE: std::sync::Mutex<Option<(Instant, String)>> =
-    std::sync::Mutex::new(None);
-static BASEBAND_RESTART_STEPS: std::sync::Mutex<Vec<BasebandRestartStep>> =
-    std::sync::Mutex::new(Vec::new());
-static BASEBAND_RESTART_RUNNING: AtomicBool = AtomicBool::new(false);
-static BASEBAND_RESTART_REGISTRATION: std::sync::Mutex<Option<String>> =
-    std::sync::Mutex::new(None);
+#[derive(Default)]
+struct BasebandRestartProgress {
+    steps: Vec<BasebandRestartStep>,
+    running: bool,
+    current_registration: Option<String>,
+}
+
+static BASEBAND_RESTART_PROGRESS: OnceLock<
+    std::sync::Mutex<HashMap<String, BasebandRestartProgress>>,
+> = OnceLock::new();
+
+tokio::task_local! {
+    static BASEBAND_RESTART_PROGRESS_KEY: String;
+}
 
 #[derive(Debug, Clone, Default)]
 struct SimpleConnectSettings {
@@ -803,7 +792,10 @@ fn line_hardware_key(hardware_key: &str, uim_slot: u8) -> String {
 /// hardware key + ICCID. This keeps the line stable across restarts and across
 /// SIM swaps in the reader, matching how the reader is configured by the user.
 pub fn reader_line_id(reader_id: &str, uim_slot: u8) -> String {
-    stable_line_id(&format!("reader:{}", reader_id.trim()), &format!("uim:{uim_slot}"))
+    stable_line_id(
+        &format!("reader:{}", reader_id.trim()),
+        &format!("uim:{uim_slot}"),
+    )
 }
 
 /// Synthesize a `ModemBinding` for a standalone SIM reader line. Readers only
@@ -1013,18 +1005,6 @@ pub fn cache_smsc_for_identity(
         &sms_center,
         source,
     );
-}
-
-fn cached_smsc_for_identity(db: &Database, identity: &SimIdentity) -> String {
-    let keys = smsc_identity_keys(identity);
-    if keys.is_empty() {
-        return String::new();
-    }
-    db.get_smsc_cache(&keys)
-        .ok()
-        .flatten()
-        .map(|entry| normalize_smsc(&entry.sms_center))
-        .unwrap_or_default()
 }
 
 pub fn cache_own_numbers_for_identity(
@@ -1450,79 +1430,12 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
     Ok(bindings)
 }
 
-fn no_modem_error(detail: impl Into<String>) -> zbus::Error {
-    zbus::fdo::Error::Failed(detail.into()).into()
-}
-
-fn recent_modem_discovery_failure() -> Option<String> {
-    let Ok(guard) = MODEM_DISCOVERY_FAILURE.lock() else {
-        return None;
-    };
-    let (recorded_at, detail) = guard.as_ref()?;
-    (recorded_at.elapsed() < Duration::from_secs(MODEM_DISCOVERY_FAILURE_CACHE_SECS))
-        .then(|| detail.clone())
-}
-
-fn record_modem_discovery_failure(detail: String) {
-    if let Ok(mut guard) = MODEM_DISCOVERY_FAILURE.lock() {
-        *guard = Some((Instant::now(), detail));
-    }
-}
-
-fn clear_modem_discovery_failure() {
-    if let Ok(mut guard) = MODEM_DISCOVERY_FAILURE.lock() {
-        *guard = None;
-    }
-}
-
-pub async fn find_modem_path(conn: &Connection) -> zbus::Result<String> {
-    if let Some(path) = list_modem_paths(conn).await?.into_iter().next() {
-        clear_modem_discovery_failure();
-        return Ok(path);
-    }
-    if let Some(detail) = recent_modem_discovery_failure() {
-        return Err(no_modem_error(detail));
-    }
-
-    let _guard = MODEM_DISCOVERY_LOCK.lock().await;
-    if let Some(path) = list_modem_paths(conn).await?.into_iter().next() {
-        clear_modem_discovery_failure();
-        return Ok(path);
-    }
-    if let Some(detail) = recent_modem_discovery_failure() {
-        return Err(no_modem_error(detail));
-    }
-
-    let scan_result = run_recovery_command("mmcli", &["--scan-modems"]).await;
-    let deadline = Instant::now() + Duration::from_secs(MODEM_DISCOVERY_TIMEOUT_SECS);
-    loop {
-        if let Some(path) = list_modem_paths(conn).await?.into_iter().next() {
-            clear_modem_discovery_failure();
-            return Ok(path);
-        }
-        if Instant::now() >= deadline {
-            let detail = match scan_result {
-                Ok(ref output) => format!("No ModemManager modem found after scan: {output}"),
-                Err(ref err) => format!("No ModemManager modem found; scan failed: {err}"),
-            };
-            record_modem_discovery_failure(detail.clone());
-            return Err(no_modem_error(detail));
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-}
-
 async fn get_sim_path(conn: &Connection, modem_path: &str) -> zbus::Result<String> {
     let value = get_property(conn, modem_path, MM_MODEM, "Sim").await?;
     let path = zbus::zvariant::ObjectPath::try_from(value.clone())
         .map(|v| v.to_string())
         .unwrap_or_else(|_| extract_string(&value));
     Ok(path)
-}
-
-pub async fn current_sim_identity(conn: &Connection) -> Option<SimIdentity> {
-    let modem_path = find_modem_path(conn).await.ok()?;
-    sim_identity_for_modem(conn, &modem_path).await
 }
 
 pub async fn sim_identity_for_modem(conn: &Connection, modem_path: &str) -> Option<SimIdentity> {
@@ -1656,9 +1569,11 @@ fn mm_access_tech_to_string(tech: u32) -> String {
     "unknown".to_string()
 }
 
-pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
+pub async fn get_device_info_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<DeviceInfoResponse> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
 
     let manufacturer = modem_props
         .get("Manufacturer")
@@ -1670,7 +1585,7 @@ pub async fn get_device_info_data(conn: &Connection) -> zbus::Result<DeviceInfoR
         .unwrap_or_default();
     let revision = modem_props.get("Revision").map(extract_string);
     let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
-    let imei = match get_property(conn, &modem_path, MM_MODEM_3GPP, "Imei").await {
+    let imei = match get_property(conn, modem_path, MM_MODEM_3GPP, "Imei").await {
         Ok(value) => extract_string(&value),
         Err(_) => String::new(),
     };
@@ -1758,7 +1673,8 @@ async fn mbim_subscriber_own_numbers_fallback(conn: &Connection, modem_path: &st
         "-p".to_string(),
         "--query-subscriber-ready-status".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("mbimcli", args).await }).await
     else {
         return Vec::new();
     };
@@ -1775,7 +1691,8 @@ async fn qmi_dms_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Ve
         device,
         "--dms-get-msisdn".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
     else {
         return Vec::new();
     };
@@ -1792,7 +1709,8 @@ async fn qmi_atr_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Ve
         device,
         "--atr-send=AT+CNUM".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
     else {
         return Vec::new();
     };
@@ -1814,8 +1732,10 @@ async fn mbim_at_tunnel_own_numbers_fallback(conn: &Connection, modem_path: &str
             "-p".to_string(),
             option.to_string(),
         ];
-        let Ok(output) =
-            with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+        let Ok(output) = with_serial_for(modem_path, async {
+            run_modem_helper_command("mbimcli", args).await
+        })
+        .await
         else {
             continue;
         };
@@ -1827,8 +1747,11 @@ async fn mbim_at_tunnel_own_numbers_fallback(conn: &Connection, modem_path: &str
     Vec::new()
 }
 
-async fn direct_at_own_numbers_fallback(conn: &Connection) -> Vec<String> {
-    let Ok(output) = with_serial(async { run_direct_at_command(conn, "AT+CNUM").await }).await
+async fn direct_at_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Vec<String> {
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_direct_at_command_for_modem(conn, modem_path, "AT+CNUM").await
+    })
+    .await
     else {
         return Vec::new();
     };
@@ -1852,7 +1775,7 @@ async fn active_protocol_own_numbers_fallback(conn: &Connection, modem_path: &st
     if !phone_numbers.is_empty() {
         return phone_numbers;
     }
-    direct_at_own_numbers_fallback(conn).await
+    direct_at_own_numbers_fallback(conn, modem_path).await
 }
 
 async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
@@ -1865,7 +1788,8 @@ async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> S
         "-p".to_string(),
         "--sms-query-configuration".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("mbimcli", args).await }).await
     else {
         return String::new();
     };
@@ -1882,7 +1806,8 @@ async fn qmi_wms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--wms-get-smsc-address".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
     else {
         return String::new();
     };
@@ -1899,7 +1824,8 @@ async fn qmi_atr_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--atr-send=AT+CSCA?".to_string(),
     ];
-    let Ok(output) = with_serial(async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) =
+        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
     else {
         return String::new();
     };
@@ -1921,8 +1847,10 @@ async fn mbim_at_tunnel_smsc_fallback(conn: &Connection, modem_path: &str) -> St
             "-p".to_string(),
             option.to_string(),
         ];
-        let Ok(output) =
-            with_serial(async { run_modem_helper_command("mbimcli", args).await }).await
+        let Ok(output) = with_serial_for(modem_path, async {
+            run_modem_helper_command("mbimcli", args).await
+        })
+        .await
         else {
             continue;
         };
@@ -1934,87 +1862,15 @@ async fn mbim_at_tunnel_smsc_fallback(conn: &Connection, modem_path: &str) -> St
     String::new()
 }
 
-async fn direct_at_smsc_fallback(conn: &Connection) -> String {
-    let Ok(output) = with_serial(async { run_direct_at_command(conn, "AT+CSCA?").await }).await
+async fn direct_at_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_direct_at_command_for_modem(conn, modem_path, "AT+CSCA?").await
+    })
+    .await
     else {
         return String::new();
     };
     parse_smsc_from_at_output(&output)
-}
-
-/// 通过 AT+CRSM 读取 SIM 卡 EF_SMSP 文件中的 SMSC 地址。
-/// 优先使用 ModemManager Modem.Command D-Bus 接口（需要 debug 模式），
-/// 直接串口作为 fallback。
-async fn direct_at_ef_smsp_fallback(conn: &Connection) -> String {
-    let modem_path = match find_modem_path(conn).await {
-        Ok(path) => path,
-        Err(err) => {
-            warn!(error = %err, "EF_SMSP fallback: cannot find modem path");
-            return String::new();
-        }
-    };
-
-    // 步骤 1: GET RESPONSE 获取 EF_SMSP 文件信息
-    let info_output = match send_at_via_modem_command(conn, &modem_path, "AT+CRSM=192,28482,0,0,15")
-        .await
-    {
-        Ok(output) => output,
-        Err(err) => {
-            warn!(error = %err, "EF_SMSP fallback step 1 (Modem.Command) failed, trying direct serial");
-            // 直接串口兜底
-            match with_serial(async {
-                run_direct_at_command_draining(conn, "AT+CRSM=192,28482,0,0,15").await
-            })
-            .await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    warn!(error = %err, "EF_SMSP fallback step 1 (direct serial) also failed");
-                    return String::new();
-                }
-            }
-        }
-    };
-
-    let record_len = parse_crsm_fcp_record_length(&info_output);
-    if record_len == 0 {
-        warn!(
-            output = %info_output,
-            "EF_SMSP fallback: cannot parse record length from FCP response"
-        );
-        return String::new();
-    }
-    info!(
-        record_len = record_len,
-        "EF_SMSP record length parsed from FCP"
-    );
-
-    // 步骤 2: READ RECORD 读取第一条记录
-    let read_cmd = format!("AT+CRSM=178,28482,1,4,{record_len}");
-    let record_output = match send_at_via_modem_command(conn, &modem_path, &read_cmd).await {
-        Ok(output) => output,
-        Err(err) => {
-            warn!(error = %err, "EF_SMSP fallback step 2 (Modem.Command) failed, trying direct serial");
-            match with_serial(async { run_direct_at_command_draining(conn, &read_cmd).await }).await
-            {
-                Ok(output) => output,
-                Err(err) => {
-                    warn!(error = %err, "EF_SMSP fallback step 2 (direct serial) also failed");
-                    return String::new();
-                }
-            }
-        }
-    };
-
-    let smsc = parse_smsc_from_crsm_record(&record_output, record_len);
-    if smsc.is_empty() {
-        warn!(
-            output = %record_output,
-            record_len = record_len,
-            "EF_SMSP fallback: parsed empty SMSC from record"
-        );
-    }
-    smsc
 }
 
 /// 通过 ModemManager D-Bus Modem.Command 发送 AT 指令。
@@ -2025,21 +1881,23 @@ async fn send_at_via_modem_command(
     modem_path: &str,
     command: &str,
 ) -> Result<String, String> {
-    // 动态提权到 DEBUG 模式
-    let mm_proxy = Proxy::new(
-        conn,
-        MM_SERVICE,
-        "/org/freedesktop/ModemManager1",
-        "org.freedesktop.ModemManager1",
-    )
-    .await;
-    if let Ok(proxy) = &mm_proxy {
-        let _ = proxy.call::<_, _, ()>("SetLogging", &("DEBUG")).await;
-    }
+    with_serial_for(MM_LOGGING_SERIAL_KEY, async {
+        // Logging level is process-global in ModemManager, so this complete
+        // DEBUG -> command -> INFO cycle is the one intentionally global lock.
+        let mm_proxy = Proxy::new(
+            conn,
+            MM_SERVICE,
+            "/org/freedesktop/ModemManager1",
+            "org.freedesktop.ModemManager1",
+        )
+        .await;
+        if let Ok(proxy) = &mm_proxy {
+            let _ = proxy.call::<_, _, ()>("SetLogging", &("DEBUG")).await;
+        }
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(SMSC_BACKGROUND_AT_TIMEOUT_SECS),
-        with_serial(async {
+        let result = tokio::time::timeout(
+            Duration::from_secs(SMSC_BACKGROUND_AT_TIMEOUT_SECS),
+            async {
             let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
             proxy
                 .call::<_, _, String>(
@@ -2047,86 +1905,27 @@ async fn send_at_via_modem_command(
                     &(command, SMSC_BACKGROUND_AT_TIMEOUT_SECS as u32),
                 )
                 .await
-        }),
-    )
-    .await;
+            },
+        )
+        .await;
 
-    // 无论成功、失败或超时，立即恢复为 INFO 模式
-    if let Ok(proxy) = &mm_proxy {
-        let _ = proxy.call::<_, _, ()>("SetLogging", &("INFO")).await;
-    }
-
-    match result {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(err)) => Err(format!("Modem.Command error: {err}")),
-        Err(_) => Err("Modem.Command timeout".to_string()),
-    }
-}
-
-/// 后台异步获取 SMSC 并写入缓存。
-/// 优先使用 AT+CRSM 读 EF_SMSP（可靠且快速）。
-/// 需要 ModemManager 以 --debug 模式运行以支持 Modem.Command 接口。
-pub async fn background_fetch_smsc(conn: &Connection, db: &Database) {
-    if SMSC_BACKGROUND_RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
-    let result = background_fetch_smsc_inner(conn, db).await;
-    SMSC_BACKGROUND_RUNNING.store(false, Ordering::SeqCst);
-    result
-}
-
-async fn background_fetch_smsc_inner(conn: &Connection, db: &Database) {
-    let identity = current_sim_identity(conn).await;
-    let identity = match identity {
-        Some(id) if !id.iccid.is_empty() || !id.imsi.is_empty() => id,
-        _ => {
-            info!("Background SMSC fetch skipped: no SIM identity");
-            return;
+        if let Ok(proxy) = &mm_proxy {
+            let _ = proxy.call::<_, _, ()>("SetLogging", &("INFO")).await;
         }
-    };
 
-    // 已有缓存则跳过
-    let cached = cached_smsc_for_identity(db, &identity);
-    if !cached.is_empty() {
-        return;
-    }
-
-    info!("Background SMSC fetch starting");
-
-    // 方法 1: AT+CRSM 读取 EF_SMSP（最可靠）
-    let smsc = direct_at_ef_smsp_fallback(conn).await;
-    if !smsc.is_empty() {
-        cache_smsc_for_identity(db, &identity, &smsc, "ef_smsp");
-        info!(smsc = %smsc, "Background SMSC fetch succeeded via EF_SMSP");
-        return;
-    }
-
-    // 方法 2: AT+CSCA? 通过 Modem.Command
-    let modem_path = find_modem_path(conn).await.ok();
-    if let Some(ref path) = modem_path {
-        match send_at_via_modem_command(conn, path, "AT+CSCA?").await {
-            Ok(output) => {
-                let smsc = parse_smsc_from_at_output(&output);
-                if !smsc.is_empty() {
-                    cache_smsc_for_identity(db, &identity, &smsc, "background_at");
-                    info!(smsc = %smsc, "Background SMSC fetch succeeded via AT+CSCA?");
-                    return;
-                }
-            }
-            Err(err) => {
-                warn!(error = %err, "Background SMSC fetch: AT+CSCA? via Modem.Command failed");
-            }
+        match result {
+            Ok(Ok(output)) => Ok(output),
+            Ok(Err(err)) => Err(format!("Modem.Command error: {err}")),
+            Err(_) => Err("Modem.Command timeout".to_string()),
         }
-    }
-
-    info!("Background SMSC fetch: all methods exhausted");
+    })
+    .await
 }
 
 async fn modem_command_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
     let result = tokio::time::timeout(
         Duration::from_secs(MODEM_AT_COMMAND_TIMEOUT_SECS),
-        with_serial(async {
+        with_serial_for(modem_path, async {
             let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
             proxy
                 .call::<_, _, String>(
@@ -2161,7 +1960,7 @@ async fn helper_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> S
     if !smsc.is_empty() {
         return smsc;
     }
-    direct_at_smsc_fallback(conn).await
+    direct_at_smsc_fallback(conn, modem_path).await
 }
 
 async fn active_protocol_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
@@ -2208,14 +2007,6 @@ fn parse_sms_storage_info(at_output: &str) -> Option<(u32, u32)> {
         }
     }
     None
-}
-
-pub async fn get_sim_info_data_with_cache(
-    conn: &Connection,
-    db: Option<&Database>,
-) -> zbus::Result<SimInfoResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    get_sim_info_for_modem_with_cache(conn, &modem_path, db).await
 }
 
 pub async fn get_sim_info_for_modem_with_cache(
@@ -2453,10 +2244,12 @@ pub async fn get_sim_info_for_modem_with_cache(
     })
 }
 
-pub async fn get_network_info_data(conn: &Connection) -> zbus::Result<NetworkInfoResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
-    let gpp_props = get_all_properties(conn, &modem_path, MM_MODEM_3GPP).await?;
+pub async fn get_network_info_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<NetworkInfoResponse> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
+    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP).await?;
 
     let operator_code = gpp_props
         .get("OperatorCode")
@@ -2597,42 +2390,11 @@ fn qmi_device_exists(_path: &str) -> bool {
     false
 }
 
-#[cfg(unix)]
-fn find_qmi_device_path() -> Option<String> {
-    let mut candidates = vec!["/dev/wwan0qmi0".to_string()];
-    if let Ok(entries) = fs::read_dir("/dev") {
-        let mut qmi_ports = Vec::new();
-        let mut cdc_wdm_ports = Vec::new();
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let path = format!("/dev/{name}");
-            if name.starts_with("wwan") && name.contains("qmi") {
-                qmi_ports.push(path);
-            } else if name.starts_with("cdc-wdm") {
-                cdc_wdm_ports.push(path);
-            }
-        }
-        qmi_ports.sort();
-        cdc_wdm_ports.sort();
-        candidates.extend(qmi_ports);
-        candidates.extend(cdc_wdm_ports);
-    }
-    candidates.into_iter().find(|path| qmi_device_exists(path))
-}
-
-#[cfg(not(unix))]
-fn find_qmi_device_path() -> Option<String> {
-    None
-}
-
-async fn wait_for_qmi_device_path(preferred: Option<&str>, timeout: Duration) -> Option<String> {
+async fn wait_for_qmi_device_path(preferred: &str, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(path) = preferred.filter(|path| qmi_device_exists(path)) {
-            return Some(path.to_string());
-        }
-        if let Some(path) = find_qmi_device_path() {
-            return Some(path);
+        if qmi_device_exists(preferred) {
+            return Some(preferred.to_string());
         }
         if Instant::now() >= deadline {
             return None;
@@ -2677,9 +2439,11 @@ fn modem_device_path(port: &str) -> String {
     }
 }
 
-async fn at_command_device(conn: &Connection) -> Result<String, String> {
-    let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-    let value = get_property(conn, &modem_path, MM_MODEM, "Ports")
+async fn at_command_device_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> Result<String, String> {
+    let value = get_property(conn, modem_path, MM_MODEM, "Ports")
         .await
         .map_err(|err| err.to_string())?;
     let ports = Vec::<(String, u32)>::try_from(value).unwrap_or_default();
@@ -2919,6 +2683,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn at_call_paths_include_modem_ownership() {
+        let first = "/org/freedesktop/ModemManager1/Modem/0";
+        let second = "/org/freedesktop/ModemManager1/Modem/1";
+        let first_path = at_call_path(first, "1");
+        let second_path = at_call_path(second, "1");
+
+        assert_ne!(first_path, second_path);
+        assert_eq!(at_call_modem_path(&first_path).as_deref(), Some(first));
+        assert_eq!(at_call_modem_path(&second_path).as_deref(), Some(second));
+    }
+
+    #[test]
+    fn dtmf_accepts_one_tone_and_rejects_command_injection() {
+        for digit in ["0", "9", "*", "#", "a", "D"] {
+            assert!(sanitize_dtmf_digit(digit).is_ok(), "{digit}");
+        }
+        for invalid in ["", "12", "E", ";ATH", "1\rATH"] {
+            assert!(sanitize_dtmf_digit(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn clcc_call_indexes_do_not_collide_between_modems() {
+        let clcc = r#"+CLCC: 1,0,2,0,0,"+601112023012",145"#;
+        let first = parse_at_clcc_line("/org/freedesktop/ModemManager1/Modem/0", clcc)
+            .expect("first modem call");
+        let second = parse_at_clcc_line("/org/freedesktop/ModemManager1/Modem/1", clcc)
+            .expect("second modem call");
+
+        assert_ne!(first.path, second.path);
+        assert_eq!(first.phone_number, "+601112023012");
+        assert_eq!(first.state, "dialing");
+    }
+
+    #[test]
     fn stable_line_identity_survives_modemmanager_renumbering() {
         assert_eq!(
             stable_line_id("imei:123", "iccid:456"),
@@ -2998,25 +2797,34 @@ mod tests {
     }
 
     #[test]
-    fn treats_only_data_attach_transitions_as_connection_in_progress() {
-        assert!(!data_connection_transition_in_progress(
-            MM_MODEM_STATE_REGISTERED
-        ));
-        assert!(data_connection_transition_in_progress(
-            MM_MODEM_STATE_DISCONNECTING
-        ));
-        assert!(data_connection_transition_in_progress(
-            MM_MODEM_STATE_CONNECTING
-        ));
-        assert!(!data_connection_transition_in_progress(
-            MM_MODEM_STATE_CONNECTED
-        ));
-    }
-
-    #[test]
     fn per_line_roaming_policy_maps_to_networkmanager_home_only() {
         assert_eq!(nm_home_only_value(true), "no");
         assert_eq!(nm_home_only_value(false), "yes");
+    }
+
+    #[tokio::test]
+    async fn baseband_restart_progress_is_isolated_per_line() {
+        with_baseband_restart_progress("test-restart-line-a".to_string(), async {
+            reset_baseband_restart_progress();
+            let _guard = BasebandRestartRunGuard::current();
+            record_restart_step("line-a-step", "ok", None);
+        })
+        .await;
+        with_baseband_restart_progress("test-restart-line-b".to_string(), async {
+            reset_baseband_restart_progress();
+            let _guard = BasebandRestartRunGuard::current();
+            record_restart_step("line-b-step", "ok", None);
+        })
+        .await;
+
+        let line_a = get_baseband_restart_progress_for_line("test-restart-line-a");
+        let line_b = get_baseband_restart_progress_for_line("test-restart-line-b");
+        assert_eq!(line_a.steps.len(), 1);
+        assert_eq!(line_a.steps[0].step, "line-a-step");
+        assert!(!line_a.running);
+        assert_eq!(line_b.steps.len(), 1);
+        assert_eq!(line_b.steps[0].step, "line-b-step");
+        assert!(!line_b.running);
     }
 
     #[test]
@@ -3417,15 +3225,23 @@ async fn read_mmcli_signal_output() -> Result<String, String> {
     run_recovery_command("mmcli", &["-m", "any", "--signal-get"]).await
 }
 
-pub async fn start_cell_monitoring() -> Result<(), String> {
-    run_recovery_command("mmcli", &["-m", "any", "--location-enable-3gpp"]).await?;
-    run_recovery_command("mmcli", &["-m", "any", "--signal-setup=5"]).await?;
+pub async fn start_cell_monitoring_for_modem(modem_path: &str) -> Result<(), String> {
+    run_recovery_command(
+        "mmcli",
+        &["-m", modem_path, "--location-enable-3gpp"],
+    )
+    .await?;
+    run_recovery_command("mmcli", &["-m", modem_path, "--signal-setup=5"]).await?;
     Ok(())
 }
 
-pub async fn stop_cell_monitoring() -> Result<(), String> {
-    run_recovery_command("mmcli", &["-m", "any", "--signal-setup=0"]).await?;
-    run_recovery_command("mmcli", &["-m", "any", "--location-disable-3gpp"]).await?;
+pub async fn stop_cell_monitoring_for_modem(modem_path: &str) -> Result<(), String> {
+    run_recovery_command("mmcli", &["-m", modem_path, "--signal-setup=0"]).await?;
+    run_recovery_command(
+        "mmcli",
+        &["-m", modem_path, "--location-disable-3gpp"],
+    )
+    .await?;
     Ok(())
 }
 
@@ -3491,11 +3307,6 @@ async fn get_cells_data_mmcli_fallback(
         serving_cell: ServingCell { tech, cell_id, tac },
         cells: vec![serving],
     })
-}
-
-pub async fn get_cells_data(conn: &Connection) -> zbus::Result<CellsResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    get_cells_data_for_modem(conn, &modem_path).await
 }
 
 pub async fn get_cells_data_for_modem(
@@ -3644,7 +3455,7 @@ pub async fn set_radio_mode_for_modem(
     modem_path: &str,
     mode: RadioMode,
 ) -> zbus::Result<()> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         let modem_path = modem_path.to_string();
         let supported_modes = get_property(conn, &modem_path, MM_MODEM, "SupportedModes").await?;
         let supported = extract_mode_pairs(&supported_modes);
@@ -3817,7 +3628,7 @@ pub async fn set_band_lock_for_modem(
     modem_path: &str,
     req: &BandLockRequest,
 ) -> zbus::Result<()> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         let modem_path = modem_path.to_string();
         let supported_bands =
             extract_u32_array(&get_property(conn, &modem_path, MM_MODEM, "SupportedBands").await?);
@@ -4049,15 +3860,6 @@ fn insert_simple_connect_settings<'a>(
     }
 }
 
-pub async fn set_data_connection_with_apn(
-    conn: &Connection,
-    active: bool,
-    allow_roaming: bool,
-    configured_apn: Option<&ApnConfig>,
-) -> zbus::Result<()> {
-    set_data_connection_inner(conn, active, allow_roaming, configured_apn).await
-}
-
 /// Activate the data profile using a selected modem's bearer settings. The
 /// profile remains NetworkManager-managed, but APN/IP settings are resolved
 /// from the selected ModemManager object instead of the primary modem.
@@ -4104,93 +3906,11 @@ pub async fn resolve_data_apn_config(
     resolved
 }
 
-async fn set_data_connection_inner(
+pub async fn get_data_connection_status_for_modem(
     conn: &Connection,
-    active: bool,
-    allow_roaming: bool,
-    configured_apn: Option<&ApnConfig>,
-) -> zbus::Result<()> {
-    with_serial(async {
-        let profile = find_nm_modem_connection()
-            .await
-            .map_err(|err| zbus::fdo::Error::Failed(format!(
-                "找不到 NM modem 连接 profile: {err}"
-            )))?;
-
-        if active {
-            // 检查 modem 状态，避免重复连接
-            if let Ok(modem_path) = find_modem_path(conn).await {
-                let state = modem_state(conn, &modem_path).await.unwrap_or(0);
-                if state >= MM_MODEM_STATE_CONNECTED {
-                    info!(
-                        state = mm_state_to_string(state),
-                        "Data connection already active, skipping duplicate connect"
-                    );
-                    return Ok(());
-                }
-                if data_connection_transition_in_progress(state) {
-                    info!(
-                        state = mm_state_to_string(state),
-                        "Data connection transition in progress, skipping duplicate connect"
-                    );
-                    return Ok(());
-                }
-            }
-
-            // 解析 APN 设置
-            let connect_settings = if let Ok(modem_path) = find_modem_path(conn).await {
-                resolve_simple_connect_settings(conn, &modem_path, configured_apn).await
-            } else {
-                configured_apn
-                    .map(apn_config_to_simple_connect_settings)
-                    .unwrap_or_default()
-            };
-
-            // 更新 NM profile 的 APN/漫游设置。
-            // 蜂窝数据一律隔离（never-default + ignore-auto-dns）：这张卡的流量
-            // 只能通过该线路的 HTTP/SOCKS5 代理出口，绝不接管系统默认路由或 DNS。
-            if let Err(err) =
-                nm_update_connection(&profile, &connect_settings, allow_roaming, true).await
-            {
-                warn!(error = %err, "Failed to update NM connection settings, proceeding with existing");
-            }
-
-            // 通过 NM 激活连接（NM 自动处理接口 UP、IP 配置、DNS、路由）
-            nm_activate_connection(&profile).await.map_err(|err| {
-                zbus::fdo::Error::Failed(format!("NM 连接激活失败: {err}"))
-            })?;
-
-            info!(
-                allow_roaming,
-                profile = %profile,
-                apn = connect_settings.apn.as_deref().unwrap_or(""),
-                apn_source = connect_settings.source.unwrap_or("none"),
-                "Data connection activated via NetworkManager"
-            );
-        } else {
-            // 通过 NM 停用连接
-            if let Err(err) = nm_deactivate_connection(&profile).await {
-                // 如果已经断开，忽略错误
-                if !get_data_connection_status(conn).await.unwrap_or(false) {
-                    warn!(error = %err, "NM deactivation returned error but data is already disconnected");
-                } else {
-                    return Err(zbus::fdo::Error::Failed(format!(
-                        "NM 连接停用失败: {err}"
-                    ))
-                    .into());
-                }
-            }
-            info!("Data connection disconnected via NetworkManager");
-        }
-
-        Ok(())
-    })
-    .await
-}
-
-pub async fn get_data_connection_status(conn: &Connection) -> zbus::Result<bool> {
-    let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
+    modem_path: &str,
+) -> zbus::Result<bool> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
     Ok(modem_props.get("State").map(extract_i32).unwrap_or(0) >= MM_MODEM_STATE_CONNECTED)
 }
 
@@ -4227,7 +3947,7 @@ pub async fn data_interface_for_modem(
 }
 
 pub async fn disconnect_data_via_modem(conn: &Connection, modem_path: &str) -> Result<(), String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         for bearer_path in bearer_paths_for_modem(conn, modem_path).await {
             let props = match get_all_properties(conn, &bearer_path, MM_BEARER).await {
                 Ok(props) => props,
@@ -4317,27 +4037,15 @@ async fn modem_state(conn: &Connection, modem_path: &str) -> zbus::Result<i32> {
         .map(|value| extract_i32(&value))
 }
 
-async fn modem_registration_state(conn: &Connection, modem_path: &str) -> zbus::Result<u32> {
-    get_property(conn, modem_path, MM_MODEM_3GPP, "RegistrationState")
-        .await
-        .map(|value| extract_u32(&value))
+/// Read one explicitly selected modem's ModemManager state. Background
+/// supervisors must use this line-scoped form and never fall back to the first
+/// object returned by ModemManager.
+pub async fn get_modem_state_for_modem(conn: &Connection, modem_path: &str) -> zbus::Result<i32> {
+    modem_state(conn, modem_path).await
 }
 
 fn modem_state_is_transient(state: i32) -> bool {
     matches!(state, 0 | 1 | 4 | 5 | 9 | 10)
-}
-
-/// MM_MODEM_STATE_DISABLED (3) / DISABLING (4): the radio is off. This is what
-/// per-line airplane mode leaves behind, so recovery logic must not undo it.
-fn modem_state_is_powered_down(state: i32) -> bool {
-    matches!(state, 3 | 4)
-}
-
-fn data_connection_transition_in_progress(state: i32) -> bool {
-    matches!(
-        state,
-        MM_MODEM_STATE_DISCONNECTING | MM_MODEM_STATE_CONNECTING
-    )
 }
 
 async fn wait_for_modem_state<F>(
@@ -4492,7 +4200,10 @@ async fn run_baseband_simple_connect_step(
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
 ) {
-    if get_data_connection_status(conn).await.unwrap_or(false) {
+    if get_data_connection_status_for_modem(conn, modem_path)
+        .await
+        .unwrap_or(false)
+    {
         record_baseband_step(
             steps,
             "触发自动驻网/拨号",
@@ -4524,7 +4235,7 @@ async fn run_baseband_simple_connect_step(
     }
 }
 
-async fn set_modem_enabled(
+pub(crate) async fn set_modem_enabled(
     conn: &Connection,
     modem_path: &str,
     enabled: bool,
@@ -4598,7 +4309,7 @@ pub async fn set_airplane_mode_for_modem(
     modem_path: &str,
     enabled: bool,
 ) -> Result<(), String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         set_modem_enabled(conn, modem_path, !enabled)
             .await
             .map(|_| ())
@@ -4619,9 +4330,11 @@ pub async fn get_airplane_mode_for_modem(
     })
 }
 
-pub async fn get_signal_strength(conn: &Connection) -> zbus::Result<SignalStrengthResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let modem_props = get_all_properties(conn, &modem_path, MM_MODEM).await?;
+pub async fn get_signal_strength_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<SignalStrengthResponse> {
+    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
     let strength = modem_props
         .get("SignalQuality")
         .and_then(|value| {
@@ -4685,9 +4398,12 @@ fn split_operator_code(code: &str) -> (String, String) {
     }
 }
 
-pub async fn get_cell_location(conn: &Connection) -> zbus::Result<CellLocationResponse> {
-    let net = get_network_info_data(conn).await?;
-    let cells = get_cells_data(conn).await?;
+pub async fn get_cell_location_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<CellLocationResponse> {
+    let net = get_network_info_for_modem(conn, modem_path).await?;
+    let cells = get_cells_data_for_modem(conn, modem_path).await?;
     let mcc = net.mcc.clone().unwrap_or_default();
     let mnc = net.mnc.clone().unwrap_or_default();
     let tac_serving = cells.serving_cell.tac;
@@ -4893,9 +4609,15 @@ pub(crate) async fn register_operator_on_modem(
     }
 }
 
-pub async fn register_operator_auto(conn: &Connection) -> Result<(), String> {
-    let modem_path = find_modem_path(conn).await.map_err(|err| err.to_string())?;
-    register_operator_for_modem(conn, &modem_path, "").await
+/// Request registration on one specific modem without radio-cycling it when
+/// ModemManager reports an error. Background health checks use this path so a
+/// failed recovery attempt cannot tear down an active CS or IMS call.
+pub async fn request_operator_registration_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    mccmnc: &str,
+) -> Result<(), String> {
+    register_operator_on_modem(conn, modem_path, mccmnc).await
 }
 
 /// Register one specific modem. An empty `mccmnc` requests automatic selection.
@@ -4904,7 +4626,7 @@ pub async fn register_operator_for_modem(
     modem_path: &str,
     mccmnc: &str,
 ) -> Result<(), String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         match register_operator_on_modem(conn, modem_path, mccmnc).await {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -5215,7 +4937,9 @@ async fn qmi_packet_stats_for_modem(
         device,
         "--wds-get-packet-statistics".to_string(),
     ];
-    let output = with_serial(async { run_modem_helper_command("qmicli", args).await })
+    let output = with_serial_for(modem_path, async {
+        run_modem_helper_command("qmicli", args).await
+    })
         .await
         .ok()?;
     parse_qmicli_packet_statistics(&output)
@@ -5295,8 +5019,12 @@ pub async fn get_bearer_stats_for_interface(
     Ok(None)
 }
 
-pub async fn set_apn_on_bearer(conn: &Connection, req: &SetApnRequest) -> zbus::Result<()> {
-    with_serial(async {
+pub async fn set_apn_on_bearer(
+    conn: &Connection,
+    modem_path: &str,
+    req: &SetApnRequest,
+) -> zbus::Result<()> {
+    with_serial_for(modem_path, async {
         let props_proxy =
             Proxy::new(conn, MM_SERVICE, req.context_path.as_str(), DBUS_PROPERTIES).await?;
         if let Some(ref auth_method) = req.auth_method {
@@ -5379,16 +5107,12 @@ async fn get_call_info(conn: &Connection, path: &str) -> zbus::Result<CallInfo> 
 
     Ok(CallInfo {
         path: path.to_string(),
+        line_id: String::new(),
         phone_number,
         state: mm_call_state_to_string(state).to_string(),
         direction: mm_call_direction_to_string(direction).to_string(),
         start_time: None,
     })
-}
-
-pub async fn list_current_calls(conn: &Connection) -> zbus::Result<CallListResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    list_current_calls_for_modem(conn, &modem_path).await
 }
 
 /// Calls belonging to one modem only. A call on baseband A must not make
@@ -5407,7 +5131,8 @@ pub async fn list_current_calls_for_modem(
             for path in call_paths {
                 if let Ok(call) = get_call_info(conn, path.as_str()).await {
                     if call.state == "terminated" {
-                        let _ = delete_call_object(conn, path.as_str()).await;
+                        let _ =
+                            delete_call_object_for_modem(conn, &modem_path, path.as_str()).await;
                     } else {
                         calls.push(call);
                     }
@@ -5416,16 +5141,11 @@ pub async fn list_current_calls_for_modem(
         }
     }
     if calls.is_empty() {
-        if let Ok(at_calls) = list_at_calls(conn).await {
+        if let Ok(at_calls) = list_at_calls_for_modem(conn, &modem_path).await {
             calls = at_calls;
         }
     }
     Ok(CallListResponse { calls })
-}
-
-pub async fn make_call(conn: &Connection, phone_number: &str) -> zbus::Result<String> {
-    let modem_path = find_modem_path(conn).await?;
-    make_call_on_modem(conn, &modem_path, phone_number).await
 }
 
 /// Dial from one specific baseband. The busy check looks only at that
@@ -5435,7 +5155,7 @@ pub async fn make_call_on_modem(
     modem_path: &str,
     phone_number: &str,
 ) -> zbus::Result<String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         let modem_path = modem_path.to_string();
         wait_until_voice_ready(conn, &modem_path).await?;
         cleanup_finished_calls(conn, &modem_path).await?;
@@ -5457,7 +5177,7 @@ pub async fn make_call_on_modem(
             }
         }
 
-        match create_and_start_at_call(conn, phone_number).await {
+        match create_and_start_at_call_for_modem(conn, &modem_path, phone_number).await {
             Ok(path) => return Ok(path),
             Err(err) => {
                 warn!(error = %err, "AT voice dial failed, falling back to ModemManager Voice")
@@ -5491,7 +5211,7 @@ pub async fn make_call_via_modem(
     modem_path: &str,
     phone_number: &str,
 ) -> zbus::Result<String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         wait_until_voice_ready(conn, modem_path).await?;
         cleanup_finished_calls(conn, modem_path).await.ok();
         for attempt in 0..2 {
@@ -5510,14 +5230,22 @@ pub async fn make_call_via_modem(
     .await
 }
 
-pub async fn hangup_call(conn: &Connection, call_path: &str) -> zbus::Result<()> {
-    if is_at_call_path(call_path) {
-        run_direct_at_command(conn, "ATH")
-            .await
-            .map_err(zbus::fdo::Error::Failed)?;
-        return Ok(());
-    }
-    terminate_call(conn, call_path).await
+pub async fn hangup_call_on_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+) -> zbus::Result<()> {
+    with_serial_for(modem_path, async {
+        get_call_by_path_for_modem(conn, modem_path, call_path).await?;
+        if is_at_call_path(call_path) {
+            run_direct_at_command_for_modem(conn, modem_path, "ATH")
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+            return Ok(());
+        }
+        terminate_call_for_modem(conn, modem_path, call_path).await
+    })
+    .await
 }
 
 async fn call_path_arg<'a>(call_path: &'a str) -> zbus::Result<zbus::zvariant::ObjectPath<'a>> {
@@ -5526,9 +5254,12 @@ async fn call_path_arg<'a>(call_path: &'a str) -> zbus::Result<zbus::zvariant::O
     })
 }
 
-async fn delete_call_object(conn: &Connection, call_path: &str) -> zbus::Result<()> {
-    let modem_path = find_modem_path(conn).await?;
-    let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_VOICE).await?;
+async fn delete_call_object_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+) -> zbus::Result<()> {
+    let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_VOICE).await?;
     let path = call_path_arg(call_path).await?;
     voice_proxy.call::<_, _, ()>("DeleteCall", &(path,)).await
 }
@@ -5541,7 +5272,9 @@ async fn cleanup_finished_calls(conn: &Connection, modem_path: &str) -> zbus::Re
             get_call_info(conn, path.as_str()).await.ok().map(|call| call.state),
             Some(state) if state == "terminated" || state == "unknown"
         ) {
-            delete_call_object(conn, path.as_str()).await.ok();
+            delete_call_object_for_modem(conn, modem_path, path.as_str())
+                .await
+                .ok();
         }
     }
     Ok(())
@@ -5600,27 +5333,34 @@ fn sanitize_voice_number(phone_number: &str) -> Result<String, String> {
     Ok(number.to_string())
 }
 
-async fn run_direct_at_command(conn: &Connection, command: &str) -> Result<String, String> {
-    let device = at_command_device(conn).await?;
+fn sanitize_dtmf_digit(value: &str) -> Result<char, String> {
+    let value = value.trim();
+    let mut chars = value.chars();
+    let Some(digit) = chars.next() else {
+        return Err("DTMF digit is required".to_string());
+    };
+    if chars.next().is_some()
+        || !matches!(digit.to_ascii_uppercase(), '0'..='9' | '*' | '#' | 'A'..='D')
+    {
+        return Err("DTMF must be one of 0-9, *, #, or A-D".to_string());
+    }
+    Ok(digit.to_ascii_uppercase())
+}
+
+async fn run_direct_at_command_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    command: &str,
+) -> Result<String, String> {
+    let device = at_command_device_for_modem(conn, modem_path).await?;
+    run_direct_at_command_on_device(device, command).await
+}
+
+async fn run_direct_at_command_on_device(device: String, command: &str) -> Result<String, String> {
     let command = command.to_string();
     tokio::task::spawn_blocking(move || run_direct_at_command_blocking(&device, &command))
         .await
         .map_err(|err| format!("AT 命令任务失败：{err}"))?
-}
-
-/// 排空串口缓冲区后发送 AT 命令，使用较长超时。
-/// 解决部分 modem 响应缓慢或串口残留前次响应数据的问题。
-async fn run_direct_at_command_draining(
-    conn: &Connection,
-    command: &str,
-) -> Result<String, String> {
-    let device = at_command_device(conn).await?;
-    let command = command.to_string();
-    tokio::task::spawn_blocking(move || {
-        run_direct_at_command_draining_blocking(&device, &command, SMSC_BACKGROUND_AT_TIMEOUT_SECS)
-    })
-    .await
-    .map_err(|err| format!("AT 命令任务失败：{err}"))?
 }
 
 #[cfg(unix)]
@@ -5686,94 +5426,21 @@ fn run_direct_at_command_blocking(_device: &str, _command: &str) -> Result<Strin
     Err("Direct AT port access is only supported on Linux devices".to_string())
 }
 
-#[cfg(unix)]
-fn run_direct_at_command_draining_blocking(
-    device: &str,
-    command: &str,
-    timeout_secs: u64,
-) -> Result<String, String> {
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-
-    let mut port = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device)
-        .map_err(|err| format!("打开 AT 端口 {device} 失败：{err}"))?;
-
-    let fd = port.as_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-
-    // 排空缓冲区中的残留数据
-    let mut drain_buf = [0u8; 512];
-    let drain_deadline = std::time::Instant::now() + Duration::from_millis(300);
-    while std::time::Instant::now() < drain_deadline {
-        match port.read(&mut drain_buf) {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-
-    port.write_all(format!("{command}\r").as_bytes())
-        .map_err(|err| format!("写入 AT 命令失败：{err}"))?;
-    port.flush()
-        .map_err(|err| format!("刷新 AT 端口失败：{err}"))?;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
-    let mut output = Vec::new();
-    let mut buffer = [0u8; 512];
-    while std::time::Instant::now() < deadline {
-        match port.read(&mut buffer) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(80)),
-            Ok(n) => {
-                output.extend_from_slice(&buffer[..n]);
-                let text = String::from_utf8_lossy(&output);
-                if text.contains("\r\nOK\r\n")
-                    || text.contains("\nOK\r")
-                    || text.contains("ERROR")
-                    || text.contains("NO CARRIER")
-                {
-                    break;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            Err(err) => return Err(format!("读取 AT 响应失败：{err}")),
-        }
-    }
-
-    let text = String::from_utf8_lossy(&output).trim().to_string();
-    if text.contains("ERROR") {
-        Err(text)
-    } else if text.is_empty() {
-        Err("AT 命令无响应".to_string())
-    } else {
-        Ok(text)
-    }
-}
-
-#[cfg(not(unix))]
-fn run_direct_at_command_draining_blocking(
-    _device: &str,
-    _command: &str,
-    _timeout_secs: u64,
-) -> Result<String, String> {
-    Err("Direct AT port access is only supported on Linux devices".to_string())
-}
-
-fn at_call_path(index: &str) -> String {
-    format!("at://call/{index}")
+fn at_call_path(modem_path: &str, index: &str) -> String {
+    let modem_path = utf8_percent_encode(modem_path, NON_ALPHANUMERIC);
+    format!("at://call/{modem_path}/{index}")
 }
 
 fn is_at_call_path(path: &str) -> bool {
     path.starts_with("at://call/")
+}
+
+fn at_call_modem_path(path: &str) -> Option<String> {
+    let encoded = path.strip_prefix("at://call/")?.split_once('/')?.0;
+    percent_decode_str(encoded)
+        .decode_utf8()
+        .ok()
+        .map(Into::into)
 }
 
 fn at_clcc_state_to_string(state: &str) -> &'static str {
@@ -5788,7 +5455,7 @@ fn at_clcc_state_to_string(state: &str) -> &'static str {
     }
 }
 
-fn parse_at_clcc_line(line: &str) -> Option<CallInfo> {
+fn parse_at_clcc_line(modem_path: &str, line: &str) -> Option<CallInfo> {
     let (_, data) = line.split_once("+CLCC:")?;
     let parts: Vec<String> = data
         .split(',')
@@ -5806,7 +5473,8 @@ fn parse_at_clcc_line(line: &str) -> Option<CallInfo> {
         "outgoing"
     };
     Some(CallInfo {
-        path: at_call_path(&parts[0]),
+        path: at_call_path(modem_path, &parts[0]),
+        line_id: String::new(),
         phone_number: parts.get(5).cloned().unwrap_or_default(),
         state: at_clcc_state_to_string(&parts[2]).to_string(),
         direction: direction.to_string(),
@@ -5814,18 +5482,28 @@ fn parse_at_clcc_line(line: &str) -> Option<CallInfo> {
     })
 }
 
-async fn list_at_calls(conn: &Connection) -> Result<Vec<CallInfo>, String> {
-    let output = run_direct_at_command(conn, "AT+CLCC").await?;
-    Ok(output.lines().filter_map(parse_at_clcc_line).collect())
+async fn list_at_calls_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> Result<Vec<CallInfo>, String> {
+    let output = run_direct_at_command_for_modem(conn, modem_path, "AT+CLCC").await?;
+    Ok(output
+        .lines()
+        .filter_map(|line| parse_at_clcc_line(modem_path, line))
+        .collect())
 }
 
-async fn create_and_start_at_call(conn: &Connection, phone_number: &str) -> Result<String, String> {
+async fn create_and_start_at_call_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    phone_number: &str,
+) -> Result<String, String> {
     let number = sanitize_voice_number(phone_number)?;
-    run_direct_at_command(conn, &format!("ATD{};", number)).await?;
+    run_direct_at_command_for_modem(conn, modem_path, &format!("ATD{};", number)).await?;
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(500)).await;
-        if let Ok(calls) = list_at_calls(conn).await {
+        if let Ok(calls) = list_at_calls_for_modem(conn, modem_path).await {
             if let Some(call) = calls.into_iter().find(|call| {
                 call.direction == "outgoing"
                     && (call.phone_number.is_empty() || call.phone_number == number)
@@ -5838,7 +5516,7 @@ async fn create_and_start_at_call(conn: &Connection, phone_number: &str) -> Resu
             }
         }
     }
-    let ceer = run_direct_at_command(conn, "AT+CEER")
+    let ceer = run_direct_at_command_for_modem(conn, modem_path, "AT+CEER")
         .await
         .unwrap_or_else(|err| err);
     Err(format!("ATD 已发送，但未检测到语音通话状态；{ceer}"))
@@ -5855,7 +5533,9 @@ async fn create_and_start_mm_call(
     let call_path: OwnedObjectPath = voice_proxy.call("CreateCall", &(call_props,)).await?;
     let call_proxy = Proxy::new(conn, MM_SERVICE, &call_path, MM_CALL).await?;
     if let Err(err) = call_proxy.call::<_, _, ()>("Start", &()).await {
-        delete_call_object(conn, call_path.as_str()).await.ok();
+        delete_call_object_for_modem(conn, modem_path, call_path.as_str())
+            .await
+            .ok();
         return Err(err);
     }
     info!(path = %call_path, phone_number = %phone_number, "Voice call started");
@@ -5876,7 +5556,11 @@ fn is_retryable_call_setup_error(error: &zbus::Error) -> bool {
     is_incompatible_call_state_error(error) || is_emergency_only_error(error)
 }
 
-async fn terminate_call(conn: &Connection, call_path: &str) -> zbus::Result<()> {
+async fn terminate_call_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+) -> zbus::Result<()> {
     let call = get_call_info(conn, call_path).await.ok();
     if !matches!(call.as_ref().map(|c| c.state.as_str()), Some("terminated")) {
         let hangup_result = async {
@@ -5892,40 +5576,44 @@ async fn terminate_call(conn: &Connection, call_path: &str) -> zbus::Result<()> 
         }
     }
 
-    match delete_call_object(conn, call_path).await {
+    match delete_call_object_for_modem(conn, modem_path, call_path).await {
         Ok(()) => Ok(()),
         Err(err) if is_incompatible_call_state_error(&err) => Ok(()),
         Err(err) => Err(err),
     }
 }
 
-pub async fn hangup_all_calls(conn: &Connection) -> zbus::Result<()> {
-    with_serial(async {
-        if list_at_calls(conn)
+pub async fn hangup_all_calls_for_modem(conn: &Connection, modem_path: &str) -> zbus::Result<()> {
+    with_serial_for(modem_path, async {
+        if list_at_calls_for_modem(conn, modem_path)
             .await
             .map(|calls| !calls.is_empty())
             .unwrap_or(false)
         {
-            run_direct_at_command(conn, "ATH")
+            run_direct_at_command_for_modem(conn, modem_path, "ATH")
                 .await
                 .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
         }
-        let modem_path = find_modem_path(conn).await?;
-        let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_VOICE).await?;
+        let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_VOICE).await?;
         let call_paths: Vec<OwnedObjectPath> = voice_proxy.call("ListCalls", &()).await?;
         for path in call_paths {
-            terminate_call(conn, path.as_str()).await?;
+            terminate_call_for_modem(conn, modem_path, path.as_str()).await?;
         }
         Ok(())
     })
     .await
 }
 
-pub async fn answer_call(conn: &Connection, call_path: &str) -> zbus::Result<()> {
-    with_serial(async {
+pub async fn answer_call_on_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+) -> zbus::Result<()> {
+    with_serial_for(modem_path, async {
+        get_call_by_path_for_modem(conn, modem_path, call_path).await?;
         if is_at_call_path(call_path) {
-            run_direct_at_command(conn, "ATA")
+            run_direct_at_command_for_modem(conn, modem_path, "ATA")
                 .await
                 .map_err(zbus::fdo::Error::Failed)?;
             return Ok(());
@@ -5937,20 +5625,65 @@ pub async fn answer_call(conn: &Connection, call_path: &str) -> zbus::Result<()>
     .await
 }
 
-pub async fn get_call_by_path(conn: &Connection, call_path: &str) -> zbus::Result<CallInfo> {
+pub async fn send_call_dtmf_on_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+    value: &str,
+) -> zbus::Result<()> {
+    let digit = sanitize_dtmf_digit(value).map_err(zbus::fdo::Error::InvalidArgs)?;
+    with_serial_for(modem_path, async {
+        get_call_by_path_for_modem(conn, modem_path, call_path).await?;
+        if is_at_call_path(call_path) {
+            run_direct_at_command_for_modem(conn, modem_path, &format!("AT+VTS={digit}"))
+                .await
+                .map_err(zbus::fdo::Error::Failed)?;
+            return Ok(());
+        }
+        let call_proxy = Proxy::new(conn, MM_SERVICE, call_path, MM_CALL).await?;
+        call_proxy
+            .call::<_, _, ()>("SendDtmf", &(digit.to_string(),))
+            .await?;
+        Ok(())
+    })
+    .await
+}
+
+pub async fn get_call_by_path_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    call_path: &str,
+) -> zbus::Result<CallInfo> {
     if is_at_call_path(call_path) {
-        if let Ok(calls) = list_at_calls(conn).await {
+        if at_call_modem_path(call_path).as_deref() != Some(modem_path) {
+            return Err(zbus::fdo::Error::InvalidArgs(
+                "Call does not belong to the selected modem".to_string(),
+            )
+            .into());
+        }
+        if let Ok(calls) = list_at_calls_for_modem(conn, modem_path).await {
             if let Some(call) = calls.into_iter().find(|call| call.path == call_path) {
                 return Ok(call);
             }
         }
+    } else {
+        let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_VOICE).await?;
+        let call_paths: Vec<OwnedObjectPath> = voice_proxy.call("ListCalls", &()).await?;
+        if call_paths.iter().any(|path| path.as_str() == call_path) {
+            return get_call_info(conn, call_path).await;
+        }
     }
-    get_call_info(conn, call_path).await
+    Err(
+        zbus::fdo::Error::InvalidArgs("Call does not belong to the selected modem".to_string())
+            .into(),
+    )
 }
 
-pub async fn get_call_settings(conn: &Connection) -> zbus::Result<CallSettingsResponse> {
-    let modem_path = find_modem_path(conn).await?;
-    let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_VOICE).await?;
+pub async fn get_call_settings_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> zbus::Result<CallSettingsResponse> {
+    let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_VOICE).await?;
     let waiting = match voice_proxy
         .call::<_, _, bool>("CallWaitingQuery", &())
         .await
@@ -5971,9 +5704,13 @@ pub async fn get_call_settings(conn: &Connection) -> zbus::Result<CallSettingsRe
     })
 }
 
-pub async fn set_call_waiting(conn: &Connection, enabled: bool) -> zbus::Result<()> {
-    with_serial(async {
-        let modem_path = find_modem_path(conn).await?;
+pub async fn set_call_waiting_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    enabled: bool,
+) -> zbus::Result<()> {
+    let modem_path = modem_path.to_string();
+    with_serial_for(modem_path.as_str(), async {
         let voice_proxy = Proxy::new(conn, MM_SERVICE, modem_path.as_str(), MM_VOICE).await?;
         voice_proxy
             .call::<_, _, ()>("CallWaitingSetup", &(enabled,))
@@ -6004,22 +5741,13 @@ fn schedule_sent_sms_delete(conn: &Connection, modem_path: &str, sms_path: Owned
     });
 }
 
-pub async fn send_sms(
-    conn: &Connection,
-    phone_number: &str,
-    content: &str,
-) -> zbus::Result<String> {
-    let modem_path = find_modem_path(conn).await?;
-    send_sms_via_modem(conn, &modem_path, phone_number, content).await
-}
-
 pub async fn send_sms_via_modem(
     conn: &Connection,
     modem_path: &str,
     phone_number: &str,
     content: &str,
 ) -> zbus::Result<String> {
-    with_serial(async {
+    with_serial_for(modem_path, async {
         let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MESSAGING).await?;
 
         let mut sms_props: HashMap<String, Value<'_>> = HashMap::new();
@@ -6093,16 +5821,6 @@ pub async fn ensure_nm_modem_profile() -> String {
             }
         },
     }
-}
-
-/// Public wrapper for handlers to query the NM modem connection profile name
-pub async fn find_nm_modem_connection_pub() -> Result<String, String> {
-    find_nm_modem_connection().await
-}
-
-/// Public wrapper for handlers to set NM autoconnect
-pub async fn nm_set_autoconnect_pub(profile: &str, enabled: bool) -> Result<(), String> {
-    nm_set_autoconnect(profile, enabled).await
 }
 
 async fn find_nm_modem_connection() -> Result<String, String> {
@@ -6209,22 +5927,6 @@ fn nm_home_only_value(allow_roaming: bool) -> &'static str {
     }
 }
 
-async fn nm_activate_connection(profile: &str) -> Result<(), String> {
-    run_recovery_command_owned(
-        "nmcli",
-        &[
-            "--wait".into(),
-            "30".into(),
-            "connection".into(),
-            "up".into(),
-            profile.into(),
-        ],
-        Duration::from_secs(45),
-    )
-    .await?;
-    Ok(())
-}
-
 fn parse_nm_device_for_modem(output: &str, modem_path: &str) -> Option<String> {
     let mut current_device = None;
     for line in output.lines() {
@@ -6280,32 +5982,6 @@ async fn nm_activate_connection_on_device(profile: &str, device: &str) -> Result
             device.into(),
         ],
         Duration::from_secs(45),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn nm_deactivate_connection(profile: &str) -> Result<(), String> {
-    run_recovery_command_owned(
-        "nmcli",
-        &["connection".into(), "down".into(), profile.into()],
-        Duration::from_secs(15),
-    )
-    .await?;
-    Ok(())
-}
-
-async fn nm_set_autoconnect(profile: &str, enabled: bool) -> Result<(), String> {
-    run_recovery_command_owned(
-        "nmcli",
-        &[
-            "connection".into(),
-            "modify".into(),
-            profile.into(),
-            "connection.autoconnect".into(),
-            if enabled { "yes" } else { "no" }.into(),
-        ],
-        Duration::from_secs(10),
     )
     .await?;
     Ok(())
@@ -6372,169 +6048,209 @@ fn record_baseband_step(
         detail,
     };
     steps.push(item.clone());
-    if let Ok(mut progress) = BASEBAND_RESTART_STEPS.lock() {
-        progress.push(item);
+    let key = current_baseband_progress_key();
+    if let Ok(mut registry) = baseband_restart_progress_registry().lock() {
+        registry.entry(key).or_default().steps.push(item);
     }
 }
 
 pub fn reset_baseband_restart_progress() {
-    if let Ok(mut progress) = BASEBAND_RESTART_STEPS.lock() {
-        progress.clear();
+    reset_baseband_restart_progress_for_key(&current_baseband_progress_key());
+}
+
+pub fn reset_baseband_restart_progress_for_line(line_id: &str) {
+    reset_baseband_restart_progress_for_key(line_id);
+}
+
+fn reset_baseband_restart_progress_for_key(key: &str) {
+    if let Ok(mut registry) = baseband_restart_progress_registry().lock() {
+        registry.insert(
+            key.to_string(),
+            BasebandRestartProgress {
+                running: true,
+                ..Default::default()
+            },
+        );
     }
-    set_baseband_restart_registration(None);
-    BASEBAND_RESTART_RUNNING.store(true, Ordering::SeqCst);
 }
 
 fn set_baseband_restart_registration(value: Option<String>) {
-    if let Ok(mut registration) = BASEBAND_RESTART_REGISTRATION.lock() {
-        *registration = value;
+    let key = current_baseband_progress_key();
+    if let Ok(mut registry) = baseband_restart_progress_registry().lock() {
+        registry.entry(key).or_default().current_registration = value;
     }
 }
 
 pub fn record_restart_step(step: &str, status: &str, detail: Option<String>) {
+    record_restart_step_for_key(&current_baseband_progress_key(), step, status, detail);
+}
+
+pub fn record_restart_step_for_line(
+    line_id: &str,
+    step: &str,
+    status: &str,
+    detail: Option<String>,
+) {
+    record_restart_step_for_key(line_id, step, status, detail);
+}
+
+fn record_restart_step_for_key(key: &str, step: &str, status: &str, detail: Option<String>) {
     let item = BasebandRestartStep {
         step: step.to_string(),
         status: status.to_string(),
         detail,
     };
-    if let Ok(mut progress) = BASEBAND_RESTART_STEPS.lock() {
-        progress.push(item);
+    if let Ok(mut registry) = baseband_restart_progress_registry().lock() {
+        registry
+            .entry(key.to_string())
+            .or_default()
+            .steps
+            .push(item);
     }
 }
 
-pub struct BasebandRestartRunGuard;
+pub struct BasebandRestartRunGuard {
+    key: String,
+}
+
+impl BasebandRestartRunGuard {
+    pub fn current() -> Self {
+        Self {
+            key: current_baseband_progress_key(),
+        }
+    }
+
+    pub fn for_line(line_id: &str) -> Self {
+        Self {
+            key: line_id.to_string(),
+        }
+    }
+}
 
 impl Drop for BasebandRestartRunGuard {
     fn drop(&mut self) {
-        BASEBAND_RESTART_RUNNING.store(false, Ordering::SeqCst);
+        if let Ok(mut registry) = baseband_restart_progress_registry().lock() {
+            registry.entry(self.key.clone()).or_default().running = false;
+        }
     }
 }
 
-pub fn get_baseband_restart_progress() -> BasebandRestartResponse {
-    let steps = BASEBAND_RESTART_STEPS
-        .lock()
-        .map(|progress| progress.clone())
-        .unwrap_or_default();
-    let current_registration = BASEBAND_RESTART_REGISTRATION
+pub fn get_baseband_restart_progress_for_line(line_id: &str) -> BasebandRestartResponse {
+    get_baseband_restart_progress_for_key(line_id)
+}
+
+fn get_baseband_restart_progress_for_key(key: &str) -> BasebandRestartResponse {
+    if let Ok(registry) = baseband_restart_progress_registry().lock() {
+        if let Some(progress) = registry.get(key) {
+            return BasebandRestartResponse {
+                steps: progress.steps.clone(),
+                running: progress.running,
+                current_registration: progress.current_registration.clone(),
+            };
+        }
+    }
+    BasebandRestartResponse::default()
+}
+
+fn baseband_restart_progress_registry(
+) -> &'static std::sync::Mutex<HashMap<String, BasebandRestartProgress>> {
+    BASEBAND_RESTART_PROGRESS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn current_baseband_progress_key() -> String {
+    BASEBAND_RESTART_PROGRESS_KEY
+        .try_with(Clone::clone)
+        .expect("baseband restart progress requires an explicit line scope")
+}
+
+fn current_baseband_restart_registration() -> Option<String> {
+    let key = current_baseband_progress_key();
+    baseband_restart_progress_registry()
         .lock()
         .ok()
-        .and_then(|registration| registration.clone());
-    BasebandRestartResponse {
-        steps,
-        running: BASEBAND_RESTART_RUNNING.load(Ordering::SeqCst),
-        current_registration,
-    }
+        .and_then(|registry| {
+            registry
+                .get(&key)
+                .and_then(|progress| progress.current_registration.clone())
+        })
 }
 
-pub async fn restart_baseband(
-    conn: &Connection,
-    auto_connect_data: bool,
-    allow_roaming: bool,
-    configured_apn: Option<ApnConfig>,
-) -> Result<BasebandRestartResponse, String> {
-    reset_baseband_restart_progress();
-    let _progress_guard = BasebandRestartRunGuard;
-    with_serial(async move {
-        restart_baseband_inner(
-            conn,
-            None,
-            auto_connect_data,
-            allow_roaming,
-            configured_apn.as_ref(),
-        )
-        .await
-    })
-    .await
+pub async fn with_baseband_restart_progress<T>(
+    line_id: String,
+    future: impl Future<Output = T>,
+) -> T {
+    BASEBAND_RESTART_PROGRESS_KEY.scope(line_id, future).await
 }
 
 /// Restart one explicitly selected modem line.
 pub async fn restart_baseband_via_modem(
     conn: &Connection,
+    line_id: &str,
     modem_path: &str,
     auto_connect_data: bool,
     allow_roaming: bool,
     configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
-    reset_baseband_restart_progress();
-    let _progress_guard = BasebandRestartRunGuard;
-    with_serial(async move {
-        restart_baseband_inner(
-            conn,
-            Some(modem_path),
-            auto_connect_data,
-            allow_roaming,
-            configured_apn.as_ref(),
-        )
+    with_baseband_restart_progress(line_id.to_string(), async move {
+        reset_baseband_restart_progress();
+        let _progress_guard = BasebandRestartRunGuard::current();
+        with_serial_for(modem_path, async move {
+            restart_baseband_inner(
+                conn,
+                modem_path,
+                auto_connect_data,
+                allow_roaming,
+                configured_apn.as_ref(),
+            )
+            .await
+        })
         .await
     })
     .await
 }
 
-/// Recover a modem that has disappeared from ModemManager.  A normal soft
-/// baseband restart needs a live Modem object, so the missing-device path must
-/// first restart ModemManager and wait for enumeration.  The caller bounds how
-/// often this operation is attempted.
-pub async fn recover_missing_baseband(conn: &Connection) -> Result<String, String> {
-    reset_baseband_restart_progress();
-    let _progress_guard = BasebandRestartRunGuard;
-    with_serial(async move {
-        record_restart_step(
-            "恢复缺失基带",
-            "running",
-            Some("正在重启 ModemManager 并等待基带重新枚举".to_string()),
-        );
-        run_recovery_command("systemctl", &["restart", "ModemManager"])
-            .await
-            .inspect_err(|error| {
-                record_restart_step("恢复缺失基带", "error", Some(error.clone()));
-            })?;
-
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match list_modem_paths(conn).await {
-                Ok(paths) if !paths.is_empty() => {
-                    let path = paths[0].clone();
-                    clear_modem_discovery_failure();
-                    record_restart_step("恢复缺失基带", "ok", Some(path.clone()));
-                    return Ok(path);
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    warn!(error = %error, "ModemManager recovery enumeration failed");
-                }
-            }
-            if Instant::now() >= deadline {
-                let error =
-                    "ModemManager restarted but no baseband appeared within 30 seconds".to_string();
-                record_restart_step("恢复缺失基带", "error", Some(error.clone()));
-                return Err(error);
-            }
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
-    })
-    .await
-}
-
-pub async fn power_cycle_sim_for_profile_switch(
+/// Refresh the SIM attached to one explicitly selected modem. The QMI hint is
+/// carried across the ModemManager restart so another modem cannot be selected
+/// merely because its D-Bus object is enumerated first.
+pub async fn power_cycle_sim_for_profile_switch_via_modem(
     conn: &Connection,
+    line_id: &str,
+    modem_path: &str,
+    qmi_device: Option<&str>,
     auto_connect_data: bool,
     allow_roaming: bool,
     configured_apn: Option<ApnConfig>,
 ) -> Result<BasebandRestartResponse, String> {
-    with_serial(async move {
-        power_cycle_sim_for_profile_switch_inner(
-            conn,
-            auto_connect_data,
-            allow_roaming,
-            configured_apn.as_ref(),
-        )
+    with_baseband_restart_progress(line_id.to_string(), async move {
+        with_serial_for(modem_path, async move {
+            power_cycle_sim_for_profile_switch_inner(
+                conn,
+                modem_path,
+                qmi_device,
+                auto_connect_data,
+                allow_roaming,
+                configured_apn.as_ref(),
+            )
+            .await
+        })
         .await
     })
     .await
 }
 
+async fn modem_path_for_qmi_device(conn: &Connection, expected_qmi_device: &str) -> Option<String> {
+    for modem_path in list_modem_paths(conn).await.ok()? {
+        if qmi_control_device(conn, &modem_path).await.as_deref() == Some(expected_qmi_device) {
+            return Some(modem_path);
+        }
+    }
+    None
+}
+
 async fn power_cycle_sim_for_profile_switch_inner(
     conn: &Connection,
+    modem_path: &str,
+    preferred_qmi_device: Option<&str>,
     auto_connect_data: bool,
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
@@ -6547,22 +6263,20 @@ async fn power_cycle_sim_for_profile_switch_inner(
         None,
     );
 
-    let initial_qmi_device = match find_modem_path(conn).await {
-        Ok(modem_path) => {
-            record_baseband_step(&mut steps, "定位当前基带", "ok", Some(modem_path.clone()));
-            qmi_control_device(conn, &modem_path)
-                .await
-                .or_else(find_qmi_device_path)
-        }
-        Err(err) => {
-            record_baseband_step(
-                &mut steps,
-                "定位当前基带",
-                "warning",
-                Some(format!("D-Bus 暂不可用，改用设备节点兜底：{err}")),
-            );
-            find_qmi_device_path()
-        }
+    record_baseband_step(
+        &mut steps,
+        "定位目标基带",
+        "ok",
+        Some(modem_path.to_string()),
+    );
+    let initial_qmi_device = match preferred_qmi_device {
+        Some(qmi_device) => Some(qmi_device.to_string()),
+        None => qmi_control_device(conn, modem_path).await,
+    };
+    let Some(initial_qmi_device) = initial_qmi_device else {
+        let message = "目标线路没有可用的 QMI 控制端口，拒绝回退到其他基带".to_string();
+        record_baseband_step(&mut steps, "定位目标 QMI", "error", Some(message.clone()));
+        return Err(message);
     };
 
     record_baseband_step(&mut steps, "停止 ModemManager", "running", None);
@@ -6588,10 +6302,9 @@ async fn power_cycle_sim_for_profile_switch_inner(
     }
 
     let power_result: Result<(), String> = async {
-        let qmi_device =
-            wait_for_qmi_device_path(initial_qmi_device.as_deref(), Duration::from_secs(12))
-                .await
-                .ok_or_else(|| "未找到 QMI 设备节点，无法执行 SIM 断电上电".to_string())?;
+        let qmi_device = wait_for_qmi_device_path(&initial_qmi_device, Duration::from_secs(12))
+            .await
+            .ok_or_else(|| "未找到 QMI 设备节点，无法执行 SIM 断电上电".to_string())?;
         record_baseband_step(&mut steps, "定位 QMI 设备", "ok", Some(qmi_device.clone()));
 
         record_baseband_step(&mut steps, "SIM 断电", "running", None);
@@ -6612,7 +6325,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
         tokio::time::sleep(Duration::from_secs(1)).await;
         record_baseband_step(&mut steps, "等待 SIM 断电完成", "ok", None);
 
-        let qmi_device = wait_for_qmi_device_path(Some(&qmi_device), Duration::from_secs(12))
+        let qmi_device = wait_for_qmi_device_path(&qmi_device, Duration::from_secs(12))
             .await
             .ok_or_else(|| "SIM 断电后未重新找到 QMI 设备节点".to_string())?;
         record_baseband_step(&mut steps, "SIM 上电", "running", None);
@@ -6658,21 +6371,21 @@ async fn power_cycle_sim_for_profile_switch_inner(
         "running",
         Some("轮询等待 Modem 出现（最长 15 秒）".to_string()),
     );
-    // Poll for modem to reappear instead of a fixed 10s sleep
+    // Poll for the selected modem to reappear instead of accepting whichever
+    // D-Bus object happens to be enumerated first.
     let modem_path = {
         let enum_deadline = Instant::now() + Duration::from_secs(15);
         let mut found_path = None;
         loop {
-            match find_modem_path(conn).await {
-                Ok(path) => {
-                    found_path = Some(path);
-                    break;
-                }
-                Err(_) if Instant::now() < enum_deadline => {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-                Err(_) => break,
+            let candidate = modem_path_for_qmi_device(conn, &initial_qmi_device).await;
+            if let Some(path) = candidate {
+                found_path = Some(path);
+                break;
             }
+            if Instant::now() >= enum_deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
         match found_path {
             Some(path) => {
@@ -6737,10 +6450,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
     }
 
     record_baseband_step(&mut steps, "eSIM Profile 刷新完成", "ok", None);
-    let current_registration = BASEBAND_RESTART_REGISTRATION
-        .lock()
-        .ok()
-        .and_then(|registration| registration.clone());
+    let current_registration = current_baseband_restart_registration();
     Ok(BasebandRestartResponse {
         steps,
         running: false,
@@ -6750,7 +6460,7 @@ async fn power_cycle_sim_for_profile_switch_inner(
 
 async fn restart_baseband_inner(
     conn: &Connection,
-    preferred_modem_path: Option<&str>,
+    modem_path: &str,
     auto_connect_data: bool,
     allow_roaming: bool,
     configured_apn: Option<&ApnConfig>,
@@ -6758,18 +6468,7 @@ async fn restart_baseband_inner(
     let mut steps = Vec::new();
     record_baseband_step(&mut steps, "开始重启基带（软重启）", "running", None);
 
-    let modem_path = if let Some(path) = preferred_modem_path {
-        path.to_string()
-    } else {
-        match find_modem_path(conn).await {
-            Ok(path) => path,
-            Err(err) => {
-                let message = err.to_string();
-                record_baseband_step(&mut steps, "定位当前基带", "error", Some(message.clone()));
-                return Err(message);
-            }
-        }
-    };
+    let modem_path = modem_path.to_string();
     record_baseband_step(&mut steps, "定位当前基带", "ok", Some(modem_path.clone()));
 
     record_baseband_step(&mut steps, "关闭射频模块", "running", None);
@@ -6855,397 +6554,10 @@ async fn restart_baseband_inner(
     }
 
     record_baseband_step(&mut steps, "重启基带完成", "ok", None);
-    let current_registration = BASEBAND_RESTART_REGISTRATION
-        .lock()
-        .ok()
-        .and_then(|registration| registration.clone());
+    let current_registration = current_baseband_restart_registration();
     Ok(BasebandRestartResponse {
         steps,
         running: false,
         current_registration,
     })
-}
-
-pub async fn data_connection_watchdog(
-    conn: std::sync::Arc<Connection>,
-    interval_secs: u64,
-    user_disabled: std::sync::Arc<AtomicBool>,
-    // Data activation is now strictly per-line/proxy-only, so the watchdog no
-    // longer reads roaming/APN config to bring up a global bearer. Retained in
-    // the signature for call-site stability and possible future recovery use.
-    _config: std::sync::Arc<ConfigManager>,
-    system_events: std::sync::Arc<SystemEventEmitter>,
-) {
-    use crate::services::network::iptables::get_iptables_rule_count;
-
-    let mut last_log = String::new();
-    let mut iptables_rules_logged = false;
-    let mut missing_count = 0u32;
-    let mut scan_requested_for_outage = false;
-    let mut modem_outage_reported = false;
-    let mut last_modem_restart_at: Option<Instant> = None;
-    let mut searching_count = 0u32;
-    let mut auto_register_requested_for_search = false;
-    let mut last_searching_recovery_at: Option<Instant> = None;
-    let mut transition_stuck_count = 0u32;
-    let mut cellular_problem_active = false;
-    const TRANSITION_STUCK_THRESHOLD: u32 = 6;
-
-    loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(interval_secs)).await;
-
-        if BASEBAND_RESTART_RUNNING.load(Ordering::SeqCst) {
-            let result = "Baseband restart in progress, watchdog paused".to_string();
-            if result != last_log {
-                info!(status = %result, "Watchdog: data connection");
-                last_log = result;
-            }
-            continue;
-        }
-
-        match get_iptables_rule_count().await {
-            Ok(count) => {
-                if count.has_rules() {
-                    if !iptables_rules_logged {
-                        info!(
-                            total = count.total(),
-                            "Watchdog: iptables rules detected; automatic flush is disabled"
-                        );
-                        iptables_rules_logged = true;
-                    }
-                } else {
-                    iptables_rules_logged = false;
-                }
-            }
-            Err(err) => warn!(error = %err, "Watchdog: iptables check failed"),
-        }
-
-        let result = match find_modem_path(&conn).await {
-            Ok(modem_path) => match get_property(&conn, &modem_path, MM_MODEM, "State").await {
-                Ok(value) => {
-                    if modem_outage_reported {
-                        system_events
-                            .emit_code(
-                                system_event_codes::BASEBAND_MODEM_RECOVERED,
-                                system_event_severity::INFO,
-                                system_event_status::RECOVERED,
-                                modem_path.to_string(),
-                                "Modem 已重新出现在 ModemManager 中",
-                            )
-                            .await;
-                        modem_outage_reported = false;
-                    }
-                    missing_count = 0;
-                    scan_requested_for_outage = false;
-                    let state = extract_i32(&value);
-                    if state != 7 {
-                        searching_count = 0;
-                        auto_register_requested_for_search = false;
-                    }
-                    if !data_connection_transition_in_progress(state) {
-                        transition_stuck_count = 0;
-                    }
-                    // A disabled modem is a deliberate per-line airplane-mode
-                    // state. The watchdog must leave it alone rather than
-                    // cycling or re-enabling it — that used to be governed by a
-                    // single global flag, which was wrong the moment a second
-                    // line wanted a different answer.
-                    if modem_state_is_powered_down(state) {
-                        "Line radio is off (airplane mode), watchdog standing by".to_string()
-                    } else if state == 6 {
-                        match set_modem_enabled(&conn, &modem_path, false).await {
-                            Ok(_) => match set_modem_enabled(&conn, &modem_path, true).await {
-                                Ok(_) => {
-                                    cellular_problem_active = true;
-                                    system_events
-                                        .emit_code(
-                                            system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                            system_event_severity::WARNING,
-                                            system_event_status::TRIGGERED,
-                                            modem_path.to_string(),
-                                            "Modem enabled but idle, watchdog cycled radio state",
-                                        )
-                                        .await;
-                                    "Modem enabled but idle, cycled radio state".to_string()
-                                }
-                                Err(err) => {
-                                    format!("Modem enabled but idle, re-enable failed: {err}")
-                                }
-                            },
-                            Err(err) => format!("Modem enabled but idle, disable failed: {err}"),
-                        }
-                    } else if state == 7 {
-                        searching_count += 1;
-                        let registration = modem_registration_state(&conn, &modem_path)
-                            .await
-                            .unwrap_or(0);
-                        let cooldown_active = last_searching_recovery_at
-                            .map(|at| {
-                                at.elapsed() < Duration::from_secs(MODEM_RECOVERY_COOLDOWN_SECS)
-                            })
-                            .unwrap_or(false);
-
-                        if searching_count >= SEARCHING_RADIO_RESET_THRESHOLD && !cooldown_active {
-                            last_searching_recovery_at = Some(Instant::now());
-                            searching_count = 0;
-                            auto_register_requested_for_search = false;
-                            match set_modem_enabled(&conn, &modem_path, false).await {
-                                Ok(_) => {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                    match set_modem_enabled(&conn, &modem_path, true).await {
-                                        Ok(_) => {
-                                            cellular_problem_active = true;
-                                            system_events
-                                                .emit_code(
-                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                                    system_event_severity::WARNING,
-                                                    system_event_status::TRIGGERED,
-                                                    modem_path.to_string(),
-                                                    "长时间 searching，watchdog 已循环射频状态",
-                                                )
-                                                .await;
-                                            "Searching for too long, cycled radio state".to_string()
-                                        }
-                                        Err(err) => {
-                                            format!(
-                                                "Searching for too long, re-enable failed: {err}"
-                                            )
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    format!("Searching for too long, disable failed: {err}")
-                                }
-                            }
-                        } else if searching_count >= SEARCHING_REGISTER_THRESHOLD
-                            && !auto_register_requested_for_search
-                        {
-                            auto_register_requested_for_search = true;
-                            cellular_problem_active = true;
-                            system_events
-                                .emit_code(
-                                    system_event_codes::CELLULAR_SEARCHING_THRESHOLD,
-                                    system_event_severity::WARNING,
-                                    system_event_status::TRIGGERED,
-                                    modem_path.to_string(),
-                                    format!(
-                                        "蜂窝网络长时间 searching，registration={}",
-                                        mm_registration_to_string(registration)
-                                    ),
-                                )
-                                .await;
-                            match register_operator_auto(&conn).await {
-                                Ok(_) => {
-                                    system_events
-                                        .emit_code(
-                                            system_event_codes::CELLULAR_AUTO_REGISTER_TRIGGERED,
-                                            system_event_severity::WARNING,
-                                            system_event_status::TRIGGERED,
-                                            modem_path.to_string(),
-                                            "长时间 searching，已触发自动驻网",
-                                        )
-                                        .await;
-                                    "Searching for too long, requested automatic registration"
-                                        .to_string()
-                                }
-                                Err(err) => format!(
-                                    "Searching for too long, automatic registration failed: {err}"
-                                ),
-                            }
-                        } else if cooldown_active
-                            && searching_count >= SEARCHING_RADIO_RESET_THRESHOLD
-                        {
-                            format!(
-                                "Waiting for registration (state: searching, registration: {}, recovery cooldown active)",
-                                mm_registration_to_string(registration)
-                            )
-                        } else {
-                            format!(
-                                "Waiting for registration (state: searching, registration: {}, attempts: {searching_count})",
-                                mm_registration_to_string(registration)
-                            )
-                        }
-                    } else if state < MM_MODEM_STATE_REGISTERED {
-                        format!(
-                            "Waiting for registration (state: {})",
-                            mm_state_to_string(state)
-                        )
-                    } else if state >= MM_MODEM_STATE_CONNECTED {
-                        if cellular_problem_active {
-                            system_events
-                                .emit_code(
-                                    system_event_codes::CELLULAR_CONNECTION_RECOVERED,
-                                    system_event_severity::INFO,
-                                    system_event_status::RECOVERED,
-                                    modem_path.to_string(),
-                                    "蜂窝数据连接已恢复",
-                                )
-                                .await;
-                            cellular_problem_active = false;
-                        }
-                        "Connected".to_string()
-                    } else if data_connection_transition_in_progress(state) {
-                        transition_stuck_count += 1;
-                        if transition_stuck_count >= TRANSITION_STUCK_THRESHOLD {
-                            transition_stuck_count = 0;
-                            warn!(
-                                state = mm_state_to_string(state),
-                                "Modem stuck in transition state, cycling radio"
-                            );
-                            match set_modem_enabled(&conn, &modem_path, false).await {
-                                Ok(_) => {
-                                    tokio::time::sleep(Duration::from_secs(3)).await;
-                                    match set_modem_enabled(&conn, &modem_path, true).await {
-                                        Ok(_) => {
-                                            cellular_problem_active = true;
-                                            system_events
-                                                .emit_code(
-                                                    system_event_codes::CELLULAR_RADIO_CYCLE_TRIGGERED,
-                                                    system_event_severity::WARNING,
-                                                    system_event_status::TRIGGERED,
-                                                    modem_path.to_string(),
-                                                    format!(
-                                                        "数据连接状态卡住，已循环射频状态: {}",
-                                                        mm_state_to_string(state)
-                                                    ),
-                                                )
-                                                .await;
-                                            "Transition stuck, cycled radio state".to_string()
-                                        }
-                                        Err(err) => {
-                                            format!("Transition stuck, re-enable failed: {err}")
-                                        }
-                                    }
-                                }
-                                Err(err) => format!("Transition stuck, disable failed: {err}"),
-                            }
-                        } else {
-                            format!(
-                                "Data connection transition in progress (state: {}), waiting ({}/{})",
-                                mm_state_to_string(state),
-                                transition_stuck_count,
-                                TRANSITION_STUCK_THRESHOLD
-                            )
-                        }
-                    } else if user_disabled.load(Ordering::SeqCst) {
-                        "User disabled cellular data, not reconnecting".to_string()
-                    } else {
-                        // Cellular data is now strictly per-line and proxy-only:
-                        // each enabled line brings up its own isolated bearer
-                        // (`connect_data_via_modem`, never-default) and exposes it
-                        // solely through that line's HTTP/SOCKS5 proxy. The
-                        // watchdog must NOT activate a global system-default
-                        // bearer on the first modem here — doing so is exactly the
-                        // implicit-routing behaviour we removed. Modem outage /
-                        // radio-cycle / registration recovery above still runs.
-                        let _ = DATA_CONNECT_RETRY_COOLDOWN_SECS;
-                        format!(
-                            "Data connection inactive (state: {}); per-line proxy owns data activation, watchdog skips global connect",
-                            mm_state_to_string(state)
-                        )
-                    }
-                }
-                Err(err) => format!("Modem unavailable: {err}"),
-            },
-            Err(err) => {
-                missing_count += 1;
-                let cooldown_active = last_modem_restart_at
-                    .map(|at| at.elapsed() < Duration::from_secs(MODEM_RECOVERY_COOLDOWN_SECS))
-                    .unwrap_or(false);
-
-                if missing_count >= MODEM_SCAN_THRESHOLD && !scan_requested_for_outage {
-                    match run_recovery_command("mmcli", &["--scan-modems"]).await {
-                        Ok(output) => {
-                            scan_requested_for_outage = true;
-                            system_events
-                                .emit_code(
-                                    system_event_codes::BASEBAND_SCAN_MODEMS_TRIGGERED,
-                                    system_event_severity::INFO,
-                                    system_event_status::TRIGGERED,
-                                    "ModemManager",
-                                    format!(
-                                        "连续 {} 次未找到 Modem，已触发 mmcli --scan-modems",
-                                        missing_count
-                                    ),
-                                )
-                                .await;
-                            info!(
-                                failures = missing_count,
-                                output = %output,
-                                "Watchdog: requested modem rescan"
-                            );
-                        }
-                        Err(scan_err) => {
-                            warn!(
-                                failures = missing_count,
-                                error = %scan_err,
-                                "Watchdog: modem rescan failed"
-                            );
-                        }
-                    }
-                }
-
-                if missing_count >= MODEM_RESTART_THRESHOLD && !cooldown_active {
-                    if !modem_outage_reported {
-                        system_events
-                            .emit_code(
-                                system_event_codes::BASEBAND_MODEM_MISSING_THRESHOLD,
-                                system_event_severity::CRITICAL,
-                                system_event_status::TRIGGERED,
-                                "ModemManager",
-                                format!("连续 {} 次未找到 Modem", missing_count),
-                            )
-                            .await;
-                        modem_outage_reported = true;
-                    }
-                    match run_recovery_command("systemctl", &["restart", "ModemManager"]).await {
-                        Ok(_) => {
-                            last_modem_restart_at = Some(Instant::now());
-                            missing_count = 0;
-                            scan_requested_for_outage = false;
-                            system_events
-                                .emit_code(
-                                    system_event_codes::BASEBAND_MODEMMANAGER_RESTARTED,
-                                    system_event_severity::WARNING,
-                                    system_event_status::TRIGGERED,
-                                    "ModemManager",
-                                    "watchdog 已重启 ModemManager",
-                                )
-                                .await;
-                            info!("Watchdog: restarted ModemManager after repeated modem loss");
-                            "Modem unavailable, restarting ModemManager".to_string()
-                        }
-                        Err(restart_err) => {
-                            system_events
-                                .emit_code(
-                                    system_event_codes::BASEBAND_MODEMMANAGER_RESTART_FAILED,
-                                    system_event_severity::CRITICAL,
-                                    system_event_status::FAILED,
-                                    "ModemManager",
-                                    format!("watchdog 重启 ModemManager 失败: {restart_err}"),
-                                )
-                                .await;
-                            warn!(
-                                failures = missing_count,
-                                error = %restart_err,
-                                "Watchdog: failed to restart ModemManager"
-                            );
-                            format!("Modem unavailable: {err}; restart failed: {restart_err}")
-                        }
-                    }
-                } else if missing_count >= MODEM_RESTART_THRESHOLD && cooldown_active {
-                    format!("Modem unavailable: {err}; recovery cooldown active")
-                } else if scan_requested_for_outage {
-                    format!("Modem unavailable: {err}; rescan requested")
-                } else {
-                    format!("Modem unavailable: {err}")
-                }
-            }
-        };
-
-        if result != last_log {
-            info!(status = %result, "Watchdog: data connection");
-            last_log = result;
-        }
-    }
 }

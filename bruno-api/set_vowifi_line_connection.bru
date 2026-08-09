@@ -1,11 +1,11 @@
 meta {
-  name: set_vowifi_connection
+  name: set_vowifi_line_connection
   type: http
   seq: 143
 }
 
 post {
-  url: http://192.168.68.1:3000/api/vowifi/connection
+  url: {{base_url}}/api/vowifi/lines/{{line_id}}/connection
   body: json
   auth: inherit
 }
