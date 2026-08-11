@@ -35,6 +35,7 @@ use api::handlers::*;
 use hardware::cellular::modem_manager::ensure_nm_modem_profile;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
+use platform::config_maintenance::{backup_database, export_json, import_json, restore_database};
 use platform::db::Database;
 use services::network::device_network::DdnsManager;
 use services::notify::notification::NotificationSender;
@@ -201,14 +202,13 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
 /// the kernel module publishes one port per registered channel, and any spare
 /// left visible gets claimed by ModemManager as an extra modem port.
 async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<()> {
-    use hardware::cellular::secondary_qmi;
+    use hardware::devices::qcm410::secondary_qmi;
 
     const STATE_DIR: &str = "/run/simadmin";
     // Keep a distinct basename from the packaged /etc fallback rule. udev gives
     // /etc precedence over /run for duplicate basenames, which would otherwise
     // hide the runtime DATA6-specific rule completely.
-    const UDEV_RULE_PATH: &str =
-        "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
+    const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
 
     // Discovering modems needs ModemManager, which by design is not up yet. Fall
     // back to enumerating the primary QMI control ports straight from sysfs.
@@ -435,6 +435,11 @@ enum CliCommand {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Explicit configuration database maintenance.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// 解压 ZIP 文件到指定目录（供安装脚本调用）
     ExtractZip {
         /// ZIP 文件路径
@@ -466,6 +471,18 @@ enum AuthCommand {
     ResetPassword,
     /// 清除管理员密码，让 Web UI 下次进入首次设置
     Clear,
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigCommand {
+    /// Create an online-consistent SQLite snapshot (never copy WAL sidecars).
+    Backup { output: PathBuf },
+    /// Export the typed application config and per-SIM overrides as JSON.
+    Export { output: PathBuf },
+    /// Explicitly import a prior SimAdmin JSON export with a rollback snapshot.
+    Import { input: PathBuf },
+    /// Restore a prior SQLite snapshot, retaining the current database first.
+    Restore { input: PathBuf },
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -501,8 +518,8 @@ async fn main() -> Result<()> {
     }
     if let Some(CliCommand::Auth { command }) = &cli.command {
         let db = Database::new(get_data_db_path())?;
-        let config_manager = ConfigManager::try_new(get_default_config_path())
-            .map_err(anyhow::Error::msg)?;
+        let config_manager =
+            ConfigManager::try_new(get_default_config_path()).map_err(anyhow::Error::msg)?;
         let security = config_manager.get_security();
         return match command {
             AuthCommand::ResetPassword => {
@@ -511,9 +528,59 @@ async fn main() -> Result<()> {
             AuthCommand::Clear => api::auth::clear_admin_auth(&db),
         };
     }
+    if let Some(CliCommand::Config { command }) = &cli.command {
+        let config_path = get_default_config_path();
+        return match command {
+            ConfigCommand::Backup { output } => {
+                let override_rows =
+                    backup_database(&config_path, output).map_err(anyhow::Error::msg)?;
+                println!(
+                    "Configuration backup created at {} ({} SIM override rows)",
+                    output.display(),
+                    override_rows
+                );
+                Ok(())
+            }
+            ConfigCommand::Export { output } => {
+                let override_rows =
+                    export_json(&config_path, output).map_err(anyhow::Error::msg)?;
+                println!(
+                    "Configuration export created at {} ({} SIM override rows)",
+                    output.display(),
+                    override_rows
+                );
+                Ok(())
+            }
+            ConfigCommand::Import { input } => {
+                let rollback = import_json(&config_path, input).map_err(anyhow::Error::msg)?;
+                if let Some(rollback) = rollback {
+                    println!(
+                        "Configuration imported; rollback snapshot retained at {}",
+                        rollback.display()
+                    );
+                } else {
+                    println!("Configuration imported into a new database");
+                }
+                Ok(())
+            }
+            ConfigCommand::Restore { input } => {
+                let rollback = restore_database(&config_path, input).map_err(anyhow::Error::msg)?;
+                if let Some(rollback) = rollback {
+                    println!(
+                        "Configuration restored; previous database retained at {}",
+                        rollback.display()
+                    );
+                } else {
+                    println!("Configuration restored into a new database");
+                }
+                Ok(())
+            }
+        };
+    }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {
         let conn = Connection::system().await?;
-        let mut bindings = hardware::cellular::modem_manager::discover_modem_bindings(&conn).await?;
+        let mut bindings =
+            hardware::cellular::modem_manager::discover_modem_bindings(&conn).await?;
         for binding in &mut bindings {
             binding.sim_iccid = services::system::system_event::mask_identifier(&binding.sim_iccid);
         }
@@ -540,7 +607,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(get_default_carrier_catalog_path);
     let carrier_catalog = Arc::new(
-        connectivity::modems::softstack::vowifi::carrier_catalog::CarrierCatalog::open(
+        connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::open(
             &carrier_catalog_path,
         )
         .map_err(anyhow::Error::msg)?,
@@ -559,6 +626,15 @@ async fn main() -> Result<()> {
         "Loaded read-only carrier catalog"
     );
 
+    let sim_overrides =
+        Arc::new(connectivity::modems::ims::profile_override::SimOverrideStore::default());
+
+    let e911 = Arc::new(services::e911::orchestrator::E911Orchestrator::new(
+        services::e911::state_store::E911StateStore::default(),
+        services::e911::registry::E911ProviderRegistry::default(),
+        Arc::new(services::e911::ts43::Ts43Transport::new()),
+    ));
+
     // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
     ensure_modemmanager_debug_override();
 
@@ -573,7 +649,8 @@ async fn main() -> Result<()> {
     let config_path = get_default_config_path();
     info!(path = ?config_path, "Loading config");
     let config_manager = Arc::new(ConfigManager::try_new(config_path).map_err(anyhow::Error::msg)?);
-    let cell_monitoring_active = Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+    let cell_monitoring_active =
+        Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
         Arc::clone(&config_manager),
         Arc::clone(&app_db),
@@ -586,28 +663,12 @@ async fn main() -> Result<()> {
         .sync_trunk_profiles(config_manager.as_ref())
         .await;
     {
-        let profile_store = connectivity::modems::softstack::vowifi::profile_store::ProfileStore::with_catalog(
-            Arc::clone(&app_db),
-            Arc::clone(&carrier_catalog),
-        );
-        match app_db.delete_vowifi_carrier_profiles_by_source("builtin") {
-            Ok(0) => {}
-            Ok(deleted) => info!(deleted, "Removed legacy built-in carrier profile rows"),
-            Err(error) => warn!(error = %error, "Failed to remove legacy built-in carrier profile rows"),
-        }
-        // Fold any pre-existing `vowifi-profiles.conf` into the database, then
-        // archive the file. Custom profiles live in one place from now on.
-        let legacy_path = config_manager.legacy_vowifi_profiles_path();
-        match profile_store.migrate_legacy_profiles_file(&legacy_path) {
-            Ok(0) => {}
-            Ok(migrated) => info!(
-                migrated,
-                "Migrated vowifi-profiles.conf into the carrier profile database"
-            ),
-            Err(error) => warn!(error = %error, "Failed to migrate legacy VoWiFi profiles"),
-        }
-        // Make the stored rows visible to the live matcher; without this an
-        // edited profile would only show up in the API, not at connect time.
+        let profile_store =
+            connectivity::modems::ims::vowifi::profile_store::ProfileStore::with_catalog(
+                Arc::clone(&carrier_catalog),
+            );
+        // Make the catalog rows visible to the live matcher; without this the
+        // API would list profiles that never resolve at connect time.
         profile_store.publish();
     }
 
@@ -670,7 +731,10 @@ async fn main() -> Result<()> {
         let notification_clone = Arc::clone(&notification_sender);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(crate::services::system::ota::duration_until_next_update_check()).await;
+                tokio::time::sleep(
+                    crate::services::system::ota::duration_until_next_update_check(),
+                )
+                .await;
                 let config = config_clone.get_version_update_notifications();
                 if config.enabled {
                     if let Err(err) = crate::services::system::ota::check_and_notify_version_update(
@@ -746,6 +810,8 @@ async fn main() -> Result<()> {
         line_registry,
         cell_monitoring_active,
         carrier_catalog,
+        sim_overrides,
+        e911,
     });
 
     api::handlers::spawn_call_monitor(app_state.clone());
@@ -889,10 +955,7 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
-                    match db.prune_sms_messages_for_line(
-                        &line_id,
-                        policy.message_retention_limit,
-                    ) {
+                    match db.prune_sms_messages_for_line(&line_id, policy.message_retention_limit) {
                         Ok(deleted) if deleted > 0 => {
                             tracing::info!(
                                 line_id,
@@ -1211,6 +1274,60 @@ async fn main() -> Result<()> {
             get(get_line_ims_status_handler).options(options_handler),
         )
         .route(
+            "/api/ims/lines/{line_id}/profile",
+            get(get_effective_ims_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/supplementary",
+            get(get_ims_supplementary_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/override",
+            get(get_ims_override_handler)
+                .patch(patch_ims_override_handler)
+                .delete(delete_ims_override_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/override/validate",
+            post(validate_ims_override_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/capability",
+            get(get_e911_capability_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/status",
+            get(get_e911_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/query",
+            post(post_e911_query_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/operations",
+            post(create_e911_operation_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/operations/{operation_id}",
+            get(get_e911_operation_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/operations/{operation_id}/callback",
+            post(callback_e911_operation_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/operations/{operation_id}/cancel",
+            post(cancel_e911_operation_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/address",
+            get(get_e911_address_handler)
+                .put(put_e911_address_handler)
+                .delete(delete_e911_address_handler)
+                .options(options_handler),
+        )
+        .route(
             "/api/modem/lines/{line_id}/calls/history",
             get(get_line_call_history_handler).options(options_handler),
         )
@@ -1234,32 +1351,15 @@ async fn main() -> Result<()> {
             "/api/vowifi/profiles",
             get(get_vowifi_profiles_handler).options(options_handler),
         )
-        // Editable carrier profile database. Replaces the compiled-in constants
-        // as the source of truth; unknown carriers still fall back to 3GPP
-        // derivation, so a SIM with no entry here can still connect.
+        // Read-only carrier catalog view. Custom profile rows are no longer
+        // stored in the database; profile persistence is being redesigned.
         .route(
             "/api/vowifi/carrier-profiles",
-            get(list_vowifi_carrier_profiles_handler)
-                .put(save_vowifi_carrier_profile_handler)
-                .options(options_handler),
+            get(list_vowifi_carrier_profiles_handler).options(options_handler),
         )
         .route(
             "/api/vowifi/carrier-profiles/resolve",
             get(resolve_vowifi_carrier_profile_handler).options(options_handler),
-        )
-        .route(
-            "/api/vowifi/carrier-profiles/import",
-            post(import_vowifi_carrier_profiles_handler).options(options_handler),
-        )
-        .route(
-            "/api/vowifi/carrier-profiles/{profile_id}",
-            delete(delete_vowifi_carrier_profile_handler).options(options_handler),
-        )
-        .route(
-            "/api/vowifi/external-profiles",
-            get(get_external_vowifi_profiles_handler)
-                .post(set_external_vowifi_profile_handler)
-                .options(options_handler),
         )
         .route(
             "/api/vowifi/lines",

@@ -186,8 +186,8 @@ fn route_plan(
     let readiness = backends
         .iter()
         .map(|backend| {
-            let available = backend.link.is_available()
-                && (!video_required || backend.link.video_enabled());
+            let available =
+                backend.link.is_available() && (!video_required || backend.link.video_enabled());
             VoiceLegReadiness {
                 kind: backend.kind,
                 feature_enabled: true,
@@ -215,9 +215,11 @@ fn refresh_router_state(
     let local_ip = trunk.trunk_local_ip();
     let incoming_mode = trunk.incoming_mode();
     let ip_connect_mode = trunk.ip_connect_mode();
-    trunk.set_video_enabled(candidates.iter().any(|kind| {
-        backend(backends, *kind).is_some_and(|backend| backend.link.video_enabled())
-    }));
+    trunk.set_video_enabled(
+        candidates.iter().any(|kind| {
+            backend(backends, *kind).is_some_and(|backend| backend.link.video_enabled())
+        }),
+    );
     let mut aggregate = OperatorDiagnostics::default();
     for backend in backends {
         backend.link.set_trunk_local_ip(local_ip);
@@ -427,8 +429,8 @@ fn is_terminal_event(event: &OperatorEvent) -> bool {
 mod tests {
     use super::*;
     use crate::{
+        connectivity::core::ims_video::parse_video_sdp,
         connectivity::core::voice::parse_audio_sdp,
-        connectivity::modems::softstack::volte::vilte::parse_video_sdp,
         platform::config::PathLayerConfig,
         services::trunk::bridge::{
             DtmfCapabilities, DtmfSignal, DtmfSource, MediaOffer, VideoOffer,

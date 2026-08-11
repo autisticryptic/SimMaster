@@ -124,8 +124,9 @@ cargo run -- serve \
   --carrier-catalog /path/to/carrier-bundles.sqlite3
 ```
 
-等价环境变量为 `HOST`、`PORT` 和 `SIMADMIN_CARRIER_CATALOG`。配置文件可通过
-`SIMADMIN_CONFIG_PATH` 覆盖，日志级别通过 `RUST_LOG` 控制。
+等价环境变量为 `HOST`、`PORT` 和 `SIMADMIN_CARRIER_CATALOG`。生产配置数据库可通过
+`SIMADMIN_CONFIG_DB` 覆盖；该路径必须指向 SQLite 数据库，不支持旧 JSON 配置导入。
+日志级别通过 `RUST_LOG` 控制。
 
 普通开发机没有 ModemManager、真实 modem、QMI 端点或 `/dev/net/tun` 时，纯逻辑测试仍可
 运行，但服务启动和硬件接口可能失败。真机网络、P-CSCF、IMS 注册、RTP、eSIM 和 Trunk

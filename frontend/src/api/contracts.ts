@@ -839,14 +839,6 @@ export interface LineVowifiConfig {
   enabled: boolean
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
-  dns_server: string
-  /**
-   * Pin this line to a specific carrier profile by `profile_id`. `null`/omitted
-   * resolves the profile automatically from the SIM's IMSI. The dropdown only
-   * offers database profiles; a pinned id that no longer resolves falls back to
-   * automatic matching so deleting a profile never strands a line.
-   */
-  profile_id?: string | null
   auto_restore: AutoRestoreConfig
 }
 
@@ -873,6 +865,37 @@ export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus
   trunk: TrunkRuntimeStatus
+  supplementary: SupplementarySnapshot
+}
+
+export interface SupplementarySnapshot {
+  line_id: string
+  call_waiting: 'enabled' | 'disabled' | 'unknown'
+  call_waiting_capability: CapabilityReadiness
+  forwarding_capability: CapabilityReadiness
+  identity_capability: CapabilityReadiness
+  mwi_capability: CapabilityReadiness
+  message_waiting?: MessageWaitingSummary | null
+}
+
+export interface CapabilityReadiness {
+  supported: boolean
+  ready: boolean
+  reason?: string | null
+}
+
+export interface MessageWaitingSummary {
+  source: 'operator_ims' | 'asterisk_local'
+  messages_waiting: boolean
+  message_account?: string | null
+  voice?: MessageCount | null
+}
+
+export interface MessageCount {
+  new: number
+  old: number
+  urgent_new: number
+  urgent_old: number
 }
 
 export interface VolteLineControlResponse {

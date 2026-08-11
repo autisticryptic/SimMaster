@@ -1095,3 +1095,170 @@ pub struct UpdateSimCacheRequest {
     pub phone_number: Option<String>,
     pub sms_center: Option<String>,
 }
+
+/// Effective VoWiFi connection facts returned by the IMS profile API.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveVowifiDto {
+    pub profile_id: String,
+    pub epdg_host: FieldDto,
+    pub epdg_port: u16,
+    pub epdg_port_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apn: Option<FieldDto>,
+    pub ip_stack: FieldDto,
+    pub dns_servers: Vec<FieldDto>,
+}
+
+/// Effective IMS connection facts for one access returned by the IMS profile API.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveImsDto {
+    pub profile_id: String,
+    pub domain: FieldDto,
+    pub realm: FieldDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pcscf: Option<FieldDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registrar: Option<FieldDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ims_apn: Option<FieldDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned_profile_id: Option<FieldDto>,
+}
+
+/// Effective device identity returned by the IMS profile API.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveDeviceIdentityDto {
+    pub available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imei_last4: Option<String>,
+    pub source: String,
+}
+
+/// One effective value plus the source that produced it.
+#[derive(Debug, Serialize, Default)]
+pub struct FieldDto {
+    pub value: String,
+    pub source: String,
+}
+
+/// Effective common facts that follow the SIM.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveCommonDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voicemail_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voicemail_number_source: Option<String>,
+}
+
+/// Effective supplementary-service preferences that follow the SIM.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveServicesDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_waiting: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_waiting_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_id_restriction: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_id_restriction_source: Option<String>,
+}
+
+/// Effective emergency facts returned by the IMS profile API. The full civic
+/// address is intentionally NOT included here: status responses never expose
+/// addresses; the authenticated override edit endpoint is the only place the
+/// user sees their own address.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveEmergencyDto {
+    pub address_saved_locally: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address_source: Option<String>,
+}
+
+/// Effective IMS profile plus a field-level source map.
+#[derive(Debug, Serialize, Default)]
+pub struct EffectiveImsProfileResponse {
+    pub binding: BindingKeyDto,
+    pub vowifi: EffectiveVowifiDto,
+    pub volte_ims: EffectiveImsDto,
+    pub vowifi_ims: EffectiveImsDto,
+    pub identity: EffectiveDeviceIdentityDto,
+    pub common: EffectiveCommonDto,
+    pub services: EffectiveServicesDto,
+    pub emergency: EffectiveEmergencyDto,
+    pub source_map: Vec<SourceEntryDto>,
+}
+
+/// Sanitized description of the binding that owns an override.
+#[derive(Debug, Serialize, Default)]
+pub struct BindingKeyDto {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iccid_last4: Option<String>,
+}
+
+/// One source-map entry: logical field name plus origin.
+#[derive(Debug, Serialize, Default)]
+pub struct SourceEntryDto {
+    pub field: String,
+    pub source: String,
+}
+
+/// The per-SIM override plus its binding identity.
+#[derive(Debug, Serialize, Default)]
+pub struct ImsOverrideResponse {
+    pub binding: BindingKeyDto,
+    pub override_: crate::connectivity::modems::ims::profile_override::SimOverride,
+}
+
+/// Validation result for a user-edited override.
+#[derive(Debug, Serialize, Default)]
+pub struct ImsOverrideValidationResponse {
+    pub valid: bool,
+    pub problems: Vec<String>,
+}
+
+/// E911 status for one line. Deliberately lacks the address, IMSI, ICCID, EID,
+/// IMEI and any token/cookie/`ServerFlow_User_Data`.
+#[derive(Debug, Serialize, Default)]
+pub struct E911StatusDto {
+    pub profile_id: String,
+    pub provider_kind: String,
+    pub state: String,
+    pub source: String,
+    /// Whether the operator requires address provisioning for this carrier.
+    pub operator_requires: bool,
+    /// Whether the user has saved an address locally (not carrier-confirmed).
+    pub address_saved_locally: bool,
+    /// Whether the operator has confirmed via a successful entitlement re-query.
+    pub operator_confirmed: bool,
+    /// Whether emergency calling is still unverified (the inverse of confirmed,
+    /// surfaced explicitly so the UI never conflates the two).
+    pub emergency_unverified: bool,
+    pub needs_user_action: bool,
+    pub needs_reconfirm: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_epoch: Option<i64>,
+}
+
+/// E911 capability for one line: what the operator allows and which provider
+/// kind applies. No secrets, no address.
+#[derive(Debug, Serialize, Default)]
+pub struct E911CapabilityDto {
+    pub profile_id: String,
+    pub provider_kind: String,
+    pub provider_id: String,
+    pub operator_requires: bool,
+    pub query_supported: bool,
+    pub websheet_expected: bool,
+}
+
+/// E911 websheet operation description returned after creation. Contains the
+/// SSRF-checked URL the user's browser should open, never user data.
+#[derive(Debug, Serialize, Default)]
+pub struct E911OperationDto {
+    pub operation_id: String,
+    pub line_id: String,
+    pub server_flow_url: String,
+    pub expires_epoch: i64,
+    pub state: String,
+}

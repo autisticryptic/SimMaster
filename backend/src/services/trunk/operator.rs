@@ -11,6 +11,7 @@ use std::{
 use tokio::sync::broadcast;
 
 use super::bridge::{OperatorCommand, OperatorEvent};
+use crate::connectivity::core::media::MediaRelayMetrics;
 use crate::platform::config::{TrunkIncomingMode, TrunkIpConnectMode};
 
 #[derive(Clone)]
@@ -103,6 +104,24 @@ impl OperatorMediaMetrics {
             .store(diagnostics.rtp_to_asterisk_packets, Ordering::Relaxed);
         self.rtp_to_asterisk_bytes
             .store(diagnostics.rtp_to_asterisk_bytes, Ordering::Relaxed);
+    }
+}
+
+impl MediaRelayMetrics for OperatorMediaMetrics {
+    fn relay_started(&self) {
+        OperatorMediaMetrics::relay_started(self);
+    }
+
+    fn relay_stopped(&self) {
+        OperatorMediaMetrics::relay_stopped(self);
+    }
+
+    fn record_rtp_from_asterisk(&self, bytes: usize) {
+        OperatorMediaMetrics::record_rtp_from_asterisk(self, bytes);
+    }
+
+    fn record_rtp_to_asterisk(&self, bytes: usize) {
+        OperatorMediaMetrics::record_rtp_to_asterisk(self, bytes);
     }
 }
 

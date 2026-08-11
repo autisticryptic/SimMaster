@@ -547,9 +547,7 @@ impl NotificationSender {
 
     /// Forward an automation task execution event to all enabled channels.
     pub async fn forward_automation_event(&self, event: &AutomationEvent) -> Result<(), String> {
-        let own_number = self
-            .get_own_number_for_line(event.line_id.as_deref())
-            .await;
+        let own_number = self.get_own_number_for_line(event.line_id.as_deref()).await;
         let event = NotificationEvent::Automation(event, own_number);
         let result = self.route_event(&event).await;
 

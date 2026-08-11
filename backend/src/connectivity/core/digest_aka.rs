@@ -56,7 +56,7 @@ pub struct AkaChallenge {
 /// Decode an AKA nonce into RAND(16) || AUTN(16). base64 by RFC 3310 (some
 /// networks send hex); first 32 bytes are RAND||AUTN, trailing data ignored.
 pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, ImsError> {
-    let raw = decode_nonce_bytes(nonce)?;
+    let raw = decode_digest_nonce(nonce)?;
     if raw.len() < 32 {
         return Err(ImsError::new("register_nonce_not_aka"));
     }
@@ -66,7 +66,10 @@ pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, ImsError> {
     })
 }
 
-fn decode_nonce_bytes(nonce: &str) -> Result<Vec<u8>, ImsError> {
+/// Decode a Digest nonce that may be hex or base64. Access adapters use this
+/// before deciding whether a short value is a carrier-approved plain MD5
+/// challenge or a full RAND || AUTN AKA challenge.
+pub fn decode_digest_nonce(nonce: &str) -> Result<Vec<u8>, ImsError> {
     let trimmed = nonce.trim();
     if !trimmed.is_empty()
         && trimmed.len().is_multiple_of(2)
@@ -222,6 +225,40 @@ pub fn build_resync_authorization_header(
         challenge.algorithm,
         BASE64_STANDARD.encode(auts),
     )
+}
+
+/// Build an AUTS resynchronization header while retaining qop/opaque parameters
+/// required by stricter P-CSCFs. `cnonce` is required when the challenge chose
+/// qop; callers that do not negotiate qop can use
+/// [`build_resync_authorization_header`].
+pub fn build_resync_authorization_header_with_digest(
+    challenge: &DigestChallenge,
+    username: &str,
+    digest_uri: &str,
+    auts: &[u8],
+    cnonce: Option<&str>,
+    nc: Option<&str>,
+) -> String {
+    let auts = BASE64_STANDARD.encode(auts);
+    let mut header = format!(
+        "{}: Digest username=\"{}\",realm=\"{}\",nonce=\"{}\",uri=\"{}\",response=\"\",algorithm={},auts=\"{}\"",
+        challenge.authorization_header_name(),
+        quote(username),
+        quote(&challenge.realm),
+        quote(&challenge.nonce),
+        quote(digest_uri),
+        challenge.algorithm,
+        quote(&auts),
+    );
+    if let Some(qop) = challenge.qop.as_deref() {
+        let cnonce = cnonce.unwrap_or_default();
+        let nc = nc.unwrap_or("00000001");
+        header.push_str(&format!(",qop={qop},nc={nc},cnonce=\"{}\"", quote(cnonce)));
+    }
+    if let Some(opaque) = challenge.opaque.as_deref() {
+        header.push_str(&format!(",opaque=\"{}\"", quote(opaque)));
+    }
+    header
 }
 
 /// Parse a digest challenge from a header value (text after `WWW-Authenticate:`).
@@ -477,5 +514,30 @@ mod tests {
         assert!(h.starts_with("Authorization: Digest username=\"user\""));
         assert!(h.contains("qop=auth,nc=00000001,cnonce=\"cnon\""));
         assert!(h.contains("opaque=\"op\""));
+    }
+
+    #[test]
+    fn resync_header_can_retain_digest_qop_and_opaque() {
+        let challenge = DigestChallenge {
+            realm: "r".to_string(),
+            nonce: "n".to_string(),
+            algorithm: "AKAv1-MD5".to_string(),
+            qop: Some("auth".to_string()),
+            opaque: Some("op".to_string()),
+            proxy: true,
+        };
+        let header = build_resync_authorization_header_with_digest(
+            &challenge,
+            "user",
+            "sip:r",
+            &[0x01, 0x02],
+            Some("cnon"),
+            Some("00000001"),
+        );
+
+        assert!(header.starts_with("Proxy-Authorization: Digest username=\"user\""));
+        assert!(header.contains("auts=\"AQI=\""));
+        assert!(header.contains("qop=auth,nc=00000001,cnonce=\"cnon\""));
+        assert!(header.contains("opaque=\"op\""));
     }
 }

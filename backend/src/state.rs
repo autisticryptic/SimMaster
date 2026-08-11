@@ -9,11 +9,13 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use zbus::Connection;
 
-use crate::connectivity::modems::softstack::vowifi::carrier_catalog::CarrierCatalog;
+use crate::connectivity::modems::ims::profile_override::SimOverrideStore;
+use crate::connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog;
 use crate::hardware::cellular::cell_lock_store::CellLockStore;
 use crate::hardware::sim::esim::EsimSupervisor;
 use crate::platform::config::ConfigManager;
 use crate::platform::db::Database;
+use crate::services::e911::orchestrator::E911Orchestrator;
 use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::messaging::sms_listener::SmsResyncHandle;
 use crate::services::network::device_network::DdnsManager;
@@ -62,6 +64,10 @@ pub struct AppState {
     pub cell_monitoring_active: Arc<Mutex<HashSet<String>>>,
     /// Immutable carrier access/IMS/SIP configuration catalog.
     pub carrier_catalog: Arc<CarrierCatalog>,
+    /// Per-SIM user overrides, keyed by `SimBindingKey`.
+    pub sim_overrides: Arc<SimOverrideStore>,
+    /// E911 entitlement orchestrator (query/status/websheet operations).
+    pub e911: Arc<E911Orchestrator>,
 }
 
 /// Named startup dependencies prevent positional mix-ups as application state grows.
@@ -77,6 +83,8 @@ pub struct AppStateDependencies {
     pub line_registry: Arc<LineRuntimeRegistry>,
     pub cell_monitoring_active: Arc<Mutex<HashSet<String>>>,
     pub carrier_catalog: Arc<CarrierCatalog>,
+    pub sim_overrides: Arc<SimOverrideStore>,
+    pub e911: Arc<E911Orchestrator>,
 }
 
 impl AppState {
@@ -94,6 +102,8 @@ impl AppState {
             line_registry,
             cell_monitoring_active,
             carrier_catalog,
+            sim_overrides,
+            e911,
         } = dependencies;
         Self {
             dbus_conn,
@@ -111,6 +121,8 @@ impl AppState {
             line_registry,
             cell_monitoring_active,
             carrier_catalog,
+            sim_overrides,
+            e911,
         }
     }
 }
@@ -170,5 +182,11 @@ impl FromRef<AppState> for Arc<Mutex<HashMap<String, CellLockStore>>> {
 impl FromRef<AppState> for (Arc<Connection>, Arc<Database>) {
     fn from_ref(state: &AppState) -> Self {
         (state.dbus_conn.clone(), state.database.clone())
+    }
+}
+
+impl FromRef<AppState> for Arc<E911Orchestrator> {
+    fn from_ref(state: &AppState) -> Self {
+        state.e911.clone()
     }
 }

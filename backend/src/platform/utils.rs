@@ -292,7 +292,8 @@ pub async fn read_interface_stats(
 
     if let Some(c) = conn {
         if let Ok(Some(mm_stats)) =
-            crate::hardware::cellular::modem_manager::get_bearer_stats_for_interface(c, interface).await
+            crate::hardware::cellular::modem_manager::get_bearer_stats_for_interface(c, interface)
+                .await
         {
             rx_bytes = std::cmp::max(rx_bytes, mm_stats.rx_bytes);
             tx_bytes = std::cmp::max(tx_bytes, mm_stats.tx_bytes);

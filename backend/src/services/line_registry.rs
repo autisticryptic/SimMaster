@@ -17,19 +17,16 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use zbus::Connection;
 
 use crate::{
-    connectivity::modems::softstack::volte::{
-        live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus,
-    },
-    connectivity::modems::softstack::vowifi::runtime::VowifiRuntime,
+    connectivity::modems::ims::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
+    connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
+    hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
     hardware::cellular::modem_manager::{discover_modem_bindings, ModemBinding},
-    hardware::cellular::{
-        data_proxy::{DataProxyRuntime, DataProxyTraffic},
-        secondary_qmi_data::SecondaryDataRuntime,
-    },
+    hardware::devices::qcm410::secondary_qmi_data::SecondaryDataRuntime,
     platform::config::{
         AccessPathKind, ConfigManager, ModemSlotObservation, TrunkProfileConfig, VoicePathPolicy,
     },
     platform::db::{Database, LineDataTrafficEntry},
+    services::supplementary::{SupplementaryRuntime, SupplementarySnapshot},
     services::trunk::{
         access_router::VoiceAccessRouter,
         runtime::{TrunkRuntime, TrunkRuntimeStatus},
@@ -72,6 +69,7 @@ pub struct LineRuntime {
     vowifi_restore_running: AtomicBool,
     pub voice_access: VoiceAccessRouter,
     pub trunk: Arc<TrunkRuntime>,
+    pub supplementary: Arc<SupplementaryRuntime>,
     pub data_proxy: Arc<DataProxyRuntime>,
     /// Serializes and records the background data-health workflow for this line.
     /// The scheduler uses `try_lock`, so overlapping ticks are dropped instead
@@ -91,7 +89,7 @@ impl LineRuntime {
         voice_policy: VoicePathPolicy,
     ) -> Self {
         let vowifi_operator =
-            crate::connectivity::modems::softstack::vowifi::operator::operator_link_for_line(
+            crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
                 &binding.line_id,
             );
         let voice_access = VoiceAccessRouter::new(
@@ -103,6 +101,12 @@ impl LineRuntime {
         );
         let operator = voice_access.operator_link();
         let vowifi = Arc::new(VowifiRuntime::for_line(&binding.line_id));
+        let supplementary = Arc::new(SupplementaryRuntime::for_line(&binding.line_id));
+        volte_live.bind_supplementary(Arc::clone(&supplementary));
+        crate::connectivity::modems::ims::vowifi::operator::bind_supplementary_for_line(
+            &binding.line_id,
+            Arc::clone(&supplementary),
+        );
         Self {
             binding: RwLock::new(binding),
             volte,
@@ -115,6 +119,7 @@ impl LineRuntime {
             vowifi_restore_running: AtomicBool::new(false),
             voice_access,
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
+            supplementary,
             data_proxy: Arc::new(DataProxyRuntime::default()),
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
             secondary_data: Arc::new(SecondaryDataRuntime::default()),
@@ -147,6 +152,7 @@ impl LineRuntime {
             modem: self.binding(),
             volte: self.volte.status().await,
             trunk: self.trunk.status().await,
+            supplementary: self.supplementary.snapshot().await,
         }
     }
 
@@ -212,6 +218,7 @@ pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
     pub volte: VolteRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,
+    pub supplementary: SupplementarySnapshot,
 }
 
 #[derive(Default)]
@@ -327,7 +334,7 @@ impl LineRuntimeRegistry {
         }
         let mut lines = self.lines.write().await;
         for line in lines.values() {
-            crate::connectivity::modems::softstack::vowifi::live::forget_line_sim_device(
+            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device(
                 &line.binding().line_id,
             );
             line.mark_absent();
@@ -335,7 +342,7 @@ impl LineRuntimeRegistry {
         for binding in discovered {
             // Tell the VoWiFi live layer which SIM device this line owns, so its
             // identity and authentication never use another modem's card.
-            crate::connectivity::modems::softstack::vowifi::live::register_line_sim_device(
+            crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
                 &binding.line_id,
                 binding.qmi_device.as_deref().unwrap_or_default(),
                 binding.uim_slot,
@@ -630,5 +637,82 @@ mod tests {
 
         assert!(operator_a.is_available());
         assert!(!operator_b.is_available());
+    }
+
+    #[tokio::test]
+    async fn trunk_and_supplementary_teardown_are_independent_per_line() {
+        let line_a = LineRuntime::new(
+            binding("line-a", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        let line_b = LineRuntime::new(
+            binding("line-b", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        let profile = TrunkProfileConfig {
+            enabled: true,
+            registration_mode: crate::platform::config::TrunkRegistrationMode::StaticPeer,
+            asterisk_host: "127.0.0.1".to_string(),
+            local_port: 5098,
+            ..Default::default()
+        };
+        line_a.trunk.apply_profile(&profile).await;
+        line_b.trunk.apply_profile(&profile).await;
+        let line_b_generation = line_b.trunk.generation();
+        let line_a_operator = line_a.voice_access.operator_link();
+        let line_b_operator = line_b.voice_access.operator_link();
+        line_a_operator.set_video_enabled(true);
+        line_a_operator.media_metrics().record_rtp_to_asterisk(160);
+        line_a
+            .supplementary
+            .begin_mwi_subscription(
+                crate::connectivity::core::registration::ImsRegistrationAccess::Volte,
+            )
+            .await;
+        line_b
+            .supplementary
+            .begin_mwi_subscription(
+                crate::connectivity::core::registration::ImsRegistrationAccess::Vowifi,
+            )
+            .await;
+
+        line_a
+            .trunk
+            .apply_profile(&TrunkProfileConfig::default())
+            .await;
+        line_a
+            .supplementary
+            .clear_registration(
+                crate::connectivity::core::registration::ImsRegistrationAccess::Volte,
+            )
+            .await;
+
+        assert_eq!(line_a.trunk.status().await.phase, "disabled");
+        assert_eq!(line_b.trunk.status().await.phase, "configured");
+        assert_eq!(line_b.trunk.generation(), line_b_generation);
+        assert_eq!(line_a_operator.diagnostics().rtp_to_asterisk_packets, 1);
+        assert_eq!(line_b_operator.diagnostics().rtp_to_asterisk_packets, 0);
+        assert!(line_a_operator.video_enabled());
+        assert!(!line_b_operator.video_enabled());
+        assert!(
+            !line_a
+                .supplementary
+                .snapshot()
+                .await
+                .mwi_capability
+                .supported
+        );
+        assert!(
+            line_b
+                .supplementary
+                .snapshot()
+                .await
+                .mwi_capability
+                .supported
+        );
     }
 }

@@ -473,14 +473,7 @@ async fn maybe_scan_sms_paths(
         );
         return;
     }
-    scan_sms_paths(
-        context,
-        modem_path,
-        reason,
-        forward_new_sms,
-        &line_id,
-    )
-    .await;
+    scan_sms_paths(context, modem_path, reason, forward_new_sms, &line_id).await;
 }
 
 async fn scan_all_modems_or_rebind(
@@ -721,8 +714,7 @@ mod tests {
 
     #[test]
     fn only_ready_ims_runtime_on_the_same_line_pauses_cs_sms() {
-        let mut line_a =
-            LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        let mut line_a = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         line_a.vowifi.enabled = true;
 
         assert!(!ims_sms_owns_reception(&line_a, false, false));

@@ -20,12 +20,12 @@ use zbus::Connection;
 
 use crate::{
     api::models::*,
-    connectivity::modems::softstack::vowifi::diagnostics::{
+    connectivity::modems::ims::vowifi::diagnostics::{
         self as vowifi_diagnostics, VowifiDiagnosticsResponse, VowifiProfilesResponse,
         VowifiStatusResponse,
     },
-    connectivity::modems::softstack::vowifi::restore::RestorePhase,
-    connectivity::modems::softstack::vowifi::{
+    connectivity::modems::ims::vowifi::restore::RestorePhase,
+    connectivity::modems::ims::vowifi::{
         live::{
             clear_live_runtime_for_line, place_live_voice_call_for_line,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
@@ -43,15 +43,15 @@ use crate::{
         list_apn_contexts_for_modem, list_current_calls_for_modem, make_call_on_modem,
         power_cycle_sim_for_profile_switch_via_modem, register_operator_for_modem,
         request_operator_registration_for_modem, restart_baseband_via_modem,
-        scan_operators_for_modem, send_sms_via_modem, set_apn_on_bearer, set_band_lock_for_modem,
-        send_call_dtmf_on_modem, set_call_waiting_for_modem, set_radio_mode_for_modem,
+        scan_operators_for_modem, send_call_dtmf_on_modem, send_sms_via_modem, set_apn_on_bearer,
+        set_band_lock_for_modem, set_call_waiting_for_modem, set_radio_mode_for_modem,
         sim_identity_for_modem, start_cell_monitoring_for_modem, stop_cell_monitoring_for_modem,
     },
     hardware::sim::esim::EsimApiError,
     platform::config::{
-        AccessPathKind, ApnConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
-        MidFlightDisablePolicy, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
-        AutoRestoreConfig, VilteConfig, VoicePathPolicy,
+        AccessPathKind, ApnConfig, AutoRestoreConfig, ImsVideoConfig, LineDataProxyConfig,
+        LineProfileConfig, LineVowifiConfig, MidFlightDisablePolicy, SmsPathPolicy,
+        StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -1315,10 +1315,7 @@ fn binding_has_baseband(binding: &crate::hardware::cellular::modem_manager::Mode
 /// Resolve an actual cellular voice line. Standalone SIM readers can run
 /// VoWiFi, but they do not own a ModemManager voice interface and must never
 /// fall through to another line's baseband.
-async fn resolve_call_line(
-    app: &AppState,
-    line_id: &str,
-) -> Result<(String, String), String> {
+async fn resolve_call_line(app: &AppState, line_id: &str) -> Result<(String, String), String> {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let line_id = line_id.trim();
     if line_id.is_empty() {
@@ -2951,7 +2948,7 @@ pub(crate) async fn suspend_line_runtime_for_hotplug(
         line.data_proxy.stop().await;
         line.secondary_data.stop().await;
         let _connect_guard = line.volte_connect_lock.lock().await;
-        crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+        crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
             &line.volte_live,
             &line.volte,
             "volte_line_not_present",
@@ -2989,10 +2986,10 @@ async fn prepare_line_data_slot_for_volte(
     line: &Arc<crate::services::line_registry::LineRuntime>,
     profile: &LineProfileConfig,
 ) -> Result<
-    crate::connectivity::modems::softstack::volte::data_slot::DataSlotMode,
-    crate::connectivity::modems::softstack::volte::VolteError,
+    crate::connectivity::modems::ims::volte::data_slot::DataSlotMode,
+    crate::connectivity::modems::ims::volte::VolteError,
 > {
-    use crate::connectivity::modems::softstack::volte::data_slot::{
+    use crate::connectivity::modems::ims::volte::data_slot::{
         select_data_slot_mode, DataSlotInputs, DataSlotMode,
     };
 
@@ -3223,7 +3220,7 @@ pub async fn set_line_roaming_handler(
         if status.registered {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
-            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+            crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
                 &line.volte_live,
                 &line.volte,
                 "line_roaming_policy_changed",
@@ -3282,7 +3279,7 @@ pub async fn set_line_airplane_mode_handler(
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         stop_line_data_runtime_locked(&app, &line).await;
         let _volte_guard = line.volte_connect_lock.lock().await;
-        crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+        crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
             &line.volte_live,
             &line.volte,
             "line_airplane_mode_enabled",
@@ -3515,7 +3512,7 @@ fn spawn_vowifi_sms_followup_persist(
     app: AppState,
     line_id: String,
     mut followup: tokio::sync::mpsc::UnboundedReceiver<
-        crate::connectivity::modems::softstack::vowifi::live::LiveSmsFollowupFrame,
+        crate::connectivity::modems::ims::vowifi::live::LiveSmsFollowupFrame,
     >,
 ) {
     tokio::spawn(async move {
@@ -3830,26 +3827,22 @@ async fn send_sms_over_volte_path(
         return Err("line_volte_connection_disabled".to_string());
     }
     if !line.volte.status().await.registered {
-        let ip_families = app
-            .config_manager
-            .get_line_volte_ip_families(line_id);
+        let (_, sim_override) = ims_override_for_line(app, line_id).await?;
+        let ip_families = app.config_manager.get_line_volte_ip_families(line_id);
         let device =
-            crate::connectivity::modems::softstack::volte::live::VolteDeviceBinding::from_modem(
-                &binding,
-            )
-            .map_err(|error| error.to_string())?;
+            crate::connectivity::modems::ims::volte::live::VolteDeviceBinding::from_modem(&binding)
+                .map_err(|error| error.to_string())?;
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile)
             .await
             .map_err(|error| error.to_string())?;
         let _guard = line.volte_connect_lock.lock().await;
         if !line.volte.status().await.registered {
-            crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
+            crate::connectivity::modems::ims::volte::live::connect_live_for_line(
                 &line.volte_live,
                 &device,
                 &line.volte,
-                app.config_manager
-                    .get_line_volte_voice_enabled(line_id),
+                app.config_manager.get_line_volte_voice_enabled(line_id),
                 &ip_families,
                 profile.roaming_allowed,
                 data_slot_mode,
@@ -3857,7 +3850,7 @@ async fn send_sms_over_volte_path(
                     .get_line_sms_path_policy(line_id)
                     .dedupe_enabled,
                 profile_store(app),
-                profile.vowifi.profile_id.clone(),
+                sim_override,
                 Arc::clone(&app.database),
                 Arc::clone(&app.notification_sender),
             )
@@ -3869,7 +3862,7 @@ async fn send_sms_over_volte_path(
         get_sim_info_for_modem_with_cache(&app.dbus_conn, &binding.modem_path, Some(&app.database))
             .await
             .map_err(|error| error.to_string())?;
-    let result = crate::connectivity::modems::softstack::volte::live::send_live_sms_for_line(
+    let result = crate::connectivity::modems::ims::volte::live::send_live_sms_for_line(
         &line.volte_live,
         &line.volte,
         &payload.phone_number,
@@ -3943,7 +3936,7 @@ async fn send_sms_over_cs_path(
 /// (ringing, answer, hangup). Mirrors `spawn_vowifi_sms_followup_persist`.
 fn spawn_vowifi_call_followup(
     mut followup: tokio::sync::mpsc::UnboundedReceiver<
-        crate::connectivity::modems::softstack::vowifi::live::LiveCallFollowupFrame,
+        crate::connectivity::modems::ims::vowifi::live::LiveCallFollowupFrame,
     >,
 ) {
     tokio::spawn(async move {
@@ -3987,16 +3980,10 @@ pub async fn place_call_handler(
     if !scope.is_present() {
         return (
             StatusCode::CONFLICT,
-            Json(ApiResponse::<serde_json::Value>::error(
-                "line_not_present",
-            )),
+            Json(ApiResponse::<serde_json::Value>::error("line_not_present")),
         );
     }
-    if !app
-        .config_manager
-        .get_line_profile(scope.line_id())
-        .enabled
-    {
+    if !app.config_manager.get_line_profile(scope.line_id()).enabled {
         return (
             StatusCode::CONFLICT,
             Json(ApiResponse::<serde_json::Value>::error("line_disabled")),
@@ -4501,9 +4488,8 @@ async fn reconcile_finished_calls(
 
 pub fn spawn_call_monitor(app: AppState) {
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            CALL_MONITOR_INTERVAL_SECS,
-        ));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(CALL_MONITOR_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             interval.tick().await;
@@ -4808,16 +4794,16 @@ pub async fn send_line_call_dtmf_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<SendCallDtmfRequest>,
 ) -> impl IntoResponse {
-    let (line_id, modem_path, call) =
-        match resolve_call_owner(&app, &line_id, &payload.path).await {
-            Ok(owner) => owner,
-            Err(reason) => {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::<serde_json::Value>::error(reason)),
-                )
-            }
-        };
+    let (line_id, modem_path, call) = match resolve_call_owner(&app, &line_id, &payload.path).await
+    {
+        Ok(owner) => owner,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            )
+        }
+    };
     if !matches!(call.state.as_str(), "active" | "held") {
         return (
             StatusCode::OK,
@@ -4826,13 +4812,7 @@ pub async fn send_line_call_dtmf_handler(
             )),
         );
     }
-    match send_call_dtmf_on_modem(
-        &app.dbus_conn,
-        &modem_path,
-        &payload.path,
-        &payload.digit,
-    )
-    .await
+    match send_call_dtmf_on_modem(&app.dbus_conn, &modem_path, &payload.path, &payload.digit).await
     {
         Ok(()) => (
             StatusCode::OK,
@@ -5129,7 +5109,7 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
 #[derive(Clone)]
 pub struct VowifiScope {
     line: Arc<crate::services::line_registry::LineRuntime>,
-    runtime: Arc<crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime>,
+    runtime: Arc<crate::connectivity::modems::ims::vowifi::runtime::VowifiRuntime>,
     line_id: String,
 }
 
@@ -5160,9 +5140,7 @@ impl VowifiScope {
         &self.line_id
     }
 
-    fn runtime(
-        &self,
-    ) -> &Arc<crate::connectivity::modems::softstack::vowifi::runtime::VowifiRuntime> {
+    fn runtime(&self) -> &Arc<crate::connectivity::modems::ims::vowifi::runtime::VowifiRuntime> {
         &self.runtime
     }
 
@@ -5380,15 +5358,11 @@ impl VowifiRestoreWorkflow {
         Self {
             trigger: VowifiRestoreTrigger::BootAutoRestore,
             line_id,
-            initial_delay: Duration::from_secs(
-                config.initial_delay_secs.clamp(30, 300),
-            ),
+            initial_delay: Duration::from_secs(config.initial_delay_secs.clamp(30, 300)),
             attempts: config.attempts.clamp(1, 5),
             retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
             connect_attempts: config.attempts.clamp(1, 5),
-            connect_retry_delay: Duration::from_secs(
-                config.retry_delay_secs.clamp(10, 180),
-            ),
+            connect_retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
             start_reason: "vowifi_auto_restore_start",
             disabled_reason: "vowifi_auto_restore_connection_disabled",
             fallback_reason: "vowifi_auto_restore_failed_cellular_fallback",
@@ -5821,16 +5795,32 @@ async fn connect_vowifi_on_line(
     if !scope.is_present() {
         return disabled_vowifi_status("vowifi_line_not_present");
     }
+    let current = scope.status().await;
+    if current.readiness.sms_ready {
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
+        return current;
+    }
+
+    // Resolve and publish SIM-bound values only after proving that this call is
+    // starting a new session. PATCHing SimOverrideStore while a session is
+    // active therefore cannot alter its IKE/REGISTER refresh behavior.
     {
         let line_id = scope.line_id().to_string();
-        // The ePDG endpoint now comes solely from the resolved carrier profile
-        // (auto-matched or pinned via `profile_id`); the line only carries DNS and
-        // proxy overrides, so this is applied as-is.
         let line_config = app.config_manager.get_line_profile(&line_id).vowifi;
+        let (_, sim_override) = match ims_override_for_line(app, &line_id).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                let mut status = disabled_vowifi_status("vowifi_sim_override_not_ready");
+                status.degraded_reason = Some(error);
+                persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+                return status;
+            }
+        };
         if let Err(error) =
-            crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(
+            crate::connectivity::modems::ims::vowifi::live::configure_live_network_overrides(
                 &line_id,
                 &line_config,
+                Some(&sim_override),
             )
         {
             let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
@@ -5838,12 +5828,6 @@ async fn connect_vowifi_on_line(
             persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
             return status;
         }
-    }
-
-    let current = scope.status().await;
-    if current.readiness.sms_ready {
-        persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
-        return current;
     }
 
     let Some(_connect_guard) = scope.try_connect_lock() else {
@@ -5956,7 +5940,7 @@ pub struct VolteControlToggleRequest {
 pub struct VolteLineControlResponse {
     pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
     pub profile: LineProfileConfig,
-    pub runtime: crate::connectivity::modems::softstack::volte::VolteRuntimeStatus,
+    pub runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -6096,14 +6080,24 @@ pub async fn set_vowifi_line_connection_handler(
             Json(ApiResponse::error("line_not_present")),
         );
     }
-    // Validate and publish this line's network overrides. Overrides are keyed per
-    // line, so a bad proxy or DNS value is rejected for the line it belongs to.
+    // Validate the future connection snapshot without replacing an active
+    // session's immutable values. Publication happens inside the connect lock.
     if payload.enabled {
         let mut next = app.config_manager.get_line_profile(&line_id).vowifi;
         next.enabled = true;
+        let (_, sim_override) = match ims_override_for_line(&app, &line_id).await {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiResponse::error(format!("Failed: {error}"))),
+                );
+            }
+        };
         if let Err(error) =
-            crate::connectivity::modems::softstack::vowifi::live::configure_live_network_overrides(
-                &line_id, &next,
+            crate::connectivity::modems::ims::vowifi::live::validate_live_network_overrides(
+                &next,
+                Some(&sim_override),
             )
         {
             return (
@@ -6113,9 +6107,7 @@ pub async fn set_vowifi_line_connection_handler(
         }
     } else {
         // Drop the overrides so a disabled line stops influencing anything.
-        crate::connectivity::modems::softstack::vowifi::live::forget_live_network_overrides(
-            &line_id,
-        );
+        crate::connectivity::modems::ims::vowifi::live::forget_live_network_overrides(&line_id);
     }
     if let Err(error) = app
         .config_manager
@@ -6382,8 +6374,8 @@ pub async fn set_volte_line_connection_handler(
         }
     };
     let result: Result<
-        crate::connectivity::modems::softstack::volte::VolteRuntimeStatus,
-        crate::connectivity::modems::softstack::volte::VolteError,
+        crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+        crate::connectivity::modems::ims::volte::VolteError,
     > = if payload.enabled {
         start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
         Ok(line.volte.status().await)
@@ -6391,7 +6383,7 @@ pub async fn set_volte_line_connection_handler(
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         let _guard = line.volte_connect_lock.lock().await;
         Ok(
-            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+            crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
                 &line.volte_live,
                 &line.volte,
                 "volte_line_connection_disabled",
@@ -6460,7 +6452,7 @@ pub async fn set_volte_line_ip_families_handler(
         {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             let _guard = line.volte_connect_lock.lock().await;
-            crate::connectivity::modems::softstack::volte::live::disconnect_live_for_line(
+            crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
                 &line.volte_live,
                 &line.volte,
                 "volte_ip_families_changed",
@@ -6681,28 +6673,28 @@ async fn resolve_control_line(
 fn line_volte_enabled(app: &AppState, line: &crate::services::line_registry::LineRuntime) -> bool {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    binding.present
-        && profile.enabled
-        && profile.volte_connection_enabled
+    binding.present && profile.enabled && profile.volte_connection_enabled
 }
 
 async fn sync_line_video_capabilities(app: &AppState) {
     for line in app.line_registry.all().await {
         let line_id = line.binding().line_id;
         let line_enabled = line_volte_enabled(app, &line);
-        let voice_enabled = app
-            .config_manager
-            .get_line_volte_voice_enabled(&line_id);
-        let vilte = app.config_manager.get_line_vilte_config(&line_id);
+        let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
+        let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
         let registered = line.volte.status().await.registered;
         line.volte_live
             .operator_link()
             .set_ready(line_enabled && voice_enabled && registered);
-        line.voice_access
-            .set_backend_video_enabled(
-                AccessPathKind::Volte,
-                line_enabled && voice_enabled && vilte.feature_enabled,
-            );
+        line.voice_access.set_backend_video_enabled(
+            AccessPathKind::Volte,
+            line_enabled && voice_enabled && ims_video.volte_enabled,
+        );
+        let vowifi = app.config_manager.get_line_profile(&line_id).vowifi;
+        line.voice_access.set_backend_video_enabled(
+            AccessPathKind::Vowifi,
+            vowifi.enabled && ims_video.vowifi_enabled,
+        );
     }
 }
 
@@ -6722,12 +6714,7 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(
-        line_id: String,
-        line_enabled: bool,
-        voice_enabled: bool,
-        registered: bool,
-    ) -> Self {
+    fn build(line_id: String, line_enabled: bool, voice_enabled: bool, registered: bool) -> Self {
         Self {
             line_id,
             enabled: line_enabled && voice_enabled,
@@ -6750,8 +6737,7 @@ async fn current_volte_voice_status(
     VolteVoiceStatusResponse::build(
         line_id.clone(),
         line_volte_enabled(app, line),
-        app.config_manager
-            .get_line_volte_voice_enabled(&line_id),
+        app.config_manager.get_line_volte_voice_enabled(&line_id),
         registered,
     )
 }
@@ -6875,31 +6861,31 @@ pub async fn set_sms_path_policy_handler(
 #[derive(Debug, serde::Serialize, Default)]
 pub struct VilteStatusResponse {
     pub line_id: String,
+    /// Whether VoLTE video is effectively available (config + voice + ready).
     pub enabled: bool,
+    /// Whether the VoLTE video gate is enabled in config (independent of ready).
     pub feature_enabled: bool,
     pub registered: bool,
     pub gateway_mode: bool,
     pub local_video_capable: bool,
-    pub config: VilteConfig,
+    pub config: ImsVideoConfig,
 }
 
 impl VilteStatusResponse {
     async fn build(app: &AppState, line: &crate::services::line_registry::LineRuntime) -> Self {
         let line_id = line.binding().line_id;
-        let vilte = app.config_manager.get_line_vilte_config(&line_id);
+        let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
         let voice_ready = line_volte_enabled(app, line)
-            && app
-                .config_manager
-                .get_line_volte_voice_enabled(&line_id);
+            && app.config_manager.get_line_volte_voice_enabled(&line_id);
         Self {
             line_id,
-            enabled: voice_ready && vilte.feature_enabled,
-            feature_enabled: vilte.feature_enabled,
+            enabled: voice_ready && ims_video.volte_enabled,
+            feature_enabled: ims_video.volte_enabled,
             registered: line.volte.status().await.registered,
             // Qualcomm 410 pocket-WiFi has no camera/display/codec: relay only.
             gateway_mode: true,
             local_video_capable: false,
-            config: vilte,
+            config: ims_video,
         }
     }
 }
@@ -6936,7 +6922,7 @@ pub async fn set_vilte_feature_handler(
     };
     match app
         .config_manager
-        .set_line_vilte_feature_enabled(&line_id, payload.enabled)
+        .set_line_ims_video_volte_enabled(&line_id, payload.enabled)
     {
         Ok(_) => {
             sync_line_video_capabilities(&app).await;
@@ -6955,13 +6941,14 @@ pub async fn set_vilte_feature_handler(
     }
 }
 
-/// Replace the full ViLTE config (codec / payload type / fmtp). The
-/// `feature_enabled` field is honored only when VoLTE voice is enabled;
-/// otherwise it is forced off by the config layer.
+/// Replace the full IMS video config (codec / payload type / fmtp). The
+/// `volte_enabled` gate is honored only when VoLTE voice is enabled, and
+/// `vowifi_enabled` only when VoWiFi voice is enabled; otherwise each gate is
+/// forced off by the config layer.
 pub async fn set_vilte_config_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<VilteConfig>,
+    Json(payload): Json<ImsVideoConfig>,
 ) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
     let Some(line) = resolve_control_line(&app, &line_id).await else {
         return (
@@ -6971,7 +6958,7 @@ pub async fn set_vilte_config_handler(
     };
     match app
         .config_manager
-        .set_line_vilte_config(&line_id, payload)
+        .set_line_ims_video_config(&line_id, payload)
     {
         Ok(_) => {
             sync_line_video_capabilities(&app).await;
@@ -7003,15 +6990,14 @@ pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<Vowi
     )
 }
 
-// ===================== VoWiFi carrier profile database =====================
+// ===================== VoWiFi carrier profile store =====================
 
 fn profile_store(
     app: &AppState,
-) -> crate::connectivity::modems::softstack::vowifi::profile_store::ProfileStore {
-    crate::connectivity::modems::softstack::vowifi::profile_store::ProfileStore::with_catalog(
-        Arc::clone(&app.database),
-        Arc::clone(&app.carrier_catalog),
-    )
+) -> crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore {
+    crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::with_catalog(Arc::clone(
+        &app.carrier_catalog,
+    ))
 }
 
 /// GET /api/vowifi/carrier-profiles
@@ -7019,11 +7005,7 @@ pub async fn list_vowifi_carrier_profiles_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<
-        ApiResponse<
-            Vec<crate::connectivity::modems::softstack::vowifi::profile_store::StoredProfile>,
-        >,
-    >,
+    Json<ApiResponse<Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>>>,
 ) {
     match profile_store(&app).list() {
         Ok(profiles) => (
@@ -7034,62 +7016,10 @@ pub async fn list_vowifi_carrier_profiles_handler(
     }
 }
 
-/// PUT /api/vowifi/carrier-profiles
-///
-/// Insert or replace one profile. The body is the full profile document; the
-/// record is validated before it is stored so a bad edit is rejected here
-/// rather than surfacing later as a failed IKE or REGISTER exchange.
-pub async fn save_vowifi_carrier_profile_handler(
-    State(app): State<AppState>,
-    Json(record): Json<
-        crate::connectivity::modems::softstack::vowifi::profile_record::CarrierProfileRecord,
-    >,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    match profile_store(&app).save(&record, "manual") {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                json!({
-                    "profile_id": record.meta.profile_id,
-                    "plmn": record.meta.plmn,
-                    // Lets the UI prompt for emergency setup where it matters
-                    // without blocking carriers that do not need it.
-                    "e911_expected": record.e911_expected(),
-                }),
-            )),
-        ),
-        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
-    }
-}
-
-/// DELETE /api/vowifi/carrier-profiles/{profile_id}
-///
-/// Removing a local override falls back to the carrier catalog for that PLMN.
-pub async fn delete_vowifi_carrier_profile_handler(
-    State(app): State<AppState>,
-    Path(profile_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    match profile_store(&app).delete(&profile_id) {
-        Ok(true) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                json!({ "deleted": true }),
-            )),
-        ),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("profile_not_found")),
-        ),
-        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
-    }
-}
-
 /// GET /api/vowifi/carrier-profiles/resolve?plmn=23433
 ///
 /// Show which profile a PLMN actually resolves to and where it came from
-/// (local database override / carrier catalog).
+/// (carrier catalog).
 pub async fn resolve_vowifi_carrier_profile_handler(
     State(app): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
@@ -7112,7 +7042,7 @@ pub async fn resolve_vowifi_carrier_profile_handler(
     let (mcc, mnc) = plmn.split_at(3);
     match profile_store(&app).resolve_by_plmn(mcc, mnc) {
         Some(resolved) => {
-            let record = crate::connectivity::modems::softstack::vowifi::profile_record::CarrierProfileRecord::from_profile(
+            let record = crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord::from_profile(
                 resolved.profile,
             );
             (
@@ -7130,167 +7060,6 @@ pub async fn resolve_vowifi_carrier_profile_handler(
         None => (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("profile_not_resolvable")),
-        ),
-    }
-}
-
-#[derive(Deserialize)]
-pub struct VowifiProfileImportRequest {
-    /// `aosp_apns`, `aosp_carrier_config` or `ipcc`.
-    pub format: String,
-    /// The raw document (XML for all three formats).
-    pub content: String,
-    /// Required for `aosp_carrier_config` and `ipcc`, which do not carry the
-    /// PLMN inside the document.
-    #[serde(default)]
-    pub mcc: Option<String>,
-    #[serde(default)]
-    pub mnc: Option<String>,
-    /// Preview only; nothing is written unless this is false.
-    #[serde(default)]
-    pub dry_run: bool,
-}
-
-/// POST /api/vowifi/carrier-profiles/import
-///
-/// Import carrier facts from a public source. Imported values can only overlay
-/// a complete carrier-catalog profile; partial source data never creates IMS or
-/// ePDG configuration by derivation.
-pub async fn import_vowifi_carrier_profiles_handler(
-    State(app): State<AppState>,
-    Json(payload): Json<VowifiProfileImportRequest>,
-) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
-    use crate::connectivity::modems::softstack::vowifi::profile_import;
-
-    let facts = match payload.format.as_str() {
-        "aosp_apns" => profile_import::parse_aosp_apns(&payload.content),
-        "aosp_carrier_config" | "ipcc" => {
-            let (Some(mcc), Some(mnc)) = (payload.mcc.as_deref(), payload.mnc.as_deref()) else {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(ApiResponse::error("mcc_and_mnc_required_for_this_format")),
-                );
-            };
-            let parsed = if payload.format == "ipcc" {
-                profile_import::parse_ipcc_carrier_plist(&payload.content, mcc, mnc)
-            } else {
-                profile_import::parse_aosp_carrier_config(&payload.content, mcc, mnc)
-            };
-            vec![parsed]
-        }
-        _ => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(ApiResponse::error("unsupported_import_format")),
-            )
-        }
-    };
-
-    let store = profile_store(&app);
-    let mut imported = Vec::new();
-    let mut skipped = Vec::new();
-    for fact in &facts {
-        let Some(base) = store.resolve_by_plmn(&fact.mcc, &fact.mnc) else {
-            skipped.push(json!({ "plmn": fact.plmn(), "reason": "carrier_catalog_profile_not_found" }));
-            continue;
-        };
-        let base = crate::connectivity::modems::softstack::vowifi::profile_record::CarrierProfileRecord::from_profile(base.profile);
-        let Some(record) = fact.to_record(&base) else {
-            skipped.push(json!({ "plmn": fact.plmn(), "reason": "invalid_or_mismatched_plmn" }));
-            continue;
-        };
-        if let Err(error) = record.validate() {
-            skipped.push(json!({ "plmn": fact.plmn(), "reason": error }));
-            continue;
-        }
-        if !payload.dry_run {
-            if let Err(error) = store.save(&record, &payload.format) {
-                skipped.push(json!({ "plmn": fact.plmn(), "reason": error }));
-                continue;
-            }
-        }
-        imported.push(json!({
-            "profile_id": record.meta.profile_id,
-            "plmn": record.meta.plmn,
-            "brand": record.meta.brand,
-            "ims_apn": record.epdg.apn,
-            "vowifi_supported": fact.vowifi_supported,
-            "e911_expected": record.e911_expected(),
-        }));
-    }
-
-    (
-        StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "Success",
-            json!({
-                "dry_run": payload.dry_run,
-                "imported": imported,
-                "skipped": skipped,
-            }),
-        )),
-    )
-}
-
-/// GET /api/vowifi/external-profiles
-///
-/// Legacy view of the carrier profile database, kept so the per-line dialog's
-/// "apply a saved ePDG" shortcut keeps working. Custom profiles are no longer a
-/// separate `vowifi-profiles.conf` file — they are rows in the database.
-pub async fn get_external_vowifi_profiles_handler(
-    State(app): State<AppState>,
-) -> (
-    StatusCode,
-    Json<ApiResponse<Vec<crate::platform::config::ExternalVowifiProfile>>>,
-) {
-    match profile_store(&app).list_as_external() {
-        Ok(profiles) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", profiles)),
-        ),
-        Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
-    }
-}
-
-/// POST /api/vowifi/external-profiles
-///
-/// Apply an ePDG override. It is expanded into a full profile row: an existing
-/// row is edited in place so any REGISTER policy already tuned there survives.
-pub async fn set_external_vowifi_profile_handler(
-    State(app): State<AppState>,
-    Json(mut payload): Json<crate::platform::config::ExternalVowifiProfile>,
-) -> (
-    StatusCode,
-    Json<ApiResponse<Vec<crate::platform::config::ExternalVowifiProfile>>>,
-) {
-    payload.profile_id = payload.profile_id.trim().to_string();
-    payload.mcc = payload.mcc.trim().to_string();
-    payload.mnc = payload.mnc.trim().to_string();
-    payload.epdg_host = payload.epdg_host.trim().trim_end_matches('.').to_string();
-    if payload.profile_id.is_empty()
-        || payload.mcc.len() != 3
-        || payload.mnc.len() < 2
-        || payload.mnc.len() > 3
-        || payload.epdg_host.is_empty()
-        || payload.epdg_port == 0
-    {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error("vowifi_external_profile_invalid")),
-        );
-    }
-    let store = profile_store(&app);
-    match store
-        .save_external(&payload)
-        .and_then(|_| store.list_as_external())
-    {
-        Ok(profiles) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", profiles)),
-        ),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(ApiResponse::error(format!("Failed: {error}"))),
         ),
     }
 }
@@ -7448,18 +7217,16 @@ async fn start_line_volte_restore(
             .attempts
             .clamp(1, 5),
     );
-    let voice_enabled = app
-        .config_manager
-        .get_line_volte_voice_enabled(&line_id);
-    let vilte = app.config_manager.get_line_vilte_config(&line_id);
-    line.voice_access
-        .set_backend_video_enabled(
-            AccessPathKind::Volte,
-            voice_enabled && vilte.feature_enabled,
-        );
+    let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
+    let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
+    line.voice_access.set_backend_video_enabled(
+        AccessPathKind::Volte,
+        voice_enabled && ims_video.volte_enabled,
+    );
     line.volte
         .update(|state| {
-            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Connecting;
+            state.recovery_state =
+                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
             state.recovery_source = Some(source.to_string());
             state.retry_attempt = 0;
             state.retry_max = retry_max;
@@ -7505,10 +7272,10 @@ async fn wait_for_line_modem(
         }
         line.volte
             .update(|state| {
-                state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
-                state.stage = crate::connectivity::modems::softstack::volte::runtime::VolteStage::Modem;
+                state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
                 state.recovery_state =
-                    crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::WaitingModem;
+                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
                 state.last_error = Some(format!(
                     "volte_modem_missing_wait:{}/{}",
                     poll + 1,
@@ -7529,8 +7296,9 @@ async fn wait_for_line_modem(
     // let the inventory reconciler start a fresh batch after hotplug.
     line.volte
         .update(|state| {
-            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
-            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::WaitingModem;
+            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state =
+                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
             state.manual_retry_available = false;
             state.next_retry_at = None;
             state.last_error = Some("volte_line_not_present".to_string());
@@ -7549,7 +7317,8 @@ async fn run_line_volte_restore_batch(
         LineModemWait::Cancelled => {
             line.volte
                 .update(|state| {
-                    state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_state =
+                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -7570,7 +7339,8 @@ async fn run_line_volte_restore_batch(
         if !profile.enabled || !profile.volte_connection_enabled {
             line.volte
                 .update(|state| {
-                    state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Idle;
+                    state.recovery_state =
+                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -7586,19 +7356,22 @@ async fn run_line_volte_restore_batch(
             }
         }
         let binding = line.binding();
-        let device = match crate::connectivity::modems::softstack::volte::live::VolteDeviceBinding::from_modem(&binding) {
-            Ok(device) => device,
-            Err(error) => {
-                line.volte
-                    .update(|state| state.last_error = Some(error.to_string()))
-                    .await;
-                continue;
-            }
-        };
+        let device =
+            match crate::connectivity::modems::ims::volte::live::VolteDeviceBinding::from_modem(
+                &binding,
+            ) {
+                Ok(device) => device,
+                Err(error) => {
+                    line.volte
+                        .update(|state| state.last_error = Some(error.to_string()))
+                        .await;
+                    continue;
+                }
+            };
         line.volte
             .update(|state| {
                 state.recovery_state =
-                    crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Connecting;
+                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
                 state.recovery_source = Some(source.to_string());
                 state.retry_attempt = attempt;
                 state.next_retry_at = None;
@@ -7610,33 +7383,41 @@ async fn run_line_volte_restore_batch(
         let result = {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
             match prepare_line_data_slot_for_volte(app, line, &profile).await {
-                Ok(data_slot_mode) => {
-                    let _guard = line.volte_connect_lock.lock().await;
-                    if line.volte.status().await.registered {
-                        return;
+                Ok(data_slot_mode) => match ims_override_for_line(app, &binding.line_id).await {
+                    Err(error) => Err(
+                        crate::connectivity::modems::ims::volte::VolteError::with_detail(
+                            "volte_sim_override_not_ready",
+                            error,
+                        ),
+                    ),
+                    Ok((_, sim_override)) => {
+                        let _guard = line.volte_connect_lock.lock().await;
+                        if line.volte.status().await.registered {
+                            return;
+                        }
+                        let ip_families = app
+                            .config_manager
+                            .get_line_volte_ip_families(&binding.line_id);
+                        crate::connectivity::modems::ims::volte::live::connect_live_for_line(
+                            &line.volte_live,
+                            &device,
+                            &line.volte,
+                            app.config_manager
+                                .get_line_volte_voice_enabled(&binding.line_id),
+                            &ip_families,
+                            profile.roaming_allowed,
+                            data_slot_mode,
+                            app.config_manager
+                                .get_line_sms_path_policy(&binding.line_id)
+                                .dedupe_enabled,
+                            profile_store(app),
+                            sim_override,
+                            Arc::clone(&app.database),
+                            Arc::clone(&app.notification_sender),
+                        )
+                        .await
                     }
-                    let ip_families = app
-                        .config_manager
-                        .get_line_volte_ip_families(&binding.line_id);
-                    crate::connectivity::modems::softstack::volte::live::connect_live_for_line(
-                        &line.volte_live,
-                        &device,
-                        &line.volte,
-                        app.config_manager
-                            .get_line_volte_voice_enabled(&binding.line_id),
-                        &ip_families,
-                        profile.roaming_allowed,
-                        data_slot_mode,
-                        app.config_manager
-                            .get_line_sms_path_policy(&binding.line_id)
-                            .dedupe_enabled,
-                        profile_store(app),
-                        profile.vowifi.profile_id.clone(),
-                        Arc::clone(&app.database),
-                        Arc::clone(&app.notification_sender),
-                    )
-                    .await
-                }
+                },
                 Err(error) => Err(error),
             }
         };
@@ -7645,7 +7426,7 @@ async fn run_line_volte_restore_batch(
                 line.volte
                     .update(|state| {
                         state.recovery_state =
-                            crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Registered;
+                            crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Registered;
                         state.manual_retry_available = false;
                         state.next_retry_at = None;
                     })
@@ -7659,9 +7440,9 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if crate::connectivity::modems::softstack::volte::plan::FailureClass::from_details(
+                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_details(
                     error.detail().unwrap_or_default(),
-                ) == crate::connectivity::modems::softstack::volte::plan::FailureClass::BasebandWedged
+                ) == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
                 {
                     warn!(
                         line_id = %binding.line_id,
@@ -7670,9 +7451,9 @@ async fn run_line_volte_restore_batch(
                     );
                     line.volte
                         .update(|state| {
-                            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
+                            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
                             state.recovery_state =
-                                crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Exhausted;
+                                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
                             state.manual_retry_available = true;
                             state.next_retry_at = None;
                             state.last_error = Some(format!("volte_baseband_wedged:{error}"));
@@ -7694,8 +7475,9 @@ async fn run_line_volte_restore_batch(
 
     line.volte
         .update(|state| {
-            state.phase = crate::connectivity::modems::softstack::volte::runtime::VoltePhase::Degraded;
-            state.recovery_state = crate::connectivity::modems::softstack::volte::runtime::VolteRecoveryState::Exhausted;
+            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+            state.recovery_state =
+                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
             state.manual_retry_available = true;
             state.next_retry_at = None;
             if state.last_error.is_none() {
@@ -7720,7 +7502,9 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                 .filter(|profile| profile.enabled && profile.volte_connection_enabled)
             {
                 if started_at.elapsed()
-                    < Duration::from_secs(profile.volte_auto_restore.initial_delay_secs.clamp(5, 300))
+                    < Duration::from_secs(
+                        profile.volte_auto_restore.initial_delay_secs.clamp(5, 300),
+                    )
                 {
                     continue;
                 }
@@ -7744,11 +7528,7 @@ pub fn spawn_volte_auto_restore(app: AppState) {
     });
 }
 
-fn persist_vowifi_runtime_snapshot(
-    app: &AppState,
-    line_id: &str,
-    status: &VowifiStatusResponse,
-) {
+fn persist_vowifi_runtime_snapshot(app: &AppState, line_id: &str, status: &VowifiStatusResponse) {
     let profile_meta = status.profile.profile.as_ref();
     if let Err(err) =
         app.database
@@ -9163,9 +8943,7 @@ pub async fn test_automation_task_handler(
     if start_result == crate::services::automation::AutomationStartResult::AlreadyRunning {
         return (
             StatusCode::OK,
-            Json(ApiResponse::error(
-                "该任务或目标线路已有自动化任务正在执行",
-            )),
+            Json(ApiResponse::error("该任务或目标线路已有自动化任务正在执行")),
         );
     }
 
@@ -9174,6 +8952,1031 @@ pub async fn test_automation_task_handler(
         Json(ApiResponse::success_with_message(
             "任务已在后台下发立即执行",
             json!({}),
+        )),
+    )
+}
+
+// =====================================================================
+// P1.4 — per-SIM IMS override and effective profile API
+// =====================================================================
+
+use crate::connectivity::modems::ims::effective_profile::{
+    EffectiveServices, EffectiveVowifiProfile,
+};
+use crate::connectivity::modems::ims::profile_override::{
+    OverrideSource, SimBindingKey, SimOverride,
+};
+use crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogAccessKind;
+use crate::connectivity::modems::ims::vowifi::profiles::CarrierProfile;
+
+/// Resolve the current SIM binding for a line. The binding is re-read here and
+/// again before a write so a card swap during editing cannot target another SIM.
+async fn resolve_ims_binding(
+    app: &AppState,
+    line_id: &str,
+) -> Result<
+    (
+        SimBindingKey,
+        crate::hardware::cellular::modem_manager::ModemBinding,
+    ),
+    String,
+> {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let line = app
+        .line_registry
+        .get(line_id)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    let iccid = if binding.sim_iccid.trim().is_empty() {
+        None
+    } else {
+        Some(binding.sim_iccid.as_str())
+    };
+    let eid = if binding.sim_type == "esim" {
+        app.esim_supervisor
+            .get_euicc_info_for_line(line_id)
+            .await
+            .ok()
+            .map(|info| info.eid)
+    } else {
+        None
+    };
+    let key = SimBindingKey::resolve(iccid, eid.as_deref()).map_err(|error| error.to_string())?;
+    Ok((key, binding))
+}
+
+fn effective_vowifi_dto(profile: &EffectiveVowifiProfile) -> EffectiveVowifiDto {
+    EffectiveVowifiDto {
+        profile_id: profile.profile_id.clone(),
+        epdg_host: FieldDto {
+            value: profile.epdg_host.value.clone(),
+            source: source_str(profile.epdg_host.source),
+        },
+        epdg_port: profile.epdg_port,
+        epdg_port_source: source_str(profile.epdg_port_source),
+        apn: profile.apn.as_ref().map(|apn| FieldDto {
+            value: apn.value.clone(),
+            source: source_str(apn.source),
+        }),
+        ip_stack: FieldDto {
+            value: profile.ip_stack.value.clone(),
+            source: source_str(profile.ip_stack.source),
+        },
+        dns_servers: profile
+            .dns_servers
+            .iter()
+            .map(|server| FieldDto {
+                value: server.value.clone(),
+                source: source_str(server.source),
+            })
+            .collect(),
+    }
+}
+
+fn source_str(source: OverrideSource) -> String {
+    match source {
+        OverrideSource::Catalog => "catalog".to_string(),
+        OverrideSource::SimOverride => "sim_override".to_string(),
+        OverrideSource::Modem => "modem".to_string(),
+        OverrideSource::Network => "network".to_string(),
+    }
+}
+
+/// Map the effective device identity origin to the `custom|modem|unavailable`
+/// vocabulary used by the P2 plan and logs. The raw IMEI is never returned.
+fn device_identity_source_str(source: OverrideSource) -> String {
+    match source {
+        OverrideSource::SimOverride => "custom".to_string(),
+        OverrideSource::Modem => "modem".to_string(),
+        OverrideSource::Catalog | OverrideSource::Network => "unavailable".to_string(),
+    }
+}
+
+fn source_opt_str(source: Option<OverrideSource>) -> Option<String> {
+    source.map(source_str)
+}
+
+fn binding_dto(key: &SimBindingKey) -> BindingKeyDto {
+    let iccid = key.iccid();
+    BindingKeyDto {
+        kind: match key {
+            SimBindingKey::Plain { .. } => "plain".to_string(),
+            SimBindingKey::Euicc { .. } => "euicc".to_string(),
+        },
+        iccid_last4: (!iccid.is_empty()).then(|| {
+            let len = iccid.chars().count();
+            if len <= 4 {
+                iccid.to_string()
+            } else {
+                iccid.chars().skip(len - 4).collect()
+            }
+        }),
+    }
+}
+
+fn identifier_last4(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let len = value.chars().count();
+    Some(if len <= 4 {
+        value.to_string()
+    } else {
+        value.chars().skip(len - 4).collect()
+    })
+}
+
+/// Resolve the carrier catalog baseline for a line, honoring a pinned
+/// `profile_id` from the override before falling back to IMSI/PLMN matching.
+fn resolve_ims_catalog(
+    app: &AppState,
+    imsi: Option<&str>,
+    pinned: Option<&str>,
+    access: CatalogAccessKind,
+) -> Option<&'static CarrierProfile> {
+    if let Some(profile_id) = pinned.filter(|value| !value.trim().is_empty()) {
+        if let Ok(Some(profile)) = app.carrier_catalog.get(profile_id, access) {
+            if let Some(interned) = catalog_profile_to_static(&profile) {
+                return Some(interned);
+            }
+        }
+    }
+    if let Some(imsi) = imsi {
+        if let Ok(Some(profile)) = app.carrier_catalog.resolve_for_imsi(imsi, None, access) {
+            if let Some(interned) = catalog_profile_to_static(&profile) {
+                return Some(interned);
+            }
+        }
+    }
+    None
+}
+
+fn catalog_profile_to_static(
+    profile: &crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogProfile,
+) -> Option<&'static CarrierProfile> {
+    Some(profile.record.intern())
+}
+
+fn build_effective_response(
+    app: &AppState,
+    key: &SimBindingKey,
+    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    imsi: Option<&str>,
+) -> Result<EffectiveImsProfileResponse, String> {
+    let override_ = app
+        .sim_overrides
+        .load(key)
+        .map_err(|error| error.to_string())?;
+    let volte_pinned = override_
+        .as_ref()
+        .and_then(|o| o.ims_volte.profile_id.as_deref());
+    let vowifi_pinned = override_
+        .as_ref()
+        .and_then(|o| o.ims_vowifi.profile_id.as_deref());
+    let volte_catalog = resolve_ims_catalog(app, imsi, volte_pinned, CatalogAccessKind::LteEpc)
+        .ok_or_else(|| "volte_carrier_profile_not_resolved".to_string())?;
+    let vowifi_catalog = resolve_ims_catalog(app, imsi, vowifi_pinned, CatalogAccessKind::WifiEpdg)
+        .ok_or_else(|| "vowifi_carrier_profile_not_resolved".to_string())?;
+
+    let vowifi =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_vowifi_profile(
+            vowifi_catalog,
+            override_.as_ref(),
+        );
+    let volte_ims =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_ims_profile(
+            volte_catalog,
+            override_.as_ref(),
+        );
+    let vowifi_ims =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_vowifi_ims_profile(
+            vowifi_catalog,
+            override_.as_ref(),
+        );
+    let identity =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity(
+            override_.as_ref(),
+            (!binding.equipment_identifier.trim().is_empty())
+                .then_some(binding.equipment_identifier.as_str()),
+        );
+    let common = crate::connectivity::modems::ims::effective_profile::resolve_effective_common(
+        override_.as_ref(),
+    );
+    let services = EffectiveServices::from_override(override_.as_ref());
+    let emergency =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_emergency(
+            override_.as_ref(),
+        );
+    let source_map = crate::connectivity::modems::ims::effective_profile::source_map_of(
+        &vowifi,
+        &volte_ims,
+        &vowifi_ims,
+        &identity,
+        &common,
+        &services,
+        &emergency,
+    );
+
+    Ok(EffectiveImsProfileResponse {
+        binding: binding_dto(key),
+        vowifi: effective_vowifi_dto(&vowifi),
+        volte_ims: effective_ims_dto(&volte_ims),
+        vowifi_ims: effective_ims_dto(&vowifi_ims),
+        identity: EffectiveDeviceIdentityDto {
+            available: identity.imei.is_some(),
+            imei_last4: identity.imei.as_deref().and_then(identifier_last4),
+            source: device_identity_source_str(identity.source),
+        },
+        common: EffectiveCommonDto {
+            voicemail_number: common.voicemail_number.clone(),
+            voicemail_number_source: source_opt_str(common.voicemail_number_source),
+        },
+        services: EffectiveServicesDto {
+            call_waiting: services.call_waiting,
+            call_waiting_source: source_opt_str(services.call_waiting_source),
+            caller_id_restriction: services.caller_id_restriction,
+            caller_id_restriction_source: source_opt_str(services.caller_id_restriction_source),
+        },
+        emergency: EffectiveEmergencyDto {
+            address_saved_locally: emergency.address_saved_locally,
+            address_source: source_opt_str(emergency.address_source),
+        },
+        source_map: source_map
+            .into_iter()
+            .map(|(field, source)| SourceEntryDto {
+                field,
+                source: source_str(source),
+            })
+            .collect(),
+    })
+}
+
+fn effective_ims_dto(
+    profile: &crate::connectivity::modems::ims::effective_profile::EffectiveImsProfile,
+) -> EffectiveImsDto {
+    EffectiveImsDto {
+        profile_id: profile.profile_id.clone(),
+        domain: FieldDto {
+            value: profile.domain.value.clone(),
+            source: source_str(profile.domain.source),
+        },
+        realm: FieldDto {
+            value: profile.realm.value.clone(),
+            source: source_str(profile.realm.source),
+        },
+        pcscf: profile.pcscf.as_ref().map(|pcscf| FieldDto {
+            value: pcscf.value.clone(),
+            source: source_str(pcscf.source),
+        }),
+        registrar: profile.registrar.as_ref().map(|registrar| FieldDto {
+            value: registrar.value.clone(),
+            source: source_str(registrar.source),
+        }),
+        ims_apn: profile.ims_apn.as_ref().map(|apn| FieldDto {
+            value: apn.value.clone(),
+            source: source_str(apn.source),
+        }),
+        pinned_profile_id: profile.pinned_profile_id.as_ref().map(|pinned| FieldDto {
+            value: pinned.value.clone(),
+            source: source_str(pinned.source),
+        }),
+    }
+}
+
+/// Normalize a user-submitted override before persistence. Whitespace-only
+/// values are treated as unset so the API never writes empty strings.
+fn normalize_ims_override_payload(mut payload: SimOverride) -> SimOverride {
+    if let Some(imei) = payload.ims_common.custom_imei.as_deref() {
+        let trimmed = imei.trim();
+        if trimmed.is_empty() {
+            payload.ims_common.custom_imei = None;
+        } else if trimmed != imei {
+            payload.ims_common.custom_imei = Some(trimmed.to_string());
+        }
+    }
+    if let Some(number) = payload.ims_common.voicemail_number.as_deref() {
+        let trimmed = number.trim();
+        if trimmed.is_empty() {
+            payload.ims_common.voicemail_number = None;
+        } else if trimmed != number {
+            payload.ims_common.voicemail_number = Some(trimmed.to_string());
+        }
+    }
+    if let Some(address) = payload.emergency.e911_address.as_deref() {
+        let trimmed = address.trim();
+        if trimmed.is_empty() {
+            payload.emergency.e911_address = None;
+        } else if trimmed != address {
+            payload.emergency.e911_address = Some(trimmed.to_string());
+        }
+    }
+    payload
+}
+
+async fn ims_override_for_line(
+    app: &AppState,
+    line_id: &str,
+) -> Result<(SimBindingKey, SimOverride), String> {
+    let (key, _binding) = resolve_ims_binding(app, line_id).await?;
+    let override_ = app
+        .sim_overrides
+        .load(&key)
+        .map_err(|error| error.to_string())?;
+    Ok((key, override_.unwrap_or_default()))
+}
+
+fn override_response(key: &SimBindingKey, override_: &SimOverride) -> ImsOverrideResponse {
+    ImsOverrideResponse {
+        binding: binding_dto(key),
+        override_: override_.clone(),
+    }
+}
+
+/// GET /api/ims/lines/{line_id}/profile
+pub async fn get_effective_ims_profile_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<EffectiveImsProfileResponse>>) {
+    let (key, binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<EffectiveImsProfileResponse>::error(reason)),
+            );
+        }
+    };
+    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+    )
+    .await
+    .map(|identity| identity.imsi);
+    match build_effective_response(&app, &key, &binding, imsi.as_deref()) {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", response)),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<EffectiveImsProfileResponse>::error(reason)),
+        ),
+    }
+}
+
+/// GET /api/ims/lines/{line_id}/supplementary
+pub async fn get_ims_supplementary_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<crate::services::supplementary::SupplementarySnapshot>>,
+) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<
+                crate::services::supplementary::SupplementarySnapshot,
+            >::error("line_not_found")),
+        );
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            line.supplementary.snapshot().await,
+        )),
+    )
+}
+
+/// GET /api/ims/lines/{line_id}/override
+pub async fn get_ims_override_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<ImsOverrideResponse>>) {
+    let (key, override_) = match ims_override_for_line(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<ImsOverrideResponse>::error(reason)),
+            );
+        }
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            override_response(&key, &override_),
+        )),
+    )
+}
+
+/// PATCH /api/ims/lines/{line_id}/override
+pub async fn patch_ims_override_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<SimOverride>,
+) -> (StatusCode, Json<ApiResponse<ImsOverrideResponse>>) {
+    let (initial_key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<ImsOverrideResponse>::error(reason)),
+            );
+        }
+    };
+    let payload = normalize_ims_override_payload(payload);
+    let problems = crate::connectivity::modems::ims::effective_profile::validate_override(&payload);
+    if !problems.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<ImsOverrideResponse>::error(
+                problems.join(","),
+            )),
+        );
+    }
+    // Re-confirm the binding key right before writing so a card swap during
+    // editing cannot target another SIM.
+    let (key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<ImsOverrideResponse>::error(reason)),
+            );
+        }
+    };
+    if key != initial_key {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<ImsOverrideResponse>::error(
+                "sim_binding_changed_during_update",
+            )),
+        );
+    }
+    if let Err(error) = app.sim_overrides.save(&key, &payload) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<ImsOverrideResponse>::error(error.to_string())),
+        );
+    }
+    let saved = app
+        .sim_overrides
+        .load(&key)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            override_response(&key, &saved),
+        )),
+    )
+}
+
+/// DELETE /api/ims/lines/{line_id}/override
+pub async fn delete_ims_override_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<ImsOverrideResponse>>) {
+    let (key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<ImsOverrideResponse>::error(reason)),
+            );
+        }
+    };
+    if let Err(error) = app.sim_overrides.delete(&key) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<ImsOverrideResponse>::error(error.to_string())),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            override_response(&key, &SimOverride::default()),
+        )),
+    )
+}
+
+/// POST /api/ims/lines/{line_id}/override/validate
+pub async fn validate_ims_override_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<SimOverride>,
+) -> (StatusCode, Json<ApiResponse<ImsOverrideValidationResponse>>) {
+    let _ = app;
+    let _ = line_id;
+    let problems = crate::connectivity::modems::ims::effective_profile::validate_override(&payload);
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            ImsOverrideValidationResponse {
+                valid: problems.is_empty(),
+                problems,
+            },
+        )),
+    )
+}
+
+/// Resolve the current line's binding and the carrier profile (from the pinned
+/// profile or the IMSI-based catalog), returning them together with the loaded
+/// override. Shared by all E911 handlers so the SIM re-confirmation rule is
+/// enforced in one place.
+async fn resolve_e911_context(
+    app: &AppState,
+    line_id: &str,
+) -> Result<
+    (
+        SimBindingKey,
+        crate::hardware::cellular::modem_manager::ModemBinding,
+        &'static CarrierProfile,
+        SimOverride,
+    ),
+    String,
+> {
+    let (key, binding) = resolve_ims_binding(app, line_id).await?;
+    let override_ = app
+        .sim_overrides
+        .load(&key)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let pinned = override_
+        .ims_volte
+        .profile_id
+        .as_deref()
+        .or_else(|| override_.ims_vowifi.profile_id.as_deref());
+    let access = if override_.ims_volte.profile_id.is_some() {
+        CatalogAccessKind::LteEpc
+    } else {
+        CatalogAccessKind::WifiEpdg
+    };
+    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+    )
+    .await
+    .map(|identity| identity.imsi);
+    let catalog = resolve_ims_catalog(app, imsi.as_deref(), pinned, access)
+        .ok_or_else(|| "carrier_profile_not_resolved".to_string())?;
+    Ok((key, binding, catalog, override_))
+}
+
+/// GET /api/ims/lines/{line_id}/e911/capability
+pub async fn get_e911_capability_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<E911CapabilityDto>>) {
+    let (key, _binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<E911CapabilityDto>::error(reason)),
+            );
+        }
+    };
+    let provider = crate::services::e911::registry::provider_from_profile(catalog);
+    let dto = E911CapabilityDto {
+        profile_id: provider.profile_id.clone(),
+        provider_kind: provider.kind.as_str().to_string(),
+        provider_id: provider.profile_id.clone(),
+        operator_requires: provider.kind.may_query() || override_.emergency.e911_address.is_some(),
+        query_supported: provider.kind.may_query(),
+        websheet_expected: provider.websheet_host_policy.is_some(),
+    };
+    let _ = key;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", dto)),
+    )
+}
+
+/// GET /api/ims/lines/{line_id}/e911/status
+pub async fn get_e911_status_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<E911StatusDto>>) {
+    let (key, _binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<E911StatusDto>::error(reason)),
+            );
+        }
+    };
+    let provider = crate::services::e911::registry::provider_from_profile(catalog);
+    let view = match app.e911.status(
+        &provider.profile_id,
+        &key,
+        override_.emergency.e911_address.is_some(),
+    ) {
+        Ok(view) => view,
+        Err(_reason) => {
+            // A store read failure must not leak internals; report a stable
+            // state and keep emergency unverified.
+            crate::services::e911::orchestrator::E911StatusView {
+                profile_id: provider.profile_id.clone(),
+                provider_kind: provider.kind,
+                state: crate::connectivity::core::entitlement::E911State::Unknown,
+                source: crate::connectivity::core::entitlement::E911StateSource::Unknown,
+                operator_requires: provider.kind.may_query(),
+                address_saved_locally: override_.emergency.e911_address.is_some(),
+                operator_confirmed: false,
+                emergency_unverified: true,
+                needs_user_action: false,
+                needs_reconfirm: false,
+                retry_after_epoch: None,
+            }
+        }
+    };
+    let dto = E911StatusDto {
+        profile_id: view.profile_id,
+        provider_kind: view.provider_kind.as_str().to_string(),
+        state: view.state.as_str().to_string(),
+        source: view.source.as_str().to_string(),
+        operator_requires: view.operator_requires,
+        address_saved_locally: view.address_saved_locally,
+        operator_confirmed: view.operator_confirmed,
+        emergency_unverified: view.emergency_unverified,
+        needs_user_action: view.needs_user_action,
+        needs_reconfirm: view.needs_reconfirm,
+        retry_after_epoch: view.retry_after_epoch,
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", dto)),
+    )
+}
+
+/// POST /api/ims/lines/{line_id}/e911/query
+/// Read-only entitlement query. Never opens a websheet and never writes the
+/// user override file; only the E911 state store is updated.
+pub async fn post_e911_query_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<E911StatusDto>>) {
+    let (key, _binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<E911StatusDto>::error(reason)),
+            );
+        }
+    };
+    let provider = crate::services::e911::registry::provider_from_profile(catalog);
+    if !provider.may_query() {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<E911StatusDto>::error(
+                crate::services::e911::orchestrator::ERR_UNSUPPORTED,
+            )),
+        );
+    }
+    // The SIM AKA adapter seam: today no verified digest adapter exists, so the
+    // transport reports the raw HTTP status. The state store is still updated
+    // with whatever the carrier returned (e.g. websheet directive).
+    let secrets = app.e911.store().load_secrets(&key).unwrap_or_default();
+    let _ = override_;
+    match app
+        .e911
+        .query(&provider.profile_id, &key, &secrets, &|_rand, _autn| {
+            Err("e911_aka_adapter_unavailable".to_string())
+        })
+        .await
+    {
+        Ok(_outcome) => {
+            let view = app.e911.status(&provider.profile_id, &key, false).unwrap();
+            let dto = E911StatusDto {
+                profile_id: view.profile_id,
+                provider_kind: view.provider_kind.as_str().to_string(),
+                state: view.state.as_str().to_string(),
+                source: view.source.as_str().to_string(),
+                operator_requires: view.operator_requires,
+                address_saved_locally: view.address_saved_locally,
+                operator_confirmed: view.operator_confirmed,
+                emergency_unverified: view.emergency_unverified,
+                needs_user_action: view.needs_user_action,
+                needs_reconfirm: view.needs_reconfirm,
+                retry_after_epoch: view.retry_after_epoch,
+            };
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", dto)),
+            )
+        }
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<E911StatusDto>::error(reason)),
+        ),
+    }
+}
+
+/// POST /api/ims/lines/{line_id}/e911/operations
+/// Create a websheet operation from the current stored state. The URL must have
+/// already been SSRF-checked by the transport; if the current state carries no
+/// websheet directive we refuse rather than guessing.
+pub async fn create_e911_operation_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<E911OperationDto>>) {
+    let (key, _binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<E911OperationDto>::error(reason)),
+            );
+        }
+    };
+    let provider = crate::services::e911::registry::provider_from_profile(catalog);
+    // Only create an operation when the carrier asked for a websheet (a
+    // metadata-only provider or a provider that never gave us a flow URL has
+    // nothing to open).
+    let secrets = app.e911.store().load_secrets(&key).unwrap_or_default();
+    let record = match app.e911.store().load(&key) {
+        Ok(record) => record,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<E911OperationDto>::error(error.to_string())),
+            );
+        }
+    };
+    let needs_websheet = matches!(
+        record.state,
+        crate::connectivity::core::entitlement::E911State::NeedsTerms
+            | crate::connectivity::core::entitlement::E911State::NeedsAddress
+            | crate::connectivity::core::entitlement::E911State::NeedsUserAction
+    ) && provider.kind.may_query();
+    if !needs_websheet {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<E911OperationDto>::error(
+                crate::services::e911::orchestrator::ERR_UNCONFIGURED,
+            )),
+        );
+    }
+    // We need a real server-flow URL. The transport stores it only in the
+    // secret store; without it there is nothing safe to open.
+    let server_flow_url = secrets
+        .server_flow_user_data
+        .as_deref()
+        .map(|_| provider.entitlement_url.clone())
+        .flatten()
+        .unwrap_or_default();
+    if server_flow_url.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<E911OperationDto>::error(
+                crate::services::e911::orchestrator::ERR_UNCONFIGURED,
+            )),
+        );
+    }
+    let callback_state = secrets.server_flow_user_data.unwrap_or_default();
+    let operation = app
+        .e911
+        .create_operation(&line_id, &key, &server_flow_url, &callback_state, 600)
+        .await
+        .unwrap();
+    let _ = override_;
+    let dto = E911OperationDto {
+        operation_id: operation.operation_id,
+        line_id: operation.line_id,
+        server_flow_url: operation.server_flow_url,
+        expires_epoch: operation.expires_epoch,
+        state: operation.state.as_str().to_string(),
+    };
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message("Success", dto)),
+    )
+}
+
+/// GET /api/ims/lines/{line_id}/e911/operations/{operation_id}
+pub async fn get_e911_operation_handler(
+    State(app): State<AppState>,
+    Path((line_id, operation_id)): Path<(String, String)>,
+) -> (StatusCode, Json<ApiResponse<E911OperationDto>>) {
+    match app.e911.get_operation(&line_id, &operation_id).await {
+        Ok(operation) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Success",
+                E911OperationDto {
+                    operation_id: operation.operation_id,
+                    line_id: operation.line_id,
+                    server_flow_url: operation.server_flow_url,
+                    expires_epoch: operation.expires_epoch,
+                    state: operation.state.as_str().to_string(),
+                },
+            )),
+        ),
+        Err(reason) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::<E911OperationDto>::error(reason)),
+        ),
+    }
+}
+
+/// POST /api/ims/lines/{line_id}/e911/operations/{operation_id}/callback
+/// Called when the websheet completes in the browser. Requires the secret
+/// callback state. This only marks the operation completed; the client must
+/// then call POST .../query again, and only a confirming re-query moves the
+/// line to `provisioned`.
+pub async fn callback_e911_operation_handler(
+    State(app): State<AppState>,
+    Path((line_id, operation_id)): Path<(String, String)>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    let callback_state = payload
+        .get("callback_state")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match app
+        .e911
+        .complete_operation(&line_id, &operation_id, &callback_state)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", ())),
+        ),
+        Err(reason) => (StatusCode::OK, Json(ApiResponse::<()>::error(reason))),
+    }
+}
+
+/// POST /api/ims/lines/{line_id}/e911/operations/{operation_id}/cancel
+pub async fn cancel_e911_operation_handler(
+    State(app): State<AppState>,
+    Path((line_id, operation_id)): Path<(String, String)>,
+) -> (StatusCode, Json<ApiResponse<()>>) {
+    match app.e911.cancel_operation(&line_id, &operation_id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", ())),
+        ),
+        Err(reason) => (StatusCode::OK, Json(ApiResponse::<()>::error(reason))),
+    }
+}
+
+/// GET /api/ims/lines/{line_id}/e911/address
+/// The full address is returned only on this authenticated edit endpoint, per
+/// the research doc §12.4.
+pub async fn get_e911_address_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let (key, _binding, _catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            );
+        }
+    };
+    let address = override_.emergency.e911_address;
+    let _ = key;
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            json!({ "e911_address": address }),
+        )),
+    )
+}
+
+/// PUT /api/ims/lines/{line_id}/e911/address
+/// Saves the user-entered civic address into the SIM override. Re-confirms the
+/// binding before writing, exactly like the override PATCH path.
+pub async fn put_e911_address_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<serde_json::Value>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let (_key, _binding, _catalog, mut override_) = match resolve_e911_context(&app, &line_id).await
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            );
+        }
+    };
+    let raw = payload.get("e911_address").and_then(|value| value.as_str());
+    override_.emergency.e911_address = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let problems =
+        crate::connectivity::modems::ims::effective_profile::validate_override(&override_);
+    if !problems.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ApiResponse::<serde_json::Value>::error(problems.join(","))),
+        );
+    }
+    // Re-confirm the binding right before writing.
+    let (key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            );
+        }
+    };
+    if let Err(error) = app.sim_overrides.save(&key, &override_) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(error.to_string())),
+        );
+    }
+    // Saving an address never confirms it: mark the entitlement stale so the
+    // UI shows needs-reconfirm and a query is required.
+    let mut record = match app.e911.store().load(&key) {
+        Ok(record) => record,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(error.to_string())),
+            );
+        }
+    };
+    record.invalidate();
+    let _ = app.e911.store().save(&key, &record);
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            json!({ "e911_address": override_.emergency.e911_address }),
+        )),
+    )
+}
+
+/// DELETE /api/ims/lines/{line_id}/e911/address
+pub async fn delete_e911_address_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let (_key, _binding, _catalog, mut override_) = match resolve_e911_context(&app, &line_id).await
+    {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            );
+        }
+    };
+    override_.emergency.e911_address = None;
+    let (key, _binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<serde_json::Value>::error(reason)),
+            );
+        }
+    };
+    if let Err(error) = app.sim_overrides.save(&key, &override_) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(error.to_string())),
+        );
+    }
+    let mut record = match app.e911.store().load(&key) {
+        Ok(record) => record,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(error.to_string())),
+            );
+        }
+    };
+    record.invalidate();
+    let _ = app.e911.store().save(&key, &record);
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            json!({ "e911_address": None::<String> }),
         )),
     )
 }
@@ -9345,13 +10148,13 @@ mod tests {
 
     #[test]
     fn vowifi_mt_storage_key_preserves_repeated_identical_replies() {
-        let first = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
+        let first = crate::connectivity::modems::ims::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-a".to_string(),
             message_id: "mo-a".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::None,
+            rpdu_ack: crate::connectivity::modems::ims::vowifi::sms::RpduAckState::None,
             delivery_state:
-                crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Accepted,
+                crate::connectivity::modems::ims::vowifi::sms::SmsDeliveryState::Accepted,
             failure_cause: None,
             mt_deliveries: Vec::new(),
         };
@@ -9387,16 +10190,16 @@ mod tests {
         let db =
             Database::new(std::path::PathBuf::from(":memory:")).expect("create in-memory database");
         let line_id = "line-0123456789abcdef0123456789abcdef";
-        let outcome = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
+        let outcome = crate::connectivity::modems::ims::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-line".to_string(),
             message_id: "message-line".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::Acked,
+            rpdu_ack: crate::connectivity::modems::ims::vowifi::sms::RpduAckState::Acked,
             delivery_state:
-                crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Delivered,
+                crate::connectivity::modems::ims::vowifi::sms::SmsDeliveryState::Delivered,
             failure_cause: None,
             mt_deliveries: vec![
-                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::ims::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 1,
                     originator: "10086".to_string(),
                     text: "line reply".to_string(),
@@ -9430,16 +10233,16 @@ mod tests {
             Database::new(std::path::PathBuf::from(":memory:")).expect("create in-memory database");
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
-        let outcome = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
+        let outcome = crate::connectivity::modems::ims::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-dedup".to_string(),
             message_id: "message-dedup".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::Acked,
+            rpdu_ack: crate::connectivity::modems::ims::vowifi::sms::RpduAckState::Acked,
             delivery_state:
-                crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Delivered,
+                crate::connectivity::modems::ims::vowifi::sms::SmsDeliveryState::Delivered,
             failure_cause: None,
             mt_deliveries: vec![
-                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::ims::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 1,
                     originator: "10086".to_string(),
                     text: "same delivery".to_string(),
@@ -9480,16 +10283,16 @@ mod tests {
 
     #[test]
     fn vowifi_mt_complete_group_count_collapses_segments() {
-        let outcome = crate::connectivity::modems::softstack::vowifi::sms::MoSmsSipOutcome {
+        let outcome = crate::connectivity::modems::ims::vowifi::sms::MoSmsSipOutcome {
             trace_id: "trace-a".to_string(),
             message_id: "mo-a".to_string(),
             sip_status: 202,
-            rpdu_ack: crate::connectivity::modems::softstack::vowifi::sms::RpduAckState::None,
+            rpdu_ack: crate::connectivity::modems::ims::vowifi::sms::RpduAckState::None,
             delivery_state:
-                crate::connectivity::modems::softstack::vowifi::sms::SmsDeliveryState::Accepted,
+                crate::connectivity::modems::ims::vowifi::sms::SmsDeliveryState::Accepted,
             failure_cause: None,
             mt_deliveries: vec![
-                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::ims::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 1,
                     originator: "10086".to_string(),
                     text: "part1".to_string(),
@@ -9499,7 +10302,7 @@ mod tests {
                     segment_sequence: 1,
                     segment_total: 2,
                 },
-                crate::connectivity::modems::softstack::vowifi::sms::MtSmsDeliver {
+                crate::connectivity::modems::ims::vowifi::sms::MtSmsDeliver {
                     rp_message_reference: 2,
                     originator: "10086".to_string(),
                     text: "part2".to_string(),
@@ -9513,5 +10316,150 @@ mod tests {
         };
 
         assert_eq!(vowifi_mt_complete_group_count(&outcome), 1);
+    }
+
+    #[test]
+    fn effective_services_reflects_override_entries() {
+        let mut override_ = SimOverride::default();
+        override_.services.call_waiting = Some(true);
+        let services = EffectiveServices::from_override(Some(&override_));
+        assert_eq!(services.call_waiting, Some(true));
+        assert_eq!(
+            services.call_waiting_source,
+            Some(OverrideSource::SimOverride)
+        );
+        assert_eq!(services.caller_id_restriction, None);
+
+        let none = EffectiveServices::from_override(None);
+        assert_eq!(none.call_waiting, None);
+        assert_eq!(none.call_waiting_source, None);
+    }
+
+    #[test]
+    fn effective_services_ignores_unset_booleans() {
+        let override_ = SimOverride::default();
+        let services = EffectiveServices::from_override(Some(&override_));
+        assert_eq!(services.call_waiting, None);
+        assert_eq!(services.caller_id_restriction, None);
+    }
+
+    #[test]
+    fn binding_dto_masks_iccid_to_last4() {
+        let key = SimBindingKey::Plain {
+            iccid: "89012345678901234567".to_string(),
+        };
+        let dto = binding_dto(&key);
+        assert_eq!(dto.kind, "plain");
+        assert_eq!(dto.iccid_last4.as_deref(), Some("4567"));
+    }
+
+    #[test]
+    fn binding_dto_masks_euicc_binding() {
+        let key = SimBindingKey::Euicc {
+            eid: "89049032023442222222555555555555".to_string(),
+            profile_iccid: "89012345678901234567".to_string(),
+        };
+        let dto = binding_dto(&key);
+        assert_eq!(dto.kind, "euicc");
+        assert_eq!(dto.iccid_last4.as_deref(), Some("4567"));
+    }
+
+    #[test]
+    fn binding_dto_handles_short_iccid() {
+        let key = SimBindingKey::Plain {
+            iccid: "123".to_string(),
+        };
+        let dto = binding_dto(&key);
+        assert_eq!(dto.iccid_last4.as_deref(), Some("123"));
+    }
+
+    #[test]
+    fn source_str_maps_all_origins() {
+        assert_eq!(source_str(OverrideSource::Catalog), "catalog");
+        assert_eq!(source_str(OverrideSource::SimOverride), "sim_override");
+        assert_eq!(source_str(OverrideSource::Modem), "modem");
+        assert_eq!(source_str(OverrideSource::Network), "network");
+    }
+
+    #[test]
+    fn device_identity_source_str_uses_custom_modem_unavailable_vocabulary() {
+        assert_eq!(
+            device_identity_source_str(OverrideSource::SimOverride),
+            "custom"
+        );
+        assert_eq!(device_identity_source_str(OverrideSource::Modem), "modem");
+        assert_eq!(
+            device_identity_source_str(OverrideSource::Catalog),
+            "unavailable"
+        );
+        assert_eq!(
+            device_identity_source_str(OverrideSource::Network),
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn normalize_payload_drops_whitespace_only_custom_imei() {
+        let mut payload = SimOverride::default();
+        payload.ims_common.custom_imei = Some("   ".to_string());
+        let normalized = normalize_ims_override_payload(payload);
+        assert_eq!(normalized.ims_common.custom_imei, None);
+    }
+
+    #[test]
+    fn normalize_payload_trims_custom_imei_and_keeps_value() {
+        let mut payload = SimOverride::default();
+        payload.ims_common.custom_imei = Some("  490154203237518  ".to_string());
+        let normalized = normalize_ims_override_payload(payload);
+        assert_eq!(
+            normalized.ims_common.custom_imei.as_deref(),
+            Some("490154203237518")
+        );
+    }
+
+    #[test]
+    fn normalize_payload_drops_whitespace_only_voicemail() {
+        let mut payload = SimOverride::default();
+        payload.ims_common.voicemail_number = Some("  ".to_string());
+        let normalized = normalize_ims_override_payload(payload);
+        assert_eq!(normalized.ims_common.voicemail_number, None);
+    }
+
+    #[test]
+    fn normalize_payload_preserves_empty_override() {
+        let payload = SimOverride::default();
+        let normalized = normalize_ims_override_payload(payload);
+        assert_eq!(normalized, SimOverride::default());
+    }
+
+    #[test]
+    fn two_lines_resolve_distinct_custom_imei_without_crossing() {
+        let first = SimOverride {
+            ims_common: crate::connectivity::modems::ims::profile_override::ImsCommonOverride {
+                custom_imei: Some("490154203237518".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let second = SimOverride {
+            ims_common: crate::connectivity::modems::ims::profile_override::ImsCommonOverride {
+                custom_imei: Some("351234567890124".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let first_identity =
+            crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity(
+                Some(&first),
+                Some("999999999999999"),
+            );
+        let second_identity =
+            crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity(
+                Some(&second),
+                Some("999999999999999"),
+            );
+        assert_eq!(first_identity.imei.as_deref(), Some("490154203237518"));
+        assert_eq!(second_identity.imei.as_deref(), Some("351234567890124"));
+        assert_ne!(first_identity.imei, second_identity.imei);
     }
 }

@@ -11,7 +11,8 @@ MODEM_RECOVERY_SCRIPT="${MODEM_RECOVERY_SCRIPT:-/usr/local/bin/simadmin-modem-re
 NM_CONF="${NM_CONF:-/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf}"
 MM_DEBUG_CONF="${MM_DEBUG_CONF:-/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf}"
 OTA_STAGING_DIR="${OTA_STAGING_DIR:-/tmp/ota_staging}"
-DEVICE_CONFIG_PATH="${DEVICE_CONFIG_PATH:-/data/config.json}"
+DEVICE_CONFIG_DB_PATH="${DEVICE_CONFIG_DB_PATH:-/data/config.sqlite3}"
+E911_STATE_DIR="${E911_STATE_DIR:-/data/simadmin/e911}"
 
 usage() {
   printf '%s\n' \
@@ -22,7 +23,7 @@ usage() {
     '' \
     'Options:' \
     '  --purge                Remove everything, including user data (default)' \
-    '  --keep-user-data       Keep data.db, SQLite sidecar files, and config.json' \
+    '  --keep-user-data       Keep data.db, config SQLite/sidecars, and E911 state' \
     '  --install-dir PATH     Installed directory (default: /opt/simadmin)' \
     '  --service-name NAME    Main systemd service name (default: simadmin)' \
     '  -h, --help             Show this help' \
@@ -127,6 +128,24 @@ assert_safe_service_name() {
   esac
 }
 
+assert_safe_user_data_path() {
+  name="$1"
+  value="$2"
+
+  case "$value" in
+    ""|"/"|"/data"|"/opt"|"/opt/simadmin"|"/etc"|"/var"|"/home"|"/root"|*"/.."*)
+      echo "error: unsafe ${name}: ${value}" >&2
+      exit 1
+      ;;
+    /*)
+      ;;
+    *)
+      echo "error: ${name} must be an absolute path: ${value}" >&2
+      exit 1
+      ;;
+  esac
+}
+
 remove_path() {
   path="$1"
   case "$path" in
@@ -209,14 +228,23 @@ remove_install_files_keep_data() {
     fi
   fi
 
-  if [ -f "$DEVICE_CONFIG_PATH" ]; then
-    echo "==> kept user config ${DEVICE_CONFIG_PATH}"
-  fi
+  for path in \
+    "$DEVICE_CONFIG_DB_PATH" \
+    "$E911_STATE_DIR"
+  do
+    if [ -e "$path" ] || [ -L "$path" ]; then
+      echo "==> kept user data ${path}"
+    fi
+  done
 }
 
 remove_install_files_purge() {
   remove_path "$INSTALL_DIR"
-  remove_path "$DEVICE_CONFIG_PATH"
+  remove_path "$DEVICE_CONFIG_DB_PATH"
+  remove_path "${DEVICE_CONFIG_DB_PATH}-wal"
+  remove_path "${DEVICE_CONFIG_DB_PATH}-shm"
+  remove_path "${DEVICE_CONFIG_DB_PATH}-journal"
+  remove_path "$E911_STATE_DIR"
 }
 
 main() {
@@ -226,6 +254,8 @@ main() {
   assert_safe_install_dir
   assert_safe_service_name SERVICE_NAME "$SERVICE_NAME"
   assert_safe_service_name MODEM_RECOVERY_SERVICE_NAME "$MODEM_RECOVERY_SERVICE_NAME"
+  assert_safe_user_data_path DEVICE_CONFIG_DB_PATH "$DEVICE_CONFIG_DB_PATH"
+  assert_safe_user_data_path E911_STATE_DIR "$E911_STATE_DIR"
 
   echo "==> uninstalling SimAdmin"
   if [ "$KEEP_USER_DATA" -eq 1 ]; then

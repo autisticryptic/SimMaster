@@ -268,26 +268,6 @@ pub struct VowifiRuntimeEventsResponse {
     pub total: i64,
 }
 
-/// One row of the VoWiFi carrier profile table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VowifiCarrierProfileRow {
-    pub profile_id: String,
-    pub plmn: String,
-    pub source: String,
-    pub payload_json: String,
-    pub updated_at: String,
-}
-
-fn vowifi_carrier_profile_from_row(row: &Row<'_>) -> Result<VowifiCarrierProfileRow> {
-    Ok(VowifiCarrierProfileRow {
-        profile_id: row.get(0)?,
-        plmn: row.get(1)?,
-        source: row.get(2)?,
-        payload_json: row.get(3)?,
-        updated_at: row.get(4)?,
-    })
-}
-
 /// Cumulative proxied traffic for one line as stored on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineDataTrafficEntry {
@@ -647,7 +627,10 @@ mod tests {
             Some("line-b")
         );
 
-        assert_eq!(db.clear_automation_logs("", "", "line-a", "", "").unwrap(), 1);
+        assert_eq!(
+            db.clear_automation_logs("", "", "line-a", "", "").unwrap(),
+            1
+        );
         let remaining = db
             .get_automation_logs("", "", "", "", "", "", 10, 0)
             .unwrap();
@@ -1156,24 +1139,19 @@ mod tests {
 
         {
             let conn = db.conn.lock().unwrap();
-            assert!(table_primary_key_is(
-                &conn,
-                "vowifi_sms_delivery",
-                &["line_id", "message_id"]
-            )
-            .unwrap());
+            assert!(
+                table_primary_key_is(&conn, "vowifi_sms_delivery", &["line_id", "message_id"])
+                    .unwrap()
+            );
             assert!(table_primary_key_is(
                 &conn,
                 "vowifi_sms_parts",
                 &["line_id", "message_id", "reference", "sequence"]
             )
             .unwrap());
-            assert!(table_primary_key_is(
-                &conn,
-                "vowifi_soak_runs",
-                &["line_id", "run_id"]
-            )
-            .unwrap());
+            assert!(
+                table_primary_key_is(&conn, "vowifi_soak_runs", &["line_id", "run_id"]).unwrap()
+            );
             assert!(table_has_column(&conn, "vowifi_soak_samples", "line_id").unwrap());
         }
 
@@ -1270,12 +1248,9 @@ mod tests {
         {
             let conn = db.conn.lock().unwrap();
             assert!(table_has_column(&conn, "sms_dedup", "line_id").unwrap());
-            assert!(table_has_unique_index(
-                &conn,
-                "sms_dedup",
-                &["line_id", "fingerprint"]
-            )
-            .unwrap());
+            assert!(
+                table_has_unique_index(&conn, "sms_dedup", &["line_id", "fingerprint"]).unwrap()
+            );
             assert!(!table_has_unique_index(&conn, "sms_dedup", &["fingerprint"]).unwrap());
             let legacy_scope: String = conn
                 .query_row(
@@ -1632,20 +1607,10 @@ mod tests {
         assert_eq!(db.sms_id_by_pdu_for_line(line_a, marker).unwrap(), Some(id));
         assert_eq!(db.sms_id_by_pdu_for_line(line_b, marker).unwrap(), None);
         assert!(db
-            .incoming_sms_exists_by_timestamp_for_line(
-                line_a,
-                "10086",
-                "same message",
-                timestamp,
-            )
+            .incoming_sms_exists_by_timestamp_for_line(line_a, "10086", "same message", timestamp,)
             .unwrap());
         assert!(!db
-            .incoming_sms_exists_by_timestamp_for_line(
-                line_b,
-                "10086",
-                "same message",
-                timestamp,
-            )
+            .incoming_sms_exists_by_timestamp_for_line(line_b, "10086", "same message", timestamp,)
             .unwrap());
 
         db.insert_sms_at_with_transport_for_line(
@@ -1660,18 +1625,10 @@ mod tests {
         )
         .expect("insert legacy line-a SMS");
         assert!(db
-            .incoming_sms_exists_by_legacy_content_for_line(
-                line_a,
-                "10010",
-                "legacy message",
-            )
+            .incoming_sms_exists_by_legacy_content_for_line(line_a, "10010", "legacy message",)
             .unwrap());
         assert!(!db
-            .incoming_sms_exists_by_legacy_content_for_line(
-                line_b,
-                "10010",
-                "legacy message",
-            )
+            .incoming_sms_exists_by_legacy_content_for_line(line_b, "10010", "legacy message",)
             .unwrap());
     }
 
@@ -2769,27 +2726,6 @@ impl Database {
             [],
         )?;
 
-        // VoWiFi carrier profiles. These used to be Rust constants, so adding a
-        // carrier meant a rebuild; they are now rows that can be edited and
-        // imported at runtime. `payload_json` holds the whole profile document
-        // so the schema does not have to change every time a policy field is
-        // added.
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS vowifi_carrier_profiles (
-                profile_id TEXT PRIMARY KEY,
-                plmn TEXT NOT NULL,
-                source TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )",
-            [],
-        )?;
-        conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_vowifi_carrier_profiles_plmn
-             ON vowifi_carrier_profiles(plmn)",
-            [],
-        )?;
-
         // Cumulative proxied traffic per line, so the web page can answer "has
         // this SIM used any data" across restarts. Keyed by line_id because
         // every SIM has its own proxy and its own quota.
@@ -3152,93 +3088,6 @@ impl Database {
         }
 
         Ok(VowifiRuntimeEventsResponse { events, total })
-    }
-
-    pub fn list_vowifi_carrier_profiles(&self) -> Result<Vec<VowifiCarrierProfileRow>> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT profile_id, plmn, source, payload_json, updated_at
-             FROM vowifi_carrier_profiles ORDER BY plmn, profile_id",
-        )?;
-        let rows = stmt.query_map([], vowifi_carrier_profile_from_row)?;
-        rows.collect()
-    }
-
-    pub fn get_vowifi_carrier_profile(
-        &self,
-        profile_id: &str,
-    ) -> Result<Option<VowifiCarrierProfileRow>> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT profile_id, plmn, source, payload_json, updated_at
-             FROM vowifi_carrier_profiles WHERE profile_id = ?1",
-            params![profile_id],
-            vowifi_carrier_profile_from_row,
-        )
-        .optional()
-    }
-
-    /// Look up by PLMN. A carrier can in principle have several rows (an
-    /// imported one and a hand-edited one); the most recently updated wins so
-    /// the operator's latest intent is what takes effect.
-    pub fn get_vowifi_carrier_profile_by_plmn(
-        &self,
-        plmn: &str,
-    ) -> Result<Option<VowifiCarrierProfileRow>> {
-        let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT profile_id, plmn, source, payload_json, updated_at
-             FROM vowifi_carrier_profiles WHERE plmn = ?1
-             ORDER BY updated_at DESC LIMIT 1",
-            params![plmn],
-            vowifi_carrier_profile_from_row,
-        )
-        .optional()
-    }
-
-    pub fn upsert_vowifi_carrier_profile(
-        &self,
-        profile_id: &str,
-        plmn: &str,
-        source: &str,
-        payload_json: &str,
-    ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO vowifi_carrier_profiles (
-                profile_id, plmn, source, payload_json, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(profile_id) DO UPDATE SET
-                plmn = excluded.plmn,
-                source = excluded.source,
-                payload_json = excluded.payload_json,
-                updated_at = excluded.updated_at",
-            params![
-                profile_id,
-                plmn,
-                source,
-                payload_json,
-                Utc::now().to_rfc3339()
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_vowifi_carrier_profile(&self, profile_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let affected = conn.execute(
-            "DELETE FROM vowifi_carrier_profiles WHERE profile_id = ?1",
-            params![profile_id],
-        )?;
-        Ok(affected > 0)
-    }
-
-    pub fn delete_vowifi_carrier_profiles_by_source(&self, source: &str) -> Result<usize> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "DELETE FROM vowifi_carrier_profiles WHERE source = ?1",
-            params![source],
-        )
     }
 
     /// Cumulative proxied traffic for one line. Absent rows read as zero, which
@@ -4019,12 +3868,7 @@ impl Database {
         let changed = conn.execute(
             "INSERT OR IGNORE INTO sms_dedup (line_id, fingerprint, transport, created_at)
              VALUES (?1, ?2, ?3, ?4)",
-            params![
-                line_id,
-                fingerprint,
-                transport,
-                beijing_sms_now_string()
-            ],
+            params![line_id, fingerprint, transport, beijing_sms_now_string()],
         )?;
         Ok(changed > 0)
     }
@@ -4368,9 +4212,7 @@ impl Database {
         )?;
 
         let rows = stmt.query_map(
-            params![
-                event_type, status, line_id, query, start_at, end_at, limit, offset
-            ],
+            params![event_type, status, line_id, query, start_at, end_at, limit, offset],
             |row| {
                 Ok(NotificationLogEntry {
                     id: row.get(0)?,
@@ -5355,15 +5197,7 @@ impl Database {
             "INSERT INTO automation_logs (
                 line_id, task_id, task_name, task_type, status, detail, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                line_id,
-                task_id,
-                task_name,
-                task_type,
-                status,
-                detail,
-                created_at
-            ],
+            params![line_id, task_id, task_name, task_type, status, detail, created_at],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -5428,9 +5262,7 @@ impl Database {
         )?;
 
         let rows = stmt.query_map(
-            params![
-                task_type, status, line_id, query, start_at, end_at, limit, offset
-            ],
+            params![task_type, status, line_id, query, start_at, end_at, limit, offset],
             |row| {
                 let mut detail: String = row.get(6)?;
                 if detail == "执行成功 (0)" || detail.starts_with("执行成功 (0)") {

@@ -1673,8 +1673,10 @@ async fn mbim_subscriber_own_numbers_fallback(conn: &Connection, modem_path: &st
         "-p".to_string(),
         "--query-subscriber-ready-status".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("mbimcli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("mbimcli", args).await
+    })
+    .await
     else {
         return Vec::new();
     };
@@ -1691,8 +1693,10 @@ async fn qmi_dms_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Ve
         device,
         "--dms-get-msisdn".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("qmicli", args).await
+    })
+    .await
     else {
         return Vec::new();
     };
@@ -1709,8 +1713,10 @@ async fn qmi_atr_own_numbers_fallback(conn: &Connection, modem_path: &str) -> Ve
         device,
         "--atr-send=AT+CNUM".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("qmicli", args).await
+    })
+    .await
     else {
         return Vec::new();
     };
@@ -1788,8 +1794,10 @@ async fn mbim_sms_config_smsc_fallback(conn: &Connection, modem_path: &str) -> S
         "-p".to_string(),
         "--sms-query-configuration".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("mbimcli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("mbimcli", args).await
+    })
+    .await
     else {
         return String::new();
     };
@@ -1806,8 +1814,10 @@ async fn qmi_wms_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--wms-get-smsc-address".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("qmicli", args).await
+    })
+    .await
     else {
         return String::new();
     };
@@ -1824,8 +1834,10 @@ async fn qmi_atr_smsc_fallback(conn: &Connection, modem_path: &str) -> String {
         device,
         "--atr-send=AT+CSCA?".to_string(),
     ];
-    let Ok(output) =
-        with_serial_for(modem_path, async { run_modem_helper_command("qmicli", args).await }).await
+    let Ok(output) = with_serial_for(modem_path, async {
+        run_modem_helper_command("qmicli", args).await
+    })
+    .await
     else {
         return String::new();
     };
@@ -1898,13 +1910,13 @@ async fn send_at_via_modem_command(
         let result = tokio::time::timeout(
             Duration::from_secs(SMSC_BACKGROUND_AT_TIMEOUT_SECS),
             async {
-            let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
-            proxy
-                .call::<_, _, String>(
-                    "Command",
-                    &(command, SMSC_BACKGROUND_AT_TIMEOUT_SECS as u32),
-                )
-                .await
+                let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MODEM).await?;
+                proxy
+                    .call::<_, _, String>(
+                        "Command",
+                        &(command, SMSC_BACKGROUND_AT_TIMEOUT_SECS as u32),
+                    )
+                    .await
             },
         )
         .await;
@@ -3226,22 +3238,14 @@ async fn read_mmcli_signal_output() -> Result<String, String> {
 }
 
 pub async fn start_cell_monitoring_for_modem(modem_path: &str) -> Result<(), String> {
-    run_recovery_command(
-        "mmcli",
-        &["-m", modem_path, "--location-enable-3gpp"],
-    )
-    .await?;
+    run_recovery_command("mmcli", &["-m", modem_path, "--location-enable-3gpp"]).await?;
     run_recovery_command("mmcli", &["-m", modem_path, "--signal-setup=5"]).await?;
     Ok(())
 }
 
 pub async fn stop_cell_monitoring_for_modem(modem_path: &str) -> Result<(), String> {
     run_recovery_command("mmcli", &["-m", modem_path, "--signal-setup=0"]).await?;
-    run_recovery_command(
-        "mmcli",
-        &["-m", modem_path, "--location-disable-3gpp"],
-    )
-    .await?;
+    run_recovery_command("mmcli", &["-m", modem_path, "--location-disable-3gpp"]).await?;
     Ok(())
 }
 
@@ -4940,8 +4944,8 @@ async fn qmi_packet_stats_for_modem(
     let output = with_serial_for(modem_path, async {
         run_modem_helper_command("qmicli", args).await
     })
-        .await
-        .ok()?;
+    .await
+    .ok()?;
     parse_qmicli_packet_statistics(&output)
 }
 

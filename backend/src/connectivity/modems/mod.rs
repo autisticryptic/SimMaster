@@ -1,7 +1,7 @@
 //! Access implementations ("modems"): the pluggable units that build a
 //! protected SIP channel on top of the shared [`super::core`].
 //!
-//!   - [`softstack`] — the user-space soft-stack: the host builds the IMS stack
+//!   - [`ims`] — the user-space IMS soft-stack: the host builds the IMS stack
 //!     itself (VoWiFi over a user-space IKEv2/ESP tunnel, VoLTE over the kernel
 //!     `ip xfrm` IMS bearer). VoLTE and VoWiFi share the same core and cross-call
 //!     each other, so they live together as one unit.
@@ -11,4 +11,4 @@
 //! VoWiFi) by delegating to modem firmware over AT, so it is organized by chip,
 //! not split by access type.
 
-pub mod softstack;
+pub mod ims;

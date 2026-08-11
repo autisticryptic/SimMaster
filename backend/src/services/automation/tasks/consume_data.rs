@@ -1,9 +1,7 @@
+use crate::hardware::cellular::modem_manager::{connect_data_via_modem, data_interface_for_modem};
+use crate::platform::utils::read_network_interfaces;
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
-use crate::hardware::cellular::modem_manager::{
-    connect_data_via_modem, data_interface_for_modem,
-};
-use crate::platform::utils::read_network_interfaces;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
@@ -44,9 +42,7 @@ fn source_ip_for_interface(
         .or_else(|| {
             interfaces
                 .iter()
-                .filter(|interface| {
-                    interface.name == interface_name && interface.status != "down"
-                })
+                .filter(|interface| interface.name == interface_name && interface.status != "down")
                 .flat_map(|interface| interface.ip_addresses.iter())
                 .filter_map(|address| address.address.parse::<IpAddr>().ok())
                 .next()
@@ -83,20 +79,17 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                 profile.roaming_allowed,
                 Some(&apn),
             )
-                .await
-                .map_err(anyhow::Error::msg)
-                .context("移动数据连接建立失败")?;
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("移动数据连接建立失败")?;
 
             let mut source_ip = None;
             let mut selected_interface = None;
             for _ in 0..10 {
-                selected_interface = data_interface_for_modem(
-                    &app.dbus_conn,
-                    &target.modem_path,
-                )
-                .await
-                .ok()
-                .flatten();
+                selected_interface = data_interface_for_modem(&app.dbus_conn, &target.modem_path)
+                    .await
+                    .ok()
+                    .flatten();
                 let interfaces = read_network_interfaces(Some(&app.dbus_conn))
                     .await
                     .unwrap_or_default();
@@ -108,8 +101,8 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
-            let selected_interface = selected_interface
-                .ok_or_else(|| anyhow!("未找到目标线路的数据接口"))?;
+            let selected_interface =
+                selected_interface.ok_or_else(|| anyhow!("未找到目标线路的数据接口"))?;
             let source_ip = source_ip.ok_or_else(|| anyhow!("未找到目标线路的数据源地址"))?;
             let endpoint = format!("https://speed.cloudflare.com/__down?bytes={amount}");
             let client = reqwest::Client::builder()
@@ -117,7 +110,11 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                 .timeout(std::time::Duration::from_secs(45))
                 .build()
                 .context("创建蜂窝数据专用客户端失败")?;
-            let response = client.get(endpoint).send().await.context("蜂窝流量请求失败")?;
+            let response = client
+                .get(endpoint)
+                .send()
+                .await
+                .context("蜂窝流量请求失败")?;
             if !response.status().is_success() {
                 return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
             }

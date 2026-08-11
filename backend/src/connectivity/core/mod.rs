@@ -18,11 +18,20 @@
 
 pub mod access;
 pub mod context;
+pub mod device_identity;
 pub mod digest_aka;
+pub mod entitlement;
+pub mod ims_video;
+pub mod media;
 pub mod register;
+pub mod register_message;
+pub mod register_response;
+pub mod registration;
 pub mod sip_frame;
 pub mod sip_message;
 pub mod sms_codec;
+pub mod supplementary;
+pub mod ut;
 pub mod voice;
 
 use std::fmt;

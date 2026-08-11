@@ -8,7 +8,6 @@ import {
   type LineVowifiConfig,
   type VowifiLineConfigResponse,
   type VowifiProxyMode,
-  type StoredCarrierProfile,
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
 
@@ -29,19 +28,14 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
   const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
 
   useEffect(() => {
     if (line) setDraft({ ...line.config })
-    if (open) void api.listVowifiCarrierProfiles().then((response) => setProfiles(response.data ?? [])).catch(() => setProfiles([]))
     setError(null)
   }, [line, open])
 
   const validationError = useMemo(() => {
     if (!draft) return null
-    if (draft.dns_server && !/^[0-9a-f:.]+$/i.test(draft.dns_server.trim())) {
-      return 'DNS 解析器必须填写 IPv4 或 IPv6 地址'
-    }
     if (draft.proxy_mode !== 'direct' && !draft.proxy_endpoint.trim()) return '所选代理模式需要填写代理端点'
     return null
   }, [draft])
@@ -73,35 +67,9 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
       <DialogContent dividers>
         <Stack spacing={2}>
           <Alert severity="info">
-            这里配置的是<strong>这条线路</strong>的覆盖值。运营商本身的 profile（ePDG、IMS、REGISTER 细节）
-            存在数据库里，可在「SIM 卡管理 → 运营商 Profile」页完整编辑。
+            这里仅配置<strong>这条线路</strong>的运行方式。运营商 profile、DNS、ePDG 和 IMS 覆写跟随 SIM 卡保存，
+            换卡或移动 SIM 时不会与物理线路配置混用。
           </Alert>
-          <FormControl fullWidth>
-            <InputLabel>指定运营商 profile</InputLabel>
-            <Select
-              label="指定运营商 profile"
-              value={draft.profile_id ?? ''}
-              onChange={(event) => update('profile_id', event.target.value ? event.target.value : null)}
-            >
-              <MenuItem value=""><em>自动（按 SIM 卡 IMSI 匹配）</em></MenuItem>
-              {profiles.map((profile) => (
-                <MenuItem key={profile.profile_id} value={profile.profile_id}>
-                  {profile.record.meta.brand || profile.profile_id} · {profile.plmn} · {profile.record.epdg.host}
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
-          <Alert severity="info">
-            留空时按 SIM 卡 IMSI 自动匹配运营商（先查数据库，未命中则按 3GPP 标准推算连接域名）。
-            指定后强制使用所选数据库 profile 的全部连接参数。
-          </Alert>
-          <TextField
-            label="专用 DNS 解析器"
-            value={draft.dns_server}
-            placeholder="例如 8.8.8.8 或 2001:4860:4860::8888"
-            helperText="留空时依次使用系统 DNS、resolv.conf 和内置公共 DNS"
-            onChange={(event) => update('dns_server', event.target.value)}
-          />
           <FormControl fullWidth>
             <InputLabel>代理模式</InputLabel>
             <Select

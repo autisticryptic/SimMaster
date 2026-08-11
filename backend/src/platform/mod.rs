@@ -5,5 +5,6 @@
 //!   - `utils`: system/network/disk/CPU sampling helpers
 
 pub mod config;
+pub mod config_maintenance;
 pub mod db;
 pub mod utils;

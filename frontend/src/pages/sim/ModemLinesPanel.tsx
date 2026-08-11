@@ -730,8 +730,7 @@ export default function ModemLinesPanel({ basicInfoForLine }: { basicInfoForLine
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {vowifiLine?.config.profile_id ? `指定 profile ${vowifiLine.config.profile_id}` : '自动匹配运营商 profile'}
-                          {vowifiLine?.config.dns_server ? ` · DNS ${vowifiLine.config.dns_server}` : ''}
+                          {vowifiLine?.matched_profile_id ? `运营商 profile ${vowifiLine.matched_profile_id}` : '等待匹配运营商 profile'}
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>

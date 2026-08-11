@@ -638,10 +638,7 @@ async fn handle_operator_event(
 async fn record_sip_rx(state: &TrunkStateWriter, frame: &[u8]) {
     let is_invite = sip_frame::is_request(frame, "INVITE");
     let has_video = is_invite
-        && crate::connectivity::modems::softstack::volte::vilte::parse_video_sdp(sip_frame::body(
-            frame,
-        ))
-        .is_ok();
+        && crate::connectivity::core::ims_video::parse_video_sdp(sip_frame::body(frame)).is_ok();
     state
         .update(|snapshot| {
             snapshot.sip_rx_frames = snapshot.sip_rx_frames.saturating_add(1);

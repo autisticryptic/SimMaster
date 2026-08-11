@@ -16,6 +16,24 @@ pub trait RegisterAuthenticator<C>: Send
 where
     C: ImsChannel,
 {
+    /// Let an access leg own one challenged REGISTER exchange when its security
+    /// transport cannot be represented as a single in-place channel update.
+    ///
+    /// Most legs use the default path below: prepare the existing channel,
+    /// build the request, then let this driver send and receive it. VoWiFi is
+    /// the important exception because one `Security-Server` offer may require
+    /// probing several protected ESP port/SPI mappings. Returning `Some` keeps
+    /// that access-specific probing behind the adapter while this driver still
+    /// owns the shared 401/407/AUTS transaction state and challenge bound.
+    async fn exchange_authenticated(
+        &mut self,
+        _challenge_response: &[u8],
+        _cseq: u32,
+        _channel: &mut C,
+    ) -> Result<Option<Vec<u8>>, ImsError> {
+        Ok(None)
+    }
+
     /// Prepare the protected channel selected by the challenge.
     ///
     /// VoLTE normally keeps the same xfrm-protected socket, while VoWiFi may
@@ -117,32 +135,43 @@ where
             }
             401 | 407 if auth_rounds < MAX_AUTH_ROUNDS => {
                 auth_rounds += 1;
-                authenticator
-                    .prepare_authenticated_channel(&response, channel)
+                let cseq = u32::from(auth_rounds) + 1;
+                if let Some(access_response) = authenticator
+                    .exchange_authenticated(&response, cseq, channel)
                     .await
                     .map_err(|error| {
                         RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                    })?
+                {
+                    response = access_response;
+                } else {
+                    authenticator
+                        .prepare_authenticated_channel(&response, channel)
+                        .await
+                        .map_err(|error| {
+                            RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                        })?;
+                    let request = authenticator
+                        .authenticated_request(&response, cseq)
+                        .await
+                        .map_err(|error| {
+                            RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                        })?;
+                    channel.send_sip(&request).await.map_err(|_| {
+                        RegisterFailure::new(
+                            ImsError::new("ims_register_authenticated_send_failed"),
+                            Some(response.clone()),
+                            auth_rounds,
+                        )
                     })?;
-                let request = authenticator
-                    .authenticated_request(&response, u32::from(auth_rounds) + 1)
-                    .await
-                    .map_err(|error| {
-                        RegisterFailure::new(error, Some(response.clone()), auth_rounds)
-                    })?;
-                channel.send_sip(&request).await.map_err(|_| {
-                    RegisterFailure::new(
-                        ImsError::new("ims_register_authenticated_send_failed"),
-                        Some(response.clone()),
-                        auth_rounds,
+                    response = recv_final_register_response(
+                        channel,
+                        "ims_register_authenticated_receive_failed",
+                        "ims_register_authenticated_unexpected_status",
                     )
-                })?;
-                response = recv_final_register_response(
-                    channel,
-                    "ims_register_authenticated_receive_failed",
-                    "ims_register_authenticated_unexpected_status",
-                )
-                .await
-                .map_err(|error| RegisterFailure::new(error, None, auth_rounds))?;
+                    .await
+                    .map_err(|error| RegisterFailure::new(error, None, auth_rounds))?;
+                }
             }
             401 | 407 => {
                 return Err(RegisterFailure::new(
@@ -276,6 +305,30 @@ mod tests {
         }
     }
 
+    struct OwnedExchangeAuthenticator;
+
+    impl RegisterAuthenticator<FakeChannel> for OwnedExchangeAuthenticator {
+        async fn exchange_authenticated(
+            &mut self,
+            _challenge_response: &[u8],
+            cseq: u32,
+            channel: &mut FakeChannel,
+        ) -> Result<Option<Vec<u8>>, ImsError> {
+            channel
+                .sends
+                .push(format!("REGISTER adapter CSeq {cseq}").into_bytes());
+            Ok(Some(response(200, "OK")))
+        }
+
+        async fn authenticated_request(
+            &mut self,
+            _challenge_response: &[u8],
+            _cseq: u32,
+        ) -> Result<Vec<u8>, ImsError> {
+            panic!("adapter-owned exchange must bypass the default request path")
+        }
+    }
+
     fn response(code: u16, reason: &str) -> Vec<u8> {
         format!("SIP/2.0 {code} {reason}\r\nContent-Length: 0\r\n\r\n").into_bytes()
     }
@@ -379,6 +432,25 @@ mod tests {
 
         assert_eq!(channel.transport, SipTransport::Tcp);
         assert_eq!(channel.sends[1], b"REGISTER protected CSeq 2");
+    }
+
+    #[tokio::test]
+    async fn access_adapter_can_own_a_challenged_exchange() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([response(401, "Unauthorized")]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = OwnedExchangeAuthenticator;
+
+        let result = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap();
+
+        assert!(result.authenticated);
+        assert_eq!(result.auth_rounds, 1);
+        assert_eq!(channel.sends[1], b"REGISTER adapter CSeq 2");
+        assert!(channel.responses.is_empty());
     }
 
     #[tokio::test]

@@ -23,11 +23,11 @@ use crate::{
     api::models::ApiResponse,
     platform::config::SecurityConfig,
     platform::db::Database,
-    state::AppState,
     services::system::system_event::{
         codes as system_event_codes, severity as system_event_severity,
         status as system_event_status,
     },
+    state::AppState,
 };
 
 const PASSWORD_KEY: &str = "admin_password_hash";

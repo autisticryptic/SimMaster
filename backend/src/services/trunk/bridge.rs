@@ -15,11 +15,11 @@ use std::{
 
 use crate::{
     connectivity::core::{
+        ims_video::{parse_video_sdp, VideoMediaDescription},
         sip_frame,
         sip_message::SipHeader,
         voice::{parse_audio_sdp, SdpAudioDescription},
     },
-    connectivity::modems::softstack::volte::vilte::{parse_video_sdp, VideoMediaDescription},
     services::trunk::{
         dialog::{self, InviteTransactionState, SipDialog},
         digest,
@@ -962,11 +962,9 @@ impl TrunkBridge {
         } else {
             "WWW-Authenticate"
         };
-        let challenge = digest::parse_challenge(
-            &sip_frame::header_value(frame, challenge_header)?,
-            proxy,
-        )
-        .ok()?;
+        let challenge =
+            digest::parse_challenge(&sip_frame::header_value(frame, challenge_header)?, proxy)
+                .ok()?;
         let digest_uri = dialog::request_uri(&call.dialog.initial_invite).ok()?;
         let next_round = call.invite_digest_rounds.saturating_add(1);
         let authorization = digest::build_authorization(
@@ -980,11 +978,9 @@ impl TrunkBridge {
         )
         .ok()?;
         let ack = sip::build_ack_for_final(&call.dialog.initial_invite, frame).ok()?;
-        let retry = sip::build_authenticated_invite_retry(
-            &call.dialog.initial_invite,
-            &authorization,
-        )
-        .ok()?;
+        let retry =
+            sip::build_authenticated_invite_retry(&call.dialog.initial_invite, &authorization)
+                .ok()?;
         let retry_cseq = dialog::cseq_number(&retry, "INVITE").ok()?;
         call.dialog.invite_cseq = retry_cseq;
         call.dialog.next_local_cseq = retry_cseq.saturating_add(1);
@@ -1653,6 +1649,32 @@ mod tests {
                 body: sdp().to_vec(),
             }]
         );
+    }
+
+    #[test]
+    fn restricted_operator_identity_reaches_asterisk_as_anonymous_only() {
+        let incoming = b"INVITE sip:user@example SIP/2.0\r\nPrivacy: id\r\nP-Asserted-Identity: <sip:+15551234567@example>\r\nFrom: <sip:anonymous@anonymous.invalid>;tag=remote\r\n\r\n";
+        let caller = crate::connectivity::core::supplementary::resolve_caller_identity(incoming)
+            .uri
+            .unwrap_or_else(|| "sip:anonymous@anonymous.invalid".to_string());
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven)
+        .with_asterisk_target("sip:6108@192.0.2.20:8060");
+
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "private-ims-call".into(),
+                caller,
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let invite = String::from_utf8_lossy(&output.asterisk_frames[0]);
+        assert!(invite.contains("From: <sip:anonymous@anonymous.invalid>;tag="));
+        assert!(!invite.contains("+15551234567"));
+        assert!(!invite.contains("P-Asserted-Identity"));
     }
 
     #[test]

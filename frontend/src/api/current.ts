@@ -42,6 +42,7 @@ import type {
   ExternalVowifiProfile,
   LoginRequest,
   LineRuntimeStatus,
+  SupplementarySnapshot,
   ManualRegisterRequest,
   TrunkProfileConfig,
   VowifiLineConfigResponse,
@@ -639,6 +640,12 @@ class SimAdminCurrentAPI {
 
   async getModemLines() {
     return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
+  }
+
+  async getImsSupplementary(lineId: string) {
+    return request<ApiResponse<SupplementarySnapshot>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/supplementary`,
+    )
   }
 
   async getVolteLines() {

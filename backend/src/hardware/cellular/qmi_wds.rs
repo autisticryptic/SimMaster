@@ -191,7 +191,7 @@ impl std::error::Error for WdsError {}
 
 impl WdsError {
     /// Whether it is unsafe to retry against the same baseband. Mirrors
-    /// `connectivity::modems::softstack::volte::plan::FailureClass::is_unsafe_to_retry`, which stays the
+    /// `connectivity::modems::ims::volte::plan::FailureClass::is_unsafe_to_retry`, which stays the
     /// authority for classifying ModemManager-level failures.
     pub fn is_unsafe_to_retry(&self) -> bool {
         matches!(self, Self::BasebandWedged(_))
@@ -200,7 +200,7 @@ impl WdsError {
 
 /// Signatures of a baseband that has stopped accepting session setup.
 ///
-/// Kept in sync with `connectivity::modems::softstack::volte::plan::is_baseband_wedge`; duplicated rather
+/// Kept in sync with `connectivity::modems::ims::volte::plan::is_baseband_wedge`; duplicated rather
 /// than shared because the cellular layer must be able to abort a family loop
 /// without depending on the VoLTE layer's error vocabulary.
 fn is_wedge_signature(text: &str) -> bool {

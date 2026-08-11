@@ -1,6 +1,6 @@
+use crate::hardware::cellular::modem_manager::restart_baseband_via_modem;
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
-use crate::hardware::cellular::modem_manager::restart_baseband_via_modem;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};

@@ -1,9 +1,9 @@
-use crate::services::automation::tasks::TaskRegistry;
-use crate::services::automation::target::target_line_id;
 use crate::platform::config::{
     AutomationAction, AutomationTarget, AutomationTask, AutomationTrigger,
 };
 use crate::platform::db::beijing_sms_now_string;
+use crate::services::automation::target::target_line_id;
+use crate::services::automation::tasks::TaskRegistry;
 use crate::services::notify::notification::AutomationEvent;
 use crate::state::AppState;
 use anyhow::Result;
@@ -65,12 +65,11 @@ struct AutomationRunGuard {
 }
 
 impl AutomationRunGuard {
-    fn try_acquire(
-        active: Arc<Mutex<HashSet<String>>>,
-        task: &AutomationTask,
-    ) -> Option<Self> {
+    fn try_acquire(active: Arc<Mutex<HashSet<String>>>, task: &AutomationTask) -> Option<Self> {
         let keys = automation_run_keys(task);
-        let mut running = active.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut running = active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if keys.iter().any(|key| running.contains(key)) {
             return None;
         }
@@ -112,10 +111,9 @@ pub fn spawn_automation_task(
     registry: Arc<TaskRegistry>,
     task: AutomationTask,
 ) -> AutomationStartResult {
-    let Some(run_guard) = AutomationRunGuard::try_acquire(
-        Arc::clone(&app.automation_running_scopes),
-        &task,
-    ) else {
+    let Some(run_guard) =
+        AutomationRunGuard::try_acquire(Arc::clone(&app.automation_running_scopes), &task)
+    else {
         return AutomationStartResult::AlreadyRunning;
     };
 
@@ -279,16 +277,14 @@ async fn execute_task(
         Some(h) => h,
         None => {
             let err_msg = format!("No handler found for task type: {}", task_type);
-            let _ = app
-                .database
-                .insert_automation_log(
-                    target_line_id(task.target.as_ref()),
-                    &task.id,
-                    &task.name,
-                    task_type,
-                    "failed",
-                    &err_msg,
-                );
+            let _ = app.database.insert_automation_log(
+                target_line_id(task.target.as_ref()),
+                &task.id,
+                &task.name,
+                task_type,
+                "failed",
+                &err_msg,
+            );
             return Err(anyhow::anyhow!(err_msg));
         }
     };
@@ -361,16 +357,14 @@ async fn execute_task(
     };
 
     // 1. 写入 SQLite 日志表
-    let _ = app
-        .database
-        .insert_automation_log(
-            target_line_id(task.target.as_ref()),
-            &task.id,
-            &task.name,
-            task_type,
-            status,
-            &detail,
-        );
+    let _ = app.database.insert_automation_log(
+        target_line_id(task.target.as_ref()),
+        &task.id,
+        &task.name,
+        task_type,
+        status,
+        &detail,
+    );
 
     // 2. 发出通知事件
     let event = AutomationEvent {
@@ -427,11 +421,9 @@ mod tests {
     #[test]
     fn automation_run_guard_serializes_each_task_and_target_only() {
         let active = Arc::new(Mutex::new(HashSet::new()));
-        let line_a = AutomationRunGuard::try_acquire(
-            Arc::clone(&active),
-            &line_task("task-a", "line-a"),
-        )
-        .expect("first task reserves line A");
+        let line_a =
+            AutomationRunGuard::try_acquire(Arc::clone(&active), &line_task("task-a", "line-a"))
+                .expect("first task reserves line A");
 
         assert!(AutomationRunGuard::try_acquire(
             Arc::clone(&active),
@@ -444,17 +436,13 @@ mod tests {
         )
         .is_none());
 
-        let line_b = AutomationRunGuard::try_acquire(
-            Arc::clone(&active),
-            &line_task("task-b", "line-b"),
-        )
-        .expect("a different line can run concurrently");
+        let line_b =
+            AutomationRunGuard::try_acquire(Arc::clone(&active), &line_task("task-b", "line-b"))
+                .expect("a different line can run concurrently");
         drop(line_a);
-        let line_a_again = AutomationRunGuard::try_acquire(
-            Arc::clone(&active),
-            &line_task("task-c", "line-a"),
-        )
-        .expect("line A is reusable after completion");
+        let line_a_again =
+            AutomationRunGuard::try_acquire(Arc::clone(&active), &line_task("task-c", "line-a"))
+                .expect("line A is reusable after completion");
 
         drop(line_a_again);
         drop(line_b);

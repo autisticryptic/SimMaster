@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::connectivity::modems::softstack::vowifi::profiles::CarrierProfile;
+use crate::connectivity::modems::ims::vowifi::profiles::CarrierProfile;
 
 static SMS_MESSAGE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -1514,7 +1514,7 @@ pub fn build_dry_run_sms_snapshot(profile: &'static CarrierProfile) -> SmsRuntim
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::connectivity::modems::softstack::vowifi::profiles::GB_EE_23433;
+    use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
 
     fn mo_record() -> SmsDeliveryRecord {
         SmsDeliveryRecord {

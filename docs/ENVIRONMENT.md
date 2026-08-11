@@ -31,9 +31,9 @@
 | `/opt/simadmin/lpac/` | 可选的手动安装 `lpac` 目录，后端优先调用此路径 |
 | `/opt/simadmin/carrier-bundles.sqlite3` | 只读运营商接入/IMS/SIP catalog；运行时只接受受支持且已封存的 release |
 | `/opt/simadmin/data.db` | SQLite 数据库文件（保存短信记录、登录认证密码散列值、会话 Token、自动化日志等） |
+| `/data/config.sqlite3` | 优先使用的用户配置 SQLite；保存 `AppConfig` 与按 SIM 的 IMS 覆写 |
+| `/opt/simadmin/config.sqlite3` | `/data` 目录不存在时的用户配置 SQLite 回退路径 |
 | `/opt/simadmin/meta.json` | 旧 OTA 流程的元数据文件；手动部署不要求，当前暂停使用 |
-| `/data/config.json` | 优先加载的系统运行持久化配置文件 |
-| `/opt/simadmin/config.json` | `/data` 目录不存在时，回退加载的系统配置文件 |
 | `/tmp/ota_staging` | 旧 OTA 流程的临时目录；当前手动部署不使用 |
 | `/run/simadmin/secondary-qmi-endpoints.json` | 各基带副 QMI 端点的临时运行态映射，重启后重建 |
 | `/etc/systemd/system/simadmin.service` | SimAdmin 后端主服务守护单元 |
@@ -90,6 +90,7 @@
 - `WorkingDirectory=/opt/simadmin`
 - `ExecStart=/opt/simadmin/simadmin`
 - `Restart=always`
+- `UMask=0077`（约束配置库 WAL/SHM、E911 state 等运行期敏感文件的默认权限）
 - `Environment=DBUS_SYSTEM_BUS_ADDRESS=unix:path=/var/run/dbus/system_bus_socket`
 
 ### 常用管理命令
@@ -119,22 +120,25 @@ journalctl -u simadmin-secondary-qmi -f
 - 短信、跨通道去重指纹、SMSC/本机号码缓存和每线路数据流量。
 - 通话记录、通知日志与失败重试队列、自动化运行日志。
 - 管理员密码哈希、Web 会话、eSIM Profile 缓存。
-- VoWiFi 运行事件、快照、短信投递、压测数据和本地 carrier profile 覆盖。
+- VoWiFi 运行事件、快照、短信投递和压测数据。
 
 *注：管理员密码和会话 token 不以明文存储。修改密码或清除管理员配置会同步置空所有旧会话令牌。*
 
-### 2. 本地持久化配置文件
+### 2. 本地持久化配置数据库
 
-保存在 `/data/config.json`（或回退路径 `/opt/simadmin/config.json`），主要存储：
+保存在 `/data/config.sqlite3`（或回退路径 `/opt/simadmin/config.sqlite3`），主要存储：
 
 - 每条线路的 APN、数据代理、流量、漫游、飞行模式、VoLTE/VoWiFi、eSIM、Trunk 和
   语音/短信路径策略。
 - 独立 SIM 读卡器、设备网络、WLAN 与 DDNS 设置。
 - 通知通道、转发规则、模板、清理策略和限流设置。
 - 自动化任务、系统安全策略、OTA/恢复相关配置。
+- `ims_sim_overrides` 中按 ICCID 或 EID + profile ICCID 绑定的 IMS/ePDG、自定义 IMEI、
+  语音信箱号码和 E911 本地地址意图。
 
-配置文件包含号码、代理和通知凭据等敏感信息，应限制文件权限并纳入备份；只读
-carrier catalog 与用户配置/数据库应分别升级和备份，不要互相覆盖。
+配置库包含号码、代理和通知凭据等敏感信息，文件权限为 `0600`。升级前先停止服务并备份
+`config.sqlite3*`，避免漏掉 WAL；只读 carrier catalog、运行数据、用户配置和 E911 secret
+state 应分别升级和备份，不要互相覆盖。程序不读取或导入旧 `config.json`。
 
 ## 自动安装与 OTA 状态
 

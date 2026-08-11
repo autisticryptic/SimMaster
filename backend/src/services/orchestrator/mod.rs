@@ -24,7 +24,7 @@
 
 // Staged module: the pure planners below are exercised by unit tests now and
 // wired into the live send/receive paths when per-leg live IO lands (design
-// phase B-live). Mirror the `connectivity::modems::softstack::volte` module's allowance for staged code.
+// phase B-live). Mirror the `connectivity::modems::ims::volte` module's allowance for staged code.
 #![allow(dead_code)]
 
 pub mod dedup;

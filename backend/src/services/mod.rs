@@ -13,10 +13,12 @@
 //!     physical line to its own VoLTE/VoWiFi/Trunk/data-proxy runtimes.
 
 pub mod automation;
+pub mod e911;
 pub mod line_registry;
 pub mod messaging;
 pub mod network;
 pub mod notify;
 pub mod orchestrator;
+pub mod supplementary;
 pub mod system;
 pub mod trunk;

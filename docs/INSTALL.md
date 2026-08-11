@@ -189,8 +189,11 @@ SimAdmin 没有默认初始密码。首次访问会进入管理员密码设置�
 systemctl stop simadmin.service
 install -d -m 0700 /opt/simadmin/manual-backup
 cp -a /opt/simadmin/data.db* /opt/simadmin/manual-backup/
+cp -a /opt/simadmin/config.sqlite3* /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /data/config.sqlite3* /opt/simadmin/manual-backup/ 2>/dev/null || true
 cp -a /opt/simadmin/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
 cp -a /data/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /data/simadmin/e911 /opt/simadmin/manual-backup/ 2>/dev/null || true
 ```
 
 然后按第 3、4 节重新传输并覆盖后端、前端和经过审核的 catalog，最后启动并检查日志：
@@ -201,7 +204,8 @@ systemctl status simadmin --no-pager
 journalctl -u simadmin -n 100 --no-pager
 ```
 
-`data.db` 和配置文件是用户数据，不要用发布包中的同名文件覆盖。catalog 是独立只读制品，
+`data.db`、`config.sqlite3` 和 E911 secret state 是用户数据，不要用发布包中的同名文件覆盖。
+复制 SQLite 文件前必须先停止服务，不能在 WAL 活跃时只复制主文件。catalog 是独立只读制品，
 升级时需要同时验证 schema、config contract 与 sealed 状态。
 
 ## 9. 暂停使用的功能

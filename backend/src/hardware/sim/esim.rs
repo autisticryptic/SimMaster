@@ -889,7 +889,7 @@ fn esim_target_for_line(line_id: &str) -> Result<EsimTarget, EsimApiError> {
     if line_id.is_empty() {
         return Err(EsimApiError::Unavailable("line_id_required".to_string()));
     }
-    let device = crate::connectivity::modems::softstack::vowifi::live::sim_device_for_line(line_id);
+    let device = crate::connectivity::modems::ims::vowifi::live::sim_device_for_line(line_id);
     if device.qmi_device.trim().is_empty() || device.uim_slot == 0 {
         return Err(EsimApiError::Unavailable(
             "esim_line_reader_not_found".to_string(),
@@ -1569,7 +1569,7 @@ mod tests {
         );
 
         let line_id = "line-esim-target-test";
-        crate::connectivity::modems::softstack::vowifi::live::register_line_sim_device(
+        crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
             line_id,
             "/dev/wwan-test-qmi",
             2,
@@ -1578,7 +1578,7 @@ mod tests {
         let target = esim_target_for_line(line_id).expect("registered eSIM target");
         assert_eq!(target.qmi_device, "/dev/wwan-test-qmi");
         assert_eq!(target.uim_slot, 2);
-        crate::connectivity::modems::softstack::vowifi::live::forget_line_sim_device(line_id);
+        crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device(line_id);
     }
 
     #[test]
