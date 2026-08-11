@@ -23,16 +23,16 @@ use super::{
     },
     ike_payloads::{
         build_authentication_shared_key_payload, build_configuration_request_payload,
-        build_identification_initiator_payload, build_identification_responder_payload,
-        build_ke_payload, build_nonce_payload, build_notify_payload, build_sa_payload,
-        build_traffic_selector_initiator_payload, build_traffic_selector_responder_payload,
-        child_sa_proposal_from_profile_string, ike_proposal_dh_group_from_profile_string,
-        ike_proposal_from_profile_string, parse_sa_payload, IkeProtocolId, NotifyProtocolId,
-        ParsedProposal, PayloadBuildError, ProposalParseError, SaParseError,
-        CFG_ATTR_INTERNAL_IP4_ADDRESS, CFG_ATTR_INTERNAL_IP4_DNS, CFG_ATTR_INTERNAL_IP4_PCSCF,
-        CFG_ATTR_INTERNAL_IP6_ADDRESS, CFG_ATTR_INTERNAL_IP6_DNS, CFG_ATTR_INTERNAL_IP6_PCSCF,
-        DH_MODP_2048, NOTIFY_EAP_ONLY_AUTHENTICATION, NOTIFY_NAT_DETECTION_DESTINATION_IP,
-        NOTIFY_NAT_DETECTION_SOURCE_IP,
+        build_device_identity_vendor_payload, build_identification_initiator_payload,
+        build_identification_responder_payload, build_ke_payload, build_nonce_payload,
+        build_notify_payload, build_sa_payload, build_traffic_selector_initiator_payload,
+        build_traffic_selector_responder_payload, child_sa_proposal_from_profile_string,
+        ike_proposal_dh_group_from_profile_string, ike_proposal_from_profile_string,
+        parse_sa_payload, IkeProtocolId, NotifyProtocolId, ParsedProposal, PayloadBuildError,
+        ProposalParseError, SaParseError, CFG_ATTR_INTERNAL_IP4_ADDRESS, CFG_ATTR_INTERNAL_IP4_DNS,
+        CFG_ATTR_INTERNAL_IP4_PCSCF, CFG_ATTR_INTERNAL_IP6_ADDRESS, CFG_ATTR_INTERNAL_IP6_DNS,
+        CFG_ATTR_INTERNAL_IP6_PCSCF, DH_MODP_2048, NOTIFY_EAP_ONLY_AUTHENTICATION,
+        NOTIFY_NAT_DETECTION_DESTINATION_IP, NOTIFY_NAT_DETECTION_SOURCE_IP,
     },
     ike_retransmit::{RetransmitPolicy, RetransmitState},
     profiles::CarrierProfile,
@@ -225,6 +225,9 @@ pub struct IkeAccessConfig {
     pub ip_stack: String,
     pub apn: Option<String>,
     pub epdg_host: String,
+    /// Optional policy-gated IMEI Vendor ID. The subscriber IDi/EAP identity
+    /// remains the permanent NAI regardless of this value.
+    pub device_identity: Option<String>,
 }
 
 impl IkeAccessConfig {
@@ -233,6 +236,7 @@ impl IkeAccessConfig {
             ip_stack: profile.epdg.ip_stack.to_string(),
             apn: profile.epdg.apn.map(str::to_string),
             epdg_host: profile.epdg.host.to_string(),
+            device_identity: None,
         }
     }
 }
@@ -783,6 +787,9 @@ impl IkeStateMachine {
                 1,
                 build_identification_responder_payload(responder_identity),
             );
+        }
+        if let Some(identity) = self.access.device_identity.as_deref() {
+            payloads.push(build_device_identity_vendor_payload(identity));
         }
         Ok(payloads)
     }
@@ -2264,6 +2271,38 @@ mod tests {
         assert_eq!(idr.body[0], super::super::ike_payloads::IKE_ID_FQDN);
         assert_eq!(&idr.body[4..], b"ims");
         assert!(!idr.body.windows(4).any(|window| window == b"epdg"));
+    }
+
+    #[test]
+    fn auth_init_device_identity_is_an_optional_vendor_id_not_subscriber_id() {
+        let access = IkeAccessConfig {
+            ip_stack: "ipv6".to_string(),
+            apn: Some("ims".to_string()),
+            epdg_host: "epdg.example".to_string(),
+            device_identity: Some("490154203237518".to_string()),
+        };
+        let machine = IkeStateMachine::new_with_dh_group_and_access(
+            &GB_EE_23433,
+            access,
+            0x1111_2222_3333_4444,
+            vec![0x55; 32],
+            vec![0x66; 256],
+            DH_MODP_2048,
+        );
+        let nai = "0234331234567890@nai.epc.mnc033.mcc234.3gppnetwork.org";
+        let payloads = machine
+            .build_auth_init_payloads(nai, [1, 2, 3, 4])
+            .expect("auth init payloads");
+        let idi = payloads
+            .iter()
+            .find(|payload| payload.payload_type == IkePayloadType::IdentificationInitiator)
+            .expect("IDi payload");
+        let vendor = payloads
+            .iter()
+            .find(|payload| payload.payload_type == IkePayloadType::VendorId)
+            .expect("device identity vendor payload");
+        assert_eq!(&idi.body[4..], nai.as_bytes());
+        assert_eq!(vendor.body, b"490154203237518");
     }
 
     #[test]

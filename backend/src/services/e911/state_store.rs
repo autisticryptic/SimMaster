@@ -7,7 +7,7 @@
 //! Layout under the store root (`E911_STATE_DIR`, default `/data/simadmin/e911`):
 //!   `<root>/state/<binding-sha256>.json`   — non-secret entitlement record
 //!   `<root>/secret/<binding-sha256>.json`  — encrypted secrets (token, cookie,
-//!                                            ServerFlow_User_Data)
+//!                                            ServiceFlow URL/user data)
 //!   `<root>/secret.key`                    — device-local AES-256-GCM key
 //!
 //! Secrets are encrypted at rest with the device key; the key file is created
@@ -98,20 +98,27 @@ impl StoredBinding {
     }
 }
 
-/// What a secret file carries. `ServerFlow_User_Data` is treated as a secret
-/// per the research doc §12.3.
+/// What a secret file carries. Token, cookie and `ServiceFlow_UserData` are
+/// treated as secrets per the research doc §12.3; the flow URL is kept beside
+/// them so operation creation cannot substitute the entitlement endpoint.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct E911Secrets {
     pub entitlement_token: Option<String>,
+    pub configuration_version: Option<u64>,
     pub cookie: Option<String>,
+    /// SSRF-validated carrier websheet URL. Kept encrypted with the associated
+    /// user data so operation creation never substitutes the entitlement URL.
+    pub server_flow_url: Option<String>,
     pub server_flow_user_data: Option<String>,
 }
 
 impl E911Secrets {
     pub fn is_empty(&self) -> bool {
         self.entitlement_token.is_none()
+            && self.configuration_version.is_none()
             && self.cookie.is_none()
+            && self.server_flow_url.is_none()
             && self.server_flow_user_data.is_none()
     }
 }
@@ -437,6 +444,7 @@ mod tests {
             entitlement_token: Some("secret-token".to_string()),
             cookie: Some("session".to_string()),
             server_flow_user_data: Some("csrf-state".to_string()),
+            ..E911Secrets::default()
         };
         store.save_secrets(&key, &secrets).unwrap();
 

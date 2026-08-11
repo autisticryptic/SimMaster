@@ -6,11 +6,11 @@
 
 use std::time::Duration;
 
-use super::{access::ImsChannel, sip_frame, ImsError};
+use super::{access::ImsChannel, registration::UnregisterResult, sip_frame, ImsError};
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_AUTH_ROUNDS: u8 = 2;
-const MAX_PROVISIONAL_RESPONSES: u8 = 4;
+pub(crate) const MAX_REGISTER_PROVISIONAL_RESPONSES: u8 = 4;
 
 pub trait RegisterAuthenticator<C>: Send
 where
@@ -207,6 +207,26 @@ where
     }
 }
 
+/// Run an explicit `REGISTER Expires: 0` exchange through the same bounded
+/// challenge engine as registration and refresh. Only a final 2xx is a
+/// network-confirmed unregister; a final non-2xx remains distinct from losing
+/// the signaling path before any final response.
+pub async fn run_unregister<C, A>(
+    channel: &mut C,
+    initial_request: &[u8],
+    authenticator: &mut A,
+) -> UnregisterResult
+where
+    C: ImsChannel,
+    A: RegisterAuthenticator<C>,
+{
+    match run_register_observed(channel, initial_request, authenticator).await {
+        Ok(_) => UnregisterResult::Confirmed,
+        Err(failure) if failure.response.is_some() => UnregisterResult::Rejected,
+        Err(_) => UnregisterResult::AccessLost,
+    }
+}
+
 async fn recv_final_register_response<C>(
     channel: &mut C,
     receive_error: &'static str,
@@ -215,7 +235,7 @@ async fn recv_final_register_response<C>(
 where
     C: ImsChannel,
 {
-    for provisional_count in 0..MAX_PROVISIONAL_RESPONSES {
+    for provisional_count in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
         let response = channel
             .recv_sip(REGISTER_TIMEOUT)
             .await
@@ -348,6 +368,51 @@ mod tests {
         assert_eq!(result.auth_rounds, 1);
         assert_eq!(channel.sends.len(), 2);
         assert!(String::from_utf8_lossy(&channel.sends[1]).contains("CSeq: 2 REGISTER"));
+    }
+
+    #[tokio::test]
+    async fn unregister_uses_the_same_bounded_challenge_exchange() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([response(401, "Unauthorized"), response(200, "OK")]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut authenticator = FakeAuthenticator;
+        let result = run_unregister(
+            &mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nExpires: 0\r\n\r\n",
+            &mut authenticator,
+        )
+        .await;
+
+        assert_eq!(result, UnregisterResult::Confirmed);
+        assert_eq!(channel.sends.len(), 2);
+        assert!(channel.sends[0]
+            .windows(b"Expires: 0".len())
+            .any(|window| window == b"Expires: 0"));
+    }
+
+    #[tokio::test]
+    async fn unregister_does_not_confirm_rejection_or_transport_loss() {
+        let mut rejected = FakeChannel {
+            responses: VecDeque::from([response(403, "Forbidden")]),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        assert_eq!(
+            run_unregister(&mut rejected, b"unregister", &mut FakeAuthenticator).await,
+            UnregisterResult::Rejected
+        );
+
+        let mut lost = FakeChannel {
+            responses: VecDeque::new(),
+            sends: Vec::new(),
+            transport: SipTransport::Udp,
+        };
+        assert_eq!(
+            run_unregister(&mut lost, b"unregister", &mut FakeAuthenticator).await,
+            UnregisterResult::AccessLost
+        );
     }
 
     #[tokio::test]
@@ -508,5 +573,245 @@ mod tests {
 
         assert_eq!(error.code(), "ims_register_authenticated_receive_failed");
         assert_eq!(channel.sends.len(), 2);
+    }
+}
+
+/// Reusable REGISTER contract exercised from both live access adapters. The
+/// harness models the two supported exchange shapes without requiring a modem:
+/// VoLTE leaves authenticated send/receive to the shared driver, while VoWiFi
+/// owns the protected exchange and must return a final (non-provisional) frame.
+#[cfg(test)]
+pub(crate) mod contract {
+    use super::*;
+    use crate::connectivity::core::{
+        context::{ImsRoute, SipTransport},
+        registration::{ImsRegistrationAccess, RegisteredImsContext},
+    };
+    use std::{
+        collections::VecDeque,
+        net::{Ipv4Addr, SocketAddr},
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum AuthenticatedExchangeStyle {
+        SharedDriver,
+        AdapterOwned,
+    }
+
+    struct ContractChannel {
+        responses: VecDeque<Vec<u8>>,
+        sends: Vec<Vec<u8>>,
+    }
+
+    impl ImsChannel for ContractChannel {
+        async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+            self.sends.push(frame.to_vec());
+            Ok(())
+        }
+
+        async fn recv_sip(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            self.responses
+                .pop_front()
+                .ok_or(ImsError::new("ims_register_contract_response_missing"))
+        }
+
+        fn route(&self) -> ImsRoute {
+            ImsRoute {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                pcscf_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                transport: SipTransport::Udp,
+            }
+        }
+
+        fn security_verify(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    struct ContractAuthenticator {
+        style: AuthenticatedExchangeStyle,
+        challenges: Vec<(u16, u32, bool)>,
+    }
+
+    impl ContractAuthenticator {
+        fn request_for(&mut self, challenge: &[u8], cseq: u32) -> Result<Vec<u8>, ImsError> {
+            let status = sip_frame::parse_status(challenge)?;
+            let resync = sip_frame::header_value(challenge, "X-Test-Auts")
+                .is_some_and(|value| value.eq_ignore_ascii_case("required"));
+            self.challenges.push((status, cseq, resync));
+            let header = if status == 407 {
+                "Proxy-Authorization"
+            } else {
+                "Authorization"
+            };
+            let proof = if resync {
+                "Digest auts=contract"
+            } else {
+                "Digest response=contract"
+            };
+            Ok(format!(
+                "REGISTER sip:ims.example SIP/2.0\r\nCSeq: {cseq} REGISTER\r\n{header}: {proof}\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes())
+        }
+    }
+
+    impl RegisterAuthenticator<ContractChannel> for ContractAuthenticator {
+        async fn exchange_authenticated(
+            &mut self,
+            challenge_response: &[u8],
+            cseq: u32,
+            channel: &mut ContractChannel,
+        ) -> Result<Option<Vec<u8>>, ImsError> {
+            if self.style == AuthenticatedExchangeStyle::SharedDriver {
+                return Ok(None);
+            }
+            let request = self.request_for(challenge_response, cseq)?;
+            channel.send_sip(&request).await?;
+            for _ in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
+                let response = channel.recv_sip(REGISTER_TIMEOUT).await?;
+                let status = sip_frame::parse_status(&response)?;
+                if !(100..=199).contains(&status) {
+                    return Ok(Some(response));
+                }
+            }
+            Err(ImsError::new(
+                "ims_register_authenticated_unexpected_status",
+            ))
+        }
+
+        async fn authenticated_request(
+            &mut self,
+            challenge_response: &[u8],
+            cseq: u32,
+        ) -> Result<Vec<u8>, ImsError> {
+            self.request_for(challenge_response, cseq)
+        }
+    }
+
+    fn response(status: u16, reason: &str, headers: &str) -> Vec<u8> {
+        format!("SIP/2.0 {status} {reason}\r\n{headers}Content-Length: 0\r\n\r\n").into_bytes()
+    }
+
+    fn success() -> Vec<u8> {
+        response(
+            200,
+            "OK",
+            concat!(
+                "Contact: <sip:user@192.0.2.2>;expires=120\r\n",
+                "Expires: 3600\r\n",
+                "Service-Route: <sip:route.ims.example;lr>\r\n",
+                "P-Associated-URI: <sip:+601100000001@ims.example>, <tel:+601100000001>\r\n",
+            ),
+        )
+    }
+
+    async fn exchange(
+        style: AuthenticatedExchangeStyle,
+        responses: impl IntoIterator<Item = Vec<u8>>,
+    ) -> (
+        Result<RegisterResult, RegisterFailure>,
+        ContractChannel,
+        ContractAuthenticator,
+    ) {
+        let mut channel = ContractChannel {
+            responses: responses.into_iter().collect(),
+            sends: Vec::new(),
+        };
+        let mut authenticator = ContractAuthenticator {
+            style,
+            challenges: Vec::new(),
+        };
+        let result = run_register_observed(
+            &mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n",
+            &mut authenticator,
+        )
+        .await;
+        (result, channel, authenticator)
+    }
+
+    fn assert_success_context(access: ImsRegistrationAccess, result: &RegisterResult) {
+        let context = RegisteredImsContext::from_response(access, &result.response, 7200);
+        assert_eq!(context.access, access);
+        assert_eq!(context.lease.expires_seconds, 120);
+        assert_eq!(
+            context.service_route.as_deref(),
+            Some("<sip:route.ims.example;lr>")
+        );
+        assert_eq!(
+            context.associated_uris,
+            ["sip:+601100000001@ims.example", "tel:+601100000001"]
+        );
+    }
+
+    pub(crate) async fn assert_register_contract(
+        style: AuthenticatedExchangeStyle,
+        access: ImsRegistrationAccess,
+    ) {
+        let (direct, channel, authenticator) = exchange(style, [success()]).await;
+        let direct = direct.expect("direct 200 REGISTER");
+        assert!(!direct.authenticated);
+        assert_eq!(direct.auth_rounds, 0);
+        assert_eq!(channel.sends.len(), 1);
+        assert!(authenticator.challenges.is_empty());
+        assert_success_context(access, &direct);
+
+        for challenge_status in [401, 407] {
+            let (challenged, channel, authenticator) = exchange(
+                style,
+                [
+                    response(100, "Trying", ""),
+                    response(challenge_status, "Challenge", ""),
+                    response(183, "Session Progress", ""),
+                    success(),
+                ],
+            )
+            .await;
+            let challenged = challenged.expect("challenged REGISTER");
+            assert!(challenged.authenticated);
+            assert_eq!(challenged.auth_rounds, 1);
+            assert_eq!(channel.sends.len(), 2);
+            assert_eq!(authenticator.challenges, [(challenge_status, 2, false)]);
+            let authenticated = String::from_utf8_lossy(&channel.sends[1]);
+            assert!(authenticated.contains("CSeq: 2 REGISTER"));
+            if challenge_status == 407 {
+                assert!(authenticated.contains("Proxy-Authorization:"));
+            } else {
+                assert!(authenticated.contains("Authorization:"));
+            }
+            assert_success_context(access, &challenged);
+        }
+
+        let (resynchronized, channel, authenticator) = exchange(
+            style,
+            [
+                response(401, "Unauthorized", "X-Test-Auts: required\r\n"),
+                response(401, "Unauthorized", ""),
+                success(),
+            ],
+        )
+        .await;
+        let resynchronized = resynchronized.expect("AUTS REGISTER");
+        assert_eq!(resynchronized.auth_rounds, 2);
+        assert_eq!(authenticator.challenges, [(401, 2, true), (401, 3, false)]);
+        assert!(String::from_utf8_lossy(&channel.sends[1]).contains("auts=contract"));
+        assert!(!String::from_utf8_lossy(&channel.sends[2]).contains("auts=contract"));
+        assert_success_context(access, &resynchronized);
+
+        let (rejected, channel, authenticator) = exchange(
+            style,
+            [
+                response(401, "Unauthorized", ""),
+                response(407, "Proxy Authentication Required", ""),
+                response(401, "Unauthorized", ""),
+            ],
+        )
+        .await;
+        let rejected = rejected.expect_err("third challenge must be rejected");
+        assert_eq!(rejected.error.code(), "ims_register_auth_rejected");
+        assert_eq!(rejected.auth_rounds, 2);
+        assert_eq!(channel.sends.len(), 3);
+        assert_eq!(authenticator.challenges, [(401, 2, false), (407, 3, false)]);
     }
 }

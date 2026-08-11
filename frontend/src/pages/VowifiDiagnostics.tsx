@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom'
 import {
   Alert,
   Box,
+  Button,
   Chip,
   CircularProgress,
   Divider,
@@ -21,6 +22,7 @@ import {
 import {
   // Public,
   Refresh,
+  OpenInNew,
   // VpnKey,
 } from '@mui/icons-material'
 import { api } from '../api/current'
@@ -36,6 +38,7 @@ import type {
   VowifiSoakRunsResponse,
   VowifiReadiness,
   VowifiStatusResponse,
+  E911Status,
 } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import ModemLineSelector from '../components/ModemLineSelector'
@@ -357,6 +360,8 @@ export default function VowifiDiagnosticsPage() {
   const traceFilter = ''
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [selectedLineId, setSelectedLineId] = useState('')
+  const [e911Status, setE911Status] = useState<E911Status | null>(null)
+  const [e911Busy, setE911Busy] = useState(false)
   const loadSequenceRef = useRef(0)
 
   const containerRef = useRef<HTMLDivElement | null>(null)
@@ -437,6 +442,21 @@ export default function VowifiDiagnosticsPage() {
     const timer = window.setInterval(() => void loadData(true), refreshInterval)
     return () => window.clearInterval(timer)
   }, [loadData, refreshInterval, refreshKey])
+
+  useEffect(() => {
+    let active = true
+    setE911Status(null)
+    if (!selectedLineId) return () => { active = false }
+    void api.getE911Status(selectedLineId)
+      .then((response) => {
+        if (active) setE911Status(response.data ?? null)
+      })
+      .catch(() => {
+        // Metadata-only carriers intentionally return an unsupported response;
+        // the diagnostics page remains usable without an E911 provider.
+      })
+    return () => { active = false }
+  }, [selectedLineId, refreshKey])
 
   const readiness = currentReadiness(state)
   const match = currentMatch(state)
@@ -622,6 +642,42 @@ export default function VowifiDiagnosticsPage() {
     }
   }
 
+  const handleE911Query = async () => {
+    if (!selectedLineId) return
+    setE911Busy(true)
+    try {
+      const response = await api.queryE911(selectedLineId)
+      setE911Status(response.data ?? null)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setE911Busy(false)
+    }
+  }
+
+  const handleE911Websheet = async () => {
+    if (!selectedLineId) return
+    setE911Busy(true)
+    try {
+      const response = await api.createE911Operation(selectedLineId)
+      const url = response.data?.launch_url || response.data?.server_flow_url
+      if (!url) throw new Error('运营商没有返回可打开的地址流程')
+      window.open(url, '_blank', 'noopener,noreferrer')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setE911Busy(false)
+    }
+  }
+
+  const e911StateLabel = (status: E911Status | null) => {
+    if (!status) return '运营商未提供 E911 entitlement'
+    if (status.operator_confirmed) return '运营商已确认地址与 entitlement'
+    if (status.needs_user_action) return '需要完成运营商条款或地址流程'
+    if (status.address_saved_locally) return '地址已保存在本机，等待运营商重新确认'
+    return '尚未完成运营商确认'
+  }
+
   if (loading) {
     return (
       <Box sx={{ minHeight: '42vh', display: 'grid', placeItems: 'center' }}>
@@ -728,6 +784,45 @@ export default function VowifiDiagnosticsPage() {
           当前 SIM 尚未匹配到内置 WiFi Calling profile，短信继续保持蜂窝路径。
         </Alert>
       )}
+
+      <Paper variant="outlined" sx={{ p: 2.5, borderRadius: 2 }}>
+        <Stack spacing={1.5}>
+          <Box sx={{ display: 'flex', justifyContent: 'space-between', gap: 2, alignItems: 'center', flexWrap: 'wrap' }}>
+            <Box>
+              <Typography variant="subtitle1" fontWeight={800}>E911 / VoWiFi entitlement</Typography>
+              <Typography variant="caption" color="text.secondary">地址 provisioning 与紧急呼叫能力分开判断</Typography>
+            </Box>
+            <Stack direction="row" spacing={1}>
+              <Button
+                size="small"
+                variant="outlined"
+                onClick={() => void handleE911Query()}
+                disabled={e911Busy || !selectedLineId}
+              >
+                查询状态
+              </Button>
+              <Button
+                size="small"
+                variant="contained"
+                endIcon={<OpenInNew fontSize="small" />}
+                onClick={() => void handleE911Websheet()}
+                disabled={e911Busy || !selectedLineId || !e911Status?.needs_user_action}
+              >
+                打开运营商流程
+              </Button>
+            </Stack>
+          </Box>
+          <Alert severity={e911Status?.operator_confirmed ? 'success' : e911Status?.needs_user_action ? 'warning' : 'info'} variant="outlined">
+            {e911StateLabel(e911Status)}。紧急呼叫本身仍需单独的运营商/实验室验证。
+          </Alert>
+          <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+            <Metric label="运营商要求" value={e911Status?.operator_requires ? '是' : '未知/否'} />
+            <Metric label="本地地址" value={e911Status?.address_saved_locally ? '已保存' : '未保存'} />
+            <Metric label="运营商确认" value={e911Status?.operator_confirmed ? '已确认' : '未确认'} />
+            <Metric label="紧急呼叫" value="未验证" />
+          </Stack>
+        </Stack>
+      </Paper>
 
       {/* Two-Column Flex Layout (Align Heights) */}
       <Box

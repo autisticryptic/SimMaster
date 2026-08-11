@@ -71,8 +71,8 @@ emergency_calling
 4. 设备通过当前 SIM/UICC 计算 AKA response
 5. server 验证订阅者并返回 TS.43 配置/状态
 6. 如果条款或紧急地址缺失：
-   - 返回 ServerFlow_URL
-   - 返回 ServerFlow_User_Data
+   - 返回 TS.43 WAP XML `ServiceFlow_URL`（旧资料/部分实现称 `ServerFlow_URL`）
+   - 返回 `ServiceFlow_UserData`（旧资料/部分实现称 `ServerFlow_User_Data`）
 7. 设备在受控 WebView 中 GET/POST 运营商页面
 8. 用户完成条款或地址登记
 9. websheet 通知客户端流程完成
@@ -127,7 +127,7 @@ AOSP 提供两部分参考实现：
 2. 查询 VoWiFi/VoLTE/SMSoIP entitlement。
 3. 缓存短期 authentication token 和配置版本。
 4. 处理 token 过期、`Retry-After` 和重新完整认证。
-5. 从 VoWiFi 响应中提取 `ServerFlow_URL` 和 `ServerFlow_User_Data`。
+5. 从 VoWiFi 响应中提取标准 `ServiceFlow_URL` / `ServiceFlow_UserData`，并兼容旧命名 `ServerFlow_URL` / `ServerFlow_User_Data`。
 
 `WfcActivationController`：
 
@@ -145,6 +145,14 @@ AOSP 提供两部分参考实现：
 - 页面调用 `dismissFlow()` 表示取消或失败。
 
 这证明标准实现是“设备端承载运营商页面”，不是设备自行猜测表单字段并直接写地址。
+
+SimAdmin 的实现边界：创建 operation 后返回同源的一次性 `launch_url`。该页面只在
+operation 仍处于 pending 且未过期时读取加密 secret store，并对标准
+`application/x-www-form-urlencoded` 的 `ServiceFlow_UserData` 生成 POST form；JSON
+接口不会返回 user data、token 或 cookie。operation completion 使用独立随机 nonce，不复用
+运营商的 `ServiceFlow_UserData`。运营商若返回非 URL-encoded/二进制 user data，
+页面会拒绝猜测并退回人工打开 URL。页面关闭本身仍不改变 entitlement 状态，必须通过运营商
+提供的 callback bridge（或人工 callback API）后重新 query。
 
 ### 4.4 对 SimAdmin 的复用边界
 
@@ -483,7 +491,7 @@ POST   /api/ims/lines/{line_id}/e911/address/provision
 
 ### Phase B：安全 websheet operation
 
-- 支持 `ServerFlow_URL/User_Data`。
+- 支持标准 `ServiceFlow_URL/ServiceFlow_UserData`，兼容旧资料中的 `ServerFlow_URL/User_Data` 命名。
 - 建立短期 operation store。
 - 支持已验证的浏览器 redirect/callback 或轮询模式。
 - 页面完成后重新查询 entitlement。

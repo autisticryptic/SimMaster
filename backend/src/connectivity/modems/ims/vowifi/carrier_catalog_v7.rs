@@ -18,7 +18,7 @@ use super::{
 use crate::connectivity::modems::ims::vowifi::profile_record::{
     CarrierProfileMetaRecord, CarrierProfileRecord, E911PolicyRecord, EpdgPolicyRecord,
     Ikev2PolicyRecord, ImsPolicyRecord, ProfileIdentityPolicyRecord, RegisterPolicyRecord,
-    SmsPolicyRecord, VoiceCodecPolicyRecord, VoicePolicyRecord,
+    SmsPolicyRecord, UtPolicyRecord, VoiceCodecPolicyRecord, VoicePolicyRecord,
 };
 use crate::connectivity::modems::ims::vowifi::profiles;
 
@@ -654,6 +654,7 @@ fn project_config(
             amr_octet_align: bool_at(config, "/services/amr_octet_align").unwrap_or(false),
             ptime_ms: u16_at(config, "/services/ptime_ms").unwrap_or(20),
             sip_endpoint_exposed: false,
+            voicemail_number: string_at(config, "/services/voicemail_number").map(str::to_string),
         },
         // TODO(E911): catalog metadata is exposed, but SimAdmin still has no
         // address-provisioning execution path.
@@ -664,12 +665,55 @@ fn project_config(
                 .map(str::to_string),
             websheet_host_policy: None,
         },
+        ut: project_ut_policy(config),
     };
     match access {
         CatalogAccessKind::LteEpc => record.validate_ims_only()?,
         CatalogAccessKind::WifiEpdg => record.validate()?,
     }
     Ok(record)
+}
+
+/// UT is unavailable unless the carrier catalog explicitly provides a complete
+/// XCAP endpoint. This keeps generic catalog entries from accidentally sending
+/// XCAP traffic over the host's default internet route.
+fn project_ut_policy(config: &Value) -> UtPolicyRecord {
+    let enabled = bool_at(config, "/services/ut/enabled").unwrap_or(false);
+    UtPolicyRecord {
+        enabled,
+        xcap_root: string_at(config, "/services/ut/xcap/root").map(str::to_string),
+        document_selector: string_at(config, "/services/ut/xcap/document_selector")
+            .map(str::to_string),
+        namespace: string_at(config, "/services/ut/xcap/namespace").map(str::to_string),
+        authentication: string_at(config, "/services/ut/xcap/authentication")
+            .unwrap_or("none")
+            .to_string(),
+        partial_update: bool_at(config, "/services/ut/xcap/partial_update/enabled")
+            .unwrap_or(false),
+        call_waiting_selector: string_at(
+            config,
+            "/services/ut/xcap/partial_update/call_waiting_selector",
+        )
+        .map(str::to_string),
+        diversion_rule_selector: string_at(
+            config,
+            "/services/ut/xcap/partial_update/diversion_rule_selector",
+        )
+        .map(str::to_string),
+        oip_selector: string_at(config, "/services/ut/xcap/partial_update/oip_selector")
+            .map(str::to_string),
+        oir_selector: string_at(config, "/services/ut/xcap/partial_update/oir_selector")
+            .map(str::to_string),
+        tls_min_version: string_at(config, "/services/ut/xcap/tls/min_version")
+            .unwrap_or("1.2")
+            .to_string(),
+        tls_max_version: string_at(config, "/services/ut/xcap/tls/max_version")
+            .unwrap_or("1.3")
+            .to_string(),
+        tls_builtin_roots: bool_at(config, "/services/ut/xcap/tls/builtin_roots").unwrap_or(true),
+        tls_additional_ca_pem: string_at(config, "/services/ut/xcap/tls/additional_ca_pem")
+            .map(str::to_string),
+    }
 }
 
 /// Project the schema-v7 media codec list into the signaling policy consumed by
@@ -1661,6 +1705,50 @@ mod tests {
         assert_eq!(lte.record.meta.aliases, ["Test", "Test Telecom"]);
 
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn projects_explicit_xcap_partial_update_and_tls_policy() {
+        let config = serde_json::json!({
+            "services": {
+                "ut": {
+                    "enabled": true,
+                    "xcap": {
+                        "root": "https://xcap.example.test/simservs",
+                        "document_selector": "users/sip:subscriber@example.test",
+                        "namespace": "urn:3gpp:ns:xml:simservs",
+                        "authentication": "digest_aka",
+                        "partial_update": {
+                            "enabled": true,
+                            "call_waiting_selector": "ss:communication-waiting/ss:active",
+                            "diversion_rule_selector": "ss:communication-diversion/cp:ruleset/cp:rule[@id='{rule-id}']"
+                        },
+                        "tls": {
+                            "min_version": "1.3",
+                            "max_version": "1.3",
+                            "builtin_roots": false,
+                            "additional_ca_pem": "-----BEGIN CERTIFICATE-----\ntest\n-----END CERTIFICATE-----"
+                        }
+                    }
+                }
+            }
+        });
+
+        let policy = project_ut_policy(&config);
+        assert!(policy.enabled);
+        assert!(policy.partial_update);
+        assert_eq!(
+            policy.call_waiting_selector.as_deref(),
+            Some("ss:communication-waiting/ss:active")
+        );
+        assert_eq!(
+            policy.diversion_rule_selector.as_deref(),
+            Some("ss:communication-diversion/cp:ruleset/cp:rule[@id='{rule-id}']")
+        );
+        assert_eq!(policy.tls_min_version, "1.3");
+        assert_eq!(policy.tls_max_version, "1.3");
+        assert!(!policy.tls_builtin_roots);
+        assert!(policy.tls_additional_ca_pem.is_some());
     }
 
     #[test]

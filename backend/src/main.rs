@@ -1282,6 +1282,16 @@ async fn main() -> Result<()> {
             get(get_ims_supplementary_handler).options(options_handler),
         )
         .route(
+            "/api/ims/lines/{line_id}/voicemail/call",
+            post(place_voicemail_call_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/ut/{document}",
+            get(get_ims_ut_document_handler)
+                .put(put_ims_ut_document_handler)
+                .options(options_handler),
+        )
+        .route(
             "/api/ims/lines/{line_id}/override",
             get(get_ims_override_handler)
                 .patch(patch_ims_override_handler)
@@ -1311,6 +1321,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/ims/lines/{line_id}/e911/operations/{operation_id}",
             get(get_e911_operation_handler).options(options_handler),
+        )
+        .route(
+            "/api/ims/lines/{line_id}/e911/operations/{operation_id}/launch",
+            get(launch_e911_operation_handler),
         )
         .route(
             "/api/ims/lines/{line_id}/e911/operations/{operation_id}/callback",

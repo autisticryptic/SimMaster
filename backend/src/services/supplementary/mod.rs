@@ -14,6 +14,7 @@ use crate::connectivity::core::registration::ImsRegistrationAccess;
 use crate::connectivity::core::supplementary::{
     CapabilityReadiness, MessageWaitingSummary, NetworkToggleState,
 };
+use crate::connectivity::core::ut::{UtDocument, UtDocumentKind};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SupplementarySnapshot {
@@ -52,6 +53,7 @@ pub struct SupplementaryRuntime {
 struct SupplementaryState {
     snapshot: SupplementarySnapshot,
     mwi_access: Option<ImsRegistrationAccess>,
+    ut_access: Option<ImsRegistrationAccess>,
 }
 
 impl SupplementaryRuntime {
@@ -66,6 +68,7 @@ impl SupplementaryRuntime {
             state: Arc::new(RwLock::new(SupplementaryState {
                 snapshot: SupplementarySnapshot::for_line(line_id),
                 mwi_access: None,
+                ut_access: None,
             })),
         }
     }
@@ -120,6 +123,42 @@ impl SupplementaryRuntime {
         }
     }
 
+    pub async fn begin_ut_request(&self, access: ImsRegistrationAccess, kind: UtDocumentKind) {
+        let mut state = self.state.write().await;
+        state.ut_access = Some(access);
+        *ut_capability_mut(&mut state.snapshot, kind) =
+            CapabilityReadiness::supported(false, Some("ut_request_pending".to_string()));
+    }
+
+    pub async fn mark_ut_document(&self, access: ImsRegistrationAccess, document: &UtDocument) {
+        let mut state = self.state.write().await;
+        if state.ut_access != Some(access) {
+            return;
+        }
+        *ut_capability_mut(&mut state.snapshot, document.kind) =
+            CapabilityReadiness::supported(true, None);
+        if document.kind == UtDocumentKind::CommunicationWaiting {
+            state.snapshot.call_waiting = match document.call_waiting {
+                Some(true) => NetworkToggleState::Enabled,
+                Some(false) => NetworkToggleState::Disabled,
+                None => NetworkToggleState::Unknown,
+            };
+        }
+    }
+
+    pub async fn fail_ut_request(
+        &self,
+        access: ImsRegistrationAccess,
+        kind: UtDocumentKind,
+        reason: impl Into<String>,
+    ) {
+        let mut state = self.state.write().await;
+        if state.ut_access == Some(access) {
+            *ut_capability_mut(&mut state.snapshot, kind) =
+                CapabilityReadiness::supported(false, Some(reason.into()));
+        }
+    }
+
     /// Clear only the access that still owns the subscription. A late teardown
     /// from the old leg must not erase state already established after an
     /// access handover.
@@ -131,6 +170,28 @@ impl SupplementaryRuntime {
                 CapabilityReadiness::unsupported("supplementary_not_connected");
             state.snapshot.message_waiting = None;
         }
+        if state.ut_access == Some(access) {
+            state.ut_access = None;
+            state.snapshot.call_waiting = NetworkToggleState::Unknown;
+            state.snapshot.call_waiting_capability =
+                CapabilityReadiness::unsupported("supplementary_not_connected");
+            state.snapshot.forwarding_capability =
+                CapabilityReadiness::unsupported("supplementary_not_connected");
+            state.snapshot.identity_capability =
+                CapabilityReadiness::unsupported("supplementary_not_connected");
+        }
+    }
+}
+
+fn ut_capability_mut(
+    snapshot: &mut SupplementarySnapshot,
+    kind: UtDocumentKind,
+) -> &mut CapabilityReadiness {
+    match kind {
+        UtDocumentKind::CommunicationWaiting => &mut snapshot.call_waiting_capability,
+        UtDocumentKind::CommunicationDiversion => &mut snapshot.forwarding_capability,
+        UtDocumentKind::OriginatingIdentityPresentation
+        | UtDocumentKind::OriginatingIdentityRestriction => &mut snapshot.identity_capability,
     }
 }
 
@@ -202,5 +263,34 @@ mod tests {
             .clear_registration(ImsRegistrationAccess::Volte)
             .await;
         assert!(runtime.snapshot().await.message_waiting.is_some());
+    }
+
+    #[tokio::test]
+    async fn stale_access_teardown_does_not_clear_ut_handover_state() {
+        let runtime = SupplementaryRuntime::for_line("line-a");
+        runtime
+            .begin_ut_request(
+                ImsRegistrationAccess::Volte,
+                UtDocumentKind::CommunicationWaiting,
+            )
+            .await;
+        runtime
+            .begin_ut_request(
+                ImsRegistrationAccess::Vowifi,
+                UtDocumentKind::CommunicationWaiting,
+            )
+            .await;
+        let mut document = UtDocument::empty(UtDocumentKind::CommunicationWaiting);
+        document.set_call_waiting(true);
+        runtime
+            .mark_ut_document(ImsRegistrationAccess::Vowifi, &document)
+            .await;
+
+        runtime
+            .clear_registration(ImsRegistrationAccess::Volte)
+            .await;
+        let snapshot = runtime.snapshot().await;
+        assert_eq!(snapshot.call_waiting, NetworkToggleState::Enabled);
+        assert!(snapshot.call_waiting_capability.ready);
     }
 }

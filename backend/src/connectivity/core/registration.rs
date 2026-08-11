@@ -6,7 +6,9 @@
 
 use std::time::{Duration, SystemTime};
 
-use super::register_response::RegisterArtifacts;
+use super::{
+    register::RegisterFailure, register_response::RegisterArtifacts, sip_frame::parse_status,
+};
 
 /// Access on which the IMS registration was established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,42 @@ pub enum RegistrationLossReason {
     AccessTransportLost,
 }
 
+impl RegistrationLossReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::AuthenticationRejected => "authentication_rejected",
+            Self::NetworkRejected => "network_rejected",
+            Self::SignalingTransportLost => "signaling_transport_lost",
+            Self::AccessTransportLost => "access_transport_lost",
+        }
+    }
+
+    /// Classify a shared REGISTER failure without depending on an access
+    /// adapter's error vocabulary. A received final SIP response is a network
+    /// decision; failure before any complete response is a signaling-path
+    /// failure. Authentication challenges are kept separate so callers can
+    /// avoid retrying a rejected SIM credential indefinitely.
+    pub fn from_register_failure(failure: &RegisterFailure) -> Self {
+        if failure.error.code() == "ims_register_auth_rejected" {
+            return Self::AuthenticationRejected;
+        }
+
+        if let Some(status) = failure
+            .response
+            .as_deref()
+            .and_then(|response| parse_status(response).ok())
+        {
+            return match status {
+                401 | 403 | 407 => Self::AuthenticationRejected,
+                _ => Self::NetworkRejected,
+            };
+        }
+
+        Self::SignalingTransportLost
+    }
+}
+
 /// Common semantic result of a refresh attempt. Adapters map their concrete
 /// errors to this result before deciding which bearer/tunnel resources to
 /// rebuild.
@@ -116,6 +154,7 @@ pub enum RegistrationRefreshResult {
 pub enum UnregisterResult {
     Confirmed,
     AlreadyExpired,
+    Rejected,
     AccessLost,
 }
 
@@ -168,5 +207,40 @@ mod tests {
         assert_eq!(lease.expires_seconds, 1);
         assert_eq!(lease.refresh_after, Duration::from_secs(1));
         assert_eq!(lease.expires_after, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn register_failure_classification_is_access_neutral() {
+        let auth = RegisterFailure {
+            error: super::super::ImsError::new("ims_register_auth_rejected"),
+            response: Some(b"SIP/2.0 401 Unauthorized\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 2,
+        };
+        assert_eq!(
+            RegistrationLossReason::from_register_failure(&auth),
+            RegistrationLossReason::AuthenticationRejected
+        );
+
+        let rejected = RegisterFailure {
+            error: super::super::ImsError::new("ims_register_authenticated_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ),
+            auth_rounds: 1,
+        };
+        assert_eq!(
+            RegistrationLossReason::from_register_failure(&rejected),
+            RegistrationLossReason::NetworkRejected
+        );
+
+        let transport = RegisterFailure {
+            error: super::super::ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        assert_eq!(
+            RegistrationLossReason::from_register_failure(&transport),
+            RegistrationLossReason::SignalingTransportLost
+        );
     }
 }

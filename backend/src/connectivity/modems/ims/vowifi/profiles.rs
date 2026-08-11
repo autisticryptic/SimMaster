@@ -176,6 +176,50 @@ pub struct E911Policy {
     pub websheet_host_policy: Option<&'static str>,
 }
 
+/// Carrier-owned supplementary-service transport policy. XCAP endpoints are
+/// deliberately opt-in: guessing a public URL or reusing an IMS registrar
+/// would send subscriber state to the wrong service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct UtPolicy {
+    pub enabled: bool,
+    pub xcap_root: Option<&'static str>,
+    pub document_selector: Option<&'static str>,
+    pub namespace: Option<&'static str>,
+    /// Currently `digest_aka` or `none`. Unsupported values are rejected
+    /// while importing a catalog profile rather than at request time.
+    pub authentication: &'static str,
+    /// Partial XCAP writes are opt-in and require an explicit selector for the
+    /// document being changed. Missing selectors retain full-document PUT.
+    pub partial_update: bool,
+    pub call_waiting_selector: Option<&'static str>,
+    pub diversion_rule_selector: Option<&'static str>,
+    pub oip_selector: Option<&'static str>,
+    pub oir_selector: Option<&'static str>,
+    /// TLS is always certificate and hostname verified. Catalog policy may
+    /// narrow the protocol range or replace public roots with a carrier CA.
+    pub tls_min_version: &'static str,
+    pub tls_max_version: &'static str,
+    pub tls_builtin_roots: bool,
+    pub tls_additional_ca_pem: Option<&'static str>,
+}
+
+pub const DEFAULT_UT_POLICY: UtPolicy = UtPolicy {
+    enabled: false,
+    xcap_root: None,
+    document_selector: None,
+    namespace: None,
+    authentication: "none",
+    partial_update: false,
+    call_waiting_selector: None,
+    diversion_rule_selector: None,
+    oip_selector: None,
+    oir_selector: None,
+    tls_min_version: "1.2",
+    tls_max_version: "1.3",
+    tls_builtin_roots: true,
+    tls_additional_ca_pem: None,
+};
+
 /// Voice-calling policy for a carrier: which legs are usable, the media codec
 /// preference, and AMR framing parameters. This mirrors [`SmsPolicy`] and drives
 /// the voice state machine + SDP offer builder in `voice.rs`.
@@ -208,6 +252,8 @@ pub struct VoicePolicy {
     /// Whether an outward standard SIP endpoint may be exposed per SIM (the
     /// external Asterisk/Linphone integration seam). Off by default.
     pub sip_endpoint_exposed: bool,
+    /// Carrier fallback when the SIM does not expose EF-MBDN/AT+CSVM.
+    pub voicemail_number: Option<&'static str>,
 }
 
 /// A sensible default voice policy: VoWiFi leg on, carrier fallback allowed
@@ -222,6 +268,7 @@ pub const DEFAULT_VOICE_POLICY: VoicePolicy = VoicePolicy {
     amr_octet_align: false,
     ptime_ms: 20,
     sip_endpoint_exposed: false,
+    voicemail_number: None,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -234,6 +281,7 @@ pub struct CarrierProfile {
     pub sms: SmsPolicy,
     pub voice: VoicePolicy,
     pub e911: E911Policy,
+    pub ut: UtPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,6 +401,7 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         entitlement_url: None,
         websheet_host_policy: None,
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -452,6 +501,7 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         entitlement_url: None,
         websheet_host_policy: None,
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -547,6 +597,7 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         entitlement_url: Some("https://eas3.msg.t-mobile.com/"),
         websheet_host_policy: Some("public_https"),
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -642,6 +693,7 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         entitlement_url: Some("https://sentitlement2.mobile.att.net/"),
         websheet_host_policy: Some("public_https"),
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -737,6 +789,7 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         entitlement_url: None,
         websheet_host_policy: None,
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -832,6 +885,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         entitlement_url: None,
         websheet_host_policy: None,
     },
+    ut: DEFAULT_UT_POLICY,
 };
 
 #[cfg(test)]
@@ -980,6 +1034,7 @@ pub fn generate_standard_3gpp_profile(
             entitlement_url: None,
             websheet_host_policy: None,
         },
+        ut: DEFAULT_UT_POLICY,
     };
 
     let static_profile = Box::leak(Box::new(profile));

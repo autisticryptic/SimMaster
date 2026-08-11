@@ -282,19 +282,28 @@ pub struct EffectiveCommon {
 }
 
 pub fn resolve_effective_common(override_: Option<&SimOverride>) -> EffectiveCommon {
-    match override_ {
-        Some(override_) => EffectiveCommon {
-            voicemail_number: override_.ims_common.voicemail_number.clone(),
-            voicemail_number_source: override_
-                .ims_common
-                .voicemail_number
-                .as_ref()
-                .map(|_| OverrideSource::SimOverride),
-        },
-        None => EffectiveCommon {
-            voicemail_number: None,
-            voicemail_number_source: None,
-        },
+    resolve_effective_common_with_sources(override_, None, None)
+}
+
+/// Resolve voicemail dialing identity. User intent wins, then the active SIM's
+/// own MBDN/AT+CSVM value, then the read-only carrier catalog fallback.
+pub fn resolve_effective_common_with_sources(
+    override_: Option<&SimOverride>,
+    sim_voicemail_number: Option<&str>,
+    catalog_voicemail_number: Option<&str>,
+) -> EffectiveCommon {
+    let candidate = override_
+        .and_then(|value| value.ims_common.voicemail_number.as_deref())
+        .map(|value| (value, OverrideSource::SimOverride))
+        .or_else(|| sim_voicemail_number.map(|value| (value, OverrideSource::Modem)))
+        .or_else(|| catalog_voicemail_number.map(|value| (value, OverrideSource::Catalog)))
+        .and_then(|(value, source)| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| (value.to_string(), source))
+        });
+    EffectiveCommon {
+        voicemail_number: candidate.as_ref().map(|(value, _)| value.clone()),
+        voicemail_number_source: candidate.map(|(_, source)| source),
     }
 }
 
@@ -365,6 +374,17 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
     if let Some(imei) = override_.ims_common.custom_imei.as_deref() {
         if !imei.trim().is_empty() && !is_valid_imei(imei) {
             problems.push("custom_imei_must_be_15_digits".to_string());
+        }
+    }
+    if let Some(number) = override_.ims_common.voicemail_number.as_deref() {
+        let number = number.trim();
+        if !number.is_empty()
+            && (number.len() > 32
+                || !number
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'*' | b'#')))
+        {
+            problems.push("voicemail_number_invalid".to_string());
         }
     }
     for (access, name) in [
@@ -577,6 +597,32 @@ mod tests {
         let identity = resolve_effective_device_identity(Some(&override_), Some("999999999999999"));
         assert_eq!(identity.imei.as_deref(), Some("999999999999999"));
         assert_eq!(identity.source, OverrideSource::Modem);
+    }
+
+    #[test]
+    fn voicemail_source_order_is_override_then_sim_then_catalog() {
+        let mut override_ = SimOverride::default();
+        override_.ims_common.voicemail_number = Some("*86".to_string());
+        let common =
+            resolve_effective_common_with_sources(Some(&override_), Some("123"), Some("456"));
+        assert_eq!(common.voicemail_number.as_deref(), Some("*86"));
+        assert_eq!(
+            common.voicemail_number_source,
+            Some(OverrideSource::SimOverride)
+        );
+
+        override_.ims_common.voicemail_number = None;
+        let common =
+            resolve_effective_common_with_sources(Some(&override_), Some("123"), Some("456"));
+        assert_eq!(common.voicemail_number.as_deref(), Some("123"));
+        assert_eq!(common.voicemail_number_source, Some(OverrideSource::Modem));
+
+        let common = resolve_effective_common_with_sources(None, None, Some("456"));
+        assert_eq!(common.voicemail_number.as_deref(), Some("456"));
+        assert_eq!(
+            common.voicemail_number_source,
+            Some(OverrideSource::Catalog)
+        );
     }
 
     #[test]

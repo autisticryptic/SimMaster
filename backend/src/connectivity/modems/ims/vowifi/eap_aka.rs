@@ -35,6 +35,8 @@ pub struct EapAkaChallenge {
     pub autn: Vec<u8>,
     pub mac_present: bool,
     pub result_indication: bool,
+    packet: Vec<u8>,
+    mac_offset: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +133,7 @@ pub enum EapAkaProtocolError {
     MissingIdentityRequest,
     MissingKeyMaterial,
     InvalidAkaResult,
+    InvalidMac,
     PacketTooLarge,
 }
 
@@ -150,6 +153,7 @@ impl fmt::Display for EapAkaProtocolError {
             Self::MissingIdentityRequest => write!(f, "EAP-AKA identity request missing selector"),
             Self::MissingKeyMaterial => write!(f, "EAP-AKA key material unavailable"),
             Self::InvalidAkaResult => write!(f, "invalid AKA result for EAP-AKA"),
+            Self::InvalidMac => write!(f, "EAP-AKA challenge MAC verification failed"),
             Self::PacketTooLarge => write!(f, "EAP-AKA packet too large"),
         }
     }
@@ -253,6 +257,8 @@ pub fn parse_challenge(packet: &[u8]) -> Result<EapAkaChallenge, EapAkaProtocolE
     let mut autn = None;
     let mut mac_present = false;
     let mut result_indication = false;
+    let mut attribute_offset = EAP_AKA_HEADER_LEN;
+    let mut mac_offset = None;
     for attr in parse_attributes(&packet[EAP_AKA_HEADER_LEN..])? {
         match attr.attribute_type {
             AT_RAND => rand = Some(extract_reserved_prefixed_value(attr.value, 16)?),
@@ -262,10 +268,12 @@ pub fn parse_challenge(packet: &[u8]) -> Result<EapAkaChallenge, EapAkaProtocolE
                     return Err(EapAkaProtocolError::InvalidAttributeLength);
                 }
                 mac_present = true;
+                mac_offset = Some(attribute_offset + 4);
             }
             AT_RESULT_IND => result_indication = true,
             _ => {}
         }
+        attribute_offset += 2 + attr.value.len();
     }
 
     Ok(EapAkaChallenge {
@@ -274,6 +282,8 @@ pub fn parse_challenge(packet: &[u8]) -> Result<EapAkaChallenge, EapAkaProtocolE
         autn: autn.ok_or(EapAkaProtocolError::MissingAutn)?,
         mac_present,
         result_indication,
+        packet: packet.to_vec(),
+        mac_offset,
     })
 }
 
@@ -289,6 +299,7 @@ pub fn build_challenge_response(
         return Err(EapAkaProtocolError::InvalidAkaResult);
     }
     let keys = derive_key_material(identity.as_bytes(), &aka.ik, &aka.ck)?;
+    verify_challenge_mac(challenge, &keys)?;
     let mut attributes = Vec::new();
     push_at_res(&mut attributes, &aka.res)?;
     if challenge.result_indication {
@@ -308,6 +319,42 @@ pub fn build_challenge_response(
         packet,
         key_material: Some(keys),
     })
+}
+
+/// Build an EAP-AKA identity response before key material exists. TS.43 EAP
+/// relay servers may send this packet before the RAND/AUTN challenge.
+pub fn build_identity_response_packet(
+    request_packet: &[u8],
+    identity: &str,
+) -> Result<EapAkaResponsePacket, EapAkaProtocolError> {
+    let request = parse_identity_request(request_packet)?;
+    build_identity_response(&request, identity, None)
+}
+
+fn verify_challenge_mac(
+    challenge: &EapAkaChallenge,
+    keys: &EapAkaKeyMaterial,
+) -> Result<(), EapAkaProtocolError> {
+    let offset = challenge
+        .mac_offset
+        .ok_or(EapAkaProtocolError::MissingMac)?;
+    let end = offset
+        .checked_add(MAC_LEN)
+        .filter(|end| *end <= challenge.packet.len())
+        .ok_or(EapAkaProtocolError::InvalidAttributeLength)?;
+    let received = &challenge.packet[offset..end];
+    let mut canonical = challenge.packet.clone();
+    canonical[offset..end].fill(0);
+    let expected = calculate_mac(&keys.k_aut, &canonical, &[])?;
+    let difference = received
+        .iter()
+        .zip(expected.iter())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right));
+    if difference == 0 {
+        Ok(())
+    } else {
+        Err(EapAkaProtocolError::InvalidMac)
+    }
 }
 
 pub fn build_sync_failure_response(
@@ -597,7 +644,15 @@ mod tests {
         autn.extend_from_slice(&[0x22; 16]);
         push_attribute(&mut attrs, AT_AUTN, &autn).expect("autn");
         push_attribute(&mut attrs, AT_MAC, &[0; 18]).expect("mac");
-        build_eap_packet(1, 7, EAP_AKA_SUBTYPE_CHALLENGE, &attrs).expect("packet")
+        let mut packet = build_eap_packet(1, 7, EAP_AKA_SUBTYPE_CHALLENGE, &attrs).expect("packet");
+        let identity = "0234331234567890@nai.epc.mnc033.mcc234.3gppnetwork.org";
+        let keys =
+            derive_key_material(identity.as_bytes(), &[0x55; 16], &[0x44; 16]).expect("keys");
+        // Header (8) + RAND attribute (20) + AUTN attribute (20) + MAC
+        // attribute header/reserved (4).
+        let mac = calculate_mac(&keys.k_aut, &packet, &[]).expect("mac");
+        packet[52..68].copy_from_slice(&mac);
+        packet
     }
 
     #[test]

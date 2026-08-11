@@ -45,12 +45,12 @@
 ### 2.2 尚未完成或仍需收口
 
 - [x] VoLTE/VoWiFi 的 MWI `SUBSCRIBE` 与 INVITE、MESSAGE、OPTIONS 一样消费注册结果中的 `Service-Route`，没有建立第二份 route 缓存。
-- [ ] VoLTE 与 VoWiFi 已共享租约与失效结果模型，但 refresh/unregister 的具体错误映射和资源重建仍由两套 adapter lifecycle 完成。
-- [ ] E911 的受控 AKA adapter 是 seam 存根：真实 401 挑战会返回原始 HTTP 状态，直到验证过的 digest adapter 落地。
+- [x] VoLTE 与 VoWiFi 已共享租约、refresh 失效分类和显式注销结果：鉴权拒绝、SIP 网络拒绝、信令传输丢失及接入传输丢失均进入同一 `RegistrationRefreshResult`，再由 VoLTE 重建 bearer、VoWiFi 重建 IKE/ESP/TUN；显式停止沿用原 REGISTER dialog/CSeq，在 401/407 后调用各线路 AKA provider 发送 `REGISTER Expires: 0`，只有最终 2xx 映射为 `UnregisterResult::Confirmed`。
+- [x] E911 使用 TS.43 EAP relay JSON（不是 HTTP Digest-AKA），复用按线路 QMI/UIM USIM AKA；challenge 的 AT_MAC 会校验，sync failure 最多重试 3 轮。
 - [x] per-SIM effective profile 已接入 VoLTE/VoWiFi live boundary：VoLTE bearer/P-CSCF/REGISTER 与 VoWiFi ePDG/DNS/IKE/REGISTER 均消费按 access 固定的会话快照。
-- [ ] 自定义 IMEI 已有解析、校验、脱敏和 policy-gated renderer，但尚未接入验证过的 IKE/SIP/TS.43 wire position。
+- [x] 自定义 IMEI 已接入 VoWiFi IKE_AUTH Vendor ID、VoLTE/VoWiFi policy-gated SIP `+sip.instance`，以及 TS.43 `terminal_id`；永久 NAI/IMPI/IMPU 不变。真实运营商是否接受各位置仍需实机验证。
 - [ ] VoWiFi adapter 已具备 IMS 视频 SDP/relay/re-INVITE 基础，但真实运营商、Asterisk/Linphone 与双线路视频矩阵尚未验收。
-- [ ] IMS Ut/XCAP 的真实 access transport、catalog policy、运营商网络回读，以及完整 CLIP/CLIR/OIP/OIR 和网络确认的呼叫转移尚未实现。共享 domain parser 与 GET→条件 PUT→GET 回读编排已落地；MWI 基础订阅/NOTIFY 已接线，但 SUBSCRIBE challenge 鉴权及语音信箱号码来源仍未完成。
+- [ ] IMS Ut/XCAP 已具备显式 catalog policy、受限 HTTPS transport、规则级原位修改以及 OIP/CLIP、OIR/CLIR 的 GET→条件 PUT→GET 编排；VoLTE/VoWiFi 当前会话的源地址/AKA provider 已接入，但运营商网络回读仍未完成。MWI 订阅/NOTIFY、一次 AKA challenge 重试和 SIM→catalog→override 语音信箱号码解析已接线，仍需运营商回读验证。
 - [ ] Asterisk trunk 的本机 live 测试已通过 Digest REGISTER、INVITE/ACK、re-INVITE、DTMF 和 BYE；Windows Linphone、目标机可达性与真实运营商媒体互通仍未验收。
 
 ## P0 — 共享 IMS 注册收尾
@@ -69,7 +69,9 @@
 
 - [x] 抽取共享的租约计算、refresh result、unregister result 和失效原因模型。
 - [x] VoLTE 与 VoWiFi 仍各自调度 refresh：VoLTE refresh 失败可重建 bearer；VoWiFi refresh 失败可重建 IKE/ESP/TUN。
-- [ ] 为两个 adapter 运行同一组 contract tests：200、401、407、AUTS、第二轮拒绝、provisional、Contact expires、Service-Route 和关联身份。
+- [x] 两条 adapter 实际消费共享 refresh result：共享 REGISTER failure 统一区分鉴权/网络/信令失败，VoWiFi 另将 ePDG/IKE/TUN 失败标为 access transport lost；日志保留 adapter 原始错误码。
+- [x] 需要显式注销时，使用同一 dialog identity/CSeq 和 AKA challenge 完成 `REGISTER Expires: 0`，再映射 `UnregisterResult`；网络拒绝、access 丢失和已过期分别收口，后续本地 bearer/TUN teardown 不会反向改写为 `Confirmed`。共享 challenge、VoLTE UDP 和 VoWiFi operator protected-channel 回归已通过，真实运营商注销响应仍待实机记录。
+- [x] VoLTE 与 VoWiFi adapter 模块运行同一组共享 REGISTER contract：覆盖 200、401、407、AUTS 后第二轮 challenge、第三次 challenge 拒绝、initial/authenticated provisional、Contact expires、Service-Route 和关联身份。VoLTE 覆盖共享 driver 管理 exchange 的形态，VoWiFi 覆盖 adapter 自管 protected exchange 的形态；真实 USIM 算法和运营商响应仍由各 access 的现有单测/实机验收负责。
 - [x] 不把“REGISTER 成功”自动等同于 voice/video/UT/MWI ready；视频按 access gate，MWI/UT 使用独立 capability/readiness。
 
 ## P1 — 按 SIM 的用户覆写与有效配置
@@ -133,7 +135,7 @@ line_id → 当前 SIM identity/SimBindingKey
 - [x] 不得用 IMEI 替换 IKE EAP-AKA permanent NAI、IMPI、IMPU、ICCID 或 IMSI。
 - [x] 仅在 carrier policy 明确要求的位置使用设备身份，例如特定 IKE_AUTH device/vendor identity、TS.43 device information，或 GSMA IMEI 格式的 `+sip.instance`。
 - [x] 未经 profile policy 允许，不修改 User-Agent，也不假设所有运营商都接受 IMEI 型 `+sip.instance`。
-- [ ] VoLTE、VoWiFi 和 entitlement 如需设备身份，均消费同一 `EffectiveDeviceIdentity`；各 adapter 只负责协议位置映射。当前只有共享解析/renderer 和 API，live wire 尚未接线。
+- [x] VoLTE、VoWiFi 和 entitlement 均消费同一 `EffectiveDeviceIdentity`；各 adapter 只负责协议位置映射。设备身份在 IKE Vendor ID、SIP `+sip.instance` 和 TS.43 `terminal_id` 上均受 carrier policy 门控。
 - [x] 测试 custom/modem/unavailable 三态、两线路不串值、换卡重解析以及日志/API 脱敏。
 
 ## P3 — E911 地址与 entitlement
@@ -144,8 +146,12 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] SIM override 可保存用户明确输入的 civic address；地址、ICCID、EID、IMSI、IMEI 均按敏感信息处理。
 - [x] entitlement token、cookie、`AddrStatus`、`ProvStatus`、重试时间和 provider reference 写独立 state/secret store，不写回用户 override。
 - [x] 新增独立 `services/e911`：TS.43 client、受控 SIM AKA adapter、provider registry、websheet operation 和状态机。
+- [x] 接入真实 TS.43 请求参数（EAP_ID/root NAI、`ap2004`、`vers`、token、terminal policy），解析 WAP provisioning XML 的 `EntitlementStatus/ProvStatus/TC_Status/AddrStatus`、token、版本和 `ServiceFlow_URL/UserData`。
+- [x] 真实 `ServiceFlow_URL` 与 cookie/token 按 `SimBindingKey` 加密保存；websheet 完成仍必须重新 query，不能把本地地址或页面关闭当成紧急呼叫确认。
+- [x] websheet operation 新增一次性同源 `launch_url`；标准 URL-encoded `ServiceFlow_UserData` 通过受控页面 POST，completion 使用独立随机 nonce，JSON 不返回 user data/token/cookie；非标准 body fail closed。
+- [x] E911 API 以当前线路 provider 和当前线路 QMI/UIM slot 执行查询；补充 VoWiFi 诊断页的状态、查询和运营商流程入口。
 - [x] entitlement URL/redirect 必须来自可信 catalog 并经过 HTTPS、host allow-list、DNS/IP/redirect/response-size 限制，防止 SSRF。
-- [x] websheet 完成后必须重新查询 entitlement；不能仅凭页面关闭或 HTTP 2xx 宣称地址已确认。
+- [x] websheet 完成后必须重新查询 entitlement；不能仅凭页面关闭或 HTTP 2xx 宣称地址已确认。完整跨域 callback bridge/proxy 仍需运营商页面实测后接入。
 - [x] API/UI 分开显示：运营商要求、地址已本地保存、运营商已确认、紧急呼叫未验证。
 - [x] 所有后台 query/provisioning 只能更新状态存储，不能自动改写用户地址文件。
 - [x] 只做非紧急 provisioning 测试；禁止用拨打 911 验收。
@@ -166,11 +172,11 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] 将通用 RTP relay 从 VoLTE 命名空间迁到 `connectivity/core/media.rs`，VoLTE、VoWiFi 与 trunk 均直接消费共享类型；旧模块仅兼容 re-export。
 - [x] 每线路统一使用 `ImsVideoConfig`，分别门控 VoLTE 和 VoWiFi；开发阶段不提供旧 `VilteConfig` 导入流程。
 - [x] VoWiFi `operator.rs` 不再用固定的 `vowifi_video_not_supported` 拒绝视频，并为 audio/video 分别持有 pending/active relay。
-- [ ] 覆盖双方初始视频 INVITE、audio→video、video→audio、488/491/超时回滚以及 BYE/CANCEL 资源释放。
+- [x] 覆盖双方初始视频 INVITE、audio→video、video→audio、488/491/超时回滚以及 BYE/CANCEL 资源释放；re-INVITE 使用 per-call deadline，超时只回滚 pending relay、保留已确认语音 dialog。
 - [x] `sync_line_video_capabilities()` 分别设置 VoLTE/VoWiFi backend，不能用一条 access 的 ready 状态替代另一条。
-- [ ] REGISTER Contact 只在 carrier policy 和本地 capability 都允许时声明 video/MMTel feature。
+- [x] REGISTER Contact 只在 carrier catalog 明确声明且本地 access capability 开启时保留 `video` feature；本地 capability 关闭时过滤该参数。
 - [x] H.264 bitstream 不在 SimAdmin 内转码；共享 relay 只做 RTP payload type 映射，真正转码交给 Asterisk。
-- [ ] 测试双线路 socket/SSRC/PT 隔离、RTP/RTCP 行为、对端拒绝视频后语音保持。
+- [x] 测试双线路 socket/SSRC/PT 隔离、RTP 与严格校验的 RTCP-mux 透明转发、RTCP 不触发 RTP answered 事件，以及 VoLTE/VoWiFi 对端以 488 拒绝视频升级后仍保留既有音频 relay。当前 SDP/socket 模型不分配独立 RTCP 端口，非 mux RTCP 继续明确不支持。
 
 ## P5 — UT、呼叫等待、语音信箱与 Caller ID
 
@@ -180,24 +186,28 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] 共享 MWI classifier 统一识别 NOTIFY、subscription response、dialog Call-ID 和 To-tag；VoLTE/VoWiFi adapter 只负责各自通道 I/O。
 - [x] IMS Ut/XCAP 的领域模型、命名空间 XML 解析和 GET/条件 PUT 请求描述已在共享 core 实现；未知扩展在只读 GET/parse/GET 路径保留。
 - [x] `services/supplementary/ut.rs` 统一 GET、带 ETag 的 `If-Match` PUT、再次 GET 和 semantic readback；PUT 2xx 本身不代表配置成功。
-- [ ] Ut/XCAP 的 HTTP/TLS/Digest-AKA transport 仍由 VoLTE 蜂窝 IMS 与 VoWiFi ePDG/TUN adapter 分别接入，并需用网络回读验证。
-- [ ] 同一订阅的 UT 规则通常是网络侧状态，不是 VoLTE/VoWiFi 各保存一份；切换 access 后重新读取网络权威值。
-- [ ] CS/ModemManager/AT 作为独立 provider，只暴露 modem 真正支持的能力。
+- [x] 共享 `HttpXcapTransport` 强制 HTTPS、禁止 redirect、支持可选源地址绑定、ETag/Content-Type、一次 401/407 Digest provider 重试，并以流式上限拒绝超大响应；不会从 registrar 猜测 XCAP 地址。
+- [x] VoLTE/VoWiFi live adapter 已分别提供当前已注册会话的源地址和按线路 Digest-AKA provider；线路级 UT GET/PUT API 只选择当前 IMS access，并复用同一共享事务。
+- [x] 同一订阅的 UT 规则不写入 VoLTE/VoWiFi 本地副本；线路 API 每次按当前注册 access GET 网络权威值，成功更新后再次 GET 回读。
+- [x] CS/ModemManager/AT 作为独立 provider，只暴露 modem 真正支持的能力：当前仅使用 ModemManager 已声明的 `CallWaitingQuery`/`CallWaitingSetup`；呼叫转移、来显、音频控制和 CS trunk 均明确报告不支持，不发送推测性的 MMI/USSD/AT 命令。
 
 ### P5.2 IMS Ut/XCAP
 
-- [ ] catalog 提供 XCAP root、鉴权/TLS policy、document selector、namespace 和 partial-update 能力。
-- [ ] 首批支持 communication-waiting、communication-diversion、OIP/CLIP、OIR/CLIR。
+- [x] catalog 可显式提供 XCAP root、`digest_aka` 鉴权、document selector 和 namespace；缺失或未启用时 fail closed 为不支持，HTTPS/完整性校验在 profile import 时完成。
+- [x] catalog 已按文档类型显式建模 XCAP partial-update selector，并支持带 `{rule-id}` 的 communication-diversion 规则 selector；只有明确启用且当前文档存在 selector 时才发 element PUT，否则保留整文档条件 PUT。TLS policy 可限制 TLS 1.2/1.3 范围、启停内置可信根并提供额外 carrier CA，证书/主机名校验始终开启。
+- [x] 首批支持 communication-waiting、communication-diversion、OIP/CLIP、OIR/CLIR；OIP 的 `active=true` 表示允许显示，OIR/CLIR 的 `active=true` 表示启用限制。OIR 使用规范 XCAP 文档名 `originating-identity-presentation-restriction`，旧 API 别名仍兼容。
 - [x] 写入编排采用 GET → parse → `If-Match` 更新 → GET 回读确认；409/412、401/407、PUT 失败和回读不一致分别返回明确错误。
-- [ ] call-waiting 与 identity active 字段修改已保留未知 XML 扩展；communication-diversion 的规则级原位修改仍需实现，不能用 canonical XML 覆盖运营商扩展。
+- [x] call-waiting、identity active 与 communication-diversion 规则级修改均保留未知 XML 扩展；新增/更新规则只改目标 rule，不覆盖整份运营商文档。
 - [x] 共享模型已拒绝非 E.164 `tel:` 目标并接受 `sip:`/`sips:` URI；完整号码和 XML 不进入事务层普通日志。
-- [ ] `REFER` 只表示 dialog 内通话转接，不替代网络侧呼叫转移配置；后者走 Ut/XCAP 或 CS provider。
+- [x] `REFER` 只表示 dialog 内通话转接，不替代网络侧呼叫转移配置；后者走 Ut/XCAP 或 CS provider。共享模型已使用独立的 `DialogTransfer` 命名和状态，不复用 forwarding API。
 
 ### P5.3 呼叫等待和通话转接
 
-- [ ] SIP dialog 层支持至少两个同时存在的 call、第二路 180/183/200/486、hold/resume 和独立 RTP/DTMF/re-INVITE。
-- [ ] 资源不足返回明确的 486/503，不能覆盖第一路 call。
-- [ ] 如实现 `REFER`，共享构建/解析 `Refer-To`、202 和 refer-event `NOTIFY` 状态机，并与“呼叫转移设置”使用不同 API 名称。
+- [x] SIP dialog 层支持至少两个同时存在的 call、第二路 180/183/200/486、hold/resume 和独立 RTP/DTMF/re-INVITE；VoLTE/VoWiFi 本地矩阵均已直接经过各自受保护 channel 与生产 dialog handler，真实运营商/Asterisk/Linphone 双通话互操作仍属于外部验收。
+- [x] 每个 IMS access 最多保留两个独立 dialog；第三路外呼向 trunk 返回 486、第三路入呼向网络返回 486，且不会覆盖或释放既有 call。hold/resume、早期媒体和真实双通话互操作仍在上一项验收范围内。
+- [x] 两条 IMS adapter 对跨 leg 的 SDP `sendonly`/`recvonly`/`inactive` 方向进行对端反转；共享 RTP relay 按最终两端 direction gate RTP，hold 时仍透明保留严格校验的 RTCP-mux。网络侧与 Asterisk 发起的 re-INVITE 都复用这条路径。
+- [x] 共享 core 已实现 `Refer-To`/`Referred-By` 安全校验、in-dialog REFER 构建、`message/sipfrag` refer-event NOTIFY 解析和单向终态状态机；两条 access 使用同一协议边界。
+- [x] 共享 REFER core 已接入 Asterisk B2BUA、VoLTE 和 VoWiFi dialog：仅 confirmed dialog 接受 blind transfer，按 call 独立透传 202/失败响应和 refer-event NOTIFY，并以 32 秒超时收口。两条 access 按 REFER CSeq 校验显式 `Event: refer;id=`，B2BUA 向 Asterisk 重写为其原始 REFER CSeq；底层 command consumer 消失只结束 REFER transaction，不误报整通电话失败。由于 Asterisk leg 与运营商 IMS leg 的 dialog 标识不同，携带 `Replaces` 的 attended transfer 当前明确返回 501；真实运营商、Asterisk 和 Linphone 的转接互操作仍属于外部验收，不据此宣称实机转接已验证。
 
 ### P5.4 MWI 与语音信箱
 
@@ -205,16 +215,16 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] 不把普通 `MESSAGE` 当作 MWI；只有 `NOTIFY Event: message-summary` 且 Content-Type 为 `application/simple-message-summary` 才更新 MWI，`MESSAGE` 继续走原 SMS/即时消息分流。
 - [x] MWI subscription/runtime 按 `line_id` 保存并记录当前 access owner；语音信箱覆写号码按 `SimBindingKey` 保存，旧 access 的延迟 teardown 不会清掉新 access 状态。
 - [x] 新增只读 `GET /api/ims/lines/{line_id}/supplementary`，返回该线路 capability/readiness 与 MWI snapshot，不写回配置库。
-- [ ] 对 MWI `SUBSCRIBE` 的 401/407 challenge 实现经过运营商验证的鉴权；当前会明确报告 `mwi_subscribe_authentication_required`，不会错误复用或伪造 REGISTER 凭据。
-- [ ] 号码来源顺序：SIM/ModemManager → catalog → SIM override；拨号走当前 `VoiceAccessRouter`。
+- [x] 对 MWI `SUBSCRIBE` 的 401/407 challenge 实现一次性、按线路的 Digest-AKA 鉴权重试；不复用 REGISTER nonce，也不跨线路取卡。运营商实际 challenge 兼容性仍需实机验证。
+- [x] 号码来源按 SIM override → SIM/ModemManager (`AT+CSVM?`) → catalog 解析；`POST /api/ims/lines/{line_id}/voicemail/call` 以按 access 的 `MediaOffer` 交给当前 `VoiceAccessRouter`，复用 `StartCall`、选路、故障切换和既有 lifecycle。`*86` 一类服务码由两条 IMS adapter 使用同一安全 dial-string 规范化。HTTP 接口目前只有预留的本地 RTP sink，尚不提供浏览器/本地音频收听或语音信箱交互 UI。
 - [x] MWI snapshot 携带 `source=operator_ims|asterisk_local`；当前解析得到的状态明确标为 `operator_ims`，不冒充 Asterisk 本地 mailbox。
 
 ### P5.5 Caller ID 与隐私
 
 - [x] 共享解析 `Privacy`、`P-Asserted-Identity`、From 和兼容性的 `Remote-Party-ID`。
 - [x] 收到 `Privacy: id` 时，VoLTE/VoWiFi 到 trunk 的入口强制替换为 `sip:anonymous@anonymous.invalid`；trunk 回归测试确认不会转发 P-Asserted-Identity 或原始号码。
-- [ ] 仍需审计 UI、Linphone、call history 和所有普通日志展示路径；trunk 提供的出站 caller ID 也必须继续受当前 SIM/carrier policy 限制。
-- [ ] 不通过只修改 From header 假装 CLIR/OIR 已被网络接受，写操作必须有网络回读结果。
+- [x] VoLTE/VoWiFi 入站 Caller ID 已统一隐私解析并在 trunk 入口匿名化；出站 caller ID 继续由注册身份生成，不接受 Asterisk `caller` 字段覆盖。UI/call-history 的专门隐私审计和 Linphone 实测仍待完成。
+- [x] CLIR/OIR 写操作不修改本地 From header 冒充成功，而是走共享 XCAP GET→条件 PUT→GET，并对 OIP/OIR 的相反 `active` 语义执行网络回读比对；真实运营商接受情况仍属于外部验收。
 
 ## P6 — 多线路与 trunk 回归门槛
 
@@ -223,7 +233,7 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] 每个 `LineRuntime` 持有独立 `TrunkRuntime`、`VoiceAccessRouter`、REGISTER/Digest/dialog generator、profile、relay metrics、generation 与 driver backoff；回归测试覆盖单线 teardown、generation、视频 gate 和 RTP 计数不影响另一线。
 - [ ] 本机 live Asterisk 已覆盖 Digest REGISTER、主叫 INVITE/ACK、re-INVITE、DTMF 和 BYE；VoLTE/VoWiFi 真实接入下的被叫、早期媒体/PRACK、CANCEL、Windows Linphone 与视频矩阵仍待完成。
 - [ ] CS trunk 只有在找到真实双向音频数据面 adapter 后才能标记支持；仅有 ModemManager 呼叫控制不等于可接入 Asterisk。
-- [ ] 任一线路断网/换卡/重注册不得释放或重置另一线路的 SIP dialog、TUN、bearer 或 relay。
+- [ ] 本地 contract 已确认一线清理不会删除另一线的 VoWiFi REGISTER variant 或 operator session，另一线仍可发 INVITE；真实双 modem 下的 TUN、bearer、活动 RTP/视频 relay 故障隔离仍待验收。
 
 ## P7 — 项目配置 SQLite 化
 
@@ -245,10 +255,10 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - [x] `cargo fmt --manifest-path backend/Cargo.toml -- --check`
 - [x] `cargo check --manifest-path backend/Cargo.toml`
 - [x] `cargo clippy --manifest-path backend/Cargo.toml --all-targets`（通过；保留既有 warning）
-- [x] `cargo test --manifest-path backend/Cargo.toml --no-fail-fast`（970 passed; 0 failed; 1 ignored）
+- [x] `cargo test --manifest-path backend/Cargo.toml --no-fail-fast`（1027 passed; 0 failed; 1 ignored）
 - [x] override store 使用临时目录测试权限、symlink、损坏 JSON、未知 schema、原子写和并发写。
-- [ ] 自动恢复/重试前后比较 override 行的 `updated_at`/document hash，确认自动化路径绝不写用户配置。
-- [ ] 两线路 contract tests 覆盖同 PLMN 不同配置、热插拔二次校验和 access 切换。
+- [x] 自动读取/重试 contract 重复执行 SQLite load 和 VoLTE/VoWiFi/IMEI/E911 effective resolution，前后比较 override `document_json` 与 `updated_at` 完全一致；生产写入口审计只保留显式用户 override/E911 地址 API 和维护工具。
+- [x] 两线路 contract tests 使用同一 carrier catalog 的两个独立 SIM binding，覆盖不同 VoLTE/VoWiFi/IMEI/E911 配置、重新打开 store 的热插拔式二次解析、VoLTE↔VoWiFi access 分支和同 EID 的 eSIM profile ICCID 切换；真实硬件矩阵仍属于 P6 外部验收。
 - [ ] Asterisk/Linphone 外部实验单独记录环境、codec、SIP trace 和脱敏结果；不得把 ignored test 当作已验收。
 - [ ] 真实运营商测试只拨打已授权的普通测试号码；E911 仅走运营商提供的非紧急验证流程。
 
@@ -304,7 +314,7 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 
 - 2026-08-10：初稿创建，当时共享 REGISTER 重构尚未完成。
 - 2026-08-10：按当前架构重审；标记共享 REGISTER 已完成，补充注册收尾边界、E911、多线路/trunk 阶段，并修正 IMEI、REFER/呼叫转移和 MWI 协议描述。
-- 2026-08-10：P1 的存储/API 与 P3（E911 entitlement）落地；P2 只完成身份解析、校验和 policy renderer，尚未接入验证过的 wire position。E911 的受控 AKA adapter 仍为 seam 存根，待验证的 digest adapter 落地。
+- 2026-08-11：E911 改为公开 TS.43 EAP relay JSON 流程；接入按线路 QMI/UIM AKA、WAP provisioning XML、AT_MAC 校验、token/cookie/真实 ServiceFlow URL 的加密保存和前端 websheet 入口。当前仍未执行真实运营商 E911 provisioning 或紧急呼叫认证。
 - 2026-08-10：P4 完成 `VilteConfig` → `ImsVideoConfig` 配置迁移：`volte/voice.rs` 字段改为 `ims_video`/`video_enabled` 并以 `volte_enabled` 门控，`start_line_volte_restore` 改用 `get_line_ims_video_config`；`cargo check --all-targets` 通过，`volte::voice` 12 个测试全部通过。SDP/relay 迁移与 VoWiFi 视频接线仍待做。
 - 2026-08-10：完成 P7 的配置持久化主体。生产 `ConfigManager` 默认使用 `/data/config.sqlite3`，支持事务持久化和版本/fail-closed 校验；`SimOverrideStore` 使用独立逐 binding 表。按开发阶段要求移除全部旧 JSON 自动导入。catalog、运行历史和 E911 secret state 按 ownership 继续独立。
 - 2026-08-10：P4 继续完成共享 `ims_video`/`media` core 和 VoWiFi 双媒体 relay/re-INVITE 接线；旧 VoLTE 模块降为兼容 re-export。审校 P1/P2 后明确 effective profile 与自定义 IMEI 尚未进入 live wire，取消端到端完成表述。
@@ -315,3 +325,19 @@ E911 不属于共享 REGISTER。地址权威副本通常在运营商 provisionin
 - 2026-08-11：部署最新 SQLite 版本并完成 QCM410/Maxis 实测：VoLTE 与 VoWiFi 均真实 REGISTER 成功且可同时保持注册；SQLite backup/export 一致性通过；本机 live Asterisk 测试通过。记录 E911 `metadata_only`、MWI pending、UT 未连接和 Windows Linphone 网络阻塞。
 - 2026-08-11：修复 direct VoWiFi 外呼重复 bind 已注册 IPsec protected port 的问题，改由 API 复用 per-line operator channel，映射 provisional/answered/rejected/ended/cancelled 状态，并为静默网络增加 32 秒 CANCEL/失败收口。单元与 operator dialog 定向测试通过；实机唯一一次 INVITE 已经 ESP 发出，但无运营商响应，未宣称通话接通。
 - 2026-08-11：完成 SimAdmin 侧 EVS 信令与透明 RTP relay 支持。共享 audio policy 消费 schema-v7 的媒体 codec/PT/sample-rate/bitrate/bandwidth，VoLTE/VoWiFi 复用 EVS SDP 与动态 PT 映射；不包含 EVS 编解码或 Asterisk/Linphone 插件，也未宣称运营商 EVS 实机验收。
+- 2026-08-11：完成后续代码收口：自定义 IMEI 接入 VoWiFi IKE Vendor ID、VoLTE/VoWiFi SIP `+sip.instance` 和 TS.43 terminal identity；MWI `SUBSCRIBE` 401/407 按线路 AKA 一次重试；`communication-diversion` 规则级原位 XML 更新；视频 re-INVITE 32 秒超时回滚；REGISTER `video` Contact feature 同时受 catalog 与本地 capability 门控；语音信箱 effective number 支持 `AT+CSVM?`、catalog、SIM override 来源链。以上仍不能替代真实运营商 Ut/MWI/E911、Linphone 和多硬件验收。
+- 2026-08-11：补齐 UT catalog/transport 基础：schema-v7 profile 可显式携带 XCAP HTTPS root、document selector、namespace 和 `digest_aka` policy；缺失时保持关闭。共享 transport 禁止 redirect、支持源地址 bind 与一次 challenge provider 重试，并改为边读边执行 512 KiB 上限。尚未把当前 VoLTE bearer 或 VoWiFi TUN 的源地址/AKA provider 接到 API，因此未宣称真实 UT 可用。
+- 2026-08-11：完成 UT 线路级接入：VoLTE 从当前 session 获取 IMS bearer 源地址/QMI/UIM/AID，VoWiFi 从已注册 ePDG/TUN channel 获取源地址/IMPI；两者通过同一 `XcapAccessContext` 和 Digest-AKA provider 服务 `GET/PUT /api/ims/lines/{line_id}/ut/{document}`，supplementary readiness 按 access owner 更新并隔离旧 access teardown。仍需真实运营商网络回读。
+- 2026-08-11：修正 OIR/CLIR 的 `active` 反向语义：`active=true` 现在表示限制已启用，而 OIP/CLIP 的同一字段仍表示允许显示。API 采用规范 `originating-identity-presentation-restriction` 文档名并兼容旧别名；定向 XML/UT 回归测试通过，真实运营商回读仍待完成。
+- 2026-08-11：重新审计 CS supplementary provider：它只使用 ModemManager 明确公开的呼叫等待 D-Bus 方法；其他补充服务和 CS trunk 继续 fail closed，未发现自动发送 MMI/USSD/猜测性 AT 的路径。
+- 2026-08-11：VoLTE 与 VoWiFi 各自限制为最多两个并发 IMS dialog；第三路 MO/MT 呼叫明确以 SIP 486 收口。VoWiFi 定向回归确认第三路不会影响前两路 dialog；hold/resume 与真实双通话媒体仍待外部验收。
+- 2026-08-11：完成 P4 媒体回归收口。共享 relay 严格识别并透明转发完整 RTCP-mux compound packet，不把其计入 RTP 指标或首 RTP answered 事件；双 relay 测试验证 socket、SSRC、动态 PT 与 RTCP-mux 不串线。VoLTE/VoWiFi re-INVITE 改为暂存媒体快照，488、超时或发送失败只释放 pending relay 并恢复已确认音频；VoLTE 补齐与 VoWiFi 一致的 32 秒网络 504/trunk 408 超时收口。独立 RTCP 端口、真实视频互操作与 hold/resume 仍不在此项完成范围内。
+- 2026-08-11：完成 P5.4 语音信箱拨号契约。新增按线路 `POST /api/ims/lines/{line_id}/voicemail/call`；号码从同一 SIM binding 的 override、当前 SIM `AT+CSVM?`、只读 catalog 解析，完整号码不写入响应或日志。`VoiceAccessRouter` 新增 access-aware call plan，在实际 policy 选路后才向对应 adapter 投递 `StartCall` 并返回初始 access，避免 VoWiFi/VoLTE codec policy 混用；后续事件和故障切换继续走原 trunk route。接口只使用预留 loopback RTP sink，实际听取语音信箱仍需要已接入的本地音频或 Asterisk media backend。
+- 2026-08-11：P5.3 增加 hold/resume 媒体方向收口。VoLTE/VoWiFi 的跨 leg SDP 方向统一取对端反转值；共享 relay 根据 offer/answer 的方向只转发允许的 RTP，`inactive` 不转发 RTP，RTCP-mux 仍可双向通过。完整第二路状态矩阵和真实双通话互操作仍未完成。
+- 2026-08-11：P5.3 完成共享 blind REFER 协议核心及 dialog 接线：统一目标 URI 注入防护、Service-Route 请求构建、refer-event `message/sipfrag` NOTIFY 解析与单向终态状态机；Asterisk B2BUA、VoLTE、VoWiFi 均已接入按 call 隔离的响应、通知和超时处理。attended `Replaces` 因跨 B2BUA leg 缺少 dialog 映射而明确返回 501；真实运营商、Asterisk 和 Linphone 互操作仍待外部验收。
+- 2026-08-11：P5.3 补齐连续 REFER 的订阅关联与失败边界。VoLTE/VoWiFi 以各自发出 REFER 的 CSeq 校验运营商 `Event: refer;id=`，显式错配或非法 id fail closed；B2BUA 重新使用 Asterisk REFER CSeq 构造 NOTIFY，避免跨 leg 复用标识。access command consumer 消失时返回本次 REFER 的 503，未知 route 返回 481，不再用 call-level `Unavailable` 错误终止已确认通话。
+- 2026-08-11：P5.3 完成本地双 dialog 状态矩阵。VoWiFi TCP operator session 与 VoLTE UDP protected-channel 测试均覆盖独立 Call-ID/relay、180/183/200/486、拒绝后槽位复用、hold/resume、一路 hold 时另一路实际 RTP 转发与 SIP INFO DTMF，以及分别 BYE；外部双通话互操作仍未据此标记完成。
+- 2026-08-11：完成 P0.2 双 adapter 共享 REGISTER contract。相同矩阵分别从 VoLTE shared-driver exchange 和 VoWiFi adapter-owned protected exchange 入口运行，覆盖 200/401/407、AUTS 两轮、重复拒绝、provisional 与成功 artifacts；同时修复 VoWiFi 认证后只读一帧的问题，初始 socket、AUTS 和 protected candidate 现在都会有界跳过 provisional 后再处理终态。
+- 2026-08-11：接通共享注册生命周期结果。VoLTE refresh 改用保留终态响应的 REGISTER driver，VoLTE/VoWiFi 统一分类鉴权拒绝、网络拒绝、信令与 access transport 丢失，再交回各 adapter 清理 bearer 或 IKE/ESP/TUN；未把未实现的 AKA `Expires: 0` 冒充确认注销。新增 SQLite override 只读不改 `updated_at`/document、同 catalog 双 SIM/eSIM access 切换，以及一线 operator teardown 后另一线继续 INVITE 的 contract tests。
+- 2026-08-11：完成 P0.2 显式 IMS 注销。共享 driver 复用有界 401/407/AUTS challenge 状态机并区分 Confirmed/Rejected/AccessLost/AlreadyExpired；VoLTE 在释放 XFRM/bearer 前复用 REGISTER identity 和按线路 QMI/UIM AKA，VoWiFi 通过持有 protected socket 的 operator task 调用按线路 AKA factory，再清理 IKE/ESP/TUN。内部故障恢复保留立即 abort 路径，避免已断链时等待注销超时；6 个注销定向测试通过，真实运营商响应仍待实机记录。
+- 2026-08-12：完成 XCAP partial-update 与 TLS policy 收口。线路 PUT 改用类型化 `UtMutation`，按 catalog 明示的 document selector 选择 element PUT，并继续执行 GET→`If-Match` PUT→GET 权威回读；未配置当前文档 selector 时保持整文档更新。HTTPS transport 强制仅 HTTPS、无 redirect、TLS 1.2/1.3 policy、可信根策略和可选 carrier CA，且不提供关闭证书或主机名校验的开关。真实运营商 element selector 和私有 CA 仍需网络验收。

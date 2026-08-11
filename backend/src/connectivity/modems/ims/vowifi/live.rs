@@ -44,14 +44,21 @@ use super::{
     voice,
 };
 use crate::connectivity::core::{
-    register::{run_register_observed, RegisterAuthenticator, RegisterFailure},
+    register::{
+        run_register_observed, RegisterAuthenticator, RegisterFailure,
+        MAX_REGISTER_PROVISIONAL_RESPONSES,
+    },
     register_response::RegisterArtifacts,
-    registration::{ImsRegistrationAccess, RegisteredImsContext},
-    ImsError,
+    registration::{
+        ImsRegistrationAccess, RegisteredImsContext, RegistrationLossReason,
+        RegistrationRefreshResult,
+    },
+    sip_frame, ImsError,
 };
 use crate::connectivity::modems::ims::profile_override::SimOverride;
 use crate::hardware::cellular::modem_manager::get_sim_info_for_modem_with_cache;
 use crate::platform::config::{LineVowifiConfig, VowifiProxyMode};
+use crate::services::supplementary::ut::{XcapAccessContext, XcapDigestProvider};
 use crate::services::trunk::bridge::{
     DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
 };
@@ -120,6 +127,7 @@ static LIVE_IMS_REGISTER_READY: OnceLock<Mutex<HashMap<String, LiveImsRegisterRe
 static LIVE_IMS_SECURITY_VERIFY: OnceLock<Mutex<HashMap<String, LiveImsSecurityVerify>>> =
     OnceLock::new();
 static LIVE_IMS_CHANNEL: OnceLock<Mutex<HashMap<String, LiveImsChannel>>> = OnceLock::new();
+static LIVE_XCAP_BINDING: OnceLock<Mutex<HashMap<String, LiveXcapBinding>>> = OnceLock::new();
 static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<
     Mutex<HashMap<String, LiveImsRegisterSuccessVariant>>,
 > = OnceLock::new();
@@ -147,7 +155,7 @@ struct LiveNetworkOverrides {
     ims_realm: Option<String>,
     ims_registrar: Option<String>,
     ims_pcscf: Vec<String>,
-    custom_imei: Option<String>,
+    effective_device_imei: Option<String>,
     /// How this line's IKE/NAT-T traffic egresses. `None` means direct.
     proxy: Option<LiveProxySetting>,
 }
@@ -167,7 +175,7 @@ pub fn validate_live_network_overrides(
     config: &LineVowifiConfig,
     sim_override: Option<&SimOverride>,
 ) -> Result<(), String> {
-    build_live_network_overrides(config, sim_override).map(|_| ())
+    build_live_network_overrides(config, sim_override, None).map(|_| ())
 }
 
 /// Fix (or clear) the immutable network snapshot for a line at the start of a
@@ -178,10 +186,19 @@ pub fn configure_live_network_overrides(
     config: &LineVowifiConfig,
     sim_override: Option<&SimOverride>,
 ) -> Result<(), String> {
+    configure_live_network_overrides_with_device_imei(line_id, config, sim_override, None)
+}
+
+pub fn configure_live_network_overrides_with_device_imei(
+    line_id: &str,
+    config: &LineVowifiConfig,
+    sim_override: Option<&SimOverride>,
+    device_imei: Option<&str>,
+) -> Result<(), String> {
     if line_id.trim().is_empty() {
         return Err("line_id_required".to_string());
     }
-    let next = build_live_network_overrides(config, sim_override)?;
+    let next = build_live_network_overrides(config, sim_override, device_imei)?;
     let mut map = network_overrides_map()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -204,6 +221,7 @@ pub fn forget_live_network_overrides(line_id: &str) {
 fn build_live_network_overrides(
     config: &LineVowifiConfig,
     sim_override: Option<&SimOverride>,
+    device_imei: Option<&str>,
 ) -> Result<LiveNetworkOverrides, String> {
     // Only transports that can actually carry UDP 500/4500 are accepted here.
     let proxy = match config.proxy_mode {
@@ -247,9 +265,12 @@ fn build_live_network_overrides(
             .and_then(|access| access.pcscf.as_ref())
             .cloned()
             .unwrap_or_default(),
-        custom_imei: non_empty_override(
-            sim_override.and_then(|override_| override_.ims_common.custom_imei.as_ref()),
-        ),
+        effective_device_imei:
+            crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity(
+                sim_override,
+                device_imei,
+            )
+            .imei,
     })
 }
 
@@ -318,6 +339,11 @@ fn live_ike_access(line_id: &str, profile: &CarrierProfile) -> IkeAccessConfig {
         epdg_host: overrides
             .epdg_host
             .unwrap_or_else(|| profile.epdg.host.to_string()),
+        device_identity: profile
+            .identity
+            .device_identity_enabled
+            .then_some(overrides.effective_device_imei)
+            .flatten(),
     }
 }
 
@@ -455,6 +481,42 @@ struct LiveImsChannel {
     profile_id: &'static str,
     expires_at: Instant,
     channel: SipChannel,
+}
+
+#[derive(Clone)]
+struct LiveXcapBinding {
+    profile: &'static CarrierProfile,
+    local_address: IpAddr,
+    username: String,
+}
+
+struct VowifiXcapDigestProvider {
+    line_id: String,
+    username: String,
+}
+
+impl XcapDigestProvider for VowifiXcapDigestProvider {
+    fn authorize<'a>(
+        &'a self,
+        challenge: &'a str,
+        proxy: bool,
+        method: &'a str,
+        uri: &'a str,
+    ) -> futures_util::future::BoxFuture<'a, Result<String, crate::connectivity::core::ut::UtError>>
+    {
+        Box::pin(async move {
+            build_line_digest_aka_authorization(
+                &self.line_id,
+                &self.username,
+                method,
+                uri,
+                challenge,
+                proxy,
+            )
+            .await
+            .map_err(|_| crate::connectivity::core::ut::UtError::new("ut_xcap_aka_failed"))
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1342,6 +1404,7 @@ pub struct LiveStageObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveStageError {
     pub reason: String,
+    registration_loss: Option<RegistrationLossReason>,
 }
 
 pub trait LiveStageAdapter: Send + Sync {
@@ -1788,7 +1851,7 @@ async fn run_live_ike_with_destination(
         .accept_encrypted_eap_aka_challenge_reason(&auth_response)
         .map_err(|reason| {
             error!("EAP-AKA challenge accept failed: {}", reason);
-            LiveStageError { reason }
+            live_stage_error(reason)
         })?;
     info!("Decrypting EAP-AKA challenge...");
     let eap_challenge = machine
@@ -1870,7 +1933,7 @@ async fn run_live_ike_with_destination(
             .accept_encrypted_auth_progress_or_reason(&auth_progress_response)
             .map_err(|reason| {
                 error!("EAP progress accept failed: {}", reason);
-                LiveStageError { reason }
+                live_stage_error(reason)
             })? {
             IkeAuthProgress::EapAkaIdentity { packet } => {
                 info!("Received EapAkaIdentity request from ePDG");
@@ -1960,7 +2023,7 @@ async fn run_live_ike_with_destination(
         validate_ike_auth_response(&child_sa_response, initiator_spi, expected_message_id)?;
         machine
             .accept_encrypted_child_sa_response_or_reason(&child_sa_response)
-            .map_err(|reason| LiveStageError { reason })?;
+            .map_err(live_stage_error)?;
     }
 
     Ok(LiveIkeSession {
@@ -2147,12 +2210,60 @@ async fn run_live_ims_register_until(
     line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Result<(), LiveStageError> {
+    let attempt = attempt_live_ims_registration(line_id, profile).await;
+    let (outcome, error) = match attempt {
+        Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
+        Err(error) => {
+            let loss_reason = error
+                .registration_loss
+                .unwrap_or(RegistrationLossReason::SignalingTransportLost);
+            (
+                RegistrationRefreshResult::RebuildAccess(loss_reason),
+                Some(error),
+            )
+        }
+    };
+
+    match outcome {
+        RegistrationRefreshResult::Refreshed(registered) => {
+            record_live_ims_register_ready(line_id, profile, true, registered).await;
+            Ok(())
+        }
+        RegistrationRefreshResult::RebuildAccess(loss_reason) => {
+            warn!(
+                line_id,
+                profile_id = profile.meta.profile_id,
+                registration_loss = loss_reason.as_str(),
+                "VoWiFi IMS registration attempt requires access rebuild"
+            );
+            Err(error.expect("failed registration retains its adapter error"))
+        }
+    }
+}
+
+async fn attempt_live_ims_registration(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Result<RegisteredImsContext, LiveStageError> {
     info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS TCP path...");
-    run_live_esp_until(line_id, profile).await?;
-    let gateway = cached_tun_gateway(line_id, profile).await?;
+    run_live_esp_until(line_id, profile)
+        .await
+        .map_err(|error| {
+            error.with_registration_loss(RegistrationLossReason::AccessTransportLost)
+        })?;
+    let gateway = cached_tun_gateway(line_id, profile)
+        .await
+        .map_err(|error| {
+            error.with_registration_loss(RegistrationLossReason::AccessTransportLost)
+        })?;
     let response = run_register_exchange_over_tunnel(line_id, profile, &gateway).await?;
     let parsed = ims::parse_sip_response(&response, &live_ims_target(line_id, profile).realm)
-        .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
+        .map_err(|_| {
+            live_registration_error(
+                "ims_register_response_parse_failed",
+                RegistrationLossReason::NetworkRejected,
+            )
+        })?;
     let registered = RegisteredImsContext::from_response(
         ImsRegistrationAccess::Vowifi,
         response.as_bytes(),
@@ -2171,12 +2282,15 @@ async fn run_live_ims_register_until(
     );
 
     match parsed.status_code {
-        200 => {
-            record_live_ims_register_ready(line_id, profile, true, registered).await;
-            Ok(())
-        }
-        401 | 407 => Err(live_stage_error("ims_register_auth_rejected")),
-        _ => Err(live_stage_error("ims_register_unexpected_status")),
+        200 => Ok(registered),
+        401 | 403 | 407 => Err(live_registration_error(
+            "ims_register_auth_rejected",
+            RegistrationLossReason::AuthenticationRejected,
+        )),
+        _ => Err(live_registration_error(
+            "ims_register_unexpected_status",
+            RegistrationLossReason::NetworkRejected,
+        )),
     }
 }
 
@@ -2446,7 +2560,9 @@ fn operator_event_call_outcome(
         | OperatorEvent::Cancelled { call_id } => call_id,
         OperatorEvent::Incoming { .. }
         | OperatorEvent::Renegotiate { .. }
-        | OperatorEvent::Dtmf { .. } => return None,
+        | OperatorEvent::Dtmf { .. }
+        | OperatorEvent::TransferResponse { .. }
+        | OperatorEvent::TransferNotify { .. } => return None,
     };
     if event_call_id != &seed.call_id {
         return None;
@@ -2503,7 +2619,9 @@ fn operator_event_call_outcome(
         }
         OperatorEvent::Incoming { .. }
         | OperatorEvent::Renegotiate { .. }
-        | OperatorEvent::Dtmf { .. } => return None,
+        | OperatorEvent::Dtmf { .. }
+        | OperatorEvent::TransferResponse { .. }
+        | OperatorEvent::TransferNotify { .. } => return None,
     };
     Some((outcome, terminal))
 }
@@ -2525,6 +2643,23 @@ fn ims_security_verify_cache() -> &'static Mutex<HashMap<String, LiveImsSecurity
 
 fn ims_channel_cache() -> &'static Mutex<HashMap<String, LiveImsChannel>> {
     LIVE_IMS_CHANNEL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn xcap_binding_cache() -> &'static Mutex<HashMap<String, LiveXcapBinding>> {
+    LIVE_XCAP_BINDING.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub async fn live_xcap_access_for_line(line_id: &str) -> Option<XcapAccessContext> {
+    let binding = xcap_binding_cache().lock().await.get(line_id).cloned()?;
+    Some(XcapAccessContext {
+        access: ImsRegistrationAccess::Vowifi,
+        profile: binding.profile,
+        local_address: binding.local_address,
+        digest: Arc::new(VowifiXcapDigestProvider {
+            line_id: line_id.to_string(),
+            username: binding.username,
+        }),
+    })
 }
 
 fn ims_register_variant_cache() -> &'static Mutex<HashMap<String, LiveImsRegisterSuccessVariant>> {
@@ -2632,9 +2767,20 @@ async fn record_live_ims_channel(
     channel: SipChannel,
     security_verify: Option<String>,
     registration: RegisteredImsContext,
+    register_context: LiveRegisterRequestContext,
+    register_variant: LiveRegisterHeaderVariant,
+    next_register_cseq: u32,
 ) {
     let route = channel.route();
     let expires_at = Instant::now() + registration.lease.expires_after;
+    xcap_binding_cache().lock().await.insert(
+        line_id.to_string(),
+        LiveXcapBinding {
+            profile,
+            local_address: route.local_addr.ip(),
+            username: identity.private_user.clone(),
+        },
+    );
     super::operator::install_registered_channel(
         super::operator::RegisteredVoiceContext {
             line_id: line_id.to_string(),
@@ -2642,7 +2788,7 @@ async fn record_live_ims_channel(
             identity,
             route,
             registration,
-            security_verify,
+            security_verify: security_verify.clone(),
             pani: build_p_access_network_info(profile),
             user_agent: build_live_user_agent(profile, LiveUserAgentFormat::ProfileDefault),
             expires_at,
@@ -2650,6 +2796,14 @@ async fn record_live_ims_channel(
                 .then(|| Duration::from_secs(u64::from(profile.ims.tcp_keepalive_seconds))),
             options_ping_interval: (profile.ims.options_ping_interval_seconds != 0)
                 .then(|| Duration::from_secs(u64::from(profile.ims.options_ping_interval_seconds))),
+            unregister: Some(Arc::new(VowifiUnregisterFactory {
+                line_id: line_id.to_string(),
+                profile,
+                context: register_context,
+                variant: register_variant,
+                next_cseq: next_register_cseq,
+                security_verify: security_verify.clone(),
+            })),
         },
         channel,
     )
@@ -2657,7 +2811,7 @@ async fn record_live_ims_channel(
 }
 
 async fn clear_live_ims_channel(line_id: &str, profile: &'static CarrierProfile) {
-    super::operator::disconnect_profile(line_id, profile.meta.profile_id).await;
+    super::operator::abort_profile(line_id, profile.meta.profile_id).await;
     let mut cache = ims_channel_cache().lock().await;
     if cache
         .get(line_id)
@@ -2665,17 +2819,26 @@ async fn clear_live_ims_channel(line_id: &str, profile: &'static CarrierProfile)
     {
         cache.remove(line_id);
     }
+    let mut xcap = xcap_binding_cache().lock().await;
+    if xcap
+        .get(line_id)
+        .is_some_and(|binding| binding.profile.meta.profile_id == profile.meta.profile_id)
+    {
+        xcap.remove(line_id);
+    }
 }
 
 /// Tear down one line's live runtime, leaving every other line untouched.
 pub async fn clear_live_runtime_for_line(line_id: &str) {
-    super::operator::disconnect_line(line_id).await;
+    let unregister = super::operator::disconnect_line(line_id).await;
+    info!(result = ?unregister, "VoWiFi explicit IMS unregister finished");
     if let Some(channel) = ims_channel_cache().lock().await.remove(line_id) {
         channel.channel.abort();
     }
     ims_register_ready_cache().lock().await.remove(line_id);
     ims_security_verify_cache().lock().await.remove(line_id);
     ims_register_variant_cache().lock().await.remove(line_id);
+    xcap_binding_cache().lock().await.remove(line_id);
     if let Some(gateway) = tun_gateway_cache().lock().await.remove(line_id) {
         gateway.shutdown();
     }
@@ -3250,7 +3413,8 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         match exchange {
             Ok(response) => Ok(Some(response.into_bytes())),
             Err(error) => {
-                self.last_error = Some(error);
+                let registration_loss = classify_vowifi_register_error(error.reason.as_str());
+                self.last_error = Some(error.with_registration_loss(registration_loss));
                 Err(ImsError::new(
                     "vowifi_register_authenticated_exchange_failed",
                 ))
@@ -3285,7 +3449,30 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         }
         other => other,
     };
-    live_stage_error(reason)
+    live_registration_error(
+        reason,
+        RegistrationLossReason::from_register_failure(failure),
+    )
+}
+
+fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
+    if reason.starts_with("ims_aka_")
+        || reason.starts_with("ims_digest_")
+        || reason.starts_with("eap_aka_")
+        || reason.starts_with("sim_auth_")
+    {
+        RegistrationLossReason::AuthenticationRejected
+    } else if reason.contains("_timeout")
+        || reason.contains("_read_")
+        || reason.contains("_write_")
+        || reason.contains("_connect_")
+        || reason.contains("_bind_")
+        || reason.contains("_shutdown_")
+    {
+        RegistrationLossReason::SignalingTransportLost
+    } else {
+        RegistrationLossReason::NetworkRejected
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3322,7 +3509,7 @@ async fn run_authenticated_register_exchange(
         );
         info!("IMS REGISTER AKA resync request ready");
         write_sip_request(initial_channel, &resync_request).await?;
-        let response = read_sip_response(initial_channel).await?;
+        let response = read_final_register_response(initial_channel).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
             .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
         if !matches!(summary.status_code, 401 | 407) {
@@ -3360,7 +3547,7 @@ async fn run_authenticated_register_exchange(
             security_verify.as_deref(),
         );
         write_sip_request(initial_channel, &authenticated).await?;
-        read_sip_response(initial_channel).await
+        read_final_register_response(initial_channel).await
     }
 }
 
@@ -3695,23 +3882,25 @@ async fn run_protected_authenticated_register_candidates(
                 } else {
                     LIVE_IMS_REGISTER_CANDIDATE_READ_TIMEOUT
                 };
-                let response =
-                    match read_sip_response_with_timeout(&mut protected_channel, candidate_timeout)
-                        .await
-                    {
-                        Ok(response) => response,
-                        Err(err) => {
-                            protected_channel.abort();
-                            warn!(
-                                policy_candidate = candidate.label,
-                                candidate_index,
-                                reason = err.reason.as_str(),
-                                "IMS protected SIP candidate timed out; trying next policy"
-                            );
-                            last_error = Some(err);
-                            continue;
-                        }
-                    };
+                let response = match read_final_register_response_with_timeout(
+                    &mut protected_channel,
+                    candidate_timeout,
+                )
+                .await
+                {
+                    Ok(response) => response,
+                    Err(err) => {
+                        protected_channel.abort();
+                        warn!(
+                            policy_candidate = candidate.label,
+                            candidate_index,
+                            reason = err.reason.as_str(),
+                            "IMS protected SIP candidate timed out; trying next policy"
+                        );
+                        last_error = Some(err);
+                        continue;
+                    }
+                };
                 let summary = ims::parse_sip_response(&response, &context.target.realm)
                     .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
                 if summary.status_code == 200 {
@@ -3734,6 +3923,9 @@ async fn run_protected_authenticated_register_candidates(
                         protected_channel,
                         security_verify.map(str::to_string),
                         registered,
+                        context.clone(),
+                        variant,
+                        authenticated_cseq.saturating_add(1),
                     )
                     .await;
                 } else {
@@ -4725,6 +4917,32 @@ async fn read_sip_response(channel: &mut SipChannel) -> Result<String, LiveStage
     read_sip_response_with_timeout(channel, LIVE_IMS_REGISTER_READ_TIMEOUT).await
 }
 
+async fn read_final_register_response(channel: &mut SipChannel) -> Result<String, LiveStageError> {
+    read_final_register_response_with_timeout(channel, LIVE_IMS_REGISTER_READ_TIMEOUT).await
+}
+
+async fn read_final_register_response_with_timeout(
+    channel: &mut SipChannel,
+    timeout: Duration,
+) -> Result<String, LiveStageError> {
+    for provisional_count in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
+        let response = read_sip_response_with_timeout(channel, timeout).await?;
+        let status = sip_frame::parse_status(response.as_bytes())
+            .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
+        if !(100..=199).contains(&status) {
+            return Ok(response);
+        }
+        debug!(
+            sip_status = status,
+            provisional_count = provisional_count + 1,
+            "VoWiFi adapter-owned REGISTER provisional response received"
+        );
+    }
+    Err(live_stage_error(
+        "ims_register_authenticated_unexpected_status",
+    ))
+}
+
 async fn read_sip_response_with_timeout(
     channel: &mut SipChannel,
     timeout: Duration,
@@ -4875,6 +5093,7 @@ impl std::ops::Deref for LiveImsRegisterIdentity {
     }
 }
 
+#[derive(Clone)]
 struct LiveRegisterRequestContext {
     identity: LiveImsRegisterIdentity,
     target: LiveImsTarget,
@@ -4893,6 +5112,7 @@ struct LiveRegisterRequestContext {
     /// both headers even though the request is sourced from port_uc. None means
     /// the round is unprotected and headers use the normal SIP port.
     protected_header_port: Option<u16>,
+    video_capability_enabled: bool,
 }
 
 impl LiveRegisterRequestContext {
@@ -4918,12 +5138,15 @@ impl LiveRegisterRequestContext {
         local_addr: SocketAddr,
         route_addr: IpAddr,
     ) -> Result<Self, LiveStageError> {
-        Self::new_with_target(
+        let device_imei = line_overrides(line_id).effective_device_imei;
+        Self::new_with_target_and_device(
             profile,
             live_ims_target(line_id, profile),
             identity,
             local_addr,
             route_addr,
+            device_imei.as_deref(),
+            super::operator::operator_link_for_line(line_id).video_enabled(),
         )
     }
 
@@ -4934,6 +5157,20 @@ impl LiveRegisterRequestContext {
         local_addr: SocketAddr,
         route_addr: IpAddr,
     ) -> Result<Self, LiveStageError> {
+        Self::new_with_target_and_device(
+            profile, target, identity, local_addr, route_addr, None, false,
+        )
+    }
+
+    fn new_with_target_and_device(
+        profile: &'static CarrierProfile,
+        target: LiveImsTarget,
+        identity: LiveImsRegisterIdentity,
+        local_addr: SocketAddr,
+        route_addr: IpAddr,
+        device_imei: Option<&str>,
+        video_capability_enabled: bool,
+    ) -> Result<Self, LiveStageError> {
         let security_client_state = LiveSecurityClientState::new(live_runtime_config())?;
         Ok(Self {
             identity,
@@ -4943,7 +5180,7 @@ impl LiveRegisterRequestContext {
             transport: ims_transport(profile),
             from_tag: hex_token(8),
             call_id: format!("{}@simadmin", hex_token(16)),
-            instance_id: format_sip_instance_id(profile)?,
+            instance_id: format_sip_instance_id(profile, device_imei)?,
             security_client_state,
             security_client_full_spaced: build_security_client_header(
                 profile,
@@ -4961,6 +5198,7 @@ impl LiveRegisterRequestContext {
                 &security_client_state,
             ),
             protected_header_port: None,
+            video_capability_enabled,
         })
     }
 
@@ -5000,6 +5238,44 @@ impl LiveRegisterRequestContext {
         cseq: u32,
         authorization: Option<&str>,
         security_verify: Option<&str>,
+    ) -> String {
+        self.build_register_request_with_expires(
+            profile,
+            variant,
+            cseq,
+            authorization,
+            security_verify,
+            profile.ims.register.expires_seconds,
+        )
+    }
+
+    fn build_unregister_request(
+        &self,
+        profile: &'static CarrierProfile,
+        variant: LiveRegisterHeaderVariant,
+        cseq: u32,
+        authorization: Option<&str>,
+        security_verify: Option<&str>,
+    ) -> String {
+        self.build_register_request_with_expires(
+            profile,
+            variant,
+            cseq,
+            authorization,
+            security_verify,
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_register_request_with_expires(
+        &self,
+        profile: &'static CarrierProfile,
+        variant: LiveRegisterHeaderVariant,
+        cseq: u32,
+        authorization: Option<&str>,
+        security_verify: Option<&str>,
+        expires_seconds: u32,
     ) -> String {
         let branch = format!("z9hG4bK{}", hex_token(12));
         let request_uri = self.request_uri(profile, variant);
@@ -5061,7 +5337,7 @@ impl LiveRegisterRequestContext {
                 .unwrap_or_default()
                 .to_string(),
             // Carrier-configurable: some networks reject the common 3600 default.
-            expires: profile.ims.register.expires_seconds,
+            expires: expires_seconds,
         };
         let authorization = authorization.map(str::to_string).or_else(|| {
             (cseq == 1)
@@ -5273,6 +5549,13 @@ impl LiveRegisterRequestContext {
         if !_header_profile.compact_register && !profile.ims.register.contact_param_order.is_empty()
         {
             for parameter in profile.ims.register.contact_param_order {
+                let name = parameter
+                    .split_once('=')
+                    .map_or(*parameter, |(name, _)| name)
+                    .trim();
+                if name.eq_ignore_ascii_case("video") && !self.video_capability_enabled {
+                    continue;
+                }
                 header.push(';');
                 header.push_str(parameter);
             }
@@ -5300,6 +5583,77 @@ impl LiveRegisterRequestContext {
         }
         header.push_str("\r\n");
         header
+    }
+}
+
+struct VowifiUnregisterFactory {
+    line_id: String,
+    profile: &'static CarrierProfile,
+    context: LiveRegisterRequestContext,
+    variant: LiveRegisterHeaderVariant,
+    next_cseq: u32,
+    security_verify: Option<String>,
+}
+
+impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
+    fn initial_request(&self) -> Result<Vec<u8>, ImsError> {
+        Ok(self
+            .context
+            .build_unregister_request(
+                self.profile,
+                self.variant,
+                self.next_cseq,
+                None,
+                self.security_verify.as_deref(),
+            )
+            .into_bytes())
+    }
+
+    fn authenticated_request<'a>(
+        &'a self,
+        challenge_response: &'a [u8],
+        challenge_cseq: u32,
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, ImsError>> {
+        Box::pin(async move {
+            let response = std::str::from_utf8(challenge_response)
+                .map_err(|_| ImsError::new("vowifi_unregister_response_not_utf8"))?;
+            let challenge = parse_live_digest_challenge(response, &self.context.target.realm)
+                .map_err(|_| ImsError::new("vowifi_unregister_challenge_invalid"))?;
+            reject_plain_digest_when_disabled(self.profile, &challenge)
+                .map_err(|_| ImsError::new("vowifi_unregister_digest_rejected"))?;
+            let mut material = build_live_register_auth_material(
+                &self.line_id,
+                self.profile,
+                &self.context,
+                &challenge,
+                self.variant,
+            )
+            .await
+            .map_err(|_| ImsError::new("vowifi_unregister_aka_failed"))?;
+            let authorization = match material.auts.take() {
+                Some(auts) => build_digest_resync_authorization_header(
+                    &self.context,
+                    &challenge,
+                    &self.context.request_uri(self.profile, self.variant),
+                    &auts,
+                )
+                .map_err(|_| ImsError::new("vowifi_unregister_resync_failed"))?,
+                None => material.authorization,
+            };
+            let cseq = self
+                .next_cseq
+                .saturating_add(challenge_cseq.saturating_sub(1));
+            Ok(self
+                .context
+                .build_unregister_request(
+                    self.profile,
+                    self.variant,
+                    cseq,
+                    Some(&authorization),
+                    self.security_verify.as_deref(),
+                )
+                .into_bytes())
+        })
     }
 }
 
@@ -6201,6 +6555,103 @@ fn compute_aka_md5_response(
     .map_err(map_shared_digest_error)
 }
 
+/// Build one policy-independent SIP Digest-AKA proof for a non-REGISTER
+/// transaction on this line. The challenge nonce is consumed immediately and
+/// never cached or shared with another SIP method/access.
+pub(crate) async fn build_line_sip_aka_authorization(
+    line_id: &str,
+    username: &str,
+    method: &str,
+    digest_uri: &str,
+    challenge_frame: &[u8],
+) -> Result<String, LiveStageError> {
+    let (challenge_value, proxy) = if let Some(value) =
+        crate::connectivity::core::sip_frame::header_value(challenge_frame, "WWW-Authenticate")
+    {
+        (value, false)
+    } else if let Some(value) =
+        crate::connectivity::core::sip_frame::header_value(challenge_frame, "Proxy-Authenticate")
+    {
+        (value, true)
+    } else {
+        return Err(live_stage_error("ims_digest_challenge_missing"));
+    };
+    build_line_digest_aka_authorization(
+        line_id,
+        username,
+        method,
+        digest_uri,
+        &challenge_value,
+        proxy,
+    )
+    .await
+}
+
+async fn build_line_digest_aka_authorization(
+    line_id: &str,
+    username: &str,
+    method: &str,
+    digest_uri: &str,
+    challenge_value: &str,
+    proxy: bool,
+) -> Result<String, LiveStageError> {
+    let challenge =
+        crate::connectivity::core::digest_aka::parse_digest_challenge(challenge_value, proxy)
+            .map_err(map_shared_digest_error)?;
+    let aka_challenge = crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce)
+        .map_err(map_shared_digest_error)?;
+    let sim_device = sim_device_for_line(line_id);
+    if sim_device.qmi_device.trim().is_empty() {
+        return Err(live_stage_error("ims_line_sim_device_missing"));
+    }
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let aka = tokio::task::spawn_blocking(move || {
+        execute_usim_authenticate_via_proxy_reason_with_retry(
+            proxy_socket.as_str(),
+            sim_device.qmi_device.as_str(),
+            sim_device.uim_slot,
+            USIM_AID_PREFIX,
+            &aka_challenge.rand,
+            &aka_challenge.autn,
+            LIVE_SIM_AUTH_ATTEMPTS,
+            LIVE_SIM_AUTH_TIMEOUT,
+            LIVE_SIM_AUTH_RETRY_DELAY,
+        )
+    })
+    .await
+    .map_err(|_| live_stage_error("ims_aka_runtime_failed"))?
+    .map_err(live_stage_error)?;
+    let cnonce = live_digest_cnonce()?;
+    if let Some(auts) = aka.auts.as_deref() {
+        return Ok(
+            crate::connectivity::core::digest_aka::build_resync_authorization_header_with_digest(
+                &challenge,
+                username,
+                digest_uri,
+                auts,
+                challenge.qop.as_ref().map(|_| cnonce.as_str()),
+                challenge.qop.as_ref().map(|_| "00000001"),
+            ),
+        );
+    }
+    let response = compute_aka_md5_response(
+        username,
+        &challenge.realm,
+        &aka,
+        &challenge.algorithm,
+        method,
+        digest_uri,
+        &challenge.nonce,
+        challenge.qop.as_deref(),
+        &cnonce,
+    )?;
+    Ok(
+        crate::connectivity::core::digest_aka::build_authorization_header(
+            &challenge, username, digest_uri, &response, &cnonce, "00000001",
+        ),
+    )
+}
+
 fn compute_plain_md5_response(
     username: &str,
     realm: &str,
@@ -6402,7 +6853,17 @@ fn quote_sip_param(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn format_sip_instance_id(_profile: &'static CarrierProfile) -> Result<String, LiveStageError> {
+fn format_sip_instance_id(
+    profile: &'static CarrierProfile,
+    device_imei: Option<&str>,
+) -> Result<String, LiveStageError> {
+    if profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance {
+        if let Some(imei) = device_imei
+            .filter(|imei| crate::connectivity::core::device_identity::is_valid_imei(imei))
+        {
+            return Ok(format!("urn:imei:{imei}"));
+        }
+    }
     let mut bytes = random_bytes(16)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
@@ -6765,6 +7226,24 @@ fn map_dataplane_state_error(error: DataplaneStateError) -> LiveStageError {
 fn live_stage_error(reason: impl Into<String>) -> LiveStageError {
     LiveStageError {
         reason: reason.into(),
+        registration_loss: None,
+    }
+}
+
+fn live_registration_error(
+    reason: impl Into<String>,
+    registration_loss: RegistrationLossReason,
+) -> LiveStageError {
+    LiveStageError {
+        reason: reason.into(),
+        registration_loss: Some(registration_loss),
+    }
+}
+
+impl LiveStageError {
+    fn with_registration_loss(mut self, registration_loss: RegistrationLossReason) -> Self {
+        self.registration_loss = Some(registration_loss);
+        self
     }
 }
 
@@ -7052,7 +7531,7 @@ mod tests {
             ..Default::default()
         };
 
-        let overrides = build_live_network_overrides(&config, Some(&sim_override))
+        let overrides = build_live_network_overrides(&config, Some(&sim_override), None)
             .expect("valid network overrides");
 
         assert_eq!(overrides.profile_id.as_deref(), Some("gb_ee_23433"));
@@ -7079,6 +7558,7 @@ mod tests {
                 ip_stack: "ipv4v6".to_string(),
                 apn: Some("ims-override".to_string()),
                 epdg_host: "epdg.example".to_string(),
+                device_identity: None,
             }
         );
         assert_eq!(
@@ -7140,7 +7620,7 @@ mod tests {
             ..LineVowifiConfig::default()
         };
         assert_eq!(
-            build_live_network_overrides(&config, None).unwrap_err(),
+            build_live_network_overrides(&config, None, None).unwrap_err(),
             "vowifi_proxy_mode_not_implemented:udp_relay"
         );
     }
@@ -7152,7 +7632,7 @@ mod tests {
             proxy_endpoint: "socks5://user:pass@127.0.0.1:1080".to_string(),
             ..LineVowifiConfig::default()
         };
-        let overrides = build_live_network_overrides(&good, None).expect("socks5 accepted");
+        let overrides = build_live_network_overrides(&good, None, None).expect("socks5 accepted");
         assert!(matches!(overrides.proxy, Some(LiveProxySetting::Socks5(_))));
 
         // A malformed endpoint must be rejected at configuration time, not at
@@ -7162,7 +7642,7 @@ mod tests {
             proxy_endpoint: "socks5://missing-port".to_string(),
             ..LineVowifiConfig::default()
         };
-        assert!(build_live_network_overrides(&bad, None).is_err());
+        assert!(build_live_network_overrides(&bad, None, None).is_err());
     }
 
     #[test]
@@ -7748,6 +8228,95 @@ mod tests {
     }
 
     #[test]
+    fn unregister_factory_reuses_registered_dialog_and_zeroes_expiry() {
+        let mut context = LiveRegisterRequestContext::new(
+            &GB_EE_23433,
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "fixture",
+            },
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5064),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        )
+        .expect("register context");
+        context.from_tag = "registered-from-tag".into();
+        context.call_id = "registered-call-id@simadmin".into();
+        context.protected_header_port = Some(5063);
+        let factory = VowifiUnregisterFactory {
+            line_id: "line-unregister".into(),
+            profile: &GB_EE_23433,
+            context,
+            variant: register_variant("profile_default_spaced_sec_client"),
+            next_cseq: 4,
+            security_verify: Some(
+                "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans".into(),
+            ),
+        };
+
+        let request = String::from_utf8(
+            crate::connectivity::modems::ims::vowifi::operator::RegisteredUnregister::initial_request(
+                &factory,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(request.starts_with("REGISTER "));
+        assert!(
+            request.contains("From: <sip:001010123456789@ims.example>;tag=registered-from-tag\r\n")
+        );
+        assert!(request.contains("Call-ID: registered-call-id@simadmin\r\n"));
+        assert!(request.contains("CSeq: 4 REGISTER\r\n"));
+        assert!(request.contains("Expires: 0\r\n"));
+        assert!(request.contains("Security-Verify: ipsec-3gpp;"));
+        assert!(request.contains("Via: SIP/2.0/"));
+        assert!(request.contains("[::1]:5063;branch="));
+    }
+
+    #[test]
+    fn vowifi_catalog_video_contact_feature_requires_local_capability() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.contact_param_order = &["audio", "video", "+g.3gpp.smsip"];
+        let profile = Box::leak(Box::new(profile));
+        let identity = || LiveImsRegisterIdentity {
+            shared: crate::connectivity::core::context::ImsIdentity {
+                private_user: "001010123456789@ims.example".to_string(),
+                public_uri: "sip:001010123456789@ims.example".to_string(),
+                contact_user: "001010123456789".to_string(),
+                home_domain: "ims.example".to_string(),
+                contact_user_phone: false,
+            },
+            shape: "fixture",
+        };
+        let build = |video_capability_enabled| {
+            LiveRegisterRequestContext::new_with_target_and_device(
+                profile,
+                live_ims_target("", profile),
+                identity(),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
+                IpAddr::V6(Ipv6Addr::LOCALHOST),
+                None,
+                video_capability_enabled,
+            )
+            .unwrap()
+            .build_initial_request(
+                profile,
+                register_variant("profile_default_spaced_sec_client"),
+            )
+        };
+        let disabled = build(false);
+        assert!(disabled.contains(";audio"));
+        assert!(!disabled.contains(";video"));
+        let enabled = build(true);
+        assert!(enabled.contains(";audio;video;+g.3gpp.smsip"));
+    }
+
+    #[test]
     fn empty_aka_initial_register_does_not_force_security_client() {
         let context = LiveRegisterRequestContext::new(
             &GB_EE_23433,
@@ -8158,6 +8727,37 @@ mod tests {
     }
 
     #[test]
+    fn vowifi_register_errors_map_to_shared_loss_reasons() {
+        for reason in [
+            "ims_aka_runtime_failed",
+            "ims_digest_nonce_missing",
+            "eap_aka_challenge_parse_failed",
+            "sim_auth_runtime_failed",
+        ] {
+            assert_eq!(
+                classify_vowifi_register_error(reason),
+                RegistrationLossReason::AuthenticationRejected,
+                "{reason}"
+            );
+        }
+        for reason in [
+            "ims_tcp_connect_timeout",
+            "ims_register_read_failed",
+            "ims_udp_bind_failed",
+        ] {
+            assert_eq!(
+                classify_vowifi_register_error(reason),
+                RegistrationLossReason::SignalingTransportLost,
+                "{reason}"
+            );
+        }
+        assert_eq!(
+            classify_vowifi_register_error("ims_security_server_offer_unmatched"),
+            RegistrationLossReason::NetworkRejected
+        );
+    }
+
+    #[test]
     fn sms_route_variants_only_retry_after_sip_rejections() {
         for reason in [
             "sms_message_sip_401",
@@ -8304,5 +8904,52 @@ mod tests {
             },
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn shared_register_contract_covers_vowifi_exchange_shape() {
+        crate::connectivity::core::register::contract::assert_register_contract(
+            crate::connectivity::core::register::contract::AuthenticatedExchangeStyle::AdapterOwned,
+            ImsRegistrationAccess::Vowifi,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn adapter_owned_register_exchange_skips_provisional_frames() {
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let local = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let local_addr = local.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        local.connect(peer_addr).await.unwrap();
+        let route = crate::connectivity::core::context::ImsRoute {
+            local_addr,
+            pcscf_addr: peer_addr,
+            transport: crate::connectivity::core::context::SipTransport::Udp,
+        };
+        let mut channel = SipChannel::new(SipChannelSocket::Udp(local), Vec::new(), route, None);
+
+        for frame in [
+            b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"SIP/2.0 183 Session Progress\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"SIP/2.0 200 OK\r\nContact: <sip:user@192.0.2.2>;expires=120\r\nContent-Length: 0\r\n\r\n"
+                .as_slice(),
+        ] {
+            peer.send_to(frame, local_addr).await.unwrap();
+        }
+
+        let response =
+            read_final_register_response_with_timeout(&mut channel, Duration::from_secs(1))
+                .await
+                .unwrap();
+        assert_eq!(sip_frame::parse_status(response.as_bytes()).unwrap(), 200);
+        assert_eq!(
+            RegisterArtifacts::parse(response.as_bytes()).expires_seconds,
+            Some(120)
+        );
     }
 }

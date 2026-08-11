@@ -51,7 +51,9 @@ impl SipDialog {
             .ok_or_else(|| "trunk_invite_to_uri_invalid".to_string())?;
         let remote_tag =
             header_tag(&from).ok_or_else(|| "trunk_invite_from_tag_missing".to_string())?;
-        let request_uri = request_uri(frame)?;
+        request_uri(frame)?;
+        let remote_target =
+            sip_frame::header_uri(frame, "Contact").unwrap_or_else(|| remote_uri.clone());
         let invite_cseq = cseq_number(frame, "INVITE")?;
         Ok(Self {
             direction: DialogDirection::AsteriskOriginated,
@@ -60,7 +62,7 @@ impl SipDialog {
             remote_tag: Some(remote_tag),
             local_uri,
             remote_uri,
-            remote_target: request_uri,
+            remote_target,
             invite_cseq,
             next_local_cseq: invite_cseq.saturating_add(1),
             state: InviteTransactionState::Proceeding,
@@ -153,6 +155,12 @@ impl SipDialog {
                 .and_then(header_tag);
         }
     }
+
+    pub fn learn_remote_target(&mut self, frame: &[u8]) {
+        if let Some(target) = sip_frame::header_uri(frame, "Contact") {
+            self.remote_target = target;
+        }
+    }
 }
 
 pub fn call_id(frame: &[u8]) -> Option<String> {
@@ -216,7 +224,7 @@ mod tests {
         assert_eq!(dialog.call_id, "call-a");
         assert_eq!(dialog.remote_tag.as_deref(), Some("remote-a"));
         assert_eq!(dialog.invite_cseq, 42);
-        assert_eq!(dialog.remote_target, "sip:41000@simadmin");
+        assert_eq!(dialog.remote_target, "sip:6108@pbx");
         assert!(!dialog.local_tag.is_empty());
     }
 

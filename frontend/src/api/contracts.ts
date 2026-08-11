@@ -729,13 +729,22 @@ export interface SmsPolicyRecord {
   smsc_auth_required: boolean
 }
 
+export interface VoiceCodecPolicyRecord {
+  codec: string
+  payload_type: number | null
+  sample_rate: number | null
+  fmtp: string | null
+}
+
 export interface VoicePolicyRecord {
   vowifi_enabled: boolean
   carrier_fallback_enabled: boolean
   preferred_codecs: string[]
+  codec_policies: VoiceCodecPolicyRecord[]
   amr_octet_align: boolean
   ptime_ms: number
   sip_endpoint_exposed: boolean
+  voicemail_number: string | null
 }
 
 export interface E911PolicyRecord {
@@ -743,6 +752,55 @@ export interface E911PolicyRecord {
   provider: string | null
   entitlement_url: string | null
   websheet_host_policy: string | null
+}
+
+export interface UtPolicyRecord {
+  enabled: boolean
+  xcap_root: string | null
+  document_selector: string | null
+  namespace: string | null
+  authentication: string
+  partial_update: boolean
+  call_waiting_selector: string | null
+  diversion_rule_selector: string | null
+  oip_selector: string | null
+  oir_selector: string | null
+  tls_min_version: string
+  tls_max_version: string
+  tls_builtin_roots: boolean
+  tls_additional_ca_pem: string | null
+}
+
+export interface E911Capability {
+  profile_id: string
+  provider_kind: string
+  provider_id: string
+  operator_requires: boolean
+  query_supported: boolean
+  websheet_expected: boolean
+}
+
+export interface E911Status {
+  profile_id: string
+  provider_kind: string
+  state: string
+  source: string
+  operator_requires: boolean
+  address_saved_locally: boolean
+  operator_confirmed: boolean
+  emergency_unverified: boolean
+  needs_user_action: boolean
+  needs_reconfirm: boolean
+  retry_after_epoch?: number | null
+}
+
+export interface E911Operation {
+  operation_id: string
+  line_id: string
+  launch_url: string
+  server_flow_url: string
+  expires_epoch: number
+  state: string
 }
 
 export interface CarrierProfileRecord {
@@ -754,6 +812,7 @@ export interface CarrierProfileRecord {
   sms: SmsPolicyRecord
   voice: VoicePolicyRecord
   e911: E911PolicyRecord
+  ut: UtPolicyRecord
 }
 
 /** Where a resolved profile came from. */

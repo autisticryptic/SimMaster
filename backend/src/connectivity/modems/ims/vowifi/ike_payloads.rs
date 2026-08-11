@@ -387,6 +387,16 @@ pub fn build_identification_responder_payload(fqdn: &str) -> IkePayload {
     }
 }
 
+/// Carrier-policy-gated device identity. This is a separate Vendor ID payload:
+/// it must never replace the permanent NAI carried in IDi/EAP-AKA.
+pub fn build_device_identity_vendor_payload(imei: &str) -> IkePayload {
+    IkePayload {
+        payload_type: IkePayloadType::VendorId,
+        critical: false,
+        body: imei.as_bytes().to_vec(),
+    }
+}
+
 pub fn build_authentication_shared_key_payload(authentication_data: &[u8]) -> IkePayload {
     let mut body = Vec::with_capacity(4 + authentication_data.len());
     body.push(AUTH_METHOD_SHARED_KEY_MIC);

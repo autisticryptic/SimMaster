@@ -11,7 +11,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{mpsc, Mutex},
+    sync::{mpsc, oneshot, Mutex},
     task::JoinHandle,
 };
 
@@ -21,12 +21,14 @@ use crate::{
             access::ImsChannel,
             context::{ImsIdentity, ImsRoute},
             ims_video::{negotiate_video, parse_video_sdp},
-            media::{ActiveRtpRelay, PayloadTypeMapping, PendingRtpRelay},
-            registration::{ImsRegistrationAccess, RegisteredImsContext},
+            media::{ActiveRtpRelay, MediaRelayPolicy, PayloadTypeMapping, PendingRtpRelay},
+            register::{run_unregister, RegisterAuthenticator},
+            registration::{ImsRegistrationAccess, RegisteredImsContext, UnregisterResult},
             sip_frame,
             sip_message::SipHeader,
             supplementary::{
-                build_mwi_subscribe, classify_mwi_frame, MwiIncomingFrame, SubscribeIds,
+                build_dialog_refer, build_mwi_subscribe, classify_mwi_frame, parse_refer_notify,
+                DialogReferRequest, DialogTransfer, MwiIncomingFrame, SubscribeIds,
             },
             voice::{parse_audio_sdp, SdpAddrType, SdpAudioDescription},
         },
@@ -51,6 +53,13 @@ use super::channel::SipChannel;
 
 const CHANNEL_POLL: Duration = Duration::from_millis(500);
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
+const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
+const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
+const UNREGISTER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+/// One IMS registration can keep two independent dialogs (active + waiting).
+/// A third dialog is rejected explicitly instead of consuming another relay
+/// or replacing an existing Call-ID entry.
+const MAX_CONCURRENT_CALLS: usize = 2;
 
 static HANDLES: OnceLock<RwLock<HashMap<String, Arc<VowifiOperatorHandle>>>> = OnceLock::new();
 
@@ -61,6 +70,7 @@ fn handles() -> &'static RwLock<HashMap<String, Arc<VowifiOperatorHandle>>> {
 struct InstalledTask {
     profile_id: &'static str,
     replacement_tx: mpsc::UnboundedSender<RegisteredChannel>,
+    unregister_tx: mpsc::UnboundedSender<oneshot::Sender<UnregisterResult>>,
     task: JoinHandle<()>,
 }
 
@@ -103,6 +113,33 @@ pub struct RegisteredVoiceContext {
     pub expires_at: Instant,
     pub tcp_keepalive_interval: Option<Duration>,
     pub options_ping_interval: Option<Duration>,
+    pub(crate) unregister: Option<Arc<dyn RegisteredUnregister>>,
+}
+
+pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn initial_request(&self) -> Result<Vec<u8>, crate::connectivity::core::ImsError>;
+
+    fn authenticated_request<'a>(
+        &'a self,
+        challenge_response: &'a [u8],
+        challenge_cseq: u32,
+    ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, crate::connectivity::core::ImsError>>;
+}
+
+struct RegisteredUnregisterAdapter {
+    factory: Arc<dyn RegisteredUnregister>,
+}
+
+impl RegisterAuthenticator<SipChannel> for RegisteredUnregisterAdapter {
+    async fn authenticated_request(
+        &mut self,
+        challenge_response: &[u8],
+        cseq: u32,
+    ) -> Result<Vec<u8>, crate::connectivity::core::ImsError> {
+        self.factory
+            .authenticated_request(challenge_response, cseq)
+            .await
+    }
 }
 
 struct RegisteredChannel {
@@ -166,6 +203,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
         .clone();
     let mut commands = link.subscribe_commands();
     let (replacement_tx, replacement_rx) = mpsc::unbounded_channel();
+    let (unregister_tx, unregister_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let line_id = registration.context.line_id.clone();
         let cleanup_supplementary = supplementary.clone();
@@ -175,6 +213,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
             link.clone(),
             &mut commands,
             replacement_rx,
+            unregister_rx,
             supplementary,
         )
         .await;
@@ -198,25 +237,41 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
     *installed = Some(InstalledTask {
         profile_id,
         replacement_tx,
+        unregister_tx,
         task,
     });
     handle.link.set_ready(true);
 }
 
-pub async fn disconnect_line(line_id: &str) {
+pub async fn disconnect_line(line_id: &str) -> UnregisterResult {
     let handle = handles()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(line_id)
         .cloned();
     let Some(handle) = handle else {
-        return;
+        return UnregisterResult::AlreadyExpired;
     };
     handle.generation.fetch_add(1, Ordering::SeqCst);
     handle.link.set_ready(false);
-    if let Some(installed) = handle.installed.lock().await.take() {
-        installed.task.abort();
+    let Some(mut installed) = handle.installed.lock().await.take() else {
+        return UnregisterResult::AlreadyExpired;
     };
+    let (result_tx, result_rx) = oneshot::channel();
+    if installed.unregister_tx.send(result_tx).is_err() {
+        installed.task.abort();
+        return UnregisterResult::AccessLost;
+    }
+    let result = match tokio::time::timeout(UNREGISTER_SHUTDOWN_TIMEOUT, result_rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) | Err(_) => {
+            installed.task.abort();
+            UnregisterResult::AccessLost
+        }
+    };
+    if !installed.task.is_finished() {
+        let _ = tokio::time::timeout(Duration::from_secs(1), &mut installed.task).await;
+    }
     let supplementary = {
         handle
             .supplementary
@@ -229,9 +284,10 @@ pub async fn disconnect_line(line_id: &str) {
             .clear_registration(ImsRegistrationAccess::Vowifi)
             .await;
     }
+    result
 }
 
-pub async fn disconnect_profile(line_id: &str, profile_id: &str) {
+pub async fn abort_profile(line_id: &str, profile_id: &str) {
     let handle = handles()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -246,8 +302,23 @@ pub async fn disconnect_profile(line_id: &str, profile_id: &str) {
         .await
         .as_ref()
         .is_some_and(|installed| installed.profile_id == profile_id);
-    if matches {
-        disconnect_line(line_id).await;
+    if !matches {
+        return;
+    }
+    handle.generation.fetch_add(1, Ordering::SeqCst);
+    handle.link.set_ready(false);
+    if let Some(installed) = handle.installed.lock().await.take() {
+        installed.task.abort();
+    }
+    let supplementary = handle
+        .supplementary
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    if let Some(runtime) = supplementary {
+        runtime
+            .clear_registration(ImsRegistrationAccess::Vowifi)
+            .await;
     }
 }
 
@@ -265,6 +336,7 @@ struct VoiceSession {
 struct MwiSubscription {
     ids: SubscribeIds,
     refresh_at: Instant,
+    authenticated: bool,
 }
 
 struct VoiceCall {
@@ -284,7 +356,68 @@ struct VoiceCall {
     next_cseq: u32,
     pending_network_reinvite: Option<Vec<u8>>,
     pending_trunk_reinvite: bool,
+    pending_media_rollback: Option<VoiceMediaSnapshot>,
+    renegotiation_deadline: Option<Instant>,
     operator_answered: bool,
+    transfer: Option<DialogTransfer>,
+    transfer_deadline: Option<Instant>,
+}
+
+/// Confirmed media state retained while a SIP re-INVITE is in flight. A
+/// rejected or timed-out re-INVITE must release only its newly allocated
+/// sockets and leave the confirmed audio dialog/relay untouched.
+#[derive(Clone)]
+struct VoiceMediaSnapshot {
+    internal_offer: MediaOffer,
+    operator_local: SocketAddr,
+    internal_local: SocketAddr,
+    operator_video_local: Option<SocketAddr>,
+    internal_video_local: Option<SocketAddr>,
+}
+
+impl VoiceCall {
+    fn stage_media_update(
+        &mut self,
+        offer: MediaOffer,
+        pending_relay: PendingRtpRelay,
+        operator_local: SocketAddr,
+        internal_local: SocketAddr,
+        pending_video_relay: Option<PendingRtpRelay>,
+        operator_video_local: Option<SocketAddr>,
+        internal_video_local: Option<SocketAddr>,
+    ) {
+        self.pending_media_rollback = Some(VoiceMediaSnapshot {
+            internal_offer: self.internal_offer.clone(),
+            operator_local: self.operator_local,
+            internal_local: self.internal_local,
+            operator_video_local: self.operator_video_local,
+            internal_video_local: self.internal_video_local,
+        });
+        self.internal_offer = offer;
+        self.pending_relay = Some(pending_relay);
+        self.operator_local = operator_local;
+        self.internal_local = internal_local;
+        self.pending_video_relay = pending_video_relay;
+        self.operator_video_local = operator_video_local;
+        self.internal_video_local = internal_video_local;
+    }
+
+    fn commit_media_update(&mut self) {
+        self.pending_media_rollback = None;
+    }
+
+    fn rollback_media_update(&mut self) {
+        self.pending_relay = None;
+        self.pending_video_relay = None;
+        let Some(snapshot) = self.pending_media_rollback.take() else {
+            return;
+        };
+        self.internal_offer = snapshot.internal_offer;
+        self.operator_local = snapshot.operator_local;
+        self.internal_local = snapshot.internal_local;
+        self.operator_video_local = snapshot.operator_video_local;
+        self.internal_video_local = snapshot.internal_video_local;
+    }
 }
 
 async fn run_session(
@@ -293,6 +426,7 @@ async fn run_session(
     link: OperatorLink,
     commands: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
     mut replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
+    mut unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
     supplementary: Option<Arc<SupplementaryRuntime>>,
 ) -> Result<(), String> {
     let mut session = VoiceSession {
@@ -307,6 +441,8 @@ async fn run_session(
     };
     start_mwi_subscription(&mut session).await;
     let mut pending_replacement = None;
+    let mut maintenance = tokio::time::interval(Duration::from_millis(250));
+    maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if session.calls.is_empty() {
             if let Some(replacement) = pending_replacement.take() {
@@ -322,6 +458,13 @@ async fn run_session(
             link.set_ready(false);
         }
         tokio::select! {
+            Some(reply) = unregister_requests.recv() => {
+                link.set_ready(false);
+                end_active_calls(&mut session, &link);
+                let result = unregister_registration(&mut session).await;
+                let _ = reply.send(result);
+                break;
+            },
             Some(replacement) = replacements.recv() => {
                 if session.calls.is_empty() {
                     activate_registration(&mut session, replacement);
@@ -366,10 +509,28 @@ async fn run_session(
             },
             _ = wait_until(session.mwi_subscription.as_ref().map(|state| state.refresh_at)) => {
                 start_mwi_subscription(&mut session).await;
+            },
+            _ = maintenance.tick() => {
+                expire_renegotiations(&mut session, &link).await?;
             }
         }
     }
     Ok(())
+}
+
+async fn unregister_registration(session: &mut VoiceSession) -> UnregisterResult {
+    if Instant::now() >= session.context.expires_at {
+        return UnregisterResult::AlreadyExpired;
+    }
+    let Some(factory) = session.context.unregister.as_ref().cloned() else {
+        return UnregisterResult::AccessLost;
+    };
+    let initial = match factory.initial_request() {
+        Ok(request) => request,
+        Err(_) => return UnregisterResult::AccessLost,
+    };
+    let mut authenticator = RegisteredUnregisterAdapter { factory };
+    run_unregister(&mut session.channel, &initial, &mut authenticator).await
 }
 
 fn next_interval(interval: Option<Duration>) -> Option<Instant> {
@@ -451,6 +612,7 @@ async fn start_mwi_subscription(session: &mut VoiceSession) {
             session.mwi_subscription = Some(MwiSubscription {
                 ids,
                 refresh_at: Instant::now() + Duration::from_secs(refresh_seconds),
+                authenticated: false,
             });
         }
         Err(error) => {
@@ -468,20 +630,106 @@ fn end_active_calls(session: &mut VoiceSession, link: &OperatorLink) {
     }
 }
 
+async fn expire_renegotiations(
+    session: &mut VoiceSession,
+    link: &OperatorLink,
+) -> Result<(), String> {
+    let now = Instant::now();
+    let mut network_timeouts = Vec::new();
+    let mut trunk_timeouts = Vec::new();
+    let mut transfer_timeouts = Vec::new();
+    for (call_id, call) in &mut session.calls {
+        if call
+            .renegotiation_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            call.renegotiation_deadline = None;
+            call.rollback_media_update();
+            if let Some(request) = call.pending_network_reinvite.take() {
+                network_timeouts.push((request, call.dialog.local_tag.clone()));
+            }
+            if call.pending_trunk_reinvite {
+                call.pending_trunk_reinvite = false;
+                trunk_timeouts.push(call_id.clone());
+            }
+        }
+        if call
+            .transfer_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            call.transfer_deadline = None;
+            if let Some(transfer) = call.transfer.as_mut() {
+                let _ = transfer.on_refer_response(408);
+            }
+            transfer_timeouts.push(call_id.clone());
+        }
+    }
+    for (request, local_tag) in network_timeouts {
+        let response = sip::build_response(
+            &request,
+            504,
+            "Server Time-out",
+            Some(&local_tag),
+            None,
+            None,
+        );
+        session
+            .channel
+            .send_sip(&response)
+            .await
+            .map_err(|error| error.code().to_string())?;
+    }
+    for call_id in trunk_timeouts {
+        link.send_event(OperatorEvent::Rejected {
+            call_id,
+            status: 408,
+        });
+    }
+    for call_id in transfer_timeouts {
+        link.send_event(OperatorEvent::TransferResponse {
+            call_id,
+            status: 408,
+        });
+    }
+    Ok(())
+}
+
 async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command: OperatorCommand) {
     let call_id = command_call_id(&command).to_string();
     let start = matches!(&command, OperatorCommand::StartCall { .. });
     let renegotiate = matches!(&command, OperatorCommand::Renegotiate { .. });
+    let transfer = matches!(&command, OperatorCommand::TransferCall { .. });
     if let Err(reason) = handle_command_inner(session, link, command).await {
         tracing::warn!(call_id, reason, "VoWiFi operator command failed");
         if start {
             session.calls.remove(&call_id);
-            link.send_event(OperatorEvent::Unavailable { call_id });
+            if reason == "vowifi_concurrent_call_limit" {
+                link.send_event(OperatorEvent::Rejected {
+                    call_id,
+                    status: 486,
+                });
+            } else {
+                link.send_event(OperatorEvent::Unavailable { call_id });
+            }
         } else if renegotiate {
+            if let Some(call) = session.calls.get_mut(&call_id) {
+                call.pending_trunk_reinvite = false;
+                call.renegotiation_deadline = None;
+                call.rollback_media_update();
+            }
             link.send_event(OperatorEvent::Rejected {
                 call_id,
                 status: 488,
             });
+        } else if transfer {
+            let status = if reason.ends_with("_pending") {
+                491
+            } else if reason.ends_with("_unknown") || reason.ends_with("_not_confirmed") {
+                481
+            } else {
+                500
+            };
+            link.send_event(OperatorEvent::TransferResponse { call_id, status });
         }
     }
 }
@@ -504,6 +752,9 @@ async fn handle_command_inner(
             }
             if session.calls.contains_key(&call_id) {
                 return Err("vowifi_call_duplicate".into());
+            }
+            if session.calls.len() >= MAX_CONCURRENT_CALLS {
+                return Err("vowifi_concurrent_call_limit".into());
             }
             let remote_uri = normalize_callee(&callee, &session.context.identity.home_domain)?;
             let pending =
@@ -566,7 +817,11 @@ async fn handle_command_inner(
                     internal_video_local,
                     pending_network_reinvite: None,
                     pending_trunk_reinvite: false,
+                    pending_media_rollback: None,
+                    renegotiation_deadline: None,
                     operator_answered: false,
+                    transfer: None,
+                    transfer_deadline: None,
                 },
             );
             frame
@@ -631,6 +886,59 @@ async fn handle_command_inner(
             )
             .map_err(|error| error.to_string())?
         }
+        OperatorCommand::TransferCall { call_id, refer_to } => {
+            let operator_refer_to =
+                normalize_callee(&refer_to, &session.context.identity.home_domain)?;
+            let call = session
+                .calls
+                .get_mut(&call_id)
+                .ok_or_else(|| "vowifi_transfer_call_unknown".to_string())?;
+            if !call.operator_answered || call.dialog.remote_tag.is_none() {
+                return Err("vowifi_transfer_call_not_confirmed".to_string());
+            }
+            if call
+                .transfer
+                .as_ref()
+                .is_some_and(|transfer| !transfer.state().is_terminal())
+            {
+                return Err("vowifi_transfer_pending".to_string());
+            }
+            let cseq = call.next_cseq;
+            call.next_cseq = call.next_cseq.saturating_add(1);
+            let to_value = format!(
+                "<{}>;tag={}",
+                call.remote_uri,
+                call.dialog.remote_tag.as_deref().unwrap_or_default()
+            );
+            let mut access_headers = vec![
+                SipHeader::new("P-Access-Network-Info", &session.context.pani),
+                SipHeader::new("User-Agent", &session.context.user_agent),
+            ];
+            if let Some(value) = session.context.security_verify.as_deref() {
+                access_headers.push(SipHeader::new("Security-Verify", value));
+            }
+            let frame = build_dialog_refer(
+                &session.context.identity,
+                &session.context.route,
+                &session.context.registration,
+                &DialogReferRequest {
+                    request_uri: &call.remote_uri,
+                    branch: &sip::new_branch(),
+                    from_uri: &session.context.identity.public_uri,
+                    from_tag: &call.dialog.local_tag,
+                    to_value: &to_value,
+                    call_id: &call.dialog.call_id,
+                    cseq,
+                    refer_to: &operator_refer_to,
+                    referred_by: Some(&session.context.identity.public_uri),
+                },
+                &access_headers,
+            )
+            .map_err(|error| error.to_string())?;
+            call.transfer = Some(DialogTransfer::for_refer_cseq(cseq));
+            call.transfer_deadline = Some(Instant::now() + REFER_RESPONSE_TIMEOUT);
+            frame
+        }
         OperatorCommand::Renegotiate {
             call_id,
             trunk_local_ip,
@@ -674,14 +982,17 @@ async fn handle_command_inner(
             }
             call.dialog.cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
-            call.internal_offer = offer.clone();
-            call.pending_relay = Some(pending);
-            call.operator_local = operator_local;
-            call.internal_local = internal_local;
-            call.pending_video_relay = video_relay;
-            call.operator_video_local = operator_video_local;
-            call.internal_video_local = internal_video_local;
+            call.stage_media_update(
+                offer.clone(),
+                pending,
+                operator_local,
+                internal_local,
+                video_relay,
+                operator_video_local,
+                internal_video_local,
+            );
             call.pending_trunk_reinvite = true;
+            call.renegotiation_deadline = Some(Instant::now() + REINVITE_TIMEOUT);
             let body = relay_media_sdp(&offer, call.operator_local, call.operator_video_local);
             sip::build_reinvite_for_access(
                 &session.context.identity,
@@ -778,6 +1089,8 @@ async fn handle_command_inner(
                 .pending_network_reinvite
                 .take()
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
+            call.renegotiation_deadline = None;
+            call.commit_media_update();
             sip::build_response(
                 &request,
                 200,
@@ -799,8 +1112,8 @@ async fn handle_command_inner(
                 .pending_network_reinvite
                 .take()
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
-            call.pending_relay = None;
-            call.pending_video_relay = None;
+            call.rollback_media_update();
+            call.renegotiation_deadline = None;
             sip::build_response(
                 &request,
                 status,
@@ -860,7 +1173,7 @@ async fn handle_frame(
             return Ok(());
         }
         MwiIncomingFrame::SubscribeResponse { status, to_tag } => {
-            if let Some(runtime) = session.supplementary.as_ref() {
+            if let Some(runtime) = session.supplementary.as_ref().cloned() {
                 match status {
                     Ok(200..=299) => {
                         if let (Some(subscription), Some(tag)) =
@@ -872,14 +1185,14 @@ async fn handle_frame(
                             .mark_mwi_subscribed(ImsRegistrationAccess::Vowifi)
                             .await;
                     }
-                    Ok(401 | 407) => {
-                        runtime
-                            .fail_mwi_subscription(
-                                ImsRegistrationAccess::Vowifi,
-                                "mwi_subscribe_authentication_required",
-                            )
-                            .await;
-                    }
+                    Ok(401 | 407) => match retry_mwi_subscription_with_aka(session, frame).await {
+                        Ok(()) => {}
+                        Err(reason) => {
+                            runtime
+                                .fail_mwi_subscription(ImsRegistrationAccess::Vowifi, reason)
+                                .await;
+                        }
+                    },
                     Ok(_) | Err(_) => {
                         runtime
                             .fail_mwi_subscription(
@@ -902,6 +1215,60 @@ async fn handle_frame(
         .iter()
         .find(|(_, call)| call.dialog.call_id == ims_call_id)
         .map(|(call_id, _)| call_id.clone());
+
+    if sip_frame::is_request(frame, "NOTIFY")
+        && sip_frame::header_value(frame, "Event").is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|event| event.trim().eq_ignore_ascii_case("refer"))
+        })
+    {
+        let Some(call_id) = trunk_call_id else {
+            let response = sip::build_response(
+                frame,
+                481,
+                "Call/Transaction Does Not Exist",
+                None,
+                None,
+                None,
+            );
+            session
+                .channel
+                .send_sip(&response)
+                .await
+                .map_err(|error| error.code().to_string())?;
+            return Ok(());
+        };
+        let parsed = parse_refer_notify(frame);
+        let accepted = parsed.as_ref().is_ok_and(|notification| {
+            session.calls.get_mut(&call_id).is_some_and(|call| {
+                call.transfer
+                    .as_mut()
+                    .is_some_and(|transfer| transfer.on_notify(notification).is_ok())
+            })
+        });
+        let (status, reason) = if accepted {
+            (200, "OK")
+        } else if parsed.is_err() {
+            (400, "Bad Request")
+        } else {
+            (481, "Call/Transaction Does Not Exist")
+        };
+        let response = sip::build_response(frame, status, reason, None, None, None);
+        session
+            .channel
+            .send_sip(&response)
+            .await
+            .map_err(|error| error.code().to_string())?;
+        if accepted {
+            link.send_event(OperatorEvent::TransferNotify {
+                call_id,
+                notification: parsed.expect("accepted REFER notification must be parsed"),
+            });
+        }
+        return Ok(());
+    }
 
     if sip_frame::is_request(frame, "OPTIONS") || sip_frame::is_request(frame, "MESSAGE") {
         let response = sip::build_response(frame, 200, "OK", None, None, None);
@@ -977,6 +1344,56 @@ async fn handle_frame(
     Ok(())
 }
 
+async fn retry_mwi_subscription_with_aka(
+    session: &mut VoiceSession,
+    challenge_frame: &[u8],
+) -> Result<(), String> {
+    let subscription = session
+        .mwi_subscription
+        .as_mut()
+        .ok_or_else(|| "mwi_subscription_missing".to_string())?;
+    if subscription.authenticated {
+        return Err("mwi_subscribe_authentication_rejected".to_string());
+    }
+    let authorization = super::live::build_line_sip_aka_authorization(
+        &session.context.line_id,
+        &session.context.identity.private_user,
+        "SUBSCRIBE",
+        &session.context.identity.public_uri,
+        challenge_frame,
+    )
+    .await
+    .map_err(|error| error.reason)?;
+    let (header_name, header_value) = authorization
+        .split_once(':')
+        .ok_or_else(|| "mwi_authorization_header_invalid".to_string())?;
+    subscription.ids.branch = sip::new_branch();
+    subscription.ids.cseq = subscription.ids.cseq.saturating_add(1);
+    let mut access_headers = vec![
+        SipHeader::new("P-Access-Network-Info", &session.context.pani),
+        SipHeader::new(header_name.trim(), header_value.trim()),
+    ];
+    if let Some(value) = session.context.security_verify.as_deref() {
+        access_headers.push(SipHeader::new("Security-Verify", value));
+    }
+    let frame = build_mwi_subscribe(
+        &session.context.identity,
+        &session.context.route,
+        &session.context.registration,
+        &subscription.ids,
+        MWI_SUBSCRIBE_EXPIRES_SECONDS,
+        &session.context.user_agent,
+        &access_headers,
+    );
+    session
+        .channel
+        .send_sip(&frame)
+        .await
+        .map_err(|error| error.code().to_string())?;
+    subscription.authenticated = true;
+    Ok(())
+}
+
 async fn handle_response(
     session: &mut VoiceSession,
     link: &OperatorLink,
@@ -987,6 +1404,27 @@ async fn handle_response(
     let cseq_method = sip_frame::header_value(frame, "CSeq")
         .and_then(|value| value.split_whitespace().nth(1).map(str::to_string))
         .unwrap_or_default();
+    if cseq_method.eq_ignore_ascii_case("REFER") {
+        let call = session
+            .calls
+            .get_mut(call_id)
+            .ok_or_else(|| "vowifi_call_unknown".to_string())?;
+        let transfer = call
+            .transfer
+            .as_mut()
+            .ok_or_else(|| "vowifi_transfer_not_pending".to_string())?;
+        transfer
+            .on_refer_response(status)
+            .map_err(|error| error.to_string())?;
+        if status >= 200 {
+            call.transfer_deadline = None;
+        }
+        link.send_event(OperatorEvent::TransferResponse {
+            call_id: call_id.to_string(),
+            status,
+        });
+        return Ok(());
+    }
     if !cseq_method.eq_ignore_ascii_case("INVITE") {
         return Ok(());
     }
@@ -1052,6 +1490,8 @@ async fn handle_response(
         let was_reinvite = call.pending_trunk_reinvite;
         call.operator_answered = true;
         call.pending_trunk_reinvite = false;
+        call.renegotiation_deadline = None;
+        call.commit_media_update();
         if !was_reinvite && link.ip_connect_mode() == TrunkIpConnectMode::FirstRtp {
             if let Some(relay) = call.active_relay.as_ref() {
                 let mut first_rtp = relay.subscribe_first_operator_rtp();
@@ -1078,8 +1518,8 @@ async fn handle_response(
 
     let was_reinvite = call.pending_trunk_reinvite;
     call.pending_trunk_reinvite = false;
-    call.pending_relay = None;
-    call.pending_video_relay = None;
+    call.renegotiation_deadline = None;
+    call.rollback_media_update();
     link.send_event(OperatorEvent::Rejected {
         call_id: call_id.to_string(),
         status,
@@ -1101,6 +1541,9 @@ async fn begin_incoming_call(
     };
     if !link.is_available() {
         return reject_request(session, frame, 480).await;
+    }
+    if session.calls.len() >= MAX_CONCURRENT_CALLS {
+        return reject_request(session, frame, 486).await;
     }
     let operator_audio =
         parse_audio_sdp(sip_frame::body(frame)).map_err(|error| error.to_string())?;
@@ -1223,7 +1666,11 @@ async fn begin_incoming_call(
             internal_video_local,
             pending_network_reinvite: None,
             pending_trunk_reinvite: false,
+            pending_media_rollback: None,
+            renegotiation_deadline: None,
             operator_answered,
+            transfer: None,
+            transfer_deadline: None,
         },
     );
     link.send_event(OperatorEvent::Incoming {
@@ -1305,14 +1752,17 @@ async fn begin_network_reinvite(
         },
     };
     let trunk_offer = relay_media_sdp(&offer, internal_local, internal_video_local);
-    call.internal_offer = offer;
-    call.operator_local = operator_local;
-    call.internal_local = internal_local;
-    call.pending_relay = Some(pending);
-    call.pending_video_relay = video_relay;
-    call.operator_video_local = operator_video_local;
-    call.internal_video_local = internal_video_local;
+    call.stage_media_update(
+        offer,
+        pending,
+        operator_local,
+        internal_local,
+        video_relay,
+        operator_video_local,
+        internal_video_local,
+    );
     call.pending_network_reinvite = Some(frame.to_vec());
+    call.renegotiation_deadline = Some(Instant::now() + REINVITE_TIMEOUT);
     let trying = sip::build_response(
         frame,
         100,
@@ -1354,6 +1804,7 @@ fn prepare_operator_media(
     let operator_audio = parse_audio_sdp(body).map_err(|error| error.to_string())?;
     let operator_remote = media_endpoint(&operator_audio)?;
     let mut internal_answer = operator_audio.clone();
+    internal_answer.direction = operator_audio.direction.for_peer();
     internal_answer.codecs = operator_audio
         .codecs
         .iter()
@@ -1375,10 +1826,15 @@ fn prepare_operator_media(
         call.internal_offer.dtmf.rtp_event.as_ref(),
     );
     if let Some(pending) = call.pending_relay.take() {
-        call.active_relay = Some(pending.activate_with_metrics(
+        let policy = MediaRelayPolicy::from_directions(
+            operator_audio.direction,
+            call.internal_offer.audio.direction,
+        );
+        call.active_relay = Some(pending.activate_with_metrics_and_policy(
             operator_remote,
             call.internal_offer.audio_endpoint,
             mappings,
+            policy,
             Some(link.media_metrics()),
         ));
     }
@@ -1414,6 +1870,7 @@ fn prepare_operator_media(
             ));
         }
         let mut trunk_video = operator_video;
+        trunk_video.direction = trunk_video.direction.for_peer();
         trunk_video.media_port = internal_local.port();
         trunk_video.connection_addr = Some(internal_local.ip().to_string());
         trunk_video.addr_type = Some(if internal_local.is_ipv4() {
@@ -1437,6 +1894,7 @@ fn prepare_incoming_media(
     let internal_audio = parse_audio_sdp(body).map_err(|error| error.to_string())?;
     let internal_remote = media_endpoint(&internal_audio)?;
     let mut operator_answer = call.internal_offer.audio.clone();
+    operator_answer.direction = internal_audio.direction.for_peer();
     operator_answer
         .codecs
         .retain(|operator| internal_audio.find_matching_codec(operator).is_some());
@@ -1451,10 +1909,15 @@ fn prepare_incoming_media(
         internal_dtmf.as_ref(),
     );
     if let Some(pending) = call.pending_relay.take() {
-        call.active_relay = Some(pending.activate_with_metrics(
+        let policy = MediaRelayPolicy::from_directions(
+            call.internal_offer.audio.direction,
+            internal_audio.direction,
+        );
+        call.active_relay = Some(pending.activate_with_metrics_and_policy(
             call.internal_offer.audio_endpoint,
             internal_remote,
             mappings,
+            policy,
             Some(link.media_metrics()),
         ));
     }
@@ -1489,6 +1952,7 @@ fn prepare_incoming_media(
             ));
         }
         let mut ims_video = operator_video.description.clone();
+        ims_video.direction = internal_video.direction.for_peer();
         ims_video.media_port = operator_local.port();
         ims_video.connection_addr = Some(operator_local.ip().to_string());
         ims_video.addr_type = Some(if operator_local.is_ipv4() {
@@ -1537,9 +2001,12 @@ fn relay_media_sdp(
     audio_local: SocketAddr,
     video_local: Option<SocketAddr>,
 ) -> String {
-    let mut output = relay_audio_sdp(&offer.audio, offer.dtmf.rtp_event.as_ref(), audio_local);
+    let mut audio = offer.audio.clone();
+    audio.direction = audio.direction.for_peer();
+    let mut output = relay_audio_sdp(&audio, offer.dtmf.rtp_event.as_ref(), audio_local);
     if let (Some(video), Some(local)) = (offer.video.as_ref(), video_local) {
         let mut description = video.description.clone();
+        description.direction = description.direction.for_peer();
         description.media_port = local.port();
         description.connection_addr = Some(local.ip().to_string());
         description.addr_type = Some(if local.is_ipv4() {
@@ -1621,26 +2088,8 @@ fn media_endpoint_for_video(
 }
 
 fn normalize_callee(callee: &str, home_domain: &str) -> Result<String, String> {
-    let without_scheme = callee
-        .trim()
-        .strip_prefix("sip:")
-        .or_else(|| callee.trim().strip_prefix("tel:"))
-        .unwrap_or(callee.trim());
-    let raw_user = without_scheme
-        .split('@')
-        .next()
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default();
-    let user = raw_user
-        .chars()
-        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '(' | ')'))
-        .collect::<String>();
-    let digits = user.strip_prefix('+').unwrap_or(&user);
-    if !(3..=20).contains(&digits.len()) || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("vowifi_callee_invalid".into());
-    }
+    let user = crate::connectivity::core::voice::normalize_ims_dial_user(callee)
+        .map_err(|_| "vowifi_callee_invalid")?;
     Ok(format!("sip:{user}@{home_domain};user=phone"))
 }
 
@@ -1761,7 +2210,8 @@ fn command_call_id(command: &OperatorCommand) -> &str {
         | OperatorCommand::ReportProvisional { call_id, .. }
         | OperatorCommand::AcceptCall { call_id, .. }
         | OperatorCommand::RejectCall { call_id, .. }
-        | OperatorCommand::SendDtmf { call_id, .. } => call_id,
+        | OperatorCommand::SendDtmf { call_id, .. }
+        | OperatorCommand::TransferCall { call_id, .. } => call_id,
     }
 }
 
@@ -1771,6 +2221,7 @@ fn sip_reason(status: u16) -> &'static str {
         180 => "Ringing",
         183 => "Session Progress",
         200 => "OK",
+        202 => "Accepted",
         400 => "Bad Request",
         480 => "Temporarily Unavailable",
         481 => "Call/Transaction Does Not Exist",
@@ -1795,6 +2246,29 @@ mod tests {
         io::{AsyncReadExt, AsyncWriteExt},
         net::{TcpListener, TcpStream, UdpSocket},
     };
+
+    struct TestUnregister;
+
+    impl RegisteredUnregister for TestUnregister {
+        fn initial_request(&self) -> Result<Vec<u8>, crate::connectivity::core::ImsError> {
+            Ok(b"REGISTER sip:ims.example SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKunregister-1\r\nFrom: <sip:user@ims.example>;tag=register-tag\r\nTo: <sip:user@ims.example>\r\nCall-ID: register-dialog@simadmin\r\nCSeq: 3 REGISTER\r\nExpires: 0\r\nContent-Length: 0\r\n\r\n".to_vec())
+        }
+
+        fn authenticated_request<'a>(
+            &'a self,
+            _challenge_response: &'a [u8],
+            challenge_cseq: u32,
+        ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, crate::connectivity::core::ImsError>>
+        {
+            Box::pin(async move {
+                Ok(format!(
+                    "REGISTER sip:ims.example SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKunregister-2\r\nFrom: <sip:user@ims.example>;tag=register-tag\r\nTo: <sip:user@ims.example>\r\nCall-ID: register-dialog@simadmin\r\nCSeq: {} REGISTER\r\nAuthorization: Digest response=\"proof\"\r\nExpires: 0\r\nContent-Length: 0\r\n\r\n",
+                    challenge_cseq + 2
+                )
+                .into_bytes())
+            })
+        }
+    }
 
     async fn tcp_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -1869,6 +2343,7 @@ mod tests {
             expires_at: Instant::now() + Duration::from_secs(30),
             tcp_keepalive_interval: None,
             options_ping_interval: None,
+            unregister: None,
         }
     }
 
@@ -1891,6 +2366,13 @@ mod tests {
                 preferred: DtmfSource::RtpEvent,
             },
         }
+    }
+
+    fn network_audio_sdp(endpoint: SocketAddr, direction: &str) -> String {
+        format!(
+            "v=0\r\no=- 2 2 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 96\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:96 telephone-event/8000\r\na=fmtp:96 0-16\r\na={direction}\r\n",
+            endpoint.port()
+        )
     }
 
     #[test]
@@ -1964,6 +2446,82 @@ mod tests {
             normalize_callee("+60 1112023012", "ims.example").unwrap(),
             "sip:+601112023012@ims.example;user=phone"
         );
+        assert_eq!(
+            normalize_callee("*86", "ims.example").unwrap(),
+            "sip:*86@ims.example;user=phone"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_disconnect_runs_authenticated_unregister_before_channel_shutdown() {
+        let (client, mut server) = tcp_pair().await;
+        let line_id = "operator-test-unregister";
+        let mut route_context = context(line_id, &client, &server);
+        route_context.unregister = Some(Arc::new(TestUnregister));
+        install_registered_channel(
+            route_context.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client,
+                Vec::new(),
+                route_context.route,
+                route_context.security_verify.clone(),
+            )),
+        )
+        .await;
+
+        let disconnect = tokio::spawn(async move { disconnect_line(line_id).await });
+        let mut pending = Vec::new();
+        let initial = read_frame(&mut server, &mut pending).await;
+        assert!(initial.starts_with(b"REGISTER "));
+        assert_eq!(
+            sip_frame::header_value(&initial, "Call-ID").as_deref(),
+            Some("register-dialog@simadmin")
+        );
+        assert_eq!(
+            sip_frame::header_value(&initial, "CSeq").as_deref(),
+            Some("3 REGISTER")
+        );
+        assert_eq!(
+            sip_frame::header_value(&initial, "Expires").as_deref(),
+            Some("0")
+        );
+        server
+            .write_all(&response(
+                &initial,
+                401,
+                "Unauthorized",
+                "network-register",
+                &[],
+            ))
+            .await
+            .unwrap();
+
+        let authenticated = read_frame(&mut server, &mut pending).await;
+        assert_eq!(
+            sip_frame::header_value(&authenticated, "Call-ID").as_deref(),
+            Some("register-dialog@simadmin")
+        );
+        assert_eq!(
+            sip_frame::header_value(&authenticated, "CSeq").as_deref(),
+            Some("4 REGISTER")
+        );
+        assert_eq!(
+            sip_frame::header_value(&authenticated, "Expires").as_deref(),
+            Some("0")
+        );
+        assert!(sip_frame::header_value(&authenticated, "Authorization").is_some());
+        server
+            .write_all(&response(
+                &authenticated,
+                200,
+                "OK",
+                "network-register",
+                &[],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(disconnect.await.unwrap(), UnregisterResult::Confirmed);
     }
 
     #[tokio::test]
@@ -2077,6 +2635,83 @@ mod tests {
             trunk_answer.codecs[0].codec,
             crate::connectivity::core::voice::AudioCodec::Pcmu
         );
+
+        link.send_command(OperatorCommand::TransferCall {
+            call_id: "trunk-call-a".into(),
+            refer_to: "sip:+601199999999@ims.example".into(),
+        })
+        .unwrap();
+        let refer = read_frame(&mut server, &mut pending).await;
+        assert!(refer.starts_with(b"REFER "));
+        assert_eq!(
+            sip_frame::header_value(&refer, "Refer-To").as_deref(),
+            Some("<sip:+601199999999@ims.example;user=phone>")
+        );
+        assert_eq!(
+            sip_frame::header_value(&refer, "Route").as_deref(),
+            Some("<sip:service-route.ims.example;lr>")
+        );
+        let refer_event_id = sip_frame::header_value(&refer, "CSeq")
+            .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+            .expect("REFER CSeq");
+        server
+            .write_all(&response(&refer, 202, "Accepted", "network-a", &[]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::TransferResponse { call_id, status: 202 }
+                if call_id == "trunk-call-a"
+        ));
+
+        let refer_body = "SIP/2.0 180 Ringing\r\n";
+        let mismatched_notify = format!(
+            "NOTIFY sip:+601100000001@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKrefer-notify-wrong\r\nFrom: <sip:+601112023012@ims.example>;tag=network-a\r\nTo: <sip:+601100000001@ims.example>;tag={}\r\nCall-ID: {}\r\nCSeq: 3 NOTIFY\r\nEvent: refer;id={}\r\nSubscription-State: active;expires=60\r\nContent-Type: message/sipfrag;version=2.0\r\nContent-Length: {}\r\n\r\n{}",
+            from_tag,
+            call_id,
+            refer_event_id.saturating_add(1),
+            refer_body.len(),
+            refer_body,
+        );
+        server
+            .write_all(mismatched_notify.as_bytes())
+            .await
+            .unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"SIP/2.0 481 Call/Transaction Does Not Exist"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), events.recv())
+                .await
+                .is_err()
+        );
+
+        let notify = format!(
+            "NOTIFY sip:+601100000001@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKrefer-notify\r\nFrom: <sip:+601112023012@ims.example>;tag=network-a\r\nTo: <sip:+601100000001@ims.example>;tag={}\r\nCall-ID: {}\r\nCSeq: 3 NOTIFY\r\nEvent: refer;id={}\r\nSubscription-State: active;expires=60\r\nContent-Type: message/sipfrag;version=2.0\r\nContent-Length: {}\r\n\r\n{}",
+            from_tag,
+            call_id,
+            refer_event_id,
+            refer_body.len(),
+            refer_body,
+        );
+        server.write_all(notify.as_bytes()).await.unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"SIP/2.0 200 OK"));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::TransferNotify { call_id, notification }
+                if call_id == "trunk-call-a"
+                    && notification.sip_status == 180
+                    && notification.event_id == Some(refer_event_id)
+                    && notification.transfer_state == crate::connectivity::core::supplementary::DialogTransferState::Trying
+        ));
 
         let network_info_body = b"Signal=8\r\nDuration=180\r\n";
         let network_info = format!(
@@ -2230,6 +2865,320 @@ mod tests {
         .unwrap();
         let bye = read_frame(&mut server, &mut pending).await;
         assert!(bye.starts_with(b"BYE "));
+        disconnect_line(line_id).await;
+    }
+
+    #[tokio::test]
+    async fn disconnecting_one_line_keeps_the_other_operator_session_usable() {
+        let line_a = "operator-test-isolation-a";
+        let line_b = "operator-test-isolation-b";
+        let (client_a, _server_a) = tcp_pair().await;
+        let (client_b, mut server_b) = tcp_pair().await;
+        let context_a = context(line_a, &client_a, &_server_a);
+        let context_b = context(line_b, &client_b, &server_b);
+        install_registered_channel(
+            context_a.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client_a,
+                Vec::new(),
+                context_a.route,
+                context_a.security_verify.clone(),
+            )),
+        )
+        .await;
+        install_registered_channel(
+            context_b.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client_b,
+                Vec::new(),
+                context_b.route,
+                context_b.security_verify.clone(),
+            )),
+        )
+        .await;
+
+        let link_a = operator_link_for_line(line_a);
+        let link_b = operator_link_for_line(line_b);
+        assert!(link_a.is_available());
+        assert!(link_b.is_available());
+        disconnect_line(line_a).await;
+        assert!(!link_a.is_available());
+        assert!(link_b.is_available());
+
+        let internal_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        link_b
+            .send_command(OperatorCommand::StartCall {
+                call_id: "isolated-call-b".into(),
+                caller: "6108".into(),
+                callee: "+601112023012".into(),
+                trunk_local_ip: "127.0.0.1".parse().unwrap(),
+                offer: audio_offer(internal_rtp.local_addr().unwrap()),
+            })
+            .unwrap();
+        let mut pending = Vec::new();
+        assert!(read_frame(&mut server_b, &mut pending)
+            .await
+            .starts_with(b"INVITE "));
+        disconnect_line(line_b).await;
+    }
+
+    #[tokio::test]
+    async fn two_dialogs_keep_progress_media_dtmf_and_reinvite_state_independent() {
+        use crate::connectivity::core::voice::MediaDirection;
+
+        let (client, mut server) = tcp_pair().await;
+        let line_id = "operator-test-two-dialog-matrix";
+        let link = operator_link_for_line(line_id);
+        let mut events = link.subscribe_events();
+        let route_context = context(line_id, &client, &server);
+        install_registered_channel(
+            route_context.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client,
+                Vec::new(),
+                route_context.route,
+                route_context.security_verify.clone(),
+            )),
+        )
+        .await;
+
+        let rtp_a = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let rtp_b = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut pending = Vec::new();
+        for (call_id, endpoint) in [
+            ("matrix-call-a", rtp_a.local_addr().unwrap()),
+            ("matrix-call-b", rtp_b.local_addr().unwrap()),
+        ] {
+            link.send_command(OperatorCommand::StartCall {
+                call_id: call_id.into(),
+                caller: "6108".into(),
+                callee: "+601112023012".into(),
+                trunk_local_ip: "127.0.0.1".parse().unwrap(),
+                offer: audio_offer(endpoint),
+            })
+            .unwrap();
+        }
+        let invite_a = read_frame(&mut server, &mut pending).await;
+        let invite_b = read_frame(&mut server, &mut pending).await;
+        let ims_call_a = sip_frame::header_value(&invite_a, "Call-ID").unwrap();
+        let ims_call_b = sip_frame::header_value(&invite_b, "Call-ID").unwrap();
+        assert_ne!(ims_call_a, ims_call_b);
+        assert_ne!(
+            parse_audio_sdp(sip_frame::body(&invite_a))
+                .unwrap()
+                .media_port,
+            parse_audio_sdp(sip_frame::body(&invite_b))
+                .unwrap()
+                .media_port
+        );
+
+        server
+            .write_all(&response(&invite_a, 180, "Ringing", "network-a", &[]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Provisional { call_id, status: 180, .. }
+                if call_id == "matrix-call-a"
+        ));
+        server
+            .write_all(&response(&invite_b, 486, "Busy Here", "network-b", &[]))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Rejected { call_id, status: 486 }
+                if call_id == "matrix-call-b"
+        ));
+
+        let operator_rtp_a = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let answer_a = network_audio_sdp(operator_rtp_a.local_addr().unwrap(), "sendrecv");
+        server
+            .write_all(&response(
+                &invite_a,
+                200,
+                "OK",
+                "network-a",
+                answer_a.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"ACK "));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Answered { call_id, .. } if call_id == "matrix-call-a"
+        ));
+
+        // The rejected slot can be reused while call A remains confirmed.
+        let rtp_c = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        link.send_command(OperatorCommand::StartCall {
+            call_id: "matrix-call-c".into(),
+            caller: "6108".into(),
+            callee: "+601112023012".into(),
+            trunk_local_ip: "127.0.0.1".parse().unwrap(),
+            offer: audio_offer(rtp_c.local_addr().unwrap()),
+        })
+        .unwrap();
+        let invite_c = read_frame(&mut server, &mut pending).await;
+        let ims_call_c = sip_frame::header_value(&invite_c, "Call-ID").unwrap();
+        let operator_rtp_c = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let answer_c = network_audio_sdp(operator_rtp_c.local_addr().unwrap(), "sendrecv");
+        server
+            .write_all(&response(
+                &invite_c,
+                183,
+                "Session Progress",
+                "network-c",
+                answer_c.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Provisional { call_id, status: 183, body: Some(_) }
+                if call_id == "matrix-call-c"
+        ));
+        server
+            .write_all(&response(
+                &invite_c,
+                200,
+                "OK",
+                "network-c",
+                answer_c.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"ACK "));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Answered { call_id, .. } if call_id == "matrix-call-c"
+        ));
+
+        let hold_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut hold_offer = audio_offer(hold_rtp.local_addr().unwrap());
+        hold_offer.audio.direction = MediaDirection::Inactive;
+        link.send_command(OperatorCommand::Renegotiate {
+            call_id: "matrix-call-a".into(),
+            trunk_local_ip: "127.0.0.1".parse().unwrap(),
+            offer: hold_offer,
+        })
+        .unwrap();
+        let hold = read_frame(&mut server, &mut pending).await;
+        assert_eq!(
+            sip_frame::header_value(&hold, "Call-ID").as_deref(),
+            Some(ims_call_a.as_str())
+        );
+        assert_eq!(
+            parse_audio_sdp(sip_frame::body(&hold)).unwrap().direction,
+            MediaDirection::Inactive
+        );
+        let inactive_answer = network_audio_sdp(operator_rtp_a.local_addr().unwrap(), "inactive");
+        server
+            .write_all(&response(
+                &hold,
+                200,
+                "OK",
+                "network-a",
+                inactive_answer.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"ACK "));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Answered { call_id, body }
+                if call_id == "matrix-call-a"
+                    && parse_audio_sdp(&body).unwrap().direction == MediaDirection::Inactive
+        ));
+
+        // Call C remains independently usable while call A is held.
+        link.send_command(OperatorCommand::SendDtmf {
+            call_id: "matrix-call-c".into(),
+            signal: DtmfSignal {
+                digit: '7',
+                duration_ms: 200,
+                source: DtmfSource::SipInfo,
+            },
+        })
+        .unwrap();
+        let info_c = read_frame(&mut server, &mut pending).await;
+        assert_eq!(
+            sip_frame::header_value(&info_c, "Call-ID").as_deref(),
+            Some(ims_call_c.as_str())
+        );
+        assert_eq!(sip_frame::body(&info_c), b"Signal=7\r\nDuration=200\r\n");
+
+        let resume_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        link.send_command(OperatorCommand::Renegotiate {
+            call_id: "matrix-call-a".into(),
+            trunk_local_ip: "127.0.0.1".parse().unwrap(),
+            offer: audio_offer(resume_rtp.local_addr().unwrap()),
+        })
+        .unwrap();
+        let resume = read_frame(&mut server, &mut pending).await;
+        assert_eq!(
+            parse_audio_sdp(sip_frame::body(&resume)).unwrap().direction,
+            MediaDirection::SendRecv
+        );
+        server
+            .write_all(&response(
+                &resume,
+                200,
+                "OK",
+                "network-a",
+                answer_a.as_bytes(),
+            ))
+            .await
+            .unwrap();
+        assert!(read_frame(&mut server, &mut pending)
+            .await
+            .starts_with(b"ACK "));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Answered { call_id, .. } if call_id == "matrix-call-a"
+        ));
+
+        for (call_id, ims_call_id) in [
+            ("matrix-call-a", ims_call_a.as_str()),
+            ("matrix-call-c", ims_call_c.as_str()),
+        ] {
+            link.send_command(OperatorCommand::HangupCall {
+                call_id: call_id.into(),
+            })
+            .unwrap();
+            let bye = read_frame(&mut server, &mut pending).await;
+            assert_eq!(
+                sip_frame::header_value(&bye, "Call-ID").as_deref(),
+                Some(ims_call_id)
+            );
+        }
         disconnect_line(line_id).await;
     }
 
@@ -2673,5 +3622,173 @@ mod tests {
             OperatorEvent::Ended { call_id: ended } if ended == call_id
         ));
         disconnect_line(line_id).await;
+    }
+
+    #[tokio::test]
+    async fn third_outgoing_dialog_is_rejected_without_disturbing_two_existing_calls() {
+        let (client, mut server) = tcp_pair().await;
+        let line_id = "operator-test-call-capacity";
+        let link = operator_link_for_line(line_id);
+        let mut events = link.subscribe_events();
+        let route_context = context(line_id, &client, &server);
+        install_registered_channel(
+            route_context.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client,
+                Vec::new(),
+                route_context.route,
+                route_context.security_verify.clone(),
+            )),
+        )
+        .await;
+
+        let first_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let second_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let third_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut pending = Vec::new();
+        for (call_id, endpoint) in [
+            ("capacity-call-a", first_rtp.local_addr().unwrap()),
+            ("capacity-call-b", second_rtp.local_addr().unwrap()),
+        ] {
+            link.send_command(OperatorCommand::StartCall {
+                call_id: call_id.to_string(),
+                caller: "6108".to_string(),
+                callee: "+601112023012".to_string(),
+                trunk_local_ip: "127.0.0.1".parse().unwrap(),
+                offer: audio_offer(endpoint),
+            })
+            .unwrap();
+            let invite = read_frame(&mut server, &mut pending).await;
+            assert!(invite.starts_with(b"INVITE "));
+        }
+
+        link.send_command(OperatorCommand::StartCall {
+            call_id: "capacity-call-c".to_string(),
+            caller: "6108".to_string(),
+            callee: "+601112023012".to_string(),
+            trunk_local_ip: "127.0.0.1".parse().unwrap(),
+            offer: audio_offer(third_rtp.local_addr().unwrap()),
+        })
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Rejected { call_id, status }
+                if call_id == "capacity-call-c" && status == 486
+        ));
+
+        disconnect_line(line_id).await;
+    }
+
+    #[tokio::test]
+    async fn rejected_video_reinvite_restores_confirmed_audio_relay() {
+        let operator_remote = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let internal_remote = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let confirmed_offer = audio_offer(internal_remote.local_addr().unwrap());
+        let confirmed_pending =
+            PendingRtpRelay::bind("127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap();
+        let confirmed_operator_local = confirmed_pending.operator_local_addr().unwrap();
+        let confirmed_internal_local = confirmed_pending.internal_local_addr().unwrap();
+        let confirmed_relay = confirmed_pending.activate(
+            operator_remote.local_addr().unwrap(),
+            confirmed_offer.audio_endpoint,
+            std::iter::empty::<PayloadTypeMapping>(),
+        );
+        let mut call = VoiceCall {
+            dialog: sip::DialogIds::fresh(),
+            remote_uri: "sip:+601112023012@ims.example;user=phone".into(),
+            invite_branch: "z9hG4bKtest".into(),
+            initial_invite: None,
+            internal_offer: confirmed_offer.clone(),
+            operator_local: confirmed_operator_local,
+            internal_local: confirmed_internal_local,
+            pending_relay: None,
+            active_relay: Some(confirmed_relay),
+            pending_video_relay: None,
+            active_video_relay: None,
+            operator_video_local: None,
+            internal_video_local: None,
+            next_cseq: 2,
+            pending_network_reinvite: None,
+            pending_trunk_reinvite: true,
+            pending_media_rollback: None,
+            renegotiation_deadline: Some(Instant::now() + REINVITE_TIMEOUT),
+            operator_answered: true,
+            transfer: None,
+            transfer_deadline: None,
+        };
+
+        let upgraded_internal = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let upgraded_video = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let mut upgraded_offer = audio_offer(upgraded_internal.local_addr().unwrap());
+        upgraded_offer.video = Some(VideoOffer {
+            description: crate::connectivity::core::ims_video::build_video_offer(
+                "h264",
+                99,
+                "packetization-mode=1;profile-level-id=42e01f",
+                upgraded_video.local_addr().unwrap().port(),
+            ),
+            endpoint: upgraded_video.local_addr().unwrap(),
+        });
+        let upgraded_pending =
+            PendingRtpRelay::bind("127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap();
+        let upgraded_operator_local = upgraded_pending.operator_local_addr().unwrap();
+        let upgraded_internal_local = upgraded_pending.internal_local_addr().unwrap();
+        let upgraded_video_pending =
+            PendingRtpRelay::bind("127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap();
+        let upgraded_operator_video_local = upgraded_video_pending.operator_local_addr().unwrap();
+        let upgraded_internal_video_local = upgraded_video_pending.internal_local_addr().unwrap();
+        call.stage_media_update(
+            upgraded_offer,
+            upgraded_pending,
+            upgraded_operator_local,
+            upgraded_internal_local,
+            Some(upgraded_video_pending),
+            Some(upgraded_operator_video_local),
+            Some(upgraded_internal_video_local),
+        );
+
+        // Simulate the IMS peer rejecting the video upgrade with 488.
+        call.pending_trunk_reinvite = false;
+        call.renegotiation_deadline = None;
+        call.rollback_media_update();
+        assert_eq!(call.internal_offer, confirmed_offer);
+        assert_eq!(call.operator_local, confirmed_operator_local);
+        assert_eq!(call.internal_local, confirmed_internal_local);
+        assert!(call.active_relay.is_some());
+        assert!(call.pending_relay.is_none());
+        assert!(call.active_video_relay.is_none());
+        assert!(call.pending_video_relay.is_none());
+
+        let packet = crate::connectivity::core::voice::RtpPacket {
+            payload_type: 0,
+            marker: false,
+            sequence: 1,
+            timestamp: 160,
+            ssrc: 0x0102_0304,
+            payload: vec![0xaa, 0xbb],
+        }
+        .encode();
+        operator_remote
+            .send_to(&packet, confirmed_operator_local)
+            .await
+            .unwrap();
+        let mut received = [0u8; 256];
+        let (len, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            internal_remote.recv_from(&mut received),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&received[..len], packet.as_slice());
     }
 }

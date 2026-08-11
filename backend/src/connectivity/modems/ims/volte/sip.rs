@@ -104,6 +104,9 @@ pub struct RegisterRequestPolicy {
     pub require_sec_agree: bool,
     pub proxy_require_sec_agree: bool,
     pub include_mmtel_features: bool,
+    /// Local media capability gate. Carrier permission still comes from the
+    /// catalog's explicit Contact parameter list.
+    pub include_video_feature: bool,
     pub include_route_header: bool,
     pub include_visited_network: bool,
 }
@@ -143,6 +146,7 @@ impl RegisterRequestPolicy {
         require_sec_agree: true,
         proxy_require_sec_agree: true,
         include_mmtel_features: false,
+        include_video_feature: false,
         include_route_header: false,
         include_visited_network: false,
     };
@@ -436,6 +440,13 @@ fn build_register_internal(
         profile.filter(|profile| !profile.ims.register.contact_param_order.is_empty())
     {
         for parameter in profile.ims.register.contact_param_order {
+            let name = parameter
+                .split_once('=')
+                .map_or(*parameter, |(name, _)| name)
+                .trim();
+            if name.eq_ignore_ascii_case("video") && !policy.include_video_feature {
+                continue;
+            }
             contact.push(';');
             contact.push_str(parameter);
         }
@@ -450,6 +461,9 @@ fn build_register_internal(
         }
         contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
         contact.push_str(&format!(";expires={expires}"));
+    }
+    if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
+        contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
     }
     let visited_network = profile
         .and_then(|profile| profile.ims.register.visited_network_header)
@@ -1238,6 +1252,56 @@ mod tests {
     }
 
     #[test]
+    fn carrier_policy_adds_imei_sip_instance_and_reg_id_to_contact() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.always_add_sip_instance = true;
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:imei:490154203237518",
+            RegisterRequestPolicy::LEGACY,
+        );
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains(";+sip.instance=\"<urn:imei:490154203237518>\";reg-id=1"));
+    }
+
+    #[test]
+    fn catalog_video_contact_feature_requires_local_capability() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &["audio", "video", "+g.3gpp.smsip"];
+        let build = |include_video_feature| {
+            build_register_from_profile(
+                &profile,
+                RegisterPhase::Initial,
+                &ident(),
+                &route_udp(),
+                &RequestIds::fresh(1),
+                profile.ims.register.expires_seconds,
+                None,
+                None,
+                None,
+                "urn:uuid:test",
+                RegisterRequestPolicy {
+                    include_video_feature,
+                    ..RegisterRequestPolicy::LEGACY
+                },
+            )
+        };
+        let disabled = String::from_utf8(build(false)).unwrap();
+        assert!(disabled.contains(";audio"));
+        assert!(!disabled.contains(";video"));
+        let enabled = String::from_utf8(build(true)).unwrap();
+        assert!(enabled.contains(";audio;video;+g.3gpp.smsip"));
+    }
+
+    #[test]
     fn register_contains_mandatory_headers_and_sms_feature_tag() {
         let ids = RequestIds::fresh(1);
         let frame = build_register(
@@ -1305,6 +1369,7 @@ mod tests {
                 require_sec_agree: false,
                 proxy_require_sec_agree: false,
                 include_mmtel_features: true,
+                include_video_feature: false,
                 include_route_header: true,
                 include_visited_network: true,
             },

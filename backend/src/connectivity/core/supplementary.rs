@@ -25,6 +25,298 @@ pub enum SupplementaryService {
     DialogTransfer,
 }
 
+/// RFC 3515 transfer subscription state. This state belongs to one SIP
+/// dialog; it is deliberately unrelated to the network-side call-forwarding
+/// rules managed through Ut/XCAP.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DialogTransferState {
+    Pending,
+    Accepted,
+    Trying,
+    Succeeded,
+    Failed,
+}
+
+impl DialogTransferState {
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferSubscriptionState {
+    Pending,
+    Active,
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferNotification {
+    pub subscription_state: ReferSubscriptionState,
+    pub sip_status: u16,
+    pub transfer_state: DialogTransferState,
+    /// RFC 3515 event id, when supplied by the notifier. It is the CSeq of
+    /// the REFER that created this implicit subscription.
+    pub event_id: Option<u32>,
+}
+
+/// Monotonic state machine for one implicit `refer` event subscription.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialogTransfer {
+    state: DialogTransferState,
+    expected_event_id: Option<u32>,
+}
+
+impl Default for DialogTransfer {
+    fn default() -> Self {
+        Self {
+            state: DialogTransferState::Pending,
+            expected_event_id: None,
+        }
+    }
+}
+
+impl DialogTransfer {
+    pub fn for_refer_cseq(cseq: u32) -> Self {
+        Self {
+            state: DialogTransferState::Pending,
+            expected_event_id: Some(cseq),
+        }
+    }
+
+    pub fn state(&self) -> DialogTransferState {
+        self.state
+    }
+
+    /// Consume the final response to REFER. A 2xx response accepts the
+    /// subscription; completion is reported later by a refer-event NOTIFY.
+    pub fn on_refer_response(&mut self, status: u16) -> Result<(), ImsError> {
+        if self.state != DialogTransferState::Pending {
+            return Err(ImsError::new("ims_refer_response_unexpected"));
+        }
+        match status {
+            100..=199 => Ok(()),
+            200..=299 => {
+                self.state = DialogTransferState::Accepted;
+                Ok(())
+            }
+            300..=699 => {
+                self.state = DialogTransferState::Failed;
+                Ok(())
+            }
+            _ => Err(ImsError::new("ims_refer_response_status_invalid")),
+        }
+    }
+
+    pub fn on_notify(&mut self, notification: &ReferNotification) -> Result<(), ImsError> {
+        if self.expected_event_id.is_some()
+            && notification.event_id.is_some()
+            && self.expected_event_id != notification.event_id
+        {
+            return Err(ImsError::new("ims_refer_notify_event_id_mismatch"));
+        }
+        if self.state.is_terminal() {
+            return Err(ImsError::new("ims_refer_notify_after_terminal"));
+        }
+        if self.state == DialogTransferState::Pending {
+            // A NOTIFY may race ahead of the 202 response on separate
+            // transports, but it still proves that the implicit subscription
+            // was accepted.
+            self.state = DialogTransferState::Accepted;
+        }
+        self.state = notification.transfer_state;
+        Ok(())
+    }
+}
+
+/// Dialog identifiers and access-specific headers required to construct a
+/// REFER without depending on either the VoLTE or VoWiFi adapter.
+pub struct DialogReferRequest<'a> {
+    pub request_uri: &'a str,
+    pub branch: &'a str,
+    pub from_uri: &'a str,
+    pub from_tag: &'a str,
+    pub to_value: &'a str,
+    pub call_id: &'a str,
+    pub cseq: u32,
+    pub refer_to: &'a str,
+    pub referred_by: Option<&'a str>,
+}
+
+/// Validate an externally supplied REFER target and return only its URI. A
+/// display name and surrounding angle brackets are discarded so caller input
+/// cannot inject arbitrary SIP headers. URI query parameters such as an
+/// encoded `Replaces` value remain intact for attended transfer.
+pub fn normalize_refer_target(value: &str) -> Result<String, ImsError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(ImsError::new("ims_refer_target_empty"));
+    }
+    if value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(ImsError::new("ims_refer_target_invalid"));
+    }
+    let uri = if let Some(open) = value.find('<') {
+        let close = value[open + 1..]
+            .find('>')
+            .map(|offset| open + 1 + offset)
+            .ok_or(ImsError::new("ims_refer_target_invalid"))?;
+        if !value[close + 1..].trim().is_empty() {
+            return Err(ImsError::new("ims_refer_target_invalid"));
+        }
+        value[open + 1..close].trim()
+    } else {
+        value
+    };
+    if uri.is_empty()
+        || uri.chars().any(char::is_whitespace)
+        || !["sip:", "sips:", "tel:"].iter().any(|scheme| {
+            uri.len() > scheme.len()
+                && uri
+                    .get(..scheme.len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scheme))
+        })
+    {
+        return Err(ImsError::new("ims_refer_target_invalid"));
+    }
+    Ok(uri.to_string())
+}
+
+/// Build an in-dialog REFER using the current registered route. The access
+/// adapter supplies PANI/security/User-Agent headers but does not duplicate
+/// REFER framing or target validation.
+pub fn build_dialog_refer(
+    identity: &ImsIdentity,
+    route: &ImsRoute,
+    registration: &RegisteredImsContext,
+    request: &DialogReferRequest<'_>,
+    access_headers: &[SipHeader],
+) -> Result<Vec<u8>, ImsError> {
+    let refer_to = normalize_refer_target(request.refer_to)?;
+    let route_value = registration
+        .service_route
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "<sip:{}:{};lr>",
+                sip_frame::sip_host(route.pcscf_addr.ip()),
+                route.pcscf_addr.port()
+            )
+        });
+    let mut headers = vec![
+        SipHeader::new("Route", route_value),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("Refer-To", format!("<{refer_to}>")),
+        SipHeader::new("Accept", "message/sipfrag"),
+    ];
+    if let Some(referred_by) = request.referred_by {
+        let referred_by = normalize_refer_target(referred_by)?;
+        headers.push(SipHeader::new("Referred-By", format!("<{referred_by}>")));
+    }
+    headers.extend_from_slice(access_headers);
+    Ok(build_request(&SipRequest {
+        method: "REFER",
+        request_uri: request.request_uri,
+        route: *route,
+        branch: request.branch,
+        from_uri: request.from_uri,
+        from_tag: request.from_tag,
+        to_value: request.to_value,
+        call_id: request.call_id,
+        cseq: request.cseq,
+        headers: &headers,
+        body: &[],
+    }))
+}
+
+/// Parse one refer-event NOTIFY and its `message/sipfrag` progress body.
+pub fn parse_refer_notify(frame: &[u8]) -> Result<ReferNotification, ImsError> {
+    if !sip_frame::is_request(frame, "NOTIFY") {
+        return Err(ImsError::new("ims_refer_notify_request_required"));
+    }
+    let event = sip_frame::header_value(frame, "Event")
+        .ok_or(ImsError::new("ims_refer_notify_event_missing"))?;
+    if !event
+        .split(';')
+        .next()
+        .is_some_and(|event| event.trim().eq_ignore_ascii_case("refer"))
+    {
+        return Err(ImsError::new("ims_refer_notify_event_invalid"));
+    }
+    let mut event_id = None;
+    for parameter in event.split(';').skip(1) {
+        let parameter = parameter.trim();
+        let Some((name, value)) = parameter.split_once('=') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("id") {
+            continue;
+        }
+        let parsed = value
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| ImsError::new("ims_refer_notify_event_id_invalid"))?;
+        if event_id.replace(parsed).is_some() {
+            return Err(ImsError::new("ims_refer_notify_event_id_invalid"));
+        }
+    }
+    let content_type = sip_frame::header_value(frame, "Content-Type")
+        .ok_or(ImsError::new("ims_refer_notify_content_type_missing"))?;
+    if !content_type.split(';').next().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "message/sipfrag" | "application/sipfrag"
+        )
+    }) {
+        return Err(ImsError::new("ims_refer_notify_content_type_invalid"));
+    }
+    let subscription = sip_frame::header_value(frame, "Subscription-State")
+        .ok_or(ImsError::new("ims_refer_subscription_state_missing"))?;
+    let subscription_state = match subscription
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pending" => ReferSubscriptionState::Pending,
+        "active" => ReferSubscriptionState::Active,
+        "terminated" => ReferSubscriptionState::Terminated,
+        _ => return Err(ImsError::new("ims_refer_subscription_state_invalid")),
+    };
+    let body = std::str::from_utf8(sip_frame::body(frame))
+        .map_err(|_| ImsError::new("ims_refer_sipfrag_not_utf8"))?;
+    let status = body
+        .lines()
+        .next()
+        .and_then(|line| line.trim().strip_prefix("SIP/2.0 "))
+        .and_then(|remainder| remainder.split_whitespace().next())
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|status| (100..=699).contains(status))
+        .ok_or(ImsError::new("ims_refer_sipfrag_status_invalid"))?;
+    let transfer_state = match status {
+        100..=199 => DialogTransferState::Trying,
+        200..=299 => DialogTransferState::Succeeded,
+        _ => DialogTransferState::Failed,
+    };
+    if subscription_state == ReferSubscriptionState::Terminated
+        && transfer_state == DialogTransferState::Trying
+    {
+        return Err(ImsError::new("ims_refer_terminated_without_final_status"));
+    }
+    Ok(ReferNotification {
+        subscription_state,
+        sip_status: status,
+        transfer_state,
+        event_id,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityReadiness {
     pub supported: bool,
@@ -547,6 +839,132 @@ mod tests {
         assert_eq!(
             sip_frame::header_value(&frame, "Event").as_deref(),
             Some("message-summary")
+        );
+    }
+
+    #[test]
+    fn refer_builder_uses_registered_route_and_sanitized_target() {
+        let identity = ImsIdentity {
+            private_user: "user@ims.example".to_string(),
+            public_uri: "sip:user@ims.example".to_string(),
+            contact_user: "user".to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        };
+        let route = ImsRoute {
+            local_addr: "192.0.2.2:5060".parse::<SocketAddr>().unwrap(),
+            pcscf_addr: "192.0.2.1:5060".parse::<SocketAddr>().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let registration = RegisteredImsContext {
+            access: ImsRegistrationAccess::Vowifi,
+            registered_at: SystemTime::now(),
+            lease: RegistrationLease::from_expires(3600),
+            service_route: Some("<sip:route.ims.example;lr>".to_string()),
+            associated_uris: Vec::new(),
+        };
+        let request = DialogReferRequest {
+            request_uri: "sip:peer@ims.example",
+            branch: "z9hG4bKrefer",
+            from_uri: "sip:user@ims.example",
+            from_tag: "local-tag",
+            to_value: "<sip:peer@ims.example>;tag=remote-tag",
+            call_id: "dialog@simadmin",
+            cseq: 4,
+            refer_to: "Transfer <sip:+15551234567@ims.example>",
+            referred_by: Some("sip:user@ims.example"),
+        };
+        let frame = build_dialog_refer(
+            &identity,
+            &route,
+            &registration,
+            &request,
+            &[SipHeader::new("P-Access-Network-Info", "3GPP-WLAN")],
+        )
+        .unwrap();
+        assert!(sip_frame::is_request(&frame, "REFER"));
+        assert_eq!(
+            sip_frame::header_value(&frame, "Route").as_deref(),
+            Some("<sip:route.ims.example;lr>")
+        );
+        assert_eq!(
+            sip_frame::header_value(&frame, "Refer-To").as_deref(),
+            Some("<sip:+15551234567@ims.example>")
+        );
+        assert_eq!(
+            sip_frame::header_value(&frame, "Referred-By").as_deref(),
+            Some("<sip:user@ims.example>")
+        );
+    }
+
+    #[test]
+    fn refer_target_rejects_header_injection_and_unknown_schemes() {
+        assert_eq!(
+            normalize_refer_target("sip:user@example\r\nRoute: <sip:evil>")
+                .unwrap_err()
+                .code(),
+            "ims_refer_target_invalid"
+        );
+        assert_eq!(
+            normalize_refer_target("https://example.test")
+                .unwrap_err()
+                .code(),
+            "ims_refer_target_invalid"
+        );
+        assert_eq!(
+            normalize_refer_target("<tel:+15551234567>").unwrap(),
+            "tel:+15551234567"
+        );
+    }
+
+    #[test]
+    fn refer_notify_drives_monotonic_transfer_state() {
+        let notify = b"NOTIFY sip:user@example SIP/2.0\r\nEvent: refer;id=1\r\nSubscription-State: active;expires=60\r\nContent-Type: message/sipfrag;version=2.0\r\nContent-Length: 21\r\n\r\nSIP/2.0 180 Ringing\r\n";
+        let progress = parse_refer_notify(notify).unwrap();
+        assert_eq!(progress.sip_status, 180);
+        assert_eq!(progress.transfer_state, DialogTransferState::Trying);
+        assert_eq!(progress.event_id, Some(1));
+
+        let mut transfer = DialogTransfer::for_refer_cseq(1);
+        transfer.on_refer_response(202).unwrap();
+        transfer.on_notify(&progress).unwrap();
+        assert_eq!(transfer.state(), DialogTransferState::Trying);
+
+        let final_notify = b"NOTIFY sip:user@example SIP/2.0\r\nEvent: refer\r\nSubscription-State: terminated;reason=noresource\r\nContent-Type: message/sipfrag\r\nContent-Length: 14\r\n\r\nSIP/2.0 200\r\n";
+        let final_progress = parse_refer_notify(final_notify).unwrap();
+        transfer.on_notify(&final_progress).unwrap();
+        assert_eq!(transfer.state(), DialogTransferState::Succeeded);
+        assert_eq!(
+            transfer.on_notify(&final_progress).unwrap_err().code(),
+            "ims_refer_notify_after_terminal"
+        );
+    }
+
+    #[test]
+    fn refer_notify_rejects_malformed_or_wrong_event_id() {
+        let malformed = b"NOTIFY sip:user@example SIP/2.0\r\nEvent: refer;id=not-a-cseq\r\nSubscription-State: active\r\nContent-Type: message/sipfrag\r\nContent-Length: 18\r\n\r\nSIP/2.0 100 Trying\r\n";
+        assert_eq!(
+            parse_refer_notify(malformed).unwrap_err().code(),
+            "ims_refer_notify_event_id_invalid"
+        );
+
+        let wrong = b"NOTIFY sip:user@example SIP/2.0\r\nEvent: refer;id=8\r\nSubscription-State: active\r\nContent-Type: message/sipfrag\r\nContent-Length: 21\r\n\r\nSIP/2.0 180 Ringing\r\n";
+        let notification = parse_refer_notify(wrong).unwrap();
+        let mut transfer = DialogTransfer::for_refer_cseq(7);
+        transfer.on_refer_response(202).unwrap();
+        assert_eq!(
+            transfer.on_notify(&notification).unwrap_err().code(),
+            "ims_refer_notify_event_id_mismatch"
+        );
+        assert_eq!(transfer.state(), DialogTransferState::Accepted);
+    }
+
+    #[test]
+    fn terminated_refer_notify_requires_final_sipfrag() {
+        let notify = b"NOTIFY sip:user@example SIP/2.0\r\nEvent: refer\r\nSubscription-State: terminated\r\nContent-Type: application/sipfrag\r\nContent-Length: 18\r\n\r\nSIP/2.0 100 Trying\r\n";
+        assert_eq!(
+            parse_refer_notify(notify).unwrap_err().code(),
+            "ims_refer_terminated_without_final_status"
         );
     }
 

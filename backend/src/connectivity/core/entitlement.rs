@@ -278,12 +278,15 @@ impl E911EntitlementRecord {
 }
 
 /// Result of a parsed TS.43 entitlement query response (server-facing facts).
-/// Secrets (`ServerFlow_User_Data`) are deliberately kept out of this struct so
+/// Secrets (`ServiceFlow_UserData`, also called `ServerFlow_User_Data` by older
+/// carriers) are deliberately kept out of this struct so
 /// a debug print can never leak them; the orchestrator routes them to the
 /// secret store.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct EntitlementQueryOutcome {
     pub state: E911State,
+    /// Top-level TS.43 `EntitlementStatus` for the VoWiFi application.
+    pub entitlement_status: EntitlementStatusValue,
     pub prov_status: EntitlementStatusValue,
     pub tc_status: EntitlementStatusValue,
     pub addr_status: EntitlementStatusValue,
@@ -304,9 +307,29 @@ impl EntitlementQueryOutcome {
     /// websheet response (`server_flow_url` set) never confirms anything.
     pub fn is_carrier_confirmed(&self) -> bool {
         self.server_flow_url.is_none()
+            && self.entitlement_status == EntitlementStatusValue::Set
             && self.prov_status == EntitlementStatusValue::Set
             && self.tc_status != EntitlementStatusValue::Rejected
             && self.addr_status == EntitlementStatusValue::Set
+    }
+}
+
+impl std::fmt::Debug for EntitlementQueryOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EntitlementQueryOutcome")
+            .field("state", &self.state)
+            .field("entitlement_status", &self.entitlement_status)
+            .field("prov_status", &self.prov_status)
+            .field("tc_status", &self.tc_status)
+            .field("addr_status", &self.addr_status)
+            .field("provider_reference", &self.provider_reference)
+            .field("server_flow_url_present", &self.server_flow_url.is_some())
+            .field(
+                "server_flow_user_data_present",
+                &self.server_flow_user_data.is_some(),
+            )
+            .field("retry_after_seconds", &self.retry_after_seconds)
+            .finish()
     }
 }
 
@@ -394,6 +417,7 @@ mod tests {
     fn outcome_with_server_flow_never_confirms() {
         let confirmed = EntitlementQueryOutcome {
             state: E911State::Provisioned,
+            entitlement_status: EntitlementStatusValue::Set,
             prov_status: EntitlementStatusValue::Set,
             tc_status: EntitlementStatusValue::Set,
             addr_status: EntitlementStatusValue::Set,

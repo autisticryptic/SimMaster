@@ -6,7 +6,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 
 use crate::{
     platform::config::{AccessPathKind, VoicePathPolicy},
@@ -28,6 +31,112 @@ struct CallRoute {
     owner: AccessPathKind,
     remaining: Vec<AccessPathKind>,
     start: Option<OperatorCommand>,
+    /// Present only for a local/API call whose media offer varies by access.
+    /// A pre-answer failover must rebuild `StartCall` for the next leg instead
+    /// of replaying the first leg's codec/payload policy.
+    start_plan: Option<VoiceCallPlan>,
+}
+
+/// A mobile-originated call prepared for each IMS access that can carry it.
+///
+/// The router owns access selection, so an HTTP/API caller must not select a
+/// VoWiFi link itself merely to send `StartCall`.  Codec policy can differ
+/// between the LTE and ePDG catalog records, however, and the selected leg
+/// must receive the matching media offer.  This plan keeps both facts
+/// together: selection remains centralized while media remains access-aware.
+#[derive(Debug, Clone)]
+pub struct VoiceCallPlan {
+    pub call_id: String,
+    pub caller: String,
+    pub callee: String,
+    pub trunk_local_ip: std::net::IpAddr,
+    offers: Vec<(AccessPathKind, super::bridge::MediaOffer)>,
+}
+
+impl VoiceCallPlan {
+    pub fn new(
+        call_id: impl Into<String>,
+        caller: impl Into<String>,
+        callee: impl Into<String>,
+        trunk_local_ip: std::net::IpAddr,
+    ) -> Self {
+        Self {
+            call_id: call_id.into(),
+            caller: caller.into(),
+            callee: callee.into(),
+            trunk_local_ip,
+            offers: Vec::new(),
+        }
+    }
+
+    pub fn with_offer(mut self, access: AccessPathKind, offer: super::bridge::MediaOffer) -> Self {
+        if let Some((_, current)) = self
+            .offers
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == access)
+        {
+            *current = offer;
+        } else {
+            self.offers.push((access, offer));
+        }
+        self
+    }
+
+    fn command_for(&self, access: AccessPathKind) -> Option<OperatorCommand> {
+        self.offers
+            .iter()
+            .find(|(candidate, _)| *candidate == access)
+            .map(|(_, offer)| offer)
+            .cloned()
+            .map(|offer| OperatorCommand::StartCall {
+                call_id: self.call_id.clone(),
+                caller: self.caller.clone(),
+                callee: self.callee.clone(),
+                trunk_local_ip: self.trunk_local_ip,
+                offer,
+            })
+    }
+}
+
+/// The initial outcome of routing a locally-originated call. A later
+/// `Unavailable` event can still make the router fail over before the dialog
+/// is answered; all later lifecycle changes continue on `OperatorLink`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedVoiceCall {
+    pub call_id: String,
+    pub access: AccessPathKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceCallStartError {
+    RouterUnavailable,
+    RouteTimedOut,
+    NoEligibleImsAccess,
+}
+
+impl VoiceCallStartError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RouterUnavailable => "voice_access_router_unavailable",
+            Self::RouteTimedOut => "voice_access_router_timeout",
+            Self::NoEligibleImsAccess => "voice_ims_access_unavailable",
+        }
+    }
+}
+
+impl std::fmt::Display for VoiceCallStartError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
+}
+
+impl std::error::Error for VoiceCallStartError {}
+
+enum RouterRequest {
+    StartCall {
+        plan: VoiceCallPlan,
+        response: oneshot::Sender<Result<RoutedVoiceCall, VoiceCallStartError>>,
+    },
 }
 
 /// Owns the public trunk-facing link and keeps each call pinned to exactly one
@@ -37,6 +146,7 @@ pub struct VoiceAccessRouter {
     trunk: OperatorLink,
     policy: Arc<RwLock<VoicePathPolicy>>,
     backends: Vec<AccessBackend>,
+    requests: Option<mpsc::Sender<RouterRequest>>,
     task: Option<JoinHandle<()>>,
 }
 
@@ -48,6 +158,8 @@ impl VoiceAccessRouter {
             .into_iter()
             .map(|(kind, link)| AccessBackend { kind, link })
             .collect::<Vec<_>>();
+
+        let (requests, request_rx) = mpsc::channel(16);
 
         let task = tokio::runtime::Handle::try_current().ok().map(|handle| {
             let command_rx = trunk.subscribe_commands();
@@ -65,6 +177,7 @@ impl VoiceAccessRouter {
                     backends_task,
                     command_rx,
                     event_receivers,
+                    request_rx,
                 )
                 .await;
             })
@@ -74,6 +187,7 @@ impl VoiceAccessRouter {
             trunk,
             policy,
             backends,
+            requests: task.as_ref().map(|_| requests),
             task,
         }
     }
@@ -99,6 +213,43 @@ impl VoiceAccessRouter {
                 .any(|backend| backend.link.video_enabled()),
         );
     }
+
+    /// Select the same preferred registered access used for a new audio call.
+    /// Supplementary services use this only to choose a transport; their state
+    /// remains network-authoritative and is not duplicated per access.
+    pub fn preferred_ready_ims_access(&self) -> Option<AccessPathKind> {
+        route_plan(&current_policy(&self.policy), &self.backends, false)
+            .into_iter()
+            .find(|kind| kind.is_ims())
+    }
+
+    /// Route a locally-originated call through the same policy and route table
+    /// used by the Asterisk trunk. The selected access is returned only after
+    /// its `StartCall` command has been accepted by the registered live leg.
+    pub async fn start_call(
+        &self,
+        plan: VoiceCallPlan,
+    ) -> Result<RoutedVoiceCall, VoiceCallStartError> {
+        if plan.call_id.trim().is_empty() || plan.callee.trim().is_empty() {
+            return Err(VoiceCallStartError::NoEligibleImsAccess);
+        }
+        let Some(requests) = self.requests.as_ref() else {
+            return Err(VoiceCallStartError::RouterUnavailable);
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        requests
+            .send(RouterRequest::StartCall {
+                plan,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| VoiceCallStartError::RouterUnavailable)?;
+        match tokio::time::timeout(Duration::from_secs(1), response_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(VoiceCallStartError::RouterUnavailable),
+            Err(_) => Err(VoiceCallStartError::RouteTimedOut),
+        }
+    }
 }
 
 impl Drop for VoiceAccessRouter {
@@ -118,6 +269,7 @@ async fn run_router(
         AccessPathKind,
         tokio::sync::broadcast::Receiver<OperatorEvent>,
     )>,
+    mut requests: mpsc::Receiver<RouterRequest>,
 ) {
     let (event_tx, mut events) = mpsc::channel::<(AccessPathKind, OperatorEvent)>(64);
     let mut event_tasks = tokio::task::JoinSet::new();
@@ -159,6 +311,18 @@ async fn run_router(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
+            request = requests.recv() => match request {
+                Some(RouterRequest::StartCall { plan, response }) => {
+                    // A timed-out HTTP caller drops its receiver. Do not start
+                    // a dial after reporting an error to that caller.
+                    if response.is_closed() {
+                        continue;
+                    }
+                    let result = route_call_plan(plan, &policy, &backends, &mut routes);
+                    let _ = response.send(result);
+                }
+                None => break,
+            },
             event = events.recv() => match event {
                 Some((kind, event)) => route_event(kind, event, &trunk, &policy, &backends, &mut routes),
                 None => break,
@@ -169,6 +333,41 @@ async fn run_router(
 
     trunk.set_ready(false);
     drop(event_tasks);
+}
+
+fn route_call_plan(
+    plan: VoiceCallPlan,
+    policy: &RwLock<VoicePathPolicy>,
+    backends: &[AccessBackend],
+    routes: &mut HashMap<String, CallRoute>,
+) -> Result<RoutedVoiceCall, VoiceCallStartError> {
+    let candidates = route_plan(&current_policy(policy), backends, false);
+    let mut remaining = candidates.clone();
+    while let Some(kind) = remaining.first().copied() {
+        remaining.remove(0);
+        let Some(command) = plan.command_for(kind) else {
+            continue;
+        };
+        let Some(selected) = backend(backends, kind) else {
+            continue;
+        };
+        if selected.link.send_command(command.clone()).is_ok() {
+            routes.insert(
+                plan.call_id.clone(),
+                CallRoute {
+                    owner: kind,
+                    remaining,
+                    start: Some(command),
+                    start_plan: Some(plan.clone()),
+                },
+            );
+            return Ok(RoutedVoiceCall {
+                call_id: plan.call_id,
+                access: kind,
+            });
+        }
+    }
+    Err(VoiceCallStartError::NoEligibleImsAccess)
 }
 
 fn current_policy(policy: &RwLock<VoicePathPolicy>) -> VoicePathPolicy {
@@ -276,6 +475,7 @@ fn route_command(
                         owner: kind,
                         remaining,
                         start: Some(command),
+                        start_plan: None,
                     },
                 );
                 return;
@@ -286,15 +486,29 @@ fn route_command(
     }
 
     let Some(owner) = routes.get(&call_id).map(|route| route.owner) else {
-        trunk.send_event(OperatorEvent::Unavailable { call_id });
+        if matches!(&command, OperatorCommand::TransferCall { .. }) {
+            trunk.send_event(OperatorEvent::TransferResponse {
+                call_id,
+                status: 481,
+            });
+        } else {
+            trunk.send_event(OperatorEvent::Unavailable { call_id });
+        }
         return;
     };
     let sent = backend(backends, owner)
         .is_some_and(|selected| selected.link.send_command(command.clone()).is_ok());
     if !sent {
-        trunk.send_event(OperatorEvent::Unavailable {
-            call_id: call_id.clone(),
-        });
+        if matches!(&command, OperatorCommand::TransferCall { .. }) {
+            trunk.send_event(OperatorEvent::TransferResponse {
+                call_id: call_id.clone(),
+                status: 503,
+            });
+        } else {
+            trunk.send_event(OperatorEvent::Unavailable {
+                call_id: call_id.clone(),
+            });
+        }
     }
     if is_terminal_command(&command) {
         routes.remove(&call_id);
@@ -328,6 +542,7 @@ fn route_event(
                 owner: kind,
                 remaining: Vec::new(),
                 start: None,
+                start_plan: None,
             },
         );
         trunk.send_event(event);
@@ -342,23 +557,31 @@ fn route_event(
     }
 
     if matches!(&event, OperatorEvent::Unavailable { .. }) {
-        if let Some(start) = route.start.clone() {
-            while let Some(next) = route.remaining.first().copied() {
-                route.remaining.remove(0);
-                let Some(selected) = backend(backends, next) else {
-                    continue;
-                };
-                if selected.link.send_command(start.clone()).is_ok() {
-                    route.owner = next;
-                    tracing::warn!(call_id = %call_id, access = next.as_str(), "Voice call failed over to next access leg");
-                    return;
-                }
+        while let Some(next) = route.remaining.first().copied() {
+            route.remaining.remove(0);
+            let start = route
+                .start_plan
+                .as_ref()
+                .and_then(|plan| plan.command_for(next))
+                .or_else(|| route.start.clone());
+            let Some(start) = start else {
+                continue;
+            };
+            let Some(selected) = backend(backends, next) else {
+                continue;
+            };
+            if selected.link.send_command(start.clone()).is_ok() {
+                route.owner = next;
+                route.start = Some(start);
+                tracing::warn!(call_id = %call_id, access = next.as_str(), "Voice call failed over to next access leg");
+                return;
             }
         }
     }
 
     if matches!(&event, OperatorEvent::Answered { .. }) {
         route.start = None;
+        route.start_plan = None;
         route.remaining.clear();
     }
     let terminal = is_terminal_event(&event);
@@ -388,7 +611,8 @@ fn command_call_id(command: &OperatorCommand) -> &str {
         | OperatorCommand::ReportProvisional { call_id, .. }
         | OperatorCommand::AcceptCall { call_id, .. }
         | OperatorCommand::RejectCall { call_id, .. }
-        | OperatorCommand::SendDtmf { call_id, .. } => call_id,
+        | OperatorCommand::SendDtmf { call_id, .. }
+        | OperatorCommand::TransferCall { call_id, .. } => call_id,
     }
 }
 
@@ -399,6 +623,8 @@ fn event_call_id(event: &OperatorEvent) -> &str {
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Renegotiate { call_id, .. }
         | OperatorEvent::Dtmf { call_id, .. }
+        | OperatorEvent::TransferResponse { call_id, .. }
+        | OperatorEvent::TransferNotify { call_id, .. }
         | OperatorEvent::Rejected { call_id, .. }
         | OperatorEvent::Unavailable { call_id }
         | OperatorEvent::Ended { call_id }
@@ -481,6 +707,22 @@ mod tests {
         }
     }
 
+    fn call_plan(call_id: &str) -> VoiceCallPlan {
+        let OperatorCommand::StartCall {
+            call_id,
+            caller,
+            callee,
+            trunk_local_ip,
+            offer,
+        } = start(call_id)
+        else {
+            unreachable!();
+        };
+        VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
+            .with_offer(AccessPathKind::Vowifi, offer.clone())
+            .with_offer(AccessPathKind::Volte, offer)
+    }
+
     async fn wait_available(link: &OperatorLink) {
         tokio::time::timeout(Duration::from_secs(1), async {
             while !link.is_available() {
@@ -541,6 +783,126 @@ mod tests {
         assert!(matches!(
             volte_commands.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_call_plan_uses_router_selection_and_returns_queued_access() {
+        let vowifi = OperatorLink::default();
+        let volte = OperatorLink::default();
+        let mut vowifi_commands = vowifi.subscribe_commands();
+        let mut volte_commands = volte.subscribe_commands();
+        vowifi.set_ready(true);
+        volte.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            policy(&[AccessPathKind::Volte, AccessPathKind::Vowifi]),
+            vec![
+                (AccessPathKind::Vowifi, vowifi),
+                (AccessPathKind::Volte, volte),
+            ],
+        );
+
+        let queued = router
+            .start_call(call_plan("local-voicemail-a"))
+            .await
+            .unwrap();
+        assert_eq!(queued.call_id, "local-voicemail-a");
+        assert_eq!(queued.access, AccessPathKind::Volte);
+        assert!(matches!(
+            recv_command(&mut volte_commands).await,
+            OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-a"
+        ));
+        assert!(matches!(
+            vowifi_commands.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_call_plan_skips_accesses_without_matching_media_offer() {
+        let vowifi = OperatorLink::default();
+        let volte = OperatorLink::default();
+        let mut vowifi_commands = vowifi.subscribe_commands();
+        let mut volte_commands = volte.subscribe_commands();
+        vowifi.set_ready(true);
+        volte.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            vec![
+                (AccessPathKind::Vowifi, vowifi),
+                (AccessPathKind::Volte, volte),
+            ],
+        );
+        let OperatorCommand::StartCall {
+            call_id,
+            caller,
+            callee,
+            trunk_local_ip,
+            offer,
+        } = start("local-voicemail-b")
+        else {
+            unreachable!();
+        };
+        let plan = VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
+            .with_offer(AccessPathKind::Volte, offer);
+
+        let queued = router.start_call(plan).await.unwrap();
+        assert_eq!(queued.access, AccessPathKind::Volte);
+        assert!(matches!(
+            recv_command(&mut volte_commands).await,
+            OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-b"
+        ));
+        assert!(matches!(
+            vowifi_commands.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_call_plan_failover_uses_the_next_access_media_offer() {
+        let vowifi = OperatorLink::default();
+        let volte = OperatorLink::default();
+        let mut vowifi_commands = vowifi.subscribe_commands();
+        let mut volte_commands = volte.subscribe_commands();
+        vowifi.set_ready(true);
+        volte.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            vec![
+                (AccessPathKind::Vowifi, vowifi.clone()),
+                (AccessPathKind::Volte, volte),
+            ],
+        );
+        let OperatorCommand::StartCall {
+            call_id,
+            caller,
+            callee,
+            trunk_local_ip,
+            offer,
+        } = start("local-voicemail-failover")
+        else {
+            unreachable!();
+        };
+        let mut volte_offer = offer.clone();
+        volte_offer.audio.media_port = 40002;
+        volte_offer.audio_endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 40002));
+        let plan = VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
+            .with_offer(AccessPathKind::Vowifi, offer)
+            .with_offer(AccessPathKind::Volte, volte_offer);
+
+        let queued = router.start_call(plan).await.unwrap();
+        assert_eq!(queued.access, AccessPathKind::Vowifi);
+        assert!(matches!(
+            recv_command(&mut vowifi_commands).await,
+            OperatorCommand::StartCall { offer, .. } if offer.audio.media_port == 40000
+        ));
+
+        vowifi.send_event(OperatorEvent::Unavailable {
+            call_id: "local-voicemail-failover".into(),
+        });
+        assert!(matches!(
+            recv_command(&mut volte_commands).await,
+            OperatorCommand::StartCall { offer, .. } if offer.audio.media_port == 40002
         ));
     }
 
@@ -688,6 +1050,47 @@ mod tests {
                 .unwrap(),
             OperatorEvent::Dtmf { call_id, signal }
                 if call_id == "dtmf-call" && signal == inbound
+        ));
+    }
+
+    #[tokio::test]
+    async fn transfer_dispatch_failure_ends_only_the_refer_transaction() {
+        let vowifi = OperatorLink::default();
+        let mut vowifi_commands = vowifi.subscribe_commands();
+        vowifi.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            policy(&[AccessPathKind::Vowifi]),
+            vec![(AccessPathKind::Vowifi, vowifi.clone())],
+        );
+        let trunk = router.operator_link();
+        let mut trunk_events = trunk.subscribe_events();
+        wait_available(&trunk).await;
+
+        trunk.send_command(start("transfer-call")).unwrap();
+        let _ = recv_command(&mut vowifi_commands).await;
+        vowifi.send_event(OperatorEvent::Answered {
+            call_id: "transfer-call".into(),
+            body: Vec::new(),
+        });
+        let _ = tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(vowifi_commands);
+
+        trunk
+            .send_command(OperatorCommand::TransferCall {
+                call_id: "transfer-call".into(),
+                refer_to: "sip:+601199999999@ims.example".into(),
+            })
+            .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::TransferResponse { call_id, status: 503 }
+                if call_id == "transfer-call"
         ));
     }
 

@@ -18,6 +18,10 @@ use crate::{
         ims_video::{parse_video_sdp, VideoMediaDescription},
         sip_frame,
         sip_message::SipHeader,
+        supplementary::{
+            normalize_refer_target, DialogTransfer, DialogTransferState, ReferNotification,
+            ReferSubscriptionState,
+        },
         voice::{parse_audio_sdp, SdpAudioDescription},
     },
     services::trunk::{
@@ -124,6 +128,10 @@ pub enum OperatorCommand {
         call_id: String,
         signal: DtmfSignal,
     },
+    TransferCall {
+        call_id: String,
+        refer_to: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +157,14 @@ pub enum OperatorEvent {
     Dtmf {
         call_id: String,
         signal: DtmfSignal,
+    },
+    TransferResponse {
+        call_id: String,
+        status: u16,
+    },
+    TransferNotify {
+        call_id: String,
+        notification: ReferNotification,
     },
     Rejected {
         call_id: String,
@@ -199,7 +215,15 @@ struct BridgedCall {
     invite_digest_rounds: u32,
     pending_invite: Option<Vec<u8>>,
     operator_reinvite: Option<Vec<u8>>,
+    transfer: Option<BridgedTransfer>,
     hangup_after_ack: bool,
+}
+
+#[derive(Debug, Clone)]
+struct BridgedTransfer {
+    refer_request: Vec<u8>,
+    state: DialogTransfer,
+    asterisk_event_id: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +334,7 @@ impl TrunkBridge {
                 invite_digest_rounds: 0,
                 pending_invite: None,
                 operator_reinvite: None,
+                transfer: None,
                 hangup_after_ack: false,
             },
         );
@@ -348,6 +373,7 @@ impl TrunkBridge {
             "CANCEL" => self.handle_cancel(frame),
             "BYE" => self.handle_bye(frame),
             "INFO" => self.handle_info(frame),
+            "REFER" => self.handle_refer(frame),
             "OPTIONS" => Ok(BridgeOutput {
                 asterisk_frames: vec![
                     sip::build_response(frame, 200, "OK").map_err(BridgeError::MalformedRequest)?
@@ -380,6 +406,8 @@ impl TrunkBridge {
             | OperatorEvent::Answered { call_id, .. }
             | OperatorEvent::Renegotiate { call_id, .. }
             | OperatorEvent::Dtmf { call_id, .. }
+            | OperatorEvent::TransferResponse { call_id, .. }
+            | OperatorEvent::TransferNotify { call_id, .. }
             | OperatorEvent::Rejected { call_id, .. }
             | OperatorEvent::Unavailable { call_id }
             | OperatorEvent::Ended { call_id }
@@ -508,6 +536,91 @@ impl TrunkBridge {
                             body: body.as_bytes(),
                         },
                         Some("application/dtmf-relay"),
+                    )
+                    .map_err(BridgeError::MalformedRequest)?,
+                );
+            }
+            OperatorEvent::TransferResponse { status, .. } => {
+                let transfer = call.transfer.as_mut().ok_or_else(|| {
+                    BridgeError::InvalidState("operator_transfer_not_pending".to_string())
+                })?;
+                transfer
+                    .state
+                    .on_refer_response(status)
+                    .map_err(|error| BridgeError::InvalidState(error.to_string()))?;
+                output.asterisk_frames.push(
+                    sip::build_response_with_body(
+                        &transfer.refer_request,
+                        status,
+                        reason(status),
+                        Some(&call.dialog.local_tag),
+                        &[],
+                        &[],
+                    )
+                    .map_err(BridgeError::MalformedRequest)?,
+                );
+            }
+            OperatorEvent::TransferNotify { notification, .. } => {
+                let transfer = call.transfer.as_mut().ok_or_else(|| {
+                    BridgeError::InvalidState("operator_transfer_not_pending".to_string())
+                })?;
+                if transfer.state.state() == DialogTransferState::Pending {
+                    transfer
+                        .state
+                        .on_refer_response(202)
+                        .map_err(|error| BridgeError::InvalidState(error.to_string()))?;
+                    output.asterisk_frames.push(
+                        sip::build_response_with_body(
+                            &transfer.refer_request,
+                            202,
+                            "Accepted",
+                            Some(&call.dialog.local_tag),
+                            &[],
+                            &[],
+                        )
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
+                }
+                transfer
+                    .state
+                    .on_notify(&notification)
+                    .map_err(|error| BridgeError::InvalidState(error.to_string()))?;
+                let cseq = call
+                    .dialog
+                    .begin_local_request()
+                    .map_err(BridgeError::InvalidState)?;
+                let subscription_state = match notification.subscription_state {
+                    ReferSubscriptionState::Pending => "pending",
+                    ReferSubscriptionState::Active => "active",
+                    ReferSubscriptionState::Terminated => "terminated;reason=noresource",
+                };
+                let body = format!(
+                    "SIP/2.0 {} {}\r\n",
+                    notification.sip_status,
+                    reason(notification.sip_status)
+                );
+                let event = format!("refer;id={}", transfer.asterisk_event_id);
+                let headers = [
+                    SipHeader::new("Event", event),
+                    SipHeader::new("Subscription-State", subscription_state),
+                ];
+                output.asterisk_frames.push(
+                    sip::build_dialog_request_with_headers_and_content_type(
+                        &DialogRequest {
+                            method: "NOTIFY",
+                            request_uri: &call.dialog.remote_target,
+                            local_addr: self.local_addr,
+                            from_uri: &call.dialog.local_uri,
+                            from_tag: &call.dialog.local_tag,
+                            to_uri: &call.dialog.remote_uri,
+                            to_tag: call.dialog.remote_tag.as_deref(),
+                            call_id: &call.dialog.call_id,
+                            cseq,
+                            contact_uri: Some(&self.local_aor),
+                            body: body.as_bytes(),
+                        },
+                        &headers,
+                        Some("message/sipfrag;version=2.0"),
                     )
                     .map_err(BridgeError::MalformedRequest)?,
                 );
@@ -746,6 +859,7 @@ impl TrunkBridge {
                 invite_digest_rounds: 0,
                 pending_invite: None,
                 operator_reinvite: None,
+                transfer: None,
                 hangup_after_ack: false,
             },
         );
@@ -932,6 +1046,94 @@ impl TrunkBridge {
         })
     }
 
+    fn handle_refer(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
+        let call_id = dialog::call_id(frame)
+            .ok_or_else(|| BridgeError::MalformedRequest("trunk_refer_call-id_missing".into()))?;
+        let Some(call) = self.calls.get_mut(&call_id) else {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response(
+                    frame,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        };
+        if call.dialog.state != InviteTransactionState::Confirmed {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response_with_body(
+                    frame,
+                    481,
+                    "Call/Transaction Does Not Exist",
+                    Some(&call.dialog.local_tag),
+                    &[],
+                    &[],
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        }
+        if call
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| !transfer.state.state().is_terminal())
+        {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response_with_body(
+                    frame,
+                    491,
+                    "Request Pending",
+                    Some(&call.dialog.local_tag),
+                    &[],
+                    &[],
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        }
+        let refer_to = sip_frame::header_value(frame, "Refer-To")
+            .ok_or_else(|| BridgeError::MalformedRequest("trunk_refer_to_missing".into()))?;
+        let asterisk_event_id =
+            dialog::cseq_number(frame, "REFER").map_err(BridgeError::MalformedRequest)?;
+        let refer_to = normalize_refer_target(&refer_to)
+            .map_err(|error| BridgeError::MalformedRequest(error.to_string()))?;
+        if refer_to.split_once('?').is_some_and(|(_, query)| {
+            query.split('&').any(|parameter| {
+                parameter
+                    .split_once('=')
+                    .map(|(name, _)| name)
+                    .unwrap_or(parameter)
+                    .eq_ignore_ascii_case("replaces")
+            })
+        }) {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response_with_body(
+                    frame,
+                    501,
+                    "Not Implemented",
+                    Some(&call.dialog.local_tag),
+                    &[],
+                    &[],
+                )
+                .map_err(BridgeError::MalformedRequest)?],
+                ..BridgeOutput::default()
+            });
+        }
+        call.transfer = Some(BridgedTransfer {
+            refer_request: frame.to_vec(),
+            state: DialogTransfer::default(),
+            asterisk_event_id,
+        });
+        Ok(BridgeOutput {
+            operator_commands: vec![OperatorCommand::TransferCall {
+                call_id: call.operator_call_id.clone(),
+                refer_to,
+            }],
+            ..BridgeOutput::default()
+        })
+    }
+
     fn handle_invite_digest_challenge(&mut self, frame: &[u8]) -> Option<BridgeOutput> {
         let status = sip::status(frame).ok()?;
         if status != 401 && status != 407 {
@@ -1049,6 +1251,7 @@ impl TrunkBridge {
             } else if (200..300).contains(&status) {
                 let _ = call.dialog.on_final(status);
                 call.dialog.learn_remote_tag(frame);
+                call.dialog.learn_remote_target(frame);
                 let ack = sip::build_ack_for_final(&call.dialog.initial_invite, frame).ok();
                 call.dialog.state = InviteTransactionState::Confirmed;
                 BridgeOutput {
@@ -1299,11 +1502,13 @@ fn reason(status: u16) -> &'static str {
         180 => "Ringing",
         183 => "Session Progress",
         200 => "OK",
+        202 => "Accepted",
         408 => "Request Timeout",
         480 => "Temporarily Unavailable",
         481 => "Call/Transaction Does Not Exist",
         487 => "Request Terminated",
         488 => "Not Acceptable Here",
+        491 => "Request Pending",
         503 => "Service Unavailable",
         _ => "Failure",
     }
@@ -1873,6 +2078,147 @@ mod tests {
             Some("application/dtmf-relay")
         );
         assert_eq!(sip_frame::body(info), b"Signal=8\r\nDuration=180\r\n");
+    }
+
+    #[test]
+    fn confirmed_call_bridges_refer_response_and_notify_subscription() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+
+        let refer = b"REFER sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKrefer\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 2 REFER\r\nRefer-To: <sip:+15551234567@pbx>\r\nContent-Length: 0\r\n\r\n";
+        let requested = bridge.handle_asterisk(refer).unwrap();
+        assert!(requested.asterisk_frames.is_empty());
+        assert_eq!(
+            requested.operator_commands,
+            vec![OperatorCommand::TransferCall {
+                call_id: "call-a".into(),
+                refer_to: "sip:+15551234567@pbx".into(),
+            }]
+        );
+
+        let accepted = bridge
+            .handle_operator_event(OperatorEvent::TransferResponse {
+                call_id: "call-a".into(),
+                status: 202,
+            })
+            .unwrap();
+        assert_eq!(accepted.asterisk_frames.len(), 1);
+        assert!(accepted.asterisk_frames[0].starts_with(b"SIP/2.0 202 Accepted"));
+        assert_eq!(
+            sip_frame::header_value(&accepted.asterisk_frames[0], "CSeq").as_deref(),
+            Some("2 REFER")
+        );
+
+        let progress = bridge
+            .handle_operator_event(OperatorEvent::TransferNotify {
+                call_id: "call-a".into(),
+                notification: ReferNotification {
+                    subscription_state: ReferSubscriptionState::Active,
+                    sip_status: 180,
+                    transfer_state: DialogTransferState::Trying,
+                    event_id: Some(2),
+                },
+            })
+            .unwrap();
+        assert_eq!(progress.asterisk_frames.len(), 1);
+        let notify = &progress.asterisk_frames[0];
+        assert!(notify.starts_with(b"NOTIFY sip:6108@pbx SIP/2.0"));
+        assert_eq!(
+            sip_frame::header_value(notify, "Event").as_deref(),
+            Some("refer;id=2")
+        );
+        assert_eq!(
+            sip_frame::header_value(notify, "Subscription-State").as_deref(),
+            Some("active")
+        );
+        assert_eq!(sip_frame::body(notify), b"SIP/2.0 180 Ringing\r\n");
+
+        let completed = bridge
+            .handle_operator_event(OperatorEvent::TransferNotify {
+                call_id: "call-a".into(),
+                notification: ReferNotification {
+                    subscription_state: ReferSubscriptionState::Terminated,
+                    sip_status: 200,
+                    transfer_state: DialogTransferState::Succeeded,
+                    event_id: Some(2),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            sip_frame::header_value(&completed.asterisk_frames[0], "Subscription-State").as_deref(),
+            Some("terminated;reason=noresource")
+        );
+
+        let attended = b"REFER sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKattended\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 3 REFER\r\nRefer-To: <sip:6109@pbx?Replaces=call-b%3Bto-tag%3Da%3Bfrom-tag%3Db>\r\nContent-Length: 0\r\n\r\n";
+        let rejected = bridge.handle_asterisk(attended).unwrap();
+        assert!(rejected.operator_commands.is_empty());
+        assert!(rejected.asterisk_frames[0].starts_with(b"SIP/2.0 501 Not Implemented"));
+    }
+
+    #[test]
+    fn second_dialog_provisional_and_busy_do_not_disturb_first_call() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        bridge.handle_asterisk(&invite()).unwrap();
+        let early = bridge
+            .handle_operator_event(OperatorEvent::Provisional {
+                call_id: "call-a".into(),
+                status: 183,
+                body: Some(sdp().to_vec()),
+            })
+            .unwrap();
+        assert!(early.asterisk_frames[0].starts_with(b"SIP/2.0 183 Session Progress"));
+        bridge
+            .handle_operator_event(OperatorEvent::Answered {
+                call_id: "call-a".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        bridge.handle_asterisk(ack).unwrap();
+
+        let second = String::from_utf8(invite())
+            .unwrap()
+            .replace("Call-ID: call-a", "Call-ID: call-b")
+            .replace("tag=asterisk-a", "tag=asterisk-b");
+        let started = bridge.handle_asterisk(second.as_bytes()).unwrap();
+        assert!(matches!(
+            started.operator_commands.as_slice(),
+            [OperatorCommand::StartCall { call_id, .. }] if call_id == "call-b"
+        ));
+        let ringing = bridge
+            .handle_operator_event(OperatorEvent::Provisional {
+                call_id: "call-b".into(),
+                status: 180,
+                body: None,
+            })
+            .unwrap();
+        assert!(ringing.asterisk_frames[0].starts_with(b"SIP/2.0 180 Ringing"));
+        let busy = bridge
+            .handle_operator_event(OperatorEvent::Rejected {
+                call_id: "call-b".into(),
+                status: 486,
+            })
+            .unwrap();
+        assert!(busy.asterisk_frames[0].starts_with(b"SIP/2.0 486"));
+        assert!(bridge.has_call("call-a"));
+        assert!(!bridge.has_call("call-b"));
+        assert_eq!(bridge.confirmed_call_count(), 1);
     }
 
     #[test]

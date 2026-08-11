@@ -76,6 +76,86 @@ pub struct VoiceParams {
     pub plmn: &'static str,
 }
 
+/// A user part that is safe to place in an IMS `tel:`/`sip:` dial target.
+///
+/// Normal phone numbers keep the established 3--20 digit range. Service
+/// access codes (such as US voicemail `*86`) additionally permit `*` and `#`
+/// and are capped at 32 characters, matching the modem's `AT+CSVM` parser.
+/// This is deliberately narrower than a generic SIP URI: an external domain,
+/// URI parameter, whitespace, or control character must never reach an
+/// operator INVITE builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImsDialStringError {
+    Empty,
+    InvalidCharacter,
+    InvalidLength,
+    InvalidPlusPlacement,
+}
+
+impl std::fmt::Display for ImsDialStringError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let code = match self {
+            Self::Empty => "ims_dial_string_empty",
+            Self::InvalidCharacter => "ims_dial_string_invalid_character",
+            Self::InvalidLength => "ims_dial_string_invalid_length",
+            Self::InvalidPlusPlacement => "ims_dial_string_invalid_plus_placement",
+        };
+        formatter.write_str(code)
+    }
+}
+
+impl std::error::Error for ImsDialStringError {}
+
+/// Normalize a locally supplied dial string before it is inserted into an IMS
+/// request URI. This accepts only the user portion of an optional `sip:` or
+/// `tel:` target; a supplied host and URI parameters are intentionally ignored
+/// because the registered IMS access owns the destination domain.
+pub fn normalize_ims_dial_user(value: &str) -> Result<String, ImsDialStringError> {
+    let trimmed = value.trim();
+    let without_scheme = trimmed
+        .strip_prefix("sip:")
+        .or_else(|| trimmed.strip_prefix("tel:"))
+        .unwrap_or(trimmed);
+    let raw_user = without_scheme
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default();
+    let user = raw_user
+        .chars()
+        .filter(|character| !character.is_whitespace() && !matches!(character, '-' | '(' | ')'))
+        .collect::<String>();
+    if user.is_empty() {
+        return Err(ImsDialStringError::Empty);
+    }
+
+    let mut saw_plus = false;
+    let mut has_service_character = false;
+    for (index, character) in user.chars().enumerate() {
+        match character {
+            '+' if index == 0 => saw_plus = true,
+            '+' => return Err(ImsDialStringError::InvalidPlusPlacement),
+            '0'..='9' => {}
+            '*' | '#' => has_service_character = true,
+            _ => return Err(ImsDialStringError::InvalidCharacter),
+        }
+    }
+    let payload = user.strip_prefix('+').unwrap_or(&user);
+    if payload.is_empty() || (saw_plus && has_service_character) {
+        return Err(ImsDialStringError::InvalidPlusPlacement);
+    }
+    let valid_length = if has_service_character {
+        (1..=32).contains(&payload.len())
+    } else {
+        (3..=20).contains(&payload.len())
+    };
+    valid_length
+        .then_some(user)
+        .ok_or(ImsDialStringError::InvalidLength)
+}
+
 /// Carrier-specific parameters for one audio codec offer.
 ///
 /// The policy deliberately models signaling only. SimAdmin can advertise,
@@ -490,6 +570,26 @@ impl MediaDirection {
     /// modules (e.g. the ViLTE video SDP parser) can reuse direction parsing.
     pub fn from_token_pub(token: &str) -> Option<Self> {
         Self::from_token(token)
+    }
+
+    /// The direction which represents the opposite endpoint of this SDP leg.
+    /// A B2BUA must invert unidirectional offers/answers while relaying them to
+    /// its peer; `sendrecv` and `inactive` are symmetric.
+    pub const fn for_peer(self) -> Self {
+        match self {
+            Self::SendRecv => Self::SendRecv,
+            Self::SendOnly => Self::RecvOnly,
+            Self::RecvOnly => Self::SendOnly,
+            Self::Inactive => Self::Inactive,
+        }
+    }
+
+    pub const fn allows_send(self) -> bool {
+        matches!(self, Self::SendRecv | Self::SendOnly)
+    }
+
+    pub const fn allows_receive(self) -> bool {
+        matches!(self, Self::SendRecv | Self::RecvOnly)
     }
 }
 
@@ -1692,6 +1792,39 @@ pub fn select_voice_leg_with_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dial_user_accepts_service_access_codes_and_e164_numbers() {
+        assert_eq!(normalize_ims_dial_user(" *86 ").unwrap(), "*86");
+        assert_eq!(
+            normalize_ims_dial_user("tel:+60 111-202-3012").unwrap(),
+            "+601112023012"
+        );
+        assert_eq!(
+            normalize_ims_dial_user("sip:*86@old.example;user=phone").unwrap(),
+            "*86"
+        );
+    }
+
+    #[test]
+    fn dial_user_rejects_ambiguous_or_unsafe_targets() {
+        assert_eq!(
+            normalize_ims_dial_user("+*86").unwrap_err(),
+            ImsDialStringError::InvalidPlusPlacement
+        );
+        assert_eq!(
+            normalize_ims_dial_user("12").unwrap_err(),
+            ImsDialStringError::InvalidLength
+        );
+        assert_eq!(
+            normalize_ims_dial_user("911,transport=tcp").unwrap_err(),
+            ImsDialStringError::InvalidCharacter
+        );
+        assert_eq!(
+            normalize_ims_dial_user("+601234567890123456789").unwrap_err(),
+            ImsDialStringError::InvalidLength
+        );
+    }
 
     fn test_params() -> VoiceParams {
         VoiceParams {

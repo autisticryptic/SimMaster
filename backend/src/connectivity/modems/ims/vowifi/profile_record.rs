@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::profiles::{
     self, CarrierProfile, CarrierProfileMeta, E911Policy, EpdgPolicy, Ikev2Policy, ImsPolicy,
-    ProfileIdentityPolicy, RegisterPolicy, SmsPolicy, VoiceCodecPolicy, VoicePolicy,
+    ProfileIdentityPolicy, RegisterPolicy, SmsPolicy, UtPolicy, VoiceCodecPolicy, VoicePolicy,
 };
 use crate::connectivity::core::voice::AudioCodec;
 
@@ -249,6 +249,8 @@ pub struct VoicePolicyRecord {
     pub ptime_ms: u16,
     #[serde(default)]
     pub sip_endpoint_exposed: bool,
+    #[serde(default)]
+    pub voicemail_number: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +266,71 @@ pub struct E911PolicyRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UtPolicyRecord {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub xcap_root: Option<String>,
+    #[serde(default)]
+    pub document_selector: Option<String>,
+    #[serde(default)]
+    pub namespace: Option<String>,
+    #[serde(default = "default_ut_authentication")]
+    pub authentication: String,
+    #[serde(default)]
+    pub partial_update: bool,
+    #[serde(default)]
+    pub call_waiting_selector: Option<String>,
+    #[serde(default)]
+    pub diversion_rule_selector: Option<String>,
+    #[serde(default)]
+    pub oip_selector: Option<String>,
+    #[serde(default)]
+    pub oir_selector: Option<String>,
+    #[serde(default = "default_ut_tls_min_version")]
+    pub tls_min_version: String,
+    #[serde(default = "default_ut_tls_max_version")]
+    pub tls_max_version: String,
+    #[serde(default = "default_true")]
+    pub tls_builtin_roots: bool,
+    #[serde(default)]
+    pub tls_additional_ca_pem: Option<String>,
+}
+
+fn default_ut_authentication() -> String {
+    "none".to_string()
+}
+
+fn default_ut_tls_min_version() -> String {
+    "1.2".to_string()
+}
+
+fn default_ut_tls_max_version() -> String {
+    "1.3".to_string()
+}
+
+impl Default for UtPolicyRecord {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            xcap_root: None,
+            document_selector: None,
+            namespace: None,
+            authentication: default_ut_authentication(),
+            partial_update: false,
+            call_waiting_selector: None,
+            diversion_rule_selector: None,
+            oip_selector: None,
+            oir_selector: None,
+            tls_min_version: default_ut_tls_min_version(),
+            tls_max_version: default_ut_tls_max_version(),
+            tls_builtin_roots: true,
+            tls_additional_ca_pem: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarrierProfileRecord {
     pub meta: CarrierProfileMetaRecord,
     pub identity: ProfileIdentityPolicyRecord,
@@ -273,6 +340,8 @@ pub struct CarrierProfileRecord {
     pub sms: SmsPolicyRecord,
     pub voice: VoicePolicyRecord,
     pub e911: E911PolicyRecord,
+    #[serde(default)]
+    pub ut: UtPolicyRecord,
 }
 
 /// Leak a string into `'static`, deduplicating so repeated interning of the
@@ -463,12 +532,29 @@ impl CarrierProfileRecord {
                 amr_octet_align: self.voice.amr_octet_align,
                 ptime_ms: self.voice.ptime_ms,
                 sip_endpoint_exposed: self.voice.sip_endpoint_exposed,
+                voicemail_number: intern_opt(self.voice.voicemail_number.as_ref()),
             },
             e911: E911Policy {
                 enabled: self.e911.enabled,
                 provider: intern_opt(self.e911.provider.as_ref()),
                 entitlement_url: intern_opt(self.e911.entitlement_url.as_ref()),
                 websheet_host_policy: intern_opt(self.e911.websheet_host_policy.as_ref()),
+            },
+            ut: UtPolicy {
+                enabled: self.ut.enabled,
+                xcap_root: intern_opt(self.ut.xcap_root.as_ref()),
+                document_selector: intern_opt(self.ut.document_selector.as_ref()),
+                namespace: intern_opt(self.ut.namespace.as_ref()),
+                authentication: intern_str(&self.ut.authentication),
+                partial_update: self.ut.partial_update,
+                call_waiting_selector: intern_opt(self.ut.call_waiting_selector.as_ref()),
+                diversion_rule_selector: intern_opt(self.ut.diversion_rule_selector.as_ref()),
+                oip_selector: intern_opt(self.ut.oip_selector.as_ref()),
+                oir_selector: intern_opt(self.ut.oir_selector.as_ref()),
+                tls_min_version: intern_str(&self.ut.tls_min_version),
+                tls_max_version: intern_str(&self.ut.tls_max_version),
+                tls_builtin_roots: self.ut.tls_builtin_roots,
+                tls_additional_ca_pem: intern_opt(self.ut.tls_additional_ca_pem.as_ref()),
             },
         }
     }
@@ -600,12 +686,29 @@ impl CarrierProfileRecord {
                 amr_octet_align: profile.voice.amr_octet_align,
                 ptime_ms: profile.voice.ptime_ms,
                 sip_endpoint_exposed: profile.voice.sip_endpoint_exposed,
+                voicemail_number: profile.voice.voicemail_number.map(str::to_string),
             },
             e911: E911PolicyRecord {
                 enabled: profile.e911.enabled,
                 provider: profile.e911.provider.map(str::to_string),
                 entitlement_url: profile.e911.entitlement_url.map(str::to_string),
                 websheet_host_policy: profile.e911.websheet_host_policy.map(str::to_string),
+            },
+            ut: UtPolicyRecord {
+                enabled: profile.ut.enabled,
+                xcap_root: profile.ut.xcap_root.map(str::to_string),
+                document_selector: profile.ut.document_selector.map(str::to_string),
+                namespace: profile.ut.namespace.map(str::to_string),
+                authentication: profile.ut.authentication.to_string(),
+                partial_update: profile.ut.partial_update,
+                call_waiting_selector: profile.ut.call_waiting_selector.map(str::to_string),
+                diversion_rule_selector: profile.ut.diversion_rule_selector.map(str::to_string),
+                oip_selector: profile.ut.oip_selector.map(str::to_string),
+                oir_selector: profile.ut.oir_selector.map(str::to_string),
+                tls_min_version: profile.ut.tls_min_version.to_string(),
+                tls_max_version: profile.ut.tls_max_version.to_string(),
+                tls_builtin_roots: profile.ut.tls_builtin_roots,
+                tls_additional_ca_pem: profile.ut.tls_additional_ca_pem.map(str::to_string),
             },
         }
     }
@@ -789,6 +892,87 @@ impl CarrierProfileRecord {
         // E911 is catalogued but deliberately not executed yet. Do not reject
         // an otherwise usable IMS profile because the product-side address
         // provisioning flow is still undecided.
+        if !matches!(self.ut.authentication.as_str(), "none" | "digest_aka") {
+            return Err("ut_authentication_unsupported".to_string());
+        }
+        if self.ut.enabled {
+            let root = self
+                .ut
+                .xcap_root
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| "ut_xcap_root_required".to_string())?;
+            let parsed = url::Url::parse(root).map_err(|_| "ut_xcap_root_invalid".to_string())?;
+            if parsed.scheme() != "https" || parsed.host_str().is_none() {
+                return Err("ut_xcap_root_must_be_https".to_string());
+            }
+            if self
+                .ut
+                .document_selector
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+                || self
+                    .ut
+                    .namespace
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err("ut_xcap_policy_incomplete".to_string());
+            }
+            if self.ut.authentication != "digest_aka" {
+                return Err("ut_xcap_authentication_required".to_string());
+            }
+            let tls_rank = |value: &str| match value.trim() {
+                "1.2" | "tls1.2" => Some(12_u8),
+                "1.3" | "tls1.3" => Some(13_u8),
+                _ => None,
+            };
+            let min_tls = tls_rank(&self.ut.tls_min_version)
+                .ok_or_else(|| "ut_xcap_tls_version_invalid".to_string())?;
+            let max_tls = tls_rank(&self.ut.tls_max_version)
+                .ok_or_else(|| "ut_xcap_tls_version_invalid".to_string())?;
+            if min_tls > max_tls {
+                return Err("ut_xcap_tls_version_range_invalid".to_string());
+            }
+            if !self.ut.tls_builtin_roots
+                && self
+                    .ut
+                    .tls_additional_ca_pem
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err("ut_xcap_tls_trust_anchor_required".to_string());
+            }
+            let selectors = [
+                self.ut.call_waiting_selector.as_deref(),
+                self.ut.diversion_rule_selector.as_deref(),
+                self.ut.oip_selector.as_deref(),
+                self.ut.oir_selector.as_deref(),
+            ];
+            if self.ut.partial_update && selectors.iter().all(|value| value.is_none()) {
+                return Err("ut_xcap_partial_selector_required".to_string());
+            }
+            for selector in selectors.into_iter().flatten() {
+                if selector.trim().is_empty()
+                    || selector.starts_with('/')
+                    || selector.contains("://")
+                    || selector.contains('#')
+                    || selector.contains('\\')
+                    || selector.contains("..")
+                    || selector.chars().any(char::is_control)
+                {
+                    return Err("ut_xcap_partial_selector_invalid".to_string());
+                }
+            }
+            if self
+                .ut
+                .diversion_rule_selector
+                .as_deref()
+                .is_some_and(|selector| !selector.contains("{rule-id}"))
+            {
+                return Err("ut_xcap_diversion_selector_template_invalid".to_string());
+            }
+        }
         Ok(())
     }
 

@@ -72,7 +72,10 @@ pub fn build_register(
             ),
         ),
         SipHeader::new("Expires", expires.to_string()),
-        SipHeader::new("Allow", "INVITE, ACK, CANCEL, BYE, INFO, OPTIONS"),
+        SipHeader::new(
+            "Allow",
+            "INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS",
+        ),
         SipHeader::new("Supported", "outbound, path"),
         SipHeader::new("User-Agent", USER_AGENT),
     ];
@@ -131,7 +134,7 @@ pub fn build_response_with_body(
         response.push_str("\r\n");
     }
     response.push_str(&format!("Server: {USER_AGENT}\r\n"));
-    response.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, OPTIONS\r\n");
+    response.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS\r\n");
     for header in extra_headers {
         response.push_str(&header.name);
         response.push_str(": ");
@@ -171,6 +174,14 @@ pub fn build_dialog_request_with_content_type(
     request: &DialogRequest<'_>,
     content_type: Option<&str>,
 ) -> Result<Vec<u8>, String> {
+    build_dialog_request_with_headers_and_content_type(request, &[], content_type)
+}
+
+pub fn build_dialog_request_with_headers_and_content_type(
+    request: &DialogRequest<'_>,
+    headers: &[SipHeader],
+    content_type: Option<&str>,
+) -> Result<Vec<u8>, String> {
     validate_token(request.method, "trunk_dialog_method_invalid")?;
     if !request.request_uri.starts_with("sip:")
         || !request.from_uri.starts_with("sip:")
@@ -202,7 +213,16 @@ pub fn build_dialog_request_with_content_type(
         frame.push_str(&format!("Contact: <{contact}>\r\n"));
     }
     frame.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, OPTIONS\r\n");
+    frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS\r\n");
+    for header in headers {
+        if header.name.contains(['\r', '\n']) || header.value.contains(['\r', '\n']) {
+            return Err("trunk_dialog_header_invalid".to_string());
+        }
+        frame.push_str(&header.name);
+        frame.push_str(": ");
+        frame.push_str(&header.value);
+        frame.push_str("\r\n");
+    }
     if let Some(content_type) = content_type.filter(|_| !request.body.is_empty()) {
         frame.push_str(&format!("Content-Type: {content_type}\r\n"));
     }

@@ -1240,6 +1240,136 @@ mod tests {
     }
 
     #[test]
+    fn automatic_resolution_does_not_rewrite_sqlite_override_row() {
+        use crate::connectivity::modems::ims::{
+            effective_profile::{
+                resolve_effective_device_identity, resolve_effective_emergency,
+                resolve_effective_ims_profile, resolve_effective_vowifi_ims_profile,
+                resolve_effective_vowifi_profile,
+            },
+            vowifi::profiles::GB_EE_23433,
+        };
+
+        let (store, dir) = temp_sqlite_store("read-only-resolution");
+        let path = dir.join("config.sqlite3");
+        let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
+        let override_ = sample_override();
+        store.save(&key, &override_).unwrap();
+
+        let row = || {
+            let connection = SqliteConnection::open(&path).unwrap();
+            connection
+                .query_row(
+                    "SELECT document_json, updated_at FROM ims_sim_overrides WHERE binding_hash = ?1",
+                    [key.sha256()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .unwrap()
+        };
+        let before = row();
+
+        for _ in 0..3 {
+            let loaded = store.load(&key).unwrap().unwrap();
+            let _ = resolve_effective_vowifi_profile(&GB_EE_23433, Some(&loaded));
+            let _ = resolve_effective_ims_profile(&GB_EE_23433, Some(&loaded));
+            let _ = resolve_effective_vowifi_ims_profile(&GB_EE_23433, Some(&loaded));
+            let _ = resolve_effective_device_identity(Some(&loaded), Some("999999999999999"));
+            let _ = resolve_effective_emergency(Some(&loaded));
+        }
+
+        assert_eq!(row(), before);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn same_catalog_multi_sim_access_and_hotplug_contract_stays_isolated() {
+        use crate::connectivity::modems::ims::{
+            effective_profile::{
+                resolve_effective_device_identity, resolve_effective_emergency,
+                resolve_effective_ims_profile, resolve_effective_vowifi_ims_profile,
+            },
+            vowifi::profiles::GB_EE_23433,
+        };
+
+        let (store, dir) = temp_sqlite_store("multi-sim-contract");
+        let path = dir.join("config.sqlite3");
+        let first = SimBindingKey::resolve(Some("8986001111111111111"), None).unwrap();
+        let second = SimBindingKey::resolve(Some("8986002222222222222"), None).unwrap();
+        let make_override = |imei: &str, suffix: &str| SimOverride {
+            ims_common: ImsCommonOverride {
+                custom_imei: Some(imei.to_string()),
+                voicemail_number: Some(format!("*8{suffix}")),
+            },
+            ims_volte: ImsAccessOverride {
+                domain: Some(format!("volte-{suffix}.ims.example")),
+                ..Default::default()
+            },
+            ims_vowifi: ImsAccessOverride {
+                domain: Some(format!("vowifi-{suffix}.ims.example")),
+                epdg_host: Some(format!("epdg-{suffix}.example")),
+                ..Default::default()
+            },
+            emergency: EmergencyOverride {
+                e911_address: Some(format!("address-{suffix}")),
+            },
+            ..Default::default()
+        };
+        store
+            .save(&first, &make_override("490154203237518", "a"))
+            .unwrap();
+        store
+            .save(&second, &make_override("351234567890124", "b"))
+            .unwrap();
+
+        // A new store instance models rediscovery after reader/modem hotplug:
+        // the lookup is repeated from the SIM key rather than a previous line.
+        let reconnected = SimOverrideStore::sqlite(path);
+        let first_loaded = reconnected.load(&first).unwrap().unwrap();
+        let second_loaded = reconnected.load(&second).unwrap().unwrap();
+        for (loaded, suffix, imei) in [
+            (&first_loaded, "a", "490154203237518"),
+            (&second_loaded, "b", "351234567890124"),
+        ] {
+            assert_eq!(
+                resolve_effective_ims_profile(&GB_EE_23433, Some(loaded))
+                    .domain
+                    .value,
+                format!("volte-{suffix}.ims.example")
+            );
+            assert_eq!(
+                resolve_effective_vowifi_ims_profile(&GB_EE_23433, Some(loaded))
+                    .domain
+                    .value,
+                format!("vowifi-{suffix}.ims.example")
+            );
+            assert_eq!(
+                resolve_effective_device_identity(Some(loaded), None)
+                    .imei
+                    .as_deref(),
+                Some(imei)
+            );
+            assert_eq!(
+                resolve_effective_emergency(Some(loaded))
+                    .e911_address
+                    .as_deref(),
+                Some(format!("address-{suffix}").as_str())
+            );
+        }
+
+        let eid = "89086030123456789012345678901234";
+        let esim_profile_a =
+            SimBindingKey::resolve(Some("8986003333333333333"), Some(eid)).unwrap();
+        let esim_profile_b =
+            SimBindingKey::resolve(Some("8986004444444444444"), Some(eid)).unwrap();
+        reconnected
+            .save(&esim_profile_a, &make_override("490154203237518", "esim-a"))
+            .unwrap();
+        assert!(reconnected.load(&esim_profile_b).unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn sqlite_empty_override_deletes_row() {
         let (store, dir) = temp_sqlite_store("delete");
         let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();

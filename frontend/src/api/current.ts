@@ -91,6 +91,9 @@ import type {
   WlanProfilesResponse,
   WlanScanResponse,
   WlanStatusResponse,
+  E911Capability,
+  E911Operation,
+  E911Status,
 } from './types'
 
 type SmsListResponse = {
@@ -1094,6 +1097,34 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VowifiDiagnosticsResponse>>(
       `/vowifi/lines/${encodeURIComponent(options.lineId.trim())}/diagnostics?${query.toString()}`,
       { timeoutMs: 30000 },
+    )
+  }
+
+  async getE911Capability(lineId: string) {
+    return request<ApiResponse<E911Capability>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/capability`,
+      { timeoutMs: 10000 },
+    )
+  }
+
+  async getE911Status(lineId: string) {
+    return request<ApiResponse<E911Status>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/status`,
+      { timeoutMs: 10000 },
+    )
+  }
+
+  async queryE911(lineId: string) {
+    return request<ApiResponse<E911Status>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/query`,
+      { method: 'POST', timeoutMs: 30000 },
+    )
+  }
+
+  async createE911Operation(lineId: string) {
+    return request<ApiResponse<E911Operation>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/e911/operations`,
+      { method: 'POST', timeoutMs: 10000 },
     )
   }
 

@@ -4,9 +4,10 @@
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::IntoResponse,
+    response::{Html, IntoResponse},
     Json,
 };
+use base64::Engine;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
@@ -27,7 +28,7 @@ use crate::{
     connectivity::modems::ims::vowifi::restore::RestorePhase,
     connectivity::modems::ims::vowifi::{
         live::{
-            clear_live_runtime_for_line, place_live_voice_call_for_line,
+            clear_live_runtime_for_line, live_xcap_access_for_line, place_live_voice_call_for_line,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
@@ -94,6 +95,10 @@ const LINE_DATA_CONNECT_COOLDOWN_SECS: u64 = 60;
 const CALL_MONITOR_INTERVAL_SECS: u64 = 2;
 const CALL_END_MISSING_POLLS: u8 = 2;
 const MM_MODEM_STATE_SEARCHING: i32 = 7;
+/// Local sink used by HTTP-originated supplementary calls until a local audio
+/// backend attaches to the per-line trunk. The IMS relay still owns distinct
+/// ephemeral sockets per dialog; this is only the internal RTP destination.
+const LOCAL_VOICE_API_MEDIA_PORT: u16 = 40000;
 
 // ============ 基础接口 ============
 
@@ -5816,12 +5821,17 @@ async fn connect_vowifi_on_line(
                 return status;
             }
         };
-        if let Err(error) =
-            crate::connectivity::modems::ims::vowifi::live::configure_live_network_overrides(
-                &line_id,
-                &line_config,
-                Some(&sim_override),
-            )
+        let device_imei = app
+            .line_registry
+            .get(&line_id)
+            .await
+            .map(|line| line.binding().equipment_identifier.clone());
+        if let Err(error) = crate::connectivity::modems::ims::vowifi::live::configure_live_network_overrides_with_device_imei(
+            &line_id,
+            &line_config,
+            Some(&sim_override),
+            device_imei.as_deref(),
+        )
         {
             let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
             status.degraded_reason = Some(error);
@@ -9119,11 +9129,44 @@ fn catalog_profile_to_static(
     Some(profile.record.intern())
 }
 
+async fn query_sim_voicemail_number(modem_id: &str) -> Option<String> {
+    if modem_id.trim().is_empty() {
+        return None;
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(4),
+        tokio::process::Command::new("mmcli")
+            .args(["-m", modem_id, "--command=AT+CSVM?"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_csvm_voicemail_number(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_csvm_voicemail_number(output: &str) -> Option<String> {
+    let payload = output.split("+CSVM:").nth(1)?;
+    let start = payload.find('"')? + 1;
+    let end = payload[start..].find('"')? + start;
+    let number = payload[start..end].trim();
+    (!number.is_empty()
+        && number.len() <= 32
+        && number
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'*' | b'#')))
+    .then(|| number.to_string())
+}
+
 fn build_effective_response(
     app: &AppState,
     key: &SimBindingKey,
     binding: &crate::hardware::cellular::modem_manager::ModemBinding,
     imsi: Option<&str>,
+    sim_voicemail_number: Option<&str>,
 ) -> Result<EffectiveImsProfileResponse, String> {
     let override_ = app
         .sim_overrides
@@ -9161,9 +9204,15 @@ fn build_effective_response(
             (!binding.equipment_identifier.trim().is_empty())
                 .then_some(binding.equipment_identifier.as_str()),
         );
-    let common = crate::connectivity::modems::ims::effective_profile::resolve_effective_common(
-        override_.as_ref(),
-    );
+    let common =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_common_with_sources(
+            override_.as_ref(),
+            sim_voicemail_number,
+            vowifi_catalog
+                .voice
+                .voicemail_number
+                .or(volte_catalog.voice.voicemail_number),
+        );
     let services = EffectiveServices::from_override(override_.as_ref());
     let emergency =
         crate::connectivity::modems::ims::effective_profile::resolve_effective_emergency(
@@ -9314,7 +9363,14 @@ pub async fn get_effective_ims_profile_handler(
     )
     .await
     .map(|identity| identity.imsi);
-    match build_effective_response(&app, &key, &binding, imsi.as_deref()) {
+    let sim_voicemail_number = query_sim_voicemail_number(&binding.modem_id).await;
+    match build_effective_response(
+        &app,
+        &key,
+        &binding,
+        imsi.as_deref(),
+        sim_voicemail_number.as_deref(),
+    ) {
         Ok(response) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", response)),
@@ -9350,6 +9406,389 @@ pub async fn get_ims_supplementary_handler(
             line.supplementary.snapshot().await,
         )),
     )
+}
+
+fn local_voice_media_offer(
+    profile: &'static CarrierProfile,
+    local_ip: std::net::IpAddr,
+) -> crate::services::trunk::bridge::MediaOffer {
+    let params = crate::connectivity::modems::ims::vowifi::voice::voice_params(profile);
+    let audio = crate::connectivity::core::voice::build_mo_audio_offer_with_params(
+        &params,
+        &local_ip.to_string(),
+        crate::connectivity::core::voice::SdpAddrType::Ip4,
+        LOCAL_VOICE_API_MEDIA_PORT,
+    );
+    crate::services::trunk::bridge::MediaOffer {
+        audio,
+        audio_endpoint: std::net::SocketAddr::new(local_ip, LOCAL_VOICE_API_MEDIA_PORT),
+        video: None,
+        dtmf: crate::services::trunk::bridge::DtmfCapabilities {
+            rtp_event: None,
+            sip_info: true,
+            preferred: crate::services::trunk::bridge::DtmfSource::SipInfo,
+        },
+    }
+}
+
+/// POST /api/ims/lines/{line_id}/voicemail/call
+///
+/// Queue a voicemail call using this line's current voice-access policy. The
+/// endpoint deliberately does not call a VoWiFi/VoLTE live adapter directly:
+/// `VoiceAccessRouter` picks the registered IMS leg and records the route, so
+/// every later SIP event, DTMF command, cancellation, and failover keeps the
+/// normal per-line lifecycle.
+///
+/// There is no browser media endpoint in this API. Its RTP target is the local
+/// reserved sink used by the existing direct-call API; a trunk/audio backend
+/// may attach there later without changing this signaling contract.
+pub async fn place_voicemail_call_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let (binding_key, binding) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(context) => context,
+        Err(reason) => return (StatusCode::NOT_FOUND, Json(ApiResponse::error(reason))),
+    };
+    if !binding.present {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_not_present")),
+        );
+    }
+    let line_profile = app.config_manager.get_line_profile(&line_id);
+    if !line_profile.enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("line_disabled")),
+        );
+    }
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let override_ = match app.sim_overrides.load(&binding_key) {
+        Ok(value) => value.unwrap_or_default(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::error(error.to_string())),
+            )
+        }
+    };
+
+    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+        app.dbus_conn.as_ref(),
+        &binding.modem_path,
+    )
+    .await
+    .map(|identity| identity.imsi);
+    let volte_catalog = resolve_ims_catalog(
+        &app,
+        imsi.as_deref(),
+        override_.ims_volte.profile_id.as_deref(),
+        CatalogAccessKind::LteEpc,
+    );
+    let vowifi_catalog = resolve_ims_catalog(
+        &app,
+        imsi.as_deref(),
+        override_.ims_vowifi.profile_id.as_deref(),
+        CatalogAccessKind::WifiEpdg,
+    );
+    let sim_voicemail_number = query_sim_voicemail_number(&binding.modem_id).await;
+    let common =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_common_with_sources(
+            Some(&override_),
+            sim_voicemail_number.as_deref(),
+            vowifi_catalog
+                .and_then(|profile| profile.voice.voicemail_number)
+                .or_else(|| volte_catalog.and_then(|profile| profile.voice.voicemail_number)),
+        );
+    let Some(voicemail_number) = common.voicemail_number else {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::error("voicemail_number_unavailable")),
+        );
+    };
+    let voicemail_number =
+        match crate::connectivity::core::voice::normalize_ims_dial_user(&voicemail_number) {
+            Ok(value) => value,
+            Err(_) => {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(ApiResponse::error("voicemail_number_invalid")),
+                )
+            }
+        };
+
+    let local_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    let call_id = format!("{}@simadmin", crate::services::trunk::sip::token(16));
+    let mut plan = crate::services::trunk::access_router::VoiceCallPlan::new(
+        call_id,
+        "simadmin",
+        voicemail_number,
+        local_ip,
+    );
+    if let Some(profile) = vowifi_catalog {
+        plan = plan.with_offer(
+            AccessPathKind::Vowifi,
+            local_voice_media_offer(profile, local_ip),
+        );
+    }
+    if let Some(profile) = volte_catalog {
+        plan = plan.with_offer(
+            AccessPathKind::Volte,
+            local_voice_media_offer(profile, local_ip),
+        );
+    }
+
+    match line.voice_access.start_call(plan).await {
+        Ok(queued) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Voicemail call queued",
+                json!({
+                    "line_id": line_id,
+                    "call_id": queued.call_id,
+                    "access": queued.access.as_str(),
+                    "voicemail_number_source": common
+                        .voicemail_number_source
+                        .map(source_str),
+                    "call_state": "dialing",
+                    "invite_state": "queued",
+                    "media_followup": "operator_link",
+                }),
+            )),
+        ),
+        Err(error) => (StatusCode::CONFLICT, Json(ApiResponse::error(error.code()))),
+    }
+}
+
+fn parse_ut_document_kind(value: &str) -> Option<crate::connectivity::core::ut::UtDocumentKind> {
+    use crate::connectivity::core::ut::UtDocumentKind;
+    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+        "communication-waiting" | "call-waiting" => Some(UtDocumentKind::CommunicationWaiting),
+        "communication-diversion" | "call-forwarding" => {
+            Some(UtDocumentKind::CommunicationDiversion)
+        }
+        "originating-identity-presentation" | "oip" | "clip" => {
+            Some(UtDocumentKind::OriginatingIdentityPresentation)
+        }
+        "originating-identity-presentation-restriction"
+        | "originating-identity-restriction"
+        | "oir"
+        | "clir" => Some(UtDocumentKind::OriginatingIdentityRestriction),
+        _ => None,
+    }
+}
+
+async fn xcap_client_for_line(
+    line: &crate::services::line_registry::LineRuntime,
+) -> Result<
+    (
+        crate::services::supplementary::ut::HttpXcapTransport,
+        crate::connectivity::core::ut::XcapPolicy,
+        crate::connectivity::core::registration::ImsRegistrationAccess,
+    ),
+    &'static str,
+> {
+    use crate::platform::config::AccessPathKind;
+    use crate::services::supplementary::ut::{
+        xcap_policy_from_carrier, HttpXcapTransport, XcapAccessContext,
+    };
+
+    let preferred = line.voice_access.preferred_ready_ims_access();
+    let mut order = Vec::with_capacity(2);
+    if let Some(access) = preferred {
+        order.push(access);
+    }
+    for access in [AccessPathKind::Vowifi, AccessPathKind::Volte] {
+        if !order.contains(&access) {
+            order.push(access);
+        }
+    }
+
+    let mut selected: Option<XcapAccessContext> = None;
+    for access in order {
+        let context = match access {
+            AccessPathKind::Vowifi => live_xcap_access_for_line(&line.binding().line_id).await,
+            AccessPathKind::Volte => line.volte_live.live_xcap_access().await,
+            AccessPathKind::Cs => None,
+        };
+        if context.is_some() {
+            selected = context;
+            break;
+        }
+    }
+    let context = selected.ok_or("ut_ims_registration_required")?;
+    let policy = xcap_policy_from_carrier(context.profile)
+        .map_err(|error| error.code())?
+        .ok_or("ut_xcap_not_configured")?;
+    let transport = HttpXcapTransport::new(Some(context.local_address), &policy)
+        .map_err(|error| error.code())?
+        .with_digest_provider(context.digest);
+    Ok((transport, policy, context.access))
+}
+
+/// GET /api/ims/lines/{line_id}/ut/{document}
+pub async fn get_ims_ut_document_handler(
+    State(app): State<AppState>,
+    Path((line_id, document)): Path<(String, String)>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let Some(kind) = parse_ut_document_kind(&document) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("ut_document_kind_invalid")),
+        );
+    };
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let (transport, policy, access) = match xcap_client_for_line(&line).await {
+        Ok(client) => client,
+        Err(reason) => return (StatusCode::CONFLICT, Json(ApiResponse::error(reason))),
+    };
+    line.supplementary.begin_ut_request(access, kind).await;
+    match crate::services::supplementary::ut::read_document(&transport, &policy, kind).await {
+        Ok(document) => {
+            line.supplementary.mark_ut_document(access, &document).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    json!({
+                        "access": match access {
+                            crate::connectivity::core::registration::ImsRegistrationAccess::Volte => "volte",
+                            crate::connectivity::core::registration::ImsRegistrationAccess::Vowifi => "vowifi",
+                        },
+                        "document": document,
+                    }),
+                )),
+            )
+        }
+        Err(error) => {
+            line.supplementary
+                .fail_ut_request(access, kind, error.code())
+                .await;
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse::error(error.code())),
+            )
+        }
+    }
+}
+
+/// PUT /api/ims/lines/{line_id}/ut/{document}
+pub async fn put_ims_ut_document_handler(
+    State(app): State<AppState>,
+    Path((line_id, document)): Path<(String, String)>,
+    Json(payload): Json<UpdateImsUtRequest>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    use crate::connectivity::core::ut::{UtDocument, UtDocumentKind, UtMutation};
+
+    let Some(kind) = parse_ut_document_kind(&document) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("ut_document_kind_invalid")),
+        );
+    };
+    let supplied = usize::from(payload.call_waiting.is_some())
+        + usize::from(payload.forwarding_rule.is_some())
+        + usize::from(payload.identity_presentation.is_some());
+    let matches_kind = match kind {
+        UtDocumentKind::CommunicationWaiting => payload.call_waiting.is_some(),
+        UtDocumentKind::CommunicationDiversion => payload.forwarding_rule.is_some(),
+        UtDocumentKind::OriginatingIdentityPresentation
+        | UtDocumentKind::OriginatingIdentityRestriction => payload.identity_presentation.is_some(),
+    };
+    if supplied != 1 || !matches_kind {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("ut_update_field_mismatch")),
+        );
+    }
+    if let Some(rule) = payload.forwarding_rule.as_ref() {
+        let mut validation = UtDocument::empty(UtDocumentKind::CommunicationDiversion);
+        if let Err(error) = validation.set_forwarding_rule(rule.clone()) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(error.code())),
+            );
+        }
+    }
+    if let Some(presentation) = payload.identity_presentation {
+        let mut validation = UtDocument::empty(kind);
+        if let Err(error) = validation.set_identity_presentation(presentation) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error(error.code())),
+            );
+        }
+    }
+
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let Some(line) = app.line_registry.get(&line_id).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    };
+    let (transport, policy, access) = match xcap_client_for_line(&line).await {
+        Ok(client) => client,
+        Err(reason) => return (StatusCode::CONFLICT, Json(ApiResponse::error(reason))),
+    };
+    line.supplementary.begin_ut_request(access, kind).await;
+    let mutation = match kind {
+        UtDocumentKind::CommunicationWaiting => {
+            UtMutation::CallWaiting(payload.call_waiting.expect("validated field"))
+        }
+        UtDocumentKind::CommunicationDiversion => {
+            UtMutation::ForwardingRule(payload.forwarding_rule.expect("validated field"))
+        }
+        UtDocumentKind::OriginatingIdentityPresentation
+        | UtDocumentKind::OriginatingIdentityRestriction => UtMutation::IdentityPresentation(
+            payload.identity_presentation.expect("validated field"),
+        ),
+    };
+    let result =
+        crate::services::supplementary::ut::update_document(&transport, &policy, kind, mutation)
+            .await;
+    match result {
+        Ok(outcome) => {
+            line.supplementary
+                .mark_ut_document(access, &outcome.document)
+                .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Updated and read back",
+                    json!({
+                        "access": match access {
+                            crate::connectivity::core::registration::ImsRegistrationAccess::Volte => "volte",
+                            crate::connectivity::core::registration::ImsRegistrationAccess::Vowifi => "vowifi",
+                        },
+                        "changed": outcome.changed,
+                        "document": outcome.document,
+                    }),
+                )),
+            )
+        }
+        Err(error) => {
+            line.supplementary
+                .fail_ut_request(access, kind, error.code())
+                .await;
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ApiResponse::error(error.code())),
+            )
+        }
+    }
 }
 
 /// GET /api/ims/lines/{line_id}/override
@@ -9533,6 +9972,79 @@ async fn resolve_e911_context(
     Ok((key, binding, catalog, override_))
 }
 
+#[derive(Clone)]
+struct LineE911AkaProvider {
+    qmi_device: String,
+    uim_slot: u8,
+    proxy_socket: String,
+}
+
+impl crate::services::e911::SimAkaProvider for LineE911AkaProvider {
+    fn authenticate<'a>(
+        &'a self,
+        rand: &'a [u8],
+        autn: &'a [u8],
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult, String>,
+    > {
+        let qmi_device = self.qmi_device.clone();
+        let uim_slot = self.uim_slot;
+        let proxy_socket = self.proxy_socket.clone();
+        let rand = rand.to_vec();
+        let autn = autn.to_vec();
+        Box::pin(async move {
+            if qmi_device.is_empty() {
+                return Err("e911_sim_auth_device_unavailable".to_string());
+            }
+            tokio::task::spawn_blocking(move || {
+                crate::connectivity::modems::ims::vowifi::qmi_uim::execute_usim_authenticate_via_proxy_reason_with_retry(
+                    &proxy_socket,
+                    &qmi_device,
+                    uim_slot,
+                    crate::connectivity::modems::ims::vowifi::qmi_uim::USIM_AID_PREFIX,
+                    &rand,
+                    &autn,
+                    3,
+                    Duration::from_secs(5),
+                    Duration::from_millis(250),
+                )
+                .map_err(str::to_string)
+            })
+            .await
+            .map_err(|_| "e911_sim_auth_runtime_failed".to_string())?
+        })
+    }
+}
+
+fn e911_request_context(
+    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    catalog: &CarrierProfile,
+    override_: &SimOverride,
+    imsi: String,
+) -> crate::services::e911::EntitlementRequestContext {
+    let device_identity =
+        crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity(
+            Some(override_),
+            Some(&binding.equipment_identifier),
+        );
+    crate::services::e911::EntitlementRequestContext {
+        imsi,
+        mcc: catalog.meta.mcc.to_string(),
+        mnc: catalog.meta.mnc.to_string(),
+        // Sending an IMEI is carrier evidence, not a global default. Reuse the
+        // sealed profile's existing device-identity policy as the privacy gate.
+        terminal_id: catalog
+            .identity
+            .device_identity_enabled
+            .then_some(device_identity.imei)
+            .flatten(),
+        terminal_vendor: binding.manufacturer.clone(),
+        terminal_model: binding.model.clone(),
+        terminal_sw_version: env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
 /// GET /api/ims/lines/{line_id}/e911/capability
 pub async fn get_e911_capability_handler(
     State(app): State<AppState>,
@@ -9578,8 +10090,8 @@ pub async fn get_e911_status_handler(
         }
     };
     let provider = crate::services::e911::registry::provider_from_profile(catalog);
-    let view = match app.e911.status(
-        &provider.profile_id,
+    let view = match app.e911.status_with_provider(
+        &provider,
         &key,
         override_.emergency.e911_address.is_some(),
     ) {
@@ -9628,7 +10140,7 @@ pub async fn post_e911_query_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<E911StatusDto>>) {
-    let (key, _binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
+    let (key, binding, catalog, override_) = match resolve_e911_context(&app, &line_id).await {
         Ok(resolved) => resolved,
         Err(reason) => {
             return (
@@ -9646,20 +10158,38 @@ pub async fn post_e911_query_handler(
             )),
         );
     }
-    // The SIM AKA adapter seam: today no verified digest adapter exists, so the
-    // transport reports the raw HTTP status. The state store is still updated
-    // with whatever the carrier returned (e.g. websheet directive).
+    let sim_identity =
+        match sim_identity_for_modem(app.dbus_conn.as_ref(), &binding.modem_path).await {
+            Some(identity) if !identity.imsi.is_empty() => identity,
+            _ => {
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::<E911StatusDto>::error(
+                        crate::services::e911::orchestrator::ERR_NOT_READY,
+                    )),
+                );
+            }
+        };
+    let context = e911_request_context(&binding, catalog, &override_, sim_identity.imsi);
+    let sim_auth = LineE911AkaProvider {
+        qmi_device: binding.qmi_device.clone().unwrap_or_default(),
+        uim_slot: binding.uim_slot,
+        proxy_socket: std::env::var("SIMADMIN_VOWIFI_QMI_PROXY_SOCKET")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "@qmi-proxy".to_string()),
+    };
     let secrets = app.e911.store().load_secrets(&key).unwrap_or_default();
-    let _ = override_;
     match app
         .e911
-        .query(&provider.profile_id, &key, &secrets, &|_rand, _autn| {
-            Err("e911_aka_adapter_unavailable".to_string())
-        })
+        .query_with_provider(&provider, &key, &context, &secrets, &sim_auth)
         .await
     {
         Ok(_outcome) => {
-            let view = app.e911.status(&provider.profile_id, &key, false).unwrap();
+            let view = app
+                .e911
+                .status_with_provider(&provider, &key, override_.emergency.e911_address.is_some())
+                .unwrap();
             let dto = E911StatusDto {
                 profile_id: view.profile_id,
                 provider_kind: view.provider_kind.as_str().to_string(),
@@ -9732,12 +10262,7 @@ pub async fn create_e911_operation_handler(
     }
     // We need a real server-flow URL. The transport stores it only in the
     // secret store; without it there is nothing safe to open.
-    let server_flow_url = secrets
-        .server_flow_user_data
-        .as_deref()
-        .map(|_| provider.entitlement_url.clone())
-        .flatten()
-        .unwrap_or_default();
+    let server_flow_url = secrets.server_flow_url.unwrap_or_default();
     if server_flow_url.is_empty() {
         return (
             StatusCode::OK,
@@ -9746,16 +10271,17 @@ pub async fn create_e911_operation_handler(
             )),
         );
     }
-    let callback_state = secrets.server_flow_user_data.unwrap_or_default();
     let operation = app
         .e911
-        .create_operation(&line_id, &key, &server_flow_url, &callback_state, 600)
+        .create_operation(&line_id, &key, &server_flow_url, 600)
         .await
         .unwrap();
     let _ = override_;
+    let launch_url = operation.launch_path();
     let dto = E911OperationDto {
         operation_id: operation.operation_id,
         line_id: operation.line_id,
+        launch_url,
         server_flow_url: operation.server_flow_url,
         expires_epoch: operation.expires_epoch,
         state: operation.state.as_str().to_string(),
@@ -9771,25 +10297,105 @@ pub async fn get_e911_operation_handler(
     State(app): State<AppState>,
     Path((line_id, operation_id)): Path<(String, String)>,
 ) -> (StatusCode, Json<ApiResponse<E911OperationDto>>) {
-    match app.e911.get_operation(&line_id, &operation_id).await {
-        Ok(operation) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Success",
-                E911OperationDto {
-                    operation_id: operation.operation_id,
-                    line_id: operation.line_id,
-                    server_flow_url: operation.server_flow_url,
-                    expires_epoch: operation.expires_epoch,
-                    state: operation.state.as_str().to_string(),
-                },
-            )),
-        ),
+    let (binding, _) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<E911OperationDto>::error(reason)),
+            )
+        }
+    };
+    match app
+        .e911
+        .get_operation_for_binding(&line_id, &operation_id, &binding)
+        .await
+    {
+        Ok(operation) => {
+            let launch_url = operation.launch_path();
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    E911OperationDto {
+                        operation_id: operation.operation_id,
+                        line_id: operation.line_id,
+                        launch_url,
+                        server_flow_url: operation.server_flow_url,
+                        expires_epoch: operation.expires_epoch,
+                        state: operation.state.as_str().to_string(),
+                    },
+                )),
+            )
+        }
         Err(reason) => (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::<E911OperationDto>::error(reason)),
         ),
     }
+}
+
+/// GET /api/ims/lines/{line_id}/e911/operations/{operation_id}/launch
+///
+/// This is intentionally a same-origin HTML response instead of another JSON
+/// endpoint. TS.43 calls for `ServiceFlow_UserData` to be sent as the POST
+/// body. A short-lived operation is the only capability needed to render it;
+/// no token, cookie or callback state is returned to JavaScript/API callers.
+///
+/// Most carrier flows use URL-encoded user data. If a carrier supplies a
+/// different body format, the page refuses to guess and gives the user a
+/// direct link rather than silently sending a malformed provisioning request.
+pub async fn launch_e911_operation_handler(
+    State(app): State<AppState>,
+    Path((line_id, operation_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let (binding, _) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => return (StatusCode::NOT_FOUND, Html(error_html(&reason))).into_response(),
+    };
+    let operation = match app
+        .e911
+        .get_operation_for_binding(&line_id, &operation_id, &binding)
+        .await
+    {
+        Ok(operation) => operation,
+        Err(reason) => return (StatusCode::NOT_FOUND, Html(error_html(&reason))).into_response(),
+    };
+    if operation.state != crate::services::e911::orchestrator::E911OperationState::Pending {
+        return (
+            StatusCode::GONE,
+            Html(error_html("e911_operation_not_pending")),
+        )
+            .into_response();
+    }
+
+    let secrets = match app.e911.store().load_secrets(&operation.binding) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(error_html(error.code())),
+            )
+                .into_response()
+        }
+    };
+    let target = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(operation.server_flow_url.as_bytes());
+    let user_data = secrets.server_flow_user_data.unwrap_or_default();
+    let body = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(user_data.as_bytes());
+    let html = format!(
+        "<!doctype html><meta charset=\"utf-8\"><meta name=\"referrer\" content=\"no-referrer\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; script-src 'unsafe-inline'; form-action https:\"><title>运营商 E911 流程</title><body><p id=\"status\">正在打开运营商 E911 流程…</p><noscript>请启用 JavaScript 后重试。</noscript><script>(()=>{{const decode=(v)=>{{const normalized=v.replace(/-/g,'+').replace(/_/g,'/');const padded=normalized+'='.repeat((4-normalized.length%4)%4);const s=atob(padded);const b=Uint8Array.from(s,c=>c.charCodeAt(0));return new TextDecoder().decode(b)}};const target=decode('{target}');const body=decode('{body}');const status=document.getElementById('status');if(!body){{location.replace(target);return}};if(!body.includes('=')){{status.textContent='运营商返回了非 URL-encoded 流程数据，请使用直接链接继续。';const a=document.createElement('a');a.href=target;a.textContent='打开运营商页面';a.rel='noreferrer';document.body.append(a);return}};const form=document.createElement('form');form.method='POST';form.action=target;form.enctype='application/x-www-form-urlencoded';for(const [name,value] of new URLSearchParams(body)){{const input=document.createElement('input');input.type='hidden';input.name=name;input.value=value;form.append(input)}};document.body.append(form);form.submit()}})()</script></body>",
+    );
+    (StatusCode::OK, Html(html)).into_response()
+}
+
+fn error_html(message: &str) -> String {
+    let escaped = message
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    format!("<!doctype html><meta charset=\"utf-8\"><title>E911 流程不可用</title><p>{escaped}</p>")
 }
 
 /// POST /api/ims/lines/{line_id}/e911/operations/{operation_id}/callback
@@ -9802,6 +10408,15 @@ pub async fn callback_e911_operation_handler(
     Path((line_id, operation_id)): Path<(String, String)>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<ApiResponse<()>>) {
+    let (binding, _) = match resolve_ims_binding(&app, &line_id).await {
+        Ok(resolved) => resolved,
+        Err(reason) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::<()>::error(reason)),
+            )
+        }
+    };
     let callback_state = payload
         .get("callback_state")
         .and_then(|value| value.as_str())
@@ -9809,7 +10424,7 @@ pub async fn callback_e911_operation_handler(
         .to_string();
     match app
         .e911
-        .complete_operation(&line_id, &operation_id, &callback_state)
+        .complete_operation_for_binding(&line_id, &operation_id, &binding, &callback_state)
         .await
     {
         Ok(()) => (
@@ -10415,6 +11030,19 @@ mod tests {
             normalized.ims_common.custom_imei.as_deref(),
             Some("490154203237518")
         );
+    }
+
+    #[test]
+    fn parses_only_the_csvm_quoted_voicemail_number() {
+        assert_eq!(
+            parse_csvm_voicemail_number("response: '+CSVM: 1,\"*86\",129'\n").as_deref(),
+            Some("*86")
+        );
+        assert_eq!(
+            parse_csvm_voicemail_number("response: '+CSVM: 1,\"+60123456789\",145'\n").as_deref(),
+            Some("+60123456789")
+        );
+        assert!(parse_csvm_voicemail_number("response: '+CSVM: 1,\"1; reboot\",129'").is_none());
     }
 
     #[test]

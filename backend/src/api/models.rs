@@ -1163,6 +1163,19 @@ pub struct EffectiveServicesDto {
     pub caller_id_restriction_source: Option<String>,
 }
 
+/// One typed IMS Ut mutation. The path selects the XCAP document and exactly
+/// one matching field must be present; raw XML is never accepted from the API.
+#[derive(Debug, Clone, Deserialize)]
+pub struct UpdateImsUtRequest {
+    #[serde(default)]
+    pub call_waiting: Option<bool>,
+    #[serde(default)]
+    pub forwarding_rule: Option<crate::connectivity::core::supplementary::CallForwardingRule>,
+    #[serde(default)]
+    pub identity_presentation:
+        Option<crate::connectivity::core::supplementary::IdentityPresentation>,
+}
+
 /// Effective emergency facts returned by the IMS profile API. The full civic
 /// address is intentionally NOT included here: status responses never expose
 /// addresses; the authenticated override edit endpoint is the only place the
@@ -1258,6 +1271,10 @@ pub struct E911CapabilityDto {
 pub struct E911OperationDto {
     pub operation_id: String,
     pub line_id: String,
+    /// Same-origin one-time launch endpoint. It keeps ServiceFlow_UserData
+    /// and carrier cookies out of the JSON API response.
+    pub launch_url: String,
+    /// Kept for clients that still open the carrier URL directly.
     pub server_flow_url: String,
     pub expires_epoch: i64,
     pub state: String,
