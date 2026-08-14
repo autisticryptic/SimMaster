@@ -67,6 +67,26 @@ export interface EsimEuiccInfo {
 export interface EsimConfig {
   lpac_path: string
   custom_memory_total_kb?: number | null
+  /** Deprecated global reader fields returned by older backends. */
+  apdu_backend?: string
+  http_backend?: string
+  at_device?: string
+  qmi_device?: string
+  qmi_uim_slot?: number
+}
+
+export interface EsimReaderConfig {
+  apdu_backend: string
+  http_backend: string
+  at_device: string
+  qmi_device: string
+  qmi_uim_slot: number
+  pcsc_reader_name: string
+  pcsc_reader_index?: number | null
+  mbim_device: string
+  mbim_uim_slot: number
+  mbim_use_proxy: boolean
+  mbim_skip_slot_mapping: boolean
 }
 
 export interface EsimProfile {
@@ -121,6 +141,34 @@ export interface EsimLpacRepairResponse {
   arch: string
   asset_name: string
   asset_url: string
+  message: string
+}
+
+export interface CarrierCatalogStatusResponse {
+  installed: boolean
+  usable: boolean
+  path: string
+  release_id: string
+  generated_at: string
+  sealed: boolean
+  volte_profiles: number
+  vowifi_profiles: number
+  message: string
+}
+
+export interface CarrierCatalogInstallRequest {
+  proxy_prefix?: string
+  asset_url?: string
+}
+
+export interface CarrierCatalogInstallResponse {
+  installed: boolean
+  path: string
+  asset_url: string
+  release_id: string
+  generated_at: string
+  volte_profiles: number
+  vowifi_profiles: number
   message: string
 }
 
@@ -620,6 +668,7 @@ export interface LineProfileConfig {
    * `false` = treat as a plain SIM (no lpac calls).
    */
   esim_control?: boolean | null
+  esim_reader: EsimReaderConfig
 }
 
 export interface LineDataProxyConfig {
@@ -690,20 +739,36 @@ export interface Ikev2PolicyRecord {
   include_epdg_idr: boolean
 }
 
+export type RequestUriPolicy = 'home_domain' | 'registrar' | 'pcscf' | 'configured'
+export type InitialAuthorization = 'none' | 'aka_empty' | 'digest_empty' | 'implementation_variant'
+export type ContactMode = 'standard' | 'android_default' | 'legacy' | 'custom'
+
 export interface RegisterPolicyRecord {
   supported_header: string
+  request_uri_policy: RequestUriPolicy
+  include_pani_initial: boolean
   include_pani_authenticated: boolean
+  initial_authorization: InitialAuthorization
+  include_mmtel_features: boolean
+  include_route_header: boolean
+  include_visited_network: boolean
+  include_p_preferred_identity: boolean
+  visited_network_header: string | null
+  allow_methods: string | null
   strict_security_server_offer: boolean
   enable_initial_reject_fallback: boolean
   use_plain_digest_placeholder: boolean
   require_sec_agree_headers: boolean
+  proxy_require_sec_agree_headers: boolean
   sec_agree_mode: 'auto' | 'required' | 'disabled'
   security_client_mechanisms: string[]
   live_header_variant_set: string
   expires_seconds: number
   access_network_info: string
-  contact_mode: 'android_default' | 'legacy'
+  contact_mode: ContactMode
   contact_param_order: string[]
+  always_add_sip_instance: boolean
+  enable_cellular_network_info: boolean
   temporary_status_codes: number[]
   forbidden_status_codes: number[]
   initial_reject_fallback_status_codes: number[]
@@ -816,15 +881,21 @@ export interface CarrierProfileRecord {
 }
 
 /** Where a resolved profile came from. */
-export type ProfileOrigin = 'database' | 'builtin' | 'derived'
+export type ProfileOrigin = 'carrier_catalog' | 'database' | 'builtin' | 'derived'
 
 export interface StoredCarrierProfile {
   profile_id: string
   plmn: string
+  origin: ProfileOrigin
   /** `builtin`, `manual`, `aosp_apns`, `ipcc`, … */
   source: string
   updated_at: string
   record: CarrierProfileRecord
+  volte_ready: boolean
+  vowifi_ready: boolean
+  vilte_enabled: boolean
+  smsoip_enabled: boolean
+  ut_xcap_enabled: boolean
 }
 
 export interface ResolvedCarrierProfile {
@@ -899,6 +970,45 @@ export interface LineVowifiConfig {
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
   auto_restore: AutoRestoreConfig
+}
+
+export interface ImsAccessOverride {
+  profile_id?: string | null
+  apn?: string | null
+  domain?: string | null
+  realm?: string | null
+  registrar?: string | null
+  pcscf?: string[] | null
+  epdg_host?: string | null
+  epdg_port?: number | null
+  ip_stack?: string | null
+  dns?: string[] | null
+  spoof_imsi: boolean
+  custom_imsi?: string | null
+}
+
+export interface SimImsOverride {
+  ims_common: {
+    custom_imei?: string | null
+    voicemail_number?: string | null
+  }
+  ims_volte: ImsAccessOverride
+  ims_vowifi: ImsAccessOverride
+  services: {
+    call_waiting?: boolean | null
+    caller_id_restriction?: boolean | null
+  }
+  emergency: {
+    e911_address?: string | null
+  }
+}
+
+export interface ImsOverrideResponse {
+  binding: {
+    kind: string
+    iccid_last4?: string | null
+  }
+  override_: SimImsOverride
 }
 
 export interface VowifiLineConfigResponse {
@@ -1156,31 +1266,6 @@ export interface OperatorListResponse {
 
 export interface ManualRegisterRequest {
   mccmnc: string
-}
-
-export interface ApnContext {
-  path: string
-  name: string
-  active: boolean
-  apn: string
-  protocol: string
-  username: string
-  password: string
-  auth_method: string
-  context_type?: string
-}
-
-export interface ApnListResponse {
-  contexts: ApnContext[]
-}
-
-export interface SetApnRequest {
-  context_path: string
-  apn?: string
-  protocol?: string
-  username?: string
-  password?: string
-  auth_method?: string
 }
 
 export interface PingResult {
@@ -1508,6 +1593,7 @@ export interface OtaValidation {
 export interface OtaStatusResponse {
   current_version: string
   current_commit: string
+  arch: string
   pending_update: boolean
   pending_meta?: OtaMeta
 }
@@ -1519,6 +1605,11 @@ export interface OtaUploadResponse {
 
 export interface OtaOnlinePrepareRequest {
   proxy_prefix?: string
+}
+
+export interface GithubDownloadProxyConfig {
+  enabled: boolean
+  proxy_prefix: string
 }
 
 export interface OtaReleaseAsset {

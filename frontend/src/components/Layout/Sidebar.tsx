@@ -16,13 +16,8 @@ import {
 import {
   Dashboard as DashboardIcon,
   Settings as SettingsIcon,
-  Sms as SmsIcon,
-  NotificationsActive as NotificationsIcon,
-  GitHub as GitHubIcon,
   SystemUpdateAlt as OtaIcon,
-  Router as RouterIcon,
   SimCard as SimIcon,
-  AutoMode as AutomationIcon,
   Shield as SecurityIcon,
 } from '@mui/icons-material'
 
@@ -59,23 +54,7 @@ type MenuConfigItem = DirectMenuItem | GroupMenuItem
 const menuGroups: MenuConfigItem[] = [
   { type: 'direct', path: '/', label: '仪表盘', icon: DashboardIcon },
   { type: 'direct', path: '/sim', label: 'SIM 卡', icon: SimIcon },
-  { type: 'direct', path: '/sms', label: '短信管理', icon: SmsIcon },
   // { path: '/phone', label: '电话管理', icon: PhoneIcon },
-  {
-    type: 'group',
-    label: '网络',
-    items: [
-      { path: '/device-network', label: '设备网络', icon: RouterIcon },
-    ],
-  },
-  {
-    type: 'group',
-    label: '自动化与通知',
-    items: [
-      { path: '/automation', label: '自动化中心', icon: AutomationIcon },
-      { path: '/notifications', label: '通知中心', icon: NotificationsIcon },
-    ],
-  },
   {
     type: 'group',
     label: '系统',
@@ -418,37 +397,6 @@ export default function Sidebar({
         }}
       >
         <Box
-          component="a"
-          href="https://github.com/3899/SimAdmin"
-          target="_blank"
-          rel="noopener noreferrer"
-          sx={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: compact ? 0 : 0.5,
-            color: 'text.secondary',
-            fontSize: '0.75rem',
-            textDecoration: 'none',
-            width: 'fit-content',
-            '&:hover': { color: 'primary.main' },
-          }}
-        >
-          <GitHubIcon sx={{ fontSize: compact ? 22 : 16 }} />
-          <Typography
-            variant="caption"
-            color="inherit"
-            sx={{
-              opacity: compact ? 0 : 1,
-              maxWidth: compact ? 0 : 110,
-              overflow: 'hidden',
-              whiteSpace: 'nowrap',
-              transition: `opacity ${SIDEBAR_TRANSITION}, max-width ${SIDEBAR_TRANSITION}`,
-            }}
-          >
-            3899/SimAdmin
-          </Typography>
-        </Box>
-        <Box
           sx={{
             opacity: compact ? 0 : 1,
             maxHeight: compact ? 0 : 48,
@@ -456,11 +404,8 @@ export default function Sidebar({
             transition: `opacity ${SIDEBAR_TRANSITION}, max-height ${SIDEBAR_TRANSITION}`,
           }}
         >
-          <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.5 }}>
-            v{__APP_VERSION__} ({__GIT_BRANCH__}/{__GIT_COMMIT__})
-          </Typography>
-          <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.5 }}>
-            Copyright © 2026 @3899
+          <Typography variant="caption" color="text.disabled" sx={{ display: 'block' }}>
+            Copyright © 2026
           </Typography>
         </Box>
       </Box>

@@ -1,8 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo, type ChangeEvent, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import {
   Box,
-  Card,
-  CardContent,
   Typography,
   Button,
   TextField,
@@ -181,7 +179,12 @@ function renderHighlightedText(text: string, query: string): ReactNode {
   return nodes
 }
 
-export default function SMSPage() {
+type SmsPageProps = {
+  /** When embedded in a SIM line workbench, restrict all reads and sends to that line. */
+  embeddedLineId?: string
+}
+
+export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
   const isMobile = useMediaQuery<Theme>((theme: Theme) => theme.breakpoints.down('md'))
 
   const [messages, setMessages] = useState<SmsMessage[]>([])
@@ -198,8 +201,8 @@ export default function SMSPage() {
   const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
   const [volteLines, setVolteLines] = useState<VolteLineControlResponse[]>([])
   const [smsChannels, setSmsChannels] = useState<SmsChannelResponse[]>([])
-  const [selectedChannelId, setSelectedChannelId] = useState('')
-  const [selectedLineId, setSelectedLineId] = useState('')
+  const [selectedChannelId, setSelectedChannelId] = useState(embeddedLineId ?? '')
+  const [selectedLineId, setSelectedLineId] = useState(embeddedLineId ?? '')
 
   // 对话状态
   const [conversations, setConversations] = useState<ConversationGroup[]>([])
@@ -315,6 +318,7 @@ export default function SMSPage() {
       const nextLines = response.data ?? []
       setVolteLines(nextLines)
       setSelectedLineId((current) => {
+        if (embeddedLineId) return embeddedLineId
         const available = nextLines.filter((line) => line.modem.present)
         return available.some((line) => line.modem.line_id === current)
           ? current
@@ -323,13 +327,27 @@ export default function SMSPage() {
       const channelResponse = await api.getSmsChannels()
       const nextChannels = channelResponse.data ?? []
       setSmsChannels(nextChannels)
-      setSelectedChannelId((current) => (
+      setSelectedChannelId((current) => {
+        if (embeddedLineId) return embeddedLineId
+        return (
         current && !nextChannels.some((channel) => channel.id === current) ? '' : current
-      ))
+        )
+      })
     } catch (err) {
       console.warn('Failed to load modem lines:', err)
     }
-  }, [])
+  }, [embeddedLineId])
+
+  useEffect(() => {
+    if (!embeddedLineId) return
+    setSelectedLineId(embeddedLineId)
+    setSelectedChannelId(embeddedLineId)
+    setSelectedConversation(null)
+    setSelectedConversationChannelId('')
+    setConversationMessages([])
+    setSelectedConversationPhones(new Set())
+    setSelectedMessageIds(new Set())
+  }, [embeddedLineId])
 
   useEffect(() => {
     void fetchMessages(false)
@@ -1229,14 +1247,14 @@ export default function SMSPage() {
           bgcolor: 'background.paper',
         }}
       >
-        <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '230px minmax(0, 1fr)' }} gap={1} alignItems="start">
-          <ModemLineSelector
-            lines={volteLines}
-            value={selectedLineId}
-            onChange={setSelectedLineId}
-            disabled={sendLoading || channelCannotSend}
-            includeAutomatic={false}
-          />
+        <Box display="grid" gridTemplateColumns={embeddedLineId ? 'minmax(0, 1fr)' : { xs: '1fr', md: '230px minmax(0, 1fr)' }} gap={1} alignItems="start">
+          {!embeddedLineId && <ModemLineSelector
+              lines={volteLines}
+              value={selectedLineId}
+              onChange={setSelectedLineId}
+              disabled={sendLoading || channelCannotSend}
+              includeAutomatic={false}
+            />}
           <TextField
             fullWidth
             multiline
@@ -1292,8 +1310,8 @@ export default function SMSPage() {
   )
 
   return (
-    <Box sx={{ height: 'calc(100vh - 140px)', minHeight: 500 }}>
-      <Box display="flex" alignItems="center" gap={1} mb={2}>
+    <Box sx={{ height: embeddedLineId ? { xs: 620, md: 720 } : 'calc(100vh - 140px)', minHeight: embeddedLineId ? 560 : 500 }}>
+      {!embeddedLineId && <Box display="flex" alignItems="center" gap={1} mb={2}>
         <Typography variant="h5" fontWeight={700}>
           短信管理
         </Typography>
@@ -1304,9 +1322,9 @@ export default function SMSPage() {
             </IconButton>
           </span>
         </Tooltip>
-      </Box>
+      </Box>}
 
-      <Box sx={{ mb: 2, borderBottom: 1, borderColor: 'divider' }}>
+      {!embeddedLineId && <Box sx={{ mb: 2, borderBottom: 1, borderColor: 'divider' }}>
         <Tabs
           value={selectedChannelId}
           onChange={(_, value: string) => selectChannel(value)}
@@ -1323,7 +1341,15 @@ export default function SMSPage() {
             />
           ))}
         </Tabs>
-      </Box>
+      </Box>}
+
+      {embeddedLineId && <Box display="flex" justifyContent="flex-end" mb={1}>
+        <Tooltip title="短信路径策略">
+          <IconButton size="small" onClick={() => setPathPolicyOpen(true)}>
+            <Settings />
+          </IconButton>
+        </Tooltip>
+      </Box>}
 
       <Snackbar open={!!error} autoHideDuration={4000} resumeHideDuration={3000} onClose={() => setError(null)} anchorOrigin={{ vertical: 'top', horizontal: 'center' }}>
         <Alert severity="error" onClose={() => setError(null)} variant="filled">{error}</Alert>
@@ -1332,8 +1358,8 @@ export default function SMSPage() {
         <Alert severity="success" onClose={() => setSuccess(null)} variant="filled">{success}</Alert>
       </Snackbar>
 
-      <Card sx={{ height: 'calc(100% - 96px)' }}>
-        <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
+      <Box sx={{ height: embeddedLineId ? 'calc(100% - 40px)' : 'calc(100% - 96px)', overflow: 'hidden', border: embeddedLineId ? 0 : 1, borderColor: 'divider', borderRadius: embeddedLineId ? 0 : 1 }}>
+        <Box sx={{ height: '100%' }}>
           {isMobile ? (
             selectedConversation ? chatAreaContent : conversationListContent
           ) : (
@@ -1353,8 +1379,8 @@ export default function SMSPage() {
               </Box>
             </Box>
           )}
-        </CardContent>
-      </Card>
+        </Box>
+      </Box>
 
       <Dialog open={!!deleteTarget} onClose={() => !deleteLoading && setDeleteTarget(null)}>
         <DialogTitle>{deleteDialogTitle}</DialogTitle>

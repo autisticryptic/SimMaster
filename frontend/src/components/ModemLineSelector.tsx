@@ -32,7 +32,10 @@ export default function ModemLineSelector({
         {includeAutomatic && <MenuItem value="">自动选择（兼容主线路）</MenuItem>}
         {lines.map((line, index) => (
           <MenuItem key={line.modem.line_id} value={line.modem.line_id} disabled={!line.modem.present}>
-            {modemLineLabel(line, index)}{line.modem.present ? '' : '（离线）'}
+            {modemLineLabel(line, index)}
+            {line.modem.line_kind === 'reader' ? ' · 读卡器' : ''}
+            {!line.modem.present ? '（离线）' : ''}
+            {line.modem.slot_conflict ? '（槽位冲突）' : ''}
           </MenuItem>
         ))}
       </Select>

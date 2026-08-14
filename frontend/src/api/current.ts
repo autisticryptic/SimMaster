@@ -1,6 +1,5 @@
 import type {
   ApiResponse,
-  ApnListResponse,
   AutomationConfig,
   AutomationLogsResponse,
   AuthSettingsResponse,
@@ -13,6 +12,9 @@ import type {
   CallSettingsResponse,
   CarrierProfileImportRequest,
   CarrierProfileImportResult,
+  CarrierCatalogInstallRequest,
+  CarrierCatalogInstallResponse,
+  CarrierCatalogStatusResponse,
   CarrierProfileRecord,
   CellLocationResponse,
   ResolvedCarrierProfile,
@@ -34,6 +36,7 @@ import type {
   EsimCommandResponse,
   EsimDownloadRequest,
   EsimConfig,
+  EsimReaderConfig,
   EsimEuiccInfo,
   EsimLpacRepairRequest,
   EsimLpacRepairResponse,
@@ -47,10 +50,11 @@ import type {
   TrunkProfileConfig,
   VowifiLineConfigResponse,
   LineVowifiConfig,
+  ImsOverrideResponse,
+  SimImsOverride,
   StandaloneSimSlotConfig,
   TrunkProfileResponse,
   VolteLineControlResponse,
-  VolteIpFamily,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -61,11 +65,11 @@ import type {
   OtaLatestReleaseResponse,
   OtaOnlinePrepareRequest,
   OtaUploadResponse,
+  GithubDownloadProxyConfig,
   RadioMode,
   RadioModeResponse,
   RoamingRequest,
   SecurityConfig,
-  SetApnRequest,
   SignalStrengthResponse,
   SimInfo,
   UpdateSimCacheRequest,
@@ -271,6 +275,23 @@ class SimAdminCurrentAPI {
     )
   }
 
+  async getLineEsimReaderConfig(lineId: string) {
+    return request<ApiResponse<EsimReaderConfig>>(
+      modemLinePath(lineId, '/esim-reader'),
+    )
+  }
+
+  async setLineEsimReaderConfig(lineId: string, config: EsimReaderConfig) {
+    return request<ApiResponse<EsimReaderConfig>>(
+      modemLinePath(lineId, '/esim-reader'),
+      {
+        method: 'POST',
+        body: JSON.stringify(config),
+        timeoutMs: 10000,
+      },
+    )
+  }
+
   async getEsimConfig() {
     return request<ApiResponse<EsimConfig>>('/esim/config')
   }
@@ -401,6 +422,14 @@ class SimAdminCurrentAPI {
     })
   }
 
+  async restartModemManager() {
+    return request<ApiResponse<Record<string, never>>>('/service/modem-manager/restart', {
+      method: 'POST',
+      body: JSON.stringify({}),
+      timeoutMs: 30000,
+    })
+  }
+
   async rebootSystem(delaySeconds = 1) {
     return request<ApiResponse<{ delay_seconds: number }>>('/system/reboot', {
       method: 'POST',
@@ -500,17 +529,6 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<Record<string, never>>>(modemLinePath(lineId, '/network/register-auto'), {
       method: 'POST',
       body: JSON.stringify({}),
-    })
-  }
-
-  async getApnList(lineId: string) {
-    return request<ApiResponse<ApnListResponse>>(modemLinePath(lineId, '/apn'))
-  }
-
-  async setApn(lineId: string, config: SetApnRequest) {
-    return request<ApiResponse<Record<string, unknown>>>(modemLinePath(lineId, '/apn'), {
-      method: 'POST',
-      body: JSON.stringify(config),
     })
   }
 
@@ -676,13 +694,6 @@ class SimAdminCurrentAPI {
     )
   }
 
-  async setVolteLineIpFamilies(lineId: string, families: VolteIpFamily[]) {
-    return request<ApiResponse<VolteLineControlResponse>>(
-      `/volte/lines/${encodeURIComponent(lineId)}/ip-families`,
-      { method: 'POST', body: JSON.stringify({ families }) },
-    )
-  }
-
   async getVowifiLines() {
     return request<ApiResponse<VowifiLineConfigResponse[]>>('/vowifi/lines')
   }
@@ -706,6 +717,19 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(config),
     })
+  }
+
+  async getImsOverride(lineId: string) {
+    return request<ApiResponse<ImsOverrideResponse>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/override`,
+    )
+  }
+
+  async setImsOverride(lineId: string, override: SimImsOverride) {
+    return request<ApiResponse<ImsOverrideResponse>>(
+      `/ims/lines/${encodeURIComponent(lineId)}/override`,
+      { method: 'PATCH', body: JSON.stringify(override) },
+    )
   }
 
   async getStandaloneSimSlots() {
@@ -999,6 +1023,17 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<OtaStatusResponse>>('/ota/status')
   }
 
+  async getGithubDownloadProxy() {
+    return request<ApiResponse<GithubDownloadProxyConfig>>('/settings/github-download-proxy')
+  }
+
+  async setGithubDownloadProxy(config: GithubDownloadProxyConfig) {
+    return request<ApiResponse<GithubDownloadProxyConfig>>('/settings/github-download-proxy', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
   async uploadOta(file: File) {
     const response = await fetch(`${API_BASE}/ota/upload`, {
       method: 'POST',
@@ -1049,8 +1084,22 @@ class SimAdminCurrentAPI {
     })
   }
 
+  async getCarrierCatalogStatus() {
+    return request<ApiResponse<CarrierCatalogStatusResponse>>('/vowifi/carrier-catalog/status', {
+      timeoutMs: 15000,
+    })
+  }
+
+  async installCarrierCatalog(config: CarrierCatalogInstallRequest) {
+    return request<ApiResponse<CarrierCatalogInstallResponse>>('/vowifi/carrier-catalog/install', {
+      method: 'POST',
+      body: JSON.stringify(config),
+      timeoutMs: 240000,
+    })
+  }
+
   async saveVowifiCarrierProfile(record: CarrierProfileRecord) {
-    return request<ApiResponse<{ profile_id: string; plmn: string; e911_expected: boolean }>>(
+    return request<ApiResponse<StoredCarrierProfile>>(
       '/vowifi/carrier-profiles',
       { method: 'PUT', body: JSON.stringify(record) },
     )

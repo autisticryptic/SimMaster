@@ -311,7 +311,9 @@ async fn execute_task(
             })
         }
         AutomationAction::ConsumeData { bytes, unit } => {
-            delay_secs = 120;
+            delay_secs = crate::services::automation::tasks::consume_data::execution_timeout_secs(
+                *bytes, unit,
+            );
             serde_json::json!({
                 "bytes": bytes,
                 "unit": unit,

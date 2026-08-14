@@ -544,14 +544,28 @@ export default function VowifiDiagnosticsPage() {
   }, [connectionEnabled, secondsElapsed, isConnected, smsReady, state.status?.phase])
 
   const getStatusIndicator = () => {
-    if (!isConnected || !connectionEnabled) {
+    const phase = state.status?.phase
+    if (!connectionEnabled) {
       return {
         label: 'WiFi Calling：未启用',
         color: 'text.disabled',
         pulse: false,
       }
     }
-    const phase = state.status?.phase
+    if (phase === 'scaffold_only') {
+      return {
+        label: 'WiFi Calling：未接线',
+        color: 'text.disabled',
+        pulse: false,
+      }
+    }
+    if (phase === 'not_started' || !isConnected) {
+      return {
+        label: 'WiFi Calling：未启动',
+        color: 'text.disabled',
+        pulse: false,
+      }
+    }
     if (phase === 'sms_ready') {
       return {
         label: 'WiFi Calling：已就绪',

@@ -33,7 +33,6 @@ import {
   Remove,
   Save,
   Shield,
-  SimCard,
   Timer,
 } from '@mui/icons-material'
 import { api } from '../api/current'
@@ -48,6 +47,7 @@ import {
   validatePasswordAgainstSecurity,
 } from '../lib/passwordPolicy'
 import type { SecurityConfig } from '../api/types'
+import DeviceNetworkPage from './DeviceNetwork'
 
 interface HealthStatus {
   status: string
@@ -785,7 +785,7 @@ export default function ConfigurationPage() {
             {isSecurity ? '安全性设置' : '基本配置'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
-            {isSecurity ? '管理账户安全及密码强度策略' : '管理工作模式和系统参数'}
+            {isSecurity ? '管理账户安全及密码强度策略' : '管理设备网络接口、WLAN、DDNS 和后续系统功能'}
           </Typography>
         </Box>
         {renderHealthBadge()}
@@ -810,25 +810,7 @@ export default function ConfigurationPage() {
         <Box sx={{ pt: 2 }}>
           {renderSecurityPanel()}
         </Box>
-      ) : (
-        <Box display="flex" flexDirection="column" gap={3} sx={{ pt: 2 }}>
-          <Card>
-            <CardHeader
-              avatar={<SimCard color="primary" />}
-              title="SIM / eSIM 管理"
-              titleTypographyProps={{ variant: 'h6', fontWeight: 600 }}
-            />
-            <CardContent>
-              <Typography variant="body2" color="text.secondary" paragraph>
-                eSIM 管理已下沉到每条线路。请在「SIM 卡 · 基带线路」中，为对应的基带卡槽或读卡器单独开启并管理 eSIM。
-              </Typography>
-              <Typography variant="body2" color="text.secondary">
-                读取到 eUICC 芯片信息的线路会自动提供 eSIM 管理入口；未探测到的线路可手动开启 eSIM 控制，通过外置 lpac 管理。
-              </Typography>
-            </CardContent>
-          </Card>
-        </Box>
-      )}
+      ) : <Box sx={{ pt: 2 }}><DeviceNetworkPage embedded /></Box>}
     </Box>
   )
 }

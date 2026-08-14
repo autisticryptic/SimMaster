@@ -48,6 +48,9 @@ export type ConnectionAddresses = ConnectionAddressesResponse
 
 export interface DashboardLineInfo {
   modem: LineRuntimeStatus['modem']
+  volte: LineRuntimeStatus['volte']
+  trunk: LineRuntimeStatus['trunk']
+  supplementary: LineRuntimeStatus['supplementary']
   deviceInfo: DeviceInfo | null
   simInfo: SimInfo | null
   networkInfo: NetworkInfo | null
@@ -146,10 +149,10 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         addressesRes,
       ] = await fastPromise
 
-      const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem }) => {
+      const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem, volte, trunk, supplementary }) => {
         const hasCellularModem = modem.present && modem.line_kind !== 'reader' && Boolean(modem.modem_path)
         if (!hasCellularModem) {
-          return { modem, deviceInfo: null, simInfo: null, networkInfo: null }
+          return { modem, volte, trunk, supplementary, deviceInfo: null, simInfo: null, networkInfo: null }
         }
         const [deviceRes, simRes, networkRes] = await Promise.all([
           requestOrNull(api.getDeviceInfo(modem.line_id), `device:${modem.line_id}`),
@@ -158,6 +161,9 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
         ])
         return {
           modem,
+          volte,
+          trunk,
+          supplementary,
           deviceInfo: deviceRes?.data ?? null,
           simInfo: simRes?.data ?? null,
           networkInfo: networkRes?.data ?? null,

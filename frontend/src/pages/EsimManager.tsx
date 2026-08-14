@@ -18,7 +18,6 @@ import {
   List,
   ListItemButton,
   ListItemText,
-  MenuItem,
   Snackbar,
   Stack,
   TextField,
@@ -48,6 +47,7 @@ import jsQR from 'jsqr'
 import { alpha, type Theme } from '@mui/material/styles'
 import { api } from '../api/current'
 import ErrorSnackbar from '../components/ErrorSnackbar'
+import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
 import { formatCarrierName } from '../utils/carriers'
 import type { BasebandRestartStep, EsimCommandResponse, EsimEuiccInfo, EsimLpacStatusResponse, EsimProfile } from '../api/types'
 
@@ -81,13 +81,6 @@ function updateEsimPageSnapshot(scope: string, partial: Partial<EsimPageSnapshot
     ...partial,
   })
 }
-
-const LPAC_PROXY_PREFIX_OPTIONS = [
-  { label: 'gh-proxy.com', value: 'https://gh-proxy.com/' },
-  { label: 'ghproxy.net', value: 'https://ghproxy.net/' },
-  { label: 'githubproxy.cc', value: 'https://githubproxy.cc/' },
-  { label: '直连', value: '' },
-]
 
 const MCC_COUNTRY: Record<string, string> = {
   // === 2xx: 欧洲区域 ===
@@ -586,7 +579,6 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
   const [actionLoading, setActionLoading] = useState(false)
   const [lpacStatus, setLpacStatus] = useState<EsimLpacStatusResponse | null>(initialSnapshot?.lpacStatus ?? null)
   const [lpacRepairing, setLpacRepairing] = useState(false)
-  const [lpacProxyPrefix, setLpacProxyPrefix] = useState(LPAC_PROXY_PREFIX_OPTIONS[0].value)
 
   const [totalMemoryDialogOpen, setTotalMemoryDialogOpen] = useState(false)
   const [totalMemoryInput, setTotalMemoryInput] = useState('')
@@ -933,7 +925,6 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
     setSuccess(null)
     try {
       const response = await api.repairEsimLpac({
-        proxy_prefix: lpacProxyPrefix.trim() || undefined,
       })
       setSuccess(response.data?.message || 'lpac 安装/修复完成')
       await loadData(true)
@@ -1169,20 +1160,6 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
               {lpacStatus.asset_name || '无匹配资源'}。{lpacStatus.message}
             </Alert>
             <Box display="flex" gap={1.5} alignItems="center" flexWrap="wrap">
-              <TextField
-                select
-                label="GitHub 代理前缀（可选）"
-                size="small"
-                value={lpacProxyPrefix}
-                onChange={(event) => setLpacProxyPrefix(event.target.value)}
-                sx={{ minWidth: { xs: '100%', sm: 240 } }}
-              >
-                {LPAC_PROXY_PREFIX_OPTIONS.map((option) => (
-                  <MenuItem key={option.label} value={option.value}>
-                    {option.label}
-                  </MenuItem>
-                ))}
-              </TextField>
               <Button
                 variant="contained"
                 startIcon={lpacRepairing ? <CircularProgress size={16} /> : <Build />}
@@ -1195,6 +1172,7 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
                 安装位置：{lpacStatus.path}
               </Typography>
             </Box>
+            <Box mt={1.5}><GithubDownloadProxyControl compact /></Box>
           </Card>
         )}
 

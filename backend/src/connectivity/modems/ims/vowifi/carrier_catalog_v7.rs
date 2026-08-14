@@ -13,7 +13,7 @@ use serde_json::Value;
 use super::{
     db_error, default_access_network_info, expand_ims_static_template, expand_static_template,
     normalize_home_plmn, normalize_ip_family, CatalogAccessKind, CatalogIdentityMatch,
-    CatalogProfile, CatalogRelease, ProfileMetaRow,
+    CatalogProfile, CatalogProfileIcon, CatalogRelease, CatalogServiceCapabilities, ProfileMetaRow,
 };
 use crate::connectivity::modems::ims::vowifi::profile_record::{
     CarrierProfileMetaRecord, CarrierProfileRecord, E911PolicyRecord, EpdgPolicyRecord,
@@ -199,6 +199,75 @@ pub(super) fn list(
         }
     }
     Ok(profiles)
+}
+
+pub(super) fn service_capabilities(
+    conn: &Connection,
+) -> Result<std::collections::HashMap<String, CatalogServiceCapabilities>, String> {
+    let mut statement = conn
+        .prepare(
+            "SELECT profile_id,
+                    lte_ims_status = 'ready',
+                    vowifi_status = 'ready',
+                    COALESCE(json_extract(config_json, '$.services.vilte'), 0),
+                    COALESCE(json_extract(config_json, '$.services.smsoip'), 0),
+                    COALESCE(json_extract(config_json, '$.services.ut_xcap'), 0)
+             FROM carrier_profiles",
+        )
+        .map_err(db_error)?;
+    let capabilities = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                CatalogServiceCapabilities {
+                    volte_ready: row.get::<_, i64>(1)? != 0,
+                    vowifi_ready: row.get::<_, i64>(2)? != 0,
+                    vilte_enabled: row.get::<_, i64>(3)? != 0,
+                    smsoip_enabled: row.get::<_, i64>(4)? != 0,
+                    ut_xcap_enabled: row.get::<_, i64>(5)? != 0,
+                },
+            ))
+        })
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()
+        .map_err(db_error)?;
+    Ok(capabilities)
+}
+
+pub(super) fn profile_icon(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<Option<CatalogProfileIcon>, String> {
+    let row = conn
+        .query_row(
+            "SELECT COALESCE(profile_asset.asset_data, carrier_asset.asset_data),
+                    COALESCE(profile_asset.media_type, carrier_asset.media_type)
+             FROM carrier_profiles AS profile
+             JOIN carriers AS carrier ON carrier.carrier_id = profile.carrier_id
+             LEFT JOIN visual_assets AS profile_asset
+                    ON profile_asset.asset_id = profile.profile_asset_id
+             LEFT JOIN visual_assets AS carrier_asset
+                    ON carrier_asset.asset_id = carrier.primary_asset_id
+             WHERE profile.profile_id = ?1",
+            [profile_id.trim()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<Vec<u8>>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(db_error)?;
+    Ok(row.and_then(|(data, media_type)| {
+        data.filter(|value| !value.is_empty())
+            .map(|data| CatalogProfileIcon {
+                data,
+                media_type: media_type
+                    .filter(|value| value.starts_with("image/"))
+                    .unwrap_or_else(|| "application/octet-stream".to_string()),
+            })
+    }))
 }
 
 pub(super) fn public_identity_matches(
@@ -1448,7 +1517,15 @@ mod tests {
                 sealed INTEGER NOT NULL,
                 notes TEXT
             );
-            CREATE TABLE visual_assets(asset_id TEXT PRIMARY KEY);
+            CREATE TABLE visual_assets(
+                asset_id TEXT PRIMARY KEY,
+                asset_kind TEXT,
+                asset_data BLOB,
+                remote_url TEXT,
+                media_type TEXT,
+                width INTEGER,
+                height INTEGER
+            );
             CREATE TABLE carriers (
                 carrier_id TEXT PRIMARY KEY,
                 canonical_name TEXT NOT NULL,
@@ -1496,10 +1573,14 @@ mod tests {
                 'v7-test-release', '2026-08-08T00:00:00Z',
                 'fixture', '1', NULL, 1, NULL
             );
+            INSERT INTO visual_assets VALUES (
+                'test-carrier-icon', 'logo', X'89504E470D0A1A0A', NULL,
+                'image/png', 1, 1
+            );
             INSERT INTO carriers VALUES (
                 'test-carrier', 'Test Mobile', 'Test', 'Test Mobile Ltd',
                 'mno', 'GB', NULL, NULL,
-                '["Test", "Test Telecom"]', NULL, NULL
+                '["Test", "Test Telecom"]', 'test-carrier-icon', NULL
             );
             INSERT INTO carrier_profiles VALUES (
                 'test-v7-23433', 'test-carrier', 'Test v7', 'default', 10, 100,
@@ -1704,6 +1785,22 @@ mod tests {
         assert_eq!(lte.record.ims.domain, "ims.mnc033.mcc234.example");
         assert_eq!(lte.record.meta.aliases, ["Test", "Test Telecom"]);
 
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn loads_profile_icon_with_carrier_fallback() {
+        let (catalog, path) = fixture();
+        let icon = catalog
+            .profile_icon("test-v7-23433")
+            .expect("icon query")
+            .expect("carrier fallback icon");
+        assert_eq!(icon.media_type, "image/png");
+        assert_eq!(icon.data, b"\x89PNG\r\n\x1a\n");
+        assert!(catalog
+            .profile_icon("missing-profile")
+            .expect("missing icon query")
+            .is_none());
         std::fs::remove_file(path).expect("remove fixture");
     }
 

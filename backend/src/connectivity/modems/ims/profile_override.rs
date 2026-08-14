@@ -155,6 +155,14 @@ pub struct ImsAccessOverride {
     pub ip_stack: Option<String>,
     /// VoWiFi only: DNS server override.
     pub dns: Option<Vec<String>>,
+    /// VoWiFi only: explicitly present a different subscriber identity to the
+    /// carrier. This changes profile matching and IMS/IKE identities, but it
+    /// never changes the SIM/UIM used for AKA authentication.
+    #[serde(default)]
+    pub spoof_imsi: bool,
+    /// IMSI to present when `spoof_imsi` is enabled (5-16 decimal digits).
+    #[serde(default)]
+    pub custom_imsi: Option<String>,
 }
 
 impl ImsAccessOverride {
@@ -169,6 +177,8 @@ impl ImsAccessOverride {
             && self.epdg_port.is_none()
             && self.ip_stack.is_none()
             && self.dns.is_none()
+            && !self.spoof_imsi
+            && self.custom_imsi.is_none()
     }
 }
 

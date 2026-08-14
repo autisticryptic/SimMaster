@@ -444,6 +444,14 @@ pub struct NewVowifiSoakRun<'a> {
     pub last_error: Option<&'a str>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CustomCarrierProfileEntry {
+    pub profile_id: String,
+    pub plmn: String,
+    pub record_json: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VowifiSoakRunsResponse {
     pub runs: Vec<VowifiSoakRunEntry>,
@@ -543,6 +551,40 @@ mod tests {
 
     fn test_database() -> Database {
         Database::new(PathBuf::from(":memory:")).expect("create test database")
+    }
+
+    #[test]
+    fn custom_carrier_profiles_round_trip_and_replace_by_profile_id() {
+        let db = test_database();
+        db.upsert_custom_carrier_profile("custom-00101", "00101", r#"{"version":1}"#)
+            .expect("insert custom profile");
+        db.upsert_custom_carrier_profile("custom-00101", "00101", r#"{"version":2}"#)
+            .expect("update custom profile");
+
+        let rows = db
+            .list_custom_carrier_profiles()
+            .expect("list custom profiles");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].profile_id, "custom-00101");
+        assert_eq!(rows[0].plmn, "00101");
+        assert_eq!(rows[0].record_json, r#"{"version":2}"#);
+        assert!(db
+            .delete_custom_carrier_profile("custom-00101")
+            .expect("delete custom profile"));
+        assert!(db
+            .list_custom_carrier_profiles()
+            .expect("list after delete")
+            .is_empty());
+    }
+
+    #[test]
+    fn custom_carrier_profiles_reject_duplicate_plmn_owners() {
+        let db = test_database();
+        db.upsert_custom_carrier_profile("custom-a", "00101", "{}")
+            .expect("insert first profile");
+        assert!(db
+            .upsert_custom_carrier_profile("custom-b", "00101", "{}")
+            .is_err());
     }
 
     #[test]
@@ -706,6 +748,64 @@ mod tests {
         assert_eq!(line_b.items[0].line_id.as_deref(), Some("line-b"));
         assert_eq!(db.get_notification_queue("device", 10).unwrap().total, 1);
         assert_eq!(db.get_notification_queue("", 10).unwrap().total, 3);
+    }
+
+    #[test]
+    fn line_traffic_aliases_merge_once_into_physical_line() {
+        let db = test_database();
+        db.set_line_data_traffic(
+            "line-physical",
+            &LineDataTrafficEntry {
+                uplink_bytes: 10,
+                downlink_bytes: 20,
+                total_connections: 1,
+            },
+        )
+        .unwrap();
+        for (line_id, uplink, downlink, connections) in [
+            ("line-legacy-a", 100, 200, 2),
+            ("line-legacy-b", 1_000, 2_000, 3),
+        ] {
+            db.set_line_data_traffic(
+                line_id,
+                &LineDataTrafficEntry {
+                    uplink_bytes: uplink,
+                    downlink_bytes: downlink,
+                    total_connections: connections,
+                },
+            )
+            .unwrap();
+        }
+
+        let aliases = vec![
+            "line-legacy-a".to_string(),
+            "line-legacy-b".to_string(),
+            "line-legacy-a".to_string(),
+        ];
+        assert!(db
+            .migrate_line_data_traffic_aliases("line-physical", &aliases)
+            .unwrap());
+        assert_eq!(
+            db.get_line_data_traffic("line-physical").unwrap(),
+            LineDataTrafficEntry {
+                uplink_bytes: 1_110,
+                downlink_bytes: 2_220,
+                total_connections: 6,
+            }
+        );
+        assert_eq!(
+            db.get_line_data_traffic("line-legacy-a").unwrap(),
+            LineDataTrafficEntry::default()
+        );
+        assert!(!db
+            .migrate_line_data_traffic_aliases("line-physical", &aliases)
+            .unwrap());
+        assert_eq!(
+            db.get_line_data_traffic("line-physical")
+                .unwrap()
+                .uplink_bytes,
+            1_110
+        );
     }
 
     #[test]
@@ -2899,9 +2999,92 @@ impl Database {
             [],
         )?;
 
+        // User-authored carrier profiles live in the application database,
+        // separate from the replaceable, read-only carrier_Bundles catalog.
+        // One custom override per PLMN keeps automatic matching deterministic.
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS custom_carrier_profiles (
+                profile_id TEXT PRIMARY KEY,
+                plmn TEXT NOT NULL UNIQUE,
+                record_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_custom_carrier_profiles_updated
+             ON custom_carrier_profiles(updated_at DESC, profile_id)",
+            [],
+        )?;
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
+    }
+
+    pub fn list_custom_carrier_profiles(&self) -> Result<Vec<CustomCarrierProfileEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let mut statement = conn.prepare(
+            "SELECT profile_id, plmn, record_json, updated_at
+             FROM custom_carrier_profiles
+             ORDER BY updated_at DESC, profile_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(CustomCarrierProfileEntry {
+                    profile_id: row.get(0)?,
+                    plmn: row.get(1)?,
+                    record_json: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            })?
+            .collect();
+        rows
+    }
+
+    pub fn upsert_custom_carrier_profile(
+        &self,
+        profile_id: &str,
+        plmn: &str,
+        record_json: &str,
+    ) -> Result<CustomCarrierProfileEntry> {
+        let profile_id = profile_id.trim();
+        let plmn = plmn.trim();
+        if profile_id.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "profile_id must not be empty".to_string(),
+            ));
+        }
+        if !matches!(plmn.len(), 5 | 6) || !plmn.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "plmn must be five or six digits".to_string(),
+            ));
+        }
+        let updated_at = Utc::now().to_rfc3339();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO custom_carrier_profiles (profile_id, plmn, record_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(profile_id) DO UPDATE SET
+                plmn = excluded.plmn,
+                record_json = excluded.record_json,
+                updated_at = excluded.updated_at",
+            params![profile_id, plmn, record_json, updated_at],
+        )?;
+        Ok(CustomCarrierProfileEntry {
+            profile_id: profile_id.to_string(),
+            plmn: plmn.to_string(),
+            record_json: record_json.to_string(),
+            updated_at,
+        })
+    }
+
+    pub fn delete_custom_carrier_profile(&self, profile_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM custom_carrier_profiles WHERE profile_id = ?1",
+            params![profile_id.trim()],
+        )? > 0)
     }
 
     // ==================== 认证相关方法 ====================
@@ -3140,6 +3323,98 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+
+    /// Merge traffic stored under older SIM-derived IDs into the physical line
+    /// ID. Source rows are removed in the same transaction, making repeated
+    /// discovery refreshes idempotent.
+    pub fn migrate_line_data_traffic_aliases(
+        &self,
+        line_id: &str,
+        legacy_line_ids: &[String],
+    ) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
+        let mut aliases = Vec::new();
+        for alias in legacy_line_ids {
+            let alias = alias.trim();
+            if !alias.is_empty() && alias != line_id && !aliases.contains(&alias) {
+                aliases.push(alias);
+            }
+        }
+        if aliases.is_empty() {
+            return Ok(false);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let transaction = conn.transaction()?;
+        let current = transaction
+            .query_row(
+                "SELECT uplink_bytes, downlink_bytes, total_connections
+                 FROM line_data_traffic WHERE line_id = ?1",
+                params![line_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut merged = current;
+        let mut found_alias = false;
+        for alias in &aliases {
+            if let Some(traffic) = transaction
+                .query_row(
+                    "SELECT uplink_bytes, downlink_bytes, total_connections
+                     FROM line_data_traffic WHERE line_id = ?1",
+                    params![alias],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .optional()?
+            {
+                found_alias = true;
+                merged.0 = merged.0.max(0).saturating_add(traffic.0.max(0));
+                merged.1 = merged.1.max(0).saturating_add(traffic.1.max(0));
+                merged.2 = merged.2.max(0).saturating_add(traffic.2.max(0));
+            }
+        }
+        if !found_alias {
+            return Ok(false);
+        }
+
+        transaction.execute(
+            "INSERT INTO line_data_traffic (
+                line_id, uplink_bytes, downlink_bytes, total_connections, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(line_id) DO UPDATE SET
+                uplink_bytes = excluded.uplink_bytes,
+                downlink_bytes = excluded.downlink_bytes,
+                total_connections = excluded.total_connections,
+                updated_at = excluded.updated_at",
+            params![
+                line_id,
+                merged.0,
+                merged.1,
+                merged.2,
+                Utc::now().to_rfc3339()
+            ],
+        )?;
+        for alias in aliases {
+            transaction.execute(
+                "DELETE FROM line_data_traffic WHERE line_id = ?1",
+                params![alias],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn clear_line_data_traffic(&self, line_id: &str) -> Result<()> {

@@ -19,6 +19,7 @@ use crate::api::models::{
     EsimLpacRepairResponse, EsimLpacStatusResponse, EsimProfile, EsimProfilesResponse,
 };
 use crate::platform::config::ConfigManager;
+use crate::platform::config::EsimReaderConfig;
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
@@ -202,10 +203,12 @@ impl EsimSupervisor {
             return Err(EsimApiError::Disabled);
         }
 
-        let target = esim_target_for_line(line_id)?;
+        let device_config = self.config_manager.get_esim_config();
+        let reader_config = self.config_manager.get_line_esim_reader_config(line_id);
+        let target = esim_target_for_line(line_id, &reader_config)?;
         let _guard = self.lpac_lock.lock().await;
         run_lpac_command(
-            &self.config_manager.get_esim_config().lpac_path,
+            &device_config.lpac_path,
             action,
             args,
             timeout_seconds,
@@ -534,6 +537,15 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
         &EsimTarget {
             qmi_device: String::new(),
             uim_slot: 0,
+            apdu_backend: "qmi".to_string(),
+            http_backend: "curl".to_string(),
+            at_device: String::new(),
+            pcsc_reader_name: String::new(),
+            pcsc_reader_index: None,
+            mbim_device: String::new(),
+            mbim_uim_slot: 0,
+            mbim_use_proxy: false,
+            mbim_skip_slot_mapping: false,
         },
     );
 
@@ -880,24 +892,66 @@ fn current_millis() -> u128 {
 pub struct EsimTarget {
     pub qmi_device: String,
     pub uim_slot: u8,
+    pub apdu_backend: String,
+    pub http_backend: String,
+    pub at_device: String,
+    pub pcsc_reader_name: String,
+    pub pcsc_reader_index: Option<u16>,
+    pub mbim_device: String,
+    pub mbim_uim_slot: u8,
+    pub mbim_use_proxy: bool,
+    pub mbim_skip_slot_mapping: bool,
 }
 
 /// Resolve the reader for a line from the same registry the VoWiFi/VoLTE layers
 /// use, so eSIM, SIM auth and IMS all agree on which card a line owns.
-fn esim_target_for_line(line_id: &str) -> Result<EsimTarget, EsimApiError> {
+fn esim_target_for_line(
+    line_id: &str,
+    config: &EsimReaderConfig,
+) -> Result<EsimTarget, EsimApiError> {
     let line_id = line_id.trim();
     if line_id.is_empty() {
         return Err(EsimApiError::Unavailable("line_id_required".to_string()));
     }
     let device = crate::connectivity::modems::ims::vowifi::live::sim_device_for_line(line_id);
-    if device.qmi_device.trim().is_empty() || device.uim_slot == 0 {
+    let qmi_device = if config.qmi_device.trim().is_empty() {
+        device.qmi_device
+    } else {
+        config.qmi_device.trim().to_string()
+    };
+    let uim_slot = if config.qmi_uim_slot == 0 {
+        device.uim_slot
+    } else {
+        config.qmi_uim_slot
+    };
+    let apdu_backend = if config.apdu_backend.trim().is_empty() {
+        "qmi"
+    } else {
+        config.apdu_backend.trim()
+    };
+    if (apdu_backend.eq_ignore_ascii_case("qmi") || apdu_backend.eq_ignore_ascii_case("qmi_qrtr"))
+        && (qmi_device.trim().is_empty() || uim_slot == 0)
+    {
         return Err(EsimApiError::Unavailable(
             "esim_line_reader_not_found".to_string(),
         ));
     }
     Ok(EsimTarget {
-        qmi_device: device.qmi_device,
-        uim_slot: device.uim_slot,
+        qmi_device,
+        uim_slot,
+        apdu_backend: apdu_backend.to_string(),
+        http_backend: if config.http_backend.trim().is_empty() {
+            "curl".to_string()
+        } else {
+            config.http_backend.trim().to_string()
+        },
+        at_device: config.at_device.trim().to_string(),
+        pcsc_reader_name: config.pcsc_reader_name.trim().to_string(),
+        pcsc_reader_index: config.pcsc_reader_index,
+        mbim_device: config.mbim_device.trim().to_string(),
+        mbim_uim_slot: config.mbim_uim_slot,
+        mbim_use_proxy: config.mbim_use_proxy,
+        mbim_skip_slot_mapping: config.mbim_skip_slot_mapping,
     })
 }
 
@@ -1014,11 +1068,69 @@ fn configure_lpac_environment(
     command_path: &Path,
     target: &EsimTarget,
 ) {
-    command.env("LPAC_APDU", "qmi");
-    set_env_default(command, "LPAC_HTTP", "curl");
+    command.env(
+        "LPAC_APDU",
+        if target.apdu_backend.trim().is_empty() {
+            "qmi"
+        } else {
+            target.apdu_backend.trim()
+        },
+    );
+    command.env(
+        "LPAC_HTTP",
+        if target.http_backend.trim().is_empty() {
+            "curl"
+        } else {
+            target.http_backend.trim()
+        },
+    );
     command.env("LPAC_APDU_QMI_DEVICE", &target.qmi_device);
-    command.env("LPAC_APDU_QMI_UIM_SLOT", target.uim_slot.to_string());
-    command.env_remove("LPAC_APDU_AT_DEVICE");
+    if target.uim_slot == 0 {
+        command.env_remove("LPAC_APDU_QMI_UIM_SLOT");
+    } else {
+        command.env("LPAC_APDU_QMI_UIM_SLOT", target.uim_slot.to_string());
+    }
+    if target.at_device.trim().is_empty() {
+        command.env_remove("LPAC_APDU_AT_DEVICE");
+    } else {
+        command.env("LPAC_APDU_AT_DEVICE", target.at_device.trim());
+    }
+    if target.pcsc_reader_name.is_empty() {
+        command.env_remove("LPAC_APDU_PCSC_DRV_NAME");
+    } else {
+        command.env("LPAC_APDU_PCSC_DRV_NAME", target.pcsc_reader_name.trim());
+    }
+    if let Some(index) = target.pcsc_reader_index {
+        command.env("LPAC_APDU_PCSC_DRV_IFID", index.to_string());
+    } else {
+        command.env_remove("LPAC_APDU_PCSC_DRV_IFID");
+    }
+    if target.mbim_device.is_empty() {
+        command.env_remove("LPAC_APDU_MBIM_DEVICE");
+    } else {
+        command.env("LPAC_APDU_MBIM_DEVICE", target.mbim_device.trim());
+    }
+    if target.mbim_uim_slot == 0 {
+        command.env_remove("LPAC_APDU_MBIM_UIM_SLOT");
+    } else {
+        command.env("LPAC_APDU_MBIM_UIM_SLOT", target.mbim_uim_slot.to_string());
+    }
+    command.env(
+        "LPAC_APDU_MBIM_USE_PROXY",
+        if target.mbim_use_proxy {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    command.env(
+        "LPAC_APDU_MBIM_SKIP_SLOT_MAPPING",
+        if target.mbim_skip_slot_mapping {
+            "true"
+        } else {
+            "false"
+        },
+    );
 
     if let Some(parent) = command_path
         .parent()
@@ -1033,12 +1145,6 @@ fn configure_lpac_environment(
             }
             command.env("LD_LIBRARY_PATH", ld_library_path);
         }
-    }
-}
-
-fn set_env_default(command: &mut tokio::process::Command, key: &str, value: &str) {
-    if env::var_os(key).is_none() {
-        command.env(key, value);
     }
 }
 
@@ -1559,12 +1665,15 @@ mod tests {
 
     #[test]
     fn esim_target_requires_an_explicit_registered_line() {
+        let config = EsimReaderConfig::default();
         assert_eq!(
-            esim_target_for_line("").unwrap_err().message(),
+            esim_target_for_line("", &config).unwrap_err().message(),
             "line_id_required"
         );
         assert_eq!(
-            esim_target_for_line("line-unknown").unwrap_err().message(),
+            esim_target_for_line("line-unknown", &config)
+                .unwrap_err()
+                .message(),
             "esim_line_reader_not_found"
         );
 
@@ -1575,7 +1684,8 @@ mod tests {
             2,
             "/org/freedesktop/ModemManager1/Modem/9",
         );
-        let target = esim_target_for_line(line_id).expect("registered eSIM target");
+        let target = esim_target_for_line(line_id, &EsimReaderConfig::default())
+            .expect("registered eSIM target");
         assert_eq!(target.qmi_device, "/dev/wwan-test-qmi");
         assert_eq!(target.uim_slot, 2);
         crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device(line_id);
@@ -1586,6 +1696,15 @@ mod tests {
         let target = EsimTarget {
             qmi_device: "/dev/cdc-wdm-test".to_string(),
             uim_slot: 2,
+            apdu_backend: "qmi".to_string(),
+            http_backend: "curl".to_string(),
+            at_device: String::new(),
+            pcsc_reader_name: String::new(),
+            pcsc_reader_index: None,
+            mbim_device: String::new(),
+            mbim_uim_slot: 0,
+            mbim_use_proxy: false,
+            mbim_skip_slot_mapping: false,
         };
         let mut command = tokio::process::Command::new("lpac");
 
@@ -1606,6 +1725,72 @@ mod tests {
         assert_eq!(
             configured_command_env(&command, "LPAC_APDU_AT_DEVICE"),
             Some(None)
+        );
+    }
+
+    #[test]
+    fn lpac_environment_maps_pcsc_reader_selection() {
+        let target = EsimTarget {
+            qmi_device: String::new(),
+            uim_slot: 0,
+            apdu_backend: "pcsc".to_string(),
+            http_backend: "curl".to_string(),
+            at_device: String::new(),
+            pcsc_reader_name: "ESTKme-RED".to_string(),
+            pcsc_reader_index: Some(3),
+            mbim_device: String::new(),
+            mbim_uim_slot: 0,
+            mbim_use_proxy: false,
+            mbim_skip_slot_mapping: false,
+        };
+        let mut command = tokio::process::Command::new("lpac");
+
+        configure_lpac_environment(&mut command, Path::new("lpac"), &target);
+
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_PCSC_DRV_NAME"),
+            Some(Some("ESTKme-RED".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_PCSC_DRV_IFID"),
+            Some(Some("3".to_string()))
+        );
+    }
+
+    #[test]
+    fn lpac_environment_maps_mbim_reader_selection() {
+        let target = EsimTarget {
+            qmi_device: String::new(),
+            uim_slot: 0,
+            apdu_backend: "mbim".to_string(),
+            http_backend: "curl".to_string(),
+            at_device: String::new(),
+            pcsc_reader_name: String::new(),
+            pcsc_reader_index: None,
+            mbim_device: "/dev/cdc-wdm7".to_string(),
+            mbim_uim_slot: 2,
+            mbim_use_proxy: true,
+            mbim_skip_slot_mapping: true,
+        };
+        let mut command = tokio::process::Command::new("lpac");
+
+        configure_lpac_environment(&mut command, Path::new("lpac"), &target);
+
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_MBIM_DEVICE"),
+            Some(Some("/dev/cdc-wdm7".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_MBIM_UIM_SLOT"),
+            Some(Some("2".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_MBIM_USE_PROXY"),
+            Some(Some("true".to_string()))
+        );
+        assert_eq!(
+            configured_command_env(&command, "LPAC_APDU_MBIM_SKIP_SLOT_MAPPING"),
+            Some(Some("true".to_string()))
         );
     }
 

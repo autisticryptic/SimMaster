@@ -68,4 +68,4 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
 - catalog 更新应作为独立制品评审；不要把个人测试数据库、未封存 SQLite 或原始厂商资产
   直接放入发布制品。
 - 新增字段时先更新 catalog contract 和 fixture，再更新 `CarrierProfileRecord`、v7 adapter、
-  运行时使用点、API/前端以及真机测试清单。
+  运行时使用点、API/前端以及 `docs/DEVELOPMENT_PLAN.md` 中的验收项。

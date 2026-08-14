@@ -6,14 +6,17 @@ name: Build-Release
 # 符合 deploy/install.sh 的安装约定，可直接被现有 OTA 流程消费。
 #
 # 目前支持的架构：
-#   - linux/aarch64 (ARM64) -> simadmin-aarch64.tar.gz
-#                              （并额外生成 simadmin.tar.gz 别名，兼容 install.sh 默认下载名）
-#   - linux/x86_64  (AMD64) -> simadmin-x86_64.tar.gz
+#   - linux/aarch64 (ARM64) -> simadmin-linux-arm64.tar.gz
+#   - linux/x86_64  (AMD64) -> simadmin-linux-amd64.tar.gz
 #
 # Windows 支持已预留（见下方 build.matrix 中被注释的条目与 TODO 说明）。
 # 因当前后端大量依赖 dbus 读取系统状态，Windows 端待后端适配完成后再开启。
 
 on:
+  push:
+    branches:
+      - main
+      - master
   workflow_dispatch:
     inputs:
       version:
@@ -61,11 +64,16 @@ jobs:
         id: version
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
           VERSION=$(echo "$INPUT_VERSION" | tr -d '[:space:]')
 
-          if [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
+          if [ "$EVENT_NAME" = "push" ]; then
+            VERSION="${CURRENT_VERSION}-build.${RUN_NUMBER}"
+            SOURCE="push build"
+          elif [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
             VERSION="$CURRENT_VERSION"
             SOURCE="VERSION file"
           else
@@ -145,11 +153,11 @@ jobs:
       matrix:
         include:
           # ARM64 (设备主力平台)：在原生 ARM runner 上用 musl-gcc 静态编译
-          - arch: aarch64
+          - arch: arm64
             target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           # x86_64：在原生 x86 runner 上用 musl-gcc 静态编译
-          - arch: x86_64
+          - arch: amd64
             target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
           # ===== Windows 预留（TODO） =====
@@ -186,7 +194,7 @@ jobs:
           musl-gcc --version
 
       - name: Install UPX
-        if: inputs.use_upx == true
+        if: github.event_name == 'workflow_dispatch' && inputs.use_upx == true
         run: |
           sudo apt-get install -y upx-ucl
           upx --version
@@ -208,6 +216,7 @@ jobs:
         working-directory: backend
         env:
           TARGET: ${{ matrix.target }}
+          GIT_COMMIT: ${{ github.sha }}
         run: |
           echo "🦀 构建后端 ($TARGET)..."
 
@@ -229,7 +238,7 @@ jobs:
           file "$BINARY_PATH"
 
       - name: Compress binary with UPX
-        if: inputs.use_upx == true
+        if: github.event_name == 'workflow_dispatch' && inputs.use_upx == true
         run: |
           BINARY_PATH="backend/target/${{ matrix.target }}/release/simadmin"
           echo "🗜️  UPX 压缩中..."
@@ -298,7 +307,7 @@ jobs:
           cat "$TMP/meta.json"
 
           mkdir -p release
-          OUT="release/simadmin-${ARCH}.tar.gz"
+          OUT="release/simadmin-linux-${ARCH}.tar.gz"
 
           # 打包内容：当前仅 meta.json + 二进制 + www/
           # 预留：后期扩展（如配置模板 / systemd unit / 附带脚本）时，
@@ -324,7 +333,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pkg-${{ matrix.arch }}
-          path: release/simadmin-${{ matrix.arch }}.tar.gz
+          path: release/simadmin-linux-${{ matrix.arch }}.tar.gz
           retention-days: 3
           if-no-files-found: error
 
@@ -346,13 +355,6 @@ jobs:
         run: |
           mkdir -p release
           cp dist/*.tar.gz release/
-
-          # install.sh 默认下载 simadmin.tar.gz（设备以 ARM 为主），
-          # 生成 aarch64 兼容别名，保证现有安装/OTA 流程无缝可用。
-          if [ -f release/simadmin-aarch64.tar.gz ]; then
-            cp release/simadmin-aarch64.tar.gz release/simadmin.tar.gz
-            echo "ℹ️  已生成 install.sh 兼容别名 simadmin.tar.gz (=aarch64)"
-          fi
 
           echo "📦 发布产物:"
           ls -lh release/
@@ -377,14 +379,15 @@ jobs:
             ### 版本信息
             - **版本**: ${{ needs.prepare.outputs.version }}
             - **Commit**: ${{ github.sha }}
-            - **发布类型**: ${{ inputs.release_type }}
-            - **UPX 压缩**: ${{ inputs.use_upx }}
+            - **触发方式**: ${{ github.event_name }}
+            - **发布类型**: ${{ github.event_name == 'push' && 'latest release' || inputs.release_type }}
+            - **UPX 压缩**: ${{ github.event_name == 'workflow_dispatch' && inputs.use_upx || false }}
 
             ### 产物（Linux）
             | 架构 | 文件 | 说明 |
             |------|------|------|
-            | aarch64 (ARM64) | `simadmin-aarch64.tar.gz` | ARM 设备（另有别名 `simadmin.tar.gz` 供 install.sh 默认下载） |
-            | x86_64 (AMD64)  | `simadmin-x86_64.tar.gz`  | x86 Linux |
+            | aarch64 (ARM64) | `simadmin-linux-arm64.tar.gz` | ARM64 Linux 设备 |
+            | x86_64 (AMD64)  | `simadmin-linux-amd64.tar.gz` | AMD64/x86_64 Linux 设备 |
 
             > Windows 版本待后端 dbus 相关能力适配后再提供（已在构建流程中预留）。
 
@@ -393,16 +396,16 @@ jobs:
 
             ### 安装 / 更新
             ```bash
-            # 通过安装脚本（自动选择 simadmin.tar.gz / aarch64）
-            curl -fsSL https://raw.githubusercontent.com/3899/SimAdmin/main/install_latest.sh | sudo sh
+            # 安装脚本会按 uname -m 自动选择 ARM64 或 AMD64 包
+            curl -fsSL https://raw.githubusercontent.com/autisticryptic/SimMaster/master/install_latest.sh | sudo sh
 
             # 或手动指定架构包进行 OTA
-            curl -X POST http://IP:3000/api/ota/upload -F "file=@simadmin-x86_64.tar.gz"
+            curl -X POST http://IP:3000/api/ota/upload -F "file=@simadmin-linux-amd64.tar.gz"
             curl -X POST http://IP:3000/api/ota/apply
             ```
           draft: false
-          prerelease: ${{ inputs.release_type == '预发布版（pre-release）' }}
-          make_latest: ${{ inputs.release_type == '最新正式版（latest release）' }}
+          prerelease: ${{ github.event_name == 'workflow_dispatch' && inputs.release_type == '预发布版（pre-release）' }}
+          make_latest: ${{ github.event_name == 'push' || inputs.release_type == '最新正式版（latest release）' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -414,11 +417,11 @@ jobs:
           echo "|------|-----|" >> $GITHUB_STEP_SUMMARY
           echo "| 版本 | ${{ needs.prepare.outputs.version }} |" >> $GITHUB_STEP_SUMMARY
           echo "| 版本来源 | ${{ needs.prepare.outputs.version_source }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 发布类型 | ${{ inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| UPX 压缩 | ${{ inputs.use_upx }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| 发布类型 | ${{ github.event_name == 'push' && 'latest release' || inputs.release_type }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| UPX 压缩 | ${{ github.event_name == 'workflow_dispatch' && inputs.use_upx || false }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📦 产物" >> $GITHUB_STEP_SUMMARY
-          echo "- \`simadmin-aarch64.tar.gz\` (+ 兼容别名 \`simadmin.tar.gz\`)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`simadmin-x86_64.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`simadmin-linux-arm64.tar.gz\`" >> $GITHUB_STEP_SUMMARY
+          echo "- \`simadmin-linux-amd64.tar.gz\`" >> $GITHUB_STEP_SUMMARY
           echo "- \`SHA256SUMS.txt\`" >> $GITHUB_STEP_SUMMARY

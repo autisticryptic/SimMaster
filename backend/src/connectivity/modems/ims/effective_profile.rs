@@ -376,6 +376,25 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
             problems.push("custom_imei_must_be_15_digits".to_string());
         }
     }
+    let vowifi = &override_.ims_vowifi;
+    if vowifi.spoof_imsi
+        && vowifi
+            .custom_imsi
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        problems.push("ims_vowifi.custom_imsi_required_when_spoof_enabled".to_string());
+    }
+    if let Some(imsi) = vowifi.custom_imsi.as_deref() {
+        let digits = imsi.trim();
+        if !digits.is_empty()
+            && (digits.len() < 5
+                || digits.len() > 16
+                || !digits.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            problems.push("ims_vowifi.custom_imsi_must_be_5_to_16_digits".to_string());
+        }
+    }
     if let Some(number) = override_.ims_common.voicemail_number.as_deref() {
         let number = number.trim();
         if !number.is_empty()
@@ -665,6 +684,21 @@ mod tests {
             },
             ..Default::default()
         };
+        assert!(validate_override(&override_).is_empty());
+    }
+
+    #[test]
+    fn spoofed_vowifi_imsi_requires_a_valid_decimal_identity() {
+        let mut override_ = SimOverride::default();
+        override_.ims_vowifi.spoof_imsi = true;
+        assert!(validate_override(&override_)
+            .contains(&"ims_vowifi.custom_imsi_required_when_spoof_enabled".to_string()));
+
+        override_.ims_vowifi.custom_imsi = Some("46000invalid".to_string());
+        assert!(validate_override(&override_)
+            .contains(&"ims_vowifi.custom_imsi_must_be_5_to_16_digits".to_string()));
+
+        override_.ims_vowifi.custom_imsi = Some("460001234567890".to_string());
         assert!(validate_override(&override_).is_empty());
     }
 

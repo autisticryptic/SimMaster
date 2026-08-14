@@ -64,6 +64,21 @@ pub struct CatalogIdentityMatch {
     pub match_prefix: String,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CatalogServiceCapabilities {
+    pub volte_ready: bool,
+    pub vowifi_ready: bool,
+    pub vilte_enabled: bool,
+    pub smsoip_enabled: bool,
+    pub ut_xcap_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogProfileIcon {
+    pub data: Vec<u8>,
+    pub media_type: String,
+}
+
 /// The handle stores only a path. Every operation opens and validates the
 /// immutable catalog again so an atomically replaced release is visible without
 /// restarting SimAdmin.
@@ -73,8 +88,17 @@ pub struct CarrierCatalog {
 }
 
 impl CarrierCatalog {
+    /// Create a catalog handle without requiring the file to exist yet.
+    ///
+    /// The web installer uses this during first-run setup. Every actual query
+    /// still opens and validates the file, so an absent or invalid catalog can
+    /// never be consumed by the IMS runtime.
+    pub fn at_path(path: impl Into<PathBuf>) -> Self {
+        Self { path: path.into() }
+    }
+
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, String> {
-        let catalog = Self { path: path.into() };
+        let catalog = Self::at_path(path);
         catalog.validated_connection()?;
         Ok(catalog)
     }
@@ -89,6 +113,16 @@ impl CarrierCatalog {
 
     pub fn list(&self, access: CatalogAccessKind) -> Result<Vec<CatalogProfile>, String> {
         v7::list(&self.validated_connection()?, access)
+    }
+
+    pub fn service_capabilities(
+        &self,
+    ) -> Result<std::collections::HashMap<String, CatalogServiceCapabilities>, String> {
+        v7::service_capabilities(&self.validated_connection()?)
+    }
+
+    pub fn profile_icon(&self, profile_id: &str) -> Result<Option<CatalogProfileIcon>, String> {
+        v7::profile_icon(&self.validated_connection()?, profile_id)
     }
 
     /// Return profiles whose rules can be evaluated from PLMN/IMSI alone.

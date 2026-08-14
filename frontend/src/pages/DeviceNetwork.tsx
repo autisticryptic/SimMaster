@@ -387,7 +387,7 @@ function isPublicIpv6Address(address: string) {
   return normalized.includes(':')
 }
 
-export default function DeviceNetworkPage() {
+export default function DeviceNetworkPage({ embedded = false }: { embedded?: boolean }) {
   const { refreshInterval, refreshKey } = useRefreshInterval()
   const [tabValue, setTabValue] = useState(0)
   const [loading, setLoading] = useState(true)
@@ -1025,14 +1025,10 @@ export default function DeviceNetworkPage() {
 
   return (
     <Box>
-      <Box mb={2}>
-        <Typography variant="h5" gutterBottom fontWeight={700}>
-          设备网络
-        </Typography>
-        <Typography variant="body2" color="text.secondary">
-          查看设备网络接口，管理 WLAN 联网、DDNS 动态解析和远程管理网络出口
-        </Typography>
-      </Box>
+      {!embedded && <Box mb={2}>
+        <Typography variant="h5" gutterBottom fontWeight={700}>设备网络</Typography>
+        <Typography variant="body2" color="text.secondary">查看设备网络接口，管理 WLAN 联网、DDNS 动态解析和远程管理网络出口</Typography>
+      </Box>}
 
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
       <Snackbar

@@ -44,6 +44,19 @@ impl VowifiSimIdentity {
         &self.operator_id
     }
 
+    /// Build the identity used for carrier/profile matching when a line has a
+    /// configured VoWiFi IMSI presentation override. The real SIM identity is
+    /// still retained by the caller for QMI/UIM AKA authentication.
+    pub fn with_presented_imsi(&self, imsi: impl Into<String>) -> Self {
+        Self {
+            iccid: self.iccid.clone(),
+            imsi: imsi.into(),
+            // A modem's current operator may describe the serving network and
+            // conflict with a spoofed home IMSI. Force matching from IMSI.
+            operator_id: String::new(),
+        }
+    }
+
     pub fn masked(&self) -> MaskedSimIdentity {
         MaskedSimIdentity {
             present: self.present(),

@@ -1,5 +1,4 @@
 export { StatusOverview } from './StatusOverview'
-export { QuickControls } from './QuickControls'
 export { SystemResources } from './SystemResources'
 export { NetworkSpeed } from './NetworkSpeed'
 export { ConnectionStatus } from './ConnectionStatus'

@@ -45,6 +45,7 @@ import type {
   AutomationConfig,
   AutomationTask,
   AutomationLogEntry,
+  AutomationTarget,
   NotificationConfig,
 } from '../api/contracts'
 import ErrorSnackbar from '../components/ErrorSnackbar'
@@ -81,7 +82,13 @@ const filterTextFieldSx = {
   },
 }
 
-export default function AutomationCenter() {
+type AutomationCenterProps = {
+  lineId?: string
+  embedded?: boolean
+  fixedTarget?: AutomationTarget
+}
+
+export default function AutomationCenter({ lineId, embedded = false, fixedTarget }: AutomationCenterProps) {
   const [tab, setTab] = useState(0)
   const [loading, setLoading] = useState(true)
   const [testingTaskId, setTestingTaskId] = useState<string | null>(null)
@@ -153,6 +160,14 @@ export default function AutomationCenter() {
     )))).sort(),
     [config.tasks],
   )
+  const visibleTasks = useMemo(
+    () => fixedTarget?.kind === 'standalone_sim_slot'
+      ? config.tasks.filter((task) => task.target?.kind === 'standalone_sim_slot' && task.target.slot_id === fixedTarget.slot_id)
+      : lineId
+        ? config.tasks.filter((task) => task.target?.kind === 'modem_line' && task.target.line_id === lineId)
+        : config.tasks,
+    [config.tasks, fixedTarget, lineId],
+  )
 
   // Load configuration and latest logs
   const loadData = useCallback(async () => {
@@ -165,7 +180,7 @@ export default function AutomationCenter() {
       }
 
       // Load latest logs to map status
-      const logsRes = await api.getAutomationLogs({ limit: 100 })
+      const logsRes = await api.getAutomationLogs({ line_id: lineId, limit: 100 })
       if (logsRes.data?.logs) {
         const cache: Record<string, AutomationLogEntry> = {}
         // Since logs are returned in descending order, we iterate backwards to keep the latest one
@@ -186,7 +201,7 @@ export default function AutomationCenter() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [lineId])
 
   useEffect(() => {
     void loadData()
@@ -199,7 +214,7 @@ export default function AutomationCenter() {
       const res = await api.getAutomationLogs({
         type: filterType,
         status: filterStatus,
-        line_id: filterLineId,
+        line_id: lineId ?? filterLineId,
         start_date: logStartDate,
         end_date: logEndDate,
         q: searchQuery,
@@ -213,7 +228,7 @@ export default function AutomationCenter() {
     } finally {
       setLogsLoading(false)
     }
-  }, [filterType, filterStatus, filterLineId, logStartDate, logEndDate, searchQuery, logPage])
+  }, [filterType, filterStatus, filterLineId, lineId, logStartDate, logEndDate, searchQuery, logPage])
 
   const pageCount = Math.max(1, Math.ceil(logTotal / LOG_PAGE_SIZE))
   const startRecord = logTotal === 0 ? 0 : logPage * LOG_PAGE_SIZE + 1
@@ -247,8 +262,8 @@ export default function AutomationCenter() {
 
   // Statistics calculation
   const stats = useMemo(() => {
-    const total = config.tasks.length
-    const enabled = config.tasks.filter((t) => t.enabled).length
+    const total = visibleTasks.length
+    const enabled = visibleTasks.filter((t) => t.enabled).length
     let successCount = 0
     let failedCount = 0
     Object.values(latestLogs).forEach((log) => {
@@ -256,7 +271,7 @@ export default function AutomationCenter() {
       else if (log.status === 'failed') failedCount++
     })
     return { total, enabled, success: successCount, failed: failedCount }
-  }, [config.tasks, latestLogs])
+  }, [latestLogs, visibleTasks])
 
   // Save config immediately to backend
   const updateConfig = async (newConfig: AutomationConfig) => {
@@ -326,10 +341,13 @@ export default function AutomationCenter() {
   }
 
   const handleSaveTask = async (task: AutomationTask) => {
-    const exists = config.tasks.some((t) => t.id === task.id)
+    const scopedTask = fixedTarget ?? (lineId ? { kind: 'modem_line' as const, line_id: lineId } : undefined)
+      ? { ...task, target: fixedTarget ?? { kind: 'modem_line' as const, line_id: lineId as string } }
+      : task
+    const exists = config.tasks.some((t) => t.id === scopedTask.id)
     const nextTasks = exists
-      ? config.tasks.map((t) => (t.id === task.id ? task : t))
-      : [...config.tasks, task]
+      ? config.tasks.map((t) => (t.id === scopedTask.id ? scopedTask : t))
+      : [...config.tasks, scopedTask]
 
     await updateConfig({ ...config, tasks: nextTasks })
     setSuccess(editingTask ? '编辑任务成功' : '添加任务成功')
@@ -370,7 +388,7 @@ export default function AutomationCenter() {
     end_date: string
   }) => {
     try {
-      const res = await api.clearAutomationLogs({ ...filters, line_id: filterLineId })
+      const res = await api.clearAutomationLogs({ ...filters, line_id: lineId ?? filterLineId })
       if (res.status === 'ok') {
         setSuccess(`已清理 ${res.data?.deleted ?? 0} 条日志`)
         setLogPage(0)
@@ -396,8 +414,8 @@ export default function AutomationCenter() {
       {/* 头部区域 */}
       <Box display="flex" alignItems="center" justifyContent="space-between" mb={2} flexWrap="wrap" gap={2}>
         <Box display="flex" alignItems="center" gap={1.5}>
-          <Typography variant="h5" fontWeight={700}>
-            自动化中心
+          <Typography variant={embedded ? 'subtitle1' : 'h5'} fontWeight={700}>
+            {embedded ? '线路自动化' : '自动化中心'}
           </Typography>
           {/* 内联统计指标 */}
           <Box display={{ xs: 'none', md: 'flex' }} gap={1} ml={2}>
@@ -433,6 +451,7 @@ export default function AutomationCenter() {
             variant="contained"
             startIcon={<Add />}
             onClick={() => handleOpenTaskDialog(null)}
+            disabled={fixedTarget?.kind === 'standalone_sim_slot'}
           >
             新建任务
           </Button>
@@ -464,7 +483,7 @@ export default function AutomationCenter() {
       {tab === 0 && (
         <Box>
           <Grid container spacing={2.5}>
-            {config.tasks.map((task) => (
+            {visibleTasks.map((task) => (
               <Grid size={{ xs: 12, md: 6, lg: 4 }} key={task.id}>
                 <AutomationTaskCard
                   task={task}
@@ -478,11 +497,11 @@ export default function AutomationCenter() {
               </Grid>
             ))}
 
-            {config.tasks.length === 0 && (
+            {visibleTasks.length === 0 && (
               <Grid size={12}>
                 <Paper variant="outlined" sx={{ p: 5, textAlign: 'center', color: 'text.secondary' }}>
                   <AutoMode sx={{ fontSize: 48, mb: 1, opacity: 0.3 }} />
-                  <Typography>暂无自动化任务，点击上方“新建任务”开始添加</Typography>
+                  <Typography>{lineId ? '当前线路暂无自动化任务，点击上方“新建任务”开始添加' : '暂无自动化任务，点击上方“新建任务”开始添加'}</Typography>
                 </Paper>
               </Grid>
             )}
@@ -492,7 +511,7 @@ export default function AutomationCenter() {
 
       {/* 面板 2：运行日志 */}
       {tab === 1 && (
-        <Card sx={{ height: cardHeight, minHeight: 520, borderRadius: 1.5 }}>
+        <Card sx={{ height: embedded ? 620 : cardHeight, minHeight: 520, borderRadius: 1.5 }}>
           <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column', p: 2, pb: 0, '&:last-child': { pb: 0 } }}>
             {/* 日志筛选与搜索工具栏 */}
             <Box display="flex" gap={1.5} flexWrap="wrap" mb={2}>
@@ -531,7 +550,7 @@ export default function AutomationCenter() {
                 <MenuItem value="failed">失败</MenuItem>
               </TextField>
 
-              <TextField
+              {!lineId && <TextField
                 select
                 size="small"
                 label="目标线路"
@@ -546,7 +565,7 @@ export default function AutomationCenter() {
                 {automationLineIds.map((lineId) => (
                   <MenuItem key={lineId} value={lineId}>线路 {shortLineId(lineId)}</MenuItem>
                 ))}
-              </TextField>
+              </TextField>}
 
               <DateRangePicker
                 startDate={logStartDate}
@@ -731,6 +750,8 @@ export default function AutomationCenter() {
         onClose={() => setTaskDialogOpen(false)}
         editingTask={editingTask}
         onSave={handleSaveTask}
+        fixedLineId={lineId}
+        fixedTarget={fixedTarget}
       />
 
       {/* 弹窗 2：自动清理配置 */}

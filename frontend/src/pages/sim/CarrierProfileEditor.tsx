@@ -23,16 +23,16 @@ import {
   Typography,
 } from '@mui/material'
 import { ExpandMore } from '@mui/icons-material'
-import { api, type CarrierProfileRecord } from '../../api/current'
+import { api, type CarrierProfileRecord, type VoiceCodecPolicyRecord } from '../../api/current'
 
 interface Props {
   open: boolean
   /** The profile being edited. Pass a derived record to create a new one. */
   record: CarrierProfileRecord | null
-  /** Shown as a hint when the carrier's country expects emergency setup. */
-  e911Expected?: boolean
   onClose: () => void
   onSaved: () => void
+  readOnly?: boolean
+  profileIdLocked?: boolean
 }
 
 /** Multi-line text field backed by a string array, one entry per line. */
@@ -130,7 +130,7 @@ function Section({
 
 /** Mirrors the backend `validate()` so bad input is caught before the request. */
 function validate(record: CarrierProfileRecord): string | null {
-  const { meta, epdg, ims, ikev2, identity, e911 } = record
+  const { meta, epdg, ims, ikev2, identity, voice, ut } = record
   if (!meta.profile_id.trim()) return 'Profile ID 不能为空'
   if (!/^\d{3}$/.test(meta.mcc)) return 'MCC 必须是 3 位数字'
   if (!/^\d{2,3}$/.test(meta.mnc)) return 'MNC 必须是 2 或 3 位数字'
@@ -150,18 +150,46 @@ function validate(record: CarrierProfileRecord): string | null {
   if (identity.device_identity_imei && !/^\d{15}$/.test(identity.device_identity_imei.trim())) {
     return 'IMEI 必须是 15 位数字'
   }
-  if (e911.enabled && !e911.websheet_host_policy?.trim()) {
-    return '启用紧急呼叫后必须填写 websheet host policy'
+  if (ims.register.include_visited_network && !ims.register.visited_network_header?.trim()) {
+    return '启用 Visited-Network 后必须填写该头的值'
   }
+  if (
+    (ims.register.sec_agree_mode === 'required' ||
+      ims.register.require_sec_agree_headers ||
+      ims.register.proxy_require_sec_agree_headers) &&
+    ims.register.security_client_mechanisms.length === 0
+  ) {
+    return '强制 sec-agree 时必须填写 Security-Client 机制'
+  }
+  if (ims.register.security_client_mechanisms.some((item) => item.split('/').length !== 4)) {
+    return 'Security-Client 机制必须是 4 段，如 hmac-sha-1-96/aes-cbc/esp/trans'
+  }
+  if (!ims.user_agent.trim()) return 'User-Agent 不能为空'
+  if (
+    (ims.register.request_uri_policy === 'registrar' ||
+      ims.register.request_uri_policy === 'configured') &&
+    !ims.registrar?.trim()
+  ) {
+    return '该 Request-URI 策略必须填写 registrar'
+  }
+  if (
+    (ims.register.include_pani_initial || ims.register.include_pani_authenticated) &&
+    !ims.register.access_network_info.trim()
+  ) {
+    return '携带 PANI 时必须填写接入网类型'
+  }
+  if (voice.preferred_codecs.length === 0) return '语音编解码优先级不能为空'
+  if (ut.enabled && !ut.xcap_root?.trim()) return '启用补充业务后必须填写 XCAP root'
   return null
 }
 
 export default function CarrierProfileEditor({
   open,
   record,
-  e911Expected,
   onClose,
   onSaved,
+  readOnly = false,
+  profileIdLocked = false,
 }: Props) {
   const [draft, setDraft] = useState<CarrierProfileRecord | null>(null)
   const [saving, setSaving] = useState(false)
@@ -221,11 +249,18 @@ export default function CarrierProfileEditor({
         运营商 profile · {draft.meta.brand || draft.meta.profile_id}
         <Chip size="small" label={draft.meta.plmn} sx={{ ml: 1 }} />
       </DialogTitle>
-      <DialogContent dividers>
+      <DialogContent
+        dividers
+        sx={readOnly ? {
+          '& .MuiInputBase-root, & .MuiSwitch-root': { pointerEvents: 'none' },
+          '& input, & textarea': { cursor: 'default' },
+        } : undefined}
+      >
         <Stack spacing={1.5}>
           <Alert severity="info">
-            ePDG 主机名和 IMS 域名按 3GPP TS 23.003 从 MCC/MNC 推导，通常不需要手改。
-            真正因运营商而异的是下面的 REGISTER 细节，这些只能靠实测确定。
+            {readOnly
+              ? '当前内容来自 sealed carrier_Bundles 数据库，仅供查看。'
+              : 'ePDG 主机名和 IMS 域名按 3GPP TS 23.003 从 MCC/MNC 推导，通常不需要手改。真正因运营商而异的是下面的 REGISTER 细节，这些只能靠实测确定。'}
           </Alert>
 
           <Section title="基本信息" subtitle="标识与归属" defaultExpanded>
@@ -234,7 +269,8 @@ export default function CarrierProfileEditor({
                 fullWidth
                 label="Profile ID"
                 value={draft.meta.profile_id}
-                helperText="唯一标识，保存时作为主键"
+                helperText={profileIdLocked ? '已存在记录的主键不可修改' : '唯一标识，保存时作为主键'}
+                slotProps={{ input: { readOnly: profileIdLocked } }}
                 onChange={(e) => patch('meta', { profile_id: e.target.value })}
               />
               <TextField
@@ -277,6 +313,34 @@ export default function CarrierProfileEditor({
                 onChange={(e) => patch('meta', { country_iso2: e.target.value })}
               />
             </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="法定名称"
+                value={draft.meta.operator_legal_name}
+                onChange={(e) => patch('meta', { operator_legal_name: e.target.value })}
+              />
+              <TextField
+                fullWidth
+                label="最后核验时间"
+                value={draft.meta.last_verified}
+                placeholder="2026-08-12"
+                helperText="记录这份配置最后一次实测通过的时间"
+                onChange={(e) => patch('meta', { last_verified: e.target.value })}
+              />
+            </Stack>
+            <ListField
+              label="别名"
+              value={draft.meta.aliases}
+              helperText="SPN / 品牌别名，用于匹配 MVNO"
+              onChange={(aliases) => patch('meta', { aliases })}
+            />
+            <ListField
+              label="来源引用"
+              value={draft.meta.source_refs}
+              helperText="配置依据，如固件包名或标准条款"
+              onChange={(source_refs) => patch('meta', { source_refs })}
+            />
           </Section>
 
           <Section title="ePDG 通道" subtitle="IKE 入口、APN、IP 协议栈与 DNS" defaultExpanded>
@@ -472,6 +536,23 @@ export default function CarrierProfileEditor({
                 </Select>
               </FormControl>
             </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="Registrar"
+                value={draft.ims.registrar ?? ''}
+                placeholder="留空则使用 IMS domain"
+                helperText="Request-URI 策略为 registrar / configured 时必填"
+                onChange={(e) => patch('ims', { registrar: e.target.value || null })}
+              />
+              <TextField
+                fullWidth
+                label="User-Agent"
+                value={draft.ims.user_agent}
+                placeholder="SimAdmin-IMS/1.0"
+                onChange={(e) => patch('ims', { user_agent: e.target.value })}
+              />
+            </Stack>
             <TextField
               label="P-CSCF 覆盖"
               value={draft.ims.pcscf ?? ''}
@@ -505,6 +586,52 @@ export default function CarrierProfileEditor({
             title="REGISTER 模板"
             subtitle="运营商差异最大的部分，注册失败优先调这里"
           >
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <FormControl fullWidth>
+                <InputLabel>Request-URI 策略</InputLabel>
+                <Select
+                  label="Request-URI 策略"
+                  value={draft.ims.register.request_uri_policy}
+                  onChange={(e) => patchRegister({ request_uri_policy: e.target.value })}
+                >
+                  <MenuItem value="registrar">registrar</MenuItem>
+                  <MenuItem value="home_domain">home_domain</MenuItem>
+                  <MenuItem value="pcscf">pcscf</MenuItem>
+                  <MenuItem value="configured">configured</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl fullWidth>
+                <InputLabel>初始 Authorization</InputLabel>
+                <Select
+                  label="初始 Authorization"
+                  value={draft.ims.register.initial_authorization}
+                  onChange={(e) => patchRegister({ initial_authorization: e.target.value })}
+                >
+                  <MenuItem value="none">none（不带）</MenuItem>
+                  <MenuItem value="aka_empty">aka_empty</MenuItem>
+                  <MenuItem value="digest_empty">digest_empty</MenuItem>
+                  <MenuItem value="implementation_variant">implementation_variant</MenuItem>
+                </Select>
+              </FormControl>
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="Header 变体集"
+                value={draft.ims.register.live_header_variant_set}
+                placeholder="default"
+                helperText="实测出的头部组合命名，用于切换整套 REGISTER 变体"
+                onChange={(e) => patchRegister({ live_header_variant_set: e.target.value })}
+              />
+              <TextField
+                fullWidth
+                label="Allow 方法"
+                value={draft.ims.register.allow_methods ?? ''}
+                placeholder="INVITE, ACK, CANCEL, BYE, OPTIONS"
+                helperText="留空则不发送 Allow 头"
+                onChange={(e) => patchRegister({ allow_methods: e.target.value || null })}
+              />
+            </Stack>
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
               <FormControl fullWidth>
                 <InputLabel>sec-agree 模式</InputLabel>
@@ -554,7 +681,9 @@ export default function CarrierProfileEditor({
                   }
                 >
                   <MenuItem value="android_default">android_default</MenuItem>
+                  <MenuItem value="standard">standard</MenuItem>
                   <MenuItem value="legacy">legacy</MenuItem>
+                  <MenuItem value="custom">custom</MenuItem>
                 </Select>
               </FormControl>
             </Stack>
@@ -578,7 +707,125 @@ export default function CarrierProfileEditor({
                 patchRegister({ security_client_mechanisms })
               }
             />
+            <TextField
+              label="Visited-Network 头"
+              value={draft.ims.register.visited_network_header ?? ''}
+              disabled={!draft.ims.register.include_visited_network}
+              placeholder="ims.mnc001.mcc460.3gppnetwork.org"
+              helperText="启用 Visited-Network 开关后必填"
+              onChange={(e) => patchRegister({ visited_network_header: e.target.value || null })}
+            />
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} flexWrap="wrap" useFlexGap>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.include_pani_initial}
+                    onChange={(_, include_pani_initial) =>
+                      patchRegister({ include_pani_initial })
+                    }
+                  />
+                }
+                label="初始 REGISTER 带 PANI"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.include_mmtel_features}
+                    onChange={(_, include_mmtel_features) =>
+                      patchRegister({ include_mmtel_features })
+                    }
+                  />
+                }
+                label="携带 MMTEL 特性标签"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.include_route_header}
+                    onChange={(_, include_route_header) =>
+                      patchRegister({ include_route_header })
+                    }
+                  />
+                }
+                label="携带 Route 头"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.include_visited_network}
+                    onChange={(_, include_visited_network) =>
+                      patchRegister({ include_visited_network })
+                    }
+                  />
+                }
+                label="携带 Visited-Network"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.include_p_preferred_identity}
+                    onChange={(_, include_p_preferred_identity) =>
+                      patchRegister({ include_p_preferred_identity })
+                    }
+                  />
+                }
+                label="携带 P-Preferred-Identity"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.require_sec_agree_headers}
+                    onChange={(_, require_sec_agree_headers) =>
+                      patchRegister({ require_sec_agree_headers })
+                    }
+                  />
+                }
+                label="Require: sec-agree"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.proxy_require_sec_agree_headers}
+                    onChange={(_, proxy_require_sec_agree_headers) =>
+                      patchRegister({ proxy_require_sec_agree_headers })
+                    }
+                  />
+                }
+                label="Proxy-Require: sec-agree"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.use_plain_digest_placeholder}
+                    onChange={(_, use_plain_digest_placeholder) =>
+                      patchRegister({ use_plain_digest_placeholder })
+                    }
+                  />
+                }
+                label="使用明文 Digest 占位"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.always_add_sip_instance}
+                    onChange={(_, always_add_sip_instance) =>
+                      patchRegister({ always_add_sip_instance })
+                    }
+                  />
+                }
+                label="总是携带 +sip.instance"
+              />
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ims.register.enable_cellular_network_info}
+                    onChange={(_, enable_cellular_network_info) =>
+                      patchRegister({ enable_cellular_network_info })
+                    }
+                  />
+                }
+                label="附加蜂窝网络信息"
+              />
               <FormControlLabel
                 control={
                   <Switch
@@ -684,93 +931,300 @@ export default function CarrierProfileEditor({
               placeholder={'amr-wb\namr\npcmu'}
               onChange={(preferred_codecs) => patch('voice', { preferred_codecs })}
             />
-            <TextField
-              type="number"
-              label="ptime（毫秒）"
-              value={draft.voice.ptime_ms}
-              onChange={(e) => patch('voice', { ptime_ms: Number(e.target.value) })}
-            />
-          </Section>
-
-          <Section
-            title="紧急呼叫 / E911"
-            subtitle={
-              e911Expected
-                ? '这是北美运营商，通常必须配置'
-                : '非北美运营商一般不需要，可以留空'
-            }
-          >
-            {e911Expected ? (
-              <Alert severity="warning">
-                该运营商属于北美（MCC 310–316）。美国 FCC 要求 VoWiFi 登记紧急地址，
-                运营商通常也会用 entitlement 流程卡注册，建议完整填写。
-              </Alert>
-            ) : (
-              <Alert severity="info">
-                该国家一般不强制要求紧急呼叫配置，保持关闭即可，不影响正常注册与通话。
-              </Alert>
-            )}
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                type="number"
+                label="ptime（毫秒）"
+                value={draft.voice.ptime_ms}
+                onChange={(e) => patch('voice', { ptime_ms: Number(e.target.value) })}
+              />
+              <TextField
+                fullWidth
+                label="语音信箱号码"
+                value={draft.voice.voicemail_number ?? ''}
+                placeholder="+8613800000000"
+                onChange={(e) => patch('voice', { voicemail_number: e.target.value || null })}
+              />
+            </Stack>
             <FormControlLabel
               control={
                 <Switch
-                  checked={draft.e911.enabled}
-                  onChange={(_, enabled) =>
-                    patch('e911', {
-                      enabled,
-                      // Enabling without a host policy is not actionable, so
-                      // fill the usual default rather than failing validation.
-                      websheet_host_policy:
-                        enabled && !draft.e911.websheet_host_policy
-                          ? 'public_https'
-                          : draft.e911.websheet_host_policy,
-                    })
+                  checked={draft.voice.sip_endpoint_exposed}
+                  onChange={(_, sip_endpoint_exposed) =>
+                    patch('voice', { sip_endpoint_exposed })
                   }
                 />
               }
-              label="启用紧急呼叫配置"
+              label="对外暴露 SIP 端点"
+            />
+            <Divider />
+            <Box display="flex" justifyContent="space-between" alignItems="center" gap={1}>
+              <Typography variant="caption" color="text.secondary">
+                编解码细节：payload type 与 fmtp 不匹配会导致接通后单通
+              </Typography>
+              <Button
+                size="small"
+                onClick={() =>
+                  patch('voice', {
+                    codec_policies: [
+                      ...draft.voice.codec_policies,
+                      { codec: draft.voice.preferred_codecs[0] ?? 'amr-wb', payload_type: null, sample_rate: null, fmtp: null },
+                    ],
+                  })
+                }
+              >
+                添加编解码
+              </Button>
+            </Box>
+            {draft.voice.codec_policies.length === 0 && (
+              <Typography variant="caption" color="text.secondary">
+                未配置时按编解码优先级使用内置默认参数
+              </Typography>
+            )}
+            {draft.voice.codec_policies.map((policy, index) => {
+              const patchCodec = (changes: Partial<VoiceCodecPolicyRecord>) =>
+                patch('voice', {
+                  codec_policies: draft.voice.codec_policies.map((item, itemIndex) =>
+                    itemIndex === index ? { ...item, ...changes } : item,
+                  ),
+                })
+              return (
+                <Stack
+                  key={index}
+                  direction={{ xs: 'column', sm: 'row' }}
+                  spacing={1.5}
+                  alignItems={{ sm: 'center' }}
+                >
+                  <TextField
+                    label="编解码"
+                    value={policy.codec}
+                    placeholder="amr-wb"
+                    onChange={(e) => patchCodec({ codec: e.target.value })}
+                  />
+                  <TextField
+                    type="number"
+                    label="Payload type"
+                    value={policy.payload_type ?? ''}
+                    slotProps={{ htmlInput: { min: 96, max: 127 } }}
+                    onChange={(e) =>
+                      patchCodec({ payload_type: e.target.value ? Number(e.target.value) : null })
+                    }
+                  />
+                  <TextField
+                    type="number"
+                    label="采样率"
+                    value={policy.sample_rate ?? ''}
+                    placeholder="16000"
+                    onChange={(e) =>
+                      patchCodec({ sample_rate: e.target.value ? Number(e.target.value) : null })
+                    }
+                  />
+                  <TextField
+                    fullWidth
+                    label="fmtp"
+                    value={policy.fmtp ?? ''}
+                    placeholder="mode-set=0,1,2; octet-align=1"
+                    onChange={(e) => patchCodec({ fmtp: e.target.value || null })}
+                  />
+                  <Button
+                    size="small"
+                    color="error"
+                    onClick={() =>
+                      patch('voice', {
+                        codec_policies: draft.voice.codec_policies.filter(
+                          (_, itemIndex) => itemIndex !== index,
+                        ),
+                      })
+                    }
+                  >
+                    删除
+                  </Button>
+                </Stack>
+              )
+            })}
+          </Section>
+
+          <Section title="短信 (SMSoIP)" subtitle="IMS 短信通道与 SMSC 鉴权">
+            <FormControl fullWidth>
+              <InputLabel>短信接收通道</InputLabel>
+              <Select
+                label="短信接收通道"
+                value={draft.sms.receiver_transport}
+                onChange={(e) => patch('sms', { receiver_transport: e.target.value })}
+              >
+                <MenuItem value="sip">SIP（IMS 短信）</MenuItem>
+                <MenuItem value="cellular">蜂窝（CS/PS 短信）</MenuItem>
+                <MenuItem value="none">不接收</MenuItem>
+              </Select>
+            </FormControl>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={draft.sms.smsc_auth_required}
+                  onChange={(_, smsc_auth_required) => patch('sms', { smsc_auth_required })}
+                />
+              }
+              label="SMSC 需要鉴权"
+            />
+          </Section>
+
+          <Section title="补充业务 (Ut / XCAP)" subtitle="呼叫等待、呼叫转移与主叫显示的配置通道">
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={draft.ut.enabled}
+                  onChange={(_, enabled) => patch('ut', { enabled })}
+                />
+              }
+              label="启用 Ut / XCAP"
+            />
+            <TextField
+              label="XCAP root"
+              value={draft.ut.xcap_root ?? ''}
+              disabled={!draft.ut.enabled}
+              placeholder="https://xcap.ims.mnc001.mcc460.pub.3gppnetwork.org"
+              onChange={(e) => patch('ut', { xcap_root: e.target.value || null })}
             />
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
               <TextField
                 fullWidth
-                label="Provider"
-                value={draft.e911.provider ?? ''}
-                disabled={!draft.e911.enabled}
-                placeholder="att_entitlement"
-                onChange={(e) => patch('e911', { provider: e.target.value || null })}
+                label="Document selector"
+                value={draft.ut.document_selector ?? ''}
+                disabled={!draft.ut.enabled}
+                placeholder="simservs.ngn.etsi.org/users/sip:{impu}/simservs.xml"
+                onChange={(e) => patch('ut', { document_selector: e.target.value || null })}
               />
               <TextField
                 fullWidth
-                label="Websheet host policy"
-                value={draft.e911.websheet_host_policy ?? ''}
-                disabled={!draft.e911.enabled}
-                placeholder="public_https"
+                label="XML namespace"
+                value={draft.ut.namespace ?? ''}
+                disabled={!draft.ut.enabled}
+                onChange={(e) => patch('ut', { namespace: e.target.value || null })}
+              />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <FormControl fullWidth disabled={!draft.ut.enabled}>
+                <InputLabel>鉴权方式</InputLabel>
+                <Select
+                  label="鉴权方式"
+                  value={draft.ut.authentication}
+                  onChange={(e) => patch('ut', { authentication: e.target.value })}
+                >
+                  <MenuItem value="none">none</MenuItem>
+                  <MenuItem value="digest">digest</MenuItem>
+                  <MenuItem value="aka">aka</MenuItem>
+                  <MenuItem value="gba">gba</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ut.partial_update}
+                    disabled={!draft.ut.enabled}
+                    onChange={(_, partial_update) => patch('ut', { partial_update })}
+                  />
+                }
+                label="使用局部更新"
+              />
+            </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="呼叫等待 selector"
+                value={draft.ut.call_waiting_selector ?? ''}
+                disabled={!draft.ut.enabled || !draft.ut.partial_update}
+                onChange={(e) => patch('ut', { call_waiting_selector: e.target.value || null })}
+              />
+              <TextField
+                fullWidth
+                label="呼叫转移 selector"
+                value={draft.ut.diversion_rule_selector ?? ''}
+                disabled={!draft.ut.enabled || !draft.ut.partial_update}
                 onChange={(e) =>
-                  patch('e911', { websheet_host_policy: e.target.value || null })
+                  patch('ut', { diversion_rule_selector: e.target.value || null })
                 }
               />
             </Stack>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <TextField
+                fullWidth
+                label="主叫显示 (OIP) selector"
+                value={draft.ut.oip_selector ?? ''}
+                disabled={!draft.ut.enabled || !draft.ut.partial_update}
+                onChange={(e) => patch('ut', { oip_selector: e.target.value || null })}
+              />
+              <TextField
+                fullWidth
+                label="主叫隐藏 (OIR) selector"
+                value={draft.ut.oir_selector ?? ''}
+                disabled={!draft.ut.enabled || !draft.ut.partial_update}
+                onChange={(e) => patch('ut', { oir_selector: e.target.value || null })}
+              />
+            </Stack>
+            <Divider />
+            <Typography variant="caption" color="text.secondary">
+              TLS：XCAP 走 HTTPS，运营商网关对版本和根证书有要求
+            </Typography>
+            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+              <FormControl fullWidth disabled={!draft.ut.enabled}>
+                <InputLabel>TLS 最低版本</InputLabel>
+                <Select
+                  label="TLS 最低版本"
+                  value={draft.ut.tls_min_version}
+                  onChange={(e) => patch('ut', { tls_min_version: e.target.value })}
+                >
+                  <MenuItem value="1.2">1.2</MenuItem>
+                  <MenuItem value="1.3">1.3</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControl fullWidth disabled={!draft.ut.enabled}>
+                <InputLabel>TLS 最高版本</InputLabel>
+                <Select
+                  label="TLS 最高版本"
+                  value={draft.ut.tls_max_version}
+                  onChange={(e) => patch('ut', { tls_max_version: e.target.value })}
+                >
+                  <MenuItem value="1.2">1.2</MenuItem>
+                  <MenuItem value="1.3">1.3</MenuItem>
+                </Select>
+              </FormControl>
+              <FormControlLabel
+                control={
+                  <Switch
+                    checked={draft.ut.tls_builtin_roots}
+                    disabled={!draft.ut.enabled}
+                    onChange={(_, tls_builtin_roots) => patch('ut', { tls_builtin_roots })}
+                  />
+                }
+                label="使用内置根证书"
+              />
+            </Stack>
             <TextField
-              label="Entitlement URL"
-              value={draft.e911.entitlement_url ?? ''}
-              disabled={!draft.e911.enabled}
-              placeholder="https://example.carrier.net/"
-              onChange={(e) => patch('e911', { entitlement_url: e.target.value || null })}
+              label="附加 CA 证书 (PEM)"
+              value={draft.ut.tls_additional_ca_pem ?? ''}
+              disabled={!draft.ut.enabled}
+              multiline
+              minRows={2}
+              maxRows={8}
+              helperText="运营商使用私有 CA 时填写"
+              onChange={(e) => patch('ut', { tls_additional_ca_pem: e.target.value || null })}
             />
           </Section>
 
-          {validationError && <Alert severity="error">{validationError}</Alert>}
+          {!readOnly && validationError && <Alert severity="error">{validationError}</Alert>}
           {error && <Alert severity="error">{error}</Alert>}
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} disabled={saving}>取消</Button>
-        <Button
+        <Button onClick={onClose} disabled={saving}>{readOnly ? '关闭' : '取消'}</Button>
+        {!readOnly && <Button
           variant="contained"
           onClick={() => void save()}
           disabled={saving || Boolean(validationError)}
         >
           {saving ? '保存中…' : '保存 profile'}
-        </Button>
+        </Button>}
       </DialogActions>
     </Dialog>
   )

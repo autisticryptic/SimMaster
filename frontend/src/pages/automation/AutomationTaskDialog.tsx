@@ -21,6 +21,8 @@ type AutomationTaskDialogProps = {
   onClose: () => void
   editingTask: AutomationTask | null
   onSave: (task: AutomationTask) => Promise<void>
+  fixedLineId?: string
+  fixedTarget?: AutomationTarget
 }
 
 
@@ -29,6 +31,8 @@ export default function AutomationTaskDialog({
   onClose,
   editingTask,
   onSave,
+  fixedLineId,
+  fixedTarget,
 }: AutomationTaskDialogProps) {
   const [formName, setFormName] = useState('')
   const [formEnabled, setFormEnabled] = useState(true)
@@ -70,7 +74,7 @@ export default function AutomationTaskDialog({
         setFormName(editingTask.name)
         setFormEnabled(editingTask.enabled)
         setFormActionType(editingTask.action.type)
-        setFormTarget(editingTask.target?.kind === 'modem_line' ? editingTask.target : null)
+        setFormTarget(fixedTarget ?? (fixedLineId ? { kind: 'modem_line', line_id: fixedLineId } : editingTask.target?.kind === 'modem_line' ? editingTask.target : null))
         if (editingTask.action.type === 'reboot_device') {
           setFormRebootDelay(editingTask.action.config.delay_seconds)
         } else if (editingTask.action.type === 'send_sms') {
@@ -112,7 +116,7 @@ export default function AutomationTaskDialog({
         setManualCountryCode(false)
         setFormCallPhone('')
         setFormCallDuration(30)
-        setFormTarget(null)
+        setFormTarget(fixedTarget ?? (fixedLineId ? { kind: 'modem_line', line_id: fixedLineId } : null))
         setFormTriggerType('fixed')
         setFormWeekdays([1, 2, 3, 4, 5, 6, 7])
         setFormTriggerTime('04:00')
@@ -121,7 +125,7 @@ export default function AutomationTaskDialog({
         setFormCronExpression('*/15 * * * *')
       }
     }
-  }, [open, editingTask])
+  }, [open, editingTask, fixedLineId, fixedTarget])
 
   const insertVariable = (token: string) => {
     const el = smsContentRef.current
@@ -154,8 +158,8 @@ export default function AutomationTaskDialog({
       return
     }
 
-    if (formActionType !== 'reboot_device' && formTarget?.kind !== 'modem_line') {
-      setDialogError('请选择执行该任务的基带线路')
+    if (formActionType !== 'reboot_device' && (!formTarget || (fixedTarget && JSON.stringify(formTarget) !== JSON.stringify(fixedTarget)) || (!fixedTarget && formTarget.kind !== 'modem_line'))) {
+      setDialogError(fixedTarget?.kind === 'standalone_sim_slot' ? '当前读卡器暂不支持自动化执行' : '请选择执行该任务的基带线路')
       return
     }
 
@@ -324,7 +328,7 @@ export default function AutomationTaskDialog({
             }}
           >
             <MenuItem value="restart_baseband">重启基带</MenuItem>
-            <MenuItem value="reboot_device">重启设备</MenuItem>
+            {!fixedLineId && <MenuItem value="reboot_device">重启设备</MenuItem>}
             <MenuItem value="send_sms">发送短信</MenuItem>
             <MenuItem value="consume_data">消耗移动流量</MenuItem>
             <MenuItem value="dial_call">定时拨号</MenuItem>
@@ -336,14 +340,16 @@ export default function AutomationTaskDialog({
               required
               label="使用的基带 / SIM 卡"
               value={formTarget ? `${formTarget.kind}:${formTarget.kind === 'modem_line' ? formTarget.line_id : formTarget.slot_id}` : ''}
+              disabled={Boolean(fixedLineId || fixedTarget)}
               onChange={(e) => {
                 const [kind, ...rest] = e.target.value.split(':')
                 setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : null)
                 setDialogError(null)
               }}
-              helperText="任务始终绑定到所选线路，不会自动回退到其他基带"
+              helperText={fixedTarget?.kind === 'standalone_sim_slot' ? '读卡器自动化执行器尚未接入' : fixedLineId ? '任务固定绑定到当前线路' : '任务始终绑定到所选线路，不会自动回退到其他基带'}
             >
               <MenuItem value="" disabled>请选择基带线路</MenuItem>
+              {fixedTarget?.kind === 'standalone_sim_slot' && <MenuItem value={`standalone_sim_slot:${fixedTarget.slot_id}`}>当前读卡器 · {fixedTarget.slot_id}</MenuItem>}
               {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>基带 {line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
             </TextField>
           )}

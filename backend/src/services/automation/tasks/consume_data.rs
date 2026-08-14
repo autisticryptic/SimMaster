@@ -1,12 +1,13 @@
-use crate::hardware::cellular::modem_manager::{connect_data_via_modem, data_interface_for_modem};
-use crate::platform::utils::read_network_interfaces;
+use crate::api::handlers::{start_line_data_runtime, stop_line_data_runtime};
+use crate::hardware::cellular::data_proxy::DataProxyStatus;
+use crate::platform::config::LineDataProxyConfig;
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
 use std::net::IpAddr;
-use tracing::info;
+use tracing::{info, warn};
 
 pub struct ConsumeDataHandler;
 
@@ -29,24 +30,75 @@ fn requested_bytes(value: u64, unit: &str) -> Result<u64> {
     Ok(amount)
 }
 
-fn source_ip_for_interface(
-    interfaces: &[crate::api::models::NetworkInterfaceInfo],
-    interface_name: &str,
-) -> Option<IpAddr> {
-    interfaces
-        .iter()
-        .filter(|interface| interface.name == interface_name && interface.status != "down")
-        .flat_map(|interface| interface.ip_addresses.iter())
-        .filter_map(|address| address.address.parse::<IpAddr>().ok())
-        .find(|address| address.is_ipv4())
-        .or_else(|| {
-            interfaces
-                .iter()
-                .filter(|interface| interface.name == interface_name && interface.status != "down")
-                .flat_map(|interface| interface.ip_addresses.iter())
-                .filter_map(|address| address.address.parse::<IpAddr>().ok())
-                .next()
-        })
+pub(crate) fn execution_timeout_secs(value: u64, unit: &str) -> u64 {
+    let amount = requested_bytes(value, unit).unwrap_or(0);
+    // Allow roughly one MiB/s, with enough fixed time for bearer setup and a
+    // ceiling that prevents one unhealthy endpoint from occupying a line
+    // indefinitely. The scheduler adds a separate cleanup margin.
+    amount
+        .div_ceil(1024 * 1024)
+        .saturating_add(60)
+        .clamp(120, 1_800)
+}
+
+fn automation_proxy_config(
+    configured: &LineDataProxyConfig,
+    temporary: bool,
+) -> LineDataProxyConfig {
+    if !temporary {
+        return configured.clone();
+    }
+    LineDataProxyConfig {
+        listen_ip: "127.0.0.1".to_string(),
+        listen_port: 0,
+        username: String::new(),
+        password: String::new(),
+    }
+}
+
+fn local_proxy_url(status: &DataProxyStatus) -> Result<String> {
+    if !status.running {
+        return Err(anyhow!("目标线路的流量代理未运行"));
+    }
+    let listen_ip = status
+        .listen_ip
+        .as_deref()
+        .ok_or_else(|| anyhow!("目标线路的流量代理没有监听地址"))?
+        .parse::<IpAddr>()
+        .context("目标线路的流量代理监听地址无效")?;
+    let connect_ip = match listen_ip {
+        IpAddr::V4(address) if address.is_unspecified() => {
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        }
+        IpAddr::V6(address) if address.is_unspecified() => {
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
+        }
+        address => address,
+    };
+    let port = status
+        .port
+        .ok_or_else(|| anyhow!("目标线路的流量代理没有监听端口"))?;
+    Ok(match connect_ip {
+        IpAddr::V4(address) => format!("http://{address}:{port}"),
+        IpAddr::V6(address) => format!("http://[{address}]:{port}"),
+    })
+}
+
+fn proxy_client(
+    proxy_url: &str,
+    config: &LineDataProxyConfig,
+    timeout_secs: u64,
+) -> Result<reqwest::Client> {
+    let mut proxy = reqwest::Proxy::all(proxy_url).context("创建线路代理配置失败")?;
+    if !config.username.is_empty() {
+        proxy = proxy.basic_auth(&config.username, &config.password);
+    }
+    reqwest::Client::builder()
+        .proxy(proxy)
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .build()
+        .context("创建线路代理下载客户端失败")
 }
 
 impl AutomationTaskHandler for ConsumeDataHandler {
@@ -70,69 +122,102 @@ impl AutomationTaskHandler for ConsumeDataHandler {
         let target = params.clone();
         async move {
             let amount = requested_bytes(value, unit)?;
+            let timeout_secs = execution_timeout_secs(value, unit);
             let target = resolve_modem_target(app, &target).await?;
-            let profile = app.config_manager.get_line_profile(&target.line_id);
-            let apn = app.config_manager.get_line_apn_config(&target.line_id);
-            connect_data_via_modem(
-                &app.dbus_conn,
-                &target.modem_path,
-                profile.roaming_allowed,
-                Some(&apn),
-            )
-            .await
-            .map_err(anyhow::Error::msg)
-            .context("移动数据连接建立失败")?;
-
-            let mut source_ip = None;
-            let mut selected_interface = None;
-            for _ in 0..10 {
-                selected_interface = data_interface_for_modem(&app.dbus_conn, &target.modem_path)
-                    .await
-                    .ok()
-                    .flatten();
-                let interfaces = read_network_interfaces(Some(&app.dbus_conn))
-                    .await
-                    .unwrap_or_default();
-                source_ip = selected_interface
-                    .as_deref()
-                    .and_then(|name| source_ip_for_interface(&interfaces, name));
-                if source_ip.is_some() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            }
-            let selected_interface =
-                selected_interface.ok_or_else(|| anyhow!("未找到目标线路的数据接口"))?;
-            let source_ip = source_ip.ok_or_else(|| anyhow!("未找到目标线路的数据源地址"))?;
-            let endpoint = format!("https://speed.cloudflare.com/__down?bytes={amount}");
-            let client = reqwest::Client::builder()
-                .local_address(source_ip)
-                .timeout(std::time::Duration::from_secs(45))
-                .build()
-                .context("创建蜂窝数据专用客户端失败")?;
-            let response = client
-                .get(endpoint)
-                .send()
+            let line = app
+                .line_registry
+                .get(&target.line_id)
                 .await
-                .context("蜂窝流量请求失败")?;
-            if !response.status().is_success() {
-                return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
+                .ok_or_else(|| anyhow!("automation_target_line_not_found"))?;
+            let profile = app.config_manager.get_line_profile(&target.line_id);
+            if profile.airplane_mode_enabled {
+                return Err(anyhow!("飞行模式已启用，无法建立移动数据连接"));
             }
-            let payload = response.bytes().await.context("读取蜂窝流量响应失败")?;
-            if payload.len() as u64 != amount {
-                return Err(anyhow!(
-                    "蜂窝流量响应大小不符：期望 {amount} Byte，实际 {} Byte",
-                    payload.len()
-                ));
+
+            // A disabled persistent switch must not prevent a keep-alive task.
+            // In that case open a loopback-only proxy for this run and restore
+            // the disabled state afterwards instead of exposing the saved
+            // listener configuration temporarily.
+            let temporary_runtime = !profile.data_connection_enabled;
+            let mut runtime_profile = profile.clone();
+            runtime_profile.data_proxy =
+                automation_proxy_config(&profile.data_proxy, temporary_runtime);
+
+            let task_result = async {
+                start_line_data_runtime(app, &line, &runtime_profile)
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("目标线路的数据承载或代理启动失败")?;
+                let proxy_status = line.data_proxy.status().await;
+                let proxy_url = local_proxy_url(&proxy_status)?;
+                let client = proxy_client(
+                    &proxy_url,
+                    &runtime_profile.data_proxy,
+                    timeout_secs,
+                )?;
+                // Use Cloudflare's anycast address with the service Host header.
+                // The cellular bearer may be usable while the device itself has
+                // no default DNS route, so resolving the public hostname here
+                // would make an otherwise valid keep-alive task fail.
+                let endpoint = format!("http://1.1.1.1/__down?bytes={amount}");
+                let mut response = client
+                    .get(endpoint)
+                    .header(reqwest::header::HOST, "speed.cloudflare.com")
+                    .send()
+                    .await
+                    .context("线路代理流量请求失败")?;
+                if !response.status().is_success() {
+                    return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
+                }
+                let mut downloaded = 0u64;
+                while let Some(chunk) = response.chunk().await.context("读取蜂窝流量响应失败")? {
+                    downloaded = downloaded.saturating_add(chunk.len() as u64);
+                    if downloaded > amount {
+                        return Err(anyhow!(
+                            "蜂窝流量响应大小不符：期望 {amount} Byte，实际超过 {downloaded} Byte"
+                        ));
+                    }
+                }
+                if downloaded != amount {
+                    return Err(anyhow!(
+                        "蜂窝流量响应大小不符：期望 {amount} Byte，实际 {downloaded} Byte"
+                    ));
+                }
+                info!(
+                    bytes = downloaded,
+                    proxy = proxy_url,
+                    line_id = target.line_id,
+                    modem_path = target.modem_path,
+                    "automation proxied cellular data consumption completed"
+                );
+                Ok(())
             }
-            info!(
-                bytes = payload.len(),
-                source_ip = %source_ip,
-                interface = selected_interface,
-                line_id = target.line_id,
-                "automation cellular data consumption completed"
-            );
-            Ok(())
+            .await;
+
+            let cleanup_result = if temporary_runtime {
+                let current_profile = app.config_manager.get_line_profile(&target.line_id);
+                if current_profile.data_connection_enabled
+                    && !current_profile.airplane_mode_enabled
+                {
+                    start_line_data_runtime(app, &line, &current_profile)
+                        .await
+                        .map_err(anyhow::Error::msg)
+                        .context("流量任务结束后恢复已启用的数据代理失败")
+                } else {
+                    stop_line_data_runtime(app, &line).await;
+                    Ok(())
+                }
+            } else {
+                Ok(())
+            };
+            app.line_registry.flush_data_traffic().await;
+
+            if let Err(error) = cleanup_result {
+                warn!(line_id = target.line_id, error = %error, "Failed to restore line data state after automation task");
+                task_result?;
+                return Err(error);
+            }
+            task_result
         }
         .boxed()
     }
@@ -140,33 +225,11 @@ impl AutomationTaskHandler for ConsumeDataHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{requested_bytes, source_ip_for_interface};
-    use crate::api::models::{IpAddress, NetworkInterfaceInfo};
-
-    fn interface(name: &str, address: &str) -> NetworkInterfaceInfo {
-        NetworkInterfaceInfo {
-            name: name.to_string(),
-            status: "up".to_string(),
-            is_wireless: false,
-            is_cellular: true,
-            is_default_ipv4: false,
-            is_default_ipv6: false,
-            mac_address: None,
-            mtu: 1500,
-            ip_addresses: vec![IpAddress {
-                address: address.to_string(),
-                prefix_len: 24,
-                ip_type: "IPv4".to_string(),
-                scope: "global".to_string(),
-            }],
-            rx_bytes: 0,
-            tx_bytes: 0,
-            rx_packets: 0,
-            tx_packets: 0,
-            rx_errors: 0,
-            tx_errors: 0,
-        }
-    }
+    use super::{
+        automation_proxy_config, execution_timeout_secs, local_proxy_url, requested_bytes,
+    };
+    use crate::hardware::cellular::data_proxy::DataProxyStatus;
+    use crate::platform::config::LineDataProxyConfig;
 
     #[test]
     fn converts_small_data_units_without_rounding() {
@@ -176,17 +239,41 @@ mod tests {
     }
 
     #[test]
-    fn selects_only_the_requested_lines_data_interface() {
-        let interfaces = vec![
-            interface("wwan-line-a", "10.1.0.2"),
-            interface("wwan-line-b", "10.2.0.2"),
-        ];
+    fn execution_timeout_scales_and_stays_bounded() {
+        assert_eq!(execution_timeout_secs(1, "mb"), 120);
+        assert_eq!(execution_timeout_secs(256, "mb"), 316);
+        assert_eq!(execution_timeout_secs(1_024, "mb"), 1_084);
+        assert_eq!(execution_timeout_secs(u64::MAX, "mb"), 120);
+    }
+
+    #[test]
+    fn disabled_data_uses_a_private_ephemeral_proxy() {
+        let configured = LineDataProxyConfig {
+            listen_ip: "0.0.0.0".to_string(),
+            listen_port: 1080,
+            username: "user".to_string(),
+            password: "secret".to_string(),
+        };
+        assert_eq!(automation_proxy_config(&configured, false), configured);
         assert_eq!(
-            source_ip_for_interface(&interfaces, "wwan-line-b")
-                .expect("line B source address")
-                .to_string(),
-            "10.2.0.2"
+            automation_proxy_config(&configured, true),
+            LineDataProxyConfig {
+                listen_ip: "127.0.0.1".to_string(),
+                listen_port: 0,
+                username: String::new(),
+                password: String::new(),
+            }
         );
-        assert!(source_ip_for_interface(&interfaces, "wwan-line-c").is_none());
+    }
+
+    #[test]
+    fn wildcard_proxy_listener_is_reached_through_loopback() {
+        let status = DataProxyStatus {
+            running: true,
+            listen_ip: Some("0.0.0.0".to_string()),
+            port: Some(12345),
+            ..DataProxyStatus::default()
+        };
+        assert_eq!(local_proxy_url(&status).unwrap(), "http://127.0.0.1:12345");
     }
 }

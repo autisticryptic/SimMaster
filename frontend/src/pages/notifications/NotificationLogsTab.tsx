@@ -118,6 +118,8 @@ type NotificationLogsTabProps = {
   onLogPageChange: (page: number) => void
   onClearLogs: (filters: NotificationLogClearFilters) => void
   onSaveLogCleanup: (logCleanup: NotificationLogCleanupConfig) => void
+  fixedLineId?: string
+  embedded?: boolean
 }
 
 export default function NotificationLogsTab({
@@ -143,6 +145,8 @@ export default function NotificationLogsTab({
   onLogPageChange,
   onClearLogs,
   onSaveLogCleanup,
+  fixedLineId,
+  embedded = false,
 }: NotificationLogsTabProps) {
   const pageCount = Math.max(1, Math.ceil(logTotal / logPageSize))
   const startRecord = logTotal === 0 ? 0 : logPage * logPageSize + 1
@@ -242,7 +246,7 @@ export default function NotificationLogsTab({
   }
 
   return (
-    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520 }}>
+    <Card sx={{ height: embedded ? 620 : 'calc(100vh - 220px)', minHeight: 520 }}>
       <CardContent sx={{ height: '100%', display: 'flex', flexDirection: 'column', p: 2, pb: 0, '&:last-child': { pb: 0 } }}>
         <Box display="flex" gap={1.5} flexWrap="wrap" mb={2}>
           <TextField
@@ -267,7 +271,7 @@ export default function NotificationLogsTab({
             <MenuItem value="">所有状态</MenuItem>
             {LOG_STATUS_OPTIONS.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
           </TextField>
-          <TextField
+          {!fixedLineId && <TextField
             select
             size="small"
             label="事件归属"
@@ -277,7 +281,7 @@ export default function NotificationLogsTab({
           >
             <MenuItem value="">全部归属</MenuItem>
             {lineOptions.map((line) => <MenuItem key={line.id} value={line.id}>{line.label}</MenuItem>)}
-          </TextField>
+          </TextField>}
           <DateRangePicker startDate={logStartDate} endDate={logEndDate} onChange={onLogDateRangeChange} minWidth={280} />
           <TextField
             size="small"
@@ -478,7 +482,7 @@ export default function NotificationLogsTab({
               <MenuItem value="">所有状态 (不限)</MenuItem>
               {LOG_STATUS_OPTIONS.map((status) => <MenuItem key={status.value} value={status.value}>{status.label}</MenuItem>)}
             </TextField>
-            <TextField
+            {!fixedLineId && <TextField
               select
               size="small"
               label="事件归属"
@@ -489,7 +493,7 @@ export default function NotificationLogsTab({
             >
               <MenuItem value="">全部归属 (不限)</MenuItem>
               {lineOptions.map((line) => <MenuItem key={line.id} value={line.id}>{line.label}</MenuItem>)}
-            </TextField>
+            </TextField>}
             <Box>
               <Typography variant="body2" color="text.secondary" mb={1}>时间范围 (按日计算)</Typography>
               <DateRangePicker

@@ -103,6 +103,10 @@ pnpm type-check
 pnpm build
 ```
 
+提交前端改动时，`.github/workflows/frontend-checks.yml` 会在前端目录使用
+`pnpm install --frozen-lockfile`，依次执行 lint、TypeScript 类型检查和 Vite 构建。CI
+通过只表示前端静态检查和打包通过，不替代真实 modem、运营商网络或多线路验收。
+
 不要使用 `pnpm add` 代替依赖安装；依赖已经由 `package.json` 和 `pnpm-lock.yaml` 固定。
 
 ### 后端
@@ -223,4 +227,4 @@ busctl introspect org.freedesktop.ModemManager1 \
 ```
 
 排查多线路问题时同时记录 `line_id`、ModemManager object path、主/副 QMI 设备、netdev、
-bearer path、P-CSCF 和 trace ID。发布前按[真机测试清单](../真机测试清单.md)执行回归。
+bearer path、P-CSCF 和 trace ID。发布前按[未完成开发计划](./DEVELOPMENT_PLAN.md)中的验收规则和矩阵执行回归。

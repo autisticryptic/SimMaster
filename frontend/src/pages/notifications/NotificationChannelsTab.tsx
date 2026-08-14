@@ -45,6 +45,7 @@ type NotificationChannelsTabProps = {
   onPatchChannelConfig: (id: string, patch: Record<string, unknown>) => void
   onSave: () => void
   onTest: () => void
+  embedded?: boolean
 }
 
 export default function NotificationChannelsTab({
@@ -59,6 +60,7 @@ export default function NotificationChannelsTab({
   onPatchChannelConfig,
   onSave,
   onTest,
+  embedded = false,
 }: NotificationChannelsTabProps) {
   const isCompact = useMediaQuery<Theme>((theme: Theme) => theme.breakpoints.down('md'))
   const [addMenuAnchor, setAddMenuAnchor] = useState<HTMLElement | null>(null)
@@ -330,7 +332,7 @@ export default function NotificationChannelsTab({
   }
 
   return (
-    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520 }}>
+    <Card sx={{ height: embedded ? 680 : 'calc(100vh - 220px)', minHeight: 520 }}>
       <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
         <Box display="flex" height="100%">
           {!isCompact && (

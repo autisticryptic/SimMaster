@@ -2,18 +2,19 @@
 
 set -eu
 
-REPO="${REPO:-3899/SimAdmin}"
+REPO="${REPO:-autisticryptic/SimMaster}"
+REPO_BRANCH="${REPO_BRANCH:-master}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/simadmin}"
 SERVICE_NAME="${SERVICE_NAME:-simadmin}"
 VERSION="${VERSION:-latest}"
 GH_PROXY="${GH_PROXY:-https://gh-proxy.com/}"
 GH_PROXY_FALLBACKS="${GH_PROXY_FALLBACKS:-https://ghproxy.net/ https://githubproxy.cc/}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}}"
-SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin.service}"
-MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.sh}"
-MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/main/scripts/simadmin-modem-recovery.service}"
+SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin.service}"
+MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin-modem-recovery.sh}"
+MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin-modem-recovery.service}"
 ASSET_URL="${ASSET_URL:-}"
-ASSET_NAME="${ASSET_NAME:-simadmin.tar.gz}"
+ASSET_NAME="${ASSET_NAME:-}"
 SIMADMIN_INSTALL_LPAC="${SIMADMIN_INSTALL_LPAC:-1}"
 LPAC_REPO="${LPAC_REPO:-estkme-group/lpac}"
 LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/${LPAC_REPO}/releases/latest/download}"
@@ -106,11 +107,27 @@ version_to_tag() {
 
 asset_url_from_tag() {
   tag="$1"
-  printf 'https://github.com/%s/releases/download/%s/simadmin.tar.gz\n' "$REPO" "$tag"
+  printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$tag" "$(resolve_asset_name)"
+}
+
+resolve_asset_name() {
+  if [ -n "$ASSET_NAME" ]; then
+    printf '%s\n' "$ASSET_NAME"
+    return 0
+  fi
+
+  case "$(uname -m)" in
+    aarch64|arm64) printf 'simadmin-linux-arm64.tar.gz\n' ;;
+    x86_64|amd64) printf 'simadmin-linux-amd64.tar.gz\n' ;;
+    *)
+      echo "error: unsupported SimAdmin architecture: $(uname -m)" >&2
+      return 1
+      ;;
+  esac
 }
 
 repo_version() {
-  version_text="$(read_with_proxies "${RAW_BASE}/main/VERSION" | tr -d '[:space:]')"
+  version_text="$(read_with_proxies "${RAW_BASE}/${REPO_BRANCH}/VERSION" | tr -d '[:space:]')"
   if [ -z "$version_text" ]; then
     return 1
   fi
@@ -124,7 +141,7 @@ resolve_asset_url() {
   fi
 
   if [ "$VERSION" = "latest" ]; then
-    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$ASSET_NAME"
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$(resolve_asset_name)"
   else
     asset_url_from_tag "$(version_to_tag "$VERSION")"
   fi

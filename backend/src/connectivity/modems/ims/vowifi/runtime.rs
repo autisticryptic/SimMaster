@@ -171,6 +171,13 @@ impl VowifiRuntime {
         let next = match self.read_bound_sim_identity(conn).await {
             Some(identity) => {
                 let identity = VowifiSimIdentity::from_modem(&identity);
+                let presented_imsi =
+                    super::live::effective_imsi_for_line(&self.line_id, identity.imsi());
+                let identity = if presented_imsi != identity.imsi() {
+                    identity.with_presented_imsi(presented_imsi)
+                } else {
+                    identity
+                };
                 let pinned = super::live::line_pinned_profile_id(&self.line_id);
                 let profile = diagnostics::match_profile_for_line(&identity, pinned.as_deref());
                 let previous = self.snapshot().await;

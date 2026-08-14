@@ -30,7 +30,6 @@ import {
   enabledPasswordTypesText,
   normalizePasswordInput,
 } from '../lib/passwordPolicy'
-import communityQrUrl from '../../../static/Community/Community_QQ_Light.png'
 
 type AuthMode = 'login' | 'setup'
 
@@ -75,60 +74,6 @@ function LogoMark({ active }: { active: boolean }) {
         }}
       />
     </Box>
-  )
-}
-
-function CommunityTooltip() {
-  return (
-    <Tooltip
-      arrow
-      placement="top"
-      slotProps={{
-        tooltip: {
-          sx: {
-            p: 0,
-            maxWidth: 'none',
-            bgcolor: 'rgba(255,255,255,0.94)',
-            color: '#334155',
-            border: '1px solid rgba(226,232,240,0.9)',
-            boxShadow: '0 18px 48px -24px rgba(15,23,42,0.38)',
-            backdropFilter: 'blur(18px)',
-            WebkitBackdropFilter: 'blur(18px)',
-          },
-        },
-        arrow: {
-          sx: {
-            color: 'rgba(255,255,255,0.94)',
-            '&::before': {
-              border: '1px solid rgba(226,232,240,0.9)',
-              boxSizing: 'border-box',
-            },
-          },
-        },
-      }}
-      title={(
-        <Stack spacing={1} alignItems="center" sx={{ p: 1.25 }}>
-          <Box
-            component="img"
-            src={communityQrUrl}
-            alt="SimAdmin 社区"
-            sx={{
-              height: 132,
-              width: 'auto',
-              maxWidth: 240,
-              objectFit: 'contain',
-              borderRadius: 1,
-              bgcolor: '#fff',
-            }}
-          />
-          <Typography variant="caption" sx={{ color: 'text.secondary', whiteSpace: 'nowrap' }}>扫码加入 QQ 群</Typography>
-        </Stack>
-      )}
-    >
-      <Link component="button" type="button" underline="none" color="inherit" sx={{ font: 'inherit' }}>
-        社区
-      </Link>
-    </Tooltip>
   )
 }
 
@@ -512,8 +457,6 @@ export default function Login() {
           >
             Copyright © 2026 GitHub 3899
           </Link>
-          <Typography component="span" color="text.disabled">|</Typography>
-          <CommunityTooltip />
           <Typography component="span" color="text.disabled">|</Typography>
           <Typography component="span" sx={{ font: 'inherit' }}>v{__APP_VERSION__}</Typography>
         </Stack>

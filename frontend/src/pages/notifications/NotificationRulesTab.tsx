@@ -3,6 +3,7 @@ import {
   Accordion,
   AccordionDetails,
   AccordionSummary,
+  Alert,
   Avatar,
   Box,
   Button,
@@ -66,6 +67,9 @@ type NotificationRulesTabProps = {
   onDeleteRule: (id: string) => void
   onPatchRule: (id: string, patch: Partial<NotificationRule>) => void
   onSave: () => void
+  eventTypes?: typeof EVENT_TYPES
+  fixedLineId?: string
+  embedded?: boolean
 }
 
 export default function NotificationRulesTab({
@@ -78,6 +82,9 @@ export default function NotificationRulesTab({
   onDeleteRule,
   onPatchRule,
   onSave,
+  eventTypes = EVENT_TYPES,
+  fixedLineId,
+  embedded = false,
 }: NotificationRulesTabProps) {
   const textareaRefs = useRef<Record<string, HTMLTextAreaElement | HTMLInputElement | null>>({})
 
@@ -191,7 +198,7 @@ export default function NotificationRulesTab({
   )
 
   return (
-    <Card sx={{ height: 'calc(100vh - 220px)', minHeight: 520 }}>
+    <Card sx={{ height: embedded ? 680 : 'calc(100vh - 220px)', minHeight: 520 }}>
       <CardContent sx={{ height: '100%', p: 0, '&:last-child': { pb: 0 } }}>
         <Box display="flex" height="100%">
           {!isCompact && (
@@ -201,7 +208,7 @@ export default function NotificationRulesTab({
               </Box>
               <Box sx={{ borderBottom: 1, borderColor: 'divider' }} />
               <List sx={{ flex: 1, overflow: 'auto' }}>
-                {EVENT_TYPES.map((type) => {
+                {eventTypes.map((type) => {
                   const Icon = EVENT_ICONS[type.key]
                   const stats = ruleCountForType(type.key)
                   const hasEnabledRule = stats.enabled > 0
@@ -250,7 +257,7 @@ export default function NotificationRulesTab({
                   onChange={(event: ChangeEvent<HTMLInputElement>) => onSelectedEventTypeChange(event.target.value as NotificationEventType)}
                   sx={{ width: '100%', mb: 2 }}
                 >
-                  {EVENT_TYPES.map((type) => {
+                  {eventTypes.map((type) => {
                     const stats = ruleCountForType(type.key)
                     return (
                       <MenuItem key={type.key} value={type.key}>
@@ -397,7 +404,13 @@ export default function NotificationRulesTab({
                       />
                     )}
 
-                    {(rule.type === 'sms' || rule.type === 'call') && (
+                    {fixedLineId && (
+                      <Alert severity="info" sx={{ mt: 2 }}>
+                        此规则固定应用于当前线路，线路作用域不能在这里修改。
+                      </Alert>
+                    )}
+
+                    {!fixedLineId && (rule.type === 'sms' || rule.type === 'call') && (
                       <Box mt={2}>
                         <Typography variant="subtitle2" mb={1}>{rule.type === 'call' ? '线路' : 'SIM 卡通道'}</Typography>
                         <Box display="flex" gap={1} flexWrap="wrap">

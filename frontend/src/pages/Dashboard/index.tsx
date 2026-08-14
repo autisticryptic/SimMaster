@@ -16,13 +16,29 @@ import Grid from '@mui/material/Grid'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
 import ErrorSnackbar from '@/components/ErrorSnackbar'
 import {
-  QuickControls,
   SystemResources,
   NetworkSpeed,
   TemperatureMonitor,
 } from './components'
 import { maskedIccid, modemSlotLabel, shortLineId } from '@/components/modemLineFormat'
 import { useDashboardData, type DashboardData, type DashboardLineInfo } from './hooks/useDashboardData'
+
+function imsStatusLabel(line: DashboardLineInfo) {
+  if (!line.modem.present || line.modem.line_kind === 'reader') return { label: '不适用', color: 'default' as const }
+  if (line.volte.registered) return { label: '已注册', color: 'success' as const }
+  if (line.volte.last_error) return { label: '异常', color: 'error' as const }
+  if (line.volte.phase && !['idle', 'stopped', 'disabled'].includes(line.volte.phase.toLowerCase())) {
+    return { label: '连接中', color: 'warning' as const }
+  }
+  return { label: '未注册', color: 'default' as const }
+}
+
+function trunkStatusLabel(line: DashboardLineInfo) {
+  if (!line.trunk.enabled) return { label: '未启用', color: 'default' as const }
+  if (line.trunk.registered || line.trunk.phase === 'ready') return { label: '就绪', color: 'success' as const }
+  if (line.trunk.last_error || line.trunk.phase === 'degraded') return { label: '异常', color: 'error' as const }
+  return { label: '连接中', color: 'warning' as const }
+}
 
 function LineStatusTable({ lines }: { lines: DashboardLineInfo[] }) {
   return (
@@ -38,13 +54,18 @@ function LineStatusTable({ lines }: { lines: DashboardLineInfo[] }) {
             <TableCell>SIM</TableCell>
             <TableCell>运营商</TableCell>
             <TableCell>信号</TableCell>
-            <TableCell align="right">状态</TableCell>
+            <TableCell>IMS</TableCell>
+            <TableCell>Trunk</TableCell>
+            <TableCell align="right">设备</TableCell>
           </TableRow>
         </TableHead>
         <TableBody>
-          {lines.map(({ modem, deviceInfo, simInfo, networkInfo }) => {
+          {lines.map((line) => {
+            const { modem, deviceInfo, simInfo, networkInfo } = line
             const isReader = modem.line_kind === 'reader'
             const online = modem.present && (isReader || Boolean(deviceInfo?.online))
+            const ims = imsStatusLabel(line)
+            const trunk = trunkStatusLabel(line)
             return (
               <TableRow key={modem.line_id} hover>
                 <TableCell>
@@ -55,11 +76,13 @@ function LineStatusTable({ lines }: { lines: DashboardLineInfo[] }) {
                 <TableCell sx={{ fontFamily: 'monospace' }}>{maskedIccid(simInfo?.iccid || modem.sim_iccid)}</TableCell>
                 <TableCell>{networkInfo?.operator_name || (isReader ? 'VoWiFi' : '-')}</TableCell>
                 <TableCell>{networkInfo ? `${networkInfo.signal_strength}%` : '-'}</TableCell>
+                <TableCell><Chip size="small" label={ims.label} color={ims.color} variant="outlined" /></TableCell>
+                <TableCell><Chip size="small" label={trunk.label} color={trunk.color} variant="outlined" /></TableCell>
                 <TableCell align="right"><Chip size="small" label={online ? '在线' : '离线'} color={online ? 'success' : 'default'} variant="outlined" /></TableCell>
               </TableRow>
             )
           })}
-          {lines.length === 0 && <TableRow><TableCell colSpan={6} align="center">未发现线路</TableCell></TableRow>}
+          {lines.length === 0 && <TableRow><TableCell colSpan={8} align="center">未发现线路</TableCell></TableRow>}
         </TableBody>
       </Table>
     </TableContainer>
@@ -143,11 +166,7 @@ export default function DashboardPage() {
         <StatusBar data={data} />
 
         <Grid container spacing={2}>
-          <Grid size={{ xs: 12, md: 6, lg: 3 }}>
-            <QuickControls />
-          </Grid>
-
-          <Grid size={{ xs: 12, md: 6, lg: 9 }}>
+          <Grid size={12}>
             <SystemResources systemStats={data.systemStats} />
           </Grid>
 

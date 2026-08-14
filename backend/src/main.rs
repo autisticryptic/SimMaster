@@ -607,24 +607,28 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(get_default_carrier_catalog_path);
     let carrier_catalog = Arc::new(
-        connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::open(
+        connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::at_path(
             &carrier_catalog_path,
-        )
-        .map_err(anyhow::Error::msg)?,
+        ),
     );
-    let carrier_release = carrier_catalog.release().map_err(anyhow::Error::msg)?;
-    if !carrier_release.sealed {
-        return Err(anyhow::anyhow!(
-            "carrier catalog release is not sealed: {}",
-            carrier_release.release_id
-        ));
+    match carrier_catalog.release() {
+        Ok(carrier_release) if carrier_release.sealed => info!(
+            path = ?carrier_catalog_path,
+            release_id = %carrier_release.release_id,
+            generated_at = %carrier_release.generated_at,
+            "Loaded read-only carrier catalog"
+        ),
+        Ok(carrier_release) => warn!(
+            path = ?carrier_catalog_path,
+            release_id = %carrier_release.release_id,
+            "Carrier catalog is not sealed; IMS profiles remain unavailable until a valid catalog is installed"
+        ),
+        Err(error) => warn!(
+            path = ?carrier_catalog_path,
+            error = %error,
+            "Carrier catalog is unavailable; install a schema-v7 catalog from the WebUI"
+        ),
     }
-    info!(
-        path = ?carrier_catalog_path,
-        release_id = %carrier_release.release_id,
-        generated_at = %carrier_release.generated_at,
-        "Loaded read-only carrier catalog"
-    );
 
     let sim_overrides =
         Arc::new(connectivity::modems::ims::profile_override::SimOverrideStore::default());
@@ -663,10 +667,10 @@ async fn main() -> Result<()> {
         .sync_trunk_profiles(config_manager.as_ref())
         .await;
     {
-        let profile_store =
-            connectivity::modems::ims::vowifi::profile_store::ProfileStore::with_catalog(
-                Arc::clone(&carrier_catalog),
-            );
+        let profile_store = connectivity::modems::ims::vowifi::profile_store::ProfileStore::new(
+            Arc::clone(&carrier_catalog),
+            Arc::clone(&app_db),
+        );
         // Make the catalog rows visible to the live matcher; without this the
         // API would list profiles that never resolve at connect time.
         profile_store.publish();
@@ -1120,12 +1124,6 @@ async fn main() -> Result<()> {
             post(register_network_auto).options(options_handler),
         )
         .route(
-            "/api/modem/lines/{line_id}/apn",
-            get(get_apn_list_handler)
-                .post(set_apn_handler)
-                .options(options_handler),
-        )
-        .route(
             "/api/modem/lines/{line_id}/cell-lock",
             get(get_cell_lock_status_handler)
                 .post(set_cell_lock_handler)
@@ -1184,6 +1182,12 @@ async fn main() -> Result<()> {
             "/api/modem/lines/{line_id}/esim-control",
             get(get_line_esim_control_handler)
                 .post(set_line_esim_control_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/esim-reader",
+            get(get_line_esim_reader_handler)
+                .post(set_line_esim_reader_handler)
                 .options(options_handler),
         )
         .route(
@@ -1365,11 +1369,27 @@ async fn main() -> Result<()> {
             "/api/vowifi/profiles",
             get(get_vowifi_profiles_handler).options(options_handler),
         )
-        // Read-only carrier catalog view. Custom profile rows are no longer
-        // stored in the database; profile persistence is being redesigned.
         .route(
             "/api/vowifi/carrier-profiles",
-            get(list_vowifi_carrier_profiles_handler).options(options_handler),
+            get(list_vowifi_carrier_profiles_handler)
+                .put(upsert_vowifi_carrier_profile_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/vowifi/carrier-profiles/{profile_id}",
+            delete(delete_vowifi_carrier_profile_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/carrier-profiles/{profile_id}/icon",
+            get(get_vowifi_carrier_profile_icon_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/carrier-catalog/status",
+            get(get_carrier_catalog_status_handler).options(options_handler),
+        )
+        .route(
+            "/api/vowifi/carrier-catalog/install",
+            post(install_carrier_catalog_handler).options(options_handler),
         )
         .route(
             "/api/vowifi/carrier-profiles/resolve",
@@ -1539,6 +1559,16 @@ async fn main() -> Result<()> {
         .route(
             "/api/service/restart",
             post(restart_service_handler).options(options_handler),
+        )
+        .route(
+            "/api/service/modem-manager/restart",
+            post(restart_modem_manager_handler).options(options_handler),
+        )
+        .route(
+            "/api/settings/github-download-proxy",
+            get(get_github_download_proxy_handler)
+                .post(set_github_download_proxy_handler)
+                .options(options_handler),
         )
         // ========== 通知配置接口 ==========
         .route(

@@ -1,4 +1,4 @@
-use crate::hardware::cellular::modem_manager::{hangup_call_on_modem, make_call_via_modem};
+use crate::hardware::cellular::modem_manager::{hangup_call_on_modem, make_call_on_modem};
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;
@@ -52,7 +52,7 @@ impl AutomationTaskHandler for DialCallHandler {
         async move {
             let phone = normalize_phone(&country, &number)?;
             let target = resolve_modem_target(app, &target).await?;
-            let call_path = make_call_via_modem(&app.dbus_conn, &target.modem_path, &phone)
+            let call_path = make_call_on_modem(&app.dbus_conn, &target.modem_path, &phone)
                 .await
                 .context("定时拨号失败")?;
             let connection = app.dbus_conn.clone();

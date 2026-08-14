@@ -156,6 +156,9 @@ struct LiveNetworkOverrides {
     ims_registrar: Option<String>,
     ims_pcscf: Vec<String>,
     effective_device_imei: Option<String>,
+    /// IMSI used for carrier matching and exposed IMS identities. The SIM
+    /// reader identity remains separate and is still used for AKA APDUs.
+    effective_imsi: Option<String>,
     /// How this line's IKE/NAT-T traffic egresses. `None` means direct.
     proxy: Option<LiveProxySetting>,
 }
@@ -271,6 +274,11 @@ fn build_live_network_overrides(
                 device_imei,
             )
             .imei,
+        effective_imsi: access
+            .filter(|access| access.spoof_imsi)
+            .and_then(|access| access.custom_imsi.as_ref())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
     })
 }
 
@@ -287,6 +295,15 @@ fn line_overrides(line_id: &str) -> LiveNetworkOverrides {
         .get(line_id)
         .cloned()
         .unwrap_or_default()
+}
+
+/// Return the IMSI used for VoWiFi carrier matching and network identities.
+/// This is intentionally distinct from the modem SIM identity used for AKA.
+pub fn effective_imsi_for_line(line_id: &str, modem_imsi: &str) -> String {
+    line_overrides(line_id)
+        .effective_imsi
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| modem_imsi.trim().to_string())
 }
 
 /// The carrier profile a line is pinned to, if any. Unknown lines and lines
@@ -363,7 +380,15 @@ pub fn resolve_profile_for_line(
         return None;
     }
     let pinned = line_pinned_profile_id(line_id);
-    profiles::resolve_for_line(pinned.as_deref(), imsi.trim(), home_plmn)
+    let effective_imsi = effective_imsi_for_line(line_id, imsi);
+    let effective_home_plmn = (effective_imsi == imsi.trim())
+        .then_some(home_plmn)
+        .flatten();
+    profiles::resolve_for_line(
+        pinned.as_deref(),
+        effective_imsi.as_str(),
+        effective_home_plmn,
+    )
 }
 
 fn live_epdg_settings(
@@ -5692,7 +5717,8 @@ async fn live_ims_register_identity(
     let sim = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("ims_identity_unavailable"))?;
-    let imsi = sim.imsi.trim();
+    let imsi = effective_imsi_for_line(line_id, &sim.imsi);
+    let imsi = imsi.trim();
     if imsi.is_empty()
         || imsi.len() < 5
         || imsi.len() > 16
@@ -7112,7 +7138,8 @@ async fn live_ike_identity(
     let sim = line_sim_identity(line_id, &conn)
         .await
         .ok_or_else(|| live_stage_error("ike_identity_unavailable"))?;
-    build_permanent_nai(profile, &sim.imsi).map_err(map_identity_error)
+    let imsi = effective_imsi_for_line(line_id, &sim.imsi);
+    build_permanent_nai(profile, &imsi).map_err(map_identity_error)
 }
 
 fn map_identity_error(error: IkeIdentityError) -> LiveStageError {
@@ -7720,6 +7747,48 @@ mod tests {
             Some("my_carrier")
         );
         forget_live_network_overrides("line-my");
+    }
+
+    #[test]
+    fn presented_imsi_is_scoped_to_one_line_and_requires_enablement() {
+        let config = LineVowifiConfig::default();
+        let enabled = SimOverride {
+            ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
+                spoof_imsi: true,
+                custom_imsi: Some("460001234567890".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let disabled = SimOverride {
+            ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
+                spoof_imsi: false,
+                custom_imsi: Some("234331234567890".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        configure_live_network_overrides("line-spoof-enabled", &config, Some(&enabled))
+            .expect("configure enabled IMSI override");
+        configure_live_network_overrides("line-spoof-disabled", &config, Some(&disabled))
+            .expect("configure disabled IMSI override");
+
+        assert_eq!(
+            effective_imsi_for_line("line-spoof-enabled", "204041111111111"),
+            "460001234567890"
+        );
+        assert_eq!(
+            effective_imsi_for_line("line-spoof-disabled", "204041111111111"),
+            "204041111111111"
+        );
+        assert_eq!(
+            effective_imsi_for_line("line-spoof-unknown", "204041111111111"),
+            "204041111111111"
+        );
+
+        forget_live_network_overrides("line-spoof-enabled");
+        forget_live_network_overrides("line-spoof-disabled");
     }
 
     #[test]

@@ -571,6 +571,28 @@ pub struct VersionUpdateNotificationConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub struct GithubDownloadProxyConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_github_download_proxy_prefix")]
+    pub proxy_prefix: String,
+}
+
+fn default_github_download_proxy_prefix() -> String {
+    "https://gh-proxy.com/".to_string()
+}
+
+impl Default for GithubDownloadProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proxy_prefix: default_github_download_proxy_prefix(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct SecurityConfig {
     #[serde(default = "default_true")]
     pub password_protection_enabled: bool,
@@ -1538,6 +1560,27 @@ mod tests {
             profile.volte_connection_enabled = true;
             profile.trunk.context = "from-migrated-slot".to_string();
             config.line_profiles.push(profile);
+            config.automation.tasks.push(AutomationTask {
+                id: "legacy-line-task".to_string(),
+                name: "legacy line task".to_string(),
+                enabled: true,
+                trigger: AutomationTrigger::Interval {
+                    interval_value: 1,
+                    interval_unit: "hours".to_string(),
+                },
+                target: Some(AutomationTarget::ModemLine {
+                    line_id: legacy_line_id.to_string(),
+                }),
+                action: AutomationAction::RestartBaseband,
+            });
+            let mut rule: NotificationRule = serde_json::from_value(serde_json::json!({
+                "id": "legacy-line-rule",
+                "type": "sms",
+                "name": "legacy line rule"
+            }))
+            .unwrap();
+            rule.sim_channel_ids = vec![legacy_line_id.to_string(), current_line_id.to_string()];
+            config.notifications.rules.push(rule);
         }
         manager.save().unwrap();
 
@@ -1547,6 +1590,16 @@ mod tests {
         let migrated = manager.get_line_profile(current_line_id);
         assert!(migrated.volte_connection_enabled);
         assert_eq!(migrated.trunk.context, "from-migrated-slot");
+        let config = manager.config.read().unwrap();
+        assert!(matches!(
+            config.automation.tasks[0].target.as_ref(),
+            Some(AutomationTarget::ModemLine { line_id }) if line_id == current_line_id
+        ));
+        assert_eq!(
+            config.notifications.rules[0].sim_channel_ids,
+            vec![current_line_id.to_string()]
+        );
+        drop(config);
         assert!(!manager
             .migrate_line_profile_aliases(current_line_id, &[legacy_line_id.to_string()])
             .unwrap());
@@ -1698,6 +1751,110 @@ mod tests {
             reloaded.get_line_voice_path_policy(line_a)
         ));
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn esim_reader_settings_are_isolated_per_line() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-esim-reader-lines-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+        let line_c = "line-00112233445566778899aabbccddeeff";
+
+        manager
+            .set_line_esim_reader_config(
+                line_a,
+                EsimReaderConfig {
+                    apdu_backend: " pcsc ".to_string(),
+                    pcsc_reader_name: " ESTKme-RED ".to_string(),
+                    pcsc_reader_index: Some(2),
+                    ..EsimReaderConfig::default()
+                },
+            )
+            .unwrap();
+        manager
+            .set_line_esim_reader_config(
+                line_b,
+                EsimReaderConfig {
+                    apdu_backend: "mbim".to_string(),
+                    mbim_device: " /dev/cdc-wdm7 ".to_string(),
+                    mbim_uim_slot: 2,
+                    mbim_use_proxy: true,
+                    mbim_skip_slot_mapping: true,
+                    ..EsimReaderConfig::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            manager.get_line_esim_reader_config(line_a),
+            EsimReaderConfig {
+                apdu_backend: "pcsc".to_string(),
+                pcsc_reader_name: "ESTKme-RED".to_string(),
+                pcsc_reader_index: Some(2),
+                ..EsimReaderConfig::default()
+            }
+        );
+        assert_eq!(
+            manager.get_line_esim_reader_config(line_c),
+            EsimReaderConfig::default()
+        );
+
+        let reloaded = ConfigManager::new(path.clone());
+        let pcsc = reloaded.get_line_esim_reader_config(line_a);
+        assert_eq!(pcsc.pcsc_reader_name, "ESTKme-RED");
+        assert_eq!(pcsc.pcsc_reader_index, Some(2));
+        let mbim = reloaded.get_line_esim_reader_config(line_b);
+        assert_eq!(mbim.mbim_device, "/dev/cdc-wdm7");
+        assert_eq!(mbim.mbim_uim_slot, 2);
+        assert!(mbim.mbim_use_proxy);
+        assert!(mbim.mbim_skip_slot_mapping);
+        assert_eq!(
+            reloaded.get_line_esim_reader_config(line_c),
+            EsimReaderConfig::default()
+        );
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_global_esim_reader_migrates_only_for_one_line() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-esim-reader-migration-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        {
+            let mut config = manager.config.write().unwrap();
+            config.esim = EsimConfig {
+                apdu_backend: "at".to_string(),
+                at_device: "/dev/ttyUSB9".to_string(),
+                ..EsimConfig::default()
+            };
+        }
+        manager.save().unwrap();
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+
+        assert!(manager
+            .reconcile_line_profiles(&[line_id.to_string()])
+            .unwrap());
+        let reader = manager.get_line_esim_reader_config(line_id);
+        assert_eq!(reader.apdu_backend, "at");
+        assert_eq!(reader.at_device, "/dev/ttyUSB9");
+        assert!(manager.get_esim_config().at_device.is_empty());
+
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(
+            reloaded.get_line_esim_reader_config(line_id).at_device,
+            "/dev/ttyUSB9"
+        );
+        let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
     }
 
@@ -2472,6 +2629,71 @@ mod tests {
     }
 
     #[test]
+    fn trunk_ignores_duplicate_port_from_removed_line() {
+        let (manager, path) = trunk_test_manager();
+        let removed_line = "line-fedcba9876543210fedcba9876543210";
+        manager
+            .set_line_trunk_profile(
+                removed_line,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        let active_lines = std::collections::HashSet::from([TRUNK_TEST_LINE.to_string()]);
+        let saved = manager
+            .set_line_trunk_profile_for_active_lines(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+                &active_lines,
+            )
+            .expect("removed line must not reserve a local SIP port");
+        assert!(saved.trunk.enabled);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trunk_active_lines_still_reject_duplicate_local_ports() {
+        let (manager, path) = trunk_test_manager();
+        let other_line = "line-fedcba9876543210fedcba9876543210";
+        manager
+            .set_line_trunk_profile(
+                other_line,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+            )
+            .unwrap();
+        let active_lines =
+            std::collections::HashSet::from([TRUNK_TEST_LINE.to_string(), other_line.to_string()]);
+        let error = manager
+            .set_line_trunk_profile_for_active_lines(
+                TRUNK_TEST_LINE,
+                TrunkProfileConfig {
+                    enabled: true,
+                    asterisk_host: "192.168.1.10".to_string(),
+                    local_port: 5062,
+                    ..TrunkProfileConfig::default()
+                },
+                &active_lines,
+            )
+            .expect_err("active line must keep its local SIP port reservation");
+        assert_eq!(error, "trunk_local_port_in_use");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trunk_invalid_line_id_rejected() {
         let (manager, path) = trunk_test_manager();
         let err = manager
@@ -2957,6 +3179,18 @@ pub struct EsimConfig {
     pub lpac_path: String,
     #[serde(default)]
     pub custom_memory_total_kb: Option<u32>,
+    /// Deprecated pre-multi-line reader settings. They are retained only so a
+    /// single discovered line can migrate them into `LineProfileConfig`.
+    #[serde(default)]
+    pub apdu_backend: String,
+    #[serde(default)]
+    pub http_backend: String,
+    #[serde(default)]
+    pub at_device: String,
+    #[serde(default)]
+    pub qmi_device: String,
+    #[serde(default)]
+    pub qmi_uim_slot: u8,
 }
 
 impl Default for EsimConfig {
@@ -2964,6 +3198,77 @@ impl Default for EsimConfig {
         Self {
             lpac_path: default_lpac_path(),
             custom_memory_total_kb: None,
+            apdu_backend: "qmi".to_string(),
+            http_backend: "curl".to_string(),
+            at_device: String::new(),
+            qmi_device: String::new(),
+            qmi_uim_slot: 0,
+        }
+    }
+}
+
+/// lpac reader selection owned by one line. Device-wide lpac installation
+/// settings remain in `EsimConfig`; ports and APDU routing must never be shared
+/// across lines.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EsimReaderConfig {
+    /// lpac APDU backend, for example `qmi`, `qmi_qrtr`, `at`, or `at_csim`.
+    #[serde(default = "default_esim_apdu_backend")]
+    pub apdu_backend: String,
+    /// lpac HTTP backend, normally `curl`.
+    #[serde(default = "default_esim_http_backend")]
+    pub http_backend: String,
+    /// Optional AT port for the `at`/`at_csim` APDU backends.
+    #[serde(default)]
+    pub at_device: String,
+    /// Optional QMI override. Empty uses the selected line's registered reader.
+    #[serde(default)]
+    pub qmi_device: String,
+    /// Optional QMI UIM slot override. Zero uses the selected line's slot.
+    #[serde(default)]
+    pub qmi_uim_slot: u8,
+    /// Optional PC/SC reader name. Empty lets lpac use its first available reader.
+    #[serde(default)]
+    pub pcsc_reader_name: String,
+    /// Optional PC/SC reader index. `None` lets lpac choose automatically.
+    #[serde(default)]
+    pub pcsc_reader_index: Option<u16>,
+    /// MBIM control device used by the MBIM APDU backend.
+    #[serde(default)]
+    pub mbim_device: String,
+    /// MBIM UIM slot. Zero uses lpac's default slot.
+    #[serde(default)]
+    pub mbim_uim_slot: u8,
+    /// Connect through mbim-proxy instead of opening the device directly.
+    #[serde(default)]
+    pub mbim_use_proxy: bool,
+    /// Keep the modem's current slot mapping instead of changing it through MBIM.
+    #[serde(default)]
+    pub mbim_skip_slot_mapping: bool,
+}
+
+fn default_esim_apdu_backend() -> String {
+    "qmi".to_string()
+}
+
+fn default_esim_http_backend() -> String {
+    "curl".to_string()
+}
+
+impl Default for EsimReaderConfig {
+    fn default() -> Self {
+        Self {
+            apdu_backend: default_esim_apdu_backend(),
+            http_backend: default_esim_http_backend(),
+            at_device: String::new(),
+            qmi_device: String::new(),
+            qmi_uim_slot: 0,
+            pcsc_reader_name: String::new(),
+            pcsc_reader_index: None,
+            mbim_device: String::new(),
+            mbim_uim_slot: 0,
+            mbim_use_proxy: false,
+            mbim_skip_slot_mapping: false,
         }
     }
 }
@@ -3361,6 +3666,9 @@ pub struct LineProfileConfig {
     /// line to be treated as a plain SIM so no lpac calls are ever issued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub esim_control: Option<bool>,
+    /// Per-line lpac reader and transport settings.
+    #[serde(default)]
+    pub esim_reader: EsimReaderConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3465,6 +3773,7 @@ impl LineProfileConfig {
             voice_path: VoicePathPolicy::default().normalized(),
             apn: ApnConfig::default(),
             esim_control: None,
+            esim_reader: EsimReaderConfig::default(),
         }
     }
 
@@ -3523,6 +3832,47 @@ fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), Stri
         }
     }
     Ok(())
+}
+
+fn validate_esim_reader_config(config: &mut EsimReaderConfig) -> Result<(), String> {
+    config.apdu_backend = config.apdu_backend.trim().to_ascii_lowercase();
+    config.http_backend = config.http_backend.trim().to_ascii_lowercase();
+    config.at_device = config.at_device.trim().to_string();
+    config.qmi_device = config.qmi_device.trim().to_string();
+    config.pcsc_reader_name = config.pcsc_reader_name.trim().to_string();
+    config.mbim_device = config.mbim_device.trim().to_string();
+    if !matches!(
+        config.apdu_backend.as_str(),
+        "qmi" | "qmi_qrtr" | "at" | "at_csim" | "pcsc" | "mbim"
+    ) {
+        return Err("esim_apdu_backend_invalid".to_string());
+    }
+    if !matches!(config.http_backend.as_str(), "curl" | "stdio") {
+        return Err("esim_http_backend_invalid".to_string());
+    }
+    if matches!(config.apdu_backend.as_str(), "at" | "at_csim") && config.at_device.is_empty() {
+        return Err("esim_at_device_required".to_string());
+    }
+    if config.apdu_backend == "mbim" && config.mbim_device.is_empty() {
+        return Err("esim_mbim_device_required".to_string());
+    }
+    Ok(())
+}
+
+fn legacy_esim_reader_config(config: &EsimConfig) -> Option<EsimReaderConfig> {
+    let mut reader = EsimReaderConfig {
+        apdu_backend: config.apdu_backend.clone(),
+        http_backend: config.http_backend.clone(),
+        at_device: config.at_device.clone(),
+        qmi_device: config.qmi_device.clone(),
+        qmi_uim_slot: config.qmi_uim_slot,
+        ..EsimReaderConfig::default()
+    };
+    if validate_esim_reader_config(&mut reader).is_err() || reader == EsimReaderConfig::default() {
+        None
+    } else {
+        Some(reader)
+    }
 }
 
 fn valid_trunk_binding(binding: &str) -> bool {
@@ -3871,6 +4221,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub version_update_notifications: VersionUpdateNotificationConfig,
     #[serde(default)]
+    pub github_download_proxy: GithubDownloadProxyConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
     pub esim: EsimConfig,
@@ -3891,6 +4243,7 @@ impl Default for AppConfig {
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
+            github_download_proxy: GithubDownloadProxyConfig::default(),
             security: SecurityConfig::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
@@ -4494,6 +4847,28 @@ impl ConfigManager {
                     changed = true;
                 }
             }
+            // Old releases stored reader ports globally. Copy them only when
+            // there is exactly one physical line; applying one port to multiple
+            // lines would route lpac to the wrong card.
+            if ordered_ids.len() == 1 {
+                if let Some(legacy_reader) = legacy_esim_reader_config(&config.esim) {
+                    if let Some(profile) = config
+                        .line_profiles
+                        .iter_mut()
+                        .find(|profile| profile.line_id == ordered_ids[0])
+                    {
+                        if profile.esim_reader == EsimReaderConfig::default() {
+                            profile.esim_reader = legacy_reader;
+                            config.esim.apdu_backend = default_esim_apdu_backend();
+                            config.esim.http_backend = default_esim_http_backend();
+                            config.esim.at_device.clear();
+                            config.esim.qmi_device.clear();
+                            config.esim.qmi_uim_slot = 0;
+                            changed = true;
+                        }
+                    }
+                }
+            }
             config
                 .line_profiles
                 .sort_by(|left, right| left.line_id.cmp(&right.line_id));
@@ -4680,9 +5055,9 @@ impl ConfigManager {
         Ok(slots)
     }
 
-    /// Preserve per-SIM line settings when an older device-derived line ID is
-    /// replaced by the physical-slot-derived ID. The old profile is retained
-    /// as history; only the current line receives a copied profile.
+    /// Move physical-line references from older device/SIM-derived IDs to the
+    /// current physical-slot ID. The old profile is retained as history while
+    /// live automation and notification references are rewritten in place.
     pub fn migrate_line_profile_aliases(
         &self,
         line_id: &str,
@@ -4693,29 +5068,63 @@ impl ConfigManager {
         }
         let migrated = {
             let mut config = self.config.write().unwrap();
-            if config
+            let aliases = legacy_line_ids
+                .iter()
+                .map(|id| id.trim())
+                .filter(|id| valid_line_id(id) && *id != line_id)
+                .collect::<std::collections::HashSet<_>>();
+            let mut changed = false;
+
+            if !config
                 .line_profiles
                 .iter()
                 .any(|profile| profile.line_id == line_id)
             {
-                false
-            } else if let Some(source) = config
-                .line_profiles
-                .iter()
-                .find(|profile| legacy_line_ids.iter().any(|id| id == &profile.line_id))
-                .cloned()
-            {
-                config.line_profiles.push(LineProfileConfig {
-                    line_id: line_id.to_string(),
-                    ..source
-                });
-                config
+                if let Some(source) = config
                     .line_profiles
-                    .sort_by(|left, right| left.line_id.cmp(&right.line_id));
-                true
-            } else {
-                false
+                    .iter()
+                    .find(|profile| aliases.contains(profile.line_id.as_str()))
+                    .cloned()
+                {
+                    config.line_profiles.push(LineProfileConfig {
+                        line_id: line_id.to_string(),
+                        ..source
+                    });
+                    config
+                        .line_profiles
+                        .sort_by(|left, right| left.line_id.cmp(&right.line_id));
+                    changed = true;
+                }
             }
+
+            for task in &mut config.automation.tasks {
+                if let Some(AutomationTarget::ModemLine { line_id: target }) = &mut task.target {
+                    if aliases.contains(target.trim()) {
+                        *target = line_id.to_string();
+                        changed = true;
+                    }
+                }
+            }
+
+            for rule in &mut config.notifications.rules {
+                let mut rewritten = Vec::with_capacity(rule.sim_channel_ids.len());
+                for target in &rule.sim_channel_ids {
+                    let target = if aliases.contains(target.trim()) {
+                        line_id
+                    } else {
+                        target.as_str()
+                    };
+                    if !rewritten.iter().any(|existing| existing == target) {
+                        rewritten.push(target.to_string());
+                    }
+                }
+                if rewritten != rule.sim_channel_ids {
+                    rule.sim_channel_ids = rewritten;
+                    changed = true;
+                }
+            }
+
+            changed
         };
         if migrated {
             self.save()?;
@@ -4804,6 +5213,23 @@ impl ConfigManager {
         };
         self.save()?;
         Ok(next)
+    }
+
+    pub fn get_line_esim_reader_config(&self, line_id: &str) -> EsimReaderConfig {
+        self.get_line_profile(line_id).esim_reader
+    }
+
+    pub fn set_line_esim_reader_config(
+        &self,
+        line_id: &str,
+        mut reader: EsimReaderConfig,
+    ) -> Result<EsimReaderConfig, String> {
+        validate_esim_reader_config(&mut reader)?;
+        let persisted = reader.clone();
+        self.update_line_profile(line_id, |profile| {
+            profile.esim_reader = persisted;
+        })?;
+        Ok(reader)
     }
 
     /// Set this line's explicit ordered VoLTE IMS address-family list.
@@ -5125,6 +5551,28 @@ impl ConfigManager {
         line_id: &str,
         trunk: TrunkProfileConfig,
     ) -> Result<LineProfileConfig, String> {
+        self.set_line_trunk_profile_scoped(line_id, trunk, None)
+    }
+
+    /// Replace one line's trunk settings while limiting local-port collision
+    /// checks to lines that currently exist in the runtime registry. Persisted
+    /// profiles for removed hardware remain available for later reuse, but they
+    /// must not block a live line from enabling its trunk.
+    pub fn set_line_trunk_profile_for_active_lines(
+        &self,
+        line_id: &str,
+        trunk: TrunkProfileConfig,
+        active_line_ids: &std::collections::HashSet<String>,
+    ) -> Result<LineProfileConfig, String> {
+        self.set_line_trunk_profile_scoped(line_id, trunk, Some(active_line_ids))
+    }
+
+    fn set_line_trunk_profile_scoped(
+        &self,
+        line_id: &str,
+        trunk: TrunkProfileConfig,
+        active_line_ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<LineProfileConfig, String> {
         if !valid_line_id(line_id) {
             return Err("invalid_line_id".to_string());
         }
@@ -5176,6 +5624,8 @@ impl ConfigManager {
                 }
                 if config.line_profiles.iter().any(|profile| {
                     profile.line_id != line_id
+                        && active_line_ids
+                            .is_none_or(|line_ids| line_ids.contains(&profile.line_id))
                         && profile.trunk.enabled
                         && profile.trunk.local_port == incoming.local_port
                 }) {
@@ -5204,6 +5654,20 @@ impl ConfigManager {
     ) -> Result<LineProfileConfig, String> {
         let current = self.get_line_profile(line_id).trunk;
         self.set_line_trunk_profile(line_id, TrunkProfileConfig { enabled, ..current })
+    }
+
+    pub fn set_line_trunk_enabled_for_active_lines(
+        &self,
+        line_id: &str,
+        enabled: bool,
+        active_line_ids: &std::collections::HashSet<String>,
+    ) -> Result<LineProfileConfig, String> {
+        let current = self.get_line_profile(line_id).trunk;
+        self.set_line_trunk_profile_for_active_lines(
+            line_id,
+            TrunkProfileConfig { enabled, ..current },
+            active_line_ids,
+        )
     }
 
     pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
@@ -5360,7 +5824,14 @@ impl ConfigManager {
         Ok(next)
     }
 
-    pub fn set_esim_config(&self, esim: EsimConfig) -> Result<(), String> {
+    pub fn set_esim_config(&self, mut esim: EsimConfig) -> Result<(), String> {
+        // Reader routing is line-owned. Accept old request documents for API
+        // compatibility, but never persist their global port selection again.
+        esim.apdu_backend = default_esim_apdu_backend();
+        esim.http_backend = default_esim_http_backend();
+        esim.at_device.clear();
+        esim.qmi_device.clear();
+        esim.qmi_uim_slot = 0;
         {
             let mut c = self.config.write().unwrap();
             c.esim = esim;
@@ -5382,6 +5853,26 @@ impl ConfigManager {
             .unwrap()
             .version_update_notifications
             .clone()
+    }
+
+    pub fn get_github_download_proxy(&self) -> GithubDownloadProxyConfig {
+        self.config.read().unwrap().github_download_proxy.clone()
+    }
+
+    pub fn set_github_download_proxy(
+        &self,
+        mut proxy: GithubDownloadProxyConfig,
+    ) -> Result<(), String> {
+        proxy.proxy_prefix =
+            crate::services::system::ota::normalize_proxy_prefix(Some(proxy.proxy_prefix));
+        if proxy.enabled && proxy.proxy_prefix.is_empty() {
+            return Err("启用 GitHub 下载加速时必须填写加速节点".to_string());
+        }
+        {
+            let mut config = self.config.write().unwrap();
+            config.github_download_proxy = proxy;
+        }
+        self.save()
     }
 
     pub fn get_security(&self) -> SecurityConfig {

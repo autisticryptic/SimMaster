@@ -119,18 +119,22 @@ SimAdmin/
 
 ## 手动安装
 
-当前只支持手动部署。完成前后端构建并准备兼容的 `carrier-bundles.sqlite3` 后，将它们安装到
-目标设备：
+当前只支持手动部署。完成前后端构建后，将后端和前端安装到目标设备。运营商数据库是可选
+组件：SimAdmin 可以在缺少 `carrier-bundles.sqlite3` 时启动，管理员随后可在 WebUI 的
+“运营商 IMS Profile -> 数据库下载”中选择并安装兼容的 schema v7 数据库。
 
 ```bash
 install -d -m 0755 /opt/simadmin /opt/simadmin/www
 install -m 0755 /path/to/simadmin /opt/simadmin/simadmin
 cp -a /path/to/frontend-dist/. /opt/simadmin/www/
-install -m 0644 /path/to/carrier-bundles.sqlite3 /opt/simadmin/carrier-bundles.sqlite3
 install -m 0644 /path/to/simadmin.service /etc/systemd/system/simadmin.service
 systemctl daemon-reload
 systemctl enable --now simadmin.service
 ```
+
+如需随安装包预置数据库，可额外将其放到
+`/opt/simadmin/carrier-bundles.sqlite3`；否则首次启动后再从 WebUI 下载。下载会先校验数据库
+契约，再原子替换当前 catalog 并立即启用，不需要重启 SimAdmin。
 
 以上命令需在目标设备以 `root` 执行，并将 `/path/to/...` 换成实际产物路径。完整的依赖、
 构建、文件传输、副 QMI 服务和升级步骤见[手动安装指南](./docs/INSTALL.md)。安装完成后访问
@@ -144,7 +148,7 @@ systemctl enable --now simadmin.service
 | [运行环境与系统管理](./docs/ENVIRONMENT.md) | 依赖、路径、systemd、数据与硬件约束 | 是，面向设备运维 |
 | [开发者指南](./docs/DEVELOPER.md) | 架构、前后端开发、构建、测试、ADB 调试 | 是，前后端子 README 已归并于此 |
 | [Bruno API 集合](./bruno-api/README.md) | API 调试方法、环境变量和线路级请求说明 | 是，可执行请求以 `.bru` 文件为准 |
-| [真机测试清单](./真机测试清单.md) | 多 SIM、多读卡器、VoLTE/VoWiFi 与路由回归 | 是，属于发布验收资料 |
+| [未完成开发计划](./docs/DEVELOPMENT_PLAN.md) | 未完成功能、真实硬件验收和发布前门槛 | 是，当前唯一后续开发计划 |
 | [版本更新记录](./docs/CHANGELOG.md) | 已发布版本的用户可见变化 | 是，不与开发计划混写 |
 | [运营商 Profile 来源说明](./docs/CARRIER_PROFILES.md) | catalog、AOSP/IPCC 来源、限制与维护边界 | 是，保留为专题背景 |
 

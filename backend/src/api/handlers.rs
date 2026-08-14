@@ -41,18 +41,20 @@ use crate::{
         get_device_info_for_modem, get_is_roaming_for_modem, get_network_info_for_modem,
         get_operators_list_for_modem, get_radio_mode_for_modem, get_signal_strength_for_modem,
         get_sim_info_for_modem_with_cache, hangup_all_calls_for_modem, hangup_call_on_modem,
-        list_apn_contexts_for_modem, list_current_calls_for_modem, make_call_on_modem,
-        power_cycle_sim_for_profile_switch_via_modem, register_operator_for_modem,
-        request_operator_registration_for_modem, restart_baseband_via_modem,
-        scan_operators_for_modem, send_call_dtmf_on_modem, send_sms_via_modem, set_apn_on_bearer,
-        set_band_lock_for_modem, set_call_waiting_for_modem, set_radio_mode_for_modem,
-        sim_identity_for_modem, start_cell_monitoring_for_modem, stop_cell_monitoring_for_modem,
+        list_current_calls_for_modem, make_call_on_modem,
+        power_cycle_sim_for_profile_switch_via_modem, recover_absent_baseband_via_qmi,
+        register_operator_for_modem, request_operator_registration_for_modem,
+        restart_baseband_via_modem, scan_operators_for_modem, send_call_dtmf_on_modem,
+        send_sms_via_modem, set_band_lock_for_modem, set_call_waiting_for_modem,
+        set_radio_mode_for_modem, sim_identity_for_modem, start_cell_monitoring_for_modem,
+        stop_cell_monitoring_for_modem,
     },
     hardware::sim::esim::EsimApiError,
     platform::config::{
-        AccessPathKind, ApnConfig, AutoRestoreConfig, ImsVideoConfig, LineDataProxyConfig,
-        LineProfileConfig, LineVowifiConfig, MidFlightDisablePolicy, SmsPathPolicy,
-        StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
+        AccessPathKind, AutoRestoreConfig, EsimReaderConfig, GithubDownloadProxyConfig,
+        ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
+        MidFlightDisablePolicy, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
+        VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -94,6 +96,13 @@ const LINE_DATA_REGISTER_COOLDOWN_SECS: u64 = 120;
 const LINE_DATA_CONNECT_COOLDOWN_SECS: u64 = 60;
 const CALL_MONITOR_INTERVAL_SECS: u64 = 2;
 const CALL_END_MISSING_POLLS: u8 = 2;
+const DEFAULT_CARRIER_CATALOG_URL: &str = "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-pixel-mustang.sqlite3";
+const ALLOWED_CARRIER_CATALOG_URLS: &[&str] = &[
+    DEFAULT_CARRIER_CATALOG_URL,
+    "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-iphone16promax-26.6.sqlite3",
+    "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-ios-ipcc.sqlite3",
+];
+const MAX_CARRIER_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MM_MODEM_STATE_SEARCHING: i32 = 7;
 /// Local sink used by HTTP-originated supplementary calls until a local audio
 /// backend attaches to the per-line trunk. The IMS relay still owns distinct
@@ -414,8 +423,11 @@ pub async fn get_esim_lpac_status_handler(State(app): State<AppState>) -> impl I
 /// POST /api/esim/lpac/repair
 pub async fn repair_esim_lpac_handler(
     State(app): State<AppState>,
-    Json(payload): Json<EsimLpacRepairRequest>,
+    Json(mut payload): Json<EsimLpacRepairRequest>,
 ) -> impl IntoResponse {
+    if payload.proxy_prefix.is_none() {
+        payload.proxy_prefix = Some(configured_github_proxy_prefix(&app));
+    }
     match app.esim_supervisor.repair_lpac(payload).await {
         Ok(data) => {
             app.system_event_emitter
@@ -448,6 +460,53 @@ pub async fn repair_esim_lpac_handler(
     }
 }
 
+fn configured_github_proxy_prefix(app: &AppState) -> String {
+    let config = app.config_manager.get_github_download_proxy();
+    if config.enabled {
+        crate::services::system::ota::normalize_proxy_prefix(Some(config.proxy_prefix))
+    } else {
+        String::new()
+    }
+}
+
+fn requested_github_proxy_prefix(app: &AppState, requested: Option<String>) -> String {
+    requested.map_or_else(
+        || configured_github_proxy_prefix(app),
+        |prefix| crate::services::system::ota::normalize_proxy_prefix(Some(prefix)),
+    )
+}
+
+/// GET /api/settings/github-download-proxy
+pub async fn get_github_download_proxy_handler(State(app): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_github_download_proxy(),
+        )),
+    )
+}
+
+/// POST /api/settings/github-download-proxy
+pub async fn set_github_download_proxy_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<GithubDownloadProxyConfig>,
+) -> impl IntoResponse {
+    match app.config_manager.set_github_download_proxy(payload) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "GitHub download proxy updated",
+                app.config_manager.get_github_download_proxy(),
+            )),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<GithubDownloadProxyConfig>::error(error)),
+        ),
+    }
+}
+
 /// GET /api/esim/config
 pub async fn get_esim_config_handler(State(app): State<AppState>) -> impl IntoResponse {
     let esim_config = app.config_manager.get_esim_config();
@@ -474,6 +533,55 @@ pub async fn set_esim_config_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ApiResponse::<()>::error(err)),
         ),
+    }
+}
+
+/// GET /api/modem/lines/{line_id}/esim-reader
+pub async fn get_line_esim_reader_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<EsimReaderConfig>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if app.line_registry.get(&line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            app.config_manager.get_line_esim_reader_config(&line_id),
+        )),
+    )
+}
+
+/// POST /api/modem/lines/{line_id}/esim-reader
+pub async fn set_line_esim_reader_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<EsimReaderConfig>,
+) -> (StatusCode, Json<ApiResponse<EsimReaderConfig>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if app.line_registry.get(&line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    match app
+        .config_manager
+        .set_line_esim_reader_config(&line_id, payload)
+    {
+        Ok(reader) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "eSIM reader config updated",
+                reader,
+            )),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
     }
 }
 
@@ -1772,149 +1880,6 @@ pub async fn register_network_auto(
     }
 }
 
-/// GET /api/modem/lines/{line_id}/apn
-pub async fn get_apn_list_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, &line_id).await {
-        Ok(path) => path,
-        Err(reason) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<ApnListResponse>::error(reason)),
-            )
-        }
-    };
-    let apn_config = app.config_manager.get_line_apn_config(&line_id);
-    match list_apn_contexts_for_modem(&app.dbus_conn, &modem_path, Some(&apn_config)).await {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
-        ),
-        Err(e) => (
-            StatusCode::OK,
-            Json(ApiResponse::<ApnListResponse>::error(format!(
-                "Failed: {}",
-                e
-            ))),
-        ),
-    }
-}
-
-/// POST /api/modem/lines/{line_id}/apn
-pub async fn set_apn_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<SetApnRequest>,
-) -> impl IntoResponse {
-    let modem_path = match resolve_modem_path(&app, &line_id).await {
-        Ok(path) => path,
-        Err(reason) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<serde_json::Value>::error(reason)),
-            )
-        }
-    };
-
-    let context_path = payload.context_path.trim();
-    let updates_existing_bearer =
-        !context_path.is_empty() && !context_path.ends_with("/bearer/default");
-    if updates_existing_bearer {
-        let contexts = match list_apn_contexts_for_modem(&app.dbus_conn, &modem_path, None).await {
-            Ok(contexts) => contexts,
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ApiResponse::<serde_json::Value>::error(format!(
-                        "Failed to verify APN context ownership: {error}"
-                    ))),
-                )
-            }
-        };
-        if !apn_context_belongs_to_line(context_path, &contexts) {
-            return (
-                StatusCode::CONFLICT,
-                Json(ApiResponse::<serde_json::Value>::error(
-                    "apn_context_not_owned_by_line",
-                )),
-            );
-        }
-    }
-
-    let mut apn_config = app.config_manager.get_line_apn_config(&line_id);
-    if let Some(apn) = &payload.apn {
-        apn_config.apn = apn.trim().to_string();
-    }
-    if let Some(protocol) = &payload.protocol {
-        apn_config.protocol = protocol.trim().to_string();
-    }
-    if let Some(username) = &payload.username {
-        apn_config.username = username.trim().to_string();
-    }
-    if let Some(password) = &payload.password {
-        apn_config.password = password.clone();
-    }
-    if let Some(auth_method) = &payload.auth_method {
-        apn_config.auth_method = auth_method.trim().to_string();
-    }
-    if apn_config.protocol.trim().is_empty() {
-        apn_config.protocol = ApnConfig::default().protocol;
-    }
-    if apn_config.auth_method.trim().is_empty() {
-        apn_config.auth_method = ApnConfig::default().auth_method;
-    }
-
-    let saved = app
-        .config_manager
-        .set_line_apn_config(&line_id, apn_config)
-        .map(|_| ());
-    if let Err(err) = saved {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(format!(
-                "Failed to save APN config: {}",
-                err
-            ))),
-        );
-    }
-
-    if !updates_existing_bearer {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "APN config saved",
-                json!({}),
-            )),
-        );
-    }
-
-    match set_apn_on_bearer(&app.dbus_conn, &modem_path, &payload).await {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("APN updated", json!({}))),
-        ),
-        Err(e) => {
-            warn!(error = %e, "APN config saved but bearer update failed");
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "APN config saved",
-                    json!({ "bearer_update_error": e.to_string() }),
-                )),
-            )
-        }
-    }
-}
-
-fn apn_context_belongs_to_line(context_path: &str, contexts: &ApnListResponse) -> bool {
-    contexts
-        .contexts
-        .iter()
-        .any(|context| context.path == context_path)
-}
-
 /// GET /api/modem/lines/{line_id}/cell-lock
 pub async fn get_cell_lock_status_handler(
     State(app): State<AppState>,
@@ -2440,31 +2405,106 @@ async fn restart_selected_baseband(
     app: &AppState,
     requested_line_id: &str,
 ) -> (StatusCode, Json<ApiResponse<BasebandRestartResponse>>) {
-    let (line_id, modem_path) = match resolve_baseband_line(app, requested_line_id).await {
-        Ok(line) => line,
-        Err(reason) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<BasebandRestartResponse>::error(reason)),
-            )
-        }
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let line_id = requested_line_id.trim();
+    let Some(line) = app.line_registry.get(line_id).await else {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<BasebandRestartResponse>::error(
+                "line_not_found",
+            )),
+        );
     };
+    let binding = line.binding();
+    if !binding_has_baseband(&binding) {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<BasebandRestartResponse>::error(
+                "line_has_no_baseband",
+            )),
+        );
+    }
     let profile = app.config_manager.get_line_profile(&line_id);
+    if !profile.enabled {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<BasebandRestartResponse>::error(
+                "line_disabled",
+            )),
+        );
+    }
     let apn_config = app.config_manager.get_line_apn_config(&line_id);
-    let result = restart_baseband_via_modem(
-        &app.dbus_conn,
-        &line_id,
-        &modem_path,
-        profile.data_connection_enabled,
-        profile.roaming_allowed,
-        Some(apn_config),
-    )
-    .await;
+    let result = if binding.present && !binding.modem_path.trim().is_empty() {
+        restart_baseband_via_modem(
+            &app.dbus_conn,
+            line_id,
+            &binding.modem_path,
+            profile.data_connection_enabled,
+            profile.roaming_allowed,
+            Some(apn_config),
+        )
+        .await
+    } else if let Some(qmi_device) = binding
+        .qmi_device
+        .as_deref()
+        .filter(|device| !device.trim().is_empty())
+    {
+        recover_absent_baseband_via_qmi(
+            &app.dbus_conn,
+            line_id,
+            qmi_device,
+            profile.data_connection_enabled,
+            profile.roaming_allowed,
+            Some(apn_config),
+        )
+        .await
+    } else {
+        Err("离线线路没有保留的 QMI 控制口，无法安全定位要恢复的基带".to_string())
+    };
+    let result = match result {
+        Ok(mut data) if profile.airplane_mode_enabled => {
+            let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+            let recovered = line.binding();
+            if !recovered.present || recovered.modem_path.trim().is_empty() {
+                Err("基带已执行恢复，但重新枚举后仍无法应用飞行模式配置".to_string())
+            } else {
+                match modem_manager::set_airplane_mode_for_modem(
+                    app.dbus_conn.as_ref(),
+                    &recovered.modem_path,
+                    true,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let step = BasebandRestartStep {
+                            step: "应用已保存的飞行模式".to_string(),
+                            status: "ok".to_string(),
+                            detail: Some("移动射频保持关闭".to_string()),
+                        };
+                        modem_manager::record_restart_step_for_line(
+                            line_id,
+                            &step.step,
+                            &step.status,
+                            step.detail.clone(),
+                        );
+                        data.steps.push(step);
+                        Ok(data)
+                    }
+                    Err(error) => Err(format!("基带已恢复，但应用飞行模式失败：{error}")),
+                }
+            }
+        }
+        result => result,
+    };
     match result {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
-                "Baseband restarted",
+                if binding.present {
+                    "Baseband restarted"
+                } else {
+                    "Offline baseband recovered"
+                },
                 data,
             )),
         ),
@@ -2549,7 +2589,10 @@ async fn build_line_network_controls(
         false
     };
     let mut proxy_status = line.data_proxy.status().await;
-    if profile.data_connection_enabled && !proxy_status.running && proxy_status.phase == "disabled"
+    if binding.present
+        && profile.data_connection_enabled
+        && !proxy_status.running
+        && proxy_status.phase == "disabled"
     {
         proxy_status.phase = "connecting".to_string();
         proxy_status.stage = if connected {
@@ -3064,12 +3107,6 @@ pub async fn set_line_data_connection_handler(
         );
     };
     let binding = line.binding();
-    if !binding.present {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_not_present")),
-        );
-    }
     let profile = app.config_manager.get_line_profile(&line_id);
     if payload.enabled && !profile.enabled {
         return (
@@ -3102,6 +3139,17 @@ pub async fn set_line_data_connection_handler(
             )
         }
     };
+    // Offline lines remain configurable. Persist the requested state now and
+    // let the inventory reconciler apply it after this exact line reappears.
+    if !binding.present {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved; device offline",
+                build_line_network_controls(&app, &line).await,
+            )),
+        );
+    }
     if payload.enabled {
         if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
             line.data_proxy.record_error(error.clone()).await;
@@ -3158,18 +3206,16 @@ pub async fn set_line_data_proxy_config_handler(
     };
     if profile.data_connection_enabled {
         let binding = line.binding();
-        if !binding.present {
-            return (
-                StatusCode::CONFLICT,
-                Json(ApiResponse::error("line_not_present")),
-            );
-        }
-        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
-            line.data_proxy.record_error(error.clone()).await;
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            );
+        if binding.present {
+            if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+                line.data_proxy.record_error(error.clone()).await;
+                return (
+                    StatusCode::OK,
+                    Json(ApiResponse::error(format!("Failed: {error}"))),
+                );
+            }
+        } else {
+            line.data_proxy.stop().await;
         }
     }
     (
@@ -3208,19 +3254,15 @@ pub async fn set_line_roaming_handler(
     let mut data_error = None;
     if profile.data_connection_enabled {
         let binding = line.binding();
-        if !binding.present {
-            return (
-                StatusCode::CONFLICT,
-                Json(ApiResponse::error("line_not_present")),
-            );
-        }
-        stop_line_data_runtime(&app, &line).await;
-        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
-            line.data_proxy.record_error(error.clone()).await;
-            data_error = Some(error);
+        if binding.present {
+            stop_line_data_runtime(&app, &line).await;
+            if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+                line.data_proxy.record_error(error.clone()).await;
+                data_error = Some(error);
+            }
         }
     }
-    if profile.enabled && profile.volte_connection_enabled {
+    if line.binding().present && profile.enabled && profile.volte_connection_enabled {
         let status = line.volte.status().await;
         if status.registered {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
@@ -3265,22 +3307,25 @@ pub async fn set_line_airplane_mode_handler(
         );
     };
     let binding = line.binding();
-    if !binding.present && payload.enabled {
+    if let Err(error) = app
+        .config_manager
+        .set_line_airplane_mode(&line_id, payload.enabled)
+    {
         return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_not_present")),
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
+    }
+    if !binding.present {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved; device offline",
+                build_line_network_controls(&app, &line).await,
+            )),
         );
     }
     if payload.enabled {
-        match app.config_manager.set_line_airplane_mode(&line_id, true) {
-            Ok(_) => {}
-            Err(error) => {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::error(format!("Failed: {error}"))),
-                )
-            }
-        };
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         stop_line_data_runtime_locked(&app, &line).await;
         let _volte_guard = line.volte_connect_lock.lock().await;
@@ -3290,11 +3335,6 @@ pub async fn set_line_airplane_mode_handler(
             "line_airplane_mode_enabled",
         )
         .await;
-    } else if let Err(error) = app.config_manager.set_line_airplane_mode(&line_id, false) {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::error(format!("Failed: {error}"))),
-        );
     }
     if let Err(error) = modem_manager::set_airplane_mode_for_modem(
         app.dbus_conn.as_ref(),
@@ -5280,17 +5320,6 @@ async fn restore_cellular_and_reset_vowifi(
     status
 }
 
-async fn fallback_to_cellular_and_disable_vowifi_connection(
-    app: &AppState,
-    scope: &VowifiScope,
-    reason: &str,
-) -> VowifiStatusResponse {
-    if let Err(err) = disable_vowifi_connection_for_scope(app, scope) {
-        warn!(error = %err, "Failed to persist WiFi Calling connection disable after fallback");
-    }
-    restore_cellular_and_reset_vowifi(app, scope, reason).await
-}
-
 async fn stop_vowifi_and_restore_cellular(
     app: &AppState,
     scope: &VowifiScope,
@@ -5462,6 +5491,20 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         return;
     }
 
+    if let Err(error) = configure_vowifi_live_overrides(&app, &scope).await {
+        persist_optional_vowifi_restore_phase(
+            &app,
+            &workflow,
+            RestorePhase::Failed,
+            Instant::now(),
+            false,
+            false,
+            Some(&error),
+            0,
+        );
+        return;
+    }
+
     let mut last_status = disabled_vowifi_status("vowifi_restore_not_attempted");
     let attempts = workflow.attempts.max(1);
     for attempt in 1..=attempts {
@@ -5560,9 +5603,10 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         reason = last_status.degraded_reason.as_deref().unwrap_or("unknown"),
         "WiFi Calling restore workflow failed after retries"
     );
-    let _ =
-        fallback_to_cellular_and_disable_vowifi_connection(&app, &scope, workflow.fallback_reason)
-            .await;
+    // A transient route, DNS, or ePDG failure must not overwrite the user's
+    // per-line enable intent. Reset only the failed runtime so a later manual
+    // attempt or boot restore can retry after connectivity returns.
+    let _ = restore_cellular_and_reset_vowifi(&app, &scope, workflow.fallback_reason).await;
 }
 
 async fn schedule_vowifi_restore_retry(
@@ -5790,6 +5834,29 @@ async fn attempt_vowifi_connect_once(
     status
 }
 
+/// Publish the immutable SIM-bound connection snapshot before profile matching
+/// starts. Manual connects and boot/profile restores must both do this so a
+/// presented IMSI behaves consistently after restart.
+async fn configure_vowifi_live_overrides(
+    app: &AppState,
+    scope: &VowifiScope,
+) -> Result<(), String> {
+    let line_id = scope.line_id().to_string();
+    let line_config = app.config_manager.get_line_profile(&line_id).vowifi;
+    let (_, sim_override) = ims_override_for_line(app, &line_id).await?;
+    let device_imei = app
+        .line_registry
+        .get(&line_id)
+        .await
+        .map(|line| line.binding().equipment_identifier.clone());
+    crate::connectivity::modems::ims::vowifi::live::configure_live_network_overrides_with_device_imei(
+        &line_id,
+        &line_config,
+        Some(&sim_override),
+        device_imei.as_deref(),
+    )
+}
+
 async fn connect_vowifi_on_line(
     app: &AppState,
     scope: &VowifiScope,
@@ -5809,35 +5876,11 @@ async fn connect_vowifi_on_line(
     // Resolve and publish SIM-bound values only after proving that this call is
     // starting a new session. PATCHing SimOverrideStore while a session is
     // active therefore cannot alter its IKE/REGISTER refresh behavior.
-    {
-        let line_id = scope.line_id().to_string();
-        let line_config = app.config_manager.get_line_profile(&line_id).vowifi;
-        let (_, sim_override) = match ims_override_for_line(app, &line_id).await {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                let mut status = disabled_vowifi_status("vowifi_sim_override_not_ready");
-                status.degraded_reason = Some(error);
-                persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
-                return status;
-            }
-        };
-        let device_imei = app
-            .line_registry
-            .get(&line_id)
-            .await
-            .map(|line| line.binding().equipment_identifier.clone());
-        if let Err(error) = crate::connectivity::modems::ims::vowifi::live::configure_live_network_overrides_with_device_imei(
-            &line_id,
-            &line_config,
-            Some(&sim_override),
-            device_imei.as_deref(),
-        )
-        {
-            let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
-            status.degraded_reason = Some(error);
-            persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
-            return status;
-        }
+    if let Err(error) = configure_vowifi_live_overrides(app, scope).await {
+        let mut status = disabled_vowifi_status("vowifi_line_network_config_invalid");
+        status.degraded_reason = Some(error);
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+        return status;
     }
 
     let Some(_connect_guard) = scope.try_connect_lock() else {
@@ -5914,8 +5957,10 @@ async fn connect_vowifi_on_line(
             reason = fallback_reason.as_str(),
             "WiFi Calling connection attempts exhausted; falling back to cellular"
         );
-        last_status =
-            fallback_to_cellular_and_disable_vowifi_connection(app, scope, &fallback_reason).await;
+        // Preserve the configured enable intent. The current runtime is
+        // degraded and cellular data is restored, but the operator should not
+        // have to re-enable VoWiFi after a temporary DNS or route outage.
+        last_status = restore_cellular_and_reset_vowifi(app, scope, &fallback_reason).await;
     }
     last_status
 }
@@ -6084,15 +6129,10 @@ pub async fn set_vowifi_line_connection_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    if payload.enabled && !line.binding().present {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_not_present")),
-        );
-    }
+    let binding = line.binding();
     // Validate the future connection snapshot without replacing an active
     // session's immutable values. Publication happens inside the connect lock.
-    if payload.enabled {
+    if payload.enabled && binding.present {
         let mut next = app.config_manager.get_line_profile(&line_id).vowifi;
         next.enabled = true;
         let (_, sim_override) = match ims_override_for_line(&app, &line_id).await {
@@ -6115,7 +6155,8 @@ pub async fn set_vowifi_line_connection_handler(
                 Json(ApiResponse::error(format!("Failed: {error}"))),
             );
         }
-    } else {
+    }
+    if !payload.enabled {
         // Drop the overrides so a disabled line stops influencing anything.
         crate::connectivity::modems::ims::vowifi::live::forget_live_network_overrides(&line_id);
     }
@@ -6126,6 +6167,15 @@ pub async fn set_vowifi_line_connection_handler(
         return (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
+    }
+    if !binding.present {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved; device offline",
+                build_vowifi_line_response(&app, &line).await,
+            )),
         );
     }
     // Connect/disconnect the line the request names. Lines no longer share a
@@ -6354,12 +6404,6 @@ pub async fn set_volte_line_connection_handler(
         );
     };
     let binding = line.binding();
-    if payload.enabled && !binding.present {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::error("line_not_present")),
-        );
-    }
     if payload.enabled
         && app
             .config_manager
@@ -6383,6 +6427,20 @@ pub async fn set_volte_line_connection_handler(
             )
         }
     };
+    if !binding.present {
+        sync_line_video_capabilities(&app).await;
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved; device offline",
+                VolteLineControlResponse {
+                    modem: line.binding(),
+                    profile: profile.redacted(),
+                    runtime: line.volte.status().await,
+                },
+            )),
+        );
+    }
     let result: Result<
         crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
         crate::connectivity::modems::ims::volte::VolteError,
@@ -6616,7 +6674,21 @@ pub async fn set_line_trunk_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    match app.config_manager.set_line_trunk_profile(&line_id, payload) {
+    let active_line_ids = app
+        .line_registry
+        .all()
+        .await
+        .into_iter()
+        .filter_map(|runtime| {
+            let binding = runtime.binding();
+            binding.present.then_some(binding.line_id)
+        })
+        .collect::<HashSet<_>>();
+    match app.config_manager.set_line_trunk_profile_for_active_lines(
+        &line_id,
+        payload,
+        &active_line_ids,
+    ) {
         Ok(profile) => {
             line.activate_trunk_profile(&profile.trunk).await;
             (
@@ -6649,10 +6721,21 @@ pub async fn set_line_trunk_enabled_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    match app
-        .config_manager
-        .set_line_trunk_enabled(&line_id, payload.enabled)
-    {
+    let active_line_ids = app
+        .line_registry
+        .all()
+        .await
+        .into_iter()
+        .filter_map(|runtime| {
+            let binding = runtime.binding();
+            binding.present.then_some(binding.line_id)
+        })
+        .collect::<HashSet<_>>();
+    match app.config_manager.set_line_trunk_enabled_for_active_lines(
+        &line_id,
+        payload.enabled,
+        &active_line_ids,
+    ) {
         Ok(profile) => {
             line.activate_trunk_profile(&profile.trunk).await;
             (
@@ -7005,9 +7088,184 @@ pub async fn get_vowifi_profiles_handler() -> (StatusCode, Json<ApiResponse<Vowi
 fn profile_store(
     app: &AppState,
 ) -> crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore {
-    crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::with_catalog(Arc::clone(
-        &app.carrier_catalog,
-    ))
+    crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::new(
+        Arc::clone(&app.carrier_catalog),
+        Arc::clone(&app.database),
+    )
+}
+
+fn carrier_catalog_status(app: &AppState) -> Result<CarrierCatalogStatusResponse, String> {
+    use crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogAccessKind;
+
+    let release = app.carrier_catalog.release()?;
+    if !release.sealed {
+        return Err(format!(
+            "carrier_catalog_release_not_sealed:{}",
+            release.release_id
+        ));
+    }
+    let volte_profiles = app.carrier_catalog.list(CatalogAccessKind::LteEpc)?.len();
+    let vowifi_profiles = app.carrier_catalog.list(CatalogAccessKind::WifiEpdg)?.len();
+    Ok(CarrierCatalogStatusResponse {
+        installed: true,
+        usable: true,
+        path: app.carrier_catalog.path().display().to_string(),
+        release_id: release.release_id,
+        generated_at: release.generated_at,
+        sealed: true,
+        volte_profiles,
+        vowifi_profiles,
+        message: "carrier catalog is ready".to_string(),
+    })
+}
+
+/// GET /api/vowifi/carrier-catalog/status
+pub async fn get_carrier_catalog_status_handler(
+    State(app): State<AppState>,
+) -> (StatusCode, Json<ApiResponse<CarrierCatalogStatusResponse>>) {
+    match carrier_catalog_status(&app) {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", status)),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Carrier catalog unavailable",
+                CarrierCatalogStatusResponse {
+                    installed: app.carrier_catalog.path().is_file(),
+                    usable: false,
+                    path: app.carrier_catalog.path().display().to_string(),
+                    message: error,
+                    ..CarrierCatalogStatusResponse::default()
+                },
+            )),
+        ),
+    }
+}
+
+async fn download_carrier_catalog(asset_url: &str, proxy_prefix: &str) -> Result<Vec<u8>, String> {
+    if !ALLOWED_CARRIER_CATALOG_URLS.contains(&asset_url) {
+        return Err("carrier_catalog_asset_not_allowed".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .user_agent("SimAdmin carrier catalog installer")
+        .timeout(Duration::from_secs(180))
+        .build()
+        .map_err(|error| format!("carrier_catalog_http_client_failed:{error}"))?;
+    let mut last_error = String::new();
+    for url in crate::services::system::ota::ota_request_urls(asset_url, proxy_prefix, false) {
+        let response = match client.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("carrier_catalog_download_failed:{error}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("carrier_catalog_download_http_status:{}", response.status());
+            continue;
+        }
+        if response
+            .content_length()
+            .is_some_and(|size| size > MAX_CARRIER_CATALOG_BYTES as u64)
+        {
+            return Err("carrier_catalog_download_too_large".to_string());
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("carrier_catalog_download_read_failed:{error}"))?;
+        if bytes.len() > MAX_CARRIER_CATALOG_BYTES {
+            return Err("carrier_catalog_download_too_large".to_string());
+        }
+        return Ok(bytes.to_vec());
+    }
+    Err(if last_error.is_empty() {
+        "carrier_catalog_download_failed".to_string()
+    } else {
+        last_error
+    })
+}
+
+/// POST /api/vowifi/carrier-catalog/install
+pub async fn install_carrier_catalog_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<CarrierCatalogInstallRequest>,
+) -> (StatusCode, Json<ApiResponse<CarrierCatalogInstallResponse>>) {
+    use crate::connectivity::modems::ims::vowifi::{
+        carrier_catalog::{CarrierCatalog, CatalogAccessKind},
+        profile_store::ProfileStore,
+    };
+
+    let asset_url = payload
+        .asset_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_CARRIER_CATALOG_URL)
+        .to_string();
+    let proxy_prefix = requested_github_proxy_prefix(&app, payload.proxy_prefix);
+    let result = async {
+        let bytes = download_carrier_catalog(&asset_url, &proxy_prefix).await?;
+        let target = app.carrier_catalog.path();
+        let parent = target
+            .parent()
+            .ok_or_else(|| "carrier_catalog_target_parent_missing".to_string())?;
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("carrier_catalog_target_create_failed:{error}"))?;
+        let temp_path = parent.join(format!(
+            ".carrier-bundles-{}-{}.sqlite3",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        ));
+
+        let install_result = (|| {
+            fs::write(&temp_path, &bytes)
+                .map_err(|error| format!("carrier_catalog_temp_write_failed:{error}"))?;
+            let candidate = CarrierCatalog::open(&temp_path)?;
+            let release = candidate.release()?;
+            if !release.sealed {
+                return Err(format!(
+                    "carrier_catalog_release_not_sealed:{}",
+                    release.release_id
+                ));
+            }
+            let volte_profiles = candidate.list(CatalogAccessKind::LteEpc)?.len();
+            let vowifi_profiles = candidate.list(CatalogAccessKind::WifiEpdg)?.len();
+            fs::rename(&temp_path, target)
+                .map_err(|error| format!("carrier_catalog_activate_failed:{error}"))?;
+            ProfileStore::new(Arc::clone(&app.carrier_catalog), Arc::clone(&app.database))
+                .publish();
+            Ok(CarrierCatalogInstallResponse {
+                installed: true,
+                path: target.display().to_string(),
+                asset_url: asset_url.clone(),
+                release_id: release.release_id,
+                generated_at: release.generated_at,
+                volte_profiles,
+                vowifi_profiles,
+                message: "carrier catalog downloaded, validated, and activated".to_string(),
+            })
+        })();
+        if temp_path.exists() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        install_result
+    }
+    .await;
+
+    match result {
+        Ok(installed) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Carrier catalog installed",
+                installed,
+            )),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
+    }
 }
 
 /// GET /api/vowifi/carrier-profiles
@@ -7023,6 +7281,75 @@ pub async fn list_vowifi_carrier_profiles_handler(
             Json(ApiResponse::success_with_message("Success", profiles)),
         ),
         Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
+}
+
+/// PUT /api/vowifi/carrier-profiles
+///
+/// Store an operator-authored override in `data.db`. The sealed catalog remains
+/// untouched, so downloading a newer release cannot overwrite local profiles.
+pub async fn upsert_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Json(record): Json<
+        crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord,
+    >,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match profile_store(&app).upsert(record) {
+        Ok(profile) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Custom carrier profile saved",
+                json!(profile),
+            )),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
+    }
+}
+
+/// DELETE /api/vowifi/carrier-profiles/{profile_id}
+pub async fn delete_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    match profile_store(&app).delete(&profile_id) {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Custom carrier profile deleted",
+                json!({ "deleted": true }),
+            )),
+        ),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("custom_carrier_profile_not_found")),
+        ),
+        Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
+    }
+}
+
+/// GET /api/vowifi/carrier-profiles/{profile_id}/icon
+pub async fn get_vowifi_carrier_profile_icon_handler(
+    State(app): State<AppState>,
+    Path(profile_id): Path<String>,
+) -> axum::response::Response {
+    match app.carrier_catalog.profile_icon(&profile_id) {
+        Ok(Some(icon)) => (
+            StatusCode::OK,
+            [
+                (axum::http::header::CONTENT_TYPE, icon.media_type),
+                (
+                    axum::http::header::CACHE_CONTROL,
+                    "private, max-age=86400".to_string(),
+                ),
+            ],
+            icon.data,
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            warn!(profile_id, error = %error, "Failed to read carrier profile icon");
+            StatusCode::NOT_FOUND.into_response()
+        }
     }
 }
 
@@ -8465,6 +8792,61 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
     )
 }
 
+/// Restart the system ModemManager service without restarting SimAdmin or the OS.
+pub async fn restart_modem_manager_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let output = tokio::task::spawn_blocking(|| {
+        Command::new("systemctl")
+            .args(["restart", "ModemManager.service"])
+            .output()
+    })
+    .await;
+
+    let result = match output {
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(String::from_utf8_lossy(&output.stderr).trim().to_string()),
+        Ok(Err(error)) => Err(error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+
+    match result {
+        Ok(()) => {
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::BASEBAND_MODEMMANAGER_RESTARTED,
+                    system_event_severity::WARNING,
+                    system_event_status::SUCCEEDED,
+                    "ModemManager.service",
+                    "用户手动重启 ModemManager.service",
+                )
+                .await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "ModemManager service restarted",
+                    json!({}),
+                )),
+            )
+        }
+        Err(error) => {
+            app.system_event_emitter
+                .emit_code(
+                    system_event_codes::BASEBAND_MODEMMANAGER_RESTART_FAILED,
+                    system_event_severity::CRITICAL,
+                    system_event_status::FAILED,
+                    "ModemManager.service",
+                    format!("用户手动重启 ModemManager.service 失败: {error}"),
+                )
+                .await;
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ApiResponse::<serde_json::Value>::error(format!(
+                    "重启 ModemManager.service 失败: {error}"
+                ))),
+            )
+        }
+    }
+}
+
 use crate::platform::config::ConfigManager;
 use crate::services::notify::notification::NotificationSender;
 
@@ -8664,23 +9046,15 @@ pub async fn upload_ota_handler(body: axum::body::Bytes) -> impl IntoResponse {
 
 /// POST /api/ota/latest-release
 pub async fn get_latest_ota_release_handler(
+    State(app): State<AppState>,
     Json(req): Json<crate::api::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
     let result: Result<crate::api::models::OtaLatestReleaseResponse, String> = async {
-        let include_builtin_proxies = req
-            .proxy_prefix
-            .as_ref()
-            .map(|prefix| !prefix.trim().is_empty())
-            .unwrap_or(false);
-        let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let proxy_prefix = requested_github_proxy_prefix(&app, req.proxy_prefix);
         let client = crate::services::system::ota::build_ota_http_client()?;
 
-        crate::services::system::ota::fetch_latest_github_release(
-            &client,
-            &proxy_prefix,
-            include_builtin_proxies,
-        )
-        .await
+        crate::services::system::ota::fetch_latest_github_release(&client, &proxy_prefix, false)
+            .await
     }
     .await;
 
@@ -8701,21 +9075,17 @@ pub async fn get_latest_ota_release_handler(
 
 /// POST /api/ota/online-prepare
 pub async fn prepare_online_ota_handler(
+    State(app): State<AppState>,
     Json(req): Json<crate::api::models::OtaOnlinePrepareRequest>,
 ) -> impl IntoResponse {
     let result: Result<crate::api::models::OtaUploadResponse, String> = async {
-        let include_builtin_proxies = req
-            .proxy_prefix
-            .as_ref()
-            .map(|prefix| !prefix.trim().is_empty())
-            .unwrap_or(false);
-        let proxy_prefix = crate::services::system::ota::normalize_proxy_prefix(req.proxy_prefix);
+        let proxy_prefix = requested_github_proxy_prefix(&app, req.proxy_prefix);
         let client = crate::services::system::ota::build_ota_http_client()?;
 
         let release = crate::services::system::ota::fetch_latest_github_release(
             &client,
             &proxy_prefix,
-            include_builtin_proxies,
+            false,
         )
         .await?;
 
@@ -8733,7 +9103,7 @@ pub async fn prepare_online_ota_handler(
         let bytes = crate::services::system::ota::download_ota_asset_bytes(
             &client,
             &proxy_prefix,
-            include_builtin_proxies,
+            false,
             asset,
         )
         .await?;
@@ -9319,6 +9689,17 @@ fn normalize_ims_override_payload(mut payload: SimOverride) -> SimOverride {
             payload.emergency.e911_address = None;
         } else if trimmed != address {
             payload.emergency.e911_address = Some(trimmed.to_string());
+        }
+    }
+    if !payload.ims_vowifi.spoof_imsi {
+        payload.ims_vowifi.custom_imsi = None;
+    } else if let Some(imsi) = payload.ims_vowifi.custom_imsi.as_deref() {
+        let trimmed = imsi.trim();
+        if trimmed.is_empty() {
+            payload.ims_vowifi.custom_imsi = None;
+            payload.ims_vowifi.spoof_imsi = false;
+        } else if trimmed != imsi {
+            payload.ims_vowifi.custom_imsi = Some(trimmed.to_string());
         }
     }
     payload
@@ -10659,25 +11040,6 @@ mod tests {
         assert!(!disabled.voice_enabled);
         assert!(!disabled.registered);
         assert_ne!(enabled.line_id, disabled.line_id);
-    }
-
-    #[test]
-    fn apn_context_ownership_requires_exact_line_bearer_path() {
-        let contexts = ApnListResponse {
-            contexts: vec![ApnContext {
-                path: "/org/freedesktop/ModemManager1/Bearer/6".to_string(),
-                ..Default::default()
-            }],
-        };
-
-        assert!(apn_context_belongs_to_line(
-            "/org/freedesktop/ModemManager1/Bearer/6",
-            &contexts
-        ));
-        assert!(!apn_context_belongs_to_line(
-            "/org/freedesktop/ModemManager1/Bearer/7",
-            &contexts
-        ));
     }
 
     #[test]

@@ -17,11 +17,11 @@ use zbus::{
 
 use crate::{
     api::models::{
-        AirplaneModeResponse, ApnContext, ApnListResponse, BandLockRequest, BandLockStatus,
-        BasebandRestartResponse, BasebandRestartStep, CallInfo, CallListResponse,
-        CallSettingsResponse, CellInfo, CellLocationInfo, CellLocationResponse, CellsResponse,
-        DeviceInfoResponse, NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode,
-        RadioModeResponse, ServingCell, SetApnRequest, SignalStrengthResponse, SimInfoResponse,
+        AirplaneModeResponse, BandLockRequest, BandLockStatus, BasebandRestartResponse,
+        BasebandRestartStep, CallInfo, CallListResponse, CallSettingsResponse, CellInfo,
+        CellLocationInfo, CellLocationResponse, CellsResponse, DeviceInfoResponse,
+        NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode, RadioModeResponse,
+        ServingCell, SignalStrengthResponse, SimInfoResponse,
     },
     hardware::cellular::serial::with_serial_for,
 };
@@ -785,6 +785,31 @@ fn line_hardware_key(hardware_key: &str, uim_slot: u8) -> String {
     }
 }
 
+fn physical_line_id(hardware_key: &str, uim_slot: u8) -> String {
+    stable_line_id("physical-line", &line_hardware_key(hardware_key, uim_slot))
+}
+
+fn physical_line_identity(
+    hardware_key: &str,
+    uim_slot: u8,
+    sim_key: &str,
+    legacy_hardware_keys: &[String],
+) -> (String, Vec<String>) {
+    let line_key = line_hardware_key(hardware_key, uim_slot);
+    let line_id = physical_line_id(hardware_key, uim_slot);
+    let legacy_line_ids = unique_non_empty(
+        std::iter::once(stable_line_id(&line_key, sim_key)).chain(
+            legacy_hardware_keys
+                .iter()
+                .map(|key| stable_line_id(&line_hardware_key(key, uim_slot), sim_key)),
+        ),
+    )
+    .into_iter()
+    .filter(|legacy_line_id| legacy_line_id != &line_id)
+    .collect();
+    (line_id, legacy_line_ids)
+}
+
 /// Build the stable line identity for a standalone SIM reader.
 ///
 /// Readers are not backed by a ModemManager object, so their line identity is
@@ -1389,15 +1414,11 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             device_reference.clone(),
             primary_port.clone(),
         ]);
-        let line_key = line_hardware_key(&hardware_key, uim_slot);
-        let legacy_line_ids = legacy_hardware_keys
-            .iter()
-            .map(|key| stable_line_id(&line_hardware_key(key, uim_slot), sim_key))
-            .filter(|line_id| line_id != &stable_line_id(&line_key, sim_key))
-            .collect::<Vec<_>>();
+        let (line_id, legacy_line_ids) =
+            physical_line_identity(&hardware_key, uim_slot, sim_key, &legacy_hardware_keys);
 
         bindings.push(ModemBinding {
-            line_id: stable_line_id(&line_key, sim_key),
+            line_id,
             display_order: 0,
             slot_label: String::new(),
             slot_source,
@@ -2430,6 +2451,16 @@ async fn qmicli_sim_power(device: &str, enabled: bool) -> Result<String, String>
     run_recovery_command_owned("qmicli", &args, Duration::from_secs(20)).await
 }
 
+async fn qmicli_baseband_reset(device: &str) -> Result<String, String> {
+    let args = vec![
+        "-p".to_string(),
+        "-d".to_string(),
+        device.to_string(),
+        "--dms-set-operating-mode=reset".to_string(),
+    ];
+    run_recovery_command_owned("qmicli", &args, Duration::from_secs(20)).await
+}
+
 fn looks_like_qmi_control_port(port: &str) -> bool {
     let p = port.to_ascii_lowercase();
     p.contains("qmi") || p.contains("cdc-wdm")
@@ -2738,10 +2769,20 @@ mod tests {
     }
 
     #[test]
-    fn stable_line_identity_changes_when_sim_changes() {
-        assert_ne!(
-            stable_line_id("imei:123", "iccid:456"),
-            stable_line_id("imei:123", "iccid:789")
+    fn physical_line_identity_survives_sim_changes() {
+        let (first, first_aliases) = physical_line_identity("sysfs:slot-1", 1, "iccid:456", &[]);
+        let (second, second_aliases) = physical_line_identity("sysfs:slot-1", 1, "iccid:789", &[]);
+        assert_eq!(
+            first, second,
+            "the current SIM must not participate in the physical line ID"
+        );
+        assert_eq!(
+            first_aliases,
+            vec![stable_line_id("sysfs:slot-1", "iccid:456")]
+        );
+        assert_eq!(
+            second_aliases,
+            vec![stable_line_id("sysfs:slot-1", "iccid:789")]
         );
     }
 
@@ -2750,8 +2791,8 @@ mod tests {
         let hardware_key = "imei:123";
         assert_eq!(line_hardware_key(hardware_key, 1), hardware_key);
         assert_ne!(
-            stable_line_id(&line_hardware_key(hardware_key, 1), "iccid:456"),
-            stable_line_id(&line_hardware_key(hardware_key, 2), "iccid:456")
+            physical_line_id(hardware_key, 1),
+            physical_line_id(hardware_key, 2)
         );
     }
 
@@ -4650,14 +4691,6 @@ const MM_BEARER_ALLOWED_AUTH_NONE: u32 = 1 << 0;
 const MM_BEARER_ALLOWED_AUTH_PAP: u32 = 1 << 1;
 const MM_BEARER_ALLOWED_AUTH_CHAP: u32 = 1 << 2;
 
-fn bearer_ip_type_to_protocol(v: u32) -> &'static str {
-    match v {
-        1 => "ip",
-        2 => "ipv6",
-        _ => "dual",
-    }
-}
-
 fn apn_auth_method_to_mm_allowed_auth(method: &str) -> Option<u32> {
     match method.to_ascii_lowercase().as_str() {
         "none" => Some(MM_BEARER_ALLOWED_AUTH_NONE),
@@ -4667,121 +4700,11 @@ fn apn_auth_method_to_mm_allowed_auth(method: &str) -> Option<u32> {
     }
 }
 
-fn mm_allowed_auth_to_apn_auth_method(mask: u32) -> &'static str {
-    if mask == MM_BEARER_ALLOWED_AUTH_NONE {
-        "none"
-    } else if mask & MM_BEARER_ALLOWED_AUTH_CHAP != 0 {
-        "chap"
-    } else if mask & MM_BEARER_ALLOWED_AUTH_PAP != 0 {
-        "pap"
-    } else {
-        "chap"
-    }
-}
-
 fn extract_bearer_settings(props: &InterfaceProperties) -> InterfaceProperties {
     props
         .get("Properties")
         .and_then(|value| InterfaceProperties::try_from(value.clone()).ok())
         .unwrap_or_default()
-}
-
-pub async fn list_apn_contexts_for_modem(
-    conn: &Connection,
-    modem_path: &str,
-    configured_apn: Option<&ApnConfig>,
-) -> zbus::Result<ApnListResponse> {
-    let modem_path = modem_path.to_string();
-    let bearer_paths = known_bearer_paths(conn, &modem_path).await?;
-    let mut contexts = Vec::new();
-    for path in bearer_paths {
-        let props = get_all_properties(conn, &path, MM_BEARER).await?;
-        let settings = extract_bearer_settings(&props);
-        let apn = props
-            .get("Apn")
-            .or_else(|| settings.get("apn"))
-            .map(extract_string)
-            .unwrap_or_default();
-        let user = props
-            .get("User")
-            .or_else(|| settings.get("user"))
-            .map(extract_string)
-            .unwrap_or_default();
-        let password = props
-            .get("Password")
-            .or_else(|| settings.get("password"))
-            .map(extract_string)
-            .unwrap_or_default();
-        let ip_type = props
-            .get("IpType")
-            .or_else(|| settings.get("ip-type"))
-            .map(extract_u32)
-            .unwrap_or(0);
-        let auth_method = props
-            .get("AllowedAuth")
-            .or_else(|| settings.get("allowed-auth"))
-            .map(extract_u32)
-            .map(mm_allowed_auth_to_apn_auth_method)
-            .unwrap_or("chap");
-        let connected = props.get("Connected").map(extract_bool).unwrap_or(false);
-        let name = path.rsplit('/').next().unwrap_or("bearer").to_string();
-        contexts.push(ApnContext {
-            path: path.clone(),
-            name,
-            active: connected,
-            apn,
-            protocol: bearer_ip_type_to_protocol(ip_type).to_string(),
-            username: user,
-            password,
-            auth_method: auth_method.into(),
-            context_type: "internet".into(),
-        });
-    }
-    if let Some(config) = configured_apn.filter(|config| !config.apn.trim().is_empty()) {
-        for ctx in &mut contexts {
-            if ctx.apn.trim().is_empty() {
-                ctx.apn = config.apn.trim().to_string();
-                ctx.protocol = config.protocol.trim().to_string();
-                ctx.username = config.username.trim().to_string();
-                ctx.password = config.password.clone();
-                ctx.auth_method = config.auth_method.trim().to_string();
-            }
-        }
-    }
-    if contexts.is_empty() {
-        let mut fallback = configured_apn
-            .map(apn_config_to_simple_connect_settings)
-            .unwrap_or_default();
-        if !fallback.has_apn() {
-            fallback.fill_missing_from(
-                inferred_default_simple_connect_settings(conn, &modem_path).await,
-            );
-        }
-        let configured_auth = configured_apn
-            .map(|config| config.auth_method.trim())
-            .filter(|auth| !auth.is_empty())
-            .unwrap_or("chap");
-        contexts.push(ApnContext {
-            path: format!("{modem_path}/bearer/default"),
-            name: "default".into(),
-            active: false,
-            apn: fallback.apn.unwrap_or_default(),
-            protocol: fallback
-                .ip_type
-                .map(bearer_ip_type_to_protocol)
-                .unwrap_or("dual")
-                .to_string(),
-            username: fallback.user.unwrap_or_default(),
-            password: fallback.password.unwrap_or_default(),
-            auth_method: fallback
-                .allowed_auth
-                .map(mm_allowed_auth_to_apn_auth_method)
-                .unwrap_or(configured_auth)
-                .to_string(),
-            context_type: "internet".into(),
-        });
-    }
-    Ok(ApnListResponse { contexts })
 }
 
 fn extract_object_path_array(value: &OwnedValue) -> Vec<String> {
@@ -5023,65 +4946,6 @@ pub async fn get_bearer_stats_for_interface(
     Ok(None)
 }
 
-pub async fn set_apn_on_bearer(
-    conn: &Connection,
-    modem_path: &str,
-    req: &SetApnRequest,
-) -> zbus::Result<()> {
-    with_serial_for(modem_path, async {
-        let props_proxy =
-            Proxy::new(conn, MM_SERVICE, req.context_path.as_str(), DBUS_PROPERTIES).await?;
-        if let Some(ref auth_method) = req.auth_method {
-            apn_auth_method_to_mm_allowed_auth(auth_method).ok_or_else(|| {
-                zbus::fdo::Error::InvalidArgs(format!("Unsupported APN auth method: {auth_method}"))
-            })?;
-        }
-        if let Some(ref apn) = req.apn {
-            props_proxy
-                .call::<_, _, ()>(
-                    "Set",
-                    &(MM_BEARER, "Apn", zbus::zvariant::Value::new(apn.as_str())),
-                )
-                .await?;
-        }
-        if let Some(ref user) = req.username {
-            props_proxy
-                .call::<_, _, ()>(
-                    "Set",
-                    &(MM_BEARER, "User", zbus::zvariant::Value::new(user.as_str())),
-                )
-                .await?;
-        }
-        if let Some(ref pass) = req.password {
-            props_proxy
-                .call::<_, _, ()>(
-                    "Set",
-                    &(
-                        MM_BEARER,
-                        "Password",
-                        zbus::zvariant::Value::new(pass.as_str()),
-                    ),
-                )
-                .await?;
-        }
-        if let Some(ref proto) = req.protocol {
-            let ip_type = match proto.as_str() {
-                "ip" => 1u32,
-                "ipv6" => 2u32,
-                _ => 3u32,
-            };
-            props_proxy
-                .call::<_, _, ()>(
-                    "Set",
-                    &(MM_BEARER, "IpType", zbus::zvariant::Value::new(ip_type)),
-                )
-                .await?;
-        }
-        Ok(())
-    })
-    .await
-}
-
 fn mm_call_state_to_string(state: i32) -> &'static str {
     match state {
         1 => "dialing",
@@ -5204,32 +5068,6 @@ pub async fn make_call_on_modem(
 
         Err(last_error
             .unwrap_or_else(|| zbus::fdo::Error::Failed("拨号失败，请稍后重试".to_string()).into()))
-    })
-    .await
-}
-
-/// Place a CS call on one persistent modem line instead of whichever modem
-/// happens to be returned by the legacy primary selector.
-pub async fn make_call_via_modem(
-    conn: &Connection,
-    modem_path: &str,
-    phone_number: &str,
-) -> zbus::Result<String> {
-    with_serial_for(modem_path, async {
-        wait_until_voice_ready(conn, modem_path).await?;
-        cleanup_finished_calls(conn, modem_path).await.ok();
-        for attempt in 0..2 {
-            match create_and_start_mm_call(conn, modem_path, phone_number).await {
-                Ok(path) => return Ok(path),
-                Err(error) if attempt == 0 && is_retryable_call_setup_error(&error) => {
-                    cleanup_finished_calls(conn, modem_path).await.ok();
-                    tokio::time::sleep(Duration::from_millis(800)).await;
-                    wait_until_voice_ready(conn, modem_path).await.ok();
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(zbus::fdo::Error::Failed("指定基带拨号失败".to_string()).into())
     })
     .await
 }
@@ -6211,6 +6049,152 @@ pub async fn restart_baseband_via_modem(
         .await
     })
     .await
+}
+
+/// Recover a line that is still known by its stable inventory entry but has
+/// disappeared from ModemManager. The retained QMI path prevents a manual
+/// recovery request from selecting a different, healthy modem.
+pub async fn recover_absent_baseband_via_qmi(
+    conn: &Connection,
+    line_id: &str,
+    qmi_device: &str,
+    auto_connect_data: bool,
+    allow_roaming: bool,
+    configured_apn: Option<ApnConfig>,
+) -> Result<BasebandRestartResponse, String> {
+    let qmi_device = qmi_device_path(qmi_device);
+    let serial_key = qmi_device.clone();
+    with_baseband_restart_progress(line_id.to_string(), async move {
+        reset_baseband_restart_progress();
+        let _progress_guard = BasebandRestartRunGuard::current();
+        with_serial_for(&serial_key, async move {
+            recover_absent_baseband_inner(
+                conn,
+                &qmi_device,
+                auto_connect_data,
+                allow_roaming,
+                configured_apn.as_ref(),
+            )
+            .await
+        })
+        .await
+    })
+    .await
+}
+
+async fn recover_absent_baseband_inner(
+    conn: &Connection,
+    qmi_device: &str,
+    auto_connect_data: bool,
+    allow_roaming: bool,
+    configured_apn: Option<&ApnConfig>,
+) -> Result<BasebandRestartResponse, String> {
+    let mut steps = Vec::new();
+    record_baseband_step(&mut steps, "开始恢复离线基带", "running", None);
+    record_baseband_step(
+        &mut steps,
+        "定位保留的 QMI 控制口",
+        "running",
+        Some(qmi_device.to_string()),
+    );
+
+    if wait_for_qmi_device_path(qmi_device, Duration::from_secs(2))
+        .await
+        .is_some()
+    {
+        record_baseband_step(
+            &mut steps,
+            "定位保留的 QMI 控制口",
+            "ok",
+            Some(qmi_device.to_string()),
+        );
+        record_baseband_step(&mut steps, "发送基带复位命令", "running", None);
+        match qmicli_baseband_reset(qmi_device).await {
+            Ok(output) => record_baseband_step(&mut steps, "发送基带复位命令", "ok", Some(output)),
+            Err(error) => record_baseband_step(
+                &mut steps,
+                "发送基带复位命令",
+                "warning",
+                Some(format!("复位时连接可能被基带主动断开：{error}")),
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    } else {
+        record_baseband_step(
+            &mut steps,
+            "定位保留的 QMI 控制口",
+            "warning",
+            Some("设备节点暂时不存在，将尝试重新枚举 ModemManager".to_string()),
+        );
+    }
+
+    let mut modem_path =
+        wait_for_modem_path_by_qmi(conn, qmi_device, Duration::from_secs(12)).await;
+    if modem_path.is_none() {
+        record_baseband_step(
+            &mut steps,
+            "重启 ModemManager 重新枚举",
+            "running",
+            Some("这是离线恢复回退，会短暂影响其他基带".to_string()),
+        );
+        match run_recovery_command("systemctl", &["restart", "ModemManager.service"]).await {
+            Ok(output) => {
+                record_baseband_step(&mut steps, "重启 ModemManager 重新枚举", "ok", Some(output))
+            }
+            Err(error) => {
+                record_baseband_step(
+                    &mut steps,
+                    "重启 ModemManager 重新枚举",
+                    "error",
+                    Some(error.clone()),
+                );
+                return Err(error);
+            }
+        }
+        modem_path = wait_for_modem_path_by_qmi(conn, qmi_device, Duration::from_secs(20)).await;
+    }
+
+    let modem_path = modem_path.ok_or_else(|| {
+        format!("离线恢复失败：未能通过保留的 QMI 控制口重新发现基带 {qmi_device}")
+    })?;
+    record_baseband_step(
+        &mut steps,
+        "重新发现目标基带",
+        "ok",
+        Some(modem_path.clone()),
+    );
+
+    // Finish with the ordinary per-modem workflow so radio, registration and
+    // the persisted data policy are restored exactly as for an online restart.
+    let result = restart_baseband_inner(
+        conn,
+        &modem_path,
+        auto_connect_data,
+        allow_roaming,
+        configured_apn,
+    )
+    .await?;
+    let mut response = get_baseband_restart_progress_for_key(&current_baseband_progress_key());
+    response.running = false;
+    response.current_registration = result.current_registration;
+    Ok(response)
+}
+
+async fn wait_for_modem_path_by_qmi(
+    conn: &Connection,
+    qmi_device: &str,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(path) = modem_path_for_qmi_device(conn, qmi_device).await {
+            return Some(path);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
 /// Refresh the SIM attached to one explicitly selected modem. The QMI hint is

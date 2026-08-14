@@ -35,6 +35,11 @@ import {
 } from './notifications/notificationModel'
 
 const LOG_PAGE_SIZE = 15
+const LINE_EVENT_TYPES: Array<{ key: NotificationEventType, label: string }> = [
+  { key: 'sms', label: '短信' },
+  { key: 'call', label: '通话' },
+  { key: 'automation', label: '自动化事件' },
+]
 
 type NotificationLogClearFilters = {
   type: string
@@ -44,7 +49,12 @@ type NotificationLogClearFilters = {
   end_date: string
 }
 
-export default function NotificationCenterPage() {
+type NotificationCenterProps = {
+  lineId?: string
+  embedded?: boolean
+}
+
+export default function NotificationCenterPage({ lineId, embedded = false }: NotificationCenterProps) {
   const { refreshInterval, refreshKey } = useRefreshInterval()
   const [tab, setTab] = useState(0)
   const [config, setConfig] = useState<NotificationConfig>(() => createDefaultConfig())
@@ -54,7 +64,7 @@ export default function NotificationCenterPage() {
   const [logTotal, setLogTotal] = useState(0)
   const [logType, setLogType] = useState('')
   const [logStatus, setLogStatus] = useState('')
-  const [logLineId, setLogLineId] = useState('')
+  const [logLineId, setLogLineId] = useState(lineId ?? '')
   const [logStartDate, setLogStartDate] = useState('')
   const [logEndDate, setLogEndDate] = useState('')
   const [logQuery, setLogQuery] = useState('')
@@ -87,7 +97,20 @@ export default function NotificationCenterPage() {
       }),
     ]
   }, [smsChannels])
-  const notificationQueueItems = queueItems
+  const notificationQueueItems = useMemo(
+    () => lineId ? queueItems.filter((item) => item.line_id === lineId) : queueItems,
+    [lineId, queueItems],
+  )
+  const visibleRules = useMemo(
+    () => lineId
+      ? config.rules.filter((rule) => rule.sim_channel_ids.includes(lineId))
+      : config.rules,
+    [config.rules, lineId],
+  )
+  const visibleConfig = useMemo(
+    () => ({ ...config, rules: visibleRules }),
+    [config, visibleRules],
+  )
 
   const loadConfig = useCallback(async () => {
     setLoading(true)
@@ -116,7 +139,7 @@ export default function NotificationCenterPage() {
       const response = await api.getNotificationLogs({
         type: logType,
         status: logStatus,
-        line_id: logLineId,
+        line_id: lineId ?? logLineId,
         start_date: logStartDate,
         end_date: logEndDate,
         q: logQuery,
@@ -131,11 +154,11 @@ export default function NotificationCenterPage() {
       logsLoadingRef.current = false
       if (!silent) setLogsLoading(false)
     }
-  }, [logEndDate, logLineId, logPage, logQuery, logStartDate, logStatus, logType])
+  }, [lineId, logEndDate, logLineId, logPage, logQuery, logStartDate, logStatus, logType])
 
   const loadQueue = useCallback(async (silent = true) => {
     try {
-      const response = await api.getNotificationQueue({ limit: 100 })
+      const response = await api.getNotificationQueue({ line_id: lineId, limit: 100 })
       const items = response.data?.items ?? []
       setQueueItems(items.map((item) => ({
           id: item.id,
@@ -153,7 +176,12 @@ export default function NotificationCenterPage() {
     } catch (err) {
       if (!silent) setError(err instanceof Error ? err.message : String(err))
     }
-  }, [])
+  }, [lineId])
+
+  useEffect(() => {
+    setLogLineId(lineId ?? '')
+    setLogPage(0)
+  }, [lineId])
 
   useEffect(() => {
     void loadConfig()
@@ -241,10 +269,13 @@ export default function NotificationCenterPage() {
       ...prev,
       rules: [
         ...prev.rules,
-        createRule(
+        {
+          ...createRule(
           selectedEventType,
           prev.channels.filter((channel) => channel.enabled).map((channel) => channel.id),
-        ),
+          ),
+          sim_channel_ids: lineId ? [lineId] : [],
+        },
       ],
     }))
   }
@@ -291,7 +322,7 @@ export default function NotificationCenterPage() {
 
   const handleClearLogs = async (filters: NotificationLogClearFilters) => {
     try {
-      const response = await api.clearNotificationLogs(filters)
+      const response = await api.clearNotificationLogs({ ...filters, line_id: lineId ?? filters.line_id })
       setLogPage(0)
       const deleted = response.data?.deleted ?? 0
       setSuccess(`已清理 ${deleted} 条转发日志`)
@@ -340,7 +371,11 @@ export default function NotificationCenterPage() {
 
   const handleRetryAllQueue = async () => {
     try {
-      await api.retryAllNotificationQueue()
+      if (lineId) {
+        await Promise.all(notificationQueueItems.map((item) => api.retryNotificationQueueItem(item.id)))
+      } else {
+        await api.retryAllNotificationQueue()
+      }
       await loadQueue(false)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -349,8 +384,13 @@ export default function NotificationCenterPage() {
 
   const handleClearQueue = async () => {
     try {
-      await api.clearNotificationQueue()
-      setQueueItems([])
+      if (lineId) {
+        await Promise.all(notificationQueueItems.map((item) => api.deleteNotificationQueueItem(item.id)))
+        setQueueItems((current) => current.filter((item) => item.line_id !== lineId))
+      } else {
+        await api.clearNotificationQueue()
+        setQueueItems([])
+      }
       await loadQueue(false)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
@@ -394,7 +434,7 @@ export default function NotificationCenterPage() {
   return (
     <Box>
       <Box display="flex" alignItems="center" gap={1} mb={2} flexWrap="wrap">
-        <Typography variant="h5" fontWeight={700}>通知中心</Typography>
+        <Typography variant={embedded ? 'subtitle1' : 'h5'} fontWeight={700}>{embedded ? '线路通知' : '通知中心'}</Typography>
         <NotificationQueueIndicator
           items={notificationQueueItems}
           open={queueOpen}
@@ -406,6 +446,12 @@ export default function NotificationCenterPage() {
           onDeleteAll={() => void handleClearQueue()}
         />
       </Box>
+
+      {lineId && (
+        <Alert severity="info" sx={{ mb: 2 }}>
+          此处仅编辑当前线路的通知规则；通知通道和日志自动清理策略由整台设备共享，设备级全局规则仍可能应用于该线路。
+        </Alert>
+      )}
 
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
       <Snackbar
@@ -450,11 +496,13 @@ export default function NotificationCenterPage() {
           onLogPageChange={setLogPage}
           onClearLogs={(filters) => void handleClearLogs(filters)}
           onSaveLogCleanup={(logCleanup) => void handleSaveLogCleanup(logCleanup)}
+          fixedLineId={lineId}
+          embedded={embedded}
         />
       )}
       {tab === 1 && (
         <NotificationRulesTab
-          config={config}
+          config={visibleConfig}
           smsChannels={smsChannels}
           selectedEventType={selectedEventType}
           saving={saving}
@@ -463,6 +511,9 @@ export default function NotificationCenterPage() {
           onDeleteRule={handleDeleteRule}
           onPatchRule={patchRule}
           onSave={() => void handleSave()}
+          eventTypes={lineId ? LINE_EVENT_TYPES : undefined}
+          fixedLineId={lineId}
+          embedded={embedded}
         />
       )}
       {tab === 2 && (
@@ -478,6 +529,7 @@ export default function NotificationCenterPage() {
           onPatchChannelConfig={patchChannelConfig}
           onSave={() => void handleSave()}
           onTest={() => void handleTest()}
+          embedded={embedded}
         />
       )}
     </Box>

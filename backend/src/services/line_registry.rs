@@ -288,8 +288,19 @@ impl LineRuntimeRegistry {
                 }
             }
             for binding in &discovered {
-                let _ = config_manager
-                    .migrate_line_profile_aliases(&binding.line_id, &binding.legacy_line_ids);
+                if let Err(error) = config_manager
+                    .migrate_line_profile_aliases(&binding.line_id, &binding.legacy_line_ids)
+                {
+                    tracing::warn!(line_id = %binding.line_id, error = %error, "Failed to migrate line configuration aliases");
+                }
+                if let Some(database) = &self.database {
+                    if let Err(error) = database.migrate_line_data_traffic_aliases(
+                        &binding.line_id,
+                        &binding.legacy_line_ids,
+                    ) {
+                        tracing::warn!(line_id = %binding.line_id, error = %error, "Failed to migrate line traffic aliases");
+                    }
+                }
             }
         }
         // Synthesize a line for each enabled standalone SIM reader. Readers are

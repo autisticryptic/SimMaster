@@ -17,8 +17,9 @@ NetworkManager、QMI 工具和与目标能力匹配的内核驱动。详细要�
 - Rust stable 与 Cargo。
 - Node.js、pnpm。
 - 交叉构建 aarch64 musl 时需要 Zig 与 cargo-zigbuild，或等价的 musl 工具链。
-- 一个由 `carrier_Bundles` 生成、已封存且契约兼容的 schema v7
-  `carrier-bundles.sqlite3`。当前仓库不会自动下载该文件。
+- 可选：一个由 `carrier_Bundles` 生成、已封存且契约兼容的 schema v7
+  `carrier-bundles.sqlite3`。不预置该文件时，SimAdmin 仍可启动，管理员可在 WebUI 中选择
+  数据库并在线安装。
 
 ## 2. 手动构建
 
@@ -65,19 +66,19 @@ cd ..
 scp backend/target/aarch64-unknown-linux-musl/release/simadmin \
   root@192.0.2.10:/tmp/simadmin.new
 scp -r frontend/dist root@192.0.2.10:/tmp/simadmin-www
-scp /path/to/carrier-bundles.sqlite3 \
-  root@192.0.2.10:/tmp/carrier-bundles.sqlite3
 scp scripts/simadmin.service root@192.0.2.10:/tmp/simadmin.service
 ```
 
-也可以使用 ADB、U 盘或其他可信方式传输，但最终至少需要以下四项：
+也可以使用 ADB、U 盘或其他可信方式传输，但最终至少需要以下三项：
 
 ```text
 simadmin                 后端可执行文件
 frontend/dist/           前端静态资源
-carrier-bundles.sqlite3  只读运营商 catalog
 simadmin.service         systemd 主服务单元
 ```
+
+`carrier-bundles.sqlite3` 是可选预置文件；不传输时，首次启动后从 WebUI 的“运营商 IMS
+Profile -> 数据库下载”选择 Pixel、iPhone 或 iOS IPCC catalog。
 
 ## 4. 安装主服务
 
@@ -87,8 +88,6 @@ SSH 登录目标设备，以 `root` 执行：
 install -d -m 0755 /opt/simadmin /opt/simadmin/www
 install -m 0755 /tmp/simadmin.new /opt/simadmin/simadmin
 cp -a /tmp/simadmin-www/. /opt/simadmin/www/
-install -m 0644 /tmp/carrier-bundles.sqlite3 \
-  /opt/simadmin/carrier-bundles.sqlite3
 install -m 0644 /tmp/simadmin.service \
   /etc/systemd/system/simadmin.service
 systemctl daemon-reload
@@ -102,8 +101,10 @@ systemctl status simadmin --no-pager
 journalctl -u simadmin -n 100 --no-pager
 ```
 
-后端默认从可执行文件同目录读取 `carrier-bundles.sqlite3`。如果使用其他位置，需要在
-systemd 单元中增加 `SIMADMIN_CARRIER_CATALOG` 环境变量或修改 `ExecStart` 参数。
+后端默认从可执行文件同目录读取 `carrier-bundles.sqlite3`。文件不存在时服务以无运营商
+catalog 模式启动，Profile 页面会提供数据库选择和下载入口。下载结果经过 schema v7 与封存
+状态校验后原子安装到默认路径，并在当前进程中立即生效。如果使用其他位置，需要通过
+`serve --carrier-catalog <path>` 指定路径。
 
 ## 5. 可选：安装副 QMI/VoLTE 服务
 

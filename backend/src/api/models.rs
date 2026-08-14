@@ -131,6 +131,37 @@ pub struct EsimLpacRepairResponse {
     pub message: String,
 }
 
+#[derive(Debug, Default, Serialize)]
+pub struct CarrierCatalogStatusResponse {
+    pub installed: bool,
+    pub usable: bool,
+    pub path: String,
+    pub release_id: String,
+    pub generated_at: String,
+    pub sealed: bool,
+    pub volte_profiles: usize,
+    pub vowifi_profiles: usize,
+    pub message: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct CarrierCatalogInstallRequest {
+    pub proxy_prefix: Option<String>,
+    pub asset_url: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct CarrierCatalogInstallResponse {
+    pub installed: bool,
+    pub path: String,
+    pub asset_url: String,
+    pub release_id: String,
+    pub generated_at: String,
+    pub volte_profiles: usize,
+    pub vowifi_profiles: usize,
+    pub message: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EsimRenameRequest {
     pub name: String,
@@ -755,35 +786,6 @@ pub struct ManualRegisterRequest {
     pub mccmnc: String,
 }
 
-#[derive(Debug, Default, Serialize)]
-pub struct ApnContext {
-    pub path: String,
-    pub name: String,
-    pub active: bool,
-    pub apn: String,
-    pub protocol: String,
-    pub username: String,
-    pub password: String,
-    pub auth_method: String,
-    #[serde(default)]
-    pub context_type: String,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct ApnListResponse {
-    pub contexts: Vec<ApnContext>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-pub struct SetApnRequest {
-    pub context_path: String,
-    pub apn: Option<String>,
-    pub protocol: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
-    pub auth_method: Option<String>,
-}
-
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct CellLockResult {
     pub success: bool,
@@ -1028,6 +1030,7 @@ pub struct OtaMeta {
 pub struct OtaStatusResponse {
     pub current_version: String,
     pub current_commit: String,
+    pub arch: String,
     pub pending_update: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_meta: Option<OtaMeta>,

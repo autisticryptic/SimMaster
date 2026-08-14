@@ -24,14 +24,7 @@ import {
   DialogContentText,
   DialogActions,
   Divider,
-  FormControl,
-  FormControlLabel,
-  InputLabel,
   Link,
-  MenuItem,
-  Select,
-  Switch,
-  TextField,
 } from '@mui/material'
 import {
   CloudUpload,
@@ -50,8 +43,8 @@ import {
 } from '@mui/icons-material'
 import { api } from '../api/current'
 import type { OtaLatestReleaseResponse, OtaStatusResponse, OtaUploadResponse } from '../api/types'
+import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
 
-type ProxyPreset = 'https://gh-proxy.com/' | 'https://ghproxy.net/' | 'https://githubproxy.cc/' | 'custom'
 type OnlineUpdateState = 'idle' | 'checking' | 'available' | 'latest' | 'downloading'
 type MarkdownHeadingLevel = 1 | 2 | 3 | 4 | 5 | 6
 type MarkdownListItem = { text: string; indent: number }
@@ -63,7 +56,7 @@ type MarkdownBlock =
   | { type: 'quote'; text: string }
   | { type: 'rule' }
 
-const GITHUB_LATEST_RELEASE_PAGE = 'https://github.com/3899/SimAdmin/releases/latest'
+const GITHUB_LATEST_RELEASE_PAGE = 'https://github.com/autisticryptic/SimMaster/releases/latest'
 const BEIJING_TIME_ZONE = 'Asia/Shanghai'
 
 function normalizeVersion(version: string) {
@@ -115,14 +108,24 @@ function formatBytes(size?: number) {
   return `${mb.toFixed(1)} MB`
 }
 
-function getReleaseAsset(release: OtaLatestReleaseResponse) {
-  return release.assets?.find(asset => /\.(tar\.gz|tgz|zip)$/i.test(asset.name)) ?? release.assets?.[0]
+function getReleaseAsset(release: OtaLatestReleaseResponse, targetArch?: string) {
+  const assets = release.assets ?? []
+  const archives = assets.filter(asset => /\.(tar\.gz|tgz|zip)$/i.test(asset.name))
+  const archPattern = targetArch?.startsWith('aarch64')
+    ? /arm64|aarch64/i
+    : targetArch?.startsWith('x86_64')
+      ? /amd64|x86_64/i
+      : null
+  const knownArchPattern = /arm64|aarch64|amd64|x86_64|armv7|armhf/i
+
+  return (archPattern ? archives.find(asset => archPattern.test(asset.name)) : undefined)
+    ?? archives.find(asset => !knownArchPattern.test(asset.name))
 }
 
 function inferArch(assetName?: string) {
   if (!assetName) return '未知'
   if (/aarch64|arm64/i.test(assetName)) return 'aarch64-unknown-linux-musl'
-  if (/x86_64|amd64/i.test(assetName)) return 'x86_64-unknown-linux-gnu'
+  if (/x86_64|amd64/i.test(assetName)) return 'x86_64-unknown-linux-musl'
   if (/armv7|armhf/i.test(assetName)) return 'armv7-unknown-linux-musleabihf'
   return '未知'
 }
@@ -443,9 +446,6 @@ export default function OtaUpdate() {
   const [uploadResult, setUploadResult] = useState<OtaUploadResponse | null>(null)
   const [confirmDialog, setConfirmDialog] = useState<'apply' | 'cancel' | null>(null)
 
-  const [proxyEnabled, setProxyEnabled] = useState(true)
-  const [proxyPreset, setProxyPreset] = useState<ProxyPreset>('https://gh-proxy.com/')
-  const [customProxy, setCustomProxy] = useState('')
   const [onlineState, setOnlineState] = useState<OnlineUpdateState>('idle')
   const [latestRelease, setLatestRelease] = useState<OtaLatestReleaseResponse | null>(null)
   const [downloadProgress, setDownloadProgress] = useState(0)
@@ -469,14 +469,6 @@ export default function OtaUpdate() {
     void loadStatus()
   }, [loadStatus])
 
-  const getProxyPrefix = () => {
-    if (!proxyEnabled) return ''
-    if (proxyPreset !== 'custom') return proxyPreset
-    const trimmed = customProxy.trim()
-    if (!trimmed) return ''
-    return trimmed.endsWith('/') ? trimmed : `${trimmed}/`
-  }
-
   const handleCheckOnlineUpdate = async () => {
     setOnlineState('checking')
     setError(null)
@@ -485,12 +477,7 @@ export default function OtaUpdate() {
     setDownloadProgress(0)
 
     try {
-      const proxyPrefix = getProxyPrefix()
-      if (proxyEnabled && proxyPreset === 'custom' && !proxyPrefix) {
-        throw new Error('请输入自定义加速节点地址，或关闭 GitHub 下载加速')
-      }
-
-      const res = await api.getLatestOtaRelease({ proxy_prefix: proxyPrefix || undefined })
+      const res = await api.getLatestOtaRelease({})
       if (res.status !== 'ok' || !res.data) {
         throw new Error(res.message || 'GitHub Releases 请求失败')
       }
@@ -508,12 +495,6 @@ export default function OtaUpdate() {
   const handlePrepareOnlineUpdate = async () => {
     if (!latestRelease) return
 
-    const proxyPrefix = getProxyPrefix()
-    if (proxyEnabled && proxyPreset === 'custom' && !proxyPrefix) {
-      setError('请输入自定义加速节点地址，或关闭 GitHub 下载加速')
-      return
-    }
-
     setOnlineState('downloading')
     setError(null)
     setSuccess(null)
@@ -524,7 +505,7 @@ export default function OtaUpdate() {
     }, 260)
 
     try {
-      const res = await api.prepareOnlineOta({ proxy_prefix: proxyPrefix || undefined })
+      const res = await api.prepareOnlineOta({})
       window.clearInterval(timer)
       setDownloadProgress(100)
 
@@ -643,13 +624,10 @@ export default function OtaUpdate() {
     )
   }
 
-  const asset = latestRelease ? getReleaseAsset(latestRelease) : undefined
+  const asset = latestRelease ? getReleaseAsset(latestRelease, status?.arch) : undefined
   const pendingMeta = status?.pending_meta
   const hasPendingUpdate = Boolean(pendingMeta)
-  const proxyPrefix = getProxyPrefix()
   const downloadUrl = asset?.browser_download_url
-    ? `${proxyPrefix}${asset.browser_download_url}`
-    : undefined
 
   return (
     <Box>
@@ -892,45 +870,9 @@ export default function OtaUpdate() {
                 连接到 GitHub 检查是否有可用的 SimAdmin 更新版本。
               </Typography>
 
-            <Stack spacing={2} sx={{ mb: 2 }}>
-              <FormControlLabel
-                control={
-                  <Switch
-                    checked={proxyEnabled}
-                    onChange={event => setProxyEnabled(event.target.checked)}
-                  />
-                }
-                label="启用 GitHub 下载加速"
-              />
-              {proxyEnabled && (
-                <Stack spacing={2} direction={{ xs: 'column', sm: 'row' }}>
-                  <FormControl fullWidth size="small">
-                    <InputLabel id="proxy-preset-label">加速节点</InputLabel>
-                    <Select
-                      labelId="proxy-preset-label"
-                      label="加速节点"
-                      value={proxyPreset}
-                      onChange={event => setProxyPreset(event.target.value as ProxyPreset)}
-                    >
-                      <MenuItem value="https://gh-proxy.com/">gh-proxy.com (默认)</MenuItem>
-                      <MenuItem value="https://ghproxy.net/">ghproxy.net</MenuItem>
-                      <MenuItem value="https://githubproxy.cc/">githubproxy.cc</MenuItem>
-                      <MenuItem value="custom">自定义</MenuItem>
-                    </Select>
-                  </FormControl>
-                  {proxyPreset === 'custom' && (
-                    <TextField
-                      fullWidth
-                      size="small"
-                      label="自定义加速节点"
-                      value={customProxy}
-                      onChange={event => setCustomProxy(event.target.value)}
-                      placeholder="https://my-proxy.example.com/"
-                    />
-                  )}
-                </Stack>
-              )}
-            </Stack>
+            <Box sx={{ mb: 2 }}>
+              <GithubDownloadProxyControl />
+            </Box>
 
             <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2} alignItems={{ xs: 'stretch', sm: 'center' }}>
               <Button
@@ -941,11 +883,6 @@ export default function OtaUpdate() {
               >
                 {onlineState === 'checking' ? '检查中...' : '检查更新'}
               </Button>
-              {proxyEnabled && proxyPrefix && (
-                <Typography variant="caption" color="text.secondary">
-                  下载加速：{proxyPreset === 'custom' ? proxyPrefix : new URL(proxyPrefix).hostname}
-                </Typography>
-              )}
             </Stack>
 
             {onlineState === 'available' && latestRelease && (
@@ -1016,7 +953,7 @@ export default function OtaUpdate() {
               <Box sx={{ mt: 2 }}>
                 <Box display="flex" justifyContent="space-between" mb={1}>
                   <Typography variant="body2" color="text.secondary">
-                    {proxyPrefix ? `正在通过 ${proxyPreset === 'custom' ? proxyPrefix : new URL(proxyPrefix).hostname} 下载更新包...` : '正在直连下载更新包...'}
+                    正在按全局 GitHub 下载设置获取更新包...
                   </Typography>
                   <Typography variant="body2" color="text.secondary">{downloadProgress}%</Typography>
                 </Box>

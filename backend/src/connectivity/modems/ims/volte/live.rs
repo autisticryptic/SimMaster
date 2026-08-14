@@ -367,6 +367,10 @@ struct LiveVoiceCall {
     internal_video_local: Option<SocketAddr>,
     pending_media_rollback: Option<LiveVoiceMediaSnapshot>,
     renegotiation_deadline: Option<Instant>,
+    /// SDP answer already negotiated from a provisional (18x) response. Per RFC 3262
+    /// the operator does not repeat the answer in the final 200 OK, so it is
+    /// retained here and reused instead of failing on an empty final body.
+    early_answer: Option<String>,
     transfer: Option<DialogTransfer>,
     transfer_deadline: Option<Instant>,
 }
@@ -550,7 +554,6 @@ struct VolteRegisterVariant {
 }
 
 impl VolteRegisterVariant {
-    #[cfg(test)]
     fn requiring_sec_agree(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -573,7 +576,6 @@ impl VolteRegisterVariant {
         }
     }
 
-    #[cfg(test)]
     fn requiring_sec_agree_without_proxy(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -594,7 +596,6 @@ impl VolteRegisterVariant {
         }
     }
 
-    #[cfg(test)]
     fn with_compact_security_client(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -611,7 +612,6 @@ impl VolteRegisterVariant {
         }
     }
 
-    #[cfg(test)]
     fn with_spaced_security_client(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -1595,7 +1595,6 @@ async fn ensure_bearer_with_runtime(
     .await
 }
 
-#[allow(clippy::never_loop)]
 async fn connect_family(
     runtime: &VolteRuntime,
     bearer: &BearerConnection,
@@ -1637,10 +1636,7 @@ async fn connect_family(
         device_identity.effective_device_identity.imei.as_deref(),
     );
     let mut register_variants = register_variants(profile).into_iter().peekable();
-    #[cfg(test)]
     let mut last_error = None;
-    #[cfg(not(test))]
-    let last_error: Option<VolteError> = None;
     let mut pending_variant = None;
     while pending_variant.is_some() || register_variants.peek().is_some() {
         let mut variant = match pending_variant.take() {
@@ -1718,73 +1714,67 @@ async fn connect_family(
             profile,
             device_identity.effective_ims.clone(),
         );
-        let registration =
-            match run_register_observed(&mut channel, &initial, &mut authenticator).await {
-                Ok(registration) => registration,
-                Err(failure) => {
-                    log_volte_register_failure_metadata(variant, &failure);
-                    if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-                        ipsec::uninstall_plan(plan);
-                    }
-                    let error = map_register_failure(&failure);
-                    runtime
-                        .record_attempt(
-                            VolteStage::RegisterInitial,
-                            Some(ip_family_name(local_addr)),
-                            "failed",
-                            Some(&error),
-                            Some(format!("register_variant={}", variant.label)),
-                        )
-                        .await;
-                    #[cfg(not(test))]
-                    return Err(error);
-
-                    #[cfg(test)]
-                    {
-                        let next_variant_available = register_variants.peek().is_some();
-                        if let Some(upgraded_variant) = sec_agree_retry_variant(variant, &failure) {
-                            last_error = Some(error);
-                            pending_variant = Some(upgraded_variant);
-                            continue;
-                        }
-                        if let Some(spaced_security_variant) =
-                            sec_agree_spaced_security_retry_variant(variant, &failure)
-                        {
-                            last_error = Some(error);
-                            pending_variant = Some(spaced_security_variant);
-                            continue;
-                        }
-                        if let Some(compact_security_variant) =
-                            sec_agree_compact_security_retry_variant(variant, &failure)
-                        {
-                            last_error = Some(error);
-                            pending_variant = Some(compact_security_variant);
-                            continue;
-                        }
-                        if let Some(require_only_variant) =
-                            sec_agree_require_only_retry_variant(variant, &failure)
-                        {
-                            last_error = Some(error);
-                            pending_variant = Some(require_only_variant);
-                            continue;
-                        }
-                        if next_variant_available
-                            && sec_agree_require_only_was_rejected(variant, &failure)
-                        {
-                            last_error = Some(error);
-                            continue;
-                        }
-                        if next_variant_available
-                            && failure.auth_rounds == 0
-                            && register_failure_status(&failure) == Some(400)
-                        {
-                            last_error = Some(error);
-                            continue;
-                        }
-                        return Err(error);
-                    }
+        let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
+            .await
+        {
+            Ok(registration) => registration,
+            Err(failure) => {
+                log_volte_register_failure_metadata(variant, &failure);
+                if let Some(plan) = authenticator.xfrm_plan.as_ref() {
+                    ipsec::uninstall_plan(plan);
                 }
-            };
+                let error = map_register_failure(&failure);
+                runtime
+                    .record_attempt(
+                        VolteStage::RegisterInitial,
+                        Some(ip_family_name(local_addr)),
+                        "failed",
+                        Some(&error),
+                        Some(format!("register_variant={}", variant.label)),
+                    )
+                    .await;
+                let next_variant_available = register_variants.peek().is_some();
+                if let Some(upgraded_variant) = sec_agree_retry_variant(variant, &failure) {
+                    last_error = Some(error);
+                    pending_variant = Some(upgraded_variant);
+                    continue;
+                }
+                if let Some(spaced_security_variant) =
+                    sec_agree_spaced_security_retry_variant(variant, &failure)
+                {
+                    last_error = Some(error);
+                    pending_variant = Some(spaced_security_variant);
+                    continue;
+                }
+                if let Some(compact_security_variant) =
+                    sec_agree_compact_security_retry_variant(variant, &failure)
+                {
+                    last_error = Some(error);
+                    pending_variant = Some(compact_security_variant);
+                    continue;
+                }
+                if let Some(require_only_variant) =
+                    sec_agree_require_only_retry_variant(variant, &failure)
+                {
+                    last_error = Some(error);
+                    pending_variant = Some(require_only_variant);
+                    continue;
+                }
+                if next_variant_available && sec_agree_require_only_was_rejected(variant, &failure)
+                {
+                    last_error = Some(error);
+                    continue;
+                }
+                if next_variant_available
+                    && failure.auth_rounds == 0
+                    && register_failure_status(&failure) == Some(400)
+                {
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
         runtime
             .record_attempt(
                 VolteStage::Registered,
@@ -2622,6 +2612,7 @@ async fn handle_operator_command_inner(
                     internal_video_local,
                     pending_media_rollback: None,
                     renegotiation_deadline: None,
+                    early_answer: None,
                     transfer: None,
                     transfer_deadline: None,
                 },
@@ -3428,7 +3419,11 @@ async fn handle_operator_sip_frame(
                 let body = if sip::sip_body(frame).is_empty() {
                     None
                 } else {
-                    Some(prepare_operator_media(call, sip::sip_body(frame))?)
+                    let answer = prepare_operator_media(call, sip::sip_body(frame))?;
+                    // Retain the early answer so a final 200 OK without SDP can
+                    // reuse it instead of being rejected as unusable media.
+                    call.early_answer = Some(answer.clone());
+                    Some(answer)
                 };
                 let first_operator_rtp = delayed_ip_connect
                     .then(|| arm_first_rtp_ip_answer(call))
@@ -3492,7 +3487,7 @@ async fn handle_operator_sip_frame(
                 let tag = response_to_tag(frame)
                     .ok_or_else(|| VolteError::new("volte_voice_remote_tag_missing"))?;
                 call.dialog.set_remote_tag(tag);
-                let answer = prepare_operator_media(call, sip::sip_body(frame));
+                let answer = prepare_final_operator_media(call, sip::sip_body(frame));
                 let first_operator_rtp =
                     if !is_asterisk_reinvite && !immediate_ip_connect && answer.is_ok() {
                         arm_first_rtp_ip_answer(call)
@@ -3504,6 +3499,9 @@ async fn handle_operator_sip_frame(
                 if answer.is_ok() {
                     call.commit_media_update();
                 }
+                // The early answer only applies to the INVITE it was negotiated
+                // for; drop it so a later re-INVITE cannot reuse a stale SDP.
+                call.early_answer = None;
                 call.renegotiation_deadline = None;
                 let ack = sip::build_ack(
                     &identity,
@@ -3753,6 +3751,7 @@ async fn begin_incoming_operator_call(
             internal_video_local,
             pending_media_rollback: None,
             renegotiation_deadline: None,
+            early_answer: None,
             transfer: None,
             transfer_deadline: None,
         },
@@ -3903,6 +3902,18 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         call.active_video_relay = None;
     }
     Ok(answer)
+}
+
+fn prepare_final_operator_media(
+    call: &mut LiveVoiceCall,
+    body: &[u8],
+) -> Result<String, VolteError> {
+    if body.is_empty() {
+        return call.early_answer.clone().ok_or_else(|| {
+            VolteError::with_detail("volte_voice_sdp_invalid", "voice_sdp_empty".to_string())
+        });
+    }
+    prepare_operator_media(call, body)
 }
 
 fn arm_first_rtp_ip_answer(call: &mut LiveVoiceCall) -> Option<tokio::sync::watch::Receiver<bool>> {
@@ -4856,7 +4867,6 @@ fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
         .and_then(|response| sip::parse_status(response).ok())
 }
 
-#[cfg(test)]
 fn sec_agree_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -4871,7 +4881,6 @@ fn sec_agree_retry_variant(
     response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
 }
 
-#[cfg(test)]
 fn sec_agree_require_only_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -4885,7 +4894,6 @@ fn sec_agree_require_only_retry_variant(
     .then(|| variant.requiring_sec_agree_without_proxy())
 }
 
-#[cfg(test)]
 fn sec_agree_require_only_was_rejected(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -4901,7 +4909,6 @@ fn sec_agree_require_only_was_rejected(
             .is_some_and(|response| response_requires_only_extension(response, "sec-agree"))
 }
 
-#[cfg(test)]
 fn sec_agree_compact_security_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -4915,7 +4922,6 @@ fn sec_agree_compact_security_retry_variant(
     .then(|| variant.with_compact_security_client())
 }
 
-#[cfg(test)]
 fn sec_agree_spaced_security_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -5680,6 +5686,79 @@ mod tests {
         assert!(sdp.contains("a=fmtp:101 0-16\r\n"));
     }
 
+    /// A reliable provisional response carries the SDP answer, and the operator's
+    /// final 200 OK then arrives with an empty body. The retained early answer
+    /// must be reused so the call is not torn down as unusable media.
+    #[tokio::test]
+    async fn empty_final_answer_reuses_early_provisional_answer() {
+        let operator_remote = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let internal_remote = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let internal_audio = parse_audio_sdp(
+            format!(
+                "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
+                internal_remote.local_addr().unwrap().port()
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let internal_offer = MediaOffer {
+            audio: internal_audio,
+            audio_endpoint: internal_remote.local_addr().unwrap(),
+            video: None,
+            dtmf: DtmfCapabilities {
+                rtp_event: None,
+                sip_info: true,
+                preferred: DtmfSource::SipInfo,
+            },
+        };
+        let pending =
+            PendingRtpRelay::bind("127.0.0.1".parse().unwrap(), "127.0.0.1".parse().unwrap())
+                .await
+                .unwrap();
+        let operator_local = pending.operator_local_addr().unwrap();
+        let internal_local = pending.internal_local_addr().unwrap();
+        let mut call = LiveVoiceCall {
+            direction: LiveVoiceDirection::MobileOriginated,
+            dialog: sip::DialogIds::fresh(),
+            callee_uri: "sip:+601112023012@ims.example;user=phone".into(),
+            invite_branch: "z9hG4bKearly".into(),
+            initial_invite: None,
+            internal_offer,
+            operator_local,
+            internal_local,
+            pending_relay: Some(pending),
+            active_relay: None,
+            ip_answer_wait_armed: false,
+            operator_answered: false,
+            next_cseq: 2,
+            media_metrics: None,
+            pending_operator_reinvite: None,
+            pending_asterisk_reinvite: false,
+            pending_video_relay: None,
+            active_video_relay: None,
+            operator_video_local: None,
+            internal_video_local: None,
+            pending_media_rollback: None,
+            renegotiation_deadline: None,
+            early_answer: None,
+            transfer: None,
+            transfer_deadline: None,
+        };
+
+        // The operator answers inside the reliable 183, exactly as Maxis does.
+        let provisional_sdp = format!(
+            "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\n",
+            operator_remote.local_addr().unwrap().port()
+        );
+        let early = prepare_operator_media(&mut call, provisional_sdp.as_bytes()).unwrap();
+        call.early_answer = Some(early.clone());
+        assert!(early.contains("m=audio"));
+
+        // The final 200 OK has no SDP, so the production final-answer path reuses
+        // the answer negotiated from the reliable provisional response.
+        assert_eq!(prepare_final_operator_media(&mut call, b"").unwrap(), early);
+    }
+
     #[test]
     fn relay_sdp_preserves_independent_video_addressing() {
         let source = b"v=0\r\no=- 1 1 IN IP4 10.0.0.3\r\ns=call\r\nc=IN IP4 10.0.0.3\r\nt=0 0\r\nm=audio 40000 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\na=sendrecv\r\nm=video 50000 RTP/AVP 99\r\nc=IN IP4 10.0.0.4\r\na=rtpmap:99 H264/90000\r\na=sendrecv\r\n";
@@ -6069,6 +6148,7 @@ mod tests {
             internal_video_local: None,
             pending_media_rollback: None,
             renegotiation_deadline: None,
+            early_answer: None,
             transfer: None,
             transfer_deadline: None,
         };
@@ -6179,6 +6259,7 @@ mod tests {
             internal_video_local: None,
             pending_media_rollback: None,
             renegotiation_deadline: None,
+            early_answer: None,
             transfer: None,
             transfer_deadline: None,
         };
@@ -6271,6 +6352,7 @@ mod tests {
             internal_video_local: None,
             pending_media_rollback: None,
             renegotiation_deadline: Some(Instant::now() + REINVITE_TIMEOUT),
+            early_answer: None,
             transfer: None,
             transfer_deadline: None,
         };

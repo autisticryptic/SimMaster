@@ -25,7 +25,8 @@ const OTA_SERVICE_NAME: &str = "simadmin.service";
 const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
 const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
-const LATEST_RELEASE_API: &str = "https://api.github.com/repos/3899/SimAdmin/releases/latest";
+const LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/autisticryptic/SimMaster/releases/latest";
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const UPDATE_CHECK_HOURS: [u32; 2] = [9, 18];
 const OTA_HTTP_TIMEOUT_SECS: u64 = 30;
@@ -44,6 +45,17 @@ pub fn get_current_commit() -> String {
     option_env!("GIT_COMMIT").unwrap_or("unknown").to_string()
 }
 
+/// Target triple used by OTA packages produced for this binary.
+pub fn current_target_triple() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64-unknown-linux-musl"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64-unknown-linux-musl"
+    } else {
+        "unsupported"
+    }
+}
+
 /// 获取 OTA 更新状态
 pub fn get_ota_status() -> OtaStatusResponse {
     let pending_meta = read_pending_meta();
@@ -51,6 +63,7 @@ pub fn get_ota_status() -> OtaStatusResponse {
     OtaStatusResponse {
         current_version: CURRENT_VERSION.to_string(),
         current_commit: get_current_commit(),
+        arch: current_target_triple().to_string(),
         pending_update: pending_meta.is_some(),
         pending_meta,
     }
@@ -147,10 +160,40 @@ pub fn is_supported_ota_asset(name: &str) -> bool {
 }
 
 pub fn supported_release_asset(release: &OtaLatestReleaseResponse) -> Option<&OtaReleaseAsset> {
+    supported_release_asset_for_arch(release, current_target_triple())
+}
+
+fn supported_release_asset_for_arch<'a>(
+    release: &'a OtaLatestReleaseResponse,
+    target: &str,
+) -> Option<&'a OtaReleaseAsset> {
     release
         .assets
         .iter()
-        .find(|asset| is_supported_ota_asset(&asset.name))
+        .find(|asset| {
+            is_supported_ota_asset(&asset.name) && asset_matches_target(&asset.name, target)
+        })
+        .or_else(|| {
+            release.assets.iter().find(|asset| {
+                is_supported_ota_asset(&asset.name) && !asset_has_known_arch(&asset.name)
+            })
+        })
+}
+
+fn asset_matches_target(name: &str, target: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    match target {
+        "aarch64-unknown-linux-musl" => lower.contains("arm64") || lower.contains("aarch64"),
+        "x86_64-unknown-linux-musl" => lower.contains("amd64") || lower.contains("x86_64"),
+        _ => false,
+    }
+}
+
+fn asset_has_known_arch(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["arm64", "aarch64", "amd64", "x86_64", "armv7", "armhf"]
+        .iter()
+        .any(|arch| lower.contains(arch))
 }
 
 pub async fn fetch_latest_github_release(
@@ -203,9 +246,14 @@ pub async fn check_and_notify_version_update(
         return Ok(());
     }
 
-    let proxy_prefix = normalize_proxy_prefix(Some(update_config.proxy_prefix));
+    let github_proxy = config_manager.get_github_download_proxy();
+    let proxy_prefix = if github_proxy.enabled {
+        normalize_proxy_prefix(Some(github_proxy.proxy_prefix))
+    } else {
+        String::new()
+    };
     let client = build_ota_http_client()?;
-    let release = fetch_latest_github_release(&client, &proxy_prefix, true).await?;
+    let release = fetch_latest_github_release(&client, &proxy_prefix, false).await?;
 
     if !compare_versions(&release.tag_name, CURRENT_VERSION) {
         return Ok(());
@@ -438,8 +486,9 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
     // 前端目录存在即可（MD5 跨平台难以保持一致）
     let frontend_md5_match = true; // 跳过前端 MD5 验证
 
-    // 检查架构（只接受 musl）
-    let arch_match = meta.arch == "aarch64-unknown-linux-musl";
+    // The package must match the architecture of the running binary.
+    let expected_arch = current_target_triple();
+    let arch_match = meta.arch == expected_arch;
 
     // 比较版本
     let is_newer = compare_versions(&meta.version, CURRENT_VERSION);
@@ -458,8 +507,8 @@ fn validate_ota_package(meta: &OtaMeta) -> Result<OtaValidation, String> {
         }
         if !arch_match {
             errors.push(format!(
-                "Arch mismatch: expected=aarch64-unknown-linux-musl, actual={}",
-                meta.arch
+                "Arch mismatch: expected={}, actual={}",
+                expected_arch, meta.arch
             ));
         }
         Some(errors.join("; "))
@@ -774,6 +823,47 @@ mod tests {
         assert!(compare_versions("v1.0.4", "1.0.3"));
         assert!(!compare_versions("v1.0.3", "1.0.3"));
         assert!(!compare_versions("v1.0.2", "1.0.3"));
+    }
+
+    #[test]
+    fn selects_release_asset_for_requested_architecture() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![
+                OtaReleaseAsset {
+                    name: "simadmin-linux-arm64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+                OtaReleaseAsset {
+                    name: "simadmin-linux-amd64.tar.gz".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            supported_release_asset_for_arch(&release, "aarch64-unknown-linux-musl")
+                .map(|asset| asset.name.as_str()),
+            Some("simadmin-linux-arm64.tar.gz")
+        );
+        assert_eq!(
+            supported_release_asset_for_arch(&release, "x86_64-unknown-linux-musl")
+                .map(|asset| asset.name.as_str()),
+            Some("simadmin-linux-amd64.tar.gz")
+        );
+    }
+
+    #[test]
+    fn does_not_fall_back_to_an_asset_for_another_architecture() {
+        let release = OtaLatestReleaseResponse {
+            assets: vec![OtaReleaseAsset {
+                name: "simadmin-linux-arm64.tar.gz".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        assert!(supported_release_asset_for_arch(&release, "x86_64-unknown-linux-musl").is_none());
     }
 
     #[test]
