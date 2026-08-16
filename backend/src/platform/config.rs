@@ -1680,30 +1680,17 @@ mod tests {
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
         // Each newly discovered line receives its own canonical values.
-        assert_eq!(
-            manager.get_line_sms_path_policy(line_a).priority,
-            SmsPathPolicy::default().priority
-        );
+        assert!(!manager.get_line_sms_path_policy(line_a).force_vowifi_send);
         assert_eq!(manager.get_line_apn_config(line_a), ApnConfig::default());
 
         // Overriding line A must not move line B.
-        let vowifi_enabled = |policy: SmsPathPolicy| {
-            policy
-                .priority
-                .iter()
-                .any(|layer| layer.kind == AccessPathKind::Vowifi && layer.enabled)
-        };
-        let mut only_volte = SmsPathPolicy::default();
-        for layer in &mut only_volte.priority {
-            if layer.kind == AccessPathKind::Vowifi {
-                layer.enabled = false;
-            }
-        }
+        let mut only_vowifi = SmsPathPolicy::default();
+        only_vowifi.force_vowifi_send = true;
         manager
-            .set_line_sms_path_policy(line_a, only_volte)
+            .set_line_sms_path_policy(line_a, only_vowifi)
             .unwrap();
-        assert!(!vowifi_enabled(manager.get_line_sms_path_policy(line_a)));
-        assert!(vowifi_enabled(manager.get_line_sms_path_policy(line_b)));
+        assert!(manager.get_line_sms_path_policy(line_a).force_vowifi_send);
+        assert!(!manager.get_line_sms_path_policy(line_b).force_vowifi_send);
 
         let mut only_volte_voice = VoicePathPolicy::default();
         for layer in &mut only_volte_voice.priority {
@@ -1736,7 +1723,7 @@ mod tests {
         // Explicit values survive a reload; submitting the initial policy only
         // changes this line.
         let reloaded = ConfigManager::new(path.clone());
-        assert!(!vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
+        assert!(reloaded.get_line_sms_path_policy(line_a).force_vowifi_send);
         assert!(!voice_vowifi_enabled(
             reloaded.get_line_voice_path_policy(line_a)
         ));
@@ -1746,7 +1733,7 @@ mod tests {
         reloaded
             .set_line_voice_path_policy(line_a, VoicePathPolicy::default())
             .unwrap();
-        assert!(vowifi_enabled(reloaded.get_line_sms_path_policy(line_a)));
+        assert!(!reloaded.get_line_sms_path_policy(line_a).force_vowifi_send);
         assert!(voice_vowifi_enabled(
             reloaded.get_line_voice_path_policy(line_a)
         ));
@@ -2050,6 +2037,8 @@ mod tests {
             ]
         );
         assert!(policy.dedupe_enabled);
+        assert!(policy.cs_fallback_receiver);
+        assert!(!policy.force_vowifi_send);
         assert_eq!(
             policy.mid_flight_disable,
             MidFlightDisablePolicy::AutoSwitch
@@ -2059,7 +2048,7 @@ mod tests {
     }
 
     #[test]
-    fn sms_path_policy_enabled_ims_layers_skips_cs_and_disabled() {
+    fn sms_receive_layers_are_fixed_and_independent_from_legacy_priority() {
         let policy = SmsPathPolicy {
             priority: vec![
                 PathLayerConfig {
@@ -2078,12 +2067,12 @@ mod tests {
             ..SmsPathPolicy::default()
         };
         let ims: Vec<AccessPathKind> = policy.enabled_ims_layers().collect();
-        assert_eq!(ims, vec![AccessPathKind::Vowifi]);
+        assert_eq!(ims, vec![AccessPathKind::Vowifi, AccessPathKind::Volte]);
+        assert!(policy.is_enabled(AccessPathKind::Cs));
     }
 
     #[test]
-    fn sms_path_policy_normalized_appends_missing_kinds_once() {
-        // Only VoLTE supplied; VoWiFi/CS must be appended (enabled) in canonical order.
+    fn sms_path_policy_normalized_resets_legacy_order() {
         let policy = SmsPathPolicy {
             priority: vec![
                 PathLayerConfig {
@@ -2103,13 +2092,13 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                AccessPathKind::Volte,
                 AccessPathKind::Vowifi,
+                AccessPathKind::Volte,
                 AccessPathKind::Cs
             ]
         );
-        // First VoLTE occurrence (disabled) is kept.
-        assert!(!policy.is_enabled(AccessPathKind::Volte));
+        assert!(policy.priority.iter().all(|layer| layer.enabled));
+        assert!(policy.is_enabled(AccessPathKind::Volte));
         assert!(policy.is_enabled(AccessPathKind::Vowifi));
     }
 
@@ -2162,8 +2151,12 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            config.line_profiles[0].sms_path.priority[0].kind,
-            AccessPathKind::Cs
+            config.line_profiles[0]
+                .sms_path
+                .clone()
+                .normalized()
+                .priority,
+            default_sms_path_order()
         );
         let voice = config.line_profiles[0].voice_path.clone().normalized();
         assert_eq!(voice.priority.len(), 2);
@@ -3953,8 +3946,7 @@ impl Default for ImsVideoConfig {
 /// One access path the orchestrator can route SMS/voice through.
 ///
 /// The set is closed (VoWiFi / VoLTE / CS), matching the `AccessLeg` enum
-/// discussed in the design doc §4.3. Kept as a config-level enum so the priority
-/// order can be persisted and reordered by the user.
+/// discussed in the design doc §4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessPathKind {
@@ -4037,21 +4029,23 @@ fn default_sms_path_order() -> Vec<PathLayerConfig> {
     ]
 }
 
-/// SMS multi-path routing policy. The `priority` vector's order *is* the
-/// priority (index 0 highest). All fields are `#[serde(default)]` so existing
-/// config files upgrade transparently.
+/// SMS routing policy. Legacy priority fields remain serializable so existing
+/// installations upgrade without losing their config, but normalization resets
+/// them to the fixed VoWiFi -> VoLTE -> CS order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmsPathPolicy {
-    /// Priority-ordered layers. Order = preference; each layer independently
-    /// enable-able.
+    /// Legacy compatibility field. User-defined ordering is no longer applied.
     #[serde(default = "default_sms_path_order")]
     pub priority: Vec<PathLayerConfig>,
+    /// Require SMS sends to use VoWiFi only. No VoLTE/CS fallback is attempted.
+    #[serde(default)]
+    pub force_vowifi_send: bool,
     /// Cross-transport dedup on receive.
     #[serde(default = "default_true")]
     pub dedupe_enabled: bool,
     /// Keep the CS listener as a fallback receiver even while an IMS leg is the
     /// active listener (with dedup enforced) instead of pausing it entirely.
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub cs_fallback_receiver: bool,
     /// What to do when the sending leg is disabled mid-flight.
     #[serde(default)]
@@ -4078,8 +4072,9 @@ impl Default for SmsPathPolicy {
     fn default() -> Self {
         Self {
             priority: default_sms_path_order(),
+            force_vowifi_send: false,
             dedupe_enabled: true,
-            cs_fallback_receiver: false,
+            cs_fallback_receiver: true,
             mid_flight_disable: MidFlightDisablePolicy::AutoSwitch,
             dedup_retention_days: default_sms_dedup_retention_days(),
             message_retention_limit: default_sms_message_retention_limit(),
@@ -4088,52 +4083,37 @@ impl Default for SmsPathPolicy {
 }
 
 impl SmsPathPolicy {
-    /// Enabled layers in priority order.
+    /// Fixed send order, reduced to VoWiFi only when explicitly forced.
     pub fn enabled_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
-        self.priority
-            .iter()
-            .filter(|layer| layer.enabled)
-            .map(|layer| layer.kind)
-    }
-
-    /// Enabled IMS layers in priority order (for listener election).
-    pub fn enabled_ims_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
-        self.enabled_layers().filter(|kind| kind.is_ims())
-    }
-
-    /// Whether a given path kind is enabled in the policy.
-    pub fn is_enabled(&self, kind: AccessPathKind) -> bool {
-        self.priority
-            .iter()
-            .any(|layer| layer.kind == kind && layer.enabled)
-    }
-
-    /// Normalize the priority list so every path kind appears exactly once.
-    /// Missing kinds are appended (enabled) in the canonical VoWiFi/VoLTE/CS
-    /// order; duplicates keep their first occurrence. This keeps a
-    /// user-supplied partial list valid.
-    pub fn normalized(mut self) -> Self {
-        let mut seen: Vec<AccessPathKind> = Vec::new();
-        let mut deduped: Vec<PathLayerConfig> = Vec::new();
-        for layer in self.priority.into_iter() {
-            if !seen.contains(&layer.kind) {
-                seen.push(layer.kind);
-                deduped.push(layer);
-            }
-        }
-        for kind in [
+        const AUTO: [AccessPathKind; 3] = [
             AccessPathKind::Vowifi,
             AccessPathKind::Volte,
             AccessPathKind::Cs,
-        ] {
-            if !seen.contains(&kind) {
-                deduped.push(PathLayerConfig {
-                    kind,
-                    enabled: true,
-                });
-            }
-        }
-        self.priority = deduped;
+        ];
+        let count = if self.force_vowifi_send {
+            1
+        } else {
+            AUTO.len()
+        };
+        AUTO[..count].iter().copied()
+    }
+
+    /// Receive-side IMS order is fixed and independent from the send-only switch.
+    pub fn enabled_ims_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
+        [AccessPathKind::Vowifi, AccessPathKind::Volte].into_iter()
+    }
+
+    /// All receive paths stay enabled; the user switch only constrains sending.
+    pub fn is_enabled(&self, _kind: AccessPathKind) -> bool {
+        true
+    }
+
+    /// Normalize legacy fields to the fixed routing and reliable receive policy.
+    pub fn normalized(mut self) -> Self {
+        self.priority = default_sms_path_order();
+        self.dedupe_enabled = true;
+        self.cs_fallback_receiver = true;
+        self.mid_flight_disable = MidFlightDisablePolicy::AutoSwitch;
         self.dedup_retention_days = self.dedup_retention_days.clamp(1, 3650);
         self.message_retention_limit = self.message_retention_limit.clamp(100, 100_000);
         self

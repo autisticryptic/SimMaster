@@ -481,6 +481,8 @@ export interface ModemBinding {
   modem_path: string
   manufacturer: string
   model: string
+  device_family?: string
+  control_transport?: string
   primary_port: string
   qmi_device?: string | null
   uim_slot: number
@@ -1030,6 +1032,13 @@ export interface StandaloneSimSlotConfig {
   enabled: boolean
 }
 
+export interface PcscReaderInfo {
+  index: number
+  name: string
+  card_present: boolean
+  selector: string
+}
+
 export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus
@@ -1164,6 +1173,7 @@ export interface PathLayerConfig {
 
 export interface SmsPathPolicy {
   priority: PathLayerConfig[]
+  force_vowifi_send: boolean
   dedupe_enabled: boolean
   cs_fallback_receiver: boolean
   mid_flight_disable: 'auto_switch' | 'fail'
@@ -2339,136 +2349,6 @@ export interface VowifiRuntimeSnapshotEntry {
   sms_ready: boolean
   degraded_reason?: string | null
   updated_at: string
-}
-
-export interface VowifiDiagnosticsSummary {
-  runtime_phase: string
-  profile_id?: string | null
-  plmn?: string | null
-  ready_stage_count: number
-  total_stage_count: number
-  pending_sms_deliveries: number
-  failed_sms_deliveries: number
-  running_soak_runs: number
-  failed_soak_runs: number
-  last_event_at?: string | null
-  active_trace_id?: string | null
-  degraded: boolean
-  read_only: boolean
-}
-
-export interface VowifiDiagnosticsPrivacy {
-  redaction_policy: string
-  sensitive_fields_returned: boolean
-  event_detail_policy: string
-  trace_filter_policy: string
-  action_interfaces_enabled: boolean
-}
-
-export interface VowifiDiagnosticsTimelineEntry {
-  kind: string
-  timestamp?: string | null
-  trace_id?: string | null
-  level: string
-  phase: string
-  title: string
-  detail: string
-  state: string
-}
-
-export interface VowifiAuditCheck {
-  check_id: string
-  status: string
-  detail: string
-}
-
-export interface VowifiProfileAuditEntry {
-  profile_id: string
-  plmn: string
-  country_iso2: string
-  brand: string
-  offline_plan_ready: boolean
-  dry_run_ready: boolean
-  live_test_ready: boolean
-  blockers: string[]
-  checks: VowifiAuditCheck[]
-}
-
-export interface VowifiLongRunGate {
-  gate_id: string
-  status: string
-  target: string
-  evidence: string
-  blocker?: string | null
-}
-
-export interface VowifiLiveStageReadiness {
-  stage_id: string
-  component: string
-  status: string
-  offline_ready: boolean
-  dry_run_ready: boolean
-  live_network_required: boolean
-  device_state_change_required: boolean
-  live_network_authorized: boolean
-  device_state_changes_authorized: boolean
-  implementation_ready: boolean
-  evidence: string
-  next_step: string
-  blockers: string[]
-  sensitive_values_policy: string
-}
-
-export interface VowifiSoakScenarioPlan {
-  scenario_id: string
-  status: string
-  duration_hours: number
-  sample_interval_seconds: number
-  live_network_required: boolean
-  device_state_change_required: boolean
-  sms_test_required: boolean
-  metrics: string[]
-  pass_criteria: string[]
-  evidence_source: string
-  blockers: string[]
-  sensitive_values_policy: string
-}
-
-export interface VowifiReadinessAuditReport {
-  stage: string
-  clean_room_policy: string
-  live_network_allowed: boolean
-  device_state_changes_allowed: boolean
-  profile_count: number
-  profiles_ready: number
-  dry_run_profiles_ready: number
-  live_profiles_ready: number
-  long_run_gate_count: number
-  long_run_ready_count: number
-  live_stage_count: number
-  live_stage_ready_count: number
-  soak_scenario_count: number
-  soak_scenario_ready_count: number
-  profile_audits: VowifiProfileAuditEntry[]
-  long_run_gates: VowifiLongRunGate[]
-  live_stage_readiness: VowifiLiveStageReadiness[]
-  soak_scenarios: VowifiSoakScenarioPlan[]
-  blockers: string[]
-  sensitive_values_policy: string
-}
-export interface VowifiDiagnosticsResponse {
-  line_id?: string | null
-  status: VowifiStatusResponse
-  persisted_snapshot?: VowifiRuntimeSnapshotEntry | null
-  events: VowifiRuntimeEventsResponse
-  sms_deliveries: VowifiSmsDeliveriesResponse
-  soak_runs: VowifiSoakRunsResponse
-  restore?: VowifiEsimRestoreEntry | null
-  summary: VowifiDiagnosticsSummary
-  timeline: VowifiDiagnosticsTimelineEntry[]
-  trace_filter?: string | null
-  privacy: VowifiDiagnosticsPrivacy
-  m10_audit: VowifiReadinessAuditReport
 }
 
 export interface VowifiRuntimeEventEntry {

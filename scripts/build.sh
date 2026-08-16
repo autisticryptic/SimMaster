@@ -324,6 +324,13 @@ if [ "$SKIP_OTA" = false ] && [ "$BUILD_BACKEND" = true ] && [ "$BUILD_FRONTEND"
         mkdir -p "$OTA_TMP/www"
         cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
+        # Include boot-time DATA6/secondary-QMI resources. The one-click
+        # installer uses the packaged unit and older packages fall back to the
+        # SimMaster raw URL.
+        mkdir -p "$OTA_TMP/system"
+        cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
+        cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
+
         # 计算前端 MD5
         if is_macos; then
             FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5 -q {} \; | sort | tr '\n' '\n' | md5 -q)
@@ -351,7 +358,7 @@ EOF
         OTA_FILE="release/simadmin_${VERSION}.tar.gz"
         echo "打包 OTA..."
         cd "$OTA_TMP"
-        tar -czf - meta.json simadmin www > "$OLDPWD/$OTA_FILE"
+        tar -czf - meta.json simadmin www system > "$OLDPWD/$OTA_FILE"
         cd "$OLDPWD"
         
         # 显示结果

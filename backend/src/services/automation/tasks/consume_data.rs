@@ -1,15 +1,18 @@
 use crate::api::handlers::{start_line_data_runtime, stop_line_data_runtime};
 use crate::hardware::cellular::data_proxy::DataProxyStatus;
-use crate::platform::config::LineDataProxyConfig;
+use crate::platform::config::{LineDataProxyConfig, LineProfileConfig};
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use tracing::{info, warn};
 
 pub struct ConsumeDataHandler;
+
+const DATA_CONSUMPTION_ENDPOINT: &str = "https://speed.cloudflare.com/__down";
+const DATA_CONSUMPTION_HOST: &str = "speed.cloudflare.com";
 
 fn requested_bytes(value: u64, unit: &str) -> Result<u64> {
     if value == 0 {
@@ -56,6 +59,17 @@ fn automation_proxy_config(
     }
 }
 
+fn automation_runtime_profile(configured: &LineProfileConfig) -> (LineProfileConfig, bool) {
+    let temporary = !configured.data_connection_enabled;
+    let mut runtime = configured.clone();
+    // The persisted switch describes the state to restore after this task. The
+    // runtime copy must explicitly request data so future start-path guards do
+    // not accidentally turn a disabled keep-alive task into a no-op.
+    runtime.data_connection_enabled = true;
+    runtime.data_proxy = automation_proxy_config(&configured.data_proxy, temporary);
+    (runtime, temporary)
+}
+
 fn local_proxy_url(status: &DataProxyStatus) -> Result<String> {
     if !status.running {
         return Err(anyhow!("目标线路的流量代理未运行"));
@@ -79,9 +93,19 @@ fn local_proxy_url(status: &DataProxyStatus) -> Result<String> {
         .port
         .ok_or_else(|| anyhow!("目标线路的流量代理没有监听端口"))?;
     Ok(match connect_ip {
-        IpAddr::V4(address) => format!("http://{address}:{port}"),
-        IpAddr::V6(address) => format!("http://[{address}]:{port}"),
+        IpAddr::V4(address) => format!("socks5://{address}:{port}"),
+        IpAddr::V6(address) => format!("socks5://[{address}]:{port}"),
     })
+}
+
+fn data_consumption_addresses() -> [SocketAddr; 2] {
+    // DATA6 is intentionally isolated from the host's default DNS route. Give
+    // SOCKS5 numeric anycast destinations while TLS keeps validating the
+    // Cloudflare service hostname.
+    [
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(172, 66, 0, 218), 443)),
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 140, 220), 443)),
+    ]
 }
 
 fn proxy_client(
@@ -95,10 +119,15 @@ fn proxy_client(
     }
     reqwest::Client::builder()
         .proxy(proxy)
+        .resolve_to_addrs(DATA_CONSUMPTION_HOST, &data_consumption_addresses())
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .build()
         .context("创建线路代理下载客户端失败")
+}
+
+fn data_consumption_url(amount: u64) -> String {
+    format!("{DATA_CONSUMPTION_ENDPOINT}?bytes={amount}")
 }
 
 impl AutomationTaskHandler for ConsumeDataHandler {
@@ -138,61 +167,64 @@ impl AutomationTaskHandler for ConsumeDataHandler {
             // In that case open a loopback-only proxy for this run and restore
             // the disabled state afterwards instead of exposing the saved
             // listener configuration temporarily.
-            let temporary_runtime = !profile.data_connection_enabled;
-            let mut runtime_profile = profile.clone();
-            runtime_profile.data_proxy =
-                automation_proxy_config(&profile.data_proxy, temporary_runtime);
+            let (runtime_profile, temporary_runtime) = automation_runtime_profile(&profile);
 
-            let task_result = async {
-                start_line_data_runtime(app, &line, &runtime_profile)
-                    .await
-                    .map_err(anyhow::Error::msg)
-                    .context("目标线路的数据承载或代理启动失败")?;
-                let proxy_status = line.data_proxy.status().await;
-                let proxy_url = local_proxy_url(&proxy_status)?;
-                let client = proxy_client(
-                    &proxy_url,
-                    &runtime_profile.data_proxy,
-                    timeout_secs,
-                )?;
-                // Use Cloudflare's anycast address with the service Host header.
-                // The cellular bearer may be usable while the device itself has
-                // no default DNS route, so resolving the public hostname here
-                // would make an otherwise valid keep-alive task fail.
-                let endpoint = format!("http://1.1.1.1/__down?bytes={amount}");
-                let mut response = client
-                    .get(endpoint)
-                    .header(reqwest::header::HOST, "speed.cloudflare.com")
-                    .send()
-                    .await
-                    .context("线路代理流量请求失败")?;
-                if !response.status().is_success() {
-                    return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
-                }
-                let mut downloaded = 0u64;
-                while let Some(chunk) = response.chunk().await.context("读取蜂窝流量响应失败")? {
-                    downloaded = downloaded.saturating_add(chunk.len() as u64);
-                    if downloaded > amount {
+            let task_result = match tokio::time::timeout(
+                std::time::Duration::from_secs(timeout_secs),
+                async {
+                    start_line_data_runtime(app, &line, &runtime_profile)
+                        .await
+                        .map_err(anyhow::Error::msg)
+                        .context("目标线路的数据承载或代理启动失败")?;
+                    let proxy_status = line.data_proxy.status().await;
+                    let proxy_url = local_proxy_url(&proxy_status)?;
+                    let client = proxy_client(
+                        &proxy_url,
+                        &runtime_profile.data_proxy,
+                        timeout_secs,
+                    )?;
+                    // SOCKS5 carries a numeric edge address through the isolated
+                    // cellular interface, while HTTPS retains the service hostname
+                    // for certificate validation and exact-size response integrity.
+                    let mut response = client
+                        .get(data_consumption_url(amount))
+                        .send()
+                        .await
+                        .context("线路代理流量请求失败")?;
+                    if !response.status().is_success() {
+                        return Err(anyhow!("蜂窝流量服务返回 {}", response.status()));
+                    }
+                    let mut downloaded = 0u64;
+                    while let Some(chunk) =
+                        response.chunk().await.context("读取蜂窝流量响应失败")?
+                    {
+                        downloaded = downloaded.saturating_add(chunk.len() as u64);
+                        if downloaded > amount {
+                            return Err(anyhow!(
+                                "蜂窝流量响应大小不符：期望 {amount} Byte，实际超过 {downloaded} Byte"
+                            ));
+                        }
+                    }
+                    if downloaded != amount {
                         return Err(anyhow!(
-                            "蜂窝流量响应大小不符：期望 {amount} Byte，实际超过 {downloaded} Byte"
+                            "蜂窝流量响应大小不符：期望 {amount} Byte，实际 {downloaded} Byte"
                         ));
                     }
-                }
-                if downloaded != amount {
-                    return Err(anyhow!(
-                        "蜂窝流量响应大小不符：期望 {amount} Byte，实际 {downloaded} Byte"
-                    ));
-                }
-                info!(
-                    bytes = downloaded,
-                    proxy = proxy_url,
-                    line_id = target.line_id,
-                    modem_path = target.modem_path,
-                    "automation proxied cellular data consumption completed"
-                );
-                Ok(())
-            }
-            .await;
+                    info!(
+                        bytes = downloaded,
+                        proxy = proxy_url,
+                        line_id = target.line_id,
+                        modem_path = target.modem_path,
+                        "automation proxied cellular data consumption completed"
+                    );
+                    Ok(())
+                },
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(anyhow!("蜂窝流量任务执行超时")),
+            };
 
             let cleanup_result = if temporary_runtime {
                 let current_profile = app.config_manager.get_line_profile(&target.line_id);
@@ -226,16 +258,29 @@ impl AutomationTaskHandler for ConsumeDataHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        automation_proxy_config, execution_timeout_secs, local_proxy_url, requested_bytes,
+        automation_proxy_config, automation_runtime_profile, data_consumption_addresses,
+        data_consumption_url, execution_timeout_secs, local_proxy_url, requested_bytes,
     };
     use crate::hardware::cellular::data_proxy::DataProxyStatus;
-    use crate::platform::config::LineDataProxyConfig;
+    use crate::platform::config::{LineDataProxyConfig, LineProfileConfig};
 
     #[test]
     fn converts_small_data_units_without_rounding() {
         assert_eq!(requested_bytes(100, "bytes").unwrap(), 100);
         assert_eq!(requested_bytes(1, "kb").unwrap(), 1024);
         assert_eq!(requested_bytes(2, "mb").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn cellular_download_uses_the_https_exact_size_endpoint() {
+        assert_eq!(
+            data_consumption_url(65_536),
+            "https://speed.cloudflare.com/__down?bytes=65536"
+        );
+        assert_eq!(
+            data_consumption_addresses()[0].to_string(),
+            "172.66.0.218:443"
+        );
     }
 
     #[test]
@@ -267,6 +312,23 @@ mod tests {
     }
 
     #[test]
+    fn disabled_persistent_switch_still_requests_a_temporary_runtime() {
+        let mut configured = LineProfileConfig::for_line("line-a");
+        configured.data_connection_enabled = false;
+        configured.data_proxy.listen_ip = "0.0.0.0".to_string();
+        configured.data_proxy.listen_port = 1080;
+        configured.data_proxy.username = "user".to_string();
+        configured.data_proxy.password = "secret".to_string();
+
+        let (runtime, temporary) = automation_runtime_profile(&configured);
+        assert!(temporary);
+        assert!(runtime.data_connection_enabled);
+        assert_eq!(runtime.data_proxy.listen_ip, "127.0.0.1");
+        assert_eq!(runtime.data_proxy.listen_port, 0);
+        assert!(runtime.data_proxy.username.is_empty());
+    }
+
+    #[test]
     fn wildcard_proxy_listener_is_reached_through_loopback() {
         let status = DataProxyStatus {
             running: true,
@@ -274,6 +336,9 @@ mod tests {
             port: Some(12345),
             ..DataProxyStatus::default()
         };
-        assert_eq!(local_proxy_url(&status).unwrap(), "http://127.0.0.1:12345");
+        assert_eq!(
+            local_proxy_url(&status).unwrap(),
+            "socks5://127.0.0.1:12345"
+        );
     }
 }

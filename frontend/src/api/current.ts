@@ -65,6 +65,7 @@ import type {
   OtaLatestReleaseResponse,
   OtaOnlinePrepareRequest,
   OtaUploadResponse,
+  PcscReaderInfo,
   GithubDownloadProxyConfig,
   RadioMode,
   RadioModeResponse,
@@ -80,7 +81,6 @@ import type {
   SmsStats,
   SmsPathPolicy,
   SystemStatsResponse,
-  VowifiDiagnosticsResponse,
   VowifiProfilesResponse,
   WebhookTestResponse,
   LineEsimControlResponse,
@@ -743,6 +743,10 @@ class SimAdminCurrentAPI {
     })
   }
 
+  async getPcscReaders() {
+    return request<ApiResponse<PcscReaderInfo[]>>('/sim/readers')
+  }
+
   async getTrunkLines() {
     return request<ApiResponse<TrunkProfileResponse[]>>('/trunk/lines')
   }
@@ -820,9 +824,7 @@ class SimAdminCurrentAPI {
     const query = `?channel_id=${encodeURIComponent(channelId)}`
     return request<ApiResponse<{ deleted: number }>>(
       `/sms/conversation/${encodeURIComponent(phoneNumber)}${query}`,
-      {
-        method: 'DELETE',
-      },
+      { method: 'DELETE' },
     )
   }
 
@@ -1136,17 +1138,6 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(profile),
     })
-  }
-
-  async getVowifiDiagnostics(options: { lineId: string; limit?: number; traceId?: string }) {
-    const query = new URLSearchParams()
-    query.set('limit', String(options.limit ?? 50))
-    const traceId = options.traceId?.trim()
-    if (traceId) query.set('trace_id', traceId)
-    return request<ApiResponse<VowifiDiagnosticsResponse>>(
-      `/vowifi/lines/${encodeURIComponent(options.lineId.trim())}/diagnostics?${query.toString()}`,
-      { timeoutMs: 30000 },
-    )
   }
 
   async getE911Capability(lineId: string) {

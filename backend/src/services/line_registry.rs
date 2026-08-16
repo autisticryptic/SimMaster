@@ -312,13 +312,16 @@ impl LineRuntimeRegistry {
                     continue;
                 }
                 let reader_path = slot.reader_path.trim();
-                // A reader is addressable for QMI/lpac only when its path is a
-                // concrete device node; abstract identifiers (e.g. "pcsc://...")
-                // are persisted but not yet resolvable, so the line stays offline.
                 let qmi_device = reader_path
                     .starts_with("/dev/")
                     .then(|| reader_path.to_string());
-                let present = qmi_device.is_some();
+                let present = if reader_path.starts_with("pcsc://") {
+                    crate::hardware::devices::pcsc::reader_available(reader_path)
+                        .await
+                        .unwrap_or(false)
+                } else {
+                    qmi_device.is_some()
+                };
                 discovered.push(crate::hardware::cellular::modem_manager::reader_binding(
                     &slot.id,
                     &slot.label,
@@ -353,12 +356,19 @@ impl LineRuntimeRegistry {
         for binding in discovered {
             // Tell the VoWiFi live layer which SIM device this line owns, so its
             // identity and authentication never use another modem's card.
-            crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
-                &binding.line_id,
-                binding.qmi_device.as_deref().unwrap_or_default(),
-                binding.uim_slot,
-                &binding.modem_path,
-            );
+            if binding.line_kind == "reader" && binding.model.starts_with("pcsc://") {
+                crate::connectivity::modems::ims::vowifi::live::register_line_pcsc_reader(
+                    &binding.line_id,
+                    &binding.model,
+                );
+            } else {
+                crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
+                    &binding.line_id,
+                    binding.qmi_device.as_deref().unwrap_or_default(),
+                    binding.uim_slot,
+                    &binding.modem_path,
+                );
+            }
             if let Some(line) = lines.get(&binding.line_id) {
                 if let Some(config_manager) = &self.config_manager {
                     line.voice_access
@@ -512,6 +522,8 @@ mod tests {
             modem_path: "/org/freedesktop/ModemManager1/Modem/0".to_string(),
             manufacturer: "test".to_string(),
             model: "test".to_string(),
+            device_family: "generic_modem".to_string(),
+            control_transport: "modemmanager_qmi_at".to_string(),
             primary_port: "wwan0mbim0".to_string(),
             qmi_device: Some("/dev/wwan0qmi0".to_string()),
             uim_slot: 1,

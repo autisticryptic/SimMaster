@@ -734,6 +734,12 @@ pub struct ModemBinding {
     pub modem_path: String,
     pub manufacturer: String,
     pub model: String,
+    /// Stable hardware family classification used for capability diagnostics.
+    #[serde(default)]
+    pub device_family: String,
+    /// Control path selected for this line (for example ModemManager QMI+AT).
+    #[serde(default)]
+    pub control_transport: String,
     pub primary_port: String,
     pub qmi_device: Option<String>,
     pub uim_slot: u8,
@@ -846,6 +852,12 @@ pub fn reader_binding(
         modem_path: String::new(),
         manufacturer: "SIM 读卡器".to_string(),
         model: reader_path.trim().to_string(),
+        device_family: "usb_sim_reader".to_string(),
+        control_transport: if reader_path.trim().starts_with("pcsc://") {
+            "pcsc".to_string()
+        } else {
+            "qmi_uim".to_string()
+        },
         primary_port: String::new(),
         qmi_device,
         uim_slot,
@@ -1394,6 +1406,14 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
         }
 
         let qmi_device = qmi_control_device(conn, &modem_path).await;
+        let device_family = crate::hardware::devices::quectel::classify(&manufacturer, &model)
+            .map(|family| family.as_str().to_string())
+            .unwrap_or_else(|| "generic_modem".to_string());
+        let control_transport = crate::hardware::devices::quectel::control_transport(
+            &primary_port,
+            qmi_device.as_deref(),
+        )
+        .to_string();
         let (hardware_key, slot_source, slot_stable) = resolve_physical_slot_id(
             &device_reference,
             &primary_port,
@@ -1428,6 +1448,8 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             modem_path: modem_path.clone(),
             manufacturer,
             model,
+            device_family,
+            control_transport,
             primary_port,
             qmi_device,
             uim_slot,

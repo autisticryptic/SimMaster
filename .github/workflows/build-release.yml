@@ -293,6 +293,11 @@ jobs:
           cp -r "$FRONTEND_DIR"/* "$TMP/www/"
           FRONTEND_MD5=$(find "$TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
 
+          # ---- DATA6 / secondary-QMI boot resources ----
+          mkdir -p "$TMP/system"
+          cp deploy/system/99-simadmin-secondary-qmi.rules "$TMP/system/"
+          cp deploy/system/simadmin-secondary-qmi.service "$TMP/system/"
+
           # ---- meta.json ----
           cat > "$TMP/meta.json" << EOF
           {
@@ -309,10 +314,9 @@ jobs:
           mkdir -p release
           OUT="release/simadmin-linux-${ARCH}.tar.gz"
 
-          # 打包内容：当前仅 meta.json + 二进制 + www/
-          # 预留：后期扩展（如配置模板 / systemd unit / 附带脚本）时，
-          #       将新增文件复制到 $TMP 下，并在下面的 tar 参数列表中追加对应条目。
-          ( cd "$TMP" && tar -czf - meta.json simadmin www ) > "$OUT"
+          # system/ carries the unit and fallback udev rule needed to reserve
+          # the DATA6 endpoint before ModemManager starts.
+          ( cd "$TMP" && tar -czf - meta.json simadmin www system ) > "$OUT"
 
           echo ""
           echo "✅ 打包完成: $OUT"
@@ -391,7 +395,7 @@ jobs:
 
             > Windows 版本待后端 dbus 相关能力适配后再提供（已在构建流程中预留）。
 
-            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端。
+            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端 + `system/` DATA6/secondary-QMI 启动资源。
             校验值见 `SHA256SUMS.txt`。
 
             ### 安装 / 更新

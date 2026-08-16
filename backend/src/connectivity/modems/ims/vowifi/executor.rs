@@ -361,16 +361,16 @@ impl DryRunRuntimeExecutor {
             vec![0x55; 32],
             vec![0x66; 256],
         );
-        let request = machine
-            .build_sa_init_request()
-            .expect("dry-run IKE SA_INIT request uses static profile data");
+        let Ok(request) = machine.build_sa_init_request() else {
+            return machine.snapshot();
+        };
         let response = dry_run_sa_init_response(&request);
-        machine
-            .accept_sa_init_response(&response)
-            .expect("dry-run IKE SA_INIT response is internally generated");
-        machine
-            .derive_session_keys(&[0x77; 256])
-            .expect("dry-run shared secret is synthetic");
+        if machine.accept_sa_init_response(&response).is_err() {
+            return machine.snapshot();
+        }
+        if machine.derive_session_keys(&[0x77; 256]).is_err() {
+            return machine.snapshot();
+        }
         machine.snapshot()
     }
 

@@ -91,22 +91,6 @@ pub fn elect_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::config::{MidFlightDisablePolicy, PathLayerConfig};
-
-    fn policy(order: Vec<(AccessPathKind, bool)>, cs_fallback: bool) -> SmsPathPolicy {
-        SmsPathPolicy {
-            priority: order
-                .into_iter()
-                .map(|(kind, enabled)| PathLayerConfig { kind, enabled })
-                .collect(),
-            dedupe_enabled: true,
-            cs_fallback_receiver: cs_fallback,
-            mid_flight_disable: MidFlightDisablePolicy::AutoSwitch,
-            dedup_retention_days: 30,
-            message_retention_limit: 10_000,
-        }
-        .normalized()
-    }
 
     fn ready(kind: AccessPathKind, ready: bool) -> LegReceiveReadiness {
         LegReceiveReadiness { kind, ready }
@@ -114,14 +98,7 @@ mod tests {
 
     #[test]
     fn highest_priority_ready_ims_leg_wins() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, true),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            false,
-        );
+        let p = SmsPathPolicy::default();
         let out = elect_listener(
             &p,
             &[
@@ -130,19 +107,12 @@ mod tests {
             ],
         );
         assert_eq!(out.active_ims_listener, Some(AccessPathKind::Vowifi));
-        assert_eq!(out.cs_action, CsListenerAction::Paused);
+        assert_eq!(out.cs_action, CsListenerAction::ActiveWithDedup);
     }
 
     #[test]
     fn falls_through_to_next_ims_leg_when_top_not_ready() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, true),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            false,
-        );
+        let p = SmsPathPolicy::default();
         let out = elect_listener(
             &p,
             &[
@@ -154,15 +124,8 @@ mod tests {
     }
 
     #[test]
-    fn disabled_ims_leg_is_skipped_even_when_ready() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, false),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            false,
-        );
+    fn legacy_priority_cannot_disable_receive_paths() {
+        let p = SmsPathPolicy::default();
         let out = elect_listener(
             &p,
             &[
@@ -170,19 +133,12 @@ mod tests {
                 ready(AccessPathKind::Volte, true),
             ],
         );
-        assert_eq!(out.active_ims_listener, Some(AccessPathKind::Volte));
+        assert_eq!(out.active_ims_listener, Some(AccessPathKind::Vowifi));
     }
 
     #[test]
     fn no_ready_ims_leg_gives_cs_reception() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, true),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            false,
-        );
+        let p = SmsPathPolicy::default();
         let out = elect_listener(
             &p,
             &[
@@ -196,31 +152,17 @@ mod tests {
 
     #[test]
     fn cs_fallback_receiver_keeps_cs_scanning_with_dedup() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, true),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            true,
-        );
+        let p = SmsPathPolicy::default();
         let out = elect_listener(&p, &[ready(AccessPathKind::Vowifi, true)]);
         assert_eq!(out.active_ims_listener, Some(AccessPathKind::Vowifi));
         assert_eq!(out.cs_action, CsListenerAction::ActiveWithDedup);
     }
 
     #[test]
-    fn cs_disabled_and_no_ims_means_nobody_receives() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, true),
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, false),
-            ],
-            false,
-        );
+    fn no_ready_ims_still_keeps_cs_active() {
+        let p = SmsPathPolicy::default();
         let out = elect_listener(&p, &[ready(AccessPathKind::Vowifi, false)]);
         assert_eq!(out.active_ims_listener, None);
-        assert_eq!(out.cs_action, CsListenerAction::Paused);
+        assert_eq!(out.cs_action, CsListenerAction::Active);
     }
 }

@@ -52,9 +52,8 @@ use crate::{
     hardware::sim::esim::EsimApiError,
     platform::config::{
         AccessPathKind, AutoRestoreConfig, EsimReaderConfig, GithubDownloadProxyConfig,
-        ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
-        MidFlightDisablePolicy, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
-        VoicePathPolicy,
+        ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig, SmsPathPolicy,
+        StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -3698,8 +3697,8 @@ pub async fn send_sms_handler(
             )
         }
     };
-    // Each line routes by its own explicit policy, so a VoLTE-only SIM and a
-    // VoWiFi-only SIM can coexist in one device.
+    // Sending uses a fixed VoWiFi -> VoLTE -> CS fallback order unless this
+    // line explicitly requires VoWiFi-only delivery.
     let scope = match VowifiScope::resolve(&app, &line_id).await {
         Ok(scope) => scope,
         Err(reason) => {
@@ -3712,7 +3711,6 @@ pub async fn send_sms_handler(
         }
     };
     let policy = app.config_manager.get_line_sms_path_policy(scope.line_id());
-    let stop_on_failure = policy.mid_flight_disable == MidFlightDisablePolicy::Fail;
     let mut failures = Vec::new();
     for path in policy.enabled_layers() {
         let result = match path {
@@ -3729,10 +3727,7 @@ pub async fn send_sms_handler(
             }
             Err(reason) => {
                 failures.push(format!("{}:{reason}", path.as_str()));
-                if stop_on_failure {
-                    break;
-                }
-                warn!(path = path.as_str(), reason = %reason, "SMS path failed; trying next path");
+                warn!(path = path.as_str(), reason = %reason, "SMS send path failed");
             }
         }
     }
@@ -5768,7 +5763,7 @@ fn persist_optional_vowifi_restore_phase(
 
 /// VoWiFi needs this line's modem powered on for SIM/AKA access, so make sure
 /// the line is not sitting in airplane mode. Only ever turns airplane mode off,
-/// and only for the line that is connecting — a second SIM keeps its own state.
+/// and only for the line that is connecting - a second SIM keeps its own state.
 async fn ensure_line_radio_enabled(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
     let Some(modem_path) = scope.modem_path() else {
         return Ok(());
@@ -6216,6 +6211,24 @@ pub async fn get_standalone_sim_slots_handler(
             app.config_manager.get_standalone_sim_slots(),
         )),
     )
+}
+
+pub async fn get_pcsc_readers_handler(
+    State(_app): State<AppState>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::hardware::devices::pcsc::PcscReaderInfo>>>,
+) {
+    match crate::hardware::devices::pcsc::discover_readers().await {
+        Ok(readers) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", readers)),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        ),
+    }
 }
 
 pub async fn set_standalone_sim_slots_handler(

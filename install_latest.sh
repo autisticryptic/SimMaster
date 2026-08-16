@@ -13,9 +13,11 @@ RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}}"
 SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin.service}"
 MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin-modem-recovery.sh}"
 MODEM_RECOVERY_SERVICE_URL="${MODEM_RECOVERY_SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin-modem-recovery.service}"
+SECONDARY_QMI_SERVICE_URL="${SECONDARY_QMI_SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/deploy/system/simadmin-secondary-qmi.service}"
 ASSET_URL="${ASSET_URL:-}"
 ASSET_NAME="${ASSET_NAME:-}"
 SIMADMIN_INSTALL_LPAC="${SIMADMIN_INSTALL_LPAC:-1}"
+SIMADMIN_INSTALL_HARDWARE_SUPPORT="${SIMADMIN_INSTALL_HARDWARE_SUPPORT:-1}"
 LPAC_REPO="${LPAC_REPO:-estkme-group/lpac}"
 LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/${LPAC_REPO}/releases/latest/download}"
 LPAC_LATEST_RELEASE_URL="${LPAC_LATEST_RELEASE_URL:-https://github.com/${LPAC_REPO}/releases/latest}"
@@ -201,6 +203,76 @@ install_modem_recovery_service() {
   download_with_proxies "$MODEM_RECOVERY_SERVICE_URL" "$service_dst"
   systemctl daemon-reload
   systemctl enable simadmin-modem-recovery.service >/dev/null
+}
+
+install_hardware_support() {
+  if ! truthy "$SIMADMIN_INSTALL_HARDWARE_SUPPORT"; then
+    echo "==> hardware support dependency installation disabled"
+    return 0
+  fi
+
+  echo "==> installing Quectel and USB SIM reader host support"
+  installed=0
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      modemmanager libqmi-utils usb-modeswitch pcscd libccid opensc pcsc-tools; then
+      installed=1
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y ModemManager libqmi-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ModemManager libqmi-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
+  elif command -v pacman >/dev/null 2>&1; then
+    pacman -Sy --noconfirm modemmanager libqmi usb_modeswitch pcsclite ccid opensc && installed=1 || true
+  elif command -v apk >/dev/null 2>&1; then
+    apk add --no-cache modemmanager libqmi-utils usb-modeswitch pcsc-lite ccid opensc && installed=1 || true
+  elif command -v opkg >/dev/null 2>&1; then
+    opkg update >/dev/null 2>&1 || true
+    for package in modemmanager qmi-utils usb-modeswitch pcscd ccid opensc-utils; do
+      opkg install "$package" >/dev/null 2>&1 || true
+    done
+    installed=1
+  fi
+
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl enable --now pcscd.socket >/dev/null 2>&1 || \
+      systemctl enable --now pcscd.service >/dev/null 2>&1 || true
+  elif [ -x /etc/init.d/pcscd ]; then
+    /etc/init.d/pcscd enable >/dev/null 2>&1 || true
+    /etc/init.d/pcscd restart >/dev/null 2>&1 || /etc/init.d/pcscd start >/dev/null 2>&1 || true
+  fi
+
+  if [ "$installed" -ne 1 ]; then
+    echo "warning: hardware support packages could not be installed automatically; existing modem support will be preserved" >&2
+  fi
+}
+
+install_secondary_qmi_service() {
+  package_root="$1"
+  service_dst="/etc/systemd/system/simadmin-secondary-qmi.service"
+  packaged_service="${package_root}/system/simadmin-secondary-qmi.service"
+
+  mkdir -p /etc/systemd/system
+  if [ -f "$packaged_service" ]; then
+    install -m 0644 "$packaged_service" "$service_dst"
+  else
+    download_with_proxies "$SECONDARY_QMI_SERVICE_URL" "$service_dst"
+  fi
+  systemctl daemon-reload
+  systemctl enable simadmin-secondary-qmi.service >/dev/null
+}
+
+activate_secondary_qmi_runtime() {
+  echo "==> preparing the DATA6 secondary QMI endpoint"
+  # The unit is ordered before ModemManager at boot. Mirror that ordering for an
+  # in-place install so ModemManager cannot claim the newly exposed DATA6 port.
+  systemctl stop ModemManager.service >/dev/null 2>&1 || true
+  if systemctl restart simadmin-secondary-qmi.service; then
+    echo "==> DATA6 secondary QMI endpoint is active"
+  else
+    echo "warning: DATA6 secondary QMI is unavailable on this device; continuing with the primary modem path" >&2
+  fi
+  systemctl restart ModemManager.service >/dev/null 2>&1 || true
 }
 
 configure_networkmanager_modem_unmanaged() {
@@ -808,14 +880,18 @@ main() {
     install -m 0644 "${tmp_dir}/pkg/meta.json" "${INSTALL_DIR}/meta.json"
   fi
 
+  install_hardware_support
   install_lpac
 
   echo "==> installing systemd unit"
   install_service_file
   echo "==> installing modem recovery service"
   install_modem_recovery_service
+  echo "==> installing secondary QMI service"
+  install_secondary_qmi_service "${tmp_dir}/pkg"
 
   configure_networkmanager_modem_unmanaged
+  activate_secondary_qmi_runtime
 
   echo "==> starting service"
   systemctl restart "${SERVICE_NAME}.service"
@@ -823,6 +899,7 @@ main() {
   echo "==> done"
   echo "    service: ${SERVICE_NAME}.service"
   echo "    modem recovery: simadmin-modem-recovery.service"
+  echo "    secondary QMI: simadmin-secondary-qmi.service"
   echo "    install dir: ${INSTALL_DIR}"
   systemctl status "${SERVICE_NAME}.service" --no-pager
 }

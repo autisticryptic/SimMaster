@@ -924,10 +924,17 @@ fn esim_target_for_line(
     } else {
         config.qmi_uim_slot
     };
-    let apdu_backend = if config.apdu_backend.trim().is_empty() {
+    let pcsc_reader = crate::hardware::devices::pcsc::selector_from_path(&device.pcsc_reader);
+    let configured_backend = config.apdu_backend.trim();
+    let apdu_backend = if pcsc_reader.is_some()
+        && (configured_backend.is_empty() || configured_backend.eq_ignore_ascii_case("qmi"))
+        && qmi_device.is_empty()
+    {
+        "pcsc"
+    } else if configured_backend.is_empty() {
         "qmi"
     } else {
-        config.apdu_backend.trim()
+        configured_backend
     };
     if (apdu_backend.eq_ignore_ascii_case("qmi") || apdu_backend.eq_ignore_ascii_case("qmi_qrtr"))
         && (qmi_device.trim().is_empty() || uim_slot == 0)
@@ -946,7 +953,11 @@ fn esim_target_for_line(
             config.http_backend.trim().to_string()
         },
         at_device: config.at_device.trim().to_string(),
-        pcsc_reader_name: config.pcsc_reader_name.trim().to_string(),
+        pcsc_reader_name: if config.pcsc_reader_name.trim().is_empty() {
+            pcsc_reader.unwrap_or_default()
+        } else {
+            config.pcsc_reader_name.trim().to_string()
+        },
         pcsc_reader_index: config.pcsc_reader_index,
         mbim_device: config.mbim_device.trim().to_string(),
         mbim_uim_slot: config.mbim_uim_slot,

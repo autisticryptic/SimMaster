@@ -109,7 +109,7 @@ jobs:
               cmake .. \
                 -DCMAKE_BUILD_TYPE=Release \
                 -DSTANDALONE_MODE=ON \
-                -DLPAC_WITH_APDU_PCSC=OFF \
+                -DLPAC_WITH_APDU_PCSC=ON \
                 -DLPAC_WITH_APDU_AT=ON \
                 -DLPAC_WITH_APDU_QMI=ON
               make -j$(nproc)
@@ -179,7 +179,7 @@ jobs:
                 "name": "lpac-linux-aarch64-glibc2.31.zip",
                 "arch": "aarch64",
                 "glibc": "2.31",
-                "description": "lpac for aarch64 built against glibc 2.31 (Debian 11)"
+                "description": "lpac for aarch64 built against glibc 2.31 with QMI, AT and PC/SC APDU backends"
               }
             ]
           }
@@ -196,6 +196,7 @@ jobs:
             * **lpac Source**: `estkme-group/lpac@${{ steps.resolve_ver.outputs.lpac_ver }}`
             * **Glibc version**: `2.31` (Debian 11)
             * **Architecture**: `aarch64` (ARM64)
+            * **APDU backends**: QMI, AT and PC/SC
           draft: false
           prerelease: true # 标记为预发布版，防止其成为最新版
           make_latest: false # ⚠️ 重要：请勿修改为 true！此 workflow 仅打包兼容版 lpac 静态资源，非项目主版本 Release，决不能发布为 Latest。

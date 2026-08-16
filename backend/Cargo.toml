@@ -19,7 +19,7 @@ chrono = { version = "0.4", features = ["serde"] }
 futures-util = "0.3"
 anyhow = "1.0"
 lazy_static = "1.5"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "socks", "stream"] }
 md5 = "0.7"
 base64 = "0.22.1"
 percent-encoding = "2.3.2"

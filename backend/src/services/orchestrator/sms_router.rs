@@ -10,11 +10,11 @@
 //! The actual send IO lives with the caller (the HTTP handler / a future
 //! `AccessLeg` dispatcher), because the VoWiFi and VoLTE send paths need real
 //! runtime handles and unix-only sockets. Keeping the *decision* logic here
-//! makes selection, fallback, and the mid-flight-disable policy fully
+//! makes selection and fallback fully
 //! unit-testable with no IO — matching the design's "enum dispatch, pure
 //! planner" approach (§4.3).
 
-use crate::platform::config::{AccessPathKind, MidFlightDisablePolicy, SmsPathPolicy};
+use crate::platform::config::{AccessPathKind, SmsPathPolicy};
 
 /// Why a leg was skipped or an attempt was not made.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,8 +36,7 @@ pub enum AttemptOutcome {
     /// Failed on the wire (rejected, timeout, transport error). Fall through to
     /// the next candidate.
     Failed,
-    /// The leg was disabled mid-flight and the send had not yet gone out. How
-    /// this is handled depends on [`MidFlightDisablePolicy`].
+    /// The leg became unavailable mid-flight and the send had not yet gone out.
     DisabledMidFlight,
 }
 
@@ -51,9 +50,6 @@ pub enum RouteDecision {
     /// Stop; all candidates exhausted (or policy said to fail). `attempted` is
     /// the ordered list of legs that were actually tried.
     Exhausted { attempted: Vec<AccessPathKind> },
-    /// Stop with an explicit failure due to the mid-flight-disable policy being
-    /// `Fail` (user turned the line off and asked not to auto-switch).
-    FailedMidFlight { kind: AccessPathKind },
 }
 
 /// Readiness of one send leg at planning time.
@@ -90,7 +86,6 @@ pub struct SendRouter {
     candidates: Vec<Candidate>,
     cursor: usize,
     attempted: Vec<AccessPathKind>,
-    mid_flight: MidFlightDisablePolicy,
 }
 
 impl SendRouter {
@@ -100,7 +95,6 @@ impl SendRouter {
             candidates: plan_candidates(policy, readiness),
             cursor: 0,
             attempted: Vec::new(),
-            mid_flight: policy.mid_flight_disable,
         }
     }
 
@@ -136,10 +130,7 @@ impl SendRouter {
         match outcome {
             AttemptOutcome::Sent => RouteDecision::Delivered { kind: current },
             AttemptOutcome::Failed => self.advance(),
-            AttemptOutcome::DisabledMidFlight => match self.mid_flight {
-                MidFlightDisablePolicy::AutoSwitch => self.advance(),
-                MidFlightDisablePolicy::Fail => RouteDecision::FailedMidFlight { kind: current },
-            },
+            AttemptOutcome::DisabledMidFlight => self.advance(),
         }
     }
 
@@ -157,41 +148,14 @@ impl SendRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::config::PathLayerConfig;
-
-    fn policy(
-        order: Vec<(AccessPathKind, bool)>,
-        mid_flight: MidFlightDisablePolicy,
-    ) -> SmsPathPolicy {
-        SmsPathPolicy {
-            priority: order
-                .into_iter()
-                .map(|(kind, enabled)| PathLayerConfig { kind, enabled })
-                .collect(),
-            dedupe_enabled: true,
-            cs_fallback_receiver: false,
-            mid_flight_disable: mid_flight,
-            dedup_retention_days: 30,
-            message_retention_limit: 10_000,
-        }
-        .normalized()
-    }
 
     fn ready(kind: AccessPathKind, ready: bool) -> LegSendReadiness {
         LegSendReadiness { kind, ready }
     }
 
-    fn default_order() -> Vec<(AccessPathKind, bool)> {
-        vec![
-            (AccessPathKind::Vowifi, true),
-            (AccessPathKind::Volte, true),
-            (AccessPathKind::Cs, true),
-        ]
-    }
-
     #[test]
-    fn plans_ready_legs_in_priority_order() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+    fn automatic_mode_uses_fixed_order() {
+        let p = SmsPathPolicy::default();
         let plan = plan_candidates(
             &p,
             &[
@@ -211,20 +175,13 @@ mod tests {
     }
 
     #[test]
-    fn skips_disabled_and_not_ready_legs() {
-        let p = policy(
-            vec![
-                (AccessPathKind::Vowifi, false), // disabled
-                (AccessPathKind::Volte, true),
-                (AccessPathKind::Cs, true),
-            ],
-            MidFlightDisablePolicy::AutoSwitch,
-        );
+    fn automatic_mode_skips_unready_legs() {
+        let p = SmsPathPolicy::default();
         let plan = plan_candidates(
             &p,
             &[
-                ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, false), // not ready
+                ready(AccessPathKind::Vowifi, false),
+                ready(AccessPathKind::Volte, false),
                 ready(AccessPathKind::Cs, true),
             ],
         );
@@ -235,8 +192,30 @@ mod tests {
     }
 
     #[test]
+    fn forced_vowifi_never_plans_chargeable_fallbacks() {
+        let p = SmsPathPolicy {
+            force_vowifi_send: true,
+            ..SmsPathPolicy::default()
+        };
+        let plan = plan_candidates(
+            &p,
+            &[
+                ready(AccessPathKind::Vowifi, true),
+                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::Cs, true),
+            ],
+        );
+        assert_eq!(
+            plan.iter()
+                .map(|candidate| candidate.kind)
+                .collect::<Vec<_>>(),
+            vec![AccessPathKind::Vowifi]
+        );
+    }
+
+    #[test]
     fn first_leg_success_delivers_without_fallthrough() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+        let p = SmsPathPolicy::default();
         let mut r = SendRouter::new(
             &p,
             &[
@@ -256,7 +235,7 @@ mod tests {
 
     #[test]
     fn failure_falls_through_to_next_leg() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+        let p = SmsPathPolicy::default();
         let mut r = SendRouter::new(
             &p,
             &[
@@ -282,7 +261,7 @@ mod tests {
 
     #[test]
     fn all_failures_exhaust_with_attempt_history() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+        let p = SmsPathPolicy::default();
         let mut r = SendRouter::new(
             &p,
             &[
@@ -317,8 +296,8 @@ mod tests {
     }
 
     #[test]
-    fn mid_flight_disable_auto_switch_falls_through() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+    fn mid_flight_unavailability_falls_through() {
+        let p = SmsPathPolicy::default();
         let mut r = SendRouter::new(
             &p,
             &[
@@ -335,8 +314,11 @@ mod tests {
     }
 
     #[test]
-    fn mid_flight_disable_fail_policy_stops_with_failure() {
-        let p = policy(default_order(), MidFlightDisablePolicy::Fail);
+    fn forced_vowifi_failure_is_terminal() {
+        let p = SmsPathPolicy {
+            force_vowifi_send: true,
+            ..SmsPathPolicy::default()
+        };
         let mut r = SendRouter::new(
             &p,
             &[
@@ -345,16 +327,16 @@ mod tests {
             ],
         );
         assert_eq!(
-            r.record(AttemptOutcome::DisabledMidFlight),
-            RouteDecision::FailedMidFlight {
-                kind: AccessPathKind::Vowifi
+            r.record(AttemptOutcome::Failed),
+            RouteDecision::Exhausted {
+                attempted: vec![AccessPathKind::Vowifi]
             }
         );
     }
 
     #[test]
     fn empty_plan_reports_exhausted_immediately() {
-        let p = policy(default_order(), MidFlightDisablePolicy::AutoSwitch);
+        let p = SmsPathPolicy::default();
         let mut r = SendRouter::new(
             &p,
             &[

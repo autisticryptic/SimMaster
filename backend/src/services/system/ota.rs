@@ -22,6 +22,8 @@ const OTA_BINARY_PATH: &str = "/opt/simadmin/simadmin";
 const OTA_WWW_PATH: &str = "/opt/simadmin/www";
 const OTA_META_PATH: &str = "/opt/simadmin/meta.json";
 const OTA_SERVICE_NAME: &str = "simadmin.service";
+const SECONDARY_QMI_SERVICE_NAME: &str = "simadmin-secondary-qmi.service";
+const SECONDARY_QMI_SERVICE_PATH: &str = "/etc/systemd/system/simadmin-secondary-qmi.service";
 const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
 const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
@@ -584,14 +586,15 @@ pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
     chmod_www_tree(OTA_WWW_PATH)?;
 
     install_meta_file()?;
+    let secondary_qmi_result = install_secondary_qmi_resources(restart_now);
     let nm_result = configure_networkmanager_modem_unmanaged(restart_now);
 
     // 清理暂存目录
     let _ = fs::remove_dir_all(OTA_STAGING_DIR);
 
     let message = format!(
-        "Update to version {} applied successfully; {}",
-        meta.version, nm_result
+        "Update to version {} applied successfully; {}; {}",
+        meta.version, secondary_qmi_result, nm_result
     );
 
     if restart_now {
@@ -602,6 +605,50 @@ pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
     }
 
     Ok(message)
+}
+
+fn install_secondary_qmi_resources(restart_now: bool) -> String {
+    let staging_service = format!("{}/system/simadmin-secondary-qmi.service", OTA_STAGING_DIR);
+    if !Path::new(&staging_service).is_file() {
+        return "secondary QMI resource not present, existing setup preserved".to_string();
+    }
+
+    if let Err(error) = fs::create_dir_all("/etc/systemd/system") {
+        return format!("secondary QMI unit directory unavailable: {error}");
+    }
+    if let Err(error) = fs::copy(&staging_service, SECONDARY_QMI_SERVICE_PATH) {
+        return format!("secondary QMI unit install failed: {error}");
+    }
+    let _ = Command::new("chmod")
+        .args(["644", SECONDARY_QMI_SERVICE_PATH])
+        .status();
+    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    let enable = Command::new("systemctl")
+        .args(["enable", SECONDARY_QMI_SERVICE_NAME])
+        .status();
+    if !matches!(enable, Ok(status) if status.success()) {
+        return "secondary QMI unit installed but could not be enabled".to_string();
+    }
+    if !restart_now {
+        return "secondary QMI unit installed; activation deferred".to_string();
+    }
+
+    let _ = Command::new("systemctl")
+        .args(["stop", "ModemManager.service"])
+        .status();
+    let secondary_started = Command::new("systemctl")
+        .args(["restart", SECONDARY_QMI_SERVICE_NAME])
+        .status()
+        .is_ok_and(|status| status.success());
+    let _ = Command::new("systemctl")
+        .args(["restart", "ModemManager.service"])
+        .status();
+
+    if secondary_started {
+        "secondary QMI unit installed and activated before ModemManager".to_string()
+    } else {
+        "secondary QMI unit installed; hardware initializer skipped or failed".to_string()
+    }
 }
 
 fn configure_networkmanager_modem_unmanaged(restart_now: bool) -> String {

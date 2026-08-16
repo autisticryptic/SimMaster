@@ -594,7 +594,6 @@ async fn main() -> Result<()> {
     {
         return run_secondary_qmi_init(*write_udev_rule, *dry_run).await;
     }
-
     let args = match cli.command {
         Some(CliCommand::Serve(args)) => args,
         None => cli.serve,
@@ -1454,6 +1453,10 @@ async fn main() -> Result<()> {
             get(get_standalone_sim_slots_handler)
                 .post(set_standalone_sim_slots_handler)
                 .options(options_handler),
+        )
+        .route(
+            "/api/sim/readers",
+            get(get_pcsc_readers_handler).options(options_handler),
         )
         .route(
             "/api/trunk/lines",

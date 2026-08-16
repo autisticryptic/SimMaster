@@ -661,6 +661,7 @@ pub struct LiveSimDevice {
     pub qmi_device: String,
     pub uim_slot: u8,
     pub modem_path: String,
+    pub pcsc_reader: String,
 }
 
 fn line_sim_devices() -> &'static StdRwLock<HashMap<String, LiveSimDevice>> {
@@ -681,6 +682,28 @@ pub fn register_line_sim_device(line_id: &str, qmi_device: &str, uim_slot: u8, m
                 qmi_device: qmi_device.to_string(),
                 uim_slot,
                 modem_path: modem_path.to_string(),
+                pcsc_reader: String::new(),
+            },
+        );
+}
+
+/// Record a standalone PC/SC reader owned by one line.
+pub fn register_line_pcsc_reader(line_id: &str, reader_path: &str) {
+    if line_id.trim().is_empty()
+        || crate::hardware::devices::pcsc::selector_from_path(reader_path).is_none()
+    {
+        return;
+    }
+    line_sim_devices()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            line_id.to_string(),
+            LiveSimDevice {
+                qmi_device: String::new(),
+                uim_slot: 0,
+                modem_path: String::new(),
+                pcsc_reader: reader_path.trim().to_string(),
             },
         );
 }
@@ -693,24 +716,84 @@ async fn line_sim_identity(
     line_id: &str,
     conn: &zbus::Connection,
 ) -> Option<crate::hardware::cellular::modem_manager::SimIdentity> {
-    let modem_path = sim_device_for_line(line_id).modem_path;
-    if modem_path.is_empty() {
-        return None;
+    let device = sim_device_for_line(line_id);
+    if !device.pcsc_reader.is_empty() {
+        return tokio::task::spawn_blocking(move || {
+            crate::hardware::devices::pcsc::read_identity(&device.pcsc_reader)
+                .ok()
+                .map(|identity| {
+                    let operator_id = identity
+                        .mnc_length
+                        .filter(|length| identity.imsi.len() >= 3 + *length as usize)
+                        .map(|length| identity.imsi[..3 + length as usize].to_string())
+                        .unwrap_or_default();
+                    crate::hardware::cellular::modem_manager::SimIdentity {
+                        iccid: identity.iccid,
+                        imsi: identity.imsi,
+                        operator_id,
+                    }
+                })
+        })
+        .await
+        .ok()
+        .flatten();
     }
-    crate::hardware::cellular::modem_manager::sim_identity_for_modem(conn, &modem_path).await
+    if !device.modem_path.is_empty() {
+        if let Some(identity) = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+            conn,
+            &device.modem_path,
+        )
+        .await
+        {
+            return Some(identity);
+        }
+    }
+    None
 }
 
 async fn line_sim_info(
     line_id: &str,
     conn: &zbus::Connection,
 ) -> Option<crate::api::models::SimInfoResponse> {
-    let modem_path = sim_device_for_line(line_id).modem_path;
-    if modem_path.is_empty() {
-        return None;
-    }
-    get_sim_info_for_modem_with_cache(conn, &modem_path, None)
+    let device = sim_device_for_line(line_id);
+    if !device.pcsc_reader.is_empty() {
+        return tokio::task::spawn_blocking(move || {
+            crate::hardware::devices::pcsc::read_identity(&device.pcsc_reader)
+                .ok()
+                .map(|identity| {
+                    let mnc_length = identity.mnc_length.unwrap_or(0) as usize;
+                    let (mcc, mnc) = if mnc_length > 0 && identity.imsi.len() >= 3 + mnc_length {
+                        (
+                            identity.imsi[..3].to_string(),
+                            identity.imsi[3..3 + mnc_length].to_string(),
+                        )
+                    } else {
+                        (String::new(), String::new())
+                    };
+                    crate::api::models::SimInfoResponse {
+                        present: true,
+                        active: true,
+                        iccid: identity.iccid,
+                        imsi: identity.imsi,
+                        mcc,
+                        mnc,
+                        sim_path: device.pcsc_reader,
+                        sim_type: "physical".to_string(),
+                        lock_status: "none".to_string(),
+                        ..Default::default()
+                    }
+                })
+        })
         .await
         .ok()
+        .flatten();
+    }
+    if !device.modem_path.is_empty() {
+        if let Ok(info) = get_sim_info_for_modem_with_cache(conn, &device.modem_path, None).await {
+            return Some(info);
+        }
+    }
+    None
 }
 
 /// Forget a line's reader mapping (line removed).
@@ -736,6 +819,7 @@ pub(crate) fn sim_device_for_line(line_id: &str) -> LiveSimDevice {
         qmi_device: String::new(),
         uim_slot: 0,
         modem_path: String::new(),
+        pcsc_reader: String::new(),
     }
 }
 
@@ -744,21 +828,60 @@ pub async fn verify_live_sim_auth_access_for_line(line_id: &str) -> Result<(), L
     let proxy_socket = live_runtime_config().qmi_proxy_socket;
     let device = sim_device_for_line(line_id);
     tokio::task::spawn_blocking(move || {
-        verify_usim_application_via_proxy_reason_with_retry(
-            proxy_socket.as_str(),
-            device.qmi_device.as_str(),
-            device.uim_slot,
-            USIM_AID_PREFIX,
-            LIVE_SIM_AUTH_GATE_ATTEMPTS,
-            LIVE_SIM_AUTH_GATE_TIMEOUT,
-            LIVE_SIM_AUTH_GATE_RETRY_DELAY,
-        )
+        if !device.pcsc_reader.is_empty() {
+            crate::hardware::devices::pcsc::verify_usim(&device.pcsc_reader)
+        } else if device.qmi_device.is_empty() {
+            Err("sim_auth_device_unavailable")
+        } else {
+            verify_usim_application_via_proxy_reason_with_retry(
+                proxy_socket.as_str(),
+                device.qmi_device.as_str(),
+                device.uim_slot,
+                USIM_AID_PREFIX,
+                LIVE_SIM_AUTH_GATE_ATTEMPTS,
+                LIVE_SIM_AUTH_GATE_TIMEOUT,
+                LIVE_SIM_AUTH_GATE_RETRY_DELAY,
+            )
+        }
     })
     .await
     .map_err(|_| live_stage_error("sim_auth_gate_runtime_failed"))?
     .map_err(live_stage_error)?;
     info!("SIMAuth access gate passed");
     Ok(())
+}
+
+/// Authenticate against the exact SIM reader registered for `line_id`.
+pub async fn authenticate_live_sim_for_line(
+    line_id: &str,
+    rand: &[u8],
+    autn: &[u8],
+) -> Result<super::qmi_uim::UsimAkaApduResult, &'static str> {
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let device = sim_device_for_line(line_id);
+    let rand = rand.to_vec();
+    let autn = autn.to_vec();
+    tokio::task::spawn_blocking(move || {
+        if !device.pcsc_reader.is_empty() {
+            crate::hardware::devices::pcsc::authenticate(&device.pcsc_reader, &rand, &autn)
+        } else if device.qmi_device.is_empty() {
+            Err("sim_auth_device_unavailable")
+        } else {
+            execute_usim_authenticate_via_proxy_reason_with_retry(
+                proxy_socket.as_str(),
+                device.qmi_device.as_str(),
+                device.uim_slot,
+                USIM_AID_PREFIX,
+                &rand,
+                &autn,
+                LIVE_SIM_AUTH_ATTEMPTS,
+                LIVE_SIM_AUTH_TIMEOUT,
+                LIVE_SIM_AUTH_RETRY_DELAY,
+            )
+        }
+    })
+    .await
+    .map_err(|_| "sim_auth_runtime_failed")?
 }
 
 fn read_non_empty_config(value: Option<String>, default: &str) -> String {
@@ -1884,35 +2007,16 @@ async fn run_live_ike_with_destination(
         .map_err(|_| live_stage_error("ike_auth_eap_challenge_decode_failed"))?;
     let challenge = parse_challenge(&eap_challenge)
         .map_err(|_| live_stage_error("eap_aka_challenge_parse_failed"))?;
-    info!("Spawning USIM Authentication via QMI proxy...");
+    info!("Spawning USIM Authentication for the selected line reader...");
     // Authenticate against THIS line's reader. Using the global device would make
     // a second line run EAP-AKA against the first line's card, which fails
     // authentication (or worse, succeeds with the wrong subscriber identity).
-    let proxy_socket = live_runtime_config().qmi_proxy_socket;
-    let sim_device = sim_device_for_line(line_id);
-    let aka_result = tokio::task::spawn_blocking({
-        let rand = challenge.rand.clone();
-        let autn = challenge.autn.clone();
-        move || {
-            execute_usim_authenticate_via_proxy_reason_with_retry(
-                proxy_socket.as_str(),
-                sim_device.qmi_device.as_str(),
-                sim_device.uim_slot,
-                USIM_AID_PREFIX,
-                &rand,
-                &autn,
-                LIVE_SIM_AUTH_ATTEMPTS,
-                LIVE_SIM_AUTH_TIMEOUT,
-                LIVE_SIM_AUTH_RETRY_DELAY,
-            )
-        }
-    })
-    .await
-    .map_err(|_| live_stage_error("sim_auth_runtime_failed"))?
-    .map_err(|reason| {
-        error!("USIM Authentication via QMI proxy failed: {}", reason);
-        live_stage_error(reason)
-    })?;
+    let aka_result = authenticate_live_sim_for_line(line_id, &challenge.rand, &challenge.autn)
+        .await
+        .map_err(|reason| {
+            error!("USIM Authentication failed: {}", reason);
+            live_stage_error(reason)
+        })?;
     info!(
         "USIM Authentication returned successfully, auts present: {}",
         aka_result.auts.is_some()
@@ -5874,29 +5978,10 @@ async fn build_live_register_auth_material(
         .nonce_kind
     {
         LiveDigestNonceKind::AkaChallenge => {
-            let rand = challenge.rand.clone();
-            let autn = challenge.autn.clone();
-            let proxy_socket = live_runtime_config().qmi_proxy_socket;
-            // AKA must run against this line's own reader, never the global
-            // fallback device: a wrong card returns a valid-looking RES that the
-            // network then rejects.
-            let sim_device = sim_device_for_line(line_id);
-            let aka_result = tokio::task::spawn_blocking(move || {
-                execute_usim_authenticate_via_proxy_reason_with_retry(
-                    proxy_socket.as_str(),
-                    sim_device.qmi_device.as_str(),
-                    sim_device.uim_slot,
-                    USIM_AID_PREFIX,
-                    &rand,
-                    &autn,
-                    LIVE_SIM_AUTH_ATTEMPTS,
-                    LIVE_SIM_AUTH_TIMEOUT,
-                    LIVE_SIM_AUTH_RETRY_DELAY,
-                )
-            })
-            .await
-            .map_err(|_| live_stage_error("ims_aka_runtime_failed"))?
-            .map_err(live_stage_error)?;
+            let aka_result =
+                authenticate_live_sim_for_line(line_id, &challenge.rand, &challenge.autn)
+                    .await
+                    .map_err(live_stage_error)?;
             if let Some(auts) = aka_result.auts {
                 return Ok(LiveRegisterAuthMaterial {
                     authorization: String::new(),
@@ -6626,27 +6711,9 @@ async fn build_line_digest_aka_authorization(
             .map_err(map_shared_digest_error)?;
     let aka_challenge = crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce)
         .map_err(map_shared_digest_error)?;
-    let sim_device = sim_device_for_line(line_id);
-    if sim_device.qmi_device.trim().is_empty() {
-        return Err(live_stage_error("ims_line_sim_device_missing"));
-    }
-    let proxy_socket = live_runtime_config().qmi_proxy_socket;
-    let aka = tokio::task::spawn_blocking(move || {
-        execute_usim_authenticate_via_proxy_reason_with_retry(
-            proxy_socket.as_str(),
-            sim_device.qmi_device.as_str(),
-            sim_device.uim_slot,
-            USIM_AID_PREFIX,
-            &aka_challenge.rand,
-            &aka_challenge.autn,
-            LIVE_SIM_AUTH_ATTEMPTS,
-            LIVE_SIM_AUTH_TIMEOUT,
-            LIVE_SIM_AUTH_RETRY_DELAY,
-        )
-    })
-    .await
-    .map_err(|_| live_stage_error("ims_aka_runtime_failed"))?
-    .map_err(live_stage_error)?;
+    let aka = authenticate_live_sim_for_line(line_id, &aka_challenge.rand, &aka_challenge.autn)
+        .await
+        .map_err(live_stage_error)?;
     let cnonce = live_digest_cnonce()?;
     if let Some(auts) = aka.auts.as_deref() {
         return Ok(
@@ -7527,6 +7594,20 @@ mod tests {
         assert!(mapped.qmi_device.is_empty());
         assert_eq!(mapped.uim_slot, 2);
         assert_eq!(mapped.modem_path, "/org/freedesktop/ModemManager1/Modem/8");
+        forget_line_sim_device(line_id);
+    }
+
+    #[test]
+    fn pcsc_lines_remain_bound_to_their_exact_reader_without_qmi_fallback() {
+        let line_id = "test-pcsc-vowifi-line";
+        register_line_pcsc_reader(line_id, "pcsc://ACS ACR38U 00 00");
+
+        let mapped = sim_device_for_line(line_id);
+        assert_eq!(mapped.pcsc_reader, "pcsc://ACS ACR38U 00 00");
+        assert!(mapped.qmi_device.is_empty());
+        assert!(mapped.modem_path.is_empty());
+        assert_eq!(mapped.uim_slot, 0);
+
         forget_line_sim_device(line_id);
     }
 

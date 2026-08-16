@@ -8,8 +8,13 @@ KEEP_USER_DATA="${KEEP_USER_DATA:-0}"
 
 MODEM_RECOVERY_SERVICE_NAME="${MODEM_RECOVERY_SERVICE_NAME:-simadmin-modem-recovery}"
 MODEM_RECOVERY_SCRIPT="${MODEM_RECOVERY_SCRIPT:-/usr/local/bin/simadmin-modem-recovery.sh}"
+SECONDARY_QMI_SERVICE_NAME="${SECONDARY_QMI_SERVICE_NAME:-simadmin-secondary-qmi}"
+SECONDARY_QMI_RULE="${SECONDARY_QMI_RULE:-/etc/udev/rules.d/99-simadmin-secondary-qmi.rules}"
+SECONDARY_QMI_RUNTIME_RULE="${SECONDARY_QMI_RUNTIME_RULE:-/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules}"
+SECONDARY_QMI_STATE_DIR="${SECONDARY_QMI_STATE_DIR:-/run/simadmin}"
 NM_CONF="${NM_CONF:-/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf}"
-MM_DEBUG_CONF="${MM_DEBUG_CONF:-/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf}"
+MM_DEBUG_CONF="${MM_DEBUG_CONF:-/etc/systemd/system/ModemManager.service.d/zz-simadmin-debug.conf}"
+MM_DEBUG_CONF_LEGACY="${MM_DEBUG_CONF_LEGACY:-/etc/systemd/system/ModemManager.service.d/99-simadmin-debug.conf}"
 OTA_STAGING_DIR="${OTA_STAGING_DIR:-/tmp/ota_staging}"
 DEVICE_CONFIG_DB_PATH="${DEVICE_CONFIG_DB_PATH:-/data/config.sqlite3}"
 E911_STATE_DIR="${E911_STATE_DIR:-/data/simadmin/e911}"
@@ -254,6 +259,7 @@ main() {
   assert_safe_install_dir
   assert_safe_service_name SERVICE_NAME "$SERVICE_NAME"
   assert_safe_service_name MODEM_RECOVERY_SERVICE_NAME "$MODEM_RECOVERY_SERVICE_NAME"
+  assert_safe_service_name SECONDARY_QMI_SERVICE_NAME "$SECONDARY_QMI_SERVICE_NAME"
   assert_safe_user_data_path DEVICE_CONFIG_DB_PATH "$DEVICE_CONFIG_DB_PATH"
   assert_safe_user_data_path E911_STATE_DIR "$E911_STATE_DIR"
 
@@ -266,14 +272,20 @@ main() {
 
   stop_disable_service "${SERVICE_NAME}.service"
   stop_disable_service "${MODEM_RECOVERY_SERVICE_NAME}.service"
+  stop_disable_service "${SECONDARY_QMI_SERVICE_NAME}.service"
 
   remove_systemd_unit "${SERVICE_NAME}.service"
   remove_systemd_unit "${MODEM_RECOVERY_SERVICE_NAME}.service"
+  remove_systemd_unit "${SECONDARY_QMI_SERVICE_NAME}.service"
   cleanup_systemd
 
   remove_path "$MODEM_RECOVERY_SCRIPT"
+  remove_path "$SECONDARY_QMI_RULE"
+  remove_path "$SECONDARY_QMI_RUNTIME_RULE"
+  remove_path "$SECONDARY_QMI_STATE_DIR"
   remove_path "$NM_CONF"
   remove_path "$MM_DEBUG_CONF"
+  remove_path "$MM_DEBUG_CONF_LEGACY"
   remove_path "$OTA_STAGING_DIR"
 
   if [ "$KEEP_USER_DATA" -eq 1 ]; then

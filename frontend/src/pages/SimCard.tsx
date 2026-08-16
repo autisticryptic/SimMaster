@@ -50,6 +50,7 @@ import ErrorSnackbar from '../components/ErrorSnackbar'
 import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
 import ModemLinesPanel from './sim/ModemLinesPanel'
 import CarrierProfilesPanel from './sim/CarrierProfilesPanel'
+import SimReaderPanel from './sim/SimReaderPanel'
 import { LineNetworkOverview } from './sim/LineCellularSettings'
 import EsimManagerPage from './EsimManager'
 import { maskedIccid, modemSlotLabel, shortLineId } from '../components/modemLineFormat'
@@ -686,7 +687,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
     <Box>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
       <Grid container spacing={3} alignItems="stretch">
-        <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex' }}>
+        <Grid size={{ xs: 12, md: 5 }} sx={{ display: 'flex' }}>
           <Box display="flex" flexDirection="column" gap={2} sx={{ flexGrow: 1, minWidth: 0 }}>
             {/* Card 1: SIM卡基本标识 */}
             <Card>
@@ -860,6 +861,8 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                       value={`${line.modem.qmi_device || '未发现'} · Slot ${line.modem.uim_slot}`}
                     />
                   </Grid>
+                  <Grid size={6}><InfoField label="硬件家族" value={line.modem.device_family || 'generic_modem'} /></Grid>
+                  <Grid size={6}><InfoField label="控制通道" value={line.modem.control_transport || 'modemmanager'} /></Grid>
                   <Grid size={6}><InfoField label="主控制端口" value={line.modem.primary_port || '未发现'} /></Grid>
                   <Grid size={6}><InfoField label="SIM 路径" value={simInfo?.sim_path || line.modem.sim_path || 'N/A'} /></Grid>
                   <Grid size={12}><InfoField label="ModemManager 路径" value={simInfo?.modem_path || line.modem.modem_path || 'N/A'} /></Grid>
@@ -869,17 +872,17 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
           </Box>
         </Grid>
 
-        <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex' }}>
+        <Grid size={{ xs: 12, md: 7 }} sx={{ display: 'flex' }}>
           <Box display="flex" flexDirection="column" gap={2} sx={{ flexGrow: 1, minWidth: 0 }}>
             {controls}
 
-            <Card sx={{ flex: 1, minHeight: 184, display: 'flex', flexDirection: 'column' }}>
+            <Card sx={{ flex: 1, minHeight: 248, display: 'flex', flexDirection: 'column' }}>
               <CardHeader
                 avatar={<LockIcon color="primary" />}
                 title="安全与锁卡状态"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
               />
-              <CardContent sx={{ pt: 0, flex: 1, display: 'flex', alignItems: 'center' }}>
+              <CardContent sx={{ pt: 0, flex: 1 }}>
                 <Grid container spacing={2} sx={{ width: '100%' }}>
                   <Grid size={6}>
                     <InfoField
@@ -905,6 +908,30 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                         simInfo?.pin2_retries,
                         simInfo?.puk2_retries
                       )}
+                    />
+                  </Grid>
+                  <Grid size={6}>
+                    <InfoField
+                      label="SIM 可用状态"
+                      value={simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未检测到 SIM'}
+                    />
+                  </Grid>
+                  <Grid size={6}>
+                    <InfoField
+                      label="卡片类型"
+                      value={formatSimType(simInfo?.sim_type, simInfo?.esim_status)}
+                    />
+                  </Grid>
+                  <Grid size={6}>
+                    <InfoField
+                      label="eUICC 状态"
+                      value={simInfo?.esim_status && simInfo.esim_status !== 'unknown' ? simInfo.esim_status : '未检测到 eUICC'}
+                    />
+                  </Grid>
+                  <Grid size={6}>
+                    <InfoField
+                      label="身份读取状态"
+                      value={simInfo?.iccid && simInfo?.imsi ? 'ICCID / IMSI 已读取' : '身份信息不完整'}
                     />
                   </Grid>
                 </Grid>
@@ -977,7 +1004,8 @@ export default function SimCardPage() {
   const [searchParams, setSearchParams] = useSearchParams()
   const [selectedLine, setSelectedLine] = useState<VolteLineControlResponse | null>(null)
 
-  const activeTab = searchParams.get('tab') === 'carrier-profiles' ? 'carrier-profiles' : 'lines'
+  const requestedTab = searchParams.get('tab')
+  const activeTab = requestedTab === 'carrier-profiles' || requestedTab === 'readers' ? requestedTab : 'lines'
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: string) => {
     const params = new URLSearchParams(searchParams)
@@ -1002,12 +1030,14 @@ export default function SimCardPage() {
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="线路与 SIM" value="lines" />
+          <Tab label="USB SIM 读卡器" value="readers" />
           <Tab label="运营商 Profile" value="carrier-profiles" sx={{ textTransform: 'none' }} />
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
+        {activeTab === 'readers' && <SimReaderPanel />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>
