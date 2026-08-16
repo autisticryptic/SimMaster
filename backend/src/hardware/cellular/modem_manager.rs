@@ -816,12 +816,9 @@ fn physical_line_identity(
     (line_id, legacy_line_ids)
 }
 
-/// Build the stable line identity for a standalone SIM reader.
-///
-/// Readers are not backed by a ModemManager object, so their line identity is
-/// anchored on the reader's persisted config `id` (plus its slot) rather than a
-/// hardware key + ICCID. This keeps the line stable across restarts and across
-/// SIM swaps in the reader, matching how the reader is configured by the user.
+/// Build the stable line identity for a SIM reader. The reader selector is the
+/// physical line anchor, so inserting another SIM does not replace the user's
+/// VoWiFi, trunk, notification, or automation configuration.
 pub fn reader_line_id(reader_id: &str, uim_slot: u8) -> String {
     stable_line_id(
         &format!("reader:{}", reader_id.trim()),
@@ -840,6 +837,9 @@ pub fn reader_binding(
     uim_slot: u8,
     qmi_device: Option<String>,
     present: bool,
+    sim_iccid: String,
+    operator_id: String,
+    legacy_line_ids: Vec<String>,
 ) -> ModemBinding {
     ModemBinding {
         line_id: reader_line_id(reader_id, uim_slot),
@@ -862,16 +862,20 @@ pub fn reader_binding(
         qmi_device,
         uim_slot,
         sim_path: None,
-        sim_iccid: String::new(),
-        operator_id: String::new(),
-        state: String::new(),
+        sim_iccid,
+        operator_id,
+        state: if present {
+            "registered".to_string()
+        } else {
+            String::new()
+        },
         present,
-        sim_type: String::new(),
-        esim_status: String::new(),
+        sim_type: "physical".to_string(),
+        esim_status: "none".to_string(),
         hardware_key: format!("reader:{}", reader_id.trim()),
         equipment_identifier: String::new(),
         legacy_hardware_keys: Vec::new(),
-        legacy_line_ids: Vec::new(),
+        legacy_line_ids,
         line_kind: "reader".to_string(),
     }
 }
@@ -1077,6 +1081,38 @@ fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec
         .flatten()
         .map(|entry| normalize_phone_numbers(entry.phone_numbers))
         .unwrap_or_default()
+}
+
+pub fn cached_sim_metadata_for_identity(
+    db: &Database,
+    identity: &SimIdentity,
+) -> (Vec<String>, String, bool, bool) {
+    let phone_entry = own_number_identity_key(identity)
+        .and_then(|key| db.get_own_number_cache(&[key]).ok().flatten());
+    let phone_number_is_manual = phone_entry
+        .as_ref()
+        .is_some_and(|entry| entry.source == "manual");
+    let phone_numbers = phone_entry
+        .map(|entry| normalize_phone_numbers(entry.phone_numbers))
+        .unwrap_or_default();
+    let smsc_entry = {
+        let keys = smsc_identity_keys(identity);
+        (!keys.is_empty())
+            .then(|| db.get_smsc_cache(&keys).ok().flatten())
+            .flatten()
+    };
+    let sms_center_is_manual = smsc_entry
+        .as_ref()
+        .is_some_and(|entry| entry.source == "manual");
+    let sms_center = smsc_entry
+        .map(|entry| normalize_smsc(&entry.sms_center))
+        .unwrap_or_default();
+    (
+        phone_numbers,
+        sms_center,
+        phone_number_is_manual,
+        sms_center_is_manual,
+    )
 }
 
 fn extract_mode_pairs(value: &OwnedValue) -> Vec<(u32, u32)> {

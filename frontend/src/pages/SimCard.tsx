@@ -50,7 +50,6 @@ import ErrorSnackbar from '../components/ErrorSnackbar'
 import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
 import ModemLinesPanel from './sim/ModemLinesPanel'
 import CarrierProfilesPanel from './sim/CarrierProfilesPanel'
-import SimReaderPanel from './sim/SimReaderPanel'
 import { LineNetworkOverview } from './sim/LineCellularSettings'
 import EsimManagerPage from './EsimManager'
 import { maskedIccid, modemSlotLabel, shortLineId } from '../components/modemLineFormat'
@@ -60,16 +59,12 @@ import SMSPage from './SMS'
 
 function lineNotificationScope(line: VolteLineControlResponse | null) {
   if (!line) return undefined
-  return line.modem.line_kind === 'reader'
-    ? `reader:${line.modem.modem_id.replace(/^reader:/, '')}`
-    : line.modem.line_id
+  return line.modem.line_id
 }
 
 function lineAutomationTarget(line: VolteLineControlResponse | null): AutomationTarget | undefined {
   if (!line) return undefined
-  return line.modem.line_kind === 'reader'
-    ? { kind: 'standalone_sim_slot', slot_id: line.modem.modem_id.replace(/^reader:/, '') }
-    : { kind: 'modem_line', line_id: line.modem.line_id }
+  return { kind: 'modem_line', line_id: line.modem.line_id }
 }
 
 function getSensitiveStyle(show: boolean) {
@@ -1005,7 +1000,7 @@ export default function SimCardPage() {
   const [selectedLine, setSelectedLine] = useState<VolteLineControlResponse | null>(null)
 
   const requestedTab = searchParams.get('tab')
-  const activeTab = requestedTab === 'carrier-profiles' || requestedTab === 'readers' ? requestedTab : 'lines'
+  const activeTab = requestedTab === 'carrier-profiles' ? requestedTab : 'lines'
 
   const handleTabChange = (_event: React.SyntheticEvent, newValue: string) => {
     const params = new URLSearchParams(searchParams)
@@ -1030,14 +1025,12 @@ export default function SimCardPage() {
       <Box sx={{ borderBottom: 1, borderColor: 'divider', mb: 2 }}>
         <Tabs value={activeTab} onChange={handleTabChange} variant="scrollable" scrollButtons="auto">
           <Tab label="线路与 SIM" value="lines" />
-          <Tab label="USB SIM 读卡器" value="readers" />
           <Tab label="运营商 Profile" value="carrier-profiles" sx={{ textTransform: 'none' }} />
         </Tabs>
       </Box>
 
       <Box sx={{ mt: 2 }}>
         {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
-        {activeTab === 'readers' && <SimReaderPanel />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>

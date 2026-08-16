@@ -68,6 +68,7 @@ use crate::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
     },
+    services::trunk::bridge::{DtmfSignal, DtmfSource, OperatorCommand},
     state::AppState,
 };
 
@@ -1246,6 +1247,25 @@ pub async fn get_device_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if let Some(line) = app.line_registry.get(line_id.trim()).await {
+        let binding = line.binding();
+        if binding.line_kind == "reader" {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    DeviceInfoResponse {
+                        manufacturer: binding.manufacturer,
+                        model: binding.model,
+                        online: binding.present,
+                        powered: binding.present,
+                        ..Default::default()
+                    },
+                )),
+            );
+        }
+    }
     let modem_path = match resolve_modem_path(&app, &line_id).await {
         Ok(path) => path,
         Err(reason) => {
@@ -1277,6 +1297,89 @@ pub async fn get_sim_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if let Some(line) = app.line_registry.get(line_id.trim()).await {
+        let binding = line.binding();
+        if binding.line_kind == "reader" {
+            let identity = if binding.present && binding.model.starts_with("pcsc://") {
+                crate::hardware::devices::pcsc::read_identity_async(&binding.model)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            let imsi = identity
+                .as_ref()
+                .map(|identity| identity.imsi.clone())
+                .unwrap_or_default();
+            let iccid = identity
+                .as_ref()
+                .map(|identity| identity.iccid.clone())
+                .filter(|value| !value.is_empty())
+                .unwrap_or(binding.sim_iccid.clone());
+            let operator_id = if !binding.operator_id.is_empty() {
+                binding.operator_id.clone()
+            } else {
+                identity
+                    .as_ref()
+                    .and_then(|identity| {
+                        let mnc_length =
+                            identity.mnc_length.map(usize::from).unwrap_or_else(|| {
+                                if identity.imsi.starts_with("460") {
+                                    2
+                                } else {
+                                    3
+                                }
+                            });
+                        (identity.imsi.len() >= 3 + mnc_length)
+                            .then(|| identity.imsi[..3 + mnc_length].to_string())
+                    })
+                    .unwrap_or_default()
+            };
+            let (mcc, mnc) = if operator_id.len() >= 5 {
+                (operator_id[..3].to_string(), operator_id[3..].to_string())
+            } else {
+                (String::new(), String::new())
+            };
+            let cache_identity = crate::hardware::cellular::modem_manager::SimIdentity {
+                iccid: iccid.clone(),
+                imsi: imsi.clone(),
+                operator_id: operator_id.clone(),
+            };
+            let (phone_numbers, sms_center, phone_number_is_manual, sms_center_is_manual) =
+                crate::hardware::cellular::modem_manager::cached_sim_metadata_for_identity(
+                    &app.database,
+                    &cache_identity,
+                );
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    SimInfoResponse {
+                        present: binding.present,
+                        iccid,
+                        imsi,
+                        phone_numbers,
+                        sms_center,
+                        mcc,
+                        mnc,
+                        phone_number_is_manual,
+                        sms_center_is_manual,
+                        sim_path: binding.model,
+                        modem_path: String::new(),
+                        sim_type: binding.sim_type,
+                        esim_status: binding.esim_status,
+                        active: binding.present,
+                        operator_name: operator_id.clone(),
+                        registered_operator_name: "VoWiFi".to_string(),
+                        registered_operator_code: operator_id,
+                        lock_status: "none".to_string(),
+                        ..Default::default()
+                    },
+                )),
+            );
+        }
+    }
     let modem_path = match resolve_modem_path(&app, &line_id).await {
         Ok(path) => path,
         Err(reason) => {
@@ -1308,6 +1411,50 @@ pub async fn update_sim_cache_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<UpdateSimCacheRequest>,
 ) -> impl IntoResponse {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if let Some(line) = app.line_registry.get(line_id.trim()).await {
+        let binding = line.binding();
+        if binding.line_kind == "reader" {
+            let pcsc_identity =
+                match crate::hardware::devices::pcsc::read_identity_async(&binding.model).await {
+                    Ok(identity) => identity,
+                    Err(reason) => {
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(ApiResponse::<serde_json::Value>::error(reason)),
+                        )
+                    }
+                };
+            let identity = crate::hardware::cellular::modem_manager::SimIdentity {
+                iccid: pcsc_identity.iccid,
+                imsi: pcsc_identity.imsi,
+                operator_id: binding.operator_id,
+            };
+            if let Some(sms_center) = &payload.sms_center {
+                crate::hardware::cellular::modem_manager::cache_smsc_for_identity(
+                    &app.database,
+                    &identity,
+                    sms_center,
+                    "manual",
+                );
+            }
+            if let Some(phone_number) = &payload.phone_number {
+                crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+                    &app.database,
+                    &identity,
+                    std::slice::from_ref(phone_number),
+                    "manual",
+                );
+            }
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "SIM cache updated",
+                    json!({}),
+                )),
+            );
+        }
+    }
     let modem_path = match resolve_modem_path(&app, &line_id).await {
         Ok(path) => path,
         Err(reason) => {
@@ -1368,6 +1515,38 @@ pub async fn get_network_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    if let Some(line) = app.line_registry.get(line_id.trim()).await {
+        let binding = line.binding();
+        if binding.line_kind == "reader" {
+            let (mcc, mnc) = if binding.operator_id.len() >= 5 {
+                (
+                    Some(binding.operator_id[..3].to_string()),
+                    Some(binding.operator_id[3..].to_string()),
+                )
+            } else {
+                (None, None)
+            };
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Success",
+                    NetworkInfoResponse {
+                        operator_name: binding.operator_id,
+                        registration_status: if binding.present {
+                            "vowifi_available".to_string()
+                        } else {
+                            "not_present".to_string()
+                        },
+                        technology_preference: "VoWiFi".to_string(),
+                        signal_strength: 0,
+                        mcc,
+                        mnc,
+                    },
+                )),
+            );
+        }
+    }
     let modem_path = match resolve_modem_path(&app, &line_id).await {
         Ok(path) => path,
         Err(reason) => {
@@ -1424,9 +1603,8 @@ fn binding_has_baseband(binding: &crate::hardware::cellular::modem_manager::Mode
     binding.line_kind.is_empty() || binding.line_kind == "baseband"
 }
 
-/// Resolve an actual cellular voice line. Standalone SIM readers can run
-/// VoWiFi, but they do not own a ModemManager voice interface and must never
-/// fall through to another line's baseband.
+/// Resolve an explicitly selected voice-capable line. Reader lines return an
+/// empty modem path and are routed through their private VoWiFi operator link.
 async fn resolve_call_line(app: &AppState, line_id: &str) -> Result<(String, String), String> {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let line_id = line_id.trim();
@@ -1449,7 +1627,9 @@ async fn resolve_call_line(app: &AppState, line_id: &str) -> Result<(String, Str
     {
         return Err("line_disabled".to_string());
     }
-    if !binding_has_baseband(&binding) || binding.modem_path.trim().is_empty() {
+    if binding.line_kind != "reader"
+        && (!binding_has_baseband(&binding) || binding.modem_path.trim().is_empty())
+    {
         return Err("line_has_no_baseband".to_string());
     }
     Ok((binding.line_id, binding.modem_path))
@@ -3697,18 +3877,38 @@ pub async fn send_sms_handler(
             )
         }
     };
-    // Sending uses a fixed VoWiFi -> VoLTE -> CS fallback order unless this
-    // line explicitly requires VoWiFi-only delivery.
+    match send_sms_on_line(&app, &line_id, &payload.phone_number, &payload.content).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("SMS sent", data)),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(format!(
+                "Failed to send SMS: {reason}"
+            ))),
+        ),
+    }
+}
+
+/// Send through the selected line's configured access policy. Automation and
+/// the interactive API share this path so reader-backed lines use VoWiFi
+/// instead of accidentally requiring a ModemManager SMS interface.
+pub(crate) async fn send_sms_on_line(
+    app: &AppState,
+    line_id: &str,
+    phone_number: &str,
+    content: &str,
+) -> Result<serde_json::Value, String> {
+    let payload = SendSmsRequest {
+        phone_number: phone_number.to_string(),
+        content: content.to_string(),
+    };
+    // Sending uses the configured VoWiFi -> VoLTE -> CS order unless this line
+    // explicitly requires VoWiFi-only delivery.
     let scope = match VowifiScope::resolve(&app, &line_id).await {
         Ok(scope) => scope,
-        Err(reason) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<serde_json::Value>::error(format!(
-                    "Failed to send SMS: {reason}"
-                ))),
-            )
-        }
+        Err(reason) => return Err(reason),
     };
     let policy = app.config_manager.get_line_sms_path_policy(scope.line_id());
     let mut failures = Vec::new();
@@ -3720,10 +3920,7 @@ pub async fn send_sms_handler(
         };
         match result {
             Ok(data) => {
-                return (
-                    StatusCode::OK,
-                    Json(ApiResponse::success_with_message("SMS sent", data)),
-                );
+                return Ok(data);
             }
             Err(reason) => {
                 failures.push(format!("{}:{reason}", path.as_str()));
@@ -3736,13 +3933,7 @@ pub async fn send_sms_handler(
     } else {
         failures.join("; ")
     };
-    (
-        StatusCode::OK,
-        Json(ApiResponse::<serde_json::Value>::error(format!(
-            "Failed to send SMS: {}",
-            detail
-        ))),
-    )
+    Err(detail)
 }
 
 async fn send_sms_over_vowifi_path(
@@ -3972,15 +4163,69 @@ async fn send_sms_over_cs_path(
     Ok(json!({ "path": path, "transport": "modem", "line_id": line_id }))
 }
 
-/// Drain the voice call follow-up channel, logging dialog/media progress
-/// (ringing, answer, hangup). Mirrors `spawn_vowifi_sms_followup_persist`.
+async fn start_vowifi_voice_call(
+    app: &AppState,
+    line_id: &str,
+    phone_number: &str,
+) -> Result<crate::connectivity::modems::ims::vowifi::live::LiveCallResult, String> {
+    let scope = VowifiScope::resolve(app, line_id).await?;
+    if !scope.is_present() {
+        return Err("line_not_present".to_string());
+    }
+    if !app.config_manager.get_line_profile(scope.line_id()).enabled {
+        return Err("line_disabled".to_string());
+    }
+    if !app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .vowifi
+        .enabled
+    {
+        return Err("vowifi_voice_disabled".to_string());
+    }
+    let mut voice_ready = scope.runtime().snapshot().await.readiness().voice_ready;
+    if !voice_ready {
+        voice_ready = scope
+            .runtime()
+            .connect_live_with_stage_timeout(
+                Some(&app.database),
+                std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
+            )
+            .await
+            .readiness()
+            .voice_ready;
+    }
+    if !voice_ready {
+        return Err("vowifi_voice_ready_not_reached".to_string());
+    }
+    place_live_voice_call_for_line(scope.line_id(), phone_number)
+        .await
+        .map_err(|error| error.reason)
+}
+
+/// Drain the voice call follow-up channel and keep the unified call list and
+/// history in sync for reader-backed VoWiFi calls.
 fn spawn_vowifi_call_followup(
+    app: AppState,
+    path: String,
     mut followup: tokio::sync::mpsc::UnboundedReceiver<
         crate::connectivity::modems::ims::vowifi::live::LiveCallFollowupFrame,
     >,
 ) {
     tokio::spawn(async move {
         while let Some(frame) = followup.recv().await {
+            let state = frame.outcome.call_state.as_str();
+            {
+                let mut active = app.active_calls.lock().await;
+                if let Some(record) = active.get_mut(&path) {
+                    record.state = state.to_string();
+                }
+            }
+            if state == "active" {
+                mark_tracked_call_answered(&app, &path).await;
+            } else if matches!(state, "ended" | "failed") {
+                let _ = finish_tracked_call(&app, &path, false).await;
+            }
             info!(
                 trace_id = frame.outcome.trace_id.as_str(),
                 call_id = frame.outcome.call_id.as_str(),
@@ -4008,78 +4253,29 @@ pub async fn place_call_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<PlaceCallRequest>,
 ) -> impl IntoResponse {
-    let scope = match VowifiScope::resolve(&app, &line_id).await {
-        Ok(scope) => scope,
-        Err(reason) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(ApiResponse::<serde_json::Value>::error(reason)),
-            )
-        }
-    };
-    if !scope.is_present() {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::<serde_json::Value>::error("line_not_present")),
-        );
-    }
-    if !app.config_manager.get_line_profile(scope.line_id()).enabled {
-        return (
-            StatusCode::CONFLICT,
-            Json(ApiResponse::<serde_json::Value>::error("line_disabled")),
-        );
-    }
-    let line_vowifi_enabled = app
-        .config_manager
-        .get_line_profile(scope.line_id())
-        .vowifi
-        .enabled;
-    if !line_vowifi_enabled {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::<serde_json::Value>::error(
-                "VoWiFi is not enabled; voice calling is unavailable".to_string(),
-            )),
-        );
-    }
-
-    let mut voice_ready = scope.runtime().snapshot().await.readiness().voice_ready;
-    if !voice_ready {
-        // Attempt to bring the runtime up to voice readiness once.
-        let snapshot = scope
-            .runtime()
-            .connect_live_with_stage_timeout(
-                Some(&app.database),
-                std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
-            )
-            .await;
-        voice_ready = snapshot.readiness().voice_ready;
-        if !voice_ready {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<serde_json::Value>::error(format!(
-                    "Failed to place call over VoWiFi: {}",
-                    snapshot
-                        .degraded_reason
-                        .as_deref()
-                        .unwrap_or("voice_ready_not_reached")
-                ))),
-            );
-        }
-    }
-
-    match place_live_voice_call_for_line(scope.line_id(), &payload.phone_number).await {
+    let resolved_line_id = line_id.trim().to_string();
+    match start_vowifi_voice_call(&app, &resolved_line_id, &payload.phone_number).await {
         Ok(call_result) => {
             let outcome = call_result.outcome;
-            spawn_vowifi_call_followup(call_result.followup);
+            let path = format!("vowifi:{}", outcome.call_id);
+            track_call_start(
+                &app,
+                &resolved_line_id,
+                &path,
+                "outgoing",
+                &payload.phone_number,
+                false,
+            )
+            .await;
+            spawn_vowifi_call_followup(app.clone(), path.clone(), call_result.followup);
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(
                     "Call placed",
                     json!({
-                        "path": "vowifi_ims",
                         "transport": "vowifi_ims",
-                        "line_id": scope.line_id(),
+                        "line_id": resolved_line_id,
+                        "path": path,
                         "call_id": outcome.call_id,
                         "trace_id": outcome.trace_id,
                         "call_state": outcome.call_state.as_str(),
@@ -4097,7 +4293,7 @@ pub async fn place_call_handler(
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value>::error(format!(
                 "Failed to place call over VoWiFi: {}",
-                err.reason
+                err
             ))),
         ),
     }
@@ -4121,23 +4317,6 @@ pub async fn get_sms_channels_handler(
             slot_id: None,
             iccid: (!modem.sim_iccid.trim().is_empty()).then_some(modem.sim_iccid),
             operator_id: (!modem.operator_id.trim().is_empty()).then_some(modem.operator_id),
-        });
-    }
-    for slot in app.config_manager.get_standalone_sim_slots() {
-        channels.push(SmsChannelResponse {
-            id: format!("reader:{}", slot.id),
-            kind: "standalone_sim_slot".to_string(),
-            label: if slot.label.trim().is_empty() {
-                format!("读卡器 · 卡槽 {}", slot.uim_slot)
-            } else {
-                format!("{} · 卡槽 {}", slot.label, slot.uim_slot)
-            },
-            available: slot.enabled,
-            uim_slot: slot.uim_slot,
-            line_id: None,
-            slot_id: Some(slot.id),
-            iccid: None,
-            operator_id: None,
         });
     }
     if app.database.has_unassigned_sms().unwrap_or(false) {
@@ -4387,6 +4566,16 @@ async fn track_call_start(
                 record.answered_at = Some(std::time::Instant::now());
             }
         }
+        if !phone_number.trim().is_empty() {
+            record.phone_number = phone_number.to_string();
+        }
+        record.state = if answered {
+            "active".to_string()
+        } else if direction == "incoming" {
+            "incoming".to_string()
+        } else {
+            "dialing".to_string()
+        };
         record.missing_polls = 0;
         return;
     }
@@ -4400,6 +4589,14 @@ async fn track_call_start(
                 id,
                 line_id: line_id.to_string(),
                 direction: direction.to_string(),
+                phone_number: phone_number.to_string(),
+                state: if answered {
+                    "active".to_string()
+                } else if direction == "incoming" {
+                    "incoming".to_string()
+                } else {
+                    "dialing".to_string()
+                },
                 answered_at: answered.then(std::time::Instant::now),
                 answered,
                 missing_polls: 0,
@@ -4412,6 +4609,7 @@ async fn mark_tracked_call_answered(app: &AppState, path: &str) {
     let mut active = app.active_calls.lock().await;
     if let Some(record) = active.get_mut(path) {
         record.answered = true;
+        record.state = "active".to_string();
         if record.answered_at.is_none() {
             record.answered_at = Some(std::time::Instant::now());
         }
@@ -4479,6 +4677,23 @@ async fn list_calls_for_line(
     line_id: &str,
     modem_path: &str,
 ) -> Result<CallListResponse, String> {
+    if modem_path.trim().is_empty() {
+        let active = app.active_calls.lock().await;
+        return Ok(CallListResponse {
+            calls: active
+                .iter()
+                .filter(|(_, record)| record.line_id == line_id)
+                .map(|(path, record)| CallInfo {
+                    path: path.clone(),
+                    line_id: record.line_id.clone(),
+                    phone_number: record.phone_number.clone(),
+                    state: record.state.clone(),
+                    direction: record.direction.clone(),
+                    start_time: None,
+                })
+                .collect(),
+        });
+    }
     let mut data = list_current_calls_for_modem(&app.dbus_conn, modem_path)
         .await
         .map_err(|error| error.to_string())?;
@@ -4606,32 +4821,72 @@ async fn dial_call_on_line(
             )),
         );
     }
-    let (line_id, modem_path) = match resolve_call_line(app, requested_line_id).await {
-        Ok(line) => line,
-        Err(reason) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::<serde_json::Value>::error(reason)),
-            )
-        }
-    };
-    match make_call_on_modem(&app.dbus_conn, &modem_path, &phone_number).await {
-        Ok(path) => {
-            track_call_start(app, &line_id, &path, "outgoing", &phone_number, false).await;
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Call started",
-                    json!({ "path": path, "line_id": line_id }),
-                )),
-            )
-        }
+    match start_call_for_automation(app, requested_line_id, &phone_number).await {
+        Ok((line_id, path, transport)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Call started",
+                json!({ "path": path, "line_id": line_id, "transport": transport }),
+            )),
+        ),
         Err(error) => (
             StatusCode::OK,
             Json(ApiResponse::<serde_json::Value>::error(format!(
                 "Failed to dial: {error}"
             ))),
         ),
+    }
+}
+
+pub(crate) async fn start_call_for_automation(
+    app: &AppState,
+    requested_line_id: &str,
+    phone_number: &str,
+) -> Result<(String, String, &'static str), String> {
+    let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
+    if modem_path.trim().is_empty() {
+        let call_result = start_vowifi_voice_call(app, &line_id, phone_number).await?;
+        let path = format!("vowifi:{}", call_result.outcome.call_id);
+        track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
+        spawn_vowifi_call_followup(app.clone(), path.clone(), call_result.followup);
+        return Ok((line_id, path, "vowifi_ims"));
+    }
+    let path = make_call_on_modem(&app.dbus_conn, &modem_path, phone_number)
+        .await
+        .map_err(|error| error.to_string())?;
+    track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
+    Ok((line_id, path, "modem"))
+}
+
+pub(crate) async fn hangup_call_for_automation(
+    app: &AppState,
+    requested_line_id: &str,
+    path: &str,
+) -> Result<(), String> {
+    let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
+    if modem_path.trim().is_empty() {
+        let existed = app.active_calls.lock().await.contains_key(path);
+        if !existed {
+            return Ok(());
+        }
+        let call_id = path.strip_prefix("vowifi:").unwrap_or(path);
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .send_command(OperatorCommand::HangupCall {
+                call_id: call_id.to_string(),
+            })
+            .map_err(|_| "vowifi_operator_channel_unavailable".to_string())?;
+        let _ = finish_tracked_call(app, path, false).await;
+        return Ok(());
+    }
+    match hangup_call_on_modem(&app.dbus_conn, &modem_path, path).await {
+        Ok(()) => {
+            let _ = finish_tracked_call(app, path, false).await;
+            Ok(())
+        }
+        Err(error) => match list_current_calls_for_modem(&app.dbus_conn, &modem_path).await {
+            Ok(calls) if calls.calls.iter().all(|call| call.path != path) => Ok(()),
+            _ => Err(error.to_string()),
+        },
     }
 }
 
@@ -4649,6 +4904,25 @@ async fn resolve_call_owner(
     call_path: &str,
 ) -> Result<(String, String, CallInfo), String> {
     let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
+    if modem_path.trim().is_empty() {
+        let active = app.active_calls.lock().await;
+        let record = active
+            .get(call_path)
+            .filter(|record| record.line_id == line_id)
+            .ok_or_else(|| "call_not_found_on_selected_line".to_string())?;
+        return Ok((
+            line_id.clone(),
+            modem_path,
+            CallInfo {
+                path: call_path.to_string(),
+                line_id,
+                phone_number: record.phone_number.clone(),
+                state: record.state.clone(),
+                direction: record.direction.clone(),
+                start_time: None,
+            },
+        ));
+    }
     let mut call = get_call_by_path_for_modem(&app.dbus_conn, &modem_path, call_path)
         .await
         .map_err(|_| "call_not_found_on_selected_line".to_string())?;
@@ -4681,7 +4955,19 @@ async fn hangup_call_on_line(
         answered,
     )
     .await;
-    match hangup_call_on_modem(&app.dbus_conn, &modem_path, &path).await {
+    let hangup_result = if modem_path.trim().is_empty() {
+        let call_id = path.strip_prefix("vowifi:").unwrap_or(path.as_str());
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .send_command(OperatorCommand::HangupCall {
+                call_id: call_id.to_string(),
+            })
+            .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
+    } else {
+        hangup_call_on_modem(&app.dbus_conn, &modem_path, &path)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match hangup_result {
         Ok(()) => {
             let _ = finish_tracked_call(app, &path, answered).await;
             (
@@ -4742,7 +5028,25 @@ async fn hangup_all_calls_on_lines(
             )
             .await;
         }
-        if let Err(error) = hangup_all_calls_for_modem(&app.dbus_conn, &modem_path).await {
+        let result = if modem_path.trim().is_empty() {
+            let calls = before.calls.clone();
+            let link = crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
+                &line_id,
+            );
+            for call in &calls {
+                let call_id = call
+                    .path
+                    .strip_prefix("vowifi:")
+                    .unwrap_or(call.path.as_str());
+                let _ = link.send_command(OperatorCommand::HangupCall {
+                    call_id: call_id.to_string(),
+                });
+            }
+            Ok(())
+        } else {
+            hangup_all_calls_for_modem(&app.dbus_conn, &modem_path).await
+        };
+        if let Err(error) = result {
             failures.push(format!("{line_id}: {error}"));
             continue;
         }
@@ -4801,6 +5105,14 @@ async fn answer_call_on_line(
         matches!(before.state.as_str(), "active" | "held"),
     )
     .await;
+    if modem_path.trim().is_empty() {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "VoWiFi incoming call answering is not exposed by this API",
+            )),
+        );
+    }
     match answer_call_on_modem(&app.dbus_conn, &modem_path, &path).await {
         Ok(()) => {
             mark_tracked_call_answered(app, &path).await;
@@ -4852,8 +5164,37 @@ pub async fn send_line_call_dtmf_handler(
             )),
         );
     }
-    match send_call_dtmf_on_modem(&app.dbus_conn, &modem_path, &payload.path, &payload.digit).await
-    {
+    let result = if modem_path.trim().is_empty() {
+        let digit = payload
+            .digit
+            .chars()
+            .next()
+            .ok_or_else(|| "dtmf_digit_required".to_string());
+        match digit {
+            Ok(digit) => {
+                crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+                    .send_command(OperatorCommand::SendDtmf {
+                        call_id: payload
+                            .path
+                            .strip_prefix("vowifi:")
+                            .unwrap_or(payload.path.as_str())
+                            .to_string(),
+                        signal: DtmfSignal {
+                            digit,
+                            duration_ms: 160,
+                            source: DtmfSource::SipInfo,
+                        },
+                    })
+                    .map_err(|_| "vowifi_operator_channel_unavailable".to_string())
+            }
+            Err(error) => Err(error),
+        }
+    } else {
+        send_call_dtmf_on_modem(&app.dbus_conn, &modem_path, &payload.path, &payload.digit)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match result {
         Ok(()) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -11001,6 +11342,8 @@ mod tests {
             id: 1,
             line_id: "line-a".to_string(),
             direction: "incoming".to_string(),
+            phone_number: "+10000".to_string(),
+            state: "incoming".to_string(),
             answered_at: None,
             answered: false,
             missing_polls: 0,

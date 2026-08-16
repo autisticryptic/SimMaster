@@ -52,7 +52,6 @@ import type {
   LineVowifiConfig,
   ImsOverrideResponse,
   SimImsOverride,
-  StandaloneSimSlotConfig,
   TrunkProfileResponse,
   VolteLineControlResponse,
   NetworkInfo,
@@ -65,7 +64,6 @@ import type {
   OtaLatestReleaseResponse,
   OtaOnlinePrepareRequest,
   OtaUploadResponse,
-  PcscReaderInfo,
   GithubDownloadProxyConfig,
   RadioMode,
   RadioModeResponse,
@@ -730,21 +728,6 @@ class SimAdminCurrentAPI {
       `/ims/lines/${encodeURIComponent(lineId)}/override`,
       { method: 'PATCH', body: JSON.stringify(override) },
     )
-  }
-
-  async getStandaloneSimSlots() {
-    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots')
-  }
-
-  async setStandaloneSimSlots(slots: StandaloneSimSlotConfig[]) {
-    return request<ApiResponse<StandaloneSimSlotConfig[]>>('/sim/slots', {
-      method: 'POST',
-      body: JSON.stringify(slots),
-    })
-  }
-
-  async getPcscReaders() {
-    return request<ApiResponse<PcscReaderInfo[]>>('/sim/readers')
   }
 
   async getTrunkLines() {

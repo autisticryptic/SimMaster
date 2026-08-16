@@ -138,8 +138,7 @@ export default function PhonePage() {
       const response = await api.getModemLines()
       const available = (response.data ?? []).filter((line) => (
         line.modem.present
-        && line.modem.line_kind !== 'reader'
-        && Boolean(line.modem.modem_path)
+        && (line.modem.line_kind === 'reader' || Boolean(line.modem.modem_path))
       ))
       setLines(available)
       setSelectedLineId((current) => (

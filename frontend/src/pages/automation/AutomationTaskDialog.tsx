@@ -50,6 +50,8 @@ export default function AutomationTaskDialog({
   const [formCallDuration, setFormCallDuration] = useState(30)
   const [formTarget, setFormTarget] = useState<AutomationTarget | null>(null)
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
+  const selectedTargetLineId = formTarget?.kind === 'modem_line' ? formTarget.line_id : ''
+  const selectedTargetIsReader = lines.some((line) => line.modem.line_id === selectedTargetLineId && line.modem.line_kind === 'reader')
 
   const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval' | 'cron'>('fixed')
   const [formWeekdays, setFormWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7])
@@ -127,6 +129,12 @@ export default function AutomationTaskDialog({
     }
   }, [open, editingTask, fixedLineId, fixedTarget])
 
+  useEffect(() => {
+    if (selectedTargetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
+      setFormActionType('send_sms')
+    }
+  }, [formActionType, selectedTargetIsReader])
+
   const insertVariable = (token: string) => {
     const el = smsContentRef.current
     if (!el) {
@@ -158,8 +166,12 @@ export default function AutomationTaskDialog({
       return
     }
 
-    if (formActionType !== 'reboot_device' && (!formTarget || (fixedTarget && JSON.stringify(formTarget) !== JSON.stringify(fixedTarget)) || (!fixedTarget && formTarget.kind !== 'modem_line'))) {
-      setDialogError(fixedTarget?.kind === 'standalone_sim_slot' ? '当前读卡器暂不支持自动化执行' : '请选择执行该任务的基带线路')
+    if (formActionType !== 'reboot_device' && (!formTarget || (fixedTarget && JSON.stringify(formTarget) !== JSON.stringify(fixedTarget)) || formTarget.kind !== 'modem_line')) {
+      setDialogError('请选择执行该任务的线路')
+      return
+    }
+    if (selectedTargetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
+      setDialogError('读卡器线路不具备基带重启或蜂窝流量能力')
       return
     }
 
@@ -327,10 +339,10 @@ export default function AutomationTaskDialog({
               if (actionType === 'reboot_device') setFormTarget(null)
             }}
           >
-            <MenuItem value="restart_baseband">重启基带</MenuItem>
+            {!selectedTargetIsReader && <MenuItem value="restart_baseband">重启基带</MenuItem>}
             {!fixedLineId && <MenuItem value="reboot_device">重启设备</MenuItem>}
             <MenuItem value="send_sms">发送短信</MenuItem>
-            <MenuItem value="consume_data">消耗移动流量</MenuItem>
+            {!selectedTargetIsReader && <MenuItem value="consume_data">消耗移动流量</MenuItem>}
             <MenuItem value="dial_call">定时拨号</MenuItem>
           </TextField>
 
@@ -338,19 +350,18 @@ export default function AutomationTaskDialog({
             <TextField
               select
               required
-              label="使用的基带 / SIM 卡"
-              value={formTarget ? `${formTarget.kind}:${formTarget.kind === 'modem_line' ? formTarget.line_id : formTarget.slot_id}` : ''}
+              label="使用的线路 / SIM 卡"
+              value={formTarget?.kind === 'modem_line' ? `modem_line:${formTarget.line_id}` : ''}
               disabled={Boolean(fixedLineId || fixedTarget)}
               onChange={(e) => {
                 const [kind, ...rest] = e.target.value.split(':')
                 setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : null)
                 setDialogError(null)
               }}
-              helperText={fixedTarget?.kind === 'standalone_sim_slot' ? '读卡器自动化执行器尚未接入' : fixedLineId ? '任务固定绑定到当前线路' : '任务始终绑定到所选线路，不会自动回退到其他基带'}
+              helperText={fixedLineId || fixedTarget ? '任务固定绑定到当前线路' : '任务始终绑定到所选线路，不会自动回退到其他线路'}
             >
-              <MenuItem value="" disabled>请选择基带线路</MenuItem>
-              {fixedTarget?.kind === 'standalone_sim_slot' && <MenuItem value={`standalone_sim_slot:${fixedTarget.slot_id}`}>当前读卡器 · {fixedTarget.slot_id}</MenuItem>}
-              {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>基带 {line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
+              <MenuItem value="" disabled>请选择线路</MenuItem>
+              {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>{line.modem.line_kind === 'reader' ? '读卡器' : '基带'} {line.modem.slot_label || line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
             </TextField>
           )}
 

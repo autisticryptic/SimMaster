@@ -520,9 +520,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
             const recovery = recoveryMessage(line)
             const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
-            // A standalone reader has no cellular baseband: it only participates
-            // in VoWiFi and eSIM management, so the cellular controls (VoLTE,
-            // data, roaming, airplane, Trunk) are hidden for it.
+            // A reader line shares VoWiFi, trunk, SMS, calls, and automation
+            // with normal lines. Only controls that require a cellular radio or
+            // ModemManager object are hidden.
             const isReader = line.modem.line_kind === 'reader'
             const overviewControls = !isReader ? (
               <Card>
@@ -782,7 +782,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         />
                       </Box>
                     </Box>}
-                    {!isReader && (!workbench || workbenchTab === 'ims') && (
+                    {(!workbench || workbenchTab === 'ims') && (
                     <Box order={0} display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
@@ -816,7 +816,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     )}
                     {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoLTE IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
                     {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoWiFi 详情</Typography><LineVowifiDetails vowifi={vowifiLine} /></Box>}
-                    {!isReader && workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
+                    {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
                     </Box>
                   </CardContent>
                 </Card>

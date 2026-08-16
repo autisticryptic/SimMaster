@@ -1,7 +1,5 @@
-use crate::hardware::cellular::modem_manager::{
-    hangup_call_on_modem, list_current_calls_for_modem, make_call_on_modem,
-};
-use crate::services::automation::target::resolve_modem_target;
+use crate::api::handlers::{hangup_call_for_automation, start_call_for_automation};
+use crate::services::automation::target::resolve_line_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
@@ -53,34 +51,17 @@ impl AutomationTaskHandler for DialCallHandler {
         let target = params.clone();
         async move {
             let phone = normalize_phone(&country, &number)?;
-            let target = resolve_modem_target(app, &target).await?;
-            let call_path = make_call_on_modem(&app.dbus_conn, &target.modem_path, &phone)
+            let target = resolve_line_target(app, &target).await?;
+            let (_, call_path, transport) = start_call_for_automation(app, &target.line_id, &phone)
                 .await
+                .map_err(anyhow::Error::msg)
                 .context("定时拨号失败")?;
-            let connection = app.dbus_conn.clone();
-            let hangup_modem_path = target.modem_path.clone();
-            let hangup = tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
-                match hangup_call_on_modem(&connection, &hangup_modem_path, &call_path).await {
-                    Ok(()) => Ok(()),
-                    Err(error) => {
-                        // A remote party may end the call before the configured
-                        // hold time. Treat an already-absent call as a completed
-                        // task, while preserving real hangup failures.
-                        match list_current_calls_for_modem(&connection, &hangup_modem_path).await {
-                            Ok(calls) if calls.calls.iter().all(|call| call.path != call_path) => {
-                                Ok(())
-                            }
-                            _ => Err(error),
-                        }
-                    }
-                }
-            });
-            hangup
+            tokio::time::sleep(std::time::Duration::from_secs(duration)).await;
+            hangup_call_for_automation(app, &target.line_id, &call_path)
                 .await
-                .context("自动挂机任务异常结束")?
+                .map_err(anyhow::Error::msg)
                 .context("自动挂机失败")?;
-            info!(line_id = %target.line_id, phone = %phone, duration_seconds = duration, "automation dial call completed");
+            info!(line_id = %target.line_id, phone = %phone, duration_seconds = duration, transport, "automation dial call completed");
             Ok(())
         }
         .boxed()

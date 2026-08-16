@@ -27,6 +27,8 @@ pub struct ActiveCallRecord {
     pub id: i64,
     pub line_id: String,
     pub direction: String,
+    pub phone_number: String,
+    pub state: String,
     pub answered_at: Option<Instant>,
     pub answered: bool,
     pub missing_polls: u8,

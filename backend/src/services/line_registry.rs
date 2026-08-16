@@ -256,7 +256,13 @@ impl LineRuntimeRegistry {
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
     pub async fn refresh(&self, conn: &Connection) -> zbus::Result<usize> {
-        let mut discovered = discover_modem_bindings(conn).await?;
+        let mut discovered = match discover_modem_bindings(conn).await {
+            Ok(bindings) => bindings,
+            Err(error) => {
+                tracing::warn!(error = %error, "ModemManager discovery unavailable; continuing with non-baseband lines");
+                Vec::new()
+            }
+        };
         let mut physical_slot_counts = std::collections::HashMap::new();
         for binding in &discovered {
             *physical_slot_counts
@@ -287,6 +293,118 @@ impl LineRuntimeRegistry {
                     }
                 }
             }
+        }
+
+        // PC/SC readers are physical line anchors just like modem slots. A card
+        // that is present is exposed automatically; the old standalone slot
+        // configuration is consulted only for label and line-ID migration.
+        if let Some(config_manager) = &self.config_manager {
+            let legacy_slots = config_manager.get_standalone_sim_slots();
+            match crate::hardware::devices::pcsc::discover_readers().await {
+                Ok(readers) => {
+                    let first_reader_order = discovered
+                        .iter()
+                        .map(|binding| binding.display_order)
+                        .max()
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    for reader in readers.into_iter().filter(|reader| reader.card_present) {
+                        let reader_path = reader.selector.as_str();
+                        let legacy_slot = legacy_slots.iter().find(|slot| {
+                            slot.reader_path.trim() == reader_path
+                                || slot.reader_path.trim() == reader.name
+                                || slot.reader_path.trim() == reader.index.to_string()
+                        });
+                        let label = legacy_slot
+                            .map(|slot| slot.label.trim())
+                            .filter(|label| !label.is_empty())
+                            .unwrap_or(reader.name.as_str());
+                        let legacy_line_ids = legacy_slot
+                            .map(|slot| {
+                                vec![crate::hardware::cellular::modem_manager::reader_line_id(
+                                    &slot.id,
+                                    slot.uim_slot,
+                                )]
+                            })
+                            .unwrap_or_default();
+                        let identity = match crate::hardware::devices::pcsc::read_identity_async(
+                            reader_path,
+                        )
+                        .await
+                        {
+                            Ok(identity) => Some(identity),
+                            Err(error) => {
+                                tracing::warn!(reader = %reader.name, error = %error, "Failed to read PC/SC SIM identity");
+                                None
+                            }
+                        };
+                        let sim_iccid = identity
+                            .as_ref()
+                            .map(|identity| identity.iccid.clone())
+                            .unwrap_or_default();
+                        let operator_id = identity
+                            .as_ref()
+                            .and_then(|identity| {
+                                let mnc_length =
+                                    identity.mnc_length.map(usize::from).unwrap_or_else(|| {
+                                        if identity.imsi.starts_with("460") {
+                                            2
+                                        } else {
+                                            3
+                                        }
+                                    });
+                                (identity.imsi.len() >= 3 + mnc_length)
+                                    .then(|| identity.imsi[..3 + mnc_length].to_string())
+                            })
+                            .unwrap_or_default();
+                        let mut binding = crate::hardware::cellular::modem_manager::reader_binding(
+                            &reader.name,
+                            label,
+                            reader_path,
+                            1,
+                            None,
+                            true,
+                            sim_iccid,
+                            operator_id,
+                            legacy_line_ids,
+                        );
+                        binding.display_order =
+                            first_reader_order.saturating_add(reader.index.into());
+                        if let Some(slot) = legacy_slot {
+                            if let Err(error) = config_manager
+                                .migrate_standalone_reader_references(&slot.id, &binding.line_id)
+                            {
+                                tracing::warn!(slot_id = %slot.id, line_id = %binding.line_id, error = %error, "Failed to migrate standalone reader references");
+                            }
+                        }
+                        discovered.push(binding);
+                    }
+                }
+                Err(error) => tracing::debug!(error = %error, "PC/SC reader discovery unavailable"),
+            }
+
+            // Preserve non-PC/SC legacy UIM adapters while their automatic
+            // hardware discovery is being implemented. They remain headless
+            // and do not require the removed reader management page.
+            for slot in legacy_slots.iter().filter(|slot| {
+                slot.enabled
+                    && !slot.reader_path.trim().starts_with("pcsc://")
+                    && slot.reader_path.trim().starts_with("/dev/")
+            }) {
+                let reader_path = slot.reader_path.trim();
+                discovered.push(crate::hardware::cellular::modem_manager::reader_binding(
+                    &slot.id,
+                    &slot.label,
+                    reader_path,
+                    slot.uim_slot,
+                    Some(reader_path.to_string()),
+                    true,
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ));
+            }
+
             for binding in &discovered {
                 if let Err(error) = config_manager
                     .migrate_line_profile_aliases(&binding.line_id, &binding.legacy_line_ids)
@@ -302,36 +420,6 @@ impl LineRuntimeRegistry {
                     }
                 }
             }
-        }
-        // Synthesize a line for each enabled standalone SIM reader. Readers are
-        // not backed by a ModemManager object, so they never appear in the
-        // discovered set; they only participate in VoWiFi and eSIM management.
-        if let Some(config_manager) = &self.config_manager {
-            for slot in config_manager.get_standalone_sim_slots() {
-                if !slot.enabled {
-                    continue;
-                }
-                let reader_path = slot.reader_path.trim();
-                let qmi_device = reader_path
-                    .starts_with("/dev/")
-                    .then(|| reader_path.to_string());
-                let present = if reader_path.starts_with("pcsc://") {
-                    crate::hardware::devices::pcsc::reader_available(reader_path)
-                        .await
-                        .unwrap_or(false)
-                } else {
-                    qmi_device.is_some()
-                };
-                discovered.push(crate::hardware::cellular::modem_manager::reader_binding(
-                    &slot.id,
-                    &slot.label,
-                    reader_path,
-                    slot.uim_slot,
-                    qmi_device,
-                    present,
-                ));
-            }
-
             let mut migration_lines = discovered.iter().collect::<Vec<_>>();
             migration_lines.sort_by(|left, right| {
                 left.display_order

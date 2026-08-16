@@ -1609,6 +1609,67 @@ mod tests {
     }
 
     #[test]
+    fn standalone_reader_targets_migrate_to_unified_line() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-reader-target-migration-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line_id = "line-33333333333333333333333333333333";
+        {
+            let mut config = manager.config.write().unwrap();
+            config.automation.tasks.push(AutomationTask {
+                id: "reader-sms".to_string(),
+                name: "reader sms".to_string(),
+                enabled: true,
+                trigger: AutomationTrigger::Interval {
+                    interval_value: 1,
+                    interval_unit: "hours".to_string(),
+                },
+                target: Some(AutomationTarget::StandaloneSimSlot {
+                    slot_id: "usb-a".to_string(),
+                }),
+                action: AutomationAction::SendSms {
+                    phone_number: "10086".to_string(),
+                    content: "test".to_string(),
+                    random_delay_seconds: Some(0),
+                    retry_limit: Some(0),
+                },
+            });
+            let mut rule: NotificationRule = serde_json::from_value(serde_json::json!({
+                "id": "reader-rule",
+                "type": "sms",
+                "name": "reader rule"
+            }))
+            .unwrap();
+            rule.sim_channel_ids = vec!["reader:usb-a".to_string()];
+            config.notifications.rules.push(rule);
+        }
+        manager.save().unwrap();
+
+        assert!(manager
+            .migrate_standalone_reader_references("usb-a", line_id)
+            .unwrap());
+        let config = manager.config.read().unwrap();
+        assert!(matches!(
+            config.automation.tasks[0].target.as_ref(),
+            Some(AutomationTarget::ModemLine { line_id: target }) if target == line_id
+        ));
+        assert_eq!(
+            config.notifications.rules[0].sim_channel_ids,
+            vec![line_id.to_string()]
+        );
+        drop(config);
+        assert!(!manager
+            .migrate_standalone_reader_references("usb-a", line_id)
+            .unwrap());
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn per_line_volte_connection_is_independent_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-config-{}-{}.json",
@@ -5104,6 +5165,58 @@ impl ConfigManager {
                 }
             }
 
+            changed
+        };
+        if migrated {
+            self.save()?;
+        }
+        Ok(migrated)
+    }
+
+    /// Convert reader reservations created by the removed standalone-reader UI
+    /// into the unified line target used by SMS, calls, notifications, and the
+    /// automation scheduler.
+    pub fn migrate_standalone_reader_references(
+        &self,
+        slot_id: &str,
+        line_id: &str,
+    ) -> Result<bool, String> {
+        let slot_id = slot_id.trim();
+        if slot_id.is_empty() || !valid_line_id(line_id) {
+            return Err("invalid_reader_line_migration".to_string());
+        }
+        let legacy_notification_id = format!("reader:{slot_id}");
+        let migrated = {
+            let mut config = self.config.write().unwrap();
+            let mut changed = false;
+            for task in &mut config.automation.tasks {
+                if matches!(
+                    task.target.as_ref(),
+                    Some(AutomationTarget::StandaloneSimSlot { slot_id: target }) if target.trim() == slot_id
+                ) {
+                    task.target = Some(AutomationTarget::ModemLine {
+                        line_id: line_id.to_string(),
+                    });
+                    changed = true;
+                }
+            }
+            for rule in &mut config.notifications.rules {
+                let mut rewritten = Vec::with_capacity(rule.sim_channel_ids.len());
+                for target in &rule.sim_channel_ids {
+                    let target = if target.trim() == legacy_notification_id {
+                        line_id
+                    } else {
+                        target.as_str()
+                    };
+                    if !rewritten.iter().any(|existing| existing == target) {
+                        rewritten.push(target.to_string());
+                    }
+                }
+                if rewritten != rule.sim_channel_ids {
+                    rule.sim_channel_ids = rewritten;
+                    changed = true;
+                }
+            }
             changed
         };
         if migrated {

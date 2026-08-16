@@ -4,7 +4,12 @@
 //! binary to libpcsclite. `pcscd`, a CCID driver and `opensc-tool` remain host
 //! dependencies installed by the deployment script.
 
-use std::{process::Command, time::Duration};
+use std::{
+    collections::HashMap,
+    process::Command,
+    sync::{Mutex, OnceLock},
+    time::{Duration, Instant},
+};
 
 use serde::Serialize;
 
@@ -14,6 +19,7 @@ use crate::connectivity::modems::ims::vowifi::qmi_uim::{
 };
 
 const COMMAND_TIMEOUT_SECS: u64 = 8;
+const IDENTITY_CACHE_TTL: Duration = Duration::from_secs(5);
 const USIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -36,6 +42,12 @@ struct ApduResponse {
     data: Vec<u8>,
     sw1: u8,
     sw2: u8,
+}
+
+static IDENTITY_CACHE: OnceLock<Mutex<HashMap<String, (Instant, PcscIdentity)>>> = OnceLock::new();
+
+fn identity_cache() -> &'static Mutex<HashMap<String, (Instant, PcscIdentity)>> {
+    IDENTITY_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 pub fn selector_from_path(path: &str) -> Option<String> {
@@ -75,13 +87,6 @@ pub async fn discover_readers() -> Result<Vec<PcscReaderInfo>, String> {
         return Err("pcsc_ccid_driver_or_service_unavailable".to_string());
     }
     Ok(readers)
-}
-
-pub async fn reader_available(path: &str) -> Result<bool, String> {
-    let Some(selector) = selector_from_path(path) else {
-        return Ok(false);
-    };
-    Ok(resolve_reader(&discover_readers().await?, &selector).is_some())
 }
 
 pub fn read_identity(path: &str) -> Result<PcscIdentity, &'static str> {
@@ -133,6 +138,39 @@ pub fn read_identity(path: &str) -> Result<PcscIdentity, &'static str> {
         imsi,
         mnc_length,
     })
+}
+
+/// Read a PC/SC card identity without blocking the async runtime. OpenSC is a
+/// synchronous process adapter, so reader discovery and APDU traffic must run
+/// on the blocking pool when they are used by the line registry and APIs.
+pub async fn read_identity_async(path: &str) -> Result<PcscIdentity, String> {
+    let path = path.trim().to_string();
+    if selector_from_path(&path).is_none() {
+        return Err("pcsc_reader_selector_invalid".to_string());
+    }
+    if let Some(identity) = identity_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&path)
+        .filter(|(captured_at, _)| captured_at.elapsed() <= IDENTITY_CACHE_TTL)
+        .map(|(_, identity)| identity.clone())
+    {
+        return Ok(identity);
+    }
+    let cache_key = path.clone();
+    let identity = tokio::time::timeout(
+        Duration::from_secs(COMMAND_TIMEOUT_SECS + 2),
+        tokio::task::spawn_blocking(move || read_identity(&path)),
+    )
+    .await
+    .map_err(|_| "pcsc_identity_timeout".to_string())?
+    .map_err(|_| "pcsc_identity_task_failed".to_string())?
+    .map_err(str::to_string)?;
+    identity_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, (Instant::now(), identity.clone()));
+    Ok(identity)
 }
 
 pub fn verify_usim(path: &str) -> Result<(), &'static str> {

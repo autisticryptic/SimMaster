@@ -1024,21 +1024,6 @@ export interface VowifiLineConfigResponse {
   matched_profile_id?: string | null
 }
 
-export interface StandaloneSimSlotConfig {
-  id: string
-  label: string
-  reader_path: string
-  uim_slot: number
-  enabled: boolean
-}
-
-export interface PcscReaderInfo {
-  index: number
-  name: string
-  card_present: boolean
-  selector: string
-}
-
 export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus

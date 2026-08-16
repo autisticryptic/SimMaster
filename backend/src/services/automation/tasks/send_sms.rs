@@ -1,6 +1,6 @@
-use crate::hardware::cellular::modem_manager::send_sms_via_modem;
+use crate::api::handlers::send_sms_on_line;
 use crate::platform::db::beijing_sms_now_string;
-use crate::services::automation::target::resolve_modem_target;
+use crate::services::automation::target::resolve_line_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;
 use anyhow::{Context, Result};
@@ -93,7 +93,7 @@ impl AutomationTaskHandler for SendSmsHandler {
             .unwrap_or(0) as u32;
 
         async move {
-            let target = resolve_modem_target(app, params).await?;
+            let target = resolve_line_target(app, params).await?;
             // 1. 随机延迟机制
             if random_delay_seconds > 0 {
                 let delay = get_random_u32(random_delay_seconds);
@@ -112,26 +112,11 @@ impl AutomationTaskHandler for SendSmsHandler {
             let mut attempts = 0;
             loop {
                 attempts += 1;
-                match send_sms_via_modem(
-                    &app.dbus_conn,
-                    &target.modem_path,
-                    &phone_number,
-                    &rendered_content,
-                )
-                .await
+                match send_sms_on_line(app, &target.line_id, &phone_number, &rendered_content).await
                 {
-                    Ok(_) => {
+                    Ok(result) => {
                         info!("Successfully sent automation SMS to {}", phone_number);
-                        // 记录到数据库
-                        let _ = app.database.insert_sms_with_transport_for_line(
-                            "outgoing",
-                            &phone_number,
-                            &rendered_content,
-                            "sent",
-                            None,
-                            "modem",
-                            Some(&target.line_id),
-                        );
+                        info!(line_id = %target.line_id, transport = ?result.get("transport"), "Automation SMS used unified line transport");
                         return Ok(());
                     }
                     Err(e) => {
@@ -147,10 +132,10 @@ impl AutomationTaskHandler for SendSmsHandler {
                                 &rendered_content,
                                 "failed",
                                 None,
-                                "modem",
+                                "line_policy",
                                 Some(&target.line_id),
                             );
-                            return Err(e).context("短信发送失败 (已达重试上限)");
+                            return Err(anyhow::anyhow!("短信发送失败 (已达重试上限): {e}"));
                         }
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }

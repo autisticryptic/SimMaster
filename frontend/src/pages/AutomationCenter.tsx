@@ -161,12 +161,10 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
     [config.tasks],
   )
   const visibleTasks = useMemo(
-    () => fixedTarget?.kind === 'standalone_sim_slot'
-      ? config.tasks.filter((task) => task.target?.kind === 'standalone_sim_slot' && task.target.slot_id === fixedTarget.slot_id)
-      : lineId
+    () => lineId
         ? config.tasks.filter((task) => task.target?.kind === 'modem_line' && task.target.line_id === lineId)
         : config.tasks,
-    [config.tasks, fixedTarget, lineId],
+    [config.tasks, lineId],
   )
 
   // Load configuration and latest logs
@@ -451,7 +449,6 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
             variant="contained"
             startIcon={<Add />}
             onClick={() => handleOpenTaskDialog(null)}
-            disabled={fixedTarget?.kind === 'standalone_sim_slot'}
           >
             新建任务
           </Button>
