@@ -242,7 +242,9 @@ export default function NotificationCenterPage({ lineId, embedded = false }: Not
   const patchRule = (id: string, patch: Partial<NotificationRule>) => {
     patchConfig((prev) => ({
       ...prev,
-      rules: prev.rules.map((rule) => rule.id === id ? { ...rule, ...patch } : rule),
+      rules: prev.rules.map((rule) => rule.id === id
+        ? { ...rule, ...patch, sim_channel_ids: lineId ? [lineId] : (patch.sim_channel_ids ?? rule.sim_channel_ids) }
+        : rule),
     }))
   }
 
@@ -449,7 +451,7 @@ export default function NotificationCenterPage({ lineId, embedded = false }: Not
 
       {lineId && (
         <Alert severity="info" sx={{ mb: 2 }}>
-          此处仅编辑当前线路的通知规则；通知通道和日志自动清理策略由整台设备共享，设备级全局规则仍可能应用于该线路。
+          转发日志与转发规则仅显示当前线路；转发通道由整台设备共享，配置一次后可供所有线路的规则复用。
         </Alert>
       )}
 
@@ -468,7 +470,7 @@ export default function NotificationCenterPage({ lineId, embedded = false }: Not
         <Tabs value={tab} onChange={(_, value: number) => setTab(value)} variant="scrollable" scrollButtons="auto">
           <Tab label="转发日志" />
           <Tab label="转发规则" />
-          <Tab label="转发通道" />
+          <Tab label={lineId ? '全局转发通道' : '转发通道'} />
         </Tabs>
       </Box>
 

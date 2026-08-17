@@ -491,6 +491,7 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
                   onEdit={handleOpenTaskDialog}
                   onDelete={handleDeleteClick}
                   onToggle={(id, val) => void handleToggleTask(id, val)}
+                  showTarget={!lineId}
                 />
               </Grid>
             ))}
@@ -611,7 +612,7 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
                   <TableRow>
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>时间</TableCell>
                     <TableCell sx={{ width: 150, fontWeight: 400 }}>任务名称</TableCell>
-                    <TableCell sx={{ width: 110, fontWeight: 400 }}>目标线路</TableCell>
+                    {!lineId && <TableCell sx={{ width: 110, fontWeight: 400 }}>目标线路</TableCell>}
                     <TableCell sx={{ width: 120, fontWeight: 400 }}>任务类型</TableCell>
                     <TableCell sx={{ width: 100, fontWeight: 400 }}>执行结果</TableCell>
                     <TableCell sx={{ fontWeight: 400 }}>执行详情</TableCell>
@@ -620,13 +621,13 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
                 <TableBody>
                   {logsLoading ? (
                     <TableRow>
-                      <TableCell colSpan={6} align="center" sx={{ py: 5 }}>
+                      <TableCell colSpan={lineId ? 5 : 6} align="center" sx={{ py: 5 }}>
                         <CircularProgress size={24} />
                       </TableCell>
                     </TableRow>
                   ) : logs.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={6} align="center" sx={{ py: 5, color: 'text.secondary' }}>
+                      <TableCell colSpan={lineId ? 5 : 6} align="center" sx={{ py: 5, color: 'text.secondary' }}>
                         暂无运行日志记录
                       </TableCell>
                     </TableRow>
@@ -635,9 +636,11 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
                       <TableRow key={log.id} sx={{ height: 40, '& .MuiTableCell-root': { py: 0.5 } }}>
                         <TableCell sx={{ width: 150, whiteSpace: 'nowrap', fontWeight: 400 }}>{log.created_at}</TableCell>
                         <TableCell sx={{ width: 150, fontWeight: 400 }}>{log.task_name}</TableCell>
-                        <TableCell sx={{ width: 110, fontWeight: 400 }} title={log.line_id ?? ''}>
-                          {log.line_id ? `线路 ${shortLineId(log.line_id)}` : '设备'}
-                        </TableCell>
+                        {!lineId && (
+                          <TableCell sx={{ width: 110, fontWeight: 400 }} title={log.line_id ?? ''}>
+                            {log.line_id ? `线路 ${shortLineId(log.line_id)}` : '设备'}
+                          </TableCell>
+                        )}
                         <TableCell sx={{ width: 120, fontWeight: 400 }}>
                           {log.task_type === 'restart_baseband' && '基带维护'}
                           {log.task_type === 'reboot_device' && '系统操作'}

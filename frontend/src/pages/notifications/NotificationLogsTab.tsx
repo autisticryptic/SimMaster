@@ -307,7 +307,7 @@ export default function NotificationLogsTab({
               <TableRow>
                 <TableCell sx={{ width: 150, fontWeight: 400 }}>时间</TableCell>
                 <TableCell sx={{ width: 96, fontWeight: 400 }}>类型</TableCell>
-                <TableCell sx={{ width: 120, fontWeight: 400 }}>归属</TableCell>
+                {!fixedLineId && <TableCell sx={{ width: 120, fontWeight: 400 }}>归属</TableCell>}
                 <TableCell sx={{ width: 88, fontWeight: 400 }}>状态</TableCell>
                 <TableCell sx={{ width: '42%', minWidth: 360, fontWeight: 400 }}>内容摘要</TableCell>
                 <TableCell sx={{ width: 160, fontWeight: 400 }}>转发规则</TableCell>
@@ -327,11 +327,13 @@ export default function NotificationLogsTab({
                   <TableRow key={log.id} sx={{ height: 40, '& .MuiTableCell-root': { py: 0.5 } }}>
                   <TableCell sx={{ width: 150, whiteSpace: 'nowrap', fontWeight: 400 }}>{log.created_at}</TableCell>
                   <TableCell sx={{ width: 96, fontWeight: 400 }}>{eventLabel(log.event_type)}</TableCell>
-                  <TableCell sx={{ width: 120, fontWeight: 400 }} title={log.line_id ?? ''}>
-                    {log.line_id
-                      ? lineOptions.find((line) => line.id === log.line_id)?.label ?? `线路 ${shortLineId(log.line_id)}`
-                      : '设备级事件'}
-                  </TableCell>
+                  {!fixedLineId && (
+                    <TableCell sx={{ width: 120, fontWeight: 400 }} title={log.line_id ?? ''}>
+                      {log.line_id
+                        ? lineOptions.find((line) => line.id === log.line_id)?.label ?? `线路 ${shortLineId(log.line_id)}`
+                        : '设备级事件'}
+                    </TableCell>
+                  )}
                   <TableCell
                     sx={{
                       width: 88,
@@ -374,7 +376,7 @@ export default function NotificationLogsTab({
               })}
               {logs.length === 0 && (
                 <TableRow>
-                  <TableCell colSpan={7} align="center" sx={{ py: 4, color: 'text.secondary' }}>暂无转发日志</TableCell>
+                  <TableCell colSpan={fixedLineId ? 6 : 7} align="center" sx={{ py: 4, color: 'text.secondary' }}>暂无转发日志</TableCell>
                 </TableRow>
               )}
             </TableBody>

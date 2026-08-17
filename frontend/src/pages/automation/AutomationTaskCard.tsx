@@ -31,6 +31,7 @@ type AutomationTaskCardProps = {
   onEdit: (task: AutomationTask) => void
   onDelete: (task: AutomationTask) => void
   onToggle: (taskId: string, checked: boolean) => void
+  showTarget?: boolean
 }
 
 export default function AutomationTaskCard({
@@ -41,6 +42,7 @@ export default function AutomationTaskCard({
   onEdit,
   onDelete,
   onToggle,
+  showTarget = true,
 }: AutomationTaskCardProps) {
 
   // Next run display helper calculation
@@ -228,7 +230,7 @@ export default function AutomationTaskCard({
               </Typography>
             </Box>
           )}
-          {task.action.type !== 'reboot_device' && (
+          {showTarget && task.action.type !== 'reboot_device' && (
             <Box display="flex" justifyContent="space-between" mb={0.75}>
               <Typography variant="body2" color="text.secondary">SIM 目标:</Typography>
               <Typography variant="body2" color={!task.target ? 'error.main' : undefined}>

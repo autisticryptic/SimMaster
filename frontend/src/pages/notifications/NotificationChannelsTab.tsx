@@ -349,7 +349,7 @@ export default function NotificationChannelsTab({
                   </Paper>
                 </Box>
                 <Box display="flex" alignItems="center" justifyContent="space-between" mt={1.5}>
-                  <Typography variant="subtitle1" fontWeight={600}>通知渠道 ({config.channels.length})</Typography>
+                  <Typography variant="subtitle1" fontWeight={600}>全局通知渠道 ({config.channels.length})</Typography>
                   <Tooltip title="新增通知渠道">
                     <IconButton size="small" color="primary" onClick={(event: MouseEvent<HTMLElement>) => setAddMenuAnchor(event.currentTarget)}>
                       <Add />
@@ -405,7 +405,7 @@ export default function NotificationChannelsTab({
                   <TextField
                     select
                     size="small"
-                    label={`通知渠道 (${config.channels.length})`}
+                    label={`全局通知渠道 (${config.channels.length})`}
                     value={selectedChannel?.id ?? ''}
                     onChange={(event: ChangeEvent<HTMLInputElement>) => onSelectChannel(event.target.value)}
                     sx={{ flex: 1, minWidth: 0 }}
