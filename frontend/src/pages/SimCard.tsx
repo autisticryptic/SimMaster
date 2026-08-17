@@ -26,6 +26,7 @@ import {
   ToggleButtonGroup,
   FormControlLabel,
   Switch,
+  Skeleton,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import {
@@ -146,12 +147,13 @@ function formatOperator(name?: string, code?: string) {
   return name || code || 'N/A';
 }
 
-function InfoField({ label, value, sensitive = false, showSensitive, extra }: {
+function InfoField({ label, value, sensitive = false, showSensitive, extra, loading = false }: {
   label: string
   value: React.ReactNode
   sensitive?: boolean
   showSensitive?: boolean
   extra?: React.ReactNode
+  loading?: boolean
 }) {
   return (
     <Box>
@@ -159,32 +161,55 @@ function InfoField({ label, value, sensitive = false, showSensitive, extra }: {
         {label}
       </Typography>
       <Box display="flex" alignItems="center" gap={0.5} mt={0.25} minHeight="20px">
-        <Typography
-          variant="body2"
-          component="div"
-          sx={{
-            fontSize: '0.825rem',
-            wordBreak: 'break-all',
-            ...(sensitive ? getSensitiveStyle(!!showSensitive) : {})
-          }}
-        >
-          {value}
-        </Typography>
-        {extra}
+        {loading ? (
+          <Skeleton variant="text" width="72%" sx={{ fontSize: '0.825rem' }} />
+        ) : (
+          <>
+            <Typography
+              variant="body2"
+              component="div"
+              sx={{
+                fontSize: '0.825rem',
+                wordBreak: 'break-all',
+                ...(sensitive ? getSensitiveStyle(!!showSensitive) : {})
+              }}
+            >
+              {value}
+            </Typography>
+            {extra}
+          </>
+        )}
       </Box>
     </Box>
   )
 }
 
-function SmsCapacityProgress({ used, total }: { used?: number, total?: number }) {
-  if (used === undefined || total === undefined) return <Typography variant="body2" sx={{ fontSize: '0.825rem' }}>N/A</Typography>;
-  const percentage = Math.min((used / total) * 100, 100);
-  const isFull = used >= total;
+function SmsCapacityProgress({ used, total }: { used?: number | null, total?: number | null }) {
+  const validUsed = typeof used === 'number' && Number.isFinite(used) && used >= 0 ? used : null
+  const validTotal = typeof total === 'number' && Number.isFinite(total) && total > 0 ? total : null
+
+  if (validTotal === null) {
+    return (
+      <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.825rem' }}>
+        {validUsed === null ? '未读取到容量' : `已存 ${validUsed} 条 · 总容量未读取`}
+      </Typography>
+    )
+  }
+  if (validUsed === null) {
+    return (
+      <Typography variant="body2" color="text.secondary" sx={{ fontSize: '0.825rem' }}>
+        总容量 {validTotal} 条 · 已用数量未读取
+      </Typography>
+    )
+  }
+
+  const percentage = Math.min((validUsed / validTotal) * 100, 100)
+  const isFull = validUsed >= validTotal
   return (
-    <Box display="flex" flexDirection="column" width="100%" gap={0.25}>
+    <Box display="flex" flexDirection="column" width="100%" gap={0.5}>
       <Box display="flex" justifyContent="space-between" alignItems="center">
         <Typography variant="body2" sx={{ fontWeight: 600, fontSize: '0.825rem' }}>
-          {used} / {total} 条
+          {validUsed} / {validTotal} 条
         </Typography>
         {isFull && (
           <Chip label="已满" color="error" size="small" sx={{ height: 16, fontSize: '0.65rem' }} />
@@ -194,10 +219,10 @@ function SmsCapacityProgress({ used, total }: { used?: number, total?: number })
         variant="determinate"
         value={percentage}
         color={isFull ? "error" : percentage > 80 ? "warning" : "primary"}
-        sx={{ height: 5, borderRadius: 3, mt: 0.5 }}
+        sx={{ height: 5, borderRadius: 3 }}
       />
     </Box>
-  );
+  )
 }
 
 function WorkbenchOverview({ line }: { line: VolteLineControlResponse }) {
@@ -576,7 +601,8 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
 
 function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, controls?: ReactNode }) {
   const lineId = line.modem.line_id
-  const [loading, setLoading] = useState(true)
+  const [simLoading, setSimLoading] = useState(true)
+  const [deviceLoading, setDeviceLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [showSensitive, setShowSensitive] = useState(false)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
@@ -605,21 +631,22 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
   const validatePhoneStr = (val: string) => /^\+?\d+$/.test(val.trim())
 
   const loadData = useCallback(async () => {
-    setLoading(true)
+    setSimLoading(true)
+    setDeviceLoading(true)
+    setSimInfo(null)
+    setDeviceInfo(null)
     setError(null)
-    try {
-      const [simResult, deviceResult] = await Promise.allSettled([
-        api.getSimInfo(lineId),
-        api.getDeviceInfo(lineId),
-      ])
-      if (simResult.status === 'rejected') throw simResult.reason
-      if (simResult.value.data) setSimInfo(simResult.value.data)
-      setDeviceInfo(deviceResult.status === 'fulfilled' ? deviceResult.value.data ?? null : null)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setLoading(false)
-    }
+    const simRequest = api.getSimInfo(lineId)
+      .then((response) => setSimInfo(response.data ?? null))
+      .finally(() => setSimLoading(false))
+    const deviceRequest = api.getDeviceInfo(lineId)
+      .then((response) => setDeviceInfo(response.data ?? null))
+      .finally(() => setDeviceLoading(false))
+    const results = await Promise.allSettled([simRequest, deviceRequest])
+    const failures = results
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
+    if (failures.length > 0) setError(failures.join('；'))
   }, [lineId])
 
   const handleSavePhone = async () => {
@@ -670,22 +697,12 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
     void loadData()
   }, [loadData])
 
-  if (loading) {
-    return (
-      <Box display="flex" justifyContent="center" alignItems="center" minHeight="30vh">
-        <CircularProgress />
-      </Box>
-    )
-  }
-
   return (
     <Box>
       <ErrorSnackbar error={error} onClose={() => setError(null)} />
       <Grid container spacing={3} alignItems="stretch">
-        <Grid size={{ xs: 12, md: 5 }} sx={{ display: 'flex' }}>
-          <Box display="flex" flexDirection="column" gap={2} sx={{ flexGrow: 1, minWidth: 0 }}>
-            {/* Card 1: SIM卡基本标识 */}
-            <Card>
+        <Grid size={{ xs: 12, md: controls ? 5 : 12 }} sx={{ display: 'flex', minWidth: 0 }}>
+            <Card sx={{ flex: 1 }}>
               <CardHeader
                 avatar={<SimIcon color="primary" />}
                 title="SIM 卡基本标识"
@@ -707,6 +724,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={6}>
                     <InfoField
                       label="SIM 状态"
+                      loading={simLoading}
                       value={
                         <Chip
                           label={simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未插入'}
@@ -720,6 +738,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={6}>
                     <InfoField
                       label="SIM 卡类型"
+                      loading={simLoading}
                       value={formatSimType(simInfo?.sim_type, simInfo?.esim_status)}
                     />
                   </Grid>
@@ -750,6 +769,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                     ) : (
                       <InfoField
                         label="手机号"
+                        loading={simLoading}
                         sensitive
                         showSensitive={showSensitive}
                         value={simInfo?.phone_numbers?.length ? simInfo.phone_numbers.join(', ') : 'N/A'}
@@ -790,6 +810,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                     ) : (
                       <InfoField
                         label="短信中心号码"
+                        loading={simLoading}
                         sensitive
                         showSensitive={showSensitive}
                         value={simInfo?.sms_center || '未读取到'}
@@ -806,6 +827,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={6}>
                     <InfoField
                       label="ICCID"
+                      loading={simLoading}
                       sensitive
                       showSensitive={showSensitive}
                       value={simInfo?.iccid || 'N/A'}
@@ -814,6 +836,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={6}>
                     <InfoField
                       label="IMSI"
+                      loading={simLoading}
                       sensitive
                       showSensitive={showSensitive}
                       value={simInfo?.imsi || 'N/A'}
@@ -822,6 +845,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={12}>
                     <InfoField
                       label="设备 IMEI"
+                      loading={deviceLoading}
                       sensitive
                       showSensitive={showSensitive}
                       value={deviceInfo?.imei || 'N/A'}
@@ -830,9 +854,16 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                 </Grid>
               </CardContent>
             </Card>
+        </Grid>
 
-            {/* Device paths and storage remain here after the line summary is removed. */}
-            <Card sx={{ flex: 1, minHeight: 248, display: 'flex', flexDirection: 'column' }}>
+        {controls && (
+          <Grid size={{ xs: 12, md: 7 }} sx={{ display: 'flex', minWidth: 0 }}>
+            {controls}
+          </Grid>
+        )}
+
+        <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex', minWidth: 0 }}>
+            <Card sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
               <CardHeader
                 avatar={<StorageIcon color="primary" />}
                 title="设备、路径与存储"
@@ -846,7 +877,9 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                         SIM 卡短信容量
                       </Typography>
                       <Box display="flex" alignItems="center" mt={0.5} width="100%">
-                        <SmsCapacityProgress used={simInfo?.sms_used} total={simInfo?.sms_total} />
+                        {simLoading
+                          ? <Skeleton variant="text" width="72%" sx={{ fontSize: '0.825rem' }} />
+                          : <SmsCapacityProgress used={simInfo?.sms_used} total={simInfo?.sms_total} />}
                       </Box>
                     </Box>
                   </Grid>
@@ -864,24 +897,21 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                 </Grid>
               </CardContent>
             </Card>
-          </Box>
         </Grid>
 
-        <Grid size={{ xs: 12, md: 7 }} sx={{ display: 'flex' }}>
-          <Box display="flex" flexDirection="column" gap={2} sx={{ flexGrow: 1, minWidth: 0 }}>
-            {controls}
-
-            <Card>
+        <Grid size={{ xs: 12, md: 6 }} sx={{ display: 'flex', minWidth: 0 }}>
+            <Card sx={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
               <CardHeader
                 avatar={<LockIcon color="primary" />}
                 title="安全与锁卡状态"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
               />
-              <CardContent sx={{ pt: 0 }}>
+              <CardContent sx={{ pt: 0, flex: 1 }}>
                 <Grid container spacing={2} sx={{ width: '100%' }}>
-                  <Grid size={6}>
+                  <Grid size={12}>
                     <InfoField
                       label="锁卡状态"
+                      loading={simLoading}
                       value={
                         <Box display="flex" alignItems="center" gap={1}>
                           <Typography variant="body2" component="span" sx={{ fontSize: '0.825rem' }}>
@@ -894,9 +924,10 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                       }
                     />
                   </Grid>
-                  <Grid size={6}>
+                  <Grid size={12}>
                     <InfoField
                       label="解锁剩余重试次数"
+                      loading={simLoading}
                       value={formatUnlockRetries(
                         simInfo?.pin1_retries,
                         simInfo?.puk1_retries,
@@ -905,22 +936,23 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                       )}
                     />
                   </Grid>
-                  <Grid size={6}>
+                  <Grid size={12}>
                     <InfoField
                       label="eUICC 状态"
+                      loading={simLoading}
                       value={simInfo?.esim_status && simInfo.esim_status !== 'unknown' ? simInfo.esim_status : '未检测到 eUICC'}
                     />
                   </Grid>
-                  <Grid size={6}>
+                  <Grid size={12}>
                     <InfoField
                       label="身份读取状态"
+                      loading={simLoading}
                       value={simInfo?.iccid && simInfo?.imsi ? 'ICCID / IMSI 已读取' : '身份信息不完整'}
                     />
                   </Grid>
                 </Grid>
               </CardContent>
             </Card>
-          </Box>
         </Grid>
       </Grid>
 
@@ -936,24 +968,28 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
             <Grid size={{ xs: 12, sm: 6, lg: 3 }}>
               <InfoField
                 label="SIM 归属运营商"
+                loading={simLoading}
                 value={formatOperator(simInfo?.operator_name, simInfo?.mcc ? `${simInfo.mcc}${simInfo.mnc}` : '')}
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6, lg: 3 }}>
               <InfoField
                 label="当前注册网络"
+                loading={simLoading}
                 value={formatOperator(simInfo?.registered_operator_name, simInfo?.registered_operator_code)}
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6, lg: 3 }}>
               <InfoField
                 label="运营商配置文件"
+                loading={simLoading}
                 value={simInfo?.carrier_config || 'Default'}
               />
             </Grid>
             <Grid size={{ xs: 12, sm: 6, lg: 3 }}>
               <InfoField
                 label="配置文件版本"
+                loading={simLoading}
                 value={simInfo?.carrier_config_revision || 'N/A'}
               />
             </Grid>
