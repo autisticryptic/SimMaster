@@ -424,11 +424,11 @@ fn sync_parent(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn set_private_file_mode(path: &Path) -> Result<(), String> {
+fn set_private_file_mode(_path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o600))
             .map_err(|error| format!("config_maintenance_permissions:{error}"))?;
     }
     Ok(())

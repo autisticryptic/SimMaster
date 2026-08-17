@@ -1,14 +1,13 @@
 #![allow(dead_code)]
 
 use std::{
-    collections::HashMap,
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};

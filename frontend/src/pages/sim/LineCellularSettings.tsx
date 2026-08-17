@@ -80,7 +80,6 @@ export function LineNetworkOverview({ lineId, lineLabel }: SectionProps) {
         <OperatorSettings lineId={lineId} lineLabel={lineLabel} onData={handleOperators} />
       </Box>
       <Box borderTop={1} borderColor="divider" pt={2}>
-        <Typography variant="subtitle2" fontWeight={700} mb={1.5}>小区与频段控制</Typography>
         <CellsSettings lineId={lineId} lineLabel={lineLabel} onData={handleCells} />
       </Box>
     </Stack>
@@ -184,10 +183,14 @@ function CellsSettings({ lineLabel, lineId, onData }: CellsSettingsProps) {
       {error && <Alert severity="error">{error}</Alert>}
       {message && <Alert severity="success" onClose={() => setMessage(null)}>{message}</Alert>}
       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap">
-        <Typography variant="subtitle1" fontWeight={700} flexGrow={1}>小区锁定</Typography>
+        <Typography variant="subtitle1" fontWeight={700} flexGrow={1}>小区、射频与频段</Typography>
         <Button size="small" startIcon={<Refresh />} onClick={() => void load()} disabled={loading || busy !== null}>刷新</Button>
+        <FormControl size="small" sx={{ minWidth: 150 }}><InputLabel>射频模式</InputLabel><Select label="射频模式" value={radioMode} onChange={(event) => { const mode = event.target.value as RadioMode; void run('radio', () => api.setRadioMode(mode, lineId), '射频模式已更新').then(() => setRadioMode(mode)) }} disabled={radioMode === '' || busy !== null}><MenuItem value="auto">自动</MenuItem><MenuItem value="lte">仅 LTE</MenuItem><MenuItem value="nr">仅 5G NR</MenuItem></Select></FormControl>
         <Button size="small" color="warning" onClick={() => void run('unlock-cell', () => api.unlockAllCells(lineId), '已解除小区锁定')} disabled={busy !== null}>解除小区锁定</Button>
+        <Button size="small" color="warning" onClick={() => void run('unlock-bands', () => api.setBandLock(EMPTY_BANDS, lineId), '已解除频段限制')} disabled={!bands || busy !== null}>使用全部频段</Button>
+        <Button size="small" variant="contained" onClick={() => void run('bands', () => api.setBandLock(selection, lineId), '频段配置已应用')} disabled={!bands || busy !== null}>应用频段</Button>
       </Box>
+      <Typography variant="subtitle2" fontWeight={700}>扫描到的小区与频点</Typography>
       <TableContainer sx={{ maxHeight: 300 }}>
         <Table size="small" stickyHeader>
           <TableHead><TableRow><TableCell>类型/频段</TableCell><TableCell>ARFCN</TableCell><TableCell>PCI</TableCell><TableCell>RSRP</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead>
@@ -210,21 +213,13 @@ function CellsSettings({ lineLabel, lineId, onData }: CellsSettingsProps) {
           </TableBody>
         </Table>
       </TableContainer>
-
-      <Box borderTop={1} borderColor="divider" pt={2.5}>
-        <Box display="flex" alignItems="center" gap={1.5} flexWrap="wrap" mb={2}>
-          <Typography variant="subtitle1" fontWeight={700} flexGrow={1}>射频与频段</Typography>
-          <FormControl size="small" sx={{ minWidth: 150 }}><InputLabel>射频模式</InputLabel><Select label="射频模式" value={radioMode} onChange={(event) => { const mode = event.target.value as RadioMode; void run('radio', () => api.setRadioMode(mode, lineId), '射频模式已更新').then(() => setRadioMode(mode)) }} disabled={radioMode === '' || busy !== null}><MenuItem value="auto">自动</MenuItem><MenuItem value="lte">仅 LTE</MenuItem><MenuItem value="nr">仅 5G NR</MenuItem></Select></FormControl>
-          <Button size="small" color="warning" onClick={() => void run('unlock-bands', () => api.setBandLock(EMPTY_BANDS, lineId), '已解除频段限制')} disabled={!bands || busy !== null}>使用全部频段</Button>
-          <Button size="small" variant="contained" onClick={() => void run('bands', () => api.setBandLock(selection, lineId), '频段配置已应用')} disabled={!bands || busy !== null}>应用频段</Button>
-        </Box>
-        <Stack spacing={2}>
-          <BandGroup label="LTE FDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_fdd_bands ?? []} selected={selection.lte_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_fdd_bands: next }))} />
-          <BandGroup label="LTE TDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_tdd_bands ?? []} selected={selection.lte_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_tdd_bands: next }))} />
-          <BandGroup label="5G NR FDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_fdd_bands ?? []} selected={selection.nr_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_fdd_bands: next }))} />
-          <BandGroup label="5G NR TDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_tdd_bands ?? []} selected={selection.nr_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_tdd_bands: next }))} />
-        </Stack>
-      </Box>
+      <Typography variant="subtitle2" fontWeight={700}>可用频段</Typography>
+      <Stack spacing={2}>
+        <BandGroup label="LTE FDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_fdd_bands ?? []} selected={selection.lte_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_fdd_bands: next }))} />
+        <BandGroup label="LTE TDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_tdd_bands ?? []} selected={selection.lte_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_tdd_bands: next }))} />
+        <BandGroup label="5G NR FDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_fdd_bands ?? []} selected={selection.nr_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_fdd_bands: next }))} />
+        <BandGroup label="5G NR TDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_tdd_bands ?? []} selected={selection.nr_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_tdd_bands: next }))} />
+      </Stack>
     </Stack>
   )
 }

@@ -232,17 +232,27 @@ function WorkbenchOverview({ line }: { line: VolteLineControlResponse }) {
 
   useEffect(() => {
     let active = true
-    void Promise.allSettled([
-      api.getSimInfo(line.modem.line_id),
-      api.getNetworkInfo(line.modem.line_id),
-      api.getVowifiLine(line.modem.line_id),
-    ]).then(([simResult, networkResult, vowifiResult]) => {
-      if (!active) return
-      setSimInfo(simResult.status === 'fulfilled' ? simResult.value.data ?? null : null)
-        setNetworkInfo(networkResult.status === 'fulfilled' ? networkResult.value.data ?? null : null)
-        setVowifi(vowifiResult.status === 'fulfilled' ? vowifiResult.value.data ?? null : null)
-      })
-    return () => { active = false }
+    const lineId = line.modem.line_id
+    // These requests deliberately settle independently: the overview can show
+    // cached SIM identity immediately without waiting for slower network/IMS IO.
+    void api.getSimInfo(lineId)
+      .then((response) => { if (active) setSimInfo(response.data ?? null) })
+      .catch(() => { if (active) setSimInfo(null) })
+
+    const refreshRuntime = () => {
+      void api.getNetworkInfo(lineId)
+        .then((response) => { if (active) setNetworkInfo(response.data ?? null) })
+        .catch(() => { if (active) setNetworkInfo(null) })
+      void api.getVowifiLine(lineId)
+        .then((response) => { if (active) setVowifi(response.data ?? null) })
+        .catch(() => { if (active) setVowifi(null) })
+    }
+    refreshRuntime()
+    const timer = window.setInterval(refreshRuntime, 5_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
   }, [line.modem.line_id])
 
   const progress = (() => {
@@ -1054,7 +1064,7 @@ export default function SimCardPage() {
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
+        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>

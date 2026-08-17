@@ -5020,12 +5020,17 @@ fn map_register_failure(failure: &RegisterFailure) -> VolteError {
 }
 
 fn should_retain_failed_bearer(error: &VolteError) -> bool {
-    matches!(
-        error.code(),
-        code::REGISTER_INITIAL_UNEXPECTED_STATUS | code::REGISTER_AUTH_UNEXPECTED_STATUS
-    ) && error
-        .detail()
-        .is_some_and(|detail| detail.contains("sip_status="))
+    match error.code() {
+        // Qualcomm 410 firmware has a short-lived WDS teardown race when
+        // every P-CSCF candidate is rejected/unreachable. Keep the connected
+        // bearer alive for the same bounded grace period used for terminal SIP
+        // failures instead of disconnecting it in the crash window.
+        code::RUNTIME_ALL_PCSCF_FAILED => true,
+        code::REGISTER_INITIAL_UNEXPECTED_STATUS | code::REGISTER_AUTH_UNEXPECTED_STATUS => error
+            .detail()
+            .is_some_and(|detail| detail.contains("sip_status=")),
+        _ => false,
+    }
 }
 
 fn log_volte_register_request_metadata(
@@ -5699,6 +5704,10 @@ mod tests {
         assert!(!local_error
             .detail()
             .is_some_and(|detail| detail.contains("sip_status=")));
+
+        assert!(should_retain_failed_bearer(&VolteError::new(
+            code::RUNTIME_ALL_PCSCF_FAILED,
+        )));
     }
 
     #[test]

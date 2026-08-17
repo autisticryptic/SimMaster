@@ -643,6 +643,8 @@ async fn main() -> Result<()> {
 
     // Connect to system D-Bus
     let dbus_conn = Arc::new(Connection::system().await?);
+    let device_kind = hardware::devices::detect_device_kind();
+    info!(?device_kind, "Detected hardware device kind");
 
     // 创建 SMS 数据库（存储在可执行文件同级目录）
     let db_path = get_data_db_path();
