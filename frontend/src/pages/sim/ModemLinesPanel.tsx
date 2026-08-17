@@ -596,8 +596,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Lan color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>数据连接</Typography>
                       </Box>
-                      <Box minWidth={0} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
-                        <Typography variant="caption" color="text.secondary" display="block" sx={{ wordBreak: 'break-word' }}>
+                      <Box minWidth={0} display="flex" alignItems="baseline" gap={0.75} flexWrap="wrap" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
+                        <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>
                         {networkLoadLabel
                           ? networkLoadLabel
                           : !line.modem.present
@@ -608,7 +608,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                             ? `${network.data.proxy.listen_ip || network.data.config.listen_ip}:${network.data.proxy.port} · ${network.data.proxy.interface_name || '移动数据网卡'}`
                             : network?.data.enabled ? network.data.proxy.stage || '正在建立移动数据出口' : '流量未启用'}
                         </Typography>
-                        <Typography variant="caption" color="text.disabled" display="block" noWrap>
+                        <Typography variant="caption" color="text.disabled" noWrap>
                           {networkLoadLabel
                             ? '状态返回后自动更新'
                             : network?.data.proxy.traffic_used

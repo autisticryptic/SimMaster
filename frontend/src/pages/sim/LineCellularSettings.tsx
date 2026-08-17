@@ -42,17 +42,46 @@ type Props = {
 }
 
 type SectionProps = { lineLabel: string; lineId: string }
+type CellsSettingsProps = SectionProps & { onData?: (data: CellsResponse | null) => void }
+type OperatorSettingsProps = SectionProps & { onData?: (data: OperatorListResponse | null) => void }
 
 export function LineNetworkOverview({ lineId, lineLabel }: SectionProps) {
+  const [operatorSummary, setOperatorSummary] = useState<{ lineId: string, data: OperatorListResponse | null } | null>(null)
+  const [cellSummary, setCellSummary] = useState<{ lineId: string, data: CellsResponse | null } | null>(null)
+  const operators = operatorSummary?.lineId === lineId ? operatorSummary.data : undefined
+  const cells = cellSummary?.lineId === lineId ? cellSummary.data : undefined
+  const cellCount = cells?.cells.filter((cell) => Boolean(cell.pci)).length ?? 0
+  const frequencyCount = new Set((cells?.cells ?? []).map((cell) => cell.arfcn || cell.earfcn || cell.nrarfcn).filter(Boolean)).size
+  const handleOperators = useCallback((data: OperatorListResponse | null) => setOperatorSummary({ lineId, data }), [lineId])
+  const handleCells = useCallback((data: CellsResponse | null) => setCellSummary({ lineId, data }), [lineId])
+
   return (
     <Stack spacing={2}>
+      <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: 'repeat(2, minmax(0, 1fr))' }} gap={1.25}>
+        <Box>
+          <Typography variant="caption" color="text.secondary">服务小区</Typography>
+          <Typography variant="body2">
+            {cells === undefined
+              ? '正在读取…'
+              : cells?.serving_cell ? `${cells.serving_cell.tech.toUpperCase()} · ${cells.serving_cell.cell_id}` : '未读取'}
+          </Typography>
+        </Box>
+        <Box>
+          <Typography variant="caption" color="text.secondary">发现网络</Typography>
+          <Typography variant="body2">
+            {operators === undefined || cells === undefined
+              ? '正在读取…'
+              : `${operators?.operators.length ?? 0} 个运营商 · ${cellCount} 个小区 · ${frequencyCount} 个频点`}
+          </Typography>
+        </Box>
+      </Box>
       <Box>
         <Typography variant="subtitle2" fontWeight={700} mb={1.5}>扫描与注册</Typography>
-        <OperatorSettings lineId={lineId} lineLabel={lineLabel} />
+        <OperatorSettings lineId={lineId} lineLabel={lineLabel} onData={handleOperators} />
       </Box>
       <Box borderTop={1} borderColor="divider" pt={2}>
         <Typography variant="subtitle2" fontWeight={700} mb={1.5}>小区与频段控制</Typography>
-        <CellsSettings lineId={lineId} lineLabel={lineLabel} />
+        <CellsSettings lineId={lineId} lineLabel={lineLabel} onData={handleCells} />
       </Box>
     </Stack>
   )
@@ -90,7 +119,7 @@ function BandGroup({ label, supported, selected, onChange, prefix, loading = fal
   )
 }
 
-function CellsSettings({ lineLabel, lineId }: SectionProps) {
+function CellsSettings({ lineLabel, lineId, onData }: CellsSettingsProps) {
   const [cells, setCells] = useState<CellsResponse | null>(null)
   const [bands, setBands] = useState<BandLockStatus | null>(null)
   const [selection, setSelection] = useState<BandLockRequest>(EMPTY_BANDS)
@@ -104,7 +133,11 @@ function CellsSettings({ lineLabel, lineId }: SectionProps) {
     setLoading(true)
     setError(null)
     const cellsRequest = api.getCellsInfo(lineId)
-      .then((response) => setCells(response.data ?? null))
+      .then((response) => {
+        const data = response.data ?? null
+        setCells(data)
+        onData?.(data)
+      })
     const bandsRequest = api.getBandLockStatus(lineId)
       .then((response) => {
         if (!response.data) return
@@ -127,7 +160,7 @@ function CellsSettings({ lineLabel, lineId }: SectionProps) {
       .filter((name): name is string => name !== null)
     if (failedSections.length > 0) setError(`${failedSections.join('、')}信息暂时加载失败`)
     setLoading(false)
-  }, [lineId])
+  }, [lineId, onData])
 
   useEffect(() => { void load() }, [load])
 
@@ -164,7 +197,7 @@ function CellsSettings({ lineLabel, lineId }: SectionProps) {
               const canLock = Number.isFinite(Number(arfcn)) && Number.isFinite(Number(cell.pci)) && arfcn !== '' && cell.pci !== ''
               return (
                 <TableRow key={`${cell.tech}-${arfcn}-${cell.pci}-${index}`}>
-                  <TableCell><Stack direction="row" spacing={0.5}><Chip size="small" label={cell.tech.toUpperCase()} color={cell.is_serving ? 'primary' : 'default'} /><Typography variant="body2">{cell.band || '-'}</Typography></Stack></TableCell>
+                  <TableCell><Stack direction="row" spacing={0.5}><Chip size="small" label={cell.is_serving ? '服务小区' : canLock ? cell.tech.toUpperCase() : '候选频点'} color={cell.is_serving ? 'primary' : 'default'} /><Typography variant="body2">{cell.band || '-'}</Typography></Stack></TableCell>
                   <TableCell sx={{ fontFamily: 'monospace' }}>{arfcn || '-'}</TableCell>
                   <TableCell sx={{ fontFamily: 'monospace' }}>{cell.pci || '-'}</TableCell>
                   <TableCell>{cell.rsrp || cell.ssb_rsrp || '-'}</TableCell>
@@ -196,19 +229,20 @@ function CellsSettings({ lineLabel, lineId }: SectionProps) {
   )
 }
 
-function OperatorSettings({ lineLabel, lineId }: SectionProps) {
+function OperatorSettings({ lineLabel, lineId, onData }: OperatorSettingsProps) {
   const [data, setData] = useState<OperatorListResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const load = useCallback(async () => { setLoading(true); try { const response = await api.getOperators(lineId); setData(response.data ?? null) } catch (err) { setError(errorText(err)) } finally { setLoading(false) } }, [lineId])
+  const updateData = useCallback((data: OperatorListResponse | null) => { setData(data); onData?.(data) }, [onData])
+  const load = useCallback(async () => { setLoading(true); try { const response = await api.getOperators(lineId); updateData(response.data ?? null) } catch (err) { setError(errorText(err)) } finally { setLoading(false) } }, [lineId, updateData])
   useEffect(() => { void load() }, [load])
   const run = async (key: string, action: () => Promise<unknown>) => { setBusy(key); setError(null); try { await action(); await load() } catch (err) { setError(errorText(err)) } finally { setBusy(null) } }
   return (
     <Stack spacing={2}>
       <Alert severity="warning">运营商扫描和重新注册会中断 {lineLabel} 当前驻网，通话或短信期间请勿操作。</Alert>
       {error && <Alert severity="error">{error}</Alert>}
-      <Box display="flex" gap={1} justifyContent="flex-end" flexWrap="wrap"><Button startIcon={<Refresh />} onClick={() => void load()} disabled={loading || busy !== null}>刷新</Button><Button startIcon={<TravelExplore />} onClick={() => void run('scan', async () => { const response = await api.scanOperators(lineId); setData(response.data ?? null) })} disabled={loading || busy !== null}>{busy === 'scan' ? '扫描中…' : '扫描运营商'}</Button><Button variant="contained" onClick={() => void run('auto', () => api.registerOperatorAuto(lineId))} disabled={loading || busy !== null}>自动注册</Button></Box>
+      <Box display="flex" gap={1} justifyContent="flex-end" flexWrap="wrap"><Button startIcon={<Refresh />} onClick={() => void load()} disabled={loading || busy !== null}>刷新</Button><Button startIcon={<TravelExplore />} onClick={() => void run('scan', async () => { const response = await api.scanOperators(lineId); updateData(response.data ?? null) })} disabled={loading || busy !== null}>{busy === 'scan' ? '扫描中…' : '扫描运营商'}</Button><Button variant="contained" onClick={() => void run('auto', () => api.registerOperatorAuto(lineId))} disabled={loading || busy !== null}>自动注册</Button></Box>
       <TableContainer><Table size="small"><TableHead><TableRow><TableCell>运营商</TableCell><TableCell>PLMN</TableCell><TableCell>制式</TableCell><TableCell>状态</TableCell><TableCell align="right">操作</TableCell></TableRow></TableHead><TableBody>{(data?.operators ?? []).map((item) => { const plmn = `${item.mcc}${item.mnc}`; return <TableRow key={`${item.path}-${plmn}`}><TableCell>{item.name || '未知运营商'}</TableCell><TableCell sx={{ fontFamily: 'monospace' }}>{plmn || '-'}</TableCell><TableCell>{item.technologies.join(' / ') || '-'}</TableCell><TableCell><Chip size="small" label={item.status === 'current' ? '当前网络' : item.status} color={item.status === 'current' ? 'success' : 'default'} variant="outlined" /></TableCell><TableCell align="right"><Button size="small" disabled={!plmn || item.status === 'current' || busy !== null} onClick={() => void run(plmn, () => api.registerOperatorManual(plmn, lineId))}>注册</Button></TableCell></TableRow>})}{loading && !data && <TableRow><TableCell colSpan={5} align="center"><Box display="flex" justifyContent="center" alignItems="center" gap={1}><CircularProgress size={16} />正在读取运营商数据</Box></TableCell></TableRow>}{!loading && (data?.operators.length ?? 0) === 0 && <TableRow><TableCell colSpan={5} align="center">暂无运营商数据</TableCell></TableRow>}</TableBody></Table></TableContainer>
     </Stack>
   )

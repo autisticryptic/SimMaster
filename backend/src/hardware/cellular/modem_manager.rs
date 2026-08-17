@@ -2626,6 +2626,20 @@ fn finish_qmicli_cell(
     cells.push(cell);
 }
 
+fn finish_qmicli_frequency(cells: &mut Vec<CellInfo>, earfcn: &str, band: &str) {
+    if earfcn.is_empty() || cells.iter().any(|cell| cell.earfcn == earfcn) {
+        return;
+    }
+    cells.push(CellInfo {
+        tech: "lte".to_string(),
+        band: band.to_string(),
+        arfcn: earfcn.to_string(),
+        earfcn: earfcn.to_string(),
+        cell_type: "LTE frequency".to_string(),
+        ..Default::default()
+    });
+}
+
 fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
@@ -2651,6 +2665,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
         let trimmed = line.trim();
         if trimmed.starts_with("Intrafrequency LTE Info") {
             finish_qmicli_cell(&mut cells, &mut current_cell, &serving_pci);
+            finish_qmicli_frequency(&mut cells, &current_earfcn, &current_band);
             section = Section::IntraLte;
             current_earfcn.clear();
             current_band.clear();
@@ -2658,6 +2673,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
         }
         if trimmed.starts_with("Interfrequency LTE Info") {
             finish_qmicli_cell(&mut cells, &mut current_cell, &serving_pci);
+            finish_qmicli_frequency(&mut cells, &current_earfcn, &current_band);
             section = Section::InterLte;
             current_earfcn.clear();
             current_band.clear();
@@ -2665,6 +2681,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
         }
         if trimmed.starts_with("LTE Info Neighboring") || trimmed.starts_with("LTE Timing") {
             finish_qmicli_cell(&mut cells, &mut current_cell, &serving_pci);
+            finish_qmicli_frequency(&mut cells, &current_earfcn, &current_band);
             section = Section::Other;
             continue;
         }
@@ -2674,6 +2691,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
 
         if trimmed.starts_with("Frequency [") {
             finish_qmicli_cell(&mut cells, &mut current_cell, &serving_pci);
+            finish_qmicli_frequency(&mut cells, &current_earfcn, &current_band);
             current_earfcn.clear();
             current_band.clear();
             continue;
@@ -2753,6 +2771,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
         }
     }
     finish_qmicli_cell(&mut cells, &mut current_cell, &serving_pci);
+    finish_qmicli_frequency(&mut cells, &current_earfcn, &current_band);
 
     if !serving_pci.is_empty() && !cells.iter().any(|cell| cell.is_serving) {
         if let Some(first) = cells.first_mut() {
@@ -2980,6 +2999,37 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(parsed.cells[2].band, "B1");
         assert_eq!(parsed.cells[2].earfcn, "100");
         assert_eq!(parsed.cells[2].pci, "76");
+    }
+
+    #[test]
+    fn preserves_interfrequency_candidates_without_reported_cells() {
+        let output = r#"Intrafrequency LTE Info
+        Tracking Area Code: '15102'
+        Global Cell ID: '55281991'
+        EUTRA Absolute RF Channel Number: '250' (E-UTRA band 1: 2100)
+        Serving Cell ID: '56'
+        Cell [0]:
+                Physical Cell ID: '56'
+                RSRQ: '-11.7' dB
+                RSRP: '-90.7' dBm
+Interfrequency LTE Info
+        Frequency [0]:
+                EUTRA Absolute RF Channel Number: '1300' (E-UTRA band 3: 1800+)
+        Frequency [1]:
+                EUTRA Absolute RF Channel Number: '2450' (E-UTRA band 5: 850)
+LTE Timing Advance: 'unavailable'"#;
+
+        let parsed = parse_qmicli_cell_location_output(output);
+
+        assert_eq!(parsed.cells.len(), 3);
+        assert_eq!(parsed.cells[0].band, "B1");
+        assert_eq!(parsed.cells[0].pci, "56");
+        assert_eq!(parsed.cells[1].band, "B3");
+        assert_eq!(parsed.cells[1].earfcn, "1300");
+        assert!(parsed.cells[1].pci.is_empty());
+        assert_eq!(parsed.cells[2].band, "B5");
+        assert_eq!(parsed.cells[2].earfcn, "2450");
+        assert!(parsed.cells[2].pci.is_empty());
     }
 
     #[test]
