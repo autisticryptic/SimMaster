@@ -709,8 +709,8 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                       label="SIM 状态"
                       value={
                         <Chip
-                          label={simInfo?.present ? '已插入' : '未插入'}
-                          color={simInfo?.present ? 'success' : 'error'}
+                          label={simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未插入'}
+                          color={simInfo?.present ? (simInfo.active ? 'success' : 'warning') : 'error'}
                           size="small"
                           sx={{ height: 20, fontSize: '0.75rem' }}
                         />
@@ -819,6 +819,14 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                       value={simInfo?.imsi || 'N/A'}
                     />
                   </Grid>
+                  <Grid size={12}>
+                    <InfoField
+                      label="设备 IMEI"
+                      sensitive
+                      showSensitive={showSensitive}
+                      value={deviceInfo?.imei || 'N/A'}
+                    />
+                  </Grid>
                 </Grid>
               </CardContent>
             </Card>
@@ -844,14 +852,6 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   </Grid>
                   <Grid size={6}>
                     <InfoField
-                      label="IMEI"
-                      sensitive
-                      showSensitive={showSensitive}
-                      value={deviceInfo?.imei || 'N/A'}
-                    />
-                  </Grid>
-                  <Grid size={6}>
-                    <InfoField
                       label="QMI / UIM"
                       value={`${line.modem.qmi_device || '未发现'} · Slot ${line.modem.uim_slot}`}
                     />
@@ -859,7 +859,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                   <Grid size={6}><InfoField label="硬件家族" value={line.modem.device_family || 'generic_modem'} /></Grid>
                   <Grid size={6}><InfoField label="控制通道" value={line.modem.control_transport || 'modemmanager'} /></Grid>
                   <Grid size={6}><InfoField label="主控制端口" value={line.modem.primary_port || '未发现'} /></Grid>
-                  <Grid size={6}><InfoField label="SIM 路径" value={simInfo?.sim_path || line.modem.sim_path || 'N/A'} /></Grid>
+                  <Grid size={12}><InfoField label="SIM 路径" value={simInfo?.sim_path || line.modem.sim_path || 'N/A'} /></Grid>
                   <Grid size={12}><InfoField label="ModemManager 路径" value={simInfo?.modem_path || line.modem.modem_path || 'N/A'} /></Grid>
                 </Grid>
               </CardContent>
@@ -871,13 +871,13 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
           <Box display="flex" flexDirection="column" gap={2} sx={{ flexGrow: 1, minWidth: 0 }}>
             {controls}
 
-            <Card sx={{ flex: 1, minHeight: 248, display: 'flex', flexDirection: 'column' }}>
+            <Card>
               <CardHeader
                 avatar={<LockIcon color="primary" />}
                 title="安全与锁卡状态"
                 titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
               />
-              <CardContent sx={{ pt: 0, flex: 1 }}>
+              <CardContent sx={{ pt: 0 }}>
                 <Grid container spacing={2} sx={{ width: '100%' }}>
                   <Grid size={6}>
                     <InfoField
@@ -903,18 +903,6 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
                         simInfo?.pin2_retries,
                         simInfo?.puk2_retries
                       )}
-                    />
-                  </Grid>
-                  <Grid size={6}>
-                    <InfoField
-                      label="SIM 可用状态"
-                      value={simInfo?.present ? (simInfo.active ? '已插入并启用' : '已插入但未启用') : '未检测到 SIM'}
-                    />
-                  </Grid>
-                  <Grid size={6}>
-                    <InfoField
-                      label="卡片类型"
-                      value={formatSimType(simInfo?.sim_type, simInfo?.esim_status)}
                     />
                   </Grid>
                   <Grid size={6}>

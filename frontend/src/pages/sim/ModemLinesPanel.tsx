@@ -525,19 +525,20 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             // ModemManager object are hidden.
             const isReader = line.modem.line_kind === 'reader'
             const overviewControls = !isReader ? (
-              <Card>
+              <Card sx={{ flex: 1, minHeight: { sm: 340 }, display: 'flex', flexDirection: 'column' }}>
                 <CardHeader
                   avatar={<Tune color="primary" />}
                   title="线路控制"
                   titleTypographyProps={{ variant: 'subtitle1', fontWeight: 600 }}
                   sx={{ pb: 0.75 }}
                 />
-                <CardContent sx={{ pt: 0, pb: '12px !important' }}>
+                <CardContent sx={{ pt: 0, pb: '12px !important', flex: 1 }}>
                   <Box
                     display="grid"
                     gridTemplateColumns={{ xs: 'minmax(0, 1fr)', sm: 'repeat(2, minmax(0, 1fr))' }}
-                    gridAutoRows="minmax(116px, auto)"
+                    gridAutoRows="minmax(132px, 1fr)"
                     gap={1.25}
+                    height="100%"
                   >
                 <Box sx={{ p: 1.25, border: '1px solid', borderColor: 'divider', borderRadius: 1, height: '100%', display: 'flex', flexDirection: 'column' }}>
                   <Box display="flex" justifyContent="space-between" alignItems="flex-start" gap={1}>

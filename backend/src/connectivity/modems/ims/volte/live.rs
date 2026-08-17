@@ -5053,6 +5053,9 @@ fn log_volte_register_request_metadata(
         sec_agree_required = variant.policy.require_sec_agree,
         proxy_sec_agree_required = variant.policy.proxy_require_sec_agree,
         mmtel_features_present = variant.policy.include_mmtel_features,
+        sms_over_ip_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains("+g.3gpp.smsip")),
         accept_contact_count = sip::header_values(request, "Accept-Contact").len(),
         request_bytes = request.len(),
         sensitive_values = "redacted",

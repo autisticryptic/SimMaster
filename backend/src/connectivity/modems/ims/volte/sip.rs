@@ -436,6 +436,7 @@ fn build_register_internal(
         local_port,
         route.transport.as_param(),
     );
+    let mut advertises_sms_over_ip = false;
     if let Some(profile) =
         profile.filter(|profile| !profile.ims.register.contact_param_order.is_empty())
     {
@@ -447,6 +448,9 @@ fn build_register_internal(
             if name.eq_ignore_ascii_case("video") && !policy.include_video_feature {
                 continue;
             }
+            if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
+                advertises_sms_over_ip = true;
+            }
             contact.push(';');
             contact.push_str(parameter);
         }
@@ -456,11 +460,15 @@ fn build_register_internal(
             contact.push_str(";audio");
         }
         contact.push_str(";+g.3gpp.smsip");
+        advertises_sms_over_ip = true;
         if policy.include_mmtel_features {
             contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
         }
         contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
         contact.push_str(&format!(";expires={expires}"));
+    }
+    if !advertises_sms_over_ip {
+        contact.push_str(";+g.3gpp.smsip");
     }
     if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
         contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
@@ -1299,6 +1307,70 @@ mod tests {
         assert!(!disabled.contains(";video"));
         let enabled = String::from_utf8(build(true)).unwrap();
         assert!(enabled.contains(";audio;video;+g.3gpp.smsip"));
+        assert_eq!(
+            enabled
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn carrier_register_adds_missing_sms_over_ip_feature_tag_once() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &["+g.3gpp.mid-call"];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert!(contact.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert_eq!(
+            contact
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn carrier_register_recognizes_existing_sms_feature_tag_case_insensitively() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &["audio", "+G.3GPP.SMSIP"];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert_eq!(
+            contact
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
     }
 
     #[test]

@@ -3406,6 +3406,7 @@ async fn run_register_exchange_on_connected_stream(
     let mut context = LiveRegisterRequestContext::new_for_line(
         line_id, profile, identity, local_addr, pcscf_addr,
     )?;
+    let request = context.build_initial_request(profile, variant);
     info!(
         pcscf_family = ip_family_name(pcscf_addr),
         identity_source = profile.ims.identity_source,
@@ -3429,6 +3430,7 @@ async fn run_register_exchange_on_connected_stream(
             variant.suppress_sec_agree_headers,
         ),
         contact_feature_count = context.contact_feature_count(profile, variant.header_profile),
+        sms_over_ip_advertised = request.to_ascii_lowercase().contains("+g.3gpp.smsip"),
         local_port = local_addr.port(),
         expected_header_port = profile.ims.local_port,
         sip_instance_present = matches!(
@@ -3438,7 +3440,6 @@ async fn run_register_exchange_on_connected_stream(
         security_client_present = variant.include_security_client,
         "IMS REGISTER request metadata prepared"
     );
-    let request = context.build_initial_request(profile, variant);
     let mut authenticator = VowifiRegisterAuthenticator {
         line_id,
         profile,
@@ -5675,6 +5676,7 @@ impl LiveRegisterRequestContext {
             user_phone,
             self.transport.as_param()
         );
+        let mut advertises_sms_over_ip = false;
         if !_header_profile.compact_register && !profile.ims.register.contact_param_order.is_empty()
         {
             for parameter in profile.ims.register.contact_param_order {
@@ -5685,6 +5687,9 @@ impl LiveRegisterRequestContext {
                 if name.eq_ignore_ascii_case("video") && !self.video_capability_enabled {
                     continue;
                 }
+                if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
+                    advertises_sms_over_ip = true;
+                }
                 header.push(';');
                 header.push_str(parameter);
             }
@@ -5694,15 +5699,20 @@ impl LiveRegisterRequestContext {
                 LiveContactFeatureSet::SmsOnly => {
                     header.push_str(";+g.3gpp.accesstype=\"IEEE-802.11\"");
                     header.push_str(";+g.3gpp.smsip");
+                    advertises_sms_over_ip = true;
                 }
                 LiveContactFeatureSet::MmtelSmsSipInstance => {
                     header.push_str(";+g.3gpp.accesstype=\"IEEE-802.11\"");
                     header.push_str(";audio");
                     header.push_str(";+g.3gpp.smsip");
+                    advertises_sms_over_ip = true;
                     header.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", IMS_MMTEL_ICSI_REF));
                     header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
                 }
             }
+        }
+        if !_header_profile.compact_register && !advertises_sms_over_ip {
+            header.push_str(";+g.3gpp.smsip");
         }
         if profile.ims.register.always_add_sip_instance && !_header_profile.compact_register {
             // RFC 5626 flow registration. `reg-id=1` pairs with +sip.instance;
@@ -8464,6 +8474,51 @@ mod tests {
         assert!(!disabled.contains(";video"));
         let enabled = build(true);
         assert!(enabled.contains(";audio;video;+g.3gpp.smsip"));
+        assert_eq!(
+            enabled
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn vowifi_catalog_register_adds_missing_sms_over_ip_feature_tag() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.contact_param_order = &["+g.3gpp.mid-call"];
+        let profile = Box::leak(Box::new(profile));
+        let context = LiveRegisterRequestContext::new_with_target_and_device(
+            profile,
+            live_ims_target("", profile),
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "fixture",
+            },
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+            None,
+            false,
+        )
+        .unwrap();
+        let request = context.build_initial_request(
+            profile,
+            register_variant("profile_default_spaced_sec_client"),
+        );
+        assert!(request.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert_eq!(
+            request
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
+            1
+        );
     }
 
     #[test]
