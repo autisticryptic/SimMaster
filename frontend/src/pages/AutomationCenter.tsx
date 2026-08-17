@@ -86,9 +86,10 @@ type AutomationCenterProps = {
   lineId?: string
   embedded?: boolean
   fixedTarget?: AutomationTarget
+  targetIsReader?: boolean
 }
 
-export default function AutomationCenter({ lineId, embedded = false, fixedTarget }: AutomationCenterProps) {
+export default function AutomationCenter({ lineId, embedded = false, fixedTarget, targetIsReader = false }: AutomationCenterProps) {
   const [tab, setTab] = useState(0)
   const [loading, setLoading] = useState(true)
   const [testingTaskId, setTestingTaskId] = useState<string | null>(null)
@@ -749,6 +750,7 @@ export default function AutomationCenter({ lineId, embedded = false, fixedTarget
         onSave={handleSaveTask}
         fixedLineId={lineId}
         fixedTarget={fixedTarget}
+        targetIsReader={targetIsReader}
       />
 
       {/* 弹窗 2：自动清理配置 */}

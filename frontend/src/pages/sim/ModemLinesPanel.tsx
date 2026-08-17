@@ -81,6 +81,25 @@ function trunkRuntimeLabel(line?: TrunkProfileResponse) {
   return line.runtime.stage || '等待启动'
 }
 
+function trunkProfileCanEnable(line: TrunkProfileResponse) {
+  const profile = line.trunk
+  return Boolean(
+    profile.asterisk_host.trim()
+      && profile.asterisk_port >= 1
+      && profile.asterisk_port <= 65535
+      && profile.local_port >= 1
+      && profile.local_port <= 65535
+      && (
+        profile.registration_mode !== 'outbound_register'
+          || (
+            profile.username.trim()
+              && profile.register_expiry_secs >= 60
+              && profile.register_expiry_secs <= 86400
+          )
+      ),
+  )
+}
+
 const vowifiStageLabels: Record<string, string> = {
   disabled: '未启用', starting: '正在启动', identity_ready: 'SIM 身份已读取',
   profile_matched: '运营商配置已匹配', sim_auth_ready: 'SIM AKA 已就绪',
@@ -143,6 +162,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
+  const [enableTrunkOnOpen, setEnableTrunkOnOpen] = useState(false)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [editingDataLineId, setEditingDataLineId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
@@ -415,6 +435,14 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleTrunk = async (lineId: string, enabled: boolean) => {
+    const currentLine = trunkLines.find((line) => line.line_id === lineId)
+    if (enabled && currentLine && !trunkProfileCanEnable(currentLine)) {
+      setError(null)
+      setSuccess(null)
+      setEnableTrunkOnOpen(true)
+      setEditingTrunkLine(currentLine)
+      return
+    }
     setSavingKey(`trunk:${lineId}`)
     setError(null)
     setSuccess(null)
@@ -735,8 +763,8 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       <Tab value="esim" label="eSIM" />
                       <Tab value="ims" label="IMS 与 Trunk" />
                       <Tab value="sms" label="短信" />
-                      <Tab value="notifications" label="通知" />
                       <Tab value="automation" label="自动化" />
+                      <Tab value="notifications" label="通知" />
                     </Tabs>
                   )}
                   <CardContent sx={{ pt: 0 }}>
@@ -845,7 +873,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Button
                           size="small"
                           variant="text"
-                          onClick={() => trunkLine && setEditingTrunkLine(trunkLine)}
+                          onClick={() => {
+                            setEnableTrunkOnOpen(false)
+                            if (trunkLine) setEditingTrunkLine(trunkLine)
+                          }}
                           disabled={!trunkLine || savingKey !== null}
                         >
                           配置
@@ -896,7 +927,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       <TrunkProfileDialog
         open={editingTrunkLine !== null}
         line={editingTrunkLine}
-        onClose={() => setEditingTrunkLine(null)}
+        enableOnOpen={enableTrunkOnOpen}
+        onClose={() => {
+          setEditingTrunkLine(null)
+          setEnableTrunkOnOpen(false)
+        }}
         onSaved={handleTrunkSaved}
       />
       <VowifiLineDialog

@@ -30,6 +30,7 @@ import { shortLineId } from '../../components/modemLineFormat'
 interface TrunkProfileDialogProps {
   open: boolean
   line: TrunkProfileResponse | null
+  enableOnOpen?: boolean
   onClose: () => void
   onSaved: (line: TrunkProfileResponse) => void
 }
@@ -42,7 +43,7 @@ function cloneProfile(profile: TrunkProfileConfig): TrunkProfileConfig {
   }
 }
 
-export default function TrunkProfileDialog({ open, line, onClose, onSaved }: TrunkProfileDialogProps) {
+export default function TrunkProfileDialog({ open, line, enableOnOpen = false, onClose, onSaved }: TrunkProfileDialogProps) {
   const [draft, setDraft] = useState<TrunkProfileConfig | null>(null)
   const [codecText, setCodecText] = useState('')
   const [saving, setSaving] = useState(false)
@@ -50,10 +51,10 @@ export default function TrunkProfileDialog({ open, line, onClose, onSaved }: Tru
 
   useEffect(() => {
     if (!line) return
-    setDraft(cloneProfile(line.trunk))
+    setDraft({ ...cloneProfile(line.trunk), enabled: enableOnOpen || line.trunk.enabled })
     setCodecText(line.trunk.codec_allow.join(', '))
     setError(null)
-  }, [line, open])
+  }, [enableOnOpen, line, open])
 
   const validationError = useMemo(() => {
     if (!draft) return '没有可编辑的线路'

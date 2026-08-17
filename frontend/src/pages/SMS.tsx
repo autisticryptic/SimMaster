@@ -45,7 +45,6 @@ import {
 } from '@mui/icons-material'
 import { api, type SmsChannelResponse, type SmsMessage, type SmsStats, type VolteLineControlResponse } from '../api/current'
 import ModemLineSelector from '../components/ModemLineSelector'
-import { shortLineId } from '../components/modemLineFormat'
 import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
 interface ConversationGroup {
@@ -363,22 +362,11 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
     return () => clearInterval(interval)
   }, [fetchLines, fetchMessages, fetchStats])
 
-  const lineNameById = useMemo(() => new Map(
-    volteLines.map((line, index) => [line.modem.line_id, `线路 ${index + 1}`]),
-  ), [volteLines])
-
   const channelById = useMemo(() => new Map(
     smsChannels.map((channel) => [channel.id, channel]),
   ), [smsChannels])
   const selectedChannel = selectedChannelId ? channelById.get(selectedChannelId) : undefined
   const channelCannotSend = Boolean(selectedChannel && selectedChannel.kind !== 'modem_line')
-
-  const messageLineLabel = useCallback((lineId?: string) => {
-    if (!lineId) return ''
-    return channelById.get(lineId)?.label
-      ?? lineNameById.get(lineId)
-      ?? (lineId.startsWith('reader:') ? lineId.slice('reader:'.length) : `线路 ${shortLineId(lineId)}`)
-  }, [channelById, lineNameById])
 
   const selectChannel = (channelId: string) => {
     setSelectedChannelId(channelId)
@@ -529,8 +517,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
       const response = await api.sendSms(selectedLineId, phoneNumber, content)
       if (response.status === 'ok') {
         const path = smsTransportInfo(response.data?.transport ?? response.data?.path).label
-        const usedLine = response.data?.line_id ? `（${messageLineLabel(response.data.line_id)}）` : ''
-        setSuccess(`短信已通过 ${path}${usedLine} 发送到 ${phoneNumber}`)
+        setSuccess(`短信已通过 ${path} 发送到 ${phoneNumber}`)
         setContent('')
         setTimeout(() => {
           void fetchMessages()
@@ -1023,8 +1010,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
                     secondary={
                       <Typography variant="body2" color="text.secondary" noWrap sx={{ maxWidth: 180 }}>
                         {displayMessage.direction === 'outgoing' ? '你: ' : ''}
-                        [{smsTransportInfo(displayMessage.transport).label}
-                        {displayMessage.line_id ? ` · ${messageLineLabel(displayMessage.line_id)}` : ''}] {' '}
+                        [{smsTransportInfo(displayMessage.transport).label}] {' '}
                         {renderHighlightedText(displayMessage.content, searchTerm)}
                       </Typography>
                     }
@@ -1186,20 +1172,6 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
                         ml: 0.5,
                       }}
                     />
-                    {msg.line_id && (
-                      <Chip
-                        label={messageLineLabel(msg.line_id)}
-                        size="small"
-                        variant="outlined"
-                        sx={{
-                          height: 16,
-                          fontSize: '0.65rem',
-                          color: msg.direction === 'outgoing' ? 'white' : 'text.secondary',
-                          borderColor: msg.direction === 'outgoing' ? 'rgba(255,255,255,0.55)' : 'divider',
-                          borderRadius: 0.5,
-                        }}
-                      />
-                    )}
                     {msg.direction === 'outgoing' && (
                       msg.status === 'sent' ? (
                         <Chip label="已发送" size="small" sx={{ height: 16, fontSize: '0.65rem', bgcolor: 'rgba(255,255,255,0.2)', color: '#ffffff' }} />
@@ -1290,7 +1262,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         <Typography variant="caption" color="text.secondary" sx={{ mt: 0.5, display: 'block' }}>
           {channelCannotSend
             ? '当前通道仅用于查看归档，尚未接入短信发送运行时'
-            : `${content.length} 字符 · ${selectedLineId ? `固定使用 ${messageLineLabel(selectedLineId)}` : '未选择发送线路'} · Enter 发送，Shift+Enter 换行`}
+            : `${content.length} 字符 · ${selectedLineId ? '' : '未选择发送线路 · '}Enter 发送，Shift+Enter 换行`}
         </Typography>
       </Box>
     </Box>

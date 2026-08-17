@@ -13,8 +13,7 @@ import {
   TextField,
   Typography,
 } from '@mui/material'
-import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget, VolteLineControlResponse } from '../../api/contracts'
-import { api } from '../../api/current'
+import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget } from '../../api/contracts'
 
 type AutomationTaskDialogProps = {
   open: boolean
@@ -23,6 +22,7 @@ type AutomationTaskDialogProps = {
   onSave: (task: AutomationTask) => Promise<void>
   fixedLineId?: string
   fixedTarget?: AutomationTarget
+  targetIsReader?: boolean
 }
 
 
@@ -33,6 +33,7 @@ export default function AutomationTaskDialog({
   onSave,
   fixedLineId,
   fixedTarget,
+  targetIsReader = false,
 }: AutomationTaskDialogProps) {
   const [formName, setFormName] = useState('')
   const [formEnabled, setFormEnabled] = useState(true)
@@ -48,11 +49,6 @@ export default function AutomationTaskDialog({
   const [manualCountryCode, setManualCountryCode] = useState(false)
   const [formCallPhone, setFormCallPhone] = useState('')
   const [formCallDuration, setFormCallDuration] = useState(30)
-  const [formTarget, setFormTarget] = useState<AutomationTarget | null>(null)
-  const [lines, setLines] = useState<VolteLineControlResponse[]>([])
-  const selectedTargetLineId = formTarget?.kind === 'modem_line' ? formTarget.line_id : ''
-  const selectedTargetIsReader = lines.some((line) => line.modem.line_id === selectedTargetLineId && line.modem.line_kind === 'reader')
-
   const [formTriggerType, setFormTriggerType] = useState<'fixed' | 'interval' | 'cron'>('fixed')
   const [formWeekdays, setFormWeekdays] = useState<number[]>([1, 2, 3, 4, 5, 6, 7])
   const [formTriggerTime, setFormTriggerTime] = useState('04:00')
@@ -67,16 +63,11 @@ export default function AutomationTaskDialog({
 
   useEffect(() => {
     if (open) {
-      setLines([])
-      void api.getVolteLines().then((response) => {
-        if (response.data) setLines(response.data)
-      }).catch(() => undefined)
       setDialogError(null)
       if (editingTask) {
         setFormName(editingTask.name)
         setFormEnabled(editingTask.enabled)
         setFormActionType(editingTask.action.type)
-        setFormTarget(fixedTarget ?? (fixedLineId ? { kind: 'modem_line', line_id: fixedLineId } : editingTask.target?.kind === 'modem_line' ? editingTask.target : null))
         if (editingTask.action.type === 'reboot_device') {
           setFormRebootDelay(editingTask.action.config.delay_seconds)
         } else if (editingTask.action.type === 'send_sms') {
@@ -118,7 +109,6 @@ export default function AutomationTaskDialog({
         setManualCountryCode(false)
         setFormCallPhone('')
         setFormCallDuration(30)
-        setFormTarget(fixedTarget ?? (fixedLineId ? { kind: 'modem_line', line_id: fixedLineId } : null))
         setFormTriggerType('fixed')
         setFormWeekdays([1, 2, 3, 4, 5, 6, 7])
         setFormTriggerTime('04:00')
@@ -127,13 +117,13 @@ export default function AutomationTaskDialog({
         setFormCronExpression('*/15 * * * *')
       }
     }
-  }, [open, editingTask, fixedLineId, fixedTarget])
+  }, [open, editingTask])
 
   useEffect(() => {
-    if (selectedTargetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
+    if (targetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
       setFormActionType('send_sms')
     }
-  }, [formActionType, selectedTargetIsReader])
+  }, [formActionType, targetIsReader])
 
   const insertVariable = (token: string) => {
     const el = smsContentRef.current
@@ -166,11 +156,12 @@ export default function AutomationTaskDialog({
       return
     }
 
-    if (formActionType !== 'reboot_device' && (!formTarget || (fixedTarget && JSON.stringify(formTarget) !== JSON.stringify(fixedTarget)) || formTarget.kind !== 'modem_line')) {
-      setDialogError('请选择执行该任务的线路')
+    const taskTarget = fixedTarget ?? (fixedLineId ? { kind: 'modem_line' as const, line_id: fixedLineId } : null)
+    if (formActionType !== 'reboot_device' && !taskTarget) {
+      setDialogError('当前页面未绑定可用线路')
       return
     }
-    if (selectedTargetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
+    if (targetIsReader && (formActionType === 'restart_baseband' || formActionType === 'consume_data')) {
       setDialogError('读卡器线路不具备基带重启或蜂窝流量能力')
       return
     }
@@ -280,7 +271,7 @@ export default function AutomationTaskDialog({
       name: formName.trim(),
       enabled: formEnabled,
       trigger,
-      target: formActionType === 'reboot_device' ? null : formTarget,
+      target: formActionType === 'reboot_device' ? null : taskTarget,
       action,
     }
 
@@ -336,34 +327,14 @@ export default function AutomationTaskDialog({
             onChange={(e) => {
               const actionType = e.target.value as typeof formActionType
               setFormActionType(actionType)
-              if (actionType === 'reboot_device') setFormTarget(null)
             }}
           >
-            {!selectedTargetIsReader && <MenuItem value="restart_baseband">重启基带</MenuItem>}
+            {!targetIsReader && <MenuItem value="restart_baseband">重启基带</MenuItem>}
             {!fixedLineId && <MenuItem value="reboot_device">重启设备</MenuItem>}
             <MenuItem value="send_sms">发送短信</MenuItem>
-            {!selectedTargetIsReader && <MenuItem value="consume_data">消耗移动流量</MenuItem>}
+            {!targetIsReader && <MenuItem value="consume_data">消耗移动流量</MenuItem>}
             <MenuItem value="dial_call">定时拨号</MenuItem>
           </TextField>
-
-          {formActionType !== 'reboot_device' && (
-            <TextField
-              select
-              required
-              label="使用的线路 / SIM 卡"
-              value={formTarget?.kind === 'modem_line' ? `modem_line:${formTarget.line_id}` : ''}
-              disabled={Boolean(fixedLineId || fixedTarget)}
-              onChange={(e) => {
-                const [kind, ...rest] = e.target.value.split(':')
-                setFormTarget(kind === 'modem_line' ? { kind: 'modem_line', line_id: rest.join(':') } : null)
-                setDialogError(null)
-              }}
-              helperText={fixedLineId || fixedTarget ? '任务固定绑定到当前线路' : '任务始终绑定到所选线路，不会自动回退到其他线路'}
-            >
-              <MenuItem value="" disabled>请选择线路</MenuItem>
-              {lines.map((line) => <MenuItem key={line.modem.line_id} value={`modem_line:${line.modem.line_id}`}>{line.modem.line_kind === 'reader' ? '读卡器' : '基带'} {line.modem.slot_label || line.modem.display_order || line.modem.modem_id} · 卡槽 {line.modem.uim_slot}</MenuItem>)}
-            </TextField>
-          )}
 
           {/* 重启设备特有字段 */}
           {formActionType === 'reboot_device' && (
