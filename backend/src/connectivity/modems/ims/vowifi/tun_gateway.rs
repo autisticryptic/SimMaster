@@ -320,11 +320,13 @@ fn platform_shutdown_tun(_tun_name: &str) {}
 mod imp {
     use super::*;
     use std::{
+        collections::HashMap,
         fs::{File, OpenOptions},
         io::{ErrorKind, Read, Write},
         net::{Ipv4Addr, Ipv6Addr},
         os::fd::AsRawFd,
         process::Command,
+        time::Duration,
     };
 
     use tokio::sync::mpsc;
