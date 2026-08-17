@@ -82,6 +82,9 @@ cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 mkdir -p "$OTA_TMP/system"
 cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
 cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
+cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
+cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"
+cp scripts/simadmin-modem-recovery.timer "$OTA_TMP/system/"
 
 # 计算前端 MD5（所有文件的 hash，与 Rust 验证逻辑一致）
 # 方式：每个文件的 MD5 排序后，用换行符连接，再计算整体 MD5

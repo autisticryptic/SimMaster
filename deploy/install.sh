@@ -71,6 +71,19 @@ if [ "$WITH_IMS" = "1" ]; then
     systemctl enable simadmin-secondary-qmi.service || true
   fi
 
+  # --- bounded runtime modem recovery -------------------------------------
+  if [ -f system/simadmin-modem-recovery.sh ] &&
+     [ -f system/simadmin-modem-recovery.service ] &&
+     [ -f system/simadmin-modem-recovery.timer ] &&
+     command -v systemctl >/dev/null 2>&1; then
+    say "installing periodic modem recovery monitor"
+    install -m 0755 system/simadmin-modem-recovery.sh /usr/local/bin/
+    install -m 0644 system/simadmin-modem-recovery.service /etc/systemd/system/
+    install -m 0644 system/simadmin-modem-recovery.timer /etc/systemd/system/
+    systemctl daemon-reload
+    systemctl enable --now simadmin-modem-recovery.timer || true
+  fi
+
   say "loading module now (safe if already loaded)"
   modprobe rpmsg_wwan_ctrl_multi 2>/dev/null || \
     insmod "/lib/modules/$KVER/extra/simadmin/rpmsg_wwan_ctrl_multi.ko" 2>/dev/null || \

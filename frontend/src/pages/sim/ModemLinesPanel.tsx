@@ -351,13 +351,13 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     setSuccess(null)
     try {
       const response = await api.retryVolteLine(lineId)
-      if (response.data) {
-        const updatedLine = response.data
+      const updatedLine = response.data
+      if (updatedLine) {
         setLines((current) => current.map((line) => (
           line.modem.line_id === lineId ? updatedLine : line
         )))
       }
-      setSuccess(`${shortLineId(lineId)} 已开始新的五次 VoLTE 恢复批次`)
+      setSuccess(`${shortLineId(lineId)} 已开始新的 ${updatedLine?.runtime.retry_max ?? 3} 次 VoLTE 恢复批次`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -733,7 +733,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Chip size="small" label={line.profile.volte_connection_enabled ? runtimeLabel(line) : 'IMS 未连接'} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
-                          <Tooltip title={recoveryRunning ? '自动恢复正在进行' : '立即开始新的五次恢复批次'}>
+                          <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
                             <span>
                               <Button
                                 size="small"

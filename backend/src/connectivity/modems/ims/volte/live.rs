@@ -113,6 +113,25 @@ fn active_ims_profile_prefetch_required(data_slot_mode: DataSlotMode) -> bool {
     native_ims_bearer_required(data_slot_mode)
 }
 
+/// Bind the prepared IMS profile when the modem accepts it so PCO and the
+/// active AT context refer to the same CID. Some modem firmware
+/// intermittently rejects an otherwise valid activation when `profile-id` is
+/// present, so retain APN-only as a compatibility fallback.
+fn modemmanager_bearer_requests(request: &BearerRequest) -> Vec<BearerRequest> {
+    let Some(_) = request.profile_id else {
+        return vec![request.clone()];
+    };
+
+    let mut apn_only = request.clone();
+    apn_only.profile_id = None;
+    vec![request.clone(), apn_only]
+}
+
+fn may_retry_modemmanager_profile_binding(error: &VolteError) -> bool {
+    error.code() == code::RUNTIME_MM_BEARER_CONNECT_FAILED
+        && !FailureClass::from_details(error.detail().unwrap_or("")).is_unsafe_to_retry()
+}
+
 /// Device-specific inputs formerly hard-coded to modem 0, `/dev/wwan0qmi0`
 /// and UIM slot 1. A distinct value is injected for every discovered line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1326,15 +1345,41 @@ async fn connect_inner(
     let mut bearer = if let Some(established) = native_bearer.as_ref() {
         established.connection.clone()
     } else {
-        match ensure_bearer_with_runtime(runtime, &device.modem_id, &request, &plan).await {
-            Ok(bearer) => bearer,
-            Err(error) => {
+        let requests = modemmanager_bearer_requests(&request);
+        let mut connected = None;
+        let mut last_error = None;
+        for (index, candidate) in requests.iter().enumerate() {
+            match ensure_bearer_with_runtime(runtime, &device.modem_id, candidate, &plan).await {
+                Ok(bearer) => {
+                    connected = Some(bearer);
+                    break;
+                }
+                Err(error) => {
+                    let has_fallback = index + 1 < requests.len();
+                    if has_fallback && may_retry_modemmanager_profile_binding(&error) {
+                        tracing::warn!(
+                            error = %error,
+                            profile_id = ?requests[index + 1].profile_id,
+                            "Profile-bound IMS bearer failed; retrying with APN-only compatibility mode"
+                        );
+                        last_error = Some(error);
+                        continue;
+                    }
+                    last_error = Some(error);
+                    break;
+                }
+            }
+        }
+        match connected {
+            Some(bearer) => bearer,
+            None => {
                 if let Some(established) = native_bearer.take() {
                     native_bearer::release_native_ims_bearer(established).await;
                 }
                 disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
                 cleanup_ims_profile_lease(ims_profile_lease.take()).await;
-                return Err(error);
+                return Err(last_error
+                    .unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)));
             }
         }
     };
@@ -5060,6 +5105,35 @@ mod tests {
             .iter()
             .find(|variant| variant.label == label)
             .unwrap_or_else(|| panic!("missing REGISTER variant: {label}"))
+    }
+
+    #[test]
+    fn modemmanager_prefers_explicit_profile_before_apn_only_fallback() {
+        let request = BearerRequest {
+            apn: "ims".into(),
+            allow_roaming: true,
+            profile_id: Some(2),
+        };
+        let candidates = modemmanager_bearer_requests(&request);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].profile_id, Some(2));
+        assert_eq!(candidates[1].profile_id, None);
+
+        let unbound = BearerRequest::for_apn("ims", true);
+        assert_eq!(modemmanager_bearer_requests(&unbound), vec![unbound]);
+    }
+
+    #[test]
+    fn modemmanager_profile_fallback_never_retries_a_wedged_baseband() {
+        let rejected = VolteError::with_detail(
+            code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+            "verbose call end reason (6,32): option-not-supported",
+        );
+        assert!(may_retry_modemmanager_profile_binding(&rejected));
+
+        let wedged =
+            VolteError::with_detail(code::RUNTIME_MM_BEARER_CONNECT_FAILED, "endpoint hangup");
+        assert!(!may_retry_modemmanager_profile_binding(&wedged));
     }
 
     fn test_audio_offer(endpoint: SocketAddr, direction: MediaDirection) -> MediaOffer {

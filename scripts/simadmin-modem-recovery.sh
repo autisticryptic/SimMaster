@@ -110,23 +110,29 @@ qmi_is_ready() {
     "Application state:[[:space:]]*'ready'"
 }
 
-list_ready_qmi_ports() {
+list_qcom_qmi_ports() {
   for qmi_path in "$SYS_CLASS_WWAN_DIR"/*qmi*; do
     [ -e "$qmi_path" ] || continue
     qmi_props="$(qcom_candidate_properties "$qmi_path")" || continue
     printf '%s\n' "$qmi_props" | grep -qx 'DEVTYPE=wwan_port' || continue
-    qmi_port="$(basename "$qmi_path")"
-    if qmi_is_ready "$qmi_port"; then
-      printf '%s\n' "$qmi_port"
+    basename "$qmi_path"
+  done
+}
+
+list_unmapped_qmi_ports() {
+  candidate_ports="$1"
+  for candidate_port in $candidate_ports; do
+    if ! modem_port_has_sim "$candidate_port"; then
+      printf '%s\n' "$candidate_port"
     fi
   done
 }
 
-list_stale_ready_qmi_ports() {
-  ready_ports="$1"
-  for ready_port in $ready_ports; do
-    if ! modem_port_has_sim "$ready_port"; then
-      printf '%s\n' "$ready_port"
+list_ready_qmi_ports() {
+  candidate_ports="$1"
+  for candidate_port in $candidate_ports; do
+    if qmi_is_ready "$candidate_port"; then
+      printf '%s\n' "$candidate_port"
     fi
   done
 }
@@ -200,14 +206,8 @@ trigger_paths() {
   return "$trigger_failed"
 }
 
-reannounce_stale_qcom_ports() {
-  stale_ports="$1"
-  selected_uids="$(uids_for_ports "$stale_ports")"
-  [ -n "$selected_uids" ] || {
-    log "QCOM port reannounce skipped: stale QMI ports have no physical-device UID"
-    return 1
-  }
-
+reannounce_qcom_uids() {
+  selected_uids="$1"
   net_candidates="$(list_qcom_net_candidates "$selected_uids")"
   control_candidates="$(list_qcom_control_candidates "$selected_uids")"
   if [ -z "$net_candidates" ] || [ -z "$control_candidates" ]; then
@@ -270,20 +270,31 @@ wait_for_ports_mapped_stable() {
 trap cleanup EXIT INT TERM
 mkdir -p "$STATE_DIR"
 set_status "observing"
-log "Cold-start modem observation started"
+log "Modem health observation started"
 
 elapsed=0
 stale_count=0
 stale_key=""
 stale_ports=""
 while [ "$elapsed" -lt "$STARTUP_TIMEOUT_SECONDS" ]; do
-  ready_ports="$(list_ready_qmi_ports)"
-  stale_ports="$(list_stale_ready_qmi_ports "$ready_ports")"
+  candidate_ports="$(list_qcom_qmi_ports)"
+  unmapped_ports="$(list_unmapped_qmi_ports "$candidate_ports")"
+
+  # A healthy ModemManager mapping is authoritative and avoids issuing QMI
+  # commands from the periodic timer. Probe only candidate ports that MM has
+  # actually lost; this keeps the monitor passive during normal operation.
+  if [ -z "$unmapped_ports" ] && mm_has_any_sim; then
+    set_status "healthy"
+    log "Every QCOM QMI port is represented by ModemManager; recovery is not needed"
+    exit 0
+  fi
+
+  stale_ports="$(list_ready_qmi_ports "$unmapped_ports")"
 
   if [ -z "$stale_ports" ]; then
-    if [ -n "$ready_ports" ] || mm_has_any_sim; then
+    if mm_has_any_sim; then
       set_status "healthy"
-      log "Every ready QMI SIM is represented by ModemManager; recovery is not needed"
+      log "No QMI-ready port is missing from ModemManager; recovery is not needed"
       exit 0
     fi
     stale_count=0
@@ -315,7 +326,18 @@ fi
 touch "$IN_PROGRESS_FILE"
 set_status "reannouncing-qcom-ports"
 log "Confirmed persistent QMI-ready/ModemManager mismatch; reannouncing only the affected QCOM port groups"
-if ! reannounce_stale_qcom_ports "$stale_ports"; then
+selected_uids="$(uids_for_ports "$stale_ports")"
+if [ -z "$selected_uids" ]; then
+  log "QCOM port reannounce skipped: stale QMI ports have no physical-device UID"
+  set_status "reannounce-failed"
+  exit 1
+fi
+
+# Keep the stable physical-device identity across both recovery phases. The
+# first remove/add cycle may replace the original sysfs port nodes; deriving the
+# UID from those stale paths again after restarting ModemManager used to fail
+# exactly when the second reannounce was needed most.
+if ! reannounce_qcom_uids "$selected_uids"; then
   set_status "reannounce-failed"
   exit 1
 fi
@@ -337,7 +359,7 @@ if ! "$SYSTEMCTL_BIN" restart ModemManager.service; then
 fi
 
 set_status "reannouncing-after-restart"
-if ! reannounce_stale_qcom_ports "$stale_ports"; then
+if ! reannounce_qcom_uids "$selected_uids"; then
   set_status "post-restart-reannounce-failed"
   exit 1
 fi

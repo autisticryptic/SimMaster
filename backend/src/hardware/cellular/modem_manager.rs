@@ -135,6 +135,18 @@ fn property_string(props: &InterfaceProperties, key: &str) -> Option<String> {
         .and_then(non_empty_string)
 }
 
+fn classify_sim_type(sim_props: &InterfaceProperties, sim_present: bool) -> String {
+    match sim_props.get("SimType").map(extract_u32).unwrap_or(0) {
+        1 => "physical".to_string(),
+        2 => "esim".to_string(),
+        _ => match sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0) {
+            2 | 3 => "esim".to_string(),
+            _ if sim_present => "physical".to_string(),
+            _ => "unknown".to_string(),
+        },
+    }
+}
+
 fn apn_protocol_to_mm_ip_type(protocol: &str) -> Option<u32> {
     match protocol.trim().to_ascii_lowercase().as_str() {
         "" => None,
@@ -1424,11 +1436,7 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             &property_string(&sim_props, "SimIdentifier").unwrap_or_default(),
         );
         let imsi = property_string(&sim_props, "Imsi").unwrap_or_default();
-        let sim_type = match sim_props.get("SimType").map(extract_u32).unwrap_or(0) {
-            1 => "physical".to_string(),
-            2 => "esim".to_string(),
-            _ => "unknown".to_string(),
-        };
+        let sim_type = classify_sim_type(&sim_props, sim_path.is_some());
         let esim_status = match sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0) {
             1 => "none".to_string(),
             2 => "no-profiles".to_string(),
@@ -2235,12 +2243,7 @@ pub async fn get_sim_info_for_modem_with_cache(
     }
 
     // --- 新增诊断属性提取 ---
-    let sim_type_u = sim_props.get("SimType").map(extract_u32).unwrap_or(0);
-    let sim_type = match sim_type_u {
-        1 => "physical".to_string(),
-        2 => "esim".to_string(),
-        _ => "unknown".to_string(),
-    };
+    let sim_type = classify_sim_type(&sim_props, true);
 
     let esim_status_u = sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0);
     let esim_status = match esim_status_u {
@@ -3069,6 +3072,25 @@ LTE Timing Advance: 'unavailable'"#;
             parse_own_numbers_from_labeled_text(output),
             vec!["+10006".to_string()]
         );
+    }
+
+    #[test]
+    fn classifies_present_legacy_sim_without_sim_type_as_physical() {
+        assert_eq!(
+            classify_sim_type(&InterfaceProperties::new(), true),
+            "physical"
+        );
+        assert_eq!(
+            classify_sim_type(&InterfaceProperties::new(), false),
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn explicit_esim_type_takes_precedence_over_physical_fallback() {
+        let mut props = InterfaceProperties::new();
+        props.insert("SimType".to_string(), OwnedValue::from(2_u32));
+        assert_eq!(classify_sim_type(&props, true), "esim");
     }
 
     #[test]

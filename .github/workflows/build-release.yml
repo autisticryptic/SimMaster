@@ -297,6 +297,9 @@ jobs:
           mkdir -p "$TMP/system"
           cp deploy/system/99-simadmin-secondary-qmi.rules "$TMP/system/"
           cp deploy/system/simadmin-secondary-qmi.service "$TMP/system/"
+          cp scripts/simadmin-modem-recovery.sh "$TMP/system/"
+          cp scripts/simadmin-modem-recovery.service "$TMP/system/"
+          cp scripts/simadmin-modem-recovery.timer "$TMP/system/"
 
           # ---- meta.json ----
           cat > "$TMP/meta.json" << EOF

@@ -33,6 +33,7 @@ prepare_case() {
   : > "$case_root/mapped-ports"
   : > "$case_root/udev-events"
   : > "$case_root/systemctl-events"
+  : > "$case_root/qmicli-events"
   printf '%s\n' "$mode" > "$case_root/mode"
   printf '0\n' > "$case_root/reannounce-round"
 
@@ -80,6 +81,7 @@ run_recovery || fail "healthy case returned failure"
 assert_status healthy
 [ ! -s "$case_root/udev-events" ] || fail "healthy case emitted udev events"
 [ ! -s "$case_root/systemctl-events" ] || fail "healthy case restarted a service"
+[ ! -s "$case_root/qmicli-events" ] || fail "healthy case unnecessarily probed QMI"
 
 prepare_case reannounce reannounce
 add_modem_fixture 0

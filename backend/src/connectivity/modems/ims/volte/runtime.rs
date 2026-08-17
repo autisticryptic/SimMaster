@@ -256,7 +256,7 @@ impl Default for VolteSnapshot {
             recovery_state: VolteRecoveryState::Idle,
             recovery_source: None,
             retry_attempt: 0,
-            retry_max: 5,
+            retry_max: 3,
             modem_restart_attempt: 0,
             modem_restart_max: 3,
             manual_retry_available: false,
@@ -560,7 +560,7 @@ mod tests {
         assert_eq!(status.registration_mode, "");
         assert!(!status.registered);
         assert_eq!(status.recovery_state, "idle");
-        assert_eq!(status.retry_max, 5);
+        assert_eq!(status.retry_max, 3);
         assert_eq!(status.modem_restart_max, 3);
     }
 

@@ -47,6 +47,7 @@ case "$tool" in
     exit 1
     ;;
   qmicli)
+    printf '%s\n' "$*" >> "$fixture/qmicli-events"
     printf '%s\n' \
       "Card state: 'present'" \
       "Application type:  'usim (2)'" \

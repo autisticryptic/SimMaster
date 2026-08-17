@@ -246,6 +246,14 @@ jobs:
           mkdir -p "$OTA_TMP/www"
           cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
+          # Include DATA6 preparation and bounded runtime modem recovery.
+          mkdir -p "$OTA_TMP/system"
+          cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
+          cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
+          cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
+          cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"
+          cp scripts/simadmin-modem-recovery.timer "$OTA_TMP/system/"
+
           # 计算前端 MD5 (Linux)
           echo "📋 计算前端 MD5..."
           FRONTEND_MD5=$(find "$OTA_TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
@@ -274,7 +282,7 @@ jobs:
           OTA_FILE="release/simadmin.tar.gz"
           echo "📦 打包 OTA 更新包..."
           cd "$OTA_TMP"
-          tar -czf "$GITHUB_WORKSPACE/$OTA_FILE" meta.json simadmin www
+          tar -czf "$GITHUB_WORKSPACE/$OTA_FILE" meta.json simadmin www system
           cd "$GITHUB_WORKSPACE"
           
           # 显示结果

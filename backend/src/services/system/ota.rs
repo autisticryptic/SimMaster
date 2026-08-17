@@ -24,6 +24,11 @@ const OTA_META_PATH: &str = "/opt/simadmin/meta.json";
 const OTA_SERVICE_NAME: &str = "simadmin.service";
 const SECONDARY_QMI_SERVICE_NAME: &str = "simadmin-secondary-qmi.service";
 const SECONDARY_QMI_SERVICE_PATH: &str = "/etc/systemd/system/simadmin-secondary-qmi.service";
+const MODEM_RECOVERY_SERVICE_NAME: &str = "simadmin-modem-recovery.service";
+const MODEM_RECOVERY_TIMER_NAME: &str = "simadmin-modem-recovery.timer";
+const MODEM_RECOVERY_SCRIPT_PATH: &str = "/usr/local/bin/simadmin-modem-recovery.sh";
+const MODEM_RECOVERY_SERVICE_PATH: &str = "/etc/systemd/system/simadmin-modem-recovery.service";
+const MODEM_RECOVERY_TIMER_PATH: &str = "/etc/systemd/system/simadmin-modem-recovery.timer";
 const NM_CONF_DIR: &str = "/etc/NetworkManager/conf.d";
 const NM_CONF_PATH: &str = "/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf";
 const NM_UNMANAGED_WWAN_CONFIG: &str = "[keyfile]\nunmanaged-devices=interface-name:wwan*\n";
@@ -587,14 +592,15 @@ pub fn apply_ota_update(restart_now: bool) -> Result<String, String> {
 
     install_meta_file()?;
     let secondary_qmi_result = install_secondary_qmi_resources(restart_now);
+    let modem_recovery_result = install_modem_recovery_resources(restart_now);
     let nm_result = configure_networkmanager_modem_unmanaged(restart_now);
 
     // 清理暂存目录
     let _ = fs::remove_dir_all(OTA_STAGING_DIR);
 
     let message = format!(
-        "Update to version {} applied successfully; {}; {}",
-        meta.version, secondary_qmi_result, nm_result
+        "Update to version {} applied successfully; {}; {}; {}",
+        meta.version, secondary_qmi_result, modem_recovery_result, nm_result
     );
 
     if restart_now {
@@ -648,6 +654,59 @@ fn install_secondary_qmi_resources(restart_now: bool) -> String {
         "secondary QMI unit installed and activated before ModemManager".to_string()
     } else {
         "secondary QMI unit installed; hardware initializer skipped or failed".to_string()
+    }
+}
+
+fn install_modem_recovery_resources(restart_now: bool) -> String {
+    let staging_script = format!("{}/system/simadmin-modem-recovery.sh", OTA_STAGING_DIR);
+    let staging_service = format!("{}/system/{}", OTA_STAGING_DIR, MODEM_RECOVERY_SERVICE_NAME);
+    let staging_timer = format!("{}/system/{}", OTA_STAGING_DIR, MODEM_RECOVERY_TIMER_NAME);
+    if !Path::new(&staging_script).is_file()
+        || !Path::new(&staging_service).is_file()
+        || !Path::new(&staging_timer).is_file()
+    {
+        return "modem recovery resources not present, existing setup preserved".to_string();
+    }
+
+    for directory in ["/usr/local/bin", "/etc/systemd/system"] {
+        if let Err(error) = fs::create_dir_all(directory) {
+            return format!("modem recovery resource directory unavailable: {error}");
+        }
+    }
+    for (source, destination) in [
+        (staging_script.as_str(), MODEM_RECOVERY_SCRIPT_PATH),
+        (staging_service.as_str(), MODEM_RECOVERY_SERVICE_PATH),
+        (staging_timer.as_str(), MODEM_RECOVERY_TIMER_PATH),
+    ] {
+        if let Err(error) = fs::copy(source, destination) {
+            return format!("modem recovery resource install failed: {error}");
+        }
+    }
+
+    let _ = Command::new("chmod")
+        .args(["755", MODEM_RECOVERY_SCRIPT_PATH])
+        .status();
+    for unit_path in [MODEM_RECOVERY_SERVICE_PATH, MODEM_RECOVERY_TIMER_PATH] {
+        let _ = Command::new("chmod").args(["644", unit_path]).status();
+    }
+    let _ = Command::new("systemctl").arg("daemon-reload").status();
+
+    let mut enable = Command::new("systemctl");
+    enable.arg("enable");
+    if restart_now {
+        enable.arg("--now");
+    }
+    let enabled = enable
+        .arg(MODEM_RECOVERY_TIMER_NAME)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !enabled {
+        return "modem recovery resources installed but timer could not be enabled".to_string();
+    }
+    if restart_now {
+        "modem recovery timer installed and active".to_string()
+    } else {
+        "modem recovery timer installed; activation deferred".to_string()
     }
 }
 

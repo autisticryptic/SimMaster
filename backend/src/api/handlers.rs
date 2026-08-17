@@ -6894,7 +6894,7 @@ pub async fn set_volte_line_ip_families_handler(
     )
 }
 
-/// Start a fresh five-attempt recovery batch without changing the persisted
+/// Start a fresh three-attempt recovery batch without changing the persisted
 /// VoLTE switch.  The response is immediate; progress is returned by the normal
 /// line status endpoint and automatic polling.
 pub async fn retry_volte_line_handler(

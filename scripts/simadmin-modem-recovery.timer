@@ -1,0 +1,12 @@
+[Unit]
+Description=Periodically check whether ModemManager lost a QCOM modem
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Persistent=true
+Unit=simadmin-modem-recovery.service
+
+[Install]
+WantedBy=timers.target
