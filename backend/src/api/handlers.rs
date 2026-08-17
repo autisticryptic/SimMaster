@@ -3671,7 +3671,12 @@ fn persist_vowifi_mt_deliveries(
                 }
             };
             if should_insert {
-                let timestamp = crate::platform::db::beijing_sms_now_string();
+                let timestamp = parts
+                    .first()
+                    .map(|part| part.service_center_timestamp.trim())
+                    .filter(|timestamp| !timestamp.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(crate::platform::db::utc_sms_now_string);
                 api_sms_id = db
                     .insert_sms_at_with_transport_for_line(
                         "incoming",
@@ -3769,6 +3774,75 @@ fn spawn_vowifi_sms_followup_persist(
                 });
             }
         }
+    });
+}
+
+fn ensure_vowifi_mt_listener(app: &AppState, scope: &VowifiScope) {
+    if !scope.line.begin_vowifi_sms_listener() {
+        return;
+    }
+    let app = app.clone();
+    let line = Arc::clone(&scope.line);
+    let line_id = scope.line_id().to_string();
+    let mut receiver =
+        crate::connectivity::modems::ims::vowifi::operator::subscribe_mt_sms_for_line(&line_id);
+    tokio::spawn(async move {
+        let mut multipart =
+            std::collections::BTreeMap::<String, (Instant, Vec<MtSmsDeliver>)>::new();
+        loop {
+            let deliver = match receiver.recv().await {
+                Ok(deliver) => deliver,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(line_id, skipped, "VoWiFi MT SMS listener lagged");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            multipart
+                .retain(|_, (received_at, _)| received_at.elapsed() < Duration::from_secs(86_400));
+            let group_key = vowifi_mt_delivery_group_key(&deliver);
+            let deliveries = {
+                let (_, deliveries) = multipart
+                    .entry(group_key.clone())
+                    .or_insert_with(|| (Instant::now(), Vec::new()));
+                if let Some(existing) = deliveries.iter_mut().find(|existing| {
+                    existing.segment_sequence == deliver.segment_sequence
+                        && existing.segment_reference == deliver.segment_reference
+                }) {
+                    *existing = deliver;
+                } else {
+                    deliveries.push(deliver);
+                }
+                deliveries.clone()
+            };
+            let outcome = MoSmsSipOutcome {
+                trace_id: format!("vowifi-passive-mt-trace-{group_key}"),
+                message_id: format!("vowifi-passive-mt-{group_key}"),
+                sip_status: 200,
+                rpdu_ack: crate::connectivity::modems::ims::vowifi::sms::RpduAckState::Acked,
+                delivery_state:
+                    crate::connectivity::modems::ims::vowifi::sms::SmsDeliveryState::Delivered,
+                failure_cause: None,
+                mt_deliveries: deliveries,
+            };
+            let complete = vowifi_mt_complete_group_count(&outcome) > 0;
+            let dedupe_enabled = app
+                .config_manager
+                .get_line_sms_path_policy(&line_id)
+                .dedupe_enabled;
+            let inserted =
+                persist_vowifi_mt_deliveries(&app.database, &line_id, &outcome, dedupe_enabled);
+            for sms in inserted {
+                let notification_sender = Arc::clone(&app.notification_sender);
+                tokio::spawn(async move {
+                    let _ = notification_sender.forward_sms(&sms).await;
+                });
+            }
+            if complete {
+                multipart.remove(&group_key);
+            }
+        }
+        line.finish_vowifi_sms_listener();
     });
 }
 fn vowifi_mt_complete_group_count(outcome: &MoSmsSipOutcome) -> usize {
@@ -5510,11 +5584,14 @@ impl VowifiScope {
         if line_id.is_empty() {
             return Err("vowifi_line_id_required".to_string());
         }
-        app.line_registry
+        let scope = app
+            .line_registry
             .get(line_id)
             .await
             .map(Self::for_line)
-            .ok_or_else(|| "vowifi_line_not_found".to_string())
+            .ok_or_else(|| "vowifi_line_not_found".to_string())?;
+        ensure_vowifi_mt_listener(app, &scope);
+        Ok(scope)
     }
 
     fn line_id(&self) -> &str {

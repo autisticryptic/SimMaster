@@ -67,6 +67,7 @@ pub struct LineRuntime {
     pub vowifi: Arc<VowifiRuntime>,
     pub vowifi_connect_lock: Mutex<()>,
     vowifi_restore_running: AtomicBool,
+    vowifi_sms_listener_running: AtomicBool,
     pub voice_access: VoiceAccessRouter,
     pub trunk: Arc<TrunkRuntime>,
     pub supplementary: Arc<SupplementaryRuntime>,
@@ -117,6 +118,7 @@ impl LineRuntime {
             vowifi,
             vowifi_connect_lock: Mutex::new(()),
             vowifi_restore_running: AtomicBool::new(false),
+            vowifi_sms_listener_running: AtomicBool::new(false),
             voice_access,
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
             supplementary,
@@ -170,6 +172,17 @@ impl LineRuntime {
 
     pub fn volte_retry_in_progress(&self) -> bool {
         self.volte_retry_running.load(Ordering::SeqCst)
+    }
+
+    pub fn begin_vowifi_sms_listener(&self) -> bool {
+        self.vowifi_sms_listener_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn finish_vowifi_sms_listener(&self) {
+        self.vowifi_sms_listener_running
+            .store(false, Ordering::SeqCst);
     }
 
     /// Claim a complete VoWiFi restore workflow, including its settle and

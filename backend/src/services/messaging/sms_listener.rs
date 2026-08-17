@@ -7,7 +7,7 @@ use crate::hardware::cellular::modem_manager::{
 };
 use crate::platform::config::{ConfigManager, LineProfileConfig};
 use crate::platform::db::{
-    beijing_sms_now_string, normalize_sms_timestamp_for_display, Database, SmsMessage,
+    normalize_sms_timestamp_for_display, utc_sms_now_string, Database, SmsMessage,
 };
 use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::notify::notification::NotificationSender;
@@ -98,9 +98,9 @@ fn sms_marker(incoming: &IncomingSms) -> String {
 fn sms_timestamp(incoming: &IncomingSms, mode: SmsIngestMode) -> String {
     match mode {
         SmsIngestMode::Live => normalize_sms_timestamp_for_display(&incoming.timestamp)
-            .unwrap_or_else(beijing_sms_now_string),
+            .unwrap_or_else(utc_sms_now_string),
         SmsIngestMode::Reconcile => normalize_sms_timestamp_for_display(&incoming.timestamp)
-            .unwrap_or_else(beijing_sms_now_string),
+            .unwrap_or_else(utc_sms_now_string),
     }
 }
 
@@ -738,15 +738,15 @@ mod tests {
     fn normalizes_sms_timestamp_with_short_timezone() {
         assert_eq!(
             normalize_sms_timestamp_for_display("2026-05-19 20:17:25+08").as_deref(),
-            Some("2026-05-19 20:17:25")
+            Some("2026-05-19T12:17:25Z")
         );
     }
 
     #[test]
-    fn keeps_naive_sms_timestamp_frontend_parseable() {
+    fn rejects_sms_timestamp_without_an_explicit_timezone() {
         assert_eq!(
-            normalize_sms_timestamp_for_display("2026-05-19 16:50:26").as_deref(),
-            Some("2026-05-19 16:50:26")
+            normalize_sms_timestamp_for_display("2026-05-19 16:50:26"),
+            None
         );
     }
 

@@ -67,8 +67,7 @@ type DeleteTarget =
   | { type: 'message'; message: SmsMessage }
 
 function parseSmsTimestamp(timestamp: string): Date | null {
-  const normalized = timestamp.includes(' ') ? timestamp.replace(' ', 'T') : timestamp
-  const date = new Date(normalized)
+  const date = new Date(timestamp)
   return Number.isNaN(date.getTime()) ? null : date
 }
 

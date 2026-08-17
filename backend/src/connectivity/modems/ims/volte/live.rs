@@ -4249,7 +4249,7 @@ async fn handle_live_frame(
                 return Ok(());
             }
             let timestamp = if message.service_center_timestamp.trim().is_empty() {
-                crate::platform::db::beijing_sms_now_string()
+                crate::platform::db::utc_sms_now_string()
             } else {
                 message.service_center_timestamp.clone()
             };

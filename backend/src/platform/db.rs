@@ -6,7 +6,7 @@
 // block creates a high-conflict diff without changing runtime organization.
 #![allow(clippy::items_after_test_module)]
 
-use chrono::{DateTime, Duration, FixedOffset, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -474,35 +474,29 @@ pub fn beijing_sms_now_string() -> String {
         .to_string()
 }
 
+pub fn utc_sms_now_string() -> String {
+    Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Normalize timestamps carrying an explicit offset to UTC.
 pub fn normalize_sms_timestamp_for_display(timestamp: &str) -> Option<String> {
     let timestamp = timestamp.trim();
     if timestamp.is_empty() {
         return None;
     }
 
-    if let Some(parsed) = parse_sms_timestamp_with_offset(timestamp) {
-        return Some(parsed);
-    }
-
-    for format in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"] {
-        if let Ok(parsed) = NaiveDateTime::parse_from_str(timestamp, format) {
-            return Some(parsed.format(SMS_TIMESTAMP_FORMAT).to_string());
-        }
-    }
-
-    None
+    parse_sms_timestamp_with_offset(timestamp).map(|parsed| {
+        parsed
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true)
+    })
 }
 
-fn parse_sms_timestamp_with_offset(timestamp: &str) -> Option<String> {
+fn parse_sms_timestamp_with_offset(timestamp: &str) -> Option<DateTime<FixedOffset>> {
     let timestamp = timestamp.replace(' ', "T");
 
     if let Ok(parsed) = DateTime::parse_from_rfc3339(&timestamp) {
-        return Some(
-            parsed
-                .with_timezone(&beijing_offset())
-                .format(SMS_TIMESTAMP_FORMAT)
-                .to_string(),
-        );
+        return Some(parsed);
     }
 
     let offset_start = timestamp
@@ -518,16 +512,11 @@ fn parse_sms_timestamp_with_offset(timestamp: &str) -> Option<String> {
     };
     let candidate = format!("{datetime}{normalized_offset}");
 
-    DateTime::parse_from_rfc3339(&candidate).ok().map(|parsed| {
-        parsed
-            .with_timezone(&beijing_offset())
-            .format(SMS_TIMESTAMP_FORMAT)
-            .to_string()
-    })
+    DateTime::parse_from_rfc3339(&candidate).ok()
 }
 
 fn sms_timestamp_for_storage(timestamp: &str) -> String {
-    normalize_sms_timestamp_for_display(timestamp).unwrap_or_else(beijing_sms_now_string)
+    normalize_sms_timestamp_for_display(timestamp).unwrap_or_else(utc_sms_now_string)
 }
 
 fn sms_timestamp_for_display(timestamp: String) -> String {
@@ -1600,7 +1589,7 @@ mod tests {
                 "outgoing",
                 "10086",
                 "CHECK",
-                "2026-06-22 13:13:59",
+                "2026-06-22T13:13:59Z",
                 "sent",
                 None,
             )
@@ -1610,7 +1599,7 @@ mod tests {
                 "incoming",
                 "10086",
                 "reply",
-                "2026-06-22 13:13:59",
+                "2026-06-22T13:13:59Z",
                 "received",
                 Some("vowifi-mt:test"),
             )
@@ -1634,6 +1623,33 @@ mod tests {
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
             vec![second, first]
+        );
+    }
+
+    #[test]
+    fn sms_timestamps_are_normalized_to_utc_at_the_database_boundary() {
+        let db = test_database();
+
+        db.insert_sms_at(
+            "incoming",
+            "10010",
+            "offset-aware timestamp",
+            "2026-08-17T15:43:56+02:00",
+            "received",
+            None,
+        )
+        .expect("insert offset-aware timestamp");
+
+        let messages = db.get_sms_messages(10, 0, None).expect("list SMS");
+        let timestamp_for = |content: &str| {
+            messages
+                .iter()
+                .find(|message| message.content == content)
+                .map(|message| message.timestamp.as_str())
+        };
+        assert_eq!(
+            timestamp_for("offset-aware timestamp"),
+            Some("2026-08-17T13:43:56Z")
         );
     }
 
@@ -1687,7 +1703,7 @@ mod tests {
         let db = test_database();
         let line_a = "line-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let line_b = "line-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let timestamp = "2026-08-04 21:30:00";
+        let timestamp = "2026-08-04T13:30:00Z";
         let marker = "mmfp:shared-marker";
         let id = db
             .insert_sms_at_with_transport_for_line(
@@ -3961,7 +3977,7 @@ impl Database {
         status: &str,
         pdu: Option<&str>,
     ) -> Result<i64> {
-        let timestamp = beijing_sms_now_string();
+        let timestamp = utc_sms_now_string();
         self.insert_sms_at(direction, phone_number, content, &timestamp, status, pdu)
     }
 
@@ -3974,7 +3990,7 @@ impl Database {
         pdu: Option<&str>,
         transport: &str,
     ) -> Result<i64> {
-        let timestamp = beijing_sms_now_string();
+        let timestamp = utc_sms_now_string();
         self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,
@@ -3998,7 +4014,7 @@ impl Database {
         transport: &str,
         line_id: Option<&str>,
     ) -> Result<i64> {
-        let timestamp = beijing_sms_now_string();
+        let timestamp = utc_sms_now_string();
         self.insert_sms_at_with_transport_for_line(
             direction,
             phone_number,

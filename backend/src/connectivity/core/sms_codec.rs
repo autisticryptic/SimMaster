@@ -1,3 +1,4 @@
+use chrono::{FixedOffset, SecondsFormat, TimeZone, Utc};
 use serde::Serialize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -648,21 +649,21 @@ fn parse_sms_deliver_tpdu(reference: u8, tpdu: &[u8]) -> Result<MtSmsDeliver, Sm
     let first_octet = tpdu[0];
     let user_data_header_present = first_octet & 0x40 != 0;
     let mut offset = 1usize;
-    let originator_digits = usize::from(tpdu[offset]);
+    let originator_address_length = usize::from(tpdu[offset]);
     offset += 1;
     if offset >= tpdu.len() {
         return Err(SmsEncodingError::BodyTooLong);
     }
     let ton_npi = tpdu[offset];
     offset += 1;
-    let originator_octets = address_value_octets(ton_npi, originator_digits);
+    let originator_octets = address_value_octets(originator_address_length);
     if offset + originator_octets + 3 + 7 > tpdu.len() {
         return Err(SmsEncodingError::BodyTooLong);
     }
     let originator = decode_address_value(
         ton_npi,
         &tpdu[offset..offset + originator_octets],
-        originator_digits,
+        originator_address_length,
     );
     offset += originator_octets;
     offset += 1;
@@ -672,7 +673,8 @@ fn parse_sms_deliver_tpdu(reference: u8, tpdu: &[u8]) -> Result<MtSmsDeliver, Sm
     if scts_end > tpdu.len() {
         return Err(SmsEncodingError::BodyTooLong);
     }
-    let service_center_timestamp = hex_lower(&tpdu[offset..scts_end]);
+    let service_center_timestamp = decode_service_center_timestamp(&tpdu[offset..scts_end])
+        .unwrap_or_else(|| hex_lower(&tpdu[offset..scts_end]));
     offset = scts_end;
     if offset >= tpdu.len() {
         return Err(SmsEncodingError::BodyTooLong);
@@ -688,8 +690,8 @@ fn parse_sms_deliver_tpdu(reference: u8, tpdu: &[u8]) -> Result<MtSmsDeliver, Sm
     } else {
         SmsUserDataHeader::empty()
     };
-    let text = match dcs {
-        0x08 => {
+    let text = match sms_alphabet_for_dcs(dcs) {
+        SmsAlphabet::Ucs2 => {
             let user_data = raw_user_data
                 .get(..std::cmp::min(raw_user_data.len(), udl))
                 .ok_or(SmsEncodingError::BodyTooLong)?;
@@ -698,7 +700,8 @@ fn parse_sms_deliver_tpdu(reference: u8, tpdu: &[u8]) -> Result<MtSmsDeliver, Sm
                 .ok_or(SmsEncodingError::BodyTooLong)?;
             decode_ucs2_text(payload, payload.len())?
         }
-        _ => decode_gsm7_user_data(raw_user_data, udl, header.header_octets),
+        SmsAlphabet::Gsm7 => decode_gsm7_user_data(raw_user_data, udl, header.header_octets),
+        SmsAlphabet::Binary => decode_binary_user_data(raw_user_data, udl, header.header_octets)?,
     };
     Ok(MtSmsDeliver {
         rp_message_reference: reference,
@@ -710,6 +713,35 @@ fn parse_sms_deliver_tpdu(reference: u8, tpdu: &[u8]) -> Result<MtSmsDeliver, Sm
         segment_sequence: header.segment.sequence,
         segment_total: header.segment.total,
     })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SmsAlphabet {
+    Gsm7,
+    Binary,
+    Ucs2,
+}
+
+/// Resolve TP-DCS according to 3GPP TS 23.038. Unknown, compressed and 8-bit
+/// payloads stay binary so they cannot be mistaken for GSM 7-bit text.
+fn sms_alphabet_for_dcs(dcs: u8) -> SmsAlphabet {
+    match dcs >> 4 {
+        0x0..=0x3 => {
+            if dcs & 0x20 != 0 {
+                return SmsAlphabet::Binary;
+            }
+            match (dcs >> 2) & 0x03 {
+                0x00 => SmsAlphabet::Gsm7,
+                0x01 => SmsAlphabet::Binary,
+                0x02 => SmsAlphabet::Ucs2,
+                _ => SmsAlphabet::Binary,
+            }
+        }
+        0x0c | 0x0d => SmsAlphabet::Gsm7,
+        0x0e => SmsAlphabet::Ucs2,
+        0x0f if dcs & 0x04 == 0 => SmsAlphabet::Gsm7,
+        _ => SmsAlphabet::Binary,
+    }
 }
 
 fn build_sms_submit_tpdu(
@@ -893,12 +925,48 @@ fn hex_lower(data: &[u8]) -> String {
     data.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn address_value_octets(ton_npi: u8, digits: usize) -> usize {
-    if address_type_is_alphanumeric(ton_npi) {
-        (digits * 7).div_ceil(8)
+fn decode_service_center_timestamp(data: &[u8]) -> Option<String> {
+    let [year, month, day, hour, minute, second, timezone] = data else {
+        return None;
+    };
+    let year = swapped_bcd(*year)?;
+    let year = if year >= 90 {
+        1900 + i32::from(year)
     } else {
-        digits.div_ceil(2)
+        2000 + i32::from(year)
+    };
+    let month = u32::from(swapped_bcd(*month)?);
+    let day = u32::from(swapped_bcd(*day)?);
+    let hour = u32::from(swapped_bcd(*hour)?);
+    let minute = u32::from(swapped_bcd(*minute)?);
+    let second = u32::from(swapped_bcd(*second)?);
+
+    let timezone_low = timezone & 0x0f;
+    let timezone_high = timezone >> 4;
+    if timezone_high > 9 || timezone_low & 0x07 > 9 {
+        return None;
     }
+    let quarter_hours = i32::from((timezone_low & 0x07) * 10 + timezone_high);
+    let direction = if timezone_low & 0x08 == 0 { 1 } else { -1 };
+    let source_offset = FixedOffset::east_opt(direction * quarter_hours * 15 * 60)?;
+    let timestamp = source_offset
+        .with_ymd_and_hms(year, month, day, hour, minute, second)
+        .single()?;
+    Some(
+        timestamp
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true),
+    )
+}
+
+fn swapped_bcd(value: u8) -> Option<u8> {
+    let tens = value & 0x0f;
+    let units = value >> 4;
+    (tens <= 9 && units <= 9).then_some(tens * 10 + units)
+}
+
+fn address_value_octets(address_length_semi_octets: usize) -> usize {
+    address_length_semi_octets.div_ceil(2)
 }
 
 fn address_type_is_alphanumeric(ton_npi: u8) -> bool {
@@ -909,19 +977,21 @@ fn address_type_is_international(ton_npi: u8) -> bool {
     ton_npi & 0x70 == 0x10
 }
 
-fn decode_address_value(ton_npi: u8, value: &[u8], digits: usize) -> String {
+fn decode_address_value(ton_npi: u8, value: &[u8], address_length_semi_octets: usize) -> String {
     if address_type_is_alphanumeric(ton_npi) {
-        return decode_gsm7_text(value, digits);
+        let septet_count = address_length_semi_octets * 4 / 7;
+        return decode_gsm7_text(value, septet_count);
     }
 
-    let mut out =
-        String::with_capacity(digits + usize::from(address_type_is_international(ton_npi)));
+    let mut out = String::with_capacity(
+        address_length_semi_octets + usize::from(address_type_is_international(ton_npi)),
+    );
     if address_type_is_international(ton_npi) {
         out.push('+');
     }
     for byte in value {
         for nibble in [byte & 0x0f, byte >> 4] {
-            if out.trim_start_matches('+').len() >= digits || nibble == 0x0f {
+            if out.trim_start_matches('+').len() >= address_length_semi_octets || nibble == 0x0f {
                 continue;
             }
             let ch = match nibble {
@@ -1035,6 +1105,20 @@ fn decode_ucs2_text(user_data: &[u8], octets: usize) -> Result<String, SmsEncodi
     String::from_utf16(&units).map_err(|_| SmsEncodingError::BodyTooLong)
 }
 
+fn decode_binary_user_data(
+    user_data: &[u8],
+    udl_octets: usize,
+    header_octets: usize,
+) -> Result<String, SmsEncodingError> {
+    let user_data = user_data
+        .get(..std::cmp::min(user_data.len(), udl_octets))
+        .ok_or(SmsEncodingError::BodyTooLong)?;
+    let payload = user_data
+        .get(header_octets..)
+        .ok_or(SmsEncodingError::BodyTooLong)?;
+    Ok(format!("0x{}", hex_lower(payload)))
+}
+
 fn decode_gsm7_user_data(user_data: &[u8], udl_septets: usize, header_octets: usize) -> String {
     if header_octets == 0 {
         return decode_gsm7_text(user_data, udl_septets);
@@ -1093,49 +1177,49 @@ fn decode_gsm7_text_from_bit_offset(
 fn gsm7_basic_char(value: u8) -> char {
     match value {
         0x00 => '@',
-        0x01 => '拢',
+        0x01 => '\u{00a3}',
         0x02 => '$',
-        0x03 => '楼',
-        0x04 => '猫',
-        0x05 => '茅',
-        0x06 => '霉',
-        0x07 => '矛',
-        0x08 => '貌',
-        0x09 => '脟',
+        0x03 => '\u{00a5}',
+        0x04 => '\u{00e8}',
+        0x05 => '\u{00e9}',
+        0x06 => '\u{00f9}',
+        0x07 => '\u{00ec}',
+        0x08 => '\u{00f2}',
+        0x09 => '\u{00c7}',
         0x0a => '\n',
-        0x0b => '脴',
-        0x0c => '酶',
+        0x0b => '\u{00d8}',
+        0x0c => '\u{00f8}',
         0x0d => '\r',
-        0x0e => '脜',
-        0x0f => '氓',
-        0x10 => '螖',
+        0x0e => '\u{00c5}',
+        0x0f => '\u{00e5}',
+        0x10 => '\u{0394}',
         0x11 => '_',
-        0x12 => '桅',
-        0x13 => '螕',
-        0x14 => '螞',
-        0x15 => '惟',
-        0x16 => '螤',
-        0x17 => '唯',
-        0x18 => '危',
-        0x19 => '螛',
-        0x1a => '螢',
-        0x1c => '脝',
-        0x1d => '忙',
-        0x1e => '脽',
-        0x1f => '脡',
+        0x12 => '\u{03a6}',
+        0x13 => '\u{0393}',
+        0x14 => '\u{039b}',
+        0x15 => '\u{03a9}',
+        0x16 => '\u{03a0}',
+        0x17 => '\u{03a8}',
+        0x18 => '\u{03a3}',
+        0x19 => '\u{0398}',
+        0x1a => '\u{039e}',
+        0x1c => '\u{00c6}',
+        0x1d => '\u{00e6}',
+        0x1e => '\u{00df}',
+        0x1f => '\u{00c9}',
         0x20..=0x3f | 0x41..=0x5a | 0x61..=0x7a => char::from(value),
-        0x40 => '隆',
-        0x5b => '脛',
-        0x5c => '脰',
-        0x5d => '脩',
-        0x5e => '脺',
-        0x5f => '§',
-        0x60 => '驴',
-        0x7b => '盲',
-        0x7c => '枚',
-        0x7d => '帽',
-        0x7e => '眉',
-        0x7f => '脿',
+        0x40 => '\u{00a1}',
+        0x5b => '\u{00c4}',
+        0x5c => '\u{00d6}',
+        0x5d => '\u{00d1}',
+        0x5e => '\u{00dc}',
+        0x5f => '\u{00a7}',
+        0x60 => '\u{00bf}',
+        0x7b => '\u{00e4}',
+        0x7c => '\u{00f6}',
+        0x7d => '\u{00f1}',
+        0x7e => '\u{00fc}',
+        0x7f => '\u{00e0}',
         _ => ' ',
     }
 }
@@ -1731,7 +1815,7 @@ mod tests {
         tpdu.extend_from_slice(&originator_address);
         tpdu.push(0x00);
         tpdu.push(0x08);
-        tpdu.extend_from_slice(&[0x42, 0x10, 0x10, 0x12, 0x34, 0x56, 0x00]);
+        tpdu.extend_from_slice(&[0x62, 0x80, 0x71, 0x12, 0x34, 0x65, 0x23]);
         tpdu.push(user_data.len() as u8);
         tpdu.extend_from_slice(&user_data);
 
@@ -1784,13 +1868,73 @@ mod tests {
         tpdu.extend_from_slice(&originator_address);
         tpdu.push(0x00);
         tpdu.push(0x00);
-        tpdu.extend_from_slice(&[0x42, 0x10, 0x10, 0x12, 0x34, 0x56, 0x00]);
+        tpdu.extend_from_slice(&[0x62, 0x80, 0x71, 0x12, 0x34, 0x65, 0x23]);
         tpdu.push(udl as u8);
         tpdu.extend_from_slice(&user_data);
 
         let mut body = Vec::new();
         body.push(0x01);
         body.push(reference);
+        push_len_prefixed(&mut body, &service_center).expect("rp origin address");
+        push_len_prefixed(&mut body, &tpdu).expect("rp user data");
+        body
+    }
+
+    fn build_test_mt_rp_data_with_alphanumeric_originator(
+        reference: u8,
+        originator: &str,
+        text: &str,
+    ) -> Vec<u8> {
+        let service_center = encode_address_value("+8613800100500").expect("service center");
+        let (originator_address, originator_septets) =
+            encode_gsm7_user_data(originator).expect("alphanumeric originator");
+        let originator_length_semi_octets = (originator_septets * 7).div_ceil(4);
+        let (user_data, user_data_septets) = encode_gsm7_user_data(text).expect("GSM7 user data");
+
+        let mut tpdu = Vec::new();
+        tpdu.push(0x00);
+        tpdu.push(originator_length_semi_octets as u8);
+        tpdu.push(0xd0);
+        tpdu.extend_from_slice(&originator_address);
+        tpdu.push(0x00);
+        tpdu.push(0x00);
+        tpdu.extend_from_slice(&[0x62, 0x80, 0x71, 0x12, 0x34, 0x65, 0x23]);
+        tpdu.push(user_data_septets as u8);
+        tpdu.extend_from_slice(&user_data);
+
+        let mut body = Vec::new();
+        body.push(0x01);
+        body.push(reference);
+        push_len_prefixed(&mut body, &service_center).expect("rp origin address");
+        push_len_prefixed(&mut body, &tpdu).expect("rp user data");
+        body
+    }
+
+    fn build_test_mt_rp_data_with_dcs(
+        reference: u8,
+        originator: &str,
+        dcs: u8,
+        user_data_length: usize,
+        user_data: &[u8],
+    ) -> Vec<u8> {
+        let service_center = encode_address_value("+8613800100500").expect("service center");
+        let originator_digits = normalized_address_digits(originator)
+            .expect("originator digits")
+            .digits
+            .len();
+        let originator_address = encode_address_value(originator).expect("originator address");
+
+        let mut tpdu = Vec::new();
+        tpdu.push(0x00);
+        tpdu.push(originator_digits as u8);
+        tpdu.extend_from_slice(&originator_address);
+        tpdu.push(0x00);
+        tpdu.push(dcs);
+        tpdu.extend_from_slice(&[0x62, 0x80, 0x71, 0x12, 0x34, 0x65, 0x23]);
+        tpdu.push(user_data_length as u8);
+        tpdu.extend_from_slice(user_data);
+
+        let mut body = vec![0x01, reference];
         push_len_prefixed(&mut body, &service_center).expect("rp origin address");
         push_len_prefixed(&mut body, &tpdu).expect("rp user data");
         body
@@ -1818,7 +1962,7 @@ mod tests {
         assert_eq!(deliver.rp_message_reference, 0x33);
         assert_eq!(deliver.originator, "10086");
         assert_eq!(deliver.text, "OK");
-        assert_eq!(deliver.service_center_timestamp, "42101012345600");
+        assert_eq!(deliver.service_center_timestamp, "2026-08-17T13:43:56Z");
         assert_eq!(deliver.segment_reference, None);
         assert_eq!(deliver.segment_sequence, 1);
         assert_eq!(deliver.segment_total, 1);
@@ -1867,6 +2011,62 @@ mod tests {
         assert_eq!(deliver.segment_reference, Some(0x7b));
         assert_eq!(deliver.segment_sequence, 1);
         assert_eq!(deliver.segment_total, 2);
+    }
+
+    #[test]
+    fn parses_gsm7_mt_from_alphanumeric_originator_without_offset_drift() {
+        let text = "Maxis ID: Your TAC to sign in is 123456 and it will expire in 5 mins. Reminder! Do NOT share your TAC with anyone. JANGAN kongsi TAC anda dengan sesiapa.";
+        let body = build_test_mt_rp_data_with_alphanumeric_originator(0x37, "80100 MAXIS", text);
+        let deliver = parse_mt_rp_data(&body).expect("GSM7 alphanumeric network RP-DATA");
+
+        assert_eq!(deliver.originator, "80100 MAXIS");
+        assert_eq!(deliver.text, text);
+        assert_eq!(deliver.service_center_timestamp, "2026-08-17T13:43:56Z");
+    }
+
+    #[test]
+    fn gsm7_default_alphabet_special_characters_round_trip() {
+        let text = "\u{00a3}\u{00a5}\u{00e8}\u{00e9}\u{00f9}\u{00ec}\u{00f2}\u{00c7}\u{00d8}\u{00f8}\u{00c5}\u{00e5}\u{0394}\u{03a6}\u{0393}\u{039b}\u{03a9}\u{03a0}\u{03a8}\u{03a3}\u{0398}\u{039e}\u{00c6}\u{00e6}\u{00df}\u{00c9}\u{00a1}\u{00c4}\u{00d6}\u{00d1}\u{00dc}\u{00a7}\u{00bf}\u{00e4}\u{00f6}\u{00f1}\u{00fc}\u{00e0}";
+        let (packed, septets) = encode_gsm7_user_data(text).expect("GSM7 default alphabet");
+
+        assert_eq!(decode_gsm7_text(&packed, septets), text);
+    }
+
+    #[test]
+    fn classifies_standard_tp_dcs_groups_without_guessing() {
+        for dcs in [0x00, 0x10, 0xc8, 0xd8, 0xf0] {
+            assert_eq!(sms_alphabet_for_dcs(dcs), SmsAlphabet::Gsm7, "{dcs:#04x}");
+        }
+        for dcs in [0x08, 0x18, 0xe8] {
+            assert_eq!(sms_alphabet_for_dcs(dcs), SmsAlphabet::Ucs2, "{dcs:#04x}");
+        }
+        for dcs in [0x04, 0x20, 0x40, 0xf4] {
+            assert_eq!(sms_alphabet_for_dcs(dcs), SmsAlphabet::Binary, "{dcs:#04x}");
+        }
+    }
+
+    #[test]
+    fn service_center_timestamp_is_normalized_to_utc() {
+        assert_eq!(
+            decode_service_center_timestamp(&[0x62, 0x80, 0x71, 0x12, 0x34, 0x65, 0x61]).as_deref(),
+            Some("2026-08-17T17:43:56Z")
+        );
+    }
+
+    #[test]
+    fn parses_tp_dcs_variants_with_the_declared_alphabet() {
+        let gsm7_text = "Hotlink login";
+        let (gsm7_data, gsm7_septets) = encode_gsm7_user_data(gsm7_text).expect("GSM7 data");
+        let gsm7 = build_test_mt_rp_data_with_dcs(0x38, "10086", 0xd8, gsm7_septets, &gsm7_data);
+        assert_eq!(parse_mt_rp_data(&gsm7).unwrap().text, gsm7_text);
+
+        let ucs2_text = "\u{9a8c}\u{8bc1}\u{7801}";
+        let ucs2_data = encode_ucs2_user_data(ucs2_text).expect("UCS2 data");
+        let ucs2 = build_test_mt_rp_data_with_dcs(0x39, "10086", 0xe8, ucs2_data.len(), &ucs2_data);
+        assert_eq!(parse_mt_rp_data(&ucs2).unwrap().text, ucs2_text);
+
+        let binary = build_test_mt_rp_data_with_dcs(0x3a, "10086", 0xf4, 3, &[0x00, 0x80, 0xff]);
+        assert_eq!(parse_mt_rp_data(&binary).unwrap().text, "0x0080ff");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{broadcast, mpsc, oneshot, Mutex},
     task::JoinHandle,
 };
 
@@ -79,15 +79,18 @@ struct VowifiOperatorHandle {
     generation: AtomicU64,
     installed: Mutex<Option<InstalledTask>>,
     supplementary: RwLock<Option<Arc<SupplementaryRuntime>>>,
+    mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
 }
 
 impl VowifiOperatorHandle {
     fn new() -> Self {
+        let (mt_sms, _) = broadcast::channel(64);
         Self {
             link: OperatorLink::default(),
             generation: AtomicU64::new(0),
             installed: Mutex::new(None),
             supplementary: RwLock::new(None),
+            mt_sms,
         }
     }
 }
@@ -166,6 +169,12 @@ pub fn operator_link_for_line(line_id: &str) -> OperatorLink {
         .clone()
 }
 
+pub fn subscribe_mt_sms_for_line(
+    line_id: &str,
+) -> broadcast::Receiver<crate::connectivity::core::sms_codec::MtSmsDeliver> {
+    handle_for_line(line_id).mt_sms.subscribe()
+}
+
 fn handle_for_line(line_id: &str) -> Arc<VowifiOperatorHandle> {
     let _ = operator_link_for_line(line_id);
     handles()
@@ -201,6 +210,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
+    let mt_sms = handle.mt_sms.clone();
     let mut commands = link.subscribe_commands();
     let (replacement_tx, replacement_rx) = mpsc::unbounded_channel();
     let (unregister_tx, unregister_rx) = mpsc::unbounded_channel();
@@ -215,6 +225,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
             replacement_rx,
             unregister_rx,
             supplementary,
+            mt_sms,
         )
         .await;
         if let Some(runtime) = cleanup_supplementary {
@@ -428,6 +439,7 @@ async fn run_session(
     mut replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
     mut unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
     supplementary: Option<Arc<SupplementaryRuntime>>,
+    mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
 ) -> Result<(), String> {
     let mut session = VoiceSession {
         next_tcp_keepalive: next_interval(context.tcp_keepalive_interval),
@@ -482,7 +494,7 @@ async fn run_session(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             frame = session.channel.recv_sip(CHANNEL_POLL) => match frame {
-                Ok(frame) => handle_frame(&mut session, &link, &frame).await?,
+                Ok(frame) => handle_frame(&mut session, &link, &mt_sms, &frame).await?,
                 Err(error) if error.code() == "ims_channel_read_timeout" => {}
                 Err(error) => {
                     end_active_calls(&mut session, &link);
@@ -1134,6 +1146,7 @@ async fn handle_command_inner(
 async fn handle_frame(
     session: &mut VoiceSession,
     link: &OperatorLink,
+    mt_sms: &broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
     frame: &[u8],
 ) -> Result<(), String> {
     let active_call_id = session
@@ -1270,13 +1283,62 @@ async fn handle_frame(
         return Ok(());
     }
 
-    if sip_frame::is_request(frame, "OPTIONS") || sip_frame::is_request(frame, "MESSAGE") {
+    if sip_frame::is_request(frame, "OPTIONS") {
         let response = sip::build_response(frame, 200, "OK", None, None, None);
         session
             .channel
             .send_sip(&response)
             .await
             .map_err(|error| error.code().to_string())?;
+        return Ok(());
+    }
+
+    if sip_frame::is_request(frame, "MESSAGE") {
+        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        session
+            .channel
+            .send_sip(&response)
+            .await
+            .map_err(|error| error.code().to_string())?;
+
+        let body = sip_frame::body(frame);
+        if body.first() != Some(&0x01) {
+            return Ok(());
+        }
+        match crate::connectivity::core::sms_codec::parse_mt_rp_data(body) {
+            Ok(deliver) => {
+                let rp_ack_body = crate::connectivity::core::sms_codec::build_network_rp_ack(
+                    deliver.rp_message_reference,
+                );
+                let rp_ack = build_mt_sms_rp_ack(&session.context, frame, &rp_ack_body)?;
+                session
+                    .channel
+                    .send_sip(&rp_ack)
+                    .await
+                    .map_err(|error| error.code().to_string())?;
+                let segment_reference_present = deliver.segment_reference.is_some();
+                let segment_sequence = deliver.segment_sequence;
+                let segment_total = deliver.segment_total;
+                let receiver_count = mt_sms.receiver_count();
+                let _ = mt_sms.send(deliver);
+                tracing::info!(
+                    line_id = session.context.line_id,
+                    receiver_count,
+                    segment_reference_present,
+                    segment_sequence,
+                    segment_total,
+                    "VoWiFi MT SMS received and RP-ACK submitted"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    line_id = session.context.line_id,
+                    reason = %error,
+                    body_bytes = body.len(),
+                    "VoWiFi MT SMS RP-DATA parse failed"
+                );
+            }
+        }
         return Ok(());
     }
 
@@ -2148,6 +2210,58 @@ fn build_options(context: &RegisteredVoiceContext, cseq: u32) -> Vec<u8> {
     })
 }
 
+fn build_mt_sms_rp_ack(
+    context: &RegisteredVoiceContext,
+    inbound_frame: &[u8],
+    body: &[u8],
+) -> Result<Vec<u8>, String> {
+    use crate::connectivity::core::sip_message::{build_rp_ack, SipHeader, SipRequest};
+
+    let request_uri = header_uri(inbound_frame, "From")
+        .ok_or_else(|| "vowifi_mt_sms_originator_uri_missing".to_string())?;
+    let ids = sip::RequestIds::fresh(1);
+    let route = context
+        .registration
+        .service_route
+        .clone()
+        .unwrap_or_else(|| {
+            let pcscf_host = sip::sip_host(context.route.pcscf_addr.ip());
+            format!(
+                "<sip:{pcscf_host}:{};transport={};lr>",
+                context.route.pcscf_addr.port(),
+                context.route.transport.as_param()
+            )
+        });
+    let to_value = format!("<{request_uri}>");
+    let mut headers = vec![
+        SipHeader::new("Route", route),
+        SipHeader::new(
+            "P-Preferred-Identity",
+            format!("<{}>", context.identity.public_uri),
+        ),
+        SipHeader::new("P-Access-Network-Info", &context.pani),
+    ];
+    if let Some(security_verify) = context.security_verify.as_deref() {
+        headers.push(SipHeader::new("Security-Verify", security_verify));
+    }
+    headers.push(SipHeader::new("Accept-Contact", "*;+g.3gpp.smsip"));
+    headers.push(SipHeader::new("User-Agent", &context.user_agent));
+    headers.push(SipHeader::new("Content-Type", "application/vnd.3gpp.sms"));
+    Ok(build_rp_ack(&SipRequest {
+        method: "MESSAGE",
+        request_uri: &request_uri,
+        route: context.route,
+        branch: &sip::new_branch(),
+        from_uri: &context.identity.public_uri,
+        from_tag: &ids.from_tag,
+        to_value: &to_value,
+        call_id: &ids.call_id,
+        cseq: ids.cseq,
+        headers: &headers,
+        body,
+    }))
+}
+
 fn ims_contact(identity: &ImsIdentity, route: &ImsRoute) -> String {
     format!(
         "sip:{}@{}:{};transport={}",
@@ -2345,6 +2459,53 @@ mod tests {
             options_ping_interval: None,
             unregister: None,
         }
+    }
+
+    #[tokio::test]
+    async fn mt_sms_rp_ack_targets_network_originator_and_preserves_rpdu() {
+        let (client, server) = tcp_pair().await;
+        let context = context("line-mt-ack", &client, &server);
+        let inbound = b"MESSAGE sip:+601100000001@ims.example SIP/2.0\r\nFrom: <sip:+601200000000@ims.example>;tag=network\r\nTo: <sip:+601100000001@ims.example>\r\nCall-ID: mt-network@ims.example\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n";
+        let rpdu = [0x02, 0x37];
+
+        let ack = build_mt_sms_rp_ack(&context, inbound, &rpdu).expect("build RP-ACK");
+
+        assert!(sip_frame::is_request(&ack, "MESSAGE"));
+        assert!(ack.starts_with(b"MESSAGE sip:+601200000000@ims.example SIP/2.0\r\n"));
+        assert_eq!(
+            sip_frame::header_value(&ack, "Content-Type").as_deref(),
+            Some("application/vnd.3gpp.sms")
+        );
+        assert_eq!(sip_frame::body(&ack), rpdu);
+    }
+
+    #[tokio::test]
+    async fn mt_sms_events_are_isolated_by_line() {
+        let line_a = "line-mt-events-a";
+        let line_b = "line-mt-events-b";
+        let mut receiver_a = subscribe_mt_sms_for_line(line_a);
+        let mut receiver_b = subscribe_mt_sms_for_line(line_b);
+        let deliver = crate::connectivity::core::sms_codec::MtSmsDeliver {
+            rp_message_reference: 0x37,
+            originator: "80100 MAXIS".to_string(),
+            text: "login code 123456".to_string(),
+            user_data_bytes: 24,
+            service_center_timestamp: "42101012345600".to_string(),
+            segment_reference: None,
+            segment_sequence: 1,
+            segment_total: 1,
+        };
+
+        handle_for_line(line_a)
+            .mt_sms
+            .send(deliver.clone())
+            .unwrap();
+
+        assert_eq!(receiver_a.recv().await.unwrap(), deliver);
+        assert!(matches!(
+            receiver_b.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     fn audio_offer(endpoint: SocketAddr) -> MediaOffer {
