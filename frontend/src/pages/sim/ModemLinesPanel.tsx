@@ -656,13 +656,20 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <TravelExplore color={network?.roaming.roaming_allowed ? 'info' : 'disabled'} fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>漫游数据</Typography>
                       </Box>
-                      <Stack minWidth={0} justifyContent="center" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
+                      <Stack minWidth={0} justifyContent="center" spacing={0.25} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
                         <Typography variant="caption" color="text.secondary" display="block">
                           {networkLoadLabel
                             ? networkLoadLabel
                             : !line.modem.present
                             ? '配置可修改，设备恢复后自动应用'
-                            : `${network?.roaming.roaming_allowed ? '允许漫游' : '禁止漫游'} · ${network?.roaming.is_roaming ? '当前正在漫游' : '当前未漫游'}`}
+                            : network?.roaming.roaming_allowed ? '允许漫游' : '禁止漫游'}
+                        </Typography>
+                        <Typography variant="caption" color="text.disabled" display="block">
+                          {networkLoadLabel
+                            ? '状态返回后自动更新'
+                            : !line.modem.present
+                            ? '当前漫游状态未知'
+                            : network?.roaming.is_roaming ? '当前正在漫游' : '当前未漫游'}
                         </Typography>
                       </Stack>
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
