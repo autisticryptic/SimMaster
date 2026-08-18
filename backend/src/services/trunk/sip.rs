@@ -8,7 +8,7 @@ use crate::connectivity::core::{
     sip_message::{SipHeader, SipRequest},
 };
 
-pub const USER_AGENT: &str = "SimAdmin Trunk/1.1.3";
+pub const USER_AGENT: &str = concat!("SimAdmin Trunk/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Clone)]
 pub struct RegisterDialog {

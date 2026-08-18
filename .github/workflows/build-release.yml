@@ -9,8 +9,7 @@ name: Build-Release
 #   - linux/aarch64 (ARM64) -> simadmin-linux-arm64.tar.gz
 #   - linux/x86_64  (AMD64) -> simadmin-linux-amd64.tar.gz
 #
-# Windows 支持已预留（见下方 build.matrix 中被注释的条目与 TODO 说明）。
-# 因当前后端大量依赖 dbus 读取系统状态，Windows 端待后端适配完成后再开启。
+# SimAdmin 运行目标仅为 Linux。
 
 on:
   push:
@@ -160,14 +159,6 @@ jobs:
           - arch: amd64
             target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
-          # ===== Windows 预留（TODO） =====
-          # 当前后端通过 dbus 读取系统状态，尚未在 Windows 上适配。
-          # 后端完成 Windows 适配后，取消下面注释并补充对应的构建步骤
-          # （Windows runner 无 apt/musl，需改用 MSVC 工具链，且打包为 simadmin.exe）：
-          # - arch: x86_64
-          #   target: x86_64-pc-windows-msvc
-          #   runner: windows-latest
-          #   os: windows
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -395,8 +386,6 @@ jobs:
             |------|------|------|
             | aarch64 (ARM64) | `simadmin-linux-arm64.tar.gz` | ARM64 Linux 设备 |
             | x86_64 (AMD64)  | `simadmin-linux-amd64.tar.gz` | AMD64/x86_64 Linux 设备 |
-
-            > Windows 版本待后端 dbus 相关能力适配后再提供（已在构建流程中预留）。
 
             每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端 + `system/` DATA6/secondary-QMI 启动资源。
             校验值见 `SHA256SUMS.txt`。
