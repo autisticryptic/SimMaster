@@ -218,8 +218,6 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
 
   // 聊天区域滚动引用
   const chatEndRef = useRef<HTMLDivElement>(null)
-  // 输入框焦点状态 - 有焦点时暂停刷新避免失焦
-  const inputFocusedRef = useRef(false)
 
   const scrollToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -262,8 +260,15 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
     }
   }, [selectedChannelId])
 
-  const fetchConversation = useCallback(async (phone: string, channelId = selectedChannelId, scrollTargetId?: number) => {
-    setConversationLoading(true)
+  const fetchConversation = useCallback(async (
+    phone: string,
+    channelId = selectedChannelId,
+    scrollTargetId?: number,
+    isBackground = false,
+  ) => {
+    if (!isBackground) {
+      setConversationLoading(true)
+    }
     try {
       const response = await api.getSmsConversation({
         phone_number: phone,
@@ -273,6 +278,23 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
       if (response.status === 'ok' && response.data) {
         const sorted = [...response.data.messages].sort(compareSmsChronological)
         setConversationMessages(sorted)
+        if (!isBackground) {
+          setTimeout(() => {
+            if (scrollTargetId !== undefined) {
+              scrollToMessage(scrollTargetId)
+            } else {
+              scrollToBottom()
+            }
+          }, 100)
+        }
+      }
+    } catch {
+      const localMsgs = messages.filter((m) => (
+        m.phone_number === phone && (!channelId || smsChannelId(m) === channelId)
+      ))
+      const sorted = [...localMsgs].sort(compareSmsChronological)
+      setConversationMessages(sorted)
+      if (!isBackground) {
         setTimeout(() => {
           if (scrollTargetId !== undefined) {
             scrollToMessage(scrollTargetId)
@@ -281,21 +303,10 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
           }
         }, 100)
       }
-    } catch {
-      const localMsgs = messages.filter((m) => (
-        m.phone_number === phone && (!channelId || smsChannelId(m) === channelId)
-      ))
-      const sorted = [...localMsgs].sort(compareSmsChronological)
-      setConversationMessages(sorted)
-      setTimeout(() => {
-        if (scrollTargetId !== undefined) {
-          scrollToMessage(scrollTargetId)
-        } else {
-          scrollToBottom()
-        }
-      }, 100)
     } finally {
-      setConversationLoading(false)
+      if (!isBackground) {
+        setConversationLoading(false)
+      }
     }
   }, [messages, scrollToBottom, scrollToMessage, selectedChannelId])
 
@@ -352,15 +363,23 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
     void fetchStats()
     void fetchLines()
     const interval = setInterval(() => {
-      if (inputFocusedRef.current) {
-        return
-      }
       void fetchMessages(true)
       void fetchStats()
       void fetchLines()
+      if (selectedConversation) {
+        void fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
+      }
     }, 10000)
     return () => clearInterval(interval)
-  }, [fetchLines, fetchMessages, fetchStats])
+  }, [
+    fetchConversation,
+    fetchLines,
+    fetchMessages,
+    fetchStats,
+    phoneNumber,
+    selectedConversation,
+    selectedConversationChannelId,
+  ])
 
   const channelById = useMemo(() => new Map(
     smsChannels.map((channel) => [channel.id, channel]),
@@ -915,8 +934,6 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
           size="small"
           value={searchQuery}
           onChange={(event: ChangeEvent<HTMLInputElement>) => setSearchQuery(event.target.value)}
-          onFocus={() => { inputFocusedRef.current = true }}
-          onBlur={() => { inputFocusedRef.current = false }}
           placeholder="搜索联系人或内容..."
           slotProps={{
             input: {
@@ -1234,8 +1251,6 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
             onChange={(e: ChangeEvent<HTMLInputElement>) => setContent(e.target.value)}
             placeholder="输入短信内容..."
             disabled={sendLoading || channelCannotSend}
-            onFocus={() => { inputFocusedRef.current = true }}
-            onBlur={() => { inputFocusedRef.current = false }}
             onKeyDown={(e: KeyboardEvent<HTMLInputElement>) => {
               if (e.key === 'Enter' && !e.shiftKey) {
                 e.preventDefault()
