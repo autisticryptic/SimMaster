@@ -677,13 +677,14 @@ async fn expire_renegotiations(
         }
     }
     for (request, local_tag) in network_timeouts {
-        let response = sip::build_response(
+        let response = sip::build_response_for_access(
             &request,
             504,
             "Server Time-out",
             Some(&local_tag),
             None,
             None,
+            &session.context.user_agent,
         );
         session
             .channel
@@ -843,13 +844,14 @@ async fn handle_command_inner(
                 .calls
                 .remove(&call_id)
                 .ok_or_else(|| "vowifi_call_unknown".to_string())?;
-            sip::build_cancel(
+            sip::build_cancel_for_access(
                 &session.context.identity,
                 &session.context.route,
                 session.context.registration.service_route.as_deref(),
                 &call.dialog,
                 &call.remote_uri,
                 &call.invite_branch,
+                &session.context.user_agent,
             )
         }
         OperatorCommand::HangupCall { call_id } => {
@@ -858,22 +860,24 @@ async fn handle_command_inner(
                 .remove(&call_id)
                 .ok_or_else(|| "vowifi_call_unknown".to_string())?;
             if call.dialog.remote_tag.is_some() {
-                sip::build_bye(
+                sip::build_bye_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
                     &call.dialog,
                     &call.remote_uri,
                     call.next_cseq,
+                    &session.context.user_agent,
                 )
             } else {
-                sip::build_cancel(
+                sip::build_cancel_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
                     &call.dialog,
                     &call.remote_uri,
                     &call.invite_branch,
+                    &session.context.user_agent,
                 )
             }
         }
@@ -1032,7 +1036,7 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 200,
                 "OK",
@@ -1042,6 +1046,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 Some(answer.as_bytes()),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::RejectCall { call_id, status } => {
@@ -1053,13 +1058,14 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 status,
                 sip_reason(status),
                 Some(&call.dialog.local_tag),
                 None,
                 None,
+                &session.context.user_agent,
             )
         }
         OperatorCommand::ReportProvisional {
@@ -1079,7 +1085,7 @@ async fn handle_command_inner(
                 .initial_invite
                 .as_deref()
                 .ok_or_else(|| "vowifi_incoming_invite_missing".to_string())?;
-            sip::build_response(
+            sip::build_response_for_access(
                 request,
                 status,
                 sip_reason(status),
@@ -1089,6 +1095,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 answer.as_deref().map(str::as_bytes),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::AcceptRenegotiation { call_id, body } => {
@@ -1103,7 +1110,7 @@ async fn handle_command_inner(
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
             call.renegotiation_deadline = None;
             call.commit_media_update();
-            sip::build_response(
+            sip::build_response_for_access(
                 &request,
                 200,
                 "OK",
@@ -1113,6 +1120,7 @@ async fn handle_command_inner(
                     &session.context.route,
                 )),
                 Some(answer.as_bytes()),
+                &session.context.user_agent,
             )
         }
         OperatorCommand::RejectRenegotiation { call_id, status } => {
@@ -1126,13 +1134,14 @@ async fn handle_command_inner(
                 .ok_or_else(|| "vowifi_network_reinvite_missing".to_string())?;
             call.rollback_media_update();
             call.renegotiation_deadline = None;
-            sip::build_response(
+            sip::build_response_for_access(
                 &request,
                 status,
                 sip_reason(status),
                 Some(&call.dialog.local_tag),
                 None,
                 None,
+                &session.context.user_agent,
             )
         }
     };
@@ -1163,7 +1172,15 @@ async fn handle_frame(
             } else {
                 "Call/Transaction Does Not Exist"
             };
-            let response = sip::build_response(frame, response_status, reason, None, None, None);
+            let response = sip::build_response_for_access(
+                frame,
+                response_status,
+                reason,
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1238,13 +1255,14 @@ async fn handle_frame(
         })
     {
         let Some(call_id) = trunk_call_id else {
-            let response = sip::build_response(
+            let response = sip::build_response_for_access(
                 frame,
                 481,
                 "Call/Transaction Does Not Exist",
                 None,
                 None,
                 None,
+                &session.context.user_agent,
             );
             session
                 .channel
@@ -1268,7 +1286,15 @@ async fn handle_frame(
         } else {
             (481, "Call/Transaction Does Not Exist")
         };
-        let response = sip::build_response(frame, status, reason, None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            status,
+            reason,
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1284,7 +1310,15 @@ async fn handle_frame(
     }
 
     if sip_frame::is_request(frame, "OPTIONS") {
-        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            200,
+            "OK",
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1294,7 +1328,15 @@ async fn handle_frame(
     }
 
     if sip_frame::is_request(frame, "MESSAGE") {
-        let response = sip::build_response(frame, 200, "OK", None, None, None);
+        let response = sip::build_response_for_access(
+            frame,
+            200,
+            "OK",
+            None,
+            None,
+            None,
+            &session.context.user_agent,
+        );
         session
             .channel
             .send_sip(&response)
@@ -1350,7 +1392,15 @@ async fn handle_frame(
     }
     if let Some(call_id) = trunk_call_id {
         if sip_frame::is_request(frame, "BYE") {
-            let response = sip::build_response(frame, 200, "OK", None, None, None);
+            let response = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1361,7 +1411,15 @@ async fn handle_frame(
             return Ok(());
         }
         if sip_frame::is_request(frame, "CANCEL") {
-            let ok = sip::build_response(frame, 200, "OK", None, None, None);
+            let ok = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&ok)
@@ -1369,13 +1427,14 @@ async fn handle_frame(
                 .map_err(|error| error.code().to_string())?;
             if let Some(call) = session.calls.remove(&call_id) {
                 if let Some(invite) = call.initial_invite.as_deref() {
-                    let terminated = sip::build_response(
+                    let terminated = sip::build_response_for_access(
                         invite,
                         487,
                         "Request Terminated",
                         Some(&call.dialog.local_tag),
                         None,
                         None,
+                        &session.context.user_agent,
                     );
                     session
                         .channel
@@ -1388,7 +1447,15 @@ async fn handle_frame(
             return Ok(());
         }
         if sip_frame::is_request(frame, "INFO") {
-            let response = sip::build_response(frame, 200, "OK", None, None, None);
+            let response = sip::build_response_for_access(
+                frame,
+                200,
+                "OK",
+                None,
+                None,
+                None,
+                &session.context.user_agent,
+            );
             session
                 .channel
                 .send_sip(&response)
@@ -1511,7 +1578,7 @@ async fn handle_response(
             {
                 let cseq = call.next_cseq;
                 call.next_cseq = call.next_cseq.saturating_add(1);
-                let prack = sip::build_prack(
+                let prack = sip::build_prack_for_access(
                     &session.context.identity,
                     &session.context.route,
                     session.context.registration.service_route.as_deref(),
@@ -1520,6 +1587,7 @@ async fn handle_response(
                     cseq,
                     rseq,
                     call.dialog.cseq,
+                    &session.context.user_agent,
                 );
                 session
                     .channel
@@ -1537,12 +1605,13 @@ async fn handle_response(
     }
     if (200..300).contains(&status) {
         let answer = prepare_operator_media(call, sip_frame::body(frame), link)?;
-        let ack = sip::build_ack(
+        let ack = sip::build_ack_for_access(
             &session.context.identity,
             &session.context.route,
             session.context.registration.service_route.as_deref(),
             &call.dialog,
             &call.remote_uri,
+            &session.context.user_agent,
         );
         session
             .channel
@@ -1582,6 +1651,14 @@ async fn handle_response(
     call.pending_trunk_reinvite = false;
     call.renegotiation_deadline = None;
     call.rollback_media_update();
+    let reason = sip_frame::header_value(frame, "Reason").unwrap_or_default();
+    tracing::warn!(
+        line_id = session.context.line_id,
+        call_id,
+        status,
+        reason,
+        "VoWiFi IMS voice INVITE rejected"
+    );
     link.send_event(OperatorEvent::Rejected {
         call_id: call_id.to_string(),
         status,
@@ -1681,7 +1758,15 @@ async fn begin_incoming_call(
         remote_tag: Some(remote_tag),
         cseq: invite_cseq,
     };
-    let trying = sip::build_response(frame, 100, "Trying", Some(&dialog.local_tag), None, None);
+    let trying = sip::build_response_for_access(
+        frame,
+        100,
+        "Trying",
+        Some(&dialog.local_tag),
+        None,
+        None,
+        &session.context.user_agent,
+    );
     session
         .channel
         .send_sip(&trying)
@@ -1690,7 +1775,7 @@ async fn begin_incoming_call(
     let operator_answered = link.incoming_mode() == TrunkIncomingMode::BoundImmediate;
     if operator_answered {
         let answer = relay_media_sdp(&offer, operator_local, operator_video_local);
-        let accepted = sip::build_response(
+        let accepted = sip::build_response_for_access(
             frame,
             200,
             "OK",
@@ -1700,6 +1785,7 @@ async fn begin_incoming_call(
                 &session.context.route,
             )),
             Some(answer.as_bytes()),
+            &session.context.user_agent,
         );
         session
             .channel
@@ -1825,13 +1911,14 @@ async fn begin_network_reinvite(
     );
     call.pending_network_reinvite = Some(frame.to_vec());
     call.renegotiation_deadline = Some(Instant::now() + REINVITE_TIMEOUT);
-    let trying = sip::build_response(
+    let trying = sip::build_response_for_access(
         frame,
         100,
         "Trying",
         Some(&call.dialog.local_tag),
         None,
         None,
+        &session.context.user_agent,
     );
     session
         .channel
@@ -1850,7 +1937,15 @@ async fn reject_request(
     frame: &[u8],
     status: u16,
 ) -> Result<(), String> {
-    let response = sip::build_response(frame, status, sip_reason(status), None, None, None);
+    let response = sip::build_response_for_access(
+        frame,
+        status,
+        sip_reason(status),
+        None,
+        None,
+        None,
+        &session.context.user_agent,
+    );
     session
         .channel
         .send_sip(&response)
@@ -2729,6 +2824,10 @@ mod tests {
         assert_eq!(
             sip_frame::header_value(&invite, "Route").as_deref(),
             Some("<sip:service-route.ims.example;lr>")
+        );
+        assert_eq!(
+            sip_frame::header_value(&invite, "Supported").as_deref(),
+            Some("100rel, timer")
         );
         let from_tag = header_tag(&sip_frame::header_value(&invite, "From").unwrap()).unwrap();
         let call_id = sip_frame::header_value(&invite, "Call-ID").unwrap();

@@ -638,7 +638,7 @@ pub fn build_invite(
     sdp_offer: &[u8],
     security_verify: Option<&str>,
 ) -> Vec<u8> {
-    build_invite_for_access(
+    build_invite_for_access_with_supported(
         identity,
         route,
         service_route,
@@ -648,6 +648,7 @@ pub fn build_invite(
         security_verify,
         PANI_EUTRAN,
         USER_AGENT,
+        "100rel, precondition",
     )
 }
 
@@ -665,6 +666,33 @@ pub fn build_invite_for_access(
     security_verify: Option<&str>,
     pani: &str,
     user_agent: &str,
+) -> Vec<u8> {
+    build_invite_for_access_with_supported(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        sdp_offer,
+        security_verify,
+        pani,
+        user_agent,
+        "100rel, timer",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_invite_for_access_with_supported(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    sdp_offer: &[u8],
+    security_verify: Option<&str>,
+    pani: &str,
+    user_agent: &str,
+    supported: &str,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -694,7 +722,7 @@ pub fn build_invite_for_access(
             "Allow",
             "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS",
         ),
-        SipHeader::new("Supported", "100rel, precondition"),
+        SipHeader::new("Supported", supported),
     ];
     if let Some(sv) = security_verify {
         headers.push(SipHeader::new("Security-Verify", sv));
@@ -832,6 +860,24 @@ pub fn build_ack(
     dialog: &DialogIds,
     callee_uri: &str,
 ) -> Vec<u8> {
+    build_ack_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        USER_AGENT,
+    )
+}
+
+pub fn build_ack_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let to = match &dialog.remote_tag {
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
@@ -839,7 +885,7 @@ pub fn build_ack(
     };
     let headers = [
         SipHeader::new("Route", route_header_value(route, service_route)),
-        SipHeader::new("User-Agent", USER_AGENT),
+        SipHeader::new("User-Agent", user_agent),
     ];
     crate::connectivity::core::sip_message::build_ack(&SipRequest {
         method: "ACK",
@@ -871,6 +917,31 @@ pub fn build_prack(
     rseq: u32,
     invite_cseq: u32,
 ) -> Vec<u8> {
+    build_prack_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        cseq,
+        rseq,
+        invite_cseq,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_prack_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    rseq: u32,
+    invite_cseq: u32,
+    user_agent: &str,
+) -> Vec<u8> {
     let branch = new_branch();
     let to = match &dialog.remote_tag {
         Some(tag) => format!("<{callee_uri}>;tag={tag}"),
@@ -879,7 +950,7 @@ pub fn build_prack(
     let headers = [
         SipHeader::new("Route", route_header_value(route, service_route)),
         SipHeader::new("RAck", format!("{rseq} {invite_cseq} INVITE")),
-        SipHeader::new("User-Agent", USER_AGENT),
+        SipHeader::new("User-Agent", user_agent),
     ];
     crate::connectivity::core::sip_message::build_request(&SipRequest {
         method: "PRACK",
@@ -905,6 +976,27 @@ pub fn build_bye(
     dialog: &DialogIds,
     callee_uri: &str,
     cseq: u32,
+) -> Vec<u8> {
+    build_bye_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        cseq,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_bye_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    cseq: u32,
+    user_agent: &str,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -932,7 +1024,7 @@ pub fn build_bye(
     h.push_str(&format!("To: {to}\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {cseq} BYE\r\n"));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     h.push_str("Content-Length: 0\r\n\r\n");
     h.into_bytes()
 }
@@ -1030,6 +1122,27 @@ pub fn build_cancel(
     callee_uri: &str,
     invite_branch: &str,
 ) -> Vec<u8> {
+    build_cancel_for_access(
+        identity,
+        route,
+        service_route,
+        dialog,
+        callee_uri,
+        invite_branch,
+        USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_cancel_for_access(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    dialog: &DialogIds,
+    callee_uri: &str,
+    invite_branch: &str,
+    user_agent: &str,
+) -> Vec<u8> {
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
 
@@ -1052,7 +1165,7 @@ pub fn build_cancel(
     h.push_str(&format!("To: <{callee_uri}>\r\n"));
     h.push_str(&format!("Call-ID: {}\r\n", dialog.call_id));
     h.push_str(&format!("CSeq: {} CANCEL\r\n", dialog.cseq));
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     h.push_str("Content-Length: 0\r\n\r\n");
     h.into_bytes()
 }
@@ -1068,6 +1181,21 @@ pub fn build_response(
     local_tag: Option<&str>,
     contact: Option<&str>,
     sdp_answer: Option<&[u8]>,
+) -> Vec<u8> {
+    build_response_for_access(
+        request, status, reason, local_tag, contact, sdp_answer, USER_AGENT,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_response_for_access(
+    request: &[u8],
+    status: u16,
+    reason: &str,
+    local_tag: Option<&str>,
+    contact: Option<&str>,
+    sdp_answer: Option<&[u8]>,
+    user_agent: &str,
 ) -> Vec<u8> {
     let mut h = String::new();
     h.push_str(&format!("SIP/2.0 {status} {reason}\r\n"));
@@ -1102,7 +1230,7 @@ pub fn build_response(
     if let Some(contact) = contact {
         h.push_str(&format!("Contact: <{contact}>\r\n"));
     }
-    h.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
+    h.push_str(&format!("User-Agent: {user_agent}\r\n"));
     match sdp_answer {
         Some(body) => {
             h.push_str("Content-Type: application/sdp\r\n");
@@ -1641,6 +1769,54 @@ mod tests {
         assert!(text.starts_with("BYE sip:+8613800138000@h SIP/2.0\r\n"));
         assert!(text.contains("CSeq: 2 BYE\r\n"));
         assert!(text.contains("To: <sip:+8613800138000@h>;tag=rt\r\n"));
+    }
+
+    #[test]
+    fn access_specific_dialog_messages_use_the_requested_user_agent() {
+        let identity = ident();
+        let route = route_udp();
+        let mut dialog = DialogIds::fresh();
+        dialog.set_remote_tag("remote-tag");
+        let callee = "sip:+8613800138000@h";
+        let user_agent = "SimAdmin VoWiFi Test";
+        let frames = [
+            build_ack_for_access(&identity, &route, None, &dialog, callee, user_agent),
+            build_prack_for_access(
+                &identity, &route, None, &dialog, callee, 2, 77, 1, user_agent,
+            ),
+            build_bye_for_access(
+                &identity, &route, None, &dialog, callee, 2, user_agent,
+            ),
+            build_cancel_for_access(
+                &identity,
+                &route,
+                None,
+                &dialog,
+                callee,
+                "z9hG4bKinvite",
+                user_agent,
+            ),
+            build_response_for_access(
+                b"OPTIONS sip:user@h SIP/2.0\r\nVia: SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKrequest\r\nFrom: <sip:user@h>;tag=from-tag\r\nTo: <sip:me@h>\r\nCall-ID: request-call-id\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+                200,
+                "OK",
+                Some("local-tag"),
+                None,
+                None,
+                user_agent,
+            ),
+        ];
+
+        for frame in frames {
+            assert_eq!(
+                header_value(&frame, "User-Agent").as_deref(),
+                Some(user_agent)
+            );
+            assert_ne!(
+                header_value(&frame, "User-Agent").as_deref(),
+                Some(USER_AGENT)
+            );
+        }
     }
 
     #[test]

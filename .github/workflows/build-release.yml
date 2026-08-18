@@ -64,14 +64,16 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
           EVENT_NAME: ${{ github.event_name }}
-          RUN_NUMBER: ${{ github.run_number }}
         run: |
           CURRENT_VERSION=$(cat VERSION | tr -d '[:space:]')
           VERSION=$(echo "$INPUT_VERSION" | tr -d '[:space:]')
 
           if [ "$EVENT_NAME" = "push" ]; then
-            VERSION="${CURRENT_VERSION}-build.${RUN_NUMBER}"
-            SOURCE="push build"
+            # A push is a release of the version explicitly recorded in VERSION.
+            # Do not append the Actions run number: it makes the package version
+            # differ from the source version and creates build-N release tags.
+            VERSION="$CURRENT_VERSION"
+            SOURCE="VERSION file (push)"
           elif [ -z "$VERSION" ] || [ "$VERSION" = "auto" ]; then
             VERSION="$CURRENT_VERSION"
             SOURCE="VERSION file"
