@@ -28,7 +28,6 @@ pub mod ike_state;
 pub mod ims;
 pub mod live;
 pub mod operator;
-pub mod profile_import;
 pub mod profile_record;
 pub mod profile_store;
 pub mod profiles;

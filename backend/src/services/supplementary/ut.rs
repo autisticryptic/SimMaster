@@ -98,11 +98,6 @@ impl HttpXcapTransport {
         self
     }
 
-    pub fn with_max_response_bytes(mut self, max_response_bytes: usize) -> Self {
-        self.max_response_bytes = max_response_bytes.max(1024);
-        self
-    }
-
     async fn send_once(
         &self,
         request: &XcapRequest,

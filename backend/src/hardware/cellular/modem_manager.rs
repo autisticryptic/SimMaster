@@ -359,6 +359,7 @@ fn extract_smsc_property(props: &HashMap<String, OwnedValue>) -> String {
 // ── EF_SMSP (AT+CRSM) SMSC 解析 ─────────────────────────────────────────
 
 /// 从十六进制字符串解析字节数组。
+#[cfg(test)]
 fn decode_hex(hex: &str) -> Vec<u8> {
     let hex = hex.trim();
     let mut bytes = Vec::with_capacity(hex.len() / 2);
@@ -378,6 +379,7 @@ fn decode_hex(hex: &str) -> Vec<u8> {
 /// 输入示例: `+CRSM: 97,12,"62198205422100280583026F428A01"`
 /// FCP 中 tag 0x82 (File Descriptor) 长度 5 时格式为:
 ///   [0x42(线性定长)] [数据编码] [记录长度高] [记录长度低] [记录数]
+#[cfg(test)]
 fn parse_crsm_fcp_record_length(output: &str) -> usize {
     for line in output.lines() {
         let trimmed = line.trim();
@@ -435,6 +437,7 @@ fn parse_crsm_fcp_record_length(output: &str) -> usize {
 ///
 /// BCD 编码: 每个字节的低 4 位在前、高 4 位在后, 0xF 为填充。
 /// 示例: [0x68, 0x31, 0x08, 0x10, 0x05, 0xF0] → "8613800100500"
+#[cfg(test)]
 fn decode_bcd_digits(bytes: &[u8]) -> String {
     let mut digits = String::with_capacity(bytes.len() * 2);
     for &byte in bytes {
@@ -456,6 +459,7 @@ fn decode_bcd_digits(bytes: &[u8]) -> String {
 ///   [长度] [类型 (0x91=国际/0x81=国内)] [BCD 编码号码 (最多 10 字节)]
 ///   长度 = 后续有效字节数 (含类型字节)
 ///   长度为 0x00 或 0xFF 表示未设置。
+#[cfg(test)]
 fn decode_smsc_from_ts_sca(sca: &[u8]) -> String {
     if sca.is_empty() {
         return String::new();
@@ -489,6 +493,7 @@ fn decode_smsc_from_ts_sca(sca: &[u8]) -> String {
 ///   [TP-PID: 1 字节]
 ///   [TP-DCS: 1 字节]
 ///   [TP-VP: 1 字节]
+#[cfg(test)]
 fn parse_smsc_from_crsm_record(output: &str, record_len: usize) -> String {
     for line in output.lines() {
         let trimmed = line.trim();

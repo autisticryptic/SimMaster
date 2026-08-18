@@ -16,11 +16,11 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 
 当前不能称为整体完成，因为多线路真实硬件矩阵、VoWiFi 业务、视频、Ut/XCAP、MWI、E911、CS 音频适配器和正式发布流程仍不完整。
 
-## P0：先恢复完整回归门槛
+## P0：回归门槛（本轮已恢复）
 
-- [ ] 修复或隔离 `connectivity::modems::ims::vowifi::channel::tests::udp_channel_recv_chunk_reassembles_oversized_datagram` 长时间不结束的问题。
-- [ ] 重新运行完整 `cargo test --no-fail-fast`，记录通过、失败、ignored 和超时测试；禁止用定向测试结果代替全量结果。
-- [ ] 清理现有 dead-code / unused warning，或明确哪些 warning 属于尚未接线的 provider seam；发布门槛不能接受新增 warning。
+- [x] 修复或隔离 `connectivity::modems::ims::vowifi::channel::tests::udp_channel_recv_chunk_reassembles_oversized_datagram` 长时间不结束的问题；当前单独运行与全量回归均结束。
+- [x] 完整 `cargo test --workspace --no-fail-fast`：1041 passed、1 ignored（需要外部 Asterisk/Linphone）、0 failed。
+- [x] 清理默认 Linux binary 的 dead-code / unused warning；未接线的 E911 provider 仍以明确待办保留，不用 warning 掩盖状态。
 - [x] 增加前端 `pnpm lint`、`pnpm type-check`、`pnpm build` 的 CI 检查，并固定非交互依赖安装方式（`.github/workflows/frontend-checks.yml`）。
 
 前端显示层已完成一轮与线路隔离契约的收口：Dashboard 分别显示设备、IMS 和 Trunk 状态；线路选择器标明读卡器、离线和槽位冲突；VoWiFi `scaffold_only` 状态明确显示为“未接线”。这些显示调整不代表对应能力已经通过真实硬件或运营商验收。
@@ -29,10 +29,10 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 
 ### 语音
 
-- [ ] 使用真实运营商完成 VoWiFi 外呼接通、被叫接听、拒接、未接记录和挂断验收。
-- [ ] 验证 VoWiFi 早期媒体、可靠 provisional response、PRACK、空 SDP final response、CANCEL、超时和对端先发 re-INVITE。
-- [ ] 验证 VoWiFi 双向 RTP、SIP INFO DTMF、RFC 4733 telephone-event、媒体方向、hold/resume 和恢复后资源清理。
-- [ ] 将普通号码测试结果按线路、access、codec、SIP 状态、RTP 计数和脱敏 trace 独立记录。
+- [ ] 使用真实运营商完成 VoWiFi 外呼接通、被叫接听、拒接、未接记录和挂断验收（代码路径与本地模拟已覆盖，仍缺运营商实测）。
+- [x] 代码层覆盖 VoWiFi/VoLTE early media、180 provisional、带 offer 的 answer、CANCEL、超时、媒体方向和 re-INVITE 路由；[ ] 真实运营商矩阵仍待执行。
+- [x] 本地协议测试覆盖双向 RTP、SIP INFO DTMF、telephone-event、媒体方向、hold/resume 和资源清理；[ ] 真实 VoWiFi 运营商验收仍待执行。
+- [ ] 将普通号码测试结果按线路、access、codec、SIP 状态、RTP 计数和脱敏 trace 独立记录（需要授权的真实测试号码）。
 
 ### 视频
 
@@ -79,7 +79,8 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 - [ ] 完成 `detect_device_kind()` 的真实 sysfs/DT/udev capability 探测；未知设备不得写 QCM410 DATA6 udev 规则或绑定 secondary QMI。
 - [ ] 将 QCM410 `ImsBearerTransport` 通过 provider/capability 注入 runtime；generic ModemManager 路径不能依赖 QCM410 类型。
-- [ ] 决定 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` 的保留边界，删除无用 stub 或为支持的设备完成接线。
+- [x] 已删除未实现的 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` stub；保留实际 `ImsBearerTransport` capability seam。
+- [ ] 为 EC20/EC25/EG25 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。
 - [ ] 只有找到真实双向音频数据面后，才实现 CS trunk；仅有 ModemManager 呼叫控制不能标记为 CS trunk ready。
 - [ ] 验证 QCM410 数据与 IMS bearer 并发时的 slot allocator、baseband wedge guard、恢复和 modem 重启行为。
 

@@ -86,15 +86,12 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 pub enum QmiOpenMode {
     /// `--device-open-qmi`: force QMI on a port whose advertised type is wrong.
     ForceQmi,
-    /// `--device-open-proxy`: share the port through `qmi-proxy`.
-    Proxy,
 }
 
 impl QmiOpenMode {
     pub fn as_arg(self) -> &'static str {
         match self {
             Self::ForceQmi => "--device-open-qmi",
-            Self::Proxy => "--device-open-proxy",
         }
     }
 
@@ -304,11 +301,6 @@ pub fn baseband_key_for_device(device_path: &str) -> Result<String, SecondaryQmi
     )))
 }
 
-/// Backwards-compatible alias used by the VoLTE code path.
-pub fn remoteproc_for_primary(device_path: &str) -> Result<String, SecondaryQmiError> {
-    baseband_key_for_device(device_path)
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RpmsgChannel {
     device_id: String,
@@ -391,51 +383,6 @@ fn ports_for_baseband(baseband: &str) -> Vec<(String, Option<String>)> {
     }
     ports.sort_by(|a, b| a.0.cmp(&b.0));
     ports
-}
-
-/// Every non-primary QMI port on this host, one entry per port.
-///
-/// ModemManager must be kept off *all* of them, not just the one that ends up
-/// carrying a session: the custom module publishes a spare port per registered
-/// channel (DATA6 *and* DATA7), and any spare left visible is enumerated by
-/// ModemManager as an extra modem port. On the reference device that left
-/// `wwan0qmi2` claimable while `wwan0qmi1` was correctly ignored.
-///
-/// The primary of each baseband is excluded — that one is ModemManager's, by
-/// design. Boot AT consoles are excluded because they are not QMI at all.
-pub fn discover_spare_qmi_ports() -> Vec<String> {
-    let primaries: Vec<String> = discover_primary_qmi_ports()
-        .into_iter()
-        .map(|device| device.rsplit('/').next().unwrap_or_default().to_string())
-        .collect();
-    let Ok(entries) = std::fs::read_dir(WWAN_CLASS_DIR) else {
-        return Vec::new();
-    };
-    let mut spares = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if primaries.contains(&name) || is_boot_port(&name) {
-            continue;
-        }
-        let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
-            continue;
-        };
-        // Only QMI-typed ports; an AT port cannot host a WDS session and
-        // ModemManager may legitimately want it.
-        let is_qmi = std::fs::read_to_string(resolved.join("type"))
-            .ok()
-            .is_some_and(|t| t.trim().eq_ignore_ascii_case("QMI"));
-        if is_qmi && remoteproc_of_path(&resolved.to_string_lossy()).is_some() {
-            spares.push(name);
-        }
-    }
-    spares.sort();
-    spares
-}
-
-/// The udev line that hides one port from ModemManager.
-pub fn udev_ignore_rule(port_name: &str) -> String {
-    format!("SUBSYSTEM==\"wwan\", KERNEL==\"{port_name}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\"")
 }
 
 fn driver_bind_path(driver: &str) -> PathBuf {
@@ -1506,7 +1453,6 @@ mod tests {
     #[test]
     fn open_mode_args_and_probe_order() {
         assert_eq!(QmiOpenMode::ForceQmi.as_arg(), "--device-open-qmi");
-        assert_eq!(QmiOpenMode::Proxy.as_arg(), "--device-open-proxy");
         assert_eq!(QmiOpenMode::probe_order(), [QmiOpenMode::ForceQmi]);
     }
 

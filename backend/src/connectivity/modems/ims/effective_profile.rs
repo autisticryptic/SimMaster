@@ -281,7 +281,8 @@ pub struct EffectiveCommon {
     pub voicemail_number_source: Option<OverrideSource>,
 }
 
-pub fn resolve_effective_common(override_: Option<&SimOverride>) -> EffectiveCommon {
+#[cfg(test)]
+fn resolve_effective_common(override_: Option<&SimOverride>) -> EffectiveCommon {
     resolve_effective_common_with_sources(override_, None, None)
 }
 

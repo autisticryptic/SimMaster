@@ -5,7 +5,6 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 
 use base64::Engine;
 use futures_util::{future::BoxFuture, StreamExt};
@@ -40,27 +39,14 @@ const APP_VOWIFI: &str = "ap2004";
 const DEFAULT_ENTITLEMENT_VERSION: &str = "2.0";
 const MAX_EAP_AKA_ATTEMPTS: usize = 3;
 
-type Resolver = Arc<dyn Fn(&str) -> Vec<IpAddr> + Send + Sync>;
-
-pub struct Ts43Transport {
-    resolver: Option<Resolver>,
-}
+pub struct Ts43Transport;
 
 impl Ts43Transport {
     pub fn new() -> Self {
-        Self { resolver: None }
-    }
-
-    pub fn with_resolver(resolver: impl Fn(&str) -> Vec<IpAddr> + Send + Sync + 'static) -> Self {
-        Self {
-            resolver: Some(Arc::new(resolver)),
-        }
+        Self
     }
 
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
-        if let Some(resolver) = &self.resolver {
-            return Ok(resolver(host));
-        }
         tokio::net::lookup_host((host, port))
             .await
             .map(|addresses| addresses.map(|address| address.ip()).collect())
@@ -544,13 +530,6 @@ fn parse_entitlement_document(body: &str) -> ParsedEntitlement {
             .get("version")
             .and_then(|value| value.parse::<u64>().ok()),
     }
-}
-
-/// Backwards-compatible public XML parser used by fixtures and carrier
-/// catalog tooling. Secret sink arguments are accepted for the old API shape,
-/// but secrets are returned only through the transport exchange.
-pub fn parse_entitlement_response(body: &str, _secrets: &E911Secrets) -> EntitlementQueryOutcome {
-    parse_entitlement_document(body).outcome
 }
 
 fn parse_characteristics(body: &str) -> HashMap<String, HashMap<String, String>> {

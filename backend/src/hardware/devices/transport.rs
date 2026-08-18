@@ -1,74 +1,9 @@
-//! Modem transport contracts: the seam between the upper protocol layers
-//! (user-space IMS, data, SMS, registration) and the device-specific drivers.
-//!
-//! Each trait is keyed by *caller* (data / voice / SMS / registration), so an
-//! upper layer depends only on the capability it actually needs. A device driver
-//! implements the subset it supports; a turnkey chip may implement all of them,
-//! while a soft-stack host may implement only registration + voice and leave
-//! data to ModemManager.
+//! Device-agnostic contracts for native modem transports.
 
 use std::fmt;
 use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
-
-/// Data-plane transport: brings up and tears down a bearer carrying IP traffic.
-///
-/// Implementations differ wildly by device: Qualcomm QMI WDS sessions on a spare
-/// channel, ModemManager D-Bus connections, AT `+CGDCONT` contexts, MBIM, etc.
-pub trait DataTransport {
-    type Error: std::fmt::Display;
-
-    /// Bring up a data bearer for `apn` on the device owning `primary_qmi`.
-    /// Returns the resolved network interface name.
-    fn start_data_bearer(
-        &self,
-        primary_qmi: &str,
-        apn: &crate::platform::config::ApnConfig,
-    ) -> impl std::future::Future<Output = Result<String, Self::Error>>;
-
-    /// Tear down the bearer created by [`Self::start_data_bearer`].
-    fn stop_data_bearer(
-        &self,
-        primary_qmi: &str,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
-}
-
-/// Voice-plane transport: establishes and releases the media/IMS bearer used
-/// for calls.
-pub trait VoiceTransport {
-    type Error: std::fmt::Display;
-
-    /// Bring up the IMS bearer (dedicated or shared) for the given APN.
-    fn start_ims_bearer(
-        &self,
-        apn: &crate::platform::config::ApnConfig,
-        family: crate::platform::config::VolteIpFamily,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
-
-    /// Release the IMS bearer.
-    fn stop_ims_bearer(&self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
-}
-
-/// SMS-plane transport: sends and receives short messages via the modem.
-pub trait SmsTransport {
-    type Error: std::fmt::Display;
-
-    /// Send a short message.
-    fn send_sms(
-        &self,
-        destination: &str,
-        text: &str,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>>;
-}
-
-/// Registration transport: observes and steers the modem's network registration.
-pub trait RegistrationTransport {
-    type Error: std::fmt::Display;
-
-    /// Current registration state of the device.
-    fn registration_state(&self) -> impl std::future::Future<Output = Result<(), Self::Error>>;
-}
 
 /// Device-agnostic description of an established native IMS bearer.
 ///

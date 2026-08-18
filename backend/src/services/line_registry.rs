@@ -68,6 +68,7 @@ pub struct LineRuntime {
     pub vowifi_connect_lock: Mutex<()>,
     vowifi_restore_running: AtomicBool,
     vowifi_sms_listener_running: AtomicBool,
+    ims_voice_listener_running: AtomicBool,
     pub voice_access: VoiceAccessRouter,
     pub trunk: Arc<TrunkRuntime>,
     pub supplementary: Arc<SupplementaryRuntime>,
@@ -119,6 +120,7 @@ impl LineRuntime {
             vowifi_connect_lock: Mutex::new(()),
             vowifi_restore_running: AtomicBool::new(false),
             vowifi_sms_listener_running: AtomicBool::new(false),
+            ims_voice_listener_running: AtomicBool::new(false),
             voice_access,
             trunk: Arc::new(TrunkRuntime::with_operator(operator)),
             supplementary,
@@ -182,6 +184,17 @@ impl LineRuntime {
 
     pub fn finish_vowifi_sms_listener(&self) {
         self.vowifi_sms_listener_running
+            .store(false, Ordering::SeqCst);
+    }
+
+    pub fn begin_ims_voice_listener(&self) -> bool {
+        self.ims_voice_listener_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn finish_ims_voice_listener(&self) {
+        self.ims_voice_listener_running
             .store(false, Ordering::SeqCst);
     }
 

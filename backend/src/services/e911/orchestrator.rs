@@ -21,6 +21,7 @@ use crate::connectivity::core::entitlement::{
 use crate::connectivity::modems::ims::profile_override::SimBindingKey;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 use crate::services::e911::registry::{E911Provider, E911ProviderRegistry};
+#[cfg(test)]
 use crate::services::e911::ssrf::SsrfError;
 use crate::services::e911::state_store::{E911Secrets, E911StateStore};
 
@@ -32,13 +33,10 @@ pub const ERR_NOT_READY: &str = "e911_sim_identity_not_ready";
 pub const ERR_UNCONFIGURED: &str = "e911_unconfigured";
 pub const ERR_SSRF: &str = "e911_endpoint_blocked";
 pub const ERR_TRANSPORT: &str = "e911_transport";
-pub const ERR_ALREADY_PROVISIONED: &str = "e911_already_provisioned";
 pub const ERR_OPERATION_NOT_FOUND: &str = "e911_operation_not_found";
 pub const ERR_OPERATION_EXPIRED: &str = "e911_operation_expired";
 pub const ERR_OPERATION_MISMATCH: &str = "e911_operation_binding_mismatch";
 pub const ERR_STORE: &str = "e911_store";
-pub const ERR_ADDRESS_REQUIRED: &str = "e911_address_required";
-pub const ERR_ADDRESS_ALREADY_SET: &str = "e911_address_already_set";
 
 /// Per-request TS.43 facts. These values are intentionally short-lived and
 /// must never be written to logs or the entitlement state files.
@@ -584,6 +582,7 @@ fn is_ssrf_error(message: &str) -> bool {
 }
 
 /// Convenience for tests: treat an `SsrfError` string as a blocked endpoint.
+#[cfg(test)]
 pub fn ssrf_error(error: SsrfError) -> String {
     error.to_string()
 }

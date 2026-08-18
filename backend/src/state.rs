@@ -32,6 +32,9 @@ pub struct ActiveCallRecord {
     pub answered_at: Option<Instant>,
     pub answered: bool,
     pub missing_polls: u8,
+    /// Relay-facing SDP offer retained only while an IMS MT call is ringing.
+    /// It contains no subscriber secret and is never persisted.
+    pub media_offer: Option<Vec<u8>>,
 }
 
 /// 应用全局状态

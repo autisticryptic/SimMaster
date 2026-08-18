@@ -140,8 +140,9 @@ async fn run_session(
         })
         .await;
     let local_aor = format!("sip:{}@{}", profile.username, local_addr);
-    let mut bridge =
-        TrunkBridge::new(local_addr, local_aor).with_operator(OperatorAvailability::Unavailable);
+    let mut bridge = TrunkBridge::new(local_addr, local_aor)
+        .with_operator(OperatorAvailability::Unavailable)
+        .with_digest_credentials(profile.username.clone(), profile.secret.clone());
     if !profile.outgoing_binding.trim().is_empty() {
         bridge = bridge.with_outgoing_binding(profile.outgoing_binding.clone());
     }

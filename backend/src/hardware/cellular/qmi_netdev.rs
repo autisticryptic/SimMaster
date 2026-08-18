@@ -100,6 +100,7 @@ impl ResolutionMethod {
     }
 
     /// Whether the answer was actually observed rather than guessed.
+    #[cfg(test)]
     pub fn is_verified(self) -> bool {
         matches!(self, Self::SoleCandidate | Self::ProbeAnswered)
     }

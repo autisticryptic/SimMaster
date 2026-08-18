@@ -1028,7 +1028,7 @@ pub fn build_sdp_answer_with_params(
         media_port,
         transport: offer.transport,
         codecs: answer_codecs,
-        direction: MediaDirection::SendRecv,
+        direction: offer.direction.for_peer(),
         ptime: offer.ptime.or(Some(params.ptime_ms)),
     })
 }
@@ -2018,6 +2018,29 @@ mod tests {
             .codecs
             .iter()
             .any(|codec| codec.codec == AudioCodec::Amr && codec.payload_type == 96));
+    }
+
+    #[test]
+    fn sdp_answer_inverts_unidirectional_hold_state() {
+        let mut offer =
+            build_mo_audio_offer_with_params(&test_params(), "192.0.2.20", SdpAddrType::Ip4, 5004);
+        for (offered, expected) in [
+            (MediaDirection::SendOnly, MediaDirection::RecvOnly),
+            (MediaDirection::RecvOnly, MediaDirection::SendOnly),
+            (MediaDirection::Inactive, MediaDirection::Inactive),
+            (MediaDirection::SendRecv, MediaDirection::SendRecv),
+        ] {
+            offer.direction = offered;
+            let answer = build_sdp_answer_with_params(
+                &test_params(),
+                &offer,
+                "192.0.2.10",
+                SdpAddrType::Ip4,
+                40000,
+            )
+            .expect("build answer");
+            assert_eq!(answer.direction, expected, "offered {offered:?}");
+        }
     }
 
     #[test]

@@ -137,6 +137,10 @@ enum RouterRequest {
         plan: VoiceCallPlan,
         response: oneshot::Sender<Result<RoutedVoiceCall, VoiceCallStartError>>,
     },
+    CallAccess {
+        call_id: String,
+        response: oneshot::Sender<Option<AccessPathKind>>,
+    },
 }
 
 /// Owns the public trunk-facing link and keeps each call pinned to exactly one
@@ -250,6 +254,25 @@ impl VoiceAccessRouter {
             Err(_) => Err(VoiceCallStartError::RouteTimedOut),
         }
     }
+
+    /// Return the IMS access that owns an active call. Incoming-call answer
+    /// generation uses this to apply the matching carrier codec profile rather
+    /// than guessing from whichever registrations happen to be live.
+    pub async fn call_access(&self, call_id: &str) -> Option<AccessPathKind> {
+        let requests = self.requests.as_ref()?;
+        let (response_tx, response_rx) = oneshot::channel();
+        requests
+            .send(RouterRequest::CallAccess {
+                call_id: call_id.to_string(),
+                response: response_tx,
+            })
+            .await
+            .ok()?;
+        tokio::time::timeout(Duration::from_secs(1), response_rx)
+            .await
+            .ok()?
+            .ok()?
+    }
 }
 
 impl Drop for VoiceAccessRouter {
@@ -320,6 +343,10 @@ async fn run_router(
                     }
                     let result = route_call_plan(plan, &policy, &backends, &mut routes);
                     let _ = response.send(result);
+                }
+                Some(RouterRequest::CallAccess { call_id, response }) => {
+                    let access = routes.get(&call_id).map(|route| route.owner);
+                    let _ = response.send(access);
                 }
                 None => break,
             },
@@ -411,7 +438,12 @@ fn refresh_router_state(
     });
     trunk.set_ready(!candidates.is_empty() || owned_consumer);
 
-    let local_ip = trunk.trunk_local_ip();
+    // Keep IMS MT signaling reachable even when no external Asterisk trunk is
+    // enabled. The HTTP call API answers against a loopback RTP sink; an
+    // active trunk replaces this address with its real local endpoint.
+    let local_ip = trunk
+        .trunk_local_ip()
+        .or(Some(std::net::Ipv4Addr::LOCALHOST.into()));
     let incoming_mode = trunk.incoming_mode();
     let ip_connect_mode = trunk.ip_connect_mode();
     trunk.set_video_enabled(
@@ -1127,5 +1159,53 @@ mod tests {
             trunk_events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn reports_the_exact_access_that_owns_an_incoming_call() {
+        let vowifi = OperatorLink::default();
+        let volte = OperatorLink::default();
+        let _vowifi_commands = vowifi.subscribe_commands();
+        let _volte_commands = volte.subscribe_commands();
+        vowifi.set_ready(true);
+        volte.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            vec![
+                (AccessPathKind::Vowifi, vowifi),
+                (AccessPathKind::Volte, volte.clone()),
+            ],
+        );
+        let trunk = router.operator_link();
+        wait_available(&trunk).await;
+        let mut events = trunk.subscribe_events();
+        volte.send_event(OperatorEvent::Incoming {
+            call_id: "ims-incoming-access".into(),
+            caller: "+601112023012".into(),
+            body: Vec::new(),
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Incoming { call_id, .. } if call_id == "ims-incoming-access"
+        ));
+        assert_eq!(
+            router.call_access("ims-incoming-access").await,
+            Some(AccessPathKind::Volte)
+        );
+
+        volte.send_event(OperatorEvent::Ended {
+            call_id: "ims-incoming-access".into(),
+        });
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+            OperatorEvent::Ended { .. }
+        ));
+        assert_eq!(router.call_access("ims-incoming-access").await, None);
     }
 }

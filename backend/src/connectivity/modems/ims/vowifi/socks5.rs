@@ -392,12 +392,7 @@ impl Socks5UdpClient {
         self
     }
 
-    pub fn with_max_datagram_bytes(mut self, max_datagram_bytes: usize) -> Self {
-        // Leave room for the SOCKS5 header on top of the caller's payload budget.
-        self.max_datagram_bytes = max_datagram_bytes.max(1) + 22;
-        self
-    }
-
+    #[cfg(test)]
     pub fn relay_addr(&self) -> SocketAddr {
         self.relay
     }

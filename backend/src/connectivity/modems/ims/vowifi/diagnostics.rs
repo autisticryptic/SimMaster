@@ -1170,17 +1170,8 @@ fn match_profile_from_parts(
     }
 }
 
-pub fn match_profile_from_identity(identity: &VowifiSimIdentity) -> VowifiProfileMatchResponse {
-    match_profile_from_parts(
-        identity.masked(),
-        None,
-        identity.imsi(),
-        identity.operator_id(),
-    )
-}
-
 /// Match honoring the current SIM snapshot's pinned carrier `profile_id`.
-/// `None` is exactly [`match_profile_from_identity`].
+/// `None` uses automatic identity matching.
 pub fn match_profile_for_line(
     identity: &VowifiSimIdentity,
     pinned_profile_id: Option<&str>,

@@ -1857,6 +1857,40 @@ mod tests {
     }
 
     #[test]
+    fn operator_incoming_retries_asterisk_digest_challenge() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven)
+        .with_asterisk_target("sip:6108@192.0.2.20:8060")
+        .with_digest_credentials("6108", "test-secret");
+        let started = bridge
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "ims-call-digest".into(),
+                caller: "sip:+8613800@ims.example".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap();
+        let invite = &started.asterisk_frames[0];
+        let challenge = format!(
+            "SIP/2.0 401 Unauthorized\r\nVia: {}\r\nFrom: {}\r\nTo: <sip:6108@192.0.2.20:8060>;tag=pbx-auth\r\nCall-ID: {}\r\nCSeq: 1 INVITE\r\nWWW-Authenticate: Digest realm=\"pbx\", nonce=\"nonce-a\", algorithm=MD5, qop=\"auth\"\r\nContent-Length: 0\r\n\r\n",
+            sip_frame::header_value(invite, "Via").unwrap(),
+            sip_frame::header_value(invite, "From").unwrap(),
+            dialog::call_id(invite).unwrap(),
+        );
+
+        let retried = bridge.handle_asterisk(challenge.as_bytes()).unwrap();
+        assert_eq!(retried.asterisk_frames.len(), 2);
+        assert!(retried.asterisk_frames[0].starts_with(b"ACK "));
+        let retry = String::from_utf8_lossy(&retried.asterisk_frames[1]);
+        assert!(retry.starts_with("INVITE "));
+        assert!(retry.contains("Authorization: Digest "));
+        assert!(retry.contains("username=\"6108\""));
+        assert!(retry.contains("CSeq: 2 INVITE"));
+    }
+
+    #[test]
     fn restricted_operator_identity_reaches_asterisk_as_anonymous_only() {
         let incoming = b"INVITE sip:user@example SIP/2.0\r\nPrivacy: id\r\nP-Asserted-Identity: <sip:+15551234567@example>\r\nFrom: <sip:anonymous@anonymous.invalid>;tag=remote\r\n\r\n";
         let caller = crate::connectivity::core::supplementary::resolve_caller_identity(incoming)

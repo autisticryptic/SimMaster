@@ -203,6 +203,7 @@ pub struct UtPolicy {
     pub tls_additional_ca_pem: Option<&'static str>,
 }
 
+#[cfg(test)]
 pub const DEFAULT_UT_POLICY: UtPolicy = UtPolicy {
     enabled: false,
     xcap_root: None,
@@ -290,7 +291,6 @@ pub struct CarrierMatch {
     pub matched_prefix: String,
 }
 
-#[cfg(test)]
 #[cfg(test)]
 pub static GB_EE_23433: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
@@ -404,7 +404,6 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
     ut: DEFAULT_UT_POLICY,
 };
 
-#[cfg(test)]
 #[cfg(test)]
 pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
     meta: CarrierProfileMeta {
@@ -1100,7 +1099,8 @@ fn overrides() -> &'static std::sync::RwLock<ProfileOverrides> {
 }
 
 /// Replace the published override set. Called by `ProfileStore` after any change.
-pub fn publish_database_profiles(profiles: &[&'static CarrierProfile]) {
+#[cfg(test)]
+fn publish_database_profiles(profiles: &[&'static CarrierProfile]) {
     let matches = profiles
         .iter()
         .map(|profile| (profile.meta.plmn.to_string(), *profile))

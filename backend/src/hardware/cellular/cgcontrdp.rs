@@ -32,12 +32,6 @@ pub struct CgcontrdpSettings {
     pub pcscf: Vec<IpAddr>,
 }
 
-impl CgcontrdpSettings {
-    pub fn is_empty(&self) -> bool {
-        self.ipv4_address.is_none() && self.ipv6_address.is_none() && self.pcscf.is_empty()
-    }
-}
-
 /// Failure detail from the `AT+CGCONTRDP` read. `detail` carries a stable string
 /// for classification (e.g. `mmcli:...`), kept separate from the structured
 /// layers above so an IMS bearer driver can fold it into its own error type.

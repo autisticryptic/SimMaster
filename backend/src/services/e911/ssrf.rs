@@ -23,11 +23,7 @@ pub enum SsrfError {
     HostNotAllowed(String),
     IpLiteral(String),
     ForbiddenIp(IpAddr),
-    TooManyRedirects,
-    RedirectNotAllowed(String),
     InvalidUrl(String),
-    TooLarge,
-    Transport(String),
 }
 
 impl std::fmt::Display for SsrfError {
@@ -38,13 +34,7 @@ impl std::fmt::Display for SsrfError {
             Self::HostNotAllowed(host) => write!(f, "entitlement_host_not_allowed:{host}"),
             Self::IpLiteral(host) => write!(f, "entitlement_ip_literal_rejected:{host}"),
             Self::ForbiddenIp(ip) => write!(f, "entitlement_ip_forbidden:{ip}"),
-            Self::TooManyRedirects => f.write_str("entitlement_too_many_redirects"),
-            Self::RedirectNotAllowed(host) => {
-                write!(f, "entitlement_redirect_not_allowed:{host}")
-            }
             Self::InvalidUrl(reason) => write!(f, "entitlement_invalid_url:{reason}"),
-            Self::TooLarge => f.write_str("entitlement_response_too_large"),
-            Self::Transport(reason) => write!(f, "entitlement_transport:{reason}"),
         }
     }
 }
@@ -151,6 +141,7 @@ pub fn validate_redirect(location: &str, allow_list: &[String]) -> Result<Url, S
 
 /// Resolve a host to public IPs. In the real client this wraps
 /// `tokio::net::lookup_host`; the pure function lets tests inject a resolver.
+#[cfg(test)]
 pub fn first_public_ip<F>(host: &str, resolve: F) -> Result<IpAddr, SsrfError>
 where
     F: Fn(&str) -> Vec<IpAddr>,

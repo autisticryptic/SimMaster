@@ -6,9 +6,6 @@
 //!   - **Send routing** ([`sms_router`]): given the policy and a live readiness
 //!     snapshot, produce a priority-ordered plan of legs to attempt, with
 //!     fallback and a configurable mid-flight-disable behavior.
-//!   - **Listener election** ([`listener_election`]): pick the *single* IMS leg
-//!     that owns MT (received) SMS at any moment, so the same number is never
-//!     registered on two IMS legs at once (which would double-deliver).
 //!   - **Cross-transport dedup** ([`dedup`]): a stable content fingerprint plus
 //!     a race-free DB claim so a message that arrives on more than one leg is
 //!     stored exactly once.
@@ -28,7 +25,6 @@
 #![allow(dead_code)]
 
 pub mod dedup;
-pub mod listener_election;
 pub mod sms_router;
 pub mod voice_router;
 
@@ -36,10 +32,6 @@ pub mod voice_router;
 // (and by tests) rather than within this file.
 #[allow(unused_imports)]
 pub use dedup::{message_fingerprint, MessageFingerprintInput};
-#[allow(unused_imports)]
-pub use listener_election::{
-    elect_listener, CsListenerAction, ElectionOutcome, LegReceiveReadiness,
-};
 #[allow(unused_imports)]
 pub use sms_router::{
     plan_candidates, AttemptOutcome, Candidate, LegSendReadiness, RouteDecision, SendRouter,
