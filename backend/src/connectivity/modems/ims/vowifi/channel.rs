@@ -169,12 +169,8 @@ impl UdpSipChannel {
         }
     }
 
-    pub fn into_parts(self) -> (UdpSocket, Vec<u8>) {
-        // The dedicated receive socket is only needed while the protected
-        // transaction is in flight; after registration the channel is kept for
-        // outbound MESSAGE/INVITE traffic and the response path is not used.
-        drop(self.receive_socket);
-        (self.socket, self.pending)
+    pub fn into_parts(self) -> (UdpSocket, Option<UdpSocket>, Vec<u8>) {
+        (self.socket, self.receive_socket, self.pending)
     }
 
     pub async fn send_keepalive(&mut self) -> Result<(), ImsError> {
@@ -221,7 +217,16 @@ impl UdpSipChannel {
 
 impl ImsChannel for UdpSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
-        self.socket
+        // TS 33.203 protected UDP uses two flows. UE-originated requests use
+        // port_uc -> port_ps, while responses to network-originated requests
+        // must use port_us -> port_pc. The latter is the dedicated receive
+        // socket kept after REGISTER succeeds.
+        let socket = if frame.starts_with(b"SIP/2.0") {
+            self.receive_socket.as_ref().unwrap_or(&self.socket)
+        } else {
+            &self.socket
+        };
+        socket
             .send(frame)
             .await
             .map(|_| ())
@@ -237,8 +242,10 @@ impl ImsChannel for UdpSipChannel {
         tokio::time::timeout(timeout, async {
             loop {
                 let mut scratch = vec![0u8; MAX_PENDING_BYTES];
-                let read = self
-                    .socket
+                // REGISTER responses, subsequent network requests and their
+                // responses all arrive on port_us for a protected UDP pair.
+                let socket = self.receive_socket.as_ref().unwrap_or(&self.socket);
+                let read = socket
                     .recv(&mut scratch)
                     .await
                     .map_err(|_| ImsError::new("ims_channel_read_failed"))?;
@@ -269,6 +276,7 @@ impl ImsChannel for UdpSipChannel {
 pub enum SipChannelSocket {
     Tcp(TcpStream),
     Udp(UdpSocket),
+    UdpPair { send: UdpSocket, receive: UdpSocket },
 }
 
 impl SipChannelSocket {
@@ -280,6 +288,9 @@ impl SipChannelSocket {
             Self::Udp(socket) => socket
                 .local_addr()
                 .map_err(|_| ImsError::new("ims_channel_local_addr_failed")),
+            Self::UdpPair { send, .. } => send
+                .local_addr()
+                .map_err(|_| ImsError::new("ims_channel_local_addr_failed")),
         }
     }
 
@@ -287,6 +298,7 @@ impl SipChannelSocket {
         match self {
             Self::Tcp(stream) => abort_tcp(stream),
             Self::Udp(_) => drop(self),
+            Self::UdpPair { .. } => drop(self),
         }
     }
 }
@@ -312,6 +324,15 @@ impl SipChannel {
             }
             SipChannelSocket::Udp(socket) => {
                 Self::Udp(UdpSipChannel::new(socket, pending, route, security_verify))
+            }
+            SipChannelSocket::UdpPair { send, receive } => {
+                Self::Udp(UdpSipChannel::new_with_receive_socket(
+                    send,
+                    receive,
+                    pending,
+                    route,
+                    security_verify,
+                ))
             }
         }
     }
@@ -339,8 +360,12 @@ impl SipChannel {
                 (SipChannelSocket::Tcp(stream), pending)
             }
             Self::Udp(channel) => {
-                let (socket, pending) = channel.into_parts();
-                (SipChannelSocket::Udp(socket), pending)
+                let (send, receive, pending) = channel.into_parts();
+                let socket = match receive {
+                    Some(receive) => SipChannelSocket::UdpPair { send, receive },
+                    None => SipChannelSocket::Udp(send),
+                };
+                (socket, pending)
             }
         }
     }
@@ -544,6 +569,46 @@ mod tests {
             }
         }
         assert_eq!(collected, frame);
+    }
+
+    #[tokio::test]
+    async fn protected_udp_pair_keeps_server_flow_for_inbound_sip() {
+        let (client_peer, client_socket, client_peer_addr) = udp_pair().await;
+        let (server_peer, server_socket, _) = udp_pair().await;
+        let client_local_addr = client_socket.local_addr().unwrap();
+        let server_local_addr = server_socket.local_addr().unwrap();
+        let mut channel = UdpSipChannel::new_with_receive_socket(
+            client_socket,
+            server_socket,
+            Vec::new(),
+            udp_route(client_local_addr, client_peer_addr),
+            Some("ipsec-3gpp".to_string()),
+        );
+
+        let options = b"OPTIONS sip:ims.example SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+        channel.send_sip(options).await.unwrap();
+        let mut scratch = vec![0u8; 4096];
+        let (len, _) = client_peer.recv_from(&mut scratch).await.unwrap();
+        assert_eq!(&scratch[..len], options);
+
+        let incoming = b"MESSAGE sip:user@ims.example SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+        server_peer
+            .send_to(incoming, server_local_addr)
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(2)).await.unwrap(),
+            incoming
+        );
+
+        let response = b"SIP/2.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+        channel.send_sip(response).await.unwrap();
+        let (len, _) = server_peer.recv_from(&mut scratch).await.unwrap();
+        assert_eq!(&scratch[..len], response);
+
+        let (_, receive_socket, pending) = channel.into_parts();
+        assert!(receive_socket.is_some());
+        assert!(pending.is_empty());
     }
 
     #[tokio::test]

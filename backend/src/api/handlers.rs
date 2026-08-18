@@ -3527,6 +3527,28 @@ pub async fn set_line_airplane_mode_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    if payload.enabled && app.config_manager.get_line_profile(&line_id).vowifi.enabled {
+        // Rebuild the WiFi Calling registration after cellular deregistration
+        // so the operator recalculates MT SMS and call routing without CS.
+        let refresh_app = app.clone();
+        let scope = VowifiScope::for_line(Arc::clone(&line));
+        tokio::spawn(async move {
+            let _ = reset_vowifi_runtime_for_scope(
+                &refresh_app,
+                &scope,
+                "line_airplane_mode_vowifi_refresh",
+            )
+            .await;
+            let _ = connect_vowifi_on_line(
+                &refresh_app,
+                &scope,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                false,
+            )
+            .await;
+        });
+    }
     sync_line_video_capabilities(&app).await;
     (
         StatusCode::OK,
@@ -5696,8 +5718,8 @@ async fn restore_cellular_and_reset_vowifi(
             detail_json: "{}",
         });
 
-    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
-        warn!(error = %err, "Failed to re-enable the line radio while stopping WiFi Calling");
+    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
+        warn!(error = %err, "Failed to restore the line radio state while stopping WiFi Calling");
     }
 
     restore_cellular_data_after_vowifi(app, scope).await;
@@ -6179,18 +6201,28 @@ fn persist_optional_vowifi_restore_phase(
     }
 }
 
-/// VoWiFi needs this line's modem powered on for SIM/AKA access, so make sure
-/// the line is not sitting in airplane mode. Only ever turns airplane mode off,
-/// and only for the line that is connecting - a second SIM keeps its own state.
-async fn ensure_line_radio_enabled(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
+/// Preserve the line's persisted RF intent while preparing VoWiFi. QMI UIM and
+/// PC/SC SIM access remain available with cellular RF disabled, so connect,
+/// refresh and fallback paths must not clear airplane mode.
+async fn ensure_line_radio_state_for_vowifi(
+    app: &AppState,
+    scope: &VowifiScope,
+) -> Result<(), String> {
     let Some(modem_path) = scope.modem_path() else {
         return Ok(());
     };
+    if app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .airplane_mode_enabled
+    {
+        return Ok(());
+    }
     modem_manager::set_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path, false).await
 }
 
 async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
-    if let Err(err) = ensure_line_radio_enabled(app, scope).await {
+    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
         warn!(error = %err, "Failed to keep modem enabled for WiFi Calling SIM access");
     }
     let Some(modem_path) = scope.modem_path() else {
@@ -6341,8 +6373,11 @@ async fn connect_vowifi_on_line(
         } else {
             "vowifi_registration_expired"
         };
-        let stale = scope.runtime().reset_runtime(reason).await;
-        persist_vowifi_runtime_snapshot(app, scope.line_id(), &stale.status_response());
+        // Release the old operator channel, protected UDP port pair and ePDG
+        // gateway before binding the replacement registration. Resetting only
+        // the public snapshot leaves port_us/port_uc occupied and makes every
+        // refresh fail with ims_udp_bind_failed.
+        let _ = reset_vowifi_runtime_for_scope(app, scope, reason).await;
     }
 
     let profile_meta = current.profile.profile.as_ref();
