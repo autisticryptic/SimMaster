@@ -1,6 +1,6 @@
 # 运营商 Profile 来源与维护边界
 
-> 状态：应用侧读取、匹配和导入框架已落地；手机基带固件的深度逆向提取未排期。
+> 状态：应用侧读取、匹配和本地覆盖已落地；公开 AOSP/IPCC 事实 importer 不属于当前运行时，手机基带固件的深度逆向提取未排期。
 > 原始调研记录于 2026-07-29，本页按当前实现更新。
 
 ## 目的
@@ -24,18 +24,20 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
 
 主要实现位置：
 
-- `backend/src/connectivity/modems/softstack/vowifi/carrier_catalog.rs`
-- `backend/src/connectivity/modems/softstack/vowifi/carrier_catalog_v7.rs`
-- `backend/src/connectivity/modems/softstack/vowifi/profile_store.rs`
-- `backend/src/connectivity/modems/softstack/vowifi/profile_record.rs`
-- `backend/src/connectivity/modems/softstack/vowifi/profile_import.rs`
+- `backend/src/connectivity/modems/ims/vowifi/carrier_catalog.rs`
+- `backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs`
+- `backend/src/connectivity/modems/ims/vowifi/profile_store.rs`
+- `backend/src/connectivity/modems/ims/vowifi/profile_record.rs`
+
+运行时不解析 AOSP/IPCC 原始文件，也不从公开资料自动生成可拨号 profile。需要新增运营商时，先在独立的
+carrier catalog 流程中完成来源审计、字段校验和封存，再由 SimAdmin 加载兼容的 catalog release。
 
 ## 支持的来源
 
 ### Android
 
-- AOSP `apns-conf.xml`：按 PLMN 提取 IMS APN 等事实。
-- AOSP CarrierConfig XML：提取运营商是否支持 VoWiFi/IMS 等公开配置。
+- AOSP `apns-conf.xml`、CarrierConfig XML 和 Apple plist 仅作为独立 catalog 流程的研究来源；SimAdmin
+  不直接解析这些文件。
 - 厂商 `/vendor` 配置、Qualcomm MBN 与专有 IMS 数据可能包含更多字段，但格式和授权边界
   不稳定，SimAdmin 运行时不直接解析这些固件资产。
 
@@ -56,7 +58,7 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
    配置不一定足够完成注册。
 2. 手机侧字段与 `CarrierProfileRecord` 并非一一对应；导入事实必须叠加在可信 catalog
    基线上，不能用猜测值覆盖未知字段。
-3. Android/iOS 和厂商格式会变化，解析器必须配套 fixture、来源引用和 schema 契约测试。
+3. Android/iOS 和厂商格式会变化，独立 catalog 流程若重新引入解析器，必须配套 fixture、来源引用和 schema 契约测试。
 4. E911 元数据目前可进入 catalog，但 SimAdmin 尚未执行完整的紧急呼叫定位流程。
 5. 固件、carrier bundle 和运营商配置可能受版权、许可或设备条款约束；收集、使用和分发前
    应分别确认授权，不应把来源不明的原始资产提交到本仓库。
