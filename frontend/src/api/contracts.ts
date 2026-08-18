@@ -1197,7 +1197,8 @@ export interface WebCallCapabilitiesResponse {
 }
 
 export interface VilteConfig {
-  feature_enabled: boolean
+  volte_enabled: boolean
+  vowifi_enabled: boolean
   codec: string
   video_payload_type: number
   h264_fmtp: string

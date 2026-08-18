@@ -12,6 +12,7 @@ import {
   type VoiceAccessPathKind,
   type VoicePathPolicy,
   type WebCallCapabilitiesResponse,
+  type VowifiLineConfigResponse,
 } from '../../api/current'
 
 const pathLabels: Record<VoiceAccessPathKind, string> = {
@@ -29,6 +30,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
   const [webCall, setWebCall] = useState<WebCallCapabilitiesResponse | null>(null)
   const [vilte, setVilte] = useState<VilteStatusResponse | null>(null)
   const [volteVoice, setVolteVoice] = useState<VolteVoiceStatusResponse | null>(null)
+  const [vowifiLine, setVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -41,6 +43,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
       setWebCall(null)
       setVilte(null)
       setVolteVoice(null)
+      setVowifiLine(null)
       setLoading(false)
       return
     }
@@ -51,12 +54,14 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     setWebCall(null)
     setVilte(null)
     setVolteVoice(null)
+    setVowifiLine(null)
     try {
-      const [pathResponse, webResponse, vilteResponse, volteVoiceResponse] = await Promise.all([
+      const [pathResponse, webResponse, vilteResponse, volteVoiceResponse, vowifiResponse] = await Promise.all([
         api.getVoicePathPolicy(lineId),
         api.getWebCallCapabilities(),
         api.getVilteStatus(lineId),
         api.getVolteVoiceStatus(lineId),
+        api.getVowifiLine(lineId),
       ])
       if (generation !== loadGeneration.current || activeLineId.current !== lineId) return
       if (vilteResponse.data?.line_id !== lineId || volteVoiceResponse.data?.line_id !== lineId) {
@@ -66,6 +71,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
       setWebCall(webResponse.data ?? null)
       setVilte(vilteResponse.data ?? null)
       setVolteVoice(volteVoiceResponse.data ?? null)
+      setVowifiLine(vowifiResponse.data ?? null)
     } catch (err) {
       if (generation === loadGeneration.current && activeLineId.current === lineId) {
         setError(err instanceof Error ? err.message : String(err))
@@ -85,11 +91,14 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     if (vilte.config.video_payload_type < 96 || vilte.config.video_payload_type > 127) {
       return 'RTP Payload Type 必须使用 96 至 127 的动态范围'
     }
-    if (vilte.config.feature_enabled && !volteVoice?.voice_enabled) {
+    if (vilte.config.volte_enabled && !volteVoice?.voice_enabled) {
       return '启用 ViLTE 前必须先启用 VoLTE 语音网关能力'
     }
+    if (vilte.config.vowifi_enabled && !vowifiLine?.config.enabled) {
+      return '启用 VoWiFi 视频前必须先启用当前线路的 VoWiFi 连接'
+    }
     return null
-  }, [vilte, volteVoice])
+  }, [vilte, volteVoice, vowifiLine])
 
   const movePath = (index: number, delta: -1 | 1) => {
     if (!voicePath) return
@@ -187,16 +196,20 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
       </CardContent></Card>
 
       <Card><CardContent>
-        <Typography variant="h6">ViLTE 视频能力</Typography>
-        <Alert severity="warning" sx={{ my: 2 }}>这里只配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。通话内音频/视频切换通过当前线路的 IMS 与 Trunk 媒体中继完成。</Alert>
+        <Typography variant="h6">IMS 视频能力</Typography>
+        <Alert severity="warning" sx={{ my: 2 }}>这里只配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。VoLTE 与 VoWiFi 共用媒体参数，但分别启用，通话内音频/视频切换由当前线路的 IMS 与 Trunk 媒体中继完成。</Alert>
         {vilte && <Stack spacing={2}>
           <FormControlLabel
             control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.ims_connection_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
             label={volteVoice?.ims_connection_enabled ? '当前线路 VoLTE 语音网关能力' : '请先启用当前线路的 VoLTE IMS 连接'}
           />
           <FormControlLabel
-            control={<Switch checked={vilte.config.feature_enabled} disabled={!volteVoice?.voice_enabled || saving} onChange={(_, feature_enabled) => setVilte({ ...vilte, config: { ...vilte.config, feature_enabled } })} />}
+            control={<Switch checked={vilte.config.volte_enabled} disabled={!volteVoice?.voice_enabled || saving} onChange={(_, volte_enabled) => setVilte({ ...vilte, config: { ...vilte.config, volte_enabled } })} />}
             label="启用当前线路 ViLTE 能力（要求该线路 VoLTE 语音已启用）"
+          />
+          <FormControlLabel
+            control={<Switch checked={vilte.config.vowifi_enabled} disabled={!vowifiLine?.config.enabled || saving} onChange={(_, vowifi_enabled) => setVilte({ ...vilte, config: { ...vilte.config, vowifi_enabled } })} />}
+            label={vowifiLine?.config.enabled ? '启用当前线路 VoWiFi 视频能力' : '请先启用当前线路的 VoWiFi 连接'}
           />
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
             <FormControl fullWidth>
@@ -209,7 +222,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
           </Box>
           <TextField label="H.264 fmtp" value={vilte.config.h264_fmtp} onChange={(e) => setVilte({ ...vilte, config: { ...vilte.config, h264_fmtp: e.target.value } })} />
           {vilteValidationError && <Alert severity="error">{vilteValidationError}</Alert>}
-          <Button variant="outlined" onClick={() => void saveVilte()} disabled={saving || Boolean(vilteValidationError)}>保存 ViLTE 配置</Button>
+          <Button variant="outlined" onClick={() => void saveVilte()} disabled={saving || Boolean(vilteValidationError)}>保存 IMS 视频配置</Button>
         </Stack>}
       </CardContent></Card>
 

@@ -2006,39 +2006,49 @@ fn prepare_operator_media(
         call.operator_video_local,
         call.internal_video_local,
     ) {
-        negotiate_video(&internal_video.description, &operator_video)
-            .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
-        let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
-            let mappings = (operator_video.payload_type != internal_video.description.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.payload_type,
-                    internal: internal_video.description.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_remote,
-                internal_video.endpoint,
-                mappings,
-                Some(link.media_metrics()),
-            ));
-        }
-        let mut trunk_video = operator_video;
-        trunk_video.direction = trunk_video.direction.for_peer();
-        trunk_video.media_port = internal_local.port();
-        trunk_video.connection_addr = Some(internal_local.ip().to_string());
-        trunk_video.addr_type = Some(if internal_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if operator_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&trunk_video.media_lines());
+            negotiate_video(&internal_video.description, &operator_video)
+                .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
+            let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
+                let mappings = (operator_video.payload_type
+                    != internal_video.description.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.payload_type,
+                        internal: internal_video.description.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_remote,
+                    internal_video.endpoint,
+                    mappings,
+                    Some(link.media_metrics()),
+                ));
+            }
+            let mut trunk_video = operator_video;
+            trunk_video.direction = trunk_video.direction.for_peer();
+            trunk_video.media_port = internal_local.port();
+            trunk_video.connection_addr = Some(internal_local.ip().to_string());
+            trunk_video.addr_type = Some(if internal_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&trunk_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(internal_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&internal_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
 }
@@ -2088,39 +2098,49 @@ fn prepare_incoming_media(
         parse_video_sdp(body),
         call.operator_video_local,
     ) {
-        negotiate_video(&operator_video.description, &internal_video)
-            .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
-        let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
-        if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
-            let pending = call
-                .pending_video_relay
-                .take()
-                .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
-            let mappings = (operator_video.description.payload_type != internal_video.payload_type)
-                .then_some(PayloadTypeMapping {
-                    operator: operator_video.description.payload_type,
-                    internal: internal_video.payload_type,
-                });
-            call.active_video_relay = Some(pending.activate_with_metrics(
-                operator_video.endpoint,
-                internal_remote,
-                mappings,
-                Some(link.media_metrics()),
-            ));
-        }
-        let mut ims_video = operator_video.description.clone();
-        ims_video.direction = internal_video.direction.for_peer();
-        ims_video.media_port = operator_local.port();
-        ims_video.connection_addr = Some(operator_local.ip().to_string());
-        ims_video.addr_type = Some(if operator_local.is_ipv4() {
-            SdpAddrType::Ip4
+        if internal_video.is_rejected() {
+            call.pending_video_relay = None;
+            call.active_video_relay = None;
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
         } else {
-            SdpAddrType::Ip6
-        });
-        answer.push_str(&ims_video.media_lines());
+            negotiate_video(&operator_video.description, &internal_video)
+                .map_err(|error| format!("vowifi_video_negotiation_failed:{error}"))?;
+            let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
+            if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
+                let pending = call
+                    .pending_video_relay
+                    .take()
+                    .ok_or_else(|| "vowifi_video_rtp_relay_missing".to_string())?;
+                let mappings = (operator_video.description.payload_type
+                    != internal_video.payload_type)
+                    .then_some(PayloadTypeMapping {
+                        operator: operator_video.description.payload_type,
+                        internal: internal_video.payload_type,
+                    });
+                call.active_video_relay = Some(pending.activate_with_metrics(
+                    operator_video.endpoint,
+                    internal_remote,
+                    mappings,
+                    Some(link.media_metrics()),
+                ));
+            }
+            let mut ims_video = operator_video.description.clone();
+            ims_video.direction = internal_video.direction.for_peer();
+            ims_video.media_port = operator_local.port();
+            ims_video.connection_addr = Some(operator_local.ip().to_string());
+            ims_video.addr_type = Some(if operator_local.is_ipv4() {
+                SdpAddrType::Ip4
+            } else {
+                SdpAddrType::Ip6
+            });
+            answer.push_str(&ims_video.media_lines());
+        }
     } else {
         call.pending_video_relay = None;
         call.active_video_relay = None;
+        if let Some(operator_video) = call.internal_offer.video.as_ref() {
+            answer.push_str(&operator_video.description.rejected_answer().media_lines());
+        }
     }
     Ok(answer)
 }

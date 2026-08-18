@@ -74,6 +74,21 @@ pub struct VideoMediaDescription {
 }
 
 impl VideoMediaDescription {
+    /// Whether the peer rejected this stream with the RFC 4566 port-0
+    /// convention. This rejects video only; sibling audio media stays valid.
+    pub fn is_rejected(&self) -> bool {
+        self.media_port == 0
+    }
+
+    /// Build the port-0 answer used when a peer declines an offered video
+    /// stream. Keeping the media line preserves SDP offer/answer ordering.
+    pub fn rejected_answer(&self) -> Self {
+        let mut rejected = self.clone();
+        rejected.media_port = 0;
+        rejected.direction = MediaDirection::Inactive;
+        rejected
+    }
+
     /// Serialize just the media-level lines for this video section:
     /// `m=video ...`, `a=rtpmap`, optional `a=fmtp`, and the direction attr.
     /// (Session-level `v=`/`o=`/`s=`/`c=`/`t=` are emitted once by
@@ -494,6 +509,16 @@ mod tests {
             parsed.fmtp.as_deref(),
             Some("profile-level-id=42e01f;packetization-mode=1")
         );
+    }
+
+    #[test]
+    fn rejected_video_answer_keeps_media_line_and_marks_it_inactive() {
+        let rejected = sample_video().rejected_answer();
+        assert!(rejected.is_rejected());
+        let lines = rejected.media_lines();
+        assert!(lines.contains("m=video 0 RTP/AVP 99\r\n"));
+        assert!(lines.contains("a=rtpmap:99 H264/90000\r\n"));
+        assert!(lines.contains("a=inactive\r\n"));
     }
 
     #[test]
