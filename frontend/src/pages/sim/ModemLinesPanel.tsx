@@ -102,6 +102,7 @@ function trunkProfileCanEnable(line: TrunkProfileResponse) {
 
 const vowifiStageLabels: Record<string, string> = {
   disabled: '未启用', starting: '正在启动', identity_ready: 'SIM 身份已读取',
+  reconnecting: 'IMS 注册已失效，正在重连',
   profile_matched: '运营商配置已匹配', sim_auth_ready: 'SIM AKA 已就绪',
   epdg_ready: 'ePDG 已连接', ike_ready: 'IKE 已建立', child_sa_ready: 'CHILD SA 已建立',
   esp_ready: 'ESP 数据通道已建立', ims_registered: 'IMS 已注册', sms_ready: '短信已就绪',

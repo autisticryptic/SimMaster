@@ -6432,17 +6432,30 @@ async fn build_vowifi_line_response(
     // Every line has a real runtime now, so report that line's own phase instead
     // of the old "only the primary line has a runtime" placeholder.
     let status = line.vowifi.snapshot().await.status_response();
+    // The runtime snapshot records the last completed IMS stage, while the
+    // operator link is the live source of truth for whether the REGISTER
+    // channel still has a consumer.  A SIP registration can expire between
+    // snapshot refreshes; do not report stale sms/voice readiness as active.
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&modem.line_id)
+            .is_available();
     let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) = {
         let stage = if config.enabled && status.phase == "not_started" {
             "starting".to_string()
+        } else if config.enabled && status.readiness.ims_registered && !operator_ready {
+            "reconnecting".to_string()
         } else {
             status.phase.to_string()
         };
         (
             status.phase.to_string(),
             stage,
-            status.readiness.ims_registered,
-            status.degraded_reason,
+            status.readiness.ims_registered && operator_ready,
+            if !operator_ready && status.readiness.ims_registered {
+                Some("vowifi_registration_expired".to_string())
+            } else {
+                status.degraded_reason
+            },
             status
                 .profile
                 .profile
@@ -7949,7 +7962,12 @@ async fn schedule_vowifi_auto_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     line_id: String,
 ) {
-    if line.vowifi_restore_in_progress() || line.vowifi.snapshot().await.readiness().sms_ready {
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .is_available();
+    if line.vowifi_restore_in_progress()
+        || (line.vowifi.snapshot().await.readiness().sms_ready && operator_ready)
+    {
         return;
     }
     let workflow = VowifiRestoreWorkflow::boot_auto_restore(config, line_id);
