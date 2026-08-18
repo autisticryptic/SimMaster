@@ -629,7 +629,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                 />
                 <CardContent sx={{ pt: 0, pb: '8px !important', flex: 1 }}>
                   <Stack divider={<Divider flexItem />}>
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <FlightTakeoff color={airplaneEnabled ? 'warning' : 'action'} fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>飞行模式</Typography>
@@ -651,7 +651,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <TravelExplore color={network?.roaming.roaming_allowed ? 'info' : 'disabled'} fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>漫游数据</Typography>
@@ -675,7 +675,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Lan color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>数据连接</Typography>
@@ -712,7 +712,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
 
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: '188px minmax(0, 1fr) 180px' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Replay color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>重启基带</Typography>
