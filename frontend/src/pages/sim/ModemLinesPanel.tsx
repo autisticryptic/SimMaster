@@ -113,7 +113,16 @@ function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
   if (!line?.config.enabled) return 'VoWiFi未启用'
   if (line.runtime_registered) return 'VoWiFi IMS 已注册'
   const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage
+  if (line.runtime_restore_in_progress) return stage
+  if (line.runtime_stage === 'reconnecting') return 'IMS 注册失效，等待下一次重试'
   return line.runtime_error ? `${stage}失败` : stage
+}
+
+function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
+  if (!line) return '等待匹配运营商 profile'
+  if (line.runtime_restore_in_progress) return '后台正在执行自动重连'
+  if (line.runtime_error) return '本轮重连未成功，后台会继续尝试'
+  return line.matched_profile_id ? `运营商 profile ${line.matched_profile_id}` : '等待匹配运营商 profile'
 }
 
 function recoveryMessage(line: VolteLineControlResponse) {
@@ -622,29 +631,75 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                   <Stack divider={<Divider flexItem />}>
                     <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
+                        <FlightTakeoff color={airplaneEnabled ? 'warning' : 'action'} fontSize="small" />
+                        <Typography variant="body2" fontWeight={700} noWrap>飞行模式</Typography>
+                      </Box>
+                      <Stack minWidth={0} justifyContent="center" spacing={0.25} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {networkLoadLabel || (!line.modem.present ? '配置可修改，设备恢复后自动应用' : network?.airplane_stage || (airplaneEnabled ? '移动射频已关闭' : '移动射频正常'))}
+                        </Typography>
+                        <Typography variant="caption" color="text.disabled" sx={{ visibility: 'hidden' }}>&nbsp;</Typography>
+                      </Stack>
+                      <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
+                        {airplaneBusy && <CircularProgress size={16} />}
+                        <Switch
+                          color="warning"
+                          checked={airplaneEnabled}
+                          onChange={(_, enabled) => void toggleAirplaneMode(line.modem.line_id, enabled)}
+                          disabled={!network || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                      <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
+                        <TravelExplore color={network?.roaming.roaming_allowed ? 'info' : 'disabled'} fontSize="small" />
+                        <Typography variant="body2" fontWeight={700} noWrap>漫游数据</Typography>
+                      </Box>
+                      <Stack minWidth={0} justifyContent="center" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {networkLoadLabel
+                            ? networkLoadLabel
+                            : !line.modem.present
+                            ? '配置可修改，设备恢复后自动应用'
+                            : `${network?.roaming.roaming_allowed ? '允许漫游' : '禁止漫游'} · ${network?.roaming.is_roaming ? '当前正在漫游' : '当前未漫游'}`}
+                        </Typography>
+                      </Stack>
+                      <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
+                        {roamingBusy && <CircularProgress size={16} />}
+                        <Switch
+                          checked={network?.roaming.roaming_allowed ?? true}
+                          onChange={(_, enabled) => void toggleRoaming(line.modem.line_id, enabled)}
+                          disabled={!network || (line.modem.present && airplaneEnabled) || savingKey !== null}
+                        />
+                      </Box>
+                    </Box>
+
+                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
+                      <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Lan color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>数据连接</Typography>
                       </Box>
-                      <Box minWidth={0} display="flex" alignItems="baseline" gap={0.75} flexWrap="wrap" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
-                        <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>
-                        {networkLoadLabel
-                          ? networkLoadLabel
-                          : !line.modem.present
-                          ? '配置可修改，设备恢复后自动应用'
-                          : network?.data.proxy.phase === 'failed'
-                          ? network.data.proxy.stage
-                          : network?.data.proxy.running && network.data.proxy.port
-                            ? `${network.data.proxy.listen_ip || network.data.config.listen_ip}:${network.data.proxy.port} · ${network.data.proxy.interface_name || '移动数据网卡'}`
-                            : network?.data.enabled ? network.data.proxy.stage || '正在建立移动数据出口' : '流量未启用'}
+                      <Stack minWidth={0} justifyContent="center" spacing={0.25} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
+                        <Typography variant="caption" color="text.secondary" display="block" sx={{ wordBreak: 'break-word' }}>
+                          {networkLoadLabel
+                            ? networkLoadLabel
+                            : !line.modem.present
+                            ? '配置可修改，设备恢复后自动应用'
+                            : network?.data.proxy.phase === 'failed'
+                            ? network.data.proxy.stage
+                            : network?.data.proxy.running && network.data.proxy.port
+                              ? `${network.data.proxy.listen_ip || network.data.config.listen_ip}:${network.data.proxy.port} · ${network.data.proxy.interface_name || '移动数据网卡'}`
+                              : network?.data.enabled ? network.data.proxy.stage || '正在建立移动数据出口' : '流量未启用'}
                         </Typography>
-                        <Typography variant="caption" color="text.disabled" noWrap>
+                        <Typography variant="caption" color="text.disabled" display="block">
                           {networkLoadLabel
                             ? '状态返回后自动更新'
                             : network?.data.proxy.traffic_used
                             ? `上行 ${formatBytes(network.data.proxy.traffic.uplink_bytes)} · 下行 ${formatBytes(network.data.proxy.traffic.downlink_bytes)}`
                             : '暂无代理流量'}
                         </Typography>
-                      </Box>
+                      </Stack>
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.25} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
                         {(dataBusy || trafficBusy) && <CircularProgress size={16} />}
                         <Button size="small" onClick={() => setEditingDataLineId(line.modem.line_id)} disabled={!network || savingKey !== null}>配置</Button>
@@ -659,55 +714,16 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
                     <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
                       <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
-                        <TravelExplore color={network?.roaming.roaming_allowed ? 'info' : 'disabled'} fontSize="small" />
-                        <Typography variant="body2" fontWeight={700} noWrap>漫游数据</Typography>
-                      </Box>
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
-                        {networkLoadLabel
-                          ? networkLoadLabel
-                          : !line.modem.present
-                          ? '配置可修改，设备恢复后自动应用'
-                          : `${network?.roaming.roaming_allowed ? '允许漫游' : '禁止漫游'} · ${network?.roaming.is_roaming ? '当前正在漫游' : '当前未漫游'}`}
-                      </Typography>
-                      <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
-                        {roamingBusy && <CircularProgress size={16} />}
-                        <Switch
-                          checked={network?.roaming.roaming_allowed ?? true}
-                          onChange={(_, enabled) => void toggleRoaming(line.modem.line_id, enabled)}
-                          disabled={!network || (line.modem.present && airplaneEnabled) || savingKey !== null}
-                        />
-                      </Box>
-                    </Box>
-
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
-                      <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
-                        <FlightTakeoff color={airplaneEnabled ? 'warning' : 'action'} fontSize="small" />
-                        <Typography variant="body2" fontWeight={700} noWrap>飞行模式</Typography>
-                      </Box>
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
-                        {networkLoadLabel || (!line.modem.present ? '配置可修改，设备恢复后自动应用' : network?.airplane_stage || (airplaneEnabled ? '移动射频已关闭' : '移动射频正常'))}
-                      </Typography>
-                      <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
-                        {airplaneBusy && <CircularProgress size={16} />}
-                        <Switch
-                          color="warning"
-                          checked={airplaneEnabled}
-                          onChange={(_, enabled) => void toggleAirplaneMode(line.modem.line_id, enabled)}
-                          disabled={!network || savingKey !== null}
-                        />
-                      </Box>
-                    </Box>
-
-                    <Box sx={{ display: 'grid', gridTemplateColumns: { xs: 'minmax(0, 1fr) auto', sm: 'minmax(128px, 0.72fr) minmax(0, 1.28fr) auto' }, alignItems: 'center', columnGap: 2, rowGap: 0.5, py: 1.15 }}>
-                      <Box display="flex" alignItems="center" gap={0.75} minWidth={0}>
                         <Replay color="action" fontSize="small" />
                         <Typography variant="body2" fontWeight={700} noWrap>重启基带</Typography>
                       </Box>
-                      <Typography variant="caption" color="text.secondary" display="block" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' } }}>
-                        {line.modem.present
-                          ? '仅重启当前线路，驻网与数据连接会短暂中断'
-                          : '设备离线，将使用保留路径尝试恢复'}
-                      </Typography>
+                      <Stack minWidth={0} justifyContent="center" sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
+                        <Typography variant="caption" color="text.secondary" display="block">
+                          {line.modem.present
+                            ? '仅重启当前线路，驻网与数据连接会短暂中断'
+                            : '设备离线，将使用保留路径尝试恢复'}
+                        </Typography>
+                      </Stack>
                       <Button
                         size="small"
                         color="warning"
@@ -835,7 +851,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           <Typography variant="body2" fontWeight={600}>VoWiFi / WiFi Calling</Typography>
                         </Box>
                         <Typography variant="caption" color="text.secondary" display="block" mt={0.25}>
-                          {vowifiLoadLabel || (vowifiLine?.matched_profile_id ? `运营商 profile ${vowifiLine.matched_profile_id}` : '等待匹配运营商 profile')}
+                          {vowifiLoadLabel || vowifiRuntimeCaption(vowifiLine)}
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>

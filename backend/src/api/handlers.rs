@@ -6280,10 +6280,28 @@ async fn connect_vowifi_on_line(
     if !scope.is_present() {
         return disabled_vowifi_status("vowifi_line_not_present");
     }
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
+            .is_available();
     let current = scope.status().await;
-    if current.readiness.sms_ready {
+    if current.readiness.sms_ready && operator_ready {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
+    }
+    if !operator_ready
+        && (current.readiness.ims_registered
+            || current.readiness.sms_ready
+            || current.readiness.voice_ready)
+    {
+        // The SIP task clears the operator link when REGISTER expires, but the
+        // runtime snapshot may still contain the last successful readiness.
+        // Invalidate that stale live state before reconnecting so the executor
+        // cannot skip IMS registration and falsely report success.
+        let stale = scope
+            .runtime()
+            .reset_runtime("vowifi_registration_expired")
+            .await;
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &stale.status_response());
     }
 
     // Resolve and publish SIM-bound values only after proving that this call is
@@ -6306,7 +6324,10 @@ async fn connect_vowifi_on_line(
     };
 
     let current = scope.status().await;
-    if current.readiness.sms_ready {
+    let operator_ready =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
+            .is_available();
+    if current.readiness.sms_ready && operator_ready {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
     }
@@ -6419,6 +6440,7 @@ pub struct VowifiLineConfigResponse {
     pub runtime_phase: String,
     pub runtime_stage: String,
     pub runtime_registered: bool,
+    pub runtime_restore_in_progress: bool,
     pub runtime_error: Option<String>,
     pub matched_profile_id: Option<String>,
 }
@@ -6469,6 +6491,7 @@ async fn build_vowifi_line_response(
         runtime_phase,
         runtime_stage,
         runtime_registered,
+        runtime_restore_in_progress: line.vowifi_restore_in_progress(),
         runtime_error,
         matched_profile_id,
     }

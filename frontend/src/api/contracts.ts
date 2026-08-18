@@ -1020,6 +1020,7 @@ export interface VowifiLineConfigResponse {
   runtime_phase: string
   runtime_stage: string
   runtime_registered: boolean
+  runtime_restore_in_progress: boolean
   runtime_error?: string | null
   matched_profile_id?: string | null
 }
