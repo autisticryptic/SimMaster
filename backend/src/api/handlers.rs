@@ -6283,25 +6283,15 @@ async fn connect_vowifi_on_line(
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
             .is_available();
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            scope.line_id(),
+        )
+        .await;
     let current = scope.status().await;
-    if current.readiness.sms_ready && operator_ready {
+    if current.readiness.sms_ready && operator_ready && !refresh_due {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
-    }
-    if !operator_ready
-        && (current.readiness.ims_registered
-            || current.readiness.sms_ready
-            || current.readiness.voice_ready)
-    {
-        // The SIP task clears the operator link when REGISTER expires, but the
-        // runtime snapshot may still contain the last successful readiness.
-        // Invalidate that stale live state before reconnecting so the executor
-        // cannot skip IMS registration and falsely report success.
-        let stale = scope
-            .runtime()
-            .reset_runtime("vowifi_registration_expired")
-            .await;
-        persist_vowifi_runtime_snapshot(app, scope.line_id(), &stale.status_response());
     }
 
     // Resolve and publish SIM-bound values only after proving that this call is
@@ -6327,9 +6317,32 @@ async fn connect_vowifi_on_line(
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
             .is_available();
-    if current.readiness.sms_ready && operator_ready {
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            scope.line_id(),
+        )
+        .await;
+    if current.readiness.sms_ready && operator_ready && !refresh_due {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
+    }
+    if (refresh_due || !operator_ready)
+        && (current.readiness.ims_registered
+            || current.readiness.sms_ready
+            || current.readiness.voice_ready)
+    {
+        // The SIP task clears the operator link when REGISTER expires, while
+        // the runtime snapshot still contains the last successful readiness.
+        // The same invalidation is required at the proactive refresh deadline,
+        // otherwise the executor would skip REGISTER and falsely report that
+        // the lease was renewed.
+        let reason = if operator_ready {
+            "vowifi_registration_refresh_due"
+        } else {
+            "vowifi_registration_expired"
+        };
+        let stale = scope.runtime().reset_runtime(reason).await;
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &stale.status_response());
     }
 
     let profile_meta = current.profile.profile.as_ref();
@@ -7988,8 +8001,13 @@ async fn schedule_vowifi_auto_restore(
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
             .is_available();
+    let refresh_due =
+        crate::connectivity::modems::ims::vowifi::live::live_ims_registration_refresh_due_for_line(
+            &line_id,
+        )
+        .await;
     if line.vowifi_restore_in_progress()
-        || (line.vowifi.snapshot().await.readiness().sms_ready && operator_ready)
+        || (line.vowifi.snapshot().await.readiness().sms_ready && operator_ready && !refresh_due)
     {
         return;
     }

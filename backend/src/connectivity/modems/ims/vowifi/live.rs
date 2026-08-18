@@ -2833,6 +2833,18 @@ async fn cached_live_ims_register_ready(line_id: &str, profile: &'static Carrier
         .is_some_and(|ready| ready.expires_at > Instant::now())
 }
 
+/// The REGISTER cache expires at the lease's refresh deadline (11/12 of the
+/// network lifetime), before the installed operator channel reaches its hard
+/// expiry. The restore scheduler uses this signal to replace the registration
+/// without creating an avoidable signaling gap every lease interval.
+pub(crate) async fn live_ims_registration_refresh_due_for_line(line_id: &str) -> bool {
+    ims_register_ready_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .is_none_or(|ready| ready.expires_at <= Instant::now())
+}
+
 async fn cached_live_ims_registration(
     line_id: &str,
     profile: &'static CarrierProfile,
