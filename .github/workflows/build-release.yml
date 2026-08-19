@@ -181,6 +181,7 @@ jobs:
           targets: ${{ matrix.target }}
 
       - name: Install musl toolchain
+        timeout-minutes: 10
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
@@ -336,6 +337,22 @@ jobs:
           path: release/simadmin-linux-${{ matrix.arch }}.tar.gz
           retention-days: 3
           if-no-files-found: error
+
+      # Do not make device deployments wait for an unrelated architecture.
+      # The final release job below still publishes both packages and checksums
+      # after the full matrix succeeds.
+      - name: Publish ARM64 package when ready
+        if: matrix.arch == 'arm64'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          files: release/simadmin-linux-arm64.tar.gz
+          overwrite_files: true
+          draft: false
+          prerelease: false
+          make_latest: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   # ==================== 3. 汇总所有架构并发布 Release ====================
   release:
