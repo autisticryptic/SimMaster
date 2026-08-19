@@ -7841,42 +7841,8 @@ pub async fn get_vilte_control_handler(
     )
 }
 
-pub async fn set_vilte_feature_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
-) -> (StatusCode, Json<ApiResponse<VilteStatusResponse>>) {
-    let Some(line) = resolve_control_line(&app, &line_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("line_not_found")),
-        );
-    };
-    match app
-        .config_manager
-        .set_line_ims_video_volte_enabled(&line_id, payload.enabled)
-    {
-        Ok(_) => {
-            sync_line_video_capabilities(&app).await;
-            let status = VilteStatusResponse::build(&app, &line).await;
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message("Success", status)),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<VilteStatusResponse>::error(format!(
-                "Failed: {err}"
-            ))),
-        ),
-    }
-}
-
-/// Replace the full IMS video config (codec / payload type / fmtp). The
-/// `volte_enabled` gate is honored only when VoLTE voice is enabled, and
-/// `vowifi_enabled` only when VoWiFi voice is enabled; otherwise each gate is
-/// forced off by the config layer.
+/// Replace the IMS video codec / payload type / fmtp settings. Access enablement
+/// is derived from the corresponding VoLTE and VoWiFi connection settings.
 pub async fn set_vilte_config_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,

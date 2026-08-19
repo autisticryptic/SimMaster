@@ -909,13 +909,6 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'))
   }
 
-  async setVilteFeature(lineId: string, enabled: boolean) {
-    return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'), {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
-  }
-
   async setVilteConfig(lineId: string, config: VilteConfig) {
     return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/config'), {
       method: 'POST',

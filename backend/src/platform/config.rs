@@ -2451,37 +2451,21 @@ mod tests {
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
         manager.set_line_volte_voice_enabled(line_a, false).unwrap();
-        assert_eq!(
-            manager
-                .set_line_ims_video_volte_enabled(line_a, true)
-                .unwrap_err(),
-            "volte_voice_disabled"
-        );
-
-        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
-        let ims_video = manager
-            .set_line_ims_video_volte_enabled(line_b, true)
+        manager
+            .set_line_volte_connection_enabled(line_b, true)
             .unwrap();
-        assert!(ims_video.volte_enabled);
-        assert_eq!(ims_video.codec, "h264");
+        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
+        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
         assert!(!manager.get_line_volte_voice_enabled(line_a));
         assert!(manager.get_line_volte_voice_enabled(line_b));
         assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
         assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
 
-        // VoWiFi gate is independent of the VoLTE voice gate.
-        assert_eq!(
-            manager
-                .set_line_ims_video_vowifi_enabled(line_b, true)
-                .unwrap_err(),
-            "vowifi_voice_disabled"
-        );
+        // VoWiFi video follows the VoWiFi connection independently.
         manager
             .set_line_vowifi_connection_enabled(line_b, true)
             .unwrap();
-        let vowifi_video = manager
-            .set_line_ims_video_vowifi_enabled(line_b, true)
-            .unwrap();
+        let vowifi_video = manager.get_line_ims_video_config(line_b);
         assert!(vowifi_video.vowifi_enabled);
         assert!(vowifi_video.volte_enabled);
 
@@ -2510,34 +2494,81 @@ mod tests {
             "vilte_payload_type_invalid"
         );
 
-        manager.set_line_volte_voice_enabled(line_b, false).unwrap();
-        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
-        let forced = manager
+        // Incoming booleans are status mirrors and cannot override the access
+        // switches. Only the media parameters are accepted from this API.
+        let derived = manager
             .set_line_ims_video_config(
                 line_b,
                 ImsVideoConfig {
-                    volte_enabled: true,
+                    volte_enabled: false,
+                    vowifi_enabled: false,
                     video_payload_type: 112,
                     ..ImsVideoConfig::default()
                 },
             )
             .unwrap();
-        assert!(
-            !forced.volte_enabled,
-            "VoLTE video must be forced off when VoLTE voice is disabled"
-        );
-        assert_eq!(forced.video_payload_type, 112);
+        assert!(derived.volte_enabled);
+        assert!(derived.vowifi_enabled);
+        assert_eq!(derived.video_payload_type, 112);
 
         let reloaded = ConfigManager::new(path.clone());
         assert!(!reloaded.get_line_volte_voice_enabled(line_a));
-        assert!(!reloaded.get_line_volte_voice_enabled(line_b));
+        assert!(reloaded.get_line_volte_voice_enabled(line_b));
         assert_eq!(
             reloaded
                 .get_line_ims_video_config(line_b)
                 .video_payload_type,
             112
         );
+        assert!(reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
         assert!(!reloaded.get_line_ims_video_config(line_a).volte_enabled);
+
+        reloaded
+            .set_line_volte_connection_enabled(line_b, false)
+            .unwrap();
+        assert!(!reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
+
+        let _ = std::fs::remove_file(path.with_extension("bak"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_ims_video_gates_are_normalized_when_config_loads() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin_vilte_normalize_{}_{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let mut config = AppConfig::default();
+        let mut profile = LineProfileConfig::for_line(line_id);
+        profile.volte_connection_enabled = true;
+        profile.volte_voice_enabled = true;
+        profile.vowifi.enabled = true;
+        assert!(!profile.ims_video.volte_enabled);
+        assert!(!profile.ims_video.vowifi_enabled);
+        config.line_profiles.push(profile);
+        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+
+        let manager = ConfigManager::new(path.clone());
+        let normalized = manager.get_line_ims_video_config(line_id);
+        assert!(normalized.volte_enabled);
+        assert!(normalized.vowifi_enabled);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted["line_profiles"][0]["ims_video"]["volte_enabled"],
+            serde_json::Value::Bool(true)
+        );
+        assert_eq!(
+            persisted["line_profiles"][0]["ims_video"]["vowifi_enabled"],
+            serde_json::Value::Bool(true)
+        );
 
         let _ = std::fs::remove_file(path.with_extension("bak"));
         let _ = std::fs::remove_file(path);
@@ -3808,6 +3839,11 @@ fn default_line_enabled() -> bool {
 }
 
 impl LineProfileConfig {
+    fn sync_ims_video_access_gates(&mut self) {
+        self.ims_video.volte_enabled = self.volte_connection_enabled && self.volte_voice_enabled;
+        self.ims_video.vowifi_enabled = self.vowifi.enabled;
+    }
+
     pub fn for_line(line_id: impl Into<String>) -> Self {
         Self {
             line_id: line_id.into(),
@@ -3845,6 +3881,23 @@ impl Default for LineProfileConfig {
     fn default() -> Self {
         Self::for_line(String::new())
     }
+}
+
+fn sync_line_ims_video_access_gates(config: &mut AppConfig) -> bool {
+    let mut changed = false;
+    for profile in &mut config.line_profiles {
+        let before = (
+            profile.ims_video.volte_enabled,
+            profile.ims_video.vowifi_enabled,
+        );
+        profile.sync_ims_video_access_gates();
+        changed |= before
+            != (
+                profile.ims_video.volte_enabled,
+                profile.ims_video.vowifi_enabled,
+            );
+    }
+    changed
 }
 
 fn valid_line_id(line_id: &str) -> bool {
@@ -3956,12 +4009,14 @@ fn default_vilte_h264_fmtp() -> String {
     "profile-level-id=42e01f;packetization-mode=1".to_string()
 }
 
-/// Shared IMS video (ViLTE / VoWiFi video) configuration, gated per access leg.
+/// Shared IMS video (ViLTE / VoWiFi video) media configuration.
 ///
 /// Video rides the *same* IMS voice session as the access's voice call (one
 /// INVITE, an audio `m=` line plus a video `m=` line). VoLTE and VoWiFi each
-/// carry their own gate: `volte_enabled` is gated on the VoLTE voice feature at
-/// the `ConfigManager` layer, and `vowifi_enabled` on the VoWiFi voice feature.
+/// expose their effective state through `volte_enabled` and `vowifi_enabled`.
+/// Those fields are maintained by `ConfigManager`: VoLTE video follows the
+/// line's VoLTE connection plus voice gateway, while VoWiFi video follows the
+/// line's VoWiFi connection. They are status mirrors, not independent switches.
 /// On the target hardware class (no audio/video capture) the device is a pure
 /// media relay: it forwards RTP between the operator IMS leg and an internal
 /// SIP UA and never encodes/decodes video. Therefore only pass-through codecs
@@ -3972,10 +4027,10 @@ fn default_vilte_h264_fmtp() -> String {
 /// so existing persisted configs migrate in place.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImsVideoConfig {
-    /// Whether IMS video is enabled for the VoLTE (LTE) access leg.
+    /// Effective configured state for the VoLTE (LTE) access leg.
     #[serde(default, alias = "feature_enabled")]
     pub volte_enabled: bool,
-    /// Whether IMS video is enabled for the VoWiFi (WiFi/ePDG) access leg.
+    /// Effective configured state for the VoWiFi (WiFi/ePDG) access leg.
     #[serde(default)]
     pub vowifi_enabled: bool,
     /// Advertised video codec name (relay is pass-through; H.264 is the IMS
@@ -4716,7 +4771,9 @@ impl ConfigManager {
             AppConfig::default()
         };
 
-        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
+        let templates_changed = migrate_templates_to_remove_md5(&mut config);
+        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
+        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -4748,7 +4805,9 @@ impl ConfigManager {
             }
         };
 
-        let changed = migrate_templates_to_remove_md5(&mut config) || canonical_rewrite_required;
+        let templates_changed = migrate_templates_to_remove_md5(&mut config);
+        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
+        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
             storage: ConfigStorage::Sqlite(config_path.clone()),
@@ -5227,12 +5286,14 @@ impl ConfigManager {
 
     pub fn get_line_profile(&self, line_id: &str) -> LineProfileConfig {
         let config = self.config.read().unwrap();
-        config
+        let mut profile = config
             .line_profiles
             .iter()
             .find(|profile| profile.line_id == line_id)
             .cloned()
-            .unwrap_or_else(|| LineProfileConfig::for_line(line_id))
+            .unwrap_or_else(|| LineProfileConfig::for_line(line_id));
+        profile.sync_ims_video_access_gates();
+        profile
     }
 
     pub fn set_line_volte_connection_enabled(
@@ -5261,6 +5322,7 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.volte_connection_enabled = enabled;
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5400,6 +5462,7 @@ impl ConfigManager {
                 return Err("line_disabled".to_string());
             }
             profile.vowifi = vowifi;
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5587,6 +5650,7 @@ impl ConfigManager {
                 profile.data_connection_enabled = false;
                 profile.volte_connection_enabled = false;
             }
+            profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
                 .line_profiles
@@ -5767,23 +5831,16 @@ impl ConfigManager {
         self.get_line_profile(line_id).volte_voice_enabled
     }
 
-    /// Toggle VoLTE voice handling for exactly one registered IMS line.
-    /// Disabling voice also disables VoLTE video on that line, matching the media
-    /// dependency without changing any other profile.
+    /// Toggle VoLTE voice handling for exactly one registered IMS line. IMS
+    /// video follows the connection and voice gates automatically.
     pub fn set_line_volte_voice_enabled(
         &self,
         line_id: &str,
         enabled: bool,
     ) -> Result<LineProfileConfig, String> {
-        let mut ims_video = self.get_line_ims_video_config(line_id);
-        if !enabled {
-            ims_video.volte_enabled = false;
-        }
         self.update_line_profile(line_id, |profile| {
             profile.volte_voice_enabled = enabled;
-            if !enabled {
-                profile.ims_video = ims_video;
-            }
+            profile.sync_ims_video_access_gates();
         })
     }
 
@@ -5856,42 +5913,9 @@ impl ConfigManager {
         self.get_line_profile(line_id).vowifi.enabled
     }
 
-    /// Toggle IMS video for one line's VoLTE leg. Video rides that line's VoLTE
-    /// voice session, so another line's voice switch cannot satisfy this
-    /// dependency.
-    pub fn set_line_ims_video_volte_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<ImsVideoConfig, String> {
-        if enabled && !self.get_line_volte_voice_enabled(line_id) {
-            return Err("volte_voice_disabled".to_string());
-        }
-        let mut next = self.get_line_ims_video_config(line_id);
-        next.volte_enabled = enabled;
-        self.set_line_ims_video_config(line_id, next)
-    }
-
-    /// Toggle IMS video for one line's VoWiFi leg. Video rides that line's
-    /// VoWiFi voice session, so another line's voice switch cannot satisfy this
-    /// dependency.
-    pub fn set_line_ims_video_vowifi_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<ImsVideoConfig, String> {
-        if enabled && !self.get_line_vowifi_voice_enabled(line_id) {
-            return Err("vowifi_voice_disabled".to_string());
-        }
-        let mut next = self.get_line_ims_video_config(line_id);
-        next.vowifi_enabled = enabled;
-        self.set_line_ims_video_config(line_id, next)
-    }
-
-    /// Replace one line's IMS video config (codec / payload type / fmtp).
-    /// `volte_enabled` is forced off when VoLTE voice is disabled on that same
-    /// line, and `vowifi_enabled` when VoWiFi voice is disabled, leaving every
-    /// other line untouched.
+    /// Replace one line's IMS video media parameters. Access enablement is
+    /// derived from the corresponding VoLTE/VoWiFi voice configuration, so API
+    /// clients cannot leave a hidden video gate out of sync.
     pub fn set_line_ims_video_config(
         &self,
         line_id: &str,
@@ -5903,18 +5927,12 @@ impl ConfigManager {
         if !(96..=127).contains(&ims_video.video_payload_type) {
             return Err("vilte_payload_type_invalid".to_string());
         }
-        let mut next = ims_video;
-        if next.volte_enabled && !self.get_line_volte_voice_enabled(line_id) {
-            next.volte_enabled = false;
-        }
-        if next.vowifi_enabled && !self.get_line_vowifi_voice_enabled(line_id) {
-            next.vowifi_enabled = false;
-        }
-        let persisted = next.clone();
-        self.update_line_profile(line_id, |profile| {
+        let profile = self.update_line_profile(line_id, |profile| {
+            let persisted = ims_video;
             profile.ims_video = persisted;
+            profile.sync_ims_video_access_gates();
         })?;
-        Ok(next)
+        Ok(profile.ims_video)
     }
 
     pub fn set_esim_config(&self, mut esim: EsimConfig) -> Result<(), String> {

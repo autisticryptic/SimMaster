@@ -1505,9 +1505,7 @@ async fn main() -> Result<()> {
         )
         .route(
             "/api/modem/lines/{line_id}/vilte/control",
-            get(get_vilte_control_handler)
-                .post(set_vilte_feature_handler)
-                .options(options_handler),
+            get(get_vilte_control_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/vilte/config",
