@@ -22,6 +22,10 @@
 7. 部署提交 `8a3c808` 后再次通过 HTTP API 单次外呼：历史记录由 3 条增至 4 条，仅新增 `id=4`，约 1 秒内以 `480 / carrier_service_control_release / carrier_policy / retryable=false` 完整结束，`carrier_reason` 为 `Release Call received from CAP`。10 次逐秒轮询中活动呼叫均为 0，未再产生重复记录或悬空 `dialing` 记录。
 8. 在飞行模式、基带 `disabled` 条件下完成两次真实 VoWiFi 呼入。Asterisk/Linphone 均正常振铃、接听并收到运营商 BYE；第二次通话 Asterisk 记录 `ANSWERED`，接通 19 秒。
 9. 第二次呼入的全接口抓包确认单向语音根因：运营商 RTP 为 `172.20.225.45:20478 <-> 2.55.30.230:50176`。下行从 `sa_vwf0c93197` TUN 正常进入，上行却从 `wlan0` 发出；同时 `192.168.100.5:10156 <-> 192.168.100.13:38981` 的 Asterisk RTP 双向连续，证明 Linphone、Asterisk 和 SimAdmin 内部媒体腿正常。
+10. 部署提交 `aa1fb0e` 后，VoWiFi 在基带 `disabled` 条件下自动恢复，ePDG、IKE/EAP-AKA、IMS `REGISTER 200 OK`、SMS 和语音就绪检查均通过。
+11. 16:11（CST）完成两次修复后真实呼入，Asterisk CDR 分别为 `ANSWERED/5s` 和 `ANSWERED/30s`；SimAdmin 历史记录也分别为 `incoming + answered=true + 5s/30s`，不再误记为未接。
+12. 第二次通话的运营商媒体地址为 `172.20.110.49`。抓包统计 TUN 入站 1509 包、出站 1500 包，全部 3009 包均经过 `sa_vwf0c93197`，`wlan0` 为 0；Asterisk 媒体腿同时记录入站 1783 包、出站 1774 包。
+13. Linphone 讲话已由手机端实际听到，确认故障方向的语音恢复。运营商到 Linphone 方向也有连续 RTP；挂断后 SimAdmin 不再保留通话 RTP socket，SIP 对话和媒体 relay 均完成清理。
 
 ## 本轮发现并修复的代码问题
 
@@ -43,16 +47,18 @@
 - trunk `StartCall` 发布 caller/callee 元数据；
 - HTTP/本地 call plan 发布相同元数据；
 - bridge 在没有 Asterisk dialog 时安全忽略 `Started`。
+- 运营商 SDP 的媒体 IP 会交给 VoWiFi 路由安装器；
+- 接听成功会发布 `Connected`，且 Asterisk bridge 将其作为元数据 no-op。
 
 ## 尚未完成的真实网络测试
 
 本次运营商在被叫振铃/接通前执行 CAP 释放，因此以下项目不能伪报为通过：
 
 - VoWiFi 外呼 200 OK、被叫接听、远端拒接、未接和正常 BYE。
-- 部署动态媒体路由修复后的双向 RTP、测试音频注入、SIP INFO/RFC 4733 DTMF。
+- 测试音频文件注入、SIP INFO/RFC 4733 DTMF。
 - hold/resume、失败 re-INVITE 后保留原媒体、音频与视频切换。
 - H.264 视频 RTP、拒绝视频升级后保留语音、VoWiFi 视频和 ViLTE 实网互操作。
-- 真实运营商来电的拒接和未接记录，以及修复后的已接听历史记录。
+- 真实运营商来电的拒接和未接记录。
 - 多线路、EC20/EC25/EG25/EG600 与 USB SIM 读卡器实机矩阵（缺少硬件）。
 
 ## 下一次复测门槛
