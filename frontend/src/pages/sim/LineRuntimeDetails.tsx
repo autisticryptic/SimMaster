@@ -2,6 +2,7 @@ import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import type { TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse } from '../../api/current'
+import { volteErrorMessage } from './volteErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
   return (
@@ -48,7 +49,7 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
       <Grid size={{ xs: 12, sm: 6 }}><Field label="REGISTER 续期" value={`${line.runtime.register_refresh_count ?? 0} 次${line.runtime.last_register_refresh_at ? ` · ${new Date(line.runtime.last_register_refresh_at).toLocaleString()}` : ''}`} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="身份来源" value={line.runtime.identity_source || '尚未读取'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={line.runtime.isim_aid ? `已发现 · ${line.runtime.isim_aid}` : '未发现，使用 IMSI 回退'} /></Grid>
-      {line.runtime.last_error && <Grid size={12}><Alert severity="warning">{line.runtime.last_error}</Alert></Grid>}
+      {line.runtime.last_error && <Grid size={12}><Alert severity="warning">{volteErrorMessage(line.runtime.last_error)}</Alert></Grid>}
       <Grid size={12}>
         <Typography variant="subtitle2" mb={1}>最近连接尝试</Typography>
         <Box sx={{ maxHeight: 260, overflowY: 'auto', borderTop: 1, borderColor: 'divider' }}>

@@ -2722,11 +2722,13 @@ fn operator_event_call_outcome(
             });
             false
         }
-        OperatorEvent::Rejected { status, .. } => {
+        OperatorEvent::Rejected {
+            status, diagnostic, ..
+        } => {
             outcome.sip_status = *status;
             outcome.invite_state = voice::SipInviteState::Failed;
             outcome.call_state = voice::CallState::Failed;
-            outcome.failure_cause = Some(format!("sip_{status}"));
+            outcome.failure_cause = Some(diagnostic.code.to_string());
             true
         }
         OperatorEvent::Unavailable { .. } => {
@@ -9106,6 +9108,8 @@ mod tests {
             &OperatorEvent::Rejected {
                 call_id: "call-a".into(),
                 status: 486,
+                diagnostic:
+                    crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_status(486),
             },
         )
         .expect("matching rejection event");

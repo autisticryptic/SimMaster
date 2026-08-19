@@ -114,6 +114,33 @@ function getCallIcon(direction: string, answered: boolean) {
   return <CallMade color="primary" />
 }
 
+const callFailureLabels: Record<string, string> = {
+  carrier_service_control_release: '运营商业务控制释放',
+  carrier_insufficient_credit: '余额或信用额度不足',
+  carrier_call_barred: '运营商限制外呼',
+  carrier_service_not_provisioned: '语音业务未开通',
+  sip_authentication_failed: 'IMS 鉴权失败',
+  sip_forbidden: 'IMS 拒绝请求',
+  number_not_found: '号码不存在',
+  number_incomplete: '号码不完整',
+  callee_temporarily_unavailable: '对方暂时不可用',
+  callee_busy: '对方忙线',
+  call_declined: '对方拒接',
+  media_not_acceptable: '媒体协商不兼容',
+  sip_request_timeout: 'SIP 请求超时',
+  sip_service_unavailable: 'IMS 服务暂不可用',
+  no_circuit_available: '无可用电路或信道',
+  network_out_of_order: '网络异常',
+  temporary_failure: '临时失败',
+}
+
+function callFailureLabel(record: CallRecord): string | undefined {
+  if (!record.failure_code) return undefined
+  const label = callFailureLabels[record.failure_code] || record.failure_code
+  if (record.sip_status) return `${label} · SIP ${record.sip_status}`
+  return label
+}
+
 export default function PhonePage() {
   const [tabValue, setTabValue] = useState(0)
   const [calls, setCalls] = useState<CallInfo[]>([])
@@ -593,10 +620,23 @@ export default function PhonePage() {
                           <Typography variant="body1" fontWeight={600}>{record.phone_number || '未知号码'}</Typography>
                           <Chip label={directionLabel(record.direction)} size="small" variant="outlined" />
                           <Chip label={getLineLabel(record.line_id)} size="small" variant="outlined" />
+                          {callFailureLabel(record) && (
+                            <Chip
+                              label={callFailureLabel(record)}
+                              size="small"
+                              color="error"
+                              variant="outlined"
+                            />
+                          )}
                           {record.duration > 0 && <Chip label={formatDuration(record.duration)} size="small" variant="outlined" />}
                         </Box>
                       }
-                      secondary={formatTime(record.start_time)}
+                      secondary={[
+                        formatTime(record.start_time),
+                        record.q850_cause ? `Q.850 cause ${record.q850_cause}` : '',
+                        record.carrier_reason || '',
+                        record.failure_retryable === true ? '建议稍后重试' : '',
+                      ].filter(Boolean).join(' · ')}
                     />
                     <ListItemSecondaryAction>
                       <Box display="flex" gap={0.5}>

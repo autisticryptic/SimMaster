@@ -25,6 +25,7 @@ pub enum VolteStage {
     Disabled,
     Starting,
     Identity,
+    CarrierProfile,
     IdentityAka,
     Radio,
     ImsContext,
@@ -52,6 +53,7 @@ impl VolteStage {
             VolteStage::Disabled => "disabled",
             VolteStage::Starting => "starting",
             VolteStage::Identity => "identity",
+            VolteStage::CarrierProfile => "carrier_profile",
             VolteStage::IdentityAka => "identity_aka",
             VolteStage::Radio => "radio",
             VolteStage::ImsContext => "ims_context",
@@ -508,6 +510,7 @@ mod tests {
         assert_eq!(VolteStage::Disabled.as_str(), "disabled");
         assert_eq!(VolteStage::Starting.as_str(), "starting");
         assert_eq!(VolteStage::Identity.as_str(), "identity");
+        assert_eq!(VolteStage::CarrierProfile.as_str(), "carrier_profile");
         assert_eq!(VolteStage::IdentityAka.as_str(), "identity_aka");
         assert_eq!(VolteStage::Radio.as_str(), "radio");
         assert_eq!(VolteStage::Pcscf.as_str(), "pcscf");

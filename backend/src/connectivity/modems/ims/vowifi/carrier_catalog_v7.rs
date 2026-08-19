@@ -408,7 +408,7 @@ pub(super) fn resolve_for_imsi(
         "SELECT cp.profile_id, mr.plmn
          FROM carrier_profiles AS cp
          JOIN profile_match_rules AS mr ON mr.profile_id = cp.profile_id
-         WHERE cp.{} = 'ready' AND mr.is_exclusion = 0
+         WHERE mr.is_exclusion = 0
            AND (mr.plmn IS NULL OR ?1 LIKE mr.plmn || '%')
            AND (mr.imsi_prefix IS NULL OR ?1 LIKE mr.imsi_prefix || '%')
            AND (?2 IS NULL OR mr.plmn IS NULL OR mr.plmn = ?2)
@@ -423,11 +423,12 @@ pub(super) fn resolve_for_imsi(
                  AND (ex.imsi_prefix IS NULL OR ?1 LIKE ex.imsi_prefix || '%')
                  AND (?2 IS NULL OR ex.plmn IS NULL OR ex.plmn = ?2)
            )
-         ORDER BY mr.priority,
+         ORDER BY CASE WHEN cp.{} = 'ready' THEN 0 ELSE 1 END,
+                  mr.priority,
                   length(COALESCE(mr.imsi_prefix, mr.plmn, '')) DESC,
                   cp.priority, cp.confidence DESC, cp.profile_id
          LIMIT 1",
-        access.v7_status_column()
+        access.v7_status_column(),
     );
     let matched = conn
         .query_row(&sql, params![imsi, home_plmn], |row| {

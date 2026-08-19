@@ -1123,6 +1123,13 @@ export interface CallRecord {
   start_time: string
   end_time?: string
   answered: boolean
+  sip_status?: number
+  failure_code?: string
+  failure_category?: string
+  q850_cause?: number
+  failure_retryable?: boolean
+  retry_after_seconds?: number
+  carrier_reason?: string
 }
 
 export interface CallStats {

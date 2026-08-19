@@ -485,18 +485,24 @@ pub fn build_register_plan(profile: &'static CarrierProfile) -> ImsRegisterPlan 
 
 pub fn build_dry_run_register_snapshot(profile: &'static CarrierProfile) -> ImsRegisterPublicState {
     let mut machine = ImsRegisterStateMachine::new(profile);
-    machine
-        .build_initial_register()
-        .expect("profile has a static Security-Client offer");
-    machine
+    if machine.build_initial_register().is_err() {
+        return machine.snapshot();
+    }
+    if machine
         .accept_challenge_response(&synthetic_challenge_response(profile))
-        .expect("synthetic 401 challenge is internally generated");
-    machine
-        .build_authenticated_register()
-        .expect("synthetic challenge selected a security mechanism");
-    machine
+        .is_err()
+    {
+        return machine.snapshot();
+    }
+    if machine.build_authenticated_register().is_err() {
+        return machine.snapshot();
+    }
+    if machine
         .accept_success_response(&synthetic_success_response(profile))
-        .expect("synthetic 200 response is internally generated");
+        .is_err()
+    {
+        return machine.snapshot();
+    }
     machine.snapshot()
 }
 
@@ -1060,6 +1066,23 @@ mod tests {
                 "IMS snapshot must not expose {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn dry_run_snapshot_reports_invalid_profile_without_panicking() {
+        let mut profile = US_ATT_310410;
+        profile.ims.register.security_client_mechanisms = &[];
+        let profile = Box::leak(Box::new(profile));
+
+        let snapshot = build_dry_run_register_snapshot(profile);
+
+        assert_eq!(snapshot.phase, "failed");
+        assert_eq!(snapshot.last_sip_status, None);
+        assert!(!snapshot.register_200_received);
+        assert_eq!(
+            snapshot.last_error.as_deref(),
+            Some("profile has no sec-agree offer")
+        );
     }
 
     #[test]

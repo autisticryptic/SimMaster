@@ -20,6 +20,7 @@ use crate::{
         core::{
             access::ImsChannel,
             context::{ImsIdentity, ImsRoute},
+            ims_failure::ImsFailureDiagnostic,
             ims_video::{negotiate_video, parse_video_sdp},
             media::{ActiveRtpRelay, MediaRelayPolicy, PayloadTypeMapping, PendingRtpRelay},
             register::{run_unregister, RegisterAuthenticator},
@@ -696,6 +697,7 @@ async fn expire_renegotiations(
         link.send_event(OperatorEvent::Rejected {
             call_id,
             status: 408,
+            diagnostic: ImsFailureDiagnostic::from_status(408),
         });
     }
     for call_id in transfer_timeouts {
@@ -720,6 +722,7 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
                 link.send_event(OperatorEvent::Rejected {
                     call_id,
                     status: 486,
+                    diagnostic: ImsFailureDiagnostic::from_status(486),
                 });
             } else {
                 link.send_event(OperatorEvent::Unavailable { call_id });
@@ -733,6 +736,7 @@ async fn handle_command(session: &mut VoiceSession, link: &OperatorLink, command
             link.send_event(OperatorEvent::Rejected {
                 call_id,
                 status: 488,
+                diagnostic: ImsFailureDiagnostic::from_status(488),
             });
         } else if transfer {
             let status = if reason.ends_with("_pending") {
@@ -1652,16 +1656,20 @@ async fn handle_response(
     call.renegotiation_deadline = None;
     call.rollback_media_update();
     let reason = sip_frame::header_value(frame, "Reason").unwrap_or_default();
+    let warning = sip_frame::header_value(frame, "Warning").unwrap_or_default();
     tracing::warn!(
         line_id = session.context.line_id,
         call_id,
         status,
         reason,
+        warning,
         "VoWiFi IMS voice INVITE rejected"
     );
     link.send_event(OperatorEvent::Rejected {
         call_id: call_id.to_string(),
         status,
+        diagnostic: ImsFailureDiagnostic::from_response(frame)
+            .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
     });
     if !was_reinvite {
         session.calls.remove(call_id);
@@ -3136,7 +3144,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 488 } if call_id == "trunk-call-a"
+            OperatorEvent::Rejected { call_id, status: 488, .. } if call_id == "trunk-call-a"
         ));
 
         link.send_command(OperatorCommand::HangupCall {
@@ -3273,7 +3281,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486 }
+            OperatorEvent::Rejected { call_id, status: 486, .. }
                 if call_id == "matrix-call-b"
         ));
 
@@ -3955,7 +3963,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status }
+            OperatorEvent::Rejected { call_id, status, .. }
                 if call_id == "capacity-call-c" && status == 486
         ));
 

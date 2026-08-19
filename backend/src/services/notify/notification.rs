@@ -3631,6 +3631,13 @@ mod tests {
             start_time: "2026-05-14T16:30:45Z".to_string(),
             end_time: Some("2026-05-14T16:31:45Z".to_string()),
             answered: true,
+            sip_status: None,
+            failure_code: None,
+            failure_category: None,
+            q850_cause: None,
+            failure_retryable: None,
+            retry_after_seconds: None,
+            carrier_reason: None,
         };
 
         assert_eq!(
@@ -3658,6 +3665,13 @@ mod tests {
             start_time: "2026-08-06 12:00:00".to_string(),
             end_time: Some("2026-08-06 12:00:05".to_string()),
             answered: false,
+            sip_status: None,
+            failure_code: None,
+            failure_category: None,
+            q850_cause: None,
+            failure_retryable: None,
+            retry_after_seconds: None,
+            carrier_reason: None,
         };
         let event = NotificationEvent::Call(&call);
         let mut rule = NotificationRule {

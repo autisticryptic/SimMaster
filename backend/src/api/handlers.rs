@@ -4772,6 +4772,22 @@ async fn finish_tracked_call(
     None
 }
 
+async fn record_tracked_call_failure(
+    app: &AppState,
+    path: &str,
+    diagnostic: &crate::connectivity::core::ims_failure::ImsFailureDiagnostic,
+) {
+    let id = {
+        let active = app.active_calls.lock().await;
+        active.get(path).map(|record| record.id)
+    };
+    if let Some(id) = id {
+        if let Err(error) = app.database.update_call_failure(id, diagnostic) {
+            warn!(call_id = id, %error, "Failed to persist IMS call failure diagnostic");
+        }
+    }
+}
+
 fn is_ims_call_path(path: &str) -> bool {
     path.starts_with("ims:")
 }
@@ -4852,8 +4868,16 @@ fn ensure_ims_voice_listener(
                 crate::services::trunk::bridge::OperatorEvent::Answered { call_id, .. } => {
                     mark_tracked_call_answered(&app, &format!("ims:{call_id}")).await;
                 }
-                crate::services::trunk::bridge::OperatorEvent::Rejected { call_id, .. }
-                | crate::services::trunk::bridge::OperatorEvent::Unavailable { call_id }
+                crate::services::trunk::bridge::OperatorEvent::Rejected {
+                    call_id,
+                    diagnostic,
+                    ..
+                } => {
+                    let path = format!("ims:{call_id}");
+                    record_tracked_call_failure(&app, &path, &diagnostic).await;
+                    let _ = finish_tracked_call(&app, &path, false).await;
+                }
+                crate::services::trunk::bridge::OperatorEvent::Unavailable { call_id }
                 | crate::services::trunk::bridge::OperatorEvent::Ended { call_id }
                 | crate::services::trunk::bridge::OperatorEvent::Cancelled { call_id } => {
                     let path = format!("ims:{call_id}");

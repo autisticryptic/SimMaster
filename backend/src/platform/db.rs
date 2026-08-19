@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
+
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 
@@ -67,6 +69,20 @@ pub struct CallRecord {
     pub start_time: String,       // 开始时间 ISO 8601
     pub end_time: Option<String>, // 结束时间 ISO 8601
     pub answered: bool,           // 是否接通
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sip_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_category: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q850_cause: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_retryable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carrier_reason: Option<String>,
 }
 
 /// 短信统计
@@ -606,6 +622,33 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(db.get_call_stats().unwrap().total, 2);
+    }
+
+    #[test]
+    fn call_failure_diagnostic_round_trips() {
+        let db = test_database();
+        let id = db
+            .insert_call(Some("line-a"), "outgoing", "+601112023012", false)
+            .expect("insert call");
+        let diagnostic = ImsFailureDiagnostic::from_response(
+            b"SIP/2.0 480 Temporarily Unavailable\r\nWarning: 399 carrier \"Release Call received from CAP\"\r\n\r\n",
+        )
+        .expect("parse diagnostic");
+        db.update_call_failure(id, &diagnostic)
+            .expect("save diagnostic");
+
+        let record = db.get_call_by_id(id).unwrap().expect("get call");
+        assert_eq!(record.sip_status, Some(480));
+        assert_eq!(
+            record.failure_code.as_deref(),
+            Some("carrier_service_control_release")
+        );
+        assert_eq!(record.failure_category.as_deref(), Some("carrier_policy"));
+        assert_eq!(record.failure_retryable, Some(false));
+        assert_eq!(
+            record.carrier_reason.as_deref(),
+            Some("Release Call received from CAP")
+        );
     }
 
     #[test]
@@ -2142,6 +2185,13 @@ fn call_record_from_row(row: &Row<'_>) -> Result<CallRecord> {
         start_time: row.get(5)?,
         end_time: row.get(6)?,
         answered: row.get::<_, i32>(7)? != 0,
+        sip_status: row.get(8)?,
+        failure_code: row.get(9)?,
+        failure_category: row.get(10)?,
+        q850_cause: row.get(11)?,
+        failure_retryable: row.get::<_, Option<i32>>(12)?.map(|value| value != 0),
+        retry_after_seconds: row.get(13)?,
+        carrier_reason: row.get(14)?,
     })
 }
 
@@ -2617,6 +2667,13 @@ impl Database {
                 start_time TEXT NOT NULL,
                 end_time TEXT,
                 answered INTEGER DEFAULT 0,
+                sip_status INTEGER,
+                failure_code TEXT,
+                failure_category TEXT,
+                q850_cause INTEGER,
+                failure_retryable INTEGER,
+                retry_after_seconds INTEGER,
+                carrier_reason TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )",
             [],
@@ -2624,6 +2681,22 @@ impl Database {
 
         if !table_has_column(&conn, "call_history", "line_id")? {
             conn.execute("ALTER TABLE call_history ADD COLUMN line_id TEXT", [])?;
+        }
+        for (name, sql_type) in [
+            ("sip_status", "INTEGER"),
+            ("failure_code", "TEXT"),
+            ("failure_category", "TEXT"),
+            ("q850_cause", "INTEGER"),
+            ("failure_retryable", "INTEGER"),
+            ("retry_after_seconds", "INTEGER"),
+            ("carrier_reason", "TEXT"),
+        ] {
+            if !table_has_column(&conn, "call_history", name)? {
+                conn.execute(
+                    &format!("ALTER TABLE call_history ADD COLUMN {name} {sql_type}"),
+                    [],
+                )?;
+            }
         }
 
         // 创建通话记录索引
@@ -5359,6 +5432,31 @@ impl Database {
         Ok(())
     }
 
+    /// Persist the protocol-level reason before the call is finalized. This is
+    /// intentionally separate from `update_call_end` so a rejected call keeps
+    /// its SIP/Q.850 evidence even when the final-state update races a poll.
+    pub fn update_call_failure(&self, id: i64, diagnostic: &ImsFailureDiagnostic) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE call_history
+             SET sip_status = ?1, failure_code = ?2, failure_category = ?3,
+                 q850_cause = ?4, failure_retryable = ?5,
+                 retry_after_seconds = ?6, carrier_reason = ?7
+             WHERE id = ?8",
+            params![
+                diagnostic.sip_status,
+                diagnostic.code,
+                diagnostic.category,
+                diagnostic.q850_cause,
+                diagnostic.retryable as i32,
+                diagnostic.retry_after_seconds,
+                diagnostic.carrier_reason,
+                id,
+            ],
+        )?;
+        Ok(())
+    }
+
     /// 标记通话为未接来电
     pub fn mark_call_missed(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -5374,7 +5472,9 @@ impl Database {
     pub fn get_call_by_id(&self, id: i64) -> Result<Option<CallRecord>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered
+            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered,
+                    sip_status, failure_code, failure_category, q850_cause,
+                    failure_retryable, retry_after_seconds, carrier_reason
              FROM call_history WHERE id = ?1",
             params![id],
             call_record_from_row,
@@ -5404,7 +5504,9 @@ impl Database {
     ) -> Result<Vec<CallRecord>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered
+            "SELECT id, line_id, direction, phone_number, duration, start_time, end_time, answered,
+                    sip_status, failure_code, failure_category, q850_cause,
+                    failure_retryable, retry_after_seconds, carrier_reason
              FROM call_history
              WHERE (?3 IS NULL OR line_id = ?3)
              ORDER BY start_time DESC

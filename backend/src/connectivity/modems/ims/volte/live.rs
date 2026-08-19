@@ -18,6 +18,7 @@ use crate::{
     connectivity::core::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
+        ims_failure::ImsFailureDiagnostic,
         ims_video::{negotiate_video, parse_video_sdp, VideoMediaDescription},
         media::{
             ActiveRtpRelay, MediaRelayMetrics, MediaRelayPolicy, PayloadTypeMapping,
@@ -1113,6 +1114,9 @@ pub async fn connect_live_for_line(
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Degraded;
+                    if let Some(stage) = failure_stage(&error) {
+                        state.stage = stage;
+                    }
                     state.last_error = Some(message);
                     state.last_failure_at = Some(now());
                 })
@@ -1120,6 +1124,43 @@ pub async fn connect_live_for_line(
             Err(error)
         }
     }
+}
+
+fn failure_stage(error: &VolteError) -> Option<VolteStage> {
+    Some(match error.code() {
+        code::MM_IMSI_MISSING | code::IMSI_MISSING => VolteStage::Identity,
+        code::CARRIER_PROFILE_MISSING | code::CARRIER_IMS_APN_MISSING => VolteStage::CarrierProfile,
+        code::USIM_AID_MISSING
+        | code::USIM_AID_NOT_USIM
+        | code::USIM_AKA_FAILED
+        | code::AKA_MATERIAL_INVALID
+        | code::AKA_RES_EMPTY => VolteStage::IdentityAka,
+        code::RUNTIME_MM_MODEM_WAIT_TIMEOUT => VolteStage::Modem,
+        code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
+        | code::RUNTIME_MM_BEARER_NOT_CONNECTED
+        | code::RUNTIME_MM_BEARER_CONNECT_FAILED
+        | code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE
+        | code::RUNTIME_IMS_BEARER_START_FAILED
+        | code::RUNTIME_MM_BEARER_PATH_MISSING
+        | code::RUNTIME_IMS_FAMILY_UNSUPPORTED
+        | code::DATA_SLOT_MODE_MISSING
+        | code::DATA_SLOT_CONFLICT => VolteStage::Bearer,
+        code::RUNTIME_ALL_PCSCF_FAILED
+        | code::RUNTIME_PROFILE_PCSCF_MISSING
+        | code::PCSCF_FAMILY_MISMATCH => VolteStage::Pcscf,
+        code::IP_SETTINGS_MISSING | code::IPV6_GATEWAY_MISSING => VolteStage::IpConfig,
+        code::REGISTER_SEND_FAILED
+        | code::REGISTER_INITIAL_UNEXPECTED_STATUS
+        | code::REGISTER_NONCE_NOT_AKA
+        | code::DIGEST_CHALLENGE_MISSING
+        | code::DIGEST_REALM_MISSING
+        | code::DIGEST_NONCE_MISSING
+        | code::DIGEST_NONCE_DECODE_FAILED => VolteStage::RegisterInitial,
+        code::REGISTER_AUTH_SEND_FAILED | code::REGISTER_AUTH_UNEXPECTED_STATUS => {
+            VolteStage::RegisterAuthenticated
+        }
+        _ => return None,
+    })
 }
 
 async fn connect_inner(
@@ -1154,7 +1195,8 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity = load_device_identity(&device, profile_store, sim_override).await?;
+    let device_identity =
+        load_device_identity(&device, runtime, profile_store, sim_override).await?;
     let ims_apn = device_identity
         .effective_ims
         .ims_apn
@@ -1162,13 +1204,6 @@ async fn connect_inner(
         .map(|field| field.value.trim())
         .filter(|value| !value.is_empty())
         .ok_or_else(|| VolteError::new(code::CARRIER_IMS_APN_MISSING))?;
-    runtime
-        .update(|state| {
-            state.identity_source = Some(device_identity.source.to_string());
-            state.usim_aid = Some(device_identity.usim_aid.clone());
-            state.isim_aid = device_identity.isim_aid.clone();
-        })
-        .await;
     ensure_generation(runtime, generation)?;
 
     runtime
@@ -2289,6 +2324,7 @@ async fn expire_volte_renegotiations(live: &VolteLiveHandle) -> Result<(), Volte
         live.operator.send_event(OperatorEvent::Rejected {
             call_id,
             status: 408,
+            diagnostic: ImsFailureDiagnostic::from_status(408),
         });
     }
     for call_id in transfer_timeouts {
@@ -2523,6 +2559,7 @@ async fn handle_operator_command(
             live.operator.send_event(OperatorEvent::Rejected {
                 call_id: call_id.clone(),
                 status: 486,
+                diagnostic: ImsFailureDiagnostic::from_status(486),
             });
         } else {
             live.operator.send_event(OperatorEvent::Unavailable {
@@ -3602,6 +3639,7 @@ async fn handle_operator_sip_frame(
                     live.operator.send_event(OperatorEvent::Rejected {
                         call_id: trunk_call_id,
                         status: 488,
+                        diagnostic: ImsFailureDiagnostic::from_status(488),
                     });
                     tracing::warn!(error = %error, "Rejected IMS answer with unusable media");
                 }
@@ -3620,6 +3658,8 @@ async fn handle_operator_sip_frame(
         live.operator.send_event(OperatorEvent::Rejected {
             call_id: trunk_call_id,
             status,
+            diagnostic: ImsFailureDiagnostic::from_response(frame)
+                .unwrap_or_else(|_| ImsFailureDiagnostic::from_status(status)),
         });
         return Ok(true);
     }
@@ -4669,6 +4709,7 @@ fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, V
 
 async fn load_device_identity(
     device: &VolteDeviceBinding,
+    runtime: &VolteRuntime,
     profile_store: &ProfileStore,
     sim_override: &SimOverride,
 ) -> Result<DeviceIdentity, VolteError> {
@@ -4677,9 +4718,25 @@ async fn load_device_identity(
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
     )
     .await?;
-    let sim_path = key_value(&modem, "modem.generic.sim")
-        .ok_or_else(|| VolteError::new(code::MM_IMSI_MISSING))?;
-    let sim = command_output("mmcli", &["-i", &sim_path, "--output-keyvalue"]).await?;
+    // ModemManager can expose the modem before its SIM object path is ready.
+    // Do not fail the whole IMS startup at that point: AT+CIMI and the cached
+    // SIM properties are valid identity sources while the object settles.
+    let sim_path =
+        key_value(&modem, "modem.generic.sim").filter(|value| !value.is_empty() && value != "/");
+    let sim = if let Some(path) = sim_path.as_deref() {
+        match command_output("mmcli", &["-i", path, "--output-keyvalue"]).await {
+            Ok(output) => output,
+            Err(error) => {
+                tracing::warn!(error = %error, sim_path = path, "ModemManager SIM object is not readable yet; continuing with modem identity");
+                String::new()
+            }
+        }
+    } else {
+        tracing::warn!(
+            "ModemManager has no SIM object path yet; continuing with AT identity probes"
+        );
+        String::new()
+    };
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     let cimi_argument = "--command=AT+CIMI";
@@ -4696,7 +4753,12 @@ async fn load_device_identity(
                     "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback"
                 );
                 (
-                    sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
+                    sim_imsi.ok_or_else(|| {
+                        VolteError::with_detail(
+                            code::MM_IMSI_MISSING,
+                            "at_cimi_and_modemmanager_sim_imsi_invalid",
+                        )
+                    })?,
                     "sim_imsi_fallback",
                 )
             }
@@ -4704,12 +4766,18 @@ async fn load_device_identity(
         Err(error) => {
             tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM IMSI fallback");
             (
-                sim_imsi.ok_or_else(|| VolteError::new(code::IMSI_MISSING))?,
+                sim_imsi.ok_or_else(|| {
+                    VolteError::with_detail(
+                        code::MM_IMSI_MISSING,
+                        "modemmanager_sim_and_at_identity_unavailable",
+                    )
+                })?,
                 "sim_imsi_fallback",
             )
         }
     };
     let home_plmn = [
+        key_value(&sim, "sim.properties.operator-code"),
         key_value(&sim, "sim.properties.operator-id"),
         key_value(&sim, "sim.properties.operator-identifier"),
         key_value(&modem, "modem.3gpp.operator-code"),
@@ -4737,6 +4805,20 @@ async fn load_device_identity(
     let aka_aid = identity::resolve_usim_aid(applications.usim_aid.as_deref());
     let usim_aid = identity::aid_hex(&aka_aid);
     let isim_aid = applications.isim_aid.as_deref().map(identity::aid_hex);
+    let identity_source = match (imsi_source, isim_aid.is_some()) {
+        ("at_cimi", true) => "at_cimi_isim_detected",
+        ("at_cimi", false) => "at_cimi",
+        (_, true) => "sim_imsi_fallback_isim_detected",
+        (_, false) => "sim_imsi_fallback",
+    };
+    runtime
+        .update(|state| {
+            state.stage = VolteStage::CarrierProfile;
+            state.identity_source = Some(identity_source.to_string());
+            state.usim_aid = Some(usim_aid.clone());
+            state.isim_aid = isim_aid.clone();
+        })
+        .await;
     let resolved = profile_store
         .resolve_for_imsi_access(
             sim_override.ims_volte.profile_id.as_deref(),
@@ -4745,7 +4827,19 @@ async fn load_device_identity(
             CatalogAccessKind::LteEpc,
         )
         .map_err(|detail| VolteError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
-        .ok_or_else(|| VolteError::new(code::CARRIER_PROFILE_MISSING))?;
+        .ok_or_else(|| {
+            let identity_hint = home_plmn
+                .as_deref()
+                .map(|plmn| format!("home_plmn:{plmn}"))
+                .unwrap_or_else(|| {
+                    let prefix = imsi.get(..imsi.len().min(6)).unwrap_or("unknown");
+                    format!("imsi_prefix:{prefix}")
+                });
+            VolteError::with_detail(
+                code::CARRIER_PROFILE_MISSING,
+                format!("{identity_hint}:access:lte_epc:no_ready_profile"),
+            )
+        })?;
     let profile = resolved.profile;
     let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
     let effective_device_identity = resolve_effective_device_identity(
@@ -4772,12 +4866,7 @@ async fn load_device_identity(
         effective_device_identity,
         aka_aid,
         usim_aid,
-        source: match (imsi_source, isim_aid.is_some()) {
-            ("at_cimi", true) => "at_cimi_isim_detected",
-            ("at_cimi", false) => "at_cimi",
-            (_, true) => "sim_imsi_fallback_isim_detected",
-            (_, false) => "sim_imsi_fallback",
-        },
+        source: identity_source,
         isim_aid,
     })
 }
@@ -5127,6 +5216,21 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
+
+    #[test]
+    fn carrier_profile_failures_are_not_reported_as_sim_identity_failures() {
+        assert_eq!(
+            failure_stage(&VolteError::with_detail(
+                code::CARRIER_PROFILE_MISSING,
+                "home_plmn:46000:access:lte_epc:no_ready_profile",
+            )),
+            Some(VolteStage::CarrierProfile)
+        );
+        assert_eq!(
+            failure_stage(&VolteError::new(code::MM_IMSI_MISSING)),
+            Some(VolteStage::Identity)
+        );
+    }
 
     fn register_variant(label: &str) -> VolteRegisterVariant {
         *VOLTE_REGISTER_VARIANTS
@@ -5964,7 +6068,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap(),
-            OperatorEvent::Rejected { call_id, status: 486 }
+            OperatorEvent::Rejected { call_id, status: 486, .. }
                 if call_id == "matrix-call-b"
         ));
 

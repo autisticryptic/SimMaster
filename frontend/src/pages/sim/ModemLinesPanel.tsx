@@ -31,12 +31,14 @@ import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
 import { LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
+import { volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
 const stageLabels: Record<string, string> = {
   disabled: '未连接',
   starting: '正在启动',
   identity: '读取 SIM 身份',
+  carrier_profile: '匹配运营商 IMS 配置',
   identity_aka: 'SIM AKA 鉴权',
   radio: '检查无线网络',
   ims_context: '建立 IMS 上下文',
@@ -803,7 +805,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
                     {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && (recovery || line.runtime.last_error) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
-                        {recovery ?? line.runtime.last_error}
+                        {recovery ?? volteErrorMessage(line.runtime.last_error)}
                         {line.runtime.next_retry_at && (
                           <Typography variant="caption" display="block">
                             下次尝试：{new Date(line.runtime.next_retry_at).toLocaleString()}

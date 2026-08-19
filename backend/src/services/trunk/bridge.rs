@@ -169,6 +169,7 @@ pub enum OperatorEvent {
     Rejected {
         call_id: String,
         status: u16,
+        diagnostic: crate::connectivity::core::ims_failure::ImsFailureDiagnostic,
     },
     Unavailable {
         call_id: String,
@@ -625,7 +626,13 @@ impl TrunkBridge {
                     .map_err(BridgeError::MalformedRequest)?,
                 );
             }
-            OperatorEvent::Rejected { status, .. } => {
+            OperatorEvent::Rejected {
+                status, diagnostic, ..
+            } => {
+                let diagnostic_headers = [
+                    SipHeader::new("Reason", diagnostic.local_reason_header()),
+                    SipHeader::new("Warning", diagnostic.local_warning_header()),
+                ];
                 if call.pending_invite.is_some() {
                     output.asterisk_frames.push(
                         sip::build_response_with_body(
@@ -633,7 +640,7 @@ impl TrunkBridge {
                             status,
                             reason(status),
                             Some(&call.dialog.local_tag),
-                            &[],
+                            &diagnostic_headers,
                             &[],
                         )
                         .map_err(BridgeError::MalformedRequest)?,
@@ -672,7 +679,7 @@ impl TrunkBridge {
                             status,
                             reason(status),
                             Some(&call.dialog.local_tag),
-                            &[],
+                            &diagnostic_headers,
                             &[],
                         )
                         .map_err(BridgeError::MalformedRequest)?,
@@ -1676,6 +1683,8 @@ mod tests {
             .handle_operator_event(OperatorEvent::Rejected {
                 call_id: "call-a".into(),
                 status: 486,
+                diagnostic:
+                    crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_status(486),
             })
             .unwrap();
         assert!(rejected.asterisk_frames.is_empty());
@@ -1791,6 +1800,8 @@ mod tests {
             .handle_operator_event(OperatorEvent::Rejected {
                 call_id: "call-a".into(),
                 status: 488,
+                diagnostic:
+                    crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_status(488),
             })
             .unwrap();
         assert!(rejected.asterisk_frames[0].starts_with(b"SIP/2.0 488"));
@@ -2247,6 +2258,8 @@ mod tests {
             .handle_operator_event(OperatorEvent::Rejected {
                 call_id: "call-b".into(),
                 status: 486,
+                diagnostic:
+                    crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_status(486),
             })
             .unwrap();
         assert!(busy.asterisk_frames[0].starts_with(b"SIP/2.0 486"));

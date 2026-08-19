@@ -504,4 +504,34 @@ mod tests {
 
         std::fs::remove_file(path).expect("remove fixture");
     }
+
+    #[test]
+    fn automatic_match_reports_a_known_but_non_ready_lte_profile() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+        {
+            let conn = rusqlite::Connection::open(&path).expect("open catalog fixture");
+            conn.execute(
+                "UPDATE carrier_profiles SET lte_ims_status = 'unknown'
+                 WHERE profile_id = 'test-v7-23433'",
+                [],
+            )
+            .expect("mark automatic profile unknown");
+        }
+
+        let error = store
+            .resolve_for_imsi_access(
+                None,
+                "234330123456789",
+                Some("23433"),
+                CatalogAccessKind::LteEpc,
+            )
+            .expect_err("known non-ready profile must explain why it cannot be used");
+        assert_eq!(
+            error,
+            "carrier_catalog_profile_not_ready:test-v7-23433:lte_epc:unknown"
+        );
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
 }
