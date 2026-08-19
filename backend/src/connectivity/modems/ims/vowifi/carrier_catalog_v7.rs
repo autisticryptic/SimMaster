@@ -394,6 +394,35 @@ pub(super) fn ambiguous_plmn_prefixes(conn: &Connection) -> Result<Vec<String>, 
     Ok(prefixes)
 }
 
+pub(super) fn infer_home_plmn(conn: &Connection, imsi: &str) -> Result<Option<String>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT mr.plmn
+             FROM profile_match_rules AS mr
+             WHERE mr.is_exclusion = 0
+               AND mr.plmn IS NOT NULL
+               AND ?1 LIKE mr.plmn || '%'
+               AND (mr.imsi_prefix IS NULL OR ?1 LIKE mr.imsi_prefix || '%')
+               AND mr.iccid_prefix IS NULL
+               AND mr.gid1 IS NULL AND mr.gid2 IS NULL AND mr.spn IS NULL
+             ORDER BY length(mr.plmn) DESC, mr.plmn",
+        )
+        .map_err(db_error)?;
+    let matches = stmt
+        .query_map([imsi], |row| row.get::<_, String>(0))
+        .map_err(db_error)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(db_error)?;
+    if matches.is_empty() {
+        return Ok(None);
+    }
+    let lengths = matches.iter().map(String::len).collect::<HashSet<_>>();
+    if lengths.len() != 1 {
+        return Ok(None);
+    }
+    Ok(matches.first().cloned())
+}
+
 pub(super) fn resolve_for_imsi(
     conn: &Connection,
     imsi: &str,

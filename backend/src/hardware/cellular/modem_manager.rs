@@ -60,6 +60,9 @@ const MODEM_HELPER_COMMAND_TIMEOUT_SECS: u64 = 3;
 const MODEM_AT_COMMAND_TIMEOUT_SECS: u64 = 2;
 const SMSC_HELPER_FALLBACK_TIMEOUT_SECS: u64 = 4;
 const SMSC_BACKGROUND_AT_TIMEOUT_SECS: u64 = 10;
+const SIM_IDENTITY_QMI_TIMEOUT_SECS: u64 = 2;
+const SIM_IDENTITY_CACHE_TTL_SECS: u64 = 30;
+const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const MM_LOGGING_SERIAL_KEY: &str = "modemmanager-global-logging";
 
 type InterfaceProperties = HashMap<String, OwnedValue>;
@@ -74,6 +77,11 @@ struct BasebandRestartProgress {
 
 static BASEBAND_RESTART_PROGRESS: OnceLock<
     std::sync::Mutex<HashMap<String, BasebandRestartProgress>>,
+> = OnceLock::new();
+
+type CachedUsimIdentity = Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity>;
+static SIM_IDENTITY_CACHE: OnceLock<
+    std::sync::Mutex<HashMap<String, (Instant, CachedUsimIdentity)>>,
 > = OnceLock::new();
 
 tokio::task_local! {
@@ -719,6 +727,84 @@ fn operator_code_from_imsi(imsi: &str) -> String {
     } else {
         String::new()
     }
+}
+
+fn operator_code_from_imsi_with_mnc_length(imsi: &str, mnc_length: Option<u8>) -> String {
+    let digits = imsi.trim();
+    let Some(length) = mnc_length
+        .map(usize::from)
+        .filter(|length| matches!(*length, 2 | 3))
+    else {
+        return if digits.starts_with("460") {
+            operator_code_from_imsi(digits)
+        } else {
+            String::new()
+        };
+    };
+    if digits.len() < 3 + length || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return String::new();
+    }
+    digits[..3 + length].to_string()
+}
+
+fn valid_home_operator_code(imsi: &str, operator: &str) -> Option<String> {
+    let digits: String = operator
+        .chars()
+        .filter(|character| character.is_ascii_digit())
+        .collect();
+    if matches!(digits.len(), 5 | 6) && imsi.trim().starts_with(&digits) {
+        Some(digits)
+    } else {
+        None
+    }
+}
+
+async fn read_usim_identity_fallback(
+    qmi_device: Option<&str>,
+    uim_slot: u8,
+    sim_key: &str,
+) -> Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity> {
+    let device = qmi_device?.trim();
+    if device.is_empty() {
+        return None;
+    }
+    let cache_key = format!("{device}:{uim_slot}:{}", sim_key.trim());
+    let cached = SIM_IDENTITY_CACHE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&cache_key)
+        .filter(|(captured_at, _)| {
+            captured_at.elapsed() <= Duration::from_secs(SIM_IDENTITY_CACHE_TTL_SECS)
+        })
+        .map(|(_, identity)| identity.clone());
+    if let Some(identity) = cached {
+        return identity;
+    }
+    let device = device.to_string();
+    let identity = tokio::time::timeout(
+        Duration::from_secs(SIM_IDENTITY_QMI_TIMEOUT_SECS + 1),
+        tokio::task::spawn_blocking(move || {
+            crate::connectivity::modems::ims::vowifi::qmi_uim::read_usim_identity_via_proxy_reason(
+                QMI_PROXY_SOCKET,
+                &device,
+                uim_slot,
+                crate::connectivity::modems::ims::vowifi::qmi_uim::USIM_AID_PREFIX,
+                Duration::from_secs(SIM_IDENTITY_QMI_TIMEOUT_SECS),
+            )
+            .ok()
+        }),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
+    SIM_IDENTITY_CACHE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(cache_key, (Instant::now(), identity.clone()));
+    identity
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1440,7 +1526,7 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
         let sim_iccid = crate::platform::utils::normalize_iccid(
             &property_string(&sim_props, "SimIdentifier").unwrap_or_default(),
         );
-        let imsi = property_string(&sim_props, "Imsi").unwrap_or_default();
+        let mut imsi = property_string(&sim_props, "Imsi").unwrap_or_default();
         let sim_type = classify_sim_type(&sim_props, sim_path.is_some());
         let esim_status = match sim_props.get("EsimStatus").map(extract_u32).unwrap_or(0) {
             1 => "none".to_string(),
@@ -1448,13 +1534,28 @@ pub async fn discover_modem_bindings(conn: &Connection) -> zbus::Result<Vec<Mode
             3 => "with-profiles".to_string(),
             _ => "unknown".to_string(),
         };
-        let mut operator_id = property_string(&sim_props, "OperatorIdentifier")
-            .unwrap_or_else(|| operator_code_from_imsi(&imsi));
-        if operator_id.is_empty() {
-            operator_id = property_string(&gpp_props, "OperatorCode").unwrap_or_default();
-        }
-
         let qmi_device = qmi_control_device(conn, &modem_path).await;
+        let qmi_identity = if !is_valid_imsi(&imsi)
+            || property_string(&sim_props, "OperatorIdentifier")
+                .and_then(|operator| valid_home_operator_code(&imsi, &operator))
+                .is_none()
+        {
+            read_usim_identity_fallback(qmi_device.as_deref(), uim_slot, &sim_iccid).await
+        } else {
+            None
+        };
+        let mnc_length = qmi_identity
+            .as_ref()
+            .and_then(|identity| identity.mnc_length);
+        if !is_valid_imsi(&imsi) {
+            imsi = qmi_identity
+                .as_ref()
+                .map(|identity| identity.imsi.clone())
+                .unwrap_or_default();
+        }
+        let operator_id = property_string(&sim_props, "OperatorIdentifier")
+            .and_then(|operator| valid_home_operator_code(&imsi, &operator))
+            .unwrap_or_else(|| operator_code_from_imsi_with_mnc_length(&imsi, mnc_length));
         let device_family = crate::hardware::devices::quectel::classify(&manufacturer, &model)
             .map(|family| family.as_str().to_string())
             .unwrap_or_else(|| "generic_modem".to_string());
@@ -1531,44 +1632,75 @@ async fn get_sim_path(conn: &Connection, modem_path: &str) -> zbus::Result<Strin
 }
 
 pub async fn sim_identity_for_modem(conn: &Connection, modem_path: &str) -> Option<SimIdentity> {
-    let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP)
+    let sim_path = get_sim_path(conn, modem_path)
         .await
-        .unwrap_or_default();
-    let sim_path = get_sim_path(conn, modem_path).await.ok()?;
-    if sim_path.is_empty() || sim_path == "/" {
-        return None;
-    }
-    let sim_props = get_all_properties(conn, &sim_path, MM_SIM)
-        .await
-        .unwrap_or_default();
+        .ok()
+        .filter(|path| !path.is_empty() && path != "/");
+    let sim_props = match sim_path.as_deref() {
+        Some(path) => get_all_properties(conn, path, MM_SIM)
+            .await
+            .unwrap_or_default(),
+        None => HashMap::new(),
+    };
     let iccid = crate::platform::utils::normalize_iccid(
         &sim_props
             .get("SimIdentifier")
             .map(extract_string)
             .unwrap_or_default(),
     );
-    let imsi = sim_props
+    let mut imsi = sim_props
         .get("Imsi")
         .map(extract_string)
         .unwrap_or_default();
+    let uim_slot = get_property(conn, modem_path, MM_MODEM, "PrimarySimSlot")
+        .await
+        .ok()
+        .map(|value| extract_u32(&value))
+        .filter(|slot| (1..=u8::MAX as u32).contains(slot))
+        .map(|slot| slot as u8)
+        .unwrap_or(1);
+    let qmi_device = qmi_control_device(conn, modem_path).await;
+    let qmi_identity = if !is_valid_imsi(&imsi)
+        || sim_props
+            .get("OperatorIdentifier")
+            .map(extract_string)
+            .and_then(|operator| valid_home_operator_code(&imsi, &operator))
+            .is_none()
+    {
+        read_usim_identity_fallback(qmi_device.as_deref(), uim_slot, &iccid).await
+    } else {
+        None
+    };
+    let mnc_length = qmi_identity
+        .as_ref()
+        .and_then(|identity| identity.mnc_length);
+    if !is_valid_imsi(&imsi) {
+        imsi = qmi_identity
+            .as_ref()
+            .map(|identity| identity.imsi.clone())
+            .unwrap_or_default();
+    }
     let mut operator_id = sim_props
         .get("OperatorIdentifier")
         .map(extract_string)
+        .and_then(|operator| valid_home_operator_code(&imsi, &operator))
         .unwrap_or_default();
     if operator_id.is_empty() {
-        operator_id = operator_code_from_imsi(&imsi);
+        operator_id = operator_code_from_imsi_with_mnc_length(&imsi, mnc_length);
     }
-    if operator_id.is_empty() {
-        operator_id = gpp_props
-            .get("OperatorCode")
-            .map(extract_string)
-            .unwrap_or_default();
+    if imsi.is_empty() && iccid.is_empty() && operator_id.is_empty() {
+        return None;
     }
     Some(SimIdentity {
         iccid,
         imsi,
         operator_id,
     })
+}
+
+fn is_valid_imsi(value: &str) -> bool {
+    let value = value.trim();
+    (10..=16).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn mm_state_to_string(state: i32) -> &'static str {
@@ -2137,7 +2269,7 @@ pub async fn get_sim_info_for_modem_with_cache(
             .map(extract_string)
             .unwrap_or_default(),
     );
-    let imsi = sim_props
+    let mut imsi = sim_props
         .get("Imsi")
         .map(extract_string)
         .unwrap_or_default();
@@ -2146,14 +2278,17 @@ pub async fn get_sim_info_for_modem_with_cache(
         .get("OperatorIdentifier")
         .map(extract_string)
         .unwrap_or_default();
-    if operator_id.is_empty() {
-        operator_id = operator_code_from_imsi(&imsi);
+    if let Some(resolved) = sim_identity_for_modem(conn, modem_path).await {
+        if is_valid_imsi(&resolved.imsi) {
+            imsi = resolved.imsi;
+        }
+        if !resolved.operator_id.is_empty() {
+            operator_id = resolved.operator_id;
+        }
     }
-    if operator_id.is_empty() {
-        operator_id = gpp_props
-            .get("OperatorCode")
-            .map(extract_string)
-            .unwrap_or_default();
+    operator_id = valid_home_operator_code(&imsi, &operator_id).unwrap_or_default();
+    if operator_id.is_empty() && imsi.starts_with("460") {
+        operator_id = operator_code_from_imsi(&imsi);
     }
     let identity = SimIdentity {
         iccid: iccid.clone(),
@@ -3188,6 +3323,19 @@ LTE Timing Advance: 'unavailable'"#;
         assert_eq!(
             split_operator_code(&operator_code_from_imsi("460020")),
             ("460".into(), "02".into())
+        );
+    }
+
+    #[test]
+    fn hardware_mnc_length_preserves_cmlink_home_operator_while_roaming() {
+        assert_eq!(
+            operator_code_from_imsi_with_mnc_length("234331234567890", Some(2)),
+            "23433"
+        );
+        assert_eq!(valid_home_operator_code("234331234567890", "46000"), None);
+        assert_eq!(
+            valid_home_operator_code("234331234567890", "23433"),
+            Some("23433".to_string())
         );
     }
 

@@ -218,6 +218,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
 
   // 聊天区域滚动引用
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const messagesRef = useRef<SmsMessage[]>([])
 
   const scrollToBottom = useCallback(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -244,6 +245,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         channel_id: selectedChannelId || undefined,
       })
       if (response.status === 'ok' && response.data) {
+        messagesRef.current = response.data.messages
         setMessages(response.data.messages)
         setConversations(buildConversations(response.data.messages))
       } else {
@@ -289,7 +291,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         }
       }
     } catch {
-      const localMsgs = messages.filter((m) => (
+      const localMsgs = messagesRef.current.filter((m) => (
         m.phone_number === phone && (!channelId || smsChannelId(m) === channelId)
       ))
       const sorted = [...localMsgs].sort(compareSmsChronological)
@@ -308,7 +310,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
         setConversationLoading(false)
       }
     }
-  }, [messages, scrollToBottom, scrollToMessage, selectedChannelId])
+  }, [scrollToBottom, scrollToMessage, selectedChannelId])
 
   const fetchStats = useCallback(async () => {
     try {
@@ -359,18 +361,28 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
   }, [embeddedLineId])
 
   useEffect(() => {
-    void fetchMessages(false)
-    void fetchStats()
-    void fetchLines()
-    const interval = setInterval(() => {
-      void fetchMessages(true)
-      void fetchStats()
-      void fetchLines()
+    let cancelled = false
+    let timer: number | undefined
+
+    const refresh = async (isBackground: boolean) => {
+      await Promise.all([
+        fetchMessages(isBackground),
+        fetchStats(),
+        fetchLines(),
+      ])
       if (selectedConversation) {
-        void fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
+        await fetchConversation(phoneNumber, selectedConversationChannelId, undefined, true)
       }
-    }, 10000)
-    return () => clearInterval(interval)
+      if (!cancelled) {
+        timer = window.setTimeout(() => void refresh(true), 10000)
+      }
+    }
+
+    void refresh(false)
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
   }, [
     fetchConversation,
     fetchLines,

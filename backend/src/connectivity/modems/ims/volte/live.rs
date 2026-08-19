@@ -4765,30 +4765,28 @@ async fn load_device_identity(
             Some(imsi) => (imsi, "at_cimi"),
             None => {
                 tracing::warn!(
-                    "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM fallback"
+                    "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM/UIM fallback"
                 );
-                (
-                    sim_imsi.ok_or_else(|| {
+                resolve_fallback_imsi(device, sim_imsi.as_deref())
+                    .await
+                    .ok_or_else(|| {
                         VolteError::with_detail(
                             code::MM_IMSI_MISSING,
-                            "at_cimi_and_modemmanager_sim_imsi_invalid",
+                            "at_cimi_modemmanager_and_uim_imsi_invalid",
                         )
-                    })?,
-                    "sim_imsi_fallback",
-                )
+                    })?
             }
         },
         Err(error) => {
-            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM IMSI fallback");
-            (
-                sim_imsi.ok_or_else(|| {
+            tracing::warn!(error = %error, "Native VoLTE ModemManager AT+CIMI failed; using SIM/UIM IMSI fallback");
+            resolve_fallback_imsi(device, sim_imsi.as_deref())
+                .await
+                .ok_or_else(|| {
                     VolteError::with_detail(
                         code::MM_IMSI_MISSING,
-                        "modemmanager_sim_and_at_identity_unavailable",
+                        "modemmanager_sim_at_and_uim_identity_unavailable",
                     )
-                })?,
-                "sim_imsi_fallback",
-            )
+                })?
         }
     };
     let home_plmn = [
@@ -4823,6 +4821,8 @@ async fn load_device_identity(
     let identity_source = match (imsi_source, isim_aid.is_some()) {
         ("at_cimi", true) => "at_cimi_isim_detected",
         ("at_cimi", false) => "at_cimi",
+        ("uim_ef_imsi_fallback", true) => "uim_ef_imsi_isim_detected",
+        ("uim_ef_imsi_fallback", false) => "uim_ef_imsi",
         (_, true) => "sim_imsi_fallback_isim_detected",
         (_, false) => "sim_imsi_fallback",
     };
@@ -4895,6 +4895,31 @@ async fn load_device_identity(
         source: identity_source,
         isim_aid,
     })
+}
+
+async fn resolve_fallback_imsi(
+    device: &VolteDeviceBinding,
+    modemmanager_imsi: Option<&str>,
+) -> Option<(String, &'static str)> {
+    if let Some(imsi) = modemmanager_imsi {
+        return Some((imsi.to_string(), "sim_imsi_fallback"));
+    }
+    let qmi_device = device.qmi_device.clone();
+    let uim_slot = device.uim_slot;
+    tokio::task::spawn_blocking(move || {
+        crate::connectivity::modems::ims::vowifi::qmi_uim::read_usim_identity_via_proxy_reason(
+            QMI_PROXY_SOCKET,
+            &qmi_device,
+            uim_slot,
+            crate::connectivity::modems::ims::vowifi::qmi_uim::USIM_AID_PREFIX,
+            Duration::from_secs(3),
+        )
+        .ok()
+        .map(|identity| (identity.imsi, "uim_ef_imsi_fallback"))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 async fn resolve_device_binding(

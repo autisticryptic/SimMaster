@@ -315,16 +315,19 @@ impl ProfileStore {
         }
 
         let digits = imsi.trim();
-        let home_plmn = home_plmn.map(str::trim).filter(|plmn| {
-            matches!(plmn.len(), 5 | 6)
-                && plmn.bytes().all(|byte| byte.is_ascii_digit())
-                && digits.starts_with(*plmn)
-        });
+        let explicit_home_plmn = home_plmn
+            .map(str::trim)
+            .filter(|plmn| {
+                matches!(plmn.len(), 5 | 6)
+                    && plmn.bytes().all(|byte| byte.is_ascii_digit())
+                    && digits.starts_with(*plmn)
+            })
+            .map(str::to_string);
         let mut custom_matches = self
             .custom_records()?
             .into_iter()
             .filter(|(_, record)| {
-                home_plmn.map_or_else(
+                explicit_home_plmn.as_deref().map_or_else(
                     || digits.starts_with(&record.meta.plmn),
                     |plmn| record.meta.plmn == plmn,
                 )
@@ -346,6 +349,9 @@ impl ProfileStore {
                 fallback_reason: None,
             }));
         }
+        let home_plmn =
+            explicit_home_plmn.or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
+        let home_plmn = home_plmn.as_deref();
         let catalog_result = match self.catalog.imsi_has_ambiguous_plmn(digits) {
             Ok(true) if home_plmn.is_none() => Ok(None),
             Ok(_) => self.catalog.resolve_for_imsi(digits, home_plmn, access),
@@ -479,12 +485,26 @@ mod tests {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let (store, path) = store_with_catalog();
 
+        assert_eq!(
+            store.catalog.infer_home_plmn("234330123456789").unwrap(),
+            Some("23433".to_string())
+        );
         let wifi = store
-            .resolve_for_imsi_access(None, "234330123456789", None, CatalogAccessKind::WifiEpdg)
+            .resolve_for_imsi_access(
+                None,
+                "234330123456789",
+                Some("46000"),
+                CatalogAccessKind::WifiEpdg,
+            )
             .expect("wifi query")
             .expect("wifi profile");
         let lte = store
-            .resolve_for_imsi_access(None, "234330123456789", None, CatalogAccessKind::LteEpc)
+            .resolve_for_imsi_access(
+                None,
+                "234330123456789",
+                Some("46000"),
+                CatalogAccessKind::LteEpc,
+            )
             .expect("lte query")
             .expect("lte profile");
         assert_eq!(wifi.profile.epdg.apn, Some("wifi-ims"));
@@ -590,7 +610,7 @@ mod tests {
             .resolve_for_imsi_access(
                 None,
                 "234330123456789",
-                Some("23433"),
+                Some("46000"),
                 CatalogAccessKind::LteEpc,
             )
             .expect("automatic match should derive")

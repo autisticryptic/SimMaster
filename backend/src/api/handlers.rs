@@ -74,7 +74,7 @@ use crate::{
 
 const ESIM_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
 const ESIM_SIM_ENRICH_TIMEOUT_SECS: u64 = 12;
-const VOWIFI_SIM_IDENTITY_TIMEOUT_SECS: u64 = 3;
+const VOWIFI_SIM_IDENTITY_TIMEOUT_SECS: u64 = 5;
 const VOWIFI_STATUS_STAGE_TIMEOUT_SECS: u64 = 12;
 const VOWIFI_LIVE_STAGE_TIMEOUT_SECS: u64 = 90;
 const VOWIFI_MANUAL_CONNECT_ATTEMPTS: u8 = 3;
@@ -10293,27 +10293,14 @@ fn resolve_ims_catalog(
     pinned: Option<&str>,
     access: CatalogAccessKind,
 ) -> Option<&'static CarrierProfile> {
-    if let Some(profile_id) = pinned.filter(|value| !value.trim().is_empty()) {
-        if let Ok(Some(profile)) = app.carrier_catalog.get(profile_id, access) {
-            if let Some(interned) = catalog_profile_to_static(&profile) {
-                return Some(interned);
-            }
-        }
-    }
-    if let Some(imsi) = imsi {
-        if let Ok(Some(profile)) = app.carrier_catalog.resolve_for_imsi(imsi, None, access) {
-            if let Some(interned) = catalog_profile_to_static(&profile) {
-                return Some(interned);
-            }
-        }
-    }
-    None
-}
-
-fn catalog_profile_to_static(
-    profile: &crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogProfile,
-) -> Option<&'static CarrierProfile> {
-    Some(profile.record.intern())
+    crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::new(
+        Arc::clone(&app.carrier_catalog),
+        Arc::clone(&app.database),
+    )
+    .resolve_for_imsi_access(pinned, imsi.unwrap_or_default(), None, access)
+    .ok()
+    .flatten()
+    .map(|resolved| resolved.profile)
 }
 
 async fn query_sim_voicemail_number(modem_id: &str) -> Option<String> {

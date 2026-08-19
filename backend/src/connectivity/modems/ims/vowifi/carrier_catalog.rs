@@ -181,6 +181,18 @@ impl CarrierCatalog {
         v7::ambiguous_plmn_prefixes(&self.validated_connection()?)
     }
 
+    /// Infer the SIM home PLMN from unconstrained catalog identity rules,
+    /// independently of whether the requested IMS access is currently ready.
+    /// This preserves the authoritative 2/3-digit MNC boundary when a known
+    /// carrier must use the explicitly labelled standard-derived fallback.
+    pub fn infer_home_plmn(&self, imsi: &str) -> Result<Option<String>, String> {
+        let imsi = imsi.trim();
+        if imsi.len() < 5 || !imsi.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Ok(None);
+        }
+        v7::infer_home_plmn(&self.validated_connection()?, imsi)
+    }
+
     pub fn resolve_for_imsi(
         &self,
         imsi: &str,

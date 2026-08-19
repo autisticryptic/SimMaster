@@ -76,6 +76,12 @@ pub struct UsimAkaApduResult {
     pub auts: Option<Vec<u8>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsimIdentity {
+    pub imsi: String,
+    pub mnc_length: Option<u8>,
+}
+
 #[derive(Debug)]
 pub enum QmiUimError {
     Io(io::Error),
@@ -86,6 +92,7 @@ pub enum QmiUimError {
     ResultFailure(u16),
     InvalidApduResponse,
     InvalidAkaResponse,
+    InvalidIdentityResponse,
 }
 
 impl fmt::Display for QmiUimError {
@@ -99,6 +106,7 @@ impl fmt::Display for QmiUimError {
             Self::ResultFailure(code) => write!(f, "QMI operation failed with code {code}"),
             Self::InvalidApduResponse => write!(f, "invalid UIM APDU response"),
             Self::InvalidAkaResponse => write!(f, "invalid USIM AKA response"),
+            Self::InvalidIdentityResponse => write!(f, "invalid USIM identity response"),
         }
     }
 }
@@ -314,6 +322,132 @@ pub fn parse_usim_authenticate_response_reason(
 ) -> Result<UsimAkaApduResult, &'static str> {
     parse_usim_authenticate_response(response)
         .map_err(|_| classify_usim_authenticate_response(response))
+}
+
+pub fn decode_ef_imsi(data: &[u8]) -> Result<String, QmiUimError> {
+    let length = data
+        .first()
+        .copied()
+        .map(usize::from)
+        .ok_or(QmiUimError::InvalidIdentityResponse)?;
+    if length == 0 || data.len() < 1 + length {
+        return Err(QmiUimError::InvalidIdentityResponse);
+    }
+
+    let mut digits = String::new();
+    let mut skip_identity_nibble = true;
+    for byte in &data[1..1 + length] {
+        for nibble in [byte & 0x0f, byte >> 4] {
+            if skip_identity_nibble {
+                skip_identity_nibble = false;
+                continue;
+            }
+            if nibble == 0x0f {
+                break;
+            }
+            if nibble > 9 {
+                return Err(QmiUimError::InvalidIdentityResponse);
+            }
+            digits.push(char::from(b'0' + nibble));
+        }
+    }
+    if (10..=16).contains(&digits.len()) {
+        Ok(digits)
+    } else {
+        Err(QmiUimError::InvalidIdentityResponse)
+    }
+}
+
+pub fn parse_ef_ad_mnc_length(data: &[u8]) -> Option<u8> {
+    data.get(3)
+        .map(|value| *value & 0x0f)
+        .filter(|length| matches!(*length, 2 | 3))
+}
+
+pub fn read_usim_identity_via_proxy_reason(
+    proxy_socket: &str,
+    device_path: &str,
+    slot: u8,
+    aid: &[u8],
+    timeout: Duration,
+) -> Result<UsimIdentity, &'static str> {
+    #[cfg(not(unix))]
+    {
+        let _ = (proxy_socket, device_path, slot, aid, timeout);
+        Err("sim_identity_platform_unsupported")
+    }
+
+    #[cfg(unix)]
+    {
+        let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)
+            .map_err(|_| "sim_identity_proxy_connect_failed")?;
+        conn.proxy_open(device_path)
+            .map_err(|_| "sim_identity_proxy_open_failed")?;
+        let client_id = conn
+            .allocate_uim_cid()
+            .map_err(|_| "sim_identity_uim_client_failed")?;
+        let channel = match conn.open_logical_channel(client_id, slot, aid) {
+            Ok(channel) => channel,
+            Err(_) => {
+                let _ = conn.release_uim_cid(client_id);
+                return Err("sim_identity_logical_channel_failed");
+            }
+        };
+
+        let result = (|| {
+            let selected = conn
+                .send_apdu(
+                    client_id,
+                    slot,
+                    channel.channel_id,
+                    &[0x00, 0xa4, 0x00, 0x04, 0x02, 0x6f, 0x07, 0x00],
+                )
+                .map_err(|_| "sim_identity_imsi_select_failed")?;
+            if !matches!(selected.sw1, 0x90 | 0x61 | 0x9f) {
+                return Err("sim_identity_imsi_select_rejected");
+            }
+            let imsi_response = conn
+                .send_apdu(
+                    client_id,
+                    slot,
+                    channel.channel_id,
+                    &[0x00, 0xb0, 0x00, 0x00, 0x09],
+                )
+                .map_err(|_| "sim_identity_imsi_read_failed")?;
+            if (imsi_response.sw1, imsi_response.sw2) != (0x90, 0x00) {
+                return Err("sim_identity_imsi_read_rejected");
+            }
+            let imsi = decode_ef_imsi(&imsi_response.data)
+                .map_err(|_| "sim_identity_imsi_decode_failed")?;
+
+            let mnc_length = conn
+                .send_apdu(
+                    client_id,
+                    slot,
+                    channel.channel_id,
+                    &[0x00, 0xa4, 0x00, 0x04, 0x02, 0x6f, 0xad, 0x00],
+                )
+                .ok()
+                .filter(|response| matches!(response.sw1, 0x90 | 0x61 | 0x9f))
+                .and_then(|_| {
+                    conn.send_apdu(
+                        client_id,
+                        slot,
+                        channel.channel_id,
+                        &[0x00, 0xb0, 0x00, 0x00, 0x04],
+                    )
+                    .ok()
+                })
+                .filter(|response| (response.sw1, response.sw2) == (0x90, 0x00))
+                .and_then(|response| parse_ef_ad_mnc_length(&response.data));
+
+            Ok(UsimIdentity { imsi, mnc_length })
+        })();
+
+        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        let _ = conn.release_uim_cid(client_id);
+        result
+    }
 }
 
 pub fn classify_usim_authenticate_response(response: &UimApduResponse) -> &'static str {
@@ -879,6 +1013,17 @@ fn tlv(tlv_type: u8, value: Vec<u8>) -> QmiTlv {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_ef_imsi_and_ef_ad_mnc_length() {
+        assert_eq!(
+            decode_ef_imsi(&[0x08, 0x19, 0x32, 0x54, 0x76, 0x98, 0x10, 0x32, 0x54]).unwrap(),
+            "123456789012345"
+        );
+        assert_eq!(parse_ef_ad_mnc_length(&[0x00, 0x00, 0x00, 0x02]), Some(2));
+        assert_eq!(parse_ef_ad_mnc_length(&[0x00, 0x00, 0x00, 0x03]), Some(3));
+        assert_eq!(parse_ef_ad_mnc_length(&[0x00, 0x00, 0x00, 0x04]), None);
+    }
 
     #[test]
     fn encodes_ctl_proxy_and_allocate_cid_frames() {

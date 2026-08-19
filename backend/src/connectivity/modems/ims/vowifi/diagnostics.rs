@@ -1238,6 +1238,24 @@ mod tests {
     }
 
     #[test]
+    fn visited_network_operator_does_not_replace_cmlink_home_profile() {
+        let sim = MaskedSimIdentity {
+            present: true,
+            operator_id: "46000".to_string(),
+            ..Default::default()
+        };
+
+        let matched = match_profile_from_parts(sim, None, "234331234567890", "46000");
+
+        assert!(matched.matched);
+        assert_eq!(matched.matched_prefix.as_deref(), Some("23433"));
+        assert_eq!(
+            matched.profile.as_ref().map(|profile| profile.profile_id),
+            Some("gb_ee_23433")
+        );
+    }
+
+    #[test]
     fn missing_database_profile_is_exposed_as_standard_derived() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let sim = MaskedSimIdentity {
