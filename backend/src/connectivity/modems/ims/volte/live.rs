@@ -2594,8 +2594,10 @@ async fn handle_operator_command(
                 }
             })
             .unwrap_or(500);
-        live.operator
-            .send_event(OperatorEvent::TransferResponse { call_id, status });
+        live.operator.send_event(OperatorEvent::TransferResponse {
+            call_id: call_id.clone(),
+            status,
+        });
     }
     if result.is_ok() && connected {
         live.operator
