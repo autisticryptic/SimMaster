@@ -593,13 +593,13 @@ const MAX_IFNAME_LEN: usize = 15;
 /// up interfaces) while staying unique per line.
 ///
 fn tun_name_for_line(base: &str, line_id: &str) -> String {
-    // `line_id` is `line-<md5>`; a short slice of its hex digits is enough to
-    // separate lines while leaving room inside IFNAMSIZ.
+    // `line_id` is `line-<md5>`; 32 bits of its hex digest keeps collision risk
+    // negligible for multi-line hosts while still fitting inside IFNAMSIZ.
     let suffix: String = line_id
         .bytes()
         .filter(|byte| byte.is_ascii_alphanumeric())
         .rev()
-        .take(6)
+        .take(8)
         .map(|byte| (byte as char).to_ascii_lowercase())
         .collect();
     let mut name = String::with_capacity(MAX_IFNAME_LEN);
@@ -7745,6 +7745,13 @@ mod tests {
         assert_eq!(
             a,
             tun_name_for_line("sa_vwf0", "line-0123456789abcdef0123456789abcdef")
+        );
+
+        // These IDs share their final 24 bits. A six-hex suffix would collide;
+        // the 32-bit suffix must keep them on separate TUN devices.
+        assert_ne!(
+            tun_name_for_line("sa_vwf0", "line-00000000000000000000000012abcdef"),
+            tun_name_for_line("sa_vwf0", "line-00000000000000000000000034abcdef")
         );
     }
 

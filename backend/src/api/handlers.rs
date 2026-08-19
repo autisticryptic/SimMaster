@@ -4358,7 +4358,7 @@ async fn start_routed_ims_voice_call(
         .start_call(plan)
         .await
         .map_err(|error| error.to_string())?;
-    let path = format!("ims:{}", queued.call_id);
+    let path = ims_call_path(&line_id, &queued.call_id);
     Ok((line_id, path, queued.access.transport_tag()))
 }
 
@@ -4791,9 +4791,14 @@ fn is_ims_call_path(path: &str) -> bool {
     path.starts_with("ims:")
 }
 
-fn ims_call_id(path: &str) -> Option<&str> {
-    path.strip_prefix("ims:")
-        .filter(|value| !value.trim().is_empty())
+fn ims_call_path(line_id: &str, call_id: &str) -> String {
+    format!("ims:{line_id}:{call_id}")
+}
+
+fn ims_call_id_for_line<'a>(path: &'a str, line_id: &str) -> Option<&'a str> {
+    let scoped = path.strip_prefix("ims:")?;
+    let (owner_line_id, call_id) = scoped.split_once(':')?;
+    (owner_line_id == line_id && !call_id.trim().is_empty()).then_some(call_id)
 }
 
 /// Keep IMS MT calls visible to the HTTP API even when there is no Asterisk
@@ -4828,7 +4833,7 @@ fn ensure_ims_voice_listener(
                     track_call_start(
                         &app,
                         &line_id,
-                        &format!("ims:{call_id}"),
+                        &ims_call_path(&line_id, &call_id),
                         "outgoing",
                         &callee,
                         false,
@@ -4840,7 +4845,7 @@ fn ensure_ims_voice_listener(
                     caller,
                     body,
                 } => {
-                    let path = format!("ims:{call_id}");
+                    let path = ims_call_path(&line_id, &call_id);
                     track_call_start(&app, &line_id, &path, "incoming", &caller, false).await;
                     {
                         let mut active = app.active_calls.lock().await;
@@ -4866,7 +4871,7 @@ fn ensure_ims_voice_listener(
                     status,
                     ..
                 } => {
-                    let path = format!("ims:{call_id}");
+                    let path = ims_call_path(&line_id, &call_id);
                     let mut active = app.active_calls.lock().await;
                     if let Some(record) = active.get_mut(&path) {
                         record.state = if status >= 180 {
@@ -4878,24 +4883,24 @@ fn ensure_ims_voice_listener(
                     }
                 }
                 crate::services::trunk::bridge::OperatorEvent::Answered { call_id, .. } => {
-                    mark_tracked_call_answered(&app, &format!("ims:{call_id}")).await;
+                    mark_tracked_call_answered(&app, &ims_call_path(&line_id, &call_id)).await;
                 }
                 crate::services::trunk::bridge::OperatorEvent::Connected { call_id } => {
-                    mark_tracked_call_answered(&app, &format!("ims:{call_id}")).await;
+                    mark_tracked_call_answered(&app, &ims_call_path(&line_id, &call_id)).await;
                 }
                 crate::services::trunk::bridge::OperatorEvent::Rejected {
                     call_id,
                     diagnostic,
                     ..
                 } => {
-                    let path = format!("ims:{call_id}");
+                    let path = ims_call_path(&line_id, &call_id);
                     record_tracked_call_failure(&app, &path, &diagnostic).await;
                     let _ = finish_tracked_call(&app, &path, false).await;
                 }
                 crate::services::trunk::bridge::OperatorEvent::Unavailable { call_id }
                 | crate::services::trunk::bridge::OperatorEvent::Ended { call_id }
                 | crate::services::trunk::bridge::OperatorEvent::Cancelled { call_id } => {
-                    let path = format!("ims:{call_id}");
+                    let path = ims_call_path(&line_id, &call_id);
                     let _ = finish_tracked_call(&app, &path, false).await;
                 }
                 crate::services::trunk::bridge::OperatorEvent::Renegotiate { .. }
@@ -5122,11 +5127,17 @@ pub(crate) async fn hangup_call_for_automation(
 ) -> Result<(), String> {
     let (line_id, modem_path) = resolve_call_line(app, requested_line_id).await?;
     if is_ims_call_path(path) {
-        let existed = app.active_calls.lock().await.contains_key(path);
+        let existed = app
+            .active_calls
+            .lock()
+            .await
+            .get(path)
+            .is_some_and(|record| record.line_id == line_id);
         if !existed {
             return Ok(());
         }
-        let call_id = ims_call_id(path).unwrap_or(path);
+        let call_id = ims_call_id_for_line(path, &line_id)
+            .ok_or_else(|| "call_not_found_on_selected_line".to_string())?;
         let line = app
             .line_registry
             .get(&line_id)
@@ -5221,7 +5232,14 @@ async fn hangup_call_on_line(
     )
     .await;
     let hangup_result = if is_ims_call_path(&path) {
-        let call_id = ims_call_id(&path).unwrap_or(path.as_str());
+        let Some(call_id) = ims_call_id_for_line(&path, &line_id) else {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(
+                    "call_not_found_on_selected_line",
+                )),
+            );
+        };
         let line = app
             .line_registry
             .get(&line_id)
@@ -5317,9 +5335,13 @@ async fn hangup_all_calls_on_lines(
                 let link = line.voice_access.operator_link();
                 if link
                     .send_command(OperatorCommand::HangupCall {
-                        call_id: ims_call_id(&call.path)
-                            .unwrap_or(call.path.as_str())
-                            .to_string(),
+                        call_id: match ims_call_id_for_line(&call.path, &line_id) {
+                            Some(call_id) => call_id.to_string(),
+                            None => {
+                                result = Err("call_not_found_on_selected_line".to_string());
+                                break;
+                            }
+                        },
                     })
                     .is_err()
                 {
@@ -5415,8 +5437,16 @@ async fn answer_call_on_line(
             );
         };
         let link = line.voice_access.operator_link();
+        let Some(call_id) = ims_call_id_for_line(&path, &line_id) else {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<serde_json::Value>::error(
+                    "call_not_found_on_selected_line",
+                )),
+            );
+        };
         link.send_command(OperatorCommand::AcceptCall {
-            call_id: ims_call_id(&path).unwrap_or(path.as_str()).to_string(),
+            call_id: call_id.to_string(),
             body,
         })
         .map_err(|_| "ims_operator_channel_unavailable".to_string())
@@ -5459,7 +5489,8 @@ async fn build_ims_answer_body(
     };
     let offer = crate::connectivity::core::voice::parse_audio_sdp(&offer_body)
         .map_err(|error| format!("ims_incoming_offer_invalid:{error}"))?;
-    let call_id = ims_call_id(path).ok_or_else(|| "ims_call_id_invalid".to_string())?;
+    let call_id = ims_call_id_for_line(path, line_id)
+        .ok_or_else(|| "ims_call_id_invalid_for_line".to_string())?;
     let line = app
         .line_registry
         .get(line_id)
@@ -5544,11 +5575,16 @@ pub async fn send_line_call_dtmf_handler(
                         )
                     }
                 };
-                let call_id = ims_call_id(&payload.path)
-                    .unwrap_or(payload.path.as_str())
-                    .to_string();
+                let Some(call_id) = ims_call_id_for_line(&payload.path, &line_id) else {
+                    return (
+                        StatusCode::OK,
+                        Json(ApiResponse::<serde_json::Value>::error(
+                            "call_not_found_on_selected_line",
+                        )),
+                    );
+                };
                 link.send_command(OperatorCommand::SendDtmf {
-                    call_id,
+                    call_id: call_id.to_string(),
                     signal: DtmfSignal {
                         digit,
                         duration_ms: 160,
@@ -11815,6 +11851,22 @@ mod tests {
         assert_eq!(record.missing_polls, 0);
         assert!(!call_poll_marks_finished(&mut record, false));
         assert!(call_poll_marks_finished(&mut record, false));
+    }
+
+    #[test]
+    fn ims_call_paths_scope_identical_call_ids_to_their_line() {
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+        let call_id = "same-call-id@carrier.example";
+        let path_a = ims_call_path(line_a, call_id);
+        let path_b = ims_call_path(line_b, call_id);
+
+        assert_ne!(path_a, path_b);
+        assert_eq!(ims_call_id_for_line(&path_a, line_a), Some(call_id));
+        assert_eq!(ims_call_id_for_line(&path_b, line_b), Some(call_id));
+        assert_eq!(ims_call_id_for_line(&path_a, line_b), None);
+        assert_eq!(ims_call_id_for_line(&path_b, line_a), None);
+        assert_eq!(ims_call_id_for_line("ims:same-call-id", line_a), None);
     }
 
     #[test]
