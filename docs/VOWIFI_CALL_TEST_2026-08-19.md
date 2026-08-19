@@ -19,6 +19,7 @@
    - `failure_retryable=false`
 5. 失败后 Asterisk 为 0 channel/0 call，SimAdmin 为 0 active call/0 active dialog/0 active media relay，未发现 SIP 或 RTP 资源泄漏。
 6. 本地 Linphone 来电振铃和取消清理正常；未将这项本地 SIP 行为误记为运营商 VoWiFi 来电验收。
+7. 部署提交 `8a3c808` 后再次通过 HTTP API 单次外呼：历史记录由 3 条增至 4 条，仅新增 `id=4`，约 1 秒内以 `480 / carrier_service_control_release / carrier_policy / retryable=false` 完整结束，`carrier_reason` 为 `Release Call received from CAP`。10 次逐秒轮询中活动呼叫均为 0，未再产生重复记录或悬空 `dialing` 记录。
 
 ## 本轮发现并修复的代码问题
 
@@ -55,4 +56,3 @@
 3. BYE、拒接、未接与历史记录。
 4. hold/resume 和失败 re-INVITE。
 5. H.264 视频、音视频切换和拒绝升级。
-
