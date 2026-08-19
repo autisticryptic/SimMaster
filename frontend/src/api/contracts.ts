@@ -554,6 +554,9 @@ export interface VolteRuntimeStatus {
   bearer_ip_type?: string
   current_ip_family?: string
   identity_source?: string
+  profile_id?: string
+  profile_source?: 'carrier_catalog' | 'database' | 'derived'
+  profile_fallback_reason?: string
   usim_aid?: string
   isim_aid?: string
   connection_attempts: VolteConnectionAttempt[]
@@ -1023,6 +1026,8 @@ export interface VowifiLineConfigResponse {
   runtime_restore_in_progress: boolean
   runtime_error?: string | null
   matched_profile_id?: string | null
+  matched_profile_source?: 'database' | 'derived' | null
+  matched_profile_fallback_reason?: string | null
 }
 
 export interface LineRuntimeStatus {
@@ -1674,6 +1679,8 @@ export interface VowifiMaskedSimIdentity {
 export interface VowifiProfileMatchResponse {
   matched: boolean
   matched_prefix?: string
+  profile_source?: 'database' | 'derived' | null
+  profile_fallback_reason?: string | null
   profile?: VowifiCarrierProfile
   sim_auth?: VowifiAkaAdapterPlan | null
   epdg?: VowifiEpdgPlan | null

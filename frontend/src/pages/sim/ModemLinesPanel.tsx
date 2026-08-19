@@ -31,7 +31,7 @@ import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
 import { LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
-import { volteErrorMessage } from './volteErrorFormat'
+import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
 const stageLabels: Record<string, string> = {
@@ -123,6 +123,11 @@ function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
 function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
   if (!line) return '等待匹配运营商 profile'
   if (line.runtime_restore_in_progress) return '后台正在执行自动重连'
+  if (line.matched_profile_source === 'derived') {
+    return line.runtime_error
+      ? '数据库无可用配置，标准自动推断本轮连接失败'
+      : '数据库无可用配置，正在使用标准自动推断'
+  }
   if (line.runtime_error) return '本轮重连未成功，后台会继续尝试'
   return line.matched_profile_id ? `运营商 profile ${line.matched_profile_id}` : '等待匹配运营商 profile'
 }
@@ -805,6 +810,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
                     {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && (recovery || line.runtime.last_error) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
+                        {standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason) && (
+                          <Typography variant="body2" fontWeight={600}>
+                            {standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason)}
+                          </Typography>
+                        )}
                         {recovery ?? volteErrorMessage(line.runtime.last_error)}
                         {line.runtime.next_retry_at && (
                           <Typography variant="caption" display="block">

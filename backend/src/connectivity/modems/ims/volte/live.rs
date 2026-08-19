@@ -4815,6 +4815,9 @@ async fn load_device_identity(
         .update(|state| {
             state.stage = VolteStage::CarrierProfile;
             state.identity_source = Some(identity_source.to_string());
+            state.profile_id = None;
+            state.profile_source = None;
+            state.profile_fallback_reason = None;
             state.usim_aid = Some(usim_aid.clone());
             state.isim_aid = isim_aid.clone();
         })
@@ -4841,6 +4844,13 @@ async fn load_device_identity(
             )
         })?;
     let profile = resolved.profile;
+    runtime
+        .update(|state| {
+            state.profile_id = Some(profile.meta.profile_id.to_string());
+            state.profile_source = Some(resolved.origin.as_str().to_string());
+            state.profile_fallback_reason = resolved.fallback_reason.clone();
+        })
+        .await;
     let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
@@ -4850,6 +4860,7 @@ async fn load_device_identity(
     tracing::info!(
         profile_id = profile.meta.profile_id,
         profile_origin = resolved.origin.as_str(),
+        profile_fallback_reason = ?resolved.fallback_reason,
         ims_domain_source = ?effective_ims.domain.source,
         "Resolved native VoLTE carrier profile"
     );

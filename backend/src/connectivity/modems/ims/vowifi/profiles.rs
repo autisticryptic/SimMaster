@@ -2,7 +2,6 @@
 use chrono::NaiveDate;
 use serde::Serialize;
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
@@ -289,6 +288,31 @@ pub struct CarrierProfile {
 pub struct CarrierMatch {
     pub profile: &'static CarrierProfile,
     pub matched_prefix: String,
+}
+
+/// Access leg for a conservative profile derived only from public 3GPP naming
+/// rules. LTE and Wi-Fi use different identifiers and P-Access-Network-Info
+/// values so a generated profile can never cross the two registration paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Standard3gppAccess {
+    LteEpc,
+    WifiEpdg,
+}
+
+impl Standard3gppAccess {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LteEpc => "lte",
+            Self::WifiEpdg => "vowifi",
+        }
+    }
+
+    fn access_network_info(self) -> &'static str {
+        match self {
+            Self::LteEpc => "3GPP-E-UTRAN-FDD",
+            Self::WifiEpdg => DEFAULT_ACCESS_NETWORK_INFO,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -897,47 +921,69 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
     NZ_SPARK_53005,
 ];
 
-#[cfg(test)]
-static DYNAMIC_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
+static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
-/// 动态生成标准的 3GPP 运营商配置，并将其转化为静态生命周期的引用
-#[cfg(test)]
-pub fn generate_standard_3gpp_profile(
+/// Generate a conservative profile from public 3GPP naming rules.
+///
+/// This is an explicitly unverified last resort. It intentionally does not
+/// guess a static P-CSCF, entitlement/XCAP endpoints, a visited-network value,
+/// or carrier-specific SIP security requirements.
+pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
-    mnc_len: u8,
-) -> &'static CarrierProfile {
-    let plmn = format!("{}{}", mcc, mnc);
-    let cache = DYNAMIC_PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cache.lock().unwrap();
-
-    if let Some(profile) = guard.get(&plmn) {
-        return profile;
+    access: Standard3gppAccess,
+) -> Option<&'static CarrierProfile> {
+    if mcc.len() != 3
+        || !matches!(mnc.len(), 2 | 3)
+        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
+        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
     }
 
-    // 格式化补全 MNC（标准 3GPP 域名中，MNC 必须固定补齐为 3 位，例如 15 需补为 015）
+    let plmn = format!("{}{}", mcc, mnc);
+    let cache_key = format!("{}:{plmn}", access.as_str());
+    let cache = DERIVED_PROFILES.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if let Some(profile) = guard.get(&cache_key) {
+        return Some(*profile);
+    }
+
+    // 3GPP domains always pad the MNC to three digits.
     let padded_mnc = format!("{:0>3}", mnc);
     let epdg_host = Box::leak(
         format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str(),
     );
     let ims_domain =
         Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
-    let profile_id = Box::leak(format!("dynamic_3gpp_{}", plmn).into_boxed_str());
+    let profile_id =
+        Box::leak(format!("derived_3gpp_{}_{}", access.as_str(), plmn).into_boxed_str());
+    let source_refs: &'static [&'static str] = match access {
+        Standard3gppAccess::LteEpc => {
+            &["Unverified standard-derived LTE fallback; not present as a ready database profile"]
+        }
+        Standard3gppAccess::WifiEpdg => &[
+            "Unverified standard-derived Wi-Fi fallback; not present as a ready database profile",
+        ],
+    };
 
     let profile = CarrierProfile {
         meta: CarrierProfileMeta {
             profile_id,
             mcc: Box::leak(mcc.to_string().into_boxed_str()),
             mnc: Box::leak(mnc.to_string().into_boxed_str()),
-            mnc_len,
+            mnc_len: mnc.len() as u8,
             plmn: Box::leak(plmn.clone().into_boxed_str()),
             country_iso2: "unknown",
             brand: "Standard 3GPP",
             operator_legal_name: "Generic 3GPP Carrier",
             aliases: &[],
-            source_refs: &["Generated dynamically via 3GPP fallback rules"],
-            last_verified: "2026-06-24",
+            source_refs,
+            last_verified: "2026-08-19",
         },
         identity: ProfileIdentityPolicy {
             device_model_hint: "generic_android_class",
@@ -998,18 +1044,18 @@ pub fn generate_standard_3gpp_profile(
                 initial_authorization: "aka_empty",
                 include_mmtel_features: true,
                 include_route_header: true,
-                include_visited_network: true,
+                include_visited_network: false,
                 include_p_preferred_identity: true,
-                visited_network_header: Some(TEST_VISITED_NETWORK_HEADER),
-                allow_methods: Some(TEST_ALLOW_METHODS),
+                visited_network_header: None,
+                allow_methods: None,
                 strict_security_server_offer: false,
                 enable_initial_reject_fallback: true,
                 use_plain_digest_placeholder: false,
-                require_sec_agree_headers: true,
-                proxy_require_sec_agree_headers: true,
+                require_sec_agree_headers: false,
+                proxy_require_sec_agree_headers: false,
                 sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
-                access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+                access_network_info: access.access_network_info(),
                 contact_mode: "android_default",
                 contact_param_order: &[],
                 temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -1026,19 +1072,96 @@ pub fn generate_standard_3gpp_profile(
             receiver_transport: "tcp",
             smsc_auth_required: false,
         },
-        voice: DEFAULT_VOICE_POLICY,
+        voice: VoicePolicy {
+            vowifi_enabled: matches!(access, Standard3gppAccess::WifiEpdg),
+            carrier_fallback_enabled: true,
+            preferred_codecs: &["amr-wb", "amr", "pcmu", "pcma"],
+            codec_policies: &[],
+            amr_octet_align: false,
+            ptime_ms: 20,
+            sip_endpoint_exposed: false,
+            voicemail_number: None,
+        },
         e911: E911Policy {
             enabled: false,
             provider: None,
             entitlement_url: None,
             websheet_host_policy: None,
         },
-        ut: DEFAULT_UT_POLICY,
+        ut: UtPolicy {
+            enabled: false,
+            xcap_root: None,
+            document_selector: None,
+            namespace: None,
+            authentication: "none",
+            partial_update: false,
+            call_waiting_selector: None,
+            diversion_rule_selector: None,
+            oip_selector: None,
+            oir_selector: None,
+            tls_min_version: "1.2",
+            tls_max_version: "1.3",
+            tls_builtin_roots: true,
+            tls_additional_ca_pem: None,
+        },
     };
 
-    let static_profile = Box::leak(Box::new(profile));
-    guard.insert(plmn, static_profile);
-    static_profile
+    let static_profile: &'static CarrierProfile = Box::leak(Box::new(profile));
+    guard.insert(cache_key, static_profile);
+    Some(static_profile)
+}
+
+pub fn is_standard_derived_profile(profile: &CarrierProfile) -> bool {
+    profile.meta.profile_id.starts_with("derived_3gpp_")
+}
+
+fn derived_profile_by_id(profile_id: &str) -> Option<&'static CarrierProfile> {
+    let guard = DERIVED_PROFILES
+        .get()?
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .values()
+        .find(|profile| profile.meta.profile_id == profile_id)
+        .copied()
+}
+
+fn derive_standard_match(
+    imsi: &str,
+    home_plmn: Option<&str>,
+    access: Standard3gppAccess,
+) -> Option<CarrierMatch> {
+    let digits = imsi.trim();
+    if digits.len() < 5 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let plmn = home_plmn
+        .map(str::trim)
+        .filter(|plmn| {
+            matches!(plmn.len(), 5 | 6)
+                && plmn.bytes().all(|byte| byte.is_ascii_digit())
+                && digits.starts_with(*plmn)
+        })
+        .map(str::to_string)
+        .or_else(|| {
+            let length = if digits.starts_with("460") { 5 } else { 6 };
+            digits.get(..length).map(str::to_string)
+        })?;
+    let profile = derive_standard_3gpp_profile(&plmn[..3], &plmn[3..], access)?;
+    Some(CarrierMatch {
+        profile,
+        matched_prefix: plmn,
+    })
+}
+
+#[cfg(test)]
+pub fn generate_standard_3gpp_profile(
+    mcc: &str,
+    mnc: &str,
+    _mnc_len: u8,
+) -> &'static CarrierProfile {
+    derive_standard_3gpp_profile(mcc, mnc, Standard3gppAccess::WifiEpdg)
+        .expect("test MCC/MNC must be valid")
 }
 
 /// Profiles published from the database, keyed by PLMN and by profile id.
@@ -1277,7 +1400,8 @@ pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile
         return None;
     }
 
-    let resolved = database_profile_for_id(normalized);
+    let resolved =
+        database_profile_for_id(normalized).or_else(|| derived_profile_by_id(normalized));
     #[cfg(test)]
     if resolved.is_none() {
         return BUILTIN_PROFILES
@@ -1292,9 +1416,8 @@ pub fn resolve_by_profile_id(profile_id: &str) -> Option<&'static CarrierProfile
 ///
 /// A per-SIM pin is an operator's explicit "use exactly this carrier profile"
 /// choice, so it must not silently derive a replacement. Returning `None` here
-/// means "the pin no longer resolves",
-/// which the caller treats as "fall back to automatic IMSI matching" so a
-/// deleted profile never strands a line.
+/// means the explicit pin no longer resolves and the line must report that
+/// configuration error instead of changing operator policy implicitly.
 pub fn resolve_pinned_database_profile(profile_id: &str) -> Option<&'static CarrierProfile> {
     let normalized = profile_id.trim();
     if normalized.is_empty() {
@@ -1306,22 +1429,19 @@ pub fn resolve_pinned_database_profile(profile_id: &str) -> Option<&'static Carr
 /// Resolve the carrier profile for one line: an explicit published profile pin
 /// wins, then the catalog/local-override public-identity path.
 ///
-/// `pinned_profile_id` comes from the access-specific SIM override. A pin that
-/// no longer resolves in the published set degrades to automatic matching rather than
-/// failing, matching the documented "deleting a profile can never strand a line"
-/// rule.
+/// `pinned_profile_id` comes from the access-specific SIM override. Pins are
+/// strict: an invalid or non-ready explicit choice must be fixed by the
+/// operator and never silently replaced by an inferred profile.
 pub fn resolve_for_line(
     pinned_profile_id: Option<&str>,
     imsi: &str,
     home_plmn: Option<&str>,
 ) -> Option<CarrierMatch> {
     if let Some(profile_id) = pinned_profile_id {
-        if let Some(profile) = resolve_pinned_database_profile(profile_id) {
-            return Some(CarrierMatch {
-                profile,
-                matched_prefix: profile.meta.plmn.to_string(),
-            });
-        }
+        return resolve_pinned_database_profile(profile_id).map(|profile| CarrierMatch {
+            profile,
+            matched_prefix: profile.meta.plmn.to_string(),
+        });
     }
     if let Some(plmn) = home_plmn.map(str::trim).filter(|plmn| {
         matches!(plmn.len(), 5 | 6)
@@ -1333,6 +1453,7 @@ pub fn resolve_for_line(
         }
     }
     resolve_by_imsi(imsi)
+        .or_else(|| derive_standard_match(imsi, home_plmn, Standard3gppAccess::WifiEpdg))
 }
 
 #[cfg(test)]
@@ -1477,11 +1598,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_plmn_is_not_dynamically_derived() {
+    fn automatic_line_match_derives_access_specific_standard_profile() {
         let _resolver_guard = profile_resolver_test_guard();
         assert!(resolve_by_imsi("262011234567890").is_none());
         assert!(resolve_by_plmn("262", "01").is_none());
-        assert!(resolve_by_profile_id("dynamic_3gpp_26201").is_none());
+        let matched = resolve_for_line(None, "262011234567890", Some("26201"))
+            .expect("missing database row should derive a fallback");
+        assert_eq!(matched.profile.meta.profile_id, "derived_3gpp_vowifi_26201");
+        assert!(!matched.profile.ims.register.include_visited_network);
+        assert_eq!(matched.profile.ims.register.visited_network_header, None);
+        assert_eq!(
+            matched.profile.ims.register.access_network_info,
+            "IEEE-802.11"
+        );
+        assert_eq!(
+            resolve_by_profile_id("derived_3gpp_vowifi_26201")
+                .map(|profile| profile.meta.profile_id),
+            Some("derived_3gpp_vowifi_26201")
+        );
+        let lte = derive_standard_3gpp_profile("262", "01", Standard3gppAccess::LteEpc)
+            .expect("valid LTE fallback");
+        assert_eq!(lte.meta.profile_id, "derived_3gpp_lte_26201");
+        assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
+        assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
+        assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
     }
 
     #[test]
@@ -1497,17 +1637,15 @@ mod tests {
     }
 
     #[test]
-    fn line_pin_falls_back_to_imsi_when_unset_or_unresolvable() {
+    fn line_pin_is_strict_while_unpinned_matching_is_automatic() {
         let _resolver_guard = profile_resolver_test_guard();
         // No pin: behaves exactly like automatic IMSI matching.
         let auto = resolve_for_line(None, "234331234567890", None).expect("imsi should match");
         assert_eq!(auto.profile.meta.profile_id, "gb_ee_23433");
 
-        // A pin that resolves to nothing in the database degrades to the IMSI
-        // path rather than failing, so deleting a profile never strands a line.
-        let stale = resolve_for_line(Some("no_such_db_profile"), "234331234567890", None)
-            .expect("fallback");
-        assert_eq!(stale.profile.meta.profile_id, "gb_ee_23433");
+        // An explicit pin is an operator decision and must not silently turn
+        // into a database or standard-derived automatic match.
+        assert!(resolve_for_line(Some("no_such_db_profile"), "234331234567890", None).is_none());
     }
 
     #[test]
@@ -1516,7 +1654,7 @@ mod tests {
         // A built-in id is reachable through automatic matching, but a per-line
         // pin only honors database profiles: it must not silently resolve here.
         assert!(resolve_pinned_database_profile("gb_ee_23433").is_none());
-        assert!(resolve_pinned_database_profile("dynamic_3gpp_26201").is_none());
+        assert!(resolve_pinned_database_profile("derived_3gpp_vowifi_26201").is_none());
         assert!(resolve_pinned_database_profile("   ").is_none());
     }
 

@@ -7,7 +7,7 @@
 
 VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain/realm、SIP
 头字段和重试策略。仅按 MCC/MNC 推导 3GPP 默认值无法覆盖所有网络，因此 SimAdmin 将
-“可发布的运营商基线”和“设备上的用户覆盖”分开管理。
+“可发布的运营商基线”“设备上的用户覆盖”和“明确标记的标准推断兜底”分开管理。
 
 ## 当前数据模型
 
@@ -21,6 +21,14 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
 3. **旧配置迁移**
    - 旧 `vowifi-profiles.conf` 会在存在 catalog 基线时一次性迁移到本地覆盖表，然后重命名
      为 `.conf.migrated`。
+4. **标准自动推断**
+   - 只在未显式指定 profile 且本地覆盖、carrier catalog 都没有可用 access 配置时启用。
+   - LTE 与 VoWiFi 分别生成独立 profile，只推导 `ims` APN、3GPP IMS domain/realm 和 ePDG
+     FQDN，并采用保守的通用 IKE/ESP 基线。
+   - 不猜测静态 P-CSCF、visited-network、entitlement、XCAP 或 E911 配置。
+   - API 和页面始终标记来源为 `derived`，并保留数据库缺失、`unknown`、`partial` 或校验失败
+     的原始原因。后续 Bearer、P-CSCF、IKE 或 REGISTER 失败时，页面同时显示推断来源和实际失败阶段。
+   - 用户显式指定的 profile 保持严格模式；配置不存在或不可用时直接报错，不自动切换到推断值。
 
 主要实现位置：
 
@@ -29,8 +37,9 @@ VoLTE/VoWiFi 注册依赖运营商的 APN、ePDG、IKE/ESP proposal、IMS domain
 - `backend/src/connectivity/modems/ims/vowifi/profile_store.rs`
 - `backend/src/connectivity/modems/ims/vowifi/profile_record.rs`
 
-运行时不解析 AOSP/IPCC 原始文件，也不从公开资料自动生成可拨号 profile。需要新增运营商时，先在独立的
-carrier catalog 流程中完成来源审计、字段校验和封存，再由 SimAdmin 加载兼容的 catalog release。
+运行时不解析 AOSP/IPCC 原始文件。标准自动推断只作为未验证的实验性兜底，不表示该运营商已受支持；
+正式支持仍需在独立 carrier catalog 流程中完成来源审计、字段校验和封存，再由 SimAdmin 加载兼容的
+catalog release。
 
 ## 支持的来源
 
@@ -48,9 +57,11 @@ carrier catalog 流程中完成来源审计、字段校验和封存，再由 Sim
 
 ### 标准兜底
 
-- ePDG FQDN 等少数字段可按 3GPP 规则从 MCC/MNC 推导。
-- 推导值只适合作为明确字段的兜底，不能凭空补齐运营商专有 proposal、SIP 变体或重试策略。
-- catalog 条目标记为 `partial` 或缺少运行时必需字段时，不应伪装为可直接拨号的 `ready` 配置。
+- ePDG FQDN、IMS domain/realm 等少数字段按 3GPP 规则从 MCC/MNC 推导。
+- 推断 profile 使用通用保守基线，可能在 IKE、P-CSCF 或 SIP REGISTER 阶段失败；失败不改变
+  catalog 状态，也不会被记录成已验证配置。
+- catalog 条目标记为 `partial`、`unknown` 或缺少运行时必需字段时，仍保持原状态；自动流程可以
+  尝试推断值，但页面必须同时展示“数据库没有可用配置”和实际失败原因。
 
 ## 已知限制
 

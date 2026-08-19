@@ -142,9 +142,8 @@ static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<HashMap<String, LiveNetworkOve
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LiveNetworkOverrides {
     /// Pin this line to a specific carrier profile by `profile_id`. `None`
-    /// resolves the profile automatically from the SIM's IMSI. A pinned id that
-    /// no longer resolves falls back to automatic matching, so deleting a
-    /// profile never strands a line.
+    /// resolves the profile automatically from the SIM's IMSI. A pinned id is
+    /// strict and must never be replaced by a standard-derived fallback.
     profile_id: Option<String>,
     dns_servers: Vec<IpAddr>,
     epdg_host: Option<String>,
@@ -367,10 +366,9 @@ fn live_ike_access(line_id: &str, profile: &CarrierProfile) -> IkeAccessConfig {
 /// Resolve the carrier profile for a line, honoring its current SIM snapshot.
 ///
 /// A pinned `profile_id` is tried first against catalog/local-database profiles;
-/// if it no longer resolves (the profile was deleted, or the id was
-/// never valid) we fall back to matching by IMSI, so a stale pin degrades to the
-/// automatic behaviour instead of stranding the line. With no pin this is
-/// exactly `resolve_by_imsi`.
+/// Explicit pins are strict. Without a pin, identity matching prefers a
+/// published database profile and then uses the marked standard-derived
+/// fallback when no usable row exists.
 pub fn resolve_profile_for_line(
     line_id: &str,
     imsi: &str,

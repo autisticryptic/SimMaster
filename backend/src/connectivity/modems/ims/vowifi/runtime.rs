@@ -769,6 +769,8 @@ mod tests {
             profile: VowifiProfileMatchResponse {
                 matched: true,
                 matched_prefix: Some("23433".to_string()),
+                profile_source: None,
+                profile_fallback_reason: None,
                 profile: None,
                 sim_auth: None,
                 epdg: None,
@@ -897,6 +899,8 @@ mod tests {
             profile: VowifiProfileMatchResponse {
                 matched: true,
                 matched_prefix: Some("23433".to_string()),
+                profile_source: None,
+                profile_fallback_reason: None,
                 profile: None,
                 sim_auth: None,
                 epdg: None,
@@ -990,6 +994,8 @@ mod tests {
             profile: VowifiProfileMatchResponse {
                 matched: true,
                 matched_prefix: Some("23433".to_string()),
+                profile_source: None,
+                profile_fallback_reason: None,
                 profile: None,
                 sim_auth: None,
                 epdg: None,
@@ -1040,6 +1046,8 @@ mod tests {
             profile: VowifiProfileMatchResponse {
                 matched: true,
                 matched_prefix: Some("23433".to_string()),
+                profile_source: None,
+                profile_fallback_reason: None,
                 profile: None,
                 sim_auth: None,
                 epdg: None,

@@ -210,6 +210,9 @@ pub struct VolteSnapshot {
     pub at_cid: Option<u8>,
     pub current_ip_family: Option<String>,
     pub identity_source: Option<String>,
+    pub profile_id: Option<String>,
+    pub profile_source: Option<String>,
+    pub profile_fallback_reason: Option<String>,
     pub usim_aid: Option<String>,
     pub isim_aid: Option<String>,
     pub connection_attempts: Vec<VolteConnectionAttempt>,
@@ -252,6 +255,9 @@ impl Default for VolteSnapshot {
             bearer_ip_type: None,
             current_ip_family: None,
             identity_source: None,
+            profile_id: None,
+            profile_source: None,
+            profile_fallback_reason: None,
             usim_aid: None,
             isim_aid: None,
             connection_attempts: Vec::new(),
@@ -319,6 +325,12 @@ pub struct VolteRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub usim_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isim_aid: Option<String>,
@@ -362,6 +374,9 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
             identity_source: s.identity_source.clone(),
+            profile_id: s.profile_id.clone(),
+            profile_source: s.profile_source.clone(),
+            profile_fallback_reason: s.profile_fallback_reason.clone(),
             usim_aid: s.usim_aid.clone(),
             isim_aid: s.isim_aid.clone(),
             connection_attempts: s.connection_attempts.clone(),

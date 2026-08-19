@@ -19,6 +19,22 @@ function plmnLabel(plmn: string) {
   return `PLMN ${plmn}`
 }
 
+export function standardDerivedProfileMessage(
+  source?: string | null,
+  fallbackReason?: string | null,
+) {
+  if (source !== 'derived') return null
+
+  const profileNotReady = fallbackReason?.match(PROFILE_NOT_READY)
+  if (profileNotReady) {
+    return `运营商数据库没有可用配置（已有条目${profileStatusLabel(profileNotReady[2])}），当前使用未经运营商验证的 3GPP 标准自动推断。`
+  }
+  if (fallbackReason?.includes('carrier_catalog_open_failed')) {
+    return '运营商数据库无法读取，当前使用未经运营商验证的 3GPP 标准自动推断。'
+  }
+  return '运营商数据库没有可用配置，当前使用未经运营商验证的 3GPP 标准自动推断。'
+}
+
 export function volteErrorMessage(error?: string | null) {
   if (!error) return null
 

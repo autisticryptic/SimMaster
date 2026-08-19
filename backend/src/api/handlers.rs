@@ -6750,6 +6750,8 @@ pub struct VowifiLineConfigResponse {
     pub runtime_restore_in_progress: bool,
     pub runtime_error: Option<String>,
     pub matched_profile_id: Option<String>,
+    pub matched_profile_source: Option<String>,
+    pub matched_profile_fallback_reason: Option<String>,
 }
 
 async fn build_vowifi_line_response(
@@ -6768,7 +6770,15 @@ async fn build_vowifi_line_response(
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&modem.line_id)
             .is_available();
-    let (runtime_phase, runtime_stage, runtime_registered, runtime_error, matched_profile_id) = {
+    let (
+        runtime_phase,
+        runtime_stage,
+        runtime_registered,
+        runtime_error,
+        matched_profile_id,
+        matched_profile_source,
+        matched_profile_fallback_reason,
+    ) = {
         let stage = if config.enabled && status.phase == "not_started" {
             "starting".to_string()
         } else if config.enabled && status.readiness.ims_registered && !operator_ready {
@@ -6789,6 +6799,8 @@ async fn build_vowifi_line_response(
                 .profile
                 .profile
                 .map(|profile| profile.profile_id.to_string()),
+            status.profile.profile_source,
+            status.profile.profile_fallback_reason,
         )
     };
     VowifiLineConfigResponse {
@@ -6801,6 +6813,8 @@ async fn build_vowifi_line_response(
         runtime_restore_in_progress: line.vowifi_restore_in_progress(),
         runtime_error,
         matched_profile_id,
+        matched_profile_source,
+        matched_profile_fallback_reason,
     }
 }
 

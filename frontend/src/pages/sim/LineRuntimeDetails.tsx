@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import type { TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse } from '../../api/current'
-import { volteErrorMessage } from './volteErrorFormat'
+import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
   return (
@@ -27,6 +27,10 @@ export function LineCsDetails({ line }: { line: VolteLineControlResponse }) {
 
 export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
   const attempts = [...(line.runtime.connection_attempts ?? [])].reverse()
+  const fallbackMessage = standardDerivedProfileMessage(
+    line.runtime.profile_source,
+    line.runtime.profile_fallback_reason,
+  )
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="IMS 阶段" value={`${line.runtime.phase} / ${line.runtime.stage}`} /></Grid>
@@ -48,7 +52,9 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
       <Grid size={{ xs: 12, sm: 6 }}><Field label="IMS 数据路径" value={line.runtime.data_path_mode || '尚未建立'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="REGISTER 续期" value={`${line.runtime.register_refresh_count ?? 0} 次${line.runtime.last_register_refresh_at ? ` · ${new Date(line.runtime.last_register_refresh_at).toLocaleString()}` : ''}`} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="身份来源" value={line.runtime.identity_source || '尚未读取'} /></Grid>
+      <Grid size={{ xs: 12, sm: 6 }}><Field label="运营商 profile" value={line.runtime.profile_id || '尚未匹配'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={line.runtime.isim_aid ? `已发现 · ${line.runtime.isim_aid}` : '未发现，使用 IMSI 回退'} /></Grid>
+      {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {line.runtime.last_error && <Grid size={12}><Alert severity="warning">{volteErrorMessage(line.runtime.last_error)}</Alert></Grid>}
       <Grid size={12}>
         <Typography variant="subtitle2" mb={1}>最近连接尝试</Typography>
@@ -77,6 +83,10 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
 
 export function LineVowifiDetails({ vowifi }: { vowifi?: VowifiLineConfigResponse }) {
   if (!vowifi) return <Alert severity="info">尚未加载该线路的 VoWiFi 状态。</Alert>
+  const fallbackMessage = standardDerivedProfileMessage(
+    vowifi.matched_profile_source,
+    vowifi.matched_profile_fallback_reason,
+  )
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="运行阶段" value={`${vowifi.runtime_phase} / ${vowifi.runtime_stage}`} /></Grid>
@@ -85,6 +95,7 @@ export function LineVowifiDetails({ vowifi }: { vowifi?: VowifiLineConfigRespons
       <Grid size={{ xs: 12, sm: 4 }}><Field label="运营商 profile" value={vowifi.matched_profile_id || '尚未匹配'} /></Grid>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理模式" value={vowifi.config.proxy_mode} /></Grid>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理端点" value={vowifi.config.proxy_endpoint || '直连'} /></Grid>
+      {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {vowifi.runtime_error && <Grid size={12}><Alert severity="warning">{vowifi.runtime_error}</Alert></Grid>}
     </Grid>
   )

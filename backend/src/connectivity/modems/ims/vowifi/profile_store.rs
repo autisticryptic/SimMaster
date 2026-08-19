@@ -6,8 +6,9 @@
 //! include it. This store merges both sources and keeps the live matcher fed via
 //! [`ProfileStore::publish`].
 //!
-//! There is deliberately no Rust built-in or code-derived fallback. Missing
-//! carrier data is reported before network registration starts.
+//! Automatic matching may use a clearly marked, conservative 3GPP-derived
+//! fallback when neither source has a usable access profile. Explicit profile
+//! pins remain strict and never silently fall back.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -24,6 +25,7 @@ pub enum ProfileOrigin {
     #[serde(rename = "carrier_catalog")]
     Catalog,
     Database,
+    Derived,
 }
 
 impl ProfileOrigin {
@@ -31,6 +33,7 @@ impl ProfileOrigin {
         match self {
             ProfileOrigin::Catalog => "carrier_catalog",
             ProfileOrigin::Database => "database",
+            ProfileOrigin::Derived => "derived",
         }
     }
 }
@@ -39,6 +42,7 @@ impl ProfileOrigin {
 pub struct ResolvedProfile {
     pub profile: &'static CarrierProfile,
     pub origin: ProfileOrigin,
+    pub fallback_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -262,6 +266,7 @@ impl ProfileStore {
             return Some(ResolvedProfile {
                 profile: record.intern(),
                 origin: ProfileOrigin::Database,
+                fallback_reason: None,
             });
         }
         self.catalog
@@ -270,6 +275,7 @@ impl ProfileStore {
             .map(|entry| ResolvedProfile {
                 profile: entry.record.intern(),
                 origin: ProfileOrigin::Catalog,
+                fallback_reason: None,
             })
     }
 
@@ -292,6 +298,7 @@ impl ProfileStore {
                 return Ok(Some(ResolvedProfile {
                     profile: record.intern(),
                     origin: ProfileOrigin::Database,
+                    fallback_reason: None,
                 }));
             }
             let profile = self.catalog.get(profile_id, access)?.ok_or_else(|| {
@@ -303,6 +310,7 @@ impl ProfileStore {
             return Ok(Some(ResolvedProfile {
                 profile: profile.record.intern(),
                 origin: ProfileOrigin::Catalog,
+                fallback_reason: None,
             }));
         }
 
@@ -335,18 +343,66 @@ impl ProfileStore {
             return Ok(Some(ResolvedProfile {
                 profile: record.intern(),
                 origin: ProfileOrigin::Database,
+                fallback_reason: None,
             }));
         }
-        if home_plmn.is_none() && self.catalog.imsi_has_ambiguous_plmn(digits)? {
-            return Ok(None);
-        }
-        let profile = self
-            .catalog
-            .resolve_for_imsi(digits, home_plmn, access)?
-            .map(|profile| profile.record.intern())
-            .map(ResolvedProfile::from);
-        Ok(profile)
+        let catalog_result = match self.catalog.imsi_has_ambiguous_plmn(digits) {
+            Ok(true) if home_plmn.is_none() => Ok(None),
+            Ok(_) => self.catalog.resolve_for_imsi(digits, home_plmn, access),
+            Err(error) => Err(error),
+        };
+        let fallback_reason = match catalog_result {
+            Ok(Some(profile)) => {
+                return Ok(Some(ResolvedProfile::from(profile.record.intern())));
+            }
+            Ok(None) => {
+                let identity_hint = home_plmn
+                    .map(|plmn| format!("home_plmn:{plmn}"))
+                    .unwrap_or_else(|| {
+                        let prefix = digits.get(..digits.len().min(6)).unwrap_or("unknown");
+                        format!("imsi_prefix:{prefix}")
+                    });
+                format!(
+                    "carrier_catalog_no_usable_profile:{identity_hint}:access:{}",
+                    access.as_str()
+                )
+            }
+            Err(error) => error,
+        };
+
+        Ok(derive_standard_fallback(
+            digits,
+            home_plmn,
+            access,
+            fallback_reason,
+        ))
     }
+}
+
+fn derive_standard_fallback(
+    imsi: &str,
+    home_plmn: Option<&str>,
+    access: CatalogAccessKind,
+    fallback_reason: String,
+) -> Option<ResolvedProfile> {
+    let inferred_length = if imsi.starts_with("460") { 5 } else { 6 };
+    let plmn = home_plmn
+        .filter(|plmn| {
+            matches!(plmn.len(), 5 | 6)
+                && plmn.bytes().all(|byte| byte.is_ascii_digit())
+                && imsi.starts_with(*plmn)
+        })
+        .or_else(|| imsi.get(..inferred_length))?;
+    let standard_access = match access {
+        CatalogAccessKind::LteEpc => profiles::Standard3gppAccess::LteEpc,
+        CatalogAccessKind::WifiEpdg => profiles::Standard3gppAccess::WifiEpdg,
+    };
+    let profile = profiles::derive_standard_3gpp_profile(&plmn[..3], &plmn[3..], standard_access)?;
+    Some(ResolvedProfile {
+        profile,
+        origin: ProfileOrigin::Derived,
+        fallback_reason: Some(fallback_reason),
+    })
 }
 
 impl From<&'static CarrierProfile> for ResolvedProfile {
@@ -354,6 +410,7 @@ impl From<&'static CarrierProfile> for ResolvedProfile {
         Self {
             profile,
             origin: ProfileOrigin::Catalog,
+            fallback_reason: None,
         }
     }
 }
@@ -388,7 +445,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_is_listed_and_unknown_carriers_are_not_derived() {
+    fn catalog_is_listed_and_missing_carriers_use_derived_fallback() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let (store, path) = store_with_catalog();
 
@@ -398,10 +455,16 @@ mod tests {
         assert_eq!(listed[1].profile_id, "test-v7-23434");
         assert!(listed[0].source.starts_with("carrier_catalog:"));
         assert!(store.resolve_by_plmn("460", "01").is_none());
-        assert!(store
+        let fallback = store
             .resolve_for_imsi_access(None, "460011234567890", None, CatalogAccessKind::LteEpc)
             .expect("unknown profile query")
-            .is_none());
+            .expect("standard fallback");
+        assert_eq!(fallback.origin, ProfileOrigin::Derived);
+        assert_eq!(fallback.profile.meta.profile_id, "derived_3gpp_lte_46001");
+        assert!(fallback
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("carrier_catalog_no_usable_profile")));
         store.publish();
         let published = profiles::resolve_for_line(None, "234330123456789", Some("23433"))
             .expect("published catalog match");
@@ -427,6 +490,10 @@ mod tests {
         assert_eq!(wifi.profile.epdg.apn, Some("wifi-ims"));
         assert_eq!(lte.profile.epdg.apn, Some("lte-ims"));
         assert_eq!(lte.profile.ims.register.expires_seconds, 1800);
+        assert_eq!(wifi.origin, ProfileOrigin::Catalog);
+        assert_eq!(lte.origin, ProfileOrigin::Catalog);
+        assert!(wifi.fallback_reason.is_none());
+        assert!(lte.fallback_reason.is_none());
 
         std::fs::remove_file(path).expect("remove fixture");
     }
@@ -506,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_match_reports_a_known_but_non_ready_lte_profile() {
+    fn automatic_match_derives_when_known_lte_profile_is_not_ready() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let (store, path) = store_with_catalog();
         {
@@ -519,18 +586,26 @@ mod tests {
             .expect("mark automatic profile unknown");
         }
 
-        let error = store
+        let resolved = store
             .resolve_for_imsi_access(
                 None,
                 "234330123456789",
                 Some("23433"),
                 CatalogAccessKind::LteEpc,
             )
-            .expect_err("known non-ready profile must explain why it cannot be used");
+            .expect("automatic match should derive")
+            .expect("derived profile");
+        assert_eq!(resolved.origin, ProfileOrigin::Derived);
+        assert_eq!(resolved.profile.meta.profile_id, "derived_3gpp_lte_23433");
         assert_eq!(
-            error,
-            "carrier_catalog_profile_not_ready:test-v7-23433:lte_epc:unknown"
+            resolved.fallback_reason.as_deref(),
+            Some("carrier_catalog_profile_not_ready:test-v7-23433:lte_epc:unknown")
         );
+        assert_eq!(
+            resolved.profile.ims.register.access_network_info,
+            "3GPP-E-UTRAN-FDD"
+        );
+        assert!(!resolved.profile.ims.register.include_visited_network);
 
         std::fs::remove_file(path).expect("remove fixture");
     }

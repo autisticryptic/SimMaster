@@ -43,6 +43,8 @@ pub struct VowifiProfilesResponse {
 pub struct VowifiProfileMatchResponse {
     pub matched: bool,
     pub matched_prefix: Option<String>,
+    pub profile_source: Option<String>,
+    pub profile_fallback_reason: Option<String>,
     pub profile: Option<PublicCarrierProfile>,
     pub sim_auth: Option<PublicAkaAdapterPlan>,
     pub epdg: Option<PublicEpdgPlan>,
@@ -1120,9 +1122,13 @@ fn matched_response(
     matched_prefix: String,
     sim: MaskedSimIdentity,
 ) -> VowifiProfileMatchResponse {
+    let derived = profiles::is_standard_derived_profile(profile);
     VowifiProfileMatchResponse {
         matched: true,
         matched_prefix: Some(matched_prefix),
+        profile_source: Some(if derived { "derived" } else { "database" }.to_string()),
+        profile_fallback_reason: derived
+            .then(|| "carrier_database_no_usable_profile:access:wifi_epdg".to_string()),
         profile: Some(PublicCarrierProfile::from_profile(profile)),
         sim_auth: Some(PublicAkaAdapterPlan::from_profile(profile)),
         epdg: Some(PublicEpdgPlan::from_profile(profile)),
@@ -1140,12 +1146,16 @@ fn match_profile_from_parts(
     operator_id_for_matching: &str,
 ) -> VowifiProfileMatchResponse {
     // A SIM-bound pin published into this line's connection snapshot is the
-    // operator's explicit choice and wins over automatic matching. A pin that no longer resolves degrades to the
-    // automatic path below, so deleting a profile never strands a line.
+    // operator's explicit choice and wins over automatic matching. An invalid
+    // pin remains unmatched so inferred settings never replace a user choice.
     if let Some(profile_id) = pinned_profile_id {
         if let Some(profile) = profiles::resolve_pinned_database_profile(profile_id) {
             return matched_response(profile, profile.meta.plmn.to_string(), sim);
         }
+        return VowifiProfileMatchResponse {
+            sim,
+            ..Default::default()
+        };
     }
 
     let operator_digits: String = operator_id_for_matching
@@ -1160,7 +1170,7 @@ fn match_profile_from_parts(
         }
     }
 
-    if let Some(matched) = profiles::resolve_by_imsi(imsi_for_matching) {
+    if let Some(matched) = profiles::resolve_for_line(None, imsi_for_matching, None) {
         return matched_response(matched.profile, matched.matched_prefix, sim);
     }
 
@@ -1225,5 +1235,41 @@ mod tests {
         );
         assert_eq!(matched.ims.as_ref().map(|ims| ims.transport), Some("tcp"));
         assert_eq!(matched.matched_prefix.as_deref(), Some("20404"));
+    }
+
+    #[test]
+    fn missing_database_profile_is_exposed_as_standard_derived() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let sim = MaskedSimIdentity {
+            present: true,
+            ..Default::default()
+        };
+
+        let matched = match_profile_from_parts(sim, None, "460001234567890", "");
+
+        assert!(matched.matched);
+        assert_eq!(matched.profile_source.as_deref(), Some("derived"));
+        assert_eq!(
+            matched.profile_fallback_reason.as_deref(),
+            Some("carrier_database_no_usable_profile:access:wifi_epdg")
+        );
+        assert_eq!(
+            matched.profile.as_ref().map(|profile| profile.profile_id),
+            Some("derived_3gpp_vowifi_46000")
+        );
+    }
+
+    #[test]
+    fn invalid_explicit_pin_does_not_use_standard_derivation() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let response = match_profile_from_parts(
+            MaskedSimIdentity::default(),
+            Some("missing-explicit-profile"),
+            "460001234567890",
+            "46000",
+        );
+
+        assert!(!response.matched);
+        assert!(response.profile_source.is_none());
     }
 }
