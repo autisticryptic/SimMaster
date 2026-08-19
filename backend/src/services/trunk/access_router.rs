@@ -341,7 +341,7 @@ async fn run_router(
                     if response.is_closed() {
                         continue;
                     }
-                    let result = route_call_plan(plan, &policy, &backends, &mut routes);
+                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes);
                     let _ = response.send(result);
                 }
                 Some(RouterRequest::CallAccess { call_id, response }) => {
@@ -364,6 +364,7 @@ async fn run_router(
 
 fn route_call_plan(
     plan: VoiceCallPlan,
+    trunk: &OperatorLink,
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &mut HashMap<String, CallRoute>,
@@ -379,6 +380,14 @@ fn route_call_plan(
             continue;
         };
         if selected.link.send_command(command.clone()).is_ok() {
+            // There is no await between accepting the backend command and
+            // publishing this event, so live provisional/final events cannot
+            // overtake creation of the API/history call record.
+            trunk.send_event(OperatorEvent::Started {
+                call_id: plan.call_id.clone(),
+                caller: plan.caller.clone(),
+                callee: plan.callee.clone(),
+            });
             routes.insert(
                 plan.call_id.clone(),
                 CallRoute {
@@ -489,6 +498,13 @@ fn route_command(
 ) {
     let call_id = command_call_id(&command).to_string();
     if matches!(&command, OperatorCommand::StartCall { .. }) {
+        if let OperatorCommand::StartCall { caller, callee, .. } = &command {
+            trunk.send_event(OperatorEvent::Started {
+                call_id: call_id.clone(),
+                caller: caller.clone(),
+                callee: callee.clone(),
+            });
+        }
         let video_required = matches!(
             &command,
             OperatorCommand::StartCall { offer, .. } if offer.video.is_some()
@@ -650,7 +666,8 @@ fn command_call_id(command: &OperatorCommand) -> &str {
 
 fn event_call_id(event: &OperatorEvent) -> &str {
     match event {
-        OperatorEvent::Incoming { call_id, .. }
+        OperatorEvent::Started { call_id, .. }
+        | OperatorEvent::Incoming { call_id, .. }
         | OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Renegotiate { call_id, .. }
@@ -774,6 +791,15 @@ mod tests {
             .expect("operator command channel closed")
     }
 
+    async fn recv_event(
+        receiver: &mut tokio::sync::broadcast::Receiver<OperatorEvent>,
+    ) -> OperatorEvent {
+        tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("operator event timed out")
+            .expect("operator event channel closed")
+    }
+
     #[tokio::test]
     async fn pins_all_commands_to_the_selected_access_leg() {
         let vowifi = OperatorLink::default();
@@ -790,9 +816,15 @@ mod tests {
             ],
         );
         let trunk = router.operator_link();
+        let mut trunk_events = trunk.subscribe_events();
         wait_available(&trunk).await;
 
         trunk.send_command(start("call-a")).unwrap();
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, caller, callee }
+                if call_id == "call-a" && caller == "6108" && callee == "+601112023012"
+        ));
         assert!(matches!(
             recv_command(&mut vowifi_commands).await,
             OperatorCommand::StartCall { .. }
@@ -833,6 +865,7 @@ mod tests {
                 (AccessPathKind::Volte, volte),
             ],
         );
+        let mut lifecycle_events = router.operator_link().subscribe_events();
 
         let queued = router
             .start_call(call_plan("local-voicemail-a"))
@@ -840,6 +873,13 @@ mod tests {
             .unwrap();
         assert_eq!(queued.call_id, "local-voicemail-a");
         assert_eq!(queued.access, AccessPathKind::Volte);
+        assert!(matches!(
+            recv_event(&mut lifecycle_events).await,
+            OperatorEvent::Started { call_id, caller, callee }
+                if call_id == "local-voicemail-a"
+                    && caller == "6108"
+                    && callee == "+601112023012"
+        ));
         assert!(matches!(
             recv_command(&mut volte_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-a"

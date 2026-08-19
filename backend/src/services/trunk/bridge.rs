@@ -136,6 +136,13 @@ pub enum OperatorCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorEvent {
+    /// Emitted by the aggregate voice router when a StartCall command is
+    /// accepted, including calls originated through the Asterisk trunk.
+    Started {
+        call_id: String,
+        caller: String,
+        callee: String,
+    },
     Incoming {
         call_id: String,
         caller: String,
@@ -393,6 +400,11 @@ impl TrunkBridge {
         &mut self,
         event: OperatorEvent,
     ) -> Result<BridgeOutput, BridgeError> {
+        // Lifecycle metadata is consumed by the API call tracker and does not
+        // represent a SIP response or in-dialog request for Asterisk.
+        if matches!(&event, OperatorEvent::Started { .. }) {
+            return Ok(BridgeOutput::default());
+        }
         if let OperatorEvent::Incoming {
             call_id,
             caller,
@@ -402,6 +414,7 @@ impl TrunkBridge {
             return self.start_operator_incoming(call_id, &caller, &body);
         }
         let call_id = match &event {
+            OperatorEvent::Started { .. } => unreachable!("handled above"),
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { call_id, .. }
             | OperatorEvent::Answered { call_id, .. }
@@ -432,6 +445,7 @@ impl TrunkBridge {
             .clone()
             .unwrap_or_else(|| call.dialog.initial_invite.clone());
         match event {
+            OperatorEvent::Started { .. } => unreachable!("handled above"),
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { status, body, .. } => {
                 if call.pending_invite.is_none() {
@@ -1543,6 +1557,22 @@ mod tests {
         );
         frame.extend_from_slice(sdp());
         frame
+    }
+
+    #[test]
+    fn started_lifecycle_metadata_does_not_require_an_asterisk_dialog() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        );
+        let output = bridge
+            .handle_operator_event(OperatorEvent::Started {
+                call_id: "api-call-a".into(),
+                caller: "simadmin".into(),
+                callee: "+601112023012".into(),
+            })
+            .unwrap();
+        assert_eq!(output, BridgeOutput::default());
     }
 
     #[test]

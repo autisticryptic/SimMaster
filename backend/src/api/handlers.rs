@@ -4359,7 +4359,6 @@ async fn start_routed_ims_voice_call(
         .await
         .map_err(|error| error.to_string())?;
     let path = format!("ims:{}", queued.call_id);
-    track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
     Ok((line_id, path, queued.access.transport_tag()))
 }
 
@@ -4823,6 +4822,19 @@ fn ensure_ims_voice_listener(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
             match event {
+                crate::services::trunk::bridge::OperatorEvent::Started {
+                    call_id, callee, ..
+                } => {
+                    track_call_start(
+                        &app,
+                        &line_id,
+                        &format!("ims:{call_id}"),
+                        "outgoing",
+                        &callee,
+                        false,
+                    )
+                    .await;
+                }
                 crate::services::trunk::bridge::OperatorEvent::Incoming {
                     call_id,
                     caller,

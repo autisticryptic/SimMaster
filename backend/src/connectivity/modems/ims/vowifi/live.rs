@@ -2679,6 +2679,7 @@ fn operator_event_call_outcome(
     event: &OperatorEvent,
 ) -> Option<(voice::MoCallSipOutcome, bool)> {
     let event_call_id = match event {
+        OperatorEvent::Started { .. } => return None,
         OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Rejected { call_id, .. }
@@ -2746,7 +2747,8 @@ fn operator_event_call_outcome(
             outcome.failure_cause = Some("cancelled".to_string());
             true
         }
-        OperatorEvent::Incoming { .. }
+        OperatorEvent::Started { .. }
+        | OperatorEvent::Incoming { .. }
         | OperatorEvent::Renegotiate { .. }
         | OperatorEvent::Dtmf { .. }
         | OperatorEvent::TransferResponse { .. }
