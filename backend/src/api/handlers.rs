@@ -4880,6 +4880,9 @@ fn ensure_ims_voice_listener(
                 crate::services::trunk::bridge::OperatorEvent::Answered { call_id, .. } => {
                     mark_tracked_call_answered(&app, &format!("ims:{call_id}")).await;
                 }
+                crate::services::trunk::bridge::OperatorEvent::Connected { call_id } => {
+                    mark_tracked_call_answered(&app, &format!("ims:{call_id}")).await;
+                }
                 crate::services::trunk::bridge::OperatorEvent::Rejected {
                     call_id,
                     diagnostic,

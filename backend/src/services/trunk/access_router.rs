@@ -667,6 +667,7 @@ fn command_call_id(command: &OperatorCommand) -> &str {
 fn event_call_id(event: &OperatorEvent) -> &str {
     match event {
         OperatorEvent::Started { call_id, .. }
+        | OperatorEvent::Connected { call_id }
         | OperatorEvent::Incoming { call_id, .. }
         | OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }

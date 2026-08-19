@@ -2550,6 +2550,7 @@ async fn handle_operator_command(
     let initial_call = matches!(&command, OperatorCommand::StartCall { .. });
     let renegotiate = matches!(&command, OperatorCommand::Renegotiate { .. });
     let transfer = matches!(&command, OperatorCommand::TransferCall { .. });
+    let connected = matches!(&command, OperatorCommand::AcceptCall { .. });
     let result = handle_operator_command_inner(live, runtime, command).await;
     if result.is_err() && initial_call {
         if result
@@ -2595,6 +2596,10 @@ async fn handle_operator_command(
             .unwrap_or(500);
         live.operator
             .send_event(OperatorEvent::TransferResponse { call_id, status });
+    }
+    if result.is_ok() && connected {
+        live.operator
+            .send_event(OperatorEvent::Connected { call_id });
     }
     result
 }

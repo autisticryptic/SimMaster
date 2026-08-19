@@ -468,6 +468,8 @@ async fn run_async_relay(
 ) -> std_io::Result<()> {
     let mut operator_buf = vec![0u8; 65_535];
     let mut internal_buf = vec![0u8; 65_535];
+    let mut operator_send_failed = false;
+    let mut internal_send_failed = false;
     loop {
         tokio::select! {
             changed = stop.changed() => {
@@ -477,8 +479,7 @@ async fn run_async_relay(
             }
             received = operator_socket.recv_from(&mut operator_buf) => {
                 let (len, source) = received?;
-                if matches!(
-                    forward_async(
+                match forward_async(
                     &mut core,
                     RelayLeg::Operator,
                     source,
@@ -486,19 +487,30 @@ async fn run_async_relay(
                     &internal_socket,
                     policy.allows_rtp_from(RelayLeg::Operator),
                 )
-                .await,
-                    Some(MediaDatagramKind::Rtp)
-                ) {
-                    if let Some(metrics) = metrics.as_ref() {
-                        metrics.record_rtp_to_asterisk(len);
+                .await {
+                    Ok(Some(MediaDatagramKind::Rtp)) => {
+                        internal_send_failed = false;
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_rtp_to_asterisk(len);
+                        }
+                        let _ = first_operator_rtp.send(true);
                     }
-                    let _ = first_operator_rtp.send(true);
+                    Ok(_) => internal_send_failed = false,
+                    Err(error) => {
+                        if !internal_send_failed {
+                            tracing::warn!(
+                                from_leg = RelayLeg::Operator.as_str(),
+                                %error,
+                                "IMS media relay UDP send failed"
+                            );
+                        }
+                        internal_send_failed = true;
+                    }
                 }
             }
             received = internal_socket.recv_from(&mut internal_buf) => {
                 let (len, source) = received?;
-                if matches!(
-                    forward_async(
+                match forward_async(
                     &mut core,
                     RelayLeg::Internal,
                     source,
@@ -506,11 +518,23 @@ async fn run_async_relay(
                     &operator_socket,
                     policy.allows_rtp_from(RelayLeg::Internal),
                 )
-                .await,
-                    Some(MediaDatagramKind::Rtp)
-                ) {
-                    if let Some(metrics) = metrics.as_ref() {
-                        metrics.record_rtp_from_asterisk(len);
+                .await {
+                    Ok(Some(MediaDatagramKind::Rtp)) => {
+                        operator_send_failed = false;
+                        if let Some(metrics) = metrics.as_ref() {
+                            metrics.record_rtp_from_asterisk(len);
+                        }
+                    }
+                    Ok(_) => operator_send_failed = false,
+                    Err(error) => {
+                        if !operator_send_failed {
+                            tracing::warn!(
+                                from_leg = RelayLeg::Internal.as_str(),
+                                %error,
+                                "IMS media relay UDP send failed"
+                            );
+                        }
+                        operator_send_failed = true;
                     }
                 }
             }
@@ -525,25 +549,25 @@ async fn forward_async(
     datagram: &[u8],
     send_socket: &UdpSocket,
     allow_rtp: bool,
-) -> Option<MediaDatagramKind> {
+) -> std_io::Result<Option<MediaDatagramKind>> {
     let Ok(decision) = core.ingest(leg, source, datagram) else {
-        return None;
+        return Ok(None);
     };
     if decision.kind == MediaDatagramKind::Rtp && !allow_rtp {
-        return None;
+        return Ok(None);
     }
     if decision.kind == MediaDatagramKind::Rtp {
         if let Some(payload_type) = decision.rewrite_payload_type {
             if let Some(rewritten) = rewrite_rtp_payload_type(datagram, payload_type) {
-                let _ = send_socket.send_to(&rewritten, decision.dest).await;
+                send_socket.send_to(&rewritten, decision.dest).await?;
             }
         } else {
-            let _ = send_socket.send_to(datagram, decision.dest).await;
+            send_socket.send_to(datagram, decision.dest).await?;
         }
     } else {
-        let _ = send_socket.send_to(datagram, decision.dest).await;
+        send_socket.send_to(datagram, decision.dest).await?;
     }
-    Some(decision.kind)
+    Ok(Some(decision.kind))
 }
 
 #[cfg(test)]

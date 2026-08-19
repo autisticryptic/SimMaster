@@ -143,6 +143,11 @@ pub enum OperatorEvent {
         caller: String,
         callee: String,
     },
+    /// Lifecycle metadata emitted after an incoming call's 200 OK has been
+    /// sent to the operator. It must not generate another SIP response.
+    Connected {
+        call_id: String,
+    },
     Incoming {
         call_id: String,
         caller: String,
@@ -402,7 +407,10 @@ impl TrunkBridge {
     ) -> Result<BridgeOutput, BridgeError> {
         // Lifecycle metadata is consumed by the API call tracker and does not
         // represent a SIP response or in-dialog request for Asterisk.
-        if matches!(&event, OperatorEvent::Started { .. }) {
+        if matches!(
+            &event,
+            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. }
+        ) {
             return Ok(BridgeOutput::default());
         }
         if let OperatorEvent::Incoming {
@@ -414,7 +422,9 @@ impl TrunkBridge {
             return self.start_operator_incoming(call_id, &caller, &body);
         }
         let call_id = match &event {
-            OperatorEvent::Started { .. } => unreachable!("handled above"),
+            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => {
+                unreachable!("handled above")
+            }
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { call_id, .. }
             | OperatorEvent::Answered { call_id, .. }
@@ -445,7 +455,9 @@ impl TrunkBridge {
             .clone()
             .unwrap_or_else(|| call.dialog.initial_invite.clone());
         match event {
-            OperatorEvent::Started { .. } => unreachable!("handled above"),
+            OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => {
+                unreachable!("handled above")
+            }
             OperatorEvent::Incoming { .. } => unreachable!("handled above"),
             OperatorEvent::Provisional { status, body, .. } => {
                 if call.pending_invite.is_none() {

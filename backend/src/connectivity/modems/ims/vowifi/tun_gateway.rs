@@ -90,6 +90,26 @@ impl TunGatewayRuntime {
         self.started_at.elapsed().as_millis()
     }
 
+    /// Route a media endpoint learned from operator SDP through the ePDG TUN.
+    /// Signaling routes only cover the P-CSCF addresses; RTP servers commonly
+    /// use separate addresses that must not fall back to the host default route.
+    pub(crate) fn ensure_media_route(&self, remote: IpAddr) -> Result<(), TunGatewayError> {
+        if self.inner_addr.is_ipv4() != remote.is_ipv4() {
+            return Err(tun_error("tun_gateway_media_route_family_mismatch"));
+        }
+        if remote.is_unspecified() || remote.is_multicast() {
+            return Err(tun_error("tun_gateway_media_route_invalid"));
+        }
+        platform_ensure_tun_host_route(&self.tun_name, self.inner_addr, remote)?;
+        tracing::info!(
+            tun_name = %self.tun_name,
+            inner_addr = %self.inner_addr,
+            media_remote = %remote,
+            "VoWiFi media host route installed"
+        );
+        Ok(())
+    }
+
     pub(crate) fn install_ims_esp_policy(
         &self,
         config: ImsEspPolicyConfig,
@@ -315,6 +335,24 @@ fn platform_shutdown_tun(tun_name: &str) {
 
 #[cfg(not(target_os = "linux"))]
 fn platform_shutdown_tun(_tun_name: &str) {}
+
+#[cfg(target_os = "linux")]
+fn platform_ensure_tun_host_route(
+    tun_name: &str,
+    inner_addr: IpAddr,
+    remote: IpAddr,
+) -> Result<(), TunGatewayError> {
+    imp::ensure_tun_host_route(tun_name, inner_addr, remote)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn platform_ensure_tun_host_route(
+    _tun_name: &str,
+    _inner_addr: IpAddr,
+    _remote: IpAddr,
+) -> Result<(), TunGatewayError> {
+    Err(tun_error("tun_gateway_platform_unsupported"))
+}
 
 #[cfg(target_os = "linux")]
 mod imp {
@@ -822,6 +860,32 @@ mod imp {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn ensure_tun_host_route(
+        tun_name: &str,
+        inner_addr: IpAddr,
+        remote: IpAddr,
+    ) -> Result<(), TunGatewayError> {
+        let route_target = match remote {
+            IpAddr::V4(addr) => format!("{addr}/32"),
+            IpAddr::V6(addr) => format!("{addr}/128"),
+        };
+        let inner_addr = inner_addr.to_string();
+        run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &[
+                "route",
+                "replace",
+                &route_target,
+                "dev",
+                tun_name,
+                "src",
+                &inner_addr,
+            ],
+            "tun_gateway_media_route_failed",
+            false,
+        )
     }
 
     fn route_targets(config: &TunGatewayConfig) -> Vec<IpAddr> {

@@ -20,6 +20,8 @@
 5. 失败后 Asterisk 为 0 channel/0 call，SimAdmin 为 0 active call/0 active dialog/0 active media relay，未发现 SIP 或 RTP 资源泄漏。
 6. 本地 Linphone 来电振铃和取消清理正常；未将这项本地 SIP 行为误记为运营商 VoWiFi 来电验收。
 7. 部署提交 `8a3c808` 后再次通过 HTTP API 单次外呼：历史记录由 3 条增至 4 条，仅新增 `id=4`，约 1 秒内以 `480 / carrier_service_control_release / carrier_policy / retryable=false` 完整结束，`carrier_reason` 为 `Release Call received from CAP`。10 次逐秒轮询中活动呼叫均为 0，未再产生重复记录或悬空 `dialing` 记录。
+8. 在飞行模式、基带 `disabled` 条件下完成两次真实 VoWiFi 呼入。Asterisk/Linphone 均正常振铃、接听并收到运营商 BYE；第二次通话 Asterisk 记录 `ANSWERED`，接通 19 秒。
+9. 第二次呼入的全接口抓包确认单向语音根因：运营商 RTP 为 `172.20.225.45:20478 <-> 2.55.30.230:50176`。下行从 `sa_vwf0c93197` TUN 正常进入，上行却从 `wlan0` 发出；同时 `192.168.100.5:10156 <-> 192.168.100.13:38981` 的 Asterisk RTP 双向连续，证明 Linphone、Asterisk 和 SimAdmin 内部媒体腿正常。
 
 ## 本轮发现并修复的代码问题
 
@@ -29,6 +31,12 @@
 - HTTP/API 发起呼叫时，快速的 provisional/final 响应可能早于历史记录创建，导致失败呼叫偶发残留为 `dialing`。
 
 修复后，路由器在后端接受 `StartCall` 后立即发布携带 caller/callee 的 `OperatorEvent::Started`。线路监听器以 `line_id + call_id` 创建或复用记录，后续 `Rejected`、`Unavailable`、`Ended`、`Cancelled` 统一结束记录。Asterisk bridge 将该事件作为元数据 no-op，不改变 SIP 对话或 VoWiFi/VoLTE 选路。
+
+呼入媒体复测又发现两个问题并在源码中修复：
+
+- ePDG TUN 原本只安装 P-CSCF 主机路由，未覆盖通话 SDP 动态给出的 RTP/视频服务器。现在呼入、外呼应答和网络 re-INVITE 都会为协商媒体 IP 安装 `/32` 或 `/128` TUN 主机路由，路由随线路 TUN 生命周期清理。
+- RTP 中继原本忽略 UDP `send_to` 错误并照常累计成功计数。现在只统计实际发送成功的数据包，并对每个方向的首个连续发送错误记录诊断日志。
+- 已接听的 IMS 呼入原本只产生 `Incoming -> Ended` 事件，历史会误记为未接。现在 VoWiFi/VoLTE 在向运营商成功发送接听响应后发布线路级 `Connected` 元数据，由历史监听器标记为已接听；Asterisk bridge 将其作为 no-op，避免重复生成 SIP 响应。
 
 新增测试覆盖：
 
@@ -41,10 +49,10 @@
 本次运营商在被叫振铃/接通前执行 CAP 释放，因此以下项目不能伪报为通过：
 
 - VoWiFi 外呼 200 OK、被叫接听、远端拒接、未接和正常 BYE。
-- 双向 RTP、测试音频注入、SIP INFO/RFC 4733 DTMF。
+- 部署动态媒体路由修复后的双向 RTP、测试音频注入、SIP INFO/RFC 4733 DTMF。
 - hold/resume、失败 re-INVITE 后保留原媒体、音频与视频切换。
 - H.264 视频 RTP、拒绝视频升级后保留语音、VoWiFi 视频和 ViLTE 实网互操作。
-- 真实运营商来电、接听、拒接和未接记录。
+- 真实运营商来电的拒接和未接记录，以及修复后的已接听历史记录。
 - 多线路、EC20/EC25/EG25/EG600 与 USB SIM 读卡器实机矩阵（缺少硬件）。
 
 ## 下一次复测门槛

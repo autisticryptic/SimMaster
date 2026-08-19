@@ -69,6 +69,13 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 const LIVE_DNS_TIMEOUT: Duration = Duration::from_secs(8);
+
+impl super::operator::MediaRouteInstaller for TunGatewayRuntime {
+    fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String> {
+        TunGatewayRuntime::ensure_media_route(self, remote)
+            .map_err(|error| error.reason().to_string())
+    }
+}
 const LIVE_IKE_SA_INIT_TIMEOUT: Duration = Duration::from_secs(4);
 const LIVE_IKE_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 const LIVE_SIM_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -2679,7 +2686,7 @@ fn operator_event_call_outcome(
     event: &OperatorEvent,
 ) -> Option<(voice::MoCallSipOutcome, bool)> {
     let event_call_id = match event {
-        OperatorEvent::Started { .. } => return None,
+        OperatorEvent::Started { .. } | OperatorEvent::Connected { .. } => return None,
         OperatorEvent::Provisional { call_id, .. }
         | OperatorEvent::Answered { call_id, .. }
         | OperatorEvent::Rejected { call_id, .. }
@@ -2748,6 +2755,7 @@ fn operator_event_call_outcome(
             true
         }
         OperatorEvent::Started { .. }
+        | OperatorEvent::Connected { .. }
         | OperatorEvent::Incoming { .. }
         | OperatorEvent::Renegotiate { .. }
         | OperatorEvent::Dtmf { .. }
@@ -2916,6 +2924,11 @@ async fn record_live_ims_channel(
 ) {
     let route = channel.route();
     let expires_at = Instant::now() + registration.lease.expires_after;
+    let media_route_installer: Option<Arc<dyn super::operator::MediaRouteInstaller>> =
+        cached_tun_gateway(line_id, profile)
+            .await
+            .ok()
+            .map(|gateway| gateway as Arc<dyn super::operator::MediaRouteInstaller>);
     xcap_binding_cache().lock().await.insert(
         line_id.to_string(),
         LiveXcapBinding {
@@ -2947,6 +2960,7 @@ async fn record_live_ims_channel(
                 next_cseq: next_register_cseq,
                 security_verify: security_verify.clone(),
             })),
+            media_route_installer,
         },
         channel,
     )
