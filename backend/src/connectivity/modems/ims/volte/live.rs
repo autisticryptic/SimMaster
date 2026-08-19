@@ -3420,6 +3420,14 @@ async fn handle_operator_sip_frame(
     }
 
     if sip::is_request(frame, "BYE") {
+        let call = session.voice_calls.get(&trunk_call_id);
+        tracing::info!(
+            ims_call_id = %ims_call_id,
+            trunk_call_id = %trunk_call_id,
+            operator_reinvite_pending = call.is_some_and(|call| call.pending_operator_reinvite.is_some()),
+            asterisk_reinvite_pending = call.is_some_and(|call| call.pending_asterisk_reinvite),
+            "Received operator BYE for VoLTE call"
+        );
         let response = sip::build_response(frame, 200, "OK", None, None, None);
         session
             .channel

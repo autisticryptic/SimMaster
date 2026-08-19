@@ -1404,6 +1404,14 @@ async fn handle_frame(
     }
     if let Some(call_id) = trunk_call_id {
         if sip_frame::is_request(frame, "BYE") {
+            let call = session.calls.get(&call_id);
+            tracing::info!(
+                ims_call_id = %ims_call_id,
+                trunk_call_id = %call_id,
+                network_reinvite_pending = call.is_some_and(|call| call.pending_network_reinvite.is_some()),
+                trunk_reinvite_pending = call.is_some_and(|call| call.pending_trunk_reinvite),
+                "Received operator BYE for VoWiFi call"
+            );
             let response = sip::build_response_for_access(
                 frame,
                 200,

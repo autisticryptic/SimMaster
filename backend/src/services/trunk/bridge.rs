@@ -232,6 +232,10 @@ struct BridgedCall {
     operator_reinvite: Option<Vec<u8>>,
     transfer: Option<BridgedTransfer>,
     hangup_after_ack: bool,
+    /// The operator ended the call while our Asterisk-side re-INVITE was
+    /// still outstanding.  A BYE must wait until that INVITE transaction has
+    /// a final response, otherwise Asterisk/Linphone may leave the dialog up.
+    hangup_after_reinvite: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +363,7 @@ impl TrunkBridge {
                 operator_reinvite: None,
                 transfer: None,
                 hangup_after_ack: false,
+                hangup_after_reinvite: false,
             },
         );
         Ok(BridgeOutput {
@@ -450,12 +455,20 @@ impl TrunkBridge {
             | OperatorEvent::Cancelled { call_id } => call_id,
         }
         .clone();
-        let asterisk_call_id = self
+        let Some(asterisk_call_id) = self
             .calls
             .iter()
             .find(|(_, call)| call.operator_call_id == call_id)
             .map(|(asterisk_call_id, _)| asterisk_call_id.clone())
-            .ok_or_else(|| BridgeError::InvalidState("operator_call_unknown".to_string()))?;
+        else {
+            if matches!(&event, OperatorEvent::Ended { .. }) {
+                tracing::debug!(operator_call_id = %call_id, "Ignoring duplicate operator end for an already closed trunk call");
+                return Ok(BridgeOutput::default());
+            }
+            return Err(BridgeError::InvalidState(
+                "operator_call_unknown".to_string(),
+            ));
+        };
         let Some(call) = self.calls.get_mut(&asterisk_call_id) else {
             return Err(BridgeError::InvalidState(
                 "operator_call_unknown".to_string(),
@@ -528,7 +541,7 @@ impl TrunkBridge {
                         .map_err(BridgeError::InvalidState)?;
                     let reinvite = sip::build_dialog_request(&DialogRequest {
                         method: "INVITE",
-                        request_uri: &call.dialog.remote_uri,
+                        request_uri: &call.dialog.remote_target,
                         local_addr: self.local_addr,
                         from_uri: &call.dialog.local_uri,
                         from_tag: &call.dialog.local_tag,
@@ -563,7 +576,7 @@ impl TrunkBridge {
                     sip::build_dialog_request_with_content_type(
                         &DialogRequest {
                             method: "INFO",
-                            request_uri: &call.dialog.remote_uri,
+                            request_uri: &call.dialog.remote_target,
                             local_addr: self.local_addr,
                             from_uri: &call.dialog.local_uri,
                             from_tag: &call.dialog.local_tag,
@@ -691,7 +704,7 @@ impl TrunkBridge {
                     output.asterisk_frames.push(
                         sip::build_dialog_request(&DialogRequest {
                             method: "BYE",
-                            request_uri: &call.dialog.remote_uri,
+                            request_uri: &call.dialog.remote_target,
                             local_addr: self.local_addr,
                             from_uri: &call.dialog.local_uri,
                             from_tag: &call.dialog.local_tag,
@@ -745,14 +758,49 @@ impl TrunkBridge {
                 call.pending_invite = None;
             }
             OperatorEvent::Ended { .. } => {
-                if call.dialog.state == InviteTransactionState::Confirmed {
+                tracing::info!(
+                    operator_call_id = %call.operator_call_id,
+                    asterisk_call_id = %call.dialog.call_id,
+                    dialog_state = ?call.dialog.state,
+                    operator_reinvite_pending = call.operator_reinvite.is_some(),
+                    asterisk_reinvite_pending = call.pending_invite.is_some(),
+                    "Operator ended trunk call"
+                );
+                if let Some(pending_invite) = call.pending_invite.take() {
+                    // Linphone/Asterisk is acting as the UAC for this
+                    // re-INVITE.  Complete that transaction before closing
+                    // the established dialog.
+                    output.asterisk_frames.push(
+                        sip::build_response_with_body(
+                            &pending_invite,
+                            487,
+                            "Request Terminated",
+                            Some(&call.dialog.local_tag),
+                            &[],
+                            &[],
+                        )
+                        .map_err(BridgeError::MalformedRequest)?,
+                    );
+                }
+                if call.operator_reinvite.is_some() {
+                    // We are the UAC for the outstanding re-INVITE.  CANCEL
+                    // it and defer BYE until its final response is ACKed.
+                    let reinvite = call
+                        .operator_reinvite
+                        .as_ref()
+                        .expect("checked operator re-INVITE presence");
+                    output
+                        .asterisk_frames
+                        .push(sip::build_cancel(reinvite).map_err(BridgeError::MalformedRequest)?);
+                    call.hangup_after_reinvite = true;
+                } else if call.dialog.state == InviteTransactionState::Confirmed {
                     let cseq = call
                         .dialog
                         .begin_local_request()
                         .map_err(BridgeError::InvalidState)?;
                     let bye = sip::build_dialog_request(&DialogRequest {
                         method: "BYE",
-                        request_uri: &call.dialog.remote_uri,
+                        request_uri: &call.dialog.remote_target,
                         local_addr: self.local_addr,
                         from_uri: &call.dialog.local_uri,
                         from_tag: &call.dialog.local_tag,
@@ -949,6 +997,7 @@ impl TrunkBridge {
                 operator_reinvite: None,
                 transfer: None,
                 hangup_after_ack: false,
+                hangup_after_reinvite: false,
             },
         );
         if self.operator == OperatorAvailability::Unavailable {
@@ -983,7 +1032,7 @@ impl TrunkBridge {
                     output.asterisk_frames.push(
                         sip::build_dialog_request(&DialogRequest {
                             method: "BYE",
-                            request_uri: &call.dialog.remote_uri,
+                            request_uri: &call.dialog.remote_target,
                             local_addr: self.local_addr,
                             from_uri: &call.dialog.local_uri,
                             from_tag: &call.dialog.local_tag,
@@ -1317,9 +1366,56 @@ impl TrunkBridge {
                 if (100..200).contains(&status) {
                     return BridgeOutput::default();
                 }
+                let hangup_after_reinvite = call.hangup_after_reinvite;
                 call.operator_reinvite = None;
+                call.dialog.learn_remote_tag(frame);
+                call.dialog.learn_remote_target(frame);
                 let ack = sip::build_ack_for_final(&reinvite, frame).ok();
-                if (200..300).contains(&status) {
+                if hangup_after_reinvite {
+                    let mut asterisk_frames = ack.into_iter().collect::<Vec<_>>();
+                    if call.dialog.state == InviteTransactionState::Confirmed {
+                        match call.dialog.begin_local_request() {
+                            Ok(cseq) => match sip::build_dialog_request(&DialogRequest {
+                                method: "BYE",
+                                request_uri: &call.dialog.remote_target,
+                                local_addr: self.local_addr,
+                                from_uri: &call.dialog.local_uri,
+                                from_tag: &call.dialog.local_tag,
+                                to_uri: &call.dialog.remote_uri,
+                                to_tag: call.dialog.remote_tag.as_deref(),
+                                call_id: &call.dialog.call_id,
+                                cseq,
+                                contact_uri: None,
+                                body: &[],
+                            }) {
+                                Ok(bye) => {
+                                    asterisk_frames.push(bye);
+                                    call.dialog.state = InviteTransactionState::Terminated;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error,
+                                        asterisk_call_id = %call.dialog.call_id,
+                                        "Failed to build BYE after operator hangup"
+                                    );
+                                }
+                            },
+                            Err(error) => {
+                                tracing::warn!(
+                                    error,
+                                    asterisk_call_id = %call.dialog.call_id,
+                                    dialog_state = ?call.dialog.state,
+                                    "Cannot start BYE after operator hangup"
+                                );
+                            }
+                        }
+                    }
+                    remove_call = true;
+                    BridgeOutput {
+                        asterisk_frames,
+                        ..BridgeOutput::default()
+                    }
+                } else if (200..300).contains(&status) {
                     BridgeOutput {
                         asterisk_frames: ack.into_iter().collect(),
                         operator_commands: vec![OperatorCommand::AcceptRenegotiation {
@@ -1932,6 +2028,84 @@ mod tests {
                 if call_id == "call-a" && body == sdp()
         ));
         assert_eq!(bridge.confirmed_call_count(), 1);
+    }
+
+    #[test]
+    fn operator_end_during_reinvite_cancels_then_sends_bye() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven)
+        .with_asterisk_target("sip:6108@192.0.2.20:8060");
+        let initial_invite = bridge
+            .handle_operator_event(OperatorEvent::Incoming {
+                call_id: "ims-video-call".into(),
+                caller: "sip:+601112023012@ims.example".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap()
+            .asterisk_frames
+            .pop()
+            .expect("operator incoming INVITE");
+        let initial_response = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {};tag=linphone-answer\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:6108@192.0.2.20:5070>\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            sip_frame::header_value(&initial_invite, "Via").unwrap(),
+            sip_frame::header_value(&initial_invite, "From").unwrap(),
+            sip_frame::header_value(&initial_invite, "To").unwrap(),
+            sip_frame::header_value(&initial_invite, "Call-ID").unwrap(),
+            sip_frame::header_value(&initial_invite, "CSeq").unwrap(),
+            sdp().len(),
+            String::from_utf8_lossy(sdp()),
+        );
+        let answered = bridge.handle_asterisk(initial_response.as_bytes()).unwrap();
+        assert!(answered.asterisk_frames[0].starts_with(b"ACK "));
+        assert!(matches!(
+            answered.operator_commands.as_slice(),
+            [OperatorCommand::AcceptCall { call_id, .. }] if call_id == "ims-video-call"
+        ));
+
+        let reinvite = bridge
+            .handle_operator_event(OperatorEvent::Renegotiate {
+                call_id: "ims-video-call".into(),
+                body: sdp().to_vec(),
+            })
+            .unwrap()
+            .asterisk_frames
+            .pop()
+            .expect("operator re-INVITE");
+        let ended = bridge
+            .handle_operator_event(OperatorEvent::Ended {
+                call_id: "ims-video-call".into(),
+            })
+            .unwrap();
+        assert_eq!(ended.operator_commands, Vec::<OperatorCommand>::new());
+        assert_eq!(ended.asterisk_frames.len(), 1);
+        assert!(ended.asterisk_frames[0].starts_with(b"CANCEL "));
+
+        let response = format!(
+            "SIP/2.0 200 OK\r\nVia: {}\r\nFrom: {}\r\nTo: {}\r\nCall-ID: {}\r\nCSeq: {}\r\nContact: <sip:6108@192.0.2.20:5070>\r\nContent-Type: application/sdp\r\nContent-Length: {}\r\n\r\n{}",
+            sip_frame::header_value(&reinvite, "Via").unwrap(),
+            sip_frame::header_value(&reinvite, "From").unwrap(),
+            sip_frame::header_value(&reinvite, "To").unwrap(),
+            sip_frame::header_value(&reinvite, "Call-ID").unwrap(),
+            sip_frame::header_value(&reinvite, "CSeq").unwrap(),
+            sdp().len(),
+            String::from_utf8_lossy(sdp()),
+        );
+        let closed = bridge.handle_asterisk(response.as_bytes()).unwrap();
+        assert_eq!(closed.operator_commands, Vec::<OperatorCommand>::new());
+        assert_eq!(closed.asterisk_frames.len(), 2);
+        assert!(closed.asterisk_frames[0].starts_with(b"ACK "));
+        assert!(closed.asterisk_frames[1].starts_with(b"BYE sip:6108@192.0.2.20:5070"));
+        assert_eq!(bridge.active_call_count(), 0);
+
+        let duplicate = bridge
+            .handle_operator_event(OperatorEvent::Ended {
+                call_id: "ims-video-call".into(),
+            })
+            .unwrap();
+        assert_eq!(duplicate, BridgeOutput::default());
     }
 
     #[test]
