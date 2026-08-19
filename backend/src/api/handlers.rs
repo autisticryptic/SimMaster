@@ -4955,6 +4955,12 @@ async fn list_calls_for_line(
 
 async fn track_observed_calls(app: &AppState, data: &CallListResponse) {
     for call in &data.calls {
+        // IMS calls are already tracked by the per-line operator event stream.
+        // Re-inserting a polled IMS snapshot can resurrect a call after its
+        // terminal event has removed it from `active_calls`.
+        if is_ims_call_path(&call.path) {
+            continue;
+        }
         let answered = matches!(call.state.as_str(), "active" | "held");
         track_call_start(
             app,
@@ -4978,7 +4984,7 @@ async fn reconcile_finished_calls(
         active
             .iter_mut()
             .filter_map(|(path, record)| {
-                if !reconciled_lines.contains(&record.line_id) {
+                if is_ims_call_path(path) || !reconciled_lines.contains(&record.line_id) {
                     return None;
                 }
                 call_poll_marks_finished(record, observed_paths.contains(path))
@@ -5013,7 +5019,12 @@ pub fn spawn_call_monitor(app: AppState) {
                 match list_calls_for_line(&app, &binding.line_id, &binding.modem_path).await {
                     Ok(data) => {
                         reconciled_lines.insert(binding.line_id);
-                        observed_paths.extend(data.calls.iter().map(|call| call.path.clone()));
+                        observed_paths.extend(
+                            data.calls
+                                .iter()
+                                .filter(|call| !is_ims_call_path(&call.path))
+                                .map(|call| call.path.clone()),
+                        );
                         track_observed_calls(&app, &data).await;
                     }
                     Err(error) => tracing::debug!(
@@ -11856,6 +11867,25 @@ mod tests {
         assert_eq!(ims_call_id_for_line(&path_a, line_b), None);
         assert_eq!(ims_call_id_for_line(&path_b, line_a), None);
         assert_eq!(ims_call_id_for_line("ims:same-call-id", line_a), None);
+    }
+
+    #[test]
+    fn poll_reconciliation_never_finishes_ims_event_records() {
+        let mut ims_record = crate::state::ActiveCallRecord {
+            id: 1,
+            line_id: "line-a".to_string(),
+            direction: "outgoing".to_string(),
+            phone_number: "+10000".to_string(),
+            state: "dialing".to_string(),
+            answered_at: None,
+            answered: false,
+            missing_polls: 0,
+            media_offer: None,
+        };
+
+        assert!(is_ims_call_path("ims:line-a:call-a"));
+        assert!(!call_poll_marks_finished(&mut ims_record, true));
+        assert_eq!(ims_record.missing_polls, 0);
     }
 
     #[test]
