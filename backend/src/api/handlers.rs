@@ -5313,17 +5313,6 @@ async fn hangup_all_calls_on_lines(
         if before.calls.is_empty() {
             continue;
         }
-        for call in &before.calls {
-            track_call_start(
-                app,
-                &line_id,
-                &call.path,
-                &call.direction,
-                &call.phone_number,
-                matches!(call.state.as_str(), "active" | "held"),
-            )
-            .await;
-        }
         let mut result: Result<(), String> = Ok(());
         let mut has_cs_call = false;
         for call in &before.calls {

@@ -11,6 +11,7 @@
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -32,6 +33,7 @@ use crate::{
 };
 
 const MAX_INVITE_DIGEST_ROUNDS: u32 = 2;
+const FINAL_INVITE_RESPONSE_TTL: Duration = Duration::from_secs(64);
 
 #[allow(dead_code)] // EventDriven is enabled when the IMS live adapter is attached.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +242,12 @@ struct BridgedTransfer {
 }
 
 #[derive(Debug, Clone)]
+struct CachedFinalInviteResponse {
+    frame: Vec<u8>,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone)]
 pub struct TrunkBridge {
     local_addr: SocketAddr,
     local_aor: String,
@@ -249,6 +257,7 @@ pub struct TrunkBridge {
     digest_secret: Option<String>,
     operator: OperatorAvailability,
     calls: HashMap<String, BridgedCall>,
+    final_invite_responses: HashMap<(String, u32), CachedFinalInviteResponse>,
 }
 
 impl TrunkBridge {
@@ -262,6 +271,7 @@ impl TrunkBridge {
             digest_secret: None,
             operator: OperatorAvailability::Unavailable,
             calls: HashMap::new(),
+            final_invite_responses: HashMap::new(),
         }
     }
 
@@ -373,6 +383,8 @@ impl TrunkBridge {
     }
 
     pub fn handle_asterisk(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
+        self.final_invite_responses
+            .retain(|_, response| response.expires_at > Instant::now());
         if !sip::is_request(frame) {
             if let Some(output) = self.handle_invite_digest_challenge(frame) {
                 return Ok(output);
@@ -795,10 +807,44 @@ impl TrunkBridge {
                 }
             }
         }
-        if matches!(
+        let terminal = matches!(
             call.dialog.state,
             InviteTransactionState::Failed | InviteTransactionState::Terminated
-        ) {
+        );
+        let cache_failed_response = if terminal {
+            if call.dialog.direction == dialog::DialogDirection::AsteriskOriginated
+                && call.dialog.state == InviteTransactionState::Failed
+            {
+                let final_response = output
+                    .asterisk_frames
+                    .iter()
+                    .rev()
+                    .find(|frame| sip::status(frame).is_ok_and(|status| status >= 300))
+                    .cloned();
+                if let Some(frame) = final_response {
+                    Some((
+                        (call.dialog.call_id.clone(), call.dialog.invite_cseq),
+                        frame,
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((key, frame)) = cache_failed_response {
+            self.final_invite_responses.insert(
+                key,
+                CachedFinalInviteResponse {
+                    frame,
+                    expires_at: Instant::now() + FINAL_INVITE_RESPONSE_TTL,
+                },
+            );
+        }
+        if terminal {
             self.calls.remove(&asterisk_call_id);
         }
         Ok(output)
@@ -807,6 +853,17 @@ impl TrunkBridge {
     fn handle_invite(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
         let call_id = dialog::call_id(frame)
             .ok_or_else(|| BridgeError::MalformedRequest("trunk_invite_call-id_missing".into()))?;
+        let invite_cseq =
+            dialog::cseq_number(frame, "INVITE").map_err(BridgeError::MalformedRequest)?;
+        if let Some(response) = self
+            .final_invite_responses
+            .get(&(call_id.clone(), invite_cseq))
+        {
+            return Ok(BridgeOutput {
+                asterisk_frames: vec![response.frame.clone()],
+                ..BridgeOutput::default()
+            });
+        }
         if let Some(call) = self.calls.get_mut(&call_id) {
             if call.dialog.state != InviteTransactionState::Confirmed {
                 return Err(BridgeError::InvalidState(
@@ -828,9 +885,7 @@ impl TrunkBridge {
                 });
             }
             let offer = parse_offer(frame)?;
-            let cseq =
-                dialog::cseq_number(frame, "INVITE").map_err(BridgeError::MalformedRequest)?;
-            call.dialog.next_local_cseq = cseq.saturating_add(1);
+            call.dialog.next_local_cseq = invite_cseq.saturating_add(1);
             call.pending_invite = Some(frame.to_vec());
             return Ok(BridgeOutput {
                 asterisk_frames: vec![sip::build_response_with_body(
@@ -906,6 +961,15 @@ impl TrunkBridge {
     fn handle_ack(&mut self, frame: &[u8]) -> Result<BridgeOutput, BridgeError> {
         let call_id = dialog::call_id(frame)
             .ok_or_else(|| BridgeError::MalformedRequest("trunk_ack_call-id_missing".into()))?;
+        let invite_cseq =
+            dialog::cseq_number(frame, "ACK").map_err(BridgeError::MalformedRequest)?;
+        if self
+            .final_invite_responses
+            .remove(&(call_id.clone(), invite_cseq))
+            .is_some()
+        {
+            return Ok(BridgeOutput::default());
+        }
         let mut output = BridgeOutput::default();
         let mut remove = false;
         if let Some(call) = self.calls.get_mut(&call_id) {
@@ -969,6 +1033,13 @@ impl TrunkBridge {
             &[],
         )
         .map_err(BridgeError::MalformedRequest)?;
+        self.final_invite_responses.insert(
+            (call.dialog.call_id.clone(), call.dialog.invite_cseq),
+            CachedFinalInviteResponse {
+                frame: final_response.clone(),
+                expires_at: Instant::now() + FINAL_INVITE_RESPONSE_TTL,
+            },
+        );
         self.calls.remove(&call_id);
         Ok(BridgeOutput {
             asterisk_frames: vec![response, final_response],
@@ -1619,6 +1690,51 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.asterisk_frames[0]).starts_with("SIP/2.0 100"));
         assert!(String::from_utf8_lossy(&output.asterisk_frames[1]).starts_with("SIP/2.0 480"));
         assert_eq!(bridge.active_call_count(), 0);
+
+        let retransmission = bridge.handle_asterisk(&invite()).unwrap();
+        assert_eq!(retransmission.asterisk_frames.len(), 1);
+        assert!(retransmission.asterisk_frames[0].starts_with(b"SIP/2.0 480"));
+        assert!(retransmission.operator_commands.is_empty());
+    }
+
+    #[test]
+    fn rejected_asterisk_invite_retransmission_replays_final_response() {
+        let mut bridge = TrunkBridge::new(
+            SocketAddr::from((Ipv4Addr::new(192, 0, 2, 30), 5062)),
+            "sip:41000@192.0.2.30:5062",
+        )
+        .with_operator(OperatorAvailability::EventDriven);
+        let started = bridge.handle_asterisk(&invite()).unwrap();
+        assert!(matches!(
+            started.operator_commands.as_slice(),
+            [OperatorCommand::StartCall { call_id, .. }] if call_id == "call-a"
+        ));
+
+        let rejected = bridge
+            .handle_operator_event(OperatorEvent::Rejected {
+                call_id: "call-a".into(),
+                status: 486,
+                diagnostic:
+                    crate::connectivity::core::ims_failure::ImsFailureDiagnostic::from_status(486),
+            })
+            .unwrap();
+        assert!(rejected.asterisk_frames[0].starts_with(b"SIP/2.0 486"));
+        assert_eq!(bridge.active_call_count(), 0);
+
+        let retransmission = bridge.handle_asterisk(&invite()).unwrap();
+        assert_eq!(retransmission.asterisk_frames, rejected.asterisk_frames);
+        assert!(retransmission.operator_commands.is_empty());
+
+        let ack = b"ACK sip:41000@simadmin SIP/2.0\r\nVia: SIP/2.0/UDP 192.0.2.20:5060;branch=z9hG4bKack\r\nFrom: <sip:6108@pbx>;tag=asterisk-a\r\nTo: <sip:41000@simadmin>;tag=local\r\nCall-ID: call-a\r\nCSeq: 1 ACK\r\nContent-Length: 0\r\n\r\n";
+        assert_eq!(
+            bridge.handle_asterisk(ack).unwrap(),
+            BridgeOutput::default()
+        );
+        let restarted = bridge.handle_asterisk(&invite()).unwrap();
+        assert!(matches!(
+            restarted.operator_commands.as_slice(),
+            [OperatorCommand::StartCall { call_id, .. }] if call_id == "call-a"
+        ));
     }
 
     #[test]
