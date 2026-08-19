@@ -6929,6 +6929,7 @@ pub async fn set_vowifi_line_config_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    sync_line_video_capabilities(&app).await;
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -6990,6 +6991,7 @@ pub async fn set_vowifi_line_connection_handler(
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
     }
+    sync_line_video_capabilities(&app).await;
     if !binding.present {
         return (
             StatusCode::OK,
