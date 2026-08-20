@@ -694,10 +694,19 @@ pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result
 /// process-wide main route table. Multiple modems can receive the same remote
 /// RTP address, and a main-table `/32` would let the last line win.
 async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
-    if let Ok(local) = bearer.local_addr() {
-        if local.is_ipv4() != host.is_ipv4() {
-            return Err(VolteError::new("volte_route_family_mismatch"));
-        }
+    // A dual-stack ModemManager bearer has two independent local addresses.
+    // `BearerConnection::local_addr()` intentionally returns the preferred
+    // address (currently IPv6-first), which is not necessarily the family
+    // selected by the current REGISTER attempt.  Comparing every destination
+    // with that preferred address made a valid IPv4 attempt fail with
+    // `volte_route_family_mismatch` whenever the same bearer also had IPv6.
+    // Select the local address belonging to the destination family instead.
+    let local = bearer
+        .settings
+        .local_addr_for_family(host)
+        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    if local.is_ipv4() != host.is_ipv4() {
+        return Err(VolteError::new("volte_route_family_mismatch"));
     }
     let table = route_table(RouteDomain::VolteIms, &bearer.interface, host);
     let destination = host_selector(host);

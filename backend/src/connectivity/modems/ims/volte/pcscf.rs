@@ -96,6 +96,19 @@ impl ImsIpSettings {
         self.ipv6_address.or(self.ipv4_address)
     }
 
+    /// Select the bearer address that belongs to a destination family.
+    ///
+    /// A dual-stack IMS bearer can expose both addresses while a particular
+    /// REGISTER/media flow uses only one of them. Do not use `local_addr()`
+    /// for family validation because it is preference-ordered (IPv6 first).
+    pub fn local_addr_for_family(&self, destination: IpAddr) -> Option<IpAddr> {
+        if destination.is_ipv6() {
+            self.ipv6_address
+        } else {
+            self.ipv4_address
+        }
+    }
+
     /// Available bearer addresses in the plan's family order.
     pub fn ordered_local_addrs(&self, plan: &ImsConnectionPlan) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
@@ -968,6 +981,20 @@ IPv4 primary DNS: 10.0.0.53";
             )),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
+    }
+
+    #[test]
+    fn local_addr_for_family_does_not_follow_preferred_family() {
+        let settings = parse_ip_settings(SAMPLE);
+        assert_eq!(
+            settings.local_addr_for_family("198.51.100.10".parse().unwrap()),
+            Some("10.0.0.2".parse().unwrap())
+        );
+        assert_eq!(
+            settings.local_addr_for_family("2001:db8::10".parse().unwrap()),
+            Some("2001:db8::2".parse().unwrap())
+        );
+        assert_eq!(settings.local_addr(), Some("2001:db8::2".parse().unwrap()));
     }
 
     #[test]
