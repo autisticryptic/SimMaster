@@ -65,6 +65,9 @@ pub struct EffectiveImsProfile {
     pub registrar: Option<EffectiveField>,
     /// APN used for the IMS bearer.
     pub ims_apn: Option<EffectiveField>,
+    /// Preferred IP stack for this access. For LTE catalog rows this is the
+    /// normalized `access.lte.ip_family` value.
+    pub ip_stack: EffectiveField,
     /// Whether the user explicitly pinned a carrier profile.
     pub pinned_profile_id: Option<EffectiveField>,
 }
@@ -225,6 +228,11 @@ pub fn resolve_effective_ims_profile_for_access(
             .filter(|s| !s.is_empty())
             .map(EffectiveField::override_)
             .or_else(|| catalog.epdg.apn.map(EffectiveField::catalog)),
+        ip_stack: access
+            .and_then(|a| a.ip_stack.as_deref())
+            .filter(|s| !s.is_empty())
+            .map(EffectiveField::override_)
+            .unwrap_or_else(|| EffectiveField::catalog(catalog.epdg.ip_stack)),
         pinned_profile_id: access
             .and_then(|a| a.profile_id.as_deref())
             .filter(|s| !s.is_empty())
@@ -423,6 +431,11 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
 }
 
 fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<String>) {
+    if let Some(ip_stack) = access.ip_stack.as_deref() {
+        if !matches!(ip_stack.trim(), "ipv4" | "ipv6" | "ipv4v6") {
+            problems.push(format!("{name}.ip_stack_invalid"));
+        }
+    }
     if let Some(epdg_host) = access.epdg_host.as_deref() {
         if epdg_host.trim().is_empty() {
             problems.push(format!("{name}.epdg_host_must_not_be_empty"));
@@ -484,6 +497,7 @@ pub fn source_map_of(
         if let Some(apn) = &ims.ims_apn {
             push_field(&mut map, &format!("{prefix}.apn"), apn);
         }
+        push_field(&mut map, &format!("{prefix}.ip_stack"), &ims.ip_stack);
         if let Some(pinned) = &ims.pinned_profile_id {
             push_field(&mut map, &format!("{prefix}.profile_id"), pinned);
         }
@@ -562,6 +576,8 @@ mod tests {
             true
         );
         assert_eq!(ims.domain.source, OverrideSource::Catalog);
+        assert_eq!(ims.ip_stack.value, "ipv6");
+        assert_eq!(ims.ip_stack.source, OverrideSource::Catalog);
         assert!(ims.pinned_profile_id.is_none());
     }
 
@@ -784,5 +800,19 @@ mod tests {
         assert_eq!(effective.pinned_profile_id.unwrap().value, "volte-profile");
         assert_eq!(effective.ims_apn.unwrap().value, "volte-ims");
         assert_eq!(effective.pcscf.unwrap().value, "192.0.2.10,192.0.2.11");
+    }
+
+    #[test]
+    fn volte_ip_stack_override_wins_over_lte_catalog_hint() {
+        let override_ = SimOverride {
+            ims_volte: ImsAccessOverride {
+                ip_stack: Some("ipv4".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let effective = resolve_effective_ims_profile(&GB_EE_23433, Some(&override_));
+        assert_eq!(effective.ip_stack.value, "ipv4");
+        assert_eq!(effective.ip_stack.source, OverrideSource::SimOverride);
     }
 }

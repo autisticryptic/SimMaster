@@ -79,6 +79,12 @@ pub mod code {
     pub const RUNTIME_IMS_FAMILY_UNSUPPORTED: &str = "volte_runtime_ims_family_unsupported";
     pub const IP_SETTINGS_MISSING: &str = "volte_ip_settings_missing";
     pub const IPV6_GATEWAY_MISSING: &str = "volte_ipv6_gateway_missing";
+    /// The connected bearer netdev did not complete its remote OPEN handshake.
+    pub const BEARER_NETDEV_NOT_UP: &str = "volte_bearer_netdev_not_up";
+    /// Runtime PM reports an error for the bearer netdev's bam-dmux device.
+    pub const BEARER_NETDEV_RUNTIME_ERROR: &str = "volte_bearer_netdev_runtime_error";
+    /// The bearer netdev was still unusable after the bounded readiness wait.
+    pub const BEARER_NETDEV_NOT_READY: &str = "volte_bearer_netdev_not_ready";
     pub const PCSCF_FAMILY_MISMATCH: &str = "volte_pcscf_family_mismatch";
 
     // Data slot allocation (beta2 alignment). The IMS bearer and the normal

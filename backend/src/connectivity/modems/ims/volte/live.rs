@@ -1179,7 +1179,11 @@ fn failure_stage(error: &VolteError) -> Option<VolteStage> {
         code::RUNTIME_ALL_PCSCF_FAILED
         | code::RUNTIME_PROFILE_PCSCF_MISSING
         | code::PCSCF_FAMILY_MISMATCH => VolteStage::Pcscf,
-        code::IP_SETTINGS_MISSING | code::IPV6_GATEWAY_MISSING => VolteStage::IpConfig,
+        code::IP_SETTINGS_MISSING
+        | code::IPV6_GATEWAY_MISSING
+        | code::BEARER_NETDEV_NOT_UP
+        | code::BEARER_NETDEV_RUNTIME_ERROR
+        | code::BEARER_NETDEV_NOT_READY => VolteStage::IpConfig,
         code::REGISTER_SEND_FAILED
         | code::REGISTER_INITIAL_UNEXPECTED_STATUS
         | code::REGISTER_NONCE_NOT_AKA
@@ -1199,7 +1203,7 @@ async fn connect_inner(
     runtime: &VolteRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
-    plan: ImsConnectionPlan,
+    mut plan: ImsConnectionPlan,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
@@ -1228,6 +1232,18 @@ async fn connect_inner(
         .await;
     let device_identity =
         load_device_identity(&device, runtime, profile_store, sim_override).await?;
+    // A line's explicit order remains authoritative. The persisted default
+    // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
+    // `access.lte.ip_family` may provide a better first single-family hint;
+    // fallback still retains both families and is driven by network errors.
+    if plan.pdp_types() == vec!["IPV4V6", "IP", "IPV6"] {
+        plan = plan.with_catalog_ip_stack_hint(&device_identity.effective_ims.ip_stack.value);
+        tracing::debug!(
+            ip_stack = %device_identity.effective_ims.ip_stack.value,
+            preference = ?plan.preference(),
+            "Applied LTE catalog IP-family hint to the default IMS plan"
+        );
+    }
     let ims_apn = device_identity
         .effective_ims
         .ims_apn
@@ -5458,6 +5474,16 @@ mod tests {
             failure_stage(&VolteError::new(code::MM_IMSI_MISSING)),
             Some(VolteStage::Identity)
         );
+        for error_code in [
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            code::BEARER_NETDEV_NOT_UP,
+            code::BEARER_NETDEV_NOT_READY,
+        ] {
+            assert_eq!(
+                failure_stage(&VolteError::new(error_code)),
+                Some(VolteStage::IpConfig)
+            );
+        }
     }
 
     fn register_variant(label: &str) -> VolteRegisterVariant {

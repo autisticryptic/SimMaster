@@ -8594,9 +8594,8 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_details(
-                    error.detail().unwrap_or_default(),
-                ) == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
+                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(&error)
+                    == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
                 {
                     warn!(
                         line_id = %binding.line_id,

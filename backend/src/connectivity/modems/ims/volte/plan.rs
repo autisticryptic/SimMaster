@@ -120,6 +120,9 @@ fn is_baseband_wedge(lowercased: &str) -> bool {
     lowercased.contains("interface-in-use-config-match")
         || lowercased.contains("endpoint hangup")
         || lowercased.contains("mobileequipment.unknown")
+        || lowercased.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
+        || lowercased.contains(code::BEARER_NETDEV_NOT_UP)
+        || lowercased.contains(code::BEARER_NETDEV_NOT_READY)
         || (lowercased.contains("call failed") && lowercased.contains("internal error"))
 }
 
@@ -139,6 +142,11 @@ impl FailureClass {
             FailureClass::NetworkForcedIpv4
         } else if error.contains("prefix-unavailable") {
             FailureClass::PrefixUnavailable
+        } else if error.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
+            || error.contains(code::BEARER_NETDEV_NOT_UP)
+            || error.contains(code::BEARER_NETDEV_NOT_READY)
+        {
+            FailureClass::BasebandWedged
         } else if is_baseband_wedge(&error) {
             FailureClass::BasebandWedged
         } else {
@@ -150,6 +158,9 @@ impl FailureClass {
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &VolteError) -> Self {
         match error.code() {
+            code::BEARER_NETDEV_RUNTIME_ERROR
+            | code::BEARER_NETDEV_NOT_UP
+            | code::BEARER_NETDEV_NOT_READY => FailureClass::BasebandWedged,
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
                 if error
                     .detail()
@@ -299,6 +310,19 @@ impl ImsConnectionPlan {
         }
     }
 
+    /// Apply the LTE access row's `ip_family` as a hint only. A catalog row is
+    /// not allowed to force a single-family connection: the standard fallback
+    /// still keeps the other families available when the network rejects the
+    /// hinted one. Callers should use this only when the line has not supplied
+    /// an explicit family order.
+    pub fn with_catalog_ip_stack_hint(self, ip_stack: &str) -> Self {
+        match ip_stack.trim().to_ascii_lowercase().as_str() {
+            "ipv4" => Self::from_preference(VolteIpFamilyPreference::Ipv4First),
+            "ipv6" => Self::from_preference(VolteIpFamilyPreference::Ipv6First),
+            _ => self,
+        }
+    }
+
     pub fn preference(&self) -> VolteIpFamilyPreference {
         self.preference
     }
@@ -433,6 +457,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn catalog_ip_stack_hint_reorders_only_single_family_fallbacks() {
+        let base = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        assert_eq!(
+            base.clone().with_catalog_ip_stack_hint("ipv6").pdp_types(),
+            vec!["IPV4V6", "IPV6", "IP"]
+        );
+        assert_eq!(
+            base.clone().with_catalog_ip_stack_hint("ipv4").pdp_types(),
+            vec!["IPV4V6", "IP", "IPV6"]
+        );
+        assert_eq!(
+            base.clone()
+                .with_catalog_ip_stack_hint("ipv4v6")
+                .pdp_types(),
+            base.pdp_types()
+        );
+    }
+
     /// The per-line ordered list reproduces every legacy preset exactly, so
     /// switching a line to a custom list cannot silently change its behaviour.
     #[test]
@@ -558,6 +601,23 @@ mod tests {
         assert!(FailureClass::PcscfFailed.is_retryable_family());
         assert!(!FailureClass::NetworkForcedIpv6.is_retryable_family());
         assert!(!FailureClass::Other.is_retryable_family());
+    }
+
+    #[test]
+    fn bearer_netdev_errors_are_terminal_and_not_family_fallbacks() {
+        for code in [
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            code::BEARER_NETDEV_NOT_UP,
+            code::BEARER_NETDEV_NOT_READY,
+        ] {
+            let error = VolteError::with_detail(code, "interface=wwan0");
+            assert_eq!(
+                FailureClass::from_error(&error),
+                FailureClass::BasebandWedged
+            );
+            assert!(!FailureClass::from_error(&error).is_retryable_family());
+            assert!(FailureClass::from_error(&error).is_unsafe_to_retry());
+        }
     }
 
     #[test]

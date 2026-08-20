@@ -151,7 +151,9 @@ pub struct ImsAccessOverride {
     pub epdg_host: Option<String>,
     /// VoWiFi only: ePDG port override.
     pub epdg_port: Option<u16>,
-    /// VoWiFi only: requested IP family, for example "ipv4" or "ipv6".
+    /// Requested IMS IP family for VoLTE/VoWiFi, for example "ipv4" or
+    /// "ipv6". The VoLTE runtime uses this as an explicit profile override;
+    /// otherwise the LTE catalog `access.ip_family` is only a fallback hint.
     pub ip_stack: Option<String>,
     /// VoWiFi only: DNS server override.
     pub dns: Option<Vec<String>>,

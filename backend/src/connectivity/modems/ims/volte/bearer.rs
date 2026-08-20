@@ -491,18 +491,7 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
-    // ModemManager already activates the bearer interface. Some Qualcomm
-    // bam-dmux point-to-point netdevs reject an administrative `link set up`
-    // with EINVAL even though the bearer is usable; do not turn that driver
-    // quirk into an IMS registration failure. Address and route operations
-    // below remain authoritative and still fail if the bearer is unusable.
-    if let Err(error) = run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await {
-        tracing::debug!(
-            interface = %bearer.interface,
-            error = %error,
-            "Bearer netdev did not accept an administrative UP request; continuing"
-        );
-    }
+    ensure_bearer_interface_ready(&bearer.interface).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
@@ -544,6 +533,106 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
         return Ok(());
     }
     Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
+}
+
+/// Ensure that the kernel data path is usable before installing policy routes.
+///
+/// ModemManager reports a connected QMI bearer before the bam-dmux netdev has
+/// necessarily completed its remote OPEN handshake. On Qualcomm SoCs an
+/// administrative OPEN can also fail with EINVAL when the driver's runtime-PM
+/// state is already `error`; continuing in that state only turns the real
+/// failure into a misleading route error and can race the modem firmware.
+async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
+    if interface_is_up(interface).await {
+        return Ok(());
+    }
+    if bam_dmux_runtime_is_error(interface) {
+        return Err(VolteError::with_detail(
+            code::BEARER_NETDEV_RUNTIME_ERROR,
+            format!("interface={interface}: runtime_status=error before OPEN"),
+        ));
+    }
+
+    // One administrative UP is one remote bam-dmux OPEN request. Never issue
+    // several OPENs in a readiness loop: duplicate requests can race the modem
+    // firmware. Polling below only observes the result of this single request.
+    if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
+        if interface_is_up(interface).await {
+            return Ok(());
+        }
+        return Err(if bam_dmux_runtime_is_error(interface) {
+            VolteError::with_detail(
+                code::BEARER_NETDEV_RUNTIME_ERROR,
+                format!("interface={interface}: {error}"),
+            )
+        } else {
+            VolteError::with_detail(
+                code::BEARER_NETDEV_NOT_UP,
+                format!("interface={interface}: {error}"),
+            )
+        });
+    }
+
+    for attempt in 0..4 {
+        if interface_is_up(interface).await {
+            return Ok(());
+        }
+        if bam_dmux_runtime_is_error(interface) {
+            return Err(VolteError::with_detail(
+                code::BEARER_NETDEV_RUNTIME_ERROR,
+                format!("interface={interface}: runtime_status=error after OPEN"),
+            ));
+        }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    Err(VolteError::with_detail(
+        code::BEARER_NETDEV_NOT_READY,
+        format!("interface={interface} remained down after one OPEN request"),
+    ))
+}
+
+async fn interface_is_up(interface: &str) -> bool {
+    let Ok(output) = run_command("ip", &["-json", "link", "show", "dev", interface]).await else {
+        return false;
+    };
+    link_output_is_up(&output)
+}
+
+fn link_output_is_up(output: &str) -> bool {
+    let Ok(links) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return false;
+    };
+    links.first().is_some_and(|link| {
+        link.get("operstate")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|state| state.eq_ignore_ascii_case("up"))
+            || link
+                .get("flags")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|flags| {
+                    flags.iter().any(|flag| {
+                        flag.as_str().is_some_and(|flag| {
+                            flag.eq_ignore_ascii_case("up") || flag.eq_ignore_ascii_case("lower_up")
+                        })
+                    })
+                })
+    })
+}
+
+fn bam_dmux_runtime_is_error(interface: &str) -> bool {
+    // The WWAN class exposes the owning bam-dmux power state through the
+    // interface's device symlink, so this remains correct for other remoteproc
+    // addresses and does not hard-code a platform path.
+    std::fs::read_to_string(format!(
+        "/sys/class/net/{interface}/device/power/runtime_status"
+    ))
+    .is_ok_and(|status| runtime_status_is_error(&status))
+}
+
+fn runtime_status_is_error(status: &str) -> bool {
+    status.trim().eq_ignore_ascii_case("error")
 }
 
 async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
@@ -703,7 +792,10 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     let _ = run_ip(&["-6", "route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["address", "flush", "dev", &bearer.interface]).await;
-    let _ = run_ip(&["link", "set", "dev", &bearer.interface, "down"]).await;
+    // Let ModemManager/QMI own the bam-dmux CLOSE handshake when the bearer is
+    // disconnected. Sending `ip link down` here duplicates that operation and
+    // can race the firmware on Qualcomm SoCs, especially after a failed route
+    // setup. Ordinary interface state is cleaned up by the bearer disconnect.
 }
 
 /// Disconnect a ModemManager bearer.
@@ -849,6 +941,27 @@ mod tests {
             check_roaming(true, false).unwrap_err().code(),
             code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
         );
+    }
+
+    #[test]
+    fn parses_ip_json_link_state_without_substring_false_positives() {
+        assert!(link_output_is_up(
+            r#"[{"ifname":"wwan0","flags":["POINTOPOINT","UP","LOWER_UP"],"operstate":"UNKNOWN"}]"#
+        ));
+        assert!(link_output_is_up(
+            r#"[{"ifname":"wwan0","flags":["POINTOPOINT"],"operstate":"UP"}]"#
+        ));
+        assert!(!link_output_is_up(
+            r#"[{"ifname":"backup0","flags":["POINTOPOINT"],"operstate":"DOWN"}]"#
+        ));
+        assert!(!link_output_is_up("not-json"));
+    }
+
+    #[test]
+    fn runtime_pm_error_detection_is_trimmed_and_case_insensitive() {
+        assert!(runtime_status_is_error("error\n"));
+        assert!(runtime_status_is_error(" ERROR "));
+        assert!(!runtime_status_is_error("active\n"));
     }
 
     #[test]

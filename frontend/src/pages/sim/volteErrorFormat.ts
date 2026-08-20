@@ -69,5 +69,11 @@ export function volteErrorMessage(error?: string | null) {
   if (error.includes('volte_runtime_all_pcscf_failed')) {
     return 'IMS Bearer 已建立，但所有 P-CSCF 候选均连接失败。请检查运营商 Profile、PCO/DNS 返回和 IMS 路由。'
   }
+  if (error.includes('volte_bearer_netdev_runtime_error')) {
+    return 'IMS Bearer 已建立，但 Qualcomm bam-dmux 网卡报告 runtime 错误，底层基带数据通道未打开。系统已停止继续切换地址族，避免反复激活导致基带崩溃；请检查基带/remoteproc 日志或重启设备。'
+  }
+  if (error.includes('volte_bearer_netdev_not_up') || error.includes('volte_bearer_netdev_not_ready')) {
+    return 'IMS Bearer 已建立，但其网卡没有完成 OPEN/UP 握手。系统已停止继续安装路由和重复重试，避免把底层链路故障误报成 P-CSCF 失败。'
+  }
   return error
 }
