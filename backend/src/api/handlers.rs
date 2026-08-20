@@ -4171,6 +4171,7 @@ async fn send_sms_over_volte_path(
                 &line.volte,
                 app.config_manager.get_line_volte_voice_enabled(line_id),
                 &ip_families,
+                app.config_manager.get_line_volte_ip_families_auto(line_id),
                 profile.roaming_allowed,
                 data_slot_mode,
                 app.config_manager
@@ -8559,6 +8560,8 @@ async fn run_line_volte_restore_batch(
                             app.config_manager
                                 .get_line_volte_voice_enabled(&binding.line_id),
                             &ip_families,
+                            app.config_manager
+                                .get_line_volte_ip_families_auto(&binding.line_id),
                             profile.roaming_allowed,
                             data_slot_mode,
                             app.config_manager

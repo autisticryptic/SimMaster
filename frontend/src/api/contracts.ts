@@ -667,6 +667,8 @@ export interface LineProfileConfig {
    * "only that family".
    */
   volte_ip_families: VolteIpFamily[]
+  /** Whether the carrier catalog may choose the preferred fallback order. */
+  volte_ip_families_auto: boolean
   /**
    * Per-line eSIM management override. `null`/undefined = auto (managed only
    * when the SIM reports a eUICC chip), `true` = force eSIM controls on,

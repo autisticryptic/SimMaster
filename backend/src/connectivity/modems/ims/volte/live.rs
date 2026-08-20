@@ -1058,6 +1058,7 @@ pub async fn connect_live_for_line(
     runtime: &Arc<VolteRuntime>,
     voice_enabled: bool,
     line_ip_families: &[VolteIpFamily],
+    line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
@@ -1236,7 +1237,7 @@ async fn connect_inner(
     // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
     // `access.lte.ip_family` may provide a better first single-family hint;
     // fallback still retains both families and is driven by network errors.
-    if plan.pdp_types() == vec!["IPV4V6", "IP", "IPV6"] {
+    if line_ip_families_auto {
         plan = plan.with_catalog_ip_stack_hint(&device_identity.effective_ims.ip_stack.value);
         tracing::debug!(
             ip_stack = %device_identity.effective_ims.ip_stack.value,

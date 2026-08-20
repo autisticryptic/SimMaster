@@ -2353,10 +2353,23 @@ mod tests {
     fn line_volte_ip_families_round_trip() {
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         assert_eq!(profile.volte_ip_families, default_line_volte_ip_families());
+        assert!(profile.volte_ip_families_auto);
         profile.volte_ip_families = vec![VolteIpFamily::Ipv6];
+        profile.volte_ip_families_auto = false;
         let round_trip: LineProfileConfig =
             serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
         assert_eq!(round_trip.volte_ip_families, vec![VolteIpFamily::Ipv6]);
+        assert!(!round_trip.volte_ip_families_auto);
+    }
+
+    #[test]
+    fn legacy_line_profile_defaults_ip_family_selection_to_automatic() {
+        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
+            "line_id": "line-0123456789abcdef0123456789abcdef",
+            "volte_ip_families": ["ipv4v6", "ipv4", "ipv6"]
+        }))
+        .unwrap();
+        assert!(profile.volte_ip_families_auto);
     }
 
     #[test]
@@ -3462,6 +3475,10 @@ fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
     VolteIpFamilyPreference::default().to_families()
 }
 
+fn default_line_volte_ip_families_auto() -> bool {
+    true
+}
+
 /// How this line's logical SIP trunk associates with the remote Asterisk/FreePBX.
 ///
 /// Both modes share the same SIP transport and RTP relay; the only difference is
@@ -3740,6 +3757,11 @@ pub struct LineProfileConfig {
     /// IPv4, then IPv6; `[Ipv6]` is IPv6-only. An empty list is invalid.
     #[serde(default = "default_line_volte_ip_families")]
     pub volte_ip_families: Vec<VolteIpFamily>,
+    /// Whether the family order is still automatic. Automatic lines may use
+    /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
+    /// the UI turns this off so the user's choice always wins.
+    #[serde(default = "default_line_volte_ip_families_auto")]
+    pub volte_ip_families_auto: bool,
     /// Per-line APN.
     #[serde(default)]
     pub apn: ApnConfig,
@@ -3853,6 +3875,7 @@ impl LineProfileConfig {
             volte_voice_enabled: default_volte_voice_enabled(),
             ims_video: ImsVideoConfig::default(),
             volte_ip_families: default_line_volte_ip_families(),
+            volte_ip_families_auto: default_line_volte_ip_families_auto(),
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
@@ -5421,6 +5444,7 @@ impl ConfigManager {
                 config.line_profiles.last_mut().expect("profile inserted")
             };
             profile.volte_ip_families = families;
+            profile.volte_ip_families_auto = false;
             let next = profile.clone();
             config
                 .line_profiles
@@ -5433,6 +5457,10 @@ impl ConfigManager {
 
     pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<VolteIpFamily> {
         self.get_line_profile(line_id).volte_ip_families
+    }
+
+    pub fn get_line_volte_ip_families_auto(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id).volte_ip_families_auto
     }
 
     pub fn set_line_vowifi_config(
