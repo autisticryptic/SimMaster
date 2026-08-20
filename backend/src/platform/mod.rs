@@ -7,4 +7,5 @@
 pub mod config;
 pub mod config_maintenance;
 pub mod db;
+pub mod network_routing;
 pub mod utils;

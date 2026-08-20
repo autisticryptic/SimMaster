@@ -27,6 +27,7 @@ use std::{
     sync::Arc,
 };
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
 
 use crate::connectivity::core::voice::{MediaDirection, RtpPacket};
@@ -348,7 +349,22 @@ pub struct PendingRtpRelay {
 
 impl PendingRtpRelay {
     pub async fn bind(operator_ip: IpAddr, internal_ip: IpAddr) -> std_io::Result<Self> {
-        let operator_socket = Arc::new(UdpSocket::bind(SocketAddr::new(operator_ip, 0)).await?);
+        Self::bind_with_operator_interface(operator_ip, internal_ip, None).await
+    }
+
+    /// Bind the operator-facing socket to the access interface as well as its
+    /// local address. The address alone is not a unique selector when two
+    /// modem interfaces receive the same private IP, so Linux must carry the
+    /// interface identity on the socket itself.
+    pub async fn bind_with_operator_interface(
+        operator_ip: IpAddr,
+        internal_ip: IpAddr,
+        operator_interface: Option<&str>,
+    ) -> std_io::Result<Self> {
+        let operator_socket = Arc::new(bind_udp_socket(
+            SocketAddr::new(operator_ip, 0),
+            operator_interface,
+        )?);
         let internal_socket = Arc::new(UdpSocket::bind(SocketAddr::new(internal_ip, 0)).await?);
         Ok(Self {
             operator_socket,
@@ -425,6 +441,53 @@ impl PendingRtpRelay {
             metrics,
         }
     }
+}
+
+fn bind_udp_socket(local: SocketAddr, interface: Option<&str>) -> std_io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    bind_socket_to_interface(&socket, interface)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    let std_socket: std::net::UdpSocket = socket.into();
+    UdpSocket::from_std(std_socket)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_socket_to_interface(socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+
+    let Some(interface) = interface.filter(|name| !name.trim().is_empty()) else {
+        return Ok(());
+    };
+    let name = CString::new(interface).map_err(|_| {
+        std_io::Error::new(std_io::ErrorKind::InvalidInput, "interface contains NUL")
+    })?;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            name.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std_io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_socket_to_interface(_socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
+    if interface.is_some() {
+        return Err(std_io::Error::new(
+            std_io::ErrorKind::Unsupported,
+            "SO_BINDTODEVICE is Linux-only",
+        ));
+    }
+    Ok(())
 }
 
 pub struct ActiveRtpRelay {

@@ -2961,6 +2961,7 @@ async fn record_live_ims_channel(
                 security_verify: security_verify.clone(),
             })),
             media_route_installer,
+            media_interface: Some(tun_name_for_line(&live_runtime_config().tun_name, line_id)),
         },
         channel,
     )
@@ -3384,6 +3385,7 @@ async fn run_register_exchange_with_pcscf_variant(
         target,
         profile.ims.local_port,
         transport,
+        Some(gateway.tun_name()),
     )
     .await?;
     let local_addr = match socket.local_addr() {
@@ -3931,6 +3933,7 @@ async fn run_protected_authenticated_register_candidates(
             target,
             candidate.client_flow_local_port,
             transport,
+            Some(gateway.tun_name()),
         )
         .await
         {
@@ -3964,6 +3967,7 @@ async fn run_protected_authenticated_register_candidates(
                                 SocketAddr::new(context.route_addr, offer.port_c),
                                 local_security.port_s,
                                 transport,
+                                Some(gateway.tun_name()),
                             )
                             .await
                             {
@@ -4230,7 +4234,15 @@ async fn send_live_sms_message_variant(
 
     let target = SocketAddr::new(route.remote_addr, route.remote_port);
     let transport = ims_transport(profile);
-    let socket = connect_sip_socket(route.local_addr, target, route.local_port, transport).await?;
+    let tun_name = tun_name_for_line(&live_runtime_config().tun_name, line_id);
+    let socket = connect_sip_socket(
+        route.local_addr,
+        target,
+        route.local_port,
+        transport,
+        Some(&tun_name),
+    )
+    .await?;
     let mut pending = Vec::new();
     let local_addr = socket
         .local_addr()
@@ -5020,6 +5032,7 @@ async fn connect_sip_socket(
     target: SocketAddr,
     preferred_local_port: u16,
     transport: crate::connectivity::core::context::SipTransport,
+    interface: Option<&str>,
 ) -> Result<SipChannelSocket, LiveStageError> {
     match transport {
         crate::connectivity::core::context::SipTransport::Tcp => {
@@ -5028,6 +5041,8 @@ async fn connect_sip_socket(
                 SocketAddr::V6(_) => TcpSocket::new_v6(),
             }
             .map_err(|_| live_stage_error("ims_tcp_socket_failed"))?;
+            bind_socket_to_interface(&socket, interface)
+                .map_err(|_| live_stage_error("ims_tcp_bind_interface_failed"))?;
             let _ = socket.set_reuseaddr(true);
             if preferred_local_port != 0 {
                 socket
@@ -5050,15 +5065,98 @@ async fn connect_sip_socket(
             } else {
                 0
             };
-            let socket = tokio::net::UdpSocket::bind(SocketAddr::new(inner_addr, local_port))
-                .await
-                .map_err(|_| live_stage_error("ims_udp_bind_failed"))?;
+            let socket =
+                bind_udp_socket_to_interface(SocketAddr::new(inner_addr, local_port), interface)
+                    .await
+                    .map_err(|_| live_stage_error("ims_udp_bind_failed"))?;
             socket
                 .connect(target)
                 .await
                 .map_err(|_| live_stage_error("ims_udp_connect_failed"))?;
             Ok(SipChannelSocket::Udp(socket))
         }
+    }
+}
+
+async fn bind_udp_socket_to_interface(
+    local: SocketAddr,
+    interface: Option<&str>,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let Some(interface) = interface.filter(|value| !value.trim().is_empty()) else {
+        return tokio::net::UdpSocket::bind(local).await;
+    };
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(local),
+        socket2::Type::DGRAM,
+        Some(socket2::Protocol::UDP),
+    )?;
+    socket.set_reuse_address(true)?;
+    bind_raw_socket_to_interface(&socket, interface)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    tokio::net::UdpSocket::from_std(socket.into())
+}
+
+fn bind_socket_to_interface(
+    _socket: &tokio::net::TcpSocket,
+    interface: Option<&str>,
+) -> std::io::Result<()> {
+    let Some(interface) = interface.filter(|value| !value.trim().is_empty()) else {
+        return Ok(());
+    };
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::fd::AsRawFd};
+        let name = CString::new(interface).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
+        })?;
+        let result = unsafe {
+            libc::setsockopt(
+                _socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(std::io::Error::last_os_error());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = interface;
+        Ok(())
+    }
+}
+
+fn bind_raw_socket_to_interface(socket: &socket2::Socket, interface: &str) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::fd::AsRawFd};
+        let name = CString::new(interface).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
+        })?;
+        let result = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_BINDTODEVICE,
+                name.as_ptr().cast(),
+                name.as_bytes_with_nul().len() as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (socket, interface);
+        Ok(())
     }
 }
 

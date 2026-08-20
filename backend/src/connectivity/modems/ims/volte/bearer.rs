@@ -16,6 +16,10 @@ use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
 
 use tokio::process::Command;
 
+use crate::platform::network_routing::{
+    host_selector, route_table, rule_priority, source_selector, RouteDomain,
+};
+
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
@@ -537,62 +541,159 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
 }
 
 async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
-    let Some(IpAddr::V6(address)) = bearer.settings.ipv6_address else {
+    let Some(address @ IpAddr::V6(_)) = bearer.settings.ipv6_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv6_prefix.unwrap_or(64);
-    let address = format!("{address}/{prefix}");
+    let address_with_prefix = format!("{address}/{prefix}");
     run_ip(&[
         "-6",
         "address",
         "replace",
-        &address,
+        &address_with_prefix,
         "dev",
         &bearer.interface,
     ])
     .await?;
+    configure_source_policy(&bearer.interface, address, prefix).await?;
     for dns in &bearer.settings.ipv6_dns {
-        route_host(&bearer.interface, *dns).await?;
+        route_host_on_bearer(bearer, *dns).await?;
     }
     Ok(())
 }
 
 async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
-    let Some(IpAddr::V4(address)) = bearer.settings.ipv4_address else {
+    let Some(address @ IpAddr::V4(_)) = bearer.settings.ipv4_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv4_prefix.unwrap_or(32);
-    let address = format!("{address}/{prefix}");
-    run_ip(&["address", "replace", &address, "dev", &bearer.interface]).await?;
+    let address_with_prefix = format!("{address}/{prefix}");
+    run_ip(&[
+        "address",
+        "replace",
+        &address_with_prefix,
+        "dev",
+        &bearer.interface,
+    ])
+    .await?;
+    configure_source_policy(&bearer.interface, address, prefix).await?;
     for dns in &bearer.settings.ipv4_dns {
-        route_host(&bearer.interface, *dns).await?;
+        route_host_on_bearer(bearer, *dns).await?;
     }
     Ok(())
 }
 
 pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
-    route_host(&bearer.interface, pcscf).await
+    route_host_on_bearer(bearer, pcscf).await
 }
 
-async fn route_host(interface: &str, host: IpAddr) -> Result<(), VolteError> {
-    let (family, suffix) = if host.is_ipv6() {
-        (Some("-6"), 128)
-    } else {
-        (None, 32)
-    };
-    let destination = format!("{host}/{suffix}");
+/// Install a host route for an operator media address on the dedicated IMS
+/// bearer. RTP/RTCP and video endpoints are supplied dynamically in SDP and
+/// are not necessarily the P-CSCF address; without this route Linux may send
+/// media through the management/Wi-Fi default route.
+pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+    route_host_on_bearer(bearer, host).await
+}
+
+/// IMS traffic must be selected by the bearer source address, not by the
+/// process-wide main route table. Multiple modems can receive the same remote
+/// RTP address, and a main-table `/32` would let the last line win.
+async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+    if let Ok(local) = bearer.local_addr() {
+        if local.is_ipv4() != host.is_ipv4() {
+            return Err(VolteError::new("volte_route_family_mismatch"));
+        }
+    }
+    let table = route_table(RouteDomain::VolteIms, &bearer.interface, host);
+    let destination = host_selector(host);
+    let family = if host.is_ipv6() { Some("-6") } else { None };
+    let table = table.to_string();
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&["route", "replace", &destination, "dev", interface]);
+    args.extend_from_slice(&[
+        "route",
+        "replace",
+        &destination,
+        "dev",
+        &bearer.interface,
+        "table",
+        &table,
+    ]);
     run_ip(&args).await.map(|_| ())
+}
+
+async fn configure_source_policy(
+    interface: &str,
+    address: IpAddr,
+    prefix: u8,
+) -> Result<(), VolteError> {
+    let family = if address.is_ipv6() { Some("-6") } else { None };
+    let table = route_table(RouteDomain::VolteIms, interface, address).to_string();
+    let priority = rule_priority(RouteDomain::VolteIms, interface, address).to_string();
+    let source = source_selector(address);
+    let connected = format!("{address}/{prefix}");
+    let mut flush = Vec::new();
+    if let Some(family) = family {
+        flush.push(family);
+    }
+    flush.extend_from_slice(&["route", "flush", "table", &table]);
+    let _ = run_ip(&flush).await;
+
+    let mut delete = Vec::new();
+    if let Some(family) = family {
+        delete.push(family);
+    }
+    delete.extend_from_slice(&["rule", "del", "priority", &priority]);
+    let _ = run_ip(&delete).await;
+
+    let mut add = Vec::new();
+    if let Some(family) = family {
+        add.push(family);
+    }
+    add.extend_from_slice(&[
+        "rule", "add", "priority", &priority, "from", &source, "table", &table,
+    ]);
+    run_ip(&add).await?;
+
+    let mut connected_route = Vec::new();
+    if let Some(family) = family {
+        connected_route.push(family);
+    }
+    connected_route.extend_from_slice(&[
+        "route", "replace", &connected, "dev", interface, "table", &table,
+    ]);
+    run_ip(&connected_route).await.map(|_| ())
 }
 
 /// Remove network state only from the dedicated bearer interface. This is
 /// used on failed registration and normal teardown so stale IPv6 addresses or
 /// host routes cannot accumulate across long-running retries.
 pub async fn teardown_bearer_network(bearer: &BearerConnection) {
+    for (address, _prefix) in [
+        (bearer.settings.ipv4_address, bearer.ipv4_prefix),
+        (bearer.settings.ipv6_address, bearer.ipv6_prefix),
+    ] {
+        if let Some(address) = address {
+            let table = route_table(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+            let priority =
+                rule_priority(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+            let family = if address.is_ipv6() { Some("-6") } else { None };
+            let mut flush = Vec::new();
+            if let Some(family) = family {
+                flush.push(family);
+            }
+            flush.extend_from_slice(&["route", "flush", "table", &table]);
+            let _ = run_ip(&flush).await;
+            let mut delete = Vec::new();
+            if let Some(family) = family {
+                delete.push(family);
+            }
+            delete.extend_from_slice(&["rule", "del", "priority", &priority]);
+            let _ = run_ip(&delete).await;
+        }
+    }
     let _ = run_ip(&["-6", "route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["address", "flush", "dev", &bearer.interface]).await;

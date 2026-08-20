@@ -26,14 +26,20 @@
 //! specific, reported failure.
 
 use std::{
+    io,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{
     net::UdpSocket,
     process::Command,
     time::{sleep, timeout},
+};
+
+use crate::platform::network_routing::{
+    host_selector, route_table, rule_priority, source_selector, RouteDomain,
 };
 use tracing::{debug, info, warn};
 
@@ -254,7 +260,7 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
         sleep(LINK_SETTLE).await;
 
         let before = read_counters(candidate);
-        let socket_replied = send_probe(config).await;
+        let socket_replied = send_probe(config, candidate).await;
         let after = read_counters(candidate);
 
         if probe_observed(socket_replied, before, after) {
@@ -333,17 +339,20 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
     // Keep bearer traffic out of the host's main routing table. A source rule
     // gives probes (and, for a data bearer, the proxy) a private table without
     // replacing Wi-Fi/Ethernet defaults or another PDP context's DNS routes.
-    let table = routing_table(interface, config.address).to_string();
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
+    let priority = rule_priority(RouteDomain::ModemData, interface, config.address).to_string();
     let source = source_selector(config.address);
     let mut delete_rule = family_arg.to_vec();
-    delete_rule.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
+    delete_rule.extend_from_slice(&["rule", "del", "priority", &priority]);
     let _ = run_ip(&delete_rule).await;
     let mut add_rule = family_arg.to_vec();
-    add_rule.extend_from_slice(&["rule", "add", "from", &source, "table", &table]);
+    add_rule.extend_from_slice(&[
+        "rule", "add", "priority", &priority, "from", &source, "table", &table,
+    ]);
     run_ip(&add_rule).await?;
 
     if let Some(target) = config.probe_target {
-        let destination = format!("{}/{}", target, if target.is_ipv6() { 128 } else { 32 });
+        let destination = host_selector(target);
         let mut args = family_arg.to_vec();
         args.extend_from_slice(&[
             "route",
@@ -369,13 +378,13 @@ async fn deconfigure(interface: &str, config: &NetdevConfig) {
     } else {
         &[]
     };
-    let table = routing_table(interface, config.address).to_string();
-    let source = source_selector(config.address);
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
+    let priority = rule_priority(RouteDomain::ModemData, interface, config.address).to_string();
     let mut args = family_arg.to_vec();
     args.extend_from_slice(&["route", "flush", "table", &table]);
     let _ = run_ip(&args).await;
     let mut args = family_arg.to_vec();
-    args.extend_from_slice(&["rule", "del", "from", &source, "table", &table]);
+    args.extend_from_slice(&["rule", "del", "priority", &priority]);
     let _ = run_ip(&args).await;
     let address = format!("{}/{}", config.address, config.prefix);
     let mut args = family_arg.to_vec();
@@ -392,7 +401,7 @@ pub async fn install_default_route(interface: &str, config: &NetdevConfig) -> Re
     } else {
         &[]
     };
-    let table = routing_table(interface, config.address).to_string();
+    let table = route_table(RouteDomain::ModemData, interface, config.address).to_string();
     let mut args = family_arg.to_vec();
     args.extend_from_slice(&[
         "route", "replace", "default", "dev", interface, "table", &table,
@@ -407,15 +416,6 @@ pub async fn teardown(interface: &str, config: &NetdevConfig) {
     deconfigure(interface, config).await;
 }
 
-fn source_selector(address: IpAddr) -> String {
-    format!("{}/{}", address, if address.is_ipv6() { 128 } else { 32 })
-}
-
-fn routing_table(interface: &str, address: IpAddr) -> u32 {
-    let suffix = trailing_number(interface).min(999);
-    12_000 + suffix * 2 + u32::from(address.is_ipv6())
-}
-
 /// Send one packet the network should answer, from the session address.
 ///
 /// A DNS query is used because it is a plain UDP datagram that needs no
@@ -423,12 +423,12 @@ fn routing_table(interface: &str, address: IpAddr) -> u32 {
 /// is irrelevant — only that *some* bytes come back on the source-bound socket
 /// (or, as a fallback, move the interface RX counter). Failures are ignored: an
 /// unreachable target simply means this candidate does not answer.
-async fn send_probe(config: &NetdevConfig) -> bool {
+async fn send_probe(config: &NetdevConfig, interface: &str) -> bool {
     let Some(target) = config.probe_target else {
         return false;
     };
     let bind = SocketAddr::new(config.address, 0);
-    let Ok(socket) = UdpSocket::bind(bind).await else {
+    let Ok(socket) = bind_probe_socket(bind, interface) else {
         debug!(?bind, "Probe socket could not bind to the session address");
         return false;
     };
@@ -459,6 +459,42 @@ async fn send_probe(config: &NetdevConfig) -> bool {
         timeout(PROBE_REPLY_WAIT, socket.recv_from(&mut response)).await,
         Ok(Ok((length, _))) if length > 0
     )
+}
+
+fn bind_probe_socket(local: SocketAddr, interface: &str) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    bind_probe_socket_to_device(&socket, interface)?;
+    socket.bind(&local.into())?;
+    socket.set_nonblocking(true)?;
+    UdpSocket::from_std(socket.into())
+}
+
+#[cfg(target_os = "linux")]
+fn bind_probe_socket_to_device(socket: &Socket, interface: &str) -> io::Result<()> {
+    use std::{ffi::CString, os::fd::AsRawFd};
+
+    let name = CString::new(interface)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface contains NUL"))?;
+    let result = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            name.as_ptr().cast(),
+            name.as_bytes_with_nul().len() as libc::socklen_t,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_probe_socket_to_device(_socket: &Socket, _interface: &str) -> io::Result<()> {
+    Ok(())
 }
 
 fn probe_observed(socket_replied: bool, before: LinkCounters, after: LinkCounters) -> bool {
@@ -587,9 +623,9 @@ mod tests {
     fn data_policy_tables_are_stable_and_family_separated() {
         let v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         let v6 = IpAddr::V6("2001:db8::2".parse().unwrap());
-        assert_eq!(routing_table("wwan0", v4), 12_000);
-        assert_eq!(routing_table("wwan0", v6), 12_001);
-        assert_eq!(routing_table("wwan7", v4), 12_014);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan0", v4), 12_000);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan0", v6), 12_001);
+        assert_eq!(route_table(RouteDomain::ModemData, "wwan7", v4), 12_014);
         assert_eq!(source_selector(v4), "10.0.0.2/32");
         assert_eq!(source_selector(v6), "2001:db8::2/128");
     }

@@ -323,8 +323,18 @@ impl ProfileStore {
                     && digits.starts_with(*plmn)
             })
             .map(str::to_string);
-        let mut custom_matches = self
-            .custom_records()?
+        let (custom_records, custom_lookup_error) = match self.custom_records() {
+            Ok(records) => (records, None),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    access = access.as_str(),
+                    "Custom carrier profile lookup failed; continuing with catalog and standard fallback"
+                );
+                (Vec::new(), Some(error))
+            }
+        };
+        let mut custom_matches = custom_records
             .into_iter()
             .filter(|(_, record)| {
                 explicit_home_plmn.as_deref().map_or_else(
@@ -357,7 +367,7 @@ impl ProfileStore {
             Ok(_) => self.catalog.resolve_for_imsi(digits, home_plmn, access),
             Err(error) => Err(error),
         };
-        let fallback_reason = match catalog_result {
+        let catalog_fallback_reason = match catalog_result {
             Ok(Some(profile)) => {
                 return Ok(Some(ResolvedProfile::from(profile.record.intern())));
             }
@@ -375,6 +385,10 @@ impl ProfileStore {
             }
             Err(error) => error,
         };
+        let fallback_reason = custom_lookup_error
+            .map_or(catalog_fallback_reason.clone(), |error| {
+                format!("custom_profile_lookup_failed:{error};{catalog_fallback_reason}")
+            });
 
         Ok(derive_standard_fallback(
             digits,

@@ -250,6 +250,7 @@ pub fn build_register_with_policy(
         security_verify,
         sip_instance,
         policy,
+        None,
     )
 }
 
@@ -301,6 +302,45 @@ pub fn build_register_from_profile_with_target(
     sip_instance: &str,
     policy: RegisterRequestPolicy,
 ) -> Vec<u8> {
+    build_register_from_profile_with_target_and_visited(
+        profile,
+        target,
+        phase,
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        policy,
+        None,
+    )
+}
+
+/// Build REGISTER with a runtime visited-network override.
+///
+/// Carrier profiles normally provide a static `P-Visited-Network-ID`. During
+/// roaming the visited PLMN is learned from ModemManager, so the live path can
+/// replace that static value without changing the home profile used for IMS
+/// identities, APN, authentication, or registrar selection.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_from_profile_with_target_and_visited(
+    profile: &CarrierProfile,
+    target: RegisterTarget<'_>,
+    phase: RegisterPhase,
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+    visited_network_override: Option<&str>,
+) -> Vec<u8> {
     build_register_internal(
         Some(profile),
         Some(target),
@@ -314,6 +354,7 @@ pub fn build_register_from_profile_with_target(
         security_verify,
         sip_instance,
         policy,
+        visited_network_override,
     )
 }
 
@@ -361,6 +402,7 @@ fn build_register_internal(
     security_verify: Option<&str>,
     sip_instance: &str,
     policy: RegisterRequestPolicy,
+    visited_network_override: Option<&str>,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -473,14 +515,19 @@ fn build_register_internal(
     if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
         contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
     }
-    let visited_network = profile
-        .and_then(|profile| profile.ims.register.visited_network_header)
-        .or_else(|| (profile.is_none() && policy.include_visited_network).then(|| ""))
+    let visited_network = visited_network_override
+        .map(str::to_string)
+        .or_else(|| {
+            profile
+                .and_then(|profile| profile.ims.register.visited_network_header)
+                .map(str::to_string)
+        })
+        .or_else(|| (profile.is_none() && policy.include_visited_network).then(String::new))
         .map(|value| {
             if value.is_empty() {
                 format!("\"{}\"", identity.home_domain)
             } else {
-                value.to_string()
+                value
             }
         });
     crate::connectivity::core::register_message::build_register(&RegisterRequest {
@@ -1384,6 +1431,37 @@ mod tests {
         assert_eq!(
             profile.ims.user_agent,
             header_value(frame.as_bytes(), "User-Agent").unwrap()
+        );
+    }
+
+    #[test]
+    fn roaming_register_overrides_static_visited_network_only_for_this_request() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let frame = build_register_from_profile_with_target_and_visited(
+            &profile,
+            RegisterTarget::from_profile(&profile),
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_visited_network: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\""),
+        );
+        assert_eq!(
+            header_value(&frame, "P-Visited-Network-ID").as_deref(),
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\"")
+        );
+        assert_eq!(
+            profile.ims.register.visited_network_header,
+            Some("\"legacy-test-profile\"")
         );
     }
 

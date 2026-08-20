@@ -42,7 +42,9 @@ use crate::{
         ImsError,
     },
     connectivity::modems::ims::vowifi::{
-        carrier_catalog::CatalogAccessKind, profile_store::ProfileStore, profiles::CarrierProfile,
+        carrier_catalog::CatalogAccessKind,
+        profile_store::{ProfileOrigin, ProfileStore},
+        profiles::CarrierProfile,
     },
     hardware::cellular::modem_manager::ModemBinding,
     platform::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily},
@@ -73,8 +75,8 @@ use crate::connectivity::modems::ims::{
 
 use super::{
     bearer::{
-        configure_bearer_network, disconnect_bearer, ensure_ims_bearer_observed, route_pcscf,
-        teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
+        configure_bearer_network, disconnect_bearer, ensure_ims_bearer_observed, route_media_host,
+        route_pcscf, teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
     data_slot::DataSlotMode,
@@ -84,7 +86,7 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf, discover_pcscf_via_active_at_context, pcscf_socket,
+        discover_pcscf_on_interface, discover_pcscf_via_active_at_context, pcscf_socket,
         prefetch_pcscf_from_ims_profile, prepare_ims_profile_context, set_pcscf_reporting,
         ImsProfileLease,
     },
@@ -345,6 +347,9 @@ struct VolteLiveSession {
     /// Owned access-specific values fixed when this session started. Refresh,
     /// SMS and voice must not re-read SimOverrideStore mid-session.
     effective_ims: EffectiveImsProfile,
+    /// Runtime `P-Visited-Network-ID` derived from the currently registered
+    /// PLMN. The home carrier profile remains unchanged while roaming.
+    visited_network_header: Option<String>,
     voice_calls: HashMap<String, LiveVoiceCall>,
     mwi_subscription: Option<MwiSubscription>,
 }
@@ -463,6 +468,7 @@ struct DeviceIdentity {
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
     effective_device_identity: EffectiveDeviceIdentity,
+    visited_network_header: Option<String>,
     aka_aid: Vec<u8>,
     usim_aid: String,
     isim_aid: Option<String>,
@@ -711,7 +717,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             .supported_header
             .split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("sec-agree"));
-    vec![VolteRegisterVariant {
+    let primary = VolteRegisterVariant {
         label: profile.ims.register.live_header_variant_set,
         authorization,
         policy: sip::RegisterRequestPolicy {
@@ -725,7 +731,28 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
         },
         server_required_sec_agree: required,
         security_client_offer: VolteSecurityClientOffer::Full,
-    }]
+    };
+    // A database row can be syntactically valid yet disagree with a visited
+    // P-CSCF's initial REGISTER expectations. Keep the profile-specific form
+    // first, then allow one conservative generic form to proceed to AKA. The
+    // transaction loop still refuses this fallback after an authentication
+    // round, so it cannot mask bad credentials or USIM authentication errors.
+    let fallback = VolteRegisterVariant {
+        label: "generic_ims_register_fallback",
+        authorization: VolteInitialAuthorization::None,
+        policy: sip::RegisterRequestPolicy {
+            advertise_sec_agree: false,
+            require_sec_agree: false,
+            proxy_require_sec_agree: false,
+            include_mmtel_features: true,
+            include_video_feature: false,
+            include_route_header: true,
+            include_visited_network: profile.ims.register.include_visited_network,
+        },
+        server_required_sec_agree: false,
+        security_client_offer: VolteSecurityClientOffer::Full,
+    };
+    vec![primary, fallback]
 }
 
 fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
@@ -773,6 +800,7 @@ struct VolteRegisterAuthenticator {
     register_policy: sip::RegisterRequestPolicy,
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
+    visited_network_header: Option<String>,
     expires_seconds: u32,
 }
 
@@ -791,6 +819,7 @@ impl VolteRegisterAuthenticator {
         register_policy: sip::RegisterRequestPolicy,
         profile: &'static CarrierProfile,
         effective_ims: EffectiveImsProfile,
+        visited_network_header: Option<String>,
     ) -> Self {
         Self {
             identity,
@@ -809,6 +838,7 @@ impl VolteRegisterAuthenticator {
             register_policy,
             profile,
             effective_ims,
+            visited_network_header,
             expires_seconds: profile.ims.register.expires_seconds,
         }
     }
@@ -1001,7 +1031,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
-        Ok(sip::build_register_from_profile_with_target(
+        Ok(sip::build_register_from_profile_with_target_and_visited(
             self.profile,
             effective_register_target(&self.effective_ims),
             sip::RegisterPhase::Authenticated,
@@ -1017,6 +1047,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 require_sec_agree: prepared.require_sec_agree,
                 ..self.register_policy
             },
+            self.visited_network_header.as_deref(),
         ))
     }
 }
@@ -1686,7 +1717,7 @@ async fn connect_family(
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
-    let pcscf = discover_pcscf(
+    let pcscf = discover_pcscf_on_interface(
         &bearer.settings,
         &device_identity.ims.home_domain,
         device_identity
@@ -1695,6 +1726,7 @@ async fn connect_family(
             .as_ref()
             .map(|field| field.value.as_str()),
         local_addr,
+        Some(&bearer.interface),
     )
     .await?;
     route_pcscf(bearer, pcscf).await?;
@@ -1726,6 +1758,7 @@ async fn connect_family(
                 .expect("REGISTER variant iterator was checked before use"),
         };
         variant.policy.include_video_feature = video_capability_enabled;
+        variant.policy.include_visited_network |= device_identity.visited_network_header.is_some();
         let mut channel = VolteSipChannel::bind(route, Some(&bearer.interface), None)
             .map_err(map_channel_error)?;
         let receive_port = channel
@@ -1755,7 +1788,7 @@ async fn connect_family(
         let initial_security_client = (profile.ims.register.sec_agree_mode != "disabled"
             && !profile.ims.register.security_client_mechanisms.is_empty())
         .then_some(negotiated_security.as_str());
-        let initial = sip::build_register_from_profile_with_target(
+        let initial = sip::build_register_from_profile_with_target_and_visited(
             profile,
             effective_register_target(&device_identity.effective_ims),
             sip::RegisterPhase::Initial,
@@ -1768,6 +1801,7 @@ async fn connect_family(
             None,
             &sip_instance,
             variant.policy,
+            device_identity.visited_network_header.as_deref(),
         );
         log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
@@ -1793,6 +1827,7 @@ async fn connect_family(
             variant.policy,
             profile,
             device_identity.effective_ims.clone(),
+            device_identity.visited_network_header.clone(),
         );
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
             .await
@@ -1916,6 +1951,7 @@ async fn connect_family(
             aka_aid: device_identity.aka_aid.clone(),
             profile,
             effective_ims: device_identity.effective_ims.clone(),
+            visited_network_header: device_identity.visited_network_header.clone(),
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
@@ -1972,7 +2008,7 @@ async fn unregister_live_session(
         require_sec_agree: security_verify.is_some(),
         ..session.register_variant.policy
     };
-    let request = sip::build_register_from_profile_with_target(
+    let request = sip::build_register_from_profile_with_target_and_visited(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -1985,6 +2021,7 @@ async fn unregister_live_session(
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
+        session.visited_network_header.as_deref(),
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
@@ -2003,6 +2040,7 @@ async fn unregister_live_session(
         register_policy,
         session.profile,
         session.effective_ims.clone(),
+        session.visited_network_header.clone(),
     )
     .with_expires_seconds(0);
     run_unregister(&mut session.channel, &request, &mut authenticator).await
@@ -2371,7 +2409,7 @@ async fn refresh_live_registration(
         require_sec_agree,
         ..session.register_variant.policy
     };
-    let initial = sip::build_register_from_profile_with_target(
+    let initial = sip::build_register_from_profile_with_target_and_visited(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -2384,6 +2422,7 @@ async fn refresh_live_registration(
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
+        session.visited_network_header.as_deref(),
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
@@ -2402,6 +2441,7 @@ async fn refresh_live_registration(
         register_policy,
         session.profile,
         session.effective_ims.clone(),
+        session.visited_network_header.clone(),
     );
     let registration =
         match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
@@ -2633,12 +2673,13 @@ async fn handle_operator_command_inner(
                 return Err(VolteError::new("vilte_feature_disabled"));
             }
             let callee_uri = normalize_operator_callee(&callee, &session.identity.home_domain)?;
-            let relay =
-                PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                    })?;
+            let relay = PendingRtpRelay::bind_with_operator_interface(
+                session.channel.route().local_addr.ip(),
+                trunk_local_ip,
+                session.channel.interface(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -2647,12 +2688,15 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| {
-                            VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                        })?;
+                let relay = PendingRtpRelay::bind_with_operator_interface(
+                    session.channel.route().local_addr.ip(),
+                    trunk_local_ip,
+                    session.channel.interface(),
+                )
+                .await
+                .map_err(|error| {
+                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
                     VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
@@ -2830,11 +2874,13 @@ async fn handle_operator_command_inner(
                 return Err(VolteError::new("vilte_feature_disabled"));
             }
             let operator_ip = session.channel.route().local_addr.ip();
-            let pending = PendingRtpRelay::bind(operator_ip, trunk_local_ip)
-                .await
-                .map_err(|error| {
-                    VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                })?;
+            let pending = PendingRtpRelay::bind_with_operator_interface(
+                operator_ip,
+                trunk_local_ip,
+                session.channel.interface(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
             let operator_local = pending.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -2843,11 +2889,15 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = PendingRtpRelay::bind(operator_ip, trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                    })?;
+                let relay = PendingRtpRelay::bind_with_operator_interface(
+                    operator_ip,
+                    trunk_local_ip,
+                    session.channel.interface(),
+                )
+                .await
+                .map_err(|error| {
+                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
                     VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
@@ -3266,6 +3316,7 @@ async fn handle_operator_sip_frame(
             VolteError::with_detail("volte_voice_sdp_invalid", error.to_string())
         })?;
         let operator_remote = media_socket_addr(&operator_audio)?;
+        ensure_operator_sdp_routes(&session.bearer, sip::sip_body(frame)).await?;
         let operator_video = parse_video_sdp(sip::sip_body(frame))
             .ok()
             .and_then(|description| {
@@ -3280,12 +3331,13 @@ async fn handle_operator_sip_frame(
             send_incoming_rejection(session, runtime, frame, 488).await?;
             return Ok(true);
         }
-        let pending =
-            PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                .await
-                .map_err(|error| {
-                    VolteError::with_detail("volte_rtp_bind_failed", error.to_string())
-                })?;
+        let pending = PendingRtpRelay::bind_with_operator_interface(
+            session.channel.route().local_addr.ip(),
+            trunk_local_ip,
+            session.channel.interface(),
+        )
+        .await
+        .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
         let operator_local = pending.operator_local_addr().map_err(|error| {
             VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
         })?;
@@ -3294,12 +3346,13 @@ async fn handle_operator_sip_frame(
         })?;
         let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some()
         {
-            let relay =
-                PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| {
-                        VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
-                    })?;
+            let relay = PendingRtpRelay::bind_with_operator_interface(
+                session.channel.route().local_addr.ip(),
+                trunk_local_ip,
+                session.channel.interface(),
+            )
+            .await
+            .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
                 VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
             })?;
@@ -3503,6 +3556,9 @@ async fn handle_operator_sip_frame(
             }
             let identity = session.identity.clone();
             let route = session.channel.route();
+            if !sip::sip_body(frame).is_empty() {
+                ensure_operator_sdp_routes(&session.bearer, sip::sip_body(frame)).await?;
+            }
             let delayed_ip_connect =
                 live.operator.ip_connect_mode() == TrunkIpConnectMode::FirstRtp;
             let (body, prack, first_operator_rtp) = {
@@ -3574,6 +3630,9 @@ async fn handle_operator_sip_frame(
         if (200..300).contains(&status) {
             let identity = session.identity.clone();
             let route = session.channel.route();
+            if !sip::sip_body(frame).is_empty() {
+                ensure_operator_sdp_routes(&session.bearer, sip::sip_body(frame)).await?;
+            }
             let immediate_ip_connect =
                 live.operator.ip_connect_mode() == TrunkIpConnectMode::GsmAnswer;
             let (ack, answer, first_operator_rtp) = {
@@ -3724,6 +3783,7 @@ async fn begin_incoming_operator_call(
                     endpoint,
                 })
         });
+    ensure_operator_media_routes(&session.bearer, operator_remote, operator_video.as_ref()).await?;
     if operator_video.is_some() && !live.operator.video_enabled() {
         send_incoming_rejection(session, runtime, frame, 488).await?;
         return Ok(true);
@@ -3750,8 +3810,12 @@ async fn begin_incoming_operator_call(
         send_incoming_rejection(session, runtime, frame, 400).await?;
         return Ok(true);
     };
-    let relay = match PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-        .await
+    let relay = match PendingRtpRelay::bind_with_operator_interface(
+        session.channel.route().local_addr.ip(),
+        trunk_local_ip,
+        session.channel.interface(),
+    )
+    .await
     {
         Ok(relay) => relay,
         Err(error) => {
@@ -3767,9 +3831,13 @@ async fn begin_incoming_operator_call(
         VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
     })?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.channel.route().local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
+        let relay = PendingRtpRelay::bind_with_operator_interface(
+            session.channel.route().local_addr.ip(),
+            trunk_local_ip,
+            session.channel.interface(),
+        )
+        .await
+        .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
         let operator_local = relay.operator_local_addr().map_err(|error| {
             VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
         })?;
@@ -4024,6 +4092,35 @@ fn prepare_final_operator_media(
         });
     }
     prepare_operator_media(call, body)
+}
+
+async fn ensure_operator_sdp_routes(
+    bearer: &BearerConnection,
+    body: &[u8],
+) -> Result<(), VolteError> {
+    let audio = parse_audio_sdp(body)
+        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+    let audio_remote = media_socket_addr(&audio)?;
+    let video = parse_video_sdp(body).ok().and_then(|description| {
+        let endpoint = media_endpoint_for_video(&audio, &description).ok()?;
+        Some(VideoOffer {
+            description,
+            endpoint,
+        })
+    });
+    ensure_operator_media_routes(bearer, audio_remote, video.as_ref()).await
+}
+
+async fn ensure_operator_media_routes(
+    bearer: &BearerConnection,
+    audio: SocketAddr,
+    video: Option<&VideoOffer>,
+) -> Result<(), VolteError> {
+    route_media_host(bearer, audio.ip()).await?;
+    if let Some(video) = video {
+        route_media_host(bearer, video.endpoint.ip()).await?;
+    }
+    Ok(())
 }
 
 fn arm_first_rtp_ip_answer(call: &mut LiveVoiceCall) -> Option<tokio::sync::watch::Receiver<bool>> {
@@ -4755,14 +4852,14 @@ async fn load_device_identity(
     let sim_imsi = key_value(&sim, "sim.properties.imsi")
         .filter(|value| value.len() >= 5 && value.bytes().all(|byte| byte.is_ascii_digit()));
     let cimi_argument = "--command=AT+CIMI";
-    let (imsi, imsi_source) = match command_output(
+    let (imsi, imsi_source, ef_ad_mnc_length) = match command_output(
         "mmcli",
         &["-m", device.modem_id.as_str(), cimi_argument],
     )
     .await
     {
         Ok(output) => match identity::parse_cimi_response(&output) {
-            Some(imsi) => (imsi, "at_cimi"),
+            Some(imsi) => (imsi, "at_cimi", None),
             None => {
                 tracing::warn!(
                     "Native VoLTE AT+CIMI response did not contain an IMSI; using SIM/UIM fallback"
@@ -4774,7 +4871,8 @@ async fn load_device_identity(
                             code::MM_IMSI_MISSING,
                             "at_cimi_modemmanager_and_uim_imsi_invalid",
                         )
-                    })?
+                    })
+                    .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
             }
         },
         Err(error) => {
@@ -4786,18 +4884,38 @@ async fn load_device_identity(
                         code::MM_IMSI_MISSING,
                         "modemmanager_sim_at_and_uim_identity_unavailable",
                     )
-                })?
+                })
+                .map(|identity| (identity.imsi, identity.source, identity.mnc_length))?
         }
     };
-    let home_plmn = [
+    let registered_plmn =
+        key_value(&modem, "modem.3gpp.operator-code").filter(|candidate| valid_plmn(candidate));
+    let mut home_plmn = [
         key_value(&sim, "sim.properties.operator-code"),
         key_value(&sim, "sim.properties.operator-id"),
         key_value(&sim, "sim.properties.operator-identifier"),
-        key_value(&modem, "modem.3gpp.operator-code"),
+        registered_plmn.clone(),
     ]
     .into_iter()
     .flatten()
     .find(|candidate| valid_home_plmn(&imsi, candidate));
+    let mut ef_ad_mnc_length = ef_ad_mnc_length;
+    if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
+        if let Some(uim_identity) = read_uim_identity(device).await {
+            if uim_identity.imsi == imsi {
+                ef_ad_mnc_length = uim_identity.mnc_length;
+            }
+        }
+    }
+    if home_plmn.is_none() && (ef_ad_mnc_length.is_some() || imsi.starts_with("460")) {
+        home_plmn = identity::resolve_home_plmn(
+            &imsi,
+            registered_plmn.as_deref(),
+            ef_ad_mnc_length.map(usize::from),
+        )
+        .ok()
+        .map(|resolved| format!("{}{}", resolved.mcc, resolved.mnc));
+    }
     let applications = match command_output(
         "qmicli",
         &[
@@ -4867,6 +4985,12 @@ async fn load_device_identity(
         })
         .await;
     let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
+    let visited_network_header = visited_network_header(
+        &imsi,
+        home_plmn.as_deref(),
+        registered_plmn.as_deref(),
+        profile.ims.register.include_visited_network || resolved.origin == ProfileOrigin::Derived,
+    );
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
         (!device.equipment_identifier.trim().is_empty())
@@ -4877,6 +5001,9 @@ async fn load_device_identity(
         profile_origin = resolved.origin.as_str(),
         profile_fallback_reason = ?resolved.fallback_reason,
         ims_domain_source = ?effective_ims.domain.source,
+        home_plmn = ?home_plmn,
+        registered_plmn = ?registered_plmn,
+        roaming_visited_network = ?visited_network_header,
         "Resolved native VoLTE carrier profile"
     );
     Ok(DeviceIdentity {
@@ -4890,6 +5017,7 @@ async fn load_device_identity(
         profile,
         effective_ims,
         effective_device_identity,
+        visited_network_header,
         aka_aid,
         usim_aid,
         source: identity_source,
@@ -4900,10 +5028,26 @@ async fn load_device_identity(
 async fn resolve_fallback_imsi(
     device: &VolteDeviceBinding,
     modemmanager_imsi: Option<&str>,
-) -> Option<(String, &'static str)> {
+) -> Option<FallbackImsi> {
     if let Some(imsi) = modemmanager_imsi {
-        return Some((imsi.to_string(), "sim_imsi_fallback"));
+        return Some(FallbackImsi {
+            imsi: imsi.to_string(),
+            source: "sim_imsi_fallback",
+            mnc_length: None,
+        });
     }
+    read_uim_identity(device)
+        .await
+        .map(|identity| FallbackImsi {
+            imsi: identity.imsi,
+            source: "uim_ef_imsi_fallback",
+            mnc_length: identity.mnc_length,
+        })
+}
+
+async fn read_uim_identity(
+    device: &VolteDeviceBinding,
+) -> Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity> {
     let qmi_device = device.qmi_device.clone();
     let uim_slot = device.uim_slot;
     tokio::task::spawn_blocking(move || {
@@ -4915,11 +5059,16 @@ async fn resolve_fallback_imsi(
             Duration::from_secs(3),
         )
         .ok()
-        .map(|identity| (identity.imsi, "uim_ef_imsi_fallback"))
     })
     .await
     .ok()
     .flatten()
+}
+
+struct FallbackImsi {
+    imsi: String,
+    source: &'static str,
+    mnc_length: Option<u8>,
 }
 
 async fn resolve_device_binding(
@@ -4985,9 +5134,37 @@ fn key_value(output: &str, key: &str) -> Option<String> {
 }
 
 fn valid_home_plmn(imsi: &str, candidate: &str) -> bool {
-    matches!(candidate.len(), 5 | 6)
-        && candidate.bytes().all(|byte| byte.is_ascii_digit())
-        && imsi.starts_with(candidate)
+    valid_plmn(candidate) && imsi.starts_with(candidate)
+}
+
+fn valid_plmn(candidate: &str) -> bool {
+    matches!(candidate.len(), 5 | 6) && candidate.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn visited_network_header(
+    imsi: &str,
+    home_plmn: Option<&str>,
+    registered_plmn: Option<&str>,
+    include_visited_network: bool,
+) -> Option<String> {
+    if !include_visited_network {
+        return None;
+    }
+    let registered = registered_plmn.filter(|plmn| valid_plmn(plmn))?;
+    let home = home_plmn.filter(|plmn| valid_home_plmn(imsi, plmn));
+    let roaming = home.map_or_else(
+        || !imsi.starts_with(registered),
+        |home| canonical_plmn(home) != canonical_plmn(registered),
+    );
+    roaming.then(|| {
+        let mcc = &registered[..3];
+        let mnc = &registered[3..];
+        format!("\"ims.mnc{:0>3}.mcc{}.3gppnetwork.org\"", mnc, mcc)
+    })
+}
+
+fn canonical_plmn(plmn: &str) -> String {
+    format!("{}{:0>3}", &plmn[..3], &plmn[3..])
 }
 
 fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
@@ -5427,6 +5604,7 @@ mod tests {
             aka_aid: Vec::new(),
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
+            visited_network_header: None,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
@@ -5441,6 +5619,20 @@ mod tests {
         assert_eq!(first.authorization, VolteInitialAuthorization::None);
         assert_eq!(first.policy, sip::RegisterRequestPolicy::LEGACY);
         assert_eq!(first.security_client_offer, VolteSecurityClientOffer::Full);
+    }
+
+    #[test]
+    fn production_register_variants_keep_a_generic_second_attempt() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let variants = register_variants(&profile);
+        assert_eq!(variants.len(), 2);
+        assert_eq!(
+            variants[0].label,
+            profile.ims.register.live_header_variant_set
+        );
+        assert_eq!(variants[1].label, "generic_ims_register_fallback");
+        assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
+        assert!(!variants[1].policy.require_sec_agree);
     }
 
     #[test]
@@ -5516,6 +5708,31 @@ mod tests {
             Some("46011")
         );
         assert!(!format!("{modem:?}").contains("460111234567890"));
+    }
+
+    #[test]
+    fn roaming_visited_network_uses_current_registered_plmn() {
+        assert_eq!(
+            visited_network_header("234331234567890", Some("23433"), Some("46000"), true,)
+                .as_deref(),
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\"")
+        );
+    }
+
+    #[test]
+    fn home_registration_does_not_override_profile_visited_network() {
+        assert_eq!(
+            visited_network_header("460011234567890", Some("46001"), Some("46001"), true,),
+            None
+        );
+        assert_eq!(
+            visited_network_header("234331234567890", Some("23433"), Some("46000"), false,),
+            None
+        );
+        assert_eq!(
+            visited_network_header("460011234567890", Some("46001"), Some("460001"), true,),
+            None
+        );
     }
 
     #[test]

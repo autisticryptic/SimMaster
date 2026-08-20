@@ -63,7 +63,7 @@ impl Drop for TunGatewayRuntime {
 impl TunGatewayRuntime {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        platform_shutdown_tun(&self.tun_name);
+        platform_shutdown_tun(&self.tun_name, self.inner_addr);
     }
 
     pub fn is_for_profile(&self, profile_id: &str) -> bool {
@@ -329,12 +329,12 @@ fn tun_error(reason: &'static str) -> TunGatewayError {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_shutdown_tun(tun_name: &str) {
-    imp::shutdown_tun(tun_name);
+fn platform_shutdown_tun(tun_name: &str, inner_addr: IpAddr) {
+    imp::shutdown_tun(tun_name, inner_addr);
 }
 
 #[cfg(not(target_os = "linux"))]
-fn platform_shutdown_tun(_tun_name: &str) {}
+fn platform_shutdown_tun(_tun_name: &str, _inner_addr: IpAddr) {}
 
 #[cfg(target_os = "linux")]
 fn platform_ensure_tun_host_route(
@@ -374,6 +374,9 @@ mod imp {
         protect_inner_packet_for_esp, protect_inner_packet_for_esp_with_mode,
         unprotect_inner_packet_from_esp, unprotect_inner_packet_from_esp_with_mode,
         AntiReplayWindow,
+    };
+    use crate::platform::network_routing::{
+        host_selector, route_table, rule_priority, source_selector, RouteDomain,
     };
 
     #[cfg(target_env = "musl")]
@@ -765,13 +768,14 @@ mod imp {
         }))
     }
 
-    pub(crate) fn shutdown_tun(tun_name: &str) {
+    pub(crate) fn shutdown_tun(tun_name: &str, inner_addr: IpAddr) {
         if tun_name.is_empty()
             || tun_name.len() >= IFNAMSIZ
             || !tun_name.bytes().all(valid_ifname_byte)
         {
             return;
         }
+        teardown_tun_policy(tun_name, inner_addr);
         let _ = Command::new("ip")
             .args(["link", "set", "dev", tun_name, "down"])
             .output();
@@ -824,15 +828,6 @@ mod imp {
                     "tun_gateway_ifconfig_address_failed",
                     true,
                 )?;
-                for pcscf_addr in route_targets(config) {
-                    let route_target = format!("{pcscf_addr}/128");
-                    run_command(
-                        &["route", "/sbin/route", "/usr/sbin/route"],
-                        &["-A", "inet6", "add", &route_target, "dev", &config.tun_name],
-                        "tun_gateway_route_failed",
-                        true,
-                    )?;
-                }
             }
             IpAddr::V4(addr) => {
                 let addr_text = addr.to_string();
@@ -848,16 +843,11 @@ mod imp {
                     "tun_gateway_ifconfig_address_failed",
                     true,
                 )?;
-                for pcscf_addr in route_targets(config) {
-                    let route_target = pcscf_addr.to_string();
-                    run_command(
-                        &["route", "/sbin/route", "/usr/sbin/route"],
-                        &["add", "-host", &route_target, "dev", &config.tun_name],
-                        "tun_gateway_route_failed",
-                        true,
-                    )?;
-                }
             }
+        }
+        configure_tun_policy(config)?;
+        for pcscf_addr in route_targets(config) {
+            ensure_tun_host_route(&config.tun_name, config.inner_addr, pcscf_addr)?;
         }
         Ok(())
     }
@@ -867,25 +857,101 @@ mod imp {
         inner_addr: IpAddr,
         remote: IpAddr,
     ) -> Result<(), TunGatewayError> {
-        let route_target = match remote {
-            IpAddr::V4(addr) => format!("{addr}/32"),
-            IpAddr::V6(addr) => format!("{addr}/128"),
-        };
-        let inner_addr = inner_addr.to_string();
+        let route_target = host_selector(remote);
+        let table = route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
+        let inner_addr_text = inner_addr.to_string();
+        let mut args = Vec::new();
+        if remote.is_ipv6() {
+            args.push("-6");
+        }
+        args.extend_from_slice(&[
+            "route",
+            "replace",
+            &route_target,
+            "dev",
+            tun_name,
+            "src",
+            &inner_addr_text,
+            "table",
+            &table,
+        ]);
         run_command(
             &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &[
-                "route",
-                "replace",
-                &route_target,
-                "dev",
-                tun_name,
-                "src",
-                &inner_addr,
-            ],
+            &args,
             "tun_gateway_media_route_failed",
             false,
         )
+    }
+
+    fn configure_tun_policy(config: &TunGatewayConfig) -> Result<(), TunGatewayError> {
+        let table =
+            route_table(RouteDomain::VowifiIms, &config.tun_name, config.inner_addr).to_string();
+        let priority =
+            rule_priority(RouteDomain::VowifiIms, &config.tun_name, config.inner_addr).to_string();
+        let source = source_selector(config.inner_addr);
+        let mut family = Vec::new();
+        if config.inner_addr.is_ipv6() {
+            family.push("-6");
+        }
+
+        let mut flush = family.clone();
+        flush.extend_from_slice(&["route", "flush", "table", &table]);
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &flush,
+            "tun_gateway_route_failed",
+            false,
+        );
+
+        let mut delete = family.clone();
+        delete.extend_from_slice(&[
+            "rule", "del", "priority", &priority, "from", &source, "table", &table,
+        ]);
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &delete,
+            "tun_gateway_rule_failed",
+            false,
+        );
+
+        let mut add = family;
+        add.extend_from_slice(&[
+            "rule", "add", "priority", &priority, "from", &source, "table", &table,
+        ]);
+        run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &add,
+            "tun_gateway_rule_failed",
+            false,
+        )
+    }
+
+    fn teardown_tun_policy(tun_name: &str, inner_addr: IpAddr) {
+        let table = route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
+        let priority = rule_priority(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
+        let source = source_selector(inner_addr);
+        let mut family = Vec::new();
+        if inner_addr.is_ipv6() {
+            family.push("-6");
+        }
+        let mut flush = family.clone();
+        flush.extend_from_slice(&["route", "flush", "table", &table]);
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &flush,
+            "tun_gateway_route_failed",
+            false,
+        );
+        let mut delete = family;
+        delete.extend_from_slice(&[
+            "rule", "del", "priority", &priority, "from", &source, "table", &table,
+        ]);
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &delete,
+            "tun_gateway_rule_failed",
+            false,
+        );
     }
 
     fn route_targets(config: &TunGatewayConfig) -> Vec<IpAddr> {

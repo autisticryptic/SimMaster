@@ -119,6 +119,10 @@ pub struct RegisteredVoiceContext {
     pub options_ping_interval: Option<Duration>,
     pub(crate) unregister: Option<Arc<dyn RegisteredUnregister>>,
     pub(crate) media_route_installer: Option<Arc<dyn MediaRouteInstaller>>,
+    /// Per-line ePDG TUN carrying operator SIP/RTP. Keeping the interface in
+    /// the registered context lets media sockets remain distinguishable even
+    /// when two tunnels receive the same inner IMS address.
+    pub(crate) media_interface: Option<String>,
 }
 
 pub(crate) trait MediaRouteInstaller: Send + Sync {
@@ -782,10 +786,13 @@ async fn handle_command_inner(
                 return Err("vowifi_concurrent_call_limit".into());
             }
             let remote_uri = normalize_callee(&callee, &session.context.identity.home_domain)?;
-            let pending =
-                PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+            let pending = PendingRtpRelay::bind_with_operator_interface(
+                session.context.route.local_addr.ip(),
+                trunk_local_ip,
+                session.context.media_interface.as_deref(),
+            )
+            .await
+            .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -794,10 +801,13 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                let relay = PendingRtpRelay::bind_with_operator_interface(
+                    session.context.route.local_addr.ip(),
+                    trunk_local_ip,
+                    session.context.media_interface.as_deref(),
+                )
+                .await
+                .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -975,10 +985,13 @@ async fn handle_command_inner(
             if offer.video.is_some() && !link.video_enabled() {
                 return Err("vowifi_video_feature_disabled".into());
             }
-            let pending =
-                PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                    .await
-                    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+            let pending = PendingRtpRelay::bind_with_operator_interface(
+                session.context.route.local_addr.ip(),
+                trunk_local_ip,
+                session.context.media_interface.as_deref(),
+            )
+            .await
+            .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -987,10 +1000,13 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay =
-                    PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-                        .await
-                        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                let relay = PendingRtpRelay::bind_with_operator_interface(
+                    session.context.route.local_addr.ip(),
+                    trunk_local_ip,
+                    session.context.media_interface.as_deref(),
+                )
+                .await
+                .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1748,9 +1764,13 @@ async fn begin_incoming_call(
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-        .await
-        .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending = PendingRtpRelay::bind_with_operator_interface(
+        session.context.route.local_addr.ip(),
+        trunk_local_ip,
+        session.context.media_interface.as_deref(),
+    )
+    .await
+    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1758,9 +1778,13 @@ async fn begin_incoming_call(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        let relay = PendingRtpRelay::bind_with_operator_interface(
+            session.context.route.local_addr.ip(),
+            trunk_local_ip,
+            session.context.media_interface.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1919,9 +1943,13 @@ async fn begin_network_reinvite(
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-        .await
-        .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending = PendingRtpRelay::bind_with_operator_interface(
+        session.context.route.local_addr.ip(),
+        trunk_local_ip,
+        session.context.media_interface.as_deref(),
+    )
+    .await
+    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1929,9 +1957,13 @@ async fn begin_network_reinvite(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind(session.context.route.local_addr.ip(), trunk_local_ip)
-            .await
-            .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        let relay = PendingRtpRelay::bind_with_operator_interface(
+            session.context.route.local_addr.ip(),
+            trunk_local_ip,
+            session.context.media_interface.as_deref(),
+        )
+        .await
+        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -2658,6 +2690,7 @@ mod tests {
             options_ping_interval: None,
             unregister: None,
             media_route_installer: None,
+            media_interface: None,
         }
     }
 
