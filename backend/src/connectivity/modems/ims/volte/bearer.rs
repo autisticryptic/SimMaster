@@ -17,7 +17,7 @@ use std::{collections::VecDeque, future::Future, net::IpAddr, process::Output};
 use tokio::process::Command;
 
 use crate::platform::network_routing::{
-    host_selector, route_table, rule_priority, source_selector, RouteDomain,
+    host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
 };
 
 use super::{
@@ -491,12 +491,18 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
-    // A raw-IP bearer still has to be administratively UP before Linux accepts
-    // host routes or transmits bound SIP/RTP sockets.  In particular, a
-    // bam-dmux runtime-PM/firmware failure may surface here as EINVAL or
-    // ETIMEDOUT.  Propagate that first failure instead of obscuring it with the
-    // inevitable later "Device for nexthop is not up" route error.
-    run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await?;
+    // ModemManager already activates the bearer interface. Some Qualcomm
+    // bam-dmux point-to-point netdevs reject an administrative `link set up`
+    // with EINVAL even though the bearer is usable; do not turn that driver
+    // quirk into an IMS registration failure. Address and route operations
+    // below remain authoritative and still fail if the bearer is unusable.
+    if let Err(error) = run_ip(&["link", "set", "dev", &bearer.interface, "up"]).await {
+        tracing::debug!(
+            interface = %bearer.interface,
+            error = %error,
+            "Bearer netdev did not accept an administrative UP request; continuing"
+        );
+    }
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
         run_ip(&["link", "set", "dev", &bearer.interface, "mtu", &mtu]).await?;
@@ -633,7 +639,7 @@ async fn configure_source_policy(
     let table = route_table(RouteDomain::VolteIms, interface, address).to_string();
     let priority = rule_priority(RouteDomain::VolteIms, interface, address).to_string();
     let source = source_selector(address);
-    let connected = format!("{address}/{prefix}");
+    let connected = format!("{}/{prefix}", network_address(address, prefix));
     let mut flush = Vec::new();
     if let Some(family) = family {
         flush.push(family);

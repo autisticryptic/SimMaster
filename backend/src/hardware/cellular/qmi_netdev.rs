@@ -39,7 +39,7 @@ use tokio::{
 };
 
 use crate::platform::network_routing::{
-    host_selector, route_table, rule_priority, source_selector, RouteDomain,
+    host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
 };
 use tracing::{debug, info, warn};
 
@@ -317,7 +317,13 @@ pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNe
 
 /// Bring an interface up with the session's address, MTU and probe route.
 async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String> {
-    run_ip(&["link", "set", "dev", interface, "up"]).await?;
+    if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
+        debug!(
+            interface,
+            error = %error,
+            "Data bearer netdev did not accept an administrative UP request; continuing"
+        );
+    }
     if let Some(mtu) = config.mtu {
         // A rejected MTU is not fatal; the link still carries traffic at its
         // default, and failing here would discard an otherwise working candidate.
@@ -350,6 +356,19 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
         "rule", "add", "priority", &priority, "from", &source, "table", &table,
     ]);
     run_ip(&add_rule).await?;
+
+    // Keep the connected network in the private table. The interface address
+    // itself is a host address and cannot be used as an IPv4 /30 route target.
+    let connected = format!(
+        "{}/{}",
+        network_address(config.address, config.prefix),
+        config.prefix
+    );
+    let mut connected_route = family_arg.to_vec();
+    connected_route.extend_from_slice(&[
+        "route", "replace", &connected, "dev", interface, "table", &table,
+    ]);
+    run_ip(&connected_route).await?;
 
     if let Some(target) = config.probe_target {
         let destination = host_selector(target);

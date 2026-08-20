@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +40,35 @@ pub fn source_selector(address: IpAddr) -> String {
 
 pub fn host_selector(address: IpAddr) -> String {
     source_selector(address)
+}
+
+/// Return the network address for an interface address and prefix length.
+/// Linux rejects a connected route such as `2.26.79.181/30`; the route must
+/// use the network address (`2.26.79.180/30`) while the source rule continues
+/// to use the original host address.
+pub fn network_address(address: IpAddr, prefix: u8) -> IpAddr {
+    match address {
+        IpAddr::V4(address) => {
+            let prefix = prefix.min(32);
+            let bits = u32::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - u32::from(prefix))
+            };
+            IpAddr::V4(Ipv4Addr::from(bits & mask))
+        }
+        IpAddr::V6(address) => {
+            let prefix = prefix.min(128);
+            let bits = u128::from(address);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - u32::from(prefix))
+            };
+            IpAddr::V6(Ipv6Addr::from(bits & mask))
+        }
+    }
 }
 
 fn interface_slot(interface: &str) -> u32 {
@@ -86,6 +115,22 @@ mod tests {
         assert_eq!(
             source_selector("2001:db8::2".parse().unwrap()),
             "2001:db8::2/128"
+        );
+    }
+
+    #[test]
+    fn network_address_is_used_for_connected_routes() {
+        assert_eq!(
+            network_address("2.26.79.181".parse().unwrap(), 30),
+            "2.26.79.180".parse().unwrap()
+        );
+        assert_eq!(
+            network_address("2001:db8::1234".parse().unwrap(), 64),
+            "2001:db8::".parse().unwrap()
+        );
+        assert_eq!(
+            network_address("192.0.2.9".parse().unwrap(), 32),
+            "192.0.2.9".parse().unwrap()
         );
     }
 }
