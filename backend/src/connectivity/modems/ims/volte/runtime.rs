@@ -77,7 +77,10 @@ impl VolteStage {
     }
 }
 
-const MAX_CONNECTION_ATTEMPTS: usize = 32;
+/// Keep enough history to diagnose a complete IMS connection lifecycle
+/// (Bearer family fallback and REGISTER) without allowing a busy line to grow
+/// the in-memory status response indefinitely.
+const MAX_CONNECTION_ATTEMPTS: usize = 100;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolteConnectionAttempt {

@@ -80,6 +80,7 @@ import type {
   SmsPathPolicy,
   SystemStatsResponse,
   VowifiProfilesResponse,
+  VowifiRuntimeEventsResponse,
   WebhookTestResponse,
   LineEsimControlResponse,
   VoicePathPolicy,
@@ -698,6 +699,17 @@ class SimAdminCurrentAPI {
 
   async getVowifiLine(lineId: string) {
     return request<ApiResponse<VowifiLineConfigResponse>>(`/vowifi/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async getVowifiEvents(lineId: string, params?: { limit?: number; offset?: number; trace_id?: string }) {
+    const query = new URLSearchParams()
+    if (params?.limit !== undefined) query.set('limit', String(params.limit))
+    if (params?.offset !== undefined) query.set('offset', String(params.offset))
+    if (params?.trace_id) query.set('trace_id', params.trace_id)
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return request<ApiResponse<VowifiRuntimeEventsResponse>>(
+      `/vowifi/lines/${encodeURIComponent(lineId)}/events${suffix}`,
+    )
   }
 
   async setVowifiLineConnection(lineId: string, enabled: boolean) {

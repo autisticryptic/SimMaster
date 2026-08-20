@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import type { TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse } from '../../api/current'
+import type { CallRecord, SmsMessage, TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
@@ -26,7 +26,6 @@ export function LineCsDetails({ line }: { line: VolteLineControlResponse }) {
 }
 
 export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
-  const attempts = [...(line.runtime.connection_attempts ?? [])].reverse()
   const fallbackMessage = standardDerivedProfileMessage(
     line.runtime.profile_source,
     line.runtime.profile_fallback_reason,
@@ -56,28 +55,175 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
       <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={line.runtime.isim_aid ? `已发现 · ${line.runtime.isim_aid}` : '未发现，使用 IMSI 回退'} /></Grid>
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
       {line.runtime.last_error && <Grid size={12}><Alert severity="warning">{volteErrorMessage(line.runtime.last_error)}</Alert></Grid>}
-      <Grid size={12}>
-        <Typography variant="subtitle2" mb={1}>最近连接尝试</Typography>
-        <Box sx={{ maxHeight: 260, overflowY: 'auto', borderTop: 1, borderColor: 'divider' }}>
-          {attempts.length === 0 && <Typography variant="body2" color="text.secondary" py={1}>尚无连接记录</Typography>}
-          {attempts.map((attempt) => (
-            <Box key={`${attempt.sequence}-${attempt.at}`} display="grid" gridTemplateColumns={{ xs: '1fr auto', sm: '150px minmax(0, 1fr) auto' }} gap={1} py={0.75} borderBottom={1} borderColor="divider" alignItems="center">
-              <Typography variant="caption" color="text.secondary">{new Date(attempt.at).toLocaleTimeString()}</Typography>
-              <Box minWidth={0}>
-                <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{attempt.stage}{attempt.ip_family ? ` · ${attempt.ip_family}` : ''}{attempt.detail ? ` · ${attempt.detail}` : ''}</Typography>
-                {[attempt.at_cid !== undefined && attempt.at_cid !== null ? `CID ${attempt.at_cid}` : null, attempt.qmi_device ? `QMI ${attempt.qmi_device}` : null, attempt.interface ? `网卡 ${attempt.interface}` : null, attempt.bearer_path ? `Bearer ${attempt.bearer_path}` : null, attempt.pcscf ? `P-CSCF ${attempt.pcscf}` : null].filter(Boolean).length > 0 && (
-                  <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-all' }}>
-                    {[attempt.at_cid !== undefined && attempt.at_cid !== null ? `CID ${attempt.at_cid}` : null, attempt.qmi_device ? `QMI ${attempt.qmi_device}` : null, attempt.interface ? `网卡 ${attempt.interface}` : null, attempt.bearer_path ? `Bearer ${attempt.bearer_path}` : null, attempt.pcscf ? `P-CSCF ${attempt.pcscf}` : null].filter(Boolean).join(' · ')}
-                  </Typography>
-                )}
-              </Box>
-              <Chip size="small" variant="outlined" color={attempt.outcome === 'succeeded' ? 'success' : attempt.outcome === 'failed' ? 'error' : 'default'} label={attempt.outcome === 'succeeded' ? '成功' : attempt.outcome === 'failed' ? '失败' : '进行中'} />
-              {attempt.error_code && <Typography variant="caption" color="error" sx={{ gridColumn: { xs: '1 / -1', sm: '2 / -1' }, wordBreak: 'break-all' }}>{attempt.error_code}</Typography>}
-            </Box>
-          ))}
-        </Box>
-      </Grid>
     </Grid>
+  )
+}
+
+type ActivityLogEntry = {
+  at: string
+  source: 'VoLTE' | 'VoWiFi' | 'Trunk' | '短信' | '通话'
+  stage: string
+  outcome: string
+  detail?: string
+  error?: string
+}
+
+const volteActivityStageLabels: Record<string, string> = {
+  bearer: '建立 IMS Bearer',
+  bearer_dual: '建立双栈 IMS Bearer',
+  bearer_ipv4: '回退 IPv4 IMS Bearer',
+  bearer_ipv6: '回退 IPv6 IMS Bearer',
+  ip_config: '配置 IMS 网络',
+  pcscf: '发现 P-CSCF',
+  register_initial: '发送初始 REGISTER',
+  register_authenticated: '发送鉴权 REGISTER',
+  register_refresh: '续期 IMS 注册',
+  register_ipsec: '通过 IPsec 注册',
+  register_udp: '通过 UDP 注册',
+  registered: 'IMS 已注册',
+}
+
+function compactEventDetail(detailJson: string) {
+  try {
+    const parsed: unknown = JSON.parse(detailJson)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return String(parsed)
+    return Object.entries(parsed as Record<string, unknown>)
+      .filter(([, value]) => value !== null && value !== undefined && value !== '')
+      .slice(0, 8)
+      .map(([key, value]) => {
+        if (typeof value === 'string') return `${key}=${value}`
+        if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return `${key}=${value}`
+        if (typeof value === 'symbol') return `${key}=${value.description || 'symbol'}`
+        if (typeof value === 'function') return `${key}=[function]`
+        return `${key}=${JSON.stringify(value)}`
+      })
+      .join(' · ')
+  } catch {
+    return detailJson
+  }
+}
+
+function compactMessageContent(content: string) {
+  const normalized = content.replace(/\s+/g, ' ').trim()
+  return normalized.length > 96 ? `${normalized.slice(0, 96)}...` : normalized
+}
+
+function activityOutcomeLabel(outcome: string) {
+  if (outcome === 'succeeded' || outcome === 'success') return '成功'
+  if (outcome === 'failed' || outcome === 'error') return '失败'
+  if (outcome === 'warning') return '警告'
+  if (outcome === 'info') return '记录'
+  return '进行中'
+}
+
+function activityOutcomeColor(outcome: string): 'success' | 'error' | 'warning' | 'default' {
+  if (outcome === 'succeeded' || outcome === 'success') return 'success'
+  if (outcome === 'failed' || outcome === 'error') return 'error'
+  if (outcome === 'warning') return 'warning'
+  return 'default'
+}
+
+export function LineActivityLog({
+  line,
+  vowifiEvents = [],
+  trunk,
+  smsMessages = [],
+  callRecords = [],
+}: {
+  line: VolteLineControlResponse
+  vowifiEvents?: VowifiRuntimeEventEntry[]
+  trunk?: TrunkProfileResponse
+  smsMessages?: SmsMessage[]
+  callRecords?: CallRecord[]
+}) {
+  const entries: ActivityLogEntry[] = [
+    ...(line.runtime.connection_attempts ?? []).map((attempt) => ({
+      at: attempt.at,
+      source: 'VoLTE' as const,
+      stage: `${volteActivityStageLabels[attempt.stage] || attempt.stage}${attempt.ip_family ? ` · ${attempt.ip_family.toUpperCase()}` : ''}`,
+      outcome: attempt.outcome,
+      detail: [
+        attempt.detail,
+        attempt.at_cid !== undefined && attempt.at_cid !== null ? `CID ${attempt.at_cid}` : null,
+        attempt.qmi_device ? `QMI ${attempt.qmi_device}` : null,
+        attempt.interface ? `网卡 ${attempt.interface}` : null,
+        attempt.bearer_path ? `Bearer ${attempt.bearer_path}` : null,
+        attempt.pcscf ? `P-CSCF ${attempt.pcscf}` : null,
+      ].filter(Boolean).join(' · ') || undefined,
+      error: attempt.error_code,
+    })),
+    ...vowifiEvents.map((event) => ({
+      at: event.created_at,
+      source: 'VoWiFi' as const,
+      stage: `${event.phase} · ${event.event_type}`,
+      outcome: event.level,
+      detail: compactEventDetail(event.detail_json),
+    })),
+    ...smsMessages.map((message) => ({
+      at: message.timestamp,
+      source: '短信' as const,
+      stage: `${message.direction === 'incoming' ? '收到短信' : '发送短信'} · ${message.transport || 'modem'}`,
+      outcome: message.status === 'failed' ? 'failed' : message.status === 'pending' ? 'pending' : 'success',
+      detail: [message.phone_number, compactMessageContent(message.content)].filter(Boolean).join(' · '),
+    })),
+    ...callRecords.map((record) => ({
+      at: record.start_time,
+      source: '通话' as const,
+      stage: `${record.direction === 'incoming' ? '来电' : record.direction === 'outgoing' ? '外呼' : '未接来电'} · ${record.answered ? '已接通' : '未接通'}`,
+      outcome: record.answered ? 'success' : record.failure_code ? 'failed' : 'pending',
+      detail: [
+        record.phone_number,
+        record.duration > 0 ? `${record.duration} 秒` : null,
+        record.sip_status ? `SIP ${record.sip_status}` : null,
+        record.carrier_reason,
+      ].filter(Boolean).join(' · '),
+      error: record.failure_code,
+    })),
+  ]
+
+  if (trunk?.trunk.enabled && (trunk.runtime.last_activity_at || trunk.runtime.registered_at || trunk.runtime.started_at)) {
+    const runtime = trunk.runtime
+    entries.push({
+      at: runtime.last_activity_at || runtime.registered_at || runtime.started_at || '',
+      source: 'Trunk',
+      stage: `当前状态 · ${runtime.stage || runtime.phase}`,
+      outcome: runtime.registered || runtime.phase === 'ready' ? 'succeeded' : runtime.last_error ? 'failed' : 'pending',
+      detail: [
+        runtime.last_sip_status ? `SIP ${runtime.last_sip_status}` : null,
+        `REGISTER ${runtime.register_attempts}`,
+        `重连 ${runtime.reconnect_count}`,
+        `通话 ${runtime.active_calls}`,
+        `媒体 ${runtime.media_negotiations}`,
+      ].filter(Boolean).join(' · '),
+      error: runtime.last_error,
+    })
+  }
+
+  entries.sort((a, b) => new Date(b.at).getTime() - new Date(a.at).getTime())
+  const visibleEntries = entries.slice(0, 100)
+
+  return (
+    <Box>
+      <Typography variant="subtitle2" mb={0.25}>线路活动日志</Typography>
+      <Typography variant="caption" color="text.secondary" display="block" mb={1}>
+        最近 100 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
+      </Typography>
+      <Box sx={{ maxHeight: 360, overflowY: 'auto', borderTop: 1, borderColor: 'divider' }}>
+        {visibleEntries.length === 0 && <Typography variant="body2" color="text.secondary" py={1}>尚无活动记录</Typography>}
+        {visibleEntries.map((entry, index) => (
+          <Box key={`${entry.source}-${entry.at}-${index}`} display="grid" gridTemplateColumns={{ xs: '1fr auto', sm: '150px 72px minmax(0, 1fr) auto' }} gap={1} py={0.75} borderBottom={1} borderColor="divider" alignItems="center">
+            <Typography variant="caption" color="text.secondary">{new Date(entry.at).toLocaleString()}</Typography>
+            <Chip size="small" variant="outlined" label={entry.source} />
+            <Box minWidth={0}>
+              <Typography variant="body2" sx={{ wordBreak: 'break-word' }}>{entry.stage}</Typography>
+              {entry.detail && <Typography variant="caption" color="text.secondary" sx={{ wordBreak: 'break-word' }}>{entry.detail}</Typography>}
+              {entry.error && <Typography variant="caption" color="error" display="block" sx={{ wordBreak: 'break-all' }}>{entry.error}</Typography>}
+            </Box>
+            <Chip size="small" variant="outlined" color={activityOutcomeColor(entry.outcome)} label={activityOutcomeLabel(entry.outcome)} />
+          </Box>
+        ))}
+      </Box>
+    </Box>
   )
 }
 

@@ -22,49 +22,26 @@ import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, Trave
 import {
   api,
   type LineNetworkControlsResponse,
+  type CallRecord,
+  type SmsMessage,
   type TrunkProfileResponse,
   type VolteLineControlResponse,
   type VowifiLineConfigResponse,
+  type VowifiRuntimeEventEntry,
 } from '../../api/current'
 import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableModemSort } from '../../components/modemLineFormat'
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
-import { LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
+import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
-const stageLabels: Record<string, string> = {
-  disabled: '未连接',
-  starting: '正在启动',
-  identity: '读取 SIM 身份',
-  carrier_profile: '匹配运营商 IMS 配置',
-  identity_aka: 'SIM AKA 鉴权',
-  radio: '检查无线网络',
-  ims_context: '建立 IMS 上下文',
-  pcscf: '发现 P-CSCF',
-  ipv6_preflight: 'IPv6 数据路径预检',
-  modem: '准备基带',
-  bearer: '建立 IMS Bearer',
-  bearer_dual: '建立双栈 IMS Bearer',
-  bearer_ipv4: '回退 IPv4 IMS Bearer',
-  bearer_ipv6: '回退 IPv6 IMS Bearer',
-  ip_config: '配置 IMS 网络',
-  register_initial: '发送初始 REGISTER',
-  ipsec: '建立 IMS IPsec',
-  register_authenticated: '发送鉴权 REGISTER',
-  register_refresh: '续期 IMS 注册',
-  register_ipsec: 'IPsec 注册',
-  register_udp: 'UDP 注册',
-  registered: 'IMS 已注册',
-  stopping: '正在断开',
-}
-
-function runtimeLabel(line: VolteLineControlResponse) {
+function imsConnectionSummary(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
-  if (line.profile.volte_connection_enabled && line.runtime.last_error) return `${stageLabels[line.runtime.stage] ?? line.runtime.stage}失败`
-  if (line.profile.volte_connection_enabled) return stageLabels[line.runtime.stage] ?? '等待重连'
-  return 'IMS 未连接'
+  if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
+  if (line.runtime.last_error) return 'IMS 连接失败'
+  return 'IMS 连接中'
 }
 
 function voiceAccessLabel(line: VolteLineControlResponse, vowifi?: VowifiLineConfigResponse) {
@@ -177,6 +154,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
+  const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
+  const [activityMessages, setActivityMessages] = useState<SmsMessage[]>([])
+  const [activityCalls, setActivityCalls] = useState<CallRecord[]>([])
   const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [enableTrunkOnOpen, setEnableTrunkOnOpen] = useState(false)
@@ -287,6 +267,33 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   useEffect(() => {
     setWorkbenchTab('overview')
   }, [selectedLineId])
+
+  useEffect(() => {
+    if (!workbench || !selectedLineId || workbenchTab !== 'ims') {
+      setVowifiEvents([])
+      setActivityMessages([])
+      setActivityCalls([])
+      return
+    }
+    let cancelled = false
+    const refresh = async () => {
+      const [eventResult, smsResult, callResult] = await Promise.allSettled([
+        api.getVowifiEvents(selectedLineId, { limit: 100 }),
+        api.getSmsList({ channel_id: selectedLineId, limit: 100 }),
+        api.getCallHistory({ lineId: selectedLineId, limit: 100, offset: 0 }),
+      ])
+      if (cancelled) return
+      setVowifiEvents(eventResult.status === 'fulfilled' ? eventResult.value.data?.events ?? [] : [])
+      setActivityMessages(smsResult.status === 'fulfilled' ? smsResult.value.data?.messages ?? [] : [])
+      setActivityCalls(callResult.status === 'fulfilled' ? callResult.value.data?.records ?? [] : [])
+    }
+    void refresh()
+    const timer = window.setInterval(() => void refresh(), 10_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [selectedLineId, workbench, workbenchTab])
 
   const filteredLines = useMemo(() => {
     const query = lineSearch.trim().toLocaleLowerCase()
@@ -835,11 +842,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       <Box>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
                         <Typography variant="caption" color="text.secondary">
-                          {line.runtime.registration_mode ? `注册方式：${line.runtime.registration_mode.toUpperCase()}` : '独立于其他基带管理'}
+                          独立于其他基带管理；连接阶段与地址族详情见线路活动日志
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1}>
-                        <Chip size="small" label={line.profile.volte_connection_enabled ? runtimeLabel(line) : 'IMS 未连接'} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
+                        <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
                           <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
@@ -929,6 +936,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoLTE IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
                     {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoWiFi 详情</Typography><LineVowifiDetails vowifi={vowifiLine} /></Box>}
                     {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
+                    {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><LineActivityLog line={line} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} /></Box>}
                     </Box>
                   </CardContent>
                 </Card>

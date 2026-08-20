@@ -1942,6 +1942,32 @@ mod tests {
     }
 
     #[test]
+    fn vowifi_runtime_events_keep_only_latest_hundred_per_line() {
+        let db = test_database();
+
+        for index in 0..105 {
+            db.insert_vowifi_runtime_event(NewVowifiRuntimeEvent {
+                line_id: "line-retention",
+                trace_id: Some("trace-retention"),
+                level: "info",
+                phase: "retention",
+                profile_id: None,
+                event_type: "retention_event",
+                detail_json: &format!(r#"{{"index":{index}}}"#),
+            })
+            .expect("write retained event");
+        }
+
+        let events = db
+            .get_vowifi_runtime_events_for_line("line-retention", 200, 0, None)
+            .expect("read retained events");
+        assert_eq!(events.total, 100);
+        assert_eq!(events.events.len(), 100);
+        assert!(events.events[0].detail_json.contains("104"));
+        assert!(events.events[99].detail_json.contains("5"));
+    }
+
+    #[test]
     fn vowifi_soak_runs_round_trip_with_counter_samples() {
         let db = test_database();
 
@@ -3307,7 +3333,19 @@ impl Database {
                 created_at,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let inserted_id = conn.last_insert_rowid();
+        conn.execute(
+            "DELETE FROM vowifi_runtime_events
+             WHERE line_id = ?1
+               AND id NOT IN (
+                   SELECT id FROM vowifi_runtime_events
+                   WHERE line_id = ?1
+                   ORDER BY id DESC
+                   LIMIT 100
+               )",
+            params![line_id],
+        )?;
+        Ok(inserted_id)
     }
 
     pub fn get_vowifi_runtime_events_for_line(
