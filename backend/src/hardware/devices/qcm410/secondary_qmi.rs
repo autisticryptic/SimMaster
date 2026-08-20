@@ -79,7 +79,12 @@ pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qm
 pub fn secondary_qmi_enabled() -> bool {
     std::env::var("SIMADMIN_ENABLE_SECONDARY_QMI")
         .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 /// Timeout for the kernel to publish a port after `bind`.
@@ -543,9 +548,9 @@ pub async fn runtime_endpoint(
 pub fn runtime_endpoint_available(primary_device: &str) -> bool {
     secondary_qmi_enabled()
         && endpoint_from_runtime_state(primary_device)
-        .ok()
-        .flatten()
-        .is_some()
+            .ok()
+            .flatten()
+            .is_some()
 }
 
 fn endpoint_from_runtime_state(

@@ -26,10 +26,15 @@ use crate::{
         AccessPathKind, ConfigManager, ModemSlotObservation, TrunkProfileConfig, VoicePathPolicy,
     },
     platform::db::{Database, LineDataTrafficEntry},
-    services::supplementary::{SupplementaryRuntime, SupplementarySnapshot},
     services::trunk::{
         access_router::VoiceAccessRouter,
         runtime::{TrunkRuntime, TrunkRuntimeStatus},
+    },
+    services::{
+        supplementary::{SupplementaryRuntime, SupplementarySnapshot},
+        ue_context::UeContext,
+        ue_netcfg,
+        ue_worker::{UeWorkerHandle, UeWorkerStatus},
     },
 };
 
@@ -52,6 +57,14 @@ impl LineDataWatchdogState {
 
 pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
+    /// Per-UE identity for this line. Every access leg (VoLTE, VoWiFi, data
+    /// proxy, trunk) resolves through this context, which owns the line's
+    /// Linux network namespace when isolation is enabled.
+    pub ue: RwLock<UeContext>,
+    /// Per-UE worker process. When isolation is enabled the worker is spawned
+    /// inside the UE namespace (`setns`) and will host the UE's IMS/data
+    /// sockets, so identical IPs/P-CSCF/xfrm state can never cross lines.
+    pub ue_worker: UeWorkerHandle,
     pub volte: Arc<VolteRuntime>,
     pub volte_live: VolteLiveHandle,
     /// Serializes every PDP/bearer transition on this physical SIM line.
@@ -109,8 +122,16 @@ impl LineRuntime {
             &binding.line_id,
             Arc::clone(&supplementary),
         );
+        let ue_context = UeContext::for_binding(
+            &binding,
+            &crate::platform::config::UeIsolationConfig::default(),
+        );
+        let line_id = binding.line_id.clone();
+        let namespace = ue_context.namespace.clone();
         Self {
             binding: RwLock::new(binding),
+            ue: RwLock::new(ue_context),
+            ue_worker: UeWorkerHandle::for_line(&line_id, namespace),
             volte,
             volte_live,
             bearer_operation_lock: Mutex::new(()),
@@ -137,11 +158,24 @@ impl LineRuntime {
             .clone()
     }
 
+    pub fn ue(&self) -> UeContext {
+        self.ue
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
     fn replace_binding(&self, binding: ModemBinding) {
         *self
             .binding
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = binding;
+        let binding = self.binding();
+        let mut ue = self
+            .ue
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ue.update_binding(&binding);
     }
 
     fn mark_absent(&self) {
@@ -154,6 +188,8 @@ impl LineRuntime {
     pub async fn status(&self) -> LineRuntimeStatus {
         LineRuntimeStatus {
             modem: self.binding(),
+            ue: self.ue(),
+            ue_worker: self.ue_worker.status().await,
             volte: self.volte.status().await,
             trunk: self.trunk.status().await,
             supplementary: self.supplementary.snapshot().await,
@@ -242,6 +278,8 @@ impl LineRuntime {
 #[derive(Debug, Clone, Serialize)]
 pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
+    pub ue: UeContext,
+    pub ue_worker: UeWorkerStatus,
     pub volte: VolteRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,
     pub supplementary: SupplementarySnapshot,
@@ -489,6 +527,7 @@ impl LineRuntimeRegistry {
                         .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
                 }
                 line.replace_binding(binding);
+                self.reconcile_ue_context(line, &line.binding()).await;
                 continue;
             }
             let runtime = Arc::new(VolteRuntime::new());
@@ -500,6 +539,7 @@ impl LineRuntimeRegistry {
                 .map(|config| config.get_line_voice_path_policy(&line_id))
                 .unwrap_or_default();
             let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
+            self.reconcile_ue_context(&line, &line.binding()).await;
             // Seed the traffic counters from disk the first time we see a line,
             // so the reported totals are cumulative rather than per-boot.
             if let Some(database) = &self.database {
@@ -515,6 +555,21 @@ impl LineRuntimeRegistry {
                 }
             }
             lines.insert(line_id, line);
+        }
+        // Shut down the UE worker of any line whose anchor disappeared in this
+        // refresh; a later rediscovery re-spawns it. Present lines were already
+        // reconciled above, so their workers are kept running.
+        for line in lines.values().filter(|line| !line.binding().present) {
+            let worker = line.ue_worker.clone();
+            if worker.is_running().await {
+                if let Err(error) = worker.shutdown().await {
+                    tracing::warn!(
+                        line_id = %line.binding().line_id,
+                        error = %error,
+                        "Failed to stop per-UE worker for absent line"
+                    );
+                }
+            }
         }
         Ok(lines.values().filter(|line| line.binding().present).count())
     }
@@ -617,6 +672,167 @@ impl LineRuntimeRegistry {
             .values()
             .filter(|line| line.binding().present)
             .count()
+    }
+
+    /// Keep a line's UE context in sync with its binding and the isolation
+    /// master switch. Namespace creation is idempotent; a failure only drops
+    /// the isolation guarantee and leaves the existing host-namespace path
+    /// fully functional.
+    async fn reconcile_ue_context(&self, line: &LineRuntime, binding: &ModemBinding) {
+        let isolation = self
+            .config_manager
+            .as_ref()
+            .map(|config| config.get_ue_isolation())
+            .unwrap_or_default();
+        let mut ue = line.ue();
+        ue.update_binding(binding);
+        if let Err(error) = ue.ensure_netns(&isolation).await {
+            tracing::warn!(
+                line_id = %binding.line_id,
+                error = %error,
+                "Failed to prepare per-UE network namespace"
+            );
+        }
+        *line
+            .ue
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ue;
+        let ue = line.ue();
+        let ue_ready = ue.isolation_enabled && ue.netns_ready;
+        let worker = line.ue_worker.clone();
+        if ue_ready && !worker.is_running().await {
+            if let Err(error) = worker.spawn().await {
+                tracing::warn!(
+                    line_id = %binding.line_id,
+                    error = %error,
+                    "Failed to start per-UE worker inside its namespace"
+                );
+            }
+        } else if !ue_ready && worker.is_running().await {
+            if let Err(error) = worker.shutdown().await {
+                tracing::warn!(
+                    line_id = %binding.line_id,
+                    error = %error,
+                    "Failed to stop per-UE worker after isolation was disabled"
+                );
+            }
+        }
+        let line_id = binding.line_id.clone();
+        if ue_ready {
+            if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
+                tracing::warn!(
+                    line_id = %line_id,
+                    error = %error,
+                    "Failed to reconcile UE egress/worker net-config; falling back to host path"
+                );
+            }
+        } else {
+            // Fall back to the host-namespace VoWiFi path and best-effort
+            // remove a leftover veth pair from a previous isolated run.
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
+                &line_id, None,
+            );
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                &line_id, None,
+            );
+            let host_if = ue.host_veth_name(&isolation);
+            if let Err(error) = crate::platform::netns::teardown_veth(&host_if).await {
+                tracing::debug!(
+                    line_id = %line_id,
+                    host_if = %host_if,
+                    error = %error,
+                    "No UE veth pair to tear down (expected when isolation was never enabled)"
+                );
+            }
+        }
+    }
+
+    /// Prepare the UE-side egress and ask the worker to apply it inside the
+    /// namespace. The parent only creates the veth pair and configures the
+    /// host side; the worker owns the UE side (address/link/default route).
+    async fn reconcile_ue_egress(&self, line: &LineRuntime, ue: &UeContext) -> Result<(), String> {
+        use std::time::Duration;
+
+        let isolation = self
+            .config_manager
+            .as_ref()
+            .map(|config| config.get_ue_isolation())
+            .unwrap_or_default();
+        let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
+        crate::platform::netns::ensure_veth_pair_host_side(
+            &ue.namespace,
+            &plan.host_if,
+            &plan.ue_if,
+            plan.host_addr,
+            plan.mtu,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        let worker = line.ue_worker.clone();
+        if !worker.is_running().await {
+            return Err("UE worker is not running; skipping egress apply".to_string());
+        }
+        worker
+            .wait_ready(Duration::from_secs(5))
+            .await
+            .map_err(|error| error.to_string())?;
+        let result = worker
+            .apply_net_config(ue_netcfg::veth_ue_side_ops(&plan))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.ok {
+            return Err(result
+                .error
+                .unwrap_or_else(|| "net-config failed".to_string()));
+        }
+        // Host-side SNAT for the UE egress subnet. Worker-created sockets
+        // inside the UE namespace egress through this veth pair; without
+        // MASQUERADE their source address would not be routable on the host
+        // primary interface. Best-effort: routing still works for equal-subnet
+        // deployments, so a failure only degrades reachability logging.
+        if let Err(error) = crate::platform::netns::ensure_host_veth_nat(plan.host_addr).await {
+            tracing::warn!(
+                line_id = %ue.ue_id,
+                host_addr = %plan.host_addr,
+                error = %error,
+                "Failed to ensure UE veth host SNAT"
+            );
+        }
+        // Stage 2b is deliberately gated: only with this flag do the VoWiFi
+        // TUN and every IKE/SIP/RTP socket move into the UE namespace through
+        // the worker. Disabling keeps the previous host-namespace path.
+        if isolation.vowifi_tun_in_namespace {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
+                &ue.ue_id,
+                Some(ue.namespace.as_str()),
+            );
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                &ue.ue_id,
+                Some(
+                    crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
+                        namespace: ue.namespace.as_str().to_string(),
+                        ue_veth: plan.ue_if.clone(),
+                        worker: worker.clone(),
+                    },
+                ),
+            );
+        } else {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
+                &ue.ue_id, None,
+            );
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                &ue.ue_id, None,
+            );
+        }
+        tracing::info!(
+            line_id = %ue.ue_id,
+            netns = %ue.namespace,
+            host_if = %plan.host_if,
+            ue_if = %plan.ue_if,
+            "UE egress veth configured by worker"
+        );
+        Ok(())
     }
 }
 

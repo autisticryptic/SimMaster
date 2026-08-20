@@ -22,8 +22,10 @@
 //! live adapter drive relays of this type against the same Trunk seam.
 
 use std::{
+    future::Future,
     io as std_io,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
     sync::Arc,
 };
 
@@ -345,6 +347,23 @@ pub fn rewrite_rtp_payload_type(datagram: &[u8], payload_type: u8) -> Option<Vec
 pub struct PendingRtpRelay {
     operator_socket: Arc<UdpSocket>,
     internal_socket: Arc<UdpSocket>,
+    /// Keeps a UE worker (if any) alive for the lifetime of the relay so the
+    /// operator-side socket stays bound to its namespace-owned fd.
+    _operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+}
+
+/// Creates the operator-facing UDP socket on behalf of a media relay.
+///
+/// The host path binds in the current namespace; the per-UE isolation path
+/// asks the line's UE worker to create the socket inside the UE network
+/// namespace and returns the fd. Keeping the creator in the relay prevents
+/// the worker handle from being dropped while the socket is still in use.
+pub trait OperatorSocketCreator: Send + Sync {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = std_io::Result<UdpSocket>> + Send + 'a>>;
 }
 
 impl PendingRtpRelay {
@@ -361,14 +380,31 @@ impl PendingRtpRelay {
         internal_ip: IpAddr,
         operator_interface: Option<&str>,
     ) -> std_io::Result<Self> {
-        let operator_socket = Arc::new(bind_udp_socket(
-            SocketAddr::new(operator_ip, 0),
-            operator_interface,
-        )?);
+        Self::bind_with_operator_source(operator_ip, internal_ip, operator_interface, None).await
+    }
+
+    /// Bind the operator-facing socket either in this namespace or inside the
+    /// UE namespace through `operator_creator`. The internal (Asterisk/Trunk)
+    /// socket always stays in the host namespace.
+    pub async fn bind_with_operator_source(
+        operator_ip: IpAddr,
+        internal_ip: IpAddr,
+        operator_interface: Option<&str>,
+        operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+    ) -> std_io::Result<Self> {
+        let operator_socket = Arc::new(match &operator_creator {
+            Some(creator) => {
+                creator
+                    .create_udp(SocketAddr::new(operator_ip, 0), operator_interface)
+                    .await?
+            }
+            None => bind_udp_socket(SocketAddr::new(operator_ip, 0), operator_interface)?,
+        });
         let internal_socket = Arc::new(UdpSocket::bind(SocketAddr::new(internal_ip, 0)).await?);
         Ok(Self {
             operator_socket,
             internal_socket,
+            _operator_creator: operator_creator,
         })
     }
 

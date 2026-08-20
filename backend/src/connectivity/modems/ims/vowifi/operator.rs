@@ -22,7 +22,10 @@ use crate::{
             context::{ImsIdentity, ImsRoute},
             ims_failure::ImsFailureDiagnostic,
             ims_video::{negotiate_video, parse_video_sdp},
-            media::{ActiveRtpRelay, MediaRelayPolicy, PayloadTypeMapping, PendingRtpRelay},
+            media::{
+                ActiveRtpRelay, MediaRelayPolicy, OperatorSocketCreator, PayloadTypeMapping,
+                PendingRtpRelay,
+            },
             register::{run_unregister, RegisterAuthenticator},
             registration::{ImsRegistrationAccess, RegisteredImsContext, UnregisterResult},
             sip_frame,
@@ -45,6 +48,7 @@ use crate::{
             },
             operator::OperatorLink,
         },
+        ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
     },
 };
 
@@ -123,10 +127,68 @@ pub struct RegisteredVoiceContext {
     /// the registered context lets media sockets remain distinguishable even
     /// when two tunnels receive the same inner IMS address.
     pub(crate) media_interface: Option<String>,
+    /// Worker-backed socket factory used when the line's VoWiFi TUN lives in
+    /// its own UE network namespace. `None` keeps the host-namespace socket
+    /// creation path (Linux `SO_BINDTODEVICE` on the host TUN).
+    pub(crate) media_operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
 }
 
 pub(crate) trait MediaRouteInstaller: Send + Sync {
     fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String>;
+}
+
+/// Creates operator-facing RTP sockets inside the line's UE namespace through
+/// the UE worker. The worker handle is kept alive by the relay that stores the
+/// creator, so an active call never drops the namespace-owned fd.
+pub(crate) struct UeWorkerOperatorSocketCreator {
+    worker: UeWorkerHandle,
+}
+
+impl UeWorkerOperatorSocketCreator {
+    pub(crate) fn new(worker: UeWorkerHandle) -> Self {
+        Self { worker }
+    }
+}
+
+impl OperatorSocketCreator for UeWorkerOperatorSocketCreator {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = std::io::Result<tokio::net::UdpSocket>> + Send + 'a>,
+    > {
+        let spec = UeSocketSpec::udp_bound(local, bind_to_device.map(str::to_string));
+        Box::pin(async move {
+            match self.worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => Ok(socket),
+                Ok(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "UE worker returned a non-UDP socket for RTP",
+                )),
+                Err(error) => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    error.to_string(),
+                )),
+            }
+        })
+    }
+}
+
+/// Bind one RTP relay using the session context's opted-in UE socket factory.
+async fn bind_operator_relay(
+    context: &RegisteredVoiceContext,
+    trunk_local_ip: IpAddr,
+    failure_label: &str,
+) -> Result<PendingRtpRelay, String> {
+    PendingRtpRelay::bind_with_operator_source(
+        context.route.local_addr.ip(),
+        trunk_local_ip,
+        context.media_interface.as_deref(),
+        context.media_operator_creator.clone(),
+    )
+    .await
+    .map_err(|error| format!("{failure_label}:{error}"))
 }
 
 pub(crate) trait RegisteredUnregister: Send + Sync {
@@ -786,13 +848,9 @@ async fn handle_command_inner(
                 return Err("vowifi_concurrent_call_limit".into());
             }
             let remote_uri = normalize_callee(&callee, &session.context.identity.home_domain)?;
-            let pending = PendingRtpRelay::bind_with_operator_interface(
-                session.context.route.local_addr.ip(),
-                trunk_local_ip,
-                session.context.media_interface.as_deref(),
-            )
-            .await
-            .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+            let pending =
+                bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed")
+                    .await?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -801,13 +859,12 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = PendingRtpRelay::bind_with_operator_interface(
-                    session.context.route.local_addr.ip(),
+                let relay = bind_operator_relay(
+                    &session.context,
                     trunk_local_ip,
-                    session.context.media_interface.as_deref(),
+                    "vowifi_video_rtp_bind_failed",
                 )
-                .await
-                .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                .await?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -985,13 +1042,9 @@ async fn handle_command_inner(
             if offer.video.is_some() && !link.video_enabled() {
                 return Err("vowifi_video_feature_disabled".into());
             }
-            let pending = PendingRtpRelay::bind_with_operator_interface(
-                session.context.route.local_addr.ip(),
-                trunk_local_ip,
-                session.context.media_interface.as_deref(),
-            )
-            .await
-            .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+            let pending =
+                bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed")
+                    .await?;
             let operator_local = pending
                 .operator_local_addr()
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1000,13 +1053,12 @@ async fn handle_command_inner(
                 .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = PendingRtpRelay::bind_with_operator_interface(
-                    session.context.route.local_addr.ip(),
+                let relay = bind_operator_relay(
+                    &session.context,
                     trunk_local_ip,
-                    session.context.media_interface.as_deref(),
+                    "vowifi_video_rtp_bind_failed",
                 )
-                .await
-                .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+                .await?;
                 let operator_local = relay
                     .operator_local_addr()
                     .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1764,13 +1816,8 @@ async fn begin_incoming_call(
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind_with_operator_interface(
-        session.context.route.local_addr.ip(),
-        trunk_local_ip,
-        session.context.media_interface.as_deref(),
-    )
-    .await
-    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending =
+        bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed").await?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1778,13 +1825,12 @@ async fn begin_incoming_call(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind_with_operator_interface(
-            session.context.route.local_addr.ip(),
+        let relay = bind_operator_relay(
+            &session.context,
             trunk_local_ip,
-            session.context.media_interface.as_deref(),
+            "vowifi_video_rtp_bind_failed",
         )
-        .await
-        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        .await?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -1943,13 +1989,8 @@ async fn begin_network_reinvite(
         return reject_request(session, frame, 488).await;
     }
     let operator_dtmf = parse_rtp_telephone_event(sip_frame::body(frame));
-    let pending = PendingRtpRelay::bind_with_operator_interface(
-        session.context.route.local_addr.ip(),
-        trunk_local_ip,
-        session.context.media_interface.as_deref(),
-    )
-    .await
-    .map_err(|error| format!("vowifi_rtp_bind_failed:{error}"))?;
+    let pending =
+        bind_operator_relay(&session.context, trunk_local_ip, "vowifi_rtp_bind_failed").await?;
     let operator_local = pending
         .operator_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
@@ -1957,13 +1998,12 @@ async fn begin_network_reinvite(
         .internal_local_addr()
         .map_err(|error| format!("vowifi_rtp_local_failed:{error}"))?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = PendingRtpRelay::bind_with_operator_interface(
-            session.context.route.local_addr.ip(),
+        let relay = bind_operator_relay(
+            &session.context,
             trunk_local_ip,
-            session.context.media_interface.as_deref(),
+            "vowifi_video_rtp_bind_failed",
         )
-        .await
-        .map_err(|error| format!("vowifi_video_rtp_bind_failed:{error}"))?;
+        .await?;
         let operator_local = relay
             .operator_local_addr()
             .map_err(|error| format!("vowifi_video_rtp_local_failed:{error}"))?;
@@ -2691,6 +2731,7 @@ mod tests {
             unregister: None,
             media_route_installer: None,
             media_interface: None,
+            media_operator_creator: None,
         }
     }
 

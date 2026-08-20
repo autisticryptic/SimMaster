@@ -8424,7 +8424,11 @@ async fn wait_for_line_modem(
         if !line_volte_restore_enabled(app, line) {
             return LineModemWait::Cancelled;
         }
-        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await.is_ok();
+        let refreshed = app
+            .line_registry
+            .refresh(app.dbus_conn.as_ref())
+            .await
+            .is_ok();
         if refreshed && line.binding().present {
             return LineModemWait::Ready;
         }

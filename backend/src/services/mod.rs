@@ -23,3 +23,6 @@ pub mod orchestrator;
 pub mod supplementary;
 pub mod system;
 pub mod trunk;
+pub mod ue_context;
+pub mod ue_netcfg;
+pub mod ue_worker;

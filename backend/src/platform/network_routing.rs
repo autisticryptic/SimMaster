@@ -122,15 +122,15 @@ mod tests {
     fn network_address_is_used_for_connected_routes() {
         assert_eq!(
             network_address("2.26.79.181".parse().unwrap(), 30),
-            "2.26.79.180".parse().unwrap()
+            "2.26.79.180".parse::<IpAddr>().unwrap()
         );
         assert_eq!(
             network_address("2001:db8::1234".parse().unwrap(), 64),
-            "2001:db8::".parse().unwrap()
+            "2001:db8::".parse::<IpAddr>().unwrap()
         );
         assert_eq!(
             network_address("192.0.2.9".parse().unwrap(), 32),
-            "192.0.2.9".parse().unwrap()
+            "192.0.2.9".parse::<IpAddr>().unwrap()
         );
     }
 }

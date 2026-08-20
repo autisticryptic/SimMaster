@@ -286,9 +286,7 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         // ModemManager primary QMI bearer remains the supported IMS fallback.
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_STATE_FILE);
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_ENDPOINTS_STATE_FILE);
-        println!(
-            "secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer"
-        );
+        println!("secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer");
         if std::env::var_os("NOTIFY_SOCKET").is_some() {
             let _ = tokio::process::Command::new("systemd-notify")
                 .args(["--ready", "--status=DATA6 disabled; primary QMI fallback"])
@@ -556,6 +554,11 @@ enum CliCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Internal: per-UE worker process, spawned by the manager with `setns`.
+    /// The worker is born inside the UE network namespace and serves the
+    /// control protocol over a JSON-lines Unix socket.
+    #[command(hide = true)]
+    UeWorker,
 }
 
 #[derive(Subcommand, Debug)]
@@ -686,6 +689,9 @@ async fn main() -> Result<()> {
     }) = &cli.command
     {
         return run_secondary_qmi_init(*write_udev_rule, *dry_run).await;
+    }
+    if matches!(&cli.command, Some(CliCommand::UeWorker)) {
+        return services::ue_worker::run_worker_from_env().await;
     }
     let args = match cli.command {
         Some(CliCommand::Serve(args)) => args,

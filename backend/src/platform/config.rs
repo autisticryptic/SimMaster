@@ -558,6 +558,70 @@ pub struct DeviceNetworkConfig {
     pub ddns: DdnsConfig,
 }
 
+/// Per-UE isolation configuration (Linux network namespaces).
+///
+/// This is the master switch for the multi-UE architecture documented in
+/// `multi_ue_ims_volte_vowifi_architecture.md`. When enabled, every line gets
+/// its own UE Context and Linux network namespace so identical IPs, P-CSCF
+/// addresses and route state can never leak between SIMs. The data planes
+/// (VoLTE bearer netdev, VoWiFi TUN, per-UE proxy) are migrated into the
+/// namespace incrementally behind this switch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct UeIsolationConfig {
+    /// Master switch. Defaults to false: behaviour is exactly the current
+    /// host-namespace routing until the migration is complete.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Prefix for per-UE network namespace names.
+    #[serde(default = "default_ue_namespace_prefix")]
+    pub namespace_prefix: String,
+    /// Prefix for the host side of each UE egress veth pair.
+    #[serde(default = "default_ue_host_veth_prefix")]
+    pub host_veth_prefix: String,
+    /// Prefix for the UE side of each UE egress veth pair.
+    #[serde(default = "default_ue_veth_prefix")]
+    pub ue_veth_prefix: String,
+    /// MTU used for the egress veth pairs.
+    #[serde(default = "default_ue_veth_mtu")]
+    pub veth_mtu: u32,
+    /// Stage 2b gate: move the VoWiFi TUN device into the UE namespace after
+    /// creation. Defaults to false because the host-side SIP/RTP sockets still
+    /// bind by device name and cannot follow the TUN into another namespace
+    /// yet; enable only after the VoWiFi sockets are migrated into the worker.
+    #[serde(default)]
+    pub vowifi_tun_in_namespace: bool,
+}
+
+impl Default for UeIsolationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            namespace_prefix: default_ue_namespace_prefix(),
+            host_veth_prefix: default_ue_host_veth_prefix(),
+            ue_veth_prefix: default_ue_veth_prefix(),
+            veth_mtu: default_ue_veth_mtu(),
+            vowifi_tun_in_namespace: false,
+        }
+    }
+}
+
+fn default_ue_namespace_prefix() -> String {
+    crate::platform::netns::DEFAULT_NAMESPACE_PREFIX.to_string()
+}
+
+fn default_ue_host_veth_prefix() -> String {
+    crate::platform::netns::DEFAULT_HOST_VETH_PREFIX.to_string()
+}
+
+fn default_ue_veth_prefix() -> String {
+    crate::platform::netns::DEFAULT_UE_VETH_PREFIX.to_string()
+}
+
+fn default_ue_veth_mtu() -> u32 {
+    crate::platform::netns::DEFAULT_VETH_MTU
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct VersionUpdateNotificationConfig {
@@ -4338,6 +4402,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub device_network: DeviceNetworkConfig,
     #[serde(default)]
+    pub ue_isolation: UeIsolationConfig,
+    #[serde(default)]
     pub version_update_notifications: VersionUpdateNotificationConfig,
     #[serde(default)]
     pub github_download_proxy: GithubDownloadProxyConfig,
@@ -4361,6 +4427,7 @@ impl Default for AppConfig {
             line_config_version: CURRENT_LINE_CONFIG_VERSION,
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
+            ue_isolation: UeIsolationConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             github_download_proxy: GithubDownloadProxyConfig::default(),
             security: SecurityConfig::default(),
@@ -6022,6 +6089,20 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.security = security;
+        }
+        self.save()
+    }
+
+    /// Return the current per-UE isolation configuration.
+    pub fn get_ue_isolation(&self) -> UeIsolationConfig {
+        self.config.read().unwrap().ue_isolation.clone()
+    }
+
+    /// Replace the per-UE isolation configuration and persist it.
+    pub fn set_ue_isolation(&self, ue_isolation: UeIsolationConfig) -> Result<(), String> {
+        {
+            let mut c = self.config.write().unwrap();
+            c.ue_isolation = ue_isolation;
         }
         self.save()
     }

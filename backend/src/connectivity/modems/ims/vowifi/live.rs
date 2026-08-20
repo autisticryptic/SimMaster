@@ -44,6 +44,7 @@ use super::{
     voice,
 };
 use crate::connectivity::core::{
+    media::OperatorSocketCreator,
     register::{
         run_register_observed, RegisterAuthenticator, RegisterFailure,
         MAX_REGISTER_PROVISIONAL_RESPONSES,
@@ -62,6 +63,7 @@ use crate::services::supplementary::ut::{XcapAccessContext, XcapDigestProvider};
 use crate::services::trunk::bridge::{
     DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
 };
+use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 use tokio::{
     net::TcpSocket,
     sync::{mpsc, Mutex},
@@ -656,6 +658,13 @@ fn live_runtime_config() -> LiveRuntimeConfig {
 /// process-global QMI device fallback.
 static LIVE_LINE_SIM_DEVICES: OnceLock<StdRwLock<HashMap<String, LiveSimDevice>>> = OnceLock::new();
 
+/// Per-line UE network namespace, registered by the line registry when
+/// isolation is enabled. When present, the VoWiFi TUN device is created in the
+/// host namespace by this process, then moved into the UE namespace; the open
+/// fd keeps driving the userspace ESP gateway while the kernel side of the TUN
+/// (address, routes, neighbour) belongs to that UE only.
+static LIVE_UE_NAMESPACES: OnceLock<StdRwLock<HashMap<String, String>>> = OnceLock::new();
+
 /// The SIM access parameters for one line.
 ///
 /// `qmi_device`/`uim_slot` address the reader for QMI/UIM operations (EAP-AKA,
@@ -671,6 +680,80 @@ pub struct LiveSimDevice {
 
 fn line_sim_devices() -> &'static StdRwLock<HashMap<String, LiveSimDevice>> {
     LIVE_LINE_SIM_DEVICES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+fn line_ue_namespaces() -> &'static StdRwLock<HashMap<String, String>> {
+    LIVE_UE_NAMESPACES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+/// Record the UE network namespace owned by a line, or clear it when isolation
+/// is disabled. Called during every line refresh so a config toggle applies on
+/// the next VoWiFi reconnect without a process restart.
+pub fn register_line_ue_namespace(line_id: &str, namespace: Option<&str>) {
+    let mut guard = line_ue_namespaces()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match namespace {
+        Some(namespace) if !namespace.trim().is_empty() => {
+            guard.insert(line_id.to_string(), namespace.trim().to_string());
+        }
+        _ => {
+            guard.remove(line_id);
+        }
+    }
+}
+
+/// Resolve the UE namespace this line's VoWiFi tunnel should live in. `None`
+/// keeps the current host-namespace behavior.
+pub(crate) fn ue_namespace_for_line(line_id: &str) -> Option<String> {
+    line_ue_namespaces()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .cloned()
+}
+
+/// Everything the VoWiFi data plane needs from a line's UE worker: the
+/// namespace, the UE-side veth name (IKE egress) and the worker handle that
+/// creates sockets inside the namespace.
+#[derive(Clone)]
+pub(crate) struct LiveUeSocketContext {
+    pub namespace: String,
+    pub ue_veth: String,
+    pub worker: UeWorkerHandle,
+}
+
+static LIVE_UE_SOCKET_CONTEXTS: OnceLock<StdRwLock<HashMap<String, LiveUeSocketContext>>> =
+    OnceLock::new();
+
+fn line_ue_socket_contexts() -> &'static StdRwLock<HashMap<String, LiveUeSocketContext>> {
+    LIVE_UE_SOCKET_CONTEXTS.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+/// Record (or clear) the UE socket context for a line. Called during every
+/// line refresh so a config toggle applies on the next VoWiFi reconnect.
+pub(crate) fn register_line_ue_socket_context(line_id: &str, context: Option<LiveUeSocketContext>) {
+    let mut guard = line_ue_socket_contexts()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match context {
+        Some(context) => {
+            guard.insert(line_id.to_string(), context);
+        }
+        None => {
+            guard.remove(line_id);
+        }
+    }
+}
+
+/// Resolve the UE socket context for a line. `None` keeps the current
+/// host-namespace socket creation path.
+pub(crate) fn ue_socket_context_for_line(line_id: &str) -> Option<LiveUeSocketContext> {
+    line_ue_socket_contexts()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .cloned()
 }
 
 /// Record which reader a line owns. Called when lines are discovered/refreshed.
@@ -804,6 +887,10 @@ async fn line_sim_info(
 /// Forget a line's reader mapping (line removed).
 pub fn forget_line_sim_device(line_id: &str) {
     line_sim_devices()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
+    line_ue_namespaces()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
@@ -1879,16 +1966,51 @@ async fn run_live_ike_with_destination(
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    let local_addr = local_bind_addr_for_destination(destination, path.preferred_local_port)
-        .await
-        .unwrap_or_else(|_| unspecified_local_addr_for(destination));
+    let ue_socket = ue_socket_context_for_line(line_id);
+    let local_addr = match &ue_socket {
+        Some(_) => {
+            let base = unspecified_local_addr_for(destination);
+            SocketAddr::new(base.ip(), path.preferred_local_port)
+        }
+        None => local_bind_addr_for_destination(destination, path.preferred_local_port)
+            .await
+            .unwrap_or_else(|_| unspecified_local_addr_for(destination)),
+    };
     info!(
         "run_live_ike_with_destination: binding local_addr={:?} for destination={:?}",
         local_addr, destination
     );
-    let transport = UdpSocketDatagramTransport::bind(local_addr)
-        .await
-        .map_err(map_transport_error)?
+    let transport = match &ue_socket {
+        Some(context) => {
+            let spec = UeSocketSpec::udp_connected(
+                local_addr,
+                destination,
+                Some(context.ue_veth.clone()),
+            );
+            match context.worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => {
+                    info!(
+                        line_id,
+                        ue_veth = %context.ue_veth,
+                        "IKE transport socket created inside UE namespace"
+                    );
+                    UdpSocketDatagramTransport::from_socket(socket)
+                }
+                Ok(_) => return Err(live_stage_error("ike_ue_socket_family_mismatch")),
+                Err(error) => {
+                    warn!(
+                        line_id,
+                        error = %error,
+                        "UE worker IKE socket creation failed; VoWiFi path aborted for this destination"
+                    );
+                    return Err(live_stage_error("ike_ue_socket_creation_failed"));
+                }
+            }
+        }
+        None => UdpSocketDatagramTransport::bind(local_addr)
+            .await
+            .map_err(map_transport_error)?,
+    }
         .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
         .with_max_datagram_bytes(8192);
 
@@ -2264,6 +2386,7 @@ async fn ensure_live_tun_gateway(
         secrets: child_sa.secrets.clone(),
         transport,
         remote,
+        ue_namespace: ue_namespace_for_line(line_id),
     })
     .await
     .map_err(|error| live_stage_error(error.reason()))?;
@@ -2929,6 +3052,12 @@ async fn record_live_ims_channel(
             .await
             .ok()
             .map(|gateway| gateway as Arc<dyn super::operator::MediaRouteInstaller>);
+    let media_operator_creator: Option<Arc<dyn OperatorSocketCreator>> =
+        ue_socket_context_for_line(line_id).map(|context| {
+            Arc::new(super::operator::UeWorkerOperatorSocketCreator::new(
+                context.worker,
+            )) as Arc<dyn OperatorSocketCreator>
+        });
     xcap_binding_cache().lock().await.insert(
         line_id.to_string(),
         LiveXcapBinding {
@@ -2962,6 +3091,7 @@ async fn record_live_ims_channel(
             })),
             media_route_installer,
             media_interface: Some(tun_name_for_line(&live_runtime_config().tun_name, line_id)),
+            media_operator_creator,
         },
         channel,
     )
@@ -3000,6 +3130,8 @@ pub async fn clear_live_runtime_for_line(line_id: &str) {
     if let Some(gateway) = tun_gateway_cache().lock().await.remove(line_id) {
         gateway.shutdown();
     }
+    register_line_ue_namespace(line_id, None);
+    register_line_ue_socket_context(line_id, None);
     forget_live_network_overrides(line_id);
 }
 
@@ -3380,12 +3512,14 @@ async fn run_register_exchange_with_pcscf_variant(
 ) -> Result<String, LiveStageError> {
     let target = SocketAddr::new(pcscf_addr, profile.ims.local_port);
     let transport = ims_transport(profile);
+    let ue_socket = ue_socket_context_for_line(line_id);
     let socket = connect_sip_socket(
         gateway.inner_addr(),
         target,
         profile.ims.local_port,
         transport,
         Some(gateway.tun_name()),
+        ue_socket.as_ref(),
     )
     .await?;
     let local_addr = match socket.local_addr() {
@@ -3928,12 +4062,14 @@ async fn run_protected_authenticated_register_candidates(
         );
         let target = SocketAddr::new(context.route_addr, candidate.client_flow_remote_port);
         let transport = ims_transport(profile);
+        let ue_socket = ue_socket_context_for_line(line_id);
         match connect_sip_socket(
             gateway.inner_addr(),
             target,
             candidate.client_flow_local_port,
             transport,
             Some(gateway.tun_name()),
+            ue_socket.as_ref(),
         )
         .await
         {
@@ -3968,6 +4104,7 @@ async fn run_protected_authenticated_register_candidates(
                                 local_security.port_s,
                                 transport,
                                 Some(gateway.tun_name()),
+                                ue_socket.as_ref(),
                             )
                             .await
                             {
@@ -4235,12 +4372,14 @@ async fn send_live_sms_message_variant(
     let target = SocketAddr::new(route.remote_addr, route.remote_port);
     let transport = ims_transport(profile);
     let tun_name = tun_name_for_line(&live_runtime_config().tun_name, line_id);
+    let ue_socket = ue_socket_context_for_line(line_id);
     let socket = connect_sip_socket(
         route.local_addr,
         target,
         route.local_port,
         transport,
         Some(&tun_name),
+        ue_socket.as_ref(),
     )
     .await?;
     let mut pending = Vec::new();
@@ -5033,7 +5172,49 @@ async fn connect_sip_socket(
     preferred_local_port: u16,
     transport: crate::connectivity::core::context::SipTransport,
     interface: Option<&str>,
+    ue_socket: Option<&LiveUeSocketContext>,
 ) -> Result<SipChannelSocket, LiveStageError> {
+    if let Some(context) = ue_socket {
+        let local = SocketAddr::new(inner_addr, preferred_local_port);
+        let device = interface.map(str::to_string);
+        return match transport {
+            crate::connectivity::core::context::SipTransport::Tcp => {
+                let spec = UeSocketSpec::tcp_connected(
+                    local,
+                    target,
+                    device,
+                    LIVE_IMS_TCP_TIMEOUT.as_secs().max(1),
+                );
+                match context.worker.create_socket(spec).await {
+                    Ok(UeSocket::Tcp(stream)) => Ok(SipChannelSocket::Tcp(stream)),
+                    Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
+                    Err(error) => {
+                        warn!(
+                            line_id = %context.namespace,
+                            error = %error,
+                            "UE worker SIP TCP socket creation failed"
+                        );
+                        Err(live_stage_error("ims_ue_tcp_socket_creation_failed"))
+                    }
+                }
+            }
+            crate::connectivity::core::context::SipTransport::Udp => {
+                let spec = UeSocketSpec::udp_connected(local, target, device);
+                match context.worker.create_socket(spec).await {
+                    Ok(UeSocket::Udp(socket)) => Ok(SipChannelSocket::Udp(socket)),
+                    Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
+                    Err(error) => {
+                        warn!(
+                            line_id = %context.namespace,
+                            error = %error,
+                            "UE worker SIP UDP socket creation failed"
+                        );
+                        Err(live_stage_error("ims_ue_udp_socket_creation_failed"))
+                    }
+                }
+            }
+        };
+    }
     match transport {
         crate::connectivity::core::context::SipTransport::Tcp => {
             let socket = match target {
@@ -9234,7 +9415,7 @@ mod tests {
         .expect("matching rejection event");
         assert!(terminal);
         assert_eq!(rejected.call_state, voice::CallState::Failed);
-        assert_eq!(rejected.failure_cause.as_deref(), Some("sip_486"));
+        assert_eq!(rejected.failure_cause.as_deref(), Some("callee_busy"));
 
         assert!(operator_event_call_outcome(
             &seed,
