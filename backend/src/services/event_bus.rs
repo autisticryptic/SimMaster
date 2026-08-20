@@ -48,13 +48,13 @@ impl AppEventBus {
         transport: Option<&str>,
         payload: serde_json::Value,
     ) -> Result<i64> {
-        self.database.insert_app_event(
+        Ok(self.database.insert_app_event(
             event_type,
             line_id,
             transport,
             &payload.to_string(),
             &chrono::Utc::now().to_rfc3339(),
-        )
+        )?)
     }
 
     pub fn publish_system_event(&self, event: &SystemEvent) -> Result<i64> {

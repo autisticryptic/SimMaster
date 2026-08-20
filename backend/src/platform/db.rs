@@ -3673,7 +3673,7 @@ impl Database {
         traffic: &LineDataTrafficEntry,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        tx.execute(
+        conn.execute(
             "INSERT INTO line_data_traffic (
                 line_id, uplink_bytes, downlink_bytes, total_connections, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -4737,7 +4737,7 @@ impl Database {
     /// 更新短信通知转发状态："pending", "success", "failed", "skipped"
     pub fn update_sms_notification_status(&self, id: i64, status: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        tx.execute(
+        conn.execute(
             "UPDATE sms_messages SET notification_status = ?1 WHERE id = ?2",
             params![status, id],
         )
@@ -5730,7 +5730,7 @@ impl Database {
         let app_event = insert_app_event_for_conn(
             &tx,
             "call.started",
-            line_id,
+            line_id.as_deref(),
             None,
             &payload,
             &Utc::now().to_rfc3339(),
