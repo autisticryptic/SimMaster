@@ -765,24 +765,13 @@ async fn prepare_data6_netdev(
             SecondaryQmiError::BindFailed(format!("no DATA6 netdev appeared under {baseband}"))
         })?;
 
-    let output = tokio::time::timeout(
-        PROBE_TIMEOUT,
-        Command::new("ip")
-            .args(["link", "set", netdev.as_str(), "up"])
-            .output(),
-    )
-    .await
-    .map_err(|_| SecondaryQmiError::BindFailed(format!("ip link set {netdev} up timed out")))?
-    .map_err(|error| {
-        SecondaryQmiError::BindFailed(format!("failed to run ip for {netdev}: {error}"))
-    })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(SecondaryQmiError::BindFailed(format!(
-            "ip link set {netdev} up failed ({}): {detail}",
-            output.status.code().unwrap_or(-1)
-        )));
-    }
+    // Binding DATA6 must not issue an administrative OPEN. On MSM8916 the
+    // bam-dmux firmware treats an OPEN without an active WDS session as a
+    // data-plane operation; during remoteproc recovery it can crash in
+    // dhcp_client_mgr/smd_dsm_memcpy and wedge every WWAN netdev. The actual
+    // IMS/data session setup calls qmi_netdev::resolve, which opens only the
+    // selected interface after it has a valid address. Here we only resolve
+    // and retain the netdev identity.
     Ok(netdev)
 }
 

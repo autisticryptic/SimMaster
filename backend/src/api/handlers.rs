@@ -8421,8 +8421,8 @@ async fn wait_for_line_modem(
         if !line_volte_restore_enabled(app, line) {
             return LineModemWait::Cancelled;
         }
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
-        if line.binding().present {
+        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await.is_ok();
+        if refreshed && line.binding().present {
             return LineModemWait::Ready;
         }
         line.volte
@@ -8503,7 +8503,25 @@ async fn run_line_volte_restore_batch(
                 .await;
             return;
         }
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        if let Err(error) = refreshed {
+            line.volte
+                .update(|state| {
+                    state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                    state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
+                    state.recovery_state =
+                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+                    state.last_error = Some(format!("volte_modem_refresh_failed:{error}"));
+                    state.next_retry_at =
+                        Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
+                })
+                .await;
+            if attempt < max_attempts {
+                tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+                continue;
+            }
+            break;
+        }
         if !line.binding().present {
             match wait_for_line_modem(app, line).await {
                 LineModemWait::Ready => {}
