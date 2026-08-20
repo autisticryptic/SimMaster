@@ -970,6 +970,11 @@ mod imp {
         let route_target = host_selector(remote);
         let inner_addr_text = inner_addr.to_string();
         let mut args = Vec::new();
+        let table = if ue_namespace.is_none() {
+            Some(route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string())
+        } else {
+            None
+        };
         if let Some(namespace) = ue_namespace {
             args.extend_from_slice(&["netns", "exec", namespace, "ip"]);
             if remote.is_ipv6() {
@@ -985,7 +990,6 @@ mod imp {
                 &inner_addr_text,
             ]);
         } else {
-            let table = route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
             if remote.is_ipv6() {
                 args.push("-6");
             }
@@ -998,7 +1002,7 @@ mod imp {
                 "src",
                 &inner_addr_text,
                 "table",
-                &table,
+                table.as_deref().unwrap_or_default(),
             ]);
         }
         run_command(

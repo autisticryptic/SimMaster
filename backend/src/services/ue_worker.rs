@@ -533,11 +533,11 @@ impl UeWorkerHandle {
         })?;
         match spec.kind {
             UeSocketKind::Udp => {
-                let std_socket = std::net::UdpSocket::from(fd)?;
+                let std_socket = std::net::UdpSocket::from(fd);
                 Ok(UeSocket::Udp(tokio::net::UdpSocket::from_std(std_socket)?))
             }
             UeSocketKind::Tcp => {
-                let std_stream = std::net::TcpStream::from(fd)?;
+                let std_stream = std::net::TcpStream::from(fd);
                 Ok(UeSocket::Tcp(tokio::net::TcpStream::from_std(std_stream)?))
             }
         }
@@ -597,7 +597,6 @@ impl UeWorkerHandle {
 
     #[cfg(unix)]
     async fn spawn_unix(&self) -> Result<(), UeWorkerError> {
-        use std::os::unix::process::CommandExt;
         use tokio::net::UnixListener;
         use tokio::process::Command;
 
@@ -655,26 +654,49 @@ impl UeWorkerHandle {
         tokio::spawn(async move {
             match tokio::time::timeout(HANDSHAKE_TIMEOUT, listener.accept()).await {
                 Ok(Ok((stream, _))) => {
-                    let read_stream = match stream.try_clone() {
-                        Ok(clone) => match clone.into_std() {
-                            Ok(std_stream) => std_stream,
-                            Err(error) => {
+                    // Tokio's UnixStream no longer exposes try_clone, so the
+                    // std stream is cloned first: one fd backs the blocking
+                    // recvmsg reader, the original is re-wrapped for the
+                    // async writer. into_std() keeps the socket nonblocking,
+                    // which tokio::from_std requires.
+                    let std_stream = match stream.into_std() {
+                        Ok(std_stream) => std_stream,
+                        Err(error) => {
+                            {
                                 let mut state = core.state.lock().unwrap();
                                 state.last_error =
-                                    Some(format!("read half conversion failed: {error}"));
-                                let _ = core.kill_child().await;
-                                return;
+                                    Some(format!("control stream conversion failed: {error}"));
                             }
-                        },
-                        Err(error) => {
-                            let mut state = core.state.lock().unwrap();
-                            state.last_error =
-                                Some(format!("control stream clone failed: {error}"));
                             let _ = core.kill_child().await;
                             return;
                         }
                     };
-                    let (write_half, _read_half) = stream.into_split();
+                    let read_stream = match std_stream.try_clone() {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            {
+                                let mut state = core.state.lock().unwrap();
+                                state.last_error =
+                                    Some(format!("control stream clone failed: {error}"));
+                            }
+                            let _ = core.kill_child().await;
+                            return;
+                        }
+                    };
+                    let write_stream = match tokio::net::UnixStream::from_std(std_stream) {
+                        Ok(stream) => stream,
+                        Err(error) => {
+                            {
+                                let mut state = core.state.lock().unwrap();
+                                state.last_error = Some(format!(
+                                    "control write stream conversion failed: {error}"
+                                ));
+                            }
+                            let _ = core.kill_child().await;
+                            return;
+                        }
+                    };
+                    let (_read_half, write_half) = write_stream.into_split();
                     let (tx, rx) = mpsc::unbounded_channel::<UeWorkerMessage>();
                     {
                         let mut guard = core.tx.lock().unwrap();
@@ -684,13 +706,17 @@ impl UeWorkerHandle {
                     tokio::task::spawn_blocking(move || run_parent_reader(read_stream, core));
                 }
                 Ok(Err(error)) => {
-                    let mut state = core.state.lock().unwrap();
-                    state.last_error = Some(format!("accept failed: {error}"));
+                    {
+                        let mut state = core.state.lock().unwrap();
+                        state.last_error = Some(format!("accept failed: {error}"));
+                    }
                     let _ = core.kill_child().await;
                 }
                 Err(_) => {
-                    let mut state = core.state.lock().unwrap();
-                    state.last_error = Some("handshake timeout".to_string());
+                    {
+                        let mut state = core.state.lock().unwrap();
+                        state.last_error = Some("handshake timeout".to_string());
+                    }
                     let _ = core.kill_child().await;
                 }
             }
@@ -939,17 +965,22 @@ pub async fn run_worker_from_env() -> anyhow::Result<()> {
 #[cfg(unix)]
 pub async fn run_worker(line_id: &str, netns_name: &str, control: &Path) -> anyhow::Result<()> {
     use std::os::fd::AsRawFd;
-    use tokio::{io::AsyncReadExt, net::UnixStream};
 
     tracing::info!(line_id, netns = %netns_name, "UE worker starting inside its namespace");
     let stream = connect_with_retry(control)
         .await
         .map_err(|error| anyhow::anyhow!("UE worker connect failed: {error}"))?;
+    // The worker only talks to the parent sequentially, so a blocking std
+    // stream keeps sendmsg/timeout semantics simple; tokio adds nothing here.
+    let mut stream = stream
+        .into_std()
+        .map_err(|error| anyhow::anyhow!("UE worker stream conversion failed: {error}"))?;
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| anyhow::anyhow!("UE worker stream blocking mode failed: {error}"))?;
     let write_stream = stream
         .try_clone()
-        .map_err(|error| anyhow::anyhow!("UE worker write clone failed: {error}"))?
-        .into_std()
-        .map_err(|error| anyhow::anyhow!("UE worker write half conversion failed: {error}"))?;
+        .map_err(|error| anyhow::anyhow!("UE worker write clone failed: {error}"))?;
     let _ = write_stream.set_write_timeout(Some(Duration::from_secs(10)));
     send_frame_std(
         &write_stream,
@@ -961,9 +992,8 @@ pub async fn run_worker(line_id: &str, netns_name: &str, control: &Path) -> anyh
         &[],
     )?;
 
-    let mut stream = stream;
     loop {
-        let Some(payload) = read_control_frame(&mut stream).await? else {
+        let Some(payload) = read_control_frame_std(&mut stream)? else {
             break;
         };
         let message = serde_json::from_slice::<UeWorkerMessage>(&payload)
@@ -1069,15 +1099,15 @@ async fn connect_with_retry(path: &Path) -> std::io::Result<tokio::net::UnixStre
 }
 
 /// Worker-side reader: length-prefixed frames. The worker never receives fds,
-/// so plain async reads are safe here.
+/// so plain blocking reads are safe here.
 #[cfg(unix)]
-async fn read_control_frame(
-    stream: &mut tokio::net::UnixStream,
+fn read_control_frame_std(
+    stream: &mut std::os::unix::net::UnixStream,
 ) -> anyhow::Result<Option<Vec<u8>>> {
-    use tokio::io::AsyncReadExt;
+    use std::io::Read;
 
     let mut header = [0u8; 4];
-    match stream.read_exact(&mut header).await {
+    match stream.read_exact(&mut header) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
         Err(error) => return Err(error.into()),
@@ -1087,7 +1117,7 @@ async fn read_control_frame(
         anyhow::bail!("control frame payload too large: {len}");
     }
     let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).await?;
+    stream.read_exact(&mut payload)?;
     Ok(Some(payload))
 }
 
@@ -1225,7 +1255,9 @@ fn sendmsg_frame(
             }
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(fds.len() * std::mem::size_of::<libc::c_int>());
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN((fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint)
+                    as usize;
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
         }
@@ -1364,7 +1396,7 @@ fn wait_byte_count(
 #[cfg(unix)]
 fn cmsg_space_for(count: usize) -> usize {
     let bytes = count * std::mem::size_of::<libc::c_int>();
-    unsafe { libc::CMSG_SPACE(bytes) }
+    unsafe { libc::CMSG_SPACE(bytes as libc::c_uint) as usize }
 }
 
 /// Collect all `SCM_RIGHTS` fds from a received message header. Ownership of
@@ -1376,7 +1408,7 @@ fn extract_scm_rights(header: &libc::msghdr) -> Vec<i32> {
     while !cmsg.is_null() {
         unsafe {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let payload_len = (*cmsg).cmsg_len.saturating_sub(libc::CMSG_LEN(0));
+                let payload_len = (*cmsg).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
                 let count = payload_len / std::mem::size_of::<libc::c_int>();
                 if count > 0 {
                     let data = libc::CMSG_DATA(cmsg) as *const libc::c_int;
