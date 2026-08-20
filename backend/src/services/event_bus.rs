@@ -34,11 +34,13 @@ impl AppEventBus {
         line_id: Option<&str>,
         limit: i64,
     ) -> Result<Vec<AppEventEntry>> {
-        self.database.get_app_events_after(after_id, line_id, limit)
+        Ok(self
+            .database
+            .get_app_events_after(after_id, line_id, limit)?)
     }
 
     pub fn recent(&self, line_id: Option<&str>, limit: i64) -> Result<Vec<AppEventEntry>> {
-        self.database.get_recent_app_events(line_id, limit)
+        Ok(self.database.get_recent_app_events(line_id, limit)?)
     }
 
     pub fn publish(

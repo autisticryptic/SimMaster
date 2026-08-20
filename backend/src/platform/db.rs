@@ -5982,7 +5982,7 @@ impl Database {
         let app_event = insert_app_event_for_conn(
             &tx,
             "automation.executed",
-            line_id,
+            line_id.as_deref(),
             Some("automation"),
             &json!({
                 "automation_id": id,
