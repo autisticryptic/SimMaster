@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
+import { CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -38,11 +38,108 @@ import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails 
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
+const volteStageStatusLabels: Record<string, string> = {
+  disabled: 'IMS 未连接',
+  starting: '正在准备 IMS 连接',
+  identity: '正在读取 SIM 身份',
+  carrier_profile: '正在匹配运营商 Profile',
+  radio: '正在检查 LTE 驻网',
+  ims_context: '正在准备 IMS 上下文',
+  modem: '正在等待基带',
+  bearer: '正在建立 IMS Bearer',
+  bearer_dual: '正在建立双栈 IMS Bearer',
+  bearer_ipv4: '正在建立 IPv4 IMS Bearer',
+  bearer_ipv6: '正在建立 IPv6 IMS Bearer',
+  ipv6_preflight: '正在执行 IPv6 预检',
+  pcscf: '正在发现 P-CSCF',
+  ip_config: '正在配置 IMS 网络',
+  register_initial: '正在发送初始 REGISTER',
+  identity_aka: '正在执行 SIM AKA 鉴权',
+  ipsec: '正在建立 IMS IPsec',
+  register_authenticated: '正在发送鉴权 REGISTER',
+  register_refresh: '正在续期 IMS 注册',
+  register_ipsec: '正在通过 IPsec 注册',
+  register_udp: '正在确认 UDP 注册',
+  registered: 'IMS 已注册',
+  stopping: '正在断开 IMS',
+}
+
 function imsConnectionSummary(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
   if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
-  if (line.runtime.last_error) return 'IMS 连接失败'
-  return 'IMS 连接中'
+  const label = volteStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
+  if (line.runtime.last_error) return `${label.replace(/^正在/, '').replace(/ IMS$/, '')}失败`
+  return label
+}
+
+const volteStageTimeline = [
+  ['identity', 'SIM 身份'],
+  ['carrier_profile', '运营商 Profile'],
+  ['bearer', 'IMS Bearer'],
+  ['pcscf', 'P-CSCF'],
+  ['ip_config', 'IP 配置'],
+  ['register_initial', '初始 REGISTER'],
+  ['register_authenticated', '鉴权 REGISTER'],
+  ['registered', 'IMS 已注册'],
+] as const
+
+const volteStageAliases: Record<string, string> = {
+  starting: 'identity',
+  ims_context: 'bearer',
+  bearer_dual: 'bearer',
+  bearer_ipv4: 'bearer',
+  bearer_ipv6: 'bearer',
+  ipv6_preflight: 'bearer',
+  modem: 'bearer',
+  ipsec: 'register_authenticated',
+  register_ipsec: 'register_authenticated',
+  register_udp: 'registered',
+}
+
+function volteStageTimelineState(line: VolteLineControlResponse) {
+  const runtime = line.runtime
+  const current = volteStageAliases[runtime.stage] || runtime.stage
+  const currentIndex = volteStageTimeline.findIndex(([stage]) => stage === current)
+  const latestByStage = new Map<string, VolteLineControlResponse['runtime']['connection_attempts'][number]>()
+  for (const attempt of runtime.connection_attempts ?? []) {
+    latestByStage.set(volteStageAliases[attempt.stage] || attempt.stage, attempt)
+  }
+  return volteStageTimeline.map(([stage, label], index) => {
+    const attempt = latestByStage.get(stage)
+    const failed = Boolean(runtime.last_error && current === stage && runtime.phase !== 'registered')
+    const complete = runtime.registered || (!failed && currentIndex > index)
+      || attempt?.outcome === 'succeeded' || attempt?.outcome === 'success'
+    const active = !complete && !failed && current === stage && line.profile.volte_connection_enabled
+    return { stage, label, attempt, complete, active, failed }
+  })
+}
+
+function VolteStageTimeline({ line }: { line: VolteLineControlResponse }) {
+  if (!line.profile.volte_connection_enabled && !line.runtime.last_error && !line.runtime.connection_attempts?.length) return null
+  const items = volteStageTimelineState(line)
+  const currentLabel = items.find((item) => item.active || item.failed)?.label
+    || (line.runtime.registered ? 'IMS 已注册' : '等待启动')
+  return (
+    <Box sx={{ mt: 1.25, p: 1.25, border: 1, borderColor: 'divider', borderRadius: 1, bgcolor: 'action.hover' }}>
+      <Box display="flex" alignItems="center" justifyContent="space-between" gap={1} mb={1}>
+        <Typography variant="caption" color="text.secondary">连接进度</Typography>
+        <Typography variant="caption" fontWeight={700}>{currentLabel}</Typography>
+      </Box>
+      <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', sm: 'repeat(4, minmax(0, 1fr))', md: 'repeat(8, minmax(0, 1fr))' }, gap: 0.75 }}>
+        {items.map((item) => (
+          <Box key={item.stage} minWidth={0} display="flex" alignItems="center" gap={0.5} title={item.attempt?.detail || item.attempt?.error_code || item.label}>
+            {item.failed ? <ErrorOutline color="error" sx={{ fontSize: 16, flexShrink: 0 }} /> : item.complete ? <CheckCircle color="success" sx={{ fontSize: 16, flexShrink: 0 }} /> : <RadioButtonUnchecked color={item.active ? 'primary' : 'disabled'} sx={{ fontSize: 16, flexShrink: 0 }} />}
+            <Typography variant="caption" color={item.failed ? 'error' : item.active ? 'primary' : item.complete ? 'text.primary' : 'text.secondary'} sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</Typography>
+          </Box>
+        ))}
+      </Box>
+      {(line.runtime.last_error || line.runtime.current_ip_family || line.runtime.bearer_interface || line.runtime.pcscf) && (
+        <Typography variant="caption" color="text.secondary" display="block" mt={1} sx={{ wordBreak: 'break-word' }}>
+          {[line.runtime.last_error, line.runtime.current_ip_family && `地址族 ${line.runtime.current_ip_family}`, line.runtime.bearer_interface && `网卡 ${line.runtime.bearer_interface}`, line.runtime.pcscf && `P-CSCF ${line.runtime.pcscf}`].filter(Boolean).join(' · ')}
+        </Typography>
+      )}
+    </Box>
+  )
 }
 
 function voiceAccessLabel(line: VolteLineControlResponse, vowifi?: VowifiLineConfigResponse) {
@@ -879,14 +976,14 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     )}
 
                     <Box display="flex" flexDirection="column">
-                    {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
-                      <Box>
+                    {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
+                      <Box minWidth={0}>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
                         <Typography variant="caption" color="text.secondary">
                           独立于其他基带管理；连接阶段与地址族详情见线路活动日志
                         </Typography>
                       </Box>
-                      <Box display="flex" alignItems="center" gap={1}>
+                      <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
                         {(volteBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
@@ -911,6 +1008,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         />
                       </Box>
                     </Box>}
+                    {!isReader && (!workbench || workbenchTab === 'ims') && <VolteStageTimeline line={line} />}
                     {(!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">

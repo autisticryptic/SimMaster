@@ -71,6 +71,17 @@ const NET_CLASS_DIR: &str = "/sys/class/net";
 pub const SECONDARY_QMI_STATE_FILE: &str = "/run/simadmin/secondary-qmi-device";
 pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qmi-endpoints.json";
 
+/// DATA6 is an optional hardware capability, not a safe default on every
+/// MSM8916 firmware.  In particular, the 410 firmware used by SimAdmin can
+/// crash the modem when the AT-labelled DATA6 channel is force-opened as QMI.
+/// Keep the primary ModemManager QMI path usable unless an operator explicitly
+/// opts in after validating the device firmware.
+pub fn secondary_qmi_enabled() -> bool {
+    std::env::var("SIMADMIN_ENABLE_SECONDARY_QMI")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -463,6 +474,11 @@ async fn run_qmicli(args: &[&str]) -> Option<Output> {
 pub async fn ensure_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    if !secondary_qmi_enabled() {
+        return Err(SecondaryQmiError::Unsupported(
+            "DATA6 probing requires SIMADMIN_ENABLE_SECONDARY_QMI=1".to_string(),
+        ));
+    }
     let baseband = baseband_key_for_device(primary_device)?;
     let primary_port = primary_device
         .rsplit('/')
@@ -509,10 +525,27 @@ pub async fn ensure_endpoint(
 pub async fn runtime_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
+    if !secondary_qmi_enabled() {
+        return Err(SecondaryQmiError::Unsupported(
+            "DATA6 is disabled by default; set SIMADMIN_ENABLE_SECONDARY_QMI=1 after firmware validation".to_string(),
+        ));
+    }
     if let Some(endpoint) = endpoint_from_runtime_state(primary_device)? {
         return Ok(endpoint);
     }
-    ensure_endpoint(primary_device).await
+    Err(SecondaryQmiError::Unsupported(
+        "DATA6 was not prepared by the opt-in secondary-QMI initializer".to_string(),
+    ))
+}
+
+/// Report whether the boot initializer published a valid secondary endpoint
+/// for this exact baseband.  This never binds or probes a channel.
+pub fn runtime_endpoint_available(primary_device: &str) -> bool {
+    secondary_qmi_enabled()
+        && endpoint_from_runtime_state(primary_device)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn endpoint_from_runtime_state(

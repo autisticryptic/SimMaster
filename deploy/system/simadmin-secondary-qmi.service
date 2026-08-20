@@ -6,9 +6,13 @@ Before=ModemManager.service simadmin.service
 [Service]
 Type=notify
 NotifyAccess=all
+# DATA6 is an opt-in experiment.  The 410 firmware can crash when its
+# AT-labelled endpoint is force-opened as QMI; primary ModemManager QMI is the
+# safe default.  Remove this override only after validating the firmware.
+Environment=SIMADMIN_ENABLE_SECONDARY_QMI=0
 # Qualcomm 410 uses the stock single-channel driver. The initializer binds
 # DATA6_CNTL itself, opens the resulting character device and keeps it open.
-ExecCondition=/bin/sh -c 'modprobe rpmsg_wwan_ctrl >/dev/null 2>&1 || true; i=0; while test "$i" -lt 20; do if test -e /sys/bus/rpmsg/drivers/rpmsg_wwan_ctrl/bind; then for d in /sys/bus/rpmsg/devices/*; do test -e "$d/driver_override" && test "$(cat "$d/name" 2>/dev/null)" = DATA6_CNTL && exit 0; done; fi; i=$((i + 1)); sleep 1; done; exit 1'
+ExecCondition=/bin/sh -c 'case "${SIMADMIN_ENABLE_SECONDARY_QMI:-0}" in 1|true|yes|on) ;; *) exit 0 ;; esac; modprobe rpmsg_wwan_ctrl >/dev/null 2>&1 || true; i=0; while test "$i" -lt 20; do if test -e /sys/bus/rpmsg/drivers/rpmsg_wwan_ctrl/bind; then for d in /sys/bus/rpmsg/devices/*; do test -e "$d/driver_override" && test "$(cat "$d/name" 2>/dev/null)" = DATA6_CNTL && exit 0; done; fi; i=$((i + 1)); sleep 1; done; exit 1'
 ExecStart=/opt/simadmin/simadmin secondary-qmi-init
 Restart=on-failure
 RestartSec=2

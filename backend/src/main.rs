@@ -280,6 +280,24 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     // hide the runtime DATA6-specific rule completely.
     const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
 
+    if !secondary_qmi::secondary_qmi_enabled() {
+        // Do not enumerate, bind, probe, or open DATA6 on firmware where the
+        // AT-labelled endpoint is known to take down the modem DSP.  The
+        // ModemManager primary QMI bearer remains the supported IMS fallback.
+        let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_STATE_FILE);
+        let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_ENDPOINTS_STATE_FILE);
+        println!(
+            "secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer"
+        );
+        if std::env::var_os("NOTIFY_SOCKET").is_some() {
+            let _ = tokio::process::Command::new("systemd-notify")
+                .args(["--ready", "--status=DATA6 disabled; primary QMI fallback"])
+                .status()
+                .await;
+        }
+        return Ok(());
+    }
+
     // Discovering modems needs ModemManager, which by design is not up yet. Fall
     // back to enumerating the primary QMI control ports straight from sysfs.
     let primaries = secondary_qmi::discover_primary_qmi_ports();

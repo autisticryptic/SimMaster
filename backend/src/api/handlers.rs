@@ -3258,7 +3258,10 @@ async fn prepare_line_data_slot_for_volte(
         data_requested: true,
         primary_data_active,
         secondary_data_active,
-        secondary_endpoint_available: secondary_data_active || binding.qmi_device.is_some(),
+        secondary_endpoint_available: secondary_data_active
+            || binding.qmi_device.as_deref().is_some_and(
+                crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
+            ),
     };
     match select_data_slot_mode(inputs) {
         Ok(mode) => {
