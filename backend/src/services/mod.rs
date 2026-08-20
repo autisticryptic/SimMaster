@@ -14,6 +14,7 @@
 
 pub mod automation;
 pub mod e911;
+pub mod event_bus;
 pub mod line_registry;
 pub mod messaging;
 pub mod network;

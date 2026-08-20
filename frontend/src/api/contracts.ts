@@ -2371,6 +2371,16 @@ export interface VowifiRuntimeEventsResponse {
   total: number
 }
 
+export interface AppEventEntry {
+  id: number
+  device_id: string
+  event_type: string
+  line_id?: string | null
+  transport?: string | null
+  payload: unknown
+  created_at: string
+}
+
 export interface VowifiSmsPartEntry {
   message_id: string
   reference: number

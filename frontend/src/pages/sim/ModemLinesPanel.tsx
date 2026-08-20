@@ -22,6 +22,7 @@ import { CellTower, FlightTakeoff, Lan, Refresh, Replay, SettingsEthernet, Trave
 import {
   api,
   type LineNetworkControlsResponse,
+  type AppEventEntry,
   type CallRecord,
   type SmsMessage,
   type TrunkProfileResponse,
@@ -157,6 +158,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
   const [activityMessages, setActivityMessages] = useState<SmsMessage[]>([])
   const [activityCalls, setActivityCalls] = useState<CallRecord[]>([])
+  const [appEvents, setAppEvents] = useState<AppEventEntry[]>([])
   const [networkControls, setNetworkControls] = useState<LineNetworkControlsResponse[]>([])
   const [editingTrunkLine, setEditingTrunkLine] = useState<TrunkProfileResponse | null>(null)
   const [enableTrunkOnOpen, setEnableTrunkOnOpen] = useState(false)
@@ -273,6 +275,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       setVowifiEvents([])
       setActivityMessages([])
       setActivityCalls([])
+      setAppEvents([])
       return
     }
     let cancelled = false
@@ -288,10 +291,48 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       setActivityCalls(callResult.status === 'fulfilled' ? callResult.value.data?.records ?? [] : [])
     }
     void refresh()
-    const timer = window.setInterval(() => void refresh(), 10_000)
+    const calibrationTimer = window.setInterval(() => void refresh(), 60_000)
+    const eventSource = api.openAppEventStream({ lineId: selectedLineId })
+    let refreshTimer: number | undefined
+    let fallbackTimer: number | undefined
+    eventSource.onopen = () => {
+      if (fallbackTimer !== undefined) {
+        window.clearInterval(fallbackTimer)
+        fallbackTimer = undefined
+      }
+    }
+    const onAppEvent = (rawEvent: Event) => {
+      const message = rawEvent as MessageEvent<string>
+      try {
+        const event = JSON.parse(message.data) as AppEventEntry
+        if (event.line_id === selectedLineId) {
+          setAppEvents((current) => {
+            if (current.some((item) => item.id === event.id)) return current
+            return [...current, event]
+              .sort((left, right) => left.id - right.id)
+              .slice(-100)
+          })
+          if (refreshTimer !== undefined) window.clearTimeout(refreshTimer)
+          refreshTimer = window.setTimeout(() => void refresh(), 250)
+        }
+      } catch {
+        // The 10-second history refresh remains as a safe fallback.
+      }
+    }
+    eventSource.addEventListener('app_event', onAppEvent)
+    eventSource.onerror = () => {
+      if (fallbackTimer === undefined) {
+        void refresh()
+        fallbackTimer = window.setInterval(() => void refresh(), 10_000)
+      }
+    }
     return () => {
       cancelled = true
-      window.clearInterval(timer)
+      window.clearInterval(calibrationTimer)
+      if (fallbackTimer !== undefined) window.clearInterval(fallbackTimer)
+      if (refreshTimer !== undefined) window.clearTimeout(refreshTimer)
+      eventSource.removeEventListener('app_event', onAppEvent)
+      eventSource.close()
     }
   }, [selectedLineId, workbench, workbenchTab])
 
@@ -936,7 +977,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoLTE IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
                     {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoWiFi 详情</Typography><LineVowifiDetails vowifi={vowifiLine} /></Box>}
                     {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
-                    {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><LineActivityLog line={line} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} /></Box>}
+                    {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><LineActivityLog line={line} appEvents={appEvents} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} /></Box>}
                     </Box>
                   </CardContent>
                 </Card>

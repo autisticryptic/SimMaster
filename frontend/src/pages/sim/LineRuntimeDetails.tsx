@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import type { CallRecord, SmsMessage, TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
+import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
@@ -61,7 +61,7 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
 
 type ActivityLogEntry = {
   at: string
-  source: 'VoLTE' | 'VoWiFi' | 'Trunk' | '短信' | '通话'
+  source: 'VoLTE' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
   stage: string
   outcome: string
   detail?: string
@@ -125,18 +125,47 @@ function activityOutcomeColor(outcome: string): 'success' | 'error' | 'warning' 
 
 export function LineActivityLog({
   line,
+  appEvents = [],
   vowifiEvents = [],
   trunk,
   smsMessages = [],
   callRecords = [],
 }: {
   line: VolteLineControlResponse
+  appEvents?: AppEventEntry[]
   vowifiEvents?: VowifiRuntimeEventEntry[]
   trunk?: TrunkProfileResponse
   smsMessages?: SmsMessage[]
   callRecords?: CallRecord[]
 }) {
+  const unifiedEntries: ActivityLogEntry[] = appEvents.map((event) => {
+    const payload = event.payload
+    const payloadEntries = payload && typeof payload === 'object' && !Array.isArray(payload)
+      ? Object.entries(payload as Record<string, unknown>)
+      : [['value', payload]] as [string, unknown][]
+    const detail = payloadEntries
+      .filter(([key, value]) => key !== 'diagnostic' && value !== null && value !== undefined && value !== '')
+      .slice(0, 6)
+      .map(([key, value]) => `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`)
+      .join(' · ')
+    const source = event.transport === 'vowifi_ims' || event.event_type.startsWith('vowifi.')
+      ? 'VoWiFi'
+      : event.transport === 'volte_ims' || event.event_type.startsWith('volte.')
+        ? 'VoLTE'
+        : event.transport === 'trunk' || event.event_type.startsWith('trunk.')
+          ? 'Trunk'
+          : event.event_type.startsWith('sms.') ? '短信' : event.event_type.startsWith('call.') ? '通话' : '系统'
+    return {
+      at: event.created_at,
+      source,
+      stage: event.event_type,
+      outcome: event.event_type.endsWith('.failed') || event.event_type.includes('failure') ? 'failed' : 'info',
+      detail,
+    }
+  })
   const entries: ActivityLogEntry[] = [
+    ...unifiedEntries,
+    ...(appEvents.length > 0 ? [] : [
     ...(line.runtime.connection_attempts ?? []).map((attempt) => ({
       at: attempt.at,
       source: 'VoLTE' as const,
@@ -179,9 +208,10 @@ export function LineActivityLog({
       ].filter(Boolean).join(' · '),
       error: record.failure_code,
     })),
+    ]),
   ]
 
-  if (trunk?.trunk.enabled && (trunk.runtime.last_activity_at || trunk.runtime.registered_at || trunk.runtime.started_at)) {
+  if (appEvents.length === 0 && trunk?.trunk.enabled && (trunk.runtime.last_activity_at || trunk.runtime.registered_at || trunk.runtime.started_at)) {
     const runtime = trunk.runtime
     entries.push({
       at: runtime.last_activity_at || runtime.registered_at || runtime.started_at || '',

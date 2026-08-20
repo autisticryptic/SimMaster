@@ -6,5 +6,6 @@
 //!   - `auth`: password/session authentication + the auth middleware
 
 pub mod auth;
+pub mod events;
 pub mod handlers;
 pub mod models;

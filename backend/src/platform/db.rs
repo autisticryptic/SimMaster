@@ -9,8 +9,10 @@
 use chrono::{DateTime, Duration, FixedOffset, SecondsFormat, Utc};
 use rusqlite::{params, Connection, OptionalExtension, Result, Row};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::sync::broadcast;
 
 use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
 
@@ -35,6 +37,21 @@ fn required_sms_channel_id(channel_id: &str) -> Result<&str> {
         ));
     }
     Ok(channel_id)
+}
+
+fn local_device_id() -> &'static str {
+    static DEVICE_ID: OnceLock<String> = OnceLock::new();
+    DEVICE_ID
+        .get_or_init(|| {
+            std::fs::read_to_string("/etc/machine-id")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .or_else(|| std::env::var("HOSTNAME").ok())
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "simadmin-device".to_string())
+        })
+        .as_str()
 }
 
 /// 短信记录
@@ -284,6 +301,17 @@ pub struct VowifiRuntimeEventsResponse {
     pub total: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppEventEntry {
+    pub id: i64,
+    pub device_id: String,
+    pub event_type: String,
+    pub line_id: Option<String>,
+    pub transport: Option<String>,
+    pub payload_json: String,
+    pub created_at: String,
+}
+
 /// Cumulative proxied traffic for one line as stored on disk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LineDataTrafficEntry {
@@ -477,6 +505,56 @@ pub struct VowifiSoakRunsResponse {
 
 pub struct Database {
     conn: Arc<Mutex<Connection>>,
+    app_event_tx: broadcast::Sender<AppEventEntry>,
+}
+
+fn insert_app_event_for_conn(
+    conn: &Connection,
+    event_type: &str,
+    line_id: Option<&str>,
+    transport: Option<&str>,
+    payload_json: &str,
+    created_at: &str,
+) -> Result<AppEventEntry> {
+    let device_id = local_device_id().to_string();
+    let line_id = line_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let transport = transport
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    conn.execute(
+        "INSERT INTO app_events (
+            device_id, event_type, line_id, transport, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            &device_id,
+            event_type,
+            line_id.as_deref(),
+            transport.as_deref(),
+            payload_json,
+            created_at,
+        ],
+    )?;
+    let event = AppEventEntry {
+        id: conn.last_insert_rowid(),
+        device_id,
+        event_type: event_type.to_string(),
+        line_id,
+        transport,
+        payload_json: payload_json.to_string(),
+        created_at: created_at.to_string(),
+    };
+    conn.execute(
+        "DELETE FROM app_events
+         WHERE id < COALESCE((
+             SELECT id FROM app_events ORDER BY id DESC LIMIT 1 OFFSET 9999
+         ), 0)",
+        [],
+    )?;
+    Ok(event)
 }
 
 fn beijing_offset() -> FixedOffset {
@@ -2858,6 +2936,35 @@ impl Database {
             )",
             [],
         )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS app_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                device_id TEXT NOT NULL DEFAULT '',
+                event_type TEXT NOT NULL,
+                line_id TEXT,
+                transport TEXT,
+                payload_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+        if !table_has_column(&conn, "app_events", "device_id")? {
+            conn.execute(
+                "ALTER TABLE app_events ADD COLUMN device_id TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_events_created_at
+             ON app_events(created_at DESC, id DESC)",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_app_events_line_id
+             ON app_events(line_id, id DESC)",
+            [],
+        )?;
         if !table_has_column(&conn, "vowifi_runtime_events", "line_id")? {
             conn.execute(
                 "ALTER TABLE vowifi_runtime_events ADD COLUMN line_id TEXT",
@@ -3132,8 +3239,10 @@ impl Database {
             [],
         )?;
 
+        let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            app_event_tx,
         })
     }
 
@@ -3315,10 +3424,11 @@ impl Database {
 
     /// 插入新短信
     pub fn insert_vowifi_runtime_event(&self, event: NewVowifiRuntimeEvent<'_>) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let created_at = beijing_sms_now_string();
         let line_id = required_line_id(event.line_id)?;
-        conn.execute(
+        tx.execute(
             "INSERT INTO vowifi_runtime_events (
                 line_id, trace_id, level, phase, profile_id, event_type, detail_json, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
@@ -3333,8 +3443,27 @@ impl Database {
                 created_at,
             ],
         )?;
-        let inserted_id = conn.last_insert_rowid();
-        conn.execute(
+        let inserted_id = tx.last_insert_rowid();
+        let app_event_type = format!("vowifi.{}", event.event_type);
+        let payload = json!({
+            "runtime_event_id": inserted_id,
+            "trace_id": event.trace_id,
+            "phase": event.phase,
+            "profile_id": event.profile_id,
+            "level": event.level,
+            "detail": serde_json::from_str::<serde_json::Value>(event.detail_json)
+                .unwrap_or_else(|_| json!(event.detail_json)),
+        })
+        .to_string();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            &app_event_type,
+            Some(line_id),
+            Some("vowifi_ims"),
+            &payload,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.execute(
             "DELETE FROM vowifi_runtime_events
              WHERE line_id = ?1
                AND id NOT IN (
@@ -3345,6 +3474,8 @@ impl Database {
                )",
             params![line_id],
         )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
         Ok(inserted_id)
     }
 
@@ -3356,6 +3487,116 @@ impl Database {
         trace_id: Option<&str>,
     ) -> Result<VowifiRuntimeEventsResponse> {
         self.get_vowifi_runtime_events_scoped(limit, offset, Some(line_id), trace_id)
+    }
+
+    pub fn insert_app_event(
+        &self,
+        event_type: &str,
+        line_id: Option<&str>,
+        transport: Option<&str>,
+        payload_json: &str,
+        created_at: &str,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let event = insert_app_event_for_conn(
+            &tx,
+            event_type,
+            line_id,
+            transport,
+            payload_json,
+            created_at,
+        )?;
+        let id = event.id;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(event);
+        Ok(id)
+    }
+
+    pub fn subscribe_app_events(&self) -> broadcast::Receiver<AppEventEntry> {
+        self.app_event_tx.subscribe()
+    }
+
+    pub fn get_app_events_after(
+        &self,
+        after_id: i64,
+        line_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AppEventEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, event_type, line_id, transport, payload_json, created_at
+             FROM app_events
+             WHERE id > ?1 AND (?2 IS NULL OR line_id = ?2)
+             ORDER BY id ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![after_id, line_id, limit], |row| {
+            Ok(AppEventEntry {
+                id: row.get(0)?,
+                device_id: row.get(1)?,
+                event_type: row.get(2)?,
+                line_id: row.get(3)?,
+                transport: row.get(4)?,
+                payload_json: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_recent_app_events(
+        &self,
+        line_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<AppEventEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let line_id = line_id.map(str::trim).filter(|value| !value.is_empty());
+        let mut stmt = conn.prepare(
+            "SELECT id, device_id, event_type, line_id, transport, payload_json, created_at
+             FROM (
+                SELECT id, device_id, event_type, line_id, transport, payload_json, created_at
+                FROM app_events
+                WHERE (?1 IS NULL OR line_id = ?1)
+                ORDER BY id DESC
+                LIMIT ?2
+             )
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map(params![line_id, limit], |row| {
+            Ok(AppEventEntry {
+                id: row.get(0)?,
+                device_id: row.get(1)?,
+                event_type: row.get(2)?,
+                line_id: row.get(3)?,
+                transport: row.get(4)?,
+                payload_json: row.get(5)?,
+                created_at: row.get(6)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn get_latest_vowifi_runtime_events_after(
+        &self,
+        after_id: i64,
+        limit: i64,
+    ) -> Result<Vec<VowifiRuntimeEventEntry>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.clamp(1, 500);
+        let mut stmt = conn.prepare(
+            "SELECT id, line_id, trace_id, level, phase, profile_id, event_type,
+                    detail_json, created_at
+             FROM vowifi_runtime_events
+             WHERE id > ?1
+             ORDER BY id ASC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![after_id, limit], vowifi_runtime_event_from_row)?;
+        rows.collect()
     }
 
     fn get_vowifi_runtime_events_scoped(
@@ -3432,7 +3673,7 @@ impl Database {
         traffic: &LineDataTrafficEntry,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "INSERT INTO line_data_traffic (
                 line_id, uplink_bytes, downlink_bytes, total_connections, updated_at
              ) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -4196,10 +4437,11 @@ impl Database {
         transport: &str,
         line_id: Option<&str>,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let timestamp = sms_timestamp_for_storage(timestamp);
         let transport = normalized_sms_transport(transport);
-        conn.execute(
+        tx.execute(
             "INSERT INTO sms_messages (direction, phone_number, content, timestamp, status, pdu, transport, line_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
@@ -4213,8 +4455,30 @@ impl Database {
                 line_id.filter(|value| !value.trim().is_empty())
             ],
         )?;
-
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        let event_type = match (direction, status) {
+            ("incoming", _) => "sms.received",
+            (_, "failed") => "sms.failed",
+            _ => "sms.sent",
+        };
+        let payload = json!({
+            "sms_id": id,
+            "direction": direction,
+            "phone_number": phone_number,
+            "status": status,
+        })
+        .to_string();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            event_type,
+            line_id,
+            Some(transport),
+            &payload,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
+        Ok(id)
     }
 
     /// Check whether an SMS marker has already been stored on one line.
@@ -4473,7 +4737,7 @@ impl Database {
     /// 更新短信通知转发状态："pending", "success", "failed", "skipped"
     pub fn update_sms_notification_status(&self, id: i64, status: &str) -> Result<usize> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        tx.execute(
             "UPDATE sms_messages SET notification_status = ?1 WHERE id = ?2",
             params![status, id],
         )
@@ -5445,28 +5709,70 @@ impl Database {
         phone_number: &str,
         answered: bool,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let start_time = Utc::now().to_rfc3339();
         let line_id = non_empty_option(line_id);
 
-        conn.execute(
+        tx.execute(
             "INSERT INTO call_history (line_id, direction, phone_number, duration, start_time, answered)
              VALUES (?1, ?2, ?3, 0, ?4, ?5)",
             params![line_id, direction, phone_number, start_time, answered as i32],
         )?;
-
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        let payload = json!({
+            "call_id": id,
+            "direction": direction,
+            "phone_number": phone_number,
+            "answered": answered,
+        })
+        .to_string();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            "call.started",
+            line_id,
+            None,
+            &payload,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
+        Ok(id)
     }
 
     /// 更新通话记录（通话结束时调用）
     pub fn update_call_end(&self, id: i64, duration: i64, answered: bool) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let end_time = Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "UPDATE call_history SET duration = ?1, end_time = ?2, answered = ?3 WHERE id = ?4",
             params![duration, end_time, answered as i32, id],
         )?;
+        let stored_line_id: Option<String> = tx
+            .query_row(
+                "SELECT line_id FROM call_history WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let payload = json!({
+            "call_id": id,
+            "duration": duration,
+            "answered": answered,
+        })
+        .to_string();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            "call.ended",
+            stored_line_id.as_deref(),
+            None,
+            &payload,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
         Ok(())
     }
 
@@ -5474,8 +5780,9 @@ impl Database {
     /// intentionally separate from `update_call_end` so a rejected call keeps
     /// its SIP/Q.850 evidence even when the final-state update races a poll.
     pub fn update_call_failure(&self, id: i64, diagnostic: &ImsFailureDiagnostic) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
             "UPDATE call_history
              SET sip_status = ?1, failure_code = ?2, failure_category = ?3,
                  q850_cause = ?4, failure_retryable = ?5,
@@ -5492,18 +5799,58 @@ impl Database {
                 id,
             ],
         )?;
+        let stored_line_id: Option<String> = tx
+            .query_row(
+                "SELECT line_id FROM call_history WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let payload = json!({
+            "call_id": id,
+            "diagnostic": diagnostic,
+        })
+        .to_string();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            "call.failed",
+            stored_line_id.as_deref(),
+            None,
+            &payload,
+            &Utc::now().to_rfc3339(),
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
         Ok(())
     }
 
     /// 标记通话为未接来电
     pub fn mark_call_missed(&self, id: i64) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let end_time = Utc::now().to_rfc3339();
 
-        conn.execute(
+        tx.execute(
             "UPDATE call_history SET direction = 'missed', end_time = ?1, answered = 0 WHERE id = ?2",
             params![end_time, id],
         )?;
+        let line_id: Option<String> = tx
+            .query_row(
+                "SELECT line_id FROM call_history WHERE id = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            "call.missed",
+            line_id.as_deref(),
+            None,
+            &json!({ "call_id": id }).to_string(),
+            &end_time,
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
         Ok(())
     }
 
@@ -5621,16 +5968,36 @@ impl Database {
         status: &str,
         detail: &str,
     ) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let created_at = beijing_sms_now_string();
         let line_id = non_empty_option(line_id);
-        conn.execute(
+        tx.execute(
             "INSERT INTO automation_logs (
                 line_id, task_id, task_name, task_type, status, detail, created_at
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![line_id, task_id, task_name, task_type, status, detail, created_at],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        let app_event = insert_app_event_for_conn(
+            &tx,
+            "automation.executed",
+            line_id,
+            Some("automation"),
+            &json!({
+                "automation_id": id,
+                "task_id": task_id,
+                "task_name": task_name,
+                "task_type": task_type,
+                "status": status,
+                "detail": detail,
+            })
+            .to_string(),
+            &created_at,
+        )?;
+        tx.commit()?;
+        let _ = self.app_event_tx.send(app_event);
+        Ok(id)
     }
 
     /// 获取自动化执行日志（分页与过滤）

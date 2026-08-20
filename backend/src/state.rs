@@ -16,6 +16,7 @@ use crate::hardware::sim::esim::EsimSupervisor;
 use crate::platform::config::ConfigManager;
 use crate::platform::db::Database;
 use crate::services::e911::orchestrator::E911Orchestrator;
+use crate::services::event_bus::AppEventBus;
 use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::messaging::sms_listener::SmsResyncHandle;
 use crate::services::network::device_network::DdnsManager;
@@ -51,6 +52,7 @@ pub struct AppState {
     /// 通知发送器（用于转发 SMS、通话和 DDNS 通知）
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub event_bus: Arc<AppEventBus>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -82,6 +84,7 @@ pub struct AppStateDependencies {
     pub config_manager: Arc<ConfigManager>,
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
+    pub event_bus: Arc<AppEventBus>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -101,6 +104,7 @@ impl AppState {
             config_manager,
             notification_sender,
             system_event_emitter,
+            event_bus,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -116,6 +120,7 @@ impl AppState {
             config_manager,
             notification_sender,
             system_event_emitter,
+            event_bus,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -162,6 +167,12 @@ impl FromRef<AppState> for Arc<NotificationSender> {
 impl FromRef<AppState> for Arc<SystemEventEmitter> {
     fn from_ref(state: &AppState) -> Self {
         state.system_event_emitter.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<AppEventBus> {
+    fn from_ref(state: &AppState) -> Self {
+        state.event_bus.clone()
     }
 }
 

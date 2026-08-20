@@ -798,6 +798,14 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<SmsStats>>(`/sms/stats${query}`)
   }
 
+  openAppEventStream(params?: { lineId?: string; afterId?: number }) {
+    const query = new URLSearchParams()
+    if (params?.lineId) query.set('line_id', params.lineId)
+    if (params?.afterId !== undefined) query.set('after_id', String(params.afterId))
+    const suffix = query.toString() ? `?${query.toString()}` : ''
+    return new EventSource(`/api/events${suffix}`)
+  }
+
   async getSmsPathPolicy(lineId: string) {
     return request<ApiResponse<SmsPathPolicy>>(modemLinePath(lineId, '/sms/path-policy'))
   }

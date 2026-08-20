@@ -37,6 +37,7 @@ use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
 use platform::config_maintenance::{backup_database, export_json, import_json, restore_database};
 use platform::db::Database;
+use services::event_bus::AppEventBus;
 use services::network::device_network::DdnsManager;
 use services::notify::notification::NotificationSender;
 use services::notify::notification_queue::*;
@@ -79,6 +80,75 @@ fn get_default_carrier_catalog_path() -> PathBuf {
         .parent()
         .expect("Failed to get executable directory")
         .join("carrier-bundles.sqlite3")
+}
+
+fn spawn_runtime_event_bridge(app: AppState) {
+    tokio::spawn(async move {
+        use std::collections::{HashMap, VecDeque};
+
+        let mut seen_volte_attempts: HashMap<String, VecDeque<String>> = HashMap::new();
+        let mut trunk_fingerprints: HashMap<String, String> = HashMap::new();
+        let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        loop {
+            ticker.tick().await;
+            for line in app.line_registry.all().await {
+                let line_id = line.binding().line_id;
+                let volte = line.volte.snapshot().await;
+                let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
+
+                for attempt in &volte.connection_attempts {
+                    let key = format!("{}:{}", attempt.sequence, attempt.at);
+                    if seen.contains(&key) {
+                        continue;
+                    }
+                    if let Err(error) = app.event_bus.publish(
+                        "volte.connection_attempt",
+                        Some(&line_id),
+                        Some("volte_ims"),
+                        serde_json::json!({ "attempt": attempt }),
+                    ) {
+                        tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
+                    }
+                    seen.push_back(key);
+                    while seen.len() > 200 {
+                        seen.pop_front();
+                    }
+                }
+
+                let trunk = line.trunk.status().await;
+                let fingerprint = serde_json::json!({
+                    "phase": &trunk.phase,
+                    "stage": &trunk.stage,
+                    "enabled": trunk.enabled,
+                    "registered": trunk.registered,
+                    "last_sip_status": trunk.last_sip_status,
+                    "last_error": &trunk.last_error,
+                    "register_attempts": trunk.register_attempts,
+                    "reconnect_count": trunk.reconnect_count,
+                    "active_calls": trunk.active_calls,
+                    "media_negotiations": trunk.media_negotiations,
+                    "video_negotiations": trunk.video_negotiations,
+                    "dtmf_events": trunk.dtmf_events,
+                })
+                .to_string();
+                let previous = trunk_fingerprints.insert(line_id.clone(), fingerprint.clone());
+                if previous.as_deref() != Some(&fingerprint)
+                    && (previous.is_some() || trunk.enabled || trunk.phase != "disabled")
+                {
+                    if let Err(error) = app.event_bus.publish(
+                        "trunk.status_changed",
+                        Some(&line_id),
+                        Some("trunk"),
+                        serde_json::to_value(&trunk).unwrap_or_else(|_| serde_json::json!({})),
+                    ) {
+                        tracing::warn!(line_id, error = %error, "Failed to publish Trunk status event");
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// SPA fallback handler - 对于所有前端路由返回 index.html
@@ -693,7 +763,11 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
-    let system_event_emitter = Arc::new(SystemEventEmitter::new(Arc::clone(&notification_sender)));
+    let event_bus = Arc::new(AppEventBus::new(Arc::clone(&app_db)));
+    let system_event_emitter = Arc::new(SystemEventEmitter::new(
+        Arc::clone(&notification_sender),
+        Arc::clone(&event_bus),
+    ));
     let (sms_resync, sms_resync_rx) = services::messaging::sms_listener::sms_resync_channel();
     let ddns_manager = Arc::new(DdnsManager::new());
     {
@@ -814,6 +888,7 @@ async fn main() -> Result<()> {
         config_manager,
         notification_sender,
         system_event_emitter,
+        event_bus,
         ddns_manager,
         esim_supervisor: Arc::clone(&esim_supervisor),
         sms_resync,
@@ -825,6 +900,7 @@ async fn main() -> Result<()> {
     });
 
     api::handlers::spawn_call_monitor(app_state.clone());
+    spawn_runtime_event_bridge(app_state.clone());
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {
@@ -994,6 +1070,10 @@ async fn main() -> Result<()> {
     spawn_volte_auto_restore(app_state.clone());
 
     let protected_routes = Router::new()
+        .route(
+            "/api/events",
+            get(api::events::stream_app_events).options(options_handler),
+        )
         // ========== 设备信息接口 ==========
         .route(
             "/api/modem/lines/{line_id}/device",

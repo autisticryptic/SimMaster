@@ -1,3 +1,4 @@
+use crate::services::event_bus::AppEventBus;
 use crate::services::notify::notification::NotificationSender;
 use chrono::Utc;
 use serde::Serialize;
@@ -510,13 +511,15 @@ struct LoginFailureState {
 
 pub struct SystemEventEmitter {
     notification_sender: Arc<NotificationSender>,
+    event_bus: Arc<AppEventBus>,
     login_failures: Mutex<LoginFailureState>,
 }
 
 impl SystemEventEmitter {
-    pub fn new(notification_sender: Arc<NotificationSender>) -> Self {
+    pub fn new(notification_sender: Arc<NotificationSender>, event_bus: Arc<AppEventBus>) -> Self {
         Self {
             notification_sender,
+            event_bus,
             login_failures: Mutex::new(LoginFailureState::default()),
         }
     }
@@ -529,9 +532,6 @@ impl SystemEventEmitter {
         entity: impl Into<String>,
         message: impl Into<String>,
     ) {
-        if !self.is_enabled(event_code.as_ref()) {
-            return;
-        }
         self.emit(SystemEvent::new(
             event_code.as_ref(),
             severity.as_ref(),
@@ -543,6 +543,9 @@ impl SystemEventEmitter {
     }
 
     pub async fn emit(&self, event: SystemEvent) {
+        if let Err(err) = self.event_bus.publish_system_event(&event) {
+            warn!(event_code = %event.event_code, error = %err, "System event persistence failed");
+        }
         if !self.is_enabled(&event.event_code) {
             return;
         }
