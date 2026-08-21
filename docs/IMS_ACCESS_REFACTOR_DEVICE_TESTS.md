@@ -1,0 +1,86 @@
+# IMS 接入路径重构：410 实机回归清单
+
+> 当前仅完成代码与离线检查。410 设备离线，本文所有项目均未视为通过。
+
+## 本轮变更
+
+- IMS registration、3GPP access、non-3GPP access、voice access selection 分层建模。
+- VoLTE 与 VoWiFi 可同时注册；语音选择独立于注册状态。
+- 飞行模式关闭蜂窝 radio、VoLTE 和 cellular data，但不阻断 VoWiFi restore，也不主动拆除健康的 VoWiFi registration。
+- radio 或 ePDG/IKE/IPsec 已断时，陈旧 snapshot 不再显示 registered。
+- 概述页通过 `/api/modem/lines/{line_id}/ims/status` 展示分层状态，reader 不再固定为“不适用”。
+
+## 410 上线后必测
+
+### 飞行模式与 VoWiFi
+
+- [ ] 开启飞行模式后 data 停止、3GPP/VoLTE 为 `down`，不继续显示 registered。
+- [ ] 开启飞行模式时，已健康注册的 VoWiFi 不因 3GPP 关闭而被无条件 teardown；失效连接仍可自动修复。
+- [ ] 飞行模式下 VoWiFi 可建立 ePDG、IKEv2/IPsec、P-CSCF 和 IMS 注册。
+- [ ] 飞行模式下短信经 VoWiFi 接收，不误走 CS。
+- [ ] 关闭飞行模式后 3GPP 独立恢复，不销毁健康的 VoWiFi registration。
+
+### 两条 access 共存与语音选择
+
+- [ ] 同时启用 VoLTE/VoWiFi，两路独立完成 bearer/tunnel、P-CSCF 与 REGISTER。
+- [ ] `registration.registered_over` 同时包含 `vowifi` 和 `volte`。
+- [ ] 默认策略 `voice.active` 选择 VoWiFi，同时保留 VoLTE fallback。
+- [ ] 断 Wi-Fi 只清除 non-3GPP，语音退回 VoLTE；Wi-Fi 恢复后 VoLTE 不被销毁。
+- [ ] access 失败不会清空另一条 access 的 P-CSCF、注册或媒体状态。
+
+### P-CSCF、多线路和隔离
+
+- [ ] 两条 access 展示各自 P-CSCF，不能串用。
+- [ ] 多基带或基带加 reader 的操作均绑定正确 `line_id`/UE context。
+- [ ] 相同 IP、网关、P-CSCF 时 netns、路由、XFRM、SIP、RTP 仍互不干扰。
+- [ ] worker 异常退出后可恢复，且不遗留 namespace、route 或 XFRM。
+- [ ] 按 `docs/ue-isolation-migration.md` 验证数据代理与 Trunk 的 per-UE 映射。
+
+注意：VoLTE `wwanX` 完整迁入 worker/netns 仍需逐步实机回归，不得仅凭 VoWiFi worker 测试宣称完成。
+
+### 短信
+
+- [ ] 分别验证 CS、VoLTE IMS、VoWiFi IMS 接收短信。
+- [ ] 多接收面观测同一短信时只入库一次，并保留真实路径证据。
+- [ ] 飞行模式下不从 CS 接收。
+- [ ] 前端与通知渠道收到同一规范化短信事件，不因线路数增加而重复轮询。
+
+### 语音、媒体与 DTMF
+
+- [ ] VoWiFi/VoLTE 来电接听、双向 RTP、DTMF、挂断同步。
+- [ ] RTP 入出站网口与所选 UE 一致，不串线路。
+- [ ] 待机 access 切换不修改已建立 dialog；通话固定在建立时的 leg。
+- [ ] 视频来电的语音降级、视频协商、挂断同步分别记录。
+
+当前阶段不承诺通话中的无缝 VoLTE/VoWiFi handover、IMS service continuity 或 SRVCC。
+
+### UI/API 与竞态
+
+- [ ] 概述页显示 `VoWiFi`、`VoLTE`、`VoWiFi + VoLTE`、`连接中`、`异常`、`未注册`、`状态未知`。
+- [ ] reader 具备 VoWiFi runtime 时显示真实 IMS 状态。
+- [ ] API 的 `registration`、`three_gpp`、`non_three_gpp`、`voice` 语义独立。
+- [ ] 飞行模式快速切换不因旧 snapshot 继续显示 VoLTE registered。
+- [ ] Wi-Fi/IPsec 拆除后不因旧 snapshot 继续显示 VoWiFi registered。
+- [ ] 连续开关不会重复 restore、旧任务覆盖新状态或无限重试。
+
+## 建议诊断采集
+
+设备上线后，每个测试场景至少保留以下证据，并确保记录中包含 `line_id`：
+
+```bash
+curl -s http://127.0.0.1:8080/api/modem/lines/<line_id>/ims/status
+journalctl -u simadmin --since "10 minutes ago" --no-pager
+ip -br link
+ip route show table all
+ip rule show
+ip netns list
+```
+
+涉及 VoWiFi 时另采集 IKE/XFRM 与 worker namespace；涉及 VoLTE 时另采集对应 `wwanX`、QMI bearer、P-CSCF、SIP REGISTER 和 RTP 绑定信息。若设备实际 API 监听端口不同，以部署配置为准。
+
+## 当前明确暂不执行
+
+- 410 离线期间不部署、不连接设备，也不把任何实机项标记为通过。
+- 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。
+- 暂不执行 EC20、EC25、EG25、EG600 与 PCSC/USB SIM reader 实机测试。
+- 暂不承诺通话中的无缝 access handover、IMS service continuity 或 SRVCC。

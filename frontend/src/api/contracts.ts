@@ -1166,6 +1166,71 @@ export interface CallSettingsResponse {
 
 export type AccessPathKind = 'vowifi' | 'volte' | 'cs'
 
+export type ImsAccessFamily = 'three_gpp' | 'non_three_gpp'
+
+export type ImsAccessPathStage =
+  | 'disabled'
+  | 'down'
+  | 'transport_up'
+  | 'signaling_ready'
+  | 'registered'
+  | 'degraded'
+
+export interface ImsAccessPath {
+  kind: AccessPathKind
+  family: ImsAccessFamily
+  configured: boolean
+  stage: ImsAccessPathStage
+  registered: boolean
+  pcscf?: string | null
+  degraded_reason?: string | null
+}
+
+export interface ThreeGppAccess extends ImsAccessPath {
+  radio_available: boolean
+  bearer_up: boolean
+  registration_mode?: string | null
+}
+
+export interface NonThreeGppAccess extends ImsAccessPath {
+  epdg_host?: string | null
+  epdg_ready: boolean
+  ike_ready: boolean
+  child_sa_ready: boolean
+  esp_ready: boolean
+  tunnel_up: boolean
+}
+
+export interface ImsRegistrationState {
+  registered_over: AccessPathKind[]
+}
+
+export type VoiceRouteRejection =
+  | 'policy_disabled'
+  | 'feature_disabled'
+  | 'not_registered'
+  | 'media_gateway_unavailable'
+
+export interface RejectedVoiceLeg {
+  kind: AccessPathKind
+  reason: VoiceRouteRejection
+}
+
+export interface VoiceAccessSelection {
+  active?: AccessPathKind | null
+  candidates: AccessPathKind[]
+  rejected: RejectedVoiceLeg[]
+  gateway_mode: boolean
+}
+
+export interface ImsSubsystemState {
+  line_id: string
+  registration: ImsRegistrationState
+  three_gpp: ThreeGppAccess
+  non_three_gpp: NonThreeGppAccess
+  voice: VoiceAccessSelection
+}
+
 export interface PathLayerConfig {
   kind: AccessPathKind
   enabled: boolean

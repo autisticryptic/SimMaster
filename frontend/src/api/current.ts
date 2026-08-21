@@ -51,6 +51,7 @@ import type {
   VowifiLineConfigResponse,
   LineVowifiConfig,
   ImsOverrideResponse,
+  ImsSubsystemState,
   SimImsOverride,
   TrunkProfileResponse,
   VolteLineControlResponse,
@@ -660,6 +661,12 @@ class SimAdminCurrentAPI {
 
   async getModemLines() {
     return request<ApiResponse<LineRuntimeStatus[]>>('/modems')
+  }
+
+  async getLineImsStatus(lineId: string) {
+    return request<ApiResponse<ImsSubsystemState>>(
+      modemLinePath(lineId, '/ims/status'),
+    )
   }
 
   async getImsSupplementary(lineId: string) {

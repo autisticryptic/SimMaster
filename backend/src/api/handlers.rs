@@ -3531,17 +3531,12 @@ pub async fn set_line_airplane_mode_handler(
         );
     }
     if payload.enabled && app.config_manager.get_line_profile(&line_id).vowifi.enabled {
-        // Rebuild the WiFi Calling registration after cellular deregistration
-        // so the operator recalculates MT SMS and call routing without CS.
+        // Airplane mode only removes the 3GPP access. The connect path is
+        // idempotent: it preserves a healthy non-3GPP registration and repairs
+        // it only when the tunnel, operator link, or REGISTER lease is stale.
         let refresh_app = app.clone();
         let scope = VowifiScope::for_line(Arc::clone(&line));
         tokio::spawn(async move {
-            let _ = reset_vowifi_runtime_for_scope(
-                &refresh_app,
-                &scope,
-                "line_airplane_mode_vowifi_refresh",
-            )
-            .await;
             let _ = connect_vowifi_on_line(
                 &refresh_app,
                 &scope,
@@ -6064,7 +6059,7 @@ impl Drop for VowifiRestoreClaim {
 
 fn vowifi_restore_intent_enabled(app: &AppState, workflow: &VowifiRestoreWorkflow) -> bool {
     let profile = app.config_manager.get_line_profile(&workflow.line_id);
-    profile.vowifi.enabled && !profile.airplane_mode_enabled
+    profile.enabled && profile.vowifi.enabled
 }
 
 async fn reset_vowifi_runtime_for_scope(
@@ -8389,7 +8384,7 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
 }
 
 fn line_vowifi_restore_enabled(profile: &LineProfileConfig) -> bool {
-    profile.enabled && profile.vowifi.enabled && !profile.airplane_mode_enabled
+    profile.enabled && profile.vowifi.enabled
 }
 
 async fn schedule_vowifi_auto_restore(
@@ -8749,7 +8744,11 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                 .config_manager
                 .get_line_profiles()
                 .iter()
-                .filter(|profile| profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled)
+                .filter(|profile| {
+                    profile.enabled
+                        && profile.volte_connection_enabled
+                        && !profile.airplane_mode_enabled
+                })
             {
                 if started_at.elapsed()
                     < Duration::from_secs(
@@ -11945,6 +11944,15 @@ mod tests {
         offline.vowifi.enabled = true;
 
         assert!(line_vowifi_restore_enabled(&offline));
+    }
+
+    #[test]
+    fn airplane_mode_keeps_non_three_gpp_restore_enabled() {
+        let mut airplane = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        airplane.airplane_mode_enabled = true;
+        airplane.vowifi.enabled = true;
+
+        assert!(line_vowifi_restore_enabled(&airplane));
     }
 
     #[test]

@@ -6,6 +6,7 @@ import type {
   QosInfo,
   SimInfo,
   LineRuntimeStatus,
+  ImsSubsystemState,
   SystemStatsResponse,
   LineNetworkControlsResponse,
   ConnectionAddressesResponse,
@@ -51,6 +52,7 @@ export interface DashboardLineInfo {
   volte: LineRuntimeStatus['volte']
   trunk: LineRuntimeStatus['trunk']
   supplementary: LineRuntimeStatus['supplementary']
+  ims: ImsSubsystemState | null
   deviceInfo: DeviceInfo | null
   simInfo: SimInfo | null
   networkInfo: NetworkInfo | null
@@ -150,9 +152,22 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
       ] = await fastPromise
 
       const lineDetails = await Promise.all((modemLinesRes?.data ?? []).map(async ({ modem, volte, trunk, supplementary }) => {
+        const imsRes = await requestOrNull(
+          api.getLineImsStatus(modem.line_id),
+          `ims:${modem.line_id}`,
+        )
         const hasCellularModem = modem.present && modem.line_kind !== 'reader' && Boolean(modem.modem_path)
         if (!hasCellularModem) {
-          return { modem, volte, trunk, supplementary, deviceInfo: null, simInfo: null, networkInfo: null }
+          return {
+            modem,
+            volte,
+            trunk,
+            supplementary,
+            ims: imsRes?.data ?? null,
+            deviceInfo: null,
+            simInfo: null,
+            networkInfo: null,
+          }
         }
         const [deviceRes, simRes, networkRes] = await Promise.all([
           requestOrNull(api.getDeviceInfo(modem.line_id), `device:${modem.line_id}`),
@@ -164,6 +179,7 @@ export function useDashboardData(refreshInterval: number, refreshKey: number) {
           volte,
           trunk,
           supplementary,
+          ims: imsRes?.data ?? null,
           deviceInfo: deviceRes?.data ?? null,
           simInfo: simRes?.data ?? null,
           networkInfo: networkRes?.data ?? null,

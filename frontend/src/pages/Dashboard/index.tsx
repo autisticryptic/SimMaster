@@ -24,10 +24,18 @@ import { maskedIccid, modemSlotLabel, shortLineId } from '@/components/modemLine
 import { useDashboardData, type DashboardData, type DashboardLineInfo } from './hooks/useDashboardData'
 
 function imsStatusLabel(line: DashboardLineInfo) {
-  if (!line.modem.present || line.modem.line_kind === 'reader') return { label: '不适用', color: 'default' as const }
-  if (line.volte.registered) return { label: '已注册', color: 'success' as const }
-  if (line.volte.last_error) return { label: '异常', color: 'error' as const }
-  if (line.volte.phase && !['idle', 'stopped', 'disabled'].includes(line.volte.phase.toLowerCase())) {
+  if (!line.ims) return { label: '状态未知', color: 'default' as const }
+
+  const registered = line.ims.registration.registered_over
+  const hasVowifi = registered.includes('vowifi')
+  const hasVolte = registered.includes('volte')
+  if (hasVowifi && hasVolte) return { label: 'VoWiFi + VoLTE', color: 'success' as const }
+  if (hasVowifi) return { label: 'VoWiFi', color: 'success' as const }
+  if (hasVolte) return { label: 'VoLTE', color: 'success' as const }
+
+  const stages = [line.ims.three_gpp.stage, line.ims.non_three_gpp.stage]
+  if (stages.includes('degraded')) return { label: '异常', color: 'error' as const }
+  if (stages.some((stage) => stage === 'transport_up' || stage === 'signaling_ready')) {
     return { label: '连接中', color: 'warning' as const }
   }
   return { label: '未注册', color: 'default' as const }

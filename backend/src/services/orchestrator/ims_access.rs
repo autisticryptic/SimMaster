@@ -173,10 +173,13 @@ impl ThreeGppObservation {
         if !self.configured {
             return AccessPathStage::Disabled;
         }
+        if !self.radio_available {
+            return AccessPathStage::Down;
+        }
         if self.degraded_reason.is_some() {
             return AccessPathStage::Degraded;
         }
-        if self.registered {
+        if self.registered && self.bearer_up && self.signaling_ready {
             return AccessPathStage::Registered;
         }
         if self.bearer_up && self.signaling_ready && self.pcscf.is_some() {
@@ -200,19 +203,23 @@ impl NonThreeGppObservation {
         if !self.configured {
             return AccessPathStage::Disabled;
         }
+        let tunnel_up = self.tunnel_up();
+        if !tunnel_up {
+            // A teardown can leave the previous error in the persisted
+            // snapshot. Without a complete ePDG/IKE/IPsec transport the path
+            // is down, not degraded and never registered.
+            return AccessPathStage::Down;
+        }
         if self.degraded_reason.is_some() {
             return AccessPathStage::Degraded;
         }
         if self.registered {
             return AccessPathStage::Registered;
         }
-        if self.tunnel_up() && self.pcscf.is_some() {
+        if self.pcscf.is_some() {
             return AccessPathStage::SignalingReady;
         }
-        if self.tunnel_up() {
-            return AccessPathStage::TransportUp;
-        }
-        AccessPathStage::Down
+        AccessPathStage::TransportUp
     }
 }
 
@@ -296,21 +303,23 @@ impl ImsSubsystemState {
         three_gpp: &ThreeGppObservation,
         non_three_gpp: &NonThreeGppObservation,
     ) -> Self {
+        let three_gpp_stage = three_gpp.stage();
         let three_gpp_path = ImsAccessPath {
             kind: AccessPathKind::Volte,
             family: AccessFamily::ThreeGpp,
             configured: three_gpp.configured,
-            stage: three_gpp.stage(),
-            registered: three_gpp.configured && three_gpp.registered,
+            stage: three_gpp_stage,
+            registered: matches!(three_gpp_stage, AccessPathStage::Registered),
             pcscf: three_gpp.pcscf.clone(),
             degraded_reason: three_gpp.degraded_reason.clone(),
         };
+        let non_three_gpp_stage = non_three_gpp.stage();
         let non_three_gpp_path = ImsAccessPath {
             kind: AccessPathKind::Vowifi,
             family: AccessFamily::NonThreeGpp,
             configured: non_three_gpp.configured,
-            stage: non_three_gpp.stage(),
-            registered: non_three_gpp.configured && non_three_gpp.registered,
+            stage: non_three_gpp_stage,
+            registered: matches!(non_three_gpp_stage, AccessPathStage::Registered),
             pcscf: non_three_gpp.pcscf.clone(),
             degraded_reason: non_three_gpp.degraded_reason.clone(),
         };
@@ -453,7 +462,10 @@ mod tests {
     fn lte_only_carries_voice_on_volte() {
         let state = build_state(&lte_up(), &wifi_down());
 
-        assert_eq!(state.registration.registered_over, vec![AccessPathKind::Volte]);
+        assert_eq!(
+            state.registration.registered_over,
+            vec![AccessPathKind::Volte]
+        );
         assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
         assert_eq!(state.three_gpp.path.stage, AccessPathStage::Registered);
         assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
@@ -470,7 +482,9 @@ mod tests {
             vec![AccessPathKind::Vowifi, AccessPathKind::Volte]
         );
         assert!(state.registration.is_registered_over(AccessPathKind::Volte));
-        assert!(state.registration.is_registered_over(AccessPathKind::Vowifi));
+        assert!(state
+            .registration
+            .is_registered_over(AccessPathKind::Vowifi));
 
         // Default policy prefers VoWiFi, but VoLTE remains a live fallback.
         assert_eq!(state.voice.active, Some(AccessPathKind::Vowifi));
@@ -501,7 +515,10 @@ mod tests {
         // registration is untouched and immediately carries voice.
         let after = build_state(&lte_up(), &wifi_down());
 
-        assert_eq!(after.registration.registered_over, vec![AccessPathKind::Volte]);
+        assert_eq!(
+            after.registration.registered_over,
+            vec![AccessPathKind::Volte]
+        );
         assert_eq!(after.voice.active, Some(AccessPathKind::Volte));
         assert_eq!(after.three_gpp.path.stage, AccessPathStage::Registered);
         assert_eq!(
@@ -529,8 +546,7 @@ mod tests {
         };
 
         let default_policy = build_state(&lte_up(), &wifi_up());
-        let swapped =
-            ImsSubsystemState::build("line-1", &volte_first, &lte_up(), &wifi_up());
+        let swapped = ImsSubsystemState::build("line-1", &volte_first, &lte_up(), &wifi_up());
 
         assert_eq!(default_policy.voice.active, Some(AccessPathKind::Vowifi));
         assert_eq!(swapped.voice.active, Some(AccessPathKind::Volte));
@@ -577,6 +593,55 @@ mod tests {
         let state = build_state(&lte_up(), &half_up);
         assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
         assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
+    }
+
+    #[test]
+    fn stale_three_gpp_registration_is_cleared_when_radio_is_unavailable() {
+        let stale = ThreeGppObservation {
+            radio_available: false,
+            ..lte_up()
+        };
+
+        let state = build_state(&stale, &wifi_up());
+
+        assert_eq!(state.three_gpp.path.stage, AccessPathStage::Down);
+        assert!(!state.three_gpp.path.registered);
+        assert!(!state.registration.is_registered_over(AccessPathKind::Volte));
+        assert_eq!(state.voice.active, Some(AccessPathKind::Vowifi));
+    }
+
+    #[test]
+    fn stale_non_three_gpp_registration_is_cleared_when_tunnel_is_incomplete() {
+        let stale = NonThreeGppObservation {
+            esp_ready: false,
+            ..wifi_up()
+        };
+
+        let state = build_state(&lte_up(), &stale);
+
+        assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
+        assert!(!state.non_three_gpp.path.registered);
+        assert!(!state
+            .registration
+            .is_registered_over(AccessPathKind::Vowifi));
+        assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
+    }
+
+    #[test]
+    fn stale_non_three_gpp_error_is_not_a_degraded_path_after_teardown() {
+        let stale = NonThreeGppObservation {
+            configured: true,
+            degraded_reason: Some("old_ipsec_error".into()),
+            ..Default::default()
+        };
+
+        let state = build_state(&lte_down(), &stale);
+
+        assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
+        assert_eq!(
+            state.non_three_gpp.path.degraded_reason.as_deref(),
+            Some("old_ipsec_error")
+        );
     }
 
     #[test]
