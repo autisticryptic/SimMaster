@@ -99,6 +99,10 @@ pub struct LineRuntime {
     /// net-config batch is skipped to avoid flooding the worker with
     /// redundant operations.
     egress_fingerprint: Mutex<Option<String>>,
+    /// Serializes namespace/worker/socket-context transitions for this line.
+    /// Refresh runs outside the registry map lock, so this per-line lock keeps
+    /// a slow reconcile from racing a later refresh teardown or worker restart.
+    ue_lifecycle_lock: Mutex<()>,
 }
 
 impl LineRuntime {
@@ -154,6 +158,7 @@ impl LineRuntime {
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
             secondary_data: Arc::new(SecondaryDataRuntime::default()),
             egress_fingerprint: Mutex::new(None),
+            ue_lifecycle_lock: Mutex::new(()),
         }
     }
 
@@ -741,6 +746,7 @@ impl LineRuntimeRegistry {
     /// the isolation guarantee and leaves the existing host-namespace path
     /// fully functional.
     async fn reconcile_ue_context(&self, line: &LineRuntime, binding: &ModemBinding) {
+        let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
         let isolation = self
             .config_manager
             .as_ref()
@@ -860,11 +866,16 @@ impl LineRuntimeRegistry {
         } else {
             // Fall back to the host-namespace VoWiFi path and best-effort
             // remove all resources from a previous isolated run.
-            self.teardown_ue_isolation(line, &line_id).await;
+            self.teardown_ue_isolation_locked(line, &line_id).await;
         }
     }
 
     async fn teardown_ue_isolation(&self, line: &LineRuntime, line_id: &str) {
+        let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
+        self.teardown_ue_isolation_locked(line, line_id).await;
+    }
+
+    async fn teardown_ue_isolation_locked(&self, line: &LineRuntime, line_id: &str) {
         let isolation = self
             .config_manager
             .as_ref()
