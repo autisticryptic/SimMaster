@@ -5862,20 +5862,91 @@ pub async fn set_line_call_forwarding_handler(
     )
 }
 
+use crate::services::orchestrator::ims_access::{
+    ImsSubsystemState, NonThreeGppObservation, ThreeGppObservation,
+};
+
+/// Unified IMS view for one line.
+///
+/// Reports IMS registration, the 3GPP access path, the non-3GPP (Wi-Fi/ePDG)
+/// access path and the current voice access selection as four separate things.
+/// Both access paths can be registered at the same time; which one carries voice
+/// is a policy decision over them, not a property of either.
 pub async fn get_line_ims_status_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(reason) = resolve_call_line(&app, &line_id).await {
+    // Deliberately not `resolve_call_line`: that helper requires a present
+    // baseband, but a line whose radio is off can still be registered over the
+    // non-3GPP access. Refusing to report IMS state in exactly that case would
+    // hide the coexistence this endpoint exists to show.
+    let Some(line) = app.line_registry.get(line_id.trim()).await else {
         return (
             StatusCode::NOT_FOUND,
-            Json(ApiResponse::<ImsStatusResponse>::error(reason)),
+            Json(ApiResponse::<ImsSubsystemState>::error("line_not_found")),
         );
-    }
+    };
+
+    let binding = line.binding();
+    let line_id = binding.line_id.clone();
+    let profile = app.config_manager.get_line_profile(&line_id);
+    let policy = app.config_manager.get_line_voice_path_policy(&line_id);
+
+    let volte = line.volte.snapshot().await;
+    let three_gpp = ThreeGppObservation {
+        configured: profile.volte_connection_enabled,
+        // Airplane mode powers down *this line's* baseband, so it disables the
+        // 3GPP access only. The non-3GPP path keeps working over Wi-Fi.
+        radio_available: binding.present && !profile.airplane_mode_enabled,
+        bearer_up: volte.bearer_up(),
+        signaling_ready: volte.signaling_ready(),
+        pcscf: volte.pcscf.clone(),
+        registered: volte.registered(),
+        registration_mode: match volte.registration_mode.as_str() {
+            "" => None,
+            mode => Some(mode.to_string()),
+        },
+        // Only a genuinely degraded phase is a degradation. A stale `last_error`
+        // from an earlier attempt must not mark a healthy registration down.
+        degraded_reason: (volte.phase
+            == crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded)
+            .then(|| {
+                volte
+                    .last_error
+                    .clone()
+                    .unwrap_or_else(|| "volte_degraded".to_string())
+            }),
+        media_gateway_ready: line.voice_access.media_gateway_ready(AccessPathKind::Volte),
+    };
+
+    let vowifi = VowifiScope::for_line(Arc::clone(&line)).status().await;
+    let non_three_gpp = NonThreeGppObservation {
+        configured: profile.vowifi.enabled,
+        epdg_host: vowifi
+            .profile
+            .epdg
+            .as_ref()
+            .map(|epdg| epdg.host.clone()),
+        epdg_ready: vowifi.readiness.epdg_ready,
+        ike_ready: vowifi.readiness.ike_ready,
+        child_sa_ready: vowifi.readiness.child_sa_ready,
+        esp_ready: vowifi.readiness.esp_ready,
+        pcscf: vowifi
+            .profile
+            .ims
+            .as_ref()
+            .and_then(|ims| ims.pcscf)
+            .map(str::to_string),
+        registered: vowifi.readiness.ims_registered,
+        degraded_reason: vowifi.degraded_reason.clone(),
+        media_gateway_ready: line.voice_access.media_gateway_ready(AccessPathKind::Vowifi),
+    };
+
     (
         StatusCode::OK,
-        Json(ApiResponse::<ImsStatusResponse>::error(
-            "IMS status is not exposed by ModemManager on this backend",
+        Json(ApiResponse::success_with_message(
+            "ok",
+            ImsSubsystemState::build(line_id.as_str(), &policy, &three_gpp, &non_three_gpp),
         )),
     )
 }
@@ -5992,10 +6063,8 @@ impl Drop for VowifiRestoreClaim {
 }
 
 fn vowifi_restore_intent_enabled(app: &AppState, workflow: &VowifiRestoreWorkflow) -> bool {
-    app.config_manager
-        .get_line_profile(&workflow.line_id)
-        .vowifi
-        .enabled
+    let profile = app.config_manager.get_line_profile(&workflow.line_id);
+    profile.vowifi.enabled && !profile.airplane_mode_enabled
 }
 
 async fn reset_vowifi_runtime_for_scope(
@@ -8320,7 +8389,7 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
 }
 
 fn line_vowifi_restore_enabled(profile: &LineProfileConfig) -> bool {
-    profile.enabled && profile.vowifi.enabled
+    profile.enabled && profile.vowifi.enabled && !profile.airplane_mode_enabled
 }
 
 async fn schedule_vowifi_auto_restore(
@@ -8413,7 +8482,7 @@ fn line_volte_restore_enabled(
     line: &crate::services::line_registry::LineRuntime,
 ) -> bool {
     let profile = app.config_manager.get_line_profile(&line.binding().line_id);
-    profile.enabled && profile.volte_connection_enabled
+    profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled
 }
 
 async fn wait_for_line_modem(
@@ -8680,7 +8749,7 @@ pub fn spawn_volte_auto_restore(app: AppState) {
                 .config_manager
                 .get_line_profiles()
                 .iter()
-                .filter(|profile| profile.enabled && profile.volte_connection_enabled)
+                .filter(|profile| profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled)
             {
                 if started_at.elapsed()
                     < Duration::from_secs(

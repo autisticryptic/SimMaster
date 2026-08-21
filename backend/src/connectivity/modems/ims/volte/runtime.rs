@@ -279,6 +279,34 @@ impl VolteSnapshot {
     pub fn registered(&self) -> bool {
         self.phase == VoltePhase::Registered
     }
+
+    /// Whether the IMS APN bearer carrying this access is established.
+    ///
+    /// Everything from `Bearer` onward implies an IP-capable IMS PDN; the
+    /// earlier stages are identity, carrier-profile and radio preparation.
+    pub fn bearer_up(&self) -> bool {
+        matches!(
+            self.stage,
+            VolteStage::Bearer
+                | VolteStage::BearerDual
+                | VolteStage::BearerIpv4
+                | VolteStage::BearerIpv6
+                | VolteStage::IpConfig
+                | VolteStage::RegisterInitial
+                | VolteStage::Ipsec
+                | VolteStage::RegisterAuthenticated
+                | VolteStage::RegisterRefresh
+                | VolteStage::RegisterIpsec
+                | VolteStage::RegisterUdp
+                | VolteStage::Registered
+        )
+    }
+
+    /// Whether a SIP transport toward the P-CSCF has been selected for this
+    /// access — an IPsec SA, or plain UDP where the carrier permits it.
+    pub fn signaling_ready(&self) -> bool {
+        self.registration_mode != RegistrationMode::None
+    }
 }
 
 /// Serializable per-line runtime projection returned by the VoLTE line APIs.

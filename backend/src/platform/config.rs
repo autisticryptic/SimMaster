@@ -1866,6 +1866,62 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// VoLTE and VoWiFi are two access paths to the same IMS core, not two
+    /// mutually exclusive modes.
+    ///
+    /// Enabling one must never silently disable the other. Doing so removes the
+    /// fallback leg that makes a Wi-Fi drop survivable, and turns every access
+    /// change into a full re-registration. "Priority switching" patches have
+    /// introduced exactly that coupling here before; this test pins it shut.
+    #[test]
+    fn enabling_one_ims_access_never_disables_the_other() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-ims-coexistence-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line = "line-0123456789abcdef0123456789abcdef";
+
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line, true)
+            .unwrap();
+
+        let profile = manager.get_line_profile(line);
+        assert!(
+            profile.volte_connection_enabled,
+            "enabling the non-3GPP access must not disable the 3GPP access"
+        );
+        assert!(profile.vowifi.enabled);
+
+        // Re-asserting VoLTE must likewise leave VoWiFi alone.
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        let profile = manager.get_line_profile(line);
+        assert!(
+            profile.vowifi.enabled,
+            "enabling the 3GPP access must not disable the non-3GPP access"
+        );
+        assert!(profile.volte_connection_enabled);
+
+        // Turning one leg off is a change to that leg only.
+        manager
+            .set_line_vowifi_connection_enabled(line, false)
+            .unwrap();
+        let profile = manager.get_line_profile(line);
+        assert!(!profile.vowifi.enabled);
+        assert!(
+            profile.volte_connection_enabled,
+            "disabling one access must not cascade into the other"
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn esim_reader_settings_are_isolated_per_line() {
         let path = std::env::temp_dir().join(format!(

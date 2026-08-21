@@ -227,6 +227,15 @@ impl VoiceAccessRouter {
             .find(|kind| kind.is_ims())
     }
 
+    /// Whether the media gateway backing one access can carry a call right now.
+    ///
+    /// Reported by the IMS status API so the UI can tell "this access is not
+    /// registered" apart from "this access is registered, but has no media path"
+    /// — two very different faults that a single readiness flag would merge.
+    pub fn media_gateway_ready(&self, kind: AccessPathKind) -> bool {
+        backend(&self.backends, kind).is_some_and(|backend| backend.link.is_available())
+    }
+
     /// Route a locally-originated call through the same policy and route table
     /// used by the Asterisk trunk. The selected access is returned only after
     /// its `StartCall` command has been accepted by the registered live leg.

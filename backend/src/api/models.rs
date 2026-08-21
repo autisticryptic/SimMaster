@@ -888,13 +888,6 @@ pub struct SetCallForwardingRequest {
     pub timeout: Option<u16>,
 }
 
-#[derive(Debug, Serialize, Default)]
-pub struct ImsStatusResponse {
-    pub registered: bool,
-    pub voice_capable: bool,
-    pub sms_capable: bool,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct MediaIngressCapabilities {
     pub adapter: String,

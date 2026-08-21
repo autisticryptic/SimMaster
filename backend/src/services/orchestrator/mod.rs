@@ -9,6 +9,13 @@
 //!   - **Cross-transport dedup** ([`dedup`]): a stable content fingerprint plus
 //!     a race-free DB claim so a message that arrives on more than one leg is
 //!     stored exactly once.
+//!   - **IMS access state** ([`ims_access`]): keeps IMS registration, the 3GPP
+//!     access path, the non-3GPP (ePDG) access path and the voice access
+//!     selection as four separate things, so both legs can stay registered at
+//!     once and voice can move between them without re-registering.
+//!   - **Voice routing** ([`voice_router`]): turns the configured voice path
+//!     policy plus a per-leg readiness snapshot into an ordered candidate list
+//!     with fallback.
 //!
 //! Design constraints honored here:
 //!   - The leg set is a **closed enum** (`AccessPathKind`), so routing uses
@@ -25,6 +32,7 @@
 #![allow(dead_code)]
 
 pub mod dedup;
+pub mod ims_access;
 pub mod sms_router;
 pub mod voice_router;
 
@@ -32,6 +40,12 @@ pub mod voice_router;
 // (and by tests) rather than within this file.
 #[allow(unused_imports)]
 pub use dedup::{message_fingerprint, MessageFingerprintInput};
+#[allow(unused_imports)]
+pub use ims_access::{
+    AccessFamily, AccessPathStage, ImsAccessPath, ImsRegistrationState, ImsSubsystemState,
+    NonThreeGppAccess, NonThreeGppObservation, ThreeGppAccess, ThreeGppObservation,
+    VoiceAccessSelection,
+};
 #[allow(unused_imports)]
 pub use sms_router::{
     plan_candidates, AttemptOutcome, Candidate, LegSendReadiness, RouteDecision, SendRouter,
