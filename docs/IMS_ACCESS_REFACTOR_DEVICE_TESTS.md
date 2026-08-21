@@ -1,9 +1,11 @@
 # IMS 接入路径重构：410 实机回归清单
 
-> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `80e6d84` 的
+> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `48e7e41` 的
 > GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
 > 基础设施能够启动，且 VoWiFi 的 IKEv2/EAP-AKA/CHILD_SA/ESP/TUN socket 已在
-> worker netns 内创建。下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
+> worker netns 内创建。只读回归还确认飞行模式下 3GPP/VoLTE 为 down，VoWiFi 的
+> ePDG/IKE/CHILD_SA/ESP/TUN 保持 ready；当前 IMS REGISTER 仍收到运营商 `421`
+> 拒绝，因此短信、语音等业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
 
 ## 本轮变更
 
