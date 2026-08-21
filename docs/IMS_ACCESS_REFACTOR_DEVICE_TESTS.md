@@ -1,9 +1,9 @@
 # IMS 接入路径重构：410 实机回归清单
 
-> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `7481f9a` 的
+> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `80e6d84` 的
 > GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
-> 基础设施能够启动；工作树中本次刷新并发/NAT fallback 修订尚未经过新的 Actions
-> 产物部署。下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
+> 基础设施能够启动，且 VoWiFi 的 IKEv2/EAP-AKA/CHILD_SA/ESP/TUN socket 已在
+> worker netns 内创建。下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
 
 ## 本轮变更
 
@@ -102,7 +102,12 @@ ip netns list
   `sa-ue286e0c9d2870` namespace、veth `/30` 地址和宿主 NAT；这些只证明隔离底座
   已启动，不等于 VoWiFi、VoLTE、数据代理或 Trunk 业务验收完成。
 - 当前 VoWiFi 已完成 ePDG、IKE、CHILD_SA、ESP 与 TUN，但 IMS REGISTER 收到
-  SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实语音测试。
+  SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实短信/语音测试。
+- 本轮实机确认主进程创建的 IKE socket 位于 worker 的 netns，worker 内可见
+  `lo`、`save<hex>` 与 `sa_vwf<hex>`，宿主没有对应的 500/4500 socket；飞行模式下
+  3GPP 状态为 `down`，没有继续显示 VoLTE 已注册。
+- SIP `421` 在迁移前的旧部署也存在，当前证据不足以归因于 netns/veth 迁移；后续应
+  单独比较宿主路径与 worker 路径的 REGISTER 报文和运营商 profile，再修复业务注册。
 - 当前 VoLTE、数据代理与 Trunk worker 功能门仍需逐项启用并回归，首次验证不得同时
   打开多个功能门；本次提交完成后应先重新验证 worker/namespace，再进入业务测试。
 - 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。

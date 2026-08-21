@@ -392,11 +392,11 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 
 ### 8.1 worker 与 VoWiFi
 
-- [ ] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
-- [ ] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
+- [x] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
+- [x] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
 - [ ] worker 进程异常退出后，状态清除旧 PID，下一次 reconcile 自动重启且无 zombie；
-- [ ] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、XFRM、SIP、RTP
-  均属于当前线路 namespace；
+- [x] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、SIP、RTP
+  均属于当前线路 namespace；本轮 IMS REGISTER 仍被运营商以 SIP `421` 拒绝，业务注册未通过；
 - [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
 - [ ] 飞行模式下仍可用 VoWiFi，退出后 TUN/XFRM/路由均无残留；
 - [ ] P-CSCF 或 worker socket 失败时错误可观测，worker 崩溃后线路能恢复。
