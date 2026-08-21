@@ -834,13 +834,17 @@ impl UeWorkerHandle {
                     // Shutdown or a previous cleanup may have retired this
                     // process while stream conversion was in progress.  Do
                     // not publish its writer over a replacement generation.
-                    let _lifecycle = core.lifecycle.lock().await;
-                    if !core.generation_is_current(pid) {
-                        return;
-                    }
                     let (_read_half, write_half) = write_stream.into_split();
                     let (tx, rx) = mpsc::unbounded_channel::<UeWorkerMessage>();
                     {
+                        // Keep the lifecycle lock only around the generation
+                        // check and writer publication.  The reader owns the
+                        // shared core after this point and must not inherit
+                        // the lock guard into its blocking task.
+                        let _lifecycle = core.lifecycle.lock().await;
+                        if !core.generation_is_current(pid) {
+                            return;
+                        }
                         let mut guard = core.tx.lock().unwrap();
                         *guard = Some(tx);
                     }
