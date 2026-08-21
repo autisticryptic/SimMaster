@@ -135,7 +135,7 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 | `connectivity/.../vowifi/live.rs` | 每线路单一 **UE socket context 注册表**（同时持有 namespace、UE veth 与 worker）；TUN namespace 与 IKE/SIP/RTP socket 均从同一 context 派生，避免刷新时出现归属分裂 |
 | `connectivity/.../vowifi/operator.rs` + `connectivity/core/media.rs` | **RTP/RTCP operator 侧 socket 通过 `OperatorSocketCreator` 走 worker**；Asterisk 内部 leg 仍留在宿主 |
 | `connectivity/.../vowifi/tun_gateway.rs` | TUN 创建后 `ip link set ... netns <ns>`，netns 内配地址/路由；`None` 时代码保持旧宿主路径 |
-| `services/line_registry.rs` | 线路刷新时 `reconcile_ue_context()`：ensure netns → spawn worker → veth → worker 应用 UE 侧配置 → 原子发布 socket context；普通读卡映射刷新不清它，关闭隔离/线路消失/worker 不可用时才清理 |
+| `services/line_registry.rs` | 线路刷新时 `reconcile_ue_context()`：ensure netns → spawn worker → veth → worker 应用 UE 侧配置 → 原子发布 socket context；普通读卡映射刷新不清它，关闭隔离/线路消失时清理；worker 不可用时还会同步清掉旧 TUN/SIP live runtime，防止宿主 fallback 复用 UE-only TUN |
 | `platform/netns.rs` | `ensure_host_veth_nat()`：宿主侧 MASQUERADE（幂等检查后追加） |
 | `connectivity/modems/ims/volte/{bearer,native_bearer,channel,pcscf,ipsec,live}.rs` | native IMS `wwanX` 受限迁移；worker 内 IP/路由、P-CSCF DNS、SIP、XFRM、RTP；失败清理与接口回宿主 |
 | `hardware/devices/qcm410/secondary_qmi_data.rs` | DATA6/secondary QMI bearer 迁入对应线路 worker，停止时清理并把接口移回宿主 |

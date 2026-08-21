@@ -716,10 +716,6 @@ impl LineRuntimeRegistry {
                 *fp = None;
             }
             if let Err(error) = worker.spawn().await {
-                crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                    &binding.line_id,
-                    None,
-                );
                 tracing::warn!(
                     line_id = %binding.line_id,
                     error = %error,
@@ -764,12 +760,22 @@ impl LineRuntimeRegistry {
             crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
                 &line_id, None,
             );
+            // A cached TUN/SIP channel may still belong to the dead worker's
+            // namespace. Tear the live access runtime down before allowing a
+            // host-path retry, otherwise a host socket can bind a UE-only TUN
+            // and reproduce ENODEV even though the context registry is clear.
+            crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(&line_id)
+                .await;
         }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
                 crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
                     &line_id, None,
                 );
+                crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
+                    &line_id,
+                )
+                .await;
                 tracing::warn!(
                     line_id = %line_id,
                     error = %error,
