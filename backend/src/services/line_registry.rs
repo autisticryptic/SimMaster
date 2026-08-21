@@ -597,14 +597,26 @@ impl LineRuntimeRegistry {
                     }
                 }
             }
+        }
 
-            // Only expose fully initialized new runtimes. `refresh_lock` keeps
-            // another refresh from publishing the same line concurrently.
-            if !new_lines.is_empty() {
-                let mut lines = self.lines.write().await;
-                for (line_id, line) in &new_lines {
-                    lines.insert(line_id.clone(), Arc::clone(line));
-                }
+        // Keep new runtimes private until their namespace/worker/socket
+        // context has been reconciled. `refresh_lock` keeps another refresh
+        // from publishing the same line concurrently, and the line is not
+        // visible to a traffic flush while this work is in progress.
+        for (_, line) in &new_lines {
+            let binding = line.binding();
+            self.reconcile_ue_context(line, &binding).await;
+        }
+
+        let new_line_ids = new_lines
+            .iter()
+            .map(|(line_id, _)| line_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        if !new_lines.is_empty() {
+            let _traffic_guard = self.traffic_persistence_lock.lock().await;
+            let mut lines = self.lines.write().await;
+            for (line_id, line) in &new_lines {
+                lines.insert(line_id.clone(), Arc::clone(line));
             }
         }
 
@@ -613,7 +625,10 @@ impl LineRuntimeRegistry {
             .read()
             .await
             .values()
-            .filter(|line| line.binding().present)
+            .filter(|line| {
+                let binding = line.binding();
+                binding.present && !new_line_ids.contains(&binding.line_id)
+            })
             .cloned()
             .collect::<Vec<_>>();
 
@@ -638,7 +653,11 @@ impl LineRuntimeRegistry {
             }
             self.teardown_ue_isolation(line, &binding.line_id).await;
         }
-        Ok(present_lines.len())
+        Ok(present_lines.len()
+            + new_lines
+                .iter()
+                .filter(|(_, line)| line.binding().present)
+                .count())
     }
 
     pub async fn get(&self, line_id: &str) -> Option<Arc<LineRuntime>> {
