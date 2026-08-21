@@ -1,6 +1,6 @@
 //! Per-UE worker process management (isolation architecture, Option B).
 //!
-//! Each UE gets its own `simadmin --ue-worker` child process. The parent uses
+//! Each UE gets its own `simadmin ue-worker` child process. The parent uses
 //! `pre_exec` + `setns(CLONE_NEWNET)` so the child is born inside the UE
 //! network namespace *before* it creates any socket. Every SIP REGISTER,
 //! RTP/RTCP, IKE/ESP and DNS socket therefore belongs to that UE's network
@@ -55,7 +55,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_ATTEMPTS: usize = 25;
 const CONNECT_DELAY: Duration = Duration::from_millis(200);
 
-/// Environment variables consumed by the hidden `--ue-worker` subcommand.
+    /// Environment variables consumed by the hidden `ue-worker` subcommand.
 pub const ENV_LINE_ID: &str = "SIMADMIN_UE_LINE_ID";
 pub const ENV_NETNS: &str = "SIMADMIN_UE_NETNS";
 pub const ENV_CONTROL: &str = "SIMADMIN_UE_CONTROL";
@@ -614,7 +614,7 @@ impl UeWorkerHandle {
 
         let mut command = Command::new(exe);
         command
-            .arg("--ue-worker")
+            .arg("ue-worker")
             .env(ENV_LINE_ID, &self.core.line_id)
             .env(ENV_NETNS, self.core.namespace.as_str())
             .env(ENV_CONTROL, &self.core.control_path)
@@ -948,11 +948,11 @@ async fn writer_loop(
     }
 }
 
-/// Entry point for the hidden `--ue-worker` subcommand. Reads its parameters
+/// Entry point for the hidden `ue-worker` subcommand. Reads its parameters
 /// from the environment (set by the parent before `exec`).
 pub async fn run_worker_from_env() -> anyhow::Result<()> {
     let line_id = std::env::var(ENV_LINE_ID)
-        .map_err(|_| anyhow::anyhow!("{ENV_LINE_ID} is required for --ue-worker"))?;
+        .map_err(|_| anyhow::anyhow!("{ENV_LINE_ID} is required for ue-worker"))?;
     let netns_name =
         std::env::var(ENV_NETNS).map_err(|_| anyhow::anyhow!("{ENV_NETNS} is required"))?;
     let control =

@@ -25,7 +25,7 @@
 用户已确认采用 Option B：
 
 > 每个 UE = 一个 `UeContext` + 一个独立 Linux `Network Namespace`，
-> 由主进程拉起一个 `simadmin --ue-worker` 子进程，子进程通过 `setns(CLONE_NEWNET)`
+> 由主进程拉起一个 `simadmin ue-worker` 子进程，子进程通过 `setns(CLONE_NEWNET)`
 > **在进入 UE netns 之后才创建任何 socket**。
 
 迁移顺序（用户确认）：
@@ -52,7 +52,7 @@ Network / IMS / IKE / RTP 状态。**
    └───────────┬─────────────┴──────────────────────────────┘
                │ spawn + setns(CLONE_NEWNET)
    ┌───────────▼────────────────────────────┐
-   │  simadmin --ue-worker  (UE netns)      │
+   │  simadmin ue-worker  (UE netns)        │
    │  ┌──────────────────────────────────┐  │
    │  │ 每个 UE 自己的网络栈：             │  │
    │  │  - veth UE 侧 (save<hex>)        │  │
