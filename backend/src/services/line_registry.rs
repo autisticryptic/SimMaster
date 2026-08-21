@@ -692,6 +692,17 @@ impl LineRuntimeRegistry {
             .as_ref()
             .map(|config| config.get_ue_isolation())
             .unwrap_or_default();
+        // Capture this before changing the registry.  A missing worker is
+        // common on the legacy host path (isolation disabled, or the worker
+        // failed before the first isolated VoWiFi runtime was published), and
+        // must not tear down an otherwise healthy host VoWiFi session.  Only a
+        // line that actually had the shared isolated socket context needs the
+        // expensive live-runtime cleanup below.
+        let had_ue_socket_context =
+            crate::connectivity::modems::ims::vowifi::live::ue_socket_context_for_line(
+                &binding.line_id,
+            )
+            .is_some();
         let mut ue = line.ue();
         ue.update_binding(binding);
         if let Err(error) = ue.ensure_netns(&isolation).await {
@@ -764,15 +775,23 @@ impl LineRuntimeRegistry {
             // namespace. Tear the live access runtime down before allowing a
             // host-path retry, otherwise a host socket can bind a UE-only TUN
             // and reproduce ENODEV even though the context registry is clear.
-            crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(&line_id)
+            if had_ue_socket_context {
+                crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
+                    &line_id,
+                )
                 .await;
+            }
         }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
                 crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
                     &line_id, None,
                 );
-                if worker_available {
+                // The failed reconcile must only tear down an isolated live
+                // runtime that was actually published before this refresh.
+                // With no prior UE socket context, the line may still be
+                // using the legacy host path and should remain untouched.
+                if worker_available && had_ue_socket_context {
                     crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
                         &line_id,
                     )

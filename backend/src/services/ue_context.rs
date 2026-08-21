@@ -97,8 +97,13 @@ impl UeContext {
     /// not ready, so toggling the switch off immediately stops namespace use.
     pub async fn ensure_netns(&mut self, config: &UeIsolationConfig) -> Result<(), NetnsError> {
         self.isolation_enabled = config.enabled;
+        // Never carry a previous successful generation's readiness across a
+        // failed ensure attempt.  A stale `true` here would make the line
+        // registry publish a worker/socket context for a namespace that was
+        // removed or could not be recreated, allowing a later caller to bind
+        // the wrong network path.
+        self.netns_ready = false;
         if !config.enabled {
-            self.netns_ready = false;
             return Ok(());
         }
         netns::ensure(&self.namespace).await?;
@@ -197,6 +202,7 @@ mod tests {
     async fn disabled_isolation_is_noop_and_not_ready() {
         let modem = binding("line-1", "baseband", "qcm410");
         let mut ue = UeContext::for_binding(&modem, &config(true));
+        ue.netns_ready = true;
         assert!(ue.ensure_netns(&config(false)).await.is_ok());
         assert!(!ue.isolation_enabled);
         assert!(!ue.netns_ready);
@@ -207,6 +213,7 @@ mod tests {
     async fn enabled_isolation_reports_unsupported_off_linux() {
         let modem = binding("line-1", "baseband", "qcm410");
         let mut ue = UeContext::for_binding(&modem, &config(true));
+        ue.netns_ready = true;
         assert!(matches!(
             ue.ensure_netns(&config(true)).await,
             Err(NetnsError {
@@ -214,6 +221,7 @@ mod tests {
                 ..
             })
         ));
+        assert!(!ue.netns_ready);
     }
 
     #[test]
