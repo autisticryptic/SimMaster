@@ -27,7 +27,8 @@ use std::net::IpAddr;
 
 use crate::hardware::devices::qcm410::ims_bearer::Qcm410ImsBearer;
 use crate::hardware::devices::transport::{
-    ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo, ImsBearerTransport,
+    BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo,
+    ImsBearerTransport,
 };
 use crate::{platform::netns, services::ue_worker::UeWorkerHandle};
 
@@ -73,6 +74,10 @@ pub struct NativeImsBearer {
     /// `assumed`), carried so the UI/logs can distinguish an observed netdev
     /// from an assumed one.
     pub netdev_method: &'static str,
+    /// Ownership declared by the bearer provider. Only a SimAdmin-owned
+    /// secondary (or an interface already created in the worker) may cross the
+    /// namespace boundary.
+    pub interface_ownership: BearerInterfaceOwnership,
     /// Device-owned teardown handle. This module never inspects it.
     handle: Box<dyn ImsBearerHandle + Send>,
     worker: Option<UeWorkerHandle>,
@@ -81,15 +86,37 @@ pub struct NativeImsBearer {
 
 impl NativeImsBearer {
     /// Move the dedicated native netdev into this line's UE namespace. The
-    /// primary ModemManager interface (`wwan0`) is intentionally rejected;
-    /// only the secondary QMI bearer created by this session may cross the
+    /// primary ModemManager interface is intentionally rejected; only a
+    /// provider-declared SimAdmin-owned secondary bearer may cross the
     /// namespace boundary.
     pub async fn move_into_worker(&mut self, worker: UeWorkerHandle) -> Result<(), VolteError> {
-        if self.interface == "wwan0" {
-            return Err(VolteError::with_detail(
-                code::COMMAND_FAILED,
-                "native bearer refuses to move ModemManager primary interface wwan0",
-            ));
+        match self.interface_ownership {
+            BearerInterfaceOwnership::HostManagedPrimary => {
+                return Err(VolteError::with_detail(
+                    code::COMMAND_FAILED,
+                    format!(
+                        "native bearer refuses to move host-managed interface {}",
+                        self.interface
+                    ),
+                ));
+            }
+            BearerInterfaceOwnership::Unknown => {
+                return Err(VolteError::with_detail(
+                    code::COMMAND_FAILED,
+                    format!(
+                        "native bearer ownership is unknown; refusing to move {}",
+                        self.interface
+                    ),
+                ));
+            }
+            BearerInterfaceOwnership::WorkerNative => {
+                // The provider already established this interface in the UE
+                // worker. Record the worker for route/socket teardown, but do
+                // not attempt a second namespace move.
+                self.worker = Some(worker);
+                return Ok(());
+            }
+            BearerInterfaceOwnership::SimAdminOwnedSecondary => {}
         }
         if self.moved_to_worker {
             return Ok(());
@@ -293,6 +320,7 @@ async fn adopt_bearer(
             connection,
             interface: info.interface,
             netdev_method: info.netdev_method,
+            interface_ownership: info.interface_ownership,
             handle,
             worker: None,
             moved_to_worker: false,

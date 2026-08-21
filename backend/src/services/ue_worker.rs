@@ -517,6 +517,17 @@ impl UeWorkerHandle {
         &self.core.namespace
     }
 
+    /// Whether two handles refer to the same worker lifecycle/connection.
+    ///
+    /// A line refresh can replace the registry entry with a new handle while
+    /// an access runtime still owns the old one. Comparing the shared core
+    /// lets those runtimes reject a stale namespace instead of silently
+    /// sending traffic through a worker generation no longer owned by the
+    /// line registry.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.core, &other.core)
+    }
+
     pub async fn status(&self) -> UeWorkerStatus {
         self.core.state.lock().unwrap().clone()
     }

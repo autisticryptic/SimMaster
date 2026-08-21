@@ -159,6 +159,19 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 这项修复必须先在 410 上验证 worker 能持续运行超过 60 秒，再判断 IMS
 注册、媒体或数据代理本身是否有问题。
 
+### 4.1.2 线路刷新发布一致性（本轮）
+
+线路刷新现在采用“准备 → 发布”两阶段流程。发现、namespace/veth 配置、worker
+重启和网络检查期间，SIM/PCSC 映射、worker 注册表和 VoWiFi socket context 都
+保持在私有快照中；只有对应的 `ModemBinding` 完成替换（或新线路插入）后，三者
+才一起发布。线路消失时则先撤销这些全局映射，再标记线路离线，最后清理 worker、
+veth 和 namespace。这样热插拔或 worker 重建不会让消费者把旧 binding 与新 UE
+网络状态拼成一个短暂的撕裂快照。
+
+数据代理和 secondary DATA6 复用同一生命周期边界：保留的 bearer 会核对当前
+worker 实例及其 netdev 快照；worker 重启、namespace 重建或接口不可见时，旧会话
+不会继续被当作可用出口，停止流程也会清理可能残留在宿主的地址/策略。
+
 ### 4.2 worker 控制协议（当前）
 
 消息（JSON-lines，`type` 区分）：
@@ -310,8 +323,11 @@ VoWiFi → VoLTE → 数据代理/Trunk 的顺序逐个启用；不能一次打�
 
 已实现：
 
-- 仅把 SimAdmin 本次 native QMI IMS session 自己创建的非 `wwan0` 接口迁入 worker；
-  明确拒绝迁移 ModemManager 主接口 `wwan0`；
+- 仅把 SimAdmin 本次 native QMI IMS session 自己创建的 secondary 接口迁入 worker；
+  明确拒绝迁移 ModemManager 主接口；
+- 迁移判定已改为读取 bearer provider 的 `interface_ownership`：QCM410 DATA6
+  标记为 `sim_admin_owned_secondary`，`host_managed_primary` 和 `unknown` 均拒绝迁移，
+  不再把接口名称当作所有权依据；
 - worker 内配置 IMS 地址、MTU、P-CSCF/DNS/媒体路由；
 - P-CSCF DNS、`VolteSipChannel`、Security-Agree 端口、XFRM、音频/视频 RTP socket
   均可在对应线路 worker 内创建；
@@ -341,6 +357,9 @@ UE netns → per-UE proxy（监听 UE 侧地址）→ 宿主 → 对应 Modem/ww
 - `data_proxy` runtime 继续按线路持有；HTTP/SOCKS5 listener 留在宿主以保持入口兼容，
   每条连接的 outbound TCP socket 由该线路 worker 创建并 `SO_BINDTODEVICE`；
 - qcm410 secondary DATA/DATA6 bearer 可迁入该线路 worker；停止时只清理该接口并移回宿主；
+- retained DATA session 复用前会同时验证 QMI CID、当前 worker generation 和 worker 内接口快照；
+  worker 崩溃/namespace 重建后不会继续复用悬空接口，而是先释放旧 session 再重新建立；
+- 线路移除、禁用隔离或 worker reconcile 失败时，会先停止 secondary DATA，再拆除 worker/veth/namespace；
 - Trunk/operator RTP socket 可由线路 worker 创建；Asterisk/internal leg 留在宿主，
   dialog、自动化和通知继续按 `line_id` 归属；
 - 接口与 worker 的选择来自线路注册表，不再以运营商分配的 IP 推断 UE，因此不同 UE
@@ -414,6 +433,7 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 ### 8.3 数据代理与 Trunk
 
 - [ ] 开启 `data_proxy_in_worker`，DATA6/secondary bearer 迁入正确 worker；
+- [ ] worker 异常退出并重建后，旧 DATA session 不被复用，接口能重新建立并迁入新 worker；
 - [ ] HTTP CONNECT、普通 HTTP、SOCKS5 的 DNS/IP 目标都从对应线路出站；
 - [ ] 停止代理/数据连接后接口回宿主，worker 内只清理该接口路由；
 - [ ] 开启 `trunk_sockets_in_worker`，operator RTP 属于当前线路 worker，Asterisk leg

@@ -296,6 +296,28 @@ pub struct LineRuntimeStatus {
     pub supplementary: SupplementarySnapshot,
 }
 
+/// The UE state prepared during a refresh but not visible to consumers until
+/// the corresponding line binding is published.  Keeping this snapshot
+/// private during namespace/worker operations prevents a reader from seeing a
+/// new worker with the previous modem binding.
+struct PreparedUePublication {
+    ue: Option<UeContext>,
+    worker: Option<UeWorkerHandle>,
+    features: crate::services::ue_worker::UeWorkerFeatures,
+    socket_context: Option<crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext>,
+}
+
+impl Default for PreparedUePublication {
+    fn default() -> Self {
+        Self {
+            ue: None,
+            worker: None,
+            features: crate::services::ue_worker::UeWorkerFeatures::default(),
+            socket_context: None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
@@ -556,21 +578,6 @@ impl LineRuntimeRegistry {
             let mut existing_lines = Vec::new();
             let mut new_lines = Vec::new();
             for binding in discovered {
-                // Tell the VoWiFi live layer which SIM device this line owns, so
-                // its identity and authentication never use another modem's card.
-                if binding.line_kind == "reader" && binding.model.starts_with("pcsc://") {
-                    crate::connectivity::modems::ims::vowifi::live::register_line_pcsc_reader(
-                        &binding.line_id,
-                        &binding.model,
-                    );
-                } else {
-                    crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
-                        &binding.line_id,
-                        binding.qmi_device.as_deref().unwrap_or_default(),
-                        binding.uim_slot,
-                        &binding.modem_path,
-                    );
-                }
                 if let Some(line) = lines.get(&binding.line_id) {
                     existing_lines.push((Arc::clone(line), binding));
                     continue;
@@ -621,13 +628,15 @@ impl LineRuntimeRegistry {
         // context has been reconciled. `refresh_lock` keeps another refresh
         // from publishing the same line concurrently, and the line is not
         // visible to a traffic flush while this work is in progress.
+        let mut prepared_new = Vec::with_capacity(new_lines.len());
         for (_, line) in &new_lines {
             let binding = line.binding();
-            self.reconcile_ue_context(line, &binding).await;
+            prepared_new.push(self.reconcile_ue_context(line, &binding).await);
         }
 
+        let mut prepared_existing = Vec::with_capacity(existing_lines.len());
         for (line, binding) in &existing_lines {
-            self.reconcile_ue_context(line, binding).await;
+            prepared_existing.push(self.reconcile_ue_context(line, binding).await);
         }
 
         // Publish the completed binding snapshot only after all namespace and
@@ -636,20 +645,21 @@ impl LineRuntimeRegistry {
         {
             let _traffic_guard = self.traffic_persistence_lock.lock().await;
             let mut lines = self.lines.write().await;
-            for (line, binding) in &existing_lines {
+            for ((line, binding), prepared) in existing_lines.iter().zip(prepared_existing) {
                 if let Some(config_manager) = &self.config_manager {
                     line.voice_access
                         .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
                 }
                 line.replace_binding(binding.clone());
+                Self::publish_sim_device_mapping(binding);
+                Self::publish_ue_context(line, &binding.line_id, prepared);
             }
             for line in &absent_lines {
-                crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
-                    &line.binding().line_id,
-                );
                 line.mark_absent();
             }
-            for (line_id, line) in &new_lines {
+            for ((line_id, line), prepared) in new_lines.iter().zip(prepared_new) {
+                Self::publish_sim_device_mapping(&line.binding());
+                Self::publish_ue_context(line, line_id.as_str(), prepared);
                 lines.insert(line_id.clone(), Arc::clone(line));
             }
         }
@@ -669,6 +679,10 @@ impl LineRuntimeRegistry {
             let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
             let binding = line.binding();
             let worker = line.ue_worker.clone();
+            // Stop any DATA6 bearer before shutting down the namespace worker.
+            // Otherwise the retained QMI session can keep an interface bound
+            // to a namespace that is about to disappear.
+            line.secondary_data.stop().await;
             if worker.is_running().await {
                 if let Err(error) = worker.shutdown().await {
                     tracing::warn!(
@@ -680,8 +694,31 @@ impl LineRuntimeRegistry {
             }
             self.teardown_ue_isolation_locked(line, &binding.line_id)
                 .await;
+            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
+                &binding.line_id,
+            );
         }
         Ok(present_count)
+    }
+
+    /// Publish the SIM/reader mapping only alongside the line binding. Keeping
+    /// discovery-time mappings private until this point prevents consumers
+    /// from combining a newly discovered reader with the previous binding
+    /// while UE reconciliation is still in progress.
+    fn publish_sim_device_mapping(binding: &ModemBinding) {
+        if binding.line_kind == "reader" && binding.model.starts_with("pcsc://") {
+            crate::connectivity::modems::ims::vowifi::live::register_line_pcsc_reader(
+                &binding.line_id,
+                &binding.model,
+            );
+        } else {
+            crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
+                &binding.line_id,
+                binding.qmi_device.as_deref().unwrap_or_default(),
+                binding.uim_slot,
+                &binding.modem_path,
+            );
+        }
     }
 
     pub async fn get(&self, line_id: &str) -> Option<Arc<LineRuntime>> {
@@ -788,7 +825,11 @@ impl LineRuntimeRegistry {
     /// master switch. Namespace creation is idempotent; a failure only drops
     /// the isolation guarantee and leaves the existing host-namespace path
     /// fully functional.
-    async fn reconcile_ue_context(&self, line: &LineRuntime, binding: &ModemBinding) {
+    async fn reconcile_ue_context(
+        &self,
+        line: &LineRuntime,
+        binding: &ModemBinding,
+    ) -> PreparedUePublication {
         let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
         let isolation = self
             .config_manager
@@ -815,11 +856,6 @@ impl LineRuntimeRegistry {
                 "Failed to prepare per-UE network namespace"
             );
         }
-        *line
-            .ue
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = ue;
-        let ue = line.ue();
         let ue_ready = ue.isolation_enabled && ue.netns_ready;
         let worker = line.ue_worker.clone();
         if ue_ready && !worker.is_running().await {
@@ -861,19 +897,12 @@ impl LineRuntimeRegistry {
             None
         };
         let worker_available = worker_registration.is_some();
-        crate::services::ue_worker::register_line_worker(
-            &line_id,
-            worker_registration,
-            crate::services::ue_worker::UeWorkerFeatures {
-                three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
-                data_proxy: isolation.data_proxy_in_worker,
-                trunk_sockets: isolation.trunk_sockets_in_worker,
-            },
-        );
+        let features = crate::services::ue_worker::UeWorkerFeatures {
+            three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
+            data_proxy: isolation.data_proxy_in_worker,
+            trunk_sockets: isolation.trunk_sockets_in_worker,
+        };
         if !worker_available {
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                &line_id, None,
-            );
             // A cached TUN/SIP channel may still belong to the dead worker's
             // namespace. Tear the live access runtime down before allowing a
             // host-path retry, otherwise a host socket can bind a UE-only TUN
@@ -887,9 +916,6 @@ impl LineRuntimeRegistry {
         }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
-                crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                    &line_id, None,
-                );
                 // The failed reconcile must only tear down an isolated live
                 // runtime that was actually published before this refresh.
                 // With no prior UE socket context, the line may still be
@@ -905,12 +931,51 @@ impl LineRuntimeRegistry {
                     error = %error,
                     "Failed to reconcile UE egress/worker net-config; falling back to host path"
                 );
+                return PreparedUePublication::default();
             }
         } else {
             // Fall back to the host-namespace VoWiFi path and best-effort
             // remove all resources from a previous isolated run.
             self.teardown_ue_isolation_locked(line, &line_id).await;
+            return PreparedUePublication::default();
         }
+
+        let socket_context = if isolation.vowifi_tun_in_namespace && worker_available {
+            let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
+            Some(
+                crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
+                    namespace: ue.namespace.as_str().to_string(),
+                    ue_veth: plan.ue_if,
+                    worker: worker.clone(),
+                },
+            )
+        } else {
+            None
+        };
+        PreparedUePublication {
+            ue: Some(ue),
+            worker: worker_registration,
+            features,
+            socket_context,
+        }
+    }
+
+    fn publish_ue_context(line: &LineRuntime, line_id: &str, prepared: PreparedUePublication) {
+        if let Some(ue) = prepared.ue {
+            *line
+                .ue
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = ue;
+        }
+        crate::services::ue_worker::register_line_worker(
+            line_id,
+            prepared.worker,
+            prepared.features,
+        );
+        crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+            line_id,
+            prepared.socket_context,
+        );
     }
 
     async fn teardown_ue_isolation(&self, line: &LineRuntime, line_id: &str) {
@@ -925,6 +990,10 @@ impl LineRuntimeRegistry {
             .map(|config| config.get_ue_isolation())
             .unwrap_or_default();
         let ue = line.ue();
+        // This helper is also called when isolation is disabled or a worker
+        // reconcile fails. Tear down secondary DATA before unregistering the
+        // worker and removing its namespace.
+        line.secondary_data.stop().await;
         crate::services::ue_worker::register_line_worker(
             line_id,
             None,
@@ -1005,10 +1074,6 @@ impl LineRuntimeRegistry {
         let unchanged =
             line.egress_fingerprint.lock().await.as_deref() == Some(fingerprint.as_str());
         if unchanged {
-            // The discovery refresh may have rebuilt only the reader map. Re-
-            // publish both UE registries even when the network plan itself is
-            // unchanged, so TUN, IKE, SIP and RTP resolve one owner together.
-            self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
             return Ok(());
         }
         let result = worker
@@ -1041,7 +1106,6 @@ impl LineRuntimeRegistry {
         // Stage 2b is deliberately gated: only with this flag do the VoWiFi
         // TUN and every IKE/SIP/RTP socket move into the UE namespace through
         // the worker. Disabling keeps the previous host-namespace path.
-        self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
         tracing::info!(
             line_id = %ue.ue_id,
             netns = %ue.namespace,
@@ -1050,32 +1114,6 @@ impl LineRuntimeRegistry {
             "UE egress veth configured by worker"
         );
         Ok(())
-    }
-
-    fn publish_ue_egress_context(
-        &self,
-        line_id: &str,
-        ue: &UeContext,
-        plan: &ue_netcfg::UeVethPlan,
-        isolation: &crate::platform::config::UeIsolationConfig,
-        worker: &UeWorkerHandle,
-    ) {
-        if isolation.vowifi_tun_in_namespace {
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                line_id,
-                Some(
-                    crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
-                        namespace: ue.namespace.as_str().to_string(),
-                        ue_veth: plan.ue_if.clone(),
-                        worker: worker.clone(),
-                    },
-                ),
-            );
-        } else {
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                line_id, None,
-            );
-        }
     }
 }
 
@@ -1163,6 +1201,20 @@ mod tests {
 
         assert!(requested.enabled);
         assert!(!effective.enabled);
+    }
+
+    #[test]
+    fn sim_mapping_is_derived_from_the_published_binding() {
+        let line_id = "test-line-registry-published-sim";
+        let binding = binding(line_id, true);
+
+        LineRuntimeRegistry::publish_sim_device_mapping(&binding);
+
+        let mapped = crate::connectivity::modems::ims::vowifi::live::sim_device_for_line(line_id);
+        assert_eq!(mapped.qmi_device, "/dev/wwan0qmi0");
+        assert_eq!(mapped.uim_slot, 1);
+        assert_eq!(mapped.modem_path, binding.modem_path);
+        crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(line_id);
     }
 
     #[test]

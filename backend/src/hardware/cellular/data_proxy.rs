@@ -313,16 +313,24 @@ impl DataProxyRuntime {
         let worker = match worker_for_line_feature(line_id, data_proxy_worker_enabled) {
             Some(worker) => {
                 let status = worker.status().await;
-                status
-                    .last_net_status
-                    .as_ref()
-                    .is_some_and(|snapshot| {
-                        snapshot
-                            .interfaces
-                            .iter()
-                            .any(|name| name == interface_name)
-                    })
-                    .then_some(worker)
+                if !status.ready {
+                    None
+                } else {
+                    // Do not trust a cached namespace snapshot here. A
+                    // worker can restart, or a bearer can move back to the
+                    // host, since the last reconcile.
+                    match worker.refresh_net_status().await {
+                        Ok(snapshot)
+                            if snapshot
+                                .interfaces
+                                .iter()
+                                .any(|name| name == interface_name) =>
+                        {
+                            Some(worker)
+                        }
+                        _ => None,
+                    }
+                }
             }
             None => None,
         };

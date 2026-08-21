@@ -57,7 +57,9 @@ impl SecondaryDataRuntime {
     ) -> Result<String, String> {
         let mut guard = self.session.lock().await;
         if let Some(session) = guard.as_ref() {
-            if retained_session_is_active(session).await {
+            if retained_session_is_active(session).await
+                && retained_session_worker_is_usable(line_id, session).await
+            {
                 return Ok(session.netdev.interface.clone());
             }
         }
@@ -160,6 +162,38 @@ fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
 async fn data_worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
     let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
     worker.status().await.ready.then_some(worker)
+}
+
+/// Verify that a retained DATA bearer still belongs to the currently
+/// registered worker generation. A QMI CID can remain connected after a
+/// worker exits or its namespace is recreated, so checking only modem status
+/// would return an interface that no caller can reach.
+async fn retained_session_worker_is_usable(line_id: &str, session: &SecondaryDataSession) -> bool {
+    let Some(session_worker) = session.worker.as_ref() else {
+        // Host-namespace sessions do not depend on a worker generation.
+        return true;
+    };
+    let Some(current_worker) = data_worker_for_line(line_id).await else {
+        return false;
+    };
+    if !session_worker.same_instance(&current_worker) {
+        return false;
+    }
+    match current_worker.refresh_net_status().await {
+        Ok(snapshot) => snapshot
+            .interfaces
+            .iter()
+            .any(|name| name == &session.netdev.interface),
+        Err(error) => {
+            warn!(
+                line_id,
+                interface = %session.netdev.interface,
+                error = %error,
+                "Secondary DATA worker is no longer reachable"
+            );
+            false
+        }
+    }
 }
 
 async fn move_data_session_into_worker(
@@ -492,6 +526,10 @@ async fn stop_session(mut session: SecondaryDataSession) {
             .await;
         let _ = netns::move_iface_out(worker.namespace(), &session.netdev.interface).await;
         let _ = worker.refresh_net_status().await;
+        // The interface may have returned to the host automatically when a
+        // worker namespace disappeared. Always remove this session's host
+        // address/policy state before releasing its QMI CID.
+        qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
     } else {
         qmi_netdev::teardown(&session.netdev.interface, &session.netdev_config).await;
     }

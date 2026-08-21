@@ -19,6 +19,7 @@
 - [x] **统一 API 拨号路径**：网页、自动化都构造每 access 的 `VoiceCallPlan`；CS 只在非飞行模式下作为明确兼容入口。
 - [x] **MT IMS listener 启动时机**：call monitor 在服务启动后的首个周期为每条线路挂接 listener，后续按原子状态避免重复监听。
 - [x] **VoLTE/VoWiFi 接收路径可观测性**：SMS listener 已按线路与 IMS readiness 暂停 CS 扫描并使用跨传输去重；剩余运营商侧路由证据仍需真实网络日志验收。
+- [x] **UE 生命周期失效保护**：线路刷新先准备再发布 binding、SIM 映射和 worker/socket context；DATA6/代理拒绝复用已退出或已重建 namespace 的旧 worker，并清理宿主残留网络状态。
 - [ ] **QCM410 恢复监督器**：检测 `4080000.remoteproc` state、WWAN 端口和 ModemManager modem 三者不一致时，先等待内核 remoteproc 自动恢复，再按 baseband 归属重建 DATA6/IMS；禁止进程级盲目重启 ModemManager 或跨线路复用 QMI endpoint。
 
 ## 中优先级

@@ -110,6 +110,9 @@ ip netns list
   单独比较宿主路径与 worker 路径的 REGISTER 报文和运营商 profile，再修复业务注册。
 - 当前 VoLTE、数据代理与 Trunk worker 功能门仍需逐项启用并回归，首次验证不得同时
   打开多个功能门；本次提交完成后应先重新验证 worker/namespace，再进入业务测试。
+- 线路刷新已改为先准备 UE worker/socket 状态、再与 binding 一起发布；DATA6 保留会话
+  会检查 worker 实例和 netdev 可见性。以上只证明代码路径具备失效保护，仍需在 410
+  上验证 worker 重建、secondary bearer 回宿主和重新建立的完整过程。
 - 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。
 - 暂不执行 EC20、EC25、EG25、EG600 与 PCSC/USB SIM reader 实机测试。
 - 暂不承诺通话中的无缝 access handover、IMS service continuity 或 SRVCC。
