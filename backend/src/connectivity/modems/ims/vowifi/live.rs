@@ -1982,9 +1982,12 @@ async fn run_live_ike_with_destination(
     );
     let transport = match &ue_socket {
         Some(context) => {
-            let spec = UeSocketSpec::udp_connected(
+            // Use udp_bound (not udp_connected) because IKE switches from
+            // port 500 to port 4500 during NAT-T. A connect()ed UDP socket
+            // on Linux rejects sendto() to a different peer and recvfrom()
+            // only accepts from the connected peer - both break NAT-T.
+            let spec = UeSocketSpec::udp_bound(
                 local_addr,
-                destination,
                 Some(context.ue_veth.clone()),
             );
             match context.worker.create_socket(spec).await {
