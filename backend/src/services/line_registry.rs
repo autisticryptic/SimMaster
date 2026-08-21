@@ -94,6 +94,11 @@ pub struct LineRuntime {
     /// It is separate from the proxy listener because the bearer must remain
     /// alive while listeners are reconfigured.
     pub secondary_data: Arc<SecondaryDataRuntime>,
+    /// Fingerprint of the last successfully applied UE egress plan.
+    /// When the plan is unchanged across reconcile calls the worker
+    /// net-config batch is skipped to avoid flooding the worker with
+    /// redundant operations.
+    egress_fingerprint: Mutex<Option<String>>,
 }
 
 impl LineRuntime {
@@ -148,6 +153,7 @@ impl LineRuntime {
             data_proxy: Arc::new(DataProxyRuntime::default()),
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
             secondary_data: Arc::new(SecondaryDataRuntime::default()),
+            egress_fingerprint: Mutex::new(None),
         }
     }
 
@@ -701,6 +707,12 @@ impl LineRuntimeRegistry {
         let ue_ready = ue.isolation_enabled && ue.netns_ready;
         let worker = line.ue_worker.clone();
         if ue_ready && !worker.is_running().await {
+            // Clear the egress fingerprint so the freshly spawned worker
+            // receives its initial net-config even if the plan is unchanged.
+            {
+                let mut fp = line.egress_fingerprint.lock().await;
+                *fp = None;
+            }
             if let Err(error) = worker.spawn().await {
                 tracing::warn!(
                     line_id = %binding.line_id,
@@ -715,6 +727,12 @@ impl LineRuntimeRegistry {
                     error = %error,
                     "Failed to stop per-UE worker after isolation was disabled"
                 );
+            }
+            // Clear the egress fingerprint so re-enabling isolation
+            // re-applies the net-config rather than skipping it.
+            {
+                let mut fp = line.egress_fingerprint.lock().await;
+                *fp = None;
             }
         }
         let line_id = binding.line_id.clone();
@@ -769,7 +787,25 @@ impl LineRuntimeRegistry {
         .await
         .map_err(|error| error.to_string())?;
 
+        // Build a fingerprint from the plan + isolation settings so we can
+        // skip the worker net-config batch when nothing has changed.
+        let fingerprint = format!(
+            "{}|{}|{}|{}|{}|{}",
+            plan.host_if, plan.ue_if, plan.host_addr, plan.ue_addr, plan.mtu,
+            isolation.vowifi_tun_in_namespace,
+        );
         let worker = line.ue_worker.clone();
+        {
+            let prev = line
+                .egress_fingerprint
+                .lock()
+                .await
+                .clone();
+            if prev.as_deref() == Some(fingerprint.as_str()) {
+                // Plan unchanged — skip the worker net-config round-trip.
+                return Ok(());
+            }
+        }
         if !worker.is_running().await {
             return Err("UE worker is not running; skipping egress apply".to_string());
         }
@@ -785,6 +821,14 @@ impl LineRuntimeRegistry {
             return Err(result
                 .error
                 .unwrap_or_else(|| "net-config failed".to_string()));
+        }
+        // Persist the fingerprint so subsequent reconcile calls are no-ops.
+        {
+            let mut slot = line
+                .egress_fingerprint
+                .lock()
+                .await;
+            *slot = Some(fingerprint);
         }
         // Host-side SNAT for the UE egress subnet. Worker-created sockets
         // inside the UE namespace egress through this veth pair; without
