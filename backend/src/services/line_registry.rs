@@ -512,8 +512,18 @@ impl LineRuntimeRegistry {
         // than once (for example when a legacy reader alias and its automatic
         // reader record overlap). Keep one deterministic binding; otherwise
         // two private runtimes would reconcile the same namespace and the
-        // later map insert would orphan the first worker/veth pair.
-        let mut unique_bindings = BTreeMap::new();
+        // later map insert would orphan the first worker/veth pair. Compute
+        // the conflict counts before deduplication: `physical_line_id` is
+        // intentionally derived from the physical slot, so counting after
+        // deduplication would erase the diagnostic flag for duplicate modem
+        // objects sharing that slot.
+        let mut physical_slot_counts = std::collections::HashMap::new();
+        for binding in &discovered {
+            *physical_slot_counts
+                .entry((binding.hardware_key.clone(), binding.uim_slot))
+                .or_insert(0usize) += 1;
+        }
+        let mut unique_bindings: BTreeMap<String, ModemBinding> = BTreeMap::new();
         for binding in discovered {
             if let Some(existing) = unique_bindings.get(&binding.line_id) {
                 tracing::warn!(
@@ -527,14 +537,8 @@ impl LineRuntimeRegistry {
             unique_bindings.insert(binding.line_id.clone(), binding);
         }
         let mut discovered = unique_bindings.into_values().collect::<Vec<_>>();
-        let mut physical_slot_counts = std::collections::HashMap::new();
-        for binding in &discovered {
-            *physical_slot_counts
-                .entry((binding.hardware_key.clone(), binding.uim_slot))
-                .or_insert(0usize) += 1;
-        }
         for binding in &mut discovered {
-            binding.slot_conflict = physical_slot_counts
+            binding.slot_conflict |= physical_slot_counts
                 .get(&(binding.hardware_key.clone(), binding.uim_slot))
                 .is_some_and(|count| *count > 1);
         }
