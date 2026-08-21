@@ -772,10 +772,12 @@ impl LineRuntimeRegistry {
                 crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
                     &line_id, None,
                 );
-                crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
-                    &line_id,
-                )
-                .await;
+                if worker_available {
+                    crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
+                        &line_id,
+                    )
+                    .await;
+                }
                 tracing::warn!(
                     line_id = %line_id,
                     error = %error,
