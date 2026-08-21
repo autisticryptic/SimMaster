@@ -347,17 +347,6 @@ impl LineRuntimeRegistry {
                 Vec::new()
             }
         };
-        let mut physical_slot_counts = std::collections::HashMap::new();
-        for binding in &discovered {
-            *physical_slot_counts
-                .entry((binding.hardware_key.clone(), binding.uim_slot))
-                .or_insert(0usize) += 1;
-        }
-        for binding in &mut discovered {
-            binding.slot_conflict = physical_slot_counts
-                .get(&(binding.hardware_key.clone(), binding.uim_slot))
-                .is_some_and(|count| *count > 1);
-        }
         if let Some(config_manager) = &self.config_manager {
             let observations = discovered
                 .iter()
@@ -518,19 +507,49 @@ impl LineRuntimeRegistry {
                 tracing::warn!(error = %error, "Failed to reconcile discovered line profiles");
             }
         }
+
+        // A modem/reader discovery pass can report the same stable line more
+        // than once (for example when a legacy reader alias and its automatic
+        // reader record overlap). Keep one deterministic binding; otherwise
+        // two private runtimes would reconcile the same namespace and the
+        // later map insert would orphan the first worker/veth pair.
+        let mut unique_bindings = BTreeMap::new();
+        for binding in discovered {
+            if let Some(existing) = unique_bindings.get(&binding.line_id) {
+                tracing::warn!(
+                    line_id = %binding.line_id,
+                    kept_model = %existing.model,
+                    dropped_model = %binding.model,
+                    "Duplicate modem binding discovered; keeping the first stable line"
+                );
+                continue;
+            }
+            unique_bindings.insert(binding.line_id.clone(), binding);
+        }
+        let mut discovered = unique_bindings.into_values().collect::<Vec<_>>();
+        let mut physical_slot_counts = std::collections::HashMap::new();
+        for binding in &discovered {
+            *physical_slot_counts
+                .entry((binding.hardware_key.clone(), binding.uim_slot))
+                .or_insert(0usize) += 1;
+        }
+        for binding in &mut discovered {
+            binding.slot_conflict = physical_slot_counts
+                .get(&(binding.hardware_key.clone(), binding.uim_slot))
+                .is_some_and(|count| *count > 1);
+        }
+
         // Publish only the binding snapshot while holding the registry lock.
         // Namespace, worker, and bearer operations are intentionally deferred
         // until after the lock is released so status/API readers stay usable
         // while one modem is slow or unavailable.
-        let (absent_lines, new_lines) = {
-            let mut lines = self.lines.write().await;
-            for line in lines.values() {
-                crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
-                    &line.binding().line_id,
-                );
-                line.mark_absent();
-            }
-
+        let discovered_ids = discovered
+            .iter()
+            .map(|binding| binding.line_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let (absent_lines, existing_lines, new_lines) = {
+            let lines = self.lines.read().await;
+            let mut existing_lines = Vec::new();
             let mut new_lines = Vec::new();
             for binding in discovered {
                 // Tell the VoWiFi live layer which SIM device this line owns, so
@@ -549,12 +568,7 @@ impl LineRuntimeRegistry {
                     );
                 }
                 if let Some(line) = lines.get(&binding.line_id) {
-                    if let Some(config_manager) = &self.config_manager {
-                        line.voice_access.set_policy(
-                            config_manager.get_line_voice_path_policy(&binding.line_id),
-                        );
-                    }
-                    line.replace_binding(binding);
+                    existing_lines.push((Arc::clone(line), binding));
                     continue;
                 }
 
@@ -572,10 +586,10 @@ impl LineRuntimeRegistry {
 
             let absent_lines = lines
                 .values()
-                .filter(|line| !line.binding().present)
+                .filter(|line| !discovered_ids.contains(&line.binding().line_id))
                 .cloned()
                 .collect::<Vec<_>>();
-            (absent_lines, new_lines)
+            (absent_lines, existing_lines, new_lines)
         };
 
         // Restore a new line's persisted counters before publishing it to the
@@ -608,38 +622,47 @@ impl LineRuntimeRegistry {
             self.reconcile_ue_context(line, &binding).await;
         }
 
-        let new_line_ids = new_lines
-            .iter()
-            .map(|(line_id, _)| line_id.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if !new_lines.is_empty() {
+        for (line, binding) in &existing_lines {
+            self.reconcile_ue_context(line, binding).await;
+        }
+
+        // Publish the completed binding snapshot only after all namespace and
+        // worker transitions have finished. Readers therefore keep seeing the
+        // previous coherent binding while a refresh is in progress.
+        {
             let _traffic_guard = self.traffic_persistence_lock.lock().await;
             let mut lines = self.lines.write().await;
+            for (line, binding) in &existing_lines {
+                if let Some(config_manager) = &self.config_manager {
+                    line.voice_access
+                        .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
+                }
+                line.replace_binding(binding.clone());
+            }
+            for line in &absent_lines {
+                crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
+                    &line.binding().line_id,
+                );
+                line.mark_absent();
+            }
             for (line_id, line) in &new_lines {
                 lines.insert(line_id.clone(), Arc::clone(line));
             }
         }
 
-        let present_lines = self
-            .lines
-            .read()
-            .await
-            .values()
-            .filter(|line| {
-                let binding = line.binding();
-                binding.present && !new_line_ids.contains(&binding.line_id)
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-
-        for line in &present_lines {
-            let binding = line.binding();
-            self.reconcile_ue_context(line, &binding).await;
-        }
+        let present_count = existing_lines
+            .iter()
+            .filter(|(_, binding)| binding.present)
+            .count()
+            + new_lines
+                .iter()
+                .filter(|(_, line)| line.binding().present)
+                .count();
 
         // Shut down workers whose hardware anchor disappeared. This is also
         // deliberately outside the registry lock.
         for line in &absent_lines {
+            let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
             let binding = line.binding();
             let worker = line.ue_worker.clone();
             if worker.is_running().await {
@@ -651,13 +674,10 @@ impl LineRuntimeRegistry {
                     );
                 }
             }
-            self.teardown_ue_isolation(line, &binding.line_id).await;
+            self.teardown_ue_isolation_locked(line, &binding.line_id)
+                .await;
         }
-        Ok(present_lines.len()
-            + new_lines
-                .iter()
-                .filter(|(_, line)| line.binding().present)
-                .count())
+        Ok(present_count)
     }
 
     pub async fn get(&self, line_id: &str) -> Option<Arc<LineRuntime>> {
