@@ -56,11 +56,56 @@ impl SecondaryDataRuntime {
         apn: &ApnConfig,
     ) -> Result<String, String> {
         let mut guard = self.session.lock().await;
-        if let Some(session) = guard.as_ref() {
-            if retained_session_is_active(session).await
-                && retained_session_worker_is_usable(line_id, session).await
-            {
-                return Ok(session.netdev.interface.clone());
+        if guard.is_some() {
+            let (active, host_namespace, interface) = {
+                let session = guard.as_ref().expect("session checked above");
+                (
+                    retained_session_is_active(session).await,
+                    session.worker.is_none(),
+                    session.netdev.interface.clone(),
+                )
+            };
+            if active {
+                // Isolation can be enabled after the DATA6 session was
+                // created. In that case migrate the still-healthy host
+                // session into the newly ready line worker instead of
+                // silently keeping the old namespace path forever.
+                if host_namespace {
+                    if let Some(worker) = data_worker_for_line(line_id).await {
+                        let mut existing = guard
+                            .take()
+                            .expect("secondary DATA session disappeared while locked");
+                        if let Err(error) =
+                            move_data_session_into_worker(&mut existing, worker).await
+                        {
+                            warn!(
+                                line_id,
+                                interface = %interface,
+                                error = %error,
+                                "Existing secondary DATA session stayed in host namespace"
+                            );
+                        }
+                        *guard = Some(existing);
+                        return Ok(interface);
+                    }
+                    // No worker is currently available; preserve the healthy
+                    // host-namespace session and let a later call migrate it
+                    // when the feature worker becomes ready.
+                    return Ok(interface);
+                } else {
+                    let usable = {
+                        let session = guard.as_ref().expect("session checked above");
+                        retained_session_worker_is_usable(line_id, session).await
+                    };
+                    if usable {
+                        return Ok(interface);
+                    }
+                    warn!(
+                        line_id,
+                        interface = %interface,
+                        "Retained secondary DATA session is bound to a stale worker"
+                    );
+                }
             }
         }
         if let Some(session) = guard.take() {

@@ -931,13 +931,19 @@ impl LineRuntimeRegistry {
                     error = %error,
                     "Failed to reconcile UE egress/worker net-config; falling back to host path"
                 );
-                return PreparedUePublication::default();
+                return PreparedUePublication {
+                    ue: Some(ue),
+                    ..PreparedUePublication::default()
+                };
             }
         } else {
             // Fall back to the host-namespace VoWiFi path and best-effort
             // remove all resources from a previous isolated run.
             self.teardown_ue_isolation_locked(line, &line_id).await;
-            return PreparedUePublication::default();
+            return PreparedUePublication {
+                ue: Some(ue),
+                ..PreparedUePublication::default()
+            };
         }
 
         let socket_context = if isolation.vowifi_tun_in_namespace && worker_available {
