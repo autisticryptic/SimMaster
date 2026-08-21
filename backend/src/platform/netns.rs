@@ -563,7 +563,9 @@ pub async fn teardown_veth(host_if: &str) -> Result<(), NetnsError> {
 /// inside the UE namespace egress through the host side of the veth pair;
 /// MASQUERADE makes that traffic routable when the host's primary interface
 /// uses a different subnet. Idempotent: the rule is only appended when the
-/// check finds it missing.
+/// check finds it missing. `iptables` is preferred for compatibility with
+/// embedded images (including the QCM410 image); systems that only expose
+/// nftables use the dedicated `simadmin_nat` table as a fallback.
 #[cfg(target_os = "linux")]
 pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
     let cidr = format!("{host_addr}/30");
@@ -580,13 +582,60 @@ pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError>
             tracing::warn!(error = %error, "Failed to spawn sysctl for UE veth forwarding")
         }
     }
+    let iptables_error = match ensure_host_veth_nat_iptables(&cidr).await {
+        Ok(()) => return Ok(()),
+        Err(error) => Some(error),
+    };
+
+    match ensure_host_veth_nat_nft(&cidr).await {
+        Ok(()) => Ok(()),
+        Err(nft_error) => Err(combine_nat_errors(iptables_error, nft_error)),
+    }
+}
+
+/// Remove the host-side SNAT rule installed by [`ensure_host_veth_nat`].
+/// Missing rules are treated as success so teardown is safe after a partial
+/// setup or a previous process crash.
+#[cfg(target_os = "linux")]
+pub async fn remove_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
+    let cidr = format!("{host_addr}/30");
+    // Inspect both backends so a rule created before a host switched its
+    // firewall frontend is not stranded. An absent binary is benign when the
+    // other backend completed cleanup; real command failures are preserved.
+    let iptables_result = remove_host_veth_nat_iptables(&cidr).await;
+    let nft_result = remove_host_veth_nat_nft(&cidr).await;
+    match (iptables_result, nft_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) if is_missing_backend_error(&error) => Ok(()),
+        (Ok(()), Err(error)) if is_missing_backend_error(&error) => Ok(()),
+        (Err(iptables_error), Err(nft_error))
+            if is_missing_backend_error(&iptables_error)
+                && is_missing_backend_error(&nft_error) =>
+        {
+            Ok(())
+        }
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(iptables_error), Err(nft_error)) => {
+            Err(combine_nat_errors(Some(iptables_error), nft_error))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const NFT_NAT_TABLE: &str = "simadmin_nat";
+
+#[cfg(target_os = "linux")]
+const NFT_NAT_CHAIN: &str = "postrouting";
+
+#[cfg(target_os = "linux")]
+async fn ensure_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
     let mut args = vec![
         "-t".to_string(),
         "nat".to_string(),
         "-C".to_string(),
         "POSTROUTING".to_string(),
         "-s".to_string(),
-        cidr.clone(),
+        cidr.to_string(),
         "-j".to_string(),
         "MASQUERADE".to_string(),
     ];
@@ -621,19 +670,15 @@ pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError>
     ))
 }
 
-/// Remove the host-side SNAT rule installed by [`ensure_host_veth_nat`].
-/// Missing rules are treated as success so teardown is safe after a partial
-/// setup or a previous process crash.
 #[cfg(target_os = "linux")]
-pub async fn remove_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
-    let cidr = format!("{host_addr}/30");
+async fn remove_host_veth_nat_iptables(cidr: &str) -> Result<(), NetnsError> {
     let args = vec![
         "-t".to_string(),
         "nat".to_string(),
         "-D".to_string(),
         "POSTROUTING".to_string(),
         "-s".to_string(),
-        cidr,
+        cidr.to_string(),
         "-j".to_string(),
         "MASQUERADE".to_string(),
     ];
@@ -661,6 +706,187 @@ pub async fn remove_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError>
         output.status.code(),
         &String::from_utf8_lossy(&output.stderr),
     ))
+}
+
+#[cfg(target_os = "linux")]
+async fn ensure_host_veth_nat_nft(cidr: &str) -> Result<(), NetnsError> {
+    // Native nftables does not require a system-wide ruleset or a shell. The
+    // private table/chain lets multiple UE rules coexist and avoids touching
+    // NetworkManager/firewalld-owned chains.
+    run_nft_command(&["add", "table", "ip", NFT_NAT_TABLE], true).await?;
+    run_nft_command(
+        &[
+            "add",
+            "chain",
+            "ip",
+            NFT_NAT_TABLE,
+            NFT_NAT_CHAIN,
+            "{",
+            "type",
+            "nat",
+            "hook",
+            "postrouting",
+            "priority",
+            "100",
+            ";",
+            "policy",
+            "accept",
+            ";",
+            "}",
+        ],
+        true,
+    )
+    .await?;
+
+    let listing =
+        run_nft_output(&["-a", "list", "chain", "ip", NFT_NAT_TABLE, NFT_NAT_CHAIN]).await?;
+    if nft_rule_handle(&listing, cidr).is_some() {
+        return Ok(());
+    }
+    run_nft_command(
+        &[
+            "add",
+            "rule",
+            "ip",
+            NFT_NAT_TABLE,
+            NFT_NAT_CHAIN,
+            "ip",
+            "saddr",
+            cidr,
+            "counter",
+            "masquerade",
+        ],
+        false,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn remove_host_veth_nat_nft(cidr: &str) -> Result<(), NetnsError> {
+    let listing =
+        match run_nft_output(&["-a", "list", "chain", "ip", NFT_NAT_TABLE, NFT_NAT_CHAIN]).await {
+            Ok(listing) => listing,
+            Err(error) if is_missing_nft_object_error(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+    let Some(handle) = nft_rule_handle(&listing, cidr) else {
+        return Ok(());
+    };
+    run_nft_command(
+        &[
+            "delete",
+            "rule",
+            "ip",
+            NFT_NAT_TABLE,
+            NFT_NAT_CHAIN,
+            "handle",
+            &handle.to_string(),
+        ],
+        false,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+async fn run_nft_output(args: &[&str]) -> Result<String, NetnsError> {
+    let output = Command::new("nft")
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| NetnsError {
+            kind: NetnsErrorKind::SpawnFailed,
+            detail: format!("nft:{error}"),
+        })?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+    }
+    Err(NetnsError::command(
+        "nft",
+        &args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>(),
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+async fn run_nft_command(args: &[&str], allow_existing: bool) -> Result<(), NetnsError> {
+    let output = Command::new("nft")
+        .args(args)
+        .output()
+        .await
+        .map_err(|error| NetnsError {
+            kind: NetnsErrorKind::SpawnFailed,
+            detail: format!("nft:{error}"),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if allow_existing && (stderr.contains("file exists") || stderr.contains("already exists")) {
+        return Ok(());
+    }
+    Err(NetnsError::command(
+        "nft",
+        &args
+            .iter()
+            .map(|arg| (*arg).to_string())
+            .collect::<Vec<_>>(),
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
+/// Parse the handle of the rule we own from `nft -a list chain` output. The
+/// expression is intentionally strict so another UE's subnet cannot be
+/// removed by accident. This helper is pure and therefore testable on every
+/// build target.
+#[cfg(any(target_os = "linux", test))]
+fn nft_rule_handle(output: &str, cidr: &str) -> Option<u64> {
+    output.lines().find_map(|line| {
+        let line = line.trim();
+        if !line.contains("ip saddr ") || !line.contains(cidr) || !line.contains("masquerade") {
+            return None;
+        }
+        let marker = line.rsplit_once("# handle ")?.1.trim();
+        marker.parse().ok()
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn is_missing_backend_error(error: &NetnsError) -> bool {
+    let detail = error.detail.to_ascii_lowercase();
+    error.kind == NetnsErrorKind::SpawnFailed
+        && (detail.contains("no such file") || detail.contains("not found"))
+}
+
+#[cfg(target_os = "linux")]
+fn is_missing_nft_object_error(error: &NetnsError) -> bool {
+    error.kind == NetnsErrorKind::CommandFailed
+        && (error.detail.to_ascii_lowercase().contains("no such file")
+            || error
+                .detail
+                .to_ascii_lowercase()
+                .contains("could not process rule")
+            || error.detail.to_ascii_lowercase().contains("does not exist"))
+}
+
+#[cfg(target_os = "linux")]
+fn combine_nat_errors(iptables_error: Option<NetnsError>, nft_error: NetnsError) -> NetnsError {
+    let detail = match iptables_error {
+        Some(error) => format!("iptables: {}; nft: {}", error.detail, nft_error.detail),
+        None => format!("nft: {}", nft_error.detail),
+    };
+    NetnsError {
+        kind: if nft_error.kind == NetnsErrorKind::SpawnFailed {
+            NetnsErrorKind::SpawnFailed
+        } else {
+            NetnsErrorKind::CommandFailed
+        },
+        detail,
+    }
 }
 
 /// Remove the host-side SNAT rule for a UE veth subnet. Unsupported off
@@ -794,6 +1020,30 @@ mod tests {
         assert!(validate_link_name("this-name-is-way-too-long").is_err());
         assert!(validate_link_name("bad name").is_err());
         assert!(validate_link_name("wwan0").is_ok());
+    }
+
+    #[test]
+    fn nft_rule_handle_matches_only_our_source_masquerade_rule() {
+        let listing = r#"
+            chain postrouting {
+                    type nat hook postrouting priority srcnat; policy accept;
+                    ip saddr 10.200.12.156/30 counter packets 0 bytes 0 masquerade # handle 17
+                    ip saddr 10.200.12.160/30 counter packets 0 bytes 0 masquerade # handle 18
+            }
+        "#;
+        assert_eq!(nft_rule_handle(listing, "10.200.12.156/30"), Some(17));
+        assert_eq!(nft_rule_handle(listing, "10.200.12.160/30"), Some(18));
+        assert_eq!(nft_rule_handle(listing, "10.200.12.164/30"), None);
+    }
+
+    #[test]
+    fn nft_rule_handle_ignores_non_masquerade_or_unrelated_lines() {
+        let listing = r#"
+            ip saddr 10.200.12.156/30 counter packets 0 bytes 0 accept # handle 21
+            ip daddr 10.200.12.156/30 counter packets 0 bytes 0 masquerade # handle 22
+            ip saddr 10.200.12.156/30 counter packets 0 bytes 0 masquerade
+        "#;
+        assert_eq!(nft_rule_handle(listing, "10.200.12.156/30"), None);
     }
 
     #[tokio::test]

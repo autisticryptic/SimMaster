@@ -294,6 +294,9 @@ pub struct LineRuntimeStatus {
 #[derive(Default)]
 pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
+    /// Serializes hardware discovery passes without holding the registry write
+    /// lock across worker, QMI, or namespace operations.
+    refresh_lock: Mutex<()>,
     config_manager: Option<Arc<ConfigManager>>,
     /// Used to restore each line's cumulative proxied-traffic counters when the
     /// line is first discovered, so totals survive a restart.
@@ -307,6 +310,7 @@ impl LineRuntimeRegistry {
     pub fn new() -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
+            refresh_lock: Mutex::new(()),
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
@@ -316,6 +320,7 @@ impl LineRuntimeRegistry {
     pub fn with_config(config_manager: Arc<ConfigManager>, database: Arc<Database>) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
+            refresh_lock: Mutex::new(()),
             config_manager: Some(config_manager),
             database: Some(database),
             traffic_persistence_lock: Mutex::new(()),
@@ -326,6 +331,10 @@ impl LineRuntimeRegistry {
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
     pub async fn refresh(&self, conn: &Connection) -> zbus::Result<usize> {
+        // Several handlers and background watchers may refresh concurrently.
+        // Keep discovery/reconciliation passes ordered, while the registry write
+        // lock remains reserved for the short snapshot publication below.
+        let _refresh_guard = self.refresh_lock.lock().await;
         let mut discovered = match discover_modem_bindings(conn).await {
             Ok(bindings) => bindings,
             Err(error) => {
@@ -504,52 +513,76 @@ impl LineRuntimeRegistry {
                 tracing::warn!(error = %error, "Failed to reconcile discovered line profiles");
             }
         }
-        let mut lines = self.lines.write().await;
-        for line in lines.values() {
-            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
-                &line.binding().line_id,
-            );
-            line.mark_absent();
-        }
-        for binding in discovered {
-            // Tell the VoWiFi live layer which SIM device this line owns, so its
-            // identity and authentication never use another modem's card.
-            if binding.line_kind == "reader" && binding.model.starts_with("pcsc://") {
-                crate::connectivity::modems::ims::vowifi::live::register_line_pcsc_reader(
-                    &binding.line_id,
-                    &binding.model,
+        // Publish only the binding snapshot while holding the registry lock.
+        // Namespace, worker, and bearer operations are intentionally deferred
+        // until after the lock is released so status/API readers stay usable
+        // while one modem is slow or unavailable.
+        let (present_lines, absent_lines, new_lines) = {
+            let mut lines = self.lines.write().await;
+            for line in lines.values() {
+                crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
+                    &line.binding().line_id,
                 );
-            } else {
-                crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
-                    &binding.line_id,
-                    binding.qmi_device.as_deref().unwrap_or_default(),
-                    binding.uim_slot,
-                    &binding.modem_path,
-                );
+                line.mark_absent();
             }
-            if let Some(line) = lines.get(&binding.line_id) {
-                if let Some(config_manager) = &self.config_manager {
-                    line.voice_access
-                        .set_policy(config_manager.get_line_voice_path_policy(&binding.line_id));
+
+            let mut new_lines = Vec::new();
+            for binding in discovered {
+                // Tell the VoWiFi live layer which SIM device this line owns, so
+                // its identity and authentication never use another modem's card.
+                if binding.line_kind == "reader" && binding.model.starts_with("pcsc://") {
+                    crate::connectivity::modems::ims::vowifi::live::register_line_pcsc_reader(
+                        &binding.line_id,
+                        &binding.model,
+                    );
+                } else {
+                    crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
+                        &binding.line_id,
+                        binding.qmi_device.as_deref().unwrap_or_default(),
+                        binding.uim_slot,
+                        &binding.modem_path,
+                    );
                 }
-                line.replace_binding(binding);
-                self.reconcile_ue_context(line, &line.binding()).await;
-                continue;
+                if let Some(line) = lines.get(&binding.line_id) {
+                    if let Some(config_manager) = &self.config_manager {
+                        line.voice_access.set_policy(
+                            config_manager.get_line_voice_path_policy(&binding.line_id),
+                        );
+                    }
+                    line.replace_binding(binding);
+                    continue;
+                }
+
+                let runtime = Arc::new(VolteRuntime::new());
+                let live = VolteLiveHandle::new();
+                let line_id = binding.line_id.clone();
+                let voice_policy = self
+                    .config_manager
+                    .as_ref()
+                    .map(|config| config.get_line_voice_path_policy(&line_id))
+                    .unwrap_or_default();
+                let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
+                lines.insert(line_id.clone(), Arc::clone(&line));
+                new_lines.push((line_id, line));
             }
-            let runtime = Arc::new(VolteRuntime::new());
-            let live = VolteLiveHandle::new();
-            let line_id = binding.line_id.clone();
-            let voice_policy = self
-                .config_manager
-                .as_ref()
-                .map(|config| config.get_line_voice_path_policy(&line_id))
-                .unwrap_or_default();
-            let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
-            self.reconcile_ue_context(&line, &line.binding()).await;
-            // Seed the traffic counters from disk the first time we see a line,
-            // so the reported totals are cumulative rather than per-boot.
-            if let Some(database) = &self.database {
-                if let Ok(stored) = database.get_line_data_traffic(&line_id) {
+
+            let present_lines = lines
+                .values()
+                .filter(|line| line.binding().present)
+                .cloned()
+                .collect::<Vec<_>>();
+            let absent_lines = lines
+                .values()
+                .filter(|line| !line.binding().present)
+                .cloned()
+                .collect::<Vec<_>>();
+            (present_lines, absent_lines, new_lines)
+        };
+
+        // Seed newly discovered traffic totals outside the registry lock.
+        if let Some(database) = &self.database {
+            for (line_id, line) in &new_lines {
+                if let Ok(stored) = database.get_line_data_traffic(line_id) {
                     line.data_proxy
                         .restore_persisted_traffic(DataProxyTraffic {
                             uplink_bytes: stored.uplink_bytes,
@@ -560,26 +593,30 @@ impl LineRuntimeRegistry {
                         .await;
                 }
             }
-            lines.insert(line_id, line);
         }
-        // Shut down the UE worker of any line whose anchor disappeared in this
-        // refresh; a later rediscovery re-spawns it. Present lines were already
-        // reconciled above, so their workers are kept running.
-        for line in lines.values().filter(|line| !line.binding().present) {
-            let line_id = line.binding().line_id;
+
+        for line in &present_lines {
+            let binding = line.binding();
+            self.reconcile_ue_context(line, &binding).await;
+        }
+
+        // Shut down workers whose hardware anchor disappeared. This is also
+        // deliberately outside the registry lock.
+        for line in &absent_lines {
+            let binding = line.binding();
             let worker = line.ue_worker.clone();
             if worker.is_running().await {
                 if let Err(error) = worker.shutdown().await {
                     tracing::warn!(
-                        line_id = %line_id,
+                        line_id = %binding.line_id,
                         error = %error,
                         "Failed to stop per-UE worker for absent line"
                     );
                 }
             }
-            self.teardown_ue_isolation(line, &line_id).await;
+            self.teardown_ue_isolation(line, &binding.line_id).await;
         }
-        Ok(lines.values().filter(|line| line.binding().present).count())
+        Ok(present_lines.len())
     }
 
     pub async fn get(&self, line_id: &str) -> Option<Arc<LineRuntime>> {

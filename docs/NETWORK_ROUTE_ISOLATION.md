@@ -105,4 +105,6 @@ AKA、registrar 和安全策略仍来自归属 profile。标准派生 profile �
 - Windows host `cargo check`：通过。
 - WSL Debian Linux `cargo check`：通过。
 - 路由域单元测试：3 个通过。
-- 410 现有二进制尚未包含本次改动，需通过 GitHub Actions 构建后再进行实机 VoLTE/VoWiFi 来电复测。
+- 410 当前部署的是 GitHub Actions 提交 `7481f9a`；本工作树的刷新并发保护与
+  iptables/nft NAT fallback 尚未进入设备。提交后必须重新拉取 ARM64 Release，再进行
+  实机 VoLTE/VoWiFi 来电复测。

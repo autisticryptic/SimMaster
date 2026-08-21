@@ -1,8 +1,9 @@
 # IMS 接入路径重构：410 实机回归清单
 
-> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `103743c` 的
+> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `7481f9a` 的
 > GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
-> 基础设施能够启动；下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
+> 基础设施能够启动；工作树中本次刷新并发/NAT fallback 修订尚未经过新的 Actions
+> 产物部署。下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
 
 ## 本轮变更
 
@@ -103,7 +104,7 @@ ip netns list
 - 当前 VoWiFi 已完成 ePDG、IKE、CHILD_SA、ESP 与 TUN，但 IMS REGISTER 收到
   SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实语音测试。
 - 当前 VoLTE、数据代理与 Trunk worker 功能门仍需逐项启用并回归，首次验证不得同时
-  打开多个功能门。
+  打开多个功能门；本次提交完成后应先重新验证 worker/namespace，再进入业务测试。
 - 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。
 - 暂不执行 EC20、EC25、EG25、EG600 与 PCSC/USB SIM reader 实机测试。
 - 暂不承诺通话中的无缝 access handover、IMS service continuity 或 SRVCC。
