@@ -1244,7 +1244,10 @@ fn sendmsg_frame(
     let mut cmsg_buf = vec![0u8; cmsg_space_for(fds.len())];
     if !fds.is_empty() {
         header.msg_control = cmsg_buf.as_mut_ptr().cast();
-        header.msg_controllen = cmsg_buf.len();
+        header.msg_controllen = cmsg_buf
+            .len()
+            .try_into()
+            .expect("control message buffer exceeds platform limit");
         unsafe {
             let cmsg = libc::CMSG_FIRSTHDR(&header);
             if cmsg.is_null() {
@@ -1255,9 +1258,11 @@ fn sendmsg_frame(
             }
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len =
-                libc::CMSG_LEN((fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint)
-                    as usize;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(
+                (fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
+            )
+            .try_into()
+            .expect("control message length exceeds platform limit");
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
         }
@@ -1337,7 +1342,10 @@ fn recv_control_frame(
     header_msg.msg_iovlen = 1;
     let mut cmsg_buf = vec![0u8; cmsg_space_for(MAX_SOCKET_FDS)];
     header_msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    header_msg.msg_controllen = cmsg_buf.len();
+    header_msg.msg_controllen = cmsg_buf
+        .len()
+        .try_into()
+        .expect("control message buffer exceeds platform limit");
     let received = unsafe { libc::recvmsg(fd, &mut header_msg, 0) };
     if received < 0 {
         return Err(std::io::Error::last_os_error());
@@ -1408,8 +1416,10 @@ fn extract_scm_rights(header: &libc::msghdr) -> Vec<i32> {
     while !cmsg.is_null() {
         unsafe {
             if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let payload_len = (*cmsg).cmsg_len.saturating_sub(libc::CMSG_LEN(0) as usize);
-                let count = payload_len / std::mem::size_of::<libc::c_int>();
+                let payload_len = (*cmsg)
+                    .cmsg_len
+                    .saturating_sub(libc::CMSG_LEN(0).try_into().expect("cmsg length overflow"));
+                let count = payload_len as usize / std::mem::size_of::<libc::c_int>();
                 if count > 0 {
                     let data = libc::CMSG_DATA(cmsg) as *const libc::c_int;
                     for index in 0..count {
