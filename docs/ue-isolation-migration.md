@@ -132,10 +132,10 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 | `services/ue_context.rs` | UE 身份模型：`ue_id`、`kind`（Modem / PCSC / 传统读卡器）、`uim_slot`、namespace、隔离开关状态 |
 | `services/ue_worker.rs` | worker 进程管理、Hello 握手、`NetStatus`、`NetConfigRequest/Result` 关联批处理、`Ping/Pong`、优雅退出；socket 工厂、受限 `ip xfrm`、按线路/功能注册表已实现 |
 | `services/ue_netcfg.rs` | 纯函数规划器：veth 地址/名称、UE 侧 ops、TUN ops、wwan ops（可单元测试） |
-| `connectivity/.../vowifi/live.rs` | 每线路 UE namespace 注册表 + worker 注册表 + **socket context 注册表**；IKE/SIP socket 按 context 选择 worker 创建或宿主路径 |
+| `connectivity/.../vowifi/live.rs` | 每线路单一 **UE socket context 注册表**（同时持有 namespace、UE veth 与 worker）；TUN namespace 与 IKE/SIP/RTP socket 均从同一 context 派生，避免刷新时出现归属分裂 |
 | `connectivity/.../vowifi/operator.rs` + `connectivity/core/media.rs` | **RTP/RTCP operator 侧 socket 通过 `OperatorSocketCreator` 走 worker**；Asterisk 内部 leg 仍留在宿主 |
 | `connectivity/.../vowifi/tun_gateway.rs` | TUN 创建后 `ip link set ... netns <ns>`，netns 内配地址/路由；`None` 时代码保持旧宿主路径 |
-| `services/line_registry.rs` | 线路刷新时 `reconcile_ue_context()`：ensure netns → spawn worker → veth → worker 应用 UE 侧配置 → 注册命名空间/socket context；关闭隔离时同时清理两个注册表 |
+| `services/line_registry.rs` | 线路刷新时 `reconcile_ue_context()`：ensure netns → spawn worker → veth → worker 应用 UE 侧配置 → 原子发布 socket context；普通读卡映射刷新不清它，关闭隔离/线路消失/worker 不可用时才清理 |
 | `platform/netns.rs` | `ensure_host_veth_nat()`：宿主侧 MASQUERADE（幂等检查后追加） |
 | `connectivity/modems/ims/volte/{bearer,native_bearer,channel,pcscf,ipsec,live}.rs` | native IMS `wwanX` 受限迁移；worker 内 IP/路由、P-CSCF DNS、SIP、XFRM、RTP；失败清理与接口回宿主 |
 | `hardware/devices/qcm410/secondary_qmi_data.rs` | DATA6/secondary QMI bearer 迁入对应线路 worker，停止时清理并把接口移回宿主 |
@@ -286,8 +286,8 @@ ue_isolation:
 4. 为 veth 宿主侧追加 MASQUERADE；
 5. VoWiFi 下一次重连时 TUN 进 netns；IKE、SIP、RTP socket 全部通过 worker
    在 UE netns 内创建；
-6. 关闭隔离或线路移除时，namespace 与 socket context 两个注册表都会被清理，
-   下一个重连自动回到宿主路径。
+6. 关闭隔离、线路移除或 worker 不可用时，单一 socket context 被清理；namespace
+   查询也随之返回 `None`，下一个重连自动回到宿主路径。
 
 任何一步失败都只告警并**回退到旧的宿主路径**（`None` 分支），不中断现有功能。
 

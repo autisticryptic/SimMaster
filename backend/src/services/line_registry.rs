@@ -716,6 +716,10 @@ impl LineRuntimeRegistry {
                 *fp = None;
             }
             if let Err(error) = worker.spawn().await {
+                crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                    &binding.line_id,
+                    None,
+                );
                 tracing::warn!(
                     line_id = %binding.line_id,
                     error = %error,
@@ -746,6 +750,7 @@ impl LineRuntimeRegistry {
         } else {
             None
         };
+        let worker_available = worker_registration.is_some();
         crate::services::ue_worker::register_line_worker(
             &line_id,
             worker_registration,
@@ -755,8 +760,16 @@ impl LineRuntimeRegistry {
                 trunk_sockets: isolation.trunk_sockets_in_worker,
             },
         );
+        if !worker_available {
+            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                &line_id, None,
+            );
+        }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
+                crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+                    &line_id, None,
+                );
                 tracing::warn!(
                     line_id = %line_id,
                     error = %error,
