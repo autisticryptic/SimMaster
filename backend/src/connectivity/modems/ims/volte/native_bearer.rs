@@ -29,9 +29,10 @@ use crate::hardware::devices::qcm410::ims_bearer::Qcm410ImsBearer;
 use crate::hardware::devices::transport::{
     ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo, ImsBearerTransport,
 };
+use crate::{platform::netns, services::ue_worker::UeWorkerHandle};
 
 use super::{
-    bearer::{BearerConnection, BearerRequest},
+    bearer::{teardown_bearer_network_in_worker, BearerConnection, BearerRequest},
     errors::{code, VolteError},
     pcscf::{self, ImsIpSettings},
     plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
@@ -74,6 +75,73 @@ pub struct NativeImsBearer {
     pub netdev_method: &'static str,
     /// Device-owned teardown handle. This module never inspects it.
     handle: Box<dyn ImsBearerHandle + Send>,
+    worker: Option<UeWorkerHandle>,
+    moved_to_worker: bool,
+}
+
+impl NativeImsBearer {
+    /// Move the dedicated native netdev into this line's UE namespace. The
+    /// primary ModemManager interface (`wwan0`) is intentionally rejected;
+    /// only the secondary QMI bearer created by this session may cross the
+    /// namespace boundary.
+    pub async fn move_into_worker(&mut self, worker: UeWorkerHandle) -> Result<(), VolteError> {
+        if self.interface == "wwan0" {
+            return Err(VolteError::with_detail(
+                code::COMMAND_FAILED,
+                "native bearer refuses to move ModemManager primary interface wwan0",
+            ));
+        }
+        if self.moved_to_worker {
+            return Ok(());
+        }
+        netns::move_iface_in(worker.namespace(), &self.interface)
+            .await
+            .map_err(|error| {
+                VolteError::with_detail(
+                    code::COMMAND_FAILED,
+                    format!(
+                        "move native bearer {} into {}: {error}",
+                        self.interface,
+                        worker.namespace()
+                    ),
+                )
+            })?;
+        let status = worker.refresh_net_status().await;
+        if status.as_ref().ok().is_none_or(|snapshot| {
+            !snapshot
+                .interfaces
+                .iter()
+                .any(|name| name == &self.interface)
+        }) {
+            let _ = netns::move_iface_out(worker.namespace(), &self.interface).await;
+            return Err(VolteError::with_detail(
+                code::COMMAND_FAILED,
+                format!(
+                    "worker cannot observe moved native interface {}",
+                    self.interface
+                ),
+            ));
+        }
+        self.worker = Some(worker);
+        self.moved_to_worker = true;
+        Ok(())
+    }
+
+    pub fn worker(&self) -> Option<&UeWorkerHandle> {
+        self.worker.as_ref()
+    }
+
+    pub async fn restore_from_worker(&mut self) {
+        if !self.moved_to_worker {
+            return;
+        }
+        if let Some(worker) = self.worker.as_ref() {
+            let _ = netns::move_iface_out(worker.namespace(), &self.interface).await;
+            let _ = worker.refresh_net_status().await;
+        }
+        self.moved_to_worker = false;
+        self.worker = None;
+    }
 }
 
 /// Families to attempt, in the plan's order, as QMI `ip-type` values.
@@ -205,7 +273,11 @@ pub async fn establish_native_ims_bearer(
 }
 
 /// Tear down a native bearer's WDS session(s) and release its endpoint.
-pub async fn release_native_ims_bearer(bearer: NativeImsBearer) {
+pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
+    if let Some(worker) = bearer.worker.as_ref() {
+        teardown_bearer_network_in_worker(&bearer.connection, worker).await;
+    }
+    bearer.restore_from_worker().await;
     bearer.handle.release().await;
 }
 
@@ -222,6 +294,8 @@ async fn adopt_bearer(
             interface: info.interface,
             netdev_method: info.netdev_method,
             handle,
+            worker: None,
+            moved_to_worker: false,
         }),
         Err(error) => {
             handle.release().await;

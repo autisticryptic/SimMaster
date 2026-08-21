@@ -35,6 +35,12 @@
 - [ ] 相同 IP、网关、P-CSCF 时 netns、路由、XFRM、SIP、RTP 仍互不干扰。
 - [ ] worker 异常退出后可恢复，且不遗留 namespace、route 或 XFRM。
 - [ ] 按 `docs/ue-isolation-migration.md` 验证数据代理与 Trunk 的 per-UE 映射。
+- [ ] ModemManager 主接口 `wwan0` 不被迁移；只迁移 SimAdmin 本次 native bearer
+  创建的非 `wwan0` 接口。
+- [ ] native `wwanN` 迁移失败、worker 网络配置失败或 worker 消失时，接口回宿主并
+  释放 QMI/WDS session，不遗留半连接 bearer。
+- [ ] P-CSCF 的 PCO、AT active-context 和 worker DNS fallback 均可观测并能分别验证。
+- [ ] 本次 IMS XFRM 只在当前 worker 安装/删除，不执行宿主或其他线路全局 flush。
 
 注意：VoLTE `wwanX` 完整迁入 worker/netns 仍需逐步实机回归，不得仅凭 VoWiFi worker 测试宣称完成。
 
@@ -51,6 +57,15 @@
 - [ ] RTP 入出站网口与所选 UE 一致，不串线路。
 - [ ] 待机 access 切换不修改已建立 dialog；通话固定在建立时的 leg。
 - [ ] 视频来电的语音降级、视频协商、挂断同步分别记录。
+- [ ] `trunk_sockets_in_worker` 开启时 operator RTP 在当前线路 netns；Asterisk/internal
+  leg 保持宿主网络，二者桥接后仍可双向收发。
+
+### 数据代理
+
+- [ ] DATA6/secondary bearer 迁入对应线路 worker，`wwan0` 不受影响。
+- [ ] HTTP、HTTP CONNECT、SOCKS5 均从所选线路出口，不能回落到 Wi-Fi/其他基带。
+- [ ] 两条线路获得完全相同地址时，代理连接和流量计数仍分别归属正确线路。
+- [ ] 停止线路后 worker 路由/地址清理，secondary interface 回宿主 namespace。
 
 当前阶段不承诺通话中的无缝 VoLTE/VoWiFi handover、IMS service continuity 或 SRVCC。
 

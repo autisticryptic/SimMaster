@@ -19,6 +19,7 @@
 use std::net::IpAddr;
 
 use super::errors::{code, VolteError};
+use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 
 /// The four-way port/SPI binding negotiated via SIP `Security-Client` /
 /// `Security-Server` (sec-agree). `port_c`/`spi_c` are the UE (client) side,
@@ -418,6 +419,44 @@ pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), VolteError> {
     Ok(())
 }
 
+/// Install an IMS XFRM plan inside a per-line UE worker namespace.
+///
+/// A worker namespace is already exclusive to one UE, so flushing XFRM there
+/// is unnecessary and would make retries race with another session in the same
+/// namespace. The operation batch is therefore add-only; on a partial failure
+/// the installed entries are removed with best-effort delete operations.
+pub async fn install_plan_in_worker(
+    plan: &XfrmInstallPlan,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    let ops = plan
+        .states
+        .iter()
+        .map(|state| NetConfigOp::Xfrm {
+            args: build_xfrm_state_add(state),
+            best_effort: false,
+        })
+        .chain(plan.policies.iter().cloned().map(|args| NetConfigOp::Xfrm {
+            args,
+            best_effort: false,
+        }))
+        .collect();
+    let outcome = worker.apply_net_config(ops).await.map_err(|error| {
+        VolteError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
+    })?;
+    if outcome.ok {
+        Ok(())
+    } else {
+        uninstall_plan_in_worker(plan, worker).await;
+        Err(VolteError::with_detail(
+            code::COMMAND_FAILED,
+            outcome
+                .error
+                .unwrap_or_else(|| "worker xfrm install failed".to_string()),
+        ))
+    }
+}
+
 /// Remove only the SAs/policies installed for this IMS session. This avoids a
 /// global xfrm flush, which could tear down an unrelated VPN on the host.
 pub fn uninstall_plan(plan: &XfrmInstallPlan) {
@@ -447,6 +486,45 @@ pub fn uninstall_plan(plan: &XfrmInstallPlan) {
         ];
         let _ = run_ip(&delete);
     }
+}
+
+/// Remove only the entries represented by `plan` inside a UE worker namespace.
+/// All operations are best-effort so a dead namespace or an already removed
+/// SA cannot mask the caller's original registration failure.
+pub async fn uninstall_plan_in_worker(plan: &XfrmInstallPlan, worker: &UeWorkerHandle) {
+    let mut ops = Vec::with_capacity(plan.policies.len() + plan.states.len());
+    for policy in plan.policies.iter().rev() {
+        let mut delete = policy.clone();
+        if let Some(action) = delete.get_mut(2) {
+            *action = "delete".to_string();
+        }
+        if let Some(template) = delete.iter().position(|part| part == "tmpl") {
+            delete.truncate(template);
+        }
+        ops.push(NetConfigOp::Xfrm {
+            args: delete,
+            best_effort: true,
+        });
+    }
+    for state in plan.states.iter().rev() {
+        ops.push(NetConfigOp::Xfrm {
+            args: vec![
+                "xfrm".to_string(),
+                "state".to_string(),
+                "delete".to_string(),
+                "src".to_string(),
+                state.src.to_string(),
+                "dst".to_string(),
+                state.dst.to_string(),
+                "proto".to_string(),
+                "esp".to_string(),
+                "spi".to_string(),
+                format!("0x{:08x}", state.spi),
+            ],
+            best_effort: true,
+        });
+    }
+    let _ = worker.apply_net_config(ops).await;
 }
 
 /// Best-effort teardown of all VoLTE xfrm state/policy.

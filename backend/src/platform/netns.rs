@@ -621,10 +621,59 @@ pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError>
     ))
 }
 
+/// Remove the host-side SNAT rule installed by [`ensure_host_veth_nat`].
+/// Missing rules are treated as success so teardown is safe after a partial
+/// setup or a previous process crash.
+#[cfg(target_os = "linux")]
+pub async fn remove_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {
+    let cidr = format!("{host_addr}/30");
+    let args = vec![
+        "-t".to_string(),
+        "nat".to_string(),
+        "-D".to_string(),
+        "POSTROUTING".to_string(),
+        "-s".to_string(),
+        cidr,
+        "-j".to_string(),
+        "MASQUERADE".to_string(),
+    ];
+    let output = Command::new("iptables")
+        .args(&args)
+        .output()
+        .await
+        .map_err(|error| NetnsError {
+            kind: NetnsErrorKind::SpawnFailed,
+            detail: format!("iptables:{error}"),
+        })?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    if stderr.contains("bad rule")
+        || stderr.contains("does a matching rule exist")
+        || stderr.contains("no chain/target/match")
+    {
+        return Ok(());
+    }
+    Err(NetnsError::command(
+        "iptables",
+        &args,
+        output.status.code(),
+        &String::from_utf8_lossy(&output.stderr),
+    ))
+}
+
 /// Remove the host-side SNAT rule for a UE veth subnet. Unsupported off
 /// Linux.
 #[cfg(not(target_os = "linux"))]
 pub async fn ensure_host_veth_nat(_host_addr: Ipv4Addr) -> Result<(), NetnsError> {
+    Err(NetnsError::unsupported(
+        "network namespaces are only supported on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub async fn remove_host_veth_nat(_host_addr: Ipv4Addr) -> Result<(), NetnsError> {
     Err(NetnsError::unsupported(
         "network namespaces are only supported on Linux",
     ))

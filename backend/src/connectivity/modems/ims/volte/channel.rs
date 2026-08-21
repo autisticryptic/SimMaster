@@ -16,16 +16,22 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
 use crate::connectivity::core::{access::ImsChannel, context::ImsRoute, ImsError};
+use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 const MAX_SIP_DATAGRAM: usize = 65_535;
 
 pub struct VolteSipChannel {
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
-    reserved_receive_socket: Option<Socket>,
+    reserved_receive_socket: Option<ReservedReceiveSocket>,
     route: ImsRoute,
     interface: Option<String>,
     security_verify: Option<String>,
+}
+
+enum ReservedReceiveSocket {
+    Host(Socket),
+    Worker(UdpSocket),
 }
 
 impl VolteSipChannel {
@@ -54,13 +60,83 @@ impl VolteSipChannel {
     /// P-CSCF.  The initial REGISTER socket remains the protected send socket.
     pub fn reserve_security_receive_port(&mut self) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
-            return socket_port(socket);
+            return match socket {
+                ReservedReceiveSocket::Host(socket) => socket_port(socket),
+                ReservedReceiveSocket::Worker(socket) => socket
+                    .local_addr()
+                    .map(|addr| addr.port())
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+            };
         }
         let local = SocketAddr::new(self.route.local_addr.ip(), 0);
         let socket = build_bound_socket(local, self.interface.as_deref())
             .map_err(|_| ImsError::new("volte_channel_receive_reserve_failed"))?;
         let port = socket_port(&socket)?;
-        self.reserved_receive_socket = Some(socket);
+        self.reserved_receive_socket = Some(ReservedReceiveSocket::Host(socket));
+        Ok(port)
+    }
+
+    /// Create the initial SIP channel inside a per-line UE worker.  The
+    /// bearer/QMI lifecycle remains in the parent; only the socket's kernel
+    /// network namespace is moved.  Callers must retain the host path as a
+    /// fallback because a worker cannot reach a bearer interface that has not
+    /// yet been bridged or moved into its namespace.
+    pub async fn bind_in_worker(
+        route: ImsRoute,
+        worker: &UeWorkerHandle,
+        interface: Option<&str>,
+        security_verify: Option<String>,
+    ) -> Result<Self, ImsError> {
+        let spec = UeSocketSpec::udp_connected(
+            route.local_addr,
+            route.pcscf_addr,
+            interface.map(ToOwned::to_owned),
+        );
+        let socket = match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+        };
+        let mut route = route;
+        route.local_addr = socket
+            .local_addr()
+            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+        Ok(Self {
+            send_socket: Some(socket),
+            receive_socket: None,
+            reserved_receive_socket: None,
+            route,
+            interface: interface.map(ToOwned::to_owned),
+            security_verify,
+        })
+    }
+
+    /// Reserve the protected receive port using the worker socket factory.
+    pub async fn reserve_security_receive_port_in_worker(
+        &mut self,
+        worker: &UeWorkerHandle,
+    ) -> Result<u16, ImsError> {
+        if let Some(socket) = self.reserved_receive_socket.as_ref() {
+            return match socket {
+                ReservedReceiveSocket::Host(socket) => socket_port(socket),
+                ReservedReceiveSocket::Worker(socket) => socket
+                    .local_addr()
+                    .map(|addr| addr.port())
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+            };
+        }
+        let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+        let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
+        let socket = match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+        };
+        let port = socket
+            .local_addr()
+            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+            .port();
+        self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(socket));
         Ok(port)
     }
 
@@ -77,11 +153,19 @@ impl VolteSipChannel {
             .reserved_receive_socket
             .take()
             .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
-        if socket_addr(&reserved)? != receive_local {
-            return Err(ImsError::new("volte_channel_receive_port_mismatch"));
-        }
-        let receive_socket = connect_bound_socket(reserved, receive_remote)
-            .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?;
+        let receive_socket = match reserved {
+            ReservedReceiveSocket::Host(reserved) => {
+                if socket_addr(&reserved)? != receive_local {
+                    return Err(ImsError::new("volte_channel_receive_port_mismatch"));
+                }
+                connect_bound_socket(reserved, receive_remote)
+                    .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?
+            }
+            ReservedReceiveSocket::Worker(socket) => {
+                let _ = (socket, receive_local, receive_remote);
+                return Err(ImsError::new("volte_channel_worker_receive_requires_async"));
+            }
+        };
 
         // Release the initial connected socket before rebinding the same local
         // send port to the P-CSCF protected client port.
@@ -92,6 +176,60 @@ impl VolteSipChannel {
             self.interface.as_deref(),
         )
         .map_err(|_| ImsError::new("volte_channel_protected_send_bind_failed"))?;
+        let mut send_route = send_route;
+        send_route.local_addr = send_socket
+            .local_addr()
+            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+        self.send_socket = Some(send_socket);
+        self.receive_socket = Some(receive_socket);
+        self.route = send_route;
+        self.security_verify = security_verify;
+        Ok(())
+    }
+
+    /// Worker equivalent of [`Self::activate_security`].  The protected send
+    /// socket is recreated in the worker after XFRM has been installed; the
+    /// already-reserved receive socket is connected locally in the parent.
+    pub async fn activate_security_in_worker(
+        &mut self,
+        send_route: ImsRoute,
+        receive_local: SocketAddr,
+        receive_remote: SocketAddr,
+        security_verify: Option<String>,
+        worker: &UeWorkerHandle,
+    ) -> Result<(), ImsError> {
+        let reserved = self
+            .reserved_receive_socket
+            .take()
+            .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
+        let receive_socket = match reserved {
+            ReservedReceiveSocket::Worker(socket) => {
+                let local = socket
+                    .local_addr()
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+                if local != receive_local {
+                    return Err(ImsError::new("volte_channel_receive_port_mismatch"));
+                }
+                socket
+                    .connect(receive_remote)
+                    .await
+                    .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?;
+                socket
+            }
+            ReservedReceiveSocket::Host(_) => {
+                return Err(ImsError::new("volte_channel_worker_receive_mismatch"));
+            }
+        };
+        let spec = UeSocketSpec::udp_connected(
+            send_route.local_addr,
+            send_route.pcscf_addr,
+            self.interface.clone(),
+        );
+        let send_socket = match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+        };
         let mut send_route = send_route;
         send_route.local_addr = send_socket
             .local_addr()

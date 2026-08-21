@@ -20,7 +20,10 @@ use std::{
 
 use tokio::{net::UdpSocket, process::Command, time::sleep};
 
-use crate::platform::config::VolteIpFamilyPreference;
+use crate::{
+    platform::config::VolteIpFamilyPreference,
+    services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
+};
 
 use super::errors::{code, VolteError};
 use super::plan::{ImsConnectionPlan, IpFamily};
@@ -565,6 +568,44 @@ pub async fn discover_pcscf_on_interface(
     local: IpAddr,
     interface: Option<&str>,
 ) -> Result<IpAddr, VolteError> {
+    discover_pcscf_on_path(
+        settings,
+        home_domain,
+        configured_pcscf,
+        local,
+        interface,
+        None,
+    )
+    .await
+}
+
+pub async fn discover_pcscf_in_worker(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: &str,
+    worker: &UeWorkerHandle,
+) -> Result<IpAddr, VolteError> {
+    discover_pcscf_on_path(
+        settings,
+        home_domain,
+        configured_pcscf,
+        local,
+        Some(interface),
+        Some(worker),
+    )
+    .await
+}
+
+async fn discover_pcscf_on_path(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: Option<&str>,
+    worker: Option<&UeWorkerHandle>,
+) -> Result<IpAddr, VolteError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
             .into_iter()
@@ -602,8 +643,15 @@ pub async fn discover_pcscf_on_interface(
         let address_type = if local.is_ipv6() { 28 } else { 1 };
         for server in dns_servers {
             if server.is_ipv4() == local.is_ipv4() {
-                if let Ok(records) =
-                    query_dns(local, *server, configured_host, address_type, interface).await
+                if let Ok(records) = query_dns(
+                    local,
+                    *server,
+                    configured_host,
+                    address_type,
+                    interface,
+                    worker,
+                )
+                .await
                 {
                     if let Some(address) = records
                         .addresses
@@ -624,7 +672,7 @@ pub async fn discover_pcscf_on_interface(
             continue;
         }
         let address_type = if local.is_ipv6() { 28 } else { 1 };
-        match query_dns(local, *server, &pcscf_name, address_type, interface).await {
+        match query_dns(local, *server, &pcscf_name, address_type, interface, worker).await {
             Ok(records) => {
                 if let Some(address) = records
                     .addresses
@@ -642,7 +690,7 @@ pub async fn discover_pcscf_on_interface(
         }
 
         for srv_name in &srv_names {
-            let records = match query_dns(local, *server, srv_name, 33, interface).await {
+            let records = match query_dns(local, *server, srv_name, 33, interface, worker).await {
                 Ok(records) => records,
                 Err(error) => {
                     tracing::debug!(dns_server = %server, name = %srv_name, error = %error, "VoLTE P-CSCF DNS SRV query failed");
@@ -651,7 +699,7 @@ pub async fn discover_pcscf_on_interface(
             };
             for target in records.srv_targets {
                 if let Ok(target_records) =
-                    query_dns(local, *server, &target, address_type, interface).await
+                    query_dns(local, *server, &target, address_type, interface, worker).await
                 {
                     if let Some(address) = target_records
                         .addresses
@@ -693,21 +741,50 @@ async fn query_dns(
     name: &str,
     record_type: u16,
     interface: Option<&str>,
+    worker: Option<&UeWorkerHandle>,
 ) -> Result<DnsRecords, VolteError> {
     let query_id = dns_query_id(name, record_type);
     let query = build_dns_query(query_id, name, record_type)?;
-    let socket = bind_dns_socket(SocketAddr::new(local, 0), interface)
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    socket
-        .send_to(&query, SocketAddr::new(server, DNS_PORT))
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    let remote = SocketAddr::new(server, DNS_PORT);
+    let socket = if let Some(worker) = worker {
+        let spec = UeSocketSpec::udp_connected(
+            SocketAddr::new(local, 0),
+            remote,
+            interface.map(str::to_string),
+        );
+        match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            _ => return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
+        }
+    } else {
+        bind_dns_socket(SocketAddr::new(local, 0), interface)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+    };
+    if worker.is_some() {
+        socket
+            .send(&query)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    } else {
+        socket
+            .send_to(&query, remote)
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    }
     let mut response = [0u8; 4096];
-    let (read, _) = tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
-        .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+    let read = if worker.is_some() {
+        tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+    } else {
+        tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
+            .await
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+            .0
+    };
     parse_dns_response(query_id, &response[..read])
 }
 

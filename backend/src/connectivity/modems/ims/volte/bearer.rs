@@ -19,6 +19,7 @@ use tokio::process::Command;
 use crate::platform::network_routing::{
     host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
 };
+use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 
 use super::{
     errors::{code, VolteError},
@@ -535,6 +536,106 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
 }
 
+/// Configure a dedicated native IMS netdev after it has been moved into its
+/// per-line worker namespace. No policy-rule/table indirection is needed there:
+/// the namespace itself is the route domain, so identical addresses on other
+/// UEs cannot collide.
+pub async fn configure_bearer_network_in_worker(
+    bearer: &BearerConnection,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    let mut ops = Vec::new();
+    if let Some(mtu) = bearer.mtu {
+        ops.push(NetConfigOp::LinkSetMtu {
+            ifname: bearer.interface.clone(),
+            mtu,
+        });
+    }
+    for (address, prefix, dns) in [
+        (
+            bearer.settings.ipv6_address,
+            bearer.ipv6_prefix.unwrap_or(64),
+            bearer.settings.ipv6_dns.as_slice(),
+        ),
+        (
+            bearer.settings.ipv4_address,
+            bearer.ipv4_prefix.unwrap_or(32),
+            bearer.settings.ipv4_dns.as_slice(),
+        ),
+    ] {
+        let Some(address) = address else { continue };
+        ops.push(NetConfigOp::AddrReplace {
+            ifname: bearer.interface.clone(),
+            cidr: format!("{address}/{prefix}"),
+        });
+        for server in dns {
+            ops.push(worker_host_route_op(bearer, *server)?);
+        }
+    }
+    if !ops
+        .iter()
+        .any(|op| matches!(op, NetConfigOp::AddrReplace { .. }))
+    {
+        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+    }
+    ops.push(NetConfigOp::LinkSetUp {
+        ifname: bearer.interface.clone(),
+    });
+    apply_worker_ops(worker, ops).await
+}
+
+pub async fn route_pcscf_in_worker(
+    bearer: &BearerConnection,
+    pcscf: IpAddr,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    apply_worker_ops(worker, vec![worker_host_route_op(bearer, pcscf)?]).await
+}
+
+pub async fn route_media_host_in_worker(
+    bearer: &BearerConnection,
+    host: IpAddr,
+    worker: &UeWorkerHandle,
+) -> Result<(), VolteError> {
+    apply_worker_ops(worker, vec![worker_host_route_op(bearer, host)?]).await
+}
+
+fn worker_host_route_op(
+    bearer: &BearerConnection,
+    host: IpAddr,
+) -> Result<NetConfigOp, VolteError> {
+    let source = bearer
+        .settings
+        .local_addr_for_family(host)
+        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    Ok(NetConfigOp::RouteReplace {
+        target: host_selector(host),
+        via: None,
+        dev: Some(bearer.interface.clone()),
+        src: Some(source.to_string()),
+        table: None,
+    })
+}
+
+async fn apply_worker_ops(
+    worker: &UeWorkerHandle,
+    ops: Vec<NetConfigOp>,
+) -> Result<(), VolteError> {
+    let outcome = worker.apply_net_config(ops).await.map_err(|error| {
+        VolteError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
+    })?;
+    if outcome.ok {
+        Ok(())
+    } else {
+        Err(VolteError::with_detail(
+            code::COMMAND_FAILED,
+            outcome
+                .error
+                .unwrap_or_else(|| "worker net-config failed".to_string()),
+        ))
+    }
+}
+
 /// Ensure that the kernel data path is usable before installing policy routes.
 ///
 /// ModemManager reports a connected QMI bearer before the bam-dmux netdev has
@@ -542,7 +643,7 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
 /// administrative OPEN can also fail with EINVAL when the driver's runtime-PM
 /// state is already `error`; continuing in that state only turns the real
 /// failure into a misleading route error and can race the modem firmware.
-async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
+pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
     if interface_is_up(interface).await {
         return Ok(());
     }
@@ -805,6 +906,40 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     // disconnected. Sending `ip link down` here duplicates that operation and
     // can race the firmware on Qualcomm SoCs, especially after a failed route
     // setup. Ordinary interface state is cleaned up by the bearer disconnect.
+}
+
+/// Remove only network state owned by a native IMS interface in a UE worker.
+/// The worker namespace may also contain VoWiFi/veth state, so cleanup is
+/// deliberately device-scoped and never flushes the whole main table.
+pub async fn teardown_bearer_network_in_worker(bearer: &BearerConnection, worker: &UeWorkerHandle) {
+    let mut ops = vec![
+        NetConfigOp::FlushRoutesForDevice {
+            ifname: bearer.interface.clone(),
+            ipv6: true,
+        },
+        NetConfigOp::FlushRoutesForDevice {
+            ifname: bearer.interface.clone(),
+            ipv6: false,
+        },
+    ];
+    for (address, prefix) in [
+        (
+            bearer.settings.ipv6_address,
+            bearer.ipv6_prefix.unwrap_or(64),
+        ),
+        (
+            bearer.settings.ipv4_address,
+            bearer.ipv4_prefix.unwrap_or(32),
+        ),
+    ] {
+        if let Some(address) = address {
+            ops.push(NetConfigOp::AddrDel {
+                ifname: bearer.interface.clone(),
+                cidr: format!("{address}/{prefix}"),
+            });
+        }
+    }
+    let _ = worker.apply_net_config(ops).await;
 }
 
 /// Disconnect a ModemManager bearer.

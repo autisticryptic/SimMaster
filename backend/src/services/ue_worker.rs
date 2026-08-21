@@ -42,6 +42,76 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
+/// Registry of live workers keyed by the stable line id.  The registry is
+/// intentionally independent from the VoWiFi module: data proxy, VoLTE and
+/// future 5G access legs all need the same UE owner, while VoWiFi may choose
+/// to enable its TUN/socket path separately.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UeWorkerFeatures {
+    /// Shared LTE/NR 3GPP IMS data plane. The worker does not care which radio
+    /// access created the bearer; both use the same namespace/socket contract.
+    pub three_gpp_ims: bool,
+    pub data_proxy: bool,
+    pub trunk_sockets: bool,
+}
+
+#[derive(Clone)]
+struct RegisteredLineWorker {
+    handle: UeWorkerHandle,
+    features: UeWorkerFeatures,
+}
+
+static LINE_WORKERS: std::sync::OnceLock<StdMutex<HashMap<String, RegisteredLineWorker>>> =
+    std::sync::OnceLock::new();
+
+fn line_workers() -> &'static StdMutex<HashMap<String, RegisteredLineWorker>> {
+    LINE_WORKERS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+pub fn register_line_worker(
+    line_id: &str,
+    worker: Option<UeWorkerHandle>,
+    features: UeWorkerFeatures,
+) {
+    let mut workers = line_workers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match worker {
+        Some(worker) => {
+            workers.insert(
+                line_id.to_string(),
+                RegisteredLineWorker {
+                    handle: worker,
+                    features,
+                },
+            );
+        }
+        None => {
+            workers.remove(line_id);
+        }
+    }
+}
+
+pub fn worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
+    line_workers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .map(|worker| worker.handle.clone())
+}
+
+pub fn worker_for_line_feature(
+    line_id: &str,
+    feature: fn(UeWorkerFeatures) -> bool,
+) -> Option<UeWorkerHandle> {
+    line_workers()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .filter(|worker| feature(worker.features))
+        .map(|worker| worker.handle.clone())
+}
+
 #[cfg(not(unix))]
 use crate::platform::netns::NetnsName;
 #[cfg(unix)]
@@ -55,7 +125,7 @@ pub const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_ATTEMPTS: usize = 25;
 const CONNECT_DELAY: Duration = Duration::from_millis(200);
 
-    /// Environment variables consumed by the hidden `ue-worker` subcommand.
+/// Environment variables consumed by the hidden `ue-worker` subcommand.
 pub const ENV_LINE_ID: &str = "SIMADMIN_UE_LINE_ID";
 pub const ENV_NETNS: &str = "SIMADMIN_UE_NETNS";
 pub const ENV_CONTROL: &str = "SIMADMIN_UE_CONTROL";
@@ -83,6 +153,10 @@ pub enum NetConfigOp {
     },
     LinkSetDown {
         ifname: String,
+    },
+    LinkSetMtu {
+        ifname: String,
+        mtu: u32,
     },
     /// `ip address replace <cidr> dev <ifname>` — idempotent.
     AddrReplace {
@@ -114,9 +188,28 @@ pub enum NetConfigOp {
         via: String,
         dev: String,
     },
+    /// Point-to-point WWAN default route without an explicit next hop.
+    DefaultRouteDeviceReplace {
+        dev: String,
+        ipv6: bool,
+        metric: u32,
+    },
     /// `ip route flush table <t>`; omitting the table flushes `table main`.
     FlushRoutes {
         table: Option<u32>,
+    },
+    /// Best-effort removal of routes owned by one interface only. Unlike a
+    /// main-table flush this preserves the UE veth/VoWiFi paths.
+    FlushRoutesForDevice {
+        ifname: String,
+        ipv6: bool,
+    },
+    /// Execute one validated `ip xfrm ...` argv inside this worker's namespace.
+    /// The command is deliberately limited to the `xfrm` family so the parent
+    /// cannot turn the worker control channel into an arbitrary shell.
+    Xfrm {
+        args: Vec<String>,
+        best_effort: bool,
     },
 }
 
@@ -471,6 +564,31 @@ impl UeWorkerHandle {
             Err(_) => Err(UeWorkerError::Protocol(format!(
                 "net-config request {request_id} timed out"
             ))),
+        }
+    }
+
+    /// Ask the worker for an immediate namespace snapshot and wait briefly for
+    /// the reader task to publish it. This is used after moving a native WWAN
+    /// interface so feature gates never rely on a stale pre-migration view.
+    pub async fn refresh_net_status(&self) -> Result<NetStatusSnapshot, UeWorkerError> {
+        self.core.state.lock().unwrap().last_net_status = None;
+        if !self.send(UeWorkerMessage::NetStatusRequest) {
+            return Err(UeWorkerError::Protocol(
+                "worker control channel is not up".to_string(),
+            ));
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = self.status().await;
+            if let Some(snapshot) = status.last_net_status {
+                return Ok(snapshot);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(UeWorkerError::Protocol(
+                    "worker net-status request timed out".to_string(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 
@@ -1258,11 +1376,10 @@ fn sendmsg_frame(
             }
             (*cmsg).cmsg_level = libc::SOL_SOCKET;
             (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-            (*cmsg).cmsg_len = libc::CMSG_LEN(
-                (fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint,
-            )
-            .try_into()
-            .expect("control message length exceeds platform limit");
+            (*cmsg).cmsg_len =
+                libc::CMSG_LEN((fds.len() * std::mem::size_of::<libc::c_int>()) as libc::c_uint)
+                    .try_into()
+                    .expect("control message length exceeds platform limit");
             let data = libc::CMSG_DATA(cmsg) as *mut libc::c_int;
             std::ptr::copy_nonoverlapping(fds.as_ptr(), data, fds.len());
         }
@@ -1493,7 +1610,10 @@ async fn execute_net_config(ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Option
     let mut output = Vec::with_capacity(ops.len());
     let ip_path = discover_ip().await.unwrap_or_else(|| "ip".to_string());
     for op in ops {
-        let argv = net_config_argv(&op);
+        let argv = match net_config_argv(&op) {
+            Ok(argv) => argv,
+            Err(error) => return (false, output, Some(error)),
+        };
         let result = Command::new(&ip_path).args(&argv).output().await;
         match result {
             Ok(command_output) if command_output.status.success() => {
@@ -1542,14 +1662,22 @@ async fn execute_net_config(_ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Optio
 /// is a static token or a value serialized from the worker protocol, never a
 /// shell string.
 #[cfg(unix)]
-fn net_config_argv(op: &NetConfigOp) -> Vec<String> {
-    match op {
+fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
+    let argv = match op {
         NetConfigOp::LinkSetUp { ifname } => {
             vec!["link".into(), "set".into(), ifname.clone(), "up".into()]
         }
         NetConfigOp::LinkSetDown { ifname } => {
             vec!["link".into(), "set".into(), ifname.clone(), "down".into()]
         }
+        NetConfigOp::LinkSetMtu { ifname, mtu } => vec![
+            "link".into(),
+            "set".into(),
+            "dev".into(),
+            ifname.clone(),
+            "mtu".into(),
+            mtu.to_string(),
+        ],
         NetConfigOp::AddrReplace { ifname, cidr } => vec![
             "address".into(),
             "replace".into(),
@@ -1601,13 +1729,67 @@ fn net_config_argv(op: &NetConfigOp) -> Vec<String> {
             "dev".into(),
             dev.as_str().into(),
         ],
+        NetConfigOp::DefaultRouteDeviceReplace { dev, ipv6, metric } => {
+            let mut argv = Vec::with_capacity(8);
+            if *ipv6 {
+                argv.push("-6".into());
+            }
+            argv.extend([
+                "route".into(),
+                "replace".into(),
+                "default".into(),
+                "dev".into(),
+                dev.clone(),
+                "metric".into(),
+                metric.to_string(),
+            ]);
+            argv
+        }
         NetConfigOp::FlushRoutes { table } => {
             let table = table
                 .map(|value| value.to_string())
                 .unwrap_or_else(|| "main".to_string());
             vec!["route".into(), "flush".into(), "table".into(), table]
         }
+        NetConfigOp::FlushRoutesForDevice { ifname, ipv6 } => {
+            let mut argv = Vec::with_capacity(5);
+            if *ipv6 {
+                argv.push("-6".into());
+            }
+            argv.extend(["route".into(), "flush".into(), "dev".into(), ifname.clone()]);
+            argv
+        }
+        NetConfigOp::Xfrm { args, best_effort } => {
+            validate_xfrm_argv(args, *best_effort)?;
+            args.clone()
+        }
+    };
+    Ok(argv)
+}
+
+/// Keep the worker control channel scoped to the exact XFRM operations emitted
+/// by the IMS stack. Values are passed directly to `Command`, never a shell,
+/// but restricting the command family still prevents a compromised parent
+/// request from using this privileged worker as a generic `ip` executor.
+#[cfg(unix)]
+fn validate_xfrm_argv(args: &[String], best_effort: bool) -> Result<(), String> {
+    let valid = matches!(
+        args,
+        [family, object, action, ..]
+            if family == "xfrm"
+                && matches!(object.as_str(), "state" | "policy")
+                && matches!(action.as_str(), "add" | "delete" | "flush")
+    );
+    if !valid {
+        return Err(format!(
+            "UE worker rejected unsupported xfrm argv: {}",
+            args.join(" ")
+        ));
     }
+    if best_effort && !matches!(args.get(2).map(String::as_str), Some("delete" | "flush")) {
+        return Err("UE worker best-effort xfrm is limited to cleanup operations".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1619,7 +1801,14 @@ fn route_argv(
     src: Option<&str>,
     table: Option<u32>,
 ) -> Vec<String> {
-    let mut argv: Vec<String> = vec!["route".into(), action.into(), target.into()];
+    let ipv6 = target.contains(':')
+        || via.is_some_and(|value| value.contains(':'))
+        || src.is_some_and(|value| value.contains(':'));
+    let mut argv: Vec<String> = Vec::new();
+    if ipv6 {
+        argv.push("-6".into());
+    }
+    argv.extend(["route".into(), action.into(), target.into()]);
     if let Some(via) = via {
         argv.push("via".into());
         argv.push(via.into());
@@ -1650,14 +1839,21 @@ fn is_benign_net_config_error(op: &NetConfigOp, stderr: &str) -> bool {
         || stderr.contains("file exists")
         || stderr.contains("already exists")
         || stderr.contains("does not exist");
-    benign
+    matches!(
+        op,
+        NetConfigOp::Xfrm {
+            best_effort: true,
+            ..
+        }
+    ) || (benign
         && matches!(
             op,
             NetConfigOp::AddrDel { .. }
                 | NetConfigOp::RouteDel { .. }
                 | NetConfigOp::LinkSetDown { .. }
                 | NetConfigOp::FlushRoutes { .. }
-        )
+                | NetConfigOp::FlushRoutesForDevice { .. }
+        ))
 }
 
 #[cfg(unix)]
@@ -1757,6 +1953,14 @@ mod tests {
                     src: Some("10.0.0.5".to_string()),
                     table: None,
                 },
+                NetConfigOp::Xfrm {
+                    args: vec![
+                        "xfrm".to_string(),
+                        "policy".to_string(),
+                        "flush".to_string(),
+                    ],
+                    best_effort: true,
+                },
             ],
         };
         let payload = serde_json::to_vec(&message).unwrap();
@@ -1774,6 +1978,28 @@ mod tests {
         let payload = serde_json::to_vec(&result).unwrap();
         let decoded: UeWorkerMessage = serde_json::from_slice(&payload).unwrap();
         assert_eq!(decoded, result);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xfrm_argv_is_restricted_to_state_and_policy_operations() {
+        let add = NetConfigOp::Xfrm {
+            args: vec!["xfrm".into(), "state".into(), "add".into()],
+            best_effort: false,
+        };
+        assert_eq!(net_config_argv(&add).unwrap(), vec!["xfrm", "state", "add"]);
+
+        let arbitrary = NetConfigOp::Xfrm {
+            args: vec!["link".into(), "delete".into(), "wwan0".into()],
+            best_effort: true,
+        };
+        assert!(net_config_argv(&arbitrary).is_err());
+
+        let ignored_add = NetConfigOp::Xfrm {
+            args: vec!["xfrm".into(), "policy".into(), "add".into()],
+            best_effort: true,
+        };
+        assert!(net_config_argv(&ignored_add).is_err());
     }
 
     #[test]

@@ -21,6 +21,9 @@ use tokio::{
 };
 
 use crate::platform::config::LineDataProxyConfig;
+use crate::services::ue_worker::{
+    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerFeatures, UeWorkerHandle,
+};
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 
@@ -295,6 +298,43 @@ impl DataProxyRuntime {
         interface_name: &str,
         config: &LineDataProxyConfig,
     ) -> Result<DataProxyStatus, String> {
+        self.start_with_worker(interface_name, config, None).await
+    }
+
+    /// Start a proxy with an optional per-line worker for outbound sockets.
+    /// The listener remains host-side so existing clients keep the same API;
+    /// only the cellular egress is moved into the UE namespace.
+    pub async fn start_for_line(
+        &self,
+        line_id: &str,
+        interface_name: &str,
+        config: &LineDataProxyConfig,
+    ) -> Result<DataProxyStatus, String> {
+        let worker = match worker_for_line_feature(line_id, data_proxy_worker_enabled) {
+            Some(worker) => {
+                let status = worker.status().await;
+                status
+                    .last_net_status
+                    .as_ref()
+                    .is_some_and(|snapshot| {
+                        snapshot
+                            .interfaces
+                            .iter()
+                            .any(|name| name == interface_name)
+                    })
+                    .then_some(worker)
+            }
+            None => None,
+        };
+        self.start_with_worker(interface_name, config, worker).await
+    }
+
+    async fn start_with_worker(
+        &self,
+        interface_name: &str,
+        config: &LineDataProxyConfig,
+        worker: Option<UeWorkerHandle>,
+    ) -> Result<DataProxyStatus, String> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() {
             return Err("cellular_data_interface_unavailable".to_string());
@@ -325,6 +365,7 @@ impl DataProxyRuntime {
             .port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let outbound_interface = interface_name.to_string();
+        let outbound_worker = worker.clone();
         let username = config.username.clone();
         let password = config.password.clone();
         let counters = Arc::clone(&self.counters);
@@ -338,11 +379,19 @@ impl DataProxyRuntime {
                         match accepted {
                             Ok((stream, _)) => {
                                 let interface = outbound_interface.clone();
+                                let worker = outbound_worker.clone();
                                 let auth = ProxyAuth::new(username.clone(), password.clone());
                                 let counters = Arc::clone(&counters);
                                 clients.spawn(async move {
                                     counters.connection_opened();
-                                    let result = serve_client(stream, &interface, &auth, &counters).await;
+                                    let result = serve_client(
+                                        stream,
+                                        &interface,
+                                        worker.as_ref(),
+                                        &auth,
+                                        &counters,
+                                    )
+                                    .await;
                                     counters.connection_closed();
                                     if let Err(error) = result {
                                         tracing::debug!(interface = %interface, error = %error, "Cellular data proxy client closed");
@@ -399,6 +448,10 @@ impl DataProxyRuntime {
     }
 }
 
+fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.data_proxy
+}
+
 async fn stop_locked(state: &mut ProxyState) {
     if let Some(shutdown) = state.shutdown.take() {
         let _ = shutdown.send(());
@@ -441,6 +494,7 @@ impl ProxyAuth {
 async fn serve_client(
     inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -450,15 +504,16 @@ async fn serve_client(
         return Ok(());
     }
     if first[0] == 0x05 {
-        serve_socks5(inbound, interface_name, auth, counters).await
+        serve_socks5(inbound, interface_name, worker, auth, counters).await
     } else {
-        serve_http_proxy(inbound, interface_name, auth, counters).await
+        serve_http_proxy(inbound, interface_name, worker, auth, counters).await
     }
 }
 
 async fn serve_socks5(
     mut inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -508,7 +563,7 @@ async fn serve_socks5(
         }
     };
     let port = inbound.read_u16().await?;
-    match connect_bound(&host, port, interface_name).await {
+    match connect_bound(&host, port, interface_name, worker).await {
         Ok(outbound) => {
             write_socks_reply(&mut inbound, 0).await?;
             relay_counted(inbound, outbound, counters).await?;
@@ -538,6 +593,7 @@ async fn write_socks_reply(stream: &mut TcpStream, code: u8) -> io::Result<()> {
 async fn serve_http_proxy(
     mut inbound: TcpStream,
     interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
     auth: &ProxyAuth,
     counters: &Arc<DataProxyCounters>,
 ) -> io::Result<()> {
@@ -572,7 +628,7 @@ async fn serve_http_proxy(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = split_host_port(target, 443)?;
-        match connect_bound(&host, port, interface_name).await {
+        match connect_bound(&host, port, interface_name, worker).await {
             Ok(outbound) => {
                 inbound
                     .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -589,7 +645,7 @@ async fn serve_http_proxy(
         name.eq_ignore_ascii_case("host").then(|| value.trim())
     });
     let (host, port, origin_target) = parse_http_target(target, host_header)?;
-    let mut outbound = match connect_bound(&host, port, interface_name).await {
+    let mut outbound = match connect_bound(&host, port, interface_name, worker).await {
         Ok(stream) => stream,
         Err(_) => {
             write_http_error(&mut inbound, 502, "Bad Gateway").await?;
@@ -713,12 +769,44 @@ async fn write_http_error(stream: &mut TcpStream, code: u16, reason: &str) -> io
     stream.write_all(response.as_bytes()).await
 }
 
-async fn connect_bound(host: &str, port: u16, interface_name: &str) -> io::Result<TcpStream> {
+async fn connect_bound(
+    host: &str,
+    port: u16,
+    interface_name: &str,
+    worker: Option<&UeWorkerHandle>,
+) -> io::Result<TcpStream> {
     let addresses = lookup_host((host, port))
         .await?
         .collect::<Vec<SocketAddr>>();
     let mut last_error = None;
     for address in addresses {
+        if let Some(worker) = worker {
+            let local = if address.is_ipv4() {
+                "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+            } else {
+                "[::]:0".parse().expect("valid IPv6 wildcard")
+            };
+            let spec =
+                UeSocketSpec::tcp_connected(local, address, Some(interface_name.to_string()), 10);
+            match worker.create_socket(spec).await {
+                Ok(UeSocket::Tcp(stream)) => return Ok(stream),
+                Ok(_) => {
+                    tracing::warn!(interface = %interface_name, "UE worker returned a non-TCP proxy socket");
+                    last_error = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "UE worker returned a non-TCP proxy socket",
+                    ));
+                }
+                Err(error) => {
+                    tracing::debug!(interface = %interface_name, error = %error, "UE worker proxy connect failed");
+                    last_error = Some(io::Error::other(error.to_string()));
+                }
+            }
+            // The selected cellular interface belongs to the worker
+            // namespace. A host fallback cannot bind it and must not escape
+            // through Wi-Fi or another modem.
+            continue;
+        }
         let socket = if address.is_ipv4() {
             TcpSocket::new_v4()?
         } else {

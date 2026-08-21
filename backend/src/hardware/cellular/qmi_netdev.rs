@@ -390,6 +390,17 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String>
     Ok(())
 }
 
+/// Restore a session interface in the host namespace after an attempted UE
+/// namespace migration. This is the public counterpart of the resolver's
+/// private candidate setup and includes the proxy default route.
+pub async fn configure_host_data_path(
+    interface: &str,
+    config: &NetdevConfig,
+) -> Result<(), String> {
+    configure(interface, config).await?;
+    install_default_route(interface, config).await
+}
+
 /// Remove what `configure` added, so a rejected candidate holds no state.
 async fn deconfigure(interface: &str, config: &NetdevConfig) {
     let family_arg: &[&str] = if config.address.is_ipv6() {

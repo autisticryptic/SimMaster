@@ -566,16 +566,18 @@ impl LineRuntimeRegistry {
         // refresh; a later rediscovery re-spawns it. Present lines were already
         // reconciled above, so their workers are kept running.
         for line in lines.values().filter(|line| !line.binding().present) {
+            let line_id = line.binding().line_id;
             let worker = line.ue_worker.clone();
             if worker.is_running().await {
                 if let Err(error) = worker.shutdown().await {
                     tracing::warn!(
-                        line_id = %line.binding().line_id,
+                        line_id = %line_id,
                         error = %error,
                         "Failed to stop per-UE worker for absent line"
                     );
                 }
             }
+            self.teardown_ue_isolation(line, &line_id).await;
         }
         Ok(lines.values().filter(|line| line.binding().present).count())
     }
@@ -736,6 +738,23 @@ impl LineRuntimeRegistry {
             }
         }
         let line_id = binding.line_id.clone();
+        // Publish the worker through the generic UE registry.  Other access
+        // legs (VoLTE, data proxy and the future 5G bearer) resolve the same
+        // line owner instead of maintaining another per-module map.
+        let worker_registration = if ue_ready && worker.is_running().await {
+            Some(worker.clone())
+        } else {
+            None
+        };
+        crate::services::ue_worker::register_line_worker(
+            &line_id,
+            worker_registration,
+            crate::services::ue_worker::UeWorkerFeatures {
+                three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
+                data_proxy: isolation.data_proxy_in_worker,
+                trunk_sockets: isolation.trunk_sockets_in_worker,
+            },
+        );
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
                 tracing::warn!(
@@ -746,23 +765,53 @@ impl LineRuntimeRegistry {
             }
         } else {
             // Fall back to the host-namespace VoWiFi path and best-effort
-            // remove a leftover veth pair from a previous isolated run.
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
-                &line_id, None,
-            );
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                &line_id, None,
-            );
-            let host_if = ue.host_veth_name(&isolation);
-            if let Err(error) = crate::platform::netns::teardown_veth(&host_if).await {
-                tracing::debug!(
-                    line_id = %line_id,
-                    host_if = %host_if,
-                    error = %error,
-                    "No UE veth pair to tear down (expected when isolation was never enabled)"
-                );
-            }
+            // remove all resources from a previous isolated run.
+            self.teardown_ue_isolation(line, &line_id).await;
         }
+    }
+
+    async fn teardown_ue_isolation(&self, line: &LineRuntime, line_id: &str) {
+        let isolation = self
+            .config_manager
+            .as_ref()
+            .map(|config| config.get_ue_isolation())
+            .unwrap_or_default();
+        let ue = line.ue();
+        crate::services::ue_worker::register_line_worker(
+            line_id,
+            None,
+            crate::services::ue_worker::UeWorkerFeatures::default(),
+        );
+        crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(line_id, None);
+        crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
+            line_id, None,
+        );
+        let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
+        if let Err(error) = crate::platform::netns::remove_host_veth_nat(plan.host_addr).await {
+            tracing::debug!(
+                line_id,
+                host_addr = %plan.host_addr,
+                error = %error,
+                "No UE veth NAT rule to remove"
+            );
+        }
+        if let Err(error) = crate::platform::netns::teardown_veth(&plan.host_if).await {
+            tracing::debug!(
+                line_id,
+                host_if = %plan.host_if,
+                error = %error,
+                "No UE veth pair to tear down"
+            );
+        }
+        if let Err(error) = ue.teardown_netns().await {
+            tracing::debug!(
+                line_id,
+                namespace = %ue.namespace,
+                error = %error,
+                "No UE namespace to remove"
+            );
+        }
+        *line.egress_fingerprint.lock().await = None;
     }
 
     /// Prepare the UE-side egress and ask the worker to apply it inside the
@@ -791,16 +840,16 @@ impl LineRuntimeRegistry {
         // skip the worker net-config batch when nothing has changed.
         let fingerprint = format!(
             "{}|{}|{}|{}|{}|{}",
-            plan.host_if, plan.ue_if, plan.host_addr, plan.ue_addr, plan.mtu,
+            plan.host_if,
+            plan.ue_if,
+            plan.host_addr,
+            plan.ue_addr,
+            plan.mtu,
             isolation.vowifi_tun_in_namespace,
         );
         let worker = line.ue_worker.clone();
         {
-            let prev = line
-                .egress_fingerprint
-                .lock()
-                .await
-                .clone();
+            let prev = line.egress_fingerprint.lock().await.clone();
             if prev.as_deref() == Some(fingerprint.as_str()) {
                 // Plan unchanged — skip the worker net-config round-trip.
                 return Ok(());
@@ -824,10 +873,7 @@ impl LineRuntimeRegistry {
         }
         // Persist the fingerprint so subsequent reconcile calls are no-ops.
         {
-            let mut slot = line
-                .egress_fingerprint
-                .lock()
-                .await;
+            let mut slot = line.egress_fingerprint.lock().await;
             *slot = Some(fingerprint);
         }
         // Host-side SNAT for the UE egress subnet. Worker-created sockets

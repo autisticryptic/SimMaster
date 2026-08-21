@@ -756,6 +756,20 @@ pub(crate) fn ue_socket_context_for_line(line_id: &str) -> Option<LiveUeSocketCo
         .cloned()
 }
 
+/// Return the common per-UE operator socket factory for another IMS access
+/// leg.  VoLTE uses this for RTP/RTCP/video while VoWiFi uses the same factory
+/// internally; keeping construction here guarantees both legs resolve the
+/// same line-owned worker.
+pub(crate) fn operator_socket_creator_for_line(
+    line_id: &str,
+) -> Option<Arc<dyn OperatorSocketCreator>> {
+    ue_socket_context_for_line(line_id).map(|context| {
+        Arc::new(super::operator::UeWorkerOperatorSocketCreator::new(
+            context.worker,
+        )) as Arc<dyn OperatorSocketCreator>
+    })
+}
+
 /// Record which reader a line owns. Called when lines are discovered/refreshed.
 pub fn register_line_sim_device(line_id: &str, qmi_device: &str, uim_slot: u8, modem_path: &str) {
     if line_id.is_empty() || (qmi_device.is_empty() && modem_path.is_empty()) {

@@ -591,6 +591,18 @@ pub struct UeIsolationConfig {
     /// yet; enable only after the VoWiFi sockets are migrated into the worker.
     #[serde(default)]
     pub vowifi_tun_in_namespace: bool,
+    /// Stage 3 gate: place 3GPP IMS (LTE today, NR later) bearer networking,
+    /// SIP/XFRM and RTP sockets in the per-line worker namespace. The hardware
+    /// bearer stays device-owned and the host path remains the safe fallback.
+    #[serde(default)]
+    pub three_gpp_ims_sockets_in_worker: bool,
+    /// Stage 4 gate: run per-line proxy outbound sockets through its worker.
+    #[serde(default)]
+    pub data_proxy_in_worker: bool,
+    /// Stage 4 gate for trunk media sockets. Signalling and dialog ownership
+    /// are already line-scoped; this controls only operator RTP socket creation.
+    #[serde(default)]
+    pub trunk_sockets_in_worker: bool,
 }
 
 impl Default for UeIsolationConfig {
@@ -602,6 +614,9 @@ impl Default for UeIsolationConfig {
             ue_veth_prefix: default_ue_veth_prefix(),
             veth_mtu: default_ue_veth_mtu(),
             vowifi_tun_in_namespace: false,
+            three_gpp_ims_sockets_in_worker: false,
+            data_proxy_in_worker: false,
+            trunk_sockets_in_worker: false,
         }
     }
 }

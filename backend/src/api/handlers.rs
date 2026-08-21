@@ -2883,7 +2883,7 @@ async fn start_line_data_runtime_locked(
     // proxy on the data path and avoids allocating a duplicate WDS session.
     if let Some(interface) = line.secondary_data.interface().await {
         line.data_proxy
-            .start(&interface, &profile.data_proxy)
+            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
         return Ok(());
     }
@@ -2897,7 +2897,7 @@ async fn start_line_data_runtime_locked(
             .map_err(|error| error.to_string())?
     {
         line.data_proxy
-            .start(&interface, &profile.data_proxy)
+            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
         return Ok(());
     }
@@ -2913,12 +2913,12 @@ async fn start_line_data_runtime_locked(
     if let Some(qmi_device) = binding.qmi_device.as_deref() {
         match line
             .secondary_data
-            .start(&binding.modem_id, qmi_device, &apn)
+            .start(&binding.line_id, qmi_device, &apn)
             .await
         {
             Ok(interface) => {
                 line.data_proxy
-                    .start(&interface, &profile.data_proxy)
+                    .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
                     .await?;
                 return Ok(());
             }
@@ -2956,7 +2956,7 @@ async fn start_line_data_runtime_locked(
     }
     let interface = interface.ok_or_else(|| "cellular_data_interface_unavailable".to_string())?;
     line.data_proxy
-        .start(&interface, &profile.data_proxy)
+        .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
         .await?;
     Ok(())
 }
@@ -3248,7 +3248,11 @@ async fn prepare_line_data_slot_for_volte(
             }
         }
     } else if let Some(interface) = primary_data_interface.as_deref() {
-        if let Err(error) = line.data_proxy.start(interface, &profile.data_proxy).await {
+        if let Err(error) = line
+            .data_proxy
+            .start_for_line(&binding.line_id, interface, &profile.data_proxy)
+            .await
+        {
             line.data_proxy.record_error(error.clone()).await;
             warn!(line_id = %binding.line_id, error = %error, "Primary data is active but its local proxy is unavailable");
         }
@@ -5917,11 +5921,7 @@ pub async fn get_line_ims_status_handler(
     let vowifi = VowifiScope::for_line(Arc::clone(&line)).status().await;
     let non_three_gpp = NonThreeGppObservation {
         configured: profile.vowifi.enabled,
-        epdg_host: vowifi
-            .profile
-            .epdg
-            .as_ref()
-            .map(|epdg| epdg.host.clone()),
+        epdg_host: vowifi.profile.epdg.as_ref().map(|epdg| epdg.host.clone()),
         epdg_ready: vowifi.readiness.epdg_ready,
         ike_ready: vowifi.readiness.ike_ready,
         child_sa_ready: vowifi.readiness.child_sa_ready,
@@ -5934,7 +5934,9 @@ pub async fn get_line_ims_status_handler(
             .map(str::to_string),
         registered: vowifi.readiness.ims_registered,
         degraded_reason: vowifi.degraded_reason.clone(),
-        media_gateway_ready: line.voice_access.media_gateway_ready(AccessPathKind::Vowifi),
+        media_gateway_ready: line
+            .voice_access
+            .media_gateway_ready(AccessPathKind::Vowifi),
     };
 
     (

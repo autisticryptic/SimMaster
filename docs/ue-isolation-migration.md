@@ -1,6 +1,6 @@
 # 多 UE 隔离架构迁移文档（Option B：per-UE worker + setns）
 
-> 状态：**阶段一/二（worker 底座 + VoWiFi 数据面）已完成代码实现，待 410 单 UE 实机验证**。
+> 状态：**阶段一至四已完成代码实现，待 410 分阶段实机回归；阶段五仅完成通用底座**。
 > 本文档是 `multi_ue_ims_volte_vowifi_architecture.md` 的落地实现记录，记录了已完成的
 > 实机验证、当前代码状态、控制协议，以及 VoWiFi → VoLTE → 数据代理/Trunk → 5G
 > 的逐步迁移计划与验收标准。
@@ -83,7 +83,8 @@ Network / IMS / IKE / RTP 状态。**
 
 - **主进程负责**：硬件访问（ModemManager/QMI）、bearer/PDP 生命周期、配置、API、
   DB、事件总线、Trunk/Asterisk、用户态 ESP/TUN 转发器（fd 跨 netns 引用同一设备）。
-- **worker 负责**：UE netns 内的所有 socket（IKE、SIP、RTP 等）与网络配置执行。
+- **worker 负责**：UE netns 内的 socket（IKE、SIP、RTP、代理出口等）、受限 XFRM
+  操作与网络配置执行；SimAdmin 自建的 secondary/native `wwanX` 可迁入该 netns。
 - **控制通道**：Unix socket，长度前缀 JSON 帧；fd 通过 `SCM_RIGHTS` 传递。
 
 为什么不是把整个 IMS 状态机搬进 worker：VoLTE 的 bearer/QMI 仍在主进程，
@@ -129,13 +130,16 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 |---|---|
 | `platform/netns.rs` | `NetnsName` 稳定命名、`ensure`/`remove`、`setns_pre_exec`、veth 对创建/拆除、单调命名检查 |
 | `services/ue_context.rs` | UE 身份模型：`ue_id`、`kind`（Modem / PCSC / 传统读卡器）、`uim_slot`、namespace、隔离开关状态 |
-| `services/ue_worker.rs` | worker 进程管理、Hello 握手、`NetStatus`、`NetConfigRequest/Result` 关联批处理、`Ping/Pong`、优雅退出；**socket 工厂已实现（见 §5）** |
+| `services/ue_worker.rs` | worker 进程管理、Hello 握手、`NetStatus`、`NetConfigRequest/Result` 关联批处理、`Ping/Pong`、优雅退出；socket 工厂、受限 `ip xfrm`、按线路/功能注册表已实现 |
 | `services/ue_netcfg.rs` | 纯函数规划器：veth 地址/名称、UE 侧 ops、TUN ops、wwan ops（可单元测试） |
 | `connectivity/.../vowifi/live.rs` | 每线路 UE namespace 注册表 + worker 注册表 + **socket context 注册表**；IKE/SIP socket 按 context 选择 worker 创建或宿主路径 |
 | `connectivity/.../vowifi/operator.rs` + `connectivity/core/media.rs` | **RTP/RTCP operator 侧 socket 通过 `OperatorSocketCreator` 走 worker**；Asterisk 内部 leg 仍留在宿主 |
 | `connectivity/.../vowifi/tun_gateway.rs` | TUN 创建后 `ip link set ... netns <ns>`，netns 内配地址/路由；`None` 时代码保持旧宿主路径 |
 | `services/line_registry.rs` | 线路刷新时 `reconcile_ue_context()`：ensure netns → spawn worker → veth → worker 应用 UE 侧配置 → 注册命名空间/socket context；关闭隔离时同时清理两个注册表 |
 | `platform/netns.rs` | `ensure_host_veth_nat()`：宿主侧 MASQUERADE（幂等检查后追加） |
+| `connectivity/modems/ims/volte/{bearer,native_bearer,channel,pcscf,ipsec,live}.rs` | native IMS `wwanX` 受限迁移；worker 内 IP/路由、P-CSCF DNS、SIP、XFRM、RTP；失败清理与接口回宿主 |
+| `hardware/devices/qcm410/secondary_qmi_data.rs` | DATA6/secondary QMI bearer 迁入对应线路 worker，停止时清理并把接口移回宿主 |
+| `hardware/cellular/data_proxy.rs` | HTTP/SOCKS5 监听仍在宿主，出站 TCP socket 由对应线路 worker 创建并绑定该线路接口 |
 | `platform/config.rs` | `ue_isolation` 配置块（见 §6） |
 
 ### 4.2 worker 控制协议（当前）
@@ -153,6 +157,8 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 - `link_set_up / link_set_down`
 - `addr_replace / addr_del`（幂等）
 - `route_replace / route_del`、`default_route_replace`、`flush_routes`
+- `link_set_mtu`、按设备 flush route、无显式网关的 WWAN default route
+- 受限的 `xfrm state/policy add/delete/flush`（不接受任意 `ip` 子命令）
 
 附加设计：`addr_del`、`route_del`、`flush_routes` 的“不存在”类错误视为良性，保证重入安全。
 
@@ -250,6 +256,9 @@ ue_isolation:
   ue_veth_prefix: save
   veth_mtu: 1500
   vowifi_tun_in_namespace: true # stage-2b 门：TUN 进 netns 且 VoWiFi socket 走 worker
+  three_gpp_ims_sockets_in_worker: false # stage-3：VoLTE/未来 VoNR 的 bearer、SIP、XFRM、RTP
+  data_proxy_in_worker: false   # stage-4：数据代理出口 socket + secondary DATA bearer
+  trunk_sockets_in_worker: false # stage-4：operator RTP socket；Asterisk/internal leg 留宿主
 ```
 
 只有 `enabled && vowifi_tun_in_namespace` 同时为 true 时，线路注册表才会：
@@ -265,12 +274,13 @@ ue_isolation:
 
 任何一步失败都只告警并**回退到旧的宿主路径**（`None` 分支），不中断现有功能。
 
-> 验收前提：阶段二 b 必须先在 410 上通过 §8 的“单 UE 验证清单”。通过之前不进入 VoLTE
-> （§6.1），核心 `volte/bearer.rs`、`volte/live.rs` 注册链保持不动。
+四个功能门默认均为 `false`。虽然阶段三/四代码已经完成，410 回归仍必须按
+VoWiFi → VoLTE → 数据代理/Trunk 的顺序逐个启用；不能一次打开全部功能后把故障归因给
+任意一层。
 
 ---
 
-## 6. 后续阶段计划（VoLTE → 数据代理/Trunk → 5G）
+## 6. 阶段三至五状态（VoLTE → 数据代理/Trunk → 5G）
 
 ### 6.1 阶段三：VoLTE
 
@@ -281,18 +291,19 @@ ue_isolation:
 - 空闲 `wwanN` 移入 netns 不干扰 ModemManager ⇒ 优先占用空闲通道；
 - `wwan0` 移出会触发 MM 重建 Modem ⇒ 保留给默认数据，SimAdmin 需要容忍重新探测窗口。
 
-实施选项：
+已实现：
 
-1. **veth 桥接**：`wwanX` 留在宿主，主进程把 wwanX 的地址/路由通过 veth 转进 UE netns，
-   UE netns 内 socket 绑定 veth UE 侧；改动小，但 P-CSCF 流量要过两层转发。
-2. **`wwanX` 直接进 netns + `VolteSipChannel`/register 迁入 worker**：
-   最彻底、隔离最干净，但 `volte/bearer.rs`、`volte/live.rs` 的注册与多媒体通道都要
-   改造为 worker 通信，属于核心 IMS 重构。
+- 仅把 SimAdmin 本次 native QMI IMS session 自己创建的非 `wwan0` 接口迁入 worker；
+  明确拒绝迁移 ModemManager 主接口 `wwan0`；
+- worker 内配置 IMS 地址、MTU、P-CSCF/DNS/媒体路由；
+- P-CSCF DNS、`VolteSipChannel`、Security-Agree 端口、XFRM、音频/视频 RTP socket
+  均可在对应线路 worker 内创建；
+- 注册失败/停止时按设备清理路由与地址、卸载本次 XFRM，并把 native 接口移回宿主；
+- worker 不可用、接口迁移或网络配置失败时保留/恢复宿主路径；ModemManager bearer
+  仍使用原宿主实现，不会迁移其活动接口。
 
-结论：**优先方案 2 的“wwanX 进 netns”，配合 worker 内的 `VolteSipChannel`；**
-在方案 2 的链路全部回归通过前，保留方案 1 作为过渡桥接。
-
-状态：**未开始**（等待阶段二 b 实机验证通过后再动核心注册链）。
+状态：**代码完成，410 实机回归待执行**。当前没有采用 veth 桥接 ModemManager
+`wwan0`；这是一条有意保留的安全边界，不应在未验证硬件行为前扩大迁移范围。
 
 验收标准：
 
@@ -300,7 +311,7 @@ ue_isolation:
 - MM 重探测期间线路自动恢复；
 - SMS over IMS、通话、DTMF 与现有宿主路径行为一致。
 
-### 6.2 阶段四：数据代理与 Trunk 映射（未开始）
+### 6.2 阶段四：数据代理与 Trunk 映射
 
 目标：HTTP/SOCKS5 代理的入口/出口一一映射到 UE：
 
@@ -308,19 +319,25 @@ ue_isolation:
 UE netns → per-UE proxy（监听 UE 侧地址）→ 宿主 → 对应 Modem/wwanX
 ```
 
-实施要点：
+已实现：
 
-- `data_proxy` 按 `UeContext.ue_id` 拆分实例，拒绝“共享代理 + 出口靠 IP 猜”；
-- proxy 监听 socket 迁进 worker（复用 `UeSocketSpec`），出口绑定绑定到该 UE 的
-  wwanX/veth；
-- Trunk（SIP/RTP）的远端地址解析与媒体出口跟随 `UeContext`，不能共享 RTP relay 状态；
-- 自动化/通知等按 line_id 归类的功能保持现有语义，只把网络出口改为 UE 确定。
+- `data_proxy` runtime 继续按线路持有；HTTP/SOCKS5 listener 留在宿主以保持入口兼容，
+  每条连接的 outbound TCP socket 由该线路 worker 创建并 `SO_BINDTODEVICE`；
+- qcm410 secondary DATA/DATA6 bearer 可迁入该线路 worker；停止时只清理该接口并移回宿主；
+- Trunk/operator RTP socket 可由线路 worker 创建；Asterisk/internal leg 留在宿主，
+  dialog、自动化和通知继续按 `line_id` 归属；
+- 接口与 worker 的选择来自线路注册表，不再以运营商分配的 IP 推断 UE，因此不同 UE
+  使用相同 IP/网关时仍有独立网络栈。
 
-### 6.3 阶段五：5G IMS（未开始，复用同一套 worker 模型）
+状态：**代码完成，410 数据代理与 Trunk 媒体回归待执行**。worker 内 DNS 仅在
+VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再由 worker 建立数据连接。
 
-- 5G 的 IMS 注册与 VoLTE 共享同一套 worker/注册链；
-- worker 协议、socket 工厂、net-config 原样复用；
-- 新增点只在 bearer/数据通道抽象（5G PDN/QoS 与 LTE 的差异），不新增隔离机制。
+### 6.3 阶段五：5G IMS（通用底座完成，NR 适配未开始）
+
+- 3GPP worker 配置和 feature 已采用 LTE/NR 通用命名，worker 协议、socket 工厂、
+  XFRM、RTP 与网络配置可直接复用；
+- 尚未实现 NR 专用 bearer 建立、5G QoS flow/PDU session、VoNR 能力探测和硬件适配；
+- 新增 NR 支持时应扩展 bearer/数据通道抽象，不再创建第二套 namespace 隔离机制。
 
 ---
 
@@ -332,28 +349,54 @@ UE netns → per-UE proxy（监听 UE 侧地址）→ 宿主 → 对应 Modem/ww
 2. **TUN fd 跨 netns 读写**：ESP 转发器从主进程读 UE netns 内的 TUN fd（Linux fd 语义上可行，
    需实测吞吐与延迟）；
 3. **MM 对 wwan 移出的重探测**：SimAdmin 的重新 probe 逻辑要以实测为准；
-4. **DNS**：UE netns 内 `/etc/resolv.conf` 或 worker 内 DNS 客户端；
+4. **DNS**：VoLTE P-CSCF 已使用 worker UDP DNS socket；VoWiFi/普通数据代理的其余
+   域名解析仍需按实际运营商行为验证是否必须 per-UE；
 5. **MTU**：veth 1500 + ESP-in-UDP 分片，与现有 `SIMADMIN_AUTO_FRAGMENT` 配合。
 
 ### 7.2 已知边界
 
 - 本仓库在 Windows 上只能做 `cargo check`/单元测试；netns、setns、SCM_RIGHTS 必须上 410。
 - `ue_isolation.enabled` 默认 false —— 未开启时行为与旧版完全一致。
-- 阶段三、四、五均**未开始**；阶段一/二（worker 底座 + VoWiFi socket 迁移）代码已完成，
-  `cargo check --all-targets` 通过，`ue_`/operator/media 相关测试通过（Windows 上有
-  少量依赖 Linux `ip` 的既有测试无法运行）。
+- 阶段一至四代码已完成但 feature gate 默认关闭；未经 410 回归不能宣称生产可用。
+- 阶段五仅完成通用架构，尚不代表已经支持 VoNR。
+- Windows 与 WSL Linux 的 `cargo check --all-targets` 已通过；Windows 上的 Unix/netns
+  路径由条件编译替代实现覆盖，真实 `setns`、SCM_RIGHTS、XFRM 必须上 Linux/410 验证。
 
 ---
 
-## 8. 单 UE 验证清单（410）
+## 8. 分阶段实机验证清单（410）
 
-1. 开启 `ue_isolation.enabled=true` + `vowifi_tun_in_namespace=true`，重启 simadmin；
-2. 确认日志：netns 创建、worker Hello、veth 配置成功；
-3. `ip netns exec sa-ue<hex> ip addr`：能看到 `lo`、`save<hex>`、`sa_vwf<hex>`；
-4. VoWiFi 连接：IKE 在 worker 内建立（日志中出现 worker socket 创建），
-   SIP REGISTER 通过 TUN 完成，IMS 注册成功；
-5. 收发短信经 VoWiFi；`tcpdump` 在 UE netns 内能看到 SIP/RTP 走 TUN；
-6. 第二张 SIM 同时上线（相同 P-CSCF/IP 场景），确认互不干扰；
-7. 飞行模式/退出 VoWiFi：TUN 与 worker 干净回收，无残留 `sa-ue*`、`savh*`、`sa_vwf*`。
+### 8.1 worker 与 VoWiFi
 
-全部通过后进入 VoLTE 阶段（§6.1）。
+- [ ] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
+- [ ] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、XFRM、SIP、RTP
+  均属于当前线路 namespace；
+- [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
+- [ ] 飞行模式下仍可用 VoWiFi，退出后 TUN/XFRM/路由均无残留；
+- [ ] P-CSCF 或 worker socket 失败时错误可观测，worker 崩溃后线路能恢复。
+
+### 8.2 VoLTE
+
+- [ ] 再开启 `three_gpp_ims_sockets_in_worker`，确认 `wwan0` 始终留在宿主；
+- [ ] SimAdmin native `wwanN` 迁入正确 worker，地址、MTU、DNS/P-CSCF route 正确；
+- [ ] P-CSCF PCO、AT fallback、worker DNS fallback 分别验证；
+- [ ] Security-Agree/XFRM 安装在对应 worker，注销/失败后只删除本 session 项；
+- [ ] VoLTE 短信、来电/接听、双向 RTP、DTMF、视频协商/降级与挂断同步正常；
+- [ ] 迁移、网络配置或 worker 失败时接口回宿主且 native WDS session 可干净释放；
+- [ ] 线路停止后 native `wwanN` 回到宿主，不遗留地址、route、XFRM 或 QMI client。
+
+### 8.3 数据代理与 Trunk
+
+- [ ] 开启 `data_proxy_in_worker`，DATA6/secondary bearer 迁入正确 worker；
+- [ ] HTTP CONNECT、普通 HTTP、SOCKS5 的 DNS/IP 目标都从对应线路出站；
+- [ ] 停止代理/数据连接后接口回宿主，worker 内只清理该接口路由；
+- [ ] 开启 `trunk_sockets_in_worker`，operator RTP 属于当前线路 worker，Asterisk leg
+  仍在宿主且双向媒体正常；
+- [ ] Trunk 注册、来电、挂断和转发规则仍只作用于当前线路。
+
+### 8.4 多线路强隔离
+
+- [ ] 两个 UE 同时获得相同 UE IP、网关、P-CSCF、RTP 对端时仍能分别注册和传输；
+- [ ] 每条线路的 SIP dialog、XFRM、RTP、数据代理计数与 Trunk 映射不串线；
+- [ ] 单个 worker 崩溃、线路断开或 bearer 重连不破坏另一条线路；
+- [ ] 重启 SimAdmin 后稳定命名能够回收旧资源，不生成重复 namespace/veth/NAT 规则。
