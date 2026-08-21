@@ -517,7 +517,7 @@ impl LineRuntimeRegistry {
         // Namespace, worker, and bearer operations are intentionally deferred
         // until after the lock is released so status/API readers stay usable
         // while one modem is slow or unavailable.
-        let (present_lines, absent_lines, new_lines) = {
+        let (absent_lines, new_lines) = {
             let mut lines = self.lines.write().await;
             for line in lines.values() {
                 crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
@@ -562,38 +562,55 @@ impl LineRuntimeRegistry {
                     .map(|config| config.get_line_voice_path_policy(&line_id))
                     .unwrap_or_default();
                 let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
-                lines.insert(line_id.clone(), Arc::clone(&line));
                 new_lines.push((line_id, line));
             }
 
-            let present_lines = lines
-                .values()
-                .filter(|line| line.binding().present)
-                .cloned()
-                .collect::<Vec<_>>();
             let absent_lines = lines
                 .values()
                 .filter(|line| !line.binding().present)
                 .cloned()
                 .collect::<Vec<_>>();
-            (present_lines, absent_lines, new_lines)
+            (absent_lines, new_lines)
         };
 
-        // Seed newly discovered traffic totals outside the registry lock.
-        if let Some(database) = &self.database {
-            for (line_id, line) in &new_lines {
-                if let Ok(stored) = database.get_line_data_traffic(line_id) {
-                    line.data_proxy
-                        .restore_persisted_traffic(DataProxyTraffic {
-                            uplink_bytes: stored.uplink_bytes,
-                            downlink_bytes: stored.downlink_bytes,
-                            total_connections: stored.total_connections,
-                            active_connections: 0,
-                        })
-                        .await;
+        // Restore a new line's persisted counters before publishing it to the
+        // registry. The persistence lock prevents a periodic flush from seeing
+        // the zero baseline and overwriting the stored cumulative total.
+        {
+            let _traffic_guard = self.traffic_persistence_lock.lock().await;
+            if let Some(database) = &self.database {
+                for (line_id, line) in &new_lines {
+                    if let Ok(stored) = database.get_line_data_traffic(line_id) {
+                        line.data_proxy
+                            .restore_persisted_traffic(DataProxyTraffic {
+                                uplink_bytes: stored.uplink_bytes,
+                                downlink_bytes: stored.downlink_bytes,
+                                total_connections: stored.total_connections,
+                                active_connections: 0,
+                            })
+                            .await;
+                    }
+                }
+            }
+
+            // Only expose fully initialized new runtimes. `refresh_lock` keeps
+            // another refresh from publishing the same line concurrently.
+            if !new_lines.is_empty() {
+                let mut lines = self.lines.write().await;
+                for (line_id, line) in &new_lines {
+                    lines.insert(line_id.clone(), Arc::clone(line));
                 }
             }
         }
+
+        let present_lines = self
+            .lines
+            .read()
+            .await
+            .values()
+            .filter(|line| line.binding().present)
+            .cloned()
+            .collect::<Vec<_>>();
 
         for line in &present_lines {
             let binding = line.binding();
