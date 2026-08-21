@@ -506,7 +506,7 @@ impl LineRuntimeRegistry {
         }
         let mut lines = self.lines.write().await;
         for line in lines.values() {
-            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device(
+            crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
                 &line.binding().line_id,
             );
             line.mark_absent();
@@ -782,7 +782,6 @@ impl LineRuntimeRegistry {
             None,
             crate::services::ue_worker::UeWorkerFeatures::default(),
         );
-        crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(line_id, None);
         crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
             line_id, None,
         );
@@ -848,13 +847,6 @@ impl LineRuntimeRegistry {
             isolation.vowifi_tun_in_namespace,
         );
         let worker = line.ue_worker.clone();
-        {
-            let prev = line.egress_fingerprint.lock().await.clone();
-            if prev.as_deref() == Some(fingerprint.as_str()) {
-                // Plan unchanged — skip the worker net-config round-trip.
-                return Ok(());
-            }
-        }
         if !worker.is_running().await {
             return Err("UE worker is not running; skipping egress apply".to_string());
         }
@@ -862,6 +854,15 @@ impl LineRuntimeRegistry {
             .wait_ready(Duration::from_secs(5))
             .await
             .map_err(|error| error.to_string())?;
+        let unchanged =
+            line.egress_fingerprint.lock().await.as_deref() == Some(fingerprint.as_str());
+        if unchanged {
+            // The discovery refresh may have rebuilt only the reader map. Re-
+            // publish both UE registries even when the network plan itself is
+            // unchanged, so TUN, IKE, SIP and RTP resolve one owner together.
+            self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
+            return Ok(());
+        }
         let result = worker
             .apply_net_config(ue_netcfg::veth_ue_side_ops(&plan))
             .await
@@ -892,13 +893,28 @@ impl LineRuntimeRegistry {
         // Stage 2b is deliberately gated: only with this flag do the VoWiFi
         // TUN and every IKE/SIP/RTP socket move into the UE namespace through
         // the worker. Disabling keeps the previous host-namespace path.
+        self.publish_ue_egress_context(&ue.ue_id, ue, &plan, &isolation, &worker);
+        tracing::info!(
+            line_id = %ue.ue_id,
+            netns = %ue.namespace,
+            host_if = %plan.host_if,
+            ue_if = %plan.ue_if,
+            "UE egress veth configured by worker"
+        );
+        Ok(())
+    }
+
+    fn publish_ue_egress_context(
+        &self,
+        line_id: &str,
+        ue: &UeContext,
+        plan: &ue_netcfg::UeVethPlan,
+        isolation: &crate::platform::config::UeIsolationConfig,
+        worker: &UeWorkerHandle,
+    ) {
         if isolation.vowifi_tun_in_namespace {
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
-                &ue.ue_id,
-                Some(ue.namespace.as_str()),
-            );
             crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                &ue.ue_id,
+                line_id,
                 Some(
                     crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
                         namespace: ue.namespace.as_str().to_string(),
@@ -908,21 +924,10 @@ impl LineRuntimeRegistry {
                 ),
             );
         } else {
-            crate::connectivity::modems::ims::vowifi::live::register_line_ue_namespace(
-                &ue.ue_id, None,
-            );
             crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
-                &ue.ue_id, None,
+                line_id, None,
             );
         }
-        tracing::info!(
-            line_id = %ue.ue_id,
-            netns = %ue.namespace,
-            host_if = %plan.host_if,
-            ue_if = %plan.ue_if,
-            "UE egress veth configured by worker"
-        );
-        Ok(())
     }
 }
 

@@ -658,13 +658,6 @@ fn live_runtime_config() -> LiveRuntimeConfig {
 /// process-global QMI device fallback.
 static LIVE_LINE_SIM_DEVICES: OnceLock<StdRwLock<HashMap<String, LiveSimDevice>>> = OnceLock::new();
 
-/// Per-line UE network namespace, registered by the line registry when
-/// isolation is enabled. When present, the VoWiFi TUN device is created in the
-/// host namespace by this process, then moved into the UE namespace; the open
-/// fd keeps driving the userspace ESP gateway while the kernel side of the TUN
-/// (address, routes, neighbour) belongs to that UE only.
-static LIVE_UE_NAMESPACES: OnceLock<StdRwLock<HashMap<String, String>>> = OnceLock::new();
-
 /// The SIM access parameters for one line.
 ///
 /// `qmi_device`/`uim_slot` address the reader for QMI/UIM operations (EAP-AKA,
@@ -680,37 +673,6 @@ pub struct LiveSimDevice {
 
 fn line_sim_devices() -> &'static StdRwLock<HashMap<String, LiveSimDevice>> {
     LIVE_LINE_SIM_DEVICES.get_or_init(|| StdRwLock::new(HashMap::new()))
-}
-
-fn line_ue_namespaces() -> &'static StdRwLock<HashMap<String, String>> {
-    LIVE_UE_NAMESPACES.get_or_init(|| StdRwLock::new(HashMap::new()))
-}
-
-/// Record the UE network namespace owned by a line, or clear it when isolation
-/// is disabled. Called during every line refresh so a config toggle applies on
-/// the next VoWiFi reconnect without a process restart.
-pub fn register_line_ue_namespace(line_id: &str, namespace: Option<&str>) {
-    let mut guard = line_ue_namespaces()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match namespace {
-        Some(namespace) if !namespace.trim().is_empty() => {
-            guard.insert(line_id.to_string(), namespace.trim().to_string());
-        }
-        _ => {
-            guard.remove(line_id);
-        }
-    }
-}
-
-/// Resolve the UE namespace this line's VoWiFi tunnel should live in. `None`
-/// keeps the current host-namespace behavior.
-pub(crate) fn ue_namespace_for_line(line_id: &str) -> Option<String> {
-    line_ue_namespaces()
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(line_id)
-        .cloned()
 }
 
 /// Everything the VoWiFi data plane needs from a line's UE worker: the
@@ -754,6 +716,13 @@ pub(crate) fn ue_socket_context_for_line(line_id: &str) -> Option<LiveUeSocketCo
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(line_id)
         .cloned()
+}
+
+/// Resolve the UE namespace this line's VoWiFi tunnel should live in. The
+/// namespace and socket owner deliberately come from the same registry, so a
+/// refresh can never place the TUN on the host while IKE/SIP use the worker.
+pub(crate) fn ue_namespace_for_line(line_id: &str) -> Option<String> {
+    ue_socket_context_for_line(line_id).map(|context| context.namespace)
 }
 
 /// Return the common per-UE operator socket factory for another IMS access
@@ -898,13 +867,23 @@ async fn line_sim_info(
     None
 }
 
-/// Forget a line's reader mapping (line removed).
-pub fn forget_line_sim_device(line_id: &str) {
+/// Forget only a line's reader mapping during discovery refresh.
+///
+/// UE namespace/socket ownership is intentionally left intact here. The line
+/// registry refreshes reader bindings before it reconciles the existing UE;
+/// clearing the network registries at that point can leave the egress
+/// fingerprint unchanged and prevent them from being published again.
+pub fn forget_line_sim_device_mapping(line_id: &str) {
     line_sim_devices()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
-    line_ue_namespaces()
+}
+
+/// Forget all live state for a line (line removed or its UE torn down).
+pub fn forget_line_sim_device(line_id: &str) {
+    forget_line_sim_device_mapping(line_id);
+    line_ue_socket_contexts()
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
@@ -3147,8 +3126,6 @@ pub async fn clear_live_runtime_for_line(line_id: &str) {
     if let Some(gateway) = tun_gateway_cache().lock().await.remove(line_id) {
         gateway.shutdown();
     }
-    register_line_ue_namespace(line_id, None);
-    register_line_ue_socket_context(line_id, None);
     forget_live_network_overrides(line_id);
 }
 
@@ -7929,6 +7906,45 @@ mod tests {
         assert_eq!(mapped.uim_slot, 2);
         assert_eq!(mapped.modem_path, "/org/freedesktop/ModemManager1/Modem/8");
         forget_line_sim_device(line_id);
+    }
+
+    #[test]
+    fn reader_refresh_preserves_the_atomic_ue_network_context() {
+        let line_id = "test-vowifi-refresh-keeps-ue-context";
+        let namespace = crate::platform::netns::NetnsName::for_line("sa-ue", line_id);
+        let worker = UeWorkerHandle::for_line(line_id, namespace.clone());
+        register_line_sim_device(
+            line_id,
+            "/dev/wwan-test-qmi",
+            1,
+            "/org/freedesktop/ModemManager1/Modem/11",
+        );
+        register_line_ue_socket_context(
+            line_id,
+            Some(LiveUeSocketContext {
+                namespace: namespace.as_str().to_string(),
+                ue_veth: "save-test".to_string(),
+                worker,
+            }),
+        );
+
+        forget_line_sim_device_mapping(line_id);
+
+        assert!(sim_device_for_line(line_id).qmi_device.is_empty());
+        assert_eq!(
+            ue_namespace_for_line(line_id).as_deref(),
+            Some(namespace.as_str())
+        );
+        assert_eq!(
+            ue_socket_context_for_line(line_id)
+                .as_ref()
+                .map(|context| context.ue_veth.as_str()),
+            Some("save-test")
+        );
+
+        forget_line_sim_device(line_id);
+        assert!(ue_namespace_for_line(line_id).is_none());
+        assert!(ue_socket_context_for_line(line_id).is_none());
     }
 
     #[test]
