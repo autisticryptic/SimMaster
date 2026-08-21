@@ -58,6 +58,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::hardware::devices::transport::{BearerDomain, PduSessionInfo, QosFlowInfo, ThreeGppRat};
 use crate::platform::config::{AccessPathKind, VoicePathPolicy};
 
 use super::voice_router::{plan_voice_route, RejectedVoiceLeg, VoiceLegReadiness};
@@ -148,6 +149,17 @@ pub struct ThreeGppObservation {
     /// Whether the per-line media gateway (Asterisk trunk backend) can carry a
     /// call over this access right now.
     pub media_gateway_ready: bool,
+    /// RAT and packet-core metadata reported by the bearer provider. Unknown
+    /// values are intentionally retained instead of inferring VoNR from a 5G
+    /// cell or from the modem's advertised radio modes.
+    pub rat: ThreeGppRat,
+    pub bearer_domain: BearerDomain,
+    pub pdu_session: Option<PduSessionInfo>,
+    pub qos_flows: Vec<QosFlowInfo>,
+    /// `None` means the provider cannot determine VoNR capability. `Some(true)`
+    /// is only a capability signal; registration and media readiness are still
+    /// evaluated independently.
+    pub vonr_capable: Option<bool>,
 }
 
 /// Observed facts about the non-3GPP access path:
@@ -231,6 +243,14 @@ pub struct ThreeGppAccess {
     pub radio_available: bool,
     pub bearer_up: bool,
     pub registration_mode: Option<String>,
+    pub rat: ThreeGppRat,
+    pub bearer_domain: BearerDomain,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pdu_session: Option<PduSessionInfo>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub qos_flows: Vec<QosFlowInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vonr_capable: Option<bool>,
 }
 
 /// Non-3GPP access path plus its ePDG/IKE/IPsec detail.
@@ -360,6 +380,11 @@ impl ImsSubsystemState {
                 radio_available: three_gpp.radio_available,
                 bearer_up: three_gpp.bearer_up,
                 registration_mode: three_gpp.registration_mode.clone(),
+                rat: three_gpp.rat,
+                bearer_domain: three_gpp.bearer_domain,
+                pdu_session: three_gpp.pdu_session.clone(),
+                qos_flows: three_gpp.qos_flows.clone(),
+                vonr_capable: three_gpp.vonr_capable,
             },
             non_three_gpp: NonThreeGppAccess {
                 path: non_three_gpp_path,
@@ -410,6 +435,11 @@ mod tests {
             registration_mode: Some("ipsec".into()),
             degraded_reason: None,
             media_gateway_ready: true,
+            rat: ThreeGppRat::Lte,
+            bearer_domain: BearerDomain::Eps,
+            pdu_session: None,
+            qos_flows: Vec::new(),
+            vonr_capable: Some(false),
         }
     }
 
@@ -666,5 +696,53 @@ mod tests {
         assert!(state.registration.is_registered_over(AccessPathKind::Volte));
         // ...but cannot carry voice in gateway mode.
         assert_eq!(state.voice.active, None);
+    }
+
+    #[test]
+    fn five_gs_metadata_survives_projection_without_changing_access_identity() {
+        let observation = ThreeGppObservation {
+            rat: ThreeGppRat::NrSa,
+            bearer_domain: BearerDomain::FiveGs,
+            pdu_session: Some(PduSessionInfo {
+                session_id: Some(7),
+                dnn: Some("ims".into()),
+                s_nssai: Some("1-010203".into()),
+                ssc_mode: Some(1),
+            }),
+            qos_flows: vec![QosFlowInfo {
+                qfi: Some(5),
+                five_qi: Some(1),
+                ..Default::default()
+            }],
+            vonr_capable: Some(true),
+            ..lte_up()
+        };
+
+        let state = build_state(&observation, &wifi_down());
+
+        // NR reaches the same 3GPP IMS access. It is metadata on that access,
+        // not a second IMS account/path and not an automatic readiness claim.
+        assert_eq!(state.three_gpp.path.family, AccessFamily::ThreeGpp);
+        assert_eq!(state.three_gpp.rat, ThreeGppRat::NrSa);
+        assert_eq!(state.three_gpp.bearer_domain, BearerDomain::FiveGs);
+        assert_eq!(state.three_gpp.pdu_session, observation.pdu_session);
+        assert_eq!(state.three_gpp.qos_flows, observation.qos_flows);
+        assert_eq!(state.three_gpp.vonr_capable, Some(true));
+    }
+
+    #[test]
+    fn absent_provider_metadata_remains_unknown_instead_of_claiming_vonr() {
+        let observation = ThreeGppObservation {
+            configured: true,
+            ..Default::default()
+        };
+
+        let state = build_state(&observation, &wifi_down());
+
+        assert_eq!(state.three_gpp.rat, ThreeGppRat::Unknown);
+        assert_eq!(state.three_gpp.bearer_domain, BearerDomain::Unknown);
+        assert!(state.three_gpp.pdu_session.is_none());
+        assert!(state.three_gpp.qos_flows.is_empty());
+        assert_eq!(state.three_gpp.vonr_capable, None);
     }
 }

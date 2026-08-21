@@ -464,6 +464,10 @@ struct WorkerCore {
     line_id: String,
     namespace: NetnsName,
     control_path: PathBuf,
+    /// Serializes spawn, shutdown and failure cleanup for one worker
+    /// generation.  The blocking control reader never holds this lock; it
+    /// schedules an async, PID-checked cleanup instead.
+    lifecycle: tokio::sync::Mutex<()>,
     child: tokio::sync::Mutex<Option<tokio::process::Child>>,
     tx: StdMutex<Option<mpsc::UnboundedSender<UeWorkerMessage>>>,
     pending: StdMutex<HashMap<u64, PendingRequest>>,
@@ -491,6 +495,7 @@ impl UeWorkerHandle {
                 line_id: line_id.to_string(),
                 namespace,
                 control_path,
+                lifecycle: tokio::sync::Mutex::new(()),
                 child: tokio::sync::Mutex::new(None),
                 tx: StdMutex::new(None),
                 pending: StdMutex::new(HashMap::new()),
@@ -709,8 +714,31 @@ impl UeWorkerHandle {
 
     /// True when the process is alive and the control channel is up.
     pub async fn is_running(&self) -> bool {
-        let status = self.status().await;
+        let mut status = self.status().await;
+        #[cfg(unix)]
+        if !status.ready && status.pid.is_some() && status.last_error.is_some() {
+            self.reap_failed_generation(&status).await;
+            status = self.status().await;
+        }
         status.ready || status.pid.is_some()
+    }
+
+    /// Retire a worker whose control channel has already failed.  The line
+    /// registry calls this before deciding whether to spawn a replacement, so
+    /// the observable `pid` cannot remain stuck while asynchronous cleanup is
+    /// still queued behind a busy runtime.
+    #[cfg(unix)]
+    async fn reap_failed_generation(&self, status: &UeWorkerStatus) {
+        if status.ready {
+            return;
+        }
+        let Some(pid) = status.pid else {
+            return;
+        };
+        let Some(reason) = status.last_error.clone() else {
+            return;
+        };
+        let _ = self.core.fail_generation(pid, reason).await;
     }
 
     #[cfg(unix)]
@@ -718,7 +746,9 @@ impl UeWorkerHandle {
         use tokio::net::UnixListener;
         use tokio::process::Command;
 
-        if self.status().await.ready {
+        let _lifecycle = self.core.lifecycle.lock().await;
+        let status = self.status().await;
+        if status.ready || status.pid.is_some() {
             return Ok(());
         }
         if !netns::exists(&self.core.namespace) {
@@ -745,21 +775,21 @@ impl UeWorkerHandle {
         unsafe {
             command.pre_exec(enter);
         }
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
+        let Some(pid) = child.id() else {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(UeWorkerError::Protocol(
+                "spawned UE worker did not expose a pid".to_string(),
+            ));
+        };
         {
             let mut guard = self.core.child.lock().await;
             *guard = Some(child);
         }
-        let pid = self
-            .core
-            .child
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|child| child.id());
         {
             let mut state = self.core.state.lock().unwrap();
-            state.pid = pid;
+            state.pid = Some(pid);
             state.ready = false;
             state.connected_at = None;
             state.last_error = None;
@@ -780,40 +810,34 @@ impl UeWorkerHandle {
                     let std_stream = match stream.into_std() {
                         Ok(std_stream) => std_stream,
                         Err(error) => {
-                            {
-                                let mut state = core.state.lock().unwrap();
-                                state.last_error =
-                                    Some(format!("control stream conversion failed: {error}"));
-                            }
-                            let _ = core.kill_child().await;
+                            let reason = format!("control stream conversion failed: {error}");
+                            let _ = core.fail_generation(pid, reason).await;
                             return;
                         }
                     };
                     let read_stream = match std_stream.try_clone() {
                         Ok(stream) => stream,
                         Err(error) => {
-                            {
-                                let mut state = core.state.lock().unwrap();
-                                state.last_error =
-                                    Some(format!("control stream clone failed: {error}"));
-                            }
-                            let _ = core.kill_child().await;
+                            let reason = format!("control stream clone failed: {error}");
+                            let _ = core.fail_generation(pid, reason).await;
                             return;
                         }
                     };
                     let write_stream = match tokio::net::UnixStream::from_std(std_stream) {
                         Ok(stream) => stream,
                         Err(error) => {
-                            {
-                                let mut state = core.state.lock().unwrap();
-                                state.last_error = Some(format!(
-                                    "control write stream conversion failed: {error}"
-                                ));
-                            }
-                            let _ = core.kill_child().await;
+                            let reason = format!("control write stream conversion failed: {error}");
+                            let _ = core.fail_generation(pid, reason).await;
                             return;
                         }
                     };
+                    // Shutdown or a previous cleanup may have retired this
+                    // process while stream conversion was in progress.  Do
+                    // not publish its writer over a replacement generation.
+                    let _lifecycle = core.lifecycle.lock().await;
+                    if !core.generation_is_current(pid) {
+                        return;
+                    }
                     let (_read_half, write_half) = write_stream.into_split();
                     let (tx, rx) = mpsc::unbounded_channel::<UeWorkerMessage>();
                     {
@@ -821,21 +845,19 @@ impl UeWorkerHandle {
                         *guard = Some(tx);
                     }
                     tokio::spawn(writer_loop(write_half, rx));
-                    tokio::task::spawn_blocking(move || run_parent_reader(read_stream, core));
+                    let runtime = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        run_parent_reader(read_stream, core, runtime, pid)
+                    });
                 }
                 Ok(Err(error)) => {
-                    {
-                        let mut state = core.state.lock().unwrap();
-                        state.last_error = Some(format!("accept failed: {error}"));
-                    }
-                    let _ = core.kill_child().await;
+                    let reason = format!("accept failed: {error}");
+                    let _ = core.fail_generation(pid, reason).await;
                 }
                 Err(_) => {
-                    {
-                        let mut state = core.state.lock().unwrap();
-                        state.last_error = Some("handshake timeout".to_string());
-                    }
-                    let _ = core.kill_child().await;
+                    let _ = core
+                        .fail_generation(pid, "handshake timeout".to_string())
+                        .await;
                 }
             }
         });
@@ -844,6 +866,7 @@ impl UeWorkerHandle {
 
     #[cfg(unix)]
     async fn shutdown_unix(&self) -> Result<(), UeWorkerError> {
+        let _lifecycle = self.core.lifecycle.lock().await;
         self.send(UeWorkerMessage::Shutdown {
             reason: "manager_shutdown".to_string(),
         });
@@ -877,16 +900,83 @@ impl UeWorkerHandle {
 }
 
 impl WorkerCore {
-    /// Best-effort kill used when the worker never completes the handshake.
-    async fn kill_child(&self) -> std::io::Result<()> {
+    fn generation_is_current(&self, expected_pid: u32) -> bool {
+        worker_generation_matches(
+            self.state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pid,
+            expected_pid,
+        )
+    }
+
+    /// Retire exactly one failed worker generation.  PID matching is vital:
+    /// a delayed handshake task or an old blocking reader may finish after a
+    /// replacement worker is already live, and must never clear or kill it.
+    async fn fail_generation(&self, expected_pid: u32, reason: String) -> std::io::Result<bool> {
+        let _lifecycle = self.lifecycle.lock().await;
+        if !self.generation_is_current(expected_pid) {
+            return Ok(false);
+        }
         let mut guard = self.child.lock().await;
+        let current_pid = guard.as_ref().and_then(tokio::process::Child::id);
+        if current_pid.is_some() && current_pid != Some(expected_pid) {
+            return Ok(false);
+        }
+
+        *self
+            .tx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        fail_pending_requests(self, &reason);
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.ready = false;
+            state.last_error = Some(reason);
+        }
         if let Some(child) = guard.as_mut() {
             let _ = child.start_kill();
             let _ = tokio::time::timeout(SHUTDOWN_TIMEOUT, child.wait()).await;
         }
         *guard = None;
-        Ok(())
+        let _ = tokio::fs::remove_file(&self.control_path).await;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The lifecycle lock prevents a replacement spawn until all old
+        // channel/socket cleanup is complete.
+        if state.pid == Some(expected_pid) {
+            state.pid = None;
+            state.connected_at = None;
+            state.last_net_status = None;
+            state.last_net_config_ok = false;
+            state.last_net_config_error = None;
+            state.last_socket_ok = false;
+            state.last_socket_error = None;
+        }
+        Ok(true)
     }
+}
+
+fn worker_generation_matches(current_pid: Option<u32>, expected_pid: u32) -> bool {
+    current_pid == Some(expected_pid)
+}
+
+fn mark_worker_generation_failed(
+    state: &mut UeWorkerStatus,
+    expected_pid: u32,
+    reason: String,
+) -> bool {
+    if !worker_generation_matches(state.pid, expected_pid) {
+        return false;
+    }
+    state.ready = false;
+    state.last_error = Some(reason);
+    true
 }
 
 /// Parent-side reader. Runs on a blocking thread because it needs
@@ -894,39 +984,149 @@ impl WorkerCore {
 /// `AsyncReadExt` cannot expose. Each frame is consumed with exactly one
 /// `recvmsg` so fds never get detached from their message.
 #[cfg(unix)]
-fn run_parent_reader(stream: std::os::unix::net::UnixStream, core: Arc<WorkerCore>) {
+fn run_parent_reader(
+    stream: std::os::unix::net::UnixStream,
+    core: Arc<WorkerCore>,
+    runtime: tokio::runtime::Handle,
+    expected_pid: u32,
+) {
+    let mut exit_reason = "worker_control_closed".to_string();
     loop {
+        if !core.generation_is_current(expected_pid) {
+            exit_reason = "worker generation superseded".to_string();
+            break;
+        }
         match recv_control_frame(&stream, CONTROL_READ_TIMEOUT) {
             Ok(Some((payload, fds))) => {
                 let message = match serde_json::from_slice::<UeWorkerMessage>(&payload) {
                     Ok(message) => message,
                     Err(error) => {
-                        let mut state = core.state.lock().unwrap();
-                        state.last_error =
-                            Some(format!("invalid control frame from worker: {error}"));
+                        exit_reason = format!("invalid control frame from worker: {error}");
                         drop(fds);
                         break;
                     }
                 };
-                handle_parent_message(&core, message, fds);
+                if !core.generation_is_current(expected_pid) {
+                    exit_reason = "worker generation superseded".to_string();
+                    drop(fds);
+                    break;
+                }
+                if matches!(
+                    &message,
+                    UeWorkerMessage::Hello { pid, .. } if *pid != expected_pid
+                ) {
+                    exit_reason = format!(
+                        "worker hello pid mismatch: expected {expected_pid}, received {}",
+                        match &message {
+                            UeWorkerMessage::Hello { pid, .. } => *pid,
+                            _ => unreachable!(),
+                        }
+                    );
+                    drop(fds);
+                    break;
+                }
+                handle_parent_message(&core, expected_pid, message, fds);
             }
             Ok(None) => break,
+            // An otherwise healthy worker may legitimately be idle for much
+            // longer than CONTROL_READ_TIMEOUT. Keep the channel alive and
+            // probe liveness instead of treating an idle poll as EOF.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !core.generation_is_current(expected_pid) {
+                    exit_reason = "worker generation superseded".to_string();
+                    break;
+                }
+                let nonce = core.request_seq.fetch_add(1, Ordering::Relaxed);
+                let sent = core
+                    .tx
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .as_ref()
+                    .is_some_and(|tx| tx.send(UeWorkerMessage::Ping { nonce }).is_ok());
+                if !sent {
+                    exit_reason = "worker control writer unavailable".to_string();
+                    break;
+                }
+                continue;
+            }
             Err(error) => {
-                let mut state = core.state.lock().unwrap();
-                state.last_error = Some(format!("worker control read failed: {error}"));
+                exit_reason = format!("worker control read failed: {error}");
                 break;
             }
         }
     }
-    let mut state = core.state.lock().unwrap();
-    state.ready = false;
-    state.last_error = Some("worker_control_closed".to_string());
-    *core.tx.lock().unwrap() = None;
+    let current_generation = {
+        let mut state = core
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        mark_worker_generation_failed(&mut state, expected_pid, exit_reason.clone())
+    };
+    if !current_generation {
+        return;
+    }
+
+    // Never block a Tokio worker from this blocking reader.  The async cleanup
+    // is generation-checked, so a late old reader cannot affect a replacement
+    // process.  During a normal shutdown the child is already gone and this
+    // becomes a no-op, preserving the clean (last_error = None) status.
+    runtime.spawn(async move {
+        if let Err(error) = core.fail_generation(expected_pid, exit_reason).await {
+            tracing::debug!(
+                expected_pid,
+                error = %error,
+                "Failed to retire disconnected UE worker generation"
+            );
+        }
+    });
+}
+
+/// Resolve every in-flight request immediately when the worker channel dies.
+/// Otherwise callers wait for the full request timeout even though recovery
+/// can already start on the next line-registry refresh.
+fn fail_pending_requests(core: &WorkerCore, reason: &str) {
+    let pending = {
+        let mut guard = core
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.drain().collect::<Vec<_>>()
+    };
+    for (request_id, request) in pending {
+        match request {
+            PendingRequest::NetConfig(sender) => {
+                let _ = sender.send(NetConfigOutcome {
+                    request_id,
+                    ok: false,
+                    output: Vec::new(),
+                    error: Some(reason.to_string()),
+                });
+            }
+            PendingRequest::Socket(sender) => {
+                let _ = sender.send(SocketCreateOutcome {
+                    request_id,
+                    ok: false,
+                    error: Some(reason.to_string()),
+                    fd: None,
+                });
+            }
+        }
+    }
 }
 
 /// Dispatch a worker-side message on the parent reader thread.
 #[cfg(unix)]
-fn handle_parent_message(core: &WorkerCore, message: UeWorkerMessage, fds: Vec<i32>) {
+fn handle_parent_message(
+    core: &WorkerCore,
+    expected_pid: u32,
+    message: UeWorkerMessage,
+    fds: Vec<i32>,
+) {
     use chrono::Utc;
 
     match message {
@@ -943,17 +1143,28 @@ fn handle_parent_message(core: &WorkerCore, message: UeWorkerMessage, fds: Vec<i
                 );
                 return;
             }
-            let mut state = core.state.lock().unwrap();
+            let mut state = core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !worker_generation_matches(state.pid, expected_pid) {
+                return;
+            }
             state.ready = true;
             state.netns = netns;
-            state.pid = Some(pid);
             state.connected_at = Some(Utc::now().to_rfc3339());
             state.last_message_at = Some(Utc::now().to_rfc3339());
             state.last_error = None;
             tracing::info!(line_id = %core.line_id, pid, "UE worker ready inside its namespace");
         }
         UeWorkerMessage::Pong { nonce } => {
-            let mut state = core.state.lock().unwrap();
+            let mut state = core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !worker_generation_matches(state.pid, expected_pid) {
+                return;
+            }
             state.last_message_at = Some(Utc::now().to_rfc3339());
             state.last_error = None;
             tracing::trace!(line_id = %core.line_id, nonce, "UE worker pong");
@@ -963,7 +1174,13 @@ fn handle_parent_message(core: &WorkerCore, message: UeWorkerMessage, fds: Vec<i
             addresses,
             default_routes,
         } => {
-            let mut state = core.state.lock().unwrap();
+            let mut state = core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !worker_generation_matches(state.pid, expected_pid) {
+                return;
+            }
             state.last_message_at = Some(Utc::now().to_rfc3339());
             state.last_net_status = Some(NetStatusSnapshot {
                 interfaces,
@@ -977,7 +1194,14 @@ fn handle_parent_message(core: &WorkerCore, message: UeWorkerMessage, fds: Vec<i
             let ok = outcome.ok;
             let error = outcome.error.clone();
             let sender = core.pending.lock().unwrap().remove(&request_id);
-            let mut state = core.state.lock().unwrap();
+            let mut state = core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !worker_generation_matches(state.pid, expected_pid) {
+                drop(sender);
+                return;
+            }
             state.last_message_at = Some(Utc::now().to_rfc3339());
             state.last_net_config_ok = ok;
             state.last_net_config_error = error.clone();
@@ -1010,7 +1234,15 @@ fn handle_parent_message(core: &WorkerCore, message: UeWorkerMessage, fds: Vec<i
                 .collect::<Vec<_>>();
             let fd = if ok { owned_fds.pop() } else { None };
             let sender = core.pending.lock().unwrap().remove(&request_id);
-            let mut state = core.state.lock().unwrap();
+            let mut state = core
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if !worker_generation_matches(state.pid, expected_pid) {
+                drop(sender);
+                drop(fd);
+                return;
+            }
             state.last_message_at = Some(Utc::now().to_rfc3339());
             state.last_socket_ok = ok;
             state.last_socket_error = error.clone();
@@ -1503,6 +1735,12 @@ fn wait_byte_count(
         let ready = unsafe { libc::poll(pfd, 1, remaining.min(i32::MAX as u128) as i32) };
         if ready < 0 {
             return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            // poll(2) timeout means "still idle", not EOF. Loop once more so
+            // the deadline branch returns WouldBlock and the parent can send
+            // a Ping without tearing down a healthy worker.
+            continue;
         }
         let mut available: libc::c_int = 0;
         if unsafe { libc::ioctl(fd, libc::FIONREAD, &mut available) } < 0 {
@@ -2012,6 +2250,57 @@ mod tests {
             .control_path
             .to_string_lossy()
             .contains("line-abc"));
+    }
+
+    #[test]
+    fn worker_cleanup_only_matches_the_expected_generation() {
+        assert!(worker_generation_matches(Some(41), 41));
+        assert!(!worker_generation_matches(Some(42), 41));
+        assert!(!worker_generation_matches(None, 41));
+    }
+
+    #[test]
+    fn failed_generation_marker_does_not_touch_a_replacement() {
+        let mut current = UeWorkerStatus {
+            pid: Some(41),
+            ready: true,
+            ..Default::default()
+        };
+        assert!(!mark_worker_generation_failed(
+            &mut current,
+            40,
+            "old reader closed".to_string(),
+        ));
+        assert!(current.ready);
+        assert!(current.last_error.is_none());
+
+        assert!(mark_worker_generation_failed(
+            &mut current,
+            41,
+            "current reader closed".to_string(),
+        ));
+        assert!(!current.ready);
+        assert_eq!(current.last_error.as_deref(), Some("current reader closed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_control_stream_times_out_without_looking_like_eof() {
+        let (reader, _writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let error = recv_control_frame(&reader, Duration::from_millis(20)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn closed_control_stream_is_reported_as_eof() {
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(writer);
+        let frame = recv_control_frame(&reader, Duration::from_millis(100)).unwrap();
+        assert!(frame.is_none());
     }
 
     #[tokio::test]

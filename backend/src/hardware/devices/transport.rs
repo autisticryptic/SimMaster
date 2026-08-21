@@ -5,6 +5,76 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 
+use serde::{Deserialize, Serialize};
+
+/// Radio access technology carrying a 3GPP IMS bearer.
+///
+/// This describes the bearer that was actually established.  It must not be
+/// inferred merely from a modem advertising 5G support or seeing an NR cell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreeGppRat {
+    #[default]
+    Unknown,
+    Lte,
+    NrNsa,
+    NrSa,
+}
+
+/// Packet-core domain that owns the bearer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BearerDomain {
+    #[default]
+    Unknown,
+    /// EPS bearer in EPC (the existing VoLTE path).
+    Eps,
+    /// PDU session in the 5G Core.
+    #[serde(rename = "5gs")]
+    FiveGs,
+}
+
+/// Ownership of the network interface exposed by a bearer provider.
+///
+/// Namespace migration must eventually key off this value instead of an
+/// interface name such as `wwan0`: a host-managed primary interface must stay
+/// with ModemManager, whereas a SimAdmin-owned secondary interface may be moved
+/// into the line worker.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BearerInterfaceOwnership {
+    #[default]
+    Unknown,
+    HostManagedPrimary,
+    SimAdminOwnedSecondary,
+    WorkerNative,
+}
+
+/// Optional 5GS PDU-session metadata supplied by a capable bearer provider.
+///
+/// Existing LTE/QMI providers leave this as `None`.  Keeping the fields
+/// optional also lets ModemManager/MBIM implementations expose only the subset
+/// reported by their modem without inventing values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PduSessionInfo {
+    pub session_id: Option<u8>,
+    pub dnn: Option<String>,
+    pub s_nssai: Option<String>,
+    pub ssc_mode: Option<u8>,
+}
+
+/// Optional 5G QoS-flow metadata associated with a PDU session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QosFlowInfo {
+    pub qfi: Option<u8>,
+    pub five_qi: Option<u16>,
+    pub arp_priority: Option<u8>,
+    pub gbr_uplink_bps: Option<u64>,
+    pub gbr_downlink_bps: Option<u64>,
+    pub mbr_uplink_bps: Option<u64>,
+    pub mbr_downlink_bps: Option<u64>,
+}
+
 /// Device-agnostic description of an established native IMS bearer.
 ///
 /// This is what an upper protocol layer consumes: enough to build its own
@@ -36,6 +106,15 @@ pub struct ImsBearerInfo {
     pub ipv6_dns: Vec<IpAddr>,
     pub ipv6_prefix: Option<u8>,
     pub pcscf: Vec<IpAddr>,
+    /// Observed access technology and packet-core domain. `Unknown` means the
+    /// provider did not expose the value; it never means VoNR is ready.
+    pub rat: ThreeGppRat,
+    pub bearer_domain: BearerDomain,
+    /// Whether the interface may be moved into a per-UE worker namespace.
+    pub interface_ownership: BearerInterfaceOwnership,
+    /// 5GS-only details. LTE/EPS providers normally leave these empty.
+    pub pdu_session: Option<PduSessionInfo>,
+    pub qos_flows: Vec<QosFlowInfo>,
 }
 
 /// Opaque teardown handle for an established IMS bearer.

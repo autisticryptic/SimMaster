@@ -1,6 +1,8 @@
 # IMS 接入路径重构：410 实机回归清单
 
-> 当前仅完成代码与离线检查。410 设备离线，本文所有项目均未视为通过。
+> 410 已于 2026-08-22 在 `192.168.100.13` 上线并部署提交 `103743c` 的
+> GitHub Actions ARM64 产物。当前已确认 per-UE namespace、worker、veth、NAT
+> 基础设施能够启动；下列业务级项目仍需按功能门分阶段验证，未勾选项目不得视为通过。
 
 ## 本轮变更
 
@@ -10,7 +12,7 @@
 - radio 或 ePDG/IKE/IPsec 已断时，陈旧 snapshot 不再显示 registered。
 - 概述页通过 `/api/modem/lines/{line_id}/ims/status` 展示分层状态，reader 不再固定为“不适用”。
 
-## 410 上线后必测
+## 410 分阶段必测
 
 ### 飞行模式与 VoWiFi
 
@@ -80,10 +82,10 @@
 
 ## 建议诊断采集
 
-设备上线后，每个测试场景至少保留以下证据，并确保记录中包含 `line_id`：
+每个测试场景至少保留以下证据，并确保记录中包含 `line_id`：
 
 ```bash
-curl -s http://127.0.0.1:8080/api/modem/lines/<line_id>/ims/status
+curl -s -b /tmp/simadmin.cookies http://127.0.0.1:3000/api/modem/lines/<line_id>/ims/status
 journalctl -u simadmin --since "10 minutes ago" --no-pager
 ip -br link
 ip route show table all
@@ -93,9 +95,15 @@ ip netns list
 
 涉及 VoWiFi 时另采集 IKE/XFRM 与 worker namespace；涉及 VoLTE 时另采集对应 `wwanX`、QMI bearer、P-CSCF、SIP REGISTER 和 RTP 绑定信息。若设备实际 API 监听端口不同，以部署配置为准。
 
-## 当前明确暂不执行
+## 当前实机基线与暂不执行项
 
-- 410 离线期间不部署、不连接设备，也不把任何实机项标记为通过。
+- 当前 410 线路为 `line-50ad5391cd09c09936f1081bd479139c`，已建立
+  `sa-ue286e0c9d2870` namespace、veth `/30` 地址和宿主 NAT；这些只证明隔离底座
+  已启动，不等于 VoWiFi、VoLTE、数据代理或 Trunk 业务验收完成。
+- 当前 VoWiFi 已完成 ePDG、IKE、CHILD_SA、ESP 与 TUN，但 IMS REGISTER 收到
+  SIP `421`，尚未进入 `voice_ready`；应先排除此注册阻碍，再执行真实语音测试。
+- 当前 VoLTE、数据代理与 Trunk worker 功能门仍需逐项启用并回归，首次验证不得同时
+  打开多个功能门。
 - 不在本机生成 production 构建或发布包；发布构建继续交给 GitHub Actions。
 - 暂不执行 EC20、EC25、EG25、EG600 与 PCSC/USB SIM reader 实机测试。
 - 暂不承诺通话中的无缝 access handover、IMS service continuity 或 SRVCC。

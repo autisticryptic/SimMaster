@@ -5916,6 +5916,10 @@ pub async fn get_line_ims_status_handler(
                     .unwrap_or_else(|| "volte_degraded".to_string())
             }),
         media_gateway_ready: line.voice_access.media_gateway_ready(AccessPathKind::Volte),
+        // Current live runtimes do not yet expose authoritative EPS/5GS, PDU
+        // session, QoS-flow or VoNR capability metadata. Preserve that as
+        // unknown until a device-specific bearer provider reports it.
+        ..Default::default()
     };
 
     let vowifi = VowifiScope::for_line(Arc::clone(&line)).status().await;

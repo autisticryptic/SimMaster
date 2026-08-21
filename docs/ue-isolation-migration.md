@@ -1,6 +1,6 @@
 # 多 UE 隔离架构迁移文档（Option B：per-UE worker + setns）
 
-> 状态：**阶段一至四已完成代码实现，待 410 分阶段实机回归；阶段五仅完成通用底座**。
+> 状态：**阶段一至四已完成代码实现，待 410 分阶段实机回归；阶段五已完成不改变现有硬件行为的通用模型底座**。
 > 本文档是 `multi_ue_ims_volte_vowifi_architecture.md` 的落地实现记录，记录了已完成的
 > 实机验证、当前代码状态、控制协议，以及 VoWiFi → VoLTE → 数据代理/Trunk → 5G
 > 的逐步迁移计划与验收标准。
@@ -141,6 +141,23 @@ IMS 状态机保持在主进程，通过 fd 引用 UE netns 内创建的 socket�
 | `hardware/devices/qcm410/secondary_qmi_data.rs` | DATA6/secondary QMI bearer 迁入对应线路 worker，停止时清理并把接口移回宿主 |
 | `hardware/cellular/data_proxy.rs` | HTTP/SOCKS5 监听仍在宿主，出站 TCP socket 由对应线路 worker 创建并绑定该线路接口 |
 | `platform/config.rs` | `ue_isolation` 配置块（见 §6） |
+
+### 4.1.1 worker 生命周期修复（本轮）
+
+实机日志暴露出一个会影响所有隔离功能的边界问题：父进程 reader 在控制通道
+连续空闲 60 秒时，把 `poll(2)` 超时误当作通道关闭，worker 随后退出；旧 PID
+还留在状态快照中，线路刷新也不会重新拉起 worker。结果是后续 IKE/SIP/RTP
+请求统一报 `worker control channel is not up`。
+
+现已修复：
+
+- 空闲超时发送 `Ping`，只有真正 EOF 或 I/O 错误才关闭控制通道；
+- 控制通道关闭时立即失败所有未完成的 net-config/socket 请求；
+- 回收旧 child、清除 PID，下一次线路 reconcile 可自动重启 worker；
+- 增加 Unix 控制帧的“空闲超时”和“真实 EOF”回归测试。
+
+这项修复必须先在 410 上验证 worker 能持续运行超过 60 秒，再判断 IMS
+注册、媒体或数据代理本身是否有问题。
 
 ### 4.2 worker 控制协议（当前）
 
@@ -332,10 +349,16 @@ UE netns → per-UE proxy（监听 UE 侧地址）→ 宿主 → 对应 Modem/ww
 状态：**代码完成，410 数据代理与 Trunk 媒体回归待执行**。worker 内 DNS 仅在
 VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再由 worker 建立数据连接。
 
-### 6.3 阶段五：5G IMS（通用底座完成，NR 适配未开始）
+### 6.3 阶段五：5G IMS（通用数据模型接口完成，NR 硬件适配未开始）
 
 - 3GPP worker 配置和 feature 已采用 LTE/NR 通用命名，worker 协议、socket 工厂、
   XFRM、RTP 与网络配置可直接复用；
+- bearer 抽象现在可以携带实际 RAT（LTE/NR NSA/NR SA）、EPS/5GS 域、PDU
+  session、QoS flow 和接口归属；这些字段只由硬件 provider 提供，缺失时保持
+  `unknown`，不会从“支持 5G”或 NR 小区信息推断 VoNR 已就绪；
+- 当前 native bearer provider 仍只实现 QCM410 DATA6/QMI 路径，尚未完成按设备能力
+  选择 provider 的 factory，也没有 ModemManager/MBIM/QMI 5GS provider；因此运行时
+  目前不会产生真实的 5GS PDU session 或 QoS flow 数据；
 - 尚未实现 NR 专用 bearer 建立、5G QoS flow/PDU session、VoNR 能力探测和硬件适配；
 - 新增 NR 支持时应扩展 bearer/数据通道抽象，不再创建第二套 namespace 隔离机制。
 
@@ -358,7 +381,8 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 - 本仓库在 Windows 上只能做 `cargo check`/单元测试；netns、setns、SCM_RIGHTS 必须上 410。
 - `ue_isolation.enabled` 默认 false —— 未开启时行为与旧版完全一致。
 - 阶段一至四代码已完成但 feature gate 默认关闭；未经 410 回归不能宣称生产可用。
-- 阶段五仅完成通用架构，尚不代表已经支持 VoNR。
+- 阶段五目前只完成通用模型和投影，尚不代表已经支持 VoNR；需要支持 5G 的硬件
+  provider 真正填充 bearer/PDU/QoS 字段后，再单独实现并验收 NR bearer。
 - Windows 与 WSL Linux 的 `cargo check --all-targets` 已通过；Windows 上的 Unix/netns
   路径由条件编译替代实现覆盖，真实 `setns`、SCM_RIGHTS、XFRM 必须上 Linux/410 验证。
 
@@ -369,6 +393,8 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 ### 8.1 worker 与 VoWiFi
 
 - [ ] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
+- [ ] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
+- [ ] worker 进程异常退出后，状态清除旧 PID，下一次 reconcile 自动重启且无 zombie；
 - [ ] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、XFRM、SIP、RTP
   均属于当前线路 namespace；
 - [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
