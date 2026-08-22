@@ -199,6 +199,30 @@ session 不被复用”这一条并未真正被满足。
 单元测试 `binding_detects_a_respawned_worker_behind_the_same_handle` 直接构造
 “同一 handle、代次自增”的场景，锁定这个回归。
 
+### 4.1.4 worker socket 的 close-on-exec（本轮）
+
+实机拿到 IMS 注册之后，一次 worker 重启暴露出 fd 归属问题：
+
+```text
+ESTAB 2.194.56.78:5063 ... users:(("simadmin",pid=155950,fd=23),
+                                  ("simadmin",pid=150999,fd=23))
+```
+
+`pid=150999` 是通过 `SCM_RIGHTS` 收下 fd 的父进程，`pid=155950` 则是很久之后才
+拉起的替代 worker。`recv_control_frame` 调用 `recvmsg` 时没有传任何 flag，因此
+父进程收下的每个 fd 都不带 close-on-exec，会被后续每一次 fork+exec 继承。
+
+这恰好破坏了本次迁移要保证的 socket 生命周期：父进程关掉某个 IMS / RTP /
+代理 socket 时并不会真正释放它，因为一个从未创建过它的 worker 仍持有引用，
+已经退役的注册可能长期停留在 ESTAB；同时每次 worker 重启都会多泄漏一组 fd。
+
+修复：接收侧 `recvmsg` 传 `MSG_CMSG_CLOEXEC`（Linux-only，其余 Unix 保持原样
+以免编译失败）。
+
+实机验证（2026-08-22 / ab6177a）：注册就绪后 `kill -9` worker，替代进程
+**没有**出现在 IMS socket 的 owner 列表中，新 worker 仅 11 个 fd，zombie 为 0，
+注册本身不受影响。
+
 ### 4.2 worker 控制协议（当前）
 
 消息（JSON-lines，`type` 区分）：
@@ -542,14 +566,25 @@ Modem 注册在 MY MAXIS（50212）LTE，信号 86%。
 
 - **VoWiFi IMS REGISTER 已修复并通过**（见 §8.6）：200 OK，voice signaling 就绪，
   可以进行实机通话/短信测试。
-- **VoLTE（§8.2）仍阻塞**：`volte_bearer_netdev_runtime_error:interface=wwan0:
-  runtime_status=error before OPEN`。根因不在 SimAdmin：开机时
-  `qcom-q6v5-mss 4080000.remoteproc: fatal error received: smd_dsm_memcpy.c:297`
-  固件崩溃，remoteproc 自身恢复为 `running`，但其子设备
-  `4080000.remoteproc:bam-dmux` 的 runtime-PM 停留在 `error`，wwan0..7 全部继承
-  该状态。实测手工 `ip link set wwan1 up` 返回 `RTNETLINK answers: Invalid
-  argument`，证明 SimAdmin 的前置检查是正确的而非过严。恢复需要
-  unbind/rebind `bam-dmux` 平台驱动或设备级重启，属硬件/驱动层面。
+- **VoLTE（§8.2）仍阻塞，且已确认是设备固件缺陷，不是 SimAdmin 的问题**：
+  `volte_bearer_netdev_runtime_error:interface=wwan0: runtime_status=error before OPEN`。
+  每次开机 `qcom-q6v5-mss 4080000.remoteproc: fatal error received:
+  smd_dsm_memcpy.c:297` 固件崩溃，remoteproc 自身恢复为 `running`，但其子设备
+  `4080000.remoteproc:bam-dmux` 的 runtime-PM 停留在 `error`，wwan0..7 全部继承。
+  本轮做过的三次验证：
+
+  1. 手工 `ip link set wwan1 up` → `RTNETLINK answers: Invalid argument`，
+     说明 SimAdmin 的前置检查是正确的而非过严；
+  2. unbind/rebind `bam-dmux` 驱动 → runtime_status 从 `error` 变成 `suspended`，
+     **但 wwan 网卡全部消失**，内核报
+     `bam-dmux: Timed out waiting for remote side to suspend`，即 modem 侧 DMUX
+     不响应，无法重建通道；
+  3. 设备重启 → wwan0..7 回来了，但同一处固件崩溃在 t=15.77s 重现，
+     runtime_status 再次为 `error`。
+
+  结论：**重启无法修复，这是可复现的固件缺陷**。可行方向只有厂商固件/内核升级，
+  或按用户此前的经验重刷系统。SimAdmin 侧不应再增加重试，它已经正确地拒绝在
+  该状态下继续。
 - **数据代理（§8.3 大部分）阻塞**：需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，
   存在固件崩溃风险，本轮决定不启用。
 - **多线路（§8.4）**：只有一张卡，无法验证跨线路互不干扰。
