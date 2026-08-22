@@ -601,8 +601,29 @@ pub struct UeIsolationConfig {
     pub data_proxy_in_worker: bool,
     /// Stage 4 gate for trunk media sockets. Signalling and dialog ownership
     /// are already line-scoped; this controls only operator RTP socket creation.
+    /// Depends on `three_gpp_ims_sockets_in_worker`; read it through
+    /// [`UeIsolationConfig::effective_trunk_sockets_in_worker`].
     #[serde(default)]
     pub trunk_sockets_in_worker: bool,
+}
+
+impl UeIsolationConfig {
+    /// Whether operator RTP sockets may actually be created inside the worker.
+    ///
+    /// Trunk media can only follow a bearer that already lives in the UE
+    /// namespace. Enabling this gate alone would advertise a worker that cannot
+    /// see the bearer interface, so the RTP socket would either fail to bind or
+    /// silently egress through an ambiguous host route — a half-migrated state
+    /// that reads as "enabled" while traffic still leaves via the host.
+    pub fn effective_trunk_sockets_in_worker(&self) -> bool {
+        self.trunk_sockets_in_worker && self.three_gpp_ims_sockets_in_worker
+    }
+
+    /// True when the trunk gate is set but suppressed by its missing
+    /// dependency. Callers use this to explain the ignored setting.
+    pub fn trunk_sockets_gate_suppressed(&self) -> bool {
+        self.trunk_sockets_in_worker && !self.three_gpp_ims_sockets_in_worker
+    }
 }
 
 impl Default for UeIsolationConfig {
@@ -1449,6 +1470,26 @@ pub enum AutomationAction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Trunk media cannot enter a worker the bearer has not moved into, so the
+    /// trunk gate alone must never advertise a worker-backed RTP path.
+    #[test]
+    fn trunk_socket_gate_requires_the_three_gpp_bearer_gate() {
+        let mut isolation = UeIsolationConfig {
+            trunk_sockets_in_worker: true,
+            ..UeIsolationConfig::default()
+        };
+        assert!(!isolation.effective_trunk_sockets_in_worker());
+        assert!(isolation.trunk_sockets_gate_suppressed());
+
+        isolation.three_gpp_ims_sockets_in_worker = true;
+        assert!(isolation.effective_trunk_sockets_in_worker());
+        assert!(!isolation.trunk_sockets_gate_suppressed());
+
+        isolation.trunk_sockets_in_worker = false;
+        assert!(!isolation.effective_trunk_sockets_in_worker());
+        assert!(!isolation.trunk_sockets_gate_suppressed());
+    }
 
     #[test]
     fn notification_channel_accepts_frontend_pushplus_key() {

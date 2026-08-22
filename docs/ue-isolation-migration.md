@@ -172,6 +172,31 @@ veth 和 namespace。这样热插拔或 worker 重建不会让消费者把旧 bi
 worker 实例及其 netdev 快照；worker 重启、namespace 重建或接口不可见时，旧会话
 不会继续被当作可用出口，停止流程也会清理可能残留在宿主的地址/策略。
 
+### 4.1.3 worker 代次（generation）绑定（本轮）
+
+上一轮的“核对当前 worker 实例”实际上无法生效。`UeWorkerHandle` 在
+`LineRuntime` 构造时创建一次，`spawn()`/`shutdown()` 都在**同一个**
+`Arc<WorkerCore>` 上原地操作，因此 `same_instance()`（`Arc::ptr_eq`）在一条线路
+的整个生命周期内恒为 true。worker 崩溃后重建，数据代理和 retained DATA session
+仍然认为自己绑定的是当前 worker，§8.3 中“worker 异常退出并重建后，旧 DATA
+session 不被复用”这一条并未真正被满足。
+
+现已修复：
+
+- `WorkerCore` 增加单调递增的 `generation`，每次成功 `spawn` 自增（0 表示尚未启动）；
+- 新增 `UeWorkerBinding`：把 handle 与**捕获时刻的代次**一起保存。
+  `is_current()` 判断绑定的进程是否仍在运行，`matches()` 同时比较线路 worker 与代次；
+- `DataProxyRuntime` 的监听器、`SecondaryDataSession` 均改为持有 `UeWorkerBinding`；
+  代次不一致时，代理会被重建、retained DATA session 会先释放再重新建立；
+- `stop_session()` 只在 `is_current()` 时通过控制通道下发地址/路由清理，
+  避免把清理指令发给一个从未配置过该接口的替代 worker；接口回宿主与宿主侧
+  地址/策略清理仍然无条件执行；
+- `same_instance()` 语义收敛为“同一条线路的 worker 管理器”，其文档明确指出
+  它不区分进程代次。
+
+单元测试 `binding_detects_a_respawned_worker_behind_the_same_handle` 直接构造
+“同一 handle、代次自增”的场景，锁定这个回归。
+
 ### 4.2 worker 控制协议（当前）
 
 消息（JSON-lines，`type` 区分）：
@@ -291,6 +316,15 @@ ue_isolation:
   trunk_sockets_in_worker: false # stage-4：operator RTP socket；Asterisk/internal leg 留宿主
 ```
 
+`trunk_sockets_in_worker` **依赖 `three_gpp_ims_sockets_in_worker`**：trunk 媒体只能
+跟随一个已经进入 UE netns 的 bearer。只开 trunk gate 会宣告一个看不到 bearer 接口的
+worker，RTP socket 要么绑定失败、要么沿一条含糊的宿主路由发出去——一种“看似已启用、
+实际仍在宿主”的半迁移状态。因此配置侧提供
+`UeIsolationConfig::effective_trunk_sockets_in_worker()` 作为唯一判定入口，缺少依赖时
+发布的 feature 为 false 并告警一次（不按线路刷新重复刷屏）。
+注意 `volte/live.rs` 中 `three_gpp_ims || trunk_sockets` 是有意的：bearer 一旦进入
+worker，媒体 socket 必须跟随，即使 trunk gate 没开。
+
 只有 `enabled && vowifi_tun_in_namespace` 同时为 true 时，线路注册表才会：
 
 1. 创建 netns 并拉起 worker；
@@ -303,6 +337,20 @@ ue_isolation:
    查询也随之返回 `None`，下一个重连自动回到宿主路径。
 
 任何一步失败都只告警并**回退到旧的宿主路径**（`None` 分支），不中断现有功能。
+
+回退不再是“只发布 `None`”：egress 准备过程可能已经建好 worker、veth、NAT 规则和
+namespace，只把 socket context 置空会把这些资源留成孤儿，并让一个仍在运行的 worker
+继续持有 DATA 接口。现在失败路径执行**完整 teardown**，顺序固定为：
+
+1. `secondary_data.stop()`——此时 worker 控制通道仍然可用，能先删掉 netns 内的
+   地址与路由，再把接口移回宿主；
+2. `worker.shutdown()`——让 namespace 里不再有运行中的进程；
+3. `teardown_ue_isolation_locked()`——注销 worker/socket context 注册表、删除 NAT、
+   拆除 veth、移除 namespace、清空 egress fingerprint。
+
+“先停 DATA、再停 worker”这一顺序与线路消失路径、关闭隔离路径现已完全一致；
+反过来先杀 worker 会让 DATA 的 netns 内清理指令发不出去。下一次线路刷新会重新
+`ensure_netns` + `spawn`，因此该路径是自愈的。
 
 四个功能门默认均为 `false`。虽然阶段三/四代码已经完成，410 回归仍必须按
 VoWiFi → VoLTE → 数据代理/Trunk 的顺序逐个启用；不能一次打开全部功能后把故障归因给
@@ -434,10 +482,15 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 
 - [ ] 开启 `data_proxy_in_worker`，DATA6/secondary bearer 迁入正确 worker；
 - [ ] worker 异常退出并重建后，旧 DATA session 不被复用，接口能重新建立并迁入新 worker；
+      （代码侧已由 worker generation 绑定保证，见 §4.1.3；实机需确认代理监听器同时被重建）
+- [ ] egress 配置失败后，`ip netns list`、`ip link`、`iptables -t nat -S` 均无残留的
+      namespace / veth / MASQUERADE，且没有游离的 `ue-worker` 进程；
 - [ ] HTTP CONNECT、普通 HTTP、SOCKS5 的 DNS/IP 目标都从对应线路出站；
 - [ ] 停止代理/数据连接后接口回宿主，worker 内只清理该接口路由；
 - [ ] 开启 `trunk_sockets_in_worker`，operator RTP 属于当前线路 worker，Asterisk leg
   仍在宿主且双向媒体正常；
+- [ ] 只开 `trunk_sockets_in_worker` 而不开 `three_gpp_ims_sockets_in_worker` 时，
+  日志出现一次抑制告警，operator RTP 仍留在宿主（不得出现半迁移）；
 - [ ] Trunk 注册、来电、挂断和转发规则仍只作用于当前线路。
 
 ### 8.4 多线路强隔离

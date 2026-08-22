@@ -873,6 +873,9 @@ impl LineRuntimeRegistry {
                 );
             }
         } else if !ue_ready && worker.is_running().await {
+            // Release the DATA6 bearer first so its in-namespace address and
+            // routes are removed over a control channel that is still up.
+            line.secondary_data.stop().await;
             if let Err(error) = worker.shutdown().await {
                 tracing::warn!(
                     line_id = %binding.line_id,
@@ -897,10 +900,21 @@ impl LineRuntimeRegistry {
             None
         };
         let worker_available = worker_registration.is_some();
+        // Operator RTP can only enter a worker after the 3GPP bearer itself
+        // has moved there.  Warn once per process rather than on every line
+        // refresh, which would bury real failures during regression runs.
+        if isolation.trunk_sockets_gate_suppressed() {
+            static SUPPRESSED_TRUNK_GATE: std::sync::Once = std::sync::Once::new();
+            SUPPRESSED_TRUNK_GATE.call_once(|| {
+                tracing::warn!(
+                    "Ignoring trunk_sockets_in_worker until three_gpp_ims_sockets_in_worker is enabled"
+                );
+            });
+        }
         let features = crate::services::ue_worker::UeWorkerFeatures {
             three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
             data_proxy: isolation.data_proxy_in_worker,
-            trunk_sockets: isolation.trunk_sockets_in_worker,
+            trunk_sockets: isolation.effective_trunk_sockets_in_worker(),
         };
         if !worker_available {
             // A cached TUN/SIP channel may still belong to the dead worker's
@@ -916,16 +930,36 @@ impl LineRuntimeRegistry {
         }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
-                // The failed reconcile must only tear down an isolated live
-                // runtime that was actually published before this refresh.
-                // With no prior UE socket context, the line may still be
-                // using the legacy host path and should remain untouched.
-                if worker_available && had_ue_socket_context {
+                // Egress preparation may have created a new worker, veth,
+                // NAT rule or namespace before failing.  Falling back by
+                // merely publishing `None` would orphan those resources and
+                // leave a stale worker/data session alive.  Only clear the
+                // live runtime when a UE socket context was already
+                // published; a first isolated reconcile can still be serving
+                // the legacy host path and must not tear that runtime down.
+                if had_ue_socket_context {
                     crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
                         &line_id,
                     )
                     .await;
                 }
+                // Stop the DATA6 bearer while the worker is still alive: its
+                // teardown deletes the in-namespace address and routes over
+                // the control channel before moving the interface back to the
+                // host.  Then stop the worker so the shared teardown can
+                // remove a namespace nothing is running in, and clear the
+                // registry/context entries, NAT, veth and egress fingerprint.
+                line.secondary_data.stop().await;
+                if worker.is_running().await {
+                    if let Err(shutdown_error) = worker.shutdown().await {
+                        tracing::warn!(
+                            line_id = %line_id,
+                            error = %shutdown_error,
+                            "Failed to stop UE worker after egress reconcile failure"
+                        );
+                    }
+                }
+                self.teardown_ue_isolation_locked(line, &line_id).await;
                 tracing::warn!(
                     line_id = %line_id,
                     error = %error,

@@ -472,6 +472,10 @@ struct WorkerCore {
     tx: StdMutex<Option<mpsc::UnboundedSender<UeWorkerMessage>>>,
     pending: StdMutex<HashMap<u64, PendingRequest>>,
     request_seq: AtomicU64,
+    /// Incremented on every successful spawn. Starts at 0, so a handle that
+    /// has never spawned a process is distinguishable from the first
+    /// generation. See [`UeWorkerBinding`] for why a counter is required.
+    generation: AtomicU64,
     state: StdMutex<UeWorkerStatus>,
 }
 
@@ -480,6 +484,41 @@ struct WorkerCore {
 #[derive(Clone)]
 pub struct UeWorkerHandle {
     core: Arc<WorkerCore>,
+}
+
+/// A worker handle captured together with the process generation that was live
+/// at capture time.
+///
+/// The handle alone is not enough to detect a restart: it is created once per
+/// line and reused for every respawn, so two clones always share one core. A
+/// runtime that moved an interface into the namespace, or that binds outbound
+/// sockets through the worker, must be able to tell the process it bound to
+/// from a replacement that never received that configuration.
+#[derive(Clone)]
+pub struct UeWorkerBinding {
+    worker: UeWorkerHandle,
+    generation: u64,
+}
+
+impl UeWorkerBinding {
+    pub fn worker(&self) -> &UeWorkerHandle {
+        &self.worker
+    }
+
+    pub fn namespace(&self) -> &NetnsName {
+        self.worker.namespace()
+    }
+
+    /// True when the bound process is still the one the handle owns now.
+    pub fn is_current(&self) -> bool {
+        self.worker.generation() == self.generation
+    }
+
+    /// True when both bindings name the same line worker *and* the same
+    /// process generation.
+    pub fn matches(&self, other: &Self) -> bool {
+        self.worker.same_instance(&other.worker) && self.generation == other.generation
+    }
 }
 
 impl UeWorkerHandle {
@@ -500,6 +539,7 @@ impl UeWorkerHandle {
                 tx: StdMutex::new(None),
                 pending: StdMutex::new(HashMap::new()),
                 request_seq: AtomicU64::new(1),
+                generation: AtomicU64::new(0),
                 state: StdMutex::new(UeWorkerStatus {
                     line_id: line_id.to_string(),
                     control_socket,
@@ -524,8 +564,26 @@ impl UeWorkerHandle {
     /// lets those runtimes reject a stale namespace instead of silently
     /// sending traffic through a worker generation no longer owned by the
     /// line registry.
+    ///
+    /// This only compares the *manager*, not the worker process: the same core
+    /// survives crashes and respawns. Runtimes that bind sockets or interfaces
+    /// to a specific process must capture a [`UeWorkerBinding`] instead.
     pub fn same_instance(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.core, &other.core)
+    }
+
+    /// Generation of the worker process currently owned by this handle.
+    /// `0` means no process has been spawned yet.
+    pub fn generation(&self) -> u64 {
+        self.core.generation.load(Ordering::SeqCst)
+    }
+
+    /// Capture this handle together with the generation running right now.
+    pub fn bind(&self) -> UeWorkerBinding {
+        UeWorkerBinding {
+            generation: self.generation(),
+            worker: self.clone(),
+        }
     }
 
     pub async fn status(&self) -> UeWorkerStatus {
@@ -798,6 +856,9 @@ impl UeWorkerHandle {
             let mut guard = self.core.child.lock().await;
             *guard = Some(child);
         }
+        // Publish the new generation before the status update so any consumer
+        // that observes a live pid also observes the generation owning it.
+        self.core.generation.fetch_add(1, Ordering::SeqCst);
         {
             let mut state = self.core.state.lock().unwrap();
             state.pid = Some(pid);
@@ -2272,6 +2333,35 @@ mod tests {
         assert!(worker_generation_matches(Some(41), 41));
         assert!(!worker_generation_matches(Some(42), 41));
         assert!(!worker_generation_matches(None, 41));
+    }
+
+    /// A handle is created once per line and reused for every respawn, so two
+    /// clones always share one core. Only the captured generation can tell a
+    /// restarted worker from the one a runtime bound its sockets to.
+    #[test]
+    fn binding_detects_a_respawned_worker_behind_the_same_handle() {
+        let namespace = NetnsName::for_line("sa-ue", "line-abc");
+        let handle = UeWorkerHandle::for_line("line-abc", namespace);
+        handle.core.generation.fetch_add(1, Ordering::SeqCst);
+        let bound = handle.bind();
+        assert!(bound.is_current());
+        assert!(bound.matches(&handle.clone().bind()));
+
+        // The worker crashes and the line registry spawns a replacement.
+        handle.core.generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!bound.is_current());
+        assert!(!bound.matches(&handle.bind()));
+        // The manager itself is unchanged, which is why pointer equality alone
+        // cannot be used to validate a captured binding.
+        assert!(bound.worker().same_instance(&handle));
+    }
+
+    #[test]
+    fn bindings_never_match_across_lines() {
+        let first = UeWorkerHandle::for_line("line-a", NetnsName::for_line("sa-ue", "line-a"));
+        let second = UeWorkerHandle::for_line("line-b", NetnsName::for_line("sa-ue", "line-b"));
+        assert!(!first.bind().matches(&second.bind()));
+        assert!(!first.same_instance(&second));
     }
 
     #[test]

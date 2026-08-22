@@ -22,7 +22,8 @@ use tokio::{
 
 use crate::platform::config::LineDataProxyConfig;
 use crate::services::ue_worker::{
-    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerFeatures, UeWorkerHandle,
+    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerFeatures,
+    UeWorkerHandle,
 };
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -246,6 +247,12 @@ impl Default for DataProxyStatus {
 struct ProxyState {
     status: DataProxyStatus,
     auth: Option<(String, String)>,
+    /// Worker generation that owns outbound sockets for the listener.  The
+    /// listener itself stays in the host namespace, but every accepted client
+    /// captures this handle; retaining the binding here lets reconciliation
+    /// detect a stale listener when a line worker is replaced, respawned or
+    /// disabled.
+    worker: Option<UeWorkerBinding>,
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<()>>,
 }
@@ -316,6 +323,10 @@ impl DataProxyRuntime {
                 if !status.ready {
                     None
                 } else {
+                    // Capture the generation before probing so a worker that
+                    // restarts mid-check yields a stale binding rather than a
+                    // fresh one backed by an unverified namespace.
+                    let binding = worker.bind();
                     // Do not trust a cached namespace snapshot here. A
                     // worker can restart, or a bearer can move back to the
                     // host, since the last reconcile.
@@ -326,7 +337,7 @@ impl DataProxyRuntime {
                                 .iter()
                                 .any(|name| name == interface_name) =>
                         {
-                            Some(worker)
+                            Some(binding)
                         }
                         _ => None,
                     }
@@ -341,7 +352,7 @@ impl DataProxyRuntime {
         &self,
         interface_name: &str,
         config: &LineDataProxyConfig,
-        worker: Option<UeWorkerHandle>,
+        worker: Option<UeWorkerBinding>,
     ) -> Result<DataProxyStatus, String> {
         let interface_name = interface_name.trim();
         if interface_name.is_empty() {
@@ -355,6 +366,7 @@ impl DataProxyRuntime {
             && (config.listen_port == 0 || state.status.port == Some(config.listen_port))
             && state.status.auth_required == !config.username.is_empty()
             && state.auth.as_ref() == Some(&(config.username.clone(), config.password.clone()))
+            && worker_binding_matches_state(state.worker.as_ref(), worker.as_ref())
         {
             return Ok(state.status.clone());
         }
@@ -373,7 +385,7 @@ impl DataProxyRuntime {
             .port();
         let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
         let outbound_interface = interface_name.to_string();
-        let outbound_worker = worker.clone();
+        let outbound_worker = worker.as_ref().map(|binding| binding.worker().clone());
         let username = config.username.clone();
         let password = config.password.clone();
         let counters = Arc::clone(&self.counters);
@@ -437,6 +449,7 @@ impl DataProxyRuntime {
         state.shutdown = Some(shutdown_tx);
         state.task = Some(task);
         state.auth = Some((config.username.clone(), config.password.clone()));
+        state.worker = worker;
         Ok(state.status.clone())
     }
 
@@ -453,6 +466,15 @@ impl DataProxyRuntime {
         state.status.stage = error.clone();
         state.status.last_error = Some(error);
         state.status.clone()
+    }
+
+    /// Whether the running listener is bound to the requested UE worker
+    /// generation.  The listener remains valid when both sides are host-side
+    /// (`None`), while a worker replacement or respawn forces the caller to
+    /// restart it so newly accepted sockets cannot use a stale namespace.
+    pub async fn worker_binding_matches(&self, expected: Option<&UeWorkerBinding>) -> bool {
+        let state = self.state.lock().await;
+        state.status.running && worker_binding_matches_state(state.worker.as_ref(), expected)
     }
 }
 
@@ -477,6 +499,18 @@ async fn stop_locked(state: &mut ProxyState) {
     state.status.auth_required = false;
     state.status.last_error = None;
     state.auth = None;
+    state.worker = None;
+}
+
+fn worker_binding_matches_state(
+    current: Option<&UeWorkerBinding>,
+    expected: Option<&UeWorkerBinding>,
+) -> bool {
+    match (current, expected) {
+        (None, None) => true,
+        (Some(current), Some(expected)) => current.matches(expected),
+        _ => false,
+    }
 }
 
 #[derive(Clone)]
@@ -861,6 +895,50 @@ fn bind_socket_to_device(_socket: &TcpSocket, _interface_name: &str) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::netns::NetnsName;
+
+    /// The listener stays host-side, but its accepted sockets are created by a
+    /// specific worker process. A respawn behind the same handle must invalidate
+    /// the listener so reconciliation rebuilds it against the new namespace.
+    #[test]
+    fn listener_binding_follows_the_worker_generation() {
+        let handle = UeWorkerHandle::for_line("line-a", NetnsName::for_line("sa-ue", "line-a"));
+        let bound = handle.bind();
+        assert!(worker_binding_matches_state(
+            Some(&bound),
+            Some(&handle.bind())
+        ));
+
+        // Host-path listeners have no worker on either side.
+        assert!(worker_binding_matches_state(None, None));
+        // Enabling or disabling isolation must force a restart.
+        assert!(!worker_binding_matches_state(Some(&bound), None));
+        assert!(!worker_binding_matches_state(None, Some(&bound)));
+    }
+
+    #[tokio::test]
+    async fn running_listener_reports_its_worker_binding() {
+        let runtime = DataProxyRuntime::default();
+        runtime
+            .start(
+                "test-interface",
+                &LineDataProxyConfig {
+                    listen_ip: "127.0.0.1".to_string(),
+                    listen_port: 0,
+                    ..LineDataProxyConfig::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Started without a worker, so only the host-path binding matches.
+        assert!(runtime.worker_binding_matches(None).await);
+        let handle = UeWorkerHandle::for_line("line-a", NetnsName::for_line("sa-ue", "line-a"));
+        assert!(!runtime.worker_binding_matches(Some(&handle.bind())).await);
+
+        // A stopped listener never counts as correctly bound.
+        runtime.stop().await;
+        assert!(!runtime.worker_binding_matches(None).await);
+    }
 
     #[tokio::test]
     async fn binds_configured_listener_and_reports_stage() {

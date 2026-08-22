@@ -18,7 +18,9 @@ use crate::{
         qmi_wds,
     },
     platform::{config::ApnConfig, netns},
-    services::ue_worker::{worker_for_line_feature, NetConfigOp, UeWorkerFeatures, UeWorkerHandle},
+    services::ue_worker::{
+        worker_for_line_feature, NetConfigOp, UeWorkerBinding, UeWorkerFeatures, UeWorkerHandle,
+    },
 };
 
 use super::secondary_qmi::{self, SecondaryQmiEndpoint};
@@ -32,7 +34,7 @@ struct SecondaryDataSession {
     endpoint: SecondaryQmiEndpoint,
     netdev: ResolvedNetdev,
     netdev_config: NetdevConfig,
-    worker: Option<UeWorkerHandle>,
+    worker: Option<UeWorkerBinding>,
 }
 
 #[derive(Default)]
@@ -221,7 +223,7 @@ async fn retained_session_worker_is_usable(line_id: &str, session: &SecondaryDat
     let Some(current_worker) = data_worker_for_line(line_id).await else {
         return false;
     };
-    if !session_worker.same_instance(&current_worker) {
+    if !session_worker.matches(&current_worker.bind()) {
         return false;
     }
     match current_worker.refresh_net_status().await {
@@ -249,6 +251,10 @@ async fn move_data_session_into_worker(
     if interface == "wwan0" {
         return Err("cellular_data_refuses_primary_interface_wwan0".to_string());
     }
+    // Capture the generation before the interface crosses namespaces. A worker
+    // that respawns during migration must invalidate this session rather than
+    // inherit an interface it never configured.
+    let binding = worker.bind();
     // Remove host policy state before the interface crosses namespaces. The
     // retained WDS session remains alive and owns the raw-IP data channel.
     qmi_netdev::teardown(interface, &session.netdev_config).await;
@@ -304,7 +310,7 @@ async fn move_data_session_into_worker(
         let _ = qmi_netdev::configure_host_data_path(interface, config).await;
         return Err("cellular_data_worker_interface_missing".to_string());
     }
-    session.worker = Some(worker);
+    session.worker = Some(binding);
     Ok(())
 }
 
@@ -553,24 +559,31 @@ async fn stop_session(mut session: SecondaryDataSession) {
         client_id: std::mem::take(&mut session.client_id),
         packet_data_handle: std::mem::take(&mut session.packet_data_handle),
     };
-    if let Some(worker) = session.worker.take() {
-        let _ = worker
-            .apply_net_config(vec![
-                NetConfigOp::FlushRoutesForDevice {
-                    ifname: session.netdev.interface.clone(),
-                    ipv6: session.netdev_config.address.is_ipv6(),
-                },
-                NetConfigOp::AddrDel {
-                    ifname: session.netdev.interface.clone(),
-                    cidr: format!(
-                        "{}/{}",
-                        session.netdev_config.address, session.netdev_config.prefix
-                    ),
-                },
-            ])
-            .await;
-        let _ = netns::move_iface_out(worker.namespace(), &session.netdev.interface).await;
-        let _ = worker.refresh_net_status().await;
+    if let Some(binding) = session.worker.take() {
+        // Only the generation that configured the interface can clean it up.
+        // A replacement worker owns a different namespace instance, so its
+        // control channel would either reject these ops or apply them to the
+        // wrong stack; the interface still needs moving back to the host.
+        if binding.is_current() {
+            let _ = binding
+                .worker()
+                .apply_net_config(vec![
+                    NetConfigOp::FlushRoutesForDevice {
+                        ifname: session.netdev.interface.clone(),
+                        ipv6: session.netdev_config.address.is_ipv6(),
+                    },
+                    NetConfigOp::AddrDel {
+                        ifname: session.netdev.interface.clone(),
+                        cidr: format!(
+                            "{}/{}",
+                            session.netdev_config.address, session.netdev_config.prefix
+                        ),
+                    },
+                ])
+                .await;
+        }
+        let _ = netns::move_iface_out(binding.namespace(), &session.netdev.interface).await;
+        let _ = binding.worker().refresh_net_status().await;
         // The interface may have returned to the host automatically when a
         // worker namespace disappeared. Always remove this session's host
         // address/policy state before releasing its QMI CID.

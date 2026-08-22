@@ -69,6 +69,7 @@ use crate::{
         status as system_event_status,
     },
     services::trunk::bridge::{DtmfSignal, DtmfSource, OperatorCommand},
+    services::ue_worker::{worker_for_line_feature, UeWorkerBinding, UeWorkerFeatures},
     state::AppState,
 };
 
@@ -3036,6 +3037,35 @@ fn cooldown_elapsed(last_attempt: Option<Instant>, cooldown_secs: u64) -> bool {
         .unwrap_or(true)
 }
 
+fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
+    features.data_proxy
+}
+
+/// Resolve the worker generation that can currently see a data interface.
+///
+/// A worker handle in the line registry is not sufficient by itself: the
+/// process may still be handshaking, or the bearer may have moved back to the
+/// host namespace after a worker restart.  Refreshing the namespace snapshot
+/// here keeps the watchdog's expected binding in lock-step with
+/// `DataProxyRuntime::start_for_line`.
+async fn current_data_proxy_worker(
+    line_id: &str,
+    interface: Option<&str>,
+) -> Option<UeWorkerBinding> {
+    let interface = interface?;
+    let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
+    if !worker.status().await.ready {
+        return None;
+    }
+    let binding = worker.bind();
+    worker
+        .refresh_net_status()
+        .await
+        .ok()
+        .filter(|snapshot| snapshot.interfaces.iter().any(|name| name == interface))
+        .map(|_| binding)
+}
+
 /// Reconcile registration, bearer and proxy health for one selected line. The
 /// caller holds that line's watchdog state lock; no counters or cooldowns are
 /// shared with another SIM.
@@ -3115,8 +3145,15 @@ async fn reconcile_line_data_health(
             .unwrap_or(None)
     };
     let proxy = line.data_proxy.status().await;
+    let current_worker = current_data_proxy_worker(&binding.line_id, interface.as_deref()).await;
+    let worker_binding_matches = line
+        .data_proxy
+        .worker_binding_matches(current_worker.as_ref())
+        .await;
     let healthy = interface.as_deref().is_some_and(|interface| {
-        proxy.running && proxy.interface_name.as_deref() == Some(interface)
+        proxy.running
+            && proxy.interface_name.as_deref() == Some(interface)
+            && worker_binding_matches
     });
     if healthy {
         watchdog.missing_data_polls = 0;
