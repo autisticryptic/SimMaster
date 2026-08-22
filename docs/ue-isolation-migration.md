@@ -468,12 +468,15 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
       （2026-08-22 / 9ae297a：连续 4 次 `kill -9`，每次约 5 秒拉起替代进程，zombie 恒为 0，
       netns/veth/NAT 始终各 1 份，net-config 每次重新下发）
 - [x] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、SIP、RTP
-  均属于当前线路 namespace；本轮 IMS REGISTER 仍被运营商以 SIP `421` 拒绝，业务注册未通过；
-      （2026-08-22 / 9ae297a：TUN 取得运营商地址 `3.2.22.195/32` 与 IPv6，两条 P-CSCF
+  均属于当前线路 namespace；
+      （2026-08-22 / 9ae297a：TUN 取得运营商地址与 IPv6，两条 P-CSCF
       主机路由均在 netns 内；IKE `0.0.0.0:500` socket 在 netns 内、fd 由主进程持有；
-      宿主侧无 `sa_vwf` 泄漏；IKEv2/EAP-AKA/ESP 隧道建立成功，REGISTER 经隧道收到应答，
-      仅被运营商以 421 拒绝 —— 属运营商侧问题，与 namespace 隔离无关）
-- [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
+      宿主侧无 `sa_vwf` 泄漏；IKEv2/EAP-AKA/ESP 隧道建立成功）
+- [x] VoWiFi IMS REGISTER 成功（2026-08-22 / dd4bb0f，见 §8.6）：
+      `status_code=200 auth_rounds=1 expires_seconds=3600`，随后
+      `Voice over IMS signaling readiness validated preferred_codec="amr-wb"`；
+      受保护的 ipsec-3gpp 两条流（5063↔7807、5064↔7777）均在 UE netns 内 ESTAB。
+- [ ] VoWiFi 短信、来电/接听、双向 RTP、DTMF、挂断同步正常；（signaling 已就绪，待拨打测试）
 - [ ] 飞行模式下仍可用 VoWiFi，退出后 TUN/XFRM/路由均无残留；
 - [ ] P-CSCF 或 worker socket 失败时错误可观测，worker 崩溃后线路能恢复。
 
@@ -537,12 +540,54 @@ Modem 注册在 MY MAXIS（50212）LTE，信号 86%。
 
 未通过或阻塞：
 
-- **VoWiFi IMS REGISTER 仍被运营商回 SIP 421**（`ims_register_initial_unexpected_status`）。
-  隧道、路由、socket 归属都正确，属运营商/profile 侧问题，需要单独排查。
-- **VoLTE（§8.2）阻塞**：`volte_bearer_netdev_runtime_error:interface=wwan0:
-  runtime_status=error before OPEN`，该错误在部署新版本之前就存在；且槽位分配
-  现在还会走 DATA6，进一步依赖下面的硬件门。
+- **VoWiFi IMS REGISTER 已修复并通过**（见 §8.6）：200 OK，voice signaling 就绪，
+  可以进行实机通话/短信测试。
+- **VoLTE（§8.2）仍阻塞**：`volte_bearer_netdev_runtime_error:interface=wwan0:
+  runtime_status=error before OPEN`。根因不在 SimAdmin：开机时
+  `qcom-q6v5-mss 4080000.remoteproc: fatal error received: smd_dsm_memcpy.c:297`
+  固件崩溃，remoteproc 自身恢复为 `running`，但其子设备
+  `4080000.remoteproc:bam-dmux` 的 runtime-PM 停留在 `error`，wwan0..7 全部继承
+  该状态。实测手工 `ip link set wwan1 up` 返回 `RTNETLINK answers: Invalid
+  argument`，证明 SimAdmin 的前置检查是正确的而非过严。恢复需要
+  unbind/rebind `bam-dmux` 平台驱动或设备级重启，属硬件/驱动层面。
 - **数据代理（§8.3 大部分）阻塞**：需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，
   存在固件崩溃风险，本轮决定不启用。
 - **多线路（§8.4）**：只有一张卡，无法验证跨线路互不干扰。
 - 通话与短信按要求不在本轮范围内。
+
+### 8.6 VoWiFi IMS REGISTER 421/400 修复（2026-08-22）
+
+回归初期 VoWiFi REGISTER 一直被 Maxis 以 `421 Extension Required` 拒绝。抓包
+（在 UE netns 内对 TUN 抓明文，外层 ESP 由用户态终结）给出了完整证据链，并且
+**先用 `ue_isolation.enabled=false` 做了 A/B**：宿主路径发出的 REGISTER 与隔离
+路径逐字段一致、同样被回 421，因此该问题与 UE 迁移无关（相关默认值比迁移早 12 天）。
+
+三个连续的缺陷，每个都由抓包确认后单独修复：
+
+| 请求形态 | 运营商响应 | 缺陷 |
+|---|---|---|
+| `Security-Client`，无 `Require` | `421 Require: sec-agree` | `auto` 模式下没有任何变体会声明 sec-agree |
+| `+ Require: sec-agree` | `400 Bad Request` | 缺少配套的 `Proxy-Require`（RFC 3329 §2.3） |
+| `+ Proxy-Require: sec-agree` | `400 Bad Request` | 缺少 IMS AKA 的空 `Authorization`（TS 24.229 §5.1.1.2.2） |
+| 三者齐备 | **`401` → AKA → `200 OK`** | — |
+
+根因是 `security_agreement` 的 `auto` 兜底不完整：从真机提取的 bundle 通常不写
+这个字段，落到 `auto` 后 `include_security_client` 为 true 而
+`force_sec_agree_headers` 为 false，且另一个变体 `catalog_v7_challenge_first`
+干脆不带 Security-Client —— 没有任何一条路径能发出运营商要求的声明。
+
+修复方式刻意**不是**"只要带 Security-Client 就强制加 Require"：`GB_EE_23433`
+是真机抓取的形态，故意只带 `Supported: sec-agree` 而不带 `Require`，其单元测试
+锁定了这一点。改为按运营商实际要求自适应（与 VoLTE 侧既有做法一致）：
+
+- 把 421 中的 `Require: sec-agree` 需求经 `LiveStageError` 带出；
+- 用同一变体加上 Require/Proxy-Require 重试一次，保留该运营商已验证的
+  request-URI、authorization 与 Security-Client 格式；
+- catalog 侧 `proxy_require_sec_agree_headers` 与 `initial_authorization`
+  改为跟随"是否真的提供了 Security-Client"。`profiles.rs` 中的硬编码 profile
+  不走 catalog 路径，因此 EE / Vodafone 的既有形态不受影响。
+
+注意：认证轮的 REGISTER 实测 `inner_packet_bytes=1352`，而软件分片阈值
+`AUTO_FRAGMENT_INNER_IP_MAX` 为 1356 —— **只剩 4 字节余量**。再增加任何头部
+（PANI、sip.instance、更多 Contact 参数）都会跨过阈值并触发分片路径，该路径
+目前尚未在实机上被真正走过，需要单独验证。
