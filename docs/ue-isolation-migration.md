@@ -642,9 +642,38 @@ runtime_status=error before OPEN`，wwan0..7 全部无法 OPEN。
 `state: connected`。VoLTE 因此前进到能建立 bearer 并真正发出 IMS REGISTER
 （`request_bytes=981`）。
 
-当前 VoLTE 的失败点已经**不是**接口问题，而是 `ims_register_initial_receive_failed`
-—— REGISTER 发出后 8 秒收不到任何响应。注意它使用的 P-CSCF 是
-`172.20.58.221` / `172.20.225.221`，这两个地址是 VoWiFi 经 ePDG 隧道才可达的；
-日志同时显示 `VoLTE bearer delivered no P-CSCF via PCO`，即 IMS APN 没有通过
-PCO 下发 P-CSCF，代码回退去读了 IMS context。**下一步应排查 VoLTE bearer 的
-P-CSCF 来源与可达性**，而不是继续动 netdev 层。
+当前 VoLTE 的失败点已经**不是**接口问题，而是更下层的 **IMS PDN 根本没有激活**。
+向 modem 直接查询（经 ModemManager 的 AT passthrough，只读）：
+
+```text
+AT+CGDCONT?      +CGDCONT: 2,"IPV4V6","ims","0.0.0.0",0,0   ← IMS context 已定义
+AT+CGPADDR       +CGPADDR: 2,0.0.0.0                        ← 但没有分到地址
+AT+CGCONTRDP=2   (空)                                        ← 没有任何动态参数
+
+ModemManager Bearer/2 (apn: ims):
+  connected: no
+  connection error: "Call failed: cm error: client-end"   attempts: 3
+```
+
+因果链因此是：**IMS PDN 激活失败 → 没有已激活的 IMS context → PCO 自然下发不了
+P-CSCF → 代码回退去读 IMS context，拿到的是 VoWiFi 侧的 `172.20.x` 地址 →
+这些地址在 LTE bearer 上不可达 → `ims_register_initial_receive_failed`。**
+
+路由层面还观察到一个真实缺陷：SimAdmin 的策略表 `14002` 只为其中一个 P-CSCF
+装了路由：
+
+```text
+ip route show table 14002
+  2.242.195.192/26  dev wwan1 scope link
+  172.20.225.221    dev wwan1 scope link        ← 只有这一个
+
+ip route get 172.20.225.221 from 2.242.195.224 → dev wwan1 table 14002   正确
+ip route get 172.20.58.221  from 2.242.195.224 → via 192.168.100.1 dev wlan0  **漏到 WiFi**
+```
+
+即候选 P-CSCF 列表里没装路由的那个会经由宿主 WiFi 发出去。即使 IMS PDN 修好，
+这一条也应当修：要么为所有候选 P-CSCF 都装策略路由，要么在没有路由时直接跳过该
+候选，而不是让它走默认路由泄漏到别的接口。
+
+**下一步应从 IMS PDN 激活查起**（`cm error: client-end` 的具体原因、IMS APN 参数、
+是否需要单独的 IMS profile / 鉴权），而不是继续在 SIP 或 netdev 层排查。
