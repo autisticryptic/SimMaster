@@ -141,6 +141,18 @@ const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// Maximum number of SCM_RIGHTS fds attached to one control frame.
 const MAX_SOCKET_FDS: usize = 4;
 
+/// `recvmsg` flags used when collecting SCM_RIGHTS fds.
+///
+/// The parent keeps IMS/RTP/proxy sockets alive for the life of a registration
+/// while spawning new `ue-worker` children across restarts. Without
+/// close-on-exec every replacement worker inherits those descriptors, so the
+/// parent closing a socket no longer releases it and a retired registration can
+/// stay ESTAB behind a worker that never created it.
+#[cfg(all(unix, target_os = "linux"))]
+const RECV_FD_FLAGS: libc::c_int = libc::MSG_CMSG_CLOEXEC;
+#[cfg(all(unix, not(target_os = "linux")))]
+const RECV_FD_FLAGS: libc::c_int = 0;
+
 /// A single ordered network operation executed by the worker *inside its own
 /// UE network namespace*. The worker is already `setns`-ed, so every `ip`
 /// command here applies to the UE namespace only and cannot leak into another
@@ -1771,7 +1783,7 @@ fn recv_control_frame(
         .len()
         .try_into()
         .expect("control message buffer exceeds platform limit");
-    let received = unsafe { libc::recvmsg(fd, &mut header_msg, 0) };
+    let received = unsafe { libc::recvmsg(fd, &mut header_msg, RECV_FD_FLAGS) };
     if received < 0 {
         return Err(std::io::Error::last_os_error());
     }
