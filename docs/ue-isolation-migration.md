@@ -677,3 +677,46 @@ ip route get 172.20.58.221  from 2.242.195.224 → via 192.168.100.1 dev wlan0  
 
 **下一步应从 IMS PDN 激活查起**（`cm error: client-end` 的具体原因、IMS APN 参数、
 是否需要单独的 IMS profile / 鉴权），而不是继续在 SIP 或 netdev 层排查。
+
+#### 8.7.1 已排除的三个假设（2026-08-23）
+
+沿着上面的线索又排除了三条，记下来避免重复走：
+
+**① 策略路由的源地址竞态 —— 不成立。** 曾观察到 `ip rule from <旧地址>` 与
+`wwan1` 当前地址不符，怀疑是配置快照与发包时刻之间的地址竞态。为此加了
+`volte_bearer_address_changed` 前置检查（`bearer.rs::interface_still_holds_address`），
+实机跑下来**触发 0 次** —— 发 REGISTER 那一刻接口地址与策略路由是一致的。
+之前那次"关联"取的是最新日志行 + 随后采样的路由，中间跨了 bearer 周期，不严密。
+该检查作为防御保留，它把这类竞态从静默超时变成显式错误。
+
+**② SIP 漏到 WiFi —— 不成立。** 在 `wwan1` 与 `wlan0` 上同时抓包：
+
+```text
+VoLTE local_port=56934
+HOST  socket : ESTAB 2.181.181.169:56934 → 172.20.110.221:5060
+NETNS socket : 无（socket 正确留在宿主，wwan1 本就是宿主接口）
+wwan1 抓到   : 2 条 REGISTER
+wlan0 抓到   : 0 条
+```
+
+包确实从 IMS bearer 出去、源地址正确、没有泄漏。**路由与源地址选择都是对的。**
+
+**③ 缺少 sec-agree 声明 —— 不成立。** VoLTE 发的确实是 VoWiFi 侧被 421 拒绝的
+那个不合规形态（`sec_agree_required=false`），而且因为 Maxis 在 LTE leg 上是
+**直接丢弃而不是回 421**，原有的 421 升级阶梯永远触发不了。为此补了一级
+`sec_agree_timeout_retry_variant`：初始 REGISTER 完全无响应时，用同一变体带上
+`Require`/`Proxy-Require` 重试一次。实机确认该升级**已生效**：
+
+```text
+ATTEMPT variant=catalog_v7                             require=false proxy=true → 无响应
+ATTEMPT variant=..._aka_uri_first_sec_agree_required   require=true  proxy=true → 无响应
+```
+
+**带齐全部 sec-agree 头之后运营商仍然完全不回**，所以 sec-agree 不是 VoLTE 的
+阻塞原因。这一级阶梯本身是真实缺口，值得保留（对会回 421 的运营商有用）。
+
+**目前的判断**：同一个 IMS 核心经 ePDG（VoWiFi）能正常应答并注册成功，经 LTE
+IMS APN 则对任何形态的 REGISTER 都保持静默。剩余的可能性集中在接入侧授权，而不
+是 SIP 报文内容：IMS APN 是否被允许承载来自宿主协议栈的信令、是否要求由基带内置
+IMS 客户端发起、以及 `cm error: client-end` 背后的 PDN 授权细节。**继续排查应从
+运营商侧 IMS 接入授权入手，SIP 层已无更多可做。**
