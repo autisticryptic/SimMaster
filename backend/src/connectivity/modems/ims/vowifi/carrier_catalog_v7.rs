@@ -1262,15 +1262,17 @@ fn project_register(
             .to_string(),
         include_pani_initial,
         include_pani_authenticated,
-        // TS 24.229 §5.1.1.1: an AKA UE's initial REGISTER SHALL carry an
+        // TS 24.229 §5.1.1.2.2: an AKA UE's initial REGISTER SHALL carry an
         // empty Authorization (username/realm/uri populated, nonce/response
-        // empty) so the network can challenge it. Default to that shape when
-        // the carrier requires sec-agree (the normal IMS AKA path); the
-        // explicit JSON value still wins.
+        // empty) so the network knows which private identity to challenge.
+        // Offering ipsec-3gpp means we are doing IMS AKA, so default to that
+        // shape; a core that demands sec-agree has no way to start the
+        // challenge without it and answers 400. The explicit JSON value still
+        // wins, and hardcoded profiles in profiles.rs are unaffected.
         initial_authorization: string_at(register, "/initial_authorization")
             .map(str::to_string)
             .unwrap_or_else(|| {
-                if sec_agree_mode == "required" {
+                if offers_sec_agree {
                     "aka_empty".to_string()
                 } else {
                     "none".to_string()
