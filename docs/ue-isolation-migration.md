@@ -1,6 +1,8 @@
 # 多 UE 隔离架构迁移文档（Option B：per-UE worker + setns）
 
-> 状态：**阶段一至四已完成代码实现，待 410 分阶段实机回归；阶段五已完成不改变现有硬件行为的通用模型底座**。
+> 状态：**阶段一至四已完成代码实现；worker 生命周期、egress 失败 teardown、trunk 门依赖
+> 与 VoWiFi 数据面隔离已在 410 实机验证（2026-08-22 / build 9ae297a，见 §8.5）；
+> VoLTE 与数据代理仍被硬件问题阻塞；阶段五已完成不改变现有硬件行为的通用模型底座**。
 > 本文档是 `multi_ue_ims_volte_vowifi_architecture.md` 的落地实现记录，记录了已完成的
 > 实机验证、当前代码状态、控制协议，以及 VoWiFi → VoLTE → 数据代理/Trunk → 5G
 > 的逐步迁移计划与验收标准。
@@ -461,9 +463,16 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 
 - [x] 只开启 `enabled + vowifi_tun_in_namespace`，确认 netns、worker Hello、veth/NAT 成功；
 - [x] worker 空闲超过 60 秒仍保持 `ready=true`，Ping/Pong 可见，控制通道不被误关闭；
-- [ ] worker 进程异常退出后，状态清除旧 PID，下一次 reconcile 自动重启且无 zombie；
+      （2026-08-22 / 9ae297a：静置 150 秒跨两个 60s 读超时，worker pid 不变，控制通道错误 0 条）
+- [x] worker 进程异常退出后，状态清除旧 PID，下一次 reconcile 自动重启且无 zombie；
+      （2026-08-22 / 9ae297a：连续 4 次 `kill -9`，每次约 5 秒拉起替代进程，zombie 恒为 0，
+      netns/veth/NAT 始终各 1 份，net-config 每次重新下发）
 - [x] worker 内可见 `lo`、`save<hex>`、`sa_vwf<hex>`；IKE、TUN、SIP、RTP
   均属于当前线路 namespace；本轮 IMS REGISTER 仍被运营商以 SIP `421` 拒绝，业务注册未通过；
+      （2026-08-22 / 9ae297a：TUN 取得运营商地址 `3.2.22.195/32` 与 IPv6，两条 P-CSCF
+      主机路由均在 netns 内；IKE `0.0.0.0:500` socket 在 netns 内、fd 由主进程持有；
+      宿主侧无 `sa_vwf` 泄漏；IKEv2/EAP-AKA/ESP 隧道建立成功，REGISTER 经隧道收到应答，
+      仅被运营商以 421 拒绝 —— 属运营商侧问题，与 namespace 隔离无关）
 - [ ] VoWiFi REGISTER、短信、来电/接听、双向 RTP、DTMF、挂断同步正常；
 - [ ] 飞行模式下仍可用 VoWiFi，退出后 TUN/XFRM/路由均无残留；
 - [ ] P-CSCF 或 worker socket 失败时错误可观测，worker 崩溃后线路能恢复。
@@ -481,21 +490,59 @@ VoLTE P-CSCF 查询中实现；普通代理域名当前仍由宿主解析，再�
 ### 8.3 数据代理与 Trunk
 
 - [ ] 开启 `data_proxy_in_worker`，DATA6/secondary bearer 迁入正确 worker；
+      **被硬件门阻塞**：DATA6 需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，而该开关被标注为
+      「410 固件把 AT 端点强制以 QMI 打开时可能导致 modem 崩溃」，默认关闭。2026-08-22
+      回归时明确选择不启用，因此本节数据代理各项均未实机验证。
 - [ ] worker 异常退出并重建后，旧 DATA session 不被复用，接口能重新建立并迁入新 worker；
-      （代码侧已由 worker generation 绑定保证，见 §4.1.3；实机需确认代理监听器同时被重建）
-- [ ] egress 配置失败后，`ip netns list`、`ip link`、`iptables -t nat -S` 均无残留的
+      （代码侧已由 worker generation 绑定保证，见 §4.1.3，并有单元测试
+      `binding_detects_a_respawned_worker_behind_the_same_handle`；实机部分随 DATA6 一起阻塞）
+- [x] egress 配置失败后，`ip netns list`、`ip link`、`iptables -t nat -S` 均无残留的
       namespace / veth / MASQUERADE，且没有游离的 `ue-worker` 进程；
+      （2026-08-22 / 9ae297a：注入非法 `veth_mtu=999999` 使 `ensure_veth_pair_host_side`
+      失败后，netns/veth/NAT/worker 计数全部归 0，zombie 0，服务未崩溃；改回 1500 后
+      自动重建且各资源仍各 1 份）
 - [ ] HTTP CONNECT、普通 HTTP、SOCKS5 的 DNS/IP 目标都从对应线路出站；
 - [ ] 停止代理/数据连接后接口回宿主，worker 内只清理该接口路由；
 - [ ] 开启 `trunk_sockets_in_worker`，operator RTP 属于当前线路 worker，Asterisk leg
   仍在宿主且双向媒体正常；
-- [ ] 只开 `trunk_sockets_in_worker` 而不开 `three_gpp_ims_sockets_in_worker` 时，
+- [x] 只开 `trunk_sockets_in_worker` 而不开 `three_gpp_ims_sockets_in_worker` 时，
   日志出现一次抑制告警，operator RTP 仍留在宿主（不得出现半迁移）；
+      （2026-08-22 / 9ae297a：窗口内发生 4 次 reconcile（4 次 worker ready + 4 次 egress
+      veth configured），抑制告警恰好 1 条，证明 `Once` 生效且不随刷新刷屏）
 - [ ] Trunk 注册、来电、挂断和转发规则仍只作用于当前线路。
 
 ### 8.4 多线路强隔离
 
 - [ ] 两个 UE 同时获得相同 UE IP、网关、P-CSCF、RTP 对端时仍能分别注册和传输；
+      （410 上目前只插了 1 张卡，`line_profiles` 只有一条线路，无法验证）
 - [ ] 每条线路的 SIP dialog、XFRM、RTP、数据代理计数与 Trunk 映射不串线；
 - [ ] 单个 worker 崩溃、线路断开或 bearer 重连不破坏另一条线路；
-- [ ] 重启 SimAdmin 后稳定命名能够回收旧资源，不生成重复 namespace/veth/NAT 规则。
+- [x] 重启 SimAdmin 后稳定命名能够回收旧资源，不生成重复 namespace/veth/NAT 规则。
+      （2026-08-22 / 9ae297a：本轮回归共重启服务 6 次、重启 worker 5 次，
+      `sa-ue286e0c9d2870` / `savh0c9d2870` / MASQUERADE 规则始终各 1 份，无累积）
+
+### 8.5 2026-08-22 回归结论（build 9ae297a）
+
+设备：`192.168.100.13`，Debian 13 aarch64，内核 `6.17.0-rc6-lkiuyu-compile+`，
+Modem 注册在 MY MAXIS（50212）LTE，信号 86%。
+
+已验证通过：
+
+- worker 生命周期（异常退出重建、长时间空闲、控制通道不误关）；
+- egress 失败的完整 teardown 与自愈；
+- trunk 门依赖与一次性抑制告警；
+- VoWiFi 数据面完全落在 UE netns 内（TUN、运营商地址、P-CSCF 路由、IKE socket），
+  宿主无泄漏；这同时验证了 §7.1 的第 1、2 项（veth+NAT 出 WiFi 可用、
+  主进程跨 netns 读写 TUN/socket fd 可用，`iptables` 在该自定义内核上可用）。
+
+未通过或阻塞：
+
+- **VoWiFi IMS REGISTER 仍被运营商回 SIP 421**（`ims_register_initial_unexpected_status`）。
+  隧道、路由、socket 归属都正确，属运营商/profile 侧问题，需要单独排查。
+- **VoLTE（§8.2）阻塞**：`volte_bearer_netdev_runtime_error:interface=wwan0:
+  runtime_status=error before OPEN`，该错误在部署新版本之前就存在；且槽位分配
+  现在还会走 DATA6，进一步依赖下面的硬件门。
+- **数据代理（§8.3 大部分）阻塞**：需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，
+  存在固件崩溃风险，本轮决定不启用。
+- **多线路（§8.4）**：只有一张卡，无法验证跨线路互不干扰。
+- 通话与短信按要求不在本轮范围内。
