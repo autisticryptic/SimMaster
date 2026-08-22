@@ -77,9 +77,9 @@ use crate::connectivity::modems::ims::{
 use super::{
     bearer::{
         configure_bearer_network, configure_bearer_network_in_worker, disconnect_bearer,
-        ensure_bearer_interface_ready, ensure_ims_bearer_observed, route_media_host,
-        route_media_host_in_worker, route_pcscf, route_pcscf_in_worker, teardown_bearer_network,
-        BearerAttempt, BearerConnection, BearerRequest,
+        ensure_bearer_interface_ready, ensure_ims_bearer_observed, interface_still_holds_address,
+        route_media_host, route_media_host_in_worker, route_pcscf, route_pcscf_in_worker,
+        teardown_bearer_network, BearerAttempt, BearerConnection, BearerRequest,
     },
     channel::VolteSipChannel,
     data_slot::DataSlotMode,
@@ -1954,6 +1954,22 @@ async fn connect_family(
         route_pcscf_in_worker(bearer, pcscf, worker).await?;
     } else {
         route_pcscf(bearer, pcscf).await?;
+    }
+    // The policy rule that steers SIP onto this bearer is keyed on the source
+    // address captured when the bearer settings were read. Maxis hands out a
+    // fresh address on every IMS PDN activation, so if the bearer re-addressed
+    // in the meantime that rule no longer matches and the REGISTER would leave
+    // over the host default route instead -- an eight second silent timeout
+    // reported as "all P-CSCF failed". Fail here instead, so the retry picks up
+    // the current address.
+    if !interface_still_holds_address(&bearer.interface, local_addr).await {
+        return Err(VolteError::with_detail(
+            code::BEARER_ADDRESS_CHANGED,
+            format!(
+                "interface={} policy_source={local_addr} pcscf={pcscf}",
+                bearer.interface
+            ),
+        ));
     }
     runtime
         .update(|state| {

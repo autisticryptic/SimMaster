@@ -722,6 +722,43 @@ fn link_output_is_up(output: &str) -> bool {
     })
 }
 
+/// Confirm the address the policy routing was built around is still the one on
+/// the interface.
+///
+/// The IMS bearer is torn down and re-established between attempts and the
+/// network hands out a different address every time, so a `BearerConnection`
+/// captured moments earlier can name an address the interface no longer owns.
+/// The `ip rule` is keyed on that source address, so once it goes stale the
+/// REGISTER misses the bearer's table entirely and follows the host default
+/// route out of the wrong interface, where a private P-CSCF address is
+/// unroutable and the transaction simply times out.
+pub(crate) async fn interface_still_holds_address(interface: &str, address: IpAddr) -> bool {
+    let Ok(output) = run_command("ip", &["-json", "address", "show", "dev", interface]).await
+    else {
+        return false;
+    };
+    addr_output_contains(&output, address)
+}
+
+fn addr_output_contains(output: &str, address: IpAddr) -> bool {
+    let Ok(links) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
+        return false;
+    };
+    let wanted = address.to_string();
+    links.iter().any(|link| {
+        link.get("addr_info")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry
+                        .get("local")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|local| local.eq_ignore_ascii_case(&wanted))
+                })
+            })
+    })
+}
+
 fn bam_dmux_runtime_is_error(interface: &str) -> bool {
     // The WWAN class exposes the owning bam-dmux power state through the
     // interface's device symlink, so this remains correct for other remoteproc
@@ -1043,6 +1080,40 @@ fn list_ip_values(output: &str, key_prefix: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Maxis re-addresses the IMS PDN on every activation, so the source-based
+    /// policy rule goes stale and SIP silently leaves via the host default
+    /// route. The liveness check has to notice the address is gone.
+    #[test]
+    fn address_liveness_follows_the_interface_not_the_snapshot() {
+        let configured = r#"[{"ifname":"wwan1","addr_info":[
+            {"family":"inet","local":"2.188.57.65","prefixlen":30},
+            {"family":"inet6","local":"2001:d08:1504:2c26::1","prefixlen":64}]}]"#;
+
+        assert!(addr_output_contains(
+            configured,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+        // The address the bearer carried a moment ago is no longer present.
+        assert!(!addr_output_contains(
+            configured,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 181, 21, 248))
+        ));
+        assert!(addr_output_contains(
+            configured,
+            "2001:d08:1504:2c26::1".parse::<IpAddr>().unwrap()
+        ));
+
+        // An interface with no addresses, and unparsable output, are both "gone".
+        assert!(!addr_output_contains(
+            r#"[{"ifname":"wwan1","addr_info":[]}]"#,
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+        assert!(!addr_output_contains(
+            "not json",
+            IpAddr::V4(std::net::Ipv4Addr::new(2, 188, 57, 65))
+        ));
+    }
 
     #[test]
     fn wds_arg_with_and_without_profile() {

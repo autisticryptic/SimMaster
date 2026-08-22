@@ -85,6 +85,9 @@ pub mod code {
     pub const BEARER_NETDEV_RUNTIME_ERROR: &str = "volte_bearer_netdev_runtime_error";
     /// The bearer netdev was still unusable after the bounded readiness wait.
     pub const BEARER_NETDEV_NOT_READY: &str = "volte_bearer_netdev_not_ready";
+    /// The bearer re-addressed between reading its settings and using them, so
+    /// the source-based policy routing no longer matches the live interface.
+    pub const BEARER_ADDRESS_CHANGED: &str = "volte_bearer_address_changed";
     pub const PCSCF_FAMILY_MISMATCH: &str = "volte_pcscf_family_mismatch";
 
     // Data slot allocation (beta2 alignment). The IMS bearer and the normal
