@@ -1638,6 +1638,12 @@ pub struct LiveStageObservation {
 pub struct LiveStageError {
     pub reason: String,
     registration_loss: Option<RegistrationLossReason>,
+    /// The core answered 421 naming `sec-agree`. Bundles captured from real
+    /// handsets often leave `security_agreement` unset, which resolves to
+    /// "auto" and emits a Security-Client offer with no Require/Proxy-Require.
+    /// Recording the demand here lets the variant loop satisfy it instead of
+    /// retrying the same rejected shape.
+    server_required_sec_agree: bool,
 }
 
 pub trait LiveStageAdapter: Send + Sync {
@@ -3360,11 +3366,62 @@ async fn run_register_exchange_with_pcscf(
                     reason = err.reason.as_str(),
                     "IMS REGISTER header variant failed"
                 );
+                // The core told us which extension it wants. Satisfying it is
+                // strictly better than moving on to the next shape, which
+                // would be rejected the same way.
+                if let Some(upgraded) = sec_agree_retry_variant(variant, &err) {
+                    info!(
+                        register_variant = upgraded.label,
+                        "Retrying IMS REGISTER with sec-agree after 421 Extension Required"
+                    );
+                    match run_register_exchange_with_pcscf_variant(
+                        line_id, profile, gateway, pcscf_addr, upgraded,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            record_live_ims_register_success_variant(line_id, profile, upgraded)
+                                .await;
+                            return Ok(response);
+                        }
+                        Err(retry_err) => {
+                            warn!(
+                                register_variant = upgraded.label,
+                                reason = retry_err.reason.as_str(),
+                                "IMS REGISTER sec-agree retry failed"
+                            );
+                            last_error = Some(retry_err);
+                            continue;
+                        }
+                    }
+                }
                 last_error = Some(err);
             }
         }
     }
     Err(last_error.unwrap_or_else(|| live_stage_error("ims_register_variant_missing")))
+}
+
+/// Upgrade a variant that was refused with `421 Extension Required: sec-agree`.
+///
+/// A bundle that leaves `security_agreement` unset resolves to "auto", which
+/// offers `Security-Client` without declaring `Require`/`Proxy-Require`. Cores
+/// that mandate the security agreement answer 421 and name the extension, so
+/// the same shape plus the declaration is the correct next attempt.
+fn sec_agree_retry_variant(
+    variant: LiveRegisterHeaderVariant,
+    error: &LiveStageError,
+) -> Option<LiveRegisterHeaderVariant> {
+    if !error.server_required_sec_agree || variant.force_sec_agree_headers {
+        return None;
+    }
+    Some(LiveRegisterHeaderVariant {
+        label: "catalog_v7_sec_agree_required",
+        force_sec_agree_headers: true,
+        suppress_sec_agree_headers: false,
+        include_security_client: true,
+        ..variant
+    })
 }
 
 fn live_register_header_variants(
@@ -3737,10 +3794,30 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         }
         other => other,
     };
-    live_registration_error(
+    let mut error = live_registration_error(
         reason,
         RegistrationLossReason::from_register_failure(failure),
-    )
+    );
+    error.server_required_sec_agree = register_failure_demands_sec_agree(failure);
+    error
+}
+
+/// True when the core rejected the unauthenticated REGISTER with
+/// `421 Extension Required` and named `sec-agree` in `Require`.
+fn register_failure_demands_sec_agree(failure: &RegisterFailure) -> bool {
+    if failure.auth_rounds != 0 {
+        return false;
+    }
+    let Some(response) = failure.response.as_deref() else {
+        return false;
+    };
+    if sip_frame::parse_status(response).ok() != Some(421) {
+        return false;
+    }
+    sip_frame::header_values(response, "Require")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .any(|extension| extension.trim().eq_ignore_ascii_case("sec-agree"))
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
@@ -7632,6 +7709,7 @@ fn live_stage_error(reason: impl Into<String>) -> LiveStageError {
     LiveStageError {
         reason: reason.into(),
         registration_loss: None,
+        server_required_sec_agree: false,
     }
 }
 
@@ -7642,6 +7720,7 @@ fn live_registration_error(
     LiveStageError {
         reason: reason.into(),
         registration_loss: Some(registration_loss),
+        server_required_sec_agree: false,
     }
 }
 
@@ -8268,6 +8347,81 @@ mod tests {
             .iter()
             .find(|variant| variant.label == label)
             .expect("register variant exists")
+    }
+
+    fn register_failure_with(response: &str, auth_rounds: u8) -> RegisterFailure {
+        RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(response.as_bytes().to_vec()),
+            auth_rounds,
+        }
+    }
+
+    /// A bundle that omits `security_agreement` resolves to "auto", so the
+    /// first REGISTER offers Security-Client without Require/Proxy-Require and
+    /// a strict core answers 421. The next attempt must carry the declaration
+    /// rather than repeat the rejected shape.
+    #[test]
+    fn sec_agree_421_upgrades_the_offering_variant() {
+        let failure = register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            0,
+        );
+        let error = map_shared_register_failure(&failure);
+        assert!(error.server_required_sec_agree);
+
+        let variant = register_variant("ims_features_aka_uri_first_full_sec_client");
+        assert!(!variant.force_sec_agree_headers);
+        let upgraded = sec_agree_retry_variant(variant, &error).expect("variant is upgraded");
+        assert!(upgraded.force_sec_agree_headers);
+        assert!(!upgraded.suppress_sec_agree_headers);
+        assert!(upgraded.include_security_client);
+        // The rest of the proven shape must survive the upgrade.
+        assert_eq!(
+            format!("{:?}", upgraded.request_uri),
+            format!("{:?}", variant.request_uri)
+        );
+        assert_eq!(
+            format!("{:?}", upgraded.initial_authorization),
+            format!("{:?}", variant.initial_authorization)
+        );
+        assert_eq!(
+            format!("{:?}", upgraded.security_client_format),
+            format!("{:?}", variant.security_client_format)
+        );
+    }
+
+    #[test]
+    fn sec_agree_421_upgrade_does_not_loop_or_fire_on_other_rejections() {
+        let sec_agree_421 = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        // Already declaring sec-agree: a second identical attempt would loop.
+        let mut forcing = register_variant("ims_features_aka_uri_first_full_sec_client");
+        forcing.force_sec_agree_headers = true;
+        assert!(sec_agree_retry_variant(forcing, &sec_agree_421).is_none());
+
+        // A 421 naming a different extension is not ours to satisfy.
+        let other_ext = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: timer\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        assert!(!other_ext.server_required_sec_agree);
+
+        // A plain rejection carries no demand.
+        let forbidden = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        assert!(!forbidden.server_required_sec_agree);
+
+        // After authentication the security agreement is already settled.
+        let after_auth = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            1,
+        ));
+        assert!(!after_auth.server_required_sec_agree);
     }
 
     fn ee_register_variant(label: &str) -> LiveRegisterHeaderVariant {

@@ -1204,17 +1204,26 @@ fn project_register(
             ))
         }
     };
+    let mut security_client = security_client_values(config, access)?;
+    if sec_agree_mode != "disabled" && security_client.is_empty() {
+        security_client.push(BASELINE_SECURITY_CLIENT.to_string());
+    }
+    // Offering ipsec-3gpp through Security-Client commits the UE to the
+    // security agreement, so the same REGISTER has to advertise and demand it:
+    // RFC 3329 §2.3 requires Supported/Require/Proxy-Require to travel with the
+    // offer, and TS 24.229 §5.1.1.2.2 requires the empty AKA Authorization.
+    // Bundles extracted from real handsets frequently omit
+    // `security_agreement`, which lands here as "auto"; sending the offer
+    // without the declaration makes the request self-contradictory and IMS
+    // cores answer 421 Extension Required.
+    let offers_sec_agree = !security_client.is_empty();
     let mut supported = string_array_or_csv(register, "/supported").unwrap_or_default();
-    if sec_agree_mode == "required"
+    if offers_sec_agree
         && !supported
             .iter()
             .any(|value| value.eq_ignore_ascii_case("sec-agree"))
     {
         supported.push("sec-agree".to_string());
-    }
-    let mut security_client = security_client_values(config, access)?;
-    if sec_agree_mode != "disabled" && security_client.is_empty() {
-        security_client.push(BASELINE_SECURITY_CLIENT.to_string());
     }
     // iOS bundles express PANI policy through `country_of_origination_format`
     // (`PANI`/`BOTH` = the REGISTER carries P-Access-Network-Info; `NONE` =
