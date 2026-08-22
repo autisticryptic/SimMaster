@@ -1288,12 +1288,14 @@ fn project_register(
         enable_initial_reject_fallback: false,
         use_plain_digest_placeholder: false,
         require_sec_agree_headers: bool_at(register, "/require_sec_agree_headers").unwrap_or(false),
-        // RFC 3329 §2.3: the client MUST add both Require and Proxy-Require
-        // with "sec-agree" when it offers sec-agree. When the carrier marks
-        // security_agreement=required, default Proxy-Require to on so the
-        // REGISTER is complete even if the bundle omitted the flag.
+        // RFC 3329 §2.3: Require and Proxy-Require travel together. The
+        // builder already gates this on require_sec_agree, so defaulting it on
+        // only takes effect once we actually send Require -- either because
+        // the bundle marks security_agreement=required or because the core
+        // answered 421 and we escalated. Maxis answers 400 Bad Request to a
+        // Require without the matching Proxy-Require.
         proxy_require_sec_agree_headers: bool_at(register, "/proxy_require_sec_agree_headers")
-            .unwrap_or(sec_agree_mode == "required"),
+            .unwrap_or(true),
         sec_agree_mode,
         security_client_mechanisms: security_client,
         live_header_variant_set: "catalog_v7".to_string(),
