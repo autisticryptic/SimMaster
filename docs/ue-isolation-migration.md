@@ -566,25 +566,7 @@ Modem 注册在 MY MAXIS（50212）LTE，信号 86%。
 
 - **VoWiFi IMS REGISTER 已修复并通过**（见 §8.6）：200 OK，voice signaling 就绪，
   可以进行实机通话/短信测试。
-- **VoLTE（§8.2）仍阻塞，且已确认是设备固件缺陷，不是 SimAdmin 的问题**：
-  `volte_bearer_netdev_runtime_error:interface=wwan0: runtime_status=error before OPEN`。
-  每次开机 `qcom-q6v5-mss 4080000.remoteproc: fatal error received:
-  smd_dsm_memcpy.c:297` 固件崩溃，remoteproc 自身恢复为 `running`，但其子设备
-  `4080000.remoteproc:bam-dmux` 的 runtime-PM 停留在 `error`，wwan0..7 全部继承。
-  本轮做过的三次验证：
-
-  1. 手工 `ip link set wwan1 up` → `RTNETLINK answers: Invalid argument`，
-     说明 SimAdmin 的前置检查是正确的而非过严；
-  2. unbind/rebind `bam-dmux` 驱动 → runtime_status 从 `error` 变成 `suspended`，
-     **但 wwan 网卡全部消失**，内核报
-     `bam-dmux: Timed out waiting for remote side to suspend`，即 modem 侧 DMUX
-     不响应，无法重建通道；
-  3. 设备重启 → wwan0..7 回来了，但同一处固件崩溃在 t=15.77s 重现，
-     runtime_status 再次为 `error`。
-
-  结论：**重启无法修复，这是可复现的固件缺陷**。可行方向只有厂商固件/内核升级，
-  或按用户此前的经验重刷系统。SimAdmin 侧不应再增加重试，它已经正确地拒绝在
-  该状态下继续。
+- **VoLTE（§8.2）根因已定位到设备侧，且状态已显著改善**，见 §8.7。
 - **数据代理（§8.3 大部分）阻塞**：需 `SIMADMIN_ENABLE_SECONDARY_QMI=1`，
   存在固件崩溃风险，本轮决定不启用。
 - **多线路（§8.4）**：只有一张卡，无法验证跨线路互不干扰。
@@ -626,3 +608,43 @@ Modem 注册在 MY MAXIS（50212）LTE，信号 86%。
 `AUTO_FRAGMENT_INNER_IP_MAX` 为 1356 —— **只剩 4 字节余量**。再增加任何头部
 （PANI、sip.instance、更多 Contact 参数）都会跨过阈值并触发分片路径，该路径
 目前尚未在实机上被真正走过，需要单独验证。
+
+### 8.7 VoLTE：`smd_dsm_memcpy.c:297` 的根因定位（2026-08-22）
+
+原始症状：`volte_bearer_netdev_runtime_error:interface=wwan0:
+runtime_status=error before OPEN`，wwan0..7 全部无法 OPEN。
+
+**根因不在 SimAdmin。** 每次冷启动 modem 固件都会崩一次
+`qcom-q6v5-mss 4080000.remoteproc: fatal error received: smd_dsm_memcpy.c:297`
+（DSM = Data Services Memory）。remoteproc 自身恢复为 `running`，但 Linux 侧
+`bam-dmux` 驱动的 runtime-PM 被锁存在 `error`，所有 wwan netdev 继承该状态。
+
+按顺序做过的排查，每一步都排除了一类原因：
+
+| 实验 | 结果 | 排除了什么 |
+|---|---|---|
+| 手工 `ip link set wwan1 up` | `RTNETLINK: Invalid argument` | SimAdmin 的前置检查是**正确**的，不是过严 |
+| 热重启 modem 子系统（stop/start remoteproc） | mpss 干净加载，**不崩** | **MPSS 镜像本身没问题**（它能通过签名并正常运行） |
+| unbind/rebind `bam-dmux` | `error` → `suspended`，但 netdev 全消失，报 `Timed out waiting for remote side to suspend` | `error` 是 **Linux 驱动侧锁存状态**，重启固件清不掉 |
+| 恢复出厂 `modemst1/modemst2`（fastboot） | 崩溃照旧，**IMEI 与校准完好** | **排除 EFS/NV 损坏**；顺带证明该操作无害 |
+| 拉黑 `qcom_bam_dmux` 后冷启动 | **完全不崩** | **mainline `qcom_bam_dmux` 的 probe 就是冷启动崩溃的触发点** |
+| 延迟到 modem 稳定后手工 `modprobe` | 不崩，8 个 netdev 建出，`wwan1` 能 UP | 延迟加载可规避该竞态 |
+
+固件是 2022-11-05，内核是 6.17.0-rc6 mainline，中间隔了三年，而 mainline 的
+`qcom_bam_dmux` 是社区重新实现的驱动 —— 这是典型的新驱动 × 旧厂商固件时序竞态。
+
+**重要推论：重刷同一个系统镜像不会修复它**，因为内核与固件都在镜像里，冷启动
+竞态会照样复现。只有厂商固件/内核升级，或在启动时规避该竞态，才有意义。
+
+恢复出厂 EFS 之后（虽然没有阻止崩溃）崩溃时刻从 t≈15.8s 推迟到 t≈38s，
+**晚于 bam-dmux 建立通道的时刻**，于是驱动扛住了：`bam-dmux runtime_status`
+变为 `suspended`，8 个 netdev 正常，`wwan1` 可以 UP，ModemManager 报
+`state: connected`。VoLTE 因此前进到能建立 bearer 并真正发出 IMS REGISTER
+（`request_bytes=981`）。
+
+当前 VoLTE 的失败点已经**不是**接口问题，而是 `ims_register_initial_receive_failed`
+—— REGISTER 发出后 8 秒收不到任何响应。注意它使用的 P-CSCF 是
+`172.20.58.221` / `172.20.225.221`，这两个地址是 VoWiFi 经 ePDG 隧道才可达的；
+日志同时显示 `VoLTE bearer delivered no P-CSCF via PCO`，即 IMS APN 没有通过
+PCO 下发 P-CSCF，代码回退去读了 IMS context。**下一步应排查 VoLTE bearer 的
+P-CSCF 来源与可达性**，而不是继续动 netdev 层。
