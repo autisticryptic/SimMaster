@@ -2155,6 +2155,11 @@ async fn connect_family(
                     pending_variant = Some(upgraded_variant);
                     continue;
                 }
+                if let Some(timeout_variant) = sec_agree_timeout_retry_variant(variant, &failure) {
+                    last_error = Some(error);
+                    pending_variant = Some(timeout_variant);
+                    continue;
+                }
                 if let Some(spaced_security_variant) =
                     sec_agree_spaced_security_retry_variant(variant, &failure)
                 {
@@ -5624,6 +5629,28 @@ fn sec_agree_retry_variant(
     response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
 }
 
+/// Offer the security agreement once when the initial REGISTER draws no reply
+/// at all.
+///
+/// `sec_agree_retry_variant` keys on a 421 naming sec-agree, but a core is free
+/// to drop a REGISTER that offers `Security-Client` without declaring
+/// `Require`/`Proxy-Require` rather than answer it. Maxis does exactly that on
+/// the LTE leg: over VoWiFi the same shape comes back as 421 and escalates, but
+/// over the IMS APN the transaction just times out, so the 421-driven rung can
+/// never fire and every attempt repeats the rejected shape. A variant always
+/// carries a Security-Client offer, so a silent timeout is worth one compliant
+/// retry before moving on.
+fn sec_agree_timeout_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    if variant.policy.require_sec_agree || failure.auth_rounds != 0 || failure.response.is_some() {
+        return None;
+    }
+    (failure.error.code() == "ims_register_initial_receive_failed")
+        .then(|| variant.requiring_sec_agree())
+}
+
 fn sec_agree_require_only_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -6212,6 +6239,45 @@ mod tests {
         let challenge = parse_digest_challenge(frame).unwrap();
         assert_eq!(challenge.realm, "ims.example");
         assert!(!challenge.proxy);
+    }
+
+    /// Maxis drops a non-compliant REGISTER on the LTE leg instead of answering
+    /// 421, so the 421-driven rung never fires and every retry repeats the
+    /// rejected shape. A silent timeout must escalate too.
+    #[test]
+    fn sec_agree_timeout_upgrades_when_the_core_never_answers() {
+        let timeout = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        let base = register_variant("ims_features_aka_uri_first");
+        assert!(!base.policy.require_sec_agree);
+
+        let upgraded = sec_agree_timeout_retry_variant(base, &timeout).expect("escalates");
+        assert!(upgraded.policy.require_sec_agree);
+        assert!(upgraded.policy.proxy_require_sec_agree);
+        assert!(upgraded.policy.advertise_sec_agree);
+        assert!(upgraded.server_required_sec_agree);
+
+        // Already compliant: a second identical attempt would loop.
+        assert!(sec_agree_timeout_retry_variant(upgraded, &timeout).is_none());
+
+        // A timeout after authentication is a different problem.
+        let after_auth = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 1,
+        };
+        assert!(sec_agree_timeout_retry_variant(base, &after_auth).is_none());
+
+        // A real response is the 421 rung's job, not this one.
+        let answered = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        assert!(sec_agree_timeout_retry_variant(base, &answered).is_none());
     }
 
     #[test]
