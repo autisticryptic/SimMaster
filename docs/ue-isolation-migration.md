@@ -733,36 +733,48 @@ SIP 直接从 `wwan1` 这个 raw-IP 接口出去，不经过 TUN，因此完全�
 因此报文大小与完整性都不是变量。（注：P-CSCF 过滤 ICMP，连 64 字节 DF ping 都不回，
 所以无法用 ping 做路径 MTU 探测，这一点不能反过来当作 MTU 有问题的证据。）
 
-#### 8.7.2 真正的原因：蜂窝用户面根本不传数据（2026-08-23）
+#### 8.7.2 IMS bearer 不通，但普通数据 APN 是好的（2026-08-23）
 
-上面四条假设全部落空之后，做了一组对照实验，结论推翻了"包已经发出去"这个前提：
+> **本节曾经写错过，现已更正。** 早先的版本据此断言"整个蜂窝用户面已死、一切归因
+> 于 DSM 固件崩溃"，那个结论是**错的**，由两个无效的测量得出，记录在此以免重犯。
 
-```text
-ping 运营商网关 10.95.72.9（与 wwan0 同一个 /28，第一跳）: 100% packet loss
-ping / DNS 到运营商 DNS 58.71.136.20                     : 无回应
-同一个 DNS 查询走 WiFi                                    : 正常收到回复
-wwan0 内核计数器                                          : rx=0 tx=0 packets
-ModemManager Bearer/1: connected=yes, total-bytes rx=352（累计 36295 秒）
-```
+**失效测量 ①：只绑源地址，没绑接口。** 之前用 `ping -I <地址>` 和
+`socket.bind((src,0))` 做探测。主路由表里 `wlan0` 默认路由 metric 600 优先于
+`wwan0` 的 700，所以那些包**带着蜂窝源地址从 WiFi 发了出去**，被当作非法源丢弃。
+正确做法是绑接口（`SO_BINDTODEVICE`，`ping -I <ifname>`）。
 
-**普通数据 APN 也完全不通** —— 连同网段的运营商网关都 ping 不到，而 `wwan0` 的
-内核统计显示它从未真正收发过任何一个包。这不是 IMS 特有的问题，是整个用户面死了。
+**失效测量 ②：`tx_packets` 计数器。** bam-dmux 驱动**根本不更新** netdev 统计：
+数据明明在正常收发，`/sys/class/net/wwan0/statistics/tx_packets` 依然是 0。这个 0
+不能作为任何证据。（`QCM410_BAM_DMUX_MODEM_CRASH.md` §7 里那段"看 tx_packets 判定"
+也随之作废，已一并更正。）
 
-这同时纠正了 §8.7.1 第②条的一个误读：当时用 AF_PACKET 在 `wwan1` 上抓到了
-REGISTER，据此认为"包已经从 IMS bearer 发出去了"。**AF_PACKET 抓的是 netdev 层，
-在驱动把包交给硬件之前**，所以那只能证明包进了网卡，不能证明它上了空口。结合
-`tx=0` 的计数器，真实链路是：
+用正确方法重测后的**真实结论**：
 
-```text
-REGISTER → 进入 wwan1 netdev（抓包可见）→ 死在 bam-dmux 驱动里（tx 计数不增长）
-        → 从未上空口 → 运营商收不到 → 永远没有回应
-```
+| 接口 | ping 8.8.8.8 | ping 运营商 DNS 58.71.136.20 | SIP OPTIONS 到 P-CSCF |
+|---|---|---|---|
+| `wwan0`（数据 APN） | 2/3，16–38ms | 3/3，0% 丢包 | — |
+| `wwan1`（IMS APN） | — | **100% 丢包** | **无回应** |
 
-**这与最初的固件崩溃是同一个根因。** `smd_dsm_memcpy.c` 中的 DSM 正是
-Data Services Memory；固件在数据服务内存上崩溃之后，PDN 在信令层仍能激活、仍能
-分配 IP、ModemManager 仍报 `connected`，但用户面一个字节也传不出去。
+**普通数据 APN 完全正常，IMS APN 一个包都过不去。** 所以问题精确定位在 IMS bearer
+本身，既不是整个用户面，也不是 SIP 内容、路由或分片。
 
-**结论：VoLTE 在这台设备上不可能注册成功，直到 §7 的 bam-dmux/固件问题被解决。**
-SIP 层、路由层、分片层都已排除，不应继续在这些方向投入。参见
-`QCM410_BAM_DMUX_MODEM_CRASH.md`。VoWiFi 不受影响，因为它走 WiFi + 用户态
-IKE/ESP/TUN，完全不经过蜂窝用户面。
+#### 8.7.3 与迁移前版本的 A/B：不是 UE 架构的回归（2026-08-23）
+
+把 UE 架构之前的构建（`551b6f8`，2026-08-19）部署回设备做对照。该版本用严格
+反序列化，不认识 `ue_isolation` 字段而拒绝启动，因此测试期间临时移除了该键
+（配置已先备份到 `/opt/simadmin/rollback-backup/`）。
+
+结果：
+
+- **VoLTE 失败方式完全一致** —— `ims_register_initial_receive_failed`，
+  REGISTER 发出后 8 秒无响应，三次尝试后 `volte_runtime_all_pcscf_failed`；
+- 同一时刻 `ping -I wwan1 58.71.136.20` 仍然 100% 丢包，而 `ping -I wwan0` 正常；
+- **VoWiFi 在旧版本上是坏的**：反复 `registration_loss="network_rejected"`，
+  因为它没有 §8.6 的 sec-agree 修复。这反过来确认了那几个修复是必需的。
+
+**结论：VoLTE 的失败与 UE 隔离迁移无关**，迁移前后表现一致，问题在设备/运营商侧的
+IMS 承载。同时新版本严格优于旧版本（VoWiFi 只在新版本上能注册），不应为了 VoLTE
+回退。
+
+按此判断，下一步是**整机重刷系统**验证是否为设备状态问题；若重刷后 IMS APN 仍然
+不通，则应向运营商核实该 SIM 的 IMS 承载是否被授权给外部协议栈使用。

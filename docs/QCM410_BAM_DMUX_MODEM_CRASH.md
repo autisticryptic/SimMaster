@@ -170,29 +170,34 @@ initramfs 或极早期的 systemd unit 里打开；热重启 modem 复现不了�
 
 ---
 
-## 7. 用户面是"看起来通、实际不传"
+## 7. 判断用户面通不通：两个常见误判
 
-这是本故障最容易误判的地方，单独列出来。
+排查数据面时有两个坑，都踩过，单独列出来。
 
-即使 wwan 网卡存在、`runtime_status` 不是 `error`、ModemManager 报
-`connected: yes` 并给出了 IP/网关/DNS，**用户面仍然可能一个字节都传不出去**：
+**坑一：只绑源地址，不绑接口。** 如果 WiFi 的默认路由 metric 比蜂窝低（本机
+`wlan0` 600 vs `wwan0` 700），那么 `ping -I <地址>` 或 `socket.bind((src,0))`
+发出的包会**带着蜂窝源地址从 WiFi 出去**，被当作非法源丢弃 —— 于是一个健康的蜂窝
+数据面看起来像是全死的。必须绑接口：
 
-```text
-ping 运营商网关（与 wwan0 同一 /28，第一跳）: 100% packet loss
-ping / DNS 到运营商 DNS                      : 无回应
-同一个 DNS 查询走 WiFi                        : 正常
-wwan0 内核计数器                              : rx=0 tx=0 packets
+```bash
+ping -I wwan0 8.8.8.8                      # 接口名，不是地址
+# python: s.setsockopt(SOL_SOCKET, SO_BINDTODEVICE, b"wwan0")
 ```
 
-**判定方法：看 `/sys/class/net/<if>/statistics/tx_packets`。** 它长期为 0 就说明
-包死在 bam-dmux 驱动里，从未上空口。
+**坑二：`tx_packets` 计数器不可信。** bam-dmux 驱动**不更新** netdev 统计。实测
+数据正常收发（ping 有回应、DNS 有应答）时：
 
-**特别注意抓包会骗人**：用 `AF_PACKET`（tcpdump 同理）在 wwan 上能抓到自己发出去的
-包，因为抓包点在 netdev 层，**位于驱动把包交给硬件之前**。抓到包只能证明它进了
-网卡，不能证明它发出去了。必须结合 `tx_packets` 计数器一起看。
+```text
+/sys/class/net/wwan0/statistics/tx_packets = 0
+/sys/class/net/wwan0/statistics/rx_packets = 0
+```
 
-这解释了为什么上层会表现为"请求发出后石沉大海"：SIP REGISTER、DNS、ping 全都
-如此，而且和报文大小、分片、路由、源地址都无关。
+所以计数器为 0 **不能**作为"包没发出去"的证据。
+
+**顺带一提**，用 `AF_PACKET`（tcpdump 同理）在 wwan 上抓到自己发的包，抓包点在
+netdev 层、位于驱动交给硬件之前，同样只能证明包进了网卡。要判断链路通不通，
+**唯一可靠的办法是做端到端往返测试**（绑接口的 ping / DNS / TCP），而不是看计数器
+或抓包。
 
 ## 8. 与 SimAdmin 的关系
 
