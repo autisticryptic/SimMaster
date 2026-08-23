@@ -522,9 +522,31 @@ fn classify(failures: &[(String, ConfigureError)]) -> NetdevError {
         .iter()
         .all(|(_, error)| matches!(error, ConfigureError::LinkUp(_)))
     {
-        return NetdevError::LinkUnavailable(detail);
+        // Name the parent's runtime-PM state in the message. `runtime_status=error`
+        // is the difference between "restart the baseband" and "look for a bug
+        // here", and it is not otherwise visible: this kernel is built without
+        // CONFIG_PM_DEBUG, so the PM core logs nothing when it latches.
+        let pm = failures
+            .first()
+            .map(|(interface, _)| interface.as_str())
+            .and_then(parent_pm_status)
+            .map(|status| format!(" [bam-dmux runtime_status={status}]"))
+            .unwrap_or_default();
+        return NetdevError::LinkUnavailable(format!("{detail}{pm}"));
     }
     NetdevError::ConfigureFailed(detail)
+}
+
+/// Runtime-PM status of the parent device every candidate netdev shares.
+///
+/// Read through the netdev's own `device` link rather than a fixed SoC path, so
+/// this holds on any host whose netdevs hang off one parent.
+fn parent_pm_status(interface: &str) -> Option<String> {
+    let path = format!("/sys/class/net/{interface}/device/power/runtime_status");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 /// Remove what `configure` added, so a rejected candidate holds no state.
