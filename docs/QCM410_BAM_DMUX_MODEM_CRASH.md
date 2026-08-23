@@ -71,6 +71,11 @@ volte_bearer_netdev_runtime_error:interface=wwan0: runtime_status=error before O
 内核是 2025 年的 mainline，而 `qcom_bam_dmux` 是社区重新实现的驱动，两者相隔三年 ——
 典型的新驱动 × 旧固件启动竞态。
 
+> **补充（2026-08-23）**：bam-dmux 的 probe 只是竞态的**一方**。整机重刷后，同样的
+> 内核与固件不再崩溃，说明还需要另一方参与才会触发。最可能的另一方是 SimAdmin
+> 安装器装的树外模块 `rpmsg_wwan_ctrl_multi.ko`，详见 §8。**§8 才是完整的因果与
+> 预防办法**，本节只描述可观察到的现象。
+
 ---
 
 ## 3. 排查决策树（每一步排除一类原因）
@@ -199,7 +204,88 @@ netdev 层、位于驱动交给硬件之前，同样只能证明包进了网卡�
 **唯一可靠的办法是做端到端往返测试**（绑接口的 ping / DNS / TCP），而不是看计数器
 或抓包。
 
-## 8. 与 SimAdmin 的关系
+## 8. 为什么会崩：最可能的原因与预防（2026-08-23 更新）
+
+整机重刷之后，**同一个内核、同一份 2022-11-05 固件，开机不再崩溃**
+（`dmesg | grep -c 'fatal error received'` = 0，`bam-dmux runtime_status = suspended`，
+8 个 wwan netdev 全部健康）。这一点很关键：它说明崩溃**不是内核或固件本身的确定性
+缺陷**，而是取决于系统上积累的某种状态 —— 否则重刷同样的软件应该同样会崩。
+
+### 8.1 最可能的原因：SimAdmin 自己装的树外内核模块
+
+重刷后的干净系统与之前的差异，集中在 SimAdmin 安装器留下的**内核层**产物：
+
+```text
+重刷后（不崩）:  /lib/modules/<kver>/extra/        不存在
+                 lsmod                              只有标准 rpmsg_wwan_ctrl
+                 /etc/udev/rules.d/*simadmin*       无
+                 simadmin-secondary-qmi.service     未安装
+
+之前（每次开机崩）: deploy/install.sh 会安装并加载
+                 kernel/rpmsg_wwan_ctrl_multi.ko   （install.sh:38-43, 88-89）
+                 99-simadmin-secondary-qmi.rules   （install.sh:61-63）
+                 simadmin-secondary-qmi.service    （install.sh:67-71）
+```
+
+`rpmsg_wwan_ctrl_multi` 是标准 `rpmsg_wwan_ctrl` 的自研替代/增强版，作用正是把
+DATA5/DATA6 等**额外的 rpmsg 通道**暴露成多个 WWAN 控制口。而 `qcom_bam_dmux` 与
+它挂在**同一条 `remoteproc0:smd-edge`** 上：
+
+```text
+remoteproc0:smd-edge.DATA5_CNTL / DATA6_CNTL / DATA7_CNTL / ... / DATA40_CNTL
+```
+
+推断的机制：冷启动时 modem 固件刚完成 mpss 加载、正在初始化 DSM（Data Services
+Memory），此时 `_multi` 模块比标准模块**多绑定若干 DATA*_CNTL 通道**，这些额外的
+通道建立请求与 `qcom_bam_dmux` 的 probe 在同一个狭窄窗口里并发打到固件上，把仍在
+初始化的 DSM 撞崩 —— 于是 `smd_dsm_memcpy.c:297`。
+
+这个推断能同时解释此前所有观察：
+
+| 观察 | 是否吻合 |
+|---|---|
+| 拉黑 `qcom_bam_dmux` → 不崩 | ✅ 移走了竞争的一方 |
+| 延迟加载 `qcom_bam_dmux` → 不崩 | ✅ 错开了那个窗口 |
+| 热重启 modem → 不崩 | ✅ 通道已建立，无并发 bring-up |
+| 恢复出厂 EFS → 仍崩，但崩溃时刻推迟 | ✅ 与 NV 无关，只是扰动了时序 |
+| 整机重刷 → 完全不崩 | ✅ 移除了 `_multi` 模块 |
+
+**注意这是推断而非证明**：崩溃前那台设备的模块加载状态已随重刷消失，无法回溯确认
+`_multi` 当时确实是加载的。但它是唯一能解释"同样的内核与固件、重刷前崩重刷后不崩"
+的差异项，且机制自洽。
+
+### 8.2 后续开发中如何避免
+
+1. **不需要 DATA6 就不要装它。** `install.sh` 默认会装内核模块 + udev 规则 +
+   secondary-qmi 服务，但 DATA6 本身被 `SIMADMIN_ENABLE_SECONDARY_QMI=0` 关着 ——
+   **模块带来的全部是风险，没有任何收益**。只装二进制、前端、carrier catalog 和主
+   systemd unit 即可（本轮重刷后就是这么装的，一切正常）。
+
+2. **把内核模块从默认安装路径里摘出去**，改成显式的 opt-in 步骤，与 DATA6 开关联动：
+   开关关闭时不应该装、也不应该加载 `rpmsg_wwan_ctrl_multi`。
+
+3. **升级/重装后做一次开机自检**：
+
+```bash
+dmesg | grep -c 'fatal error received'                                    # 应为 0
+cat /sys/bus/platform/devices/4080000.remoteproc:bam-dmux/power/runtime_status  # 应为 suspended
+lsmod | grep rpmsg                                                        # 不应出现 _multi（除非你确实要 DATA6）
+```
+
+### 8.3 万一又崩了：不必重刷
+
+重刷代价大，而且**已经验证有更轻的办法**（§5.2）：拉黑 `qcom_bam_dmux`，等 modem
+稳定后再加载。实测结果是不触发崩溃、8 个 netdev 正常、`ip link set wwan1 up` 成功。
+
+排查顺序建议：
+
+1. 先确认是不是这个故障（§1 的三条命令）；
+2. 检查 `lsmod | grep rpmsg` 有没有 `_multi`；有就卸载它并从
+   `/lib/modules/<kver>/extra/simadmin/` 移走，然后重启，看是否还崩；
+3. 仍崩则用 §5.2 的延迟加载兜底；
+4. 以上都无效，再考虑重刷。
+
+## 9. 与 SimAdmin 的关系
 
 - 该崩溃在 SimAdmin 做任何 IMS 操作之前就已发生，不能归因于 SimAdmin。
 - SimAdmin 侧**不应该**为此增加重试或放宽 `runtime_status=error` 的检查：内核会
