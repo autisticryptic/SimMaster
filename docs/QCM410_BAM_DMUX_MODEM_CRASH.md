@@ -254,12 +254,48 @@ Memory），此时 `_multi` 模块比标准模块**多绑定若干 DATA*_CNTL �
 `_multi` 当时确实是加载的。但它是唯一能解释"同样的内核与固件、重刷前崩重刷后不崩"
 的差异项，且机制自洽。
 
+#### 8.1.1 beta8 参考实现的佐证（2026-08-23）
+
+从 `simadmin_1.1.7-beta8.tar.gz` 提取的证据把上面的推断坐实了一大半：
+
+- beta8 的分发包**根本没有 `kernel/` 目录**，`system/` 下只有 udev 规则、
+  secondary-qmi service 和 modem-recovery 三个文件 —— 它在**不带任何自研内核模块**
+  的前提下做到了 DATA6 与 IMS 并存；
+- 其 service 标题直接写着 `SimAdmin DATA6 stock RPMSG QMI initializer`，
+  ExecCondition 用的是 **stock `rpmsg_wwan_ctrl`** + `driver_override` 绑
+  `DATA6_CNTL`；
+- 二进制里有一条日志：
+  **`Migrated DATA6 runtime from the kernel-specific module to the stock RPMSG driver`**，
+  并且伴随 `rmmod`、`/sys/module/rpmsg_wwan_ctrl_multi`、
+  `/opt/simadmin/modules/rpmsg_wwan_ctrl_multi.ko`、`depmod -a`、
+  `DATA6 legacy RPMSG driver did not detach` 等字符串 ——
+  **beta8 会主动卸载并删除这个遗留模块**，而不只是解绑；
+- 它还会写运行时规则 `/run/udev/rules.d/99-simadmin-secondary-qmi.rules`
+  （内容形如 `SUBSYSTEM=="wwan", KERNEL=="wwan0qmi1", ENV{ID_MM_PORT_IGNORE}="1"`）
+  把实际出现的那个端口对 ModemManager 隐藏，并检查
+  `multiple WWAN ports appeared while binding DATA6` —— 即**只允许出现一个新端口**。
+
+对照本项目：`secondary_qmi.rs` 已经迁到 stock 驱动、也会在候选被 legacy 驱动占用时
+**解绑**它，但**从不卸载模块本身**。模块只要还加载着，它的 id_table 就会在每次开机
+自动去绑其余 `DATA*_CNTL` 通道 —— 这正是撞崩 DSM 的那些额外绑定。
+
+**已修复**（commit `f3308ed`）：新增 `purge_legacy_rpmsg_module()`，按 beta8 的做法
+`rmmod` + 删除 `.ko` + `depmod -a`，并且**放在 DATA6 开关判断之前**执行 ——
+`SIMADMIN_ENABLE_SECONDARY_QMI=0` 时旧代码会提前返回、完全不碰残留模块，而那恰恰是
+模块纯属负担的配置。
+
 ### 8.2 后续开发中如何避免
+
+0. **升级到含 `f3308ed` 的版本**。`secondary-qmi-init` 现在会在每次启动时无条件
+   卸载并删除遗留的 `rpmsg_wwan_ctrl_multi`，所以从旧版本升级上来的设备会自动清掉
+   这个隐患，不需要人工处理。
 
 1. **不需要 DATA6 就不要装它。** `install.sh` 默认会装内核模块 + udev 规则 +
    secondary-qmi 服务，但 DATA6 本身被 `SIMADMIN_ENABLE_SECONDARY_QMI=0` 关着 ——
    **模块带来的全部是风险，没有任何收益**。只装二进制、前端、carrier catalog 和主
    systemd unit 即可（本轮重刷后就是这么装的，一切正常）。
+   注意当前仓库其实**没有** `kernel/` 目录，`install.sh` 里那段内核模块代码两个分支
+   都不会命中；风险来自更早版本或手工安装留下的模块。
 
 2. **把内核模块从默认安装路径里摘出去**，改成显式的 opt-in 步骤，与 DATA6 开关联动：
    开关关闭时不应该装、也不应该加载 `rpmsg_wwan_ctrl_multi`。
