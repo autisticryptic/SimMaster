@@ -280,6 +280,16 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     // hide the runtime DATA6-specific rule completely.
     const UDEV_RULE_PATH: &str = "/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules";
 
+    // Runs before the DATA6 gate on purpose. An older install may have left the
+    // out-of-tree multi-port module loaded, and while it is loaded it keeps
+    // auto-binding spare DATA*_CNTL channels at every boot -- which is what
+    // crashes this firmware's DSP during Data Services Memory bring-up and
+    // latches bam-dmux at runtime_status=error. With DATA6 disabled the module
+    // is not merely unused, it is the one thing that can still break the modem.
+    if !dry_run && secondary_qmi::purge_legacy_rpmsg_module().await {
+        println!("secondary-qmi-init: removed the legacy multi-port RPMSG module");
+    }
+
     if !secondary_qmi::secondary_qmi_enabled() {
         // Do not enumerate, bind, probe, or open DATA6 on firmware where the
         // AT-labelled endpoint is known to take down the modem DSP.  The

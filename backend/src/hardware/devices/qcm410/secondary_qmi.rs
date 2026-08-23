@@ -90,6 +90,73 @@ pub fn secondary_qmi_enabled() -> bool {
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Where an older install may have left the out-of-tree multi-port module.
+const LEGACY_MODULE_SYSFS: &str = "/sys/module/rpmsg_wwan_ctrl_multi";
+const LEGACY_MODULE_FILES: &[&str] = &[
+    "/opt/simadmin/modules/rpmsg_wwan_ctrl_multi.ko",
+    "/lib/modules/{kver}/extra/simadmin/rpmsg_wwan_ctrl_multi.ko",
+    "/lib/modules/{kver}/extra/rpmsg_wwan_ctrl_multi.ko",
+];
+
+/// Unload and delete the legacy out-of-tree multi-port RPMSG module.
+///
+/// `rpmsg_wwan_ctrl_multi` published one WWAN port per channel in its id_table.
+/// DATA6 now binds through the in-tree `rpmsg_wwan_ctrl` instead, so the module
+/// is redundant — but leaving it installed is not merely untidy. While it stays
+/// loaded it keeps auto-binding *every* matching `DATA*_CNTL` channel on each
+/// boot, and those extra binds land on the modem while it is still bringing up
+/// Data Services Memory. On this MSM8916 firmware that is what takes the DSP
+/// down with `smd_dsm_memcpy.c` a second after mpss starts, which in turn
+/// latches `bam-dmux` runtime PM at `error` and leaves every `wwanN` unusable
+/// for the rest of the boot.
+///
+/// Deliberately runs whether or not DATA6 is enabled: with DATA6 off the module
+/// has no purpose whatsoever, so keeping it loaded is pure risk. Every step is
+/// best-effort — a read-only rootfs or a module built into the kernel must not
+/// stop the rest of initialization.
+pub async fn purge_legacy_rpmsg_module() -> bool {
+    let mut changed = false;
+
+    if Path::new(LEGACY_MODULE_SYSFS).exists() {
+        match Command::new("rmmod")
+            .arg(LEGACY_RPMSG_WWAN_DRIVER)
+            .status()
+            .await
+        {
+            Ok(status) if status.success() => {
+                info!(
+                    module = LEGACY_RPMSG_WWAN_DRIVER,
+                    "Unloaded the legacy multi-port RPMSG module"
+                );
+                changed = true;
+            }
+            Ok(status) => debug!(
+                module = LEGACY_RPMSG_WWAN_DRIVER,
+                ?status,
+                "rmmod refused; the module may still be in use"
+            ),
+            Err(error) => debug!(error = %error, "rmmod is unavailable"),
+        }
+    }
+
+    let kver = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    for template in LEGACY_MODULE_FILES {
+        let path = template.replace("{kver}", &kver);
+        if Path::new(&path).exists() && std::fs::remove_file(&path).is_ok() {
+            info!(path = %path, "Removed the legacy multi-port RPMSG module file");
+            changed = true;
+        }
+    }
+
+    if changed && !kver.is_empty() {
+        let _ = Command::new("depmod").arg("-a").arg(&kver).status().await;
+    }
+    changed
+}
+
 /// Timeout for one capability probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -1492,6 +1559,34 @@ mod tests {
         // A channel held by an unrelated driver must not be stolen.
         assert!(!is_wwan_ctrl_driver("rpmsg_chrdev"));
         assert!(!is_wwan_ctrl_driver("qcom_smd_qrtr"));
+    }
+
+    /// The purge has to reach every location an older install could have used,
+    /// because a module left loaded keeps auto-binding spare DATA*_CNTL
+    /// channels at boot and that is what crashes the DSP.
+    #[test]
+    fn legacy_module_purge_covers_every_known_install_location() {
+        let expanded: Vec<String> = LEGACY_MODULE_FILES
+            .iter()
+            .map(|t| t.replace("{kver}", "6.17.0-rc6-lkiuyu-compile+"))
+            .collect();
+
+        // Where beta8 kept it, and where deploy/install.sh puts it.
+        assert!(expanded
+            .iter()
+            .any(|p| p == "/opt/simadmin/modules/rpmsg_wwan_ctrl_multi.ko"));
+        assert!(expanded.iter().any(|p| p
+            == "/lib/modules/6.17.0-rc6-lkiuyu-compile+/extra/simadmin/rpmsg_wwan_ctrl_multi.ko"));
+
+        // Every entry must name the legacy module and no template may be left
+        // unexpanded, or the removal silently misses.
+        for path in &expanded {
+            assert!(path.ends_with("rpmsg_wwan_ctrl_multi.ko"), "{path}");
+            assert!(!path.contains("{kver}"), "{path}");
+        }
+        // The purge must never target the in-tree driver.
+        assert!(!expanded.iter().any(|p| p.contains("rpmsg_wwan_ctrl.ko")));
+        assert_eq!(LEGACY_MODULE_SYSFS, "/sys/module/rpmsg_wwan_ctrl_multi");
     }
 
     #[test]
