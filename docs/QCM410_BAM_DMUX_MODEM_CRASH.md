@@ -170,7 +170,31 @@ initramfs 或极早期的 systemd unit 里打开；热重启 modem 复现不了�
 
 ---
 
-## 7. 与 SimAdmin 的关系
+## 7. 用户面是"看起来通、实际不传"
+
+这是本故障最容易误判的地方，单独列出来。
+
+即使 wwan 网卡存在、`runtime_status` 不是 `error`、ModemManager 报
+`connected: yes` 并给出了 IP/网关/DNS，**用户面仍然可能一个字节都传不出去**：
+
+```text
+ping 运营商网关（与 wwan0 同一 /28，第一跳）: 100% packet loss
+ping / DNS 到运营商 DNS                      : 无回应
+同一个 DNS 查询走 WiFi                        : 正常
+wwan0 内核计数器                              : rx=0 tx=0 packets
+```
+
+**判定方法：看 `/sys/class/net/<if>/statistics/tx_packets`。** 它长期为 0 就说明
+包死在 bam-dmux 驱动里，从未上空口。
+
+**特别注意抓包会骗人**：用 `AF_PACKET`（tcpdump 同理）在 wwan 上能抓到自己发出去的
+包，因为抓包点在 netdev 层，**位于驱动把包交给硬件之前**。抓到包只能证明它进了
+网卡，不能证明它发出去了。必须结合 `tx_packets` 计数器一起看。
+
+这解释了为什么上层会表现为"请求发出后石沉大海"：SIP REGISTER、DNS、ping 全都
+如此，而且和报文大小、分片、路由、源地址都无关。
+
+## 8. 与 SimAdmin 的关系
 
 - 该崩溃在 SimAdmin 做任何 IMS 操作之前就已发生，不能归因于 SimAdmin。
 - SimAdmin 侧**不应该**为此增加重试或放宽 `runtime_status=error` 的检查：内核会

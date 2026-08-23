@@ -715,8 +715,54 @@ ATTEMPT variant=..._aka_uri_first_sec_agree_required   require=true  proxy=true 
 **带齐全部 sec-agree 头之后运营商仍然完全不回**，所以 sec-agree 不是 VoLTE 的
 阻塞原因。这一级阶梯本身是真实缺口，值得保留（对会回 421 的运营商有用）。
 
-**目前的判断**：同一个 IMS 核心经 ePDG（VoWiFi）能正常应答并注册成功，经 LTE
-IMS APN 则对任何形态的 REGISTER 都保持静默。剩余的可能性集中在接入侧授权，而不
-是 SIP 报文内容：IMS APN 是否被允许承载来自宿主协议栈的信令、是否要求由基带内置
-IMS 客户端发起、以及 `cm error: client-end` 背后的 PDN 授权细节。**继续排查应从
-运营商侧 IMS 接入授权入手，SIP 层已无更多可做。**
+**④ 包过大 / 未触发分片 —— 不成立。** VoWiFi 那套软件分片
+（`tun_gateway.rs`，`AUTO_FRAGMENT_INNER_IP_MAX=1356`）只作用于 TUN 路径；VoLTE 的
+SIP 直接从 `wwan1` 这个 raw-IP 接口出去，不经过 TUN，因此完全不涉及那套机制。
+在 `wwan1` 上按 IP 头逐包核对：
+
+```text
+#1 ip_total=1010  DF=True MF=False frag_off=0  captured_payload=982   单个完整数据报
+#2 ip_total=1031  DF=True MF=False frag_off=0  captured_payload=1003  单个完整数据报
+发往 P-CSCF:5060 : 2 个包        从 P-CSCF 回来 : 0 个包
+```
+
+`wwan1` MTU 为 1500，而 REGISTER 连同 IP+UDP 头只有 1010–1031 字节，既不需要分片
+也确实没有分片（`MF=0`、`frag_off=0`）；抓到的载荷长度与 SimAdmin 自报的
+`request_bytes` 逐字节吻合，没有截断。此外从同一 bearer 源地址发出的约 120 字节
+极小 SIP OPTIONS 同样**没有任何回应** —— 如果是尺寸导致运营商收不全，小包应当能通。
+因此报文大小与完整性都不是变量。（注：P-CSCF 过滤 ICMP，连 64 字节 DF ping 都不回，
+所以无法用 ping 做路径 MTU 探测，这一点不能反过来当作 MTU 有问题的证据。）
+
+#### 8.7.2 真正的原因：蜂窝用户面根本不传数据（2026-08-23）
+
+上面四条假设全部落空之后，做了一组对照实验，结论推翻了"包已经发出去"这个前提：
+
+```text
+ping 运营商网关 10.95.72.9（与 wwan0 同一个 /28，第一跳）: 100% packet loss
+ping / DNS 到运营商 DNS 58.71.136.20                     : 无回应
+同一个 DNS 查询走 WiFi                                    : 正常收到回复
+wwan0 内核计数器                                          : rx=0 tx=0 packets
+ModemManager Bearer/1: connected=yes, total-bytes rx=352（累计 36295 秒）
+```
+
+**普通数据 APN 也完全不通** —— 连同网段的运营商网关都 ping 不到，而 `wwan0` 的
+内核统计显示它从未真正收发过任何一个包。这不是 IMS 特有的问题，是整个用户面死了。
+
+这同时纠正了 §8.7.1 第②条的一个误读：当时用 AF_PACKET 在 `wwan1` 上抓到了
+REGISTER，据此认为"包已经从 IMS bearer 发出去了"。**AF_PACKET 抓的是 netdev 层，
+在驱动把包交给硬件之前**，所以那只能证明包进了网卡，不能证明它上了空口。结合
+`tx=0` 的计数器，真实链路是：
+
+```text
+REGISTER → 进入 wwan1 netdev（抓包可见）→ 死在 bam-dmux 驱动里（tx 计数不增长）
+        → 从未上空口 → 运营商收不到 → 永远没有回应
+```
+
+**这与最初的固件崩溃是同一个根因。** `smd_dsm_memcpy.c` 中的 DSM 正是
+Data Services Memory；固件在数据服务内存上崩溃之后，PDN 在信令层仍能激活、仍能
+分配 IP、ModemManager 仍报 `connected`，但用户面一个字节也传不出去。
+
+**结论：VoLTE 在这台设备上不可能注册成功，直到 §7 的 bam-dmux/固件问题被解决。**
+SIP 层、路由层、分片层都已排除，不应继续在这些方向投入。参见
+`QCM410_BAM_DMUX_MODEM_CRASH.md`。VoWiFi 不受影响，因为它走 WiFi + 用户态
+IKE/ESP/TUN，完全不经过蜂窝用户面。
