@@ -91,6 +91,14 @@ pub fn secondary_qmi_enabled() -> bool {
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// How long the primary-port set must stay unchanged before it counts as final.
+/// Long enough for a second baseband attaching a little later to be picked up,
+/// short enough not to delay ModemManager on a single-modem host.
+const PRIMARY_PORT_SETTLE: Duration = Duration::from_secs(2);
+/// Upper bound on waiting for the first primary QMI port to appear. Hosts with
+/// no QMI hardware at all pay this once per boot and then fall through.
+pub const PRIMARY_PORT_WAIT: Duration = Duration::from_secs(45);
+
 /// Where an older install may have left the out-of-tree multi-port module.
 const LEGACY_MODULE_SYSFS: &str = "/sys/module/rpmsg_wwan_ctrl_multi";
 const LEGACY_MODULE_FILES: &[&str] = &[
@@ -332,6 +340,49 @@ pub fn discover_primary_qmi_ports() -> Vec<String> {
         .into_values()
         .map(|port| format!("/dev/{port}"))
         .collect()
+}
+
+/// Wait for the basebands to publish their primary QMI control ports.
+///
+/// `secondary-qmi-init` is ordered before ModemManager, which puts it well ahead
+/// of the modem: on this hardware the firmware finishes booting and attaches its
+/// wwan ports around 13 s after kernel start, and the rpmsg channels land later
+/// still. Enumerating immediately therefore finds nothing and the whole DATA6
+/// preparation is skipped for the rest of the boot.
+///
+/// `udevadm settle` cannot substitute for this. It waits for the *event queue* to
+/// drain and returns at once when the device does not exist yet, which is exactly
+/// the situation here.
+///
+/// Once a port shows up this keeps polling until the count holds steady for
+/// [`PRIMARY_PORT_SETTLE`]. A host with two modems can attach them seconds apart,
+/// and returning on the first one would silently leave the second baseband
+/// without an IMS endpoint.
+pub async fn wait_for_primary_qmi_ports(timeout: Duration) -> Vec<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut ports = discover_primary_qmi_ports();
+    let mut stable_since = None;
+
+    while tokio::time::Instant::now() < deadline {
+        if !ports.is_empty() {
+            match stable_since {
+                Some(since) if tokio::time::Instant::now().duration_since(since) >= PRIMARY_PORT_SETTLE => {
+                    break;
+                }
+                Some(_) => {}
+                None => stable_since = Some(tokio::time::Instant::now()),
+            }
+        }
+        tokio::time::sleep(PORT_POLL_INTERVAL).await;
+        let latest = discover_primary_qmi_ports();
+        if latest != ports {
+            // Something changed: restart the settle window.
+            stable_since = (!latest.is_empty()).then(tokio::time::Instant::now);
+            ports = latest;
+        }
+    }
+
+    ports
 }
 
 /// Extract the owning `<addr>.remoteproc` component from a resolved sysfs path.
@@ -1559,6 +1610,63 @@ mod tests {
         // A channel held by an unrelated driver must not be stolen.
         assert!(!is_wwan_ctrl_driver("rpmsg_chrdev"));
         assert!(!is_wwan_ctrl_driver("qcom_smd_qrtr"));
+    }
+
+    /// The port wait lives in the binary, but the deadline that can cut it short
+    /// lives in the systemd unit. They are edited in different files, so pin the
+    /// relationship: a `TimeoutStartSec` below the wait means systemd kills the
+    /// initializer mid-probe and DATA6 is skipped for the rest of the boot.
+    #[test]
+    fn the_unit_allows_more_startup_time_than_the_port_wait_needs() {
+        let unit = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../deploy/system/simadmin-secondary-qmi.service"),
+        )
+        .expect("the packaged unit must exist");
+
+        let timeout: u64 = unit
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("TimeoutStartSec="))
+            .expect("the unit must set TimeoutStartSec")
+            .trim()
+            .parse()
+            .expect("TimeoutStartSec must be plain seconds");
+
+        assert!(
+            timeout > PRIMARY_PORT_WAIT.as_secs(),
+            "TimeoutStartSec={timeout}s must exceed the {}s port wait",
+            PRIMARY_PORT_WAIT.as_secs()
+        );
+
+        // No *directive* may name a channel, driver, or port: the whole point of
+        // discovering the layout at runtime is that these differ per platform,
+        // and a hardcoded name once skipped the unit entirely. Comments are
+        // exempt on purpose -- they carry the history of why that is banned.
+        let directives: String = unit
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for forbidden in ["DATA6_CNTL", "wwan0qmi1", "wwan0at2", "rpmsg_wwan_ctrl_multi"] {
+            assert!(
+                !directives.contains(forbidden),
+                "the unit must not hardcode {forbidden}"
+            );
+        }
+        assert!(
+            !directives.contains("ExecCondition="),
+            "an ExecCondition can skip the unit, and with it the legacy-module purge"
+        );
+    }
+
+    /// The settle window exists to catch a second baseband attaching late; it is
+    /// useless if it is not comfortably shorter than the overall wait.
+    #[test]
+    fn the_settle_window_fits_inside_the_port_wait() {
+        assert!(PRIMARY_PORT_SETTLE < PRIMARY_PORT_WAIT);
+        assert!(PORT_POLL_INTERVAL < PRIMARY_PORT_SETTLE);
     }
 
     /// The purge has to reach every location an older install could have used,

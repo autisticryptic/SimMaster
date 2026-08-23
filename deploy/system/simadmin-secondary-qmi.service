@@ -25,15 +25,22 @@ Environment=SIMADMIN_ENABLE_SECONDARY_QMI=0
 # skip the unit when it did not appear, which on any other layout also skipped
 # the purge of the crash-inducing legacy module -- exactly what must always run.
 #
-# So the unit always starts the initializer and lets it decide. This step only
-# gives the kernel a chance to publish the devices first; every part is
-# best-effort because a platform may have the driver built in, or no rpmsg at
-# all.
-ExecStartPre=-/bin/sh -c 'modprobe rpmsg_wwan_ctrl 2>/dev/null || true; udevadm settle --timeout=20 || true'
+# So the unit always starts the initializer and lets it decide.
+#
+# Waiting for the modem is the initializer's job, not this unit's. `udevadm
+# settle` cannot do it: it drains the event queue and returns immediately when
+# the device does not exist yet, which is precisely the case here -- this unit is
+# ordered before ModemManager and therefore runs well before the firmware
+# attaches its wwan ports (~13 s after kernel start on the 410, rpmsg channels
+# later still). So this step only loads the driver, best-effort, because a
+# platform may have it built in or no rpmsg at all.
+ExecStartPre=-/bin/sh -c 'modprobe rpmsg_wwan_ctrl 2>/dev/null || true'
 ExecStart=/opt/simadmin/simadmin secondary-qmi-init
 Restart=on-failure
 RestartSec=2
-TimeoutStartSec=75
+# Must exceed the initializer's own port wait (45 s) plus per-endpoint bind and
+# QMI probe time, or systemd kills it mid-probe and restarts it on a loop.
+TimeoutStartSec=120
 
 [Install]
 WantedBy=multi-user.target

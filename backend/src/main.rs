@@ -369,7 +369,16 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
 
     // Discovering modems needs ModemManager, which by design is not up yet. Fall
     // back to enumerating the primary QMI control ports straight from sysfs.
-    let primaries = secondary_qmi::discover_primary_qmi_ports();
+    //
+    // This unit is ordered ahead of ModemManager and therefore well ahead of the
+    // modem itself, so the ports usually do not exist yet: wait for them rather
+    // than concluding the host has no QMI hardware. `--dry-run` reports what is
+    // visible right now instead of blocking an operator at a shell.
+    let primaries = if dry_run {
+        secondary_qmi::discover_primary_qmi_ports()
+    } else {
+        secondary_qmi::wait_for_primary_qmi_ports(secondary_qmi::PRIMARY_PORT_WAIT).await
+    };
     if primaries.is_empty() {
         // Not an error: plenty of supported hardware has no spare QMI channel,
         // and every line falls back to the ModemManager bearer. Still has to
