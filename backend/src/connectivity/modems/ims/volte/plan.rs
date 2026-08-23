@@ -116,14 +116,36 @@ pub enum FailureClass {
 /// QMI port. The generic ModemManager "internal error" on an IMS bearer connect
 /// is the same condition surfaced one layer up. `endpoint hangup` is the QMI
 /// control channel itself going away.
+///
+/// Two phrasings of the same refusal reach this function, and only one of them
+/// is ModemManager's. The native path shells out to `qmicli`, which renders the
+/// identical failure as `QMI protocol error (14): 'CallFailed'` and
+/// `verbose call end reason (2,201): [internal] error` — no space in
+/// `CallFailed`, brackets around `internal`. Matching only ModemManager's
+/// spelling classified the native failure as retryable and produced an
+/// unbounded retry loop; see the leak note below for what that cost.
+///
+/// `client id not released` is the expensive one. It is `qmicli` reporting that
+/// the WDS client it allocated could not be freed, so **every** retry strands
+/// another client ID in the firmware. On MSM8916 that pool is small: roughly a
+/// hundred seconds of retries exhausted it and the modem's DHCP client manager
+/// died (`dhcp_client_mgr.c:263`), taking every wwanN interface down with it.
+/// The condition is never transient, so it must abort the batch on the first
+/// occurrence rather than after a bounded number of tries.
 fn is_baseband_wedge(lowercased: &str) -> bool {
+    let call_failed =
+        lowercased.contains("call failed") || lowercased.contains("callfailed");
+    let internal_error =
+        lowercased.contains("internal error") || lowercased.contains("[internal] error");
+
     lowercased.contains("interface-in-use-config-match")
         || lowercased.contains("endpoint hangup")
         || lowercased.contains("mobileequipment.unknown")
+        || lowercased.contains("client id not released")
         || lowercased.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
         || lowercased.contains(code::BEARER_NETDEV_NOT_UP)
         || lowercased.contains(code::BEARER_NETDEV_NOT_READY)
-        || (lowercased.contains("call failed") && lowercased.contains("internal error"))
+        || (call_failed && internal_error)
 }
 
 impl FailureClass {
@@ -601,6 +623,64 @@ mod tests {
         assert!(FailureClass::PcscfFailed.is_retryable_family());
         assert!(!FailureClass::NetworkForcedIpv6.is_retryable_family());
         assert!(!FailureClass::Other.is_retryable_family());
+    }
+
+    /// Verbatim detail from the QCM410, captured while the firmware was crash
+    /// looping. Classifying this as retryable is what made the loop: each retry
+    /// stranded another WDS client ID until the modem's DHCP client manager died
+    /// (`dhcp_client_mgr.c:263`). Note the spellings `'CallFailed'` (no space)
+    /// and `[internal] error` (bracketed) -- `qmicli` renders the same refusal
+    /// differently from ModemManager, and matching only ModemManager's wording
+    /// let this through.
+    #[test]
+    fn native_qmi_call_failure_is_unsafe_to_retry() {
+        let detail = concat!(
+            "secondary_qmi_action_failed:[/dev/wwan0at2] Client ID not released:\n",
+            "        Service: 'wds'\n",
+            "            CID: '4'\n",
+            "[/dev/wwan0at2] couldn't detect transport type of port: unsupported wwan port\n",
+            "[/dev/wwan0at2] requested QMI mode but unexpected transport type found\n",
+            "error: couldn't start network: QMI protocol error (14): 'CallFailed'\n",
+            "call end reason (12): (null)\n",
+            "verbose call end reason (2,201): [internal] error",
+        );
+
+        let class = FailureClass::from_details(detail);
+        assert_eq!(class, FailureClass::BasebandWedged, "detail: {detail}");
+        assert!(
+            class.is_unsafe_to_retry(),
+            "retrying this strands another WDS client ID and crashes the firmware"
+        );
+    }
+
+    /// A leaked WDS client is never transient, so it must abort on its own --
+    /// without needing the CallFailed/internal-error pair to also be present.
+    #[test]
+    fn a_stranded_wds_client_alone_aborts_the_batch() {
+        let class = FailureClass::from_details(
+            "secondary_qmi_action_failed:[/dev/wwan0at2] Client ID not released: Service: 'wds'",
+        );
+        assert_eq!(class, FailureClass::BasebandWedged);
+        assert!(class.is_unsafe_to_retry());
+    }
+
+    /// The ModemManager spelling must keep working -- this is the pairing that
+    /// was already covered, and only the pair may trip it.
+    #[test]
+    fn modemmanager_call_failure_still_needs_both_halves() {
+        assert_eq!(
+            FailureClass::from_details("Call failed: internal error"),
+            FailureClass::BasebandWedged
+        );
+        // Either half on its own is too generic to abandon a batch over.
+        assert_eq!(
+            FailureClass::from_details("call failed: no service"),
+            FailureClass::Other
+        );
+        assert_eq!(
+            FailureClass::from_details("internal error while reading state"),
+            FailureClass::Other
+        );
     }
 
     #[test]
