@@ -76,6 +76,18 @@ volte_bearer_netdev_runtime_error:interface=wwan0: runtime_status=error before O
 > 安装器装的树外模块 `rpmsg_wwan_ctrl_multi.ko`，详见 §8。**§8 才是完整的因果与
 > 预防办法**，本节只描述可观察到的现象。
 
+> **重要（2026-08-23 晚）：这台设备上存在两种互不相同的固件崩溃。** 本文档到 §8
+> 为止讲的都是第一种。第二种在同一天被发现并定位，见 **§10**：
+>
+> | | 第一种 | 第二种 |
+> |---|---|---|
+> | 固件断言 | `smd_dsm_memcpy.c:297` | `dhcp_client_mgr.c:263` |
+> | 时刻 | 每次开机，boot 窗口内 | 运行中，绑定 DATA6 后 50–120 秒 |
+> | 后果 | `bam-dmux` 锁存 `error`，需整机重刷 | 固件自恢复，`bam-dmux` 保持 `suspended` |
+> | 根因 | 树外 `_multi` 模块抢绑 `DATA*_CNTL` | **SimAdmin 自己的无界重试循环** |
+>
+> 不要把 §9 的现象当成第一种的复发 —— 断言位置、时序和后果都不同，处理方式也不同。
+
 ---
 
 ## 3. 排查决策树（每一步排除一类原因）
@@ -332,11 +344,108 @@ lsmod | grep rpmsg                                                        # 不�
 
 ## 9. 与 SimAdmin 的关系
 
-- 该崩溃在 SimAdmin 做任何 IMS 操作之前就已发生，不能归因于 SimAdmin。
-- SimAdmin 侧**不应该**为此增加重试或放宽 `runtime_status=error` 的检查：内核会
-  直接以 EINVAL 拒绝 OPEN，重试只会反复撞固件。当前的"拒绝并如实报错"是正确的。
+- **第一种崩溃**（`smd_dsm_memcpy.c:297`）在 SimAdmin 做任何 IMS 操作之前就已发生，
+  不能归因于 SimAdmin 的运行时行为 —— 但它的**成因**仍在 SimAdmin：是安装器装的树外
+  模块（§8）。**第二种崩溃**（`dhcp_client_mgr.c:263`）则完全是 SimAdmin 自己造成的，
+  见 §10。
+- SimAdmin 侧**不应该**为第一种崩溃增加重试或放宽 `runtime_status=error` 的检查：内核
+  会直接以 EINVAL 拒绝 OPEN，重试只会反复撞固件。当前的"拒绝并如实报错"是正确的。
+  §10 是同一条原则在另一处被违反的后果。
 - VoWiFi **不受影响**：它走 WiFi + 用户态 IKE/ESP/TUN，完全不碰 wwan 网卡。
   数据面卡死时 VoWiFi 仍可正常注册、收发短信与通话。
 - 数据面恢复之后，VoLTE 的失败点会前移到 IMS 层
   （`ims_register_initial_receive_failed`、P-CSCF 可达性），那是另一个问题，
   见 `ue-isolation-migration.md` §8.7。
+
+## 10. 第二种崩溃：`dhcp_client_mgr.c:263` —— SimAdmin 把固件打死的（2026-08-23）
+
+### 10.1 现象
+
+重刷后的干净系统、stock `rpmsg_wwan_ctrl`、`_multi` 模块确认未加载，DATA6 开启后
+固件**每 50–120 秒崩一次**：
+
+```text
+[  109.717389] qcom-q6v5-mss 4080000.remoteproc: fatal error received: dhcp_client_mgr.c:263:
+[  231.462449] qcom-q6v5-mss 4080000.remoteproc: fatal error received: dhcp_client_mgr.c:263:
+[  285.368627] qcom-q6v5-mss 4080000.remoteproc: fatal error received: dhcp_client_mgr.c:263:
+[  338.278098] qcom-q6v5-mss 4080000.remoteproc: fatal error received: dhcp_client_mgr.c:263:
+```
+
+与第一种不同：固件每次都**自行恢复**（`remote processor is now up`），
+`bam-dmux` 保持 `suspended`，`Failed to resume` 计数为 0。
+
+### 10.2 判定归因的那一步实验
+
+**停掉 SimAdmin，崩溃立刻停止：**
+
+```bash
+systemctl stop simadmin.service simadmin-secondary-qmi.service
+dmesg | grep -c 'fatal error received'   # 4
+sleep 90
+dmesg | grep -c 'fatal error received'   # 仍然是 4
+```
+
+固件闲置 90 秒零新增故障。**这条实验把归因钉死了：不是硬件、不是固件、不是驱动，
+是 SimAdmin 在打它。**
+
+### 10.3 因果链
+
+1. 槽位分配器把 IMS 分给了 DATA6（`mode="independent_wwan1"`，
+   `allocation="IMS allocated to DATA6; primary qmi0 is reserved for data"`），
+   因为 ModemManager 已经在 qmi0 上持有数据承载（`primary_data_active=true`，
+   见 `data_slot.rs:125`）；
+2. 而 `secondary-qmi-init` 的职责之一就是**持续持有** `/dev/wwan0at2`
+   （unit 描述里的 "initializer and **holder**"）；
+3. 在被持有的设备上启动 WDS 会话必然失败，报文原样如下：
+
+```text
+[/dev/wwan0at2] Client ID not released:  Service: 'wds'  CID: '4'
+[/dev/wwan0at2] couldn't detect transport type of port: unsupported wwan port
+[/dev/wwan0at2] requested QMI mode but unexpected transport type found
+error: couldn't start network: QMI protocol error (14): 'CallFailed'
+verbose call end reason (2,201): [internal] error
+```
+
+4. `native_bearer.rs:253` 本来有护栏 —— `failure_class(&error).is_unsafe_to_retry()`，
+   遇到楔死的基带就放弃整批尝试。但 `FailureClass::from_details` **在标点上漏掉了这个
+   失败**：它匹配的是 `"call failed"` 和 `"internal error"`，而 qmicli 输出的是
+   `'CallFailed'`（无空格）和 `[internal] error`（带方括号）。那套模式是照
+   ModemManager 的措辞写的，原生 QMI 路径走的却是 qmicli；
+5. 于是失败被归类成 `FailureClass::Other`（可重试），运行时无界重试
+   ipv4 → ipv6 → attempt 1 → attempt 2 → …；
+6. **每次重试都漏掉一个 WDS client ID** —— `Client ID not released` 说的就是这件事。
+   MSM8916 的 client 池很小，约一百秒就耗尽，固件的 DHCP 客户端管理器随之崩溃。
+
+### 10.4 已修复的部分
+
+commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写，并且把
+`client id not released` **单独**作为楔死信号 —— 泄漏的 client 绝不会自愈，必须在
+第一次出现时就放弃整批，而不是重试若干次之后。测试用的是设备上原样抓下来的文本，
+同时钉住 ModemManager 那套拼写仍需两半同时命中（单独一个 `call failed` 或
+`internal error` 太宽，不足以放弃整批）。
+
+### 10.5 尚未解决：IMS-on-DATA6 这个分配本身
+
+`secondary-qmi-init` 持有那个字符设备期间，**IMS-on-DATA6 根本不可能成功**。也就是说
+分配器正在选择一个本设备无法履行的分配。这是个设计问题，两条路：
+
+- **让它可行**：IMS 要用 DATA6 时，holder 先把设备交出去（需要一套交接协议，
+  且要保证交接失败时不会两边都不持有）；
+- **永不选它**：分配器把"DATA6 被 holder 占用"作为输入，此时不产出
+  `SecondaryImsPrimaryData`；`primary_data_active=true` 改为先把数据从 qmi0 让出来，
+  回到已验证可用的 `secondary_qmi_data`（IMS→qmi0，数据→DATA6）。
+
+已验证可用的组合是后者：`mode="secondary_qmi_data"` 下 VoLTE registered、VoWiFi
+200 OK、数据经代理出站正常（见 `ue-isolation-migration.md` §8.8）。
+
+### 10.6 这次留下的通用教训
+
+- **无界重试是可以把硬件打坏的**，不只是浪费时间。任何对基带的重试都必须有明确的
+  "不可重试"分类，且该分类的**默认方向应当是保守的** —— 认不出来的失败应倾向于放弃，
+  而不是倾向于重试。当前 `from_details` 的兜底是 `FailureClass::Other`（可重试），
+  这个默认值本身值得重新考虑。
+- **按错误文本字符串做分类是脆的。** 同一个失败经 ModemManager 和经 qmicli 出来的
+  措辞不同，这次就差在一个空格和一对方括号上。新增一条产生错误的路径时，必须同时
+  检查分类器认不认得它的措辞。
+- **"某个东西持有某个设备"应当是显式状态，而不是靠错误信息事后发现。** holder 与
+  分配器目前对彼此一无所知，分配器因此会选一个注定失败的槽位。
