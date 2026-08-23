@@ -51,6 +51,21 @@ impl SecondaryDataRuntime {
             .map(|session| session.netdev.interface.clone())
     }
 
+    /// True when the retained DATA session lives inside a UE worker namespace.
+    ///
+    /// Only such a session is tied to the isolation lifecycle: its interface sits
+    /// in a namespace that disappears with the worker. A host-side session
+    /// belongs to the legacy path and has to survive isolation teardown, or
+    /// simply running with `ue_isolation.enabled = false` would destroy working
+    /// cellular data on every line refresh.
+    pub async fn is_worker_bound(&self) -> bool {
+        self.session
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.worker.is_some())
+    }
+
     pub async fn start(
         &self,
         line_id: &str,

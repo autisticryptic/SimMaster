@@ -874,8 +874,11 @@ impl LineRuntimeRegistry {
             }
         } else if !ue_ready && worker.is_running().await {
             // Release the DATA6 bearer first so its in-namespace address and
-            // routes are removed over a control channel that is still up.
-            line.secondary_data.stop().await;
+            // routes are removed over a control channel that is still up. Only
+            // a worker-bound session needs this; a host-side one keeps running.
+            if line.secondary_data.is_worker_bound().await {
+                line.secondary_data.stop().await;
+            }
             if let Err(error) = worker.shutdown().await {
                 tracing::warn!(
                     line_id = %binding.line_id,
@@ -949,7 +952,11 @@ impl LineRuntimeRegistry {
                 // host.  Then stop the worker so the shared teardown can
                 // remove a namespace nothing is running in, and clear the
                 // registry/context entries, NAT, veth and egress fingerprint.
-                line.secondary_data.stop().await;
+                // A host-side session is untouched -- the line is falling back
+                // to the host path, which is exactly where that session lives.
+                if line.secondary_data.is_worker_bound().await {
+                    line.secondary_data.stop().await;
+                }
                 if worker.is_running().await {
                     if let Err(shutdown_error) = worker.shutdown().await {
                         tracing::warn!(
@@ -1030,10 +1037,16 @@ impl LineRuntimeRegistry {
             .map(|config| config.get_ue_isolation())
             .unwrap_or_default();
         let ue = line.ue();
-        // This helper is also called when isolation is disabled or a worker
-        // reconcile fails. Tear down secondary DATA before unregistering the
-        // worker and removing its namespace.
-        line.secondary_data.stop().await;
+        // Only a DATA session that was actually migrated into the worker
+        // namespace is tied to this lifecycle: its interface lives in a
+        // namespace that is about to disappear. A host-side session belongs to
+        // the legacy path, and stopping it here would tear down healthy
+        // cellular data on every single line refresh whenever isolation is
+        // disabled -- the watchdog rebuilds it, this runs again, and the bearer
+        // churns instead of ever carrying traffic.
+        if line.secondary_data.is_worker_bound().await {
+            line.secondary_data.stop().await;
+        }
         crate::services::ue_worker::register_line_worker(
             line_id,
             None,
