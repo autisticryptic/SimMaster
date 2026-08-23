@@ -9,4 +9,5 @@ pub mod config_maintenance;
 pub mod db;
 pub mod netns;
 pub mod network_routing;
+pub mod shutdown;
 pub mod utils;

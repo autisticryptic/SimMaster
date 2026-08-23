@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::{platform::db::AppEventEntry, services::event_bus::AppEventBus};
+use crate::{
+    platform::{db::AppEventEntry, shutdown::ShutdownSignal},
+    services::event_bus::AppEventBus,
+};
 
 #[derive(Debug, Default, Deserialize)]
 pub struct EventStreamQuery {
@@ -52,6 +55,10 @@ struct EventStreamState {
     line_id: Option<String>,
     last_id: i64,
     replaying: bool,
+    /// Ends the stream when the process is going down. Without this the
+    /// response never completes, and `with_graceful_shutdown` waits on it until
+    /// the force-exit watchdog fires -- which skips every teardown path.
+    shutdown: ShutdownSignal,
 }
 
 fn event_matches_line(event: &AppEventEntry, line_id: Option<&str>) -> bool {
@@ -70,6 +77,7 @@ fn sse_event(event: AppEventEntry) -> Event {
 
 pub async fn stream_app_events(
     State(event_bus): State<Arc<AppEventBus>>,
+    State(shutdown): State<ShutdownSignal>,
     Query(query): Query<EventStreamQuery>,
     headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -103,9 +111,16 @@ pub async fn stream_app_events(
         line_id,
         last_id,
         replaying: requested_after_id.is_some(),
+        shutdown,
     };
     let stream = stream::unfold(state, |mut state| async move {
         loop {
+            // Drain what is already buffered even while going down, so a client
+            // that reconnects does not lose events, then end the response.
+            if state.pending.is_empty() && state.shutdown.is_shutting_down() {
+                return None;
+            }
+
             if let Some(event) = state.pending.pop_front() {
                 if event.id <= state.last_id {
                     continue;
@@ -131,7 +146,15 @@ pub async fn stream_app_events(
                 }
             }
 
-            match state.receiver.recv().await {
+            // `recv` on an idle bus parks indefinitely, so the shutdown signal
+            // has to be raced against it rather than only polled around it.
+            let received = tokio::select! {
+                biased;
+                _ = state.shutdown.wait() => return None,
+                received = state.receiver.recv() => received,
+            };
+
+            match received {
                 Ok(event) => {
                     if event.id <= state.last_id
                         || !event_matches_line(&event, state.line_id.as_deref())

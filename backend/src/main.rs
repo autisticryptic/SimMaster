@@ -1015,8 +1015,15 @@ async fn main() -> Result<()> {
         .allow_methods(Any)
         .allow_headers(Any);
 
+    // Announced to long-lived responses (the SSE stream) so they can end. An
+    // SSE response never completes on its own, and `with_graceful_shutdown`
+    // waits for in-flight connections, so without this a single open browser
+    // tab holds the drain until the force-exit watchdog fires.
+    let (shutdown_controller, shutdown_signal) = platform::shutdown::channel();
+
     // 创建统一的应用状态
     let app_state = AppState::new(AppStateDependencies {
+        shutdown: shutdown_signal,
         dbus_conn,
         database: app_db,
         config_manager,
@@ -1032,6 +1039,10 @@ async fn main() -> Result<()> {
         sim_overrides,
         e911,
     });
+
+    // Kept out of the router's state so session teardown can still run after
+    // `serve` returns and the state itself has been consumed.
+    let shutdown_registry = Arc::clone(&app_state.line_registry);
 
     api::handlers::spawn_call_monitor(app_state.clone());
     spawn_runtime_event_bridge(app_state.clone());
@@ -1929,10 +1940,59 @@ async fn main() -> Result<()> {
     info!(addr = %bind_addr, "Server listening");
     // 使用优雅关闭
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
         .await?;
 
+    // Only reached once the drain completes, which is what the shutdown signal
+    // above makes possible. Releasing the data sessions here is what keeps the
+    // DATA netdev from being left inside a UE namespace.
+    release_data_sessions(&shutdown_registry).await;
+
     Ok(())
+}
+
+/// Deactivate every DATA bearer before the process exits.
+///
+/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
+/// namespace and releases the retained QMI client. Every other caller is either
+/// an API handler or the reconcile path that reacts to a SIM going away, so
+/// before this existed a normal `systemctl restart simadmin` never ran it at
+/// all: the netdev stayed in the namespace, the next process re-attached to that
+/// same namespace, and the data interface was invisible to a resolver that only
+/// enumerates the host. See
+/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
+/// up after the cases this cannot cover (SIGKILL, power loss).
+///
+/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
+/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
+/// fatal: the startup reclaim recovers whatever is left behind.
+async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let lines = line_registry.all().await;
+    if lines.is_empty() {
+        return;
+    }
+
+    let released = tokio::time::timeout(BUDGET, async {
+        for line in lines {
+            let line_id = line.binding().line_id;
+            if line.secondary_data.interface().await.is_none() {
+                continue;
+            }
+            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
+            line.secondary_data.stop().await;
+        }
+    })
+    .await;
+
+    if released.is_err() {
+        warn!(
+            timeout_s = BUDGET.as_secs(),
+            "DATA bearer release did not finish before the shutdown budget; \
+             the next start will reclaim any netdev left in a namespace"
+        );
+    }
 }
 
 /// 绑定端口，如果被占用则轮询等待
@@ -1988,7 +2048,13 @@ async fn bind_with_retry(
 }
 
 /// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
-async fn shutdown_signal() {
+///
+/// Firing `controller` is what lets the drain finish at all. Axum waits for
+/// in-flight responses, and the SSE stream at `/api/events` never ends on its
+/// own, so an open browser tab would otherwise hold the drain until the
+/// watchdog below force-exits -- skipping the session teardown that returns
+/// DATA netdevs to the host namespace.
+async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
     use tokio::signal;
 
     let ctrl_c = async {
@@ -2014,6 +2080,8 @@ async fn shutdown_signal() {
     }
 
     warn!("Shutdown signal received; starting graceful shutdown");
+    // Before the watchdog, so long-lived responses get the whole window to end.
+    controller.trigger();
     std::thread::spawn(|| {
         std::thread::sleep(std::time::Duration::from_secs(8));
         eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
