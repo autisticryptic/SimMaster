@@ -9,7 +9,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, RwLock,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -55,6 +55,47 @@ impl LineDataWatchdogState {
     }
 }
 
+/// Base suppression window applied after an IMS activation wedges the baseband.
+const BASEBAND_WEDGE_BASE_COOLDOWN_SECS: u64 = 120;
+/// Ceiling for the escalating window. A firmware that keeps dying on IMS
+/// activation must not be retried more often than this.
+const BASEBAND_WEDGE_MAX_COOLDOWN_SECS: u64 = 1800;
+
+/// Memory of IMS activations that took the baseband down with them.
+///
+/// The MSM8916 firmware answers some IMS PDP activations with a modem subsystem
+/// fatal (`dhcp_client_mgr.c:263`). That crash re-enumerates the modem, which
+/// makes the line briefly absent, which resets the VoLTE snapshot -- including
+/// the `manual_retry_available` flag the abort path had just set. The guard was
+/// therefore erased by the very crash it exists to prevent, and automatic
+/// restore re-issued the identical activation on its next pass.
+///
+/// Keeping the fact on `LineRuntime` instead survives that hotplug, and the
+/// window doubles per consecutive crash so a reproducibly hostile firmware
+/// backs off instead of restarting the baseband every minute.
+#[derive(Debug, Default)]
+struct BasebandWedgeState {
+    /// When the most recent wedging activation was observed.
+    observed_at: Option<Instant>,
+    /// Consecutive wedges with no successful registration in between.
+    consecutive: u32,
+}
+
+impl BasebandWedgeState {
+    fn cooldown(&self) -> Duration {
+        let shift = self.consecutive.saturating_sub(1).min(4);
+        let secs = BASEBAND_WEDGE_BASE_COOLDOWN_SECS
+            .saturating_mul(1u64 << shift)
+            .min(BASEBAND_WEDGE_MAX_COOLDOWN_SECS);
+        Duration::from_secs(secs)
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        let observed_at = self.observed_at?;
+        self.cooldown().checked_sub(observed_at.elapsed())
+    }
+}
+
 pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
     /// Per-UE identity for this line. Every access leg (VoLTE, VoWiFi, data
@@ -73,6 +114,10 @@ pub struct LineRuntime {
     pub bearer_operation_lock: Mutex<()>,
     pub volte_connect_lock: Mutex<()>,
     pub volte_retry_running: AtomicBool,
+    /// Suppression window for IMS activations that crash the baseband. Held
+    /// here, not in the VoLTE snapshot, because the crash re-enumerates the
+    /// modem and that hotplug resets the snapshot. See [`BasebandWedgeState`].
+    baseband_wedge: RwLock<BasebandWedgeState>,
     /// This line's own VoWiFi runtime, bound to its `line_id` so its executor
     /// stages read that line's ePDG/DNS/proxy overrides and its tunnel gets its
     /// own TUN device. Several SIMs (different countries, different proxies) can
@@ -146,6 +191,7 @@ impl LineRuntime {
             bearer_operation_lock: Mutex::new(()),
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),
+            baseband_wedge: RwLock::new(BasebandWedgeState::default()),
             vowifi,
             vowifi_connect_lock: Mutex::new(()),
             vowifi_restore_running: AtomicBool::new(false),
@@ -221,6 +267,38 @@ impl LineRuntime {
 
     pub fn volte_retry_in_progress(&self) -> bool {
         self.volte_retry_running.load(Ordering::SeqCst)
+    }
+
+    /// Record that an IMS activation on this line wedged the baseband, opening
+    /// (or widening) the window during which it must not be retried.
+    pub fn note_baseband_wedged(&self) -> Duration {
+        let mut wedge = self
+            .baseband_wedge
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        wedge.consecutive = wedge.consecutive.saturating_add(1);
+        wedge.observed_at = Some(Instant::now());
+        wedge.cooldown()
+    }
+
+    /// How long IMS activation is still suppressed on this line, if at all.
+    ///
+    /// Read by automatic restore before it starts a batch. Unlike the VoLTE
+    /// snapshot this is not cleared by the hotplug that a wedging crash causes.
+    pub fn baseband_wedge_remaining(&self) -> Option<Duration> {
+        self.baseband_wedge
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remaining()
+    }
+
+    /// Clear the suppression window after IMS registers, so an occasional crash
+    /// does not permanently inflate the backoff for a line that works.
+    pub fn clear_baseband_wedge(&self) {
+        *self
+            .baseband_wedge
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BasebandWedgeState::default();
     }
 
     pub fn begin_vowifi_sms_listener(&self) -> bool {
@@ -1234,6 +1312,91 @@ mod tests {
         line.mark_absent();
         assert_eq!(line.binding().line_id, "line-a");
         assert!(!line.binding().present);
+    }
+
+    fn wedge_line(line_id: &str) -> LineRuntime {
+        LineRuntime::new(
+            binding(line_id, true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        )
+    }
+
+    #[test]
+    fn a_fresh_line_never_suppresses_ims_activation() {
+        assert!(wedge_line("line-a").baseband_wedge_remaining().is_none());
+    }
+
+    #[test]
+    fn the_wedge_window_survives_the_hotplug_the_crash_itself_causes() {
+        // This is the regression that made the crash loop self-sustaining: the
+        // modem subsystem restart re-enumerates the modem, the line goes absent,
+        // and the VoLTE snapshot -- where the abort flag used to live -- is reset
+        // by `disconnect_live_for_line`. The cooldown must outlive all of that.
+        let line = wedge_line("line-a");
+        line.note_baseband_wedged();
+        line.mark_absent();
+        assert!(
+            line.baseband_wedge_remaining().is_some(),
+            "re-enumeration must not clear the suppression window"
+        );
+    }
+
+    #[test]
+    fn consecutive_wedges_widen_the_window_instead_of_retrying_every_minute() {
+        let mut state = BasebandWedgeState::default();
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            state.consecutive = state.consecutive.saturating_add(1);
+            seen.push(state.cooldown().as_secs());
+        }
+        assert_eq!(
+            seen,
+            vec![
+                BASEBAND_WEDGE_BASE_COOLDOWN_SECS,
+                BASEBAND_WEDGE_BASE_COOLDOWN_SECS * 2,
+                BASEBAND_WEDGE_BASE_COOLDOWN_SECS * 4,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_permanently_allergic_baseband_backs_off_to_a_bounded_ceiling() {
+        let mut state = BasebandWedgeState::default();
+        state.consecutive = 64;
+        assert_eq!(
+            state.cooldown().as_secs(),
+            BASEBAND_WEDGE_MAX_COOLDOWN_SECS,
+            "the window must stop growing rather than suppress the line forever"
+        );
+    }
+
+    #[test]
+    fn registering_clears_the_backoff_so_one_bad_activation_is_not_permanent() {
+        let line = wedge_line("line-a");
+        line.note_baseband_wedged();
+        line.note_baseband_wedged();
+        line.clear_baseband_wedge();
+        assert!(line.baseband_wedge_remaining().is_none());
+        // The next crash starts from the base window again, not from where the
+        // previous streak left off.
+        assert_eq!(
+            line.note_baseband_wedged().as_secs(),
+            BASEBAND_WEDGE_BASE_COOLDOWN_SECS
+        );
+    }
+
+    #[test]
+    fn one_lines_wedge_never_suppresses_another_sim() {
+        let a = wedge_line("line-a");
+        let b = wedge_line("line-b");
+        a.note_baseband_wedged();
+        assert!(a.baseband_wedge_remaining().is_some());
+        assert!(
+            b.baseband_wedge_remaining().is_none(),
+            "the cooldown is per physical line, not process-wide"
+        );
     }
 
     #[test]

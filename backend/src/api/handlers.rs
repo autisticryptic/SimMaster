@@ -8490,7 +8490,23 @@ async fn start_line_volte_restore(
     line: Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) -> bool {
-    if !line_volte_restore_enabled(&app, &line) || !line.begin_volte_retry() {
+    if !line_volte_restore_enabled(&app, &line) {
+        return false;
+    }
+    // An operator asking explicitly may always try; only the unattended pass is
+    // suppressed, because that is the one that loops the baseband into a crash
+    // every time its cooldown is lost to re-enumeration.
+    if source == "automatic" {
+        if let Some(remaining) = line.baseband_wedge_remaining() {
+            tracing::debug!(
+                line_id = %line.binding().line_id,
+                remaining_secs = remaining.as_secs(),
+                "Skipping automatic VoLTE restore: baseband wedge cooldown active"
+            );
+            return false;
+        }
+    }
+    if !line.begin_volte_retry() {
         return false;
     }
     let line_id = line.binding().line_id;
@@ -8731,6 +8747,10 @@ async fn run_line_volte_restore_batch(
         };
         match result {
             Ok(_) => {
+                // This baseband accepted an IMS session, so any earlier wedge was
+                // a transient firmware race rather than a standing refusal. Drop
+                // the backoff so the next failure starts from the base window.
+                line.clear_baseband_wedge();
                 line.volte
                     .update(|state| {
                         state.recovery_state =
@@ -8751,9 +8771,14 @@ async fn run_line_volte_restore_batch(
                 if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(&error)
                     == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
                 {
+                    // The crash this abort guards against re-enumerates the
+                    // modem, and that hotplug resets the VoLTE snapshot. Record
+                    // the cooldown on the line instead, where it survives.
+                    let cooldown = line.note_baseband_wedged();
                     warn!(
                         line_id = %binding.line_id,
                         error = %error,
+                        cooldown_secs = cooldown.as_secs(),
                         "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
                     );
                     line.volte
