@@ -1,8 +1,10 @@
 # 多 UE 隔离架构迁移文档（Option B：per-UE worker + setns）
 
-> 状态：**阶段一至四已完成代码实现；worker 生命周期、egress 失败 teardown、trunk 门依赖
-> 与 VoWiFi 数据面隔离已在 410 实机验证（2026-08-22 / build 9ae297a，见 §8.5）；
-> VoLTE 与数据代理仍被硬件问题阻塞；阶段五已完成不改变现有硬件行为的通用模型底座**。
+> 状态：**阶段一至四已完成代码实现，并已在 410 实机全量验证 —— 隔离四门中
+> `enabled` / `vowifi_tun_in_namespace` / `three_gpp_ims_sockets_in_worker` /
+> `data_proxy_in_worker` 全部打开时，VoWiFi、VoLTE 与蜂窝数据三条业务同时在线
+> （2026-08-23，见 §8.8）；`trunk_sockets_in_worker` 因需 Asterisk 配置仍未验证；
+> 阶段五已完成不改变现有硬件行为的通用模型底座**。
 > 本文档是 `multi_ue_ims_volte_vowifi_architecture.md` 的落地实现记录，记录了已完成的
 > 实机验证、当前代码状态、控制协议，以及 VoWiFi → VoLTE → 数据代理/Trunk → 5G
 > 的逐步迁移计划与验收标准。
@@ -778,3 +780,63 @@ IMS 承载。同时新版本严格优于旧版本（VoWiFi 只在新版本上能
 
 按此判断，下一步是**整机重刷系统**验证是否为设备状态问题；若重刷后 IMS APN 仍然
 不通，则应向运营商核实该 SIM 的 IMS 承载是否被授权给外部协议栈使用。
+
+### 8.8 全隔离 + 三业务并存实机验证（2026-08-23，重刷后）
+
+设备整机重刷、按最小集重新安装 SimAdmin（**只装二进制、前端、carrier catalog 和主
+systemd unit，不装 `install.sh` 里的内核模块与 DATA6 udev/service**），随后按门逐级
+打开隔离。全过程 `dmesg | grep -c 'fatal error received'` 恒为 **0**。
+
+**先决修复**（本轮定位并修掉的两个真问题）：
+
+- `f3308ed` —— `purge_legacy_rpmsg_module()`：按 beta8 的做法 `rmmod` + 删 `.ko` +
+  `depmod -a`，并放在 DATA6 开关**之前**执行。旧代码只解绑单个设备，模块仍加载着，
+  每次开机继续自动绑其余 `DATA*_CNTL`，撞崩正在初始化的 DSM（见
+  `QCM410_BAM_DMUX_MODEM_CRASH.md` §8）。
+- `f79c97d` —— `teardown_ue_isolation_locked()` 曾**无条件** `secondary_data.stop()`。
+  隔离关闭时每次线路刷新都走该分支，把 watchdog 刚建好的宿主数据 bearer 在 98ms 后
+  拆掉，循环往复 —— 这是数据一直不通的直接原因。改为仅在会话确实迁入 worker
+  namespace 时才停。
+
+**DATA6 与 IMS 可以并存**，槽位分配为
+`mode="secondary_qmi_data"`、`allocation="IMS allocated to primary qmi0; DATA6 is
+reserved for data"`。此前"DATA6 会崩固件"的判断是被残留的 `_multi` 模块污染的结论，
+本轮全程启用 DATA6 未出现任何崩溃。
+
+分阶段结果：
+
+| 阶段 | 打开的门 | VoWiFi | VoLTE | 数据 | 隔离设施 |
+|---|---|---|---|---|---|
+| 基线 | 全关 | 200 OK | registered | 代理出站 OK | — |
+| A | `+vowifi_tun_in_namespace` | 200 OK | registered | OK | TUN 进 netns，宿主无泄漏 |
+| B | `+three_gpp_ims_sockets_in_worker` | 200 OK | registered | OK | 同上，零 warning |
+| C | `+data_proxy_in_worker` | 200 OK | registered | 代理出站 OK | **`wwan1` 迁入 netns** |
+
+阶段 C 的 netns 内容：
+
+```text
+lo / wwan1 / save0c9d2870 / sa_vwf0c931974d
+flow: 3.16.215.118:5063 <-> 172.20.58.221:7807
+flow: 3.16.215.118:5064 <-> 172.20.58.221:7777
+宿主 sa_vwf 泄漏 = 0
+```
+
+注意阶段 C 之后从**宿主** `ping -I wwan1` 会失败，这是**正确**的：该接口已不在宿主
+命名空间；数据仍然通，因为代理的出站 socket 由 worker 在 netns 内创建，实测公网出口
+`113.211.112.0`（Maxis），不是 WiFi。
+
+**全隔离下的 worker 崩溃恢复**（§8.1 最后一项，此前一直未验证）：
+
+```text
+kill -9 worker → 21142 -> 22160
+netns/veth/NAT 各 1，zombies 0
+wwan1 仍在 netns 内（接口迁移扛住了重启）
+IMS flows 仍 ESTAB 且仅父进程持有 —— fd 泄漏检查 PASS（§4.1.4 的 MSG_CMSG_CLOEXEC）
+代理出站恢复后仍为 113.211.112.0
+fatal 0，warning 0
+```
+
+**结论：UE 隔离架构在真实硬件上、三条业务同时在线的前提下工作正常。** 通话与短信
+所需的 VoLTE / VoWiFi 信令均已就绪，待换卡后进行业务测试。`trunk_sockets_in_worker`
+仍未验证，因为它需要 Asterisk 配置。
+
