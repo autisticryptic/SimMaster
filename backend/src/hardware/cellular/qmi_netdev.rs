@@ -118,6 +118,14 @@ pub enum NetdevError {
     NoCandidates(String),
     /// Candidates exist but none could be configured with the session address.
     ConfigureFailed(String),
+    /// Candidates exist and the kernel refuses to bring *every* one of them up.
+    ///
+    /// This is a statement about the baseband, not about any single interface.
+    /// All candidates hang off one `bam-dmux` parent device, and once that parent
+    /// latches a runtime-PM error the kernel answers `EINVAL` to an
+    /// administrative UP on all of its netdevs at once. Nothing this module does
+    /// clears that; the baseband has to be restarted.
+    LinkUnavailable(String),
 }
 
 impl std::fmt::Display for NetdevError {
@@ -125,11 +133,34 @@ impl std::fmt::Display for NetdevError {
         match self {
             Self::NoCandidates(d) => write!(f, "qmi_netdev_no_candidates:{d}"),
             Self::ConfigureFailed(d) => write!(f, "qmi_netdev_configure_failed:{d}"),
+            Self::LinkUnavailable(d) => write!(f, "qmi_netdev_link_unavailable:{d}"),
         }
     }
 }
 
 impl std::error::Error for NetdevError {}
+
+/// Why one candidate could not be configured.
+///
+/// The distinction the resolver cares about is whether the failure is a property
+/// of the *interface* (wrong MUX channel, address clash) or of the *baseband*
+/// they all share. A refused UP is the latter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConfigureError {
+    /// The kernel refused an administrative UP on the interface.
+    LinkUp(String),
+    /// An address, rule or route step failed.
+    Step(String),
+}
+
+impl std::fmt::Display for ConfigureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::LinkUp(d) => write!(f, "link will not come up: {d}"),
+            Self::Step(d) => f.write_str(d),
+        }
+    }
+}
 
 /// The address configuration a session needs on its interface.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -276,7 +307,7 @@ pub async fn resolve(
     if let [only] = candidates.as_slice() {
         configure(only, config)
             .await
-            .map_err(|error| NetdevError::ConfigureFailed(format!("{only}: {error}")))?;
+            .map_err(|error| classify(&[(only.clone(), error)]))?;
         info!(interface = %only, "Data netdev resolved: sole candidate for this baseband");
         return Ok(ResolvedNetdev {
             interface: only.clone(),
@@ -285,11 +316,11 @@ pub async fn resolve(
         });
     }
 
-    let mut configure_errors = Vec::new();
+    let mut configure_errors: Vec<(String, ConfigureError)> = Vec::new();
     for candidate in &candidates {
         if let Err(error) = configure(candidate, config).await {
             debug!(interface = %candidate, error = %error, "Candidate could not be configured");
-            configure_errors.push(format!("{candidate}: {error}"));
+            configure_errors.push((candidate.clone(), error));
             continue;
         }
         sleep(LINK_SETTLE).await;
@@ -318,7 +349,7 @@ pub async fn resolve(
     }
 
     if configure_errors.len() == candidates.len() {
-        return Err(NetdevError::ConfigureFailed(configure_errors.join("; ")));
+        return Err(classify(&configure_errors));
     }
 
     // Nothing answered. This is expected when the session's network offers no
@@ -329,14 +360,12 @@ pub async fn resolve(
         .find(|candidate| {
             !configure_errors
                 .iter()
-                .any(|error| error.starts_with(&format!("{candidate}: ")))
+                .any(|(failed, _)| failed == *candidate)
         })
         .cloned()
         .unwrap_or_else(|| candidates[0].clone());
-    if configure(&assumed, config).await.is_err() {
-        return Err(NetdevError::ConfigureFailed(format!(
-            "no candidate answered and {assumed} could not be reconfigured"
-        )));
+    if let Err(error) = configure(&assumed, config).await {
+        return Err(classify(&[(assumed, error)]));
     }
     warn!(
         interface = %assumed,
@@ -351,14 +380,52 @@ pub async fn resolve(
 }
 
 /// Bring an interface up with the session's address, MTU and probe route.
-async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), String> {
+///
+/// On failure nothing is left behind: an address that outlives its candidate
+/// accumulates on every retry and, being on the wrong MUX channel, does not even
+/// carry traffic.
+async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), ConfigureError> {
+    // A link that will not come up cannot be configured, probed, or used. Report
+    // it instead of continuing: every later step fails too, and the route error
+    // that surfaces ("Device for nexthop is not up") describes the symptom rather
+    // than the cause.
     if let Err(error) = run_ip(&["link", "set", "dev", interface, "up"]).await {
-        debug!(
-            interface,
-            error = %error,
-            "Data bearer netdev did not accept an administrative UP request; continuing"
-        );
+        return Err(ConfigureError::LinkUp(error));
     }
+    // `ip` reports success once the request is accepted. Confirm the kernel
+    // actually set IFF_UP — checking the administrative flag, not `operstate`,
+    // because a bam-dmux netdev has no carrier and stays `unknown` forever.
+    if !link_is_up(interface) {
+        return Err(ConfigureError::LinkUp(
+            "administrative UP was accepted but IFF_UP is not set".to_string(),
+        ));
+    }
+    if let Err(error) = configure_addressing(interface, config).await {
+        // Undo the partial state; `address replace` may already have landed.
+        deconfigure(interface, config).await;
+        return Err(ConfigureError::Step(error));
+    }
+    Ok(())
+}
+
+/// Whether the kernel has IFF_UP set on this interface.
+fn link_is_up(interface: &str) -> bool {
+    let path = format!("/sys/class/net/{interface}/flags");
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        // Unreadable sysfs is not evidence of a down link; leave the verdict to
+        // the steps that follow rather than rejecting a usable candidate.
+        return true;
+    };
+    let text = raw.trim();
+    let digits = text.strip_prefix("0x").unwrap_or(text);
+    match u32::from_str_radix(digits, 16) {
+        Ok(flags) => flags & libc::IFF_UP as u32 != 0,
+        Err(_) => true,
+    }
+}
+
+/// Apply the address, MTU, policy rule and routes for a session.
+async fn configure_addressing(interface: &str, config: &NetdevConfig) -> Result<(), String> {
     if let Some(mtu) = config.mtu {
         // A rejected MTU is not fatal; the link still carries traffic at its
         // default, and failing here would discard an otherwise working candidate.
@@ -432,8 +499,32 @@ pub async fn configure_host_data_path(
     interface: &str,
     config: &NetdevConfig,
 ) -> Result<(), String> {
-    configure(interface, config).await?;
+    configure(interface, config)
+        .await
+        .map_err(|error| error.to_string())?;
     install_default_route(interface, config).await
+}
+
+/// Turn per-candidate failures into the error the caller acts on.
+///
+/// A refused UP on *every* candidate is the baseband, not the interfaces: they
+/// all hang off one `bam-dmux` parent, and a latched runtime-PM error there makes
+/// the kernel answer `EINVAL` to an administrative UP on all of them. Reporting
+/// that as `ConfigureFailed` sends the caller looking for an address or route
+/// problem that does not exist, so it gets its own variant.
+fn classify(failures: &[(String, ConfigureError)]) -> NetdevError {
+    let detail = failures
+        .iter()
+        .map(|(interface, error)| format!("{interface}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    if failures
+        .iter()
+        .all(|(_, error)| matches!(error, ConfigureError::LinkUp(_)))
+    {
+        return NetdevError::LinkUnavailable(detail);
+    }
+    NetdevError::ConfigureFailed(detail)
 }
 
 /// Remove what `configure` added, so a rejected candidate holds no state.
@@ -756,6 +847,63 @@ mod tests {
             NetdevError::ConfigureFailed("wwan0: EINVAL".into()).to_string(),
             "qmi_netdev_configure_failed:wwan0: EINVAL"
         );
+        assert_eq!(
+            NetdevError::LinkUnavailable("wwan0: link will not come up: EINVAL".into()).to_string(),
+            "qmi_netdev_link_unavailable:wwan0: link will not come up: EINVAL"
+        );
+    }
+
+    #[test]
+    fn every_candidate_refusing_up_is_reported_as_a_baseband_fault() {
+        // All candidates share one bam-dmux parent. Once that parent latches a
+        // runtime-PM error the kernel answers EINVAL to an administrative UP on
+        // every netdev under it at once, so a clean sweep of refused UPs says the
+        // baseband is unusable — not that seven interfaces are individually broken.
+        let refused: Vec<(String, ConfigureError)> = (0..3)
+            .map(|index| {
+                (
+                    format!("wwan{index}"),
+                    ConfigureError::LinkUp("RTNETLINK answers: Invalid argument".to_string()),
+                )
+            })
+            .collect();
+        let error = classify(&refused);
+        assert!(
+            matches!(error, NetdevError::LinkUnavailable(_)),
+            "all-refused must classify as LinkUnavailable, got {error:?}"
+        );
+        // The detail names every interface and preserves the kernel's own wording,
+        // because "Device for nexthop is not up" is what used to surface instead.
+        let detail = error.to_string();
+        for index in 0..3 {
+            assert!(detail.contains(&format!("wwan{index}")), "missing wwan{index} in {detail}");
+        }
+        assert!(detail.contains("RTNETLINK answers: Invalid argument"));
+    }
+
+    #[test]
+    fn one_configurable_link_keeps_the_failure_per_interface() {
+        // A mix means the parent is fine: at least one link came up and failed
+        // later, so the fault is a property of interfaces, not of the baseband.
+        let failures = vec![
+            (
+                "wwan0".to_string(),
+                ConfigureError::LinkUp("RTNETLINK answers: Invalid argument".to_string()),
+            ),
+            (
+                "wwan1".to_string(),
+                ConfigureError::Step("wwan1: Device for nexthop is not up".to_string()),
+            ),
+        ];
+        assert!(matches!(
+            classify(&failures),
+            NetdevError::ConfigureFailed(_)
+        ));
+        // A single non-link failure is likewise not a baseband verdict.
+        assert!(matches!(
+            classify(&failures[1..]),
+            NetdevError::ConfigureFailed(_)
+        ));
     }
 
     #[test]
