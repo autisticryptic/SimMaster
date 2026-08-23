@@ -735,13 +735,25 @@ impl UeWorkerHandle {
         let fd = outcome.fd.ok_or_else(|| {
             UeWorkerError::Protocol("socket create ok but fd missing".to_string())
         })?;
+        // `tokio::net::*::from_std` REQUIRES a non-blocking fd: it registers the
+        // fd with the reactor but never sets the flag itself. These fds arrive
+        // over SCM_RIGHTS from the worker, and O_NONBLOCK lives on the shared
+        // open file description, so whatever mode the worker left is what we get.
+        // Assert it here rather than trusting the sender: a blocking fd parks a
+        // tokio *worker thread* inside recvfrom() instead of parking the task,
+        // and once every core worker is parked the reactor stops being driven --
+        // unrelated work wedges, including the HTTP API accept loop, which then
+        // leaves connections sitting completed-but-unaccepted in the kernel
+        // backlog. That failure looks nothing like its cause, so pin it down here.
         match spec.kind {
             UeSocketKind::Udp => {
                 let std_socket = std::net::UdpSocket::from(fd);
+                std_socket.set_nonblocking(true)?;
                 Ok(UeSocket::Udp(tokio::net::UdpSocket::from_std(std_socket)?))
             }
             UeSocketKind::Tcp => {
                 let std_stream = std::net::TcpStream::from(fd);
+                std_stream.set_nonblocking(true)?;
                 Ok(UeSocket::Tcp(tokio::net::TcpStream::from_std(std_stream)?))
             }
         }
@@ -1619,6 +1631,16 @@ fn create_socket_fd(spec: &UeSocketSpec) -> std::io::Result<std::os::fd::OwnedFd
             }
         }
     }
+    // O_NONBLOCK must be set before this fd crosses SCM_RIGHTS: the flag lives on
+    // the open file description, so the parent inherits whatever we leave here,
+    // and the parent hands the fd straight to `tokio::net::*::from_std`, which
+    // requires non-blocking. A blocking fd there blocks a tokio worker *thread*
+    // in recvfrom() rather than parking the task.
+    //
+    // This must stay AFTER the connect above. `socket2::connect_timeout` toggles
+    // non-blocking mode internally and restores the socket to *blocking* before
+    // it returns, so setting the flag any earlier would be silently undone.
+    socket.set_nonblocking(true)?;
     Ok(socket.into())
 }
 
@@ -2441,5 +2463,63 @@ mod tests {
             handle.create_socket(spec).await,
             Err(UeWorkerError::Unsupported)
         ));
+    }
+
+    /// Read `O_NONBLOCK` back off an fd the way the kernel reports it, rather
+    /// than trusting the value we think we set.
+    #[cfg(unix)]
+    fn fd_is_nonblocking(fd: std::os::fd::RawFd) -> bool {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+        flags & libc::O_NONBLOCK != 0
+    }
+
+    /// Every fd leaving `create_socket_fd` crosses SCM_RIGHTS and is handed
+    /// straight to `tokio::net::*::from_std`, which requires a non-blocking fd
+    /// and does not set the flag itself. A blocking fd there parks a tokio
+    /// *worker thread* inside `recvfrom` instead of parking the task; with one
+    /// such socket per core worker the reactor stops being driven entirely and
+    /// unrelated subsystems wedge -- observed on the 410 as an HTTP API that
+    /// accepted TCP handshakes in the kernel but never answered a request.
+    /// The cause is arbitrarily far from the symptom, so assert it at the source.
+    #[test]
+    #[cfg(unix)]
+    fn created_udp_sockets_are_nonblocking() {
+        use std::os::fd::AsRawFd;
+
+        let spec = UeSocketSpec::udp_bound("127.0.0.1:0".parse().unwrap(), None);
+        let fd = create_socket_fd(&spec).expect("bind loopback udp");
+        assert!(
+            fd_is_nonblocking(fd.as_raw_fd()),
+            "a blocking UDP fd would starve a tokio worker thread"
+        );
+    }
+
+    /// The TCP path needs its own case: `socket2::connect_timeout` toggles
+    /// non-blocking mode internally and restores the socket to *blocking*
+    /// before returning, so a `set_nonblocking` call placed before the connect
+    /// is silently undone. Only a connected socket exercises that ordering.
+    #[test]
+    #[cfg(unix)]
+    fn created_tcp_sockets_are_nonblocking_after_connect_timeout() {
+        use std::os::fd::AsRawFd;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listen");
+        let target = listener.local_addr().expect("local addr");
+
+        let spec = UeSocketSpec {
+            kind: UeSocketKind::Tcp,
+            family: socket_family(target),
+            bind: None,
+            connect: Some(target),
+            bind_to_device: None,
+            reuse_address: true,
+            connect_timeout_secs: Some(5),
+        };
+        let fd = create_socket_fd(&spec).expect("connect loopback tcp");
+        assert!(
+            fd_is_nonblocking(fd.as_raw_fd()),
+            "connect_timeout leaves the socket blocking; the flag must be set after it"
+        );
     }
 }
