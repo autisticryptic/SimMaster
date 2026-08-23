@@ -87,6 +87,20 @@ impl NetnsName {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Adopt a namespace name that already exists on this host.
+    ///
+    /// [`Self::for_line`] can only name a namespace for a line we currently
+    /// know about. Startup reclaim has the opposite problem: a namespace left
+    /// by a previous process may hold a netdev while its line has not been
+    /// discovered yet, so the name has to come from `/run/netns` instead of
+    /// from a line id. The name is validated because it comes from the
+    /// filesystem rather than from a hash.
+    pub fn adopt(name: &str) -> Result<Self, NetnsError> {
+        let name = name.trim();
+        validate_namespace_name(name)?;
+        Ok(Self(name.to_string()))
+    }
 }
 
 impl fmt::Display for NetnsName {
@@ -161,6 +175,28 @@ impl fmt::Display for NetnsError {
 }
 
 impl std::error::Error for NetnsError {}
+
+/// Validate a namespace name adopted from the filesystem.
+///
+/// Namespace names are directory entries under `/run/netns`, so unlike
+/// [`NetnsName::for_line`] output they are not trusted by construction. `.` and
+/// `..` are rejected along with any path separator, and the character set is the
+/// same one `for_line` can produce plus `.` for prefixes that contain one.
+fn validate_namespace_name(name: &str) -> Result<(), NetnsError> {
+    if name.is_empty()
+        || name.len() > 64
+        || name == "."
+        || name == ".."
+        || !name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.'
+        })
+    {
+        return Err(NetnsError::invalid_name(format!(
+            "namespace name {name:?} must be 1..64 chars of [A-Za-z0-9_.-] and not . or .."
+        )));
+    }
+    Ok(())
+}
 
 fn validate_link_name(name: &str) -> Result<(), NetnsError> {
     if name.is_empty()
@@ -387,6 +423,216 @@ pub async fn move_iface_out(namespace: &NetnsName, interface: &str) -> Result<()
         "network namespaces are only supported on Linux",
     ))
 }
+
+/// Every namespace currently present on this host, in a stable order.
+///
+/// Both conventional mount points are read because `exists` accepts either.
+/// Unparseable entries are skipped rather than reported: this feeds a
+/// best-effort startup sweep, and a stray file in `/run/netns` must not stop it.
+#[cfg(target_os = "linux")]
+pub fn list_namespaces() -> Vec<NetnsName> {
+    let mut names = Vec::new();
+    for dir in ["/run/netns", "/var/run/netns"] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(namespace) = NetnsName::adopt(&name) else {
+                continue;
+            };
+            if !names.contains(&namespace) {
+                names.push(namespace);
+            }
+        }
+    }
+    names.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    names
+}
+
+/// Every namespace currently present on this host. Never any off Linux.
+#[cfg(not(target_os = "linux"))]
+pub fn list_namespaces() -> Vec<NetnsName> {
+    Vec::new()
+}
+
+/// Extract link names from `ip -o link show` output.
+///
+/// Pure so the parsing is testable without a Linux host or a namespace. Handles
+/// the `@peer` suffix `ip` appends to veth and other paired links, which is part
+/// of the display form and not part of the device name.
+pub fn parse_link_names(output: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for line in output.lines() {
+        // `6: wwan1: <POINTOPOINT,...> mtu 1500 ...`
+        let Some((_index, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some((name, _rest)) = rest.trim_start().split_once(':') else {
+            continue;
+        };
+        // veth and other paired links render as `save0c9d2870@if19`.
+        let name = name.split('@').next().unwrap_or(name).trim();
+        if name.is_empty() {
+            continue;
+        }
+        names.push(name.to_string());
+    }
+    names
+}
+
+/// List the link names inside a namespace.
+#[cfg(target_os = "linux")]
+pub async fn links_in(namespace: &NetnsName) -> Result<Vec<String>, NetnsError> {
+    let output = run_ip_in(namespace, &["-o", "link", "show"], false).await?;
+    Ok(parse_link_names(&output))
+}
+
+/// List the link names inside a namespace. Unsupported off Linux.
+#[cfg(not(target_os = "linux"))]
+pub async fn links_in(namespace: &NetnsName) -> Result<Vec<String>, NetnsError> {
+    let _ = namespace;
+    Err(NetnsError::unsupported(
+        "network namespaces are only supported on Linux",
+    ))
+}
+
+/// True when a link inside the namespace is backed by a real device.
+///
+/// `/sys/class/net` is network-namespace scoped, and a netdev's `device`
+/// symlink still resolves to its global bus path from inside the namespace.
+/// That makes the presence of `device` an exact, platform-independent split
+/// between hardware netdevs (the modem's bam-dmux interfaces, USB, WiFi) and
+/// the software links we create ourselves: veth, the VoWiFi tun and `lo` have
+/// no `device` at all. Verified on the reference 410 — from inside the UE
+/// namespace `wwan1/device` resolved to `4080000.remoteproc:bam-dmux` while
+/// `save*`, `sa_vwf*` and `lo` had none.
+///
+/// Deliberately does not key off a name prefix or a baseband token. A name
+/// pattern would either miss hardware on a platform whose netdevs are not
+/// called `wwan*`, or claim a software link that happens to match.
+#[cfg(target_os = "linux")]
+async fn link_is_hardware(namespace: &NetnsName, interface: &str) -> bool {
+    if validate_link_name(interface).is_err() {
+        return false;
+    }
+    // `ls` on the symlink is a plain existence check that needs no shell, so
+    // nothing here interpolates into a command line an interpreter would parse.
+    let path = format!("/sys/class/net/{interface}/device");
+    matches!(
+        run_command(
+            "ip",
+            &["netns", "exec", namespace.as_str(), "ls", path.as_str()],
+            false,
+        )
+        .await,
+        Ok(_)
+    )
+}
+
+/// Return hardware netdevs stranded inside a namespace to the host namespace.
+///
+/// A data session legitimately keeps its netdev inside the UE namespace while it
+/// is active, so this is only correct where no session can exist — see
+/// [`reclaim_all_stranded_hardware_links`]. Software links are left alone: the
+/// veth peer and the VoWiFi tun belong to the namespace and are rebuilt by their
+/// own reconcilers.
+///
+/// Best effort per interface. One link that refuses to move must not hide the
+/// others, so failures are collected and reported rather than returned early.
+#[cfg(target_os = "linux")]
+pub async fn reclaim_stranded_hardware_links(
+    namespace: &NetnsName,
+) -> (Vec<String>, Vec<(String, NetnsError)>) {
+    let mut reclaimed = Vec::new();
+    let mut failed = Vec::new();
+    let links = match links_in(namespace).await {
+        Ok(links) => links,
+        Err(error) => {
+            failed.push((namespace.as_str().to_string(), error));
+            return (reclaimed, failed);
+        }
+    };
+    for link in links {
+        if link == "lo" {
+            continue;
+        }
+        if !link_is_hardware(namespace, &link).await {
+            continue;
+        }
+        match move_iface_out(namespace, &link).await {
+            Ok(()) => reclaimed.push(link),
+            Err(error) => failed.push((link, error)),
+        }
+    }
+    (reclaimed, failed)
+}
+
+/// Return hardware netdevs stranded inside a namespace. Nothing off Linux.
+#[cfg(not(target_os = "linux"))]
+pub async fn reclaim_stranded_hardware_links(
+    namespace: &NetnsName,
+) -> (Vec<String>, Vec<(String, NetnsError)>) {
+    let _ = namespace;
+    (Vec::new(), Vec::new())
+}
+
+/// One-shot startup sweep that returns every stranded hardware netdev to the
+/// host namespace.
+///
+/// # Why this is needed
+///
+/// An active data session legitimately holds its netdev *inside* the UE
+/// namespace: `move_data_session_into_worker` puts it there and `deactivate`
+/// takes it back out. When the process dies without running `deactivate` — the
+/// `graceful shutdown exceeded 8s; forcing process exit` path — the netdev stays
+/// behind. Namespace names are deterministic per line, so the next process
+/// re-attaches to the very namespace still holding it, and `ensure` only brings
+/// `lo` up. Meanwhile `qmi_netdev::candidates_for_baseband` enumerates the
+/// *host's* `/sys/class/net`, so the interface is invisible: the resolver finds
+/// no candidate that answers, falls back to `Assumed`, and the session comes up
+/// unverified — which makes SIP fail silently. Observed on the reference 410,
+/// where `wwan1` sat in `sa-ue286e0c9d2870` with `inet 10.92.5.194/30` while the
+/// host's ifindex list had a gap exactly at 6.
+///
+/// # Why it must only run at startup
+///
+/// This is why the sweep does not live in `ensure`. `ensure` is reached from
+/// `reconcile_ue_context` on *every* reconcile, and pulling a netdev out from
+/// under a live session would break the working data path this is meant to
+/// protect. Call this once, before any line is discovered and therefore before
+/// any session can hold a netdev; at that point anything found inside a
+/// namespace is by definition a leftover. It is not enough to do this in the
+/// `secondary-qmi-init` unit either: that runs once per boot, whereas the leak
+/// happens on any `systemctl restart simadmin` within the same boot.
+#[cfg(target_os = "linux")]
+pub async fn reclaim_all_stranded_hardware_links() {
+    for namespace in list_namespaces() {
+        let (reclaimed, failed) = reclaim_stranded_hardware_links(&namespace).await;
+        for interface in &reclaimed {
+            // Deliberately info: this only fires after an unclean shutdown, and
+            // it explains why an interface reappeared on the host.
+            tracing::info!(
+                namespace = %namespace,
+                interface = %interface,
+                "Reclaimed a data netdev stranded in a UE namespace by a previous run"
+            );
+        }
+        for (interface, error) in &failed {
+            tracing::warn!(
+                namespace = %namespace,
+                interface = %interface,
+                error = %error,
+                "Could not reclaim a netdev stranded in a UE namespace; \
+                 data resolution may fall back to an unverified interface"
+            );
+        }
+    }
+}
+
+/// One-shot startup sweep for stranded netdevs. Nothing to do off Linux.
+#[cfg(not(target_os = "linux"))]
+pub async fn reclaim_all_stranded_hardware_links() {}
 
 /// Create a veth pair that gives the UE namespace an Internet egress through
 /// the host (used by VoWiFi and the per-UE proxy in later phases).
@@ -1020,6 +1266,63 @@ mod tests {
         assert!(validate_link_name("this-name-is-way-too-long").is_err());
         assert!(validate_link_name("bad name").is_err());
         assert!(validate_link_name("wwan0").is_ok());
+    }
+
+    #[test]
+    fn adopted_namespace_names_reject_path_traversal() {
+        // These become `ip netns exec` arguments, so a separator or a relative
+        // entry must never survive validation.
+        assert!(NetnsName::adopt(".").is_err());
+        assert!(NetnsName::adopt("..").is_err());
+        assert!(NetnsName::adopt("").is_err());
+        assert!(NetnsName::adopt("../../etc/passwd").is_err());
+        assert!(NetnsName::adopt("sa-ue 286e0c9d2870").is_err());
+        assert!(NetnsName::adopt("sa-ue/286e").is_err());
+        // A real name from the reference device, and one that a configured
+        // prefix containing a dot could produce.
+        assert_eq!(
+            NetnsName::adopt("sa-ue286e0c9d2870").unwrap().as_str(),
+            "sa-ue286e0c9d2870"
+        );
+        assert!(NetnsName::adopt("sa.ue286e0c9d2870").is_ok());
+        // The name comes from a directory entry, so surrounding whitespace is
+        // trimmed rather than rejected.
+        assert_eq!(
+            NetnsName::adopt("  sa-ue286e0c9d2870\n").unwrap().as_str(),
+            "sa-ue286e0c9d2870"
+        );
+    }
+
+    #[test]
+    fn parse_link_names_reads_real_namespace_listing() {
+        // Verbatim `ip -o link show` output from inside sa-ue286e0c9d2870 on the
+        // reference 410, where wwan1 was found stranded after a forced exit.
+        let output = "1: lo: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noqueue state UNKNOWN mode DEFAULT group default qlen 1000\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n\
+             6: wwan1: <POINTOPOINT,NOARP,UP,LOWER_UP> mtu 1500 qdisc pfifo_fast state UNKNOWN mode DEFAULT group default qlen 1000\\    link/[519] \n\
+             18: save0c9d2870@if19: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT group default qlen 1000\\    link/ether 86:94:09:cc:f0:c7 brd ff:ff:ff:ff:ff:ff link-netnsid 0\n\
+             20: sa_vwf0c931974d: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1600 qdisc pfifo_fast state UNKNOWN mode DEFAULT group default qlen 500\\    link/none \n";
+        assert_eq!(
+            parse_link_names(output),
+            vec![
+                "lo".to_string(),
+                "wwan1".to_string(),
+                // The `@if19` peer suffix is display form, not part of the name;
+                // passing it to `ip link set` would fail.
+                "save0c9d2870".to_string(),
+                "sa_vwf0c931974d".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_link_names_ignores_malformed_lines() {
+        assert!(parse_link_names("").is_empty());
+        assert!(parse_link_names("garbage with no colon\n").is_empty());
+        assert!(parse_link_names("7:\n").is_empty());
+        assert_eq!(
+            parse_link_names("7: wwan2: <UP>\n"),
+            vec!["wwan2".to_string()]
+        );
     }
 
     #[test]

@@ -860,6 +860,15 @@ async fn main() -> Result<()> {
         Arc::clone(&config_manager),
         Arc::clone(&app_db),
     ));
+    // Must precede the first discovery pass. A previous process that was killed
+    // before `deactivate` ran leaves its data netdev inside a UE namespace, and
+    // namespace names are stable per line, so this process re-attaches to the
+    // namespace still holding it. The resolver only enumerates the host, so the
+    // interface would be invisible and the session would come up as `Assumed`
+    // (unverified), which makes SIP fail silently. Nothing owns a netdev yet at
+    // this point, so anything found inside a namespace is a leftover.
+    platform::netns::reclaim_all_stranded_hardware_links().await;
+
     match line_registry.refresh(dbus_conn.as_ref()).await {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),
         Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
