@@ -122,26 +122,33 @@ pub enum FailureClass {
 /// identical failure as `QMI protocol error (14): 'CallFailed'` and
 /// `verbose call end reason (2,201): [internal] error` — no space in
 /// `CallFailed`, brackets around `internal`. Matching only ModemManager's
-/// spelling classified the native failure as retryable and produced an
-/// unbounded retry loop; see the leak note below for what that cost.
+/// spelling classified the native failure as retryable, which is how the
+/// firmware crash loop got started.
 ///
-/// `client id not released` is the expensive one. It is `qmicli` reporting that
-/// the WDS client it allocated could not be freed, so **every** retry strands
-/// another client ID in the firmware. On MSM8916 that pool is small: roughly a
-/// hundred seconds of retries exhausted it and the modem's DHCP client manager
-/// died (`dhcp_client_mgr.c:263`), taking every wwanN interface down with it.
-/// The condition is never transient, so it must abort the batch on the first
-/// occurrence rather than after a bounded number of tries.
+/// `client id not released` deliberately does **not** appear below, and must not
+/// be added. It reads like a leak, but it is `qmicli` acknowledging the
+/// `--client-no-release-cid` flag that every secondary-QMI invocation passes on
+/// purpose (the CID has to outlive the process that started the call). Because
+/// stderr is folded into the error text, the notice rides along on *every*
+/// secondary-QMI failure whatever the cause — so matching it classified all of
+/// them as wedged, and a transient refusal abandoned the batch instead of
+/// retrying. On hardware that cost the data path ~70 s on every start: the
+/// first attempt lost a PDN race against ModemManager's own `simple connect`
+/// (which logs the very same `'CallFailed'` for itself), and recovery had to
+/// wait for the next watchdog pass.
+///
+/// What separates the two is the call-end reason, not the CID notice. The crash
+/// signature carries `[internal] error`; PDN contention carries
+/// `generic-unspecified`. Only the former is a baseband that has stopped
+/// accepting sessions.
 fn is_baseband_wedge(lowercased: &str) -> bool {
-    let call_failed =
-        lowercased.contains("call failed") || lowercased.contains("callfailed");
+    let call_failed = lowercased.contains("call failed") || lowercased.contains("callfailed");
     let internal_error =
         lowercased.contains("internal error") || lowercased.contains("[internal] error");
 
     lowercased.contains("interface-in-use-config-match")
         || lowercased.contains("endpoint hangup")
         || lowercased.contains("mobileequipment.unknown")
-        || lowercased.contains("client id not released")
         || lowercased.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
         || lowercased.contains(code::BEARER_NETDEV_NOT_UP)
         || lowercased.contains(code::BEARER_NETDEV_NOT_READY)
@@ -626,12 +633,15 @@ mod tests {
     }
 
     /// Verbatim detail from the QCM410, captured while the firmware was crash
-    /// looping. Classifying this as retryable is what made the loop: each retry
-    /// stranded another WDS client ID until the modem's DHCP client manager died
-    /// (`dhcp_client_mgr.c:263`). Note the spellings `'CallFailed'` (no space)
-    /// and `[internal] error` (bracketed) -- `qmicli` renders the same refusal
-    /// differently from ModemManager, and matching only ModemManager's wording
-    /// let this through.
+    /// looping. Classifying this as retryable is what made the loop. Note the
+    /// spellings `'CallFailed'` (no space) and `[internal] error` (bracketed) --
+    /// `qmicli` renders the same refusal differently from ModemManager, and
+    /// matching only ModemManager's wording let this through.
+    ///
+    /// The `Client ID not released` line is present here but carries no weight:
+    /// what makes this detail unsafe is `[internal] error`. Compare with
+    /// `pdn_contention_stays_retryable_despite_the_cid_notice`, which has the
+    /// same CID line and must classify the other way.
     #[test]
     fn native_qmi_call_failure_is_unsafe_to_retry() {
         let detail = concat!(
@@ -649,19 +659,57 @@ mod tests {
         assert_eq!(class, FailureClass::BasebandWedged, "detail: {detail}");
         assert!(
             class.is_unsafe_to_retry(),
-            "retrying this strands another WDS client ID and crashes the firmware"
+            "an [internal] error refusal escalates to a subsystem restart if retried"
         );
     }
 
-    /// A leaked WDS client is never transient, so it must abort on its own --
-    /// without needing the CallFailed/internal-error pair to also be present.
+    /// Verbatim detail from the QCM410, captured on a healthy modem with fault
+    /// count 0. The first DATA6 activation after a start loses a PDN race with
+    /// ModemManager's own `simple connect` -- which logs the identical
+    /// `'CallFailed'` against its own bearer seconds earlier -- and the next
+    /// attempt succeeds.
+    ///
+    /// The `Client ID not released` notice is here too, because every
+    /// secondary-QMI call passes `--client-no-release-cid` and stderr is folded
+    /// into the error text. Treating that notice as a wedge signal made this
+    /// transient failure abandon the batch, costing the data path ~70 s per
+    /// start. What distinguishes it from the crash signature is
+    /// `generic-unspecified` where that one has `[internal] error`.
     #[test]
-    fn a_stranded_wds_client_alone_aborts_the_batch() {
-        let class = FailureClass::from_details(
-            "secondary_qmi_action_failed:[/dev/wwan0at2] Client ID not released: Service: 'wds'",
+    fn pdn_contention_stays_retryable_despite_the_cid_notice() {
+        let detail = concat!(
+            "secondary_qmi_data_action_failed:[/dev/wwan0at2] Client ID not released: ",
+            "Service: 'wds' CID: '4' ",
+            "-Warning ** [/dev/wwan0at2] couldn't detect transport type of port: ",
+            "unsupported wwan port ",
+            "-Warning ** [/dev/wwan0at2] requested QMI mode but unexpected transport type found ",
+            "error: couldn't start network: QMI protocol error (14): 'CallFailed' ",
+            "call end reason (1): generic-unspecified ",
+            "verbose call end reason (49372,1380): [(null)] (null)",
         );
-        assert_eq!(class, FailureClass::BasebandWedged);
-        assert!(class.is_unsafe_to_retry());
+
+        let class = FailureClass::from_details(detail);
+        assert_ne!(
+            class,
+            FailureClass::BasebandWedged,
+            "PDN contention is transient; abandoning the batch strands the data path \
+             until the next watchdog pass -- detail: {detail}"
+        );
+        assert!(!class.is_unsafe_to_retry());
+    }
+
+    /// The CID notice must never on its own decide the class, in either
+    /// direction: it is present on every secondary-QMI failure whatever the
+    /// cause, so it carries no diagnostic information at all.
+    #[test]
+    fn the_cid_notice_alone_decides_nothing() {
+        assert_eq!(
+            FailureClass::from_details(
+                "secondary_qmi_data_action_failed:[/dev/wwan0at2] Client ID not released: \
+                 Service: 'wds' CID: '4'"
+            ),
+            FailureClass::Other
+        );
     }
 
     /// The ModemManager spelling must keep working -- this is the pairing that
