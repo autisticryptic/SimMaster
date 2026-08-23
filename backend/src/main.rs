@@ -256,6 +256,31 @@ ExecStartPost=-/usr/bin/busctl call org.freedesktop.ModemManager1 /org/freedeskt
     }
 }
 
+/// The udev rules that reserve one prepared endpoint for SimAdmin.
+///
+/// Two devices have to be reserved, not one. The control port (`wwan0at2`,
+/// `wwan0qmi1`, ...) lives in the `wwan` subsystem and is what `qmicli -d`
+/// talks to. Its data interface (`wwan1`, ...) is a *separate* udev device in
+/// the `net` subsystem, and ModemManager tags it `ID_MM_CANDIDATE=1` and will
+/// bind a bearer of its own to it. That was observed on the reference device:
+/// with only the control port hidden, ModemManager took `wwan1` for an `ims`
+/// APN bearer, leaving this line's user data with no interface and making every
+/// DATA6 activation fail with `CallFailed` / `PolicyMismatch`. Whoever asks
+/// first wins, so the interface must be reserved rather than raced for.
+///
+/// Pure so the subsystem/name pairing is testable without udev or a modem.
+fn secondary_qmi_udev_rules(port_name: &str, netdev: Option<&str>) -> Vec<String> {
+    let mut rules = vec![format!(
+        "SUBSYSTEM==\"wwan\", KERNEL==\"{port_name}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\""
+    )];
+    if let Some(netdev) = netdev {
+        rules.push(format!(
+            "SUBSYSTEM==\"net\", KERNEL==\"{netdev}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\""
+        ));
+    }
+    rules
+}
+
 /// Reconcile the udev rules that keep ModemManager off SimAdmin's IMS endpoints.
 ///
 /// The rule set is derived entirely at runtime from the ports that were actually
@@ -308,11 +333,14 @@ async fn reconcile_secondary_qmi_udev_rules(path: &str, rules: &[String]) {
         .status()
         .await;
     // The ports already exist by the time the rule lands, so the tag has to be
-    // re-applied rather than waiting for the next hotplug.
-    let _ = tokio::process::Command::new("udevadm")
-        .args(["trigger", "--subsystem-match=wwan"])
-        .status()
-        .await;
+    // re-applied rather than waiting for the next hotplug. Both subsystems
+    // matter: the QMI control port lives in `wwan`, its data interface in `net`.
+    for subsystem in ["wwan", "net"] {
+        let _ = tokio::process::Command::new("udevadm")
+            .args(["trigger", &format!("--subsystem-match={subsystem}")])
+            .status()
+            .await;
+    }
 }
 
 /// Prepare each baseband's secondary QMI endpoint, and hide the ports it binds
@@ -420,9 +448,9 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
                     endpoint.remoteproc,
                     endpoint.open_mode
                 );
-                rules.push(format!(
-                    "SUBSYSTEM==\"wwan\", KERNEL==\"{}\", ENV{{ID_MM_PORT_IGNORE}}=\"1\"",
-                    endpoint.port_name
+                rules.extend(secondary_qmi_udev_rules(
+                    &endpoint.port_name,
+                    endpoint.netdev.as_deref(),
                 ));
                 prepared.push(endpoint);
             }
@@ -1982,4 +2010,68 @@ async fn shutdown_signal() {
         eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
         std::process::exit(0);
     });
+}
+
+#[cfg(test)]
+mod udev_rule_tests {
+    use super::secondary_qmi_udev_rules;
+
+    /// The two rules live in different subsystems and getting that wrong is
+    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
+    /// loads, does nothing, and the interface stays available to ModemManager.
+    #[test]
+    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert_eq!(rules.len(), 2, "{rules:?}");
+
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
+
+        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
+
+        for rule in &rules {
+            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
+        }
+    }
+
+    /// Reserving the data interface is the whole point of the second rule:
+    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
+    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
+    /// with CallFailed / PolicyMismatch.
+    #[test]
+    fn the_data_interface_is_reserved_whenever_one_is_known() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert!(
+            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
+            "the netdev must be hidden, not just the control port: {rules:?}"
+        );
+    }
+
+    /// A platform may expose the control port without a paired interface.
+    /// Emitting a rule with an empty KERNEL== would match everything in the
+    /// `net` subsystem and hide every interface on the host.
+    #[test]
+    fn no_netdev_means_no_net_rule_at_all() {
+        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
+            "an empty KERNEL== would match every net device: {rules:?}"
+        );
+    }
+
+    /// Port names are per-platform, so nothing may be hardcoded: the same
+    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
+    #[test]
+    fn rules_follow_the_observed_names() {
+        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
+        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
+    }
 }
