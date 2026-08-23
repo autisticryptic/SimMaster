@@ -195,6 +195,21 @@ pub fn candidates_for_baseband(baseband: &str) -> Vec<String> {
     candidates
 }
 
+/// Drop the caller's reserved interfaces from a candidate list.
+///
+/// Filtering happens once, at the top of resolution, rather than at each
+/// decision point. Resolution has three exits -- sole candidate, probe answered,
+/// and assumed -- and the assumed exit is the one that actually misfired on this
+/// target: with no probe reply it takes the lowest-numbered candidate, which is
+/// `wwan0`. A filter per exit would have to be correct three times; a filter on
+/// the input is correct once.
+fn usable_candidates(candidates: Vec<String>, reserved: ReservedNetdevs<'_>) -> Vec<String> {
+    candidates
+        .into_iter()
+        .filter(|name| !reserved.contains(&name.as_str()))
+        .collect()
+}
+
 /// Numeric suffix of an interface name, for natural ordering (`wwan10` after
 /// `wwan9`).
 fn trailing_number(name: &str) -> u32 {
@@ -223,6 +238,15 @@ pub fn read_counters(interface: &str) -> LinkCounters {
     }
 }
 
+/// Interfaces a caller must never be given, even as a last-resort guess.
+///
+/// The MSM8916 firmware cannot keep IMS and Internet bearers alive through the
+/// same data slot, so the two runtimes divide the netdevs between them. Handing
+/// a caller an interface that belongs to the other one does not fail loudly: it
+/// produces a session on a link whose packets belong to somebody else, which
+/// looks like an unreachable peer several layers up.
+pub type ReservedNetdevs<'a> = &'a [&'a str];
+
 /// Find the interface carrying a session, and leave it configured.
 ///
 /// Each candidate is configured, probed, and — if it does not answer — stripped
@@ -232,8 +256,19 @@ pub fn read_counters(interface: &str) -> LinkCounters {
 /// A single candidate is accepted without probing: there is nothing to
 /// disambiguate, and spending a probe timeout on the USB/single-netdev case would
 /// slow down every connection for no information.
-pub async fn resolve(baseband: &str, config: &NetdevConfig) -> Result<ResolvedNetdev, NetdevError> {
-    let candidates = candidates_for_baseband(baseband);
+///
+/// `reserved` names interfaces this caller must not be given under any
+/// circumstance — not as a probe candidate and not as the assumed fallback. The
+/// fallback is the reason this parameter exists: when no candidate answers,
+/// resolution picks the lowest-numbered one, which on this target is `wwan0`,
+/// the port ModemManager holds for IMS. Filtering at the top means a caller can
+/// never receive a reserved interface, however resolution ends up deciding.
+pub async fn resolve(
+    baseband: &str,
+    config: &NetdevConfig,
+    reserved: ReservedNetdevs<'_>,
+) -> Result<ResolvedNetdev, NetdevError> {
+    let candidates = usable_candidates(candidates_for_baseband(baseband), reserved);
     if candidates.is_empty() {
         return Err(NetdevError::NoCandidates(baseband.to_string()));
     }
@@ -670,6 +705,45 @@ mod tests {
         assert_eq!(ResolutionMethod::ProbeAnswered.as_str(), "probe_answered");
         assert_eq!(ResolutionMethod::Assumed.as_str(), "assumed");
         assert_eq!(ResolutionMethod::SoleCandidate.as_str(), "sole_candidate");
+    }
+
+    #[test]
+    fn reserved_netdevs_are_removed_from_resolution() {
+        let all = vec![
+            "wwan0".to_string(),
+            "wwan2".to_string(),
+            "wwan3".to_string(),
+        ];
+        assert_eq!(
+            usable_candidates(all.clone(), &["wwan0"]),
+            vec!["wwan2", "wwan3"]
+        );
+        // Nothing reserved leaves the list untouched: the IMS caller owns the
+        // primary netdev and must still be able to resolve onto it.
+        assert_eq!(usable_candidates(all.clone(), &[]), all);
+    }
+
+    #[test]
+    fn a_reserved_netdev_can_never_become_the_assumed_fallback() {
+        // The actual failure this guards. No candidate answered the probe, so
+        // resolution falls back to the lowest-numbered one -- wwan0, the netdev
+        // ModemManager holds for IMS. DATA6 taking it stops the IMS PDN from
+        // establishing, and the VoLTE REGISTER then leaves over Wi-Fi toward a
+        // carrier-private P-CSCF that cannot answer. Filtering the input means
+        // the fallback has no way to select it.
+        let candidates = usable_candidates(
+            vec!["wwan0".to_string(), "wwan2".to_string()],
+            &["wwan0"],
+        );
+        let assumed = candidates.first().cloned();
+        assert_eq!(assumed.as_deref(), Some("wwan2"));
+    }
+
+    #[test]
+    fn reserving_every_candidate_reports_no_candidates_rather_than_guessing() {
+        // Better a named failure than a session on somebody else's link: a wrong
+        // interface produces no error at any layer, just a peer that never replies.
+        assert!(usable_candidates(vec!["wwan0".to_string()], &["wwan0"]).is_empty());
     }
 
     #[test]

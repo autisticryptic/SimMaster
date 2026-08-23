@@ -176,6 +176,15 @@ impl SecondaryDataRuntime {
     }
 }
 
+/// The netdev DATA6 must never land on.
+///
+/// `wwan0` is the netdev of the primary QMI port, which ModemManager holds and
+/// IMS registers through. If a DATA6 session takes it, the IMS PDN cannot come
+/// up at all, and the VoLTE REGISTER then has no policy route to its P-CSCF --
+/// it falls through to the host default and leaves over Wi-Fi toward a
+/// carrier-private address that can never answer.
+const DATA_RESERVED_NETDEVS: &[&str] = &["wwan0"];
+
 async fn start_family(
     endpoint: &SecondaryQmiEndpoint,
     apn: &ApnConfig,
@@ -194,7 +203,7 @@ async fn start_family(
     let baseband = secondary_qmi::baseband_key_for_device(&endpoint.device_path)
         .or_else(|_| secondary_qmi::baseband_key_for_device(&endpoint.port_name))
         .unwrap_or_else(|_| endpoint.remoteproc.clone());
-    let netdev = match qmi_netdev::resolve(&baseband, &settings).await {
+    let netdev = match qmi_netdev::resolve(&baseband, &settings, DATA_RESERVED_NETDEVS).await {
         Ok(netdev) => netdev,
         Err(error) => {
             stop_retained_session(endpoint, &retained).await;
@@ -263,8 +272,15 @@ async fn move_data_session_into_worker(
     worker: UeWorkerHandle,
 ) -> Result<(), String> {
     let interface = session.netdev.interface.as_str();
-    if interface == "wwan0" {
-        return Err("cellular_data_refuses_primary_interface_wwan0".to_string());
+    // Belt to the resolver's braces. Resolution can no longer hand back a
+    // reserved interface, so reaching this is a bug rather than a race -- but a
+    // DATA6 session on the IMS netdev is silent breakage several layers up, so
+    // keep refusing it here too. Both checks read the same list so they cannot
+    // drift apart.
+    if DATA_RESERVED_NETDEVS.contains(&interface) {
+        return Err(format!(
+            "cellular_data_refuses_primary_interface_{interface}"
+        ));
     }
     // Capture the generation before the interface crosses namespaces. A worker
     // that respawns during migration must invalidate this session rather than

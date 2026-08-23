@@ -146,7 +146,10 @@ async fn establish_bearer(
             "native_ims_session_has_no_address".to_string(),
         ));
     };
-    let resolution = match qmi_netdev::resolve(baseband, &config).await {
+    // IMS is the runtime that legitimately owns the primary netdev, so nothing is
+    // reserved against it. The reservation exists to keep the *data* runtime off
+    // this interface; see DATA_RESERVED_NETDEVS in secondary_qmi_data.
+    let resolution = match qmi_netdev::resolve(baseband, &config, &[]).await {
         Ok(resolution) => resolution,
         Err(error) => {
             stop_sessions(endpoint, &sessions).await;
