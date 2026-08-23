@@ -413,16 +413,23 @@ verbose call end reason (2,201): [internal] error
    ModemManager 的措辞写的，原生 QMI 路径走的却是 qmicli；
 5. 于是失败被归类成 `FailureClass::Other`（可重试），运行时无界重试
    ipv4 → ipv6 → attempt 1 → attempt 2 → …；
-6. **每次重试都漏掉一个 WDS client ID** —— `Client ID not released` 说的就是这件事。
-   MSM8916 的 client 池很小，约一百秒就耗尽，固件的 DHCP 客户端管理器随之崩溃。
+6. 每次重试都在被 holder 占着的设备上再开一次 WDS 会话。MSM8916 的 client 池很小，
+   约一百秒就耗尽，固件的 DHCP 客户端管理器随之崩溃。
+
+> **注意 `Client ID not released` 不是这条链上的一环。** 它读起来像"泄漏了一个
+> client"，实际上是 qmicli 在确认我们自己传的 `--client-no-release-cid`（"Do not
+> release the CID when exiting"）—— 见 §10.8。上面第 3 步的报文里有这一行，但真正
+> 说明基带楔死的是 `[internal] error`，不是它。
 
 ### 10.4 已修复的部分
 
-commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写，并且把
-`client id not released` **单独**作为楔死信号 —— 泄漏的 client 绝不会自愈，必须在
-第一次出现时就放弃整批，而不是重试若干次之后。测试用的是设备上原样抓下来的文本，
-同时钉住 ModemManager 那套拼写仍需两半同时命中（单独一个 `call failed` 或
+commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写（`'CallFailed'` /
+`call failed`、`[internal] error` / `internal error`）。测试用的是设备上原样抓下来的
+文本，同时钉住 ModemManager 那套拼写仍需两半同时命中（单独一个 `call failed` 或
 `internal error` 太宽，不足以放弃整批）。
+
+同一个 commit 还把 `client id not released` **单独**列为楔死信号，那部分是错的，已由
+`330f059` 撤销 —— 见 §10.8。
 
 ### 10.5 已修复：分配策略固定为 IMS→qmi0、DATA6→数据
 
@@ -504,7 +511,81 @@ fault count: 0
 > `Before=ModemManager.service`，所以正常启动路径没问题；但**手工改规则后必须重启
 > ModemManager**，否则看到的是旧结论。
 
-### 10.7 这次留下的通用教训
+### 10.7 已验证：DATA6 数据面是通的（以及三次把它误判为不通）
+
+`3136797` 冷启动实测：两条 udev 规则都由 `secondary-qmi-init` 运行时生成，
+`wwan0at2 (ignored)`、`wwan1 (ignored)`，unit 重启次数 0，`fatal count` **0**，
+VoLTE 421 → sec-agree → AKA → 200 OK。
+
+**数据面结论：通。** 但要在正确的位置、用正确的方式测：
+
+```bash
+ip netns exec sa-ue<...> ping -I wwan1 8.8.8.8      # 4/4, 0% loss
+ip netns exec sa-ue<...> curl --interface wwan1 ...  # 113.211.125.91  ← 蜂窝出口
+ip netns exec sa-ue<...> curl ...                    # 161.142.152.209 ← WiFi（对照）
+```
+
+这一节主要记录**三个连续的测量错误**，因为每一个都足以让人得出"数据不通"的错误结论：
+
+1. **在宿主命名空间里找 `wwan1`。** 它不在那里，而且**不该**在那里 ——
+   `move_data_session_into_worker()` 会把网卡迁进 per-UE netns。宿主侧看到的
+   `wwan1 oper=absent` 是迁移**成功**的表现，不是失败。
+2. **用不绑定接口的 `curl` 测出口。** netns 里有两条默认路由，veth 那条
+   （metric 0）故意优先于 `wwan1`（metric 500）—— 见 `secondary_qmi_data.rs:299`
+   的注释：代理套接字用 `SO_BINDTODEVICE`，不靠默认路由取胜。所以未绑定的 `curl`
+   走 WiFi 出口是**设计如此**，它测不出数据面通不通。
+3. **看 `rx_packets`/`tx_packets` 判断有没有流量。** `bam-dmux` 在本平台不报
+   per-netdev 计数：宿主 `wwan0` 在给 ModemManager 承载真实流量时同样是 0/0。
+
+### 10.8 `Client ID not released` 不是泄漏 —— `9bb0913` 的过度匹配
+
+§10.3 曾把这条消息读成"WDS client 泄漏"，§10.4 据此把它单独列为楔死信号。
+**这个判断是错的。** qmicli 的 help 写得很直接：
+
+```text
+--client-no-release-cid    Do not release the CID when exiting
+```
+
+而 SimAdmin **每一次**secondary-QMI 调用都传这个 flag（`secondary_qmi_data.rs:402`、
+`415`、`478`），CID 必须活过发起调用的那个进程。所以这条消息是 qmicli 在确认
+"按你说的，我没释放" —— 一条 stderr 通知，被我们连同 stderr 一起并进了错误文本。
+它出现在**每一条** secondary-QMI 失败里，与失败原因无关，因此不携带任何诊断信息。
+
+后果：`is_baseband_wedge()` 匹配它，等于把所有 secondary-QMI 失败都判成
+`BasebandWedged` → `is_unsafe_to_retry()`。VoLTE IMS 恢复循环
+（`handlers.rs:8751`）因此会在一次**瞬态**失败后直接把线路打成
+`Degraded`/`Exhausted` 并要求人工重试。
+
+commit `330f059`：把 `client id not released` 从楔死集合中移除，并在 docstring 里
+写明**不得再加回去**。区分两者靠的是 call-end reason，不是 CID 通知：
+
+| | 崩溃签名（必须放弃） | PDN 争用（应当重试） |
+|---|---|---|
+| call end reason | `[internal] error` | `generic-unspecified` |
+| CID 通知 | 有 | 有（无鉴别力） |
+| 固件状态 | 楔死 | `fatal count` 0 |
+
+两条都用设备上原样抓下来的文本钉了测试。§10.3 引用的崩溃期报文带
+`(2,201): [internal] error`，仍然命中 `call_failed && internal_error`，护栏未被削弱。
+
+**首次尝试失败的真正原因是 PDN 争用，不是楔死。** ModemManager 自己的承载在同一时刻
+报同一个错：
+
+```text
+[modem0/bearer1] couldn't start IPv4 network: QMI protocol error (14): 'CallFailed'
+```
+
+MM 的 bearer 抖动时刻（22:01:11、22:07:16）与我们的失败时刻（22:01:11、22:07:17）
+逐秒对应 —— MM 在 disconnect 后重跑 `simple connect`，两边同时向调制解调器要 PDN。
+下一次尝试即成功（21:53:39 失败 → 21:54:51 成功，间隔 72 秒）。
+
+> **一处需要更正的因果推断**：这 72 秒的间隔**不是**上述误分类造成的。数据面走
+> `prepare_line_data_slot_for_volte` → `start_line_data_runtime_locked`，那条路径只
+> `record_error`（`handlers.rs:3319-3327`），从不查 `FailureClass` —— 这也是日志里
+> 两个 family 都被尝试过的原因。分类器修复对 VoLTE IMS 恢复循环是必要且正确的，
+> 但它不是数据面那 72 秒的修复。恢复间隔由 watchdog 周期决定，仍是待办。
+
+### 10.9 这次留下的通用教训
 
 - **无界重试是可以把硬件打坏的**，不只是浪费时间。任何对基带的重试都必须有明确的
   "不可重试"分类，且该分类的**默认方向应当是保守的** —— 认不出来的失败应倾向于放弃，
@@ -528,3 +609,18 @@ fault count: 0
   实际它属于 ModemManager 的 `ims` APN 承载，`ping -I wwan1` 100% 丢包。判定数据面
   必须端到端验证（`ping -I` / `curl --interface`），并核对**谁**建的承载、APN 是什么
   —— 见 §7 同类误判。
+- **"接口不见了"同样不等于"数据不通"。** 与上一条方向相反、性质相同：per-UE netns
+  隔离之后，宿主命名空间里**看不到**数据网卡才是正常的。测量之前必须先确定"该在哪个
+  命名空间里看"，否则会把迁移成功读成迁移失败 —— 见 §10.7 第 1 条。
+- **先读代码的意图，再判断观测结果是不是 bug。** netns 里 veth 默认路由优先于
+  `wwan1`，这是 `secondary_qmi_data.rs:299` 注释里写明的设计（代理用
+  `SO_BINDTODEVICE`）。我一度把它当成"蜂窝出口输掉了路由竞争"的缺陷。**观测到的行为
+  与预期不符时，先去看那行代码有没有解释它。**
+- **不要在诊断过程中动被诊断的对象。** 我用 `qmicli` 对 `/dev/wwan0at2` 做只读探测，
+  两秒后 SimAdmin 的 bearer 就断了；那之后的"故障状态"是我自己造成的，不能作为证据。
+  对活跃的 QMI 端口，任何手工调用都可能干扰会话 —— 观测应当只读日志与 `sysfs`。
+- **"某个字符串出现在所有失败里"意味着它没有鉴别力，而不是它很重要。** 反过来说，
+  给分类器加一个新签名之前，必须先确认它在**成功**路径上不出现。`Client ID not
+  released` 就是这么进去的：它看起来触目，实际每次调用都有 —— 见 §10.8。
+- **修复要对准被证实的因果链。** §10.8 的分类器修复是对的，但它修的是 VoLTE IMS 恢复
+  循环，不是数据面那 72 秒。把两件事混为一谈会让人以为待办已经清掉。
