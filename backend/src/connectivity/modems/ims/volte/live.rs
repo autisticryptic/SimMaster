@@ -6036,28 +6036,28 @@ mod tests {
         assert!(!variants[1].policy.require_sec_agree);
     }
 
+    /// IMS is always on the ModemManager-owned port, so the native QMI bearer
+    /// path is never taken. It stayed reachable for as long as the allocator
+    /// could put IMS on DATA6, and driving it against that held device is what
+    /// crashed the baseband -- see docs/QCM410_BAM_DMUX_MODEM_CRASH.md §10.
     #[test]
-    fn bearer_backend_follows_the_selected_ims_endpoint() {
+    fn no_allocation_selects_the_native_ims_bearer_backend() {
         assert!(!native_ims_bearer_required(DataSlotMode::PrimaryImsOnly));
         assert!(!native_ims_bearer_required(
             DataSlotMode::PrimaryImsSecondaryData
         ));
-        assert!(native_ims_bearer_required(
-            DataSlotMode::SecondaryImsPrimaryData
-        ));
     }
 
+    /// The AT profile is only pre-activated for the native path. With that path
+    /// unreachable, ModemManager stays the sole PDP activation owner on qmi0 --
+    /// pre-activating the same CID first makes its bearer connect fail.
     #[test]
-    fn primary_ims_with_secondary_data_does_not_pre_activate_the_profile() {
+    fn no_allocation_pre_activates_the_ims_profile() {
         assert!(!active_ims_profile_prefetch_required(
             DataSlotMode::PrimaryImsSecondaryData
         ));
-    }
-
-    #[test]
-    fn secondary_ims_with_primary_data_keeps_native_profile_prefetch() {
-        assert!(active_ims_profile_prefetch_required(
-            DataSlotMode::SecondaryImsPrimaryData
+        assert!(!active_ims_profile_prefetch_required(
+            DataSlotMode::PrimaryImsOnly
         ));
     }
 

@@ -2889,9 +2889,11 @@ async fn start_line_data_runtime_locked(
         return Ok(());
     }
 
-    // Preserve an ordinary-data bearer that is already active on qmi0. Beta8
-    // moves IMS to DATA6 in this case; replacing the data bearer would discard
-    // the observed slot state before the VoLTE allocator can act on it.
+    // Last resort: adopt an ordinary-data bearer still sitting on qmi0. The
+    // caller normally releases it first so IMS can own that port -- reaching
+    // here means that release failed, and some data is better than none. IMS
+    // will fail on this firmware while it stays, which the VoLTE activation
+    // reports on its own.
     if let Some(interface) =
         modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
@@ -3269,32 +3271,6 @@ async fn prepare_line_data_slot_for_volte(
     let primary_data_active = primary_data_interface.is_some();
     let mut secondary_data_active = line.secondary_data.interface().await.is_some();
 
-    if !primary_data_active {
-        let data_start_error = start_line_data_runtime_locked(app, line, profile)
-            .await
-            .err();
-        secondary_data_active = line.secondary_data.interface().await.is_some();
-        if let Some(error) = data_start_error {
-            line.data_proxy.record_error(error.clone()).await;
-            if secondary_data_active {
-                // The DATA6 bearer can be healthy even when the local proxy
-                // listener fails. Keep the real allocation in that case.
-                warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
-            } else {
-                warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; VoLTE allocation will use the observed slot state");
-            }
-        }
-    } else if let Some(interface) = primary_data_interface.as_deref() {
-        if let Err(error) = line
-            .data_proxy
-            .start_for_line(&binding.line_id, interface, &profile.data_proxy)
-            .await
-        {
-            line.data_proxy.record_error(error.clone()).await;
-            warn!(line_id = %binding.line_id, error = %error, "Primary data is active but its local proxy is unavailable");
-        }
-    }
-
     let inputs = DataSlotInputs {
         data_requested: true,
         primary_data_active,
@@ -3304,17 +3280,60 @@ async fn prepare_line_data_slot_for_volte(
                 crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
             ),
     };
-    match select_data_slot_mode(inputs) {
-        Ok(mode) => {
-            info!(line_id = %binding.line_id, mode = mode.as_str(), allocation = mode.allocation_message(), "VoLTE/data slot allocation selected");
-            Ok(mode)
-        }
+    let mode = match select_data_slot_mode(inputs) {
+        Ok(mode) => mode,
         Err(error) => {
             line.data_proxy.record_error(error.to_string()).await;
             warn!(line_id = %binding.line_id, error = %error, "VoLTE/data slot allocation failed");
-            Err(error)
+            return Err(error);
+        }
+    };
+
+    // IMS needs qmi0 to itself: an ordinary ModemManager bearer on that port
+    // deactivates the IMS bearer on this firmware. Move the user data to DATA6
+    // rather than moving IMS -- IMS cannot run on DATA6 while secondary-qmi-init
+    // holds that character device open, and trying strands a WDS client per
+    // attempt until the baseband faults.
+    if mode.requires_primary_data_release(primary_data_active) {
+        info!(
+            line_id = %binding.line_id,
+            interface = primary_data_interface.as_deref().unwrap_or("unknown"),
+            "Releasing the qmi0 data bearer so IMS can own the primary port"
+        );
+        line.data_proxy.stop().await;
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            // Not fatal on its own: DATA6 may still come up below, and the IMS
+            // activation that follows reports the real consequence.
+            warn!(line_id = %binding.line_id, error = %error, "Could not release the qmi0 data bearer");
         }
     }
+
+    // Establish user data on DATA6, or adopt the session already there.
+    let data_start_error = start_line_data_runtime_locked(app, line, profile)
+        .await
+        .err();
+    secondary_data_active = line.secondary_data.interface().await.is_some();
+    if let Some(error) = data_start_error {
+        line.data_proxy.record_error(error.clone()).await;
+        if secondary_data_active {
+            // The DATA6 bearer can be healthy even when the local proxy
+            // listener fails. Keep the real allocation in that case.
+            warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
+        } else {
+            warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; the line has no data exit");
+        }
+    }
+
+    info!(
+        line_id = %binding.line_id,
+        mode = mode.as_str(),
+        allocation = mode.allocation_message(),
+        "VoLTE/data slot allocation selected"
+    );
+    Ok(mode)
 }
 
 pub async fn set_line_data_connection_handler(
