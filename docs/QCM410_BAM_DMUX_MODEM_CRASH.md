@@ -424,21 +424,87 @@ commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写，并且
 同时钉住 ModemManager 那套拼写仍需两半同时命中（单独一个 `call failed` 或
 `internal error` 太宽，不足以放弃整批）。
 
-### 10.5 尚未解决：IMS-on-DATA6 这个分配本身
+### 10.5 已修复：分配策略固定为 IMS→qmi0、DATA6→数据
 
-`secondary-qmi-init` 持有那个字符设备期间，**IMS-on-DATA6 根本不可能成功**。也就是说
-分配器正在选择一个本设备无法履行的分配。这是个设计问题，两条路：
+`secondary-qmi-init` 持有那个字符设备期间，**IMS-on-DATA6 根本不可能成功** —— 分配器
+在选一个本设备无法履行的分配。当时列了两条路（让 holder 交接设备，或永不选它），
+采用的是后者，因为它不需要引入交接协议这种新的失败模式。
 
-- **让它可行**：IMS 要用 DATA6 时，holder 先把设备交出去（需要一套交接协议，
-  且要保证交接失败时不会两边都不持有）；
-- **永不选它**：分配器把"DATA6 被 holder 占用"作为输入，此时不产出
-  `SecondaryImsPrimaryData`；`primary_data_active=true` 改为先把数据从 qmi0 让出来，
-  回到已验证可用的 `secondary_qmi_data`（IMS→qmi0，数据→DATA6）。
+commit `d081601`：**IMS 必定在 ModemManager 持有的端口（qmi0）上注册，DATA6 端口固定
+分配给数据流量。** 这是本项目的不变量，不再从"哪个端点恰好忙"推导：
 
-已验证可用的组合是后者：`mode="secondary_qmi_data"` 下 VoLTE registered、VoWiFi
-200 OK、数据经代理出站正常（见 `ue-isolation-migration.md` §8.8）。
+- `DataSlotMode::SecondaryImsPrimaryData` 这个变体被**整个删除**，而不是"尽量不选" ——
+  一个绝不该被选中的枚举值留在类型里，只会等着下一个人再把它选出来；
+- `ims_on_primary()` 恒为 `true`，于是 `native_ims_bearer_required()` 恒为 `false`，
+  原生 QMI IMS 承载那条（撞 holder 的）路径不再被触发；
+- `primary_data_active=true` 不再翻转 IMS，而是通过新增的
+  `requires_primary_data_release()` 要求**把放错位置的数据从 qmi0 释放掉**，让它回到
+  DATA6 —— 触发条件相同，但修的是错位的那个 bearer，而不是把 IMS 挪到一个被别人
+  占着的端点上；
+- `both_data_slots_active` 这个冲突也随之消失：在固定策略下，qmi0 上有普通数据不是
+  "没有空闲端点"，而是"数据放错了地方"，是个可修复的前置条件。
 
-### 10.6 这次留下的通用教训
+实测（`d081601`，开机 9 分钟）：`fatal count` **0**、`mode="secondary_qmi_data"`、
+VoLTE `IMS restore registered`、VoWiFi 200 OK、bearer 抖动 0、
+`secondary-qmi` 端点丢失 0。对比修复前**每 50-120 秒崩一次**。
+
+### 10.6 同一台设备上的第二场争用：数据网卡 `wwan1`
+
+10.5 修好之后固件不再崩，但**数据依然不通**，而且失败方式会骗人：`wwan1` 上有一个
+公网地址，看起来像通了。端到端测试才暴露真相：
+
+```text
+ping -I wwan1 8.8.8.8    → 100% packet loss
+curl --interface wwan1   → 无输出
+curl --interface wlan0   → 161.142.152.209    （WiFi 出口，对照用）
+```
+
+`mmcli` 给出了原因：
+
+```text
+Bearer/0  default-attach  APN=UNET   connected=yes
+Bearer/2  default         APN=ims    connected=yes   interface=wwan1   ← 
+```
+
+`wwan1` 上那个地址**不是数据承载，是 ModemManager 自己建的 IMS 承载**（APN=`ims`）。
+IMS APN 本来就不承载普通流量，所以 ping 不通是正常的 —— 而 SimAdmin 的 DATA6 数据
+路径要用的也正是 `wwan1`。两边抢同一块网卡，先要到的赢：
+
+```text
+QMI protocol error (79): 'PolicyMismatch'      ← 手工 start-network 时的直接表现
+```
+
+**根因是 udev 规则的覆盖面不足。** 规则只隐藏了**控制口**：
+
+```text
+wwan0at2   SUBSYSTEM=wwan   (wwan_port)   ← 规则覆盖到了
+wwan1      SUBSYSTEM=net    ID_MM_CANDIDATE=1   ← 完全没覆盖
+```
+
+两者是**不同子系统的两个独立 udev 设备**，所以 `SUBSYSTEM=="wwan"` 那条规则结构上
+就不可能匹配到 netdev。而 ModemManager 给 `wwan1` 打了 `ID_MM_CANDIDATE=1`，明确
+把它当候选口用。
+
+commit `3136797`：`secondary-qmi-init` 现在为端点**同时**生成两条规则 —— 控制口一条
+（`SUBSYSTEM=="wwan"`）、数据网卡一条（`SUBSYSTEM=="net"`），并且 `udevadm trigger`
+要覆盖两个子系统（原先只 trigger `wwan`，新规则落在 `net` 上不会被重新应用）。
+netdev 名字取自 `SecondaryQmiEndpoint.netdev`，即内核实际发布的那个，不猜名字。
+
+硬件验证（重启 ModemManager 使其重新枚举）：
+
+```text
+wwan1 (ignored)                    ← MM 不再认领
+Bearer/1 → interface: wwan0        ← MM 的承载挪回 wwan0
+fault count: 0
+```
+
+> **时序要求**：`ID_MM_PORT_IGNORE` 必须在 ModemManager **枚举端口之前**就位。运行时
+> 加规则再 `udevadm trigger` 会把属性写上，但已经在跑的 MM 不会重新枚举 —— 实测属性
+> 落上了而 `wwan1` 仍是 `(net)`，直到重启 MM 才变成 `(ignored)`。单元已经是
+> `Before=ModemManager.service`，所以正常启动路径没问题；但**手工改规则后必须重启
+> ModemManager**，否则看到的是旧结论。
+
+### 10.7 这次留下的通用教训
 
 - **无界重试是可以把硬件打坏的**，不只是浪费时间。任何对基带的重试都必须有明确的
   "不可重试"分类，且该分类的**默认方向应当是保守的** —— 认不出来的失败应倾向于放弃，
@@ -447,5 +513,18 @@ commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写，并且
 - **按错误文本字符串做分类是脆的。** 同一个失败经 ModemManager 和经 qmicli 出来的
   措辞不同，这次就差在一个空格和一对方括号上。新增一条产生错误的路径时，必须同时
   检查分类器认不认得它的措辞。
+- **一个 QMI 端点是两个 udev 设备，不是一个。** 控制口在 `SUBSYSTEM=="wwan"`，
+  数据网卡在 `SUBSYSTEM=="net"`。只隐藏控制口会留下另一半被 ModemManager 认领，
+  而这一半才是承载流量的。凡是"为 SimAdmin 保留某个端点"的动作，都必须覆盖两者。
+- **`ID_MM_PORT_IGNORE` 只在 ModemManager 枚举之前设置才有效。** 事后补规则 +
+  `udevadm trigger` 会让属性出现在 `udevadm info` 里，却**不会**让 MM 放手 ——
+  实测必须重启 MM 才生效。所以 `Before=ModemManager.service` 这个排序不是优化，
+  是正确性要求。
 - **"某个东西持有某个设备"应当是显式状态，而不是靠错误信息事后发现。** holder 与
-  分配器目前对彼此一无所知，分配器因此会选一个注定失败的槽位。
+  分配器此前对彼此一无所知，分配器因此会选一个注定失败的槽位。10.5 用固定策略
+  绕开了这个问题，但底层的耦合仍未表达出来：将来若真要支持 IMS→DATA6，必须先有
+  显式的持有权模型。
+- **"接口有地址"不等于"数据通"。** `wwan1` 上那个公网地址曾让我误判数据已经打通，
+  实际它属于 ModemManager 的 `ims` APN 承载，`ping -I wwan1` 100% 丢包。判定数据面
+  必须端到端验证（`ping -I` / `curl --interface`），并核对**谁**建的承载、APN 是什么
+  —— 见 §7 同类误判。
