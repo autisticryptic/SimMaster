@@ -248,7 +248,6 @@ jobs:
 
           # Include DATA6 preparation and bounded runtime modem recovery.
           mkdir -p "$OTA_TMP/system"
-          cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
           cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
           cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
           cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"

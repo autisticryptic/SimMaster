@@ -324,11 +324,9 @@ if [ "$SKIP_OTA" = false ] && [ "$BUILD_BACKEND" = true ] && [ "$BUILD_FRONTEND"
         mkdir -p "$OTA_TMP/www"
         cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
-        # Include boot-time DATA6/secondary-QMI resources. The one-click
-        # installer uses the packaged unit and older packages fall back to the
-        # SimMaster raw URL.
+        # Include boot-time DATA6/secondary-QMI resources. The udev rule these
+        # need is generated at runtime, so it is not packaged here.
         mkdir -p "$OTA_TMP/system"
-        cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
         cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
         cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
         cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"

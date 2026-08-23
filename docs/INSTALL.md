@@ -117,8 +117,6 @@ catalog 模式启动，Profile 页面会提供数据库选择和下载入口。�
 在构建机上传文件：
 
 ```bash
-scp deploy/system/99-simadmin-secondary-qmi.rules \
-  root@192.0.2.10:/tmp/99-simadmin-secondary-qmi.rules
 scp deploy/system/simadmin-secondary-qmi.service \
   root@192.0.2.10:/tmp/simadmin-secondary-qmi.service
 ```
@@ -126,15 +124,18 @@ scp deploy/system/simadmin-secondary-qmi.service \
 在目标设备安装：
 
 ```bash
-install -d -m 0755 /etc/udev/rules.d
-install -m 0644 /tmp/99-simadmin-secondary-qmi.rules \
-  /etc/udev/rules.d/99-simadmin-secondary-qmi.rules
 install -m 0644 /tmp/simadmin-secondary-qmi.service \
   /etc/systemd/system/simadmin-secondary-qmi.service
-udevadm control --reload-rules
 systemctl daemon-reload
 systemctl enable simadmin-secondary-qmi.service
 ```
+
+**不需要安装 udev 规则。** 让 ModemManager 避开 IMS 端点的规则由
+`secondary-qmi-init` 在运行时生成到 `/run/udev/rules.d/`，写入的是**实际出现的
+那个端口名**，并自动 `reload` + `trigger` 使其立即生效。端口名是平台相关的
+（同一个通道在一块基带上叫 `wwan0qmi1`，在另一块上叫 `wwan0at2`），预置一条静态
+规则要么完全不匹配，要么更糟 —— 在没见过的硬件上把 ModemManager 本该拥有的端口
+藏起来。规则写在 `/run` 而不是 `/etc`，因为端口名到基带的映射只在当前 boot 内有效。
 
 该服务必须在 ModemManager 之前准备 DATA6 端点。启用后建议在维护窗口重启设备，再检查：
 

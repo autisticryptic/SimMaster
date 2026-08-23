@@ -289,7 +289,6 @@ jobs:
 
           # ---- DATA6 / secondary-QMI boot resources ----
           mkdir -p "$TMP/system"
-          cp deploy/system/99-simadmin-secondary-qmi.rules "$TMP/system/"
           cp deploy/system/simadmin-secondary-qmi.service "$TMP/system/"
           cp scripts/simadmin-modem-recovery.sh "$TMP/system/"
           cp scripts/simadmin-modem-recovery.service "$TMP/system/"
@@ -311,8 +310,8 @@ jobs:
           mkdir -p release
           OUT="release/simadmin-linux-${ARCH}.tar.gz"
 
-          # system/ carries the unit and fallback udev rule needed to reserve
-          # the DATA6 endpoint before ModemManager starts.
+          # system/ carries the unit that reserves the DATA6 endpoint before
+          # ModemManager starts. The udev rule it needs is generated at runtime.
           ( cd "$TMP" && tar -czf - meta.json simadmin www system ) > "$OUT"
 
           echo ""

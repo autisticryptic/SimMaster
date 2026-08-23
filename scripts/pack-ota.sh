@@ -80,7 +80,6 @@ cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
 # Include the resources that prepare DATA6 before ModemManager starts.
 mkdir -p "$OTA_TMP/system"
-cp deploy/system/99-simadmin-secondary-qmi.rules "$OTA_TMP/system/"
 cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
 cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
 cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"

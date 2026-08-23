@@ -840,3 +840,60 @@ fatal 0，warning 0
 所需的 VoLTE / VoWiFi 信令均已就绪，待换卡后进行业务测试。`trunk_sockets_in_worker`
 仍未验证，因为它需要 Asterisk 配置。
 
+### 8.9 部署路径去平台化：udev 与内核模块（2026-08-23）
+
+本项目最初只面向 410，后来扩到多平台，但部署侧仍停留在"单基带高通"的假设上。这一
+轮把它清干净，原则是**运行时观测 > 打包时猜测**。
+
+**删掉的静态 udev 规则**（`deploy/system/99-simadmin-secondary-qmi.rules`）：
+
+- 它匹配 `wwan[0-9]qmi1` / `wwan[0-9]qmi2`，而参考设备实际出现的端口叫 `wwan0at2`
+  —— **它从来就没生效过**，只是让人误以为端口已经对 ModemManager 隐藏；
+- 端口名是平台相关的：同一条通道在一块基带上叫 `wwan0qmi1`，在另一块上叫
+  `wwan0at2`。打包时写死名字，要么完全不匹配（本例），要么更糟 —— 在没见过的硬件上
+  把 ModemManager 本该拥有的端口藏起来；
+- 它的注释描述的还是已被清除的 `_multi` 模块的行为。
+
+改为 `main.rs::reconcile_secondary_qmi_udev_rules(path, rules)`，只写**实际绑定成功
+的那些端口**，落到 `/run/udev/rules.d/`（端口名到基带的映射只在当前 boot 内有效），
+然后 `udevadm control --reload-rules` + `udevadm trigger --subsystem-match=wwan`
+立即生效。传空规则集时**删除文件** —— DATA6 关闭或全部端点失败时，同一 boot 内早先
+写下的规则必须撤掉，否则会把已经该还给 ModemManager 的端口继续藏着（旧代码在
+disabled 分支上直接返回，从不清理，是个真实的漏洞）。
+
+发现端点的那条路径本来就已经是平台无关的，无需改动：`discover_primary_qmi_ports()`
+读 `/sys/class/wwan/*/type` 并按基带去重，端点只有在 QMI 探测确认 `wds` 之后才被
+接受，unit 排在 `Before=ModemManager.service`。
+
+**`deploy/install.sh` 里整段内核模块代码也删了。** 它是这次清理中真正危险的一处：
+即便 `secondary-qmi-init` 每次开机都 purge 掉 `rpmsg_wwan_ctrl_multi`，安装器仍会在
+安装结束时立刻 `modprobe` 把它加载回来 —— **自己的崩溃修复和自己的安装器对打**。
+DATA6 走 in-tree `rpmsg_wwan_ctrl` + `driver_override` 即可，这也是 beta8 在完全没有
+树外代码的前提下做到 DATA6 与 IMS 并存的方式。
+
+`purge_legacy_rpmsg_module()` 予以保留。它清理的不是"旧配置"，而是一个会让基带固件
+崩溃、代价是整机重刷的内核模块残留；`bind_and_probe()` 里对 legacy 驱动的解绑同样
+保留，作为 `rmmod` 被拒（模块被占用或编进内核）时唯一还能拿到通道的兜底。
+
+#### 8.9.1 顺带查出的两个部署期真 bug
+
+清理过程中发现的，都只在**非 410 平台或没有备用通道的硬件**上才会暴露：
+
+1. **`secondary-qmi-init` 在"没有 QMI 控制口"时不发 readiness 就返回 `Ok(())`。**
+   unit 是 `Type=notify` + `TimeoutStartSec=75` + `Restart=on-failure`，所以在任何没有
+   QMI 控制口的平台上（即多数非高通硬件），systemd 会等满 75 秒判定启动失败，然后
+   每 2 秒重启一次，整个 boot 循环下去。这条分支是全函数里唯一漏发 `systemd-notify
+   --ready` 的路径。已修：补 readiness，并把 udev 规则一并 reconcile 成空。
+
+2. **unit 的 `ExecCondition` 写死了 `DATA6_CNTL`。** 门打开、但该平台的备用通道不叫
+   DATA6 时，条件返回 1、unit 被整体跳过 —— 于是 `purge_legacy_rpmsg_module()` 也一起
+   被跳过，而"门开着 + 遗留模块还在"恰恰是最需要 purge 的组合。它同时还重复实现了
+   Rust 侧已经做得更好的发现逻辑（`/sys/class/wwan/*/type` + 按基带去重 + QMI `wds`
+   探测）。已改为：unit 无条件启动 initializer，由它自己判断；`ExecStartPre` 只保留
+   一次平台无关的 `modprobe rpmsg_wwan_ctrl` + `udevadm settle`，全部 best-effort。
+
+unit 里 `SIMADMIN_ENABLE_SECONDARY_QMI=0` 的注释也一并更正 —— 原注释写的是"410 固件
+在 AT 端点被强开为 QMI 时会崩"，那是**已被推翻的结论**（真凶是 `_multi` 模块）。默认
+仍为 0，但理由改成真实的那个：占用一条通道之前需要在该平台上先验证端点，而不是因为
+DATA6 危险。
+

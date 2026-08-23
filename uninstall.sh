@@ -9,7 +9,6 @@ KEEP_USER_DATA="${KEEP_USER_DATA:-0}"
 MODEM_RECOVERY_SERVICE_NAME="${MODEM_RECOVERY_SERVICE_NAME:-simadmin-modem-recovery}"
 MODEM_RECOVERY_SCRIPT="${MODEM_RECOVERY_SCRIPT:-/usr/local/bin/simadmin-modem-recovery.sh}"
 SECONDARY_QMI_SERVICE_NAME="${SECONDARY_QMI_SERVICE_NAME:-simadmin-secondary-qmi}"
-SECONDARY_QMI_RULE="${SECONDARY_QMI_RULE:-/etc/udev/rules.d/99-simadmin-secondary-qmi.rules}"
 SECONDARY_QMI_RUNTIME_RULE="${SECONDARY_QMI_RUNTIME_RULE:-/run/udev/rules.d/99-simadmin-secondary-qmi-runtime.rules}"
 SECONDARY_QMI_STATE_DIR="${SECONDARY_QMI_STATE_DIR:-/run/simadmin}"
 NM_CONF="${NM_CONF:-/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf}"
@@ -280,7 +279,6 @@ main() {
   cleanup_systemd
 
   remove_path "$MODEM_RECOVERY_SCRIPT"
-  remove_path "$SECONDARY_QMI_RULE"
   remove_path "$SECONDARY_QMI_RUNTIME_RULE"
   remove_path "$SECONDARY_QMI_STATE_DIR"
   remove_path "$NM_CONF"

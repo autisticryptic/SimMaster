@@ -222,9 +222,9 @@ netdev 层、位于驱动交给硬件之前，同样只能证明包进了网卡�
                  simadmin-secondary-qmi.service     未安装
 
 之前（每次开机崩）: deploy/install.sh 会安装并加载
-                 kernel/rpmsg_wwan_ctrl_multi.ko   （install.sh:38-43, 88-89）
-                 99-simadmin-secondary-qmi.rules   （install.sh:61-63）
-                 simadmin-secondary-qmi.service    （install.sh:67-71）
+                 kernel/rpmsg_wwan_ctrl_multi.ko   （树外内核模块）
+                 99-simadmin-secondary-qmi.rules   （静态 udev 规则，已删除）
+                 simadmin-secondary-qmi.service    （仍在，且是必需的）
 ```
 
 `rpmsg_wwan_ctrl_multi` 是标准 `rpmsg_wwan_ctrl` 的自研替代/增强版，作用正是把
@@ -284,21 +284,30 @@ Memory），此时 `_multi` 模块比标准模块**多绑定若干 DATA*_CNTL �
 `SIMADMIN_ENABLE_SECONDARY_QMI=0` 时旧代码会提前返回、完全不碰残留模块，而那恰恰是
 模块纯属负担的配置。
 
+udev 规则也已经对齐 beta8 的做法：静态的 `deploy/system/99-simadmin-secondary-qmi.rules`
+已从仓库删除，规则改为在运行时按实际出现的端口名生成到 `/run/udev/rules.d/`。原先那条
+静态规则匹配的是 `wwan[0-9]qmi1`/`qmi2`，而参考设备实际出现的端口叫 `wwan0at2` ——
+它从来就没生效过，只是让人误以为端口已经对 ModemManager 隐藏了。
+
 ### 8.2 后续开发中如何避免
 
 0. **升级到含 `f3308ed` 的版本**。`secondary-qmi-init` 现在会在每次启动时无条件
    卸载并删除遗留的 `rpmsg_wwan_ctrl_multi`，所以从旧版本升级上来的设备会自动清掉
    这个隐患，不需要人工处理。
 
-1. **不需要 DATA6 就不要装它。** `install.sh` 默认会装内核模块 + udev 规则 +
-   secondary-qmi 服务，但 DATA6 本身被 `SIMADMIN_ENABLE_SECONDARY_QMI=0` 关着 ——
-   **模块带来的全部是风险，没有任何收益**。只装二进制、前端、carrier catalog 和主
-   systemd unit 即可（本轮重刷后就是这么装的，一切正常）。
-   注意当前仓库其实**没有** `kernel/` 目录，`install.sh` 里那段内核模块代码两个分支
-   都不会命中；风险来自更早版本或手工安装留下的模块。
+1. **安装器已经不再碰内核层**（本轮修复）。`deploy/install.sh` 里那段
+   "装 `.ko` / 从源码编译 / `modprobe rpmsg_wwan_ctrl_multi`" 的代码**已整段删除**。
+   它此前是最危险的一处：即使 `secondary-qmi-init` 每次开机都把模块清掉，安装器
+   仍会在安装结束时立刻 `modprobe` 把它加载回来 —— 自己的修复和自己的安装器对打。
+   静态 udev 规则同样删掉了，ModemManager 的避让规则改由 `secondary-qmi-init`
+   在运行时按**实际出现的端口名**生成到 `/run/udev/rules.d/`（详见
+   `docs/INSTALL.md` 第 5 节）。现在要装的只有二进制、前端、carrier catalog、主
+   systemd unit，以及需要 DATA6 时的 secondary-qmi unit 和 modem-recovery。
 
-2. **把内核模块从默认安装路径里摘出去**，改成显式的 opt-in 步骤，与 DATA6 开关联动：
-   开关关闭时不应该装、也不应该加载 `rpmsg_wwan_ctrl_multi`。
+2. **内核模块永远不要作为默认安装项回归。** DATA6 走的是 in-tree
+   `rpmsg_wwan_ctrl` + `driver_override`，这也是 beta8 在**完全没有树外代码**的
+   前提下让 DATA6 与 IMS 并存的方式 —— 树外模块没有任何收益。如果将来某个平台
+   真的需要它，必须是显式 opt-in 且与 DATA6 开关联动：开关关闭时既不装也不加载。
 
 3. **升级/重装后做一次开机自检**：
 

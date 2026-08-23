@@ -8,7 +8,10 @@
 # Installs:
 #   /opt/simadmin/simadmin          the service binary
 #   /opt/simadmin/www/              the web UI
-#   kernel module + systemd unit + udev rule for the IMS QMI endpoint (optional)
+#   systemd units for the IMS QMI endpoint and modem recovery (optional)
+#
+# Nothing is installed into the kernel, and no udev rule is packaged. Both used
+# to be here and both were mistakes -- see the two comment blocks below.
 
 set -e
 
@@ -28,40 +31,27 @@ install -d "$PREFIX/www"
 cp -r www/. "$PREFIX/www/"
 
 if [ "$WITH_IMS" = "1" ]; then
-  KVER=$(uname -r)
+  # --- no kernel module ------------------------------------------------------
+  # This used to install and modprobe an out-of-tree `rpmsg_wwan_ctrl_multi`.
+  # Do not bring that back. While loaded, its id_table keeps auto-binding spare
+  # DATA*_CNTL channels at every boot, racing the modem's Data Services Memory
+  # bring-up; that crashes the DSP (smd_dsm_memcpy.c:297) and latches bam-dmux
+  # at runtime_status=error, which kills every wwanN interface until a full
+  # system reflash. `secondary-qmi-init` now actively purges the module for
+  # exactly this reason -- installing it here would fight our own fix.
+  #
+  # It is also unnecessary: DATA6 is bound through the in-tree
+  # `rpmsg_wwan_ctrl` with driver_override, which is how the beta8 reference
+  # build ran DATA6 and IMS side by side with no out-of-tree code at all.
+  # See docs/QCM410_BAM_DMUX_MODEM_CRASH.md.
 
-  # --- kernel module -------------------------------------------------------
-  # Exposes spare Qualcomm DATA*_CNTL channels as real QMI ports so IMS/VoLTE
-  # can run on its own endpoint instead of fighting ModemManager for the
-  # primary one. Without this the IMS bearer either fails with
-  # interface-in-use-config-match or wedges the baseband.
-  if [ -f "kernel/rpmsg_wwan_ctrl_multi.ko" ]; then
-    say "installing prebuilt kernel module for $KVER"
-    install -d "/lib/modules/$KVER/extra/simadmin"
-    install -m 0644 kernel/rpmsg_wwan_ctrl_multi.ko \
-      "/lib/modules/$KVER/extra/simadmin/"
-    depmod -a "$KVER" || true
-  elif [ -d kernel/src ]; then
-    say "building kernel module from source"
-    if [ ! -e "/lib/modules/$KVER/build/Makefile" ]; then
-      echo "    kernel headers missing at /lib/modules/$KVER/build — skipping."
-      echo "    install them, then run: cd kernel/src && make && make install"
-    elif ! command -v gcc >/dev/null 2>&1 || ! command -v make >/dev/null 2>&1; then
-      echo "    gcc/make missing — skipping."
-      echo "    apt-get install -y --no-install-recommends gcc make"
-      echo "    then: cd kernel/src && make && make install"
-    else
-      ( cd kernel/src && make && make install )
-    fi
-  fi
-
-  # --- udev rule ------------------------------------------------------------
-  if [ -f system/99-simadmin-secondary-qmi.rules ]; then
-    say "installing udev rule (keeps ModemManager off the IMS endpoint)"
-    install -d /etc/udev/rules.d
-    install -m 0644 system/99-simadmin-secondary-qmi.rules /etc/udev/rules.d/
-    udevadm control --reload-rules 2>/dev/null || true
-  fi
+  # --- no udev rule ---------------------------------------------------------
+  # The rule that keeps ModemManager off SimAdmin's IMS endpoints is generated
+  # at runtime by `secondary-qmi-init` into /run/udev/rules.d, naming the port
+  # that actually appeared. A packaged rule would have to guess the port name,
+  # and the name differs per platform (wwan0qmi1 on one baseband, wwan0at2 on
+  # another) -- a wrong guess is either dead weight or, worse, hides a port
+  # ModemManager legitimately owns.
 
   # --- systemd unit ---------------------------------------------------------
   if [ -f system/simadmin-secondary-qmi.service ] && command -v systemctl >/dev/null 2>&1; then
@@ -83,11 +73,6 @@ if [ "$WITH_IMS" = "1" ]; then
     systemctl daemon-reload
     systemctl enable --now simadmin-modem-recovery.timer || true
   fi
-
-  say "loading module now (safe if already loaded)"
-  modprobe rpmsg_wwan_ctrl_multi 2>/dev/null || \
-    insmod "/lib/modules/$KVER/extra/simadmin/rpmsg_wwan_ctrl_multi.ko" 2>/dev/null || \
-    echo "    could not load; check: modinfo rpmsg_wwan_ctrl_multi"
 fi
 
 cat <<EOF
@@ -105,7 +90,8 @@ IMS/VoLTE endpoint status:
   $PREFIX/simadmin secondary-qmi-init               # prepare it now
   for p in /sys/class/wwan/*; do echo "\$(basename \$p) \$(cat \$p/type)"; done
 
-A spare port showing type=QMI (e.g. wwan0qmi1) means the module is working.
-After loading the module ModemManager may briefly report no modems while it
-re-enumerates; it recovers within ~15s.
+secondary-qmi-init binds DATA6 through the in-tree rpmsg_wwan_ctrl driver and
+accepts the endpoint only after a QMI probe confirms the wds service. A spare
+port whose type reads QMI is the one it took. ModemManager may briefly report
+no modems while it re-enumerates; it recovers within ~15s.
 EOF
