@@ -537,6 +537,27 @@ fn classify(failures: &[(String, ConfigureError)]) -> NetdevError {
     NetdevError::ConfigureFailed(detail)
 }
 
+/// The latched runtime-PM status of a baseband's netdevs, if it has one.
+///
+/// Every candidate hangs off the same `bam-dmux` parent, so a single read answers
+/// for all of them and no session or address is needed to ask. Callers check this
+/// *before* allocating a WDS client: once the parent has latched, the kernel
+/// answers `EINVAL` to an administrative UP on every candidate, so the session
+/// cannot succeed — but by the time resolution discovers that, the client and its
+/// packet data handle already exist, and tearing down a session whose netdev was
+/// never resolved leaks the CID. Asking first is what keeps a latched baseband
+/// from accumulating one leaked `wds` client per retry, and stops the retry loop
+/// from re-arming a baseband that is already recovering from a crash.
+///
+/// Only `error` is reported. `suspended` is this driver's normal idle state and
+/// resumes on demand.
+pub fn baseband_runtime_is_latched(baseband: &str) -> Option<String> {
+    candidates_for_baseband(baseband)
+        .iter()
+        .find_map(|interface| parent_pm_status(interface))
+        .filter(|status| status.eq_ignore_ascii_case("error"))
+}
+
 /// Runtime-PM status of the parent device every candidate netdev shares.
 ///
 /// Read through the netdev's own `device` link rather than a fixed SoC path, so

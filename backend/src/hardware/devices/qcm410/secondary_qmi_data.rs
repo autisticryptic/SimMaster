@@ -133,11 +133,28 @@ impl SecondaryDataRuntime {
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
         let apn_name = normalized_data_apn(&apn.apn)?;
+        let baseband = baseband_key(&endpoint);
+
+        // A latched baseband cannot carry this session: the kernel refuses an
+        // administrative UP on every candidate netdev, so resolution is certain to
+        // fail. Refusing here rather than inside the family loop is what keeps the
+        // failure cheap. Each family attempt allocates a WDS client and starts a
+        // network before resolution runs, and a session whose netdev was never
+        // resolved cannot be torn down cleanly -- the firmware leaves the CID
+        // behind. Retried every watchdog pass, that accumulated one leaked
+        // `wds` client per attempt and kept issuing start-network requests at a
+        // baseband that was still recovering from a crash.
+        if let Some(status) = qmi_netdev::baseband_runtime_is_latched(&baseband) {
+            return Err(format!(
+                "cellular_secondary_data_baseband_latched:{baseband}: bam-dmux runtime_status={status}"
+            ));
+        }
+
         let families = data_family_attempts(&apn.protocol);
         let mut errors = Vec::new();
 
         for family in families {
-            match start_family(&endpoint, apn, &apn_name, family).await {
+            match start_family(&endpoint, &baseband, apn, &apn_name, family).await {
                 Ok(mut session) => {
                     if let Some(worker) = data_worker_for_line(line_id).await {
                         if let Err(error) =
@@ -185,12 +202,33 @@ impl SecondaryDataRuntime {
 /// carrier-private address that can never answer.
 const DATA_RESERVED_NETDEVS: &[&str] = &["wwan0"];
 
+/// The sysfs key every candidate netdev of this endpoint's baseband contains.
+///
+/// Resolved from the QMI device path, then the port name, falling back to the
+/// endpoint's own remoteproc name. Hoisted out of `start_family` so the latch
+/// check can run once, before the first WDS client is allocated.
+fn baseband_key(endpoint: &SecondaryQmiEndpoint) -> String {
+    secondary_qmi::baseband_key_for_device(&endpoint.device_path)
+        .or_else(|_| secondary_qmi::baseband_key_for_device(&endpoint.port_name))
+        .unwrap_or_else(|_| endpoint.remoteproc.clone())
+}
+
 async fn start_family(
     endpoint: &SecondaryQmiEndpoint,
+    baseband: &str,
     apn: &ApnConfig,
     apn_name: &str,
     family: u8,
 ) -> Result<SecondaryDataSession, String> {
+    // The previous family's attempt can itself crash the baseband, and a start
+    // issued into a latched one only leaks another client. Re-read rather than
+    // trusting the check the caller made before the loop.
+    if let Some(status) = qmi_netdev::baseband_runtime_is_latched(baseband) {
+        return Err(format!(
+            "cellular_secondary_data_baseband_latched:{baseband}: bam-dmux runtime_status={status}"
+        ));
+    }
+
     let retained = start_retained_session(endpoint, apn, apn_name, family).await?;
 
     let settings = match wait_for_current_settings(endpoint, &retained.client_id, family).await {
@@ -200,10 +238,7 @@ async fn start_family(
             return Err(error);
         }
     };
-    let baseband = secondary_qmi::baseband_key_for_device(&endpoint.device_path)
-        .or_else(|_| secondary_qmi::baseband_key_for_device(&endpoint.port_name))
-        .unwrap_or_else(|_| endpoint.remoteproc.clone());
-    let netdev = match qmi_netdev::resolve(&baseband, &settings, DATA_RESERVED_NETDEVS).await {
+    let netdev = match qmi_netdev::resolve(baseband, &settings, DATA_RESERVED_NETDEVS).await {
         Ok(netdev) => netdev,
         Err(error) => {
             stop_retained_session(endpoint, &retained).await;
