@@ -3585,11 +3585,34 @@ async fn handle_operator_sip_frame(
     runtime: &Arc<VolteRuntime>,
     frame: &[u8],
 ) -> Result<bool, VolteError> {
+    // An inbound INVITE left no trace until it had already been accepted, so a
+    // terminating call that we dropped on a missing Call-ID, an absent session
+    // or a local gate was indistinguishable from one the network never
+    // delivered. Log arrival first, then the outcome, so MT diagnosis can tell
+    // "no call reached us" from "a call reached us and we refused it".
+    let inbound_invite = sip::is_request(frame, "INVITE");
+    if inbound_invite {
+        tracing::info!(
+            call_id = ?sip::header_value(frame, "Call-ID"),
+            from = ?sip::header_value(frame, "From"),
+            has_sdp = !sip::sip_body(frame).is_empty(),
+            "VoLTE inbound INVITE received on the IMS leg"
+        );
+    }
     let Some(ims_call_id) = sip::header_value(frame, "Call-ID") else {
+        if inbound_invite {
+            tracing::warn!("VoLTE inbound INVITE dropped: no Call-ID header");
+        }
         return Ok(false);
     };
     let mut sessions = live.session.lock().await;
     let Some(session) = sessions.as_mut() else {
+        if inbound_invite {
+            tracing::warn!(
+                call_id = %ims_call_id,
+                "VoLTE inbound INVITE dropped: no live IMS session"
+            );
+        }
         return Ok(false);
     };
     let Some(trunk_call_id) = session
@@ -4313,6 +4336,17 @@ async fn send_incoming_rejection(
     frame: &[u8],
     status: u16,
 ) -> Result<(), VolteError> {
+    // Every MT-call rejection used to be silent, which made "the call never
+    // arrived" and "we rejected the call" indistinguishable from the journal:
+    // an INVITE could be answered 480/486/488 without leaving a single line.
+    // Diagnosing MT delivery needs to tell those two apart.
+    tracing::warn!(
+        status,
+        reason = ims_reason(status),
+        is_invite = sip::is_request(frame, "INVITE"),
+        call_id = ?sip::header_value(frame, "Call-ID"),
+        "VoLTE MT call rejected locally"
+    );
     let response = sip::build_response(frame, status, ims_reason(status), None, None, None);
     session
         .channel
