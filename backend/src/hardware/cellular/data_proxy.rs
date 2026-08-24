@@ -964,7 +964,22 @@ mod tests {
         assert_eq!(stopped.stage, "流量未启用");
     }
 
+    /// Hangs forever under WSL2, so it is gated rather than left to wedge the
+    /// suite. `connect_bound` applies `SO_BINDTODEVICE` to the outbound socket,
+    /// and on kernel 6.18.33.2-microsoft-standard-WSL2 a socket bound to `lo`
+    /// that connects to 127.0.0.1 never completes the handshake -- it sits in
+    /// `SYN-SENT` indefinitely, with the client->proxy leg `ESTAB` and the
+    /// proxy->upstream leg stuck, so the relay never starts and the client's
+    /// `read_to_end` never sees EOF. Reproduced as root with a plain Python
+    /// socket and no SimAdmin code involved: the same connect succeeds without
+    /// the bind and times out with it.
+    ///
+    /// The bind is deliberate -- it is the boundary that stops proxy traffic
+    /// from escaping through Wi-Fi or another modem's default route -- so this
+    /// is gated on the environment, not worked around in the proxy.
+    /// Run it on real Linux with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore = "SO_BINDTODEVICE(lo) + 127.0.0.1 never completes the handshake under WSL2"]
     async fn socks5_relay_counts_uplink_and_downlink_separately() {
         // An echo-ish upstream that reads a request and answers with a longer
         // body, so uplink and downlink cannot be confused for each other.

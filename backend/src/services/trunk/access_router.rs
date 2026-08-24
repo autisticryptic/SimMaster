@@ -1169,10 +1169,12 @@ mod tests {
             call_id: "transfer-call".into(),
             body: Vec::new(),
         });
-        let _ = tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // Dispatching the StartCall publishes `Started` upstream; name it so a
+        // future extra emission cannot be absorbed by a bare discard.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "transfer-call"
+        ));
         drop(vowifi_commands);
 
         trunk
@@ -1181,14 +1183,32 @@ mod tests {
                 refer_to: "sip:+601199999999@ims.example".into(),
             })
             .unwrap();
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-                .await
-                .unwrap()
-                .unwrap(),
-            OperatorEvent::TransferResponse { call_id, status: 503 }
-                if call_id == "transfer-call"
-        ));
+
+        // The backend `Answered` and the `TransferResponse` published by the
+        // failed dispatch reach the trunk through two different arms of the
+        // router's select loop, so their relative order is not deterministic --
+        // asserting the 503 comes next fails roughly half the time. Scan for it
+        // instead, and let any terminal event fail the test: the point of this
+        // case is that only the REFER transaction ends, not the call.
+        let mut transfer_status = None;
+        for _ in 0..4 {
+            match recv_event(&mut trunk_events).await {
+                OperatorEvent::TransferResponse { call_id, status } => {
+                    assert_eq!(call_id, "transfer-call");
+                    transfer_status = Some(status);
+                    break;
+                }
+                OperatorEvent::Answered { call_id, .. } => {
+                    assert_eq!(call_id, "transfer-call");
+                }
+                other => panic!("unexpected event before the transfer response: {other:?}"),
+            }
+        }
+        assert_eq!(
+            transfer_status,
+            Some(503),
+            "the failed REFER dispatch must report 503"
+        );
     }
 
     #[tokio::test]

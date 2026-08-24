@@ -547,7 +547,20 @@ mod tests {
         assert_eq!(&got[..], response);
     }
 
+    /// Hangs forever under WSL2, so it is gated rather than left to wedge the
+    /// suite. The point of the test is a datagram larger than the MTU, and on
+    /// kernel 6.18.33.2-microsoft-standard-WSL2 a UDP datagram that needs IP
+    /// fragmentation is never delivered over loopback. Measured with a plain
+    /// Python socket and no SimAdmin code involved: 1024 and 1472 bytes arrive,
+    /// 2048 and above never do. 1472 is exactly 1500 - 28 (IP 20 + UDP 8), so
+    /// the cutoff is fragmentation, not a buffer limit (`SO_RCVBUF` is 212992).
+    ///
+    /// `recv_chunk` itself is correct: a 2940-byte frame read in 1024-byte
+    /// chunks drains as 1024/1024/892, and the real IMS path on the 410 does
+    /// reassemble oversized responses.
+    /// Run it on real Linux with `cargo test -- --ignored`.
     #[tokio::test]
+    #[ignore = "loopback UDP over the MTU is never delivered under WSL2"]
     async fn udp_channel_recv_chunk_reassembles_oversized_datagram() {
         let (peer, local, peer_addr) = udp_pair().await;
         let local_addr = local.local_addr().unwrap();
