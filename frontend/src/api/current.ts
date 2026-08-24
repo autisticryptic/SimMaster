@@ -925,13 +925,6 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/call/status'))
   }
 
-  async setVolteVoice(lineId: string, enabled: boolean) {
-    return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/voice'), {
-      method: 'POST',
-      body: JSON.stringify({ enabled }),
-    })
-  }
-
   async getVilteStatus(lineId: string) {
     return request<ApiResponse<VilteStatusResponse>>(modemLinePath(lineId, '/vilte/control'))
   }

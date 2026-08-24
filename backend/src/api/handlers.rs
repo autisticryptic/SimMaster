@@ -4227,7 +4227,6 @@ async fn send_sms_over_volte_path(
                 &line.volte_live,
                 &device,
                 &line.volte,
-                app.config_manager.get_line_volte_voice_enabled(line_id),
                 &ip_families,
                 app.config_manager.get_line_volte_ip_families_auto(line_id),
                 profile.roaming_allowed,
@@ -7743,16 +7742,19 @@ fn line_volte_enabled(app: &AppState, line: &crate::services::line_registry::Lin
 async fn sync_line_video_capabilities(app: &AppState) {
     for line in app.line_registry.all().await {
         let line_id = line.binding().line_id;
+        // A connected IMS leg is a voice-capable leg. There is no separate
+        // "voice enabled" opinion to AND in any more: MMTEL voice and video are
+        // why the line registers at all, and a carrier that withholds them
+        // answers the REGISTER or the INVITE with a SIP error.
         let line_enabled = line_volte_enabled(app, &line);
-        let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
         let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
         let registered = line.volte.status().await.registered;
         line.volte_live
             .operator_link()
-            .set_ready(line_enabled && voice_enabled && registered);
+            .set_ready(line_enabled && registered);
         line.voice_access.set_backend_video_enabled(
             AccessPathKind::Volte,
-            line_enabled && voice_enabled && ims_video.volte_enabled,
+            line_enabled && ims_video.volte_enabled,
         );
         let vowifi = app.config_manager.get_line_profile(&line_id).vowifi;
         line.voice_access.set_backend_video_enabled(
@@ -7762,10 +7764,16 @@ async fn sync_line_video_capabilities(app: &AppState) {
     }
 }
 
-/// VoLTE voice (gateway-mode) status. Voice is a forward-looking extension: the
-/// target device relays RTP between the operator IMS leg and an internal SIP UA;
-/// it never plays audio locally. `enabled` reflects this line's IMS connection
-/// and voice switches; `gateway_mode` is always true on this hardware class.
+/// VoLTE voice (gateway-mode) status. The target device relays RTP between the
+/// operator IMS leg and an internal SIP UA; it never plays audio locally.
+///
+/// MMTEL voice is the reason this project registers IMS at all, so there is no
+/// separate voice switch to report: `enabled` follows the line's IMS connection.
+/// `voice_enabled` is retained as a response field for API compatibility and is
+/// now a mirror of `ims_connection_enabled`. A carrier that does not permit
+/// voice answers the REGISTER or the INVITE with a SIP error, which the runtime
+/// surfaces instead of pre-emptively refusing locally. `gateway_mode` is always
+/// true on this hardware class.
 #[derive(Debug, serde::Serialize, Default)]
 pub struct VolteVoiceStatusResponse {
     pub line_id: String,
@@ -7778,12 +7786,12 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(line_id: String, line_enabled: bool, voice_enabled: bool, registered: bool) -> Self {
+    fn build(line_id: String, line_enabled: bool, registered: bool) -> Self {
         Self {
             line_id,
-            enabled: line_enabled && voice_enabled,
+            enabled: line_enabled,
             ims_connection_enabled: line_enabled,
-            voice_enabled,
+            voice_enabled: line_enabled,
             registered,
             // Qualcomm 410 pocket-WiFi has no mic/speaker/PCM: relay only.
             gateway_mode: true,
@@ -7798,12 +7806,7 @@ async fn current_volte_voice_status(
 ) -> VolteVoiceStatusResponse {
     let line_id = line.binding().line_id;
     let registered = line.volte.status().await.registered;
-    VolteVoiceStatusResponse::build(
-        line_id.clone(),
-        line_volte_enabled(app, line),
-        app.config_manager.get_line_volte_voice_enabled(&line_id),
-        registered,
-    )
+    VolteVoiceStatusResponse::build(line_id, line_volte_enabled(app, line), registered)
 }
 
 pub async fn get_volte_call_status_handler(
@@ -7823,40 +7826,6 @@ pub async fn get_volte_call_status_handler(
             current_volte_voice_status(&app, &line).await,
         )),
     )
-}
-
-pub async fn set_volte_voice_handler(
-    State(app): State<AppState>,
-    Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteVoiceStatusResponse>>) {
-    let Some(line) = resolve_control_line(&app, &line_id).await else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("line_not_found")),
-        );
-    };
-    match app
-        .config_manager
-        .set_line_volte_voice_enabled(&line_id, payload.enabled)
-    {
-        Ok(_) => {
-            sync_line_video_capabilities(&app).await;
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    current_volte_voice_status(&app, &line).await,
-                )),
-            )
-        }
-        Err(err) => (
-            StatusCode::OK,
-            Json(ApiResponse::<VolteVoiceStatusResponse>::error(format!(
-                "Failed: {err}"
-            ))),
-        ),
-    }
 }
 
 // ============ SMS multi-path orchestration policy (phase C) ============
@@ -7939,8 +7908,7 @@ impl VilteStatusResponse {
     async fn build(app: &AppState, line: &crate::services::line_registry::LineRuntime) -> Self {
         let line_id = line.binding().line_id;
         let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
-        let voice_ready = line_volte_enabled(app, line)
-            && app.config_manager.get_line_volte_voice_enabled(&line_id);
+        let voice_ready = line_volte_enabled(app, line);
         Self {
             line_id,
             enabled: voice_ready && ims_video.volte_enabled,
@@ -8517,12 +8485,9 @@ async fn start_line_volte_restore(
             .attempts
             .clamp(1, 5),
     );
-    let voice_enabled = app.config_manager.get_line_volte_voice_enabled(&line_id);
     let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
-    line.voice_access.set_backend_video_enabled(
-        AccessPathKind::Volte,
-        voice_enabled && ims_video.volte_enabled,
-    );
+    line.voice_access
+        .set_backend_video_enabled(AccessPathKind::Volte, ims_video.volte_enabled);
     line.volte
         .update(|state| {
             state.recovery_state =
@@ -8724,8 +8689,6 @@ async fn run_line_volte_restore_batch(
                             &line.volte_live,
                             &device,
                             &line.volte,
-                            app.config_manager
-                                .get_line_volte_voice_enabled(&binding.line_id),
                             &ip_families,
                             app.config_manager
                                 .get_line_volte_ip_families_auto(&binding.line_id),
@@ -12057,11 +12020,9 @@ mod tests {
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             true,
-            true,
         );
         let disabled = VolteVoiceStatusResponse::build(
             "line-fedcba9876543210fedcba9876543210".to_string(),
-            true,
             false,
             false,
         );
@@ -12069,10 +12030,29 @@ mod tests {
         assert!(enabled.enabled);
         assert!(enabled.registered);
         assert!(!disabled.enabled);
-        assert!(disabled.ims_connection_enabled);
-        assert!(!disabled.voice_enabled);
+        assert!(!disabled.ims_connection_enabled);
         assert!(!disabled.registered);
         assert_ne!(enabled.line_id, disabled.line_id);
+    }
+
+    #[test]
+    fn volte_voice_is_available_whenever_the_ims_connection_is() {
+        // Voice used to need its own switch on top of the IMS connection, so a
+        // connected line could still report voice unavailable and refuse calls
+        // locally. MMTEL voice is the reason this project registers IMS, so the
+        // only local precondition is the connection itself; a carrier that
+        // withholds voice says so with a SIP error.
+        let connected = VolteVoiceStatusResponse::build(
+            "line-0123456789abcdef0123456789abcdef".to_string(),
+            true,
+            false,
+        );
+
+        assert!(connected.enabled);
+        assert!(connected.voice_enabled);
+        assert!(connected.ims_connection_enabled);
+        assert!(connected.gateway_mode);
+        assert!(!connected.local_audio_capable);
     }
 
     #[test]

@@ -1709,10 +1709,6 @@ async fn main() -> Result<()> {
             get(get_volte_call_status_handler).options(options_handler),
         )
         .route(
-            "/api/modem/lines/{line_id}/volte/voice",
-            post(set_volte_voice_handler).options(options_handler),
-        )
-        .route(
             "/api/modem/lines/{line_id}/voice/path-policy",
             get(get_voice_path_policy_handler)
                 .post(set_voice_path_policy_handler)

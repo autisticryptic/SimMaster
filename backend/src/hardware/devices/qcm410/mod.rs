@@ -5,6 +5,7 @@
 //! ModemManager's hands (udev `ID_MM_PORT_IGNORE`), and running a retained WDS
 //! session for user data so the IMS bearer never shares a slot with it.
 
+pub mod baseband_faults;
 pub mod ims_bearer;
 pub mod secondary_qmi;
 pub mod secondary_qmi_data;

@@ -5,6 +5,7 @@
 //! those traits and registers here; dispatch picks the right driver at runtime
 //! (sysfs detection, overridable by configuration).
 
+pub mod baseband_faults;
 pub mod pcsc;
 pub mod qcm410;
 pub mod quectel;

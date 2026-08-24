@@ -18,7 +18,7 @@ use crate::{
     connectivity::core::{
         access::ImsChannel,
         context::{ImsRoute, SipTransport},
-        ims_failure::ImsFailureDiagnostic,
+        ims_failure::{ImsFailureDiagnostic, ImsServiceState, ImsServiceVerdict},
         ims_video::{negotiate_video, parse_video_sdp, VideoMediaDescription},
         media::{
             ActiveRtpRelay, MediaRelayMetrics, MediaRelayPolicy, OperatorSocketCreator,
@@ -1194,7 +1194,6 @@ pub async fn connect_live_for_line(
     live: &VolteLiveHandle,
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
-    voice_enabled: bool,
     line_ip_families: &[VolteIpFamily],
     line_ip_families_auto: bool,
     allow_roaming: bool,
@@ -1254,7 +1253,10 @@ pub async fn connect_live_for_line(
             let pcscf = session.pcscf.to_string();
             let data_path_mode = session.data_slot_mode.as_str().to_string();
             *live.session.lock().await = Some(session);
-            live.operator.set_ready(voice_enabled);
+            // A registered IMS session IS the voice capability: MMTEL is what the
+            // registration was for. There is no local switch left to consult --
+            // a carrier that refuses voice says so with a SIP status.
+            live.operator.set_ready(true);
             runtime
                 .update(|state| {
                     state.phase = VoltePhase::Registered;
@@ -2193,6 +2195,31 @@ async fn connect_family(
                     last_error = Some(error);
                     continue;
                 }
+                // Record the service verdict only where registration actually
+                // gives up. Doing it per attempt would leave a stale denial
+                // behind whenever a later variant succeeds -- this device is
+                // answered 421 on its first variant and registers on the next.
+                if let Some(response) = failure.response.as_deref() {
+                    let verdict = ImsServiceVerdict::from_register_failure(response);
+                    if verdict.voice != ImsServiceState::Unknown {
+                        tracing::warn!(
+                            register_variant = variant.label,
+                            voice_service = verdict.voice.as_str(),
+                            voice_service_code = verdict.code,
+                            carrier_reason = ?verdict.carrier_reason,
+                            alternative_service = ?verdict.alternative_service,
+                            "VoLTE IMS registration refused MMTEL voice service"
+                        );
+                    }
+                    runtime
+                        .update(|state| {
+                            state.voice_service = verdict.voice.as_str();
+                            state.voice_service_code = verdict.code;
+                            state.voice_service_reason = verdict.carrier_reason;
+                            state.voice_alternative_service = verdict.alternative_service;
+                        })
+                        .await;
+                }
                 return Err(error);
             }
         };
@@ -2219,10 +2246,17 @@ async fn connect_family(
             // MSISDN-associated IMPU.
             registered_identity.public_uri = uri.to_string();
         }
+        // There is no local voice switch left to consult: the UE always
+        // advertises the MMTEL feature tags, so the network's answer is the only
+        // authority on whether calls will work. Classify it here and publish the
+        // verdict, so a refusal is a reported fact rather than an inference.
+        let verdict = ImsServiceVerdict::from_register_success(&registration.response);
         tracing::info!(
             register_variant = variant.label,
             service_route_present = registered.service_route.is_some(),
             associated_uri_present = associated_uri.is_some(),
+            voice_service = verdict.voice.as_str(),
+            voice_service_code = verdict.code,
             "VoLTE IMS registration routing identities captured"
         );
         // Publish the registered identities. The registrar's P-Associated-URI
@@ -2235,6 +2269,10 @@ async fn connect_family(
             .update(|state| {
                 state.public_uri = Some(published_public_uri);
                 state.associated_uris = published_associated_uris;
+                state.voice_service = verdict.voice.as_str();
+                state.voice_service_code = verdict.code;
+                state.voice_service_reason = verdict.carrier_reason.clone();
+                state.voice_alternative_service = verdict.alternative_service.clone();
             })
             .await;
         if authenticator.mode == RegistrationMode::Udp {

@@ -1821,7 +1821,6 @@ mod tests {
         let line_id = "line-0123456789abcdef0123456789abcdef";
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line(line_id);
-        profile.volte_voice_enabled = false;
         profile.ims_video.video_payload_type = 111;
         config.line_profiles.push(profile);
         std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
@@ -1831,15 +1830,10 @@ mod tests {
             .reconcile_line_profiles(&[line_id.to_string()])
             .unwrap());
         let profile = manager.get_line_profile(line_id);
-        assert!(!profile.volte_voice_enabled);
         assert_eq!(profile.ims_video.video_payload_type, 111);
 
         let persisted: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted["line_profiles"][0]["volte_voice_enabled"],
-            serde_json::Value::Bool(false)
-        );
         assert_eq!(
             persisted["line_profiles"][0]["ims_video"]["video_payload_type"],
             serde_json::Value::from(111)
@@ -2639,14 +2633,12 @@ mod tests {
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
 
-        manager.set_line_volte_voice_enabled(line_a, false).unwrap();
+        // IMS video follows the access leg's connection: there is no separate
+        // voice or video switch to set. Connecting VoLTE on line_b is therefore
+        // the whole action, and line_a stays off because it is not connected.
         manager
             .set_line_volte_connection_enabled(line_b, true)
             .unwrap();
-        assert!(!manager.get_line_ims_video_config(line_b).volte_enabled);
-        manager.set_line_volte_voice_enabled(line_b, true).unwrap();
-        assert!(!manager.get_line_volte_voice_enabled(line_a));
-        assert!(manager.get_line_volte_voice_enabled(line_b));
         assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
         assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
 
@@ -2737,7 +2729,6 @@ mod tests {
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line(line_id);
         profile.volte_connection_enabled = true;
-        profile.volte_voice_enabled = true;
         profile.vowifi.enabled = true;
         assert!(!profile.ims_video.volte_enabled);
         assert!(!profile.ims_video.vowifi_enabled);
@@ -3547,10 +3538,6 @@ impl Default for EsimReaderConfig {
     }
 }
 
-fn default_volte_voice_enabled() -> bool {
-    false
-}
-
 fn default_volte_auto_restore_initial_delay_secs() -> u64 {
     60
 }
@@ -3901,8 +3888,6 @@ pub struct LineProfileConfig {
     pub volte_connection_enabled: bool,
     #[serde(default)]
     pub volte_auto_restore: AutoRestoreConfig,
-    #[serde(default = "default_volte_voice_enabled")]
-    pub volte_voice_enabled: bool,
     #[serde(default, alias = "vilte")]
     pub ims_video: ImsVideoConfig,
     #[serde(default)]
@@ -4037,8 +4022,16 @@ fn default_line_enabled() -> bool {
 }
 
 impl LineProfileConfig {
+    /// Mirror each access leg's presence onto its IMS video state.
+    ///
+    /// These are status mirrors, not feature switches. IMS voice and video are
+    /// the reason this project implements user-space IMS registration, so there
+    /// is no separate "voice enabled" or "video enabled" opinion to consult: a
+    /// leg that is connected offers MMTEL voice and video, and a carrier that
+    /// does not permit them answers with a SIP error (488 on the media, 403/420
+    /// or 380 on the registration) which the runtime surfaces as-is.
     fn sync_ims_video_access_gates(&mut self) {
-        self.ims_video.volte_enabled = self.volte_connection_enabled && self.volte_voice_enabled;
+        self.ims_video.volte_enabled = self.volte_connection_enabled;
         self.ims_video.vowifi_enabled = self.vowifi.enabled;
     }
 
@@ -4048,7 +4041,6 @@ impl LineProfileConfig {
             enabled: true,
             volte_connection_enabled: false,
             volte_auto_restore: AutoRestoreConfig::default(),
-            volte_voice_enabled: default_volte_voice_enabled(),
             ims_video: ImsVideoConfig::default(),
             volte_ip_families: default_line_volte_ip_families(),
             volte_ip_families_auto: default_line_volte_ip_families_auto(),
@@ -6034,21 +6026,14 @@ impl ConfigManager {
         )
     }
 
+    /// Whether the VoLTE voice leg is available for one line.
+    ///
+    /// MMTEL voice is the purpose of registering IMS at all, so this follows the
+    /// line's VoLTE connection rather than a separate switch. A carrier that
+    /// does not permit voice answers the REGISTER or the INVITE with a SIP
+    /// error, which the runtime reports instead of pre-emptively refusing.
     pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
-        self.get_line_profile(line_id).volte_voice_enabled
-    }
-
-    /// Toggle VoLTE voice handling for exactly one registered IMS line. IMS
-    /// video follows the connection and voice gates automatically.
-    pub fn set_line_volte_voice_enabled(
-        &self,
-        line_id: &str,
-        enabled: bool,
-    ) -> Result<LineProfileConfig, String> {
-        self.update_line_profile(line_id, |profile| {
-            profile.volte_voice_enabled = enabled;
-            profile.sync_ims_video_access_gates();
-        })
+        self.get_line_profile(line_id).volte_connection_enabled
     }
 
     /// SMS path policy for one line.

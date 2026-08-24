@@ -654,7 +654,6 @@ export interface LineProfileConfig {
   enabled: boolean
   volte_connection_enabled: boolean
   volte_auto_restore: AutoRestoreConfig
-  volte_voice_enabled: boolean
   vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig

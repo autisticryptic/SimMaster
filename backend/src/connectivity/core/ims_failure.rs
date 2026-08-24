@@ -80,6 +80,203 @@ impl ImsFailureDiagnostic {
     }
 }
 
+/// What the network said about our right to use MMTEL voice/video on this
+/// registration.
+///
+/// SimAdmin does not keep local "voice enabled" switches: MMTEL is the reason
+/// the project registers IMS at all, so the UE always advertises the voice
+/// feature tags and lets the network decide. That only works if a refusal is
+/// actually recognised, which is what this type is for.
+///
+/// The signals, in the order the 3GPP specs make them authoritative:
+///
+/// * A `200 OK` to REGISTER carries `P-Associated-URI` (TS 24.229 §5.1.1.2).
+///   A voice-capable subscription is given a `tel:` URI or a `sip:` URI with
+///   `user=phone` — that is the E.164 identity terminating calls are addressed
+///   to. A registration that comes back with only a SIP-URI identity (no
+///   telephone identity at all) is registered for messaging, not for calls.
+/// * `Service-Route` must be present, or originating requests cannot be routed
+///   through the S-CSCF that would select the MMTEL AS.
+/// * A refusal arrives as a final status: `403` (not authorised / not
+///   provisioned), `420`/`421` (a required extension we did not offer), `380`
+///   (Alternative Service — how IMS says "use CS instead", TS 24.229
+///   §5.1.2A.1.1), or `503` with a policy `Warning`.
+///
+/// `Unknown` is deliberately distinct from `Denied`: never report a refusal we
+/// did not actually observe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ImsServiceVerdict {
+    /// Whether the network accepted this registration for MMTEL voice.
+    pub voice: ImsServiceState,
+    /// Stable machine code describing how the verdict was reached.
+    pub code: &'static str,
+    /// Whether retrying the same registration could plausibly change this.
+    pub retryable: bool,
+    /// Carrier-supplied explanatory text, bounded and control-stripped.
+    pub carrier_reason: Option<String>,
+    /// Set when the network told us to fall back to another access (380).
+    pub alternative_service: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImsServiceState {
+    /// The network accepted the registration and gave us a telephone identity.
+    Available,
+    /// The network accepted the registration but published no telephone
+    /// identity, so terminating calls have no address to reach.
+    WithoutTelephoneIdentity,
+    /// The network refused: not provisioned, barred, or redirected to CS.
+    Denied,
+    /// Nothing observed yet, or the response did not speak to voice at all.
+    Unknown,
+}
+
+impl ImsServiceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::WithoutTelephoneIdentity => "without_telephone_identity",
+            Self::Denied => "denied",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether a call may be attempted. Only an observed denial blocks it:
+    /// `Unknown` must not become a local gate by the back door.
+    pub fn permits_calls(self) -> bool {
+        !matches!(self, Self::Denied)
+    }
+}
+
+impl ImsServiceVerdict {
+    pub const fn unknown() -> Self {
+        Self {
+            voice: ImsServiceState::Unknown,
+            code: "ims_voice_service_unknown",
+            retryable: true,
+            carrier_reason: None,
+            alternative_service: None,
+        }
+    }
+
+    /// Classify a successful REGISTER (`200 OK`) for voice capability.
+    pub fn from_register_success(frame: &[u8]) -> Self {
+        let associated = sip_frame::header_values(frame, "P-Associated-URI");
+        let has_service_route = !sip_frame::header_values(frame, "Service-Route").is_empty();
+        let has_telephone_identity = associated
+            .iter()
+            .flat_map(|value| split_quoted(value, ','))
+            .any(uri_is_telephone_identity);
+
+        if has_telephone_identity && has_service_route {
+            return Self {
+                voice: ImsServiceState::Available,
+                code: "ims_voice_service_available",
+                retryable: false,
+                carrier_reason: None,
+                alternative_service: None,
+            };
+        }
+        if has_telephone_identity {
+            // A telephone identity with no Service-Route cannot originate
+            // through the S-CSCF, so treat it as not yet usable rather than
+            // available.
+            return Self {
+                voice: ImsServiceState::Unknown,
+                code: "ims_voice_service_route_missing",
+                retryable: true,
+                carrier_reason: None,
+                alternative_service: None,
+            };
+        }
+        Self {
+            voice: ImsServiceState::WithoutTelephoneIdentity,
+            code: "ims_voice_no_telephone_identity",
+            retryable: false,
+            carrier_reason: None,
+            alternative_service: None,
+        }
+    }
+
+    /// Classify a REGISTER failure. Only refusals that genuinely speak to
+    /// service entitlement produce `Denied`; a transport or authentication
+    /// problem leaves the verdict `Unknown` so it is retried, not reported as
+    /// a carrier refusal.
+    pub fn from_register_failure(frame: &[u8]) -> Self {
+        let Ok(status) = sip_frame::parse_status(frame) else {
+            return Self::unknown();
+        };
+        let carrier_reason = parse_warning_text(frame).or_else(|| parse_reason_text(frame));
+        let alternative_service = (status == 380)
+            .then(|| sip_frame::header_value(frame, "Contact"))
+            .flatten()
+            .and_then(|value| sanitize_carrier_reason(&value));
+
+        // A policy Warning is authoritative regardless of the status it rides
+        // on: carriers attach "not provisioned" to 403, 503 and 480 alike.
+        let policy_denial = carrier_reason
+            .as_deref()
+            .and_then(classify_carrier_warning)
+            .is_some_and(|rule| rule.category == "carrier_policy");
+
+        let (voice, code, retryable) = match status {
+            380 => (
+                ImsServiceState::Denied,
+                "ims_voice_alternative_service",
+                false,
+            ),
+            403 => (ImsServiceState::Denied, "ims_voice_forbidden", false),
+            // 420/421 are SIP extension negotiation, NOT an entitlement answer.
+            // Observed on live Maxis: the first REGISTER variant is answered 421
+            // and the next variant (offering sec-agree) registers successfully.
+            // Classifying that as a denial would report voice unavailable on
+            // every session that in fact ends up registered for voice.
+            420 | 421 => (
+                ImsServiceState::Unknown,
+                "ims_voice_extension_negotiation",
+                true,
+            ),
+            _ if policy_denial => (
+                ImsServiceState::Denied,
+                "ims_voice_carrier_policy_denied",
+                false,
+            ),
+            // 401/407 are the ordinary AKA challenge; 5xx and timeouts are
+            // transport. Neither says anything about entitlement.
+            _ => (
+                ImsServiceState::Unknown,
+                "ims_voice_service_unknown",
+                !matches!(status, 400..=499),
+            ),
+        };
+
+        Self {
+            voice,
+            code,
+            retryable,
+            carrier_reason,
+            alternative_service,
+        }
+    }
+}
+
+/// Whether an associated URI is an E.164 telephone identity: a `tel:` URI, or
+/// a `sip:` URI carrying `user=phone` (TS 24.229 / RFC 3261 §19.1.1).
+fn uri_is_telephone_identity(value: &str) -> bool {
+    let value = value.trim().trim_start_matches('<').trim_end_matches('>');
+    let lower = value.to_ascii_lowercase();
+    lower.starts_with("tel:")
+        || (lower.starts_with("sip:") || lower.starts_with("sips:"))
+            && lower.split(';').skip(1).any(|parameter| {
+                parameter
+                    .split_once('=')
+                    .is_some_and(|(name, value)| {
+                        name.trim() == "user" && value.trim() == "phone"
+                    })
+            })
+}
+
 fn rule(code: &'static str, category: &'static str, retryable: bool) -> FailureRule {
     FailureRule {
         code,
@@ -353,5 +550,103 @@ mod tests {
         let diagnostic = ImsFailureDiagnostic::from_response(response).unwrap();
         assert_eq!(diagnostic.q850_cause, Some(41));
         assert_eq!(diagnostic.code, "temporary_failure");
+    }
+
+    #[test]
+    fn register_success_with_telephone_identity_permits_voice() {
+        // The device's real answer: a tel: URI plus a sip: URI with user=phone,
+        // and a Service-Route. This is what "provisioned for MMTEL" looks like.
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+60174231067@ims.mnc012.mcc502.3gppnetwork.org>, <tel:+60174231067>\r\nService-Route: <sip:orig@scscf.example:5060;lr>\r\nContent-Length: 0\r\n\r\n";
+        let verdict = ImsServiceVerdict::from_register_success(response);
+
+        assert_eq!(verdict.voice, ImsServiceState::Available);
+        assert_eq!(verdict.code, "ims_voice_service_available");
+        assert!(verdict.voice.permits_calls());
+    }
+
+    #[test]
+    fn register_success_without_telephone_identity_has_no_call_address() {
+        // Registered, but only a SIP-URI identity: messaging works, terminating
+        // calls have no E.164 address to reach. Reported, not guessed at.
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:460001234567890@ims.example>\r\nService-Route: <sip:orig@scscf.example:5060;lr>\r\n\r\n";
+        let verdict = ImsServiceVerdict::from_register_success(response);
+
+        assert_eq!(verdict.voice, ImsServiceState::WithoutTelephoneIdentity);
+        assert_eq!(verdict.code, "ims_voice_no_telephone_identity");
+    }
+
+    #[test]
+    fn user_phone_parameter_counts_as_a_telephone_identity() {
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+8613800138000@ims.example;user=phone>\r\nService-Route: <sip:orig@scscf.example;lr>\r\n\r\n";
+        assert_eq!(
+            ImsServiceVerdict::from_register_success(response).voice,
+            ImsServiceState::Available
+        );
+    }
+
+    #[test]
+    fn register_403_is_an_observed_voice_denial() {
+        // With the local switches gone, a carrier that does not provision MMTEL
+        // must be recognised from its own answer.
+        let verdict =
+            ImsServiceVerdict::from_register_failure(b"SIP/2.0 403 Forbidden\r\n\r\n");
+
+        assert_eq!(verdict.voice, ImsServiceState::Denied);
+        assert_eq!(verdict.code, "ims_voice_forbidden");
+        assert!(!verdict.retryable);
+        assert!(!verdict.voice.permits_calls());
+    }
+
+    #[test]
+    fn alternative_service_redirect_is_a_denial_that_names_the_target() {
+        let verdict = ImsServiceVerdict::from_register_failure(
+            b"SIP/2.0 380 Alternative Service\r\nContact: <sip:cs@carrier.example>\r\n\r\n",
+        );
+
+        assert_eq!(verdict.voice, ImsServiceState::Denied);
+        assert_eq!(verdict.code, "ims_voice_alternative_service");
+        assert_eq!(
+            verdict.alternative_service.as_deref(),
+            Some("<sip:cs@carrier.example>")
+        );
+    }
+
+    #[test]
+    fn policy_warning_denies_voice_whatever_status_it_rides_on() {
+        let verdict = ImsServiceVerdict::from_register_failure(
+            b"SIP/2.0 503 Service Unavailable\r\nWarning: 399 pcscf \"IMS voice not provisioned\"\r\n\r\n",
+        );
+
+        assert_eq!(verdict.voice, ImsServiceState::Denied);
+        assert_eq!(verdict.code, "ims_voice_carrier_policy_denied");
+        assert_eq!(
+            verdict.carrier_reason.as_deref(),
+            Some("IMS voice not provisioned")
+        );
+    }
+
+    #[test]
+    fn negotiation_and_transport_failures_never_deny_voice() {
+        // 421 is answered to this device's first REGISTER variant on live Maxis
+        // and the next variant registers fine; 401/407 are the AKA challenge;
+        // 5xx is transport. None of these is an entitlement answer, so none may
+        // become a local gate by the back door.
+        for status in [401u16, 407, 420, 421, 494, 500, 503] {
+            let frame = format!("SIP/2.0 {status} Something\r\n\r\n");
+            let verdict = ImsServiceVerdict::from_register_failure(frame.as_bytes());
+            assert_ne!(
+                verdict.voice,
+                ImsServiceState::Denied,
+                "{status} must not be reported as a voice denial"
+            );
+            assert!(verdict.voice.permits_calls());
+        }
+    }
+
+    #[test]
+    fn unknown_state_permits_calls_so_it_cannot_act_as_a_gate() {
+        let verdict = ImsServiceVerdict::unknown();
+        assert_eq!(verdict.voice, ImsServiceState::Unknown);
+        assert!(verdict.voice.permits_calls());
     }
 }

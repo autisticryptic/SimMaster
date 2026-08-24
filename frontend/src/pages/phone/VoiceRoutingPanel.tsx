@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert, Box, Button, Card, CardContent, CircularProgress, FormControl,
-  FormControlLabel, IconButton, InputLabel, List, ListItem, ListItemText,
+  IconButton, InputLabel, List, ListItem, ListItemText,
   MenuItem, Select, Stack, Switch, TextField, Tooltip, Typography,
 } from '@mui/material'
 import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
@@ -129,27 +129,6 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     }
   }
 
-  const toggleVolteVoice = async (enabled: boolean) => {
-    setSaving(true)
-    setError(null)
-    try {
-      const response = await api.setVolteVoice(lineId, enabled)
-      if (activeLineId.current !== lineId) return
-      if (response.data?.line_id !== lineId) throw new Error('VoLTE 语音响应线路不匹配')
-      setVolteVoice(response.data)
-      if (!enabled) {
-        const refreshed = await api.getVilteStatus(lineId)
-        if (activeLineId.current !== lineId) return
-        if (refreshed.data?.line_id !== lineId) throw new Error('ViLTE 状态响应线路不匹配')
-        setVilte(refreshed.data)
-      }
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setSaving(false)
-    }
-  }
-
   if (!lineId) return <Alert severity="info">请选择电话线路后查看语音路由。</Alert>
   if (loading || !voicePath) return <Box display="flex" justifyContent="center" py={6}><CircularProgress /></Box>
 
@@ -187,12 +166,11 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
         <Typography variant="h6">IMS 视频能力</Typography>
         <Alert severity="info" sx={{ my: 2 }}>视频中继自动跟随当前线路的 VoLTE 语音和 VoWiFi 连接，不需要单独开关。这里仅配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。</Alert>
         {vilte && <Stack spacing={2}>
-          <FormControlLabel
-            control={<Switch checked={volteVoice?.voice_enabled ?? false} disabled={!volteVoice?.ims_connection_enabled || saving} onChange={(_, enabled) => void toggleVolteVoice(enabled)} />}
-            label={volteVoice?.ims_connection_enabled ? '当前线路 VoLTE 语音网关能力' : '请先启用当前线路的 VoLTE IMS 连接'}
-          />
           <Typography variant="body2" color="text.secondary">
-            VoLTE 视频：{vilte.config.volte_enabled ? '已随语音启用' : '等待 VoLTE 连接与语音启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
+            VoLTE 语音：{volteVoice?.ims_connection_enabled ? '随 IMS 连接自动可用' : '请先启用当前线路的 VoLTE IMS 连接'}
+          </Typography>
+          <Typography variant="body2" color="text.secondary">
+            VoLTE 视频：{vilte.config.volte_enabled ? '已随连接启用' : '等待 VoLTE 连接启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
           </Typography>
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: '1fr 1fr' }} gap={2}>
             <FormControl fullWidth>

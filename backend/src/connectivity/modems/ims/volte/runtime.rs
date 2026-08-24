@@ -19,6 +19,8 @@ use std::sync::{
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
+use crate::connectivity::core::ims_failure::ImsServiceState;
+
 /// Connection sub-stage. String values MUST match `volteStatus.js` `b()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VolteStage {
@@ -226,6 +228,20 @@ pub struct VolteSnapshot {
     /// SIM reports nothing (`AT+CNUM` empty, ModemManager's `own-numbers` unset)
     /// and USSD needs a network that a data-only bearer does not provide.
     pub associated_uris: Vec<String>,
+    /// What the network said about our right to use MMTEL voice on this
+    /// registration.
+    ///
+    /// There is no local voice switch to consult: the UE always advertises the
+    /// MMTEL feature tags and the network decides. This is where that decision
+    /// is recorded, so a carrier refusal is reported as an observed fact rather
+    /// than inferred. `voice_service` starts `unknown` and only an actual
+    /// refusal makes it `denied`.
+    pub voice_service: &'static str,
+    pub voice_service_code: &'static str,
+    pub voice_service_reason: Option<String>,
+    /// Set when the network answered 380 Alternative Service, naming the access
+    /// it wants used instead.
+    pub voice_alternative_service: Option<String>,
     pub profile_id: Option<String>,
     pub profile_source: Option<String>,
     pub profile_fallback_reason: Option<String>,
@@ -273,6 +289,10 @@ impl Default for VolteSnapshot {
             identity_source: None,
             public_uri: None,
             associated_uris: Vec::new(),
+            voice_service: ImsServiceState::Unknown.as_str(),
+            voice_service_code: "ims_voice_service_unknown",
+            voice_service_reason: None,
+            voice_alternative_service: None,
             profile_id: None,
             profile_source: None,
             profile_fallback_reason: None,
@@ -377,6 +397,16 @@ pub struct VolteRuntimeStatus {
     /// entry here is the only observable source of the line's own number.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub associated_uris: Vec<String>,
+    /// MMTEL voice entitlement as reported by the network: `available`,
+    /// `without_telephone_identity`, `denied` or `unknown`. Replaces the removed
+    /// local voice switches — a client that wants to know whether calls will
+    /// work reads this, not a configuration flag.
+    pub voice_service: String,
+    pub voice_service_code: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_service_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice_alternative_service: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -429,6 +459,10 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             identity_source: s.identity_source.clone(),
             public_uri: s.public_uri.clone(),
             associated_uris: s.associated_uris.clone(),
+            voice_service: s.voice_service.to_string(),
+            voice_service_code: s.voice_service_code.to_string(),
+            voice_service_reason: s.voice_service_reason.clone(),
+            voice_alternative_service: s.voice_alternative_service.clone(),
             profile_id: s.profile_id.clone(),
             profile_source: s.profile_source.clone(),
             profile_fallback_reason: s.profile_fallback_reason.clone(),
