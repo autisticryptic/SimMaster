@@ -396,6 +396,45 @@ impl Default for PreparedUePublication {
     }
 }
 
+/// Why a UE egress reconcile did not finish, and whether that justifies
+/// dismantling the line's isolation.
+///
+/// The distinction is not cosmetic. The failure path tears down the DATA6
+/// bearer, stops the worker and removes the namespace, and a refresh runs every
+/// ten seconds. Treating a worker that simply has not finished its handshake as
+/// a terminal failure therefore builds a self-sustaining loop: teardown, the
+/// data watchdog rebuilds the bearer, the next refresh spawns a worker and
+/// times out on it again. Each turn of that loop issues another QMI
+/// stop/start pair at the baseband, and the firmware does not survive being
+/// driven that way -- it dies in `dhcp_client_mgr.c`. A worker that is still
+/// starting is expected, costs nothing to wait for, and must leave a healthy
+/// bearer alone.
+enum EgressError {
+    /// The worker is absent or has not signalled ready yet. The next refresh
+    /// finds it running; nothing is torn down.
+    WorkerNotReady(String),
+    /// The veth pair could not be created, or the worker rejected the
+    /// configuration. The namespace cannot carry traffic, so the line has to
+    /// fall back to the host path.
+    Terminal(String),
+}
+
+impl EgressError {
+    fn is_transient(&self) -> bool {
+        matches!(self, Self::WorkerNotReady(_))
+    }
+}
+
+impl std::fmt::Display for EgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkerNotReady(message) | Self::Terminal(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
@@ -936,6 +975,10 @@ impl LineRuntimeRegistry {
         }
         let ue_ready = ue.isolation_enabled && ue.netns_ready;
         let worker = line.ue_worker.clone();
+        // A worker spawned in this pass has not completed its handshake yet.
+        // Reconciling its egress in the same pass would only wait out the ready
+        // timeout, and the timeout is what used to dismantle the line.
+        let mut worker_spawned_this_pass = false;
         if ue_ready && !worker.is_running().await {
             // Clear the egress fingerprint so the freshly spawned worker
             // receives its initial net-config even if the plan is unchanged.
@@ -943,12 +986,15 @@ impl LineRuntimeRegistry {
                 let mut fp = line.egress_fingerprint.lock().await;
                 *fp = None;
             }
-            if let Err(error) = worker.spawn().await {
-                tracing::warn!(
-                    line_id = %binding.line_id,
-                    error = %error,
-                    "Failed to start per-UE worker inside its namespace"
-                );
+            match worker.spawn().await {
+                Ok(()) => worker_spawned_this_pass = true,
+                Err(error) => {
+                    tracing::warn!(
+                        line_id = %binding.line_id,
+                        error = %error,
+                        "Failed to start per-UE worker inside its namespace"
+                    );
+                }
             }
         } else if !ue_ready && worker.is_running().await {
             // Release the DATA6 bearer first so its in-namespace address and
@@ -1009,8 +1055,41 @@ impl LineRuntimeRegistry {
                 .await;
             }
         }
+        if ue_ready && worker_spawned_this_pass {
+            // Let the worker finish its handshake on its own time. Everything
+            // this pass built -- namespace, veth, a running child -- stays, and
+            // the next refresh reconciles the egress against a ready worker.
+            tracing::debug!(
+                line_id = %line_id,
+                "UE worker just spawned; deferring egress apply to the next refresh"
+            );
+            return PreparedUePublication {
+                ue: Some(ue),
+                ..PreparedUePublication::default()
+            };
+        }
         if ue_ready {
             if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
+                // A worker that has not finished its handshake yet is not a
+                // failure of this line's isolation, and the next refresh is ten
+                // seconds away. Returning without publishing the worker leaves
+                // the bearer, the namespace and the veth exactly as they are so
+                // that retry is free. Tearing them down instead would make this
+                // path self-sustaining: the data watchdog rebuilds DATA6, the
+                // following refresh spawns a worker and times out on it again,
+                // and every turn drives another QMI stop/start pair into a
+                // baseband whose firmware does not survive that treatment.
+                if error.is_transient() {
+                    tracing::debug!(
+                        line_id = %line_id,
+                        error = %error,
+                        "UE worker not ready for egress apply; retrying on the next refresh"
+                    );
+                    return PreparedUePublication {
+                        ue: Some(ue),
+                        ..PreparedUePublication::default()
+                    };
+                }
                 // Egress preparation may have created a new worker, veth,
                 // NAT rule or namespace before failing.  Falling back by
                 // merely publishing `None` would orphan those resources and
@@ -1164,7 +1243,11 @@ impl LineRuntimeRegistry {
     /// Prepare the UE-side egress and ask the worker to apply it inside the
     /// namespace. The parent only creates the veth pair and configures the
     /// host side; the worker owns the UE side (address/link/default route).
-    async fn reconcile_ue_egress(&self, line: &LineRuntime, ue: &UeContext) -> Result<(), String> {
+    async fn reconcile_ue_egress(
+        &self,
+        line: &LineRuntime,
+        ue: &UeContext,
+    ) -> Result<(), EgressError> {
         use std::time::Duration;
 
         let isolation = self
@@ -1181,7 +1264,7 @@ impl LineRuntimeRegistry {
             plan.mtu,
         )
         .await
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| EgressError::Terminal(error.to_string()))?;
 
         // Build a fingerprint from the plan + isolation settings so we can
         // skip the worker net-config batch when nothing has changed.
@@ -1196,25 +1279,32 @@ impl LineRuntimeRegistry {
         );
         let worker = line.ue_worker.clone();
         if !worker.is_running().await {
-            return Err("UE worker is not running; skipping egress apply".to_string());
+            return Err(EgressError::WorkerNotReady(
+                "UE worker is not running; skipping egress apply".to_string(),
+            ));
         }
         worker
             .wait_ready(Duration::from_secs(5))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| EgressError::WorkerNotReady(error.to_string()))?;
         let unchanged =
             line.egress_fingerprint.lock().await.as_deref() == Some(fingerprint.as_str());
         if unchanged {
             return Ok(());
         }
+        // A transport failure means the worker went away mid-batch, which the
+        // next refresh resolves by respawning it. Only an answer that actually
+        // rejected the configuration proves the namespace cannot carry traffic.
         let result = worker
             .apply_net_config(ue_netcfg::veth_ue_side_ops(&plan))
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| EgressError::WorkerNotReady(error.to_string()))?;
         if !result.ok {
-            return Err(result
-                .error
-                .unwrap_or_else(|| "net-config failed".to_string()));
+            return Err(EgressError::Terminal(
+                result
+                    .error
+                    .unwrap_or_else(|| "net-config failed".to_string()),
+            ));
         }
         // Persist the fingerprint so subsequent reconcile calls are no-ops.
         {
