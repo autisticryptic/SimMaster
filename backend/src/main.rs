@@ -1948,7 +1948,22 @@ async fn main() -> Result<()> {
     // DATA netdev from being left inside a UE namespace.
     release_data_sessions(&shutdown_registry).await;
 
-    Ok(())
+    // Exit explicitly rather than returning. Returning drops the tokio runtime,
+    // and that drop blocks until every `spawn_blocking` task has finished --
+    // but several of them never finish by design. `spawn_tun_reader` is the
+    // clearest: it re-checks its shutdown flag only at the top of its loop and
+    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
+    // flag is set it still waits for a packet that may never arrive.
+    //
+    // That drop, not the drain, is what held the process for the full 8s
+    // watchdog on the device: the drain finished in 8ms and the bearers were
+    // released 155ms in, after which the log went completely silent until the
+    // watchdog called `exit`. Everything that has to outlive the process has
+    // already happened by this point, so exiting here is deliberate rather
+    // than a shortcut -- and it demotes the watchdog to the backstop it was
+    // meant to be.
+    info!("Shutdown complete; exiting");
+    std::process::exit(0);
 }
 
 /// Deactivate every DATA bearer before the process exits.
