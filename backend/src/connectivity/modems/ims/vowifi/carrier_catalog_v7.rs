@@ -1245,7 +1245,9 @@ fn project_register(
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_visited_network_id"))
         .transpose()?;
     let contact_param_order = contact_parameters(config, meta, domain)?;
-    let include_mmtel_features = contact_param_order.iter().any(|parameter| {
+    // An explicit Contact parameter list is the strongest signal: if the bundle
+    // spells out `audio` or `+g.3gpp.icsi-ref`, honour exactly that.
+    let contact_declares_mmtel = contact_param_order.iter().any(|parameter| {
         matches!(
             parameter
                 .split_once('=')
@@ -1255,6 +1257,23 @@ fn project_register(
             "audio" | "+g.3gpp.icsi-ref"
         )
     });
+    // Most bundles (Maxis among them, and all 1444 rows currently shipped)
+    // carry no `sip.common.contact_parameters` at all. Deriving MMTEL purely
+    // from that absent list made every such profile register as non-voice: no
+    // `+g.3gpp.icsi-ref` reaches the S-CSCF, so it never selects the MMTEL AS
+    // for terminating requests and MT calls are simply never delivered --
+    // while REGISTER still answers 200 OK, which makes the fault look like a
+    // network problem rather than ours. A real UE advertises the voice feature
+    // tags on any voice-capable registration, and a core that does not offer
+    // MMTEL just ignores them, so the safe default when the bundle expresses
+    // no Contact opinion is to advertise -- only an explicit `services` flag
+    // turning the access off suppresses it.
+    let declares_voice_service = match access {
+        CatalogAccessKind::LteEpc => bool_at(config, "/services/volte").unwrap_or(true),
+        CatalogAccessKind::WifiEpdg => bool_at(config, "/services/vowifi").unwrap_or(true),
+    };
+    let include_mmtel_features =
+        contact_declares_mmtel || (contact_param_order.is_empty() && declares_voice_service);
     Ok(RegisterPolicyRecord {
         supported_header: supported.join(","),
         request_uri_policy: string_at(register, "/request_uri_policy")
@@ -1828,6 +1847,34 @@ mod tests {
         assert_eq!(lte.record.ims.domain, "ims.mnc033.mcc234.example");
         assert_eq!(lte.record.meta.aliases, ["Test", "Test Telecom"]);
 
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn voice_service_declaration_drives_mmtel_features_without_contact_parameters() {
+        let (catalog, path) = fixture();
+        // The fixture bundle declares services.volte/vowifi but carries no
+        // sip.common.contact_parameters -- the shape of essentially every real
+        // bundle. Deriving MMTEL from the absent parameter list alone left the
+        // REGISTER Contact without +g.3gpp.icsi-ref, so the S-CSCF never
+        // treated the registration as voice capable and MT calls were dropped
+        // while REGISTER still answered 200 OK.
+        for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
+            let resolved = catalog
+                .resolve_for_imsi("234330123456789", None, access)
+                .expect("query")
+                .expect("profile");
+            assert!(
+                resolved.record.ims.register.contact_param_order.is_empty(),
+                "fixture should carry no explicit Contact parameters for {}",
+                access.as_str()
+            );
+            assert!(
+                resolved.record.ims.register.include_mmtel_features,
+                "{} should advertise MMTEL from the service declaration",
+                access.as_str()
+            );
+        }
         std::fs::remove_file(path).expect("remove fixture");
     }
 

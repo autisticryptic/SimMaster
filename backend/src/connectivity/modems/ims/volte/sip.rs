@@ -479,10 +479,23 @@ fn build_register_internal(
         route.transport.as_param(),
     );
     let mut advertises_sms_over_ip = false;
-    if let Some(profile) =
-        profile.filter(|profile| !profile.ims.register.contact_param_order.is_empty())
-    {
-        for parameter in profile.ims.register.contact_param_order {
+    let mut declared_sip_instance = false;
+    let always_add_sip_instance =
+        profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance);
+    // A profile dictates the Contact parameter list only when it actually
+    // carries one. Catalog bundles that omit `sip.common.contact_parameters`
+    // -- and every hardcoded profile, which sets `contact_param_order: &[]`
+    // -- are expressing no opinion, not "advertise nothing". Treating the
+    // empty list as a third, silent case skipped both arms below and emitted
+    // a bare `<sip:user@host:port;transport=udp>;+g.3gpp.smsip`: without
+    // `+g.3gpp.icsi-ref` the S-CSCF has no reason to consider the
+    // registration MMTEL voice capable, so terminating calls are never
+    // delivered even though REGISTER answers 200 OK.
+    let explicit_parameters = profile
+        .map(|profile| profile.ims.register.contact_param_order)
+        .unwrap_or(&[]);
+    if !explicit_parameters.is_empty() {
+        for parameter in explicit_parameters {
             let name = parameter
                 .split_once('=')
                 .map_or(*parameter, |(name, _)| name)
@@ -493,10 +506,13 @@ fn build_register_internal(
             if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
                 advertises_sms_over_ip = true;
             }
+            if name.eq_ignore_ascii_case("+sip.instance") {
+                declared_sip_instance = true;
+            }
             contact.push(';');
             contact.push_str(parameter);
         }
-    } else if profile.is_none() {
+    } else {
         contact.push_str(&format!(";+g.3gpp.accesstype=\"{access_network_info}\""));
         if policy.include_mmtel_features {
             contact.push_str(";audio");
@@ -507,12 +523,19 @@ fn build_register_internal(
             contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
         }
         contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
+        // RFC 5626: reg-id only has meaning next to the instance it pairs
+        // with, so emit it here rather than letting the tail append a second
+        // +sip.instance further down the parameter list.
+        if always_add_sip_instance {
+            contact.push_str(";reg-id=1");
+        }
+        declared_sip_instance = true;
         contact.push_str(&format!(";expires={expires}"));
     }
     if !advertises_sms_over_ip {
         contact.push_str(";+g.3gpp.smsip");
     }
-    if profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance) {
+    if always_add_sip_instance && !declared_sip_instance {
         contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
     }
     let visited_network = visited_network_override
@@ -1520,6 +1543,105 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn catalog_profile_without_contact_parameters_still_advertises_mmtel() {
+        // Regression: a profile with an empty contact_param_order used to skip
+        // both Contact arms, emitting a bare
+        // `<sip:...;transport=udp>;+g.3gpp.smsip`. Without +g.3gpp.icsi-ref the
+        // S-CSCF does not treat the registration as MMTEL voice capable and MT
+        // calls are never delivered, even though REGISTER answers 200 OK.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &[];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert!(contact.contains(";audio"));
+        assert!(contact.contains(&format!(";+g.3gpp.icsi-ref=\"{MMTEL_ICSI_REF}\"")));
+        assert!(contact.contains(";+sip.instance=\"<urn:uuid:test>\""));
+        assert!(contact.contains(";expires="));
+        assert_eq!(
+            contact.to_ascii_lowercase().matches("+g.3gpp.smsip").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn empty_contact_parameters_keep_sip_instance_single_with_reg_id() {
+        // always_add_sip_instance must not append a second +sip.instance when
+        // the fallback arm already emitted one.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &[];
+        profile.ims.register.always_add_sip_instance = true;
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:imei:490154203237518",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert_eq!(
+            contact.to_ascii_lowercase().matches("+sip.instance").count(),
+            1
+        );
+        assert_eq!(contact.matches(";reg-id=1").count(), 1);
+    }
+
+    #[test]
+    fn explicit_contact_parameters_are_not_widened_by_the_fallback() {
+        // A bundle that spells out its Contact list keeps expressing the whole
+        // opinion: no accesstype, no icsi-ref, no expires get bolted on.
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.contact_param_order = &["+g.3gpp.mid-call"];
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        let contact = header_value(text.as_bytes(), "Contact").unwrap();
+        assert!(contact.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert!(!contact.contains("+g.3gpp.icsi-ref"));
+        assert!(!contact.contains("+g.3gpp.accesstype"));
+        assert!(!contact.contains(";expires="));
     }
 
     #[test]

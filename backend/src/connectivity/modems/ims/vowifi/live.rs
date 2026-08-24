@@ -6034,7 +6034,7 @@ impl LiveRegisterRequestContext {
         &self,
         profile: &'static CarrierProfile,
         local_host: &str,
-        _header_profile: LiveRegisterHeaderProfile,
+        header_profile: LiveRegisterHeaderProfile,
     ) -> String {
         let contact_port = self.protected_header_port.unwrap_or(self.local_addr.port());
         let user_phone = if self.identity.contact_user_phone {
@@ -6055,8 +6055,16 @@ impl LiveRegisterRequestContext {
             self.transport.as_param()
         );
         let mut advertises_sms_over_ip = false;
-        if !_header_profile.compact_register && !profile.ims.register.contact_param_order.is_empty()
-        {
+        let mut declared_sip_instance = false;
+        // The feature-set fallback below used to be #[cfg(test)] only, so a
+        // release build emitted a Contact with no feature tags whenever the
+        // profile carried an empty contact_param_order -- which is every
+        // hardcoded profile and every catalog bundle without
+        // `sip.common.contact_parameters`. The S-CSCF then saw no
+        // +g.3gpp.icsi-ref and never treated the registration as MMTEL
+        // voice capable. contact_features already mirrors
+        // register.include_mmtel_features, so honour it in all builds.
+        if !header_profile.compact_register && !profile.ims.register.contact_param_order.is_empty() {
             for parameter in profile.ims.register.contact_param_order {
                 let name = parameter
                     .split_once('=')
@@ -6068,12 +6076,14 @@ impl LiveRegisterRequestContext {
                 if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
                     advertises_sms_over_ip = true;
                 }
+                if name.eq_ignore_ascii_case("+sip.instance") {
+                    declared_sip_instance = true;
+                }
                 header.push(';');
                 header.push_str(parameter);
             }
-        } else {
-            #[cfg(test)]
-            match _header_profile.contact_features {
+        } else if !header_profile.compact_register {
+            match header_profile.contact_features {
                 LiveContactFeatureSet::SmsOnly => {
                     header.push_str(";+g.3gpp.accesstype=\"IEEE-802.11\"");
                     header.push_str(";+g.3gpp.smsip");
@@ -6086,13 +6096,20 @@ impl LiveRegisterRequestContext {
                     advertises_sms_over_ip = true;
                     header.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", IMS_MMTEL_ICSI_REF));
                     header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
+                    if profile.ims.register.always_add_sip_instance {
+                        header.push_str(";reg-id=1");
+                    }
+                    declared_sip_instance = true;
                 }
             }
         }
-        if !_header_profile.compact_register && !advertises_sms_over_ip {
+        if !header_profile.compact_register && !advertises_sms_over_ip {
             header.push_str(";+g.3gpp.smsip");
         }
-        if profile.ims.register.always_add_sip_instance && !_header_profile.compact_register {
+        if profile.ims.register.always_add_sip_instance
+            && !header_profile.compact_register
+            && !declared_sip_instance
+        {
             // RFC 5626 flow registration. `reg-id=1` pairs with +sip.instance;
             // iOS carriers that set `always_add_sip_instance` expect both.
             header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));

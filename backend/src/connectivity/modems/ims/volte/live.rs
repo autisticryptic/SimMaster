@@ -5863,6 +5863,19 @@ fn log_volte_register_request_metadata(
         sec_agree_required = variant.policy.require_sec_agree,
         proxy_sec_agree_required = variant.policy.proxy_require_sec_agree,
         mmtel_features_present = variant.policy.include_mmtel_features,
+        // Report what the Contact actually carries, not just what the policy
+        // asked for. These two disagreed while the builder silently dropped
+        // every feature tag for profiles with an empty contact_param_order,
+        // and the policy-only field made the REGISTER look correct.
+        icsi_ref_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains("+g.3gpp.icsi-ref")),
+        audio_feature_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains(";audio")),
+        sip_instance_advertised = sip::header_values(request, "Contact")
+            .iter()
+            .any(|contact| contact.to_ascii_lowercase().contains("+sip.instance")),
         sms_over_ip_advertised = sip::header_values(request, "Contact")
             .iter()
             .any(|contact| contact.to_ascii_lowercase().contains("+g.3gpp.smsip")),
