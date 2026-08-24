@@ -213,6 +213,19 @@ pub struct VolteSnapshot {
     pub at_cid: Option<u8>,
     pub current_ip_family: Option<String>,
     pub identity_source: Option<String>,
+    /// The public user identity actually in force after REGISTER.
+    ///
+    /// This starts out IMSI-derived, but the network's default P-Associated-URI
+    /// replaces it once registration succeeds, so it is the identity later
+    /// requests are sent under -- not the one the profile was built from.
+    pub public_uri: Option<String>,
+    /// Every P-Associated-URI the registrar returned, in header order.
+    ///
+    /// Operators return both the IMSI-derived IMPU and the MSISDN-associated
+    /// one, so this is the only place the line's own number is observable: the
+    /// SIM reports nothing (`AT+CNUM` empty, ModemManager's `own-numbers` unset)
+    /// and USSD needs a network that a data-only bearer does not provide.
+    pub associated_uris: Vec<String>,
     pub profile_id: Option<String>,
     pub profile_source: Option<String>,
     pub profile_fallback_reason: Option<String>,
@@ -258,6 +271,8 @@ impl Default for VolteSnapshot {
             bearer_ip_type: None,
             current_ip_family: None,
             identity_source: None,
+            public_uri: None,
+            associated_uris: Vec::new(),
             profile_id: None,
             profile_source: None,
             profile_fallback_reason: None,
@@ -355,6 +370,13 @@ pub struct VolteRuntimeStatus {
     pub current_ip_family: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_source: Option<String>,
+    /// The public user identity in force after REGISTER, network-assigned.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub public_uri: Option<String>,
+    /// Every P-Associated-URI the registrar returned. The MSISDN-associated
+    /// entry here is the only observable source of the line's own number.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub associated_uris: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -405,6 +427,8 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
             identity_source: s.identity_source.clone(),
+            public_uri: s.public_uri.clone(),
+            associated_uris: s.associated_uris.clone(),
             profile_id: s.profile_id.clone(),
             profile_source: s.profile_source.clone(),
             profile_fallback_reason: s.profile_fallback_reason.clone(),

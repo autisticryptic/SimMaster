@@ -2225,6 +2225,18 @@ async fn connect_family(
             associated_uri_present = associated_uri.is_some(),
             "VoLTE IMS registration routing identities captured"
         );
+        // Publish the registered identities. The registrar's P-Associated-URI
+        // set is the only place this line's own number is observable -- the SIM
+        // reports nothing and USSD needs a network a data-only bearer does not
+        // provide -- so it has to leave this function or it is lost.
+        let published_public_uri = registered_identity.public_uri.clone();
+        let published_associated_uris = registered.associated_uris.clone();
+        runtime
+            .update(|state| {
+                state.public_uri = Some(published_public_uri);
+                state.associated_uris = published_associated_uris;
+            })
+            .await;
         if authenticator.mode == RegistrationMode::Udp {
             runtime
                 .update(|state| state.stage = VolteStage::RegisterUdp)
@@ -2789,6 +2801,10 @@ async fn refresh_live_registration(
         session.identity.public_uri = uri.to_string();
     }
     session.registration = registered.clone();
+    // A refresh can hand back a different identity set than the initial
+    // register did, so republish rather than assuming the first one still holds.
+    let refreshed_public_uri = session.identity.public_uri.clone();
+    let refreshed_associated_uris = registered.associated_uris.clone();
     runtime
         .record_attempt(
             VolteStage::RegisterRefresh,
@@ -2806,6 +2822,8 @@ async fn refresh_live_registration(
             state.last_register_refresh_at = Some(now());
             state.last_tx_at = Some(now());
             state.register_refresh_count = state.register_refresh_count.saturating_add(1);
+            state.public_uri = Some(refreshed_public_uri);
+            state.associated_uris = refreshed_associated_uris;
         })
         .await;
     VolteRefreshAttempt {
