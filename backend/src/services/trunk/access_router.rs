@@ -1016,6 +1016,14 @@ mod tests {
             recv_command(&mut volte_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "call-b"
         ));
+        // Dispatching the StartCall publishes `Started` upstream before any
+        // backend replies, so drain it here. What must not surface is the
+        // `Unavailable` from the first leg -- the failover has to stay
+        // invisible to the trunk.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "call-b"
+        ));
         assert!(matches!(
             trunk_events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -1090,10 +1098,17 @@ mod tests {
             call_id: "dtmf-call".into(),
             body: Vec::new(),
         });
-        let _ = tokio::time::timeout(Duration::from_secs(1), trunk_events.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        // Two events precede the DTMF: `Started` from dispatching the
+        // StartCall, then the answered leg. Asserting both by name keeps a
+        // future extra emission from being absorbed by a bare discard.
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Started { call_id, .. } if call_id == "dtmf-call"
+        ));
+        assert!(matches!(
+            recv_event(&mut trunk_events).await,
+            OperatorEvent::Answered { call_id, .. } if call_id == "dtmf-call"
+        ));
 
         let outbound = DtmfSignal {
             digit: '5',
