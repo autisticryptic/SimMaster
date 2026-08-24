@@ -5452,12 +5452,74 @@ async fn resolve_device_binding(
             }
         }
 
+        // ModemManager renumbers its modem index on every re-probe, and
+        // restarting SimAdmin is itself enough to trigger one -- the device has
+        // walked modem6 -> modem9 -> modem10 across three restarts. A cached
+        // index therefore goes stale routinely, and polling it cannot recover:
+        // `mmcli -m <stale>` fails with "couldn't find modem" every time, so
+        // all ten attempts burn 20s and report a timeout for a modem that was
+        // registered throughout. The IMEI survives renumbering, so use it to
+        // find the modem's current index before spending another delay.
+        if let Some(found) = relocate_modem_by_equipment_id(requested).await {
+            tracing::info!(
+                previous_modem_id = %requested.modem_id,
+                modem_id = %found.modem_id,
+                attempt,
+                "Modem index changed; re-resolved the VoLTE binding by equipment id"
+            );
+            return Ok(found);
+        }
+
         if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
             tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
         }
     }
     Err(VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))
 }
+
+/// Find the modem that currently carries this binding's equipment id (IMEI).
+///
+/// Returns `None` when the id is unknown, no listed modem matches, or the match
+/// is not yet ready -- all of which leave the ordinary wait loop in charge.
+/// Matching on the IMEI rather than the index is the point: the index is
+/// ModemManager's own enumeration order and is not stable across a re-probe.
+async fn relocate_modem_by_equipment_id(
+    requested: &VolteDeviceBinding,
+) -> Option<VolteDeviceBinding> {
+    let wanted = requested.equipment_identifier.trim();
+    if wanted.is_empty() {
+        return None;
+    }
+
+    let listed = command_output("mmcli", &["-L", "--output-keyvalue"]).await.ok()?;
+    // `--output-keyvalue` separates with " : ", not "=", and the first line is a
+    // `modem-list.length` count rather than a path -- hence keying off the
+    // `modem-list.value` prefix instead of just taking every value.
+    for candidate in listed
+        .lines()
+        .filter(|line| line.trim_start().starts_with("modem-list.value"))
+        .filter_map(|line| line.split(':').nth(1))
+        .filter_map(|value| value.trim().rsplit('/').next())
+        .filter(|index| !index.is_empty() && *index != requested.modem_id)
+    {
+        let Ok(details) = command_output("mmcli", &["-m", candidate, "--output-keyvalue"]).await
+        else {
+            continue;
+        };
+        let matches_equipment = key_value(&details, "modem.generic.equipment-identifier")
+            .as_deref()
+            .map(str::trim)
+            == Some(wanted);
+        if matches_equipment && modem_is_ready(&details) {
+            return Some(VolteDeviceBinding {
+                modem_id: candidate.to_string(),
+                ..requested.clone()
+            });
+        }
+    }
+    None
+}
+
 
 fn modem_is_ready(output: &str) -> bool {
     matches!(
@@ -6034,6 +6096,40 @@ mod tests {
         assert_eq!(variants[1].label, "generic_ims_register_fallback");
         assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
         assert!(!variants[1].policy.require_sec_agree);
+    }
+
+    /// Verbatim `mmcli -L --output-keyvalue` output from the 410. The separator
+    /// is " : " rather than "=", and the first line is a count -- parsing it as
+    /// a path would make the relocation silently never match, which is
+    /// indistinguishable from the stale-index bug it exists to fix.
+    #[test]
+    fn modem_list_keyvalue_parsing_yields_the_indices() {
+        let listed = "modem-list.length   : 1\n\
+                      modem-list.value[1] : /org/freedesktop/ModemManager1/Modem/10\n";
+
+        let indices: Vec<&str> = listed
+            .lines()
+            .filter(|line| line.trim_start().starts_with("modem-list.value"))
+            .filter_map(|line| line.split(':').nth(1))
+            .filter_map(|value| value.trim().rsplit('/').next())
+            .filter(|index| !index.is_empty())
+            .collect();
+
+        assert_eq!(indices, vec!["10"]);
+    }
+
+    /// The IMEI is what survives ModemManager renumbering, so the key name is
+    /// load-bearing. Verbatim from `mmcli -m 10 --output-keyvalue` on the 410.
+    #[test]
+    fn equipment_identifier_is_read_from_the_generic_key() {
+        let details = "modem.generic.equipment-identifier              : 861716071107730\n\
+                       modem.generic.state                             : connected\n";
+
+        assert_eq!(
+            key_value(details, "modem.generic.equipment-identifier").as_deref(),
+            Some("861716071107730")
+        );
+        assert!(modem_is_ready(details));
     }
 
     /// IMS is always on the ModemManager-owned port, so the native QMI bearer
