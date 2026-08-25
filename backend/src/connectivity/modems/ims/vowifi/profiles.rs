@@ -124,8 +124,11 @@ pub struct RegisterPolicy {
     /// Order of Contact header parameters. Empty means "use the built-in order
     /// for `contact_mode`".
     pub contact_param_order: &'static [&'static str],
-    /// Always add `+sip.instance="<urn:uuid:...>"` and `;reg-id=1` to the
-    /// REGISTER Contact (RFC 5626). Mirrors `sip.common.register.always_add_sip_instance`.
+    /// Always add `+sip.instance="<urn:uuid:...>"` and the access leg's `reg-id`
+    /// to the REGISTER Contact (RFC 5626). The value is per access leg
+    /// (`ImsAccess::reg_id`), never a literal `1`, because both legs share one
+    /// instance id and a binding is keyed on (AOR, instance-id, reg-id).
+    /// Mirrors `sip.common.register.always_add_sip_instance`.
     pub always_add_sip_instance: bool,
     /// Send a `Cellular-Network-Info` header with the REGISTER. Mirrors
     /// `sip.common.register.enable_cellular_network_info`.

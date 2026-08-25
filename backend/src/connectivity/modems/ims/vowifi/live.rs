@@ -94,6 +94,15 @@ const LIVE_IKE_MAX_PROPOSAL_GROUPS_PER_PASS: usize = 2;
 const LIVE_IKE_MAX_TRANSPORT_PATHS_PER_PASS: usize = 2;
 const IKE_PORT: u16 = 500;
 const IKE_NAT_T_PORT: u16 = 4500;
+/// RFC 5626 `reg-id` for this access leg's flow.
+///
+/// Taken from the shared access policy rather than written literally, so the
+/// WLAN and cellular legs cannot drift onto the same value. Both legs now
+/// present one stable `+sip.instance`, and RFC 5626 §6 keys a binding on
+/// (AOR, instance-id, reg-id) -- equal reg-ids would make whichever leg
+/// registers second silently *replace* the other's binding (§3.2).
+const WLAN_REG_ID: u32 =
+    crate::connectivity::core::ims_access::ImsAccess::Wlan.reg_id();
 const DEFAULT_QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const DEFAULT_LIVE_TUN_NAME: &str = "sa_vwf0";
 const LIVE_IMS_TCP_TIMEOUT: Duration = Duration::from_secs(8);
@@ -6098,7 +6107,7 @@ impl LiveRegisterRequestContext {
                     header.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", IMS_MMTEL_ICSI_REF));
                     header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
                     if profile.ims.register.always_add_sip_instance {
-                        header.push_str(";reg-id=1");
+                        header.push_str(&format!(";reg-id={WLAN_REG_ID}"));
                     }
                     declared_sip_instance = true;
                 }
@@ -6111,10 +6120,10 @@ impl LiveRegisterRequestContext {
             && !header_profile.compact_register
             && !declared_sip_instance
         {
-            // RFC 5626 flow registration. `reg-id=1` pairs with +sip.instance;
+            // RFC 5626 flow registration. `reg-id` pairs with +sip.instance;
             // iOS carriers that set `always_add_sip_instance` expect both.
             header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
-            header.push_str(";reg-id=1");
+            header.push_str(&format!(";reg-id={WLAN_REG_ID}"));
         }
         header.push_str("\r\n");
         header
@@ -9142,6 +9151,19 @@ mod tests {
             "protected UDP Contact must advertise port_us"
         );
         assert!(authenticated.contains("Security-Verify: ipsec-3gpp;"));
+    }
+
+    #[test]
+    fn wlan_reg_id_never_collides_with_the_cellular_leg() {
+        // Both legs now present one stable +sip.instance (so the instance id
+        // names the UE, per RFC 5626 §4.1). A binding is keyed on
+        // (AOR, instance-id, reg-id) by §6, so equal reg-ids would make
+        // whichever leg registers second *replace* the other's binding (§3.2)
+        // while this runtime still reported both as registered. Guard the two
+        // constants against drifting onto the same value.
+        use crate::connectivity::core::ims_access::ImsAccess;
+        assert_eq!(WLAN_REG_ID, ImsAccess::Wlan.reg_id());
+        assert_ne!(WLAN_REG_ID, ImsAccess::Cellular.reg_id());
     }
 
     #[test]

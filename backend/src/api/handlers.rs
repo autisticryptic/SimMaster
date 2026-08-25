@@ -6069,6 +6069,10 @@ impl VowifiScope {
         self.line.binding().present
     }
 
+    fn line(&self) -> &Arc<crate::services::line_registry::LineRuntime> {
+        &self.line
+    }
+
     /// The modem this line owns, when the line is actually present. `None` means
     /// there is nothing to act on, which callers treat as a no-op rather than
     /// falling back to some other baseband.
@@ -6343,6 +6347,26 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
             0,
         );
         let _ = stop_vowifi_and_restore_cellular(&app, &scope, workflow.disabled_reason).await;
+        return;
+    }
+
+    // The access policy can park this leg even though the line's VoWiFi switch
+    // is on: `CellularPreferred` keeps WLAN down while the cellular leg is
+    // usable. Asked in the bring-up form, so "WLAN is not up yet" is not itself
+    // the reason for refusing. The user's enable intent is left untouched --
+    // flipping the preference must be enough to bring this leg back.
+    let wlan_decision = line_ims_access_permits_bringup(
+        &app,
+        scope.line(),
+        crate::connectivity::core::ims_access::ImsAccess::Wlan,
+    )
+    .await;
+    if !wlan_decision.permits(crate::connectivity::core::ims_access::ImsAccess::Wlan) {
+        tracing::debug!(
+            line_id = %workflow.line_id,
+            reason = wlan_decision.code,
+            "Skipping WiFi Calling restore: IMS access policy does not permit the WLAN leg"
+        );
         return;
     }
 
@@ -7739,6 +7763,88 @@ fn line_volte_enabled(app: &AppState, line: &crate::services::line_registry::Lin
     binding.present && profile.enabled && profile.volte_connection_enabled
 }
 
+/// Whether this line presents a user-supplied IMEI rather than the modem's own.
+///
+/// Reading the SIM override is a database load, so failures resolve to `false`:
+/// an unreadable override must not silently switch a line into the
+/// spoofed-identity regime and take the cellular leg down.
+async fn line_device_identity_spoofed(app: &AppState, line_id: &str) -> bool {
+    use crate::connectivity::modems::ims::effective_profile::resolve_effective_device_identity;
+    let Ok((_, sim_override)) = ims_override_for_line(app, line_id).await else {
+        return false;
+    };
+    // `None` for the modem IMEI is deliberate: only the override decides
+    // whether the presented identity is user-supplied, and an invalid custom
+    // IMEI is already rejected by the resolver.
+    resolve_effective_device_identity(Some(&sim_override), None).source
+        == OverrideSource::SimOverride
+}
+
+/// Which IMS access legs may hold a registration for this line right now.
+///
+/// See `connectivity::core::ims_access` for the standards reasoning. Two input
+/// choices are worth stating explicitly:
+///
+/// * `wlan_available` means the WLAN leg is *actually* up or coming up, not
+///   merely configured. Treating "enabled" as "available" would let a preferred
+///   but unreachable Wi-Fi leg hold the cellular leg down and leave the line
+///   with no registration at all.
+/// * `cellular_available` requires a present modem binding and no airplane
+///   mode, matching the existing VoLTE gates.
+async fn line_ims_access_decision(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    line_ims_access_decision_assuming(app, line, None).await
+}
+
+/// [`line_ims_access_decision`], optionally treating one leg as available.
+///
+/// `assume_available` exists because a bring-up gate cannot ask "is this leg
+/// already up?" -- that is what it is about to establish. Evaluating the policy
+/// with the target leg pinned available answers the question that gate actually
+/// has: *if* this leg came up, would the policy let it hold a registration?
+/// Without this, `WlanPreferred` would refuse to start WLAN (it is not up yet),
+/// fall back to cellular, and the preferred leg could never be reached.
+async fn line_ims_access_decision_assuming(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    assume_available: Option<crate::connectivity::core::ims_access::ImsAccess>,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    use crate::connectivity::core::ims_access::{decide, ImsAccess, ImsAccessInputs};
+
+    let binding = line.binding();
+    let line_id = binding.line_id.clone();
+    let profile = app.config_manager.get_line_profile(&line_id);
+    let wlan_up = crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
+        &line_id,
+    )
+    .is_available()
+        || line.vowifi_restore_in_progress();
+
+    decide(ImsAccessInputs {
+        cellular_enabled: profile.enabled && profile.volte_connection_enabled,
+        wlan_enabled: profile.enabled && profile.vowifi.enabled,
+        cellular_available: (binding.present && !profile.airplane_mode_enabled)
+            || assume_available == Some(ImsAccess::Cellular),
+        wlan_available: wlan_up || assume_available == Some(ImsAccess::Wlan),
+        device_identity_spoofed: line_device_identity_spoofed(app, &line_id).await,
+        preference: profile.ims_access_preference,
+    })
+}
+
+/// Whether the access policy would let `access` hold a registration if its
+/// bring-up succeeded. This is the form the restore gates want; see
+/// [`line_ims_access_decision_assuming`] for why they cannot use the plain
+/// observed-state decision.
+async fn line_ims_access_permits_bringup(
+    app: &AppState,
+    line: &crate::services::line_registry::LineRuntime,
+    access: crate::connectivity::core::ims_access::ImsAccess,
+) -> crate::connectivity::core::ims_access::ImsAccessDecision {
+    line_ims_access_decision_assuming(app, line, Some(access)).await
+}
+
 async fn sync_line_video_capabilities(app: &AppState) {
     for line in app.line_registry.all().await {
         let line_id = line.binding().line_id;
@@ -8461,6 +8567,20 @@ async fn start_line_volte_restore(
     if !line_volte_restore_enabled(&app, &line) {
         return false;
     }
+    // The access policy can forbid this leg even when the line's own VoLTE
+    // switch is on: a presented device identity excludes the cellular leg
+    // outright, and a single-registration preference parks it behind WLAN. Both
+    // are configuration the user chose, so refusing here is not a failure --
+    // hence debug rather than warn.
+    let decision = line_ims_access_decision(&app, &line).await;
+    if !decision.permits(crate::connectivity::core::ims_access::ImsAccess::Cellular) {
+        tracing::debug!(
+            line_id = %line.binding().line_id,
+            reason = decision.code,
+            "Skipping VoLTE restore: IMS access policy does not permit the cellular leg"
+        );
+        return false;
+    }
     // An operator asking explicitly may always try; only the unattended pass is
     // suppressed, because that is the one that loops the baseband into a crash
     // every time its cooldown is lost to re-enumeration.
@@ -9110,6 +9230,72 @@ pub async fn set_voice_path_policy_handler(
                 Json(ApiResponse::success_with_message("Saved", policy)),
             )
         }
+        Err(err) => (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {err}"))),
+        ),
+    }
+}
+
+/// Which IMS access legs may hold a *registration* for this line.
+///
+/// Deliberately a separate endpoint from `voice/path-policy`: that orders
+/// **originating** calls across already-registered legs, while this decides which
+/// legs register at all. See `connectivity::core::ims_access`.
+// `Default` is required by `ApiResponse::error`, which both handlers below use
+// on the not-found path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ImsAccessPreferencePayload {
+    pub preference: crate::connectivity::core::ims_access::ImsAccessPreference,
+}
+
+pub async fn get_ims_access_preference_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
+    if resolve_control_line(&app, &line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            ImsAccessPreferencePayload {
+                preference: app.config_manager.get_line_ims_access_preference(&line_id),
+            },
+        )),
+    )
+}
+
+pub async fn set_ims_access_preference_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<ImsAccessPreferencePayload>,
+) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
+    if resolve_control_line(&app, &line_id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    match app
+        .config_manager
+        .set_line_ims_access_preference(&line_id, payload.preference)
+    {
+        // Only the stored preference changes here. Legs are not torn down or
+        // brought up inline: the restore workflows consult the policy on their
+        // next pass, and the per-line enable intent is left exactly as the user
+        // set it.
+        Ok(preference) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Saved",
+                ImsAccessPreferencePayload { preference },
+            )),
+        ),
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {err}"))),

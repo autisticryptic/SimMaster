@@ -1714,6 +1714,15 @@ async fn main() -> Result<()> {
                 .post(set_voice_path_policy_handler)
                 .options(options_handler),
         )
+        // Which access legs may hold an IMS *registration*. Deliberately a
+        // separate endpoint from voice/path-policy above, which orders
+        // originating calls over legs that are already registered.
+        .route(
+            "/api/modem/lines/{line_id}/ims/access-preference",
+            get(get_ims_access_preference_handler)
+                .post(set_ims_access_preference_handler)
+                .options(options_handler),
+        )
         .route(
             "/api/web-call/capabilities",
             get(get_web_call_capabilities_handler).options(options_handler),

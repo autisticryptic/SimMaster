@@ -36,6 +36,15 @@ pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
 pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
 
+/// RFC 5626 `reg-id` for this (cellular) access leg.
+///
+/// Sourced from the access policy rather than written literally, because the
+/// two legs now share one `+sip.instance` and a binding is keyed on
+/// (AOR, instance-id, reg-id): if both legs emitted the same reg-id, the
+/// second registration would silently replace the first.
+const CELLULAR_REG_ID: u32 =
+    crate::connectivity::core::ims_access::ImsAccess::Cellular.reg_id();
+
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
 pub fn sip_host(ip: IpAddr) -> String {
@@ -527,7 +536,7 @@ fn build_register_internal(
         // with, so emit it here rather than letting the tail append a second
         // +sip.instance further down the parameter list.
         if always_add_sip_instance {
-            contact.push_str(";reg-id=1");
+            contact.push_str(&format!(";reg-id={CELLULAR_REG_ID}"));
         }
         declared_sip_instance = true;
         contact.push_str(&format!(";expires={expires}"));
@@ -536,7 +545,10 @@ fn build_register_internal(
         contact.push_str(";+g.3gpp.smsip");
     }
     if always_add_sip_instance && !declared_sip_instance {
-        contact.push_str(&format!(";+sip.instance=\"<{}>\";reg-id=1", sip_instance));
+        contact.push_str(&format!(
+            ";+sip.instance=\"<{}>\";reg-id={CELLULAR_REG_ID}",
+            sip_instance
+        ));
     }
     let visited_network = visited_network_override
         .map(str::to_string)
@@ -1506,7 +1518,20 @@ mod tests {
             RegisterRequestPolicy::LEGACY,
         );
         let text = String::from_utf8(frame).unwrap();
-        assert!(text.contains(";+sip.instance=\"<urn:imei:490154203237518>\";reg-id=1"));
+        assert!(text.contains(&format!(
+            ";+sip.instance=\"<urn:imei:490154203237518>\";reg-id={CELLULAR_REG_ID}"
+        )));
+    }
+
+    #[test]
+    fn cellular_reg_id_never_equals_the_wlan_leg() {
+        // The two legs share one +sip.instance now, so RFC 5626 §6 keys their
+        // bindings on (AOR, instance-id, reg-id) alone. If this ever collides,
+        // whichever leg registers second replaces the other's binding while our
+        // runtime still reports both as registered.
+        use crate::connectivity::core::ims_access::ImsAccess;
+        assert_eq!(CELLULAR_REG_ID, ImsAccess::Cellular.reg_id());
+        assert_ne!(CELLULAR_REG_ID, ImsAccess::Wlan.reg_id());
     }
 
     #[test]
@@ -1611,7 +1636,10 @@ mod tests {
             contact.to_ascii_lowercase().matches("+sip.instance").count(),
             1
         );
-        assert_eq!(contact.matches(";reg-id=1").count(), 1);
+        assert_eq!(
+            contact.matches(&format!(";reg-id={CELLULAR_REG_ID}")).count(),
+            1
+        );
     }
 
     #[test]

@@ -8,6 +8,8 @@
 use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, TransactionBehavior};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+use crate::connectivity::core::ims_access::ImsAccessPreference;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -1972,6 +1974,84 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The registration preference must never edit the enable intent.
+    ///
+    /// Companion to `enabling_one_ims_access_never_disables_the_other`: that test
+    /// pins the two enable switches apart from each other, this one pins them
+    /// apart from the preference. If setting `CellularPreferred` also cleared
+    /// `vowifi.enabled`, flipping the preference back would silently fail to
+    /// restore the WLAN leg.
+    #[test]
+    fn ims_access_preference_never_edits_the_enable_intent() {
+        let path = std::env::temp_dir().join(format!(
+            "simadmin-ims-access-pref-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let manager = ConfigManager::new(path.clone());
+        let line = "line-0123456789abcdef0123456789abcdef";
+
+        // Default keeps both legs registered, matching the coexistence invariant
+        // in services::orchestrator::ims_access.
+        assert_eq!(
+            manager.get_line_ims_access_preference(line),
+            ImsAccessPreference::Concurrent
+        );
+
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line, true)
+            .unwrap();
+
+        for preference in [
+            ImsAccessPreference::WlanPreferred,
+            ImsAccessPreference::CellularPreferred,
+            ImsAccessPreference::Concurrent,
+        ] {
+            manager
+                .set_line_ims_access_preference(line, preference)
+                .unwrap();
+            let profile = manager.get_line_profile(line);
+            assert_eq!(profile.ims_access_preference, preference);
+            assert!(
+                profile.volte_connection_enabled,
+                "{preference:?} must not clear the VoLTE enable intent"
+            );
+            assert!(
+                profile.vowifi.enabled,
+                "{preference:?} must not clear the VoWiFi enable intent"
+            );
+        }
+
+        // And it survives a reload.
+        manager
+            .set_line_ims_access_preference(line, ImsAccessPreference::WlanPreferred)
+            .unwrap();
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(
+            reloaded.get_line_ims_access_preference(line),
+            ImsAccessPreference::WlanPreferred
+        );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// A line that never set a preference must deserialize to the coexisting
+    /// default rather than failing or silently parking a leg.
+    #[test]
+    fn line_profile_without_ims_access_preference_defaults_to_concurrent() {
+        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
+            "line_id": "line-0123456789abcdef0123456789abcdef"
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.ims_access_preference,
+            ImsAccessPreference::Concurrent
+        );
+    }
+
     #[test]
     fn esim_reader_settings_are_isolated_per_line() {
         let path = std::env::temp_dir().join(format!(
@@ -3913,6 +3993,18 @@ pub struct LineProfileConfig {
     /// Per-line voice path priority.
     #[serde(default)]
     pub voice_path: VoicePathPolicy,
+    /// Which IMS access leg may hold the *registration* when both VoLTE and
+    /// VoWiFi are switched on.
+    ///
+    /// Distinct from `voice_path`, which orders **originating** calls across
+    /// legs that are already registered. The default keeps both legs registered
+    /// (each with its own RFC 5626 `reg-id`), preserving the live fallback that
+    /// `services::orchestrator::ims_access` treats as an invariant. The
+    /// single-registration modes follow GSMA IR.51 instead (§2.2.1
+    /// re-registration on handover, §4.8 keep the same P-CSCF) and are opt-in.
+    /// See `connectivity::core::ims_access` for the full reasoning.
+    #[serde(default)]
+    pub ims_access_preference: ImsAccessPreference,
     /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
     /// enable, in fallback order. `[Ipv4v6, Ipv4, Ipv6]` tries dual-stack, then
     /// IPv4, then IPv6; `[Ipv6]` is IPv6-only. An empty list is invalid.
@@ -4052,6 +4144,7 @@ impl LineProfileConfig {
             airplane_mode_enabled: false,
             sms_path: SmsPathPolicy::default().normalized(),
             voice_path: VoicePathPolicy::default().normalized(),
+            ims_access_preference: ImsAccessPreference::default(),
             apn: ApnConfig::default(),
             esim_control: None,
             esim_reader: EsimReaderConfig::default(),
@@ -6070,6 +6163,30 @@ impl ConfigManager {
     /// Voice path policy for one line.
     pub fn get_line_voice_path_policy(&self, line_id: &str) -> VoicePathPolicy {
         self.get_line_profile(line_id).voice_path.normalized()
+    }
+
+    /// Which IMS access legs may hold a registration for this line.
+    pub fn get_line_ims_access_preference(&self, line_id: &str) -> ImsAccessPreference {
+        self.get_line_profile(line_id).ims_access_preference
+    }
+
+    /// Set one line's IMS access (registration) preference.
+    ///
+    /// Deliberately independent of `volte_connection_enabled` and
+    /// `vowifi.enabled`: this says which *enabled* legs may register, and must
+    /// never edit the enable intent itself. Coupling the two is the bug
+    /// `enabling_one_ims_access_never_disables_the_other` pins shut — the user's
+    /// switch has to survive a preference change so flipping it back is enough
+    /// to restore the leg.
+    pub fn set_line_ims_access_preference(
+        &self,
+        line_id: &str,
+        preference: ImsAccessPreference,
+    ) -> Result<ImsAccessPreference, String> {
+        self.update_line_profile(line_id, |profile| {
+            profile.ims_access_preference = preference;
+        })?;
+        Ok(self.get_line_ims_access_preference(line_id))
     }
 
     /// Set one line's explicit voice path policy.

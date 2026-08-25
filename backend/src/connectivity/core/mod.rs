@@ -21,6 +21,7 @@ pub mod context;
 pub mod device_identity;
 pub mod digest_aka;
 pub mod entitlement;
+pub mod ims_access;
 pub mod ims_failure;
 pub mod ims_video;
 pub mod media;
