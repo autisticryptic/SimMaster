@@ -110,6 +110,54 @@ pub fn present_device_identity(
     presentation
 }
 
+/// A `+sip.instance` value that is stable for one subscription across access
+/// legs and across restarts.
+///
+/// RFC 5626 §4.1: the instance id identifies the *UE*, not the registration. A
+/// device that registers the same IMPU from two access legs (VoLTE over the LTE
+/// bearer and VoWiFi over the ePDG) must present the same instance id, or the
+/// S-CSCF keeps two independent bindings for one identity and terminating calls
+/// are forked to — or delivered at — whichever binding the TAS happens to pick.
+/// A freshly randomised uuid per registration also loses the binding's identity
+/// across a restart, so the network keeps a stale contact for the old one.
+///
+/// When carrier policy asks for the GSMA IMEI form, that is already stable and
+/// is used as-is. Otherwise the uuid is derived from the IMPI, which is the
+/// subscription's own permanent identity: an RFC 4122 version 3 (MD5
+/// name-based) uuid over a fixed namespace string. The IMPI never reaches the
+/// wire through this value — MD5 is one-way here, and the input is an identity
+/// the UE already sends in `Authorization` anyway.
+pub fn stable_sip_instance(impi: &str, imei: Option<&str>, prefer_imei: bool) -> String {
+    if prefer_imei {
+        if let Some(imei) = imei.map(str::trim).filter(|imei| is_valid_imei(imei)) {
+            return format!("urn:imei:{imei}");
+        }
+    }
+    format!("urn:uuid:{}", name_based_uuid_v3(impi.trim()))
+}
+
+/// RFC 4122 §4.3 name-based UUID using MD5 (version 3).
+fn name_based_uuid_v3(name: &str) -> String {
+    // A fixed, project-local namespace so the digest cannot collide with any
+    // other MD5 use in this codebase.
+    let mut input = Vec::with_capacity(name.len() + 32);
+    input.extend_from_slice(b"simadmin/ims/sip-instance/v1:");
+    input.extend_from_slice(name.as_bytes());
+    let mut bytes = *md5::compute(&input);
+    // Version 3 and the RFC 4122 variant, per §4.3 steps 4 and 5.
+    bytes[6] = (bytes[6] & 0x0f) | 0x30;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    format!(
+        "{}-{}-{}-{}-{}",
+        &hex[0..8],
+        &hex[8..12],
+        &hex[12..16],
+        &hex[16..20],
+        &hex[20..32]
+    )
+}
+
 /// 15-digit IMEI with a valid GSMA Luhn check digit. Kept local so this module
 /// has no dependency on the access-leg override code.
 pub fn is_valid_imei(imei: &str) -> bool {
@@ -160,6 +208,73 @@ mod tests {
             imei: None,
             source: DeviceIdentitySource::Unavailable,
         }
+    }
+
+    #[test]
+    fn stable_sip_instance_is_identical_for_both_access_legs() {
+        // The whole point: the VoLTE leg and the VoWiFi leg call this
+        // independently, and must arrive at the same instance id or the S-CSCF
+        // holds two RFC 5626 bindings for one IMPU.
+        let impi = "502120000000001@ims.mnc012.mcc502.3gppnetwork.org";
+        let volte = stable_sip_instance(impi, None, false);
+        let vowifi = stable_sip_instance(impi, None, false);
+        assert_eq!(volte, vowifi);
+        assert!(volte.starts_with("urn:uuid:"));
+    }
+
+    #[test]
+    fn stable_sip_instance_survives_a_restart_and_differs_per_subscription() {
+        let a = stable_sip_instance("502120000000001@ims.example", None, false);
+        let b = stable_sip_instance("502120000000002@ims.example", None, false);
+        assert_ne!(a, b, "different IMPIs must not share an instance id");
+        // Same input, computed again as a fresh process would: unchanged.
+        assert_eq!(a, stable_sip_instance("502120000000001@ims.example", None, false));
+    }
+
+    #[test]
+    fn stable_sip_instance_uuid_is_rfc4122_version_3() {
+        let value = stable_sip_instance("502120000000001@ims.example", None, false);
+        let uuid = value.strip_prefix("urn:uuid:").expect("urn:uuid prefix");
+        let fields: Vec<&str> = uuid.split('-').collect();
+        let lengths: Vec<usize> = fields.iter().map(|field| field.len()).collect();
+        assert_eq!(lengths, vec![8, 4, 4, 4, 12], "uuid shape: {uuid}");
+        assert!(uuid.bytes().all(|byte| byte == b'-' || byte.is_ascii_hexdigit()));
+        // Version nibble (§4.3 step 4) and variant bits (step 5).
+        assert!(fields[2].starts_with('3'), "version 3 expected, got {uuid}");
+        assert!(
+            matches!(fields[3].as_bytes()[0], b'8' | b'9' | b'a' | b'b'),
+            "RFC 4122 variant expected, got {uuid}"
+        );
+    }
+
+    #[test]
+    fn stable_sip_instance_never_leaks_the_impi() {
+        let impi = "502120000000001@ims.example";
+        let value = stable_sip_instance(impi, None, false);
+        assert!(!value.contains("502120000000001"));
+        assert!(!value.contains("ims.example"));
+    }
+
+    #[test]
+    fn stable_sip_instance_prefers_imei_only_when_policy_asks_and_imei_is_valid() {
+        let impi = "502120000000001@ims.example";
+        // Policy off: a valid IMEI is ignored.
+        assert!(stable_sip_instance(impi, Some("490154203237518"), false).starts_with("urn:uuid:"));
+        // Policy on with a valid IMEI: GSMA form.
+        assert_eq!(
+            stable_sip_instance(impi, Some("490154203237518"), true),
+            "urn:imei:490154203237518"
+        );
+        // Policy on but the IMEI fails Luhn/length: fall back to the derived
+        // uuid, still stable rather than random.
+        let short = stable_sip_instance(impi, Some("12345"), true);
+        assert!(short.starts_with("urn:uuid:"));
+        assert_eq!(short, stable_sip_instance(impi, None, false));
+        // Absent IMEI behaves the same way.
+        assert_eq!(
+            stable_sip_instance(impi, None, true),
+            stable_sip_instance(impi, None, false)
+        );
     }
 
     #[test]

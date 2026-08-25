@@ -5680,6 +5680,7 @@ impl LiveRegisterRequestContext {
         video_capability_enabled: bool,
     ) -> Result<Self, LiveStageError> {
         let security_client_state = LiveSecurityClientState::new(live_runtime_config())?;
+        let instance_id = format_sip_instance_id(profile, &identity, device_imei);
         Ok(Self {
             identity,
             target,
@@ -5688,7 +5689,7 @@ impl LiveRegisterRequestContext {
             transport: ims_transport(profile),
             from_tag: hex_token(8),
             call_id: format!("{}@simadmin", hex_token(16)),
-            instance_id: format_sip_instance_id(profile, device_imei)?,
+            instance_id,
             security_client_state,
             security_client_full_spaced: build_security_client_header(
                 profile,
@@ -7351,39 +7352,25 @@ fn quote_sip_param(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// `+sip.instance` for this line's VoWiFi registration.
+///
+/// Derived from the IMPI rather than randomised per registration, so this leg
+/// and the VoLTE leg present the *same* instance id for the same subscription.
+/// Two different ids for one IMPU leave the S-CSCF holding two independent RFC
+/// 5626 bindings, and terminating calls then land on whichever one the TAS
+/// picks. See [`stable_sip_instance`] for the full reasoning.
+///
+/// [`stable_sip_instance`]: crate::connectivity::core::device_identity::stable_sip_instance
 fn format_sip_instance_id(
     profile: &'static CarrierProfile,
+    identity: &crate::connectivity::core::context::ImsIdentity,
     device_imei: Option<&str>,
-) -> Result<String, LiveStageError> {
-    if profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance {
-        if let Some(imei) = device_imei
-            .filter(|imei| crate::connectivity::core::device_identity::is_valid_imei(imei))
-        {
-            return Ok(format!("urn:imei:{imei}"));
-        }
-    }
-    let mut bytes = random_bytes(16)?;
-    bytes[6] = (bytes[6] & 0x0f) | 0x40;
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Ok(format!(
-        "urn:uuid:{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-        bytes[0],
-        bytes[1],
-        bytes[2],
-        bytes[3],
-        bytes[4],
-        bytes[5],
-        bytes[6],
-        bytes[7],
-        bytes[8],
-        bytes[9],
-        bytes[10],
-        bytes[11],
-        bytes[12],
-        bytes[13],
-        bytes[14],
-        bytes[15]
-    ))
+) -> String {
+    crate::connectivity::core::device_identity::stable_sip_instance(
+        &identity.private_user,
+        device_imei,
+        profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance,
+    )
 }
 
 fn build_live_user_agent(profile: &'static CarrierProfile, format: LiveUserAgentFormat) -> String {

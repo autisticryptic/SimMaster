@@ -121,8 +121,18 @@ pub struct ImsServiceVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImsServiceState {
-    /// The network accepted the registration and gave us a telephone identity.
-    Available,
+    /// The registrar accepted this registration for MMTEL voice: it published a
+    /// telephone identity and a Service-Route.
+    ///
+    /// This is what the REGISTER answer can prove, and no more. It says the
+    /// S-CSCF holds a voice-capable binding for this identity; it does **not**
+    /// say a terminating INVITE will be delivered to it. Delivery additionally
+    /// depends on the TAS, on call-forwarding and voicemail settings, and — when
+    /// the same IMPU is registered from more than one access leg — on which
+    /// binding the TAS selects. Observed on this device: registration reports a
+    /// telephone identity and a Service-Route while terminating calls go to
+    /// voicemail without ever reaching the UE.
+    RegistrarAccepted,
     /// The network accepted the registration but published no telephone
     /// identity, so terminating calls have no address to reach.
     WithoutTelephoneIdentity,
@@ -135,7 +145,7 @@ pub enum ImsServiceState {
 impl ImsServiceState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Available => "available",
+            Self::RegistrarAccepted => "registrar_accepted",
             Self::WithoutTelephoneIdentity => "without_telephone_identity",
             Self::Denied => "denied",
             Self::Unknown => "unknown",
@@ -170,9 +180,14 @@ impl ImsServiceVerdict {
             .any(uri_is_telephone_identity);
 
         if has_telephone_identity && has_service_route {
+            // The registrar's answer is the limit of what this proves: a
+            // voice-capable binding exists. Whether a terminating INVITE
+            // actually arrives is decided later, by the TAS and by whichever
+            // binding it picks, so the code says "registrar accepted" rather
+            // than claiming the service works end to end.
             return Self {
-                voice: ImsServiceState::Available,
-                code: "ims_voice_service_available",
+                voice: ImsServiceState::RegistrarAccepted,
+                code: "ims_voice_registrar_accepted",
                 retryable: false,
                 carrier_reason: None,
                 alternative_service: None,
@@ -555,13 +570,25 @@ mod tests {
     #[test]
     fn register_success_with_telephone_identity_permits_voice() {
         // The device's real answer: a tel: URI plus a sip: URI with user=phone,
-        // and a Service-Route. This is what "provisioned for MMTEL" looks like.
+        // and a Service-Route. That is the registrar accepting a voice-capable
+        // binding -- deliberately not reported as end-to-end "available", since
+        // this exact answer coexisted with terminating calls going to voicemail.
         let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+60174231067@ims.mnc012.mcc502.3gppnetwork.org>, <tel:+60174231067>\r\nService-Route: <sip:orig@scscf.example:5060;lr>\r\nContent-Length: 0\r\n\r\n";
         let verdict = ImsServiceVerdict::from_register_success(response);
 
-        assert_eq!(verdict.voice, ImsServiceState::Available);
-        assert_eq!(verdict.code, "ims_voice_service_available");
+        assert_eq!(verdict.voice, ImsServiceState::RegistrarAccepted);
+        assert_eq!(verdict.code, "ims_voice_registrar_accepted");
         assert!(verdict.voice.permits_calls());
+    }
+
+    #[test]
+    fn registrar_acceptance_never_claims_end_to_end_availability() {
+        // Guard against the overclaim being reintroduced: no state and no code
+        // emitted by from_register_success may read as plain "available".
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>\r\nService-Route: <sip:orig@scscf.example;lr>\r\n\r\n";
+        let verdict = ImsServiceVerdict::from_register_success(response);
+        assert_ne!(verdict.voice.as_str(), "available");
+        assert_ne!(verdict.code, "ims_voice_service_available");
     }
 
     #[test]
@@ -580,7 +607,7 @@ mod tests {
         let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+8613800138000@ims.example;user=phone>\r\nService-Route: <sip:orig@scscf.example;lr>\r\n\r\n";
         assert_eq!(
             ImsServiceVerdict::from_register_success(response).voice,
-            ImsServiceState::Available
+            ImsServiceState::RegistrarAccepted
         );
     }
 

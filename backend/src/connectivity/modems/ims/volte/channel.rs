@@ -25,6 +25,13 @@ pub struct VolteSipChannel {
     receive_socket: Option<UdpSocket>,
     reserved_receive_socket: Option<ReservedReceiveSocket>,
     route: ImsRoute,
+    /// Port to advertise in Via/Contact once a security association is active.
+    /// TS 24.229 §5.1.1.2.2 b)/c): a UDP request protected by an SA is sourced
+    /// from the protected client port (port_uc) but must advertise the protected
+    /// *server* port (port_us), because that is where the P-CSCF sends
+    /// terminating requests. `None` means the channel is unprotected and the
+    /// send port is also the right port to advertise.
+    advertised_local_port: Option<u16>,
     interface: Option<String>,
     security_verify: Option<String>,
 }
@@ -51,6 +58,7 @@ impl VolteSipChannel {
             receive_socket: None,
             reserved_receive_socket: None,
             route,
+            advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
             security_verify,
         })
@@ -106,6 +114,7 @@ impl VolteSipChannel {
             receive_socket: None,
             reserved_receive_socket: None,
             route,
+            advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
             security_verify,
         })
@@ -183,6 +192,9 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
+        // Terminating requests arrive on the protected server port, so that is
+        // what Via/Contact must advertise from here on -- not the send port.
+        self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
         Ok(())
     }
@@ -237,8 +249,31 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
+        // Same rule as the host path: advertise the protected server port.
+        self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
         Ok(())
+    }
+
+    /// Route to put in Via/Contact. Identical to [`Self::send_route`] until a
+    /// security association is active, after which the local port becomes the
+    /// protected server port while sends keep using the client port.
+    ///
+    /// This is what [`ImsChannel::route`] returns, because every consumer
+    /// outside this module uses the route to build headers or to read the local
+    /// IP -- sending goes through `send_socket`, which is already connected.
+    pub fn advertised_route(&self) -> ImsRoute {
+        let mut route = self.route;
+        if let Some(port) = self.advertised_local_port {
+            route.local_addr.set_port(port);
+        }
+        route
+    }
+
+    /// The route packets are actually sourced from: after sec-agree the
+    /// protected client port (port_uc). Only the security offer needs this.
+    pub fn send_route(&self) -> ImsRoute {
+        self.route
     }
 
     pub fn local_addr(&self) -> Result<SocketAddr, ImsError> {
@@ -285,7 +320,7 @@ impl ImsChannel for VolteSipChannel {
     }
 
     fn route(&self) -> ImsRoute {
-        self.route
+        self.advertised_route()
     }
 
     fn security_verify(&self) -> Option<&str> {

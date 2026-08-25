@@ -998,7 +998,10 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         .map_err(to_ims_error)?;
 
         if let Some(auts) = aka.auts.as_deref() {
-            self.route = channel.route();
+            // `self.route` is only ever used to build headers, so it holds the
+            // advertised route. No SA is active on this resync path yet, so it
+            // still equals the send route.
+            self.route = channel.advertised_route();
             let request_uri = sip::register_request_uri_with_target(
                 self.profile,
                 effective_register_target(&self.effective_ims),
@@ -1117,7 +1120,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             self.mode = RegistrationMode::Udp;
             (None, None, false)
         };
-        self.route = channel.route();
+        // `self.route` only ever feeds header construction (Via/Contact and the
+        // Request-URI), never a socket, so it must carry the advertised route.
+        // After sec-agree that means the protected *server* port: TS 24.229
+        // §5.1.1.2.2 b)/c) requires the UE to advertise port_us even though the
+        // request leaves from port_uc. Advertising port_uc instead points the
+        // P-CSCF at a port nothing receives on, so terminating INVITEs are lost.
+        self.route = channel.advertised_route();
         let request_uri = sip::register_request_uri_with_target(
             self.profile,
             effective_register_target(&self.effective_ims),
@@ -2001,6 +2010,7 @@ async fn connect_family(
     }
     let sip_instance = sip_instance_for_profile(
         profile,
+        &device_identity.ims,
         device_identity.effective_device_identity.imei.as_deref(),
     );
     let mut register_variants = register_variants(profile).into_iter().peekable();
@@ -2063,7 +2073,11 @@ async fn connect_family(
                 .map_err(map_channel_error)?
         };
         let ids = RequestIds::fresh(1);
-        let offered_binding = offered_security(channel.route().local_addr.port(), receive_port);
+        // port_c is the port packets are actually sourced from, so this reads the
+        // send route rather than the advertised one. They are identical here (no
+        // SA is active yet), but being explicit keeps the offer correct if this
+        // ever runs on an already-protected channel.
+        let offered_binding = offered_security(channel.send_route().local_addr.port(), receive_port);
         // TS 24.229 / RFC 3329: the initial REGISTER already advertises the
         // full ipsec-3gpp offer (alg/ealg/prot/mod + client SPI/ports). The
         // 401 then supplies the server binding; the authenticated REGISTER
@@ -5706,28 +5720,23 @@ fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
     }
 }
 
-fn new_sip_instance() -> String {
-    let token = sip::hex_token(16);
-    format!(
-        "urn:uuid:{}-{}-{}-{}-{}",
-        &token[0..8],
-        &token[8..12],
-        &token[12..16],
-        &token[16..20],
-        &token[20..32]
+/// `+sip.instance` for this line's VoLTE registration.
+///
+/// Derived from the IMPI rather than randomised per registration, so this leg
+/// and the VoWiFi leg present the *same* instance id for the same subscription.
+/// See [`stable_sip_instance`] for why that matters to terminating calls.
+///
+/// [`stable_sip_instance`]: crate::connectivity::core::device_identity::stable_sip_instance
+fn sip_instance_for_profile(
+    profile: &CarrierProfile,
+    identity: &ImsIdentity,
+    effective_imei: Option<&str>,
+) -> String {
+    crate::connectivity::core::device_identity::stable_sip_instance(
+        &identity.private_user,
+        effective_imei,
+        profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance,
     )
-}
-
-fn sip_instance_for_profile(profile: &CarrierProfile, effective_imei: Option<&str>) -> String {
-    if profile.identity.device_identity_enabled && profile.ims.register.always_add_sip_instance {
-        if let Some(imei) = effective_imei
-            .map(str::trim)
-            .filter(|imei| crate::connectivity::core::device_identity::is_valid_imei(imei))
-        {
-            return format!("urn:imei:{imei}");
-        }
-    }
-    new_sip_instance()
 }
 
 fn ensure_generation(runtime: &VolteRuntime, expected: u64) -> Result<(), VolteError> {
@@ -6277,22 +6286,52 @@ mod tests {
         assert_eq!(device.equipment_identifier, "490154203237518");
     }
 
+    fn instance_identity(impi: &str) -> ImsIdentity {
+        ImsIdentity {
+            private_user: impi.to_string(),
+            public_uri: format!("sip:{impi}"),
+            contact_user: impi.to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        }
+    }
+
     #[test]
     fn sip_instance_imei_is_strictly_carrier_policy_gated() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let identity = instance_identity("460001234567890@ims.example");
         profile.ims.register.always_add_sip_instance = true;
         profile.identity.device_identity_enabled = false;
         assert!(
-            sip_instance_for_profile(&profile, Some("490154203237518")).starts_with("urn:uuid:")
+            sip_instance_for_profile(&profile, &identity, Some("490154203237518"))
+                .starts_with("urn:uuid:")
         );
 
         profile.identity.device_identity_enabled = true;
         assert_eq!(
-            sip_instance_for_profile(&profile, Some("490154203237518")),
+            sip_instance_for_profile(&profile, &identity, Some("490154203237518")),
             "urn:imei:490154203237518"
         );
-        assert!(sip_instance_for_profile(&profile, Some("12345")).starts_with("urn:uuid:"));
-        assert!(sip_instance_for_profile(&profile, None).starts_with("urn:uuid:"));
+        assert!(sip_instance_for_profile(&profile, &identity, Some("12345"))
+            .starts_with("urn:uuid:"));
+        assert!(sip_instance_for_profile(&profile, &identity, None).starts_with("urn:uuid:"));
+    }
+
+    #[test]
+    fn sip_instance_is_stable_per_subscription_not_per_registration() {
+        // RFC 5626 §4.1: the instance id names the UE. Re-registering, or
+        // registering the same IMPU over the other access leg, must present the
+        // same value or the S-CSCF keeps two bindings for one identity and a
+        // terminating INVITE can be delivered to the wrong one.
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let identity = instance_identity("460001234567890@ims.example");
+        let first = sip_instance_for_profile(&profile, &identity, None);
+        let second = sip_instance_for_profile(&profile, &identity, None);
+        assert_eq!(first, second);
+        assert!(first.starts_with("urn:uuid:"));
+
+        let other = instance_identity("460009999999999@ims.example");
+        assert_ne!(first, sip_instance_for_profile(&profile, &other, None));
     }
 
     #[test]
