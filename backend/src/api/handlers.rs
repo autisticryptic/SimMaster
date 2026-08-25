@@ -1293,6 +1293,53 @@ pub async fn get_device_info(
 
 // ============ SIM 卡 ============
 
+/// Fill in this line's own number from an IMS registration when no other source
+/// knew it, and persist it so every other reader sees it too.
+///
+/// On a data-only line the SIM does not carry the number: `EF-MSISDN` is
+/// commonly unprogrammed, so ModemManager reports nothing and the own-number
+/// cache stays empty -- which is why the UI showed `N/A` even while the line was
+/// registered. The registrar's `P-Associated-URI` is the only observable source
+/// (TS 24.229 §5.1.1.2), and both access legs publish what they learned into
+/// `connectivity::core::own_numbers`.
+///
+/// Two things this deliberately does not do: it never overrides a manual entry
+/// (the user's own statement outranks an observed one), and it never overwrites
+/// numbers another source already supplied.
+async fn apply_ims_observed_own_numbers(
+    app: &AppState,
+    line_id: &str,
+    info: &mut crate::api::models::SimInfoResponse,
+) {
+    if info.phone_number_is_manual || !info.phone_numbers.is_empty() {
+        return;
+    }
+    let observed = crate::connectivity::core::own_numbers::for_line(line_id);
+    if observed.is_empty() {
+        return;
+    }
+    // Persisting needs the ICCID: it is the cache's identity key, and without it
+    // the value would be re-derived from the registrar on every read.
+    if !info.iccid.is_empty() {
+        crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+            &app.database,
+            &crate::hardware::cellular::modem_manager::SimIdentity {
+                iccid: info.iccid.clone(),
+                imsi: info.imsi.clone(),
+                operator_id: format!("{}{}", info.mcc, info.mnc),
+            },
+            &observed,
+            crate::connectivity::core::own_numbers::IMS_NUMBER_SOURCE,
+        );
+    }
+    tracing::debug!(
+        line_id,
+        number_count = observed.len(),
+        "Reported this line's own number from the IMS registrar's P-Associated-URI"
+    );
+    info.phone_numbers = observed;
+}
+
 /// GET /api/modem/lines/{line_id}/sim
 pub async fn get_sim_info(
     State(app): State<AppState>,
@@ -1352,32 +1399,33 @@ pub async fn get_sim_info(
                     &app.database,
                     &cache_identity,
                 );
+            let mut info = SimInfoResponse {
+                present: binding.present,
+                iccid,
+                imsi,
+                phone_numbers,
+                sms_center,
+                mcc,
+                mnc,
+                phone_number_is_manual,
+                sms_center_is_manual,
+                sim_path: binding.model,
+                modem_path: String::new(),
+                sim_type: binding.sim_type,
+                esim_status: binding.esim_status,
+                active: binding.present,
+                operator_name: operator_id.clone(),
+                registered_operator_name: "VoWiFi".to_string(),
+                registered_operator_code: operator_id,
+                lock_status: "none".to_string(),
+                ..Default::default()
+            };
+            // A reader line has no baseband to ask, so the registrar's answer is
+            // the only source of its number.
+            apply_ims_observed_own_numbers(&app, line_id.trim(), &mut info).await;
             return (
                 StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    SimInfoResponse {
-                        present: binding.present,
-                        iccid,
-                        imsi,
-                        phone_numbers,
-                        sms_center,
-                        mcc,
-                        mnc,
-                        phone_number_is_manual,
-                        sms_center_is_manual,
-                        sim_path: binding.model,
-                        modem_path: String::new(),
-                        sim_type: binding.sim_type,
-                        esim_status: binding.esim_status,
-                        active: binding.present,
-                        operator_name: operator_id.clone(),
-                        registered_operator_name: "VoWiFi".to_string(),
-                        registered_operator_code: operator_id,
-                        lock_status: "none".to_string(),
-                        ..Default::default()
-                    },
-                )),
+                Json(ApiResponse::success_with_message("Success", info)),
             );
         }
     }
@@ -1392,10 +1440,15 @@ pub async fn get_sim_info(
     };
     match get_sim_info_for_modem_with_cache(&app.dbus_conn, &modem_path, Some(&app.database)).await
     {
-        Ok(data) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message("Success", data)),
-        ),
+        Ok(mut data) => {
+            // The modem had nothing to say about the number on a data-only line;
+            // the IMS registrar did.
+            apply_ims_observed_own_numbers(&app, line_id.trim(), &mut data).await;
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message("Success", data)),
+            )
+        }
         Err(e) => (
             StatusCode::OK,
             Json(ApiResponse::<SimInfoResponse>::error(format!(

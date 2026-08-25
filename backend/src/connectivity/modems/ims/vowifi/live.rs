@@ -4293,6 +4293,17 @@ async fn run_protected_authenticated_register_candidates(
                     if let Some(uri) = registered.default_associated_uri() {
                         registered_identity.public_uri = uri.to_string();
                     }
+                    // The registrar's P-Associated-URI set is the only place a
+                    // data-only line's own MSISDN is observable, and this leg
+                    // previously only logged how many URIs arrived. Publish the
+                    // telephone identities so the API layer can surface the
+                    // number instead of reporting N/A.
+                    crate::connectivity::core::own_numbers::record(
+                        line_id,
+                        crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
+                            response.as_bytes(),
+                        ),
+                    );
                     record_live_ims_security_verify(line_id, profile, security_verify, &registered)
                         .await;
                     record_live_ims_channel(

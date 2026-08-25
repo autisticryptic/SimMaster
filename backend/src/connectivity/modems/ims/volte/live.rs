@@ -2289,6 +2289,17 @@ async fn connect_family(
                 state.voice_alternative_service = verdict.alternative_service.clone();
             })
             .await;
+        // The runtime snapshot above carries the raw URIs, but every existing
+        // reader of "this line's number" -- the UI, notification templates,
+        // device status -- goes through the own-number cache instead, and this
+        // function has no database handle. Publish the dialable numbers where
+        // the API layer can pick them up and persist them.
+        crate::connectivity::core::own_numbers::record(
+            &device.line_id,
+            crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
+                &registration.response,
+            ),
+        );
         if authenticator.mode == RegistrationMode::Udp {
             runtime
                 .update(|state| state.stage = VolteStage::RegisterUdp)

@@ -276,6 +276,75 @@ impl ImsServiceVerdict {
     }
 }
 
+/// Extract this line's own telephone numbers from a REGISTER `200 OK`.
+///
+/// The registrar's `P-Associated-URI` set (TS 24.229 §5.1.1.2) is the only place
+/// a data-only line's own MSISDN is observable: the SIM's EF-MSISDN is commonly
+/// unprogrammed, ModemManager then reports nothing, and USSD needs a circuit
+/// this bearer does not provide. So when the network hands us
+/// `<tel:+60174231067>` in the registration answer, that *is* the number.
+///
+/// Only genuine telephone identities are returned, using the same rule
+/// [`ImsServiceVerdict::from_register_success`] applies — a SIP-URI identity
+/// with no `user=phone` is an IMS identity, not a dialable number. Values are
+/// normalised to bare E.164 (`+` plus digits) and de-duplicated, preserving the
+/// registrar's order so the default identity stays first.
+pub fn telephone_numbers_from_register_success(frame: &[u8]) -> Vec<String> {
+    telephone_numbers_from_associated_uris(&sip_frame::header_values(frame, "P-Associated-URI"))
+}
+
+/// [`telephone_numbers_from_register_success`] for callers that already parsed
+/// the header set into `RegisteredImsContext::associated_uris`.
+///
+/// Each element may itself be a comma-separated list, because a registrar is
+/// free to fold several URIs into one header line.
+pub fn telephone_numbers_from_associated_uris(uris: &[String]) -> Vec<String> {
+    let mut numbers = Vec::new();
+    for value in uris {
+        for entry in split_quoted(value, ',') {
+            if !uri_is_telephone_identity(entry) {
+                continue;
+            }
+            if let Some(number) = e164_from_uri(entry) {
+                if !numbers.contains(&number) {
+                    numbers.push(number);
+                }
+            }
+        }
+    }
+    numbers
+}
+
+/// Pull a bare `+E.164` out of a `tel:` or `sip:...;user=phone` URI.
+///
+/// Rejects anything that is not a plausible international number so a malformed
+/// or unexpected URI cannot end up displayed as this line's phone number.
+fn e164_from_uri(value: &str) -> Option<String> {
+    let trimmed = value.trim().trim_start_matches('<').trim_end_matches('>');
+    // Strip the scheme, then the host part and any URI parameters: both
+    // `tel:+6017...;phone-context=...` and `sip:+6017...@domain;user=phone`
+    // reduce to the user part.
+    let without_scheme = trimmed
+        .split_once(':')
+        .map(|(_, rest)| rest)
+        .unwrap_or(trimmed);
+    let user = without_scheme
+        .split(['@', ';'])
+        .next()
+        .unwrap_or(without_scheme)
+        .trim();
+    // Visual separators are permitted in tel: URIs (RFC 3966 §3).
+    let digits: String = user
+        .chars()
+        .filter(|ch| !matches!(ch, '-' | '.' | '(' | ')' | ' '))
+        .collect();
+    let bare = digits.strip_prefix('+').unwrap_or(&digits);
+    if bare.len() < 8 || bare.len() > 15 || !bare.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(format!("+{bare}"))
+}
+
 /// Whether an associated URI is an E.164 telephone identity: a `tel:` URI, or
 /// a `sip:` URI carrying `user=phone` (TS 24.229 / RFC 3261 §19.1.1).
 fn uri_is_telephone_identity(value: &str) -> bool {
@@ -608,6 +677,89 @@ mod tests {
         assert_eq!(
             ImsServiceVerdict::from_register_success(response).voice,
             ImsServiceState::RegistrarAccepted
+        );
+    }
+
+    #[test]
+    fn own_number_is_extracted_from_the_registrars_associated_uris() {
+        // The observed Maxis answer: the IMSI-derived SIP IMPU plus the
+        // MSISDN-associated tel: URI. Only the second is a dialable number, and
+        // it is the only place this line's own number is observable.
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+60174231067@ims.mnc012.mcc502.3gppnetwork.org>, <tel:+60174231067>\r\nService-Route: <sip:orig@scscf.example:5060;lr>\r\n\r\n";
+        assert_eq!(
+            telephone_numbers_from_register_success(response),
+            vec!["+60174231067".to_string()],
+            "the sip: and tel: forms of one number must not be reported twice"
+        );
+    }
+
+    #[test]
+    fn a_sip_identity_without_user_phone_is_not_reported_as_a_number() {
+        // An IMS identity is not a dialable number. Reporting it would put an
+        // IMSI on screen labelled as the subscriber's phone number.
+        let response =
+            b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:460001234567890@ims.example>\r\n\r\n";
+        assert!(telephone_numbers_from_register_success(response).is_empty());
+    }
+
+    #[test]
+    fn own_numbers_keep_registrar_order_and_survive_folded_headers() {
+        // A registrar may fold several URIs onto one line or split them across
+        // header lines; both must yield the same list, default identity first.
+        let folded = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>, <tel:+60199999999>\r\n\r\n";
+        let split = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>\r\nP-Associated-URI: <tel:+60199999999>\r\n\r\n";
+        let expected = vec!["+60174231067".to_string(), "+60199999999".to_string()];
+        assert_eq!(telephone_numbers_from_register_success(folded), expected);
+        assert_eq!(telephone_numbers_from_register_success(split), expected);
+    }
+
+    #[test]
+    fn tel_uri_visual_separators_and_parameters_are_normalised_away() {
+        // RFC 3966 §3 permits visual separators, and phone-context is common.
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60-17-423.1067;phone-context=+60>\r\n\r\n";
+        assert_eq!(
+            telephone_numbers_from_register_success(response),
+            vec!["+60174231067".to_string()]
+        );
+    }
+
+    #[test]
+    fn implausible_values_are_rejected_rather_than_displayed() {
+        // Guard the display path: a short extension, a non-numeric user part, or
+        // an over-long value must never reach the UI as a phone number.
+        for header in [
+            "<tel:911>",
+            "<tel:+1-800-FLOWERS>",
+            "<sip:1234567@ims.example;user=phone>",
+            "<tel:+1234567890123456789>",
+        ] {
+            let frame = format!("SIP/2.0 200 OK\r\nP-Associated-URI: {header}\r\n\r\n");
+            assert!(
+                telephone_numbers_from_register_success(frame.as_bytes()).is_empty(),
+                "{header} must not be reported as this line's number"
+            );
+        }
+    }
+
+    #[test]
+    fn a_register_answer_without_associated_uris_yields_nothing() {
+        let response = b"SIP/2.0 200 OK\r\nService-Route: <sip:orig@scscf.example;lr>\r\n\r\n";
+        assert!(telephone_numbers_from_register_success(response).is_empty());
+    }
+
+    #[test]
+    fn parsed_uri_lists_agree_with_parsing_the_frame() {
+        // The two entry points must not drift: one takes the raw frame, the
+        // other the already-parsed `associated_uris` a leg holds.
+        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:+60174231067@ims.example;user=phone>, <tel:+60199999999>\r\n\r\n";
+        let from_frame = telephone_numbers_from_register_success(response);
+        let from_parsed = telephone_numbers_from_associated_uris(&[
+            "<sip:+60174231067@ims.example;user=phone>, <tel:+60199999999>".to_string(),
+        ]);
+        assert_eq!(from_frame, from_parsed);
+        assert_eq!(
+            from_frame,
+            vec!["+60174231067".to_string(), "+60199999999".to_string()]
         );
     }
 

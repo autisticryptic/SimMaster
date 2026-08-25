@@ -25,6 +25,7 @@ pub mod ims_access;
 pub mod ims_failure;
 pub mod ims_video;
 pub mod media;
+pub mod own_numbers;
 pub mod register;
 pub mod register_message;
 pub mod register_response;
