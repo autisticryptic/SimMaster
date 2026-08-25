@@ -9244,7 +9244,7 @@ pub async fn set_voice_path_policy_handler(
 /// legs register at all. See `connectivity::core::ims_access`.
 // `Default` is required by `ApiResponse::error`, which both handlers below use
 // on the not-found path.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, Deserialize)]
 pub struct ImsAccessPreferencePayload {
     pub preference: crate::connectivity::core::ims_access::ImsAccessPreference,
 }
