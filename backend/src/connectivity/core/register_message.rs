@@ -22,6 +22,7 @@ pub struct RegisterHeaderFields {
     pub require_sec_agree: bool,
     pub proxy_require_sec_agree: bool,
     pub allow: Option<String>,
+    pub preferred_service: Option<String>,
     pub preferred_identity: Option<String>,
     pub visited_network: Option<String>,
     pub access_network_info: Option<String>,
@@ -67,6 +68,11 @@ pub fn build_register(request: &RegisterRequest) -> Vec<u8> {
         headers.push(SipHeader::new("Proxy-Require", "sec-agree"));
     }
     push_non_empty(&mut headers, "Allow", fields.allow.as_deref());
+    push_optional(
+        &mut headers,
+        "P-Preferred-Service",
+        fields.preferred_service.as_deref(),
+    );
     push_optional(
         &mut headers,
         "P-Preferred-Identity",
@@ -165,6 +171,7 @@ mod tests {
                 require_sec_agree: true,
                 proxy_require_sec_agree: true,
                 allow: None,
+                preferred_service: None,
                 preferred_identity: Some("<sip:user@ims.example>".into()),
                 visited_network: None,
                 access_network_info: Some("IEEE-802.11".into()),

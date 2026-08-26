@@ -5932,6 +5932,7 @@ impl LiveRegisterRequestContext {
                     proxy_require_sec_agree: params.require_sec_agree
                         && profile.ims.register.proxy_require_sec_agree_headers,
                     allow: Some(params.allow_header),
+                    preferred_service: None,
                     preferred_identity: variant
                         .header_profile
                         .include_p_preferred_identity
