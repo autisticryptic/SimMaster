@@ -927,11 +927,15 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
 static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
-/// Generate a conservative profile from public 3GPP naming rules.
+/// Generate an iPhone/IPCC-shaped fallback from public 3GPP naming rules.
 ///
-/// This is an explicitly unverified last resort. It intentionally does not
-/// guess a static P-CSCF, entitlement/XCAP endpoints, a visited-network value,
-/// or carrier-specific SIP security requirements.
+/// This is an explicitly unverified last resort. The registration envelope is
+/// deliberately modelled on the smallest interoperable shape observed in the
+/// iPhone/IPCC catalog: PANI and Cellular-Network-Info are present, the Contact
+/// stays compact, and sec-agree is negotiated without adding the Pixel-style
+/// MMTEL/+sip.instance feature set before the network asks for it. It still does
+/// not guess a static P-CSCF, entitlement/XCAP endpoints or carrier-specific
+/// identities.
 pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
@@ -1039,7 +1043,7 @@ pub fn derive_standard_3gpp_profile(
             // TCP before the P-CSCF has expressed that requirement.
             transport: "udp",
             local_port: 5060,
-            user_agent: "SimAdmin VoWiFi",
+            user_agent: "SimAdmin IMS",
             identity_source: "isim",
             tcp_keepalive_seconds: DEFAULT_IMS_TCP_KEEPALIVE_SECONDS,
             options_ping_interval_seconds: DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS,
@@ -1049,30 +1053,34 @@ pub fn derive_standard_3gpp_profile(
                 include_pani_initial: true,
                 include_pani_authenticated: true,
                 initial_authorization: "aka_empty",
-                include_mmtel_features: true,
-                include_route_header: true,
+                include_mmtel_features: false,
+                include_route_header: false,
                 include_visited_network: false,
                 include_p_preferred_identity: true,
                 visited_network_header: None,
                 allow_methods: None,
-                strict_security_server_offer: false,
-                enable_initial_reject_fallback: true,
+                strict_security_server_offer: true,
+                enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
-                require_sec_agree_headers: false,
-                proxy_require_sec_agree_headers: false,
-                sec_agree_mode: "auto",
+                require_sec_agree_headers: true,
+                proxy_require_sec_agree_headers: true,
+                sec_agree_mode: "required",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
-                contact_mode: "android_default",
-                contact_param_order: &[],
+                contact_mode: "standard",
+                contact_param_order: &[
+                    "+g.3gpp.mid-call",
+                    "+g.3gpp.srvcc-alerting",
+                    "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
+                ],
                 temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
                 always_add_sip_instance: false,
-                enable_cellular_network_info: false,
+                enable_cellular_network_info: true,
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
-                live_header_variant_set: "standard_ims_features",
+                live_header_variant_set: "iphone_ipcc_fallback",
             },
         },
         sms: SmsPolicy {
@@ -1628,6 +1636,28 @@ mod tests {
         assert_eq!(lte.meta.profile_id, "derived_3gpp_lte_26201");
         assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
         assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
+        assert_eq!(lte.ims.transport, "udp");
+        assert_eq!(lte.ims.register.sec_agree_mode, "required");
+        assert!(lte.ims.register.require_sec_agree_headers);
+        assert!(lte.ims.register.proxy_require_sec_agree_headers);
+        assert!(lte.ims.register.include_pani_initial);
+        assert!(lte.ims.register.include_pani_authenticated);
+        assert!(lte.ims.register.enable_cellular_network_info);
+        assert!(!lte.ims.register.include_mmtel_features);
+        assert!(!lte.ims.register.include_route_header);
+        assert_eq!(lte.ims.register.contact_mode, "standard");
+        assert_eq!(
+            lte.ims.register.contact_param_order,
+            &[
+                "+g.3gpp.mid-call",
+                "+g.3gpp.srvcc-alerting",
+                "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
+            ]
+        );
+        assert_eq!(
+            lte.ims.register.live_header_variant_set,
+            "iphone_ipcc_fallback"
+        );
         assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
     }
 

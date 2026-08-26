@@ -253,8 +253,9 @@ impl ProfileStore {
         }
     }
 
-    /// Resolve the VoWiFi profile for a PLMN. The carrier catalog is the only
-    /// source; no generated or compiled-in answer is returned.
+    /// Resolve the VoWiFi profile for a PLMN. Custom/catalog rows win; when no
+    /// usable row exists, return the standard 3GPP-derived fallback so profile
+    /// discovery and live registration have the same no-catalog behaviour.
     pub fn resolve_by_plmn(&self, mcc: &str, mnc: &str) -> Option<ResolvedProfile> {
         let plmn = format!("{mcc}{mnc}");
         if let Some((_, record)) = self
@@ -269,14 +270,28 @@ impl ProfileStore {
                 fallback_reason: None,
             });
         }
-        self.catalog
+        if let Ok(Some(entry)) = self
+            .catalog
             .unique_for_plmn(&plmn, CatalogAccessKind::WifiEpdg)
-            .ok()?
-            .map(|entry| ResolvedProfile {
+        {
+            return Some(ResolvedProfile {
                 profile: entry.record.intern(),
                 origin: ProfileOrigin::Catalog,
                 fallback_reason: None,
-            })
+            });
+        }
+        let profile = profiles::derive_standard_3gpp_profile(
+            mcc,
+            mnc,
+            profiles::Standard3gppAccess::WifiEpdg,
+        )?;
+        Some(ResolvedProfile {
+            profile,
+            origin: ProfileOrigin::Derived,
+            fallback_reason: Some(format!(
+                "carrier_catalog_no_usable_profile:home_plmn:{plmn}:access:wifi_epdg"
+            )),
+        })
     }
 
     /// Resolve a profile for one registration access. A pinned profile id is
@@ -323,24 +338,6 @@ impl ProfileStore {
                     && digits.starts_with(*plmn)
             })
             .map(str::to_string);
-        // Controlled catalog-free interoperability mode. Explicit profile
-        // pins still win above; this switch only changes runtime resolution
-        // and never mutates the read-only catalog on disk.
-        if std::env::var_os("SIMADMIN_FORCE_STANDARD_PROFILE").is_some() {
-            let plmn = explicit_home_plmn.as_deref().or_else(|| {
-                let length = if digits.starts_with("460") { 5 } else { 6 };
-                digits.get(..digits.len().min(length))
-            });
-            let reason = plmn
-                .map(|value| format!("standard_profile_forced:home_plmn:{value}"))
-                .unwrap_or_else(|| "standard_profile_forced:home_plmn:unknown".to_string());
-            tracing::warn!(
-                access = access.as_str(),
-                home_plmn = ?plmn,
-                "Forcing catalog-free standard 3GPP IMS profile"
-            );
-            return Ok(derive_standard_fallback(digits, plmn, access, reason));
-        }
         let (custom_records, custom_lookup_error) = match self.custom_records() {
             Ok(records) => (records, None),
             Err(error) => {
@@ -377,8 +374,13 @@ impl ProfileStore {
                 fallback_reason: None,
             }));
         }
-        let home_plmn =
-            explicit_home_plmn.or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
+        let home_plmn = explicit_home_plmn.or_else(|| {
+            self.catalog
+                .infer_home_plmn(digits)
+                .ok()
+                .flatten()
+                .or_else(|| inferred_home_plmn(digits).map(str::to_string))
+        });
         let home_plmn = home_plmn.as_deref();
         let catalog_result = match self.catalog.imsi_has_ambiguous_plmn(digits) {
             Ok(true) if home_plmn.is_none() => Ok(None),
@@ -441,6 +443,11 @@ fn derive_standard_fallback(
         origin: ProfileOrigin::Derived,
         fallback_reason: Some(fallback_reason),
     })
+}
+
+fn inferred_home_plmn(imsi: &str) -> Option<&str> {
+    let inferred_length = if imsi.starts_with("460") { 5 } else { 6 };
+    imsi.get(..inferred_length)
 }
 
 impl From<&'static CarrierProfile> for ResolvedProfile {
@@ -510,6 +517,35 @@ mod tests {
         assert_eq!(published.matched_prefix, "234330");
 
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn absent_catalog_uses_derived_fallback_without_a_runtime_switch() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog = CarrierCatalog::at_path(PathBuf::from(
+            "/definitely-missing/carrier-bundles.sqlite3",
+        ));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+
+        let resolved = store
+            .resolve_for_imsi_access(
+                None,
+                "502121234567890",
+                Some("50212"),
+                CatalogAccessKind::LteEpc,
+            )
+            .expect("missing catalog query")
+            .expect("derived profile");
+
+        assert_eq!(resolved.origin, ProfileOrigin::Derived);
+        assert_eq!(resolved.profile.meta.profile_id, "derived_3gpp_lte_50212");
+        assert!(resolved
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("carrier_catalog_open_failed")));
     }
 
     #[test]
