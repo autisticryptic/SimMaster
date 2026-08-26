@@ -7869,11 +7869,10 @@ async fn line_ims_access_decision_assuming(
     let binding = line.binding();
     let line_id = binding.line_id.clone();
     let profile = app.config_manager.get_line_profile(&line_id);
-    let wlan_up = crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
-        &line_id,
-    )
-    .is_available()
-        || line.vowifi_restore_in_progress();
+    let wlan_up =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .is_available()
+            || line.vowifi_restore_in_progress();
 
     decide(ImsAccessInputs {
         cellular_enabled: profile.enabled && profile.volte_connection_enabled,
@@ -8634,6 +8633,27 @@ async fn start_line_volte_restore(
         );
         return false;
     }
+    if line.baseband_wedge_permanent() {
+        tracing::warn!(
+            line_id = %line.binding().line_id,
+            source,
+            "Skipping VoLTE restore: Qualcomm bam-dmux is latched until a full system reboot"
+        );
+        line.volte
+            .update(|state| {
+                state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                state.recovery_state =
+                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
+                state.manual_retry_available = false;
+                state.next_retry_at = None;
+                state.last_error = Some(
+                    "volte_baseband_wedged:volte_bearer_netdev_runtime_error:full_system_reboot_required"
+                        .to_string(),
+                );
+            })
+            .await;
+        return false;
+    }
     // An operator asking explicitly may always try; only the unattended pass is
     // suppressed, because that is the one that loops the baseband into a crash
     // every time its cooldown is lost to re-enumeration.
@@ -8910,11 +8930,19 @@ async fn run_line_volte_restore_batch(
                     // The crash this abort guards against re-enumerates the
                     // modem, and that hotplug resets the VoLTE snapshot. Record
                     // the cooldown on the line instead, where it survives.
-                    let cooldown = line.note_baseband_wedged();
+                    let permanent = error.code()
+                        == crate::connectivity::modems::ims::volte::errors::code::BEARER_NETDEV_RUNTIME_ERROR;
+                    let cooldown = if permanent {
+                        line.note_baseband_wedged_permanent();
+                        None
+                    } else {
+                        Some(line.note_baseband_wedged())
+                    };
                     warn!(
                         line_id = %binding.line_id,
                         error = %error,
-                        cooldown_secs = cooldown.as_secs(),
+                        permanent,
+                        cooldown_secs = cooldown.map(|value| value.as_secs()),
                         "VoLTE IMS restore aborted: the baseband refused the session in a way that is unsafe to retry"
                     );
                     line.volte
@@ -8922,7 +8950,7 @@ async fn run_line_volte_restore_batch(
                             state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
                             state.recovery_state =
                                 crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
-                            state.manual_retry_available = true;
+                            state.manual_retry_available = !permanent;
                             state.next_retry_at = None;
                             state.last_error = Some(format!("volte_baseband_wedged:{error}"));
                             state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());

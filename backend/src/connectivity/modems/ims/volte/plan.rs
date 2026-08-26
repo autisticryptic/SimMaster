@@ -150,8 +150,6 @@ fn is_baseband_wedge(lowercased: &str) -> bool {
         || lowercased.contains("endpoint hangup")
         || lowercased.contains("mobileequipment.unknown")
         || lowercased.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
-        || lowercased.contains(code::BEARER_NETDEV_NOT_UP)
-        || lowercased.contains(code::BEARER_NETDEV_NOT_READY)
         || (call_failed && internal_error)
 }
 
@@ -171,11 +169,14 @@ impl FailureClass {
             FailureClass::NetworkForcedIpv4
         } else if error.contains("prefix-unavailable") {
             FailureClass::PrefixUnavailable
-        } else if error.contains(code::BEARER_NETDEV_RUNTIME_ERROR)
-            || error.contains(code::BEARER_NETDEV_NOT_UP)
+        } else if error.contains(code::BEARER_NETDEV_RUNTIME_ERROR) {
+            FailureClass::BasebandWedged
+        } else if error.contains(code::BEARER_NETDEV_NOT_UP)
             || error.contains(code::BEARER_NETDEV_NOT_READY)
         {
-            FailureClass::BasebandWedged
+            // Interface bring-up races are recoverable. Only the kernel's
+            // latched runtime-PM error is a confirmed permanent bam-dmux wedge.
+            FailureClass::Other
         } else if is_baseband_wedge(&error) {
             FailureClass::BasebandWedged
         } else {
@@ -187,9 +188,7 @@ impl FailureClass {
     /// loop (was `live::should_try_next_family`).
     pub fn from_error(error: &VolteError) -> Self {
         match error.code() {
-            code::BEARER_NETDEV_RUNTIME_ERROR
-            | code::BEARER_NETDEV_NOT_UP
-            | code::BEARER_NETDEV_NOT_READY => FailureClass::BasebandWedged,
+            code::BEARER_NETDEV_RUNTIME_ERROR => FailureClass::BasebandWedged,
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
                 if error
                     .detail()

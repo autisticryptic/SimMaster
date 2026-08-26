@@ -79,6 +79,10 @@ struct BasebandWedgeState {
     observed_at: Option<Instant>,
     /// Consecutive wedges with no successful registration in between.
     consecutive: u32,
+    /// A confirmed Qualcomm bam-dmux runtime-PM latch survives every in-process
+    /// retry; only a full system reboot clears it. Keep this distinct from a
+    /// transient activation crash so manual retries cannot hammer wwan0.
+    permanent: bool,
 }
 
 impl BasebandWedgeState {
@@ -281,6 +285,22 @@ impl LineRuntime {
         wedge.cooldown()
     }
 
+    pub fn note_baseband_wedged_permanent(&self) {
+        let mut wedge = self
+            .baseband_wedge
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        wedge.permanent = true;
+        wedge.observed_at = Some(Instant::now());
+    }
+
+    pub fn baseband_wedge_permanent(&self) -> bool {
+        self.baseband_wedge
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .permanent
+    }
+
     /// How long IMS activation is still suppressed on this line, if at all.
     ///
     /// Read by automatic restore before it starts a batch. Unlike the VoLTE
@@ -295,10 +315,13 @@ impl LineRuntime {
     /// Clear the suppression window after IMS registers, so an occasional crash
     /// does not permanently inflate the backoff for a line that works.
     pub fn clear_baseband_wedge(&self) {
-        *self
+        let mut wedge = self
             .baseband_wedge
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = BasebandWedgeState::default();
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !wedge.permanent {
+            *wedge = BasebandWedgeState::default();
+        }
     }
 
     pub fn begin_vowifi_sms_listener(&self) -> bool {
@@ -428,9 +451,7 @@ impl EgressError {
 impl std::fmt::Display for EgressError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::WorkerNotReady(message) | Self::Terminal(message) => {
-                formatter.write_str(message)
-            }
+            Self::WorkerNotReady(message) | Self::Terminal(message) => formatter.write_str(message),
         }
     }
 }

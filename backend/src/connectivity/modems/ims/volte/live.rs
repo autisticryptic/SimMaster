@@ -107,6 +107,10 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
+const OPTIONS_PING_INTERVAL: Duration = Duration::from_secs(45);
+const OPTIONS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const OPTIONS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// Keep two independent IMS dialogs for call waiting. A further call is
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
@@ -467,6 +471,12 @@ struct MwiSubscription {
     ids: SubscribeIds,
     refresh_at: tokio::time::Instant,
     authenticated: bool,
+}
+
+struct PendingOptionsPing {
+    call_id: String,
+    cseq: u32,
+    deadline: tokio::time::Instant,
 }
 
 struct RetainedFailedBearer {
@@ -1273,6 +1283,12 @@ pub async fn connect_live_for_line(
                     state.registration_mode = mode;
                     state.pcscf = Some(pcscf);
                     state.registered_at = Some(now());
+                    // The initial REGISTER transaction already proved both
+                    // directions of the SIP path. Seed the health timestamps
+                    // so the UI cannot present a freshly-created session with
+                    // an empty/unknown data path.
+                    state.last_tx_at = Some(now());
+                    state.last_rx_at = Some(now());
                     state.data_path_mode = Some(data_path_mode);
                     state.recovery_state = super::runtime::VolteRecoveryState::Registered;
                     state.manual_retry_available = false;
@@ -2077,7 +2093,8 @@ async fn connect_family(
         // send route rather than the advertised one. They are identical here (no
         // SA is active yet), but being explicit keeps the offer correct if this
         // ever runs on an already-protected channel.
-        let offered_binding = offered_security(channel.send_route().local_addr.port(), receive_port);
+        let offered_binding =
+            offered_security(channel.send_route().local_addr.port(), receive_port);
         // TS 24.229 / RFC 3329: the initial REGISTER already advertises the
         // full ipsec-3gpp offer (alg/ealg/prot/mod + client SPI/ports). The
         // 401 then supplies the server binding; the authenticated REGISTER
@@ -2147,7 +2164,7 @@ async fn connect_family(
         {
             Ok(registration) => registration,
             Err(failure) => {
-                log_volte_register_failure_metadata(variant, &failure);
+                log_volte_register_failure_metadata(variant, &failure, None);
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
                     if let Some(worker) = authenticator.worker.as_ref() {
                         ipsec::uninstall_plan_in_worker(plan, worker).await;
@@ -2557,6 +2574,10 @@ async fn live_receive_loop(
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
     start_volte_mwi_subscription(&live).await;
+    let mut options_cseq = 1u32;
+    let mut options_due = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut pending_options: Option<PendingOptionsPing> = None;
+    let mut options_failures = 0u8;
     let mut refresh_at = {
         let sessions = live.session.lock().await;
         sessions
@@ -2570,6 +2591,69 @@ async fn live_receive_loop(
     loop {
         if runtime.generation() != generation {
             break;
+        }
+        if let Some(pending) = pending_options.as_ref() {
+            if tokio::time::Instant::now() >= pending.deadline {
+                pending_options = None;
+                options_failures = options_failures.saturating_add(1);
+                if options_failures >= OPTIONS_MAX_CONSECUTIVE_FAILURES {
+                    let error = format!("volte_options_ping_timeout:failures={options_failures}");
+                    tracing::warn!(error = %error, "VoLTE SIP liveness ping timed out");
+                    live.operator.set_ready(false);
+                    runtime
+                        .update(|state| {
+                            state.phase = VoltePhase::Degraded;
+                            state.stage = VolteStage::Registered;
+                            state.last_error = Some(error);
+                            state.last_failure_at = Some(now());
+                        })
+                        .await;
+                    cleanup_live_session(&live).await;
+                    break;
+                }
+                options_due = tokio::time::Instant::now() + OPTIONS_RETRY_INTERVAL;
+            }
+        }
+        if pending_options.is_none() && tokio::time::Instant::now() >= options_due {
+            let (call_id, cseq, send_result) = {
+                let mut sessions = live.session.lock().await;
+                let Some(session) = sessions.as_mut() else {
+                    break;
+                };
+                let cseq = options_cseq;
+                options_cseq = options_cseq.saturating_add(1);
+                let frame = sip::build_options(
+                    &session.identity,
+                    &session.channel.route(),
+                    session.registration.service_route.as_deref(),
+                    cseq,
+                    session.channel.security_verify(),
+                );
+                let call_id = sip::header_value(&frame, "Call-ID")
+                    .unwrap_or_else(|| format!("options-{cseq}@simadmin"));
+                let send_result = session.channel.send_sip(&frame).await;
+                (call_id, cseq, send_result)
+            };
+            if let Err(error) = send_result {
+                let error = map_channel_error(error);
+                live.operator.set_ready(false);
+                runtime
+                    .update(|state| {
+                        state.phase = VoltePhase::Degraded;
+                        state.last_error = Some(error.to_string());
+                        state.last_failure_at = Some(now());
+                    })
+                    .await;
+                cleanup_live_session(&live).await;
+                break;
+            }
+            runtime.update(|state| state.last_tx_at = Some(now())).await;
+            pending_options = Some(PendingOptionsPing {
+                call_id,
+                cseq,
+                deadline: tokio::time::Instant::now() + OPTIONS_RESPONSE_TIMEOUT,
+            });
+            continue;
         }
         if let Err(error) = expire_volte_renegotiations(&live).await {
             tracing::warn!(error = %error, "VoLTE re-INVITE timeout handling failed");
@@ -2669,6 +2753,38 @@ async fn live_receive_loop(
             }
             LiveLoopInput::Sip(Ok(frame)) => {
                 runtime.update(|state| state.last_rx_at = Some(now())).await;
+                if let Some(pending) = pending_options.as_ref() {
+                    let response_call_id = sip::header_value(&frame, "Call-ID");
+                    let response_cseq = sip::header_value(&frame, "CSeq").and_then(|value| {
+                        let mut parts = value.split_whitespace();
+                        parts.next()?.parse::<u32>().ok()
+                    });
+                    if response_call_id.as_deref() == Some(pending.call_id.as_str())
+                        && response_cseq == Some(pending.cseq)
+                    {
+                        let status = sip::parse_status(&frame).ok();
+                        pending_options = None;
+                        options_due = tokio::time::Instant::now() + OPTIONS_PING_INTERVAL;
+                        options_failures = 0;
+                        tracing::debug!(?status, "VoLTE SIP liveness response received");
+                        runtime
+                            .update(|state| {
+                                state.phase = VoltePhase::Registered;
+                                state.stage = VolteStage::Registered;
+                                state.last_error = None;
+                                state.last_rx_at = Some(now());
+                            })
+                            .await;
+                        continue;
+                    }
+                    // An INVITE, MESSAGE, NOTIFY, or unrelated SIP response is
+                    // equally strong proof that the protected inbound path is
+                    // alive. Do not tear down a working call leg merely because
+                    // the carrier chose not to answer OPTIONS.
+                    pending_options = None;
+                    options_failures = 0;
+                    options_due = tokio::time::Instant::now() + OPTIONS_PING_INTERVAL;
+                }
                 if let Err(error) = handle_live_frame(
                     LiveFrameContext {
                         live: &live,
@@ -2809,6 +2925,7 @@ async fn refresh_live_registration(
         register_policy,
         session.visited_network_header.as_deref(),
     );
+    log_volte_register_request_metadata(session.register_variant, &session.channel, &initial);
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
         ids.clone(),
@@ -2833,6 +2950,11 @@ async fn refresh_live_registration(
         match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
             Ok(registration) => registration,
             Err(failure) => {
+                log_volte_register_failure_metadata(
+                    session.register_variant,
+                    &failure,
+                    Some(&initial),
+                );
                 let loss_reason = RegistrationLossReason::from_register_failure(&failure);
                 let error = map_register_failure(&failure);
                 runtime
@@ -2884,6 +3006,7 @@ async fn refresh_live_registration(
             state.last_error = None;
             state.last_register_refresh_at = Some(now());
             state.last_tx_at = Some(now());
+            state.last_rx_at = Some(now());
             state.register_refresh_count = state.register_refresh_count.saturating_add(1);
             state.public_uri = Some(refreshed_public_uri);
             state.associated_uris = refreshed_associated_uris;
@@ -5606,7 +5729,9 @@ async fn relocate_modem_by_equipment_id(
         return None;
     }
 
-    let listed = command_output("mmcli", &["-L", "--output-keyvalue"]).await.ok()?;
+    let listed = command_output("mmcli", &["-L", "--output-keyvalue"])
+        .await
+        .ok()?;
     // `--output-keyvalue` separates with " : ", not "=", and the first line is a
     // `modem-list.length` count rather than a path -- hence keying off the
     // `modem-list.value` prefix instead of just taking every value.
@@ -5634,7 +5759,6 @@ async fn relocate_modem_by_equipment_id(
     }
     None
 }
-
 
 fn modem_is_ready(output: &str) -> bool {
     matches!(
@@ -5978,7 +6102,31 @@ fn log_volte_register_request_metadata(
     );
 }
 
-fn log_volte_register_failure_metadata(variant: VolteRegisterVariant, failure: &RegisterFailure) {
+fn log_volte_register_failure_metadata(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+    request: Option<&[u8]>,
+) {
+    if let Some(request) = request {
+        tracing::warn!(
+            register_phase = "refresh",
+            request_route_present = !sip::header_values(request, "Route").is_empty(),
+            request_authorization_present =
+                !sip::header_values(request, "Authorization").is_empty(),
+            request_security_verify_present =
+                !sip::header_values(request, "Security-Verify").is_empty(),
+            request_security_client_present =
+                !sip::header_values(request, "Security-Client").is_empty(),
+            request_require_present = !sip::header_values(request, "Require").is_empty(),
+            request_proxy_require_present =
+                !sip::header_values(request, "Proxy-Require").is_empty(),
+            request_pani_present = !sip::header_values(request, "P-Access-Network-Info").is_empty(),
+            request_cseq = sip::header_value(request, "CSeq")
+                .and_then(|value| value.split_whitespace().next().map(str::to_owned)),
+            sensitive_values = "redacted",
+            "VoLTE IMS REGISTER refresh request metadata"
+        );
+    }
     let Some(response) = failure.response.as_deref() else {
         tracing::warn!(
             register_variant = variant.label,
@@ -6000,6 +6148,9 @@ fn log_volte_register_failure_metadata(variant: VolteRegisterVariant, failure: &
         unsupported_present = !sip::header_values(response, "Unsupported").is_empty(),
         require_present = !sip::header_values(response, "Require").is_empty(),
         proxy_require_present = !sip::header_values(response, "Proxy-Require").is_empty(),
+        response_route_present = !sip::header_values(response, "Route").is_empty(),
+        response_security_server_count = sip::header_values(response, "Security-Server").len(),
+        response_cseq = sip::header_value(response, "CSeq"),
         sensitive_values = "redacted",
         "VoLTE IMS REGISTER terminal response metadata received"
     );
@@ -6323,8 +6474,9 @@ mod tests {
             sip_instance_for_profile(&profile, &identity, Some("490154203237518")),
             "urn:imei:490154203237518"
         );
-        assert!(sip_instance_for_profile(&profile, &identity, Some("12345"))
-            .starts_with("urn:uuid:"));
+        assert!(
+            sip_instance_for_profile(&profile, &identity, Some("12345")).starts_with("urn:uuid:")
+        );
         assert!(sip_instance_for_profile(&profile, &identity, None).starts_with("urn:uuid:"));
     }
 

@@ -42,8 +42,7 @@ pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
 /// two legs now share one `+sip.instance` and a binding is keyed on
 /// (AOR, instance-id, reg-id): if both legs emitted the same reg-id, the
 /// second registration would silently replace the first.
-const CELLULAR_REG_ID: u32 =
-    crate::connectivity::core::ims_access::ImsAccess::Cellular.reg_id();
+const CELLULAR_REG_ID: u32 = crate::connectivity::core::ims_access::ImsAccess::Cellular.reg_id();
 
 /// Format a host for a SIP URI: bare IPv4, bracketed IPv6 (RFC 3261 §19.1.2).
 /// Delegates to the shared IMS core.
@@ -1111,6 +1110,48 @@ pub fn build_bye_for_access(
     h.into_bytes()
 }
 
+/// Build an out-of-dialog OPTIONS request used to verify that the registered
+/// cellular binding is still reachable.  The request deliberately carries the
+/// current Service-Route/security binding, but no digest credentials: a
+/// registrar may answer 401/403 and that is still useful evidence that the
+/// SIP path is alive; only transport timeout is treated as a dead leg.
+pub fn build_options(
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    service_route: Option<&str>,
+    cseq: u32,
+    security_verify: Option<&str>,
+) -> Vec<u8> {
+    use crate::connectivity::core::sip_message::build_request;
+
+    let ids = RequestIds::fresh(cseq);
+    let route_header = route_header_value(route, service_route);
+    let to = format!("<{}>", identity.public_uri);
+    let mut headers = vec![
+        SipHeader::new("Route", route_header),
+        SipHeader::new("P-Preferred-Identity", format!("<{}>", identity.public_uri)),
+        SipHeader::new("P-Access-Network-Info", PANI_EUTRAN),
+        SipHeader::new("Accept", "application/sdp"),
+    ];
+    if let Some(value) = security_verify {
+        headers.push(SipHeader::new("Security-Verify", value));
+    }
+    headers.push(SipHeader::new("User-Agent", USER_AGENT));
+    build_request(&SipRequest {
+        method: "OPTIONS",
+        request_uri: &identity.public_uri,
+        route: *route,
+        branch: &new_branch(),
+        from_uri: &identity.public_uri,
+        from_tag: &ids.from_tag,
+        to_value: &to,
+        call_id: &ids.call_id,
+        cseq: ids.cseq,
+        headers: &headers,
+        body: &[],
+    })
+}
+
 /// Build an in-dialog SIP INFO carrying one DTMF digit. This is the signaling
 /// fallback when the operator dialog did not negotiate RFC 4733
 /// `telephone-event`, or when Asterisk explicitly delivered DTMF via INFO.
@@ -1602,7 +1643,10 @@ mod tests {
         assert!(contact.contains(";+sip.instance=\"<urn:uuid:test>\""));
         assert!(contact.contains(";expires="));
         assert_eq!(
-            contact.to_ascii_lowercase().matches("+g.3gpp.smsip").count(),
+            contact
+                .to_ascii_lowercase()
+                .matches("+g.3gpp.smsip")
+                .count(),
             1
         );
     }
@@ -1633,11 +1677,16 @@ mod tests {
         let text = String::from_utf8(frame).unwrap();
         let contact = header_value(text.as_bytes(), "Contact").unwrap();
         assert_eq!(
-            contact.to_ascii_lowercase().matches("+sip.instance").count(),
+            contact
+                .to_ascii_lowercase()
+                .matches("+sip.instance")
+                .count(),
             1
         );
         assert_eq!(
-            contact.matches(&format!(";reg-id={CELLULAR_REG_ID}")).count(),
+            contact
+                .matches(&format!(";reg-id={CELLULAR_REG_ID}"))
+                .count(),
             1
         );
     }
