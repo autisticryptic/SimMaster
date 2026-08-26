@@ -16,6 +16,7 @@ on:
     branches:
       - main
       - master
+      - feat/catalog-free-iphone-fallback
   workflow_dispatch:
     inputs:
       version:
