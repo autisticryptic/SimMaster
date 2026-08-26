@@ -1702,6 +1702,35 @@ mod tests {
     }
 
     #[test]
+    fn protected_reregistration_repeats_security_client_and_verify() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Refresh,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            Some("Digest username=\"impi\", realm=\"ims.example\", uri=\"sip:ims.example\""),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001"),
+            Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;spi-c=1;spi-s=2;port-c=6000;port-s=6001"),
+            "urn:uuid:test",
+            RegisterRequestPolicy {
+                advertise_sec_agree: true,
+                require_sec_agree: true,
+                proxy_require_sec_agree: true,
+                include_mmtel_features: true,
+                ..RegisterRequestPolicy::LEGACY
+            },
+        );
+        let text = String::from_utf8(frame).unwrap();
+        assert!(text.contains("Security-Client: ipsec-3gpp;"));
+        assert!(text.contains("Security-Verify: ipsec-3gpp;"));
+        assert!(text.contains("Require: sec-agree\r\n"));
+        assert!(text.contains("Proxy-Require: sec-agree\r\n"));
+    }
+
+    #[test]
     fn non_mmtel_register_still_obeys_carrier_pani_policy() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.include_pani_initial = false;

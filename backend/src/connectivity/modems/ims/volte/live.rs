@@ -1057,7 +1057,17 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             } else {
                 RegistrationMode::Udp
             };
-            (None, security_verify.clone(), security_verify.is_some())
+            // TS 24.229 section 5.1.1.4.2 requires a protected AKA
+            // re-registration to repeat the negotiated Security-Client offer
+            // and mirror it with Security-Verify. Omitting Security-Client
+            // makes the P-CSCF reject an otherwise valid refresh with 4xx.
+            (
+                security_verify
+                    .as_ref()
+                    .map(|_| self.offered_security.clone()),
+                security_verify.clone(),
+                security_verify.is_some(),
+            )
         } else if let Some((selected, verify)) = security_server {
             self.runtime
                 .update(|state| state.stage = VolteStage::Ipsec)
@@ -2395,6 +2405,12 @@ async fn unregister_live_session(
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
+    let security_client = security_verify.as_ref().map(|_| {
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile)
+    });
     let request_uri = sip::register_request_uri_with_target(
         session.profile,
         effective_register_target(&session.effective_ims),
@@ -2418,7 +2434,7 @@ async fn unregister_live_session(
         &ids,
         0,
         initial_authorization.as_deref(),
-        None,
+        security_client.as_deref(),
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
@@ -2895,6 +2911,12 @@ async fn refresh_live_registration(
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
+    let security_client = security_verify.as_ref().map(|_| {
+        session
+            .register_variant
+            .security_client_offer
+            .build(session.security_binding, session.profile)
+    });
     let require_sec_agree = security_verify.is_some();
     let request_uri = sip::register_request_uri_with_target(
         session.profile,
@@ -2919,7 +2941,7 @@ async fn refresh_live_registration(
         &ids,
         session.profile.ims.register.expires_seconds,
         initial_authorization.as_deref(),
-        None,
+        security_client.as_deref(),
         security_verify.as_deref(),
         &session.sip_instance,
         register_policy,
