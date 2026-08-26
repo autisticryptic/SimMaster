@@ -35,6 +35,8 @@ pub const PANI_EUTRAN: &str = "3GPP-E-UTRAN-FDD";
 pub const USER_AGENT: &str = "SimAdmin VoLTE";
 pub const SMS_CONTENT_TYPE: &str = "application/vnd.3gpp.sms";
 pub const DTMF_RELAY_CONTENT_TYPE: &str = "application/dtmf-relay";
+pub const MMTEL_ALLOW_METHODS: &str =
+    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS";
 
 /// RFC 5626 `reg-id` for this (cellular) access leg.
 ///
@@ -463,10 +465,12 @@ fn build_register_internal(
         allow_header: profile
             .and_then(|profile| profile.ims.register.allow_methods)
             .unwrap_or_else(|| {
-                if profile.is_some() {
+                if policy.include_mmtel_features {
+                    MMTEL_ALLOW_METHODS
+                } else if profile.is_some() {
                     ""
                 } else {
-                    "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS"
+                    MMTEL_ALLOW_METHODS
                 }
             })
             .to_string(),
@@ -1711,6 +1715,7 @@ mod tests {
             RegisterRequestPolicy::LEGACY,
         );
         assert!(header_value(&frame, "P-Access-Network-Info").is_none());
+        assert!(header_value(&frame, "Allow").is_none());
     }
 
     #[test]
@@ -1921,6 +1926,7 @@ mod tests {
         assert!(text.contains("Route: <sip:10.0.0.1:5060;lr>\r\n"));
         assert!(text.contains("P-Visited-Network-ID: \"ims.mnc000.mcc460.3gppnetwork.org\"\r\n"));
         assert!(text.contains("Supported: path, gruu, sec-agree\r\n"));
+        assert!(text.contains(&format!("Allow: {MMTEL_ALLOW_METHODS}\r\n")));
         assert!(!text.contains("Require: sec-agree\r\n"));
         assert!(!text.contains("Proxy-Require: sec-agree\r\n"));
         assert!(!text.contains("Authorization:"));
