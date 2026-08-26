@@ -415,12 +415,16 @@ fn build_register_internal(
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
-    let include_pani = profile.is_none_or(|profile| match phase {
-        RegisterPhase::Initial => profile.ims.register.include_pani_initial,
-        RegisterPhase::Authenticated | RegisterPhase::Refresh => {
-            profile.ims.register.include_pani_authenticated
-        }
-    });
+    // An MMTEL-capable cellular binding must identify its radio access. Some
+    // imported carrier bundles omit the PANI booleans even though they enable
+    // MMTEL, which can leave a 200-OK registration ineligible for MT routing.
+    let include_pani = policy.include_mmtel_features
+        || profile.is_none_or(|profile| match phase {
+            RegisterPhase::Initial => profile.ims.register.include_pani_initial,
+            RegisterPhase::Authenticated | RegisterPhase::Refresh => {
+                profile.ims.register.include_pani_authenticated
+            }
+        });
     let access_network_info = profile
         .map(|profile| profile.ims.register.access_network_info)
         .unwrap_or(PANI_EUTRAN);
@@ -1649,6 +1653,64 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn mmtel_register_keeps_lte_pani_across_registration_phases() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+        profile.ims.register.access_network_info = "3GPP-E-UTRAN-FDD";
+
+        for phase in [
+            RegisterPhase::Initial,
+            RegisterPhase::Authenticated,
+            RegisterPhase::Refresh,
+        ] {
+            let frame = build_register_from_profile(
+                &profile,
+                phase,
+                &ident(),
+                &route_udp(),
+                &RequestIds::fresh(1),
+                profile.ims.register.expires_seconds,
+                None,
+                None,
+                None,
+                "urn:uuid:test",
+                RegisterRequestPolicy {
+                    include_mmtel_features: true,
+                    ..RegisterRequestPolicy::LEGACY
+                },
+            );
+            assert_eq!(
+                header_value(&frame, "P-Access-Network-Info").as_deref(),
+                Some("3GPP-E-UTRAN-FDD"),
+                "missing PANI during {phase:?} REGISTER"
+            );
+        }
+    }
+
+    #[test]
+    fn non_mmtel_register_still_obeys_carrier_pani_policy() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+
+        let frame = build_register_from_profile(
+            &profile,
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+        );
+        assert!(header_value(&frame, "P-Access-Network-Info").is_none());
     }
 
     #[test]
