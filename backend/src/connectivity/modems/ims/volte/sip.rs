@@ -584,10 +584,11 @@ fn build_register_internal(
         headers: RegisterHeaderFields {
             authorization: authorization.map(str::to_string),
             contact,
-            accept_contacts: policy
-                .include_mmtel_features
-                .then(|| vec![format!("*;+g.3gpp.icsi-ref=\"{MMTEL_ICSI_REF}\"")])
-                .unwrap_or_default(),
+            // REGISTER publishes the UE's MMTEL capability through the
+            // Contact feature tags above. Accept-Contact is caller preference
+            // for a target request and P-Preferred-Service selects the service
+            // of that request; neither belongs on this registration binding.
+            accept_contacts: Vec::new(),
             route: policy.include_route_header.then(|| {
                 format!(
                     "<sip:{}:{};lr>",
@@ -600,9 +601,7 @@ fn build_register_internal(
             require_sec_agree: policy.require_sec_agree,
             proxy_require_sec_agree: policy.proxy_require_sec_agree,
             allow: Some(params.allow_header),
-            preferred_service: policy
-                .include_mmtel_features
-                .then(|| MMTEL_ICSI.to_string()),
+            preferred_service: None,
             preferred_identity: profile
                 .is_none_or(|profile| profile.ims.register.include_p_preferred_identity)
                 .then(|| format!("<{}>", identity.public_uri)),
@@ -1957,8 +1956,8 @@ mod tests {
 
         assert!(text.contains(";audio;+g.3gpp.smsip;+g.3gpp.icsi-ref=\""));
         assert!(text.contains(";+sip.instance=\"<urn:uuid:"));
-        assert!(text.contains("Accept-Contact: *;+g.3gpp.icsi-ref=\""));
-        assert!(text.contains(&format!("P-Preferred-Service: {MMTEL_ICSI}\r\n")));
+        assert!(!text.contains("Accept-Contact:"));
+        assert!(!text.contains("P-Preferred-Service:"));
         assert!(text.contains("Route: <sip:10.0.0.1:5060;lr>\r\n"));
         assert!(text.contains("P-Visited-Network-ID: \"ims.mnc000.mcc460.3gppnetwork.org\"\r\n"));
         assert!(text.contains("Supported: path, gruu, sec-agree\r\n"));
