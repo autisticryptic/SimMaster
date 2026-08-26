@@ -323,6 +323,24 @@ impl ProfileStore {
                     && digits.starts_with(*plmn)
             })
             .map(str::to_string);
+        // Controlled catalog-free interoperability mode. Explicit profile
+        // pins still win above; this switch only changes runtime resolution
+        // and never mutates the read-only catalog on disk.
+        if std::env::var_os("SIMADMIN_FORCE_STANDARD_PROFILE").is_some() {
+            let plmn = explicit_home_plmn.as_deref().or_else(|| {
+                let length = if digits.starts_with("460") { 5 } else { 6 };
+                digits.get(..digits.len().min(length))
+            });
+            let reason = plmn
+                .map(|value| format!("standard_profile_forced:home_plmn:{value}"))
+                .unwrap_or_else(|| "standard_profile_forced:home_plmn:unknown".to_string());
+            tracing::warn!(
+                access = access.as_str(),
+                home_plmn = ?plmn,
+                "Forcing catalog-free standard 3GPP IMS profile"
+            );
+            return Ok(derive_standard_fallback(digits, plmn, access, reason));
+        }
         let (custom_records, custom_lookup_error) = match self.custom_records() {
             Ok(records) => (records, None),
             Err(error) => {

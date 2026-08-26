@@ -1033,7 +1033,11 @@ pub fn derive_standard_3gpp_profile(
             realm: ims_domain,
             registrar: None,
             pcscf: None,
-            transport: "tcp",
+            // UDP is the most interoperable IMS fallback transport. A catalog
+            // profile may still override this explicitly (for networks that
+            // require TCP), but an unknown operator should not be forced onto
+            // TCP before the P-CSCF has expressed that requirement.
+            transport: "udp",
             local_port: 5060,
             user_agent: "SimAdmin VoWiFi",
             identity_source: "isim",
