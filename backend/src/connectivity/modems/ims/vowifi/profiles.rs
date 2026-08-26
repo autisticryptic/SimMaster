@@ -933,7 +933,8 @@ static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>
 /// deliberately modelled on the smallest interoperable shape observed in the
 /// iPhone/IPCC catalog: PANI and Cellular-Network-Info are present, the Contact
 /// stays compact, and sec-agree is negotiated without adding the Pixel-style
-/// MMTEL/+sip.instance feature set before the network asks for it. It still does
+/// MMTEL feature set. The stable +sip.instance is retained as required by the
+/// iPhone bundle's flow-binding policy. It still does
 /// not guess a static P-CSCF, entitlement/XCAP endpoints or carrier-specific
 /// identities.
 pub fn derive_standard_3gpp_profile(
@@ -1077,7 +1078,7 @@ pub fn derive_standard_3gpp_profile(
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
-                always_add_sip_instance: false,
+                always_add_sip_instance: true,
                 enable_cellular_network_info: true,
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
                 live_header_variant_set: "iphone_ipcc_fallback",
@@ -1643,6 +1644,7 @@ mod tests {
         assert!(lte.ims.register.include_pani_initial);
         assert!(lte.ims.register.include_pani_authenticated);
         assert!(lte.ims.register.enable_cellular_network_info);
+        assert!(lte.ims.register.always_add_sip_instance);
         assert!(!lte.ims.register.include_mmtel_features);
         assert!(!lte.ims.register.include_route_header);
         assert_eq!(lte.ims.register.contact_mode, "standard");
