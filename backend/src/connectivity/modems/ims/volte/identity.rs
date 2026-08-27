@@ -64,16 +64,20 @@ pub fn parse_ef_ad_mnc_length(output: &str) -> Option<usize> {
     None
 }
 
-/// Resolve the IMS home PLMN. The currently registered operator is usable only
-/// when it is a prefix of the IMSI; otherwise it is a visited network. EF_AD is
-/// the next source, followed by beta8's three-digit default and China two-digit
-/// compatibility fallback.
+/// Resolve the IMS home PLMN from authoritative subscription-owned data.
+///
+/// The serving PLMN is deliberately not accepted here: while roaming it names
+/// the visited access network, and an IMSI prefix match is not enough to prove
+/// whether the home MNC has two or three digits. EF_AD byte four is the
+/// authoritative fallback when ModemManager exposes no SIM operator code.
+/// Catalog-based inference is performed by `ProfileStore`, where ambiguity can
+/// be checked against all known 5/6-digit PLMN rules.
 pub fn resolve_home_plmn(
     imsi: &str,
-    registered_operator: Option<&str>,
+    sim_operator: Option<&str>,
     ef_ad_mnc_length: Option<usize>,
 ) -> Result<HomePlmn, VolteError> {
-    let matching_operator_length = registered_operator
+    let matching_operator_length = sim_operator
         .filter(|operator| {
             matches!(operator.len(), 5 | 6)
                 && operator.bytes().all(|byte| byte.is_ascii_digit())
@@ -85,10 +89,11 @@ pub fn resolve_home_plmn(
         (length, "modemmanager_home_operator")
     } else if let Some(length @ (2 | 3)) = ef_ad_mnc_length {
         (length, "sim_ef_ad")
-    } else if imsi.starts_with("460") {
-        (2, "china_compatibility_fallback")
     } else {
-        (3, "three_digit_fallback")
+        return Err(VolteError::with_detail(
+            code::CARRIER_PROFILE_MISSING,
+            "home_plmn_mnc_length_ambiguous",
+        ));
     };
     let (mcc, mnc) = split_imsi(imsi, mnc_length)?;
     Ok(HomePlmn {
@@ -309,8 +314,8 @@ mod tests {
     }
 
     #[test]
-    fn visited_operator_does_not_replace_imsi_home_plmn() {
-        let home = resolve_home_plmn("460001234567890", Some("46011"), Some(2)).unwrap();
+    fn ef_ad_resolves_home_plmn_without_using_the_visited_operator() {
+        let home = resolve_home_plmn("460001234567890", None, Some(2)).unwrap();
         assert_eq!(home.mcc, "460");
         assert_eq!(home.mnc, "00");
         assert_eq!(home.mnc_length_source, "sim_ef_ad");
@@ -318,14 +323,14 @@ mod tests {
 
     #[test]
     fn cmlink_roaming_on_china_mobile_keeps_its_two_digit_home_mnc() {
-        let home = resolve_home_plmn("234331234567890", Some("46000"), Some(2)).unwrap();
+        let home = resolve_home_plmn("234331234567890", None, Some(2)).unwrap();
         assert_eq!(home.mcc, "234");
         assert_eq!(home.mnc, "33");
         assert_eq!(home.mnc_length_source, "sim_ef_ad");
     }
 
     #[test]
-    fn matching_registered_operator_can_supply_mnc_length() {
+    fn matching_sim_operator_can_supply_mnc_length() {
         let home = resolve_home_plmn("310260123456789", Some("310260"), Some(2)).unwrap();
         assert_eq!(home.mcc, "310");
         assert_eq!(home.mnc, "260");
@@ -333,14 +338,10 @@ mod tests {
     }
 
     #[test]
-    fn home_plmn_fallback_matches_beta8_policy() {
-        let china = resolve_home_plmn("460001234567890", None, None).unwrap();
-        assert_eq!(china.mnc, "00");
-        assert_eq!(china.mnc_length_source, "china_compatibility_fallback");
-
-        let global = resolve_home_plmn("310260123456789", None, None).unwrap();
-        assert_eq!(global.mnc, "260");
-        assert_eq!(global.mnc_length_source, "three_digit_fallback");
+    fn imsi_alone_does_not_guess_the_mnc_length() {
+        let error = resolve_home_plmn("310260123456789", None, None).unwrap_err();
+        assert_eq!(error.code(), code::CARRIER_PROFILE_MISSING);
+        assert!(error.to_string().contains("home_plmn_mnc_length_ambiguous"));
     }
 
     #[test]

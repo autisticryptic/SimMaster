@@ -1054,7 +1054,11 @@ pub fn derive_standard_3gpp_profile(
                 include_pani_initial: true,
                 include_pani_authenticated: true,
                 initial_authorization: "aka_empty",
-                include_mmtel_features: false,
+                // A 200 OK without the MMTEL Contact feature tags creates a
+                // data/SMS-capable binding that the TAS may not use for MT
+                // voice. The generic LTE fallback is intended to carry calls,
+                // so advertise voice on its first successful registration.
+                include_mmtel_features: true,
                 include_route_header: false,
                 include_visited_network: false,
                 include_p_preferred_identity: true,
@@ -1158,11 +1162,7 @@ fn derive_standard_match(
                 && plmn.bytes().all(|byte| byte.is_ascii_digit())
                 && digits.starts_with(*plmn)
         })
-        .map(str::to_string)
-        .or_else(|| {
-            let length = if digits.starts_with("460") { 5 } else { 6 };
-            digits.get(..length).map(str::to_string)
-        })?;
+        .map(str::to_string)?;
     let profile = derive_standard_3gpp_profile(&plmn[..3], &plmn[3..], access)?;
     Some(CarrierMatch {
         profile,
@@ -1645,7 +1645,7 @@ mod tests {
         assert!(lte.ims.register.include_pani_authenticated);
         assert!(lte.ims.register.enable_cellular_network_info);
         assert!(lte.ims.register.always_add_sip_instance);
-        assert!(!lte.ims.register.include_mmtel_features);
+        assert!(lte.ims.register.include_mmtel_features);
         assert!(!lte.ims.register.include_route_header);
         assert_eq!(lte.ims.register.contact_mode, "standard");
         assert_eq!(

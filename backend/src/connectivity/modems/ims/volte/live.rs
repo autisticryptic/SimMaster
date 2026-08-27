@@ -104,6 +104,10 @@ const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
+/// SIP interoperability candidates are separate from the outer bearer
+/// recovery budget. Keep the ladder bounded so a malformed profile cannot
+/// create an unbounded REGISTER storm on the QCM410.
+const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 8;
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -2042,13 +2046,29 @@ async fn connect_family(
     let mut register_variants = register_variants(profile).into_iter().peekable();
     let mut last_error = None;
     let mut pending_variant = None;
+    let mut candidate_attempts = 0usize;
     while pending_variant.is_some() || register_variants.peek().is_some() {
+        if candidate_attempts >= VOLTE_REGISTER_CANDIDATE_LIMIT {
+            tracing::warn!(
+                line_id = %device.line_id,
+                candidate_attempts,
+                "VoLTE REGISTER interoperability candidate budget exhausted"
+            );
+            break;
+        }
         let mut variant = match pending_variant.take() {
             Some(variant) => variant,
             None => register_variants
                 .next()
                 .expect("REGISTER variant iterator was checked before use"),
         };
+        candidate_attempts = candidate_attempts.saturating_add(1);
+        tracing::info!(
+            line_id = %device.line_id,
+            candidate_attempt = candidate_attempts,
+            register_variant = variant.label,
+            "Trying bounded VoLTE REGISTER interoperability candidate"
+        );
         variant.policy.include_video_feature = video_capability_enabled;
         variant.policy.include_visited_network |= device_identity.visited_network_header.is_some();
         let mut channel = if let Some(worker) = worker.as_ref() {
@@ -5516,15 +5536,27 @@ async fn load_device_identity(
     };
     let registered_plmn =
         key_value(&modem, "modem.3gpp.operator-code").filter(|candidate| valid_plmn(candidate));
-    let mut home_plmn = [
+    let registration_state =
+        key_value(&modem, "modem.3gpp.registration-state").map(|state| state.to_ascii_lowercase());
+    // The serving PLMN is subscription-owned evidence only when NAS explicitly
+    // says the UE is registered at home. In roaming it is the VPLMN and must
+    // never select the IMS profile/domain.
+    let registered_home_plmn = registration_state
+        .as_deref()
+        .is_some_and(|state| state == "home")
+        .then(|| registered_plmn.clone())
+        .flatten()
+        .filter(|candidate| valid_home_plmn(&imsi, candidate));
+    let sim_home_plmn = [
         key_value(&sim, "sim.properties.operator-code"),
         key_value(&sim, "sim.properties.operator-id"),
         key_value(&sim, "sim.properties.operator-identifier"),
-        registered_plmn.clone(),
+        registered_home_plmn,
     ]
     .into_iter()
     .flatten()
     .find(|candidate| valid_home_plmn(&imsi, candidate));
+    let mut home_plmn = sim_home_plmn.clone();
     let mut ef_ad_mnc_length = ef_ad_mnc_length;
     if home_plmn.is_none() && ef_ad_mnc_length.is_none() {
         if let Some(uim_identity) = read_uim_identity(device).await {
@@ -5533,10 +5565,10 @@ async fn load_device_identity(
             }
         }
     }
-    if home_plmn.is_none() && (ef_ad_mnc_length.is_some() || imsi.starts_with("460")) {
+    if home_plmn.is_none() {
         home_plmn = identity::resolve_home_plmn(
             &imsi,
-            registered_plmn.as_deref(),
+            sim_home_plmn.as_deref(),
             ef_ad_mnc_length.map(usize::from),
         )
         .ok()
@@ -5629,6 +5661,8 @@ async fn load_device_identity(
         ims_domain_source = ?effective_ims.domain.source,
         home_plmn = ?home_plmn,
         registered_plmn = ?registered_plmn,
+        registration_state = ?registration_state,
+        roaming = home_plmn.as_deref().zip(registered_plmn.as_deref()).is_some_and(|(home, visited)| canonical_plmn(home) != canonical_plmn(visited)),
         roaming_visited_network = ?visited_network_header,
         "Resolved native VoLTE carrier profile"
     );

@@ -374,13 +374,8 @@ impl ProfileStore {
                 fallback_reason: None,
             }));
         }
-        let home_plmn = explicit_home_plmn.or_else(|| {
-            self.catalog
-                .infer_home_plmn(digits)
-                .ok()
-                .flatten()
-                .or_else(|| inferred_home_plmn(digits).map(str::to_string))
-        });
+        let home_plmn =
+            explicit_home_plmn.or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
         let home_plmn = home_plmn.as_deref();
         let catalog_result = match self.catalog.imsi_has_ambiguous_plmn(digits) {
             Ok(true) if home_plmn.is_none() => Ok(None),
@@ -425,14 +420,11 @@ fn derive_standard_fallback(
     access: CatalogAccessKind,
     fallback_reason: String,
 ) -> Option<ResolvedProfile> {
-    let inferred_length = if imsi.starts_with("460") { 5 } else { 6 };
-    let plmn = home_plmn
-        .filter(|plmn| {
-            matches!(plmn.len(), 5 | 6)
-                && plmn.bytes().all(|byte| byte.is_ascii_digit())
-                && imsi.starts_with(*plmn)
-        })
-        .or_else(|| imsi.get(..inferred_length))?;
+    let plmn = home_plmn.filter(|plmn| {
+        matches!(plmn.len(), 5 | 6)
+            && plmn.bytes().all(|byte| byte.is_ascii_digit())
+            && imsi.starts_with(*plmn)
+    })?;
     let standard_access = match access {
         CatalogAccessKind::LteEpc => profiles::Standard3gppAccess::LteEpc,
         CatalogAccessKind::WifiEpdg => profiles::Standard3gppAccess::WifiEpdg,
@@ -443,11 +435,6 @@ fn derive_standard_fallback(
         origin: ProfileOrigin::Derived,
         fallback_reason: Some(fallback_reason),
     })
-}
-
-fn inferred_home_plmn(imsi: &str) -> Option<&str> {
-    let inferred_length = if imsi.starts_with("460") { 5 } else { 6 };
-    imsi.get(..inferred_length)
 }
 
 impl From<&'static CarrierProfile> for ResolvedProfile {
@@ -501,7 +488,12 @@ mod tests {
         assert!(listed[0].source.starts_with("carrier_catalog:"));
         assert!(store.resolve_by_plmn("460", "01").is_none());
         let fallback = store
-            .resolve_for_imsi_access(None, "460011234567890", None, CatalogAccessKind::LteEpc)
+            .resolve_for_imsi_access(
+                None,
+                "460011234567890",
+                Some("46001"),
+                CatalogAccessKind::LteEpc,
+            )
             .expect("unknown profile query")
             .expect("standard fallback");
         assert_eq!(fallback.origin, ProfileOrigin::Derived);
@@ -520,11 +512,28 @@ mod tests {
     }
 
     #[test]
-    fn absent_catalog_uses_derived_fallback_without_a_runtime_switch() {
+    fn unknown_imsi_does_not_guess_a_two_or_three_digit_mnc() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let catalog = CarrierCatalog::at_path(PathBuf::from(
             "/definitely-missing/carrier-bundles.sqlite3",
         ));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+
+        let resolved = store
+            .resolve_for_imsi_access(None, "310260123456789", None, CatalogAccessKind::LteEpc)
+            .expect("ambiguous query should remain non-fatal");
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn absent_catalog_uses_derived_fallback_without_a_runtime_switch() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
         let database = Arc::new(
             Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
         );
