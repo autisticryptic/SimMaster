@@ -107,7 +107,7 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// SIP interoperability candidates are separate from the outer bearer
 /// recovery budget. Keep the ladder bounded so a malformed profile cannot
 /// create an unbounded REGISTER storm on the QCM410.
-const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 8;
+const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 12;
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -704,6 +704,58 @@ struct VolteRegisterVariant {
 }
 
 impl VolteRegisterVariant {
+    fn without_visited_network(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_no_visited_network"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_no_visited_network"
+            }
+        };
+        Self {
+            label,
+            policy: sip::RegisterRequestPolicy {
+                include_visited_network: false,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
+    fn without_access_network_info(self) -> Self {
+        Self {
+            label: "generic_ims_register_no_pani",
+            policy: sip::RegisterRequestPolicy {
+                include_access_network_info: false,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
+    fn without_route_header(self) -> Self {
+        Self {
+            label: "generic_ims_register_no_route",
+            policy: sip::RegisterRequestPolicy {
+                include_route_header: false,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
+    fn without_sip_instance(self) -> Self {
+        Self {
+            label: "generic_ims_register_no_instance",
+            policy: sip::RegisterRequestPolicy {
+                include_sip_instance: false,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
     fn requiring_sec_agree(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -802,6 +854,8 @@ const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
             include_video_feature: false,
             include_route_header: true,
             include_visited_network: true,
+            include_access_network_info: true,
+            include_sip_instance: true,
         },
         server_required_sec_agree: false,
         security_client_offer: VolteSecurityClientOffer::Full,
@@ -817,6 +871,8 @@ const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
             include_video_feature: false,
             include_route_header: true,
             include_visited_network: true,
+            include_access_network_info: true,
+            include_sip_instance: true,
         },
         server_required_sec_agree: false,
         security_client_offer: VolteSecurityClientOffer::Full,
@@ -852,6 +908,8 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             include_video_feature: false,
             include_route_header: profile.ims.register.include_route_header,
             include_visited_network: profile.ims.register.include_visited_network,
+            include_access_network_info: true,
+            include_sip_instance: true,
         },
         server_required_sec_agree: required,
         security_client_offer: VolteSecurityClientOffer::Full,
@@ -872,11 +930,28 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             include_video_feature: false,
             include_route_header: true,
             include_visited_network: profile.ims.register.include_visited_network,
+            include_access_network_info: true,
+            include_sip_instance: true,
         },
         server_required_sec_agree: false,
         security_client_offer: VolteSecurityClientOffer::Full,
     };
-    vec![primary, fallback]
+    let mut variants = vec![primary, fallback];
+    // RFC 3455 §4.3.2.1 says a UA SHOULD NOT originate P-Visited-Network-ID.
+    // Keep a single omission candidate for catalog rows that explicitly carry
+    // the header, since some legacy P-CSCFs reject that extension from a UE.
+    if profile.ims.register.include_visited_network
+        || profile.ims.register.visited_network_header.is_some()
+    {
+        variants.push(primary.without_visited_network());
+    }
+    // These are deliberately linear, not a Cartesian product. They only run
+    // after an authentication-free format rejection/timeout, within the
+    // session-wide candidate budget, and never alter the selected PLMN.
+    variants.push(fallback.without_access_network_info());
+    variants.push(fallback.without_route_header());
+    variants.push(fallback.without_sip_instance());
+    variants
 }
 
 fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> bool {
@@ -2070,7 +2145,6 @@ async fn connect_family(
             "Trying bounded VoLTE REGISTER interoperability candidate"
         );
         variant.policy.include_video_feature = video_capability_enabled;
-        variant.policy.include_visited_network |= device_identity.visited_network_header.is_some();
         let mut channel = if let Some(worker) = worker.as_ref() {
             match VolteSipChannel::bind_in_worker(route, worker, Some(&bearer.interface), None)
                 .await
@@ -2251,7 +2325,7 @@ async fn connect_family(
                 }
                 if next_variant_available
                     && failure.auth_rounds == 0
-                    && register_failure_status(&failure) == Some(400)
+                    && pre_authentication_variant_failure(&failure)
                 {
                     last_error = Some(error);
                     continue;
@@ -5647,7 +5721,10 @@ async fn load_device_identity(
         &imsi,
         home_plmn.as_deref(),
         registered_plmn.as_deref(),
-        profile.ims.register.include_visited_network || resolved.origin == ProfileOrigin::Derived,
+        // The visited PLMN never changes the selected home IMS profile.  It is
+        // exposed to SIP only for an explicit, carrier-tested exception;
+        // standards-derived fallback leaves P-Visited-Network-ID to the P-CSCF.
+        resolved.origin != ProfileOrigin::Derived && profile.ims.register.include_visited_network,
     );
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
@@ -5965,6 +6042,15 @@ fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
         .response
         .as_deref()
         .and_then(|response| sip::parse_status(response).ok())
+}
+
+/// Only format/interoperability failures may advance to another REGISTER
+/// candidate. Once AKA has started, credentials and security negotiation are
+/// fixed for this session and must not be hidden by header experimentation.
+fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
+    matches!(register_failure_status(failure), Some(400 | 420 | 421))
+        || (failure.response.is_none()
+            && failure.error.code() == "ims_register_initial_receive_failed")
 }
 
 fn sec_agree_retry_variant(
@@ -6418,7 +6504,7 @@ mod tests {
     fn production_register_variants_keep_a_generic_second_attempt() {
         let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         let variants = register_variants(&profile);
-        assert_eq!(variants.len(), 2);
+        assert_eq!(variants.len(), 6);
         assert_eq!(
             variants[0].label,
             profile.ims.register.live_header_variant_set
@@ -6426,6 +6512,42 @@ mod tests {
         assert_eq!(variants[1].label, "generic_ims_register_fallback");
         assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
         assert!(!variants[1].policy.require_sec_agree);
+        assert_eq!(
+            variants[2].label,
+            "ims_features_aka_uri_first_no_visited_network"
+        );
+        assert!(!variants[2].policy.include_visited_network);
+        assert!(!variants[3].policy.include_access_network_info);
+        assert!(!variants[4].policy.include_route_header);
+        assert!(!variants[5].policy.include_sip_instance);
+    }
+
+    #[test]
+    fn derived_profile_register_variants_do_not_originate_visited_network() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "460",
+                "00",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("derived LTE profile");
+        let variants = register_variants(&profile);
+
+        assert_eq!(variants.len(), 5);
+        assert!(variants
+            .iter()
+            .all(|variant| !variant.policy.include_visited_network));
+    }
+
+    #[test]
+    fn register_candidate_ladder_stops_after_authentication() {
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_authenticated_unexpected_status"),
+            response: Some(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 1,
+        };
+
+        assert!(!pre_authentication_variant_failure(&failure));
     }
 
     /// Verbatim `mmcli -L --output-keyvalue` output from the 410. The separator

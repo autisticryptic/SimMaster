@@ -119,6 +119,8 @@ pub struct RegisterRequestPolicy {
     pub include_video_feature: bool,
     pub include_route_header: bool,
     pub include_visited_network: bool,
+    pub include_access_network_info: bool,
+    pub include_sip_instance: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,6 +161,8 @@ impl RegisterRequestPolicy {
         include_video_feature: false,
         include_route_header: false,
         include_visited_network: false,
+        include_access_network_info: true,
+        include_sip_instance: true,
     };
 }
 
@@ -420,13 +424,14 @@ fn build_register_internal(
     // An MMTEL-capable cellular binding must identify its radio access. Some
     // imported carrier bundles omit the PANI booleans even though they enable
     // MMTEL, which can leave a 200-OK registration ineligible for MT routing.
-    let include_pani = policy.include_mmtel_features
-        || profile.is_none_or(|profile| match phase {
-            RegisterPhase::Initial => profile.ims.register.include_pani_initial,
-            RegisterPhase::Authenticated | RegisterPhase::Refresh => {
-                profile.ims.register.include_pani_authenticated
-            }
-        });
+    let include_pani = policy.include_access_network_info
+        && (policy.include_mmtel_features
+            || profile.is_none_or(|profile| match phase {
+                RegisterPhase::Initial => profile.ims.register.include_pani_initial,
+                RegisterPhase::Authenticated | RegisterPhase::Refresh => {
+                    profile.ims.register.include_pani_authenticated
+                }
+            }));
     let access_network_info = profile
         .map(|profile| profile.ims.register.access_network_info)
         .unwrap_or(PANI_EUTRAN);
@@ -519,6 +524,12 @@ fn build_register_internal(
             if name.eq_ignore_ascii_case("video") && !policy.include_video_feature {
                 continue;
             }
+            if !policy.include_sip_instance
+                && (name.eq_ignore_ascii_case("+sip.instance")
+                    || name.eq_ignore_ascii_case("reg-id"))
+            {
+                continue;
+            }
             if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
                 advertises_sms_over_ip = true;
             }
@@ -538,40 +549,51 @@ fn build_register_internal(
         if policy.include_mmtel_features {
             contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
         }
-        contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
-        // RFC 5626: reg-id only has meaning next to the instance it pairs
-        // with, so emit it here rather than letting the tail append a second
-        // +sip.instance further down the parameter list.
-        if always_add_sip_instance {
-            contact.push_str(&format!(";reg-id={CELLULAR_REG_ID}"));
+        if policy.include_sip_instance {
+            contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
+            // RFC 5626: reg-id only has meaning next to the instance it pairs
+            // with, so emit it here rather than letting the tail append a second
+            // +sip.instance further down the parameter list.
+            if always_add_sip_instance {
+                contact.push_str(&format!(";reg-id={CELLULAR_REG_ID}"));
+            }
+            declared_sip_instance = true;
         }
-        declared_sip_instance = true;
         contact.push_str(&format!(";expires={expires}"));
     }
     if !advertises_sms_over_ip {
         contact.push_str(";+g.3gpp.smsip");
     }
-    if always_add_sip_instance && !declared_sip_instance {
+    if policy.include_sip_instance && always_add_sip_instance && !declared_sip_instance {
         contact.push_str(&format!(
             ";+sip.instance=\"<{}>\";reg-id={CELLULAR_REG_ID}",
             sip_instance
         ));
     }
-    let visited_network = visited_network_override
-        .map(str::to_string)
-        .or_else(|| {
-            profile
-                .and_then(|profile| profile.ims.register.visited_network_header)
+    // RFC 3455 §4.3.2.1 says a SIP UA SHOULD NOT originate
+    // P-Visited-Network-ID.  A profile may still opt in for a field-tested
+    // carrier exception, but a candidate that disables the policy must also
+    // suppress a static catalog value and any runtime roaming override.
+    let visited_network = policy
+        .include_visited_network
+        .then(|| {
+            visited_network_override
                 .map(str::to_string)
+                .or_else(|| {
+                    profile
+                        .and_then(|profile| profile.ims.register.visited_network_header)
+                        .map(str::to_string)
+                })
+                .or_else(|| (profile.is_none()).then(String::new))
+                .map(|value| {
+                    if value.is_empty() {
+                        format!("\"{}\"", identity.home_domain)
+                    } else {
+                        value
+                    }
+                })
         })
-        .or_else(|| (profile.is_none() && policy.include_visited_network).then(String::new))
-        .map(|value| {
-            if value.is_empty() {
-                format!("\"{}\"", identity.home_domain)
-            } else {
-                value
-            }
-        });
+        .flatten();
     crate::connectivity::core::register_message::build_register(&RegisterRequest {
         request_uri,
         advertised_route: *route,
@@ -1552,6 +1574,28 @@ mod tests {
             profile.ims.register.visited_network_header,
             Some("\"legacy-test-profile\"")
         );
+    }
+
+    #[test]
+    fn ue_omission_policy_suppresses_static_and_runtime_visited_network() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let frame = build_register_from_profile_with_target_and_visited(
+            &profile,
+            RegisterTarget::from_profile(&profile),
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+            Some("\"ims.mnc000.mcc460.3gppnetwork.org\""),
+        );
+
+        assert!(header_values(&frame, "P-Visited-Network-ID").is_empty());
     }
 
     #[test]
