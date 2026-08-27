@@ -1994,6 +1994,7 @@ mod tests {
                 include_video_feature: false,
                 include_route_header: true,
                 include_visited_network: true,
+                ..RegisterRequestPolicy::LEGACY
             },
         );
         let text = String::from_utf8(frame).unwrap();

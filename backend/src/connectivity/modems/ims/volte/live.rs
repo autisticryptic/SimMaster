@@ -107,7 +107,7 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// SIP interoperability candidates are separate from the outer bearer
 /// recovery budget. Keep the ladder bounded so a malformed profile cannot
 /// create an unbounded REGISTER storm on the QCM410.
-const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 12;
+const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 24;
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
