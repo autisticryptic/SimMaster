@@ -14,6 +14,7 @@ const Dashboard = lazy(() => import('./pages/Dashboard'))
 const SimCard = lazy(() => import('./pages/SimCard'))
 const Phone = lazy(() => import('./pages/Phone'))
 const Configuration = lazy(() => import('./pages/Configuration'))
+const DiagnosticLog = lazy(() => import('./pages/DiagnosticLog'))
 const OtaUpdate = lazy(() => import('./pages/OtaUpdate'))
 const Login = lazy(() => import('./pages/Login'))
 
@@ -127,6 +128,7 @@ function App() {
               <Route path="phone" element={<Suspense fallback={<PageLoading />}><Phone /></Suspense>} />
               <Route path="config" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
               <Route path="config/security" element={<Suspense fallback={<PageLoading />}><Configuration /></Suspense>} />
+              <Route path="config/diagnostics" element={<Suspense fallback={<PageLoading />}><DiagnosticLog /></Suspense>} />
               <Route path="ota" element={<Suspense fallback={<PageLoading />}><OtaUpdate /></Suspense>} />
             </Route>
           </Routes>

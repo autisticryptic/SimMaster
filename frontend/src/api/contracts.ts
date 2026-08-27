@@ -1687,6 +1687,33 @@ export interface GithubDownloadProxyConfig {
   proxy_prefix: string
 }
 
+/** Lowest severity written to the on-disk diagnostic log. */
+export type DiagnosticLogSeverity = 'debug' | 'info' | 'warn' | 'error'
+
+export interface DiagnosticLogConfig {
+  enabled: boolean
+  retention_days: number
+  max_total_mb: number
+  min_severity: DiagnosticLogSeverity
+  redact_sensitive: boolean
+  directory: string | null
+}
+
+export interface DiagnosticLogStatus {
+  directory: string
+  file_count: number
+  total_bytes: number
+  earliest_date: string | null
+  latest_date: string | null
+  /** Records discarded because the writer fell behind; non-zero means gaps. */
+  dropped_records: number
+}
+
+export interface DiagnosticLogSettingsResponse {
+  config: DiagnosticLogConfig
+  status: DiagnosticLogStatus
+}
+
 export interface OtaReleaseAsset {
   name: string
   size: number

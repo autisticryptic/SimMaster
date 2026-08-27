@@ -219,7 +219,10 @@ function recoveryMessage(line: VolteLineControlResponse) {
         ? `正在执行第 ${runtime.retry_attempt}/${runtime.retry_max} 次完整 IMS 注册尝试`
         : '正在准备 IMS 注册重试'
     case 'exhausted':
-      return runtime.modem_restart_attempt >= runtime.modem_restart_max
+      // modem_restart_max 为 0 表示本轮恢复没有走过基带重启（per-line 重启已移除），
+      // 不加此前置条件时 0 >= 0 恒成立，会把所有 IMS 注册耗尽误报成基带故障。
+      return runtime.modem_restart_max > 0 &&
+        runtime.modem_restart_attempt >= runtime.modem_restart_max
         ? `基带恢复 ${runtime.modem_restart_max} 次后仍不可用，已停止自动恢复`
         : `连续 ${runtime.retry_max} 次完整 IMS 注册尝试均失败，已停止自动恢复`
     default:
@@ -1008,7 +1011,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         />
                       </Box>
                     </Box>}
-                    {!isReader && (!workbench || workbenchTab === 'ims') && <VolteStageTimeline line={line} />}
+                    {/* 工作台的 IMS 标签页不再重复渲染阶段进度：线路卡片顶部已有同源的
+                        阶段条，两处并列只是同一份 connection_attempts 的两种画法。 */}
+                    {!isReader && !workbench && <VolteStageTimeline line={line} />}
                     {(!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">

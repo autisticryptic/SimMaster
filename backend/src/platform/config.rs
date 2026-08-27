@@ -693,6 +693,102 @@ impl Default for GithubDownloadProxyConfig {
     }
 }
 
+/// On-disk diagnostic log settings.
+///
+/// The web UI keeps only the newest handful of activity entries; anything older
+/// exists solely in this file, which is the sole record when a field failure has
+/// to be reconstructed after the fact. Retention is enforced by whichever bound
+/// trips first — age or total bytes — so a burst of registration retries cannot
+/// fill the device flash and an idle device still ages its history out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct DiagnosticLogConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Files older than this are deleted by the cleanup pass.
+    #[serde(default = "default_diagnostic_log_retention_days")]
+    pub retention_days: u32,
+    /// Combined ceiling across all rotated files, in mebibytes.
+    #[serde(default = "default_diagnostic_log_max_total_mb")]
+    pub max_total_mb: u32,
+    /// Lowest severity written to disk.
+    #[serde(default)]
+    pub min_severity: DiagnosticLogSeverity,
+    /// Mask subscriber identifiers (IMSI/IMPI/IMPU), phone numbers, SMS bodies
+    /// and P-CSCF addresses. On by default: the download endpoint hands the file
+    /// to anyone who can log in, and the recovery path for the common failures
+    /// (SIP status codes, error chains, stage transitions) does not need PII.
+    #[serde(default = "default_true")]
+    pub redact_sensitive: bool,
+    /// Directory override. Empty means the platform default.
+    #[serde(default)]
+    pub directory: Option<String>,
+}
+
+/// Severity ladder for on-disk diagnostic lines.
+///
+/// Deliberately ordered so `PartialOrd` expresses "at least as severe as", which
+/// is how the writer applies `min_severity`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticLogSeverity {
+    Debug,
+    #[default]
+    Info,
+    Warn,
+    Error,
+}
+
+impl DiagnosticLogSeverity {
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Debug => "DEBUG",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+fn default_diagnostic_log_retention_days() -> u32 {
+    7
+}
+
+fn default_diagnostic_log_max_total_mb() -> u32 {
+    50
+}
+
+impl Default for DiagnosticLogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            retention_days: default_diagnostic_log_retention_days(),
+            max_total_mb: default_diagnostic_log_max_total_mb(),
+            min_severity: DiagnosticLogSeverity::default(),
+            redact_sensitive: true,
+            directory: None,
+        }
+    }
+}
+
+impl DiagnosticLogConfig {
+    /// Reject values that would disable retention entirely or overflow the byte
+    /// math, so a bad API payload cannot turn the log into an unbounded writer.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.retention_days == 0 || self.retention_days > 365 {
+            return Err("日志保留天数需在 1-365 之间".to_string());
+        }
+        if self.max_total_mb == 0 || self.max_total_mb > 4096 {
+            return Err("日志体积上限需在 1-4096 MB 之间".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn max_total_bytes(&self) -> u64 {
+        u64::from(self.max_total_mb) * 1024 * 1024
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct SecurityConfig {
@@ -4605,6 +4701,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub github_download_proxy: GithubDownloadProxyConfig,
     #[serde(default)]
+    pub diagnostic_log: DiagnosticLogConfig,
+    #[serde(default)]
     pub security: SecurityConfig,
     #[serde(default)]
     pub esim: EsimConfig,
@@ -4627,6 +4725,7 @@ impl Default for AppConfig {
             ue_isolation: UeIsolationConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             github_download_proxy: GithubDownloadProxyConfig::default(),
+            diagnostic_log: DiagnosticLogConfig::default(),
             security: SecurityConfig::default(),
             esim: EsimConfig::default(),
             automation: AutomationConfig::default(),
@@ -6291,6 +6390,19 @@ impl ConfigManager {
         {
             let mut config = self.config.write().unwrap();
             config.github_download_proxy = proxy;
+        }
+        self.save()
+    }
+
+    pub fn get_diagnostic_log(&self) -> DiagnosticLogConfig {
+        self.config.read().unwrap().diagnostic_log.clone()
+    }
+
+    pub fn set_diagnostic_log(&self, diagnostic_log: DiagnosticLogConfig) -> Result<(), String> {
+        diagnostic_log.validate()?;
+        {
+            let mut c = self.config.write().unwrap();
+            c.diagnostic_log = diagnostic_log;
         }
         self.save()
     }

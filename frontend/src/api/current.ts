@@ -33,6 +33,8 @@ import type {
   DdnsStatusResponse,
   DdnsSyncResponse,
   DeviceInfo,
+  DiagnosticLogConfig,
+  DiagnosticLogSettingsResponse,
   EsimCommandResponse,
   EsimDownloadRequest,
   EsimConfig,
@@ -1030,6 +1032,40 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify(config),
     })
+  }
+
+  async getDiagnosticLog() {
+    return request<ApiResponse<DiagnosticLogSettingsResponse>>('/settings/diagnostic-log')
+  }
+
+  async setDiagnosticLog(config: DiagnosticLogConfig) {
+    return request<ApiResponse<DiagnosticLogSettingsResponse>>('/settings/diagnostic-log', {
+      method: 'POST',
+      body: JSON.stringify(config),
+    })
+  }
+
+  /**
+   * Fetch the log archive as a Blob.
+   *
+   * Not a plain `<a href>`: the endpoint sits behind the session cookie and
+   * answers 401 by redirecting to the login page, which a naive link would
+   * silently save as an HTML file named like a log.
+   */
+  async downloadDiagnosticLog(): Promise<Blob> {
+    const response = await fetch(`${API_BASE}/settings/diagnostic-log/download`, {
+      credentials: 'same-origin',
+    })
+    if (!response.ok) {
+      if (response.status === 401) {
+        redirectToLogin()
+      }
+      if (response.status === 404) {
+        throw new Error('诊断日志文件尚未生成')
+      }
+      throw new Error(httpStatusMessage(response.status))
+    }
+    return response.blob()
   }
 
   async uploadOta(file: File) {

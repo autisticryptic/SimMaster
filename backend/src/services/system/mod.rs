@@ -4,8 +4,10 @@
 //!   - `system_event`: structured system-event emitter + severity/status codes
 //!   - `system_event_monitor`: background watcher that raises system events
 //!   - `device_status`: aggregated device/runtime status reporting
+//!   - `diagnostic_log`: append-only on-disk log with the untruncated error chain
 
 pub mod device_status;
+pub mod diagnostic_log;
 pub mod ota;
 pub mod system_event;
 pub mod system_event_monitor;

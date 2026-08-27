@@ -214,12 +214,17 @@ function CellsSettings({ lineLabel, lineId, onData }: CellsSettingsProps) {
         </Table>
       </TableContainer>
       <Typography variant="subtitle2" fontWeight={700}>可用频段</Typography>
-      <Stack spacing={2}>
-        <BandGroup label="LTE FDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_fdd_bands ?? []} selected={selection.lte_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_fdd_bands: next }))} />
-        <BandGroup label="LTE TDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_tdd_bands ?? []} selected={selection.lte_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_tdd_bands: next }))} />
-        <BandGroup label="5G NR FDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_fdd_bands ?? []} selected={selection.nr_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_fdd_bands: next }))} />
-        <BandGroup label="5G NR TDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_tdd_bands ?? []} selected={selection.nr_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_tdd_bands: next }))} />
-      </Stack>
+      {/* LTE 与 5G NR 分列：竖排四组时右侧留白过大，左右分栏让 chip 铺开得更均匀。 */}
+      <Box display="grid" gridTemplateColumns={{ xs: '1fr', md: 'repeat(2, minmax(0, 1fr))' }} gap={2} alignItems="start">
+        <Stack spacing={2} minWidth={0}>
+          <BandGroup label="LTE FDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_fdd_bands ?? []} selected={selection.lte_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_fdd_bands: next }))} />
+          <BandGroup label="LTE TDD" prefix="B" loading={loading && !bands} supported={bands?.supported_lte_tdd_bands ?? []} selected={selection.lte_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, lte_tdd_bands: next }))} />
+        </Stack>
+        <Stack spacing={2} minWidth={0}>
+          <BandGroup label="5G NR FDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_fdd_bands ?? []} selected={selection.nr_fdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_fdd_bands: next }))} />
+          <BandGroup label="5G NR TDD" prefix="n" loading={loading && !bands} supported={bands?.supported_nr_tdd_bands ?? []} selected={selection.nr_tdd_bands} onChange={(next) => setSelection((current) => ({ ...current, nr_tdd_bands: next }))} />
+        </Stack>
+      </Box>
     </Stack>
   )
 }

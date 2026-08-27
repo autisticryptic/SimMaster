@@ -95,57 +95,65 @@ fn spawn_runtime_event_bridge(app: AppState) {
             ticker.tick().await;
             for line in app.line_registry.all().await {
                 let line_id = line.binding().line_id;
-                let volte = line.volte.snapshot().await;
-                let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
+                // This poller is one shared task, but everything it publishes in
+                // here describes a single line's UE. Scoping the body attributes
+                // those records to that UE instead of to the poller, which is
+                // what keeps the diagnostic log readable when several cards are
+                // retrying at the same time.
+                services::system::diagnostic_log::with_ue_worker_context(async {
+                    let volte = line.volte.snapshot().await;
+                    let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
 
-                for attempt in &volte.connection_attempts {
-                    let key = format!("{}:{}", attempt.sequence, attempt.at);
-                    if seen.contains(&key) {
-                        continue;
+                    for attempt in &volte.connection_attempts {
+                        let key = format!("{}:{}", attempt.sequence, attempt.at);
+                        if seen.contains(&key) {
+                            continue;
+                        }
+                        if let Err(error) = app.event_bus.publish(
+                            "volte.connection_attempt",
+                            Some(&line_id),
+                            Some("volte_ims"),
+                            serde_json::json!({ "attempt": attempt }),
+                        ) {
+                            tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
+                        }
+                        seen.push_back(key);
+                        while seen.len() > 200 {
+                            seen.pop_front();
+                        }
                     }
-                    if let Err(error) = app.event_bus.publish(
-                        "volte.connection_attempt",
-                        Some(&line_id),
-                        Some("volte_ims"),
-                        serde_json::json!({ "attempt": attempt }),
-                    ) {
-                        tracing::warn!(line_id, error = %error, "Failed to publish VoLTE connection event");
-                    }
-                    seen.push_back(key);
-                    while seen.len() > 200 {
-                        seen.pop_front();
-                    }
-                }
 
-                let trunk = line.trunk.status().await;
-                let fingerprint = serde_json::json!({
-                    "phase": &trunk.phase,
-                    "stage": &trunk.stage,
-                    "enabled": trunk.enabled,
-                    "registered": trunk.registered,
-                    "last_sip_status": trunk.last_sip_status,
-                    "last_error": &trunk.last_error,
-                    "register_attempts": trunk.register_attempts,
-                    "reconnect_count": trunk.reconnect_count,
-                    "active_calls": trunk.active_calls,
-                    "media_negotiations": trunk.media_negotiations,
-                    "video_negotiations": trunk.video_negotiations,
-                    "dtmf_events": trunk.dtmf_events,
+                    let trunk = line.trunk.status().await;
+                    let fingerprint = serde_json::json!({
+                        "phase": &trunk.phase,
+                        "stage": &trunk.stage,
+                        "enabled": trunk.enabled,
+                        "registered": trunk.registered,
+                        "last_sip_status": trunk.last_sip_status,
+                        "last_error": &trunk.last_error,
+                        "register_attempts": trunk.register_attempts,
+                        "reconnect_count": trunk.reconnect_count,
+                        "active_calls": trunk.active_calls,
+                        "media_negotiations": trunk.media_negotiations,
+                        "video_negotiations": trunk.video_negotiations,
+                        "dtmf_events": trunk.dtmf_events,
+                    })
+                    .to_string();
+                    let previous = trunk_fingerprints.insert(line_id.clone(), fingerprint.clone());
+                    if previous.as_deref() != Some(&fingerprint)
+                        && (previous.is_some() || trunk.enabled || trunk.phase != "disabled")
+                    {
+                        if let Err(error) = app.event_bus.publish(
+                            "trunk.status_changed",
+                            Some(&line_id),
+                            Some("trunk"),
+                            serde_json::to_value(&trunk).unwrap_or_else(|_| serde_json::json!({})),
+                        ) {
+                            tracing::warn!(line_id, error = %error, "Failed to publish Trunk status event");
+                        }
+                    }
                 })
-                .to_string();
-                let previous = trunk_fingerprints.insert(line_id.clone(), fingerprint.clone());
-                if previous.as_deref() != Some(&fingerprint)
-                    && (previous.is_some() || trunk.enabled || trunk.phase != "disabled")
-                {
-                    if let Err(error) = app.event_bus.publish(
-                        "trunk.status_changed",
-                        Some(&line_id),
-                        Some("trunk"),
-                        serde_json::to_value(&trunk).unwrap_or_else(|_| serde_json::json!({})),
-                    ) {
-                        tracing::warn!(line_id, error = %error, "Failed to publish Trunk status event");
-                    }
-                }
+                .await;
             }
         }
     });
@@ -897,7 +905,15 @@ async fn main() -> Result<()> {
         Arc::clone(&dbus_conn),
         Arc::clone(&app_db),
     ));
-    let event_bus = Arc::new(AppEventBus::new(Arc::clone(&app_db)));
+    // On-disk diagnostic log. Created before the event bus so published events
+    // can be mirrored to the file; the writer task owns the file and drains a
+    // bounded queue, so a slow or full disk never blocks a request path.
+    let diagnostic_log_sink =
+        services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
+    let event_bus = Arc::new(
+        AppEventBus::new(Arc::clone(&app_db))
+            .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+    );
     let system_event_emitter = Arc::new(SystemEventEmitter::new(
         Arc::clone(&notification_sender),
         Arc::clone(&event_bus),
@@ -1027,6 +1043,7 @@ async fn main() -> Result<()> {
         dbus_conn,
         database: app_db,
         config_manager,
+        diagnostic_log_sink: Arc::clone(&diagnostic_log_sink),
         notification_sender,
         system_event_emitter,
         event_bus,
@@ -1807,6 +1824,17 @@ async fn main() -> Result<()> {
             get(get_github_download_proxy_handler)
                 .post(set_github_download_proxy_handler)
                 .options(options_handler),
+        )
+        // ========== 诊断日志接口 ==========
+        .route(
+            "/api/settings/diagnostic-log",
+            get(get_diagnostic_log_handler)
+                .post(set_diagnostic_log_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/settings/diagnostic-log/download",
+            get(download_diagnostic_log_handler).options(options_handler),
         )
         // ========== 通知配置接口 ==========
         .route(

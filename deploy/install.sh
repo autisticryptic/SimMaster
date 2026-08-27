@@ -16,6 +16,7 @@
 set -e
 
 PREFIX=/opt/simadmin
+LOG_DIR=/var/log/simadmin
 WITH_IMS=1
 [ "${1:-}" = "--no-ims" ] && WITH_IMS=0
 
@@ -29,6 +30,12 @@ install -m 0755 simadmin "$PREFIX/simadmin"
 rm -rf "$PREFIX/www"
 install -d "$PREFIX/www"
 cp -r www/. "$PREFIX/www/"
+
+# Diagnostic log directory. The service creates this itself on first write, but
+# doing it here pins the mode before any log exists: with redaction turned off
+# the file holds IMSIs and message bodies, so it must not be world-readable.
+say "preparing diagnostic log directory at $LOG_DIR"
+install -d -m 0750 "$LOG_DIR"
 
 if [ "$WITH_IMS" = "1" ]; then
   # --- no kernel module ------------------------------------------------------
@@ -81,6 +88,7 @@ Done.
 
   binary : $PREFIX/simadmin
   web UI : $PREFIX/www
+  logs   : $LOG_DIR
 
 Start the service:
   $PREFIX/simadmin serve --port 3000

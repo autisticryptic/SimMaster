@@ -22,6 +22,7 @@ use crate::services::line_registry::LineRuntimeRegistry;
 use crate::services::messaging::sms_listener::SmsResyncHandle;
 use crate::services::network::device_network::DdnsManager;
 use crate::services::notify::notification::NotificationSender;
+use crate::services::system::diagnostic_log::DiagnosticLogSink;
 use crate::services::system::system_event::SystemEventEmitter;
 
 #[derive(Clone)]
@@ -54,6 +55,9 @@ pub struct AppState {
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
     pub event_bus: Arc<AppEventBus>,
+    /// On-disk diagnostic log writer. Producers hand it records without
+    /// blocking; the background task owns the file handles.
+    pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -90,6 +94,7 @@ pub struct AppStateDependencies {
     pub notification_sender: Arc<NotificationSender>,
     pub system_event_emitter: Arc<SystemEventEmitter>,
     pub event_bus: Arc<AppEventBus>,
+    pub diagnostic_log_sink: Arc<DiagnosticLogSink>,
     pub ddns_manager: Arc<DdnsManager>,
     pub esim_supervisor: Arc<EsimSupervisor>,
     pub sms_resync: SmsResyncHandle,
@@ -111,6 +116,7 @@ impl AppState {
             notification_sender,
             system_event_emitter,
             event_bus,
+            diagnostic_log_sink,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -128,6 +134,7 @@ impl AppState {
             notification_sender,
             system_event_emitter,
             event_bus,
+            diagnostic_log_sink,
             ddns_manager,
             esim_supervisor,
             sms_resync,
@@ -181,6 +188,12 @@ impl FromRef<AppState> for Arc<SystemEventEmitter> {
 impl FromRef<AppState> for Arc<AppEventBus> {
     fn from_ref(state: &AppState) -> Self {
         state.event_bus.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<DiagnosticLogSink> {
+    fn from_ref(state: &AppState) -> Self {
+        state.diagnostic_log_sink.clone()
     }
 }
 

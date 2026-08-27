@@ -51,9 +51,10 @@ use crate::{
     },
     hardware::sim::esim::EsimApiError,
     platform::config::{
-        AccessPathKind, AutoRestoreConfig, EsimReaderConfig, GithubDownloadProxyConfig,
-        ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig, SmsPathPolicy,
-        StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
+        AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
+        GithubDownloadProxyConfig, ImsVideoConfig, LineDataProxyConfig, LineProfileConfig,
+        LineVowifiConfig, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
+        VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -64,6 +65,7 @@ use crate::{
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
     },
+    services::system::diagnostic_log,
     services::system::system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
         status as system_event_status,
@@ -506,6 +508,144 @@ pub async fn set_github_download_proxy_handler(
             Json(ApiResponse::<GithubDownloadProxyConfig>::error(error)),
         ),
     }
+}
+
+/// Settings plus on-disk state, so one request populates the whole settings card.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct DiagnosticLogSettingsResponse {
+    pub config: DiagnosticLogConfig,
+    pub status: diagnostic_log::DiagnosticLogStatus,
+}
+
+fn diagnostic_log_settings(app: &AppState) -> DiagnosticLogSettingsResponse {
+    let config = app.config_manager.get_diagnostic_log();
+    let status = diagnostic_log::read_status(&config, app.diagnostic_log_sink.dropped_count());
+    DiagnosticLogSettingsResponse { config, status }
+}
+
+/// GET /api/settings/diagnostic-log
+///
+/// Returns the settings plus on-disk state (size, file count, oldest record) so
+/// the UI can show whether the log is actually accumulating anything before a
+/// user tries to download it.
+pub async fn get_diagnostic_log_handler(State(app): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            diagnostic_log_settings(&app),
+        )),
+    )
+}
+
+/// POST /api/settings/diagnostic-log
+pub async fn set_diagnostic_log_handler(
+    State(app): State<AppState>,
+    Json(payload): Json<DiagnosticLogConfig>,
+) -> impl IntoResponse {
+    if let Err(error) = payload.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<DiagnosticLogSettingsResponse>::error(error)),
+        );
+    }
+    match app.config_manager.set_diagnostic_log(payload) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Diagnostic log settings updated",
+                diagnostic_log_settings(&app),
+            )),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::<DiagnosticLogSettingsResponse>::error(error)),
+        ),
+    }
+}
+
+/// Ceiling on one download response.
+///
+/// Retention allows far more than this on disk, and the whole body is buffered to
+/// set Content-Length, so newest-first truncation keeps a large archive from
+/// pinning that many megabytes of device RAM per concurrent request. Recent
+/// records are the ones being diagnosed, so the oldest files are what gets cut.
+const DIAGNOSTIC_LOG_DOWNLOAD_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
+/// GET /api/settings/diagnostic-log/download
+///
+/// Returns the rotated files concatenated newest-first as one plain-text
+/// attachment. Redaction already happened at write time, so what lands on disk
+/// is what the operator gets — there is no second, unredacted copy to leak.
+pub async fn download_diagnostic_log_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let config = app.config_manager.get_diagnostic_log();
+    let directory = diagnostic_log::resolve_log_directory(&config);
+    let files = diagnostic_log::list_log_files(&directory);
+    if files.is_empty() {
+        return (
+            StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8",
+            )],
+            "诊断日志文件尚未生成".to_string().into_bytes(),
+        )
+            .into_response();
+    }
+
+    let mut body = Vec::new();
+    let mut budget = DIAGNOSTIC_LOG_DOWNLOAD_MAX_BYTES;
+    let mut omitted = 0usize;
+    // Newest first: `list_log_files` returns oldest-first.
+    for file in files.iter().rev() {
+        if budget == 0 {
+            omitted += 1;
+            continue;
+        }
+        match fs::read(&file.path) {
+            Ok(bytes) => {
+                body.extend_from_slice(format!("===== {} =====\n", file.name).as_bytes());
+                let take = bytes.len().min(budget as usize);
+                body.extend_from_slice(&bytes[..take]);
+                if take < bytes.len() {
+                    body.extend_from_slice(
+                        format!("\n===== {} 已按下载上限截断 =====\n", file.name).as_bytes(),
+                    );
+                } else if !bytes.ends_with(b"\n") {
+                    body.push(b'\n');
+                }
+                budget = budget.saturating_sub(take as u64);
+            }
+            Err(error) => {
+                warn!(file = %file.name, %error, "failed to read diagnostic log file for download");
+            }
+        }
+    }
+    if omitted > 0 {
+        body.extend_from_slice(
+            format!("===== 另有 {omitted} 个较早的日志文件因下载上限未包含 =====\n").as_bytes(),
+        );
+    }
+
+    let filename = format!(
+        "simadmin-diagnostics-{}.log",
+        chrono::Local::now().format("%Y%m%d-%H%M%S")
+    );
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; charset=utf-8".to_string(),
+            ),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// GET /api/esim/config
@@ -3248,7 +3388,14 @@ pub fn spawn_line_data_supervisor(app: AppState) {
             for line in app.line_registry.all().await {
                 let reconcile_app = app.clone();
                 tokio::spawn(async move {
-                    reconcile_line_data_health(&reconcile_app, &line).await;
+                    // Marks every diagnostic record this reconcile publishes as
+                    // per-line UE work, so the log separates it from the
+                    // device-wide schedulers sharing the same runtime.
+                    diagnostic_log::with_ue_worker_context(reconcile_line_data_health(
+                        &reconcile_app,
+                        &line,
+                    ))
+                    .await;
                 });
             }
         }
@@ -8603,7 +8750,10 @@ async fn schedule_vowifi_auto_restore(
     );
     let restore_app = app.clone();
     tokio::spawn(async move {
-        run_vowifi_restore_workflow(restore_app, workflow).await;
+        // Attributed to the line rather than the shared scheduler loop that
+        // queued it: everything this workflow publishes belongs to one UE.
+        diagnostic_log::with_ue_worker_context(run_vowifi_restore_workflow(restore_app, workflow))
+            .await;
     });
 }
 
@@ -8696,8 +8846,16 @@ async fn start_line_volte_restore(
         })
         .await;
     tokio::spawn(async move {
-        run_line_volte_restore_batch(&app, &line, source).await;
-        line.finish_volte_retry();
+        // Attributes this line's registration diagnostics to per-line UE work.
+        // This is the path that produces the nested
+        // `volte_runtime_mm_bearer_connect_failed:...` chains, so separating it
+        // from the device-wide schedulers is what makes the log readable when
+        // several cards are retrying at once.
+        diagnostic_log::with_ue_worker_context(async {
+            run_line_volte_restore_batch(&app, &line, source).await;
+            line.finish_volte_retry();
+        })
+        .await;
     });
     true
 }

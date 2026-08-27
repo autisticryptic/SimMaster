@@ -15,6 +15,7 @@ import {
 } from '@mui/material'
 import {
   Dashboard as DashboardIcon,
+  Description as DiagnosticsIcon,
   Settings as SettingsIcon,
   SystemUpdateAlt as OtaIcon,
   SimCard as SimIcon,
@@ -61,6 +62,7 @@ const menuGroups: MenuConfigItem[] = [
     items: [
       { path: '/config', label: '基本配置', icon: SettingsIcon },
       { path: '/config/security', label: '安全性', icon: SecurityIcon },
+      { path: '/config/diagnostics', label: '诊断日志', icon: DiagnosticsIcon },
       { path: '/ota', label: 'OTA 更新', icon: OtaIcon },
     ],
   },
