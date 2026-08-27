@@ -1196,7 +1196,11 @@ fn project_register(
     let register = config
         .pointer("/sip/common/register")
         .unwrap_or(&Value::Null);
-    let sec_agree_mode = match string_at(register, "/security_agreement").unwrap_or("auto") {
+    // A missing security-agreement field is an incomplete bundle, not an
+    // instruction to omit RFC 3329.  Use the interoperable baseline and keep
+    // the challenge-first variant available for cores that reject an initial
+    // Require header.  An explicit `auto` or `disabled` remains authoritative.
+    let sec_agree_mode = match string_at(register, "/security_agreement").unwrap_or("required") {
         value @ ("auto" | "required" | "disabled") => value.to_string(),
         unsupported => {
             return Err(format!(
@@ -1217,7 +1221,8 @@ fn project_register(
     // without the declaration makes the request self-contradictory and IMS
     // cores answer 421 Extension Required.
     let offers_sec_agree = !security_client.is_empty();
-    let mut supported = string_array_or_csv(register, "/supported").unwrap_or_default();
+    let mut supported = string_array_or_csv(register, "/supported")
+        .unwrap_or_else(|| vec!["path".to_string(), "gruu".to_string()]);
     if offers_sec_agree
         && !supported
             .iter()
@@ -1232,11 +1237,15 @@ fn project_register(
     let country_of_origination_format = string_at(register, "/country_of_origination_format")
         .unwrap_or("")
         .to_string();
-    let country_needs_pani = matches!(country_of_origination_format.as_str(), "PANI" | "BOTH");
+    let baseline_includes_pani = match country_of_origination_format.as_str() {
+        "PANI" | "BOTH" => true,
+        "NONE" => false,
+        _ => true,
+    };
     let include_pani_initial =
-        bool_at(register, "/include_pani_initial").unwrap_or(country_needs_pani);
+        bool_at(register, "/include_pani_initial").unwrap_or(baseline_includes_pani);
     let include_pani_authenticated =
-        bool_at(register, "/include_pani_authenticated").unwrap_or(country_needs_pani);
+        bool_at(register, "/include_pani_authenticated").unwrap_or(baseline_includes_pani);
     let pani = string_at(register, "/access_network_info")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_access_network_info"))
         .transpose()?
@@ -1257,23 +1266,20 @@ fn project_register(
             "audio" | "+g.3gpp.icsi-ref"
         )
     });
-    // Most bundles (Maxis among them, and all 1444 rows currently shipped)
-    // carry no `sip.common.contact_parameters` at all. Deriving MMTEL purely
-    // from that absent list made every such profile register as non-voice: no
-    // `+g.3gpp.icsi-ref` reaches the S-CSCF, so it never selects the MMTEL AS
-    // for terminating requests and MT calls are simply never delivered --
-    // while REGISTER still answers 200 OK, which makes the fault look like a
-    // network problem rather than ours. A real UE advertises the voice feature
-    // tags on any voice-capable registration, and a core that does not offer
-    // MMTEL just ignores them, so the safe default when the bundle expresses
-    // no Contact opinion is to advertise -- only an explicit `services` flag
-    // turning the access off suppresses it.
+    // Contact feature tags are not a reliable substitute for access identity.
+    // A field-tested iOS VoWiFi binding is deliberately SMS-only, while a
+    // Pixel-shaped binding with the full MMTEL set receives 200 OK but is not
+    // selected by the TAS for terminating calls.  Preserve explicit bundle
+    // tags; otherwise use the compact iOS-shaped baseline on Wi-Fi and the
+    // normal MMTEL baseline on LTE.
     let declares_voice_service = match access {
         CatalogAccessKind::LteEpc => bool_at(config, "/services/volte").unwrap_or(true),
         CatalogAccessKind::WifiEpdg => bool_at(config, "/services/vowifi").unwrap_or(true),
     };
-    let include_mmtel_features =
-        contact_declares_mmtel || (contact_param_order.is_empty() && declares_voice_service);
+    let include_mmtel_features = contact_declares_mmtel
+        || (contact_param_order.is_empty()
+            && declares_voice_service
+            && matches!(access, CatalogAccessKind::LteEpc));
     Ok(RegisterPolicyRecord {
         supported_header: supported.join(","),
         request_uri_policy: string_at(register, "/request_uri_policy")
@@ -1327,9 +1333,13 @@ fn project_register(
             .unwrap_or("standard")
             .to_string(),
         contact_param_order,
-        always_add_sip_instance: bool_at(register, "/always_add_sip_instance").unwrap_or(false),
+        // Stable flow identity is part of the generic registration baseline.
+        // Cellular-Network-Info is an interoperability hint used by successful
+        // IPCC-derived profiles rather than a 3GPP mandatory header; it is on
+        // for incomplete bundles, while an explicit carrier value still wins.
+        always_add_sip_instance: bool_at(register, "/always_add_sip_instance").unwrap_or(true),
         enable_cellular_network_info: bool_at(register, "/enable_cellular_network_info")
-            .unwrap_or(false),
+            .unwrap_or(true),
         temporary_status_codes: u16_array_at(register, "/temporary_status_codes")
             .unwrap_or_else(|| profiles::DEFAULT_TEMPORARY_STATUS_CODES.to_vec()),
         forbidden_status_codes: u16_array_at(register, "/forbidden_status_codes")
@@ -1851,14 +1861,12 @@ mod tests {
     }
 
     #[test]
-    fn voice_service_declaration_drives_mmtel_features_without_contact_parameters() {
+    fn voice_service_declaration_uses_access_specific_contact_baseline() {
         let (catalog, path) = fixture();
         // The fixture bundle declares services.volte/vowifi but carries no
-        // sip.common.contact_parameters -- the shape of essentially every real
-        // bundle. Deriving MMTEL from the absent parameter list alone left the
-        // REGISTER Contact without +g.3gpp.icsi-ref, so the S-CSCF never
-        // treated the registration as voice capable and MT calls were dropped
-        // while REGISTER still answered 200 OK.
+        // sip.common.contact_parameters. LTE advertises the conventional
+        // MMTEL tags; Wi-Fi uses the field-tested compact IPCC binding and
+        // relies on PANI/Cellular-Network-Info for access classification.
         for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
             let resolved = catalog
                 .resolve_for_imsi("234330123456789", None, access)
@@ -1869,9 +1877,10 @@ mod tests {
                 "fixture should carry no explicit Contact parameters for {}",
                 access.as_str()
             );
-            assert!(
+            assert_eq!(
                 resolved.record.ims.register.include_mmtel_features,
-                "{} should advertise MMTEL from the service declaration",
+                matches!(access, CatalogAccessKind::LteEpc),
+                "{} should use the access-specific Contact baseline",
                 access.as_str()
             );
         }
@@ -2075,7 +2084,12 @@ mod tests {
         // are filtered out; the supported AES-CBC/SHA1 entry remains.
         assert_eq!(wifi.record.ikev2.ike_proposals, ["aes128-sha1-modp2048"]);
         assert_eq!(wifi.record.ikev2.esp_proposals, ["aes128-sha1"]);
-        // security_agreement removed -> mode auto -> baseline Security-Client applied.
+        // security_agreement removed -> required baseline -> Security-Client applied.
+        assert_eq!(wifi.record.ims.register.sec_agree_mode, "required");
+        assert!(wifi.record.ims.register.include_pani_initial);
+        assert!(wifi.record.ims.register.include_pani_authenticated);
+        assert!(wifi.record.ims.register.enable_cellular_network_info);
+        assert!(wifi.record.ims.register.always_add_sip_instance);
         assert_eq!(
             wifi.record.ims.register.security_client_mechanisms,
             ["hmac-sha-1-96/aes-cbc/esp/trans"]

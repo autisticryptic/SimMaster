@@ -15,6 +15,7 @@ use std::net::IpAddr;
 
 use super::errors::VolteError;
 use crate::connectivity::core::{
+    contact::{complete_contact_parameters, ContactCompletion},
     register_message::{RegisterHeaderFields, RegisterRequest},
     sip_message::{SipHeader, SipRequest},
 };
@@ -499,8 +500,6 @@ fn build_register_internal(
         local_port,
         route.transport.as_param(),
     );
-    let mut advertises_sms_over_ip = false;
-    let mut declared_sip_instance = false;
     let always_add_sip_instance =
         profile.is_some_and(|profile| profile.ims.register.always_add_sip_instance);
     // A profile dictates the Contact parameter list only when it actually
@@ -515,60 +514,24 @@ fn build_register_internal(
     let explicit_parameters = profile
         .map(|profile| profile.ims.register.contact_param_order)
         .unwrap_or(&[]);
-    if !explicit_parameters.is_empty() {
-        for parameter in explicit_parameters {
-            let name = parameter
-                .split_once('=')
-                .map_or(*parameter, |(name, _)| name)
-                .trim();
-            if name.eq_ignore_ascii_case("video") && !policy.include_video_feature {
-                continue;
-            }
-            if !policy.include_sip_instance
-                && (name.eq_ignore_ascii_case("+sip.instance")
-                    || name.eq_ignore_ascii_case("reg-id"))
-            {
-                continue;
-            }
-            if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
-                advertises_sms_over_ip = true;
-            }
-            if name.eq_ignore_ascii_case("+sip.instance") {
-                declared_sip_instance = true;
-            }
-            contact.push(';');
-            contact.push_str(parameter);
-        }
-    } else {
-        contact.push_str(&format!(";+g.3gpp.accesstype=\"{access_network_info}\""));
-        if policy.include_mmtel_features {
-            contact.push_str(";audio");
-        }
-        contact.push_str(";+g.3gpp.smsip");
-        advertises_sms_over_ip = true;
-        if policy.include_mmtel_features {
-            contact.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", MMTEL_ICSI_REF));
-        }
-        if policy.include_sip_instance {
-            contact.push_str(&format!(";+sip.instance=\"<{}>\"", sip_instance));
-            // RFC 5626: reg-id only has meaning next to the instance it pairs
-            // with, so emit it here rather than letting the tail append a second
-            // +sip.instance further down the parameter list.
-            if always_add_sip_instance {
-                contact.push_str(&format!(";reg-id={CELLULAR_REG_ID}"));
-            }
-            declared_sip_instance = true;
-        }
-        contact.push_str(&format!(";expires={expires}"));
-    }
-    if !advertises_sms_over_ip {
-        contact.push_str(";+g.3gpp.smsip");
-    }
-    if policy.include_sip_instance && always_add_sip_instance && !declared_sip_instance {
-        contact.push_str(&format!(
-            ";+sip.instance=\"<{}>\";reg-id={CELLULAR_REG_ID}",
-            sip_instance
-        ));
+    let mode = profile
+        .map(|profile| profile.ims.register.contact_mode)
+        .unwrap_or("standard");
+    let completed_parameters = complete_contact_parameters(ContactCompletion {
+        mode,
+        explicit: explicit_parameters,
+        access_network_info,
+        include_mmtel: policy.include_mmtel_features,
+        include_video: policy.include_video_feature,
+        include_sip_instance: policy.include_sip_instance,
+        always_add_sip_instance,
+        sip_instance,
+        reg_id: CELLULAR_REG_ID,
+        expires: Some(expires),
+    });
+    for parameter in completed_parameters {
+        contact.push(';');
+        contact.push_str(&parameter);
     }
     // RFC 3455 §4.3.2.1 says a SIP UA SHOULD NOT originate
     // P-Visited-Network-ID.  A profile may still opt in for a field-tested
@@ -1837,9 +1800,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_contact_parameters_are_not_widened_by_the_fallback() {
-        // A bundle that spells out its Contact list keeps expressing the whole
-        // opinion: no accesstype, no icsi-ref, no expires get bolted on.
+    fn standard_contact_parameters_are_completed_by_the_baseline() {
+        // A non-custom bundle's Contact list is an overlay.  Access identity,
+        // SMS, flow binding and expiry are completed after its own parameters.
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.contact_param_order = &["+g.3gpp.mid-call"];
         let frame = build_register_from_profile(
@@ -1860,10 +1823,11 @@ mod tests {
         );
         let text = String::from_utf8(frame).unwrap();
         let contact = header_value(text.as_bytes(), "Contact").unwrap();
-        assert!(contact.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
-        assert!(!contact.contains("+g.3gpp.icsi-ref"));
-        assert!(!contact.contains("+g.3gpp.accesstype"));
-        assert!(!contact.contains(";expires="));
+        assert!(contact.contains(";+g.3gpp.mid-call"));
+        assert!(contact.contains(";+g.3gpp.smsip"));
+        assert!(contact.contains("+g.3gpp.accesstype"));
+        assert!(contact.contains(";+sip.instance="));
+        assert!(contact.contains(";expires="));
     }
 
     #[test]
@@ -1885,7 +1849,8 @@ mod tests {
         );
         let text = String::from_utf8(frame).unwrap();
         let contact = header_value(text.as_bytes(), "Contact").unwrap();
-        assert!(contact.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert!(contact.contains(";+g.3gpp.mid-call"));
+        assert!(contact.contains(";+g.3gpp.smsip"));
         assert_eq!(
             contact
                 .to_ascii_lowercase()

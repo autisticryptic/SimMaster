@@ -90,7 +90,7 @@ pub struct RegisterPolicyRecord {
     pub request_uri_policy: String,
     #[serde(default = "default_true")]
     pub include_pani_initial: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub include_pani_authenticated: bool,
     #[serde(default = "default_initial_authorization")]
     pub initial_authorization: String,
@@ -130,9 +130,9 @@ pub struct RegisterPolicyRecord {
     pub contact_mode: String,
     #[serde(default)]
     pub contact_param_order: Vec<String>,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub always_add_sip_instance: bool,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub enable_cellular_network_info: bool,
     #[serde(default = "default_temporary_status_codes")]
     pub temporary_status_codes: Vec<u16>,
@@ -145,7 +145,7 @@ pub struct RegisterPolicyRecord {
 }
 
 fn default_sec_agree_mode() -> String {
-    "auto".to_string()
+    "required".to_string()
 }
 
 fn default_request_uri_policy() -> String {
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn sec_agree_mode_and_contact_mode_are_constrained() {
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
-        assert_eq!(record.ims.register.sec_agree_mode, "auto");
+        assert_eq!(record.ims.register.sec_agree_mode, "required");
         record.ims.register.sec_agree_mode = "maybe".to_string();
         assert_eq!(record.validate().unwrap_err(), "sec_agree_mode_invalid");
 
@@ -1179,7 +1179,7 @@ mod tests {
 
         let parsed: CarrierProfileRecord = serde_json::from_value(value).expect("deserialize");
         parsed.validate().expect("defaults must be valid");
-        assert_eq!(parsed.ims.register.sec_agree_mode, "auto");
+        assert_eq!(parsed.ims.register.sec_agree_mode, "required");
         assert_eq!(parsed.ims.register.expires_seconds, 3600);
         assert_eq!(parsed.ims.register.access_network_info, "IEEE-802.11");
         assert_eq!(parsed.ims.tcp_keepalive_seconds, 30);

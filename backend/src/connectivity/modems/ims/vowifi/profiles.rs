@@ -1054,11 +1054,12 @@ pub fn derive_standard_3gpp_profile(
                 include_pani_initial: true,
                 include_pani_authenticated: true,
                 initial_authorization: "aka_empty",
-                // A 200 OK without the MMTEL Contact feature tags creates a
-                // data/SMS-capable binding that the TAS may not use for MT
-                // voice. The generic LTE fallback is intended to carry calls,
-                // so advertise voice on its first successful registration.
-                include_mmtel_features: true,
+                // LTE uses the conventional MMTEL Contact declaration.  The
+                // generic Wi-Fi fallback stays compact: field testing found a
+                // successful IPCC-derived terminating binding with SMS-only
+                // Contact tags, PANI and Cellular-Network-Info, while the
+                // Pixel-shaped full feature set received 200 OK but no INVITE.
+                include_mmtel_features: matches!(access, Standard3gppAccess::LteEpc),
                 include_route_header: false,
                 include_visited_network: false,
                 include_p_preferred_identity: true,
@@ -1073,11 +1074,14 @@ pub fn derive_standard_3gpp_profile(
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
                 contact_mode: "standard",
-                contact_param_order: &[
-                    "+g.3gpp.mid-call",
-                    "+g.3gpp.srvcc-alerting",
-                    "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
-                ],
+                contact_param_order: match access {
+                    Standard3gppAccess::LteEpc => &[
+                        "+g.3gpp.mid-call",
+                        "+g.3gpp.srvcc-alerting",
+                        "+g.3gpp.ps2cs-srvcc-orig-pre-alerting",
+                    ],
+                    Standard3gppAccess::WifiEpdg => &[],
+                },
                 temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
                 forbidden_status_codes: DEFAULT_FORBIDDEN_STATUS_CODES,
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,

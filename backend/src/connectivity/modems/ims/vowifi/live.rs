@@ -44,6 +44,7 @@ use super::{
     voice,
 };
 use crate::connectivity::core::{
+    contact::{complete_contact_parameters, ContactCompletion},
     media::OperatorSocketCreator,
     register::{
         run_register_observed, RegisterAuthenticator, RegisterFailure,
@@ -3413,10 +3414,11 @@ async fn run_register_exchange_with_pcscf(
 
 /// Upgrade a variant that was refused with `421 Extension Required: sec-agree`.
 ///
-/// A bundle that leaves `security_agreement` unset resolves to "auto", which
-/// offers `Security-Client` without declaring `Require`/`Proxy-Require`. Cores
-/// that mandate the security agreement answer 421 and name the extension, so
-/// the same shape plus the declaration is the correct next attempt.
+/// An explicit `auto` profile offers `Security-Client` without declaring
+/// `Require`/`Proxy-Require`. Cores that mandate the security agreement answer
+/// 421 and name the extension, so the same shape plus the declaration is the
+/// correct next attempt. Missing catalog fields now resolve to the required
+/// baseline before reaching this path.
 fn sec_agree_retry_variant(
     variant: LiveRegisterHeaderVariant,
     error: &LiveStageError,
@@ -3510,7 +3512,44 @@ fn live_register_header_variants(
         identity_format: full.identity_format,
         header_profile,
     };
-    vec![full, challenge_first]
+    // IPCC-shaped access baseline for bundles whose Android/Pixel Contact and
+    // network-info flags are incomplete. This candidate deliberately uses the
+    // compact SMS-only Contact while retaining PANI, Cellular-Network-Info and
+    // the same security/identity negotiation.
+    let ipcc_fallback = LiveRegisterHeaderVariant {
+        label: "catalog_v7_ipcc_access_baseline",
+        force_sec_agree_headers: true,
+        suppress_sec_agree_headers: false,
+        include_route_header: register.include_route_header,
+        include_security_client: true,
+        initial_authorization,
+        security_client_format: LiveSecurityClientFormat::FullSpaced,
+        request_uri: full.request_uri,
+        identity_format: full.identity_format,
+        header_profile: LiveRegisterHeaderProfile {
+            contact_features: LiveContactFeatureSet::SmsOnly,
+            include_accept_contact: false,
+            include_p_preferred_identity: register.include_p_preferred_identity,
+            visited_network: if register.include_visited_network {
+                LiveVisitedNetworkFormat::QuotedHome
+            } else {
+                LiveVisitedNetworkFormat::Omit
+            },
+            pani: LivePaniFormat::ProfileDefault,
+            include_cellular_network_info: !compact_register,
+            user_agent: LiveUserAgentFormat::ProfileDefault,
+            compact_register,
+        },
+    };
+    let incomplete_access_identity = !register.include_pani_initial
+        || !register.include_pani_authenticated
+        || !register.enable_cellular_network_info
+        || register.sec_agree_mode == "auto";
+    if incomplete_access_identity {
+        vec![ipcc_fallback, full, challenge_first]
+    } else {
+        vec![full, challenge_first, ipcc_fallback]
+    }
 }
 
 async fn live_register_header_variants_for_attempt(
@@ -5818,7 +5857,7 @@ impl LiveRegisterRequestContext {
             profile.ims.register.include_pani_initial
         } else {
             profile.ims.register.include_pani_authenticated
-        };
+        } || variant.label == "catalog_v7_ipcc_access_baseline";
         let pani = match variant.header_profile.pani {
             LivePaniFormat::ProfileDefault => {
                 phase_includes_pani.then(|| build_p_access_network_info(profile))
@@ -6043,13 +6082,25 @@ impl LiveRegisterRequestContext {
         profile: &'static CarrierProfile,
         header_profile: LiveRegisterHeaderProfile,
     ) -> usize {
-        if !profile.ims.register.contact_param_order.is_empty() {
-            return profile.ims.register.contact_param_order.len();
+        if header_profile.compact_register {
+            return 0;
         }
-        match header_profile.contact_features {
-            LiveContactFeatureSet::SmsOnly => 2,
-            LiveContactFeatureSet::MmtelSmsSipInstance => 5,
-        }
+        complete_contact_parameters(ContactCompletion {
+            mode: profile.ims.register.contact_mode,
+            explicit: profile.ims.register.contact_param_order,
+            access_network_info: profile.ims.register.access_network_info,
+            include_mmtel: matches!(
+                header_profile.contact_features,
+                LiveContactFeatureSet::MmtelSmsSipInstance
+            ),
+            include_video: self.video_capability_enabled,
+            include_sip_instance: true,
+            always_add_sip_instance: profile.ims.register.always_add_sip_instance,
+            sip_instance: &self.instance_id,
+            reg_id: WLAN_REG_ID,
+            expires: None,
+        })
+        .len()
     }
 
     fn build_contact_header(
@@ -6076,8 +6127,6 @@ impl LiveRegisterRequestContext {
             user_phone,
             self.transport.as_param()
         );
-        let mut advertises_sms_over_ip = false;
-        let mut declared_sip_instance = false;
         // The feature-set fallback below used to be #[cfg(test)] only, so a
         // release build emitted a Contact with no feature tags whenever the
         // profile carried an empty contact_param_order -- which is every
@@ -6086,56 +6135,26 @@ impl LiveRegisterRequestContext {
         // +g.3gpp.icsi-ref and never treated the registration as MMTEL
         // voice capable. contact_features already mirrors
         // register.include_mmtel_features, so honour it in all builds.
-        if !header_profile.compact_register && !profile.ims.register.contact_param_order.is_empty() {
-            for parameter in profile.ims.register.contact_param_order {
-                let name = parameter
-                    .split_once('=')
-                    .map_or(*parameter, |(name, _)| name)
-                    .trim();
-                if name.eq_ignore_ascii_case("video") && !self.video_capability_enabled {
-                    continue;
-                }
-                if name.eq_ignore_ascii_case("+g.3gpp.smsip") {
-                    advertises_sms_over_ip = true;
-                }
-                if name.eq_ignore_ascii_case("+sip.instance") {
-                    declared_sip_instance = true;
-                }
+        if !header_profile.compact_register {
+            let parameters = complete_contact_parameters(ContactCompletion {
+                mode: profile.ims.register.contact_mode,
+                explicit: profile.ims.register.contact_param_order,
+                access_network_info: profile.ims.register.access_network_info,
+                include_mmtel: matches!(
+                    header_profile.contact_features,
+                    LiveContactFeatureSet::MmtelSmsSipInstance
+                ),
+                include_video: self.video_capability_enabled,
+                include_sip_instance: true,
+                always_add_sip_instance: profile.ims.register.always_add_sip_instance,
+                sip_instance: &self.instance_id,
+                reg_id: WLAN_REG_ID,
+                expires: None,
+            });
+            for parameter in parameters {
                 header.push(';');
-                header.push_str(parameter);
+                header.push_str(&parameter);
             }
-        } else if !header_profile.compact_register {
-            match header_profile.contact_features {
-                LiveContactFeatureSet::SmsOnly => {
-                    header.push_str(";+g.3gpp.accesstype=\"IEEE-802.11\"");
-                    header.push_str(";+g.3gpp.smsip");
-                    advertises_sms_over_ip = true;
-                }
-                LiveContactFeatureSet::MmtelSmsSipInstance => {
-                    header.push_str(";+g.3gpp.accesstype=\"IEEE-802.11\"");
-                    header.push_str(";audio");
-                    header.push_str(";+g.3gpp.smsip");
-                    advertises_sms_over_ip = true;
-                    header.push_str(&format!(";+g.3gpp.icsi-ref=\"{}\"", IMS_MMTEL_ICSI_REF));
-                    header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
-                    if profile.ims.register.always_add_sip_instance {
-                        header.push_str(&format!(";reg-id={WLAN_REG_ID}"));
-                    }
-                    declared_sip_instance = true;
-                }
-            }
-        }
-        if !header_profile.compact_register && !advertises_sms_over_ip {
-            header.push_str(";+g.3gpp.smsip");
-        }
-        if profile.ims.register.always_add_sip_instance
-            && !header_profile.compact_register
-            && !declared_sip_instance
-        {
-            // RFC 5626 flow registration. `reg-id` pairs with +sip.instance;
-            // iOS carriers that set `always_add_sip_instance` expect both.
-            header.push_str(&format!(";+sip.instance=\"<{}>\"", self.instance_id));
-            header.push_str(&format!(";reg-id={WLAN_REG_ID}"));
         }
         header.push_str("\r\n");
         header
@@ -8703,6 +8722,33 @@ mod tests {
     }
 
     #[test]
+    fn catalog_variants_include_ipcc_access_identity_fallback() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.live_header_variant_set = "catalog_v7";
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+        profile.ims.register.enable_cellular_network_info = false;
+        profile.ims.register.include_mmtel_features = true;
+        let profile = Box::leak(Box::new(profile));
+
+        let variants = live_register_header_variants(profile);
+        assert_eq!(variants[0].label, "catalog_v7_ipcc_access_baseline");
+        let fallback = variants
+            .iter()
+            .find(|variant| variant.label == "catalog_v7_ipcc_access_baseline")
+            .expect("IPCC access fallback");
+        assert!(matches!(
+            fallback.header_profile.pani,
+            LivePaniFormat::ProfileDefault
+        ));
+        assert!(fallback.header_profile.include_cellular_network_info);
+        assert!(matches!(
+            fallback.header_profile.contact_features,
+            LiveContactFeatureSet::SmsOnly
+        ));
+    }
+
+    #[test]
     fn live_runtime_config_defaults_to_shared_transport_environment() {
         let config = config_from_pairs(&[]);
 
@@ -9037,7 +9083,8 @@ mod tests {
             profile,
             register_variant("profile_default_spaced_sec_client"),
         );
-        assert!(request.contains(";+g.3gpp.mid-call;+g.3gpp.smsip"));
+        assert!(request.contains(";+g.3gpp.mid-call"));
+        assert!(request.contains(";+g.3gpp.smsip"));
         assert_eq!(
             request
                 .to_ascii_lowercase()

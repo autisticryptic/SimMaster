@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 pub mod access;
+pub mod contact;
 pub mod context;
 pub mod device_identity;
 pub mod digest_aka;
