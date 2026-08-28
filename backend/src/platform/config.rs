@@ -3952,6 +3952,10 @@ pub struct TrunkProfileConfig {
     /// StaticPeer only: the far-end host used to identify inbound requests.
     #[serde(default)]
     pub match_host: Option<String>,
+    /// Restrict trunk-originated calls and SMS, and MT events delivered to the
+    /// trunk, to the VoWiFi IMS leg. This does not alter Web/API routing.
+    #[serde(default)]
+    pub vowifi_only: bool,
 }
 
 impl Default for TrunkProfileConfig {
@@ -3972,6 +3976,7 @@ impl Default for TrunkProfileConfig {
             codec_allow: Vec::new(),
             register_expiry_secs: default_trunk_register_expiry_secs(),
             match_host: None,
+            vowifi_only: false,
         }
     }
 }

@@ -38,6 +38,7 @@ interface TrunkProfileDialogProps {
 function cloneProfile(profile: TrunkProfileConfig): TrunkProfileConfig {
   return {
     ...profile,
+    vowifi_only: Boolean(profile.vowifi_only),
     codec_allow: [...profile.codec_allow],
     secret: '',
   }
@@ -120,6 +121,13 @@ export default function TrunkProfileDialog({ open, line, enableOnOpen = false, o
             control={<Switch checked={draft.enabled} onChange={(_, enabled) => update('enabled', enabled)} />}
             label="保存后启用此线路的 Trunk 意图"
           />
+          <FormControlLabel
+            control={<Switch checked={draft.vowifi_only} onChange={(_, enabled) => update('vowifi_only', enabled)} />}
+            label="仅允许 VoWiFi 处理 trunk 电话和短信"
+          />
+          <Typography variant="caption" color="text.secondary">
+            开启后，Asterisk 发起的电话和短信只使用 VoWiFi；VoWiFi 不可用时不会回退到 VoLTE 或 CS，运营商来电也不会经此 trunk 送出。
+          </Typography>
 
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={2}>
             <FormControl size="small" fullWidth>

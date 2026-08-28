@@ -264,6 +264,7 @@ pub struct VolteLiveHandle {
     listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     operator: OperatorLink,
     supplementary: Arc<StdRwLock<Option<Arc<SupplementaryRuntime>>>>,
+    mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
 }
 
 impl Default for VolteLiveHandle {
@@ -274,12 +275,14 @@ impl Default for VolteLiveHandle {
 
 impl VolteLiveHandle {
     pub fn new() -> Self {
+        let (mt_sms, _) = tokio::sync::broadcast::channel(256);
         Self {
             session: Arc::new(Mutex::new(None)),
             failed_bearer: Arc::new(Mutex::new(None)),
             listener: Arc::new(Mutex::new(None)),
             operator: OperatorLink::default(),
             supplementary: Arc::new(StdRwLock::new(None)),
+            mt_sms,
         }
     }
 
@@ -299,6 +302,10 @@ impl VolteLiveHandle {
 
     pub fn operator_link(&self) -> OperatorLink {
         self.operator.clone()
+    }
+
+    pub fn subscribe_mt_sms(&self) -> tokio::sync::broadcast::Receiver<SmsMessage> {
+        self.mt_sms.subscribe()
     }
 
     pub async fn live_xcap_access(&self) -> Option<XcapAccessContext> {
@@ -5171,6 +5178,7 @@ async fn handle_live_frame(
                 transport: TRANSPORT_TAG.to_string(),
                 line_id: Some(line_id.to_string()),
             };
+            let _ = live.mt_sms.send(sms.clone());
             let notification_sender = Arc::clone(notification_sender);
             tokio::spawn(async move {
                 let _ = notification_sender.forward_sms(&sms).await;

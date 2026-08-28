@@ -589,6 +589,7 @@ export interface TrunkProfileConfig {
   codec_allow: string[]
   register_expiry_secs: number
   match_host?: string | null
+  vowifi_only: boolean
 }
 
 export interface TrunkRuntimeStatus {

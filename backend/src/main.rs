@@ -984,7 +984,10 @@ async fn main() -> Result<()> {
         });
     }
 
-    // 启动 SMS 监听线程
+    // 启动 SMS 监听线程。MT 短信会通过 broadcast 桥接到 Asterisk trunk，
+    // 由 AppState 就绪后的转发任务负责发布（见 spawn_modem_mt_sms_bridge）。
+    let (modem_mt_sms_tx, modem_mt_sms_rx) =
+        tokio::sync::broadcast::channel::<platform::db::SmsMessage>(256);
     {
         let conn_clone = Connection::system().await?;
         let db_clone = Arc::clone(&app_db);
@@ -992,6 +995,7 @@ async fn main() -> Result<()> {
         let sms_config_clone = Arc::clone(&config_manager);
         let sms_line_registry = Arc::clone(&line_registry);
         let resync_rx = sms_resync_rx;
+        let mt_sms_tx = modem_mt_sms_tx;
         tokio::spawn(async move {
             let _ = services::messaging::sms_listener::start_sms_listener(
                 conn_clone,
@@ -999,6 +1003,7 @@ async fn main() -> Result<()> {
                 notification_clone,
                 sms_config_clone,
                 sms_line_registry,
+                mt_sms_tx,
                 resync_rx,
             )
             .await;
@@ -1063,6 +1068,8 @@ async fn main() -> Result<()> {
 
     api::handlers::spawn_call_monitor(app_state.clone());
     spawn_runtime_event_bridge(app_state.clone());
+    spawn_trunk_sms_bridge(app_state.clone());
+    spawn_modem_mt_sms_bridge(app_state.clone(), modem_mt_sms_rx);
 
     // Restore only explicitly enabled per-line data and airplane-mode intents.
     {
@@ -1997,6 +2004,95 @@ async fn main() -> Result<()> {
     // meant to be.
     info!("Shutdown complete; exiting");
     std::process::exit(0);
+}
+
+/// Bridge SIP MESSAGE requests received by each line's Asterisk trunk into the
+/// existing SMS sender, and forward VoLTE MT SMS toward the trunk as SIP
+/// MESSAGE. Both directions are deliberately independent from the voice event
+/// stream so SMS cannot affect call state or media routing.
+fn spawn_trunk_sms_bridge(app: AppState) {
+    tokio::spawn(async move {
+        let mut attached = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+        loop {
+            for line in app.line_registry.all().await {
+                let line_id = line.binding().line_id;
+                if attached.contains_key(&line_id) {
+                    continue;
+                }
+                let mut requests = line.trunk.operator_link().subscribe_sms_requests();
+                let mut volte_mt = line.volte_live.subscribe_mt_sms();
+                let app_task = app.clone();
+                let attach_id = line_id.clone();
+                let handle = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            maybe = requests.recv() => {
+                                match maybe {
+                                    Ok(request) => {
+                                        let profile = app_task.config_manager.get_line_profile(&attach_id);
+                                        let target = if request.to.trim().is_empty() {
+                                            request.from.clone()
+                                        } else {
+                                            request.to.clone()
+                                        };
+                                        if let Err(error) = crate::api::handlers::send_sms_on_line_with_vowifi_only(
+                                            &app_task,
+                                            &attach_id,
+                                            &target,
+                                            &request.body,
+                                            profile.trunk.vowifi_only,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(line_id = %attach_id, error = %error, "Trunk SIP MESSAGE SMS send failed");
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "Trunk SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                            maybe = volte_mt.recv() => {
+                                match maybe {
+                                    Ok(sms) => {
+                                        crate::api::handlers::publish_sms_to_trunk(&app_task, &sms).await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "VoLTE MT SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+                attached.insert(line_id, handle);
+            }
+            attached.retain(|_, handle| !handle.is_finished());
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Forward ModemManager (CS) MT SMS toward each line's Asterisk trunk as SIP
+/// MESSAGE. The listener itself runs before AppState exists, so this task owns
+/// the broadcast receiver and publishes once the app state is available.
+fn spawn_modem_mt_sms_bridge(
+    app: AppState,
+    mut rx: tokio::sync::broadcast::Receiver<platform::db::SmsMessage>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(sms) => crate::api::handlers::publish_sms_to_trunk(&app, &sms).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "Modem MT SMS receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
 }
 
 /// Deactivate every DATA bearer before the process exits.

@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, RwLock},
+    sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock},
     time::Duration,
 };
 
@@ -152,6 +152,7 @@ pub struct VoiceAccessRouter {
     backends: Vec<AccessBackend>,
     requests: Option<mpsc::Sender<RouterRequest>>,
     task: Option<JoinHandle<()>>,
+    trunk_vowifi_only: Arc<AtomicBool>,
 }
 
 impl VoiceAccessRouter {
@@ -164,6 +165,7 @@ impl VoiceAccessRouter {
             .collect::<Vec<_>>();
 
         let (requests, request_rx) = mpsc::channel(16);
+        let trunk_vowifi_only = Arc::new(AtomicBool::new(false));
 
         let task = tokio::runtime::Handle::try_current().ok().map(|handle| {
             let command_rx = trunk.subscribe_commands();
@@ -174,11 +176,13 @@ impl VoiceAccessRouter {
             let trunk_task = trunk.clone();
             let policy_task = Arc::clone(&policy);
             let backends_task = backends.clone();
+            let vowifi_only_task = Arc::clone(&trunk_vowifi_only);
             handle.spawn(async move {
                 run_router(
                     trunk_task,
                     policy_task,
                     backends_task,
+                    vowifi_only_task,
                     command_rx,
                     event_receivers,
                     request_rx,
@@ -193,6 +197,7 @@ impl VoiceAccessRouter {
             backends,
             requests: task.as_ref().map(|_| requests),
             task,
+            trunk_vowifi_only,
         }
     }
 
@@ -205,6 +210,10 @@ impl VoiceAccessRouter {
             .policy
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy.normalized();
+    }
+
+    pub fn set_trunk_vowifi_only(&self, enabled: bool) {
+        self.trunk_vowifi_only.store(enabled, Ordering::SeqCst);
     }
 
     pub fn set_backend_video_enabled(&self, kind: AccessPathKind, enabled: bool) {
@@ -296,6 +305,7 @@ async fn run_router(
     trunk: OperatorLink,
     policy: Arc<RwLock<VoicePathPolicy>>,
     backends: Vec<AccessBackend>,
+    trunk_vowifi_only: Arc<AtomicBool>,
     mut commands: tokio::sync::broadcast::Receiver<OperatorCommand>,
     event_receivers: Vec<(
         AccessPathKind,
@@ -334,10 +344,10 @@ async fn run_router(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        refresh_router_state(&trunk, &policy, &backends, &routes);
+        refresh_router_state(&trunk, &policy, &backends, &routes, trunk_vowifi_only.load(Ordering::SeqCst));
         tokio::select! {
             command = commands.recv() => match command {
-                Ok(command) => route_command(command, &trunk, &policy, &backends, &mut routes),
+                Ok(command) => route_command(command, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst)),
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                     tracing::error!(skipped, "Trunk access command receiver lagged");
                 }
@@ -350,7 +360,7 @@ async fn run_router(
                     if response.is_closed() {
                         continue;
                     }
-                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes);
+                    let result = route_call_plan(plan, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst));
                     let _ = response.send(result);
                 }
                 Some(RouterRequest::CallAccess { call_id, response }) => {
@@ -360,7 +370,7 @@ async fn run_router(
                 None => break,
             },
             event = events.recv() => match event {
-                Some((kind, event)) => route_event(kind, event, &trunk, &policy, &backends, &mut routes),
+                Some((kind, event)) => route_event(kind, event, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst)),
                 None => break,
             },
             _ = ticker.tick() => {}
@@ -377,8 +387,9 @@ fn route_call_plan(
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &mut HashMap<String, CallRoute>,
+    vowifi_only: bool,
 ) -> Result<RoutedVoiceCall, VoiceCallStartError> {
-    let candidates = route_plan(&current_policy(policy), backends, false);
+    let candidates = route_plan_for_trunk(&current_policy(policy), backends, false, vowifi_only);
     let mut remaining = candidates.clone();
     while let Some(kind) = remaining.first().copied() {
         remaining.remove(0);
@@ -443,14 +454,29 @@ fn route_plan(
     plan_voice_route(policy, &readiness).candidates
 }
 
+fn route_plan_for_trunk(
+    policy: &VoicePathPolicy,
+    backends: &[AccessBackend],
+    video_required: bool,
+    vowifi_only: bool,
+) -> Vec<AccessPathKind> {
+    let candidates = route_plan(policy, backends, video_required);
+    if vowifi_only {
+        candidates.into_iter().filter(|kind| *kind == AccessPathKind::Vowifi).collect()
+    } else {
+        candidates
+    }
+}
+
 fn refresh_router_state(
     trunk: &OperatorLink,
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &HashMap<String, CallRoute>,
+    vowifi_only: bool,
 ) {
     let policy = current_policy(policy);
-    let candidates = route_plan(&policy, backends, false);
+    let candidates = route_plan_for_trunk(&policy, backends, false, vowifi_only);
     let owned_consumer = routes.values().any(|route| {
         backend(backends, route.owner).is_some_and(|backend| backend.link.has_command_consumer())
     });
@@ -504,6 +530,7 @@ fn route_command(
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &mut HashMap<String, CallRoute>,
+    vowifi_only: bool,
 ) {
     let call_id = command_call_id(&command).to_string();
     if matches!(&command, OperatorCommand::StartCall { .. }) {
@@ -518,7 +545,7 @@ fn route_command(
             &command,
             OperatorCommand::StartCall { offer, .. } if offer.video.is_some()
         );
-        let candidates = route_plan(&current_policy(policy), backends, video_required);
+        let candidates = route_plan_for_trunk(&current_policy(policy), backends, video_required, vowifi_only);
         let mut remaining = candidates.clone();
         while let Some(kind) = remaining.first().copied() {
             remaining.remove(0);
@@ -579,6 +606,7 @@ fn route_event(
     policy: &RwLock<VoicePathPolicy>,
     backends: &[AccessBackend],
     routes: &mut HashMap<String, CallRoute>,
+    vowifi_only: bool,
 ) {
     let call_id = event_call_id(&event).to_string();
     if matches!(&event, OperatorEvent::Incoming { .. }) {
@@ -588,7 +616,7 @@ fn route_event(
             }
             return;
         }
-        let allowed = route_plan(&current_policy(policy), backends, false).contains(&kind);
+        let allowed = route_plan_for_trunk(&current_policy(policy), backends, false, vowifi_only).contains(&kind);
         if !allowed {
             reject_incoming_collision(kind, &call_id, backends);
             return;

@@ -373,6 +373,7 @@ impl LineRuntime {
 
     pub async fn activate_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
+        self.voice_access.set_trunk_vowifi_only(effective.vowifi_only);
         self.trunk.activate_profile(&effective).await;
         self.trunk.status().await
     }
@@ -382,6 +383,7 @@ impl LineRuntime {
         profile: &TrunkProfileConfig,
     ) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
+        self.voice_access.set_trunk_vowifi_only(effective.vowifi_only);
         self.trunk.reconcile_profile(&effective).await;
         self.trunk.status().await
     }

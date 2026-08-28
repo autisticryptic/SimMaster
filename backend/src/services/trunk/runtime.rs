@@ -268,6 +268,10 @@ impl TrunkRuntime {
         }
     }
 
+    pub fn operator_link(&self) -> OperatorLink {
+        self.operator.clone()
+    }
+
     pub async fn snapshot(&self) -> TrunkSnapshot {
         self.snapshot.read().await.clone()
     }

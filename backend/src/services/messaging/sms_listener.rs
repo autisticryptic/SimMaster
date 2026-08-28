@@ -202,6 +202,7 @@ struct SmsIngestContext<'a> {
     modem_path: &'a str,
     line_id: &'a str,
     config_manager: &'a ConfigManager,
+    mt_sms: &'a tokio::sync::broadcast::Sender<SmsMessage>,
 }
 
 #[derive(Clone, Copy)]
@@ -211,6 +212,7 @@ struct SmsScanContext<'a> {
     notification_sender: &'a Arc<NotificationSender>,
     config_manager: &'a ConfigManager,
     line_registry: &'a LineRuntimeRegistry,
+    mt_sms: &'a tokio::sync::broadcast::Sender<SmsMessage>,
 }
 
 async fn process_sms_path(
@@ -226,6 +228,7 @@ async fn process_sms_path(
         modem_path,
         line_id,
         config_manager,
+        mt_sms,
     } = context;
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
         return;
@@ -338,6 +341,7 @@ async fn process_sms_path(
                 transport: "modem".to_string(),
                 line_id: Some(line_id.to_string()),
             };
+            let _ = mt_sms.send(sms.clone());
             if should_forward_after_insert(mode, forward_reconciled_new_sms) {
                 let notification_sender = Arc::clone(notification_sender);
                 tokio::spawn(async move {
@@ -371,6 +375,7 @@ async fn scan_sms_paths(
         db,
         notification_sender,
         config_manager,
+        mt_sms,
         ..
     } = context;
     match list_sms_paths(conn, modem_path).await {
@@ -392,6 +397,7 @@ async fn scan_sms_paths(
                         modem_path,
                         line_id,
                         config_manager,
+                        mt_sms,
                     },
                     &sms_path,
                     SmsIngestMode::Reconcile,
@@ -530,6 +536,7 @@ pub async fn start_sms_listener(
     notification_sender: Arc<NotificationSender>,
     config_manager: Arc<ConfigManager>,
     line_registry: Arc<LineRuntimeRegistry>,
+    mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
     mut resync_receiver: SmsResyncReceiver,
 ) -> zbus::Result<()> {
     info!("Starting SMS listener (ModemManager mode)");
@@ -586,6 +593,7 @@ pub async fn start_sms_listener(
             notification_sender: &notification_sender,
             config_manager: config_manager.as_ref(),
             line_registry: line_registry.as_ref(),
+            mt_sms: &mt_sms,
         };
         for modem_path in &modem_paths {
             maybe_scan_sms_paths(scan_context, modem_path, "initial", false).await;
@@ -660,6 +668,7 @@ pub async fn start_sms_listener(
                                         modem_path: signal_path.as_str(),
                                         line_id: &signal_line_id,
                                         config_manager: &config_manager,
+                                        mt_sms: &mt_sms,
                                     },
                                     &sms_path_str,
                                     SmsIngestMode::Live,

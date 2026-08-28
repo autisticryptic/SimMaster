@@ -14,6 +14,14 @@ use super::bridge::{OperatorCommand, OperatorEvent};
 use crate::connectivity::core::media::MediaRelayMetrics;
 use crate::platform::config::{TrunkIncomingMode, TrunkIpConnectMode};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmsRequest {
+    pub from: String,
+    pub to: String,
+    pub body: String,
+}
+pub type SmsDelivery = SmsRequest;
+
 #[derive(Clone)]
 pub struct OperatorLink {
     inner: Arc<OperatorLinkInner>,
@@ -27,6 +35,8 @@ struct OperatorLinkInner {
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
     commands: broadcast::Sender<OperatorCommand>,
     events: broadcast::Sender<OperatorEvent>,
+    sms_requests: broadcast::Sender<SmsRequest>,
+    sms_deliveries: broadcast::Sender<SmsDelivery>,
     metrics: Arc<OperatorMediaMetrics>,
 }
 
@@ -129,6 +139,8 @@ impl Default for OperatorLink {
     fn default() -> Self {
         let (commands, _) = broadcast::channel(32);
         let (events, _) = broadcast::channel(32);
+        let (sms_requests, _) = broadcast::channel(32);
+        let (sms_deliveries, _) = broadcast::channel(32);
         Self {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
@@ -138,6 +150,8 @@ impl Default for OperatorLink {
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
                 commands,
                 events,
+                sms_requests,
+                sms_deliveries,
                 metrics: Arc::new(OperatorMediaMetrics::default()),
             }),
         }
@@ -216,6 +230,22 @@ impl OperatorLink {
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<OperatorEvent> {
         self.inner.events.subscribe()
+    }
+
+    pub fn subscribe_sms_requests(&self) -> broadcast::Receiver<SmsRequest> {
+        self.inner.sms_requests.subscribe()
+    }
+
+    pub fn send_sms_request(&self, request: SmsRequest) {
+        let _ = self.inner.sms_requests.send(request);
+    }
+
+    pub fn subscribe_sms_deliveries(&self) -> broadcast::Receiver<SmsDelivery> {
+        self.inner.sms_deliveries.subscribe()
+    }
+
+    pub fn send_sms_delivery(&self, delivery: SmsDelivery) {
+        let _ = self.inner.sms_deliveries.send(delivery);
     }
 
     pub fn media_metrics(&self) -> Arc<OperatorMediaMetrics> {

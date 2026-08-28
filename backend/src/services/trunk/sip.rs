@@ -74,7 +74,7 @@ pub fn build_register(
         SipHeader::new("Expires", expires.to_string()),
         SipHeader::new(
             "Allow",
-            "INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS",
+            "INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS, MESSAGE",
         ),
         SipHeader::new("Supported", "outbound, path"),
         SipHeader::new("User-Agent", USER_AGENT),
@@ -134,7 +134,7 @@ pub fn build_response_with_body(
         response.push_str("\r\n");
     }
     response.push_str(&format!("Server: {USER_AGENT}\r\n"));
-    response.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS\r\n");
+    response.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS, MESSAGE\r\n");
     for header in extra_headers {
         response.push_str(&header.name);
         response.push_str(": ");
@@ -213,7 +213,7 @@ pub fn build_dialog_request_with_headers_and_content_type(
         frame.push_str(&format!("Contact: <{contact}>\r\n"));
     }
     frame.push_str(&format!("User-Agent: {USER_AGENT}\r\n"));
-    frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS\r\n");
+    frame.push_str("Allow: INVITE, ACK, CANCEL, BYE, INFO, REFER, NOTIFY, OPTIONS, MESSAGE\r\n");
     for header in headers {
         if header.name.contains(['\r', '\n']) || header.value.contains(['\r', '\n']) {
             return Err("trunk_dialog_header_invalid".to_string());

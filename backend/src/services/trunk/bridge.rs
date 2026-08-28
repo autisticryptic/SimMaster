@@ -293,6 +293,12 @@ impl TrunkBridge {
         self
     }
 
+    pub fn asterisk_target_uri(&self) -> String {
+        self.asterisk_target
+            .clone()
+            .unwrap_or_else(|| self.local_aor.clone())
+    }
+
     pub fn with_outgoing_binding(mut self, binding: impl Into<String>) -> Self {
         let binding = binding.into();
         self.outgoing_binding = (!binding.trim().is_empty()).then(|| binding.trim().to_string());
@@ -408,6 +414,11 @@ impl TrunkBridge {
                 asterisk_frames: vec![
                     sip::build_response(frame, 200, "OK").map_err(BridgeError::MalformedRequest)?
                 ],
+                ..BridgeOutput::default()
+            }),
+            "MESSAGE" => Ok(BridgeOutput {
+                asterisk_frames: vec![sip::build_response(frame, 202, "Accepted")
+                    .map_err(BridgeError::MalformedRequest)?],
                 ..BridgeOutput::default()
             }),
             _ => Ok(BridgeOutput {
@@ -986,6 +997,7 @@ impl TrunkBridge {
             )
             .map_err(BridgeError::MalformedRequest)?],
             operator_commands: vec![command],
+            ..BridgeOutput::default()
         };
         self.calls.insert(
             call_id.clone(),

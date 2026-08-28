@@ -226,6 +226,7 @@ async fn run_static_peer(
         .await;
     let mut next_keepalive = tokio::time::Instant::now() + STATIC_KEEPALIVE;
     let mut operator_events = operator.subscribe_events();
+    let mut sms_deliveries = operator.subscribe_sms_deliveries();
     loop {
         if !state.is_current() || *shutdown.borrow() {
             return Ok(());
@@ -244,6 +245,22 @@ async fn run_static_peer(
             event = operator_events.recv() => {
                 if let Ok(event) = event {
                     handle_operator_event(&transport, bridge, event, state).await?;
+                }
+            },
+            delivery = sms_deliveries.recv() => {
+                if let Ok(delivery) = delivery {
+                    let target = bridge.asterisk_target_uri();
+                    let from_uri = format!("sip:{}", delivery.from);
+                    let to_uri = target.clone();
+                    let call_id = format!("sms-{}", sip::token(12));
+                    if let Ok(frame) = sip::build_dialog_request_with_content_type(&sip::DialogRequest {
+                        method: "MESSAGE", request_uri: &target, local_addr: transport.local_addr()?,
+                        from_uri: &from_uri, from_tag: "simadmin", to_uri: &to_uri, to_tag: None,
+                        call_id: &call_id, cseq: 1, contact_uri: None, body: delivery.body.as_bytes(),
+                    }, Some("text/plain; charset=utf-8")) {
+                        transport.send(&frame).await?;
+                        record_sip_tx(state, &frame).await;
+                    }
                 }
             },
             changed = shutdown.changed() => {
@@ -265,6 +282,7 @@ async fn run_outbound_register(
 ) -> Result<(), String> {
     let mut dialog = sip::RegisterDialog::fresh();
     let mut operator_events = operator.subscribe_events();
+    let mut sms_deliveries = operator.subscribe_sms_deliveries();
     loop {
         let expiry =
             register_transaction(&transport, profile, state, &mut dialog, bridge, operator).await?;
@@ -303,6 +321,21 @@ async fn run_outbound_register(
                 event = operator_events.recv() => {
                     if let Ok(event) = event {
                         handle_operator_event(&transport, bridge, event, state).await?;
+                    }
+                },
+                delivery = sms_deliveries.recv() => {
+                    if let Ok(delivery) = delivery {
+                        let target = bridge.asterisk_target_uri();
+                        let from_uri = format!("sip:{}", delivery.from);
+                        let call_id = format!("sms-{}", sip::token(12));
+                        if let Ok(frame) = sip::build_dialog_request_with_content_type(&sip::DialogRequest {
+                            method: "MESSAGE", request_uri: &target, local_addr: transport.local_addr()?,
+                            from_uri: &from_uri, from_tag: "simadmin", to_uri: &target, to_tag: None,
+                            call_id: &call_id, cseq: 1, contact_uri: None, body: delivery.body.as_bytes(),
+                        }, Some("text/plain; charset=utf-8")) {
+                            transport.send(&frame).await?;
+                            record_sip_tx(state, &frame).await;
+                        }
                     }
                 },
                 changed = shutdown.changed() => {
@@ -533,6 +566,36 @@ async fn handle_inbound(
         return Ok(());
     }
     record_sip_rx(state, frame).await;
+    if sip_frame::is_request(frame, "MESSAGE") {
+        let content_type = sip_frame::header_value(frame, "Content-Type")
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !content_type.is_empty() && !content_type.starts_with("text/plain") {
+            let response = sip::build_response(frame, 415, "Unsupported Media Type")?;
+            transport.send(&response).await?;
+            record_sip_tx(state, &response).await;
+            return Ok(());
+        }
+        let body = sip_frame::body(frame);
+        if body.len() > 4096 {
+            let response = sip::build_response(frame, 413, "Request Entity Too Large")?;
+            transport.send(&response).await?;
+            record_sip_tx(state, &response).await;
+            return Ok(());
+        }
+        let body = std::str::from_utf8(body)
+            .map_err(|_| "trunk_message_body_not_utf8".to_string())?
+            .to_string();
+        let from = sip_user_from_header(frame, "From").unwrap_or_default();
+        let to = sip_request_user(frame).or_else(|| sip_user_from_header(frame, "To")).unwrap_or_default();
+        let response = sip::build_response(frame, 202, "Accepted")?;
+        transport.send(&response).await?;
+        record_sip_tx(state, &response).await;
+        if let Some(operator) = operator {
+            operator.send_sms_request(crate::services::trunk::operator::SmsRequest { from, to, body });
+        }
+        return Ok(());
+    }
     if sip_frame::is_request(frame, "INVITE") {
         let is_reinvite = crate::services::trunk::dialog::call_id(frame)
             .is_some_and(|call_id| bridge.has_call(&call_id));
@@ -612,6 +675,21 @@ async fn handle_inbound(
     }
     sync_bridge_diagnostics(state, bridge).await;
     Ok(())
+}
+
+fn sip_user_from_header(frame: &[u8], header: &str) -> Option<String> {
+    let value = sip_frame::header_value(frame, header)?;
+    let uri = value
+        .split_once('<')
+        .and_then(|(_, rest)| rest.split_once('>').map(|(uri, _)| uri))
+        .unwrap_or(value.as_str());
+    uri.strip_prefix("sip:")?.split(['@', ';']).next().filter(|v| !v.is_empty()).map(str::to_string)
+}
+
+fn sip_request_user(frame: &[u8]) -> Option<String> {
+    let line = std::str::from_utf8(frame).ok()?.lines().next()?;
+    let uri = line.split_whitespace().nth(1)?;
+    uri.strip_prefix("sip:")?.split(['@', ';']).next().filter(|v| !v.is_empty()).map(str::to_string)
 }
 
 async fn handle_operator_event(

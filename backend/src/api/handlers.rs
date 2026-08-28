@@ -4048,6 +4048,7 @@ fn spawn_vowifi_sms_followup_persist(
                 );
             }
             for sms in mt_messages {
+                publish_sms_to_trunk(&app, &sms).await;
                 let notification_sender = Arc::clone(&app.notification_sender);
                 tokio::spawn(async move {
                     let _ = notification_sender.forward_sms(&sms).await;
@@ -4113,6 +4114,7 @@ fn ensure_vowifi_mt_listener(app: &AppState, scope: &VowifiScope) {
             let inserted =
                 persist_vowifi_mt_deliveries(&app.database, &line_id, &outcome, dedupe_enabled);
             for sms in inserted {
+                publish_sms_to_trunk(&app, &sms).await;
                 let notification_sender = Arc::clone(&app.notification_sender);
                 tokio::spawn(async move {
                     let _ = notification_sender.forward_sms(&sms).await;
@@ -4254,6 +4256,18 @@ pub(crate) async fn send_sms_on_line(
     phone_number: &str,
     content: &str,
 ) -> Result<serde_json::Value, String> {
+    send_sms_on_line_with_vowifi_only(app, line_id, phone_number, content, false).await
+}
+
+/// Trunk-facing SMS send path. When `vowifi_only` is set, only the VoWiFi IMS
+/// transport is attempted and no VoLTE/CS fallback is allowed.
+pub(crate) async fn send_sms_on_line_with_vowifi_only(
+    app: &AppState,
+    line_id: &str,
+    phone_number: &str,
+    content: &str,
+    vowifi_only: bool,
+) -> Result<serde_json::Value, String> {
     let payload = SendSmsRequest {
         phone_number: phone_number.to_string(),
         content: content.to_string(),
@@ -4266,7 +4280,12 @@ pub(crate) async fn send_sms_on_line(
     };
     let policy = app.config_manager.get_line_sms_path_policy(scope.line_id());
     let mut failures = Vec::new();
-    for path in policy.enabled_layers() {
+    let paths: Vec<AccessPathKind> = if vowifi_only {
+        vec![AccessPathKind::Vowifi]
+    } else {
+        policy.enabled_layers().collect()
+    };
+    for path in paths {
         let result = match path {
             AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &scope, &payload).await,
             AccessPathKind::Volte => send_sms_over_volte_path(&app, &line_id, &payload).await,
@@ -4288,6 +4307,28 @@ pub(crate) async fn send_sms_on_line(
         failures.join("; ")
     };
     Err(detail)
+}
+
+pub(crate) async fn publish_sms_to_trunk(app: &AppState, sms: &crate::platform::db::SmsMessage) {
+    if sms.direction != "incoming" {
+        return;
+    }
+    let Some(line_id) = sms.line_id.as_deref() else { return; };
+    let Some(line) = app.line_registry.get(line_id).await else { return; };
+    let profile = app.config_manager.get_line_profile(line_id);
+    // Trunk 的 "仅允许 VoWiFi" 门控对入向短信同样生效：开关开启时，只有
+    // VoWiFi（vowifi_ims）路径收到的短信才推送给 trunk；VoLTE/CS 短信
+    // 仍留在本地 Web 短信记录中，不进入 Asterisk/Linphone。
+    if profile.trunk.vowifi_only && sms.transport != "vowifi_ims" {
+        return;
+    }
+    line.trunk.operator_link().send_sms_delivery(
+        crate::services::trunk::operator::SmsDelivery {
+            from: sms.phone_number.clone(),
+            to: profile.trunk.incoming_binding.clone(),
+            body: sms.content.clone(),
+        },
+    );
 }
 
 async fn send_sms_over_vowifi_path(
