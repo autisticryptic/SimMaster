@@ -25,8 +25,8 @@ use crate::{
             PayloadTypeMapping, PendingRtpRelay,
         },
         register::{
-            run_register, run_register_observed, run_unregister, RegisterAuthenticator,
-            RegisterFailure,
+            run_register, run_register_observed, run_unregister,
+            status_permits_register_variant_fallback, RegisterAuthenticator, RegisterFailure,
         },
         register_response::RegisterArtifacts,
         registration::{
@@ -6126,15 +6126,14 @@ fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
     // below are what escape after the bounded retry loop.
     matches!(
         register_failure_status(failure),
-        Some(400 | 415 | 420 | 421 | 423 | 430 | 480 | 491 | 494 | 500 | 502 | 503)
+        Some(status) if status_permits_register_variant_fallback(status),
     ) || matches!(
         failure.error.code(),
         "ims_register_initial_min_expires_invalid"
             | "ims_register_initial_min_expires_exhausted"
             | "ims_register_initial_min_expires_unsupported"
-    )
-        || (failure.response.is_none()
-            && failure.error.code() == "ims_register_initial_receive_failed")
+    ) || (failure.response.is_none()
+        && failure.error.code() == "ims_register_initial_receive_failed")
 }
 
 fn sec_agree_retry_variant(
@@ -6644,6 +6643,47 @@ mod tests {
         };
 
         assert!(!pre_authentication_variant_failure(&failure));
+    }
+
+    #[test]
+    fn register_candidate_ladder_advances_on_shaped_rejections() {
+        let retryable = [
+            400, 404, 408, 410, 415, 420, 421, 423, 430, 480, 491, 494, 500, 501, 502, 503, 504,
+        ];
+        for status in retryable {
+            let failure = RegisterFailure {
+                error: ImsError::new("ims_register_initial_unexpected_status"),
+                response: Some(
+                    format!("SIP/2.0 {status} X\r\nContent-Length: 0\r\n\r\n").into_bytes(),
+                ),
+                auth_rounds: 0,
+            };
+            assert!(
+                pre_authentication_variant_failure(&failure),
+                "status {status} should advance to the next REGISTER candidate"
+            );
+        }
+    }
+
+    #[test]
+    fn register_candidate_ladder_gives_up_on_terminal_rejections() {
+        let terminal = [
+            300, 302, 403, 405, 406, 409, 413, 414, 416, 422, 432, 433, 436, 437, 438, 481, 482,
+            483, 484, 485, 486, 487, 488, 489, 493, 505, 513, 580, 600, 603,
+        ];
+        for status in terminal {
+            let failure = RegisterFailure {
+                error: ImsError::new("ims_register_initial_unexpected_status"),
+                response: Some(
+                    format!("SIP/2.0 {status} X\r\nContent-Length: 0\r\n\r\n").into_bytes(),
+                ),
+                auth_rounds: 0,
+            };
+            assert!(
+                !pre_authentication_variant_failure(&failure),
+                "status {status} should stop the REGISTER ladder"
+            );
+        }
     }
 
     /// Verbatim `mmcli -L --output-keyvalue` output from the 410. The separator

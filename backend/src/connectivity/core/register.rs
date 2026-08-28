@@ -23,6 +23,47 @@ pub(crate) const MAX_MIN_EXPIRES_ROUNDS: u8 = 2;
 pub(crate) const MIN_EXPIRES_CAP: u32 = 86_400;
 pub(crate) const MAX_REGISTER_PROVISIONAL_RESPONSES: u8 = 4;
 
+/// Final-response statuses that a differently shaped REGISTER candidate (or a
+/// different P-CSCF) may clear. Format, lease, extension, routing and
+/// transient server failures are all candidates; anything that names a
+/// policy/identity problem is not. The candidate ladder is bounded by every
+/// adapter, so a broad retryable set costs at most a few extra attempts.
+pub(crate) fn status_permits_register_variant_fallback(status: u16) -> bool {
+    matches!(
+        status,
+        400 | 404
+            | 408
+            | 410
+            | 415
+            | 420
+            | 421
+            | 423
+            | 430
+            | 480
+            | 491
+            | 494
+            | 500
+            | 501
+            | 502
+            | 503
+            | 504
+    )
+}
+
+/// Final-response statuses for which retrying another REGISTER shape is
+/// pointless: the server stated a policy/identity/format problem that header
+/// experimentation cannot address, or a redirect this project does not follow.
+/// Adapters should give up immediately instead of exhausting the ladder.
+pub(crate) fn status_is_terminal_register_failure(status: u16) -> bool {
+    matches!(
+        status,
+        300..=399
+            | 403 | 405 | 406 | 409 | 413 | 414 | 416 | 422 | 432 | 433 | 436 | 437 | 438
+            | 481 | 482 | 483 | 484 | 485 | 486 | 487 | 488 | 489 | 493 | 505 | 513 | 580
+            | 600..=699
+    )
+}
+
 pub trait RegisterAuthenticator<C>: Send
 where
     C: ImsChannel,

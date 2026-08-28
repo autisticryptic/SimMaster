@@ -47,8 +47,9 @@ use crate::connectivity::core::{
     contact::{complete_contact_parameters, ContactCompletion},
     media::OperatorSocketCreator,
     register::{
-        run_register_observed, RegisterAuthenticator, RegisterFailure,
-        MAX_MIN_EXPIRES_ROUNDS, MAX_REGISTER_PROVISIONAL_RESPONSES, MIN_EXPIRES_CAP,
+        run_register_observed, status_is_terminal_register_failure, RegisterAuthenticator,
+        RegisterFailure, MAX_MIN_EXPIRES_ROUNDS, MAX_REGISTER_PROVISIONAL_RESPONSES,
+        MIN_EXPIRES_CAP,
     },
     register_response::RegisterArtifacts,
     registration::{
@@ -3336,6 +3337,11 @@ async fn run_register_exchange_over_tunnel(
                     reason = error.reason.as_str(),
                     "IMS REGISTER candidate failed"
                 );
+                // A terminal rejection is the same answer on every P-CSCF;
+                // stop instead of cycling the remaining candidates.
+                if live_register_error_is_terminal(&error) {
+                    return Err(error);
+                }
                 last_error = Some(error);
             }
         }
@@ -3376,6 +3382,11 @@ async fn run_register_exchange_with_pcscf(
                     reason = err.reason.as_str(),
                     "IMS REGISTER header variant failed"
                 );
+                // A terminal rejection cannot be cleared by another shape or
+                // P-CSCF; stop the whole ladder instead of exhausting it.
+                if live_register_error_is_terminal(&err) {
+                    return Err(err);
+                }
                 // The core told us which extension it wants. Satisfying it is
                 // strictly better than moving on to the next shape, which
                 // would be rejected the same way.
@@ -3400,6 +3411,9 @@ async fn run_register_exchange_with_pcscf(
                                 reason = retry_err.reason.as_str(),
                                 "IMS REGISTER sec-agree retry failed"
                             );
+                            if live_register_error_is_terminal(&retry_err) {
+                                return Err(retry_err);
+                            }
                             last_error = Some(retry_err);
                             continue;
                         }
@@ -3890,7 +3904,38 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         RegistrationLossReason::from_register_failure(failure),
     );
     error.server_required_sec_agree = register_failure_demands_sec_agree(failure);
+    // Preserve the final SIP status in the reason so the candidate loops can
+    // classify terminal rejections without touching the secret-bearing
+    // response buffer.
+    if let Some(status) = failure
+        .response
+        .as_deref()
+        .and_then(|response| sip_frame::parse_status(response).ok())
+    {
+        error.reason = format!("{}:sip_status={status}", error.reason);
+    }
     error
+}
+
+/// Recover the final SIP status embedded by `map_shared_register_failure`.
+fn live_register_error_status(error: &LiveStageError) -> Option<u16> {
+    error
+        .reason
+        .rsplit_once(":sip_status=")
+        .and_then(|(_, suffix)| suffix.parse::<u16>().ok())
+}
+
+/// True when this REGISTER failure is final for the SIM/line: the core
+/// rejected the identity, refused the request on policy, or sent a redirect
+/// this project does not follow. No other header shape or P-CSCF can change
+/// the answer, so abort the candidate ladder instead of burning attempts.
+fn live_register_error_is_terminal(error: &LiveStageError) -> bool {
+    if error.reason.starts_with("ims_register_auth_rejected") {
+        // The bounded challenge rounds were exhausted: credentials were
+        // rejected, not shaped wrong.
+        return true;
+    }
+    live_register_error_status(error).is_some_and(status_is_terminal_register_failure)
 }
 
 /// True when the core rejected the unauthenticated REGISTER with
@@ -8611,6 +8656,55 @@ mod tests {
             1,
         ));
         assert!(!after_auth.server_required_sec_agree);
+    }
+
+    #[test]
+    fn terminal_register_status_stops_the_candidate_ladder() {
+        let terminal = [
+            300, 302, 403, 405, 406, 409, 413, 414, 416, 422, 432, 433, 436, 437, 438, 481, 482,
+            483, 484, 485, 486, 487, 488, 489, 493, 505, 513, 580, 600, 603,
+        ];
+        for status in terminal {
+            let failure = register_failure_with(
+                &format!("SIP/2.0 {status} X\r\nContent-Length: 0\r\n\r\n"),
+                0,
+            );
+            let error = map_shared_register_failure(&failure);
+            assert!(
+                live_register_error_is_terminal(&error),
+                "status {status} should abort the REGISTER ladder"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_register_status_keeps_the_candidate_ladder_alive() {
+        let retryable = [
+            400, 404, 408, 410, 415, 420, 421, 423, 430, 480, 491, 494, 500, 501, 502, 503, 504,
+        ];
+        for status in retryable {
+            let failure = register_failure_with(
+                &format!("SIP/2.0 {status} X\r\nContent-Length: 0\r\n\r\n"),
+                0,
+            );
+            let error = map_shared_register_failure(&failure);
+            assert!(
+                !live_register_error_is_terminal(&error),
+                "status {status} should keep trying further REGISTER candidates"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_rejected_without_status_is_terminal() {
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_auth_rejected"),
+            response: None,
+            auth_rounds: 1,
+        };
+        let error = map_shared_register_failure(&failure);
+        assert!(live_register_error_is_terminal(&error));
+        assert!(live_register_error_status(&error).is_none());
     }
 
     fn ee_register_variant(label: &str) -> LiveRegisterHeaderVariant {
