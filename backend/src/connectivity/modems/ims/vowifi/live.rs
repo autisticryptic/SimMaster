@@ -48,7 +48,7 @@ use crate::connectivity::core::{
     media::OperatorSocketCreator,
     register::{
         run_register_observed, RegisterAuthenticator, RegisterFailure,
-        MAX_REGISTER_PROVISIONAL_RESPONSES,
+        MAX_MIN_EXPIRES_ROUNDS, MAX_REGISTER_PROVISIONAL_RESPONSES, MIN_EXPIRES_CAP,
     },
     register_response::RegisterArtifacts,
     registration::{
@@ -3824,6 +3824,36 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
             "vowifi_register_default_exchange_unreachable",
         ))
     }
+
+    async fn rebuild_register_with_min_expires(
+        &mut self,
+        _challenge_response: &[u8],
+        cseq: u32,
+        min_expires: u32,
+        authenticated: bool,
+    ) -> Result<Vec<u8>, ImsError> {
+        if authenticated {
+            // Authenticated 423 retries are handled inside the adapter-owned
+            // exchange so the ESP-protected channel is reused; rebuilding over
+            // the plain channel here would drop the security association.
+            return Err(ImsError::new(
+                "ims_register_authenticated_min_expires_unsupported",
+            ));
+        }
+        // Re-send the same initial shape (including its empty-AKA
+        // Authorization, if any) with a lease that satisfies Min-Expires.
+        let initial_authorization =
+            self.context.build_initial_authorization_header(self.profile, self.variant);
+        let request = self.context.build_register_request_with_expires(
+            self.profile,
+            self.variant,
+            cseq,
+            initial_authorization.as_deref(),
+            None,
+            min_expires,
+        );
+        Ok(request.into_bytes())
+    }
 }
 
 fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
@@ -3837,6 +3867,19 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         "ims_register_authenticated_unexpected_status" => "ims_register_unexpected_status",
         "ims_register_auth_rejected" => "ims_register_auth_rejected",
         "ims_register_initial_unexpected_status" => "ims_register_initial_unexpected_status",
+        // 423 is negotiated inside the shared engine; these escape only after
+        // the bounded retry loop, so treat them as the unexpected-status
+        // family rather than inventing a new terminal reason.
+        "ims_register_initial_min_expires_invalid"
+        | "ims_register_initial_min_expires_exhausted"
+        | "ims_register_initial_min_expires_unsupported" => {
+            "ims_register_initial_unexpected_status"
+        }
+        "ims_register_authenticated_min_expires_invalid"
+        | "ims_register_authenticated_min_expires_exhausted"
+        | "ims_register_authenticated_min_expires_unsupported" => {
+            "ims_register_unexpected_status"
+        }
         "sip_status_line_missing" | "sip_status_code_invalid" => {
             "ims_register_response_parse_failed"
         }
@@ -3851,7 +3894,8 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
 }
 
 /// True when the core rejected the unauthenticated REGISTER with
-/// `421 Extension Required` and named `sec-agree` in `Require`.
+/// `421 Extension Required` (naming `sec-agree` in `Require`) or with
+/// `494 Security Agreement Required`.
 fn register_failure_demands_sec_agree(failure: &RegisterFailure) -> bool {
     if failure.auth_rounds != 0 {
         return false;
@@ -3859,13 +3903,28 @@ fn register_failure_demands_sec_agree(failure: &RegisterFailure) -> bool {
     let Some(response) = failure.response.as_deref() else {
         return false;
     };
-    if sip_frame::parse_status(response).ok() != Some(421) {
-        return false;
+    match sip_frame::parse_status(response).ok() {
+        // RFC 3329: a 494 means the security agreement is mandatory even when
+        // the server does not echo a Require header, so it always escalates.
+        Some(494) => return true,
+        Some(421) => {}
+        _ => return false,
     }
     sip_frame::header_values(response, "Require")
         .iter()
         .flat_map(|value| value.split(','))
         .any(|extension| extension.trim().eq_ignore_ascii_case("sec-agree"))
+}
+
+/// Read the `Min-Expires` floor from a `423 Interval Too Brief` response.
+///
+/// RFC 3261 §21.4.4: the registrar refuses a lease below this value. The
+/// value is capped so a misconfigured floor cannot pin the registration open
+/// forever.
+fn parse_register_min_expires(response: &str) -> Option<u32> {
+    let value = sip_frame::header_value(response.as_bytes(), "Min-Expires")?;
+    let parsed = value.trim().parse::<u32>().ok()?;
+    Some(parsed.min(MIN_EXPIRES_CAP).max(1))
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
@@ -3952,15 +4011,41 @@ async fn run_authenticated_register_exchange(
         )
         .await
     } else {
-        let authenticated = context.build_authorized_request(
-            profile,
-            variant,
-            authenticated_cseq,
-            &auth_material.authorization,
-            security_verify.as_deref(),
-        );
-        write_sip_request(initial_channel, &authenticated).await?;
-        read_final_register_response(initial_channel).await
+        let mut retry_cseq = authenticated_cseq;
+        let mut expires = profile.ims.register.expires_seconds;
+        let mut min_expires_rounds = 0u8;
+        loop {
+            let authenticated = context.build_register_request_with_expires(
+                profile,
+                variant,
+                retry_cseq,
+                Some(auth_material.authorization.as_str()),
+                security_verify.as_deref(),
+                expires,
+            );
+            write_sip_request(initial_channel, &authenticated).await?;
+            let response = read_final_register_response(initial_channel).await?;
+            let summary = ims::parse_sip_response(&response, &context.target.realm)
+                .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
+            if summary.status_code == 423 && min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS {
+                let Some(min_expires) = parse_register_min_expires(&response) else {
+                    return Err(live_stage_error(
+                        "ims_register_authenticated_min_expires_invalid",
+                    ));
+                };
+                expires = expires.max(min_expires);
+                retry_cseq = retry_cseq.saturating_add(1);
+                min_expires_rounds += 1;
+                info!(
+                    sip_status = 423,
+                    min_expires,
+                    retry_cseq,
+                    "VoWiFi authenticated REGISTER negotiating a longer lease"
+                );
+                continue;
+            }
+            return Ok(response);
+        }
     }
 }
 
@@ -4300,7 +4385,7 @@ async fn run_protected_authenticated_register_candidates(
                 } else {
                     LIVE_IMS_REGISTER_CANDIDATE_READ_TIMEOUT
                 };
-                let response = match read_final_register_response_with_timeout(
+                let mut response = match read_final_register_response_with_timeout(
                     &mut protected_channel,
                     candidate_timeout,
                 )
@@ -4319,48 +4404,108 @@ async fn run_protected_authenticated_register_candidates(
                         continue;
                     }
                 };
-                let summary = ims::parse_sip_response(&response, &context.target.realm)
+                let mut summary = ims::parse_sip_response(&response, &context.target.realm)
                     .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
-                if summary.status_code == 200 {
-                    let artifacts = RegisterArtifacts::parse(response.as_bytes());
-                    let registered = RegisteredImsContext::from_artifacts(
-                        ImsRegistrationAccess::Vowifi,
-                        artifacts,
-                        profile.ims.register.expires_seconds,
-                    );
-                    let mut registered_identity = context.identity.shared.clone();
-                    if let Some(uri) = registered.default_associated_uri() {
-                        registered_identity.public_uri = uri.to_string();
-                    }
-                    // The registrar's P-Associated-URI set is the only place a
-                    // data-only line's own MSISDN is observable, and this leg
-                    // previously only logged how many URIs arrived. Publish the
-                    // telephone identities so the API layer can surface the
-                    // number instead of reporting N/A.
-                    crate::connectivity::core::own_numbers::record(
-                        line_id,
-                        crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
-                            response.as_bytes(),
-                        ),
-                    );
-                    record_live_ims_security_verify(line_id, profile, security_verify, &registered)
+                let mut retry_cseq = authenticated_cseq;
+                let mut expires = profile.ims.register.expires_seconds;
+                let mut min_expires_rounds = 0u8;
+                loop {
+                    if summary.status_code == 200 {
+                        let artifacts = RegisterArtifacts::parse(response.as_bytes());
+                        let registered = RegisteredImsContext::from_artifacts(
+                            ImsRegistrationAccess::Vowifi,
+                            artifacts,
+                            expires,
+                        );
+                        let mut registered_identity = context.identity.shared.clone();
+                        if let Some(uri) = registered.default_associated_uri() {
+                            registered_identity.public_uri = uri.to_string();
+                        }
+                        // The registrar's P-Associated-URI set is the only place a
+                        // data-only line's own MSISDN is observable, and this leg
+                        // previously only logged how many URIs arrived. Publish the
+                        // telephone identities so the API layer can surface the
+                        // number instead of reporting N/A.
+                        crate::connectivity::core::own_numbers::record(
+                            line_id,
+                            crate::connectivity::core::ims_failure::telephone_numbers_from_register_success(
+                                response.as_bytes(),
+                            ),
+                        );
+                        record_live_ims_security_verify(
+                            line_id,
+                            profile,
+                            security_verify,
+                            &registered,
+                        )
                         .await;
-                    record_live_ims_channel(
-                        line_id,
+                        record_live_ims_channel(
+                            line_id,
+                            profile,
+                            registered_identity,
+                            protected_channel,
+                            security_verify.map(str::to_string),
+                            registered,
+                            context.clone(),
+                            variant,
+                            retry_cseq.saturating_add(1),
+                        )
+                        .await;
+                        return Ok(response);
+                    }
+                    if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS
+                    {
+                        protected_channel.abort();
+                        return Ok(response);
+                    }
+                    let Some(min_expires) = parse_register_min_expires(&response) else {
+                        protected_channel.abort();
+                        last_error = Some(live_stage_error(
+                            "ims_register_authenticated_min_expires_invalid",
+                        ));
+                        break;
+                    };
+                    expires = expires.max(min_expires);
+                    retry_cseq = retry_cseq.saturating_add(1);
+                    min_expires_rounds += 1;
+                    info!(
+                        policy_candidate = candidate.label,
+                        sip_status = 423,
+                        min_expires,
+                        retry_cseq,
+                        "IMS REGISTER protected 423 negotiation"
+                    );
+                    let authenticated = context.build_register_request_with_expires(
                         profile,
-                        registered_identity,
-                        protected_channel,
-                        security_verify.map(str::to_string),
-                        registered,
-                        context.clone(),
                         variant,
-                        authenticated_cseq.saturating_add(1),
+                        retry_cseq,
+                        Some(auth_material.authorization.as_str()),
+                        security_verify,
+                        expires,
+                    );
+                    write_sip_request(&mut protected_channel, &authenticated).await?;
+                    response = match read_final_register_response_with_timeout(
+                        &mut protected_channel,
+                        candidate_timeout,
                     )
-                    .await;
-                } else {
-                    protected_channel.abort();
+                    .await
+                    {
+                        Ok(response) => response,
+                        Err(err) => {
+                            protected_channel.abort();
+                            warn!(
+                                policy_candidate = candidate.label,
+                                candidate_index,
+                                reason = err.reason.as_str(),
+                                "IMS protected 423 retry timed out; trying next policy"
+                            );
+                            last_error = Some(err);
+                            break;
+                        }
+                    };
+                    summary = ims::parse_sip_response(&response, &context.target.realm)
+                        .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
                 }
-                return Ok(response);
             }
             Err(err) => {
                 warn!(

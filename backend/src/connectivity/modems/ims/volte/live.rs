@@ -622,6 +622,7 @@ pub struct VolteSmsSendResult {
     pub sip_statuses: Vec<u16>,
 }
 
+#[derive(Clone)]
 struct PreparedAuth {
     authorization: String,
     security_client: Option<String>,
@@ -1008,6 +1009,18 @@ struct VolteRegisterAuthenticator {
     effective_ims: EffectiveImsProfile,
     visited_network_header: Option<String>,
     expires_seconds: u32,
+    /// CSeq of the most recent REGISTER actually emitted by this exchange.
+    /// Min-Expires retries and AKA challenges all advance the sequence, so the
+    /// next refresh must continue from here instead of assuming a fixed number
+    /// of authentication rounds.
+    last_cseq: u32,
+    /// Authorization carried by the initial (unauthenticated) REGISTER. A 423
+    /// rebuild repeats the same initial shape with a longer lease, so the
+    /// authenticator must remember what the first request looked like instead
+    /// of reconstructing it from the 401 challenge.
+    initial_authorization: Option<String>,
+    /// Security-Client offered on the initial REGISTER, if any.
+    initial_security_client: Option<String>,
     /// Optional per-line worker used for SIP/IPsec sockets. The parent still
     /// owns the bearer and AKA/QMI lifecycle; absence keeps the host path.
     worker: Option<UeWorkerHandle>,
@@ -1029,6 +1042,8 @@ impl VolteRegisterAuthenticator {
         profile: &'static CarrierProfile,
         effective_ims: EffectiveImsProfile,
         visited_network_header: Option<String>,
+        initial_authorization: Option<String>,
+        initial_security_client: Option<String>,
         worker: Option<UeWorkerHandle>,
     ) -> Self {
         Self {
@@ -1050,6 +1065,9 @@ impl VolteRegisterAuthenticator {
             effective_ims,
             visited_network_header,
             expires_seconds: profile.ims.register.expires_seconds,
+            last_cseq: ids.cseq,
+            initial_authorization,
+            initial_security_client,
             worker,
         }
     }
@@ -1280,10 +1298,11 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             .await;
         let prepared = self
             .pending
-            .take()
+            .clone()
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
+        self.last_cseq = ids.cseq;
         Ok(sip::build_register_from_profile_with_target_and_visited(
             self.profile,
             effective_register_target(&self.effective_ims),
@@ -1300,6 +1319,40 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 require_sec_agree: prepared.require_sec_agree,
                 ..self.register_policy
             },
+            self.visited_network_header.as_deref(),
+        ))
+    }
+
+    async fn rebuild_register_with_min_expires(
+        &mut self,
+        challenge_response: &[u8],
+        cseq: u32,
+        min_expires: u32,
+        authenticated: bool,
+    ) -> Result<Vec<u8>, ImsError> {
+        if authenticated {
+            // Keep the negotiated security context and challenge proof; only
+            // the lease floor changes for the retry.
+            self.expires_seconds = min_expires.max(self.expires_seconds);
+            return self.authenticated_request(challenge_response, cseq).await;
+        }
+        self.expires_seconds = min_expires;
+        let mut ids = self.ids.clone();
+        ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
+        self.last_cseq = ids.cseq;
+        Ok(sip::build_register_from_profile_with_target_and_visited(
+            self.profile,
+            effective_register_target(&self.effective_ims),
+            sip::RegisterPhase::Initial,
+            &self.identity,
+            &self.route,
+            &ids,
+            self.expires_seconds,
+            self.initial_authorization.as_deref(),
+            self.initial_security_client.as_deref(),
+            None,
+            &self.sip_instance,
+            self.register_policy,
             self.visited_network_header.as_deref(),
         ))
     }
@@ -2268,6 +2321,8 @@ async fn connect_family(
             profile,
             device_identity.effective_ims.clone(),
             device_identity.visited_network_header.clone(),
+            initial_authorization.clone(),
+            initial_security_client.map(str::to_string),
             socket_worker,
         );
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
@@ -2377,7 +2432,7 @@ async fn connect_family(
         let registered = RegisteredImsContext::from_response(
             ImsRegistrationAccess::Volte,
             &registration.response,
-            profile.ims.register.expires_seconds,
+            authenticator.expires_seconds,
         );
         let associated_uri = registered.default_associated_uri();
         let mut registered_identity = device_identity.ims.clone();
@@ -2450,11 +2505,7 @@ async fn connect_family(
             pcscf_reporting_cid: None,
             ims_profile_lease: None,
             register_ids: authenticator.ids.clone(),
-            next_register_cseq: authenticator
-                .ids
-                .cseq
-                .saturating_add(u32::from(registration.auth_rounds))
-                .saturating_add(1),
+            next_register_cseq: authenticator.last_cseq.saturating_add(1),
             sip_instance: authenticator.sip_instance,
             security_binding: authenticator.offered_security_binding,
             register_variant: variant,
@@ -2559,6 +2610,8 @@ async fn unregister_live_session(
         session.profile,
         session.effective_ims.clone(),
         session.visited_network_header.clone(),
+        initial_authorization,
+        security_client,
         None,
     )
     .with_expires_seconds(0);
@@ -3033,6 +3086,14 @@ async fn refresh_live_registration(
         require_sec_agree,
         ..session.register_variant.policy
     };
+    // A 423 negotiation on refresh may raise the accepted lease above the
+    // profile default, so both the request and the fallback lease follow the
+    // currently registered value (never below the profile floor).
+    let refresh_expires = session
+        .registration
+        .lease
+        .expires_seconds
+        .max(session.profile.ims.register.expires_seconds);
     let initial = sip::build_register_from_profile_with_target_and_visited(
         session.profile,
         effective_register_target(&session.effective_ims),
@@ -3040,7 +3101,7 @@ async fn refresh_live_registration(
         &session.identity,
         &session.channel.route(),
         &ids,
-        session.profile.ims.register.expires_seconds,
+        refresh_expires,
         initial_authorization.as_deref(),
         security_client.as_deref(),
         security_verify.as_deref(),
@@ -3067,8 +3128,11 @@ async fn refresh_live_registration(
         session.profile,
         session.effective_ims.clone(),
         session.visited_network_header.clone(),
+        initial_authorization,
+        security_client,
         None,
-    );
+    )
+    .with_expires_seconds(refresh_expires);
     let registration =
         match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
             Ok(registration) => registration,
@@ -3096,14 +3160,11 @@ async fn refresh_live_registration(
             }
         };
 
-    session.next_register_cseq = ids
-        .cseq
-        .saturating_add(u32::from(registration.auth_rounds))
-        .saturating_add(1);
+    session.next_register_cseq = authenticator.last_cseq.saturating_add(1);
     let registered = RegisteredImsContext::from_response(
         ImsRegistrationAccess::Volte,
         &registration.response,
-        session.profile.ims.register.expires_seconds,
+        authenticator.expires_seconds,
     );
     if let Some(uri) = registered.default_associated_uri() {
         session.identity.public_uri = uri.to_string();
@@ -6039,7 +6100,10 @@ fn map_register_error(error: ImsError) -> VolteError {
     let stage = match error.code() {
         "ims_register_initial_send_failed"
         | "ims_register_initial_receive_failed"
-        | "ims_register_initial_unexpected_status" => code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+        | "ims_register_initial_unexpected_status"
+        | "ims_register_initial_min_expires_invalid"
+        | "ims_register_initial_min_expires_exhausted"
+        | "ims_register_initial_min_expires_unsupported" => code::REGISTER_INITIAL_UNEXPECTED_STATUS,
         _ => code::REGISTER_AUTH_UNEXPECTED_STATUS,
     };
     VolteError::with_detail(stage, error.code())
@@ -6056,7 +6120,19 @@ fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
 /// candidate. Once AKA has started, credentials and security negotiation are
 /// fixed for this session and must not be hidden by header experimentation.
 fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
-    matches!(register_failure_status(failure), Some(400 | 420 | 421))
+    // Format, lease, extension and transient server rejections may all be
+    // cleared by a differently shaped REGISTER candidate. 423 itself is
+    // negotiated inside the shared driver; the exhausted/min-expires errors
+    // below are what escape after the bounded retry loop.
+    matches!(
+        register_failure_status(failure),
+        Some(400 | 415 | 420 | 421 | 423 | 430 | 480 | 491 | 494 | 500 | 502 | 503)
+    ) || matches!(
+        failure.error.code(),
+        "ims_register_initial_min_expires_invalid"
+            | "ims_register_initial_min_expires_exhausted"
+            | "ims_register_initial_min_expires_unsupported"
+    )
         || (failure.response.is_none()
             && failure.error.code() == "ims_register_initial_receive_failed")
 }
@@ -6067,11 +6143,17 @@ fn sec_agree_retry_variant(
 ) -> Option<VolteRegisterVariant> {
     if variant.policy.require_sec_agree
         || failure.auth_rounds != 0
-        || register_failure_status(failure) != Some(421)
+        || !matches!(register_failure_status(failure), Some(421 | 494))
     {
         return None;
     }
     let response = failure.response.as_deref()?;
+    if register_failure_status(failure) == Some(494) {
+        // RFC 3329: a 494 itself means the registrar demands a security
+        // agreement, even when a lenient core omits the Require header.
+        // Escalate directly instead of dropping the response.
+        return Some(variant.requiring_sec_agree());
+    }
     response_requires_only_extension(response, "sec-agree").then(|| variant.requiring_sec_agree())
 }
 
@@ -6174,6 +6256,12 @@ fn terminal_register_failure_status(failure: &RegisterFailure) -> Option<u16> {
         "ims_register_initial_unexpected_status"
             | "ims_register_authenticated_unexpected_status"
             | "ims_register_auth_rejected"
+            | "ims_register_initial_min_expires_invalid"
+            | "ims_register_initial_min_expires_exhausted"
+            | "ims_register_initial_min_expires_unsupported"
+            | "ims_register_authenticated_min_expires_invalid"
+            | "ims_register_authenticated_min_expires_exhausted"
+            | "ims_register_authenticated_min_expires_unsupported"
     )
     .then(|| register_failure_status(failure))
     .flatten()
