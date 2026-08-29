@@ -978,6 +978,29 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     if fallback.policy.include_sip_instance {
         variants.push(fallback.without_sip_instance());
     }
+    // Last resort: repeat the proven shape with an empty AKA Authorization.
+    //
+    // TS 24.229 §5.1.1.2.2 wants the first REGISTER unauthenticated, so every
+    // candidate above deliberately omits Authorization -- and the catalog and
+    // derived profiles default `initial_authorization` to `none` for that
+    // reason. But some cores answer 400/421 to every unauthenticated form and
+    // only challenge once an empty AKA Authorization is present: on Maxis
+    // (50212) the sequence that reaches 200 OK is
+    // `Security-Client -> +Require -> +Proxy-Require -> +empty AKA -> 401 -> AKA`.
+    // Without this candidate the ladder never sends step four, so `auth_rounds`
+    // stays 0 and the leg dies on a terminal 400 having never been challenged.
+    //
+    // Appended rather than reordered: no operator loses its unauthenticated
+    // first attempt, and this only runs after every other shape was rejected.
+    // Skipped when the profile already starts from an empty AKA, since then the
+    // shapes above already carry one.
+    if authorization == VolteInitialAuthorization::None {
+        variants.push(VolteRegisterVariant {
+            label: "ims_features_empty_aka_last_resort",
+            authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+            ..primary
+        });
+    }
     variants
 }
 
@@ -6863,6 +6886,68 @@ mod tests {
             .all(|variant| !variant.policy.include_sip_instance));
     }
 
+    /// A profile that starts unauthenticated must still end up offering an empty
+    /// AKA Authorization.
+    ///
+    /// TS 24.229 §5.1.1.2.2 wants the first REGISTER unauthenticated, so the
+    /// derived and catalog profiles set `initial_authorization: "none"`. Some
+    /// cores answer 400/421 to every unauthenticated shape and only challenge
+    /// once an empty AKA is present -- observed on Maxis (50212), where the
+    /// sequence reaching 200 OK ends `+empty AKA -> 401 -> AKA`. Without a
+    /// candidate carrying it, `auth_rounds` stays 0 and the leg dies on a
+    /// terminal 400 having never been challenged, which is exactly what the
+    /// device logged.
+    #[test]
+    fn an_unauthenticated_profile_still_offers_an_empty_aka_last_resort() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.initial_authorization = "none";
+
+        let variants = register_variants(&profile);
+
+        // Every earlier candidate stays unauthenticated, so no operator loses
+        // its RFC-correct first attempt.
+        let last = variants.last().expect("ladder is never empty");
+        assert!(
+            variants[..variants.len() - 1]
+                .iter()
+                .all(|variant| variant.authorization == VolteInitialAuthorization::None),
+            "only the final candidate may pre-fill Authorization: {:?}",
+            variants.iter().map(|v| v.label).collect::<Vec<_>>()
+        );
+
+        assert_eq!(last.label, "ims_features_empty_aka_last_resort");
+        assert_eq!(
+            last.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+    }
+
+    /// A profile that already starts from an empty AKA gains no extra candidate:
+    /// its shapes carry one already, so appending a duplicate would waste an
+    /// attempt from the session-wide candidate budget.
+    #[test]
+    fn a_profile_already_using_empty_aka_gains_no_extra_candidate() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.initial_authorization = "aka_empty";
+
+        let variants = register_variants(&profile);
+
+        assert!(
+            variants
+                .iter()
+                .all(|variant| variant.label != "ims_features_empty_aka_last_resort"),
+            "no last-resort candidate is needed: {:?}",
+            variants.iter().map(|v| v.label).collect::<Vec<_>>()
+        );
+        // The profile's own shape carries the empty AKA. The generic fallback is
+        // deliberately unauthenticated whatever the profile says, so it is
+        // excluded here rather than asserted over.
+        assert_eq!(
+            variants[0].authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+    }
+
     #[test]
     fn register_fallback_never_reenables_explicitly_disabled_profile_capabilities() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
@@ -7129,7 +7214,16 @@ mod tests {
             .expect("derived LTE profile");
         let variants = register_variants(&profile);
 
-        assert_eq!(variants.len(), 4);
+        // Four unauthenticated shapes plus the empty-AKA last resort. A derived
+        // profile sets `initial_authorization: "none"`, so it is exactly the case
+        // that needs that final candidate: without it a core which only
+        // challenges once an empty AKA is present rejects every shape and the leg
+        // dies without ever being challenged.
+        assert_eq!(variants.len(), 5);
+        assert_eq!(
+            variants.last().map(|variant| variant.label),
+            Some("ims_features_empty_aka_last_resort")
+        );
         assert!(variants
             .iter()
             .all(|variant| !variant.policy.include_visited_network));
