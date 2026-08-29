@@ -152,8 +152,15 @@
   - 确认的无服务/不完整观测立即 `clear(reason)`；瞬时查询失败只 `record_refresh_error(reason)`，旧上下文保留到 TTL 到期。
   - 错误串区分 `access_network_modem_path_invalid`、`access_network_network_query_failed`、`access_network_cell_query_failed`、`access_network_not_registered`、`access_network_snapshot_incomplete`（后者列出 tech/plmn/cell/tac 各自 present 还是 missing）。
   - 状态可读：`AccessNetworkRuntimeStatus`，经 `line_registry.rs:268` 暴露。
-- [ ] 从 QMI 读取同一组字段。
-  - 当前只有 ModemManager 路径。QMI 侧未接入，这是本节剩下的主要实现缺口。
+- [x] 从 QMI 读取小区标识。**（本轮复核修正：QMI 其实是首选来源，不是"未接入"）**
+  - 完成日期：2026-08-29（复核，未改代码）
+  - `serving_access_snapshot()` 取小区数据走 `get_cells_data_for_modem()`（`hardware/cellular/modem_manager.rs:3653`），该函数**先试 QMI**：`get_cells_data_qmicli()` 执行 `qmicli -p -d <dev> --nas-get-cell-location-info`，由 `parse_qmicli_cell_location_output()` 解析；只有 QMI 返回空 cells 时才回落到 ModemManager 的 `GetCellInfo`，再回落到 `mmcli`。
+  - 也就是说 cell id / TAC / tech / band 这组"绝不能伪造"的字段，主来源已经是 QMI。
+  - 注：本项目的 QMI 访问方式是解析 `qmicli` 文本输出，不是自建 QMI 协议封帧，与 `qmi_wds.rs` 的结构一致。
+- [ ] 从 QMI 读取注册 PLMN 与注册状态。
+  - 这是 QMI 侧真正剩下的缺口，范围比原描述窄得多：`get_network_info_for_modem()`（`modem_manager.rs:2485`）只读 ModemManager D-Bus 属性——MCC/MNC 来自 `MM_MODEM_3GPP` 的 `OperatorCode`，注册状态同样来自 D-Bus。
+  - 若要在 ModemManager 3GPP 属性不可用时仍能取到 PLMN/注册状态，需要新增 `--nas-get-serving-system` 解析路径。
+  - 现状不是正确性问题：PLMN 缺失时 `ServingAccessSnapshot::new()` 直接构造失败，不会伪造 PLMN。
 - [ ] 明确 QCM410 当前固件能稳定提供哪些字段，以及字段刷新事件。
   - 需要实机采样，尚未做。
 - [x] 切换后的上下文刷新有界，且不会使用过期数据。
