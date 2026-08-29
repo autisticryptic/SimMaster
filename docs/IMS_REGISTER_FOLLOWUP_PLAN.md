@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1352 passed; 0 failed; 3 ignored（共 1355 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 6 个 HTTP 集成测试。
+  - 结果：1354 passed; 0 failed; 3 ignored（共 1357 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 8 个 HTTP 集成测试。
   - 前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过（2026-08-29）。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
@@ -498,9 +498,18 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - PUT 一个 `always_add_sip_instance` 显式为 false 但字段被删掉的 body，再经 `/resolve` 读回存储投影，断言该开关又变成了 `true`。这把第 7 节的 serde 层证据提升到了真实客户端会遇到的边界。
   - 该测试**刻意断言当前行为**：handler 改成 presence-aware 后它必须失败，失败信息里写明了这一点，以免过期测试对两种行为都点头。
   - 用 `/resolve` 而不是 list 端点，因为 list 只返回摘要，看不到开关。
-- [ ] 继续扩大 HTTP 集成测试覆盖面：VoLTE profile-selection 的保存路径、其余错误码矩阵。
-  - 基础设施与 helper 已就位，逐个端点补即可。
-  - 注意：测试环境没有 modem 线路，凡校验 `line_id` 的端点都会拒绝，所以这类用例应断言错误码，happy path 留到实机验收。
+- [x] VoLTE profile-selection 错误码矩阵的 HTTP 覆盖。
+  - 完成日期：2026-08-29
+  - 测试：`http_router_tests::profile_selection_put_reports_each_validation_error`、`profile_selection_get_answers_for_a_config_only_line`。
+  - **无需硬件的关键点**：handler 的线路检查同时接受"config 里存在的线路"，所以用 `ConfigManager::reconcile_line_profiles(&["line-" + 32位hex])` 注册一条纯配置线路，就能越过线路检查、抵达全部校验错误。`TempState` 现在保留 `ConfigManager` 供测试注册。
+  - PUT 侧断言五个错误码，全部经真实 HTTP：
+    - 未知线路 → 404 `line_not_found`，且在存储任何策略之前拒绝（打错 line_id 不会留下无人读取的策略）
+    - 槽位数不等于 3 → 400 `volte_profile_attempt_count_invalid`（不会静默补齐到三个）
+    - `derived` 带 `profile_id` → 400 `volte_derived_profile_id_not_allowed`（derived 由 SIM 的 home PLMN 推导，指定 ID 是矛盾而非偏好）
+    - 显式 ID 在指定来源中不存在 → 400 `volte_profile_not_found_in_source:<source>:<id>`，并断言错误里含来源名，避免另一来源的同名 ID 被当成命中
+    - 无法识别的 source → 400（拒绝而非回落默认）
+  - GET 侧：纯配置线路必须能返回三个槽位（对话框要在 modem 就位前就能打开），未知线路仍 404。
+  - 未覆盖：保存成功的 happy path。为在线线路保存策略会启动一次连接批次，需要真实硬件，留到第 14.8 节。
 - [x] 前端 TypeScript 类型检查、lint 和 production build。
   - 完成日期：2026-08-29；已执行 `pnpm type-check`、`pnpm lint`、`pnpm build:full`。
 - [ ] 浏览器级 VoLTE Profile 对话框交互测试。
@@ -512,7 +521,8 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - 定向测试：`register::tests` 23、`volte::sip::tests` 36、`volte::live::tests` 53、`carrier_catalog::v7::tests` 12、`volte::channel::tests` 4、`core::access::tests` 3 均通过；`vowifi::channel::tests` 6 passed、1 ignored。
 - `git diff --check` 通过。
 - 前端：`pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过。
-- 仍缺：真实 bearer/QMI/xfrm/P-CSCF/profile lease 资源释放集成测试、浏览器 E2E，以及第 14.8 节真实设备/网络验收。HTTP/AppState 集成测试的基础设施和首批用例已于 2026-08-29 完成（见上），剩下的是逐端点扩大覆盖面。
+- 仍缺：真实 bearer/QMI/xfrm/P-CSCF/profile lease 资源释放集成测试、浏览器 E2E，以及第 14.8 节真实设备/网络验收。
+- HTTP/AppState 集成测试已于 2026-08-29 完成基础设施加 8 个用例（router 抽取、认证闭环、SPA/API 分支、CORS preflight、`omit` 端点暴露面、profile-selection 错误码矩阵）。剩余的 HTTP 覆盖都属于需要真实线路的 happy path，归入第 14.8 节，不再作为第 14.7 节的缺口。
 
 ### 14.8 实机验收
 
