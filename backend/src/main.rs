@@ -1269,6 +1269,347 @@ async fn main() -> Result<()> {
     spawn_vowifi_auto_restore(app_state.clone());
     spawn_volte_auto_restore(app_state.clone());
 
+    let app = build_router(app_state, cors);
+
+    // Start server - 显示版权信息
+    info!(
+        version = env!("APP_VERSION"),
+        branch = env!("GIT_BRANCH"),
+        commit = env!("GIT_COMMIT"),
+        "SimAdmin - Debian SIM Management Service"
+    );
+    info!("Copyright © 2026 GitHub 3899 - SimAdmin");
+
+    // 绑定端口，如果被占用则轮询等待（最多 30 秒）
+    let listener = bind_with_retry(&args.host, args.port, 30).await?;
+    info!(addr = %bind_addr, "Server listening");
+    // 使用优雅关闭
+    axum::serve(listener, app)
+        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
+        .await?;
+
+    // Only reached once the drain completes, which is what the shutdown signal
+    // above makes possible. Releasing the data sessions here is what keeps the
+    // DATA netdev from being left inside a UE namespace.
+    release_data_sessions(&shutdown_registry).await;
+
+    // Exit explicitly rather than returning. Returning drops the tokio runtime,
+    // and that drop blocks until every `spawn_blocking` task has finished --
+    // but several of them never finish by design. `spawn_tun_reader` is the
+    // clearest: it re-checks its shutdown flag only at the top of its loop and
+    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
+    // flag is set it still waits for a packet that may never arrive.
+    //
+    // That drop, not the drain, is what held the process for the full 8s
+    // watchdog on the device: the drain finished in 8ms and the bearers were
+    // released 155ms in, after which the log went completely silent until the
+    // watchdog called `exit`. Everything that has to outlive the process has
+    // already happened by this point, so exiting here is deliberate rather
+    // than a shortcut -- and it demotes the watchdog to the backstop it was
+    // meant to be.
+    info!("Shutdown complete; exiting");
+    std::process::exit(0);
+}
+
+/// Bridge SIP MESSAGE requests received by each line's Asterisk trunk into the
+/// existing SMS sender, and forward VoLTE MT SMS toward the trunk as SIP
+/// MESSAGE. Both directions are deliberately independent from the voice event
+/// stream so SMS cannot affect call state or media routing.
+fn spawn_trunk_sms_bridge(app: AppState) {
+    tokio::spawn(async move {
+        let mut attached = HashMap::<String, tokio::task::JoinHandle<()>>::new();
+        loop {
+            for line in app.line_registry.all().await {
+                let line_id = line.binding().line_id;
+                if attached.contains_key(&line_id) {
+                    continue;
+                }
+                let mut requests = line.trunk.operator_link().subscribe_sms_requests();
+                let mut volte_mt = line.volte_live.subscribe_mt_sms();
+                let app_task = app.clone();
+                let attach_id = line_id.clone();
+                let handle = tokio::spawn(async move {
+                    loop {
+                        tokio::select! {
+                            maybe = requests.recv() => {
+                                match maybe {
+                                    Ok(request) => {
+                                        let profile = app_task.config_manager.get_line_profile(&attach_id);
+                                        let target = if request.to.trim().is_empty() {
+                                            request.from.clone()
+                                        } else {
+                                            request.to.clone()
+                                        };
+                                        if let Err(error) = crate::api::handlers::send_sms_on_line_with_vowifi_only(
+                                            &app_task,
+                                            &attach_id,
+                                            &target,
+                                            &request.body,
+                                            profile.trunk.vowifi_only,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(line_id = %attach_id, error = %error, "Trunk SIP MESSAGE SMS send failed");
+                                        }
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "Trunk SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                            maybe = volte_mt.recv() => {
+                                match maybe {
+                                    Ok(sms) => {
+                                        crate::api::handlers::publish_sms_to_trunk(&app_task, &sms).await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                                        tracing::warn!(line_id = %attach_id, skipped, "VoLTE MT SMS receiver lagged");
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                }
+                            }
+                        }
+                    }
+                });
+                attached.insert(line_id, handle);
+            }
+            attached.retain(|_, handle| !handle.is_finished());
+            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        }
+    });
+}
+
+/// Forward ModemManager (CS) MT SMS toward each line's Asterisk trunk as SIP
+/// MESSAGE. The listener itself runs before AppState exists, so this task owns
+/// the broadcast receiver and publishes once the app state is available.
+fn spawn_modem_mt_sms_bridge(
+    app: AppState,
+    mut rx: tokio::sync::broadcast::Receiver<platform::db::SmsMessage>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(sms) => crate::api::handlers::publish_sms_to_trunk(&app, &sms).await,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "Modem MT SMS receiver lagged");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+/// Deactivate every DATA bearer before the process exits.
+///
+/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
+/// namespace and releases the retained QMI client. Every other caller is either
+/// an API handler or the reconcile path that reacts to a SIM going away, so
+/// before this existed a normal `systemctl restart simadmin` never ran it at
+/// all: the netdev stayed in the namespace, the next process re-attached to that
+/// same namespace, and the data interface was invisible to a resolver that only
+/// enumerates the host. See
+/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
+/// up after the cases this cannot cover (SIGKILL, power loss).
+///
+/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
+/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
+/// fatal: the startup reclaim recovers whatever is left behind.
+async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+    let lines = line_registry.all().await;
+    if lines.is_empty() {
+        return;
+    }
+
+    let released = tokio::time::timeout(BUDGET, async {
+        for line in lines {
+            let line_id = line.binding().line_id;
+            if line.secondary_data.interface().await.is_none() {
+                continue;
+            }
+            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
+            line.secondary_data.stop().await;
+        }
+    })
+    .await;
+
+    if released.is_err() {
+        warn!(
+            timeout_s = BUDGET.as_secs(),
+            "DATA bearer release did not finish before the shutdown budget; \
+             the next start will reclaim any netdev left in a namespace"
+        );
+    }
+}
+
+/// 绑定端口，如果被占用则轮询等待
+fn display_bind_addr(host: &str, port: u16) -> String {
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
+async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let normalized_host = host.trim_matches(|c| c == '[' || c == ']');
+    if normalized_host == "::" {
+        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+        socket.set_reuse_address(true)?;
+        socket.set_only_v6(false)?;
+        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
+        socket.listen(1024)?;
+        socket.set_nonblocking(true)?;
+        let listener: std::net::TcpListener = socket.into();
+        return tokio::net::TcpListener::from_std(listener);
+    }
+
+    tokio::net::TcpListener::bind((normalized_host, port)).await
+}
+
+async fn bind_with_retry(
+    host: &str,
+    port: u16,
+    max_retries: u32,
+) -> Result<tokio::net::TcpListener> {
+    use std::time::Duration;
+    let addr = display_bind_addr(host, port);
+
+    for i in 0..max_retries {
+        match bind_listener(host, port).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => {
+                if i == 0 {
+                    warn!(addr = %addr, "Port busy, waiting for release...");
+                }
+                if i + 1 < max_retries {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    return Err(anyhow::anyhow!("Failed to bind to {}: {}", addr, e));
+                }
+            }
+        }
+    }
+    unreachable!()
+}
+
+/// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
+///
+/// Firing `controller` is what lets the drain finish at all. Axum waits for
+/// in-flight responses, and the SSE stream at `/api/events` never ends on its
+/// own, so an open browser tab would otherwise hold the drain until the
+/// watchdog below force-exits -- skipping the session teardown that returns
+/// DATA netdevs to the host namespace.
+async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("Failed to install Ctrl+C signal handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("Failed to install SIGTERM signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+
+    warn!("Shutdown signal received; starting graceful shutdown");
+    // Before the watchdog, so long-lived responses get the whole window to end.
+    controller.trigger();
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
+        std::process::exit(0);
+    });
+}
+
+#[cfg(test)]
+mod udev_rule_tests {
+    use super::secondary_qmi_udev_rules;
+
+    /// The two rules live in different subsystems and getting that wrong is
+    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
+    /// loads, does nothing, and the interface stays available to ModemManager.
+    #[test]
+    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert_eq!(rules.len(), 2, "{rules:?}");
+
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
+
+        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
+
+        for rule in &rules {
+            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
+        }
+    }
+
+    /// Reserving the data interface is the whole point of the second rule:
+    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
+    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
+    /// with CallFailed / PolicyMismatch.
+    #[test]
+    fn the_data_interface_is_reserved_whenever_one_is_known() {
+        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
+        assert!(
+            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
+            "the netdev must be hidden, not just the control port: {rules:?}"
+        );
+    }
+
+    /// A platform may expose the control port without a paired interface.
+    /// Emitting a rule with an empty KERNEL== would match everything in the
+    /// `net` subsystem and hide every interface on the host.
+    #[test]
+    fn no_netdev_means_no_net_rule_at_all() {
+        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
+        assert_eq!(rules.len(), 1, "{rules:?}");
+        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
+            "{rules:?}"
+        );
+        assert!(
+            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
+            "an empty KERNEL== would match every net device: {rules:?}"
+        );
+    }
+
+    /// Port names are per-platform, so nothing may be hardcoded: the same
+    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
+    #[test]
+    fn rules_follow_the_observed_names() {
+        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
+        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
+        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
+    }
+}
+
+/// Assemble the HTTP router: public routes, then the authenticated
+/// routes merged in behind `auth_middleware`, then state, CORS and the
+/// SPA fallback.
+///
+/// Extracted from `main` so a test can build the real router. Nothing here
+/// is conditional on having booted: given an `AppState` and a `CorsLayer`
+/// it returns exactly the router the binary serves.
+fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
     let protected_routes = Router::new()
         .route(
             "/api/events",
@@ -2003,333 +2344,5 @@ async fn main() -> Result<()> {
         .layer(cors)
         .fallback(spa_fallback);
 
-    // Start server - 显示版权信息
-    info!(
-        version = env!("APP_VERSION"),
-        branch = env!("GIT_BRANCH"),
-        commit = env!("GIT_COMMIT"),
-        "SimAdmin - Debian SIM Management Service"
-    );
-    info!("Copyright © 2026 GitHub 3899 - SimAdmin");
-
-    // 绑定端口，如果被占用则轮询等待（最多 30 秒）
-    let listener = bind_with_retry(&args.host, args.port, 30).await?;
-    info!(addr = %bind_addr, "Server listening");
-    // 使用优雅关闭
-    axum::serve(listener, app)
-        .with_graceful_shutdown(wait_for_shutdown_signal(shutdown_controller))
-        .await?;
-
-    // Only reached once the drain completes, which is what the shutdown signal
-    // above makes possible. Releasing the data sessions here is what keeps the
-    // DATA netdev from being left inside a UE namespace.
-    release_data_sessions(&shutdown_registry).await;
-
-    // Exit explicitly rather than returning. Returning drops the tokio runtime,
-    // and that drop blocks until every `spawn_blocking` task has finished --
-    // but several of them never finish by design. `spawn_tun_reader` is the
-    // clearest: it re-checks its shutdown flag only at the top of its loop and
-    // otherwise parks in a blocking `read()` on the IMS TUN fd, so once the
-    // flag is set it still waits for a packet that may never arrive.
-    //
-    // That drop, not the drain, is what held the process for the full 8s
-    // watchdog on the device: the drain finished in 8ms and the bearers were
-    // released 155ms in, after which the log went completely silent until the
-    // watchdog called `exit`. Everything that has to outlive the process has
-    // already happened by this point, so exiting here is deliberate rather
-    // than a shortcut -- and it demotes the watchdog to the backstop it was
-    // meant to be.
-    info!("Shutdown complete; exiting");
-    std::process::exit(0);
-}
-
-/// Bridge SIP MESSAGE requests received by each line's Asterisk trunk into the
-/// existing SMS sender, and forward VoLTE MT SMS toward the trunk as SIP
-/// MESSAGE. Both directions are deliberately independent from the voice event
-/// stream so SMS cannot affect call state or media routing.
-fn spawn_trunk_sms_bridge(app: AppState) {
-    tokio::spawn(async move {
-        let mut attached = HashMap::<String, tokio::task::JoinHandle<()>>::new();
-        loop {
-            for line in app.line_registry.all().await {
-                let line_id = line.binding().line_id;
-                if attached.contains_key(&line_id) {
-                    continue;
-                }
-                let mut requests = line.trunk.operator_link().subscribe_sms_requests();
-                let mut volte_mt = line.volte_live.subscribe_mt_sms();
-                let app_task = app.clone();
-                let attach_id = line_id.clone();
-                let handle = tokio::spawn(async move {
-                    loop {
-                        tokio::select! {
-                            maybe = requests.recv() => {
-                                match maybe {
-                                    Ok(request) => {
-                                        let profile = app_task.config_manager.get_line_profile(&attach_id);
-                                        let target = if request.to.trim().is_empty() {
-                                            request.from.clone()
-                                        } else {
-                                            request.to.clone()
-                                        };
-                                        if let Err(error) = crate::api::handlers::send_sms_on_line_with_vowifi_only(
-                                            &app_task,
-                                            &attach_id,
-                                            &target,
-                                            &request.body,
-                                            profile.trunk.vowifi_only,
-                                        )
-                                        .await
-                                        {
-                                            tracing::warn!(line_id = %attach_id, error = %error, "Trunk SIP MESSAGE SMS send failed");
-                                        }
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                        tracing::warn!(line_id = %attach_id, skipped, "Trunk SMS receiver lagged");
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                            maybe = volte_mt.recv() => {
-                                match maybe {
-                                    Ok(sms) => {
-                                        crate::api::handlers::publish_sms_to_trunk(&app_task, &sms).await;
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                                        tracing::warn!(line_id = %attach_id, skipped, "VoLTE MT SMS receiver lagged");
-                                    }
-                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                        }
-                    }
-                });
-                attached.insert(line_id, handle);
-            }
-            attached.retain(|_, handle| !handle.is_finished());
-            tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-        }
-    });
-}
-
-/// Forward ModemManager (CS) MT SMS toward each line's Asterisk trunk as SIP
-/// MESSAGE. The listener itself runs before AppState exists, so this task owns
-/// the broadcast receiver and publishes once the app state is available.
-fn spawn_modem_mt_sms_bridge(
-    app: AppState,
-    mut rx: tokio::sync::broadcast::Receiver<platform::db::SmsMessage>,
-) {
-    tokio::spawn(async move {
-        loop {
-            match rx.recv().await {
-                Ok(sms) => crate::api::handlers::publish_sms_to_trunk(&app, &sms).await,
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::warn!(skipped, "Modem MT SMS receiver lagged");
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
-}
-
-/// Deactivate every DATA bearer before the process exits.
-///
-/// `SecondaryDataRuntime::stop` is what moves the DATA netdev back out of the UE
-/// namespace and releases the retained QMI client. Every other caller is either
-/// an API handler or the reconcile path that reacts to a SIM going away, so
-/// before this existed a normal `systemctl restart simadmin` never ran it at
-/// all: the netdev stayed in the namespace, the next process re-attached to that
-/// same namespace, and the data interface was invisible to a resolver that only
-/// enumerates the host. See
-/// [`crate::platform::netns::reclaim_all_stranded_hardware_links`], which cleans
-/// up after the cases this cannot cover (SIGKILL, power loss).
-///
-/// Bounded, because systemd's `TimeoutStopSec` is the next thing in line and a
-/// QMI deactivate can hang on a wedged baseband. Exceeding the bound is not
-/// fatal: the startup reclaim recovers whatever is left behind.
-async fn release_data_sessions(line_registry: &services::line_registry::LineRuntimeRegistry) {
-    const BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
-
-    let lines = line_registry.all().await;
-    if lines.is_empty() {
-        return;
-    }
-
-    let released = tokio::time::timeout(BUDGET, async {
-        for line in lines {
-            let line_id = line.binding().line_id;
-            if line.secondary_data.interface().await.is_none() {
-                continue;
-            }
-            info!(line_id = %line_id, "Releasing DATA bearer for shutdown");
-            line.secondary_data.stop().await;
-        }
-    })
-    .await;
-
-    if released.is_err() {
-        warn!(
-            timeout_s = BUDGET.as_secs(),
-            "DATA bearer release did not finish before the shutdown budget; \
-             the next start will reclaim any netdev left in a namespace"
-        );
-    }
-}
-
-/// 绑定端口，如果被占用则轮询等待
-fn display_bind_addr(host: &str, port: u16) -> String {
-    let host = host.trim_matches(|c| c == '[' || c == ']');
-    if host.contains(':') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-async fn bind_listener(host: &str, port: u16) -> std::io::Result<tokio::net::TcpListener> {
-    let normalized_host = host.trim_matches(|c| c == '[' || c == ']');
-    if normalized_host == "::" {
-        let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
-        socket.set_reuse_address(true)?;
-        socket.set_only_v6(false)?;
-        socket.bind(&SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), port).into())?;
-        socket.listen(1024)?;
-        socket.set_nonblocking(true)?;
-        let listener: std::net::TcpListener = socket.into();
-        return tokio::net::TcpListener::from_std(listener);
-    }
-
-    tokio::net::TcpListener::bind((normalized_host, port)).await
-}
-
-async fn bind_with_retry(
-    host: &str,
-    port: u16,
-    max_retries: u32,
-) -> Result<tokio::net::TcpListener> {
-    use std::time::Duration;
-    let addr = display_bind_addr(host, port);
-
-    for i in 0..max_retries {
-        match bind_listener(host, port).await {
-            Ok(listener) => return Ok(listener),
-            Err(e) => {
-                if i == 0 {
-                    warn!(addr = %addr, "Port busy, waiting for release...");
-                }
-                if i + 1 < max_retries {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                } else {
-                    return Err(anyhow::anyhow!("Failed to bind to {}: {}", addr, e));
-                }
-            }
-        }
-    }
-    unreachable!()
-}
-
-/// 监听 Ctrl+C 和 SIGTERM 信号，用于优雅关闭
-///
-/// Firing `controller` is what lets the drain finish at all. Axum waits for
-/// in-flight responses, and the SSE stream at `/api/events` never ends on its
-/// own, so an open browser tab would otherwise hold the drain until the
-/// watchdog below force-exits -- skipping the session teardown that returns
-/// DATA netdevs to the host namespace.
-async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownController) {
-    use tokio::signal;
-
-    let ctrl_c = async {
-        signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C signal handler");
-    };
-
-    #[cfg(unix)]
-    let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("Failed to install SIGTERM signal handler")
-            .recv()
-            .await;
-    };
-
-    #[cfg(not(unix))]
-    let terminate = std::future::pending::<()>();
-
-    tokio::select! {
-        _ = ctrl_c => {},
-        _ = terminate => {},
-    }
-
-    warn!("Shutdown signal received; starting graceful shutdown");
-    // Before the watchdog, so long-lived responses get the whole window to end.
-    controller.trigger();
-    std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_secs(8));
-        eprintln!("SimAdmin graceful shutdown exceeded 8s; forcing process exit");
-        std::process::exit(0);
-    });
-}
-
-#[cfg(test)]
-mod udev_rule_tests {
-    use super::secondary_qmi_udev_rules;
-
-    /// The two rules live in different subsystems and getting that wrong is
-    /// silent: a `net` device never matches `SUBSYSTEM=="wwan"`, so the rule
-    /// loads, does nothing, and the interface stays available to ModemManager.
-    #[test]
-    fn the_control_port_and_the_netdev_use_their_own_subsystems() {
-        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
-        assert_eq!(rules.len(), 2, "{rules:?}");
-
-        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
-        assert!(rules[0].contains(r#"KERNEL=="wwan0at2""#), "{rules:?}");
-
-        assert!(rules[1].contains(r#"SUBSYSTEM=="net""#), "{rules:?}");
-        assert!(rules[1].contains(r#"KERNEL=="wwan1""#), "{rules:?}");
-
-        for rule in &rules {
-            assert!(rule.contains(r#"ENV{ID_MM_PORT_IGNORE}="1""#), "{rule}");
-        }
-    }
-
-    /// Reserving the data interface is the whole point of the second rule:
-    /// ModemManager tags it ID_MM_CANDIDATE=1 and was observed binding its own
-    /// `ims` APN bearer to wwan1, after which every DATA6 activation failed
-    /// with CallFailed / PolicyMismatch.
-    #[test]
-    fn the_data_interface_is_reserved_whenever_one_is_known() {
-        let rules = secondary_qmi_udev_rules("wwan0at2", Some("wwan1"));
-        assert!(
-            rules.iter().any(|rule| rule.contains(r#"KERNEL=="wwan1""#)),
-            "the netdev must be hidden, not just the control port: {rules:?}"
-        );
-    }
-
-    /// A platform may expose the control port without a paired interface.
-    /// Emitting a rule with an empty KERNEL== would match everything in the
-    /// `net` subsystem and hide every interface on the host.
-    #[test]
-    fn no_netdev_means_no_net_rule_at_all() {
-        let rules = secondary_qmi_udev_rules("wwan0qmi1", None);
-        assert_eq!(rules.len(), 1, "{rules:?}");
-        assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
-        assert!(
-            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
-            "{rules:?}"
-        );
-        assert!(
-            !rules.iter().any(|rule| rule.contains(r#"KERNEL=="""#)),
-            "an empty KERNEL== would match every net device: {rules:?}"
-        );
-    }
-
-    /// Port names are per-platform, so nothing may be hardcoded: the same
-    /// channel surfaces as wwan0at2 here and wwan0qmi1 elsewhere.
-    #[test]
-    fn rules_follow_the_observed_names() {
-        let rules = secondary_qmi_udev_rules("wwan3qmi7", Some("wwan9"));
-        assert!(rules[0].contains(r#"KERNEL=="wwan3qmi7""#), "{rules:?}");
-        assert!(rules[1].contains(r#"KERNEL=="wwan9""#), "{rules:?}");
-    }
+    app
 }
