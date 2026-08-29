@@ -2493,7 +2493,7 @@ pub async fn get_network_info_for_modem(
         .get("OperatorCode")
         .map(extract_string)
         .unwrap_or_default();
-    let (mcc, mnc) = if operator_code.len() >= 5 {
+    let (mut mcc, mut mnc) = if operator_code.len() >= 5 {
         (
             Some(operator_code[..3].to_string()),
             Some(operator_code[3..].to_string()),
@@ -2501,6 +2501,36 @@ pub async fn get_network_info_for_modem(
     } else {
         (None, None)
     };
+
+    // Fall back to QMI when ModemManager has no 3GPP operator code. Without a
+    // serving PLMN `ServingAccessSnapshot::new` refuses to build, so the IMS
+    // access context stays empty and PANI drops to the profile's static
+    // template -- even though the modem knows the answer. Cell identity already
+    // prefers QMI (`get_cells_data_for_modem`); this closes the same gap for the
+    // PLMN. A failure here is not fatal: the caller still gets the ModemManager
+    // view, which is what it would have had anyway.
+    if mcc.is_none() || mnc.is_none() {
+        match get_serving_system_qmicli(conn, modem_path).await {
+            Ok(serving) => {
+                if let (Some(qmi_mcc), Some(qmi_mnc)) = (&serving.mcc, &serving.mnc) {
+                    tracing::debug!(
+                        modem_path = %modem_path,
+                        registration = %serving.registration_status,
+                        "Recovered the serving PLMN from QMI after ModemManager reported none"
+                    );
+                    mcc = Some(qmi_mcc.clone());
+                    mnc = Some(qmi_mnc.clone());
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    modem_path = %modem_path,
+                    error = %error,
+                    "QMI serving-system fallback did not yield a PLMN"
+                );
+            }
+        }
+    }
 
     let signal_strength = modem_props
         .get("SignalQuality")
@@ -2601,6 +2631,137 @@ fn value_after_colon(line: &str) -> Option<String> {
             .unwrap_or_default()
             .to_string(),
     )
+}
+
+/// Serving registration facts read straight from QMI NAS.
+///
+/// Only what the IMS access context needs. `tac` is the LTE tracking area code,
+/// never the 2G/3G location area code, and `cell_id` is the serving global cell
+/// id.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QmiServingSystem {
+    pub registration_status: String,
+    pub mcc: Option<String>,
+    pub mnc: Option<String>,
+    pub technology: String,
+    pub roaming: bool,
+    pub tac: u32,
+    pub cell_id: u64,
+}
+
+/// Parse `qmicli --nas-get-serving-system`.
+///
+/// Two details in this output are easy to get wrong, and both were confirmed
+/// against a QCM410 on Maxis (MCC 502 / MNC 12) rather than assumed:
+///
+/// 1. **MCC/MNC appear twice** — under `Current PLMN:` and again under
+///    `Full operator code info:`. A parser that matches `MCC:` anywhere takes
+///    whichever came last. Only the `Current PLMN:` block is the serving PLMN,
+///    so the search is scoped to it.
+/// 2. **There are two area codes.** `3GPP location area code` is the 2G/3G LAC
+///    and reads `65534` (0xFFFE, the "not applicable" sentinel) on an LTE-only
+///    attach; the real value is `LTE tracking area code`. Taking the former
+///    would put a sentinel into PANI, which is worse than sending no header.
+///
+/// Values are quoted, so `'502'` is stripped to `502`. An unparseable or absent
+/// field is left at its default and the caller decides -- this returns what it
+/// could read, never a fabricated cell identity.
+fn parse_qmicli_serving_system_output(output: &str) -> QmiServingSystem {
+    /// Strip `Label: 'value'` down to `value`, if this line is that label.
+    fn quoted_value<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+        let rest = line.trim().strip_prefix(label)?.trim_start();
+        let rest = rest.strip_prefix(':')?.trim();
+        Some(rest.trim_matches('\''))
+    }
+
+    #[derive(PartialEq, Eq)]
+    enum Block {
+        Other,
+        CurrentPlmn,
+    }
+
+    let mut serving = QmiServingSystem::default();
+    let mut block = Block::Other;
+    let mut expect_radio_interface = false;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+
+        // Block headers carry no value and end with ':'.
+        if trimmed == "Current PLMN:" {
+            block = Block::CurrentPlmn;
+            continue;
+        }
+        if trimmed.ends_with(':') && !trimmed.contains('\'') {
+            block = Block::Other;
+            // `Radio interfaces: '1'` has a value, so it is not caught here; the
+            // list entry that follows it is `[0]: 'lte'`.
+            continue;
+        }
+
+        if let Some(value) = quoted_value(trimmed, "Registration state") {
+            serving.registration_status = value.to_string();
+            continue;
+        }
+        if let Some(value) = quoted_value(trimmed, "Roaming status") {
+            // A per-RAT `Roaming indicators` list repeats this; the scalar wins.
+            serving.roaming = value.eq_ignore_ascii_case("on");
+            continue;
+        }
+        if quoted_value(trimmed, "Radio interfaces").is_some() {
+            expect_radio_interface = true;
+            continue;
+        }
+        if expect_radio_interface {
+            if let Some(value) = quoted_value(trimmed, "[0]") {
+                serving.technology = value.to_ascii_lowercase();
+                expect_radio_interface = false;
+                continue;
+            }
+            expect_radio_interface = false;
+        }
+        if block == Block::CurrentPlmn {
+            if let Some(value) = quoted_value(trimmed, "MCC") {
+                serving.mcc = Some(value.to_string());
+                continue;
+            }
+            if let Some(value) = quoted_value(trimmed, "MNC") {
+                serving.mnc = Some(value.to_string());
+                continue;
+            }
+        }
+        // LTE TAC only. The 3GPP location area code is deliberately ignored.
+        if let Some(value) = quoted_value(trimmed, "LTE tracking area code") {
+            if let Ok(tac) = value.parse::<u32>() {
+                serving.tac = tac;
+            }
+            continue;
+        }
+        if let Some(value) = quoted_value(trimmed, "3GPP cell ID") {
+            if let Ok(cell_id) = value.parse::<u64>() {
+                serving.cell_id = cell_id;
+            }
+        }
+    }
+
+    serving
+}
+
+/// Read the serving system over QMI.
+///
+/// A fallback for when ModemManager's 3GPP properties are unavailable: without
+/// a serving PLMN `ServingAccessSnapshot::new` refuses to build, so PANI falls
+/// back to the profile's static template even though the modem knows the answer.
+pub async fn get_serving_system_qmicli(
+    conn: &Connection,
+    modem_path: &str,
+) -> Result<QmiServingSystem, String> {
+    let device = qmi_control_device(conn, modem_path)
+        .await
+        .ok_or_else(|| "No QMI control port found".to_string())?;
+    let output =
+        run_recovery_command("qmicli", &["-p", "-d", &device, "--nas-get-serving-system"]).await?;
+    Ok(parse_qmicli_serving_system_output(&output))
 }
 
 fn qmicli_lte_band_label(line: &str) -> String {
@@ -3508,6 +3669,122 @@ LTE Timing Advance: 'unavailable'"#;
             unsupported,
             vec!["LTE B8".to_string(), "NR n78".to_string()]
         );
+    }
+
+    /// Captured verbatim from a QCM410 on Maxis via
+    /// `qmicli -p -d /dev/wwan0qmi0 --nas-get-serving-system` (2026-08-29).
+    ///
+    /// A hand-written fixture would be worthless here: this parser's whole job
+    /// is matching libqmi's exact labels and indentation, so the fixture has to
+    /// come from a real device or the test only proves it agrees with itself.
+    const QCM410_SERVING_SYSTEM: &str = "\
+[/dev/wwan0qmi0] Successfully got serving system:
+\tRegistration state: 'registered'
+\tCS: 'attached'
+\tPS: 'attached'
+\tSelected network: '3gpp'
+\tRadio interfaces: '1'
+\t\t[0]: 'lte'
+\tRoaming status: 'off'
+\tData service capabilities: '1'
+\t\t[0]: 'lte'
+\tCurrent PLMN:
+\t\tMCC: '502'
+\t\tMNC: '12'
+\t\tDescription: 'MY MAXIS'
+\tRoaming indicators: '1'
+\t\t[0]: 'off' (lte)
+\t3GPP time zone offset: '480' minutes
+\t3GPP daylight saving time adjustment: '0' hours
+\t3GPP location area code: '65534'
+\t3GPP cell ID: '55281991'
+\tDetailed status:
+\t\tStatus: 'available'
+\t\tCapability: 'cs-ps'
+\t\tHDR Status: 'none'
+\t\tHDR Hybrid: 'no'
+\t\tForbidden: 'no'
+\tLTE tracking area code: '15102'
+\tFull operator code info:
+\t\tMCC: '502'
+\t\tMNC: '12'
+\t\tMNC with PCS digit: 'no'
+";
+
+    #[test]
+    fn parses_real_qmi_serving_system_output() {
+        let serving = parse_qmicli_serving_system_output(QCM410_SERVING_SYSTEM);
+
+        assert_eq!(serving.registration_status, "registered");
+        assert_eq!(serving.mcc.as_deref(), Some("502"));
+        assert_eq!(serving.mnc.as_deref(), Some("12"));
+        assert_eq!(serving.technology, "lte");
+        assert!(!serving.roaming);
+
+        // The LTE tracking area code, not the 3GPP location area code, which
+        // reads 65534 (0xFFFE, "not applicable") on this attach. Getting this
+        // wrong would put a sentinel into PANI.
+        assert_eq!(serving.tac, 15102);
+        assert_ne!(
+            serving.tac, 65534,
+            "the 2G/3G LAC must never be used as TAC"
+        );
+
+        assert_eq!(serving.cell_id, 55_281_991);
+    }
+
+    /// The serving PLMN must come from `Current PLMN:`, not from the
+    /// `Full operator code info:` block that repeats MCC/MNC further down. Both
+    /// read 502/12 on the captured device, so change the second block to prove
+    /// the parser is scoped rather than picking whichever came last.
+    #[test]
+    fn serving_plmn_comes_from_the_current_plmn_block_only() {
+        let output = QCM410_SERVING_SYSTEM.replace(
+            "\tFull operator code info:\n\t\tMCC: '502'\n\t\tMNC: '12'",
+            "\tFull operator code info:\n\t\tMCC: '999'\n\t\tMNC: '99'",
+        );
+        assert!(output.contains("'999'"), "fixture edit must apply");
+
+        let serving = parse_qmicli_serving_system_output(&output);
+
+        assert_eq!(serving.mcc.as_deref(), Some("502"));
+        assert_eq!(serving.mnc.as_deref(), Some("12"));
+    }
+
+    /// A modem with no service must yield no cell identity rather than zeros
+    /// that look like a real cell. `ServingAccessSnapshot::new` rejects a zero
+    /// cell id, so the two layers agree.
+    #[test]
+    fn unregistered_serving_system_yields_no_identity() {
+        let output = "\
+[/dev/wwan0qmi0] Successfully got serving system:
+\tRegistration state: 'not-registered'
+\tSelected network: 'unknown'
+\tRoaming status: 'off'
+";
+        let serving = parse_qmicli_serving_system_output(output);
+
+        assert_eq!(serving.registration_status, "not-registered");
+        assert_eq!(serving.mcc, None);
+        assert_eq!(serving.mnc, None);
+        assert_eq!(serving.tac, 0);
+        assert_eq!(serving.cell_id, 0);
+    }
+
+    /// Roaming is read from the scalar `Roaming status`, not from the per-RAT
+    /// `Roaming indicators` list that follows it.
+    #[test]
+    fn roaming_status_is_read_from_the_scalar_field() {
+        let output = QCM410_SERVING_SYSTEM
+            .replace("\tRoaming status: 'off'", "\tRoaming status: 'on'")
+            .replace("\t\t[0]: 'off' (lte)", "\t\t[0]: 'on' (lte)");
+
+        let serving = parse_qmicli_serving_system_output(&output);
+
+        assert!(serving.roaming);
+        // The indicator list must not have clobbered the technology read from
+        // the `Radio interfaces` list earlier in the output.
+        assert_eq!(serving.technology, "lte");
     }
 }
 
