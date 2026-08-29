@@ -9,6 +9,7 @@
     "build:full": "pnpm lint && tsc -b && vite build",
     "lint": "eslint . --max-warnings 0",
     "lint:fix": "eslint . --fix",
+    "test:e2e": "playwright test",
     "preview": "vite preview",
     "type-check": "tsc -b --noEmit"
   },
@@ -26,6 +27,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",
+    "@playwright/test": "1.62.1",
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.2",
     "@types/react-dom": "^19.2.2",

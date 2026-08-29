@@ -1008,6 +1008,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Button
                           size="small"
                           variant="text"
+                          // A line card carries several buttons labelled 配置
+                          // (data proxy, VoLTE, VoWiFi, trunk). The test id
+                          // names this one so a browser test cannot pick the
+                          // wrong one and act on it.
+                          data-testid="volte-profile-config"
                           onClick={() => setEditingVolteProfileLineId(line.modem.line_id)}
                           disabled={savingKey !== null}
                         >

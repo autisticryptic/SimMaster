@@ -27,3 +27,10 @@ dist-ssr
 .env
 .env.local
 .env.production
+
+# Playwright output: run artifacts, traces and screenshots, plus the browser
+# binaries it installs outside the repo.
+test-results/
+playwright-report/
+blob-report/
+playwright/.cache/
