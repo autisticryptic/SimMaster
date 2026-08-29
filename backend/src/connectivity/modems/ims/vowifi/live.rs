@@ -468,6 +468,19 @@ fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<I
     candidates
 }
 
+/// Build the resolver attempts in priority order. The final `None` attempt is
+/// intentional: it delegates to the platform resolver after every explicit
+/// line/profile DNS server has failed, so a stale custom DNS setting cannot
+/// make ePDG discovery permanently fail when ordinary DNS still works.
+fn live_dns_attempts(line_id: &str, profile: &'static CarrierProfile) -> Vec<Option<IpAddr>> {
+    let mut attempts = live_dns_candidates(line_id, profile)
+        .into_iter()
+        .map(Some)
+        .collect::<Vec<_>>();
+    attempts.push(None);
+    attempts
+}
+
 async fn resolve_live_epdg(
     line_id: &str,
     profile: &'static CarrierProfile,
@@ -483,15 +496,10 @@ async fn resolve_live_epdg(
     // and operator DNS interception on the ePDG name is bypassed. With no proxy
     // configured the query goes out directly to the configured server.
     let proxy = overrides.proxy;
-    // An empty candidate list means "no explicit server": a single `None`
-    // attempt lets the resolver layer fall back to the system resolver.
-    let mut candidates: Vec<Option<IpAddr>> = live_dns_candidates(line_id, profile)
-        .into_iter()
-        .map(Some)
-        .collect();
-    if candidates.is_empty() {
-        candidates.push(None);
-    }
+    // Always try the platform resolver last, even when explicit DNS servers
+    // were configured. This preserves the documented custom -> profile ->
+    // system fallback chain.
+    let candidates = live_dns_attempts(line_id, profile);
     let mut last_error = None;
     for dns_server in candidates {
         let attempt = match &proxy {
@@ -8560,6 +8568,26 @@ mod tests {
             LiveNetworkStageAdapter::for_line("line-b", MockEpdgAdapter, MockDatagramAdapter);
 
         assert_eq!(adapter.line_id, "line-b");
+    }
+
+    #[test]
+    fn live_dns_attempts_end_with_system_resolver_fallback() {
+        let line_id = "line-vowifi-dns-system-fallback";
+        let config = LineVowifiConfig::default();
+        let sim_override = SimOverride {
+            ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
+                dns: Some(vec!["192.0.2.1".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        configure_live_network_overrides(line_id, &config, Some(&sim_override))
+            .expect("publish DNS override");
+        let attempts = live_dns_attempts(line_id, &GB_EE_23433);
+        assert_eq!(attempts.first(), Some(&Some("192.0.2.1".parse().unwrap())));
+        assert_eq!(attempts.last(), Some(&None));
+        forget_live_network_overrides(line_id);
     }
 
     #[test]

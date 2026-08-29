@@ -422,4 +422,7 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - [x] 后端定向测试：`effective_profile::tests` 16 passed。
 - [x] 后端 VoWiFi live 定向测试：69 passed。
 - [x] 前端 `pnpm type-check`、`pnpm lint` 和 `pnpm build:full` 通过（2026-08-29）。
-- [ ] 真实设备/运营商网络验证：确认指定 DNS 能解析 ePDG，并完成后续 IKEv2 建链和 VoWiFi 注册。
+- [x] 410 实机确认 `ims_vowifi.dns` 可持久化，配置 `1.1.1.1`、`8.8.8.8` 后 ePDG 解析阶段达到 `epdg_ready`（2026-08-29）。
+- [x] 410 实机故障注入确认运行时确实使用线路级 DNS：配置不可达的 `192.0.2.1` 后日志记录该地址并返回 ePDG DNS 超时（2026-08-29）。
+- [ ] 真实设备/运营商网络完整验收：指定 DNS 已能解析 ePDG，但当前 `50212` 派生 profile 在后续 IKE/IMS REGISTER 阶段收到网络 `400/421`，尚未完成 IKEv2、Child SA、ESP 和 VoWiFi 注册闭环。
+  - 说明：本项不能仅因 `epdg_ready` 勾选；需要可用 carrier profile 或运营商允许的真实 VoWiFi 参数后重新验收。
