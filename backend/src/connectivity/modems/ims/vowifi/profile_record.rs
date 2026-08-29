@@ -1484,4 +1484,54 @@ mod tests {
         record.ikev2.ike_proposals.clear();
         assert_eq!(record.validate().unwrap_err(), "ike_proposals_required");
     }
+
+    /// A carrier bundle's explicit `omit` reaches this record as `false`. Four
+    /// of these switches carry `#[serde(default = "default_true")]`, so any
+    /// layer that drops the field on the way through — an export/import round
+    /// trip, a partial patch, a hand-edited row — turns the operator's "do not
+    /// send" back into "send". Serialising and reparsing must keep every one of
+    /// them false, and must not disturb the rest of the record.
+    #[test]
+    fn omitted_register_switches_survive_a_json_round_trip() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.include_pani_initial = false;
+        record.ims.register.include_pani_authenticated = false;
+        record.ims.register.include_route_header = false;
+        record.ims.register.include_p_preferred_identity = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.enable_cellular_network_info = false;
+        record.ims.register.require_sec_agree_headers = false;
+        record.ims.register.proxy_require_sec_agree_headers = false;
+        record.ims.register.sec_agree_mode = "disabled".to_string();
+
+        let json = serde_json::to_string(&record).expect("serialize omit record");
+        let parsed: CarrierProfileRecord =
+            serde_json::from_str(&json).expect("deserialize omit record");
+        let register = &parsed.ims.register;
+
+        assert!(!register.include_pani_initial);
+        assert!(!register.include_pani_authenticated);
+        assert!(!register.include_route_header);
+        assert!(!register.include_p_preferred_identity);
+        assert!(!register.always_add_sip_instance);
+        assert!(!register.enable_cellular_network_info);
+        assert!(!register.require_sec_agree_headers);
+        assert!(!register.proxy_require_sec_agree_headers);
+        assert_eq!(register.sec_agree_mode, "disabled");
+
+        // `disabled` suppresses the RFC 3329 offer at the live layer, but the
+        // mechanism list is still data and must round-trip unchanged so an
+        // operator can flip the mode back without re-entering it.
+        assert_eq!(
+            register.security_client_mechanisms,
+            GB_EE_23433
+                .ims
+                .register
+                .security_client_mechanisms
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(parsed, record);
+    }
 }

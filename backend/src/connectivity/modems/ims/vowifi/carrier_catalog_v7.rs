@@ -1245,9 +1245,9 @@ fn project_register(
         _ => matches!(access, CatalogAccessKind::LteEpc),
     };
     let include_pani_initial =
-        bool_at_or_omit(register, "/include_pani_initial").unwrap_or(baseline_includes_pani);
+        bool_at_or_omit(register, "/include_pani_initial")?.unwrap_or(baseline_includes_pani);
     let include_pani_authenticated =
-        bool_at_or_omit(register, "/include_pani_authenticated").unwrap_or(baseline_includes_pani);
+        bool_at_or_omit(register, "/include_pani_authenticated")?.unwrap_or(baseline_includes_pani);
     let pani = string_at(register, "/access_network_info")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_access_network_info"))
         .transpose()?
@@ -1257,15 +1257,10 @@ fn project_register(
             CatalogAccessKind::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
             CatalogAccessKind::WifiEpdg => AccessIdentityPolicy::Static,
         });
-    let enable_cellular_network_info = bool_at_or_omit(
-        register,
-        "/enable_cellular_network_info",
-    )
-    .unwrap_or(false);
+    let enable_cellular_network_info =
+        bool_at_or_omit(register, "/enable_cellular_network_info")?.unwrap_or(false);
     let cellular_network_info = string_at(register, "/cellular_network_info")
-        .map(|value| {
-            expand_ims_static_template(value, meta, domain, "sip_cellular_network_info")
-        })
+        .map(|value| expand_ims_static_template(value, meta, domain, "sip_cellular_network_info"))
         .transpose()?;
     let cni_identity_policy = access_identity_policy_at(register, "/cni_identity_policy")?
         .unwrap_or(if enable_cellular_network_info {
@@ -1319,9 +1314,9 @@ fn project_register(
             .unwrap_or("none")
             .to_string(),
         include_mmtel_features,
-        include_route_header: bool_at_or_omit(register, "/include_route_header").unwrap_or(false),
+        include_route_header: bool_at_or_omit(register, "/include_route_header")?.unwrap_or(false),
         include_visited_network: visited_network_header.is_some(),
-        include_p_preferred_identity: bool_at_or_omit(register, "/include_p_preferred_identity")
+        include_p_preferred_identity: bool_at_or_omit(register, "/include_p_preferred_identity")?
             .unwrap_or(true),
         visited_network_header,
         allow_methods: string_array_or_csv(register, "/allow_methods")
@@ -1330,15 +1325,15 @@ fn project_register(
         enable_initial_reject_fallback: bool_at_or_omit(
             register,
             "/enable_initial_reject_fallback",
-        )
+        )?
         .unwrap_or(false),
         use_plain_digest_placeholder: false,
-        require_sec_agree_headers: bool_at_or_omit(register, "/require_sec_agree_headers")
+        require_sec_agree_headers: bool_at_or_omit(register, "/require_sec_agree_headers")?
             .unwrap_or(false),
         proxy_require_sec_agree_headers: bool_at_or_omit(
             register,
             "/proxy_require_sec_agree_headers",
-        )
+        )?
         .unwrap_or(false),
         sec_agree_mode,
         security_client_mechanisms: security_client,
@@ -1356,7 +1351,7 @@ fn project_register(
         // Stable flow identity is part of the generic registration baseline.
         // CNI is conditionally applicable and may disclose serving-cell data;
         // only an explicit carrier/database policy enables it.
-        always_add_sip_instance: bool_at_or_omit(register, "/always_add_sip_instance")
+        always_add_sip_instance: bool_at_or_omit(register, "/always_add_sip_instance")?
             .unwrap_or(true),
         enable_cellular_network_info,
         temporary_status_codes: u16_array_at(register, "/temporary_status_codes")
@@ -1526,15 +1521,26 @@ fn access_identity_policy_at(
 /// `Some(false)` and its default no longer kicks in, while a missing field
 /// still returns `None` so the baseline default applies.  `"true"`/`"false"`
 /// strings are accepted as well for bundles that store booleans as text.
-fn bool_at_or_omit(value: &Value, pointer: &str) -> Option<bool> {
+///
+/// An unrecognised value is an error, not a `None`.  Returning `None` would
+/// hand the decision back to the caller's baseline, so a bundle saying `"no"`
+/// or `"disabled"` — plainly meaning "do not send" — would enable a header
+/// whose default is `true`, silently and on the registration path.  A bad
+/// value is a bundle authoring mistake and must be visible.
+fn bool_at_or_omit(value: &Value, pointer: &str) -> Result<Option<bool>, String> {
     match value.pointer(pointer) {
-        Some(Value::Bool(flag)) => Some(*flag),
-        Some(Value::String(text)) => match text.to_ascii_lowercase().as_str() {
-            "true" => Some(true),
-            "false" | "omit" => Some(false),
-            _ => None,
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(flag)) => Ok(Some(*flag)),
+        Some(Value::String(text)) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(Some(true)),
+            "false" | "omit" => Ok(Some(false)),
+            other => Err(format!(
+                "carrier_catalog_register_bool_invalid:{pointer}:{other}"
+            )),
         },
-        _ => None,
+        Some(other) => Err(format!(
+            "carrier_catalog_register_bool_invalid:{pointer}:{other}"
+        )),
     }
 }
 
@@ -2212,6 +2218,94 @@ mod tests {
             ["hmac-sha-1-96/aes-cbc/esp/trans"]
         );
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    /// A tri-state switch only has three legal spellings: `true`, `false` and
+    /// `omit`.  Anything else used to return `None`, which handed the decision
+    /// to the caller's baseline — so a bundle saying `"no"` enabled a header
+    /// whose default is `true`.  The projection must refuse the row instead.
+    #[test]
+    fn wrongly_typed_register_switch_is_rejected_instead_of_defaulting() {
+        for (bad_value, expected_fragment) in [
+            ("'no'", "no"),
+            ("'yes'", "yes"),
+            ("'disabled'", "disabled"),
+            ("1", "1"),
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture for mutation");
+                conn.execute_batch(&format!(
+                    "UPDATE carrier_profiles
+                        SET config_json = json_set(
+                            config_json,
+                            '$.sip.common.register.always_add_sip_instance',
+                            {bad_value}
+                        )
+                      WHERE profile_id = 'test-v7-23433';"
+                ))
+                .expect("write wrongly typed switch");
+            }
+
+            let error = catalog
+                .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+                .expect_err("a wrongly typed switch must not fall back to the default");
+            assert!(
+                error.contains("carrier_catalog_register_bool_invalid"),
+                "unexpected error for {bad_value}: {error}"
+            );
+            assert!(
+                error.contains("always_add_sip_instance"),
+                "error must name the offending pointer, got: {error}"
+            );
+            assert!(
+                error.contains(expected_fragment),
+                "error must quote the offending value, got: {error}"
+            );
+
+            std::fs::remove_file(path).expect("remove fixture");
+        }
+    }
+
+    /// `true`, `false` and `omit` all stay accepted, in both JSON-native and
+    /// string spellings, so tightening the error path above cannot reject a
+    /// bundle that was previously valid.
+    #[test]
+    fn legal_register_switch_spellings_are_all_still_accepted() {
+        for (value, expected) in [
+            ("json('true')", true),
+            ("json('false')", false),
+            ("'true'", true),
+            ("'false'", false),
+            ("'omit'", false),
+            ("'OMIT'", false),
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture for mutation");
+                conn.execute_batch(&format!(
+                    "UPDATE carrier_profiles
+                        SET config_json = json_set(
+                            config_json,
+                            '$.sip.common.register.always_add_sip_instance',
+                            {value}
+                        )
+                      WHERE profile_id = 'test-v7-23433';"
+                ))
+                .expect("write legal switch value");
+            }
+
+            let profile = catalog
+                .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+                .unwrap_or_else(|error| panic!("{value} must stay accepted, got: {error}"))
+                .unwrap_or_else(|| panic!("{value} must still resolve a profile"));
+            assert_eq!(
+                profile.record.ims.register.always_add_sip_instance, expected,
+                "{value} projected to the wrong boolean"
+            );
+
+            std::fs::remove_file(path).expect("remove fixture");
+        }
     }
 
     #[test]

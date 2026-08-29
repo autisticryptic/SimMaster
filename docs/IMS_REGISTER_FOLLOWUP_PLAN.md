@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1338 passed; 0 failed; 3 ignored（共 1341 个测试）。
-  - 完成日期：2026-08-29
+  - 结果：1342 passed; 0 failed; 3 ignored（共 1345 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 4 个测试。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -180,8 +180,15 @@
 
 catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需要确认从数据库到最终 SIP 报文的端到端一致性。
 
-- [ ] 列出所有支持三态的字段及其最终行为，形成唯一 schema 文档。
-- [ ] 检查 profile override、profile record、profile store 和配置导入导出是否保留 `omit`，不能在中途变为缺失值。
+- [x] 列出所有支持三态的字段及其最终行为，形成唯一 schema 文档。
+  - 位置：`docs/IMS_REGISTER_TRISTATE_SCHEMA.md`（2026-08-29）
+  - 内容：三态定义、取值解析规则、11 个字段的 baseline 与报文影响、`security_agreement`/`sec_agree_mode` 语义、四层链路图、回归测试对应表。
+- [x] 检查 profile record 的 JSON 往返是否保留 `omit`。
+  - 完成日期：2026-08-29
+  - 风险确认：`include_pani_initial`、`include_pani_authenticated`、`include_p_preferred_identity`、`always_add_sip_instance` 四个字段带 `#[serde(default = "default_true")]`，任何丢字段的中间层都会把 `false` 翻回 `true`。
+  - 测试：`profile_record::tests::omitted_register_switches_survive_a_json_round_trip`（九个开关 + `sec_agree_mode` + 机制列表 + 整体相等）。
+- [ ] 检查 profile override、profile store 和配置导入导出路径是否保留 `omit`。
+  - record 层已覆盖；override/store/导入导出这三条路径尚未单独断言。
 - [ ] 检查以下字段的端到端测试：
   - `security_agreement`
   - `include_pani_initial`
@@ -192,10 +199,22 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - `enable_cellular_network_info`
   - `require_sec_agree_headers`
   - `proxy_require_sec_agree_headers`
-- [ ] 明确 `security_client_mechanisms` 与 `sec_agree_mode=disabled` 的关系。
-  - 数据可以保留以便往返序列化，但 live layer 不得发送 Security-Client offer。
-- [ ] 增加最终 SIP 报文断言，不只验证中间 `RegisterPolicyRecord`。
-- [ ] 为错误类型值增加验证和诊断，避免无提示回落到默认行为。
+- [x] 明确 `security_client_mechanisms` 与 `sec_agree_mode=disabled` 的关系。
+  - 完成日期：2026-08-29；已写入 schema 文档第 3.1 节。
+  - 实现确认：机制列表保留在数据里用于往返；`vowifi/live.rs` 用 `sec_agree_mode != "disabled"` 同时门控 `security_client` 和 `security_verify`，所以列表非空不等于会发 offer。此行为本来就正确，本轮只是补上文档和断言。
+- [x] 增加最终 SIP 报文断言，不只验证中间 `RegisterPolicyRecord`。
+  - 完成日期：2026-08-29
+  - 测试：`volte::live::tests::omitted_register_switches_are_absent_from_the_built_request`。
+  - 覆盖：从 record 经 `intern()` → `register_variants()` → `build_register_from_profile_with_target_visited_and_access()` 生成真实报文字节；对候选阶梯每个 variant × Initial/Authenticated/Refresh 三个阶段，断言 `P-Access-Network-Info`、`Cellular-Network-Info`、`P-Preferred-Identity`、`Route`、`Security-Client`、`Security-Verify` 均不存在，`Require`/`Proxy-Require` 不含 `sec-agree`，`Contact` 不含 `+sip.instance`。
+  - 测试里刻意填入 P-CSCF 地址，避免 `Route` 断言空转。
+  - 附带结论：`include_route_header` 在 VoLTE 侧本来就生效（`volte/sip.rs` 的 `policy.include_route_header`，由 `register_variants()` 从 profile 拷入），不存在 VoLTE 忽略该字段的问题，无需改三态。
+- [x] 为错误类型值增加验证和诊断，避免无提示回落到默认行为。
+  - 完成日期：2026-08-29
+  - 缺陷：`bool_at_or_omit()` 旧实现对无法识别的值返回 `None`，等于把决定权交回调用方 baseline。于是 bundle 写 `"no"`、`"disabled"`、`1` 这类值时，默认值为 `true` 的头会被静默打开，且发生在注册路径上。
+  - 修复：返回类型改为 `Result<Option<bool>, String>`，非法值返回 `carrier_catalog_register_bool_invalid:<pointer>:<value>` 并拒绝整行 profile；九个调用点全部用 `?` 传播。
+  - 位置：`backend/src/connectivity/modems/ims/vowifi/carrier_catalog_v7.rs`
+  - 测试：`wrongly_typed_register_switch_is_rejected_instead_of_defaulting`（`"no"`/`"yes"`/`"disabled"`/`1` 四种，断言错误里含 pointer 和原值）、`legal_register_switch_spellings_are_all_still_accepted`（`true`/`false`/`"true"`/`"false"`/`"omit"`/`"OMIT"` 六种仍可用，确保收紧不误伤既有 bundle）。
+  - `access_identity_policy_at()` 本来就对非法值报错，无需修改。
 
 ## 8. 尚未实现：VoNR/5G IMS 实际链路
 

@@ -6885,6 +6885,115 @@ mod tests {
             .all(|variant| variant.label != "generic_ims_register_no_instance"));
     }
 
+    /// Prove an explicit carrier `omit` reaches the wire, not just the policy.
+    ///
+    /// The existing coverage stops at `RegisterPolicyRecord` (catalog v7) and at
+    /// `RegisterRequestPolicy` (`register_fallback_never_reenables_...`). This
+    /// walks the whole chain a real registration uses — record → `intern()` →
+    /// `register_variants()` → REGISTER bytes — and asserts the headers are
+    /// absent from the built request in every phase, for every variant the
+    /// fallback ladder would try.
+    #[test]
+    fn omitted_register_switches_are_absent_from_the_built_request() {
+        use crate::connectivity::core::context::{ImsIdentity, ImsRoute, SipTransport};
+        use crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord;
+
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        // A distinct id: `intern()` caches per profile_id and other tests in
+        // this binary intern the unmodified GB_EE_23433.
+        record.meta.profile_id = "test-omit-e2e-23433".to_string();
+        record.ims.register.include_pani_initial = false;
+        record.ims.register.include_pani_authenticated = false;
+        record.ims.register.include_route_header = false;
+        record.ims.register.include_p_preferred_identity = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.enable_cellular_network_info = false;
+        record.ims.register.require_sec_agree_headers = false;
+        record.ims.register.proxy_require_sec_agree_headers = false;
+        record.ims.register.sec_agree_mode = "disabled".to_string();
+        record.validate().expect("omit record must stay valid");
+
+        let profile = record.intern();
+        let identity = ImsIdentity {
+            private_user: "310410123456789@ims.mnc410.mcc310.3gppnetwork.org".to_string(),
+            public_uri: "sip:+15551230000@ims.mnc410.mcc310.3gppnetwork.org".to_string(),
+            contact_user: "+15551230000".to_string(),
+            home_domain: "ims.mnc410.mcc310.3gppnetwork.org".to_string(),
+            contact_user_phone: true,
+        };
+        // A P-CSCF address is present on purpose: Route is only suppressed by
+        // the profile switch, so a test without one would pass vacuously.
+        let route = ImsRoute {
+            local_addr: "10.0.0.2:5060".parse().expect("local addr"),
+            pcscf_addr: "10.0.0.1:5060".parse().expect("pcscf addr"),
+            transport: SipTransport::Udp,
+        };
+
+        let variants = register_variants(profile);
+        assert!(
+            !variants.is_empty(),
+            "the ladder must offer at least one variant"
+        );
+
+        for variant in &variants {
+            for phase in [
+                sip::RegisterPhase::Initial,
+                sip::RegisterPhase::Authenticated,
+                sip::RegisterPhase::Refresh,
+            ] {
+                let frame = sip::build_register_from_profile_with_target_visited_and_access(
+                    profile,
+                    sip::RegisterTarget::from_profile(profile),
+                    phase,
+                    &identity,
+                    &route,
+                    &sip::RequestIds::fresh(1),
+                    profile.ims.register.expires_seconds,
+                    None,
+                    None,
+                    None,
+                    "urn:uuid:test-omit-e2e",
+                    variant.policy,
+                    None,
+                    None,
+                );
+                let text = String::from_utf8_lossy(&frame);
+                let label = variant.label;
+                let where_ = format!("variant {label}, phase {phase:?}");
+
+                for header in [
+                    "P-Access-Network-Info",
+                    "Cellular-Network-Info",
+                    "P-Preferred-Identity",
+                    "Route",
+                    "Security-Client",
+                    "Security-Verify",
+                ] {
+                    assert_eq!(
+                        sip::header_value(&frame, header),
+                        None,
+                        "{header} must be absent ({where_}) in:\n{text}"
+                    );
+                }
+
+                for header in ["Require", "Proxy-Require"] {
+                    let value = sip::header_value(&frame, header).unwrap_or_default();
+                    assert!(
+                        !value.contains("sec-agree"),
+                        "{header} must not require sec-agree ({where_}), got {value:?}"
+                    );
+                }
+
+                let contact = sip::header_value(&frame, "Contact")
+                    .unwrap_or_else(|| panic!("Contact is mandatory ({where_})"));
+                assert!(
+                    !contact.contains("+sip.instance"),
+                    "Contact must not carry +sip.instance ({where_}), got {contact:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn derived_profile_register_variants_do_not_originate_visited_network() {
         let profile =
