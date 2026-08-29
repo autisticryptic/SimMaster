@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1346 passed; 0 failed; 3 ignored（共 1349 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试。
+  - 结果：1350 passed; 0 failed; 3 ignored（共 1353 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 4 个 HTTP 集成测试。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -473,7 +473,22 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - [ ] 真实 bearer/QMI endpoint、AT CID、xfrm/IPsec、P-CSCF reporting 和 IMS profile lease 释放的集成测试。
 - [x] API helper 的 GET/PUT payload、校验、离线保存、在线重启和跨线路隔离。
   - 测试：`api::handlers::tests::volte_profile_selection_*`。
-- [ ] 完整 HTTP/AppState API 集成测试。
+- [x] HTTP/AppState API 集成测试基础设施与首批用例。
+  - 完成日期：2026-08-29
+  - 前置改造：把 `main()` 里内联的 733 行 router 抽成 `build_router(app_state, cors) -> Router`，逐行核对与 HEAD 一致，161 条路由数量不变。这是此前"测试无法构造真实 router"的唯一障碍。
+  - 新增 `main.rs` 的 `http_router_tests` 模块，构造**仓库首个 `main()` 之外的 `AppState`**：十五个依赖全部按 `main` 的方式真实构造（database、overrides、config manager、carrier catalog、line registry、eSIM supervisor、notification sender、diagnostic log、event bus、event emitter、SMS resync、DDNS、E911、shutdown channel），落在用完即删的临时文件上，没有任何 stub。
+  - 请求走真实 ephemeral 端口的 TCP socket，不用 `tower::ServiceExt::oneshot`（`tower` 只是传递依赖），因此同时覆盖 `axum::serve` 和 router 之外的 layer。
+  - 四个用例：`/api/health` 免认证可达；四个不同子系统的受保护路由被 auth layer 拒绝；`spa_fallback` 两个分支被区分；受保护路由的 preflight 成功且带 CORS 头。
+  - 两处刻意设计：受保护路由除断言 401 外还断言错误体，因为端点改名后会返回 404，只断言状态码会因错误原因通过——写这批测试时正是这条断言抓出了三个不存在的路径；SPA 用例断言响应体而非状态码，因为测试检出没有前端产物，两个分支都会 404。
+  - D-Bus 处理：`Connection::system()` 认 `DBUS_SYSTEM_BUS_ADDRESS`，所以 session bus 可以顶替：
+    ```bash
+    dbus-run-session -- env DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+      cargo test --bin simadmin http_router
+    ```
+    无 bus 时每个用例带警告跳过而不是失败，保证无 D-Bus 机器上 `cargo test` 仍为绿。
+- [ ] 扩大 HTTP 集成测试覆盖面：登录后的读写、VoLTE profile-selection 端到端、错误码矩阵。
+  - 基础设施已就位，可直接复用 `build_test_router()`、`serve()`、`send()` 逐个端点补。
+  - 注意：测试环境没有 modem 线路，凡校验 `line_id` 的端点都会拒绝，所以这类用例应断言错误码，happy path 留到实机验收。
 - [x] 前端 TypeScript 类型检查、lint 和 production build。
   - 完成日期：2026-08-29；已执行 `pnpm type-check`、`pnpm lint`、`pnpm build:full`。
 - [ ] 浏览器级 VoLTE Profile 对话框交互测试。
@@ -485,7 +500,7 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - 定向测试：`register::tests` 23、`volte::sip::tests` 36、`volte::live::tests` 53、`carrier_catalog::v7::tests` 12、`volte::channel::tests` 4、`core::access::tests` 3 均通过；`vowifi::channel::tests` 6 passed、1 ignored。
 - `git diff --check` 通过。
 - 前端：`pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过。
-- 仍缺：完整 HTTP/AppState 集成测试、真实 bearer/QMI/xfrm/P-CSCF/profile lease 资源释放集成测试、浏览器 E2E，以及第 14.8 节真实设备/网络验收。
+- 仍缺：真实 bearer/QMI/xfrm/P-CSCF/profile lease 资源释放集成测试、浏览器 E2E，以及第 14.8 节真实设备/网络验收。HTTP/AppState 集成测试的基础设施和首批用例已于 2026-08-29 完成（见上），剩下的是逐端点扩大覆盖面。
 
 ### 14.8 实机验收
 
