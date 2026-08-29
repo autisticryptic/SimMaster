@@ -2390,8 +2390,13 @@ mod http_router_tests {
     }
 
     /// Files backing one test's state, removed on drop.
+    ///
+    /// `config_manager` is kept so a test can register a line without hardware:
+    /// `reconcile_line_profiles` creates a config entry, and the profile-selection
+    /// handler accepts a line that exists in config even when no modem is bound.
     struct TempState {
         router: Router,
+        config_manager: Arc<ConfigManager>,
         paths: Vec<PathBuf>,
     }
 
@@ -2431,6 +2436,7 @@ mod http_router_tests {
             ConfigManager::try_new(config_path, Arc::clone(&app_db))
                 .expect("create test config manager"),
         );
+        let config_manager_for_test = Arc::clone(&config_manager);
         let carrier_catalog = Arc::new(
             connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::at_path(
                 &catalog_path,
@@ -2493,6 +2499,7 @@ mod http_router_tests {
 
         Some(TempState {
             router: build_router(app_state, cors),
+            config_manager: config_manager_for_test,
             paths,
         })
     }
@@ -2766,6 +2773,169 @@ mod http_router_tests {
              this test pins. If the handler became presence-aware, update it: \
              {resolved}"
         );
+    }
+
+    /// The profile-selection PUT error matrix, over HTTP.
+    ///
+    /// Section 14.6 lists the codes this endpoint must produce. A test machine
+    /// has no modem, but the handler accepts a line that exists in config even
+    /// with nothing bound, so `reconcile_line_profiles` unlocks every validation
+    /// error without hardware. Only the happy path needs a real line, because
+    /// saving starts a connection batch.
+    #[tokio::test]
+    async fn profile_selection_put_reports_each_validation_error() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        // `line-` plus 32 hex digits is the only accepted shape.
+        let line_id = format!("line-{:032x}", 0x5eaf00du64);
+        let unknown_id = format!("line-{:032x}", 0xdeadbeefu64);
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .expect("register a config-only line");
+
+        let three_valid = serde_json::json!({
+            "attempts": [
+                { "source": "database" },
+                { "source": "carrier_catalog" },
+                { "source": "derived" },
+            ]
+        });
+
+        // An unknown line is refused before any policy is stored, so a typo
+        // cannot leave a selection nobody reads.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{unknown_id}/profile-selection"),
+            three_valid.clone(),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert!(body.contains("line_not_found"), "{body}");
+
+        // Exactly three slots. The three-slot shape is the policy, so a shorter
+        // list must not be silently padded.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({ "attempts": [{ "source": "database" }] }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("volte_profile_attempt_count_invalid"),
+            "{body}"
+        );
+
+        // `derived` is computed from the SIM's home PLMN, so pinning an id in
+        // that slot is a contradiction rather than a preference.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "derived", "profile_id": "some-profile" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.contains("volte_derived_profile_id_not_allowed"),
+            "{body}"
+        );
+
+        // An explicit id that does not exist in the named source is refused,
+        // and the error names the source so a same-id row in the other origin
+        // cannot be mistaken for a match.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "database", "profile_id": "no-such-profile" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("volte_profile_not_found_in_source"), "{body}");
+        assert!(
+            body.contains("database"),
+            "the error must name the source it searched: {body}"
+        );
+
+        // An unrecognised source must be rejected, not defaulted.
+        let (status, body) = put_json(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            serde_json::json!({
+                "attempts": [
+                    { "source": "not_a_source" },
+                    { "source": "carrier_catalog" },
+                    { "source": "derived" },
+                ]
+            }),
+            &cookie,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "an unknown source must be refused: {body}"
+        );
+    }
+
+    /// GET profile-selection must answer for a config-only line, so the dialog
+    /// can be opened before a modem is present, and must still refuse an
+    /// unknown line.
+    #[tokio::test]
+    async fn profile_selection_get_answers_for_a_config_only_line() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        let line_id = format!("line-{:032x}", 0xc0ffeeu64);
+        let unknown_id = format!("line-{:032x}", 0xbadf00du64);
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .expect("register a config-only line");
+
+        let (status, body) = get_with_cookie(
+            &served,
+            &format!("/api/volte/lines/{line_id}/profile-selection"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The three ordered slots are the contract the dialog renders.
+        assert!(
+            body.contains("attempts"),
+            "the response must carry the candidate slots: {body}"
+        );
+
+        let (status, body) = get_with_cookie(
+            &served,
+            &format!("/api/volte/lines/{unknown_id}/profile-selection"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     }
 
     /// `/api/health` is public and must answer before any login. This is the
