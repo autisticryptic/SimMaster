@@ -2576,6 +2576,30 @@ mod http_router_tests {
         (status, headers, text)
     }
 
+    /// PUT a JSON body with a session cookie.
+    async fn put_json(
+        served: &Served,
+        path: &str,
+        body: serde_json::Value,
+        cookie: &str,
+    ) -> (StatusCode, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .put(format!("{}{path}", served.base))
+            .header(reqwest::header::COOKIE, cookie)
+            .json(&body)
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let text = response.text().await.unwrap_or_default();
+        (status, text)
+    }
+
     /// GET with a session cookie.
     async fn get_with_cookie(served: &Served, path: &str, cookie: &str) -> (StatusCode, String) {
         let client = reqwest::Client::builder()
@@ -2675,6 +2699,72 @@ mod http_router_tests {
             status,
             StatusCode::UNAUTHORIZED,
             "a forged session must be refused, got {status}: {body}"
+        );
+    }
+
+    /// The partial-body exposure, at the boundary where it actually bites.
+    ///
+    /// `profile_record::tests::a_partial_api_body_silently_reenables_default_true_switches`
+    /// proves this at the serde layer. This proves it through the live endpoint:
+    /// a client that PUTs a record without the four switches whose serde default
+    /// is `true` cancels the operator's `omit` in stored state, because the
+    /// handler takes `Json<CarrierProfileRecord>` and never sees the raw body.
+    ///
+    /// Asserting today's behaviour on purpose. When the handler is made
+    /// presence-aware this test must fail, which is the point -- the API
+    /// contract change should be deliberate and visible, not silent.
+    #[tokio::test]
+    async fn a_partial_put_body_cancels_an_omit_through_the_live_endpoint() {
+        use crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord;
+        use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+        let cookie = authenticate(&served).await;
+
+        // Start from a valid record with the switch explicitly off. The
+        // profile_id and PLMN are left exactly as `from_profile` produced them,
+        // because validation cross-checks them.
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.always_add_sip_instance = false;
+        let profile_id = record.meta.profile_id.clone();
+        let plmn = record.meta.plmn.clone();
+
+        let mut body = serde_json::to_value(&record).expect("serialize record");
+        let register = body
+            .pointer_mut("/ims/register")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("register object");
+        register.remove("always_add_sip_instance");
+        assert!(!register.contains_key("always_add_sip_instance"));
+
+        let (status, response) =
+            put_json(&served, "/api/vowifi/carrier-profiles", body, &cookie).await;
+        assert!(
+            status.is_success(),
+            "a partial body is accepted today, got {status}: {response}"
+        );
+
+        // Read the stored projection back. `/resolve` returns the full record;
+        // the list endpoint only carries summaries.
+        let (status, resolved) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resolve must answer: {resolved}");
+        assert!(
+            resolved.contains(&profile_id),
+            "resolve must return the profile just stored: {resolved}"
+        );
+        assert!(
+            resolved.contains("\"always_add_sip_instance\":true"),
+            "the omitted switch is silently back on -- this is the exposure \
+             this test pins. If the handler became presence-aware, update it: \
+             {resolved}"
         );
     }
 
