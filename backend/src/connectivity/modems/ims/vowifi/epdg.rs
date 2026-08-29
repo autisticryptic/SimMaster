@@ -98,7 +98,7 @@ pub async fn resolve_epdg_with_dns_override(
     profile: &'static super::profiles::CarrierProfileMeta,
     host: &str,
     port: u16,
-    dns_server: Option<IpAddr>,
+    dns_server: Option<SocketAddr>,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
     let Some(dns_server) = dns_server else {
         return SystemDnsResolver.resolve_epdg(profile, host, port).await;
@@ -142,7 +142,7 @@ pub async fn resolve_epdg_via_socks5(
     profile: &'static super::profiles::CarrierProfileMeta,
     host: &str,
     port: u16,
-    dns_server: Option<IpAddr>,
+    dns_server: Option<SocketAddr>,
     proxy: &super::socks5::Socks5Endpoint,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
     let Some(dns_server) = dns_server else {
@@ -151,12 +151,12 @@ pub async fn resolve_epdg_via_socks5(
     };
 
     let client =
-        super::socks5::Socks5UdpClient::connect(proxy, dns_server, PROXY_DNS_CONNECT_TIMEOUT)
+        super::socks5::Socks5UdpClient::connect(proxy, dns_server.ip(), PROXY_DNS_CONNECT_TIMEOUT)
             .await
             .map_err(|error| TransportError::UnsupportedProxy(error.to_string()))?
             .with_recv_timeout(FALLBACK_DNS_TIMEOUT);
 
-    let server = SocketAddr::new(dns_server, 53);
+    let server = dns_server;
     let mut addresses = Vec::new();
     let mut last_error = None;
     for qtype in [1u16, 28u16] {
@@ -232,7 +232,7 @@ async fn resolve_epdg_via_dns_fallback(
         .unwrap_or_else(|| TransportError::DnsFailed("empty_fallback_answer".to_string())))
 }
 
-fn candidate_dns_servers() -> Vec<IpAddr> {
+fn candidate_dns_servers() -> Vec<SocketAddr> {
     let mut servers = std::fs::read_to_string("/etc/resolv.conf")
         .unwrap_or_default()
         .lines()
@@ -240,30 +240,35 @@ fn candidate_dns_servers() -> Vec<IpAddr> {
         .filter(|line| line.starts_with("nameserver"))
         .filter_map(|line| line.split_whitespace().nth(1))
         .filter_map(|value| value.parse::<IpAddr>().ok())
+        .map(|ip| SocketAddr::new(ip, 53))
         .collect::<Vec<_>>();
-    servers.extend(PUBLIC_DNS_FALLBACKS.iter().copied());
+    servers.extend(
+        PUBLIC_DNS_FALLBACKS
+            .iter()
+            .copied()
+            .map(|ip| SocketAddr::new(ip, 53)),
+    );
     servers.sort();
     servers.dedup();
     servers
 }
 
 async fn query_dns_records(
-    dns_server: IpAddr,
+    dns_server: SocketAddr,
     host: &str,
     port: u16,
     qtype: u16,
 ) -> Result<Vec<SocketAddr>, TransportError> {
     let query = build_dns_query(host, qtype)?;
-    let bind_addr = match dns_server {
+    let bind_addr = match dns_server.ip() {
         IpAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
         IpAddr::V6(_) => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
     };
     let socket = UdpSocket::bind(bind_addr)
         .await
         .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-    let server = SocketAddr::new(dns_server, 53);
     socket
-        .send_to(&query, server)
+        .send_to(&query, dns_server)
         .await
         .map_err(|err| TransportError::Io(err.kind().to_string()))?;
 
@@ -497,5 +502,70 @@ mod tests {
         for forbidden in ["payload", "query", "imsi", "iccid", "key"] {
             assert!(!json.to_ascii_lowercase().contains(forbidden));
         }
+    }
+
+    /// A custom DNS port must actually be used. The resolver sends an A query
+    /// and an AAAA query, so the responder answers both: the A query with an
+    /// address, the AAAA query with an empty NOERROR. Answering both keeps the
+    /// test off the 2s `FALLBACK_DNS_TIMEOUT` path.
+    #[tokio::test]
+    async fn custom_dns_query_uses_the_configured_udp_port() {
+        // Bind an ephemeral port rather than port 53. If the implementation
+        // rebuilt the destination as `ip:53`, this responder would never
+        // receive the query and the test would fail on its deadline.
+        let responder = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind DNS responder");
+        let dns_server = responder.local_addr().expect("DNS responder address");
+        assert_ne!(dns_server.port(), 53);
+
+        let responder_task = tokio::spawn(async move {
+            let mut seen_qtypes = Vec::new();
+            for _ in 0..2 {
+                let mut request = vec![0u8; 512];
+                let (length, peer) =
+                    tokio::time::timeout(Duration::from_secs(5), responder.recv_from(&mut request))
+                        .await
+                        .expect("DNS query must arrive on the configured port")
+                        .expect("receive DNS query");
+                request.truncate(length);
+
+                // Transaction id is SimAdmin's fixed "SA" marker.
+                assert_eq!(&request[..2], b"SA");
+                let qtype =
+                    u16::from_be_bytes([request[request.len() - 4], request[request.len() - 3]]);
+                seen_qtypes.push(qtype);
+
+                let mut response = request;
+                response[2] = 0x81; // response, recursion desired
+                response[3] = 0x80; // recursion available, RCODE 0
+                if qtype == 1 {
+                    response[6..8].copy_from_slice(&1u16.to_be_bytes());
+                    response.extend_from_slice(&[
+                        0xc0, 0x0c, // answer name: pointer to the question name
+                        0x00, 0x01, // A
+                        0x00, 0x01, // IN
+                        0x00, 0x00, 0x00, 0x3c, // TTL
+                        0x00, 0x04, // IPv4 RDATA length
+                        192, 0, 2, 53,
+                    ]);
+                }
+                responder
+                    .send_to(&response, peer)
+                    .await
+                    .expect("send DNS response");
+            }
+            seen_qtypes
+        });
+
+        let endpoint =
+            resolve_epdg_with_dns_override(&GB_EE_23433.meta, "epdg.test", 4500, Some(dns_server))
+                .await
+                .expect("resolve through custom DNS port");
+
+        let seen_qtypes = responder_task.await.expect("DNS responder task");
+        assert_eq!(seen_qtypes, vec![1, 28]);
+        assert_eq!(endpoint.addresses, vec!["192.0.2.53:4500".parse().unwrap()]);
+        assert_eq!(endpoint.port, 4500);
     }
 }

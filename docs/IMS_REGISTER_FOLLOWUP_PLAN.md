@@ -108,9 +108,10 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1335 passed; 0 failed; 3 ignored。
+  - 结果：1338 passed; 0 failed; 3 ignored（共 1341 个测试）。
   - 完成日期：2026-08-29
-- [ ] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
+- [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
+  - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
 ## 5. 尚未实现：真实接入网络上下文
 
@@ -393,7 +394,7 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 
 **本轮自动验证记录（2026-08-29）：**
 
-- WSL Debian：`cargo test --bin simadmin -- --test-threads=1` 通过，结果为 `1335 passed; 0 failed; 3 ignored`。
+- WSL Debian：`cargo test --bin simadmin -- --test-threads=1` 通过，结果为 `1338 passed; 0 failed; 3 ignored`（含新增 DNS 自定义端口测试）。
 - WSL Debian：`cargo check --bin simadmin` 通过；仅有既有 dead-code warnings。
 - 定向测试：`register::tests` 23、`volte::sip::tests` 36、`volte::live::tests` 53、`carrier_catalog::v7::tests` 12、`volte::channel::tests` 4、`core::access::tests` 3 均通过；`vowifi::channel::tests` 6 passed、1 ignored。
 - `git diff --check` 通过。
@@ -424,5 +425,27 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - [x] 前端 `pnpm type-check`、`pnpm lint` 和 `pnpm build:full` 通过（2026-08-29）。
 - [x] 410 实机确认 `ims_vowifi.dns` 可持久化，配置 `1.1.1.1`、`8.8.8.8` 后 ePDG 解析阶段达到 `epdg_ready`（2026-08-29）。
 - [x] 410 实机故障注入确认运行时确实使用线路级 DNS：配置不可达的 `192.0.2.1` 后日志记录该地址并返回 ePDG DNS 超时（2026-08-29）。
+- [x] 显式 DNS 全部失败时追加系统 resolver 兜底：`live_dns_attempts()` 始终在“线路 DNS -> profile DNS”之后加入 `None`，由系统 resolver 接管；新增单元测试 `live_dns_attempts_end_with_system_resolver_fallback` 通过（2026-08-29）。
+  - 410 实机故障注入：临时将 ePDG host 设为 `localhost`、端口设为 `9`，仅配置不可达 `192.0.2.1`；日志记录自定义 DNS 超时但未产生最终 `epdg_dns_resolution_failed`，流程继续到 IKE 阶段，随后因测试端点失败而结束。该记录证明系统 resolver 兜底生效，但不代表运营商网络验收。
+- [x] v1.1.5 ARM64 制品已构建、校验并部署到 410（2026-08-29）。
+  - GitHub Actions Run `33236459920` 成功；制品 `aarch64-unknown-linux-musl`，commit `f44aac8`，SHA-256 已与 `SHA256SUMS.txt` 一致。
+  - `/api/health` 返回 `version: 1.1.5`；三个 systemd 服务/定时器均为 active；管理员密码登录验证成功（明文密码不写入文档）；既有 `data.db`、`config.sqlite3`、carrier 数据库和 `config.yaml` 均保留。
+  - 恢复后的 `ims_vowifi.dns` 仍为 `1.1.1.1`、`8.8.8.8`，重新连接后 ePDG/IKE/Child SA/ESP readiness 均达到 true；当前运营商仍在 IMS REGISTER 阶段返回 SIP `400`，所以完整 VoWiFi 注册仍未完成。
+- [x] 自定义 DNS 端口在运行时真正生效（2026-08-29，未提交）。
+  - 问题：前端和 `parse_dns_server` 都支持 `1.1.1.1:5353`、`[IPv6]:5353`，但 live 层调用 `parse_dns_server(...).ip()` 丢弃端口，`epdg.rs` 又用 `SocketAddr::new(dns_server, 53)` 重建目标，导致自定义端口被静默改回 53。
+  - 修复：DNS 候选类型由 `Vec<IpAddr>` 改为 `Vec<SocketAddr>`，贯穿 `live_dns_candidates()`、`live_dns_attempts()`、`resolve_epdg_with_dns_override()`、`resolve_epdg_via_socks5()` 和 `query_dns_records()`。
+    - 位置：`backend/src/connectivity/modems/ims/vowifi/live.rs`、`backend/src/connectivity/modems/ims/vowifi/epdg.rs`
+  - 系统 resolver 与公共 DNS 兜底显式构造为端口 53，行为不变。
+  - `live_epdg_settings()` 对外仍返回 `Option<IpAddr>`，既有 API 形状不变。
+  - SOCKS5 代理路径同样保留自定义端口：`query_dns_via_socks5()` 传入完整 `SocketAddr`，由 `encode_udp_datagram()` 写入 RFC 1928 §7 的 `DST.PORT`；既有测试 `encodes_ipv4_udp_request_header`、`encodes_ipv6_udp_request_header` 已覆盖任意端口编码。
+  - 新增测试：`connectivity::modems::ims::vowifi::epdg::tests::custom_dns_query_uses_the_configured_udp_port`。
+    - 用本地 UDP responder 绑定临时端口（断言不等于 53），同时应答 A 与 AAAA 查询，证明查询确实发到配置端口而不是 53。
+  - 自动测试：`vowifi::epdg::tests` 4 passed；完整后端 `cargo test --bin simadmin -- --test-threads=1` 结果 `1338 passed; 0 failed; 3 ignored`。
+  - 格式化：仅对本次修改的两个后端文件执行 `rustfmt`，`git diff --check` 无空白错误。
+- [x] 前端帮助文本明确端口有效：输入项标签改为“自定义 ePDG DNS（地址或地址:端口）”，helper text 说明 `IPv4:端口` / `[IPv6]:端口`，省略端口默认 53（2026-08-29，未提交）。
+  - 位置：`frontend/src/pages/sim/VowifiLineDialog.tsx`
+  - 自动测试：`pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过。
+- [ ] 410 实机验证自定义 DNS 端口：需在设备上配置 `ip:非 53 端口` 并抓包确认查询发往该端口。
+  - 本项尚未执行；当前仅有本地单元测试证据。
 - [ ] 真实设备/运营商网络完整验收：指定 DNS 已能解析 ePDG，但当前 `50212` 派生 profile 在后续 IKE/IMS REGISTER 阶段收到网络 `400/421`，尚未完成 IKEv2、Child SA、ESP 和 VoWiFi 注册闭环。
   - 说明：本项不能仅因 `epdg_ready` 勾选；需要可用 carrier profile 或运营商允许的真实 VoWiFi 参数后重新验收。

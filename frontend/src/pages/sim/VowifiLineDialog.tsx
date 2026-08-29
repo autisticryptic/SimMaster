@@ -209,14 +209,14 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
           </Stack>
           <TextField
             fullWidth
-            label="自定义 ePDG DNS"
+            label="自定义 ePDG DNS（地址或地址:端口）"
             value={dnsText}
             disabled={overrideLoading || !override}
             multiline
             minRows={2}
             maxRows={6}
-            placeholder={'1.1.1.1\n8.8.8.8\n2001:4860:4860::8888'}
-            helperText="每行一个 IPv4/IPv6 地址，按填写顺序依次尝试。留空则回退到运营商 profile DNS 或系统 DNS；修改后需重新连接 VoWiFi 生效"
+            placeholder={'1.1.1.1\n8.8.8.8:53\n[2001:4860:4860::8888]:5353'}
+            helperText="每行一个 DNS 服务器：IPv4/IPv6 地址，或 IPv4:端口 / [IPv6]:端口；省略端口默认 53，按填写顺序依次尝试。留空则回退到运营商 profile DNS 或系统 DNS；修改后需重新连接 VoWiFi 生效"
             onChange={(event) => setDnsText(event.target.value)}
           />
           <FormControl fullWidth>

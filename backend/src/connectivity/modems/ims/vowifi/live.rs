@@ -181,7 +181,7 @@ struct LiveNetworkOverrides {
     /// resolves the profile automatically from the SIM's IMSI. A pinned id is
     /// strict and must never be replaced by a standard-derived fallback.
     profile_id: Option<String>,
-    dns_servers: Vec<IpAddr>,
+    dns_servers: Vec<SocketAddr>,
     epdg_host: Option<String>,
     epdg_port: Option<u16>,
     epdg_apn: Option<String>,
@@ -281,7 +281,6 @@ fn build_live_network_overrides(
         .flatten()
         .map(|server| {
             super::profile_record::parse_dns_server(server)
-                .map(|server| server.ip())
                 .ok_or_else(|| "vowifi_dns_server_invalid".to_string())
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -435,14 +434,17 @@ fn live_epdg_settings(
             .epdg_host
             .unwrap_or_else(|| profile.epdg.host.to_string()),
         overrides.epdg_port.unwrap_or(profile.epdg.port),
-        live_dns_candidates(line_id, profile).into_iter().next(),
+        live_dns_candidates(line_id, profile)
+            .into_iter()
+            .next()
+            .map(|server| server.ip()),
     )
 }
 
 /// DNS servers to try, in order: this line's override first, then the carrier
 /// profile's list. Resolving the ePDG FQDN is a hard prerequisite for
 /// connecting at all, so a single unreachable resolver must not be fatal.
-fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<IpAddr> {
+fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<SocketAddr> {
     let mut candidates = Vec::new();
     for server in line_overrides(line_id).dns_servers {
         if !candidates.contains(&server) {
@@ -451,8 +453,8 @@ fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<I
     }
     for server in profile.epdg.dns_servers {
         if let Some(addr) = super::profile_record::parse_dns_server(server) {
-            if !candidates.contains(&addr.ip()) {
-                candidates.push(addr.ip());
+            if !candidates.contains(&addr) {
+                candidates.push(addr);
             }
         }
     }
@@ -461,8 +463,8 @@ fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<I
         .dns_server
         .and_then(|value| super::profile_record::parse_dns_server(value))
     {
-        if !candidates.contains(&server.ip()) {
-            candidates.push(server.ip());
+        if !candidates.contains(&server) {
+            candidates.push(server);
         }
     }
     candidates
@@ -472,7 +474,7 @@ fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<I
 /// intentional: it delegates to the platform resolver after every explicit
 /// line/profile DNS server has failed, so a stale custom DNS setting cannot
 /// make ePDG discovery permanently fail when ordinary DNS still works.
-fn live_dns_attempts(line_id: &str, profile: &'static CarrierProfile) -> Vec<Option<IpAddr>> {
+fn live_dns_attempts(line_id: &str, profile: &'static CarrierProfile) -> Vec<Option<SocketAddr>> {
     let mut attempts = live_dns_candidates(line_id, profile)
         .into_iter()
         .map(Some)
@@ -8585,7 +8587,10 @@ mod tests {
         configure_live_network_overrides(line_id, &config, Some(&sim_override))
             .expect("publish DNS override");
         let attempts = live_dns_attempts(line_id, &GB_EE_23433);
-        assert_eq!(attempts.first(), Some(&Some("192.0.2.1".parse().unwrap())));
+        assert_eq!(
+            attempts.first(),
+            Some(&Some("192.0.2.1:53".parse().unwrap()))
+        );
         assert_eq!(attempts.last(), Some(&None));
         forget_live_network_overrides(line_id);
     }
@@ -8595,7 +8600,7 @@ mod tests {
         let config = LineVowifiConfig::default();
         let sim_override = SimOverride {
             ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
-                dns: Some(vec!["2001:4860:4860::8888".to_string()]),
+                dns: Some(vec!["[2001:4860:4860::8888]:5353".to_string()]),
                 profile_id: Some("gb_ee_23433".to_string()),
                 domain: Some("ims.example".to_string()),
                 realm: Some("realm.example".to_string()),
@@ -8616,7 +8621,7 @@ mod tests {
         assert_eq!(overrides.profile_id.as_deref(), Some("gb_ee_23433"));
         assert_eq!(
             overrides.dns_servers,
-            vec!["2001:4860:4860::8888".parse::<IpAddr>().unwrap()]
+            vec!["[2001:4860:4860::8888]:5353".parse::<SocketAddr>().unwrap()]
         );
         assert_eq!(overrides.ims_domain.as_deref(), Some("ims.example"));
 
@@ -8778,14 +8783,14 @@ mod tests {
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            vec!["1.1.1.1"]
+            vec!["1.1.1.1:53"]
         );
         assert_eq!(
             my.dns_servers
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
-            vec!["8.8.8.8"]
+            vec!["8.8.8.8:53"]
         );
         // Only the Japanese line is proxied.
         assert!(jp.proxy.is_some());
