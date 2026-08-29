@@ -87,6 +87,12 @@ bundle config_json
 
 回归测试：`connectivity::modems::ims::vowifi::profile_record::tests::omitted_register_switches_survive_a_json_round_trip`。
 
+数据库加载路径是安全的：`from_database_json()` 先反序列化，再把**原始 JSON** 交给 `normalize_legacy_database_record()`，靠 presence 判断区分"缺失"和"authored false"。
+
+**但 HTTP 写入路径没有这个保护。** `PUT /api/vowifi/carrier-profiles` 以 `Json<CarrierProfileRecord>` 反序列化，拿不到原始 body，所以 body 省掉上面四个字段时它们会翻回 `true`。前端发送完整强类型记录，不会触发；第三方或手工 read-modify-write 会。已用 `a_partial_api_body_silently_reenables_default_true_switches` 固定当前行为。修复方向见 `IMS_REGISTER_FOLLOWUP_PLAN.md` 第 7 节。
+
+配置导入导出不受影响：`custom_carrier_profiles` 表不在 `CONFIG_TABLES` 导出范围内，二进制 restore 又是整表 `SELECT *` 原样复制。
+
 ## 5. 回归测试对应关系
 
 | 覆盖层 | 测试 |

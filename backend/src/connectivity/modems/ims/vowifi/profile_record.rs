@@ -1485,6 +1485,69 @@ mod tests {
         assert_eq!(record.validate().unwrap_err(), "ike_proposals_required");
     }
 
+    /// `PUT /api/vowifi/carrier-profiles` deserializes `Json<CarrierProfileRecord>`
+    /// straight into `ProfileStore::upsert`, with no access to the raw body. So
+    /// unlike `from_database_json`, it cannot tell an absent switch from an
+    /// authored `false`, and the four switches whose serde default is `true`
+    /// come back `true`.
+    ///
+    /// This is the API-shaped form of the hazard the plan calls "中途变为缺失值":
+    /// a client doing read-modify-write that drops these fields silently
+    /// re-enables headers the operator had omitted. Pin the current behaviour so
+    /// the exposure is visible and a fix is a deliberate, test-visible change.
+    #[test]
+    fn a_partial_api_body_silently_reenables_default_true_switches() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.include_pani_initial = false;
+        record.ims.register.include_pani_authenticated = false;
+        record.ims.register.include_p_preferred_identity = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.include_route_header = false;
+        record.ims.register.enable_cellular_network_info = false;
+
+        // Model a client that sends the record back without these fields.
+        let mut value = serde_json::to_value(&record).expect("serialize");
+        let register = value
+            .pointer_mut("/ims/register")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("register object");
+        for field in [
+            "include_pani_initial",
+            "include_pani_authenticated",
+            "include_p_preferred_identity",
+            "always_add_sip_instance",
+            "include_route_header",
+            "enable_cellular_network_info",
+        ] {
+            register.remove(field);
+        }
+
+        // This is the exact deserialization the axum handler performs.
+        let parsed: CarrierProfileRecord =
+            serde_json::from_value(value).expect("partial body still deserializes");
+        let round_tripped = &parsed.ims.register;
+
+        // The four with `default = "default_true"` flip back on. This is the
+        // exposure, asserted rather than assumed.
+        assert!(
+            round_tripped.include_pani_initial,
+            "absent include_pani_initial defaults back to true"
+        );
+        assert!(round_tripped.include_pani_authenticated);
+        assert!(round_tripped.include_p_preferred_identity);
+        assert!(round_tripped.always_add_sip_instance);
+
+        // The two defaulting to false happen to survive, but only by accident of
+        // their default matching the omit, not by presence-awareness.
+        assert!(!round_tripped.include_route_header);
+        assert!(!round_tripped.enable_cellular_network_info);
+
+        assert_ne!(
+            parsed, record,
+            "the record must differ, which is precisely the problem"
+        );
+    }
+
     /// The store's load path is `from_database_json`, which deserializes and
     /// then calls `normalize_legacy_database_record` with the *raw* JSON so it
     /// can tell an absent field from an authored `false`.

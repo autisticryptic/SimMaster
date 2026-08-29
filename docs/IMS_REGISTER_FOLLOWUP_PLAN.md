@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1345 passed; 0 failed; 3 ignored（共 1348 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 7 个测试。
+  - 结果：1346 passed; 0 failed; 3 ignored（共 1349 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -228,8 +228,22 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - override 解析产物是 `EffectiveImsProfile`，该结构只有 8 个字段且完全不含 register policy；`effective_register_target()` 进一步只取 domain/realm/registrar。
   - 报文构造时 header 策略来自 `&CarrierProfile`，寻址来自独立的 `RegisterTarget` 参数。所以 override 能改"发到哪里"，无法改"带哪些头"。
   - 测试：`volte::live::tests::a_sim_override_cannot_resurrect_an_omitted_register_header`。测试里 override 填了 domain/realm/registrar/pcscf 并**先断言这些覆写确实生效**，再断言六个被 omit 的头仍然不存在——避免 override 被忽略时测试空转。
-- [ ] 检查配置导入导出路径。
-  - 当前未发现 patch 语义的导入导出路径；若将来引入部分字段更新，必须重新评估丢字段风险。
+- [x] 检查配置导入导出路径。
+  - 完成日期：2026-08-29
+  - 配置导入导出是 CLI 路径，不是 HTTP：`simadmin config export` / `config import`，实现在 `backend/src/platform/config_maintenance.rs` 的 `export_json()` / `import_json()`。
+  - **这九个开关不在导出范围内。** `CONFIG_TABLES` 只有 `config_line_profiles`、`config_modem_slots`、`config_standalone_sim_slots`、`config_documents`，restore 时额外带 `ims_sim_overrides`。存放 REGISTER 开关的 `custom_carrier_profiles` 表根本不参与 JSON 导出，所以导出导入无法丢掉这些字段。
+  - 二进制 restore 路径（`restore_config_tables()`）用 `INSERT INTO {table} SELECT * FROM restore_source.{table}` 原样整表复制，`record_json` 逐字节保留。
+  - 导出确实包含 SIM override，但如上一项所述，`ImsAccessOverride` 不含 REGISTER 开关。
+- [x] 检查 HTTP 写入路径，并记录发现的暴露面。
+  - 完成日期：2026-08-29
+  - `PUT /api/vowifi/carrier-profiles`（`handlers.rs:8948`）直接以 `Json<CarrierProfileRecord>` 反序列化后交给 `ProfileStore::upsert()`。这条路径**拿不到原始 JSON**，因此和 `from_database_json()` 不同，无法区分"字段缺失"和"运营商写了 false"。
+  - 后果：body 里省掉 `include_pani_initial`、`include_pani_authenticated`、`include_p_preferred_identity`、`always_add_sip_instance` 时，serde 默认值把这四个开关翻回 `true`，运营商的 omit 被静默取消。`include_route_header` 和 `enable_cellular_network_info` 恰好因为默认值就是 `false` 而幸存，但这是巧合，不是 presence 判断。
+  - 当前实际风险有限：前端 `saveVowifiCarrierProfile(record: CarrierProfileRecord)` 发送完整的强类型记录，`CarrierProfileRecord` 是非 Partial 接口，所以自家 UI 不会触发。暴露面主要是第三方或手工调用 API 的 read-modify-write。
+  - 测试：`profile_record::tests::a_partial_api_body_silently_reenables_default_true_switches`，断言的是**当前行为**，让暴露面可见并可回归。
+- [ ] 决定是否修复 HTTP 部分 body 的暴露面。
+  - 建议修复方式：handler 改收 `Json<serde_json::Value>`，走 presence-aware 解析，body 缺少任一三态开关时直接报错并指名字段——与第 7 节第 6 项对 catalog bundle 非法值的处理方向一致（宁可报错，不要静默回落）。
+  - 这是 API 契约变更：目前省字段的客户端会从"静默得到错误行为"变成"收到明确错误"。需要产品决策，本轮未改。
+- [ ] 附带发现（不属于第 7 节，未处理）：前端 `current.ts:1172` 调用 `/vowifi/carrier-profiles/import`，但 `main.rs` 没有注册该路由，`aosp_apns`/`aosp_carrier_config`/`ipcc` 三种导入格式在后端没有实现。`contracts.ts` 的类型定义领先于实现。
 - [ ] 检查以下字段的端到端测试：
   - `security_agreement`
   - `include_pani_initial`
