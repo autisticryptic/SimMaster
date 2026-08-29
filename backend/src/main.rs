@@ -2346,3 +2346,315 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
 
     app
 }
+
+/// HTTP-level tests against the real router.
+///
+/// These need an `AppState`, which needs a D-Bus connection. `Connection::system`
+/// honours `DBUS_SYSTEM_BUS_ADDRESS`, so a session bus can stand in:
+///
+/// ```text
+/// dbus-run-session -- env DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS" \
+///   cargo test --bin simadmin http_router
+/// ```
+///
+/// Without a bus every test here skips rather than fails: a plain `cargo test`
+/// must stay green on a machine with no D-Bus, and CI does not run these.
+#[cfg(test)]
+mod http_router_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Distinct temp paths per test; several of these run in one process.
+    fn temp_path(tag: &str, extension: &str) -> PathBuf {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "simadmin-router-{tag}-{}-{nonce}-{seq}.{extension}",
+            std::process::id()
+        ))
+    }
+
+    /// Warn once, so a skipped run says why instead of looking like a pass.
+    fn note_missing_bus(error: &dyn std::fmt::Display) {
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!(
+                "skipping http_router_tests: no system D-Bus ({error}). \
+                 Run under `dbus-run-session` with DBUS_SYSTEM_BUS_ADDRESS set."
+            );
+        }
+    }
+
+    /// Files backing one test's state, removed on drop.
+    struct TempState {
+        router: Router,
+        paths: Vec<PathBuf>,
+    }
+
+    impl Drop for TempState {
+        fn drop(&mut self) {
+            for path in &self.paths {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    /// Build the real router over throwaway storage, or `None` with no bus.
+    ///
+    /// Every dependency is constructed exactly as `main` does. Nothing is
+    /// stubbed, so what the test exercises is the shipped wiring.
+    async fn build_test_router() -> Option<TempState> {
+        let dbus_conn = match zbus::Connection::system().await {
+            Ok(connection) => Arc::new(connection),
+            Err(error) => {
+                note_missing_bus(&error);
+                return None;
+            }
+        };
+
+        let db_path = temp_path("db", "db");
+        let config_path = temp_path("config", "yaml");
+        let catalog_path = temp_path("catalog", "sqlite3");
+        let paths = vec![db_path.clone(), config_path.clone(), catalog_path.clone()];
+
+        let app_db = Arc::new(Database::new(db_path).expect("create test database"));
+        let sim_overrides = Arc::new(
+            connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(
+                &app_db,
+            )),
+        );
+        let config_manager = Arc::new(
+            ConfigManager::try_new(config_path, Arc::clone(&app_db))
+                .expect("create test config manager"),
+        );
+        let carrier_catalog = Arc::new(
+            connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog::at_path(
+                &catalog_path,
+            ),
+        );
+        let cell_monitoring_active =
+            Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
+        let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
+            Arc::clone(&config_manager),
+            Arc::clone(&app_db),
+        ));
+        let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
+        let notification_sender = Arc::new(NotificationSender::new(
+            Arc::clone(&config_manager),
+            Arc::clone(&dbus_conn),
+            Arc::clone(&app_db),
+        ));
+        let diagnostic_log_sink =
+            services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
+        let event_bus = Arc::new(
+            AppEventBus::new(Arc::clone(&app_db))
+                .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+        );
+        let system_event_emitter = Arc::new(SystemEventEmitter::new(
+            Arc::clone(&notification_sender),
+            Arc::clone(&event_bus),
+        ));
+        let (sms_resync, _sms_resync_rx) = services::messaging::sms_listener::sms_resync_channel();
+        let ddns_manager = Arc::new(DdnsManager::new());
+        let e911 = Arc::new(services::e911::orchestrator::E911Orchestrator::new(
+            services::e911::state_store::E911StateStore::default(),
+            services::e911::registry::E911ProviderRegistry::default(),
+            Arc::new(services::e911::ts43::Ts43Transport::new()),
+        ));
+        let (_shutdown_controller, shutdown_signal) = platform::shutdown::channel();
+
+        let app_state = AppState::new(AppStateDependencies {
+            shutdown: shutdown_signal,
+            dbus_conn,
+            database: app_db,
+            config_manager,
+            diagnostic_log_sink,
+            notification_sender,
+            system_event_emitter,
+            event_bus,
+            ddns_manager,
+            esim_supervisor,
+            sms_resync,
+            line_registry,
+            cell_monitoring_active,
+            carrier_catalog,
+            sim_overrides,
+            e911,
+        });
+
+        let cors = CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any);
+
+        Some(TempState {
+            router: build_router(app_state, cors),
+            paths,
+        })
+    }
+
+    /// Serve the router on an ephemeral port for the duration of one test.
+    ///
+    /// A real socket rather than `tower::ServiceExt::oneshot`: `tower` is only a
+    /// transitive dependency, and going over TCP also covers `axum::serve` and
+    /// the layers outside the router, which is the point of an integration test.
+    struct Served {
+        base: String,
+        handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Served {
+        fn drop(&mut self) {
+            self.handle.abort();
+        }
+    }
+
+    async fn serve(router: Router) -> Served {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind ephemeral port");
+        let address = listener.local_addr().expect("listener address");
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Served {
+            base: format!("http://{address}"),
+            handle,
+        }
+    }
+
+    /// One request, returning status, headers and body.
+    async fn send(
+        served: &Served,
+        method: reqwest::Method,
+        path: &str,
+    ) -> (StatusCode, reqwest::header::HeaderMap, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            // A redirect would hide which status the router actually chose.
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .request(method, format!("{}{path}", served.base))
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let headers = response.headers().clone();
+        let body = response.text().await.unwrap_or_default();
+        (status, headers, body)
+    }
+
+    /// `/api/health` is public and must answer before any login. This is the
+    /// first test to exercise the assembled router over HTTP rather than
+    /// calling a handler directly.
+    #[tokio::test]
+    async fn health_is_reachable_without_authentication() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, _headers, body) = send(&served, reqwest::Method::GET, "/api/health").await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            body.contains("\"status\""),
+            "health payload should report a status: {body}"
+        );
+    }
+
+    /// The auth middleware is applied with `route_layer`, so it must guard the
+    /// protected routes while leaving the public ones alone. A regression here
+    /// would expose every device endpoint, and no test covered it.
+    #[tokio::test]
+    async fn protected_routes_reject_an_unauthenticated_request() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        // Three different subsystems, all registered without a path parameter
+        // so the request cannot 404 for an unrelated reason.
+        for uri in [
+            "/api/modems",
+            "/api/vowifi/carrier-profiles",
+            "/api/sms/list",
+            "/api/network/interfaces",
+        ] {
+            let (status, _headers, body) = send(&served, reqwest::Method::GET, uri).await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{uri} must not serve an unauthenticated caller, got {status}: {body}"
+            );
+            // A 404 here would mean the path never matched a route, so the
+            // assertion above would pass for the wrong reason on a renamed
+            // endpoint. Requiring the auth error body rules that out.
+            assert!(
+                body.contains("error"),
+                "{uri} must be refused by the auth layer, not fall through: {body}"
+            );
+        }
+    }
+
+    /// `spa_fallback` has two branches and picking the wrong one is silent: an
+    /// unmatched client route must be handed to the frontend, while an unmatched
+    /// `/api/` path must 404 rather than be answered with `index.html`.
+    ///
+    /// Both branches 404 in a test checkout, because `www/` holds no built
+    /// assets, so the status alone cannot tell them apart. Assert on the body,
+    /// which names the branch that ran.
+    #[tokio::test]
+    async fn unknown_paths_reach_the_spa_branch_but_unknown_api_paths_do_not() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (_status, _headers, body) =
+            send(&served, reqwest::Method::GET, "/some/client/route").await;
+        assert!(
+            body.contains("index.html"),
+            "a client route must reach the asset branch, got: {body}"
+        );
+
+        let (status, _headers, body) =
+            send(&served, reqwest::Method::GET, "/api/definitely-not-a-route").await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "an unknown /api path must 404, got: {body}"
+        );
+        assert!(
+            !body.contains("index.html"),
+            "an /api path must never be answered with the SPA shell, got: {body}"
+        );
+    }
+
+    /// CORS is layered outside the router, so a preflight must be answered even
+    /// for a protected path -- the browser sends it before any credentials.
+    #[tokio::test]
+    async fn preflight_is_answered_on_a_protected_route() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, headers, body) = send(&served, reqwest::Method::OPTIONS, "/api/modems").await;
+
+        assert!(
+            status.is_success(),
+            "preflight must succeed, got {status}: {body}"
+        );
+        assert!(
+            headers.contains_key("access-control-allow-origin"),
+            "preflight response must carry CORS headers: {headers:?}"
+        );
+    }
+}
