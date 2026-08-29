@@ -628,5 +628,24 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 修复前（commit `f44aac8` 及更早）这里会打印 `192.0.2.1:53`——端口被静默改回 53。
   - 测试后已把 DNS 恢复为 `['1.1.1.1', '8.8.8.8']`。
   - 说明：未用 tcpdump 抓包，设备上没有该工具；证据是运行时日志打印的目标 `SocketAddr`，它就是 `send_to()` 的实际目标。
-- [ ] 真实设备/运营商网络完整验收：指定 DNS 已能解析 ePDG，但当前 `50212` 派生 profile 在后续 IKE/IMS REGISTER 阶段收到网络 `400/421`，尚未完成 IKEv2、Child SA、ESP 和 VoWiFi 注册闭环。
-  - 说明：本项不能仅因 `epdg_ready` 勾选；需要可用 carrier profile 或运营商允许的真实 VoWiFi 参数后重新验收。
+- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但 IMS REGISTER 未闭环。
+  - **纠正一处此前写错的结论（2026-08-30）。** 本项原先写成"运营商阻塞在 `400/421`"，那是照抄更早 session 的说法，没有对照已有记录核实。实际上 **2026-08-22 这条线路曾拿到 `200 OK`**（修复提交 `97e982d`、`2818de0`、`dd4bb0f`，当时 SMS 与 Voice over IMS readiness 都验过）。所以这更可能是回归，不是运营商侧拒绝。把它记成"运营商阻塞"会让后续 session 放弃排查，这个错误说明必须留在文档里。
+  - 当时确认过的 Maxis(50212) 四步握手：
+    | 发送 | 运营商回 |
+    |---|---|
+    | Security-Client，无 Require | 421 Require: sec-agree |
+    | + Require | 400（RFC 3329 §2.3 还要 Proxy-Require） |
+    | + Proxy-Require | 400（TS 24.229 §5.1.1.2.2 还要空 AKA Authorization） |
+    | + 空 AKA Authorization | 401 → AKA → **200 OK** |
+  - **当前可疑点（尚未在设备上确认）**：410 的 REGISTER 日志里只出现两个 variant，且两者的 `initial_authorization` 都是 `"none"`：
+    ```text
+    register_variant="standard_3gpp_conservative"     initial_authorization="none"  sec_agree_headers_present=false
+    register_variant="catalog_v7_sec_agree_required"  initial_authorization="none"  sec_agree_headers_present=true
+    ```
+    也就是上表第 4 步那个空 AKA Authorization 没有被发出。
+  - 相关背景：`0444d58` 有意把 catalog 投影的 `initial_authorization` 默认值从 `"aka_empty"` 改成 `"none"`，理由是 TS 24.229 §5.1.1.2.2 要求首次 REGISTER 不带认证，某些运营商对预填的空 AKA 直接回 400；差异改由候选阶梯吸收。`vowifi/live.rs` 的阶梯里确实存在多个 `AkaEmpty*` 形态（约 1242–1395 行），但设备日志显示阶梯没有走到它们。
+  - 下一步需要的证据（都要在设备上取）：
+    1. 运营商现在实际回的状态码（是否仍是 421/400，还是别的）
+    2. 阶梯为何停在前两个 variant——是提前放弃、还是这个 profile 的候选列表本就不含 `AkaEmpty*`
+    3. 与 `f44aac8`（已知可注册的提交）做 A/B 对照
+  - 本项不能仅因 `epdg_ready` 勾选。
