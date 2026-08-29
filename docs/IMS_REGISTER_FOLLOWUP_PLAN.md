@@ -108,7 +108,7 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1355 passed; 0 failed; 3 ignored（共 1358 个测试）。
+  - 结果：1359 passed; 0 failed; 3 ignored（共 1362 个测试）。
   - 完成日期：2026-08-29；含第 7 节新增的 9 个测试和第 14.7 节新增的 8 个 HTTP 集成测试。
   - 前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过（2026-08-29）。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
@@ -158,10 +158,17 @@
   - `serving_access_snapshot()` 取小区数据走 `get_cells_data_for_modem()`（`hardware/cellular/modem_manager.rs:3653`），该函数**先试 QMI**：`get_cells_data_qmicli()` 执行 `qmicli -p -d <dev> --nas-get-cell-location-info`，由 `parse_qmicli_cell_location_output()` 解析；只有 QMI 返回空 cells 时才回落到 ModemManager 的 `GetCellInfo`，再回落到 `mmcli`。
   - 也就是说 cell id / TAC / tech / band 这组"绝不能伪造"的字段，主来源已经是 QMI。
   - 注：本项目的 QMI 访问方式是解析 `qmicli` 文本输出，不是自建 QMI 协议封帧，与 `qmi_wds.rs` 的结构一致。
-- [ ] 从 QMI 读取注册 PLMN 与注册状态。
-  - 这是 QMI 侧真正剩下的缺口，范围比原描述窄得多：`get_network_info_for_modem()`（`modem_manager.rs:2485`）只读 ModemManager D-Bus 属性——MCC/MNC 来自 `MM_MODEM_3GPP` 的 `OperatorCode`，注册状态同样来自 D-Bus。
-  - 若要在 ModemManager 3GPP 属性不可用时仍能取到 PLMN/注册状态，需要新增 `--nas-get-serving-system` 解析路径。
-  - 现状不是正确性问题：PLMN 缺失时 `ServingAccessSnapshot::new()` 直接构造失败，不会伪造 PLMN。
+- [x] 从 QMI 读取注册 PLMN 与注册状态。
+  - 完成日期：2026-08-29；提交 `726823d`
+  - 新增 `parse_qmicli_serving_system_output()`、`get_serving_system_qmicli()`、`QmiServingSystem`，位置 `backend/src/hardware/cellular/modem_manager.rs`。
+  - 接线点：`get_network_info_for_modem()` 仅在 ModemManager 未给出 operator code 时才走 QMI；失败只记 debug 日志，调用方仍拿到原本的 ModemManager 视图。
+  - **夹具是从 410 抓的真实输出**（`qmicli -p -d /dev/wwan0qmi0 --nas-get-serving-system`），不是凭记忆写的。抓取时先发现 410 根本没有 `/dev/cdc-wdm*`，真实节点是 `/dev/wwan0qmi0`。
+  - 该输出里有两个必须避开的陷阱，都已写成断言：
+    1. **MCC/MNC 出现两次**——`Current PLMN:` 和 `Full operator code info:` 各一份。逐行匹配 `MCC:` 会取到后出现的那个，所以搜索限定在第一个 block 内。测试 `serving_plmn_comes_from_the_current_plmn_block_only` 把第二个 block 改成 999/99 来证明作用域生效。
+    2. **有两个区域码**——`3GPP location area code: '65534'`（0xFFFE，2G/3G 的 LAC "不适用"哨兵值）与 `LTE tracking area code: '15102'`（真正的 TAC）。取错会把哨兵值写进 PANI，比不发更糟。已用同设备的 `--nas-get-cell-location-info` 交叉验证：该命令报 TAC 15102、cell 55281991，与 serving-system 的 LTE 字段一致，与 LAC 不一致。
+  - 归属说明：解析器放在 `hardware/cellular/` 而不是 `hardware/devices/qcm410/`。输出格式来自 libqmi，任何 QMI modem 都相同；410 专属的只是控制节点名，而 `qmi_control_device()` 已经处理。这与 `cellular/mod.rs` 文档描述的分界一致。
+  - 测试：`parses_real_qmi_serving_system_output`、`serving_plmn_comes_from_the_current_plmn_block_only`、`unregistered_serving_system_yields_no_identity`、`roaming_status_is_read_from_the_scalar_field`。
+  - **实机注意**：410 上 ModemManager 报得出 `operator id: 50212`，所以这条 fallback 实际不会触发。它补的是健壮性，不是当前的实际缺口。
 - [ ] 明确 QCM410 当前固件能稳定提供哪些字段，以及字段刷新事件。
   - 需要实机采样，尚未做。
 - [x] 切换后的上下文刷新有界，且不会使用过期数据。
@@ -193,7 +200,21 @@
   - CNI 有独立的 `cni_identity_policy` 和 `enable_cellular_network_info` 开关，且已被第 7 节的端到端测试覆盖"不发"的情形；但"发"的情形只有 `volte::sip::tests` 里基于测试夹具上下文的断言，尚未确认真实 ModemManager 快照driven 的 CNI 输出。
 - [ ] home/visited network 区分的单元测试。
   - 现有测试覆盖 FDD/TDD 和 LTE/NR，未覆盖 home 与 visited 的差异。
-- [ ] 实机验收：真实 modem 上确认 PANI 内容与网络侧观测一致。
+- [x] 实机确认动态接入上下文在真实 LTE 线路上可用（2026-08-29，v1.1.5 / commit `726823d`）。
+  - 设备 API 返回的线路接入状态：
+    ```json
+    {"available": true, "stale": false, "technology": "lte",
+     "serving_plmn": "50212", "age_seconds": 0, "last_error": null}
+    ```
+  - 日志确认刷新周期真实生效（每 10 秒一轮）：
+    ```text
+    DEBUG Refreshed per-line IMS serving access context
+          line_id=line-50ad5391cd09c09936f1081bd479139c technology=lte
+    ```
+  - 即 §5.1/§5.2 的数据模型、采集、按线路注入、TTL 与错误可观察性在实机跑通，`serving_plmn` 是真实值而非模板。
+- [x] 澄清一处此前的误读：410 REGISTER 日志里的 `pani_format="profile_default"` 来自 **VoWiFi** 链路（`vowifi/live.rs`），其 `LivePaniFormat` 只有 `ProfileDefault`/`PlainWifi`/`Omit` 三态，本就没有"动态"选项——对 WLAN 接入而言用 profile 字符串是正确的，不该带蜂窝小区 ID。VoLTE 的动态 PANI 是另一条路径（`volte/sip.rs` 的 `resolve_access_identity`），派生 profile 已经是 `DynamicIfKnown`（`profiles.rs:1099`：`LteEpc => DynamicIfKnown`，`WifiEpdg => Static`），CNI 则相反（`LteEpc => Omit`，`WifiEpdg => DynamicIfKnown`）。两条链路的策略都符合设计，无需修改。
+- [ ] 实机抓包确认 VoLTE REGISTER 报文里的 PANI 内容与网络侧观测一致。
+  - 上面证明了上下文可用且策略正确，但没有抓到实际报文比对。设备上没有 `tcpdump`，需要先安装。
 
 ## 6. 尚未完成：VoWiFi refresh 对等性
 
@@ -514,10 +535,24 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
     - 显式 ID 在指定来源中不存在 → 400 `volte_profile_not_found_in_source:<source>:<id>`，并断言错误里含来源名，避免另一来源的同名 ID 被当成命中
     - 无法识别的 source → 400（拒绝而非回落默认）
   - GET 侧：纯配置线路必须能返回三个槽位（对话框要在 modem 就位前就能打开），未知线路仍 404。
-  - 未覆盖：保存成功的 happy path。为在线线路保存策略会启动一次连接批次，需要真实硬件，留到第 14.8 节。
+- [x] profile-selection 保存成功的 happy path，实机（2026-08-29，v1.1.5 / commit `726823d`）。
+  - 在真实线路 `line-50ad5391cd09c09936f1081bd479139c` 上：GET 读到默认顺序 `[database, carrier_catalog, derived]`；PUT 改为 `[derived, database, carrier_catalog]` 返回 `status: ok`；重新 GET 读回新顺序，证明持久化；再 PUT 恢复默认顺序并再次读回确认。
+  - 这补上了本地 HTTP 测试无法覆盖的部分——为在线线路保存会启动连接批次，需要真实线路。
 - [x] 前端 TypeScript 类型检查、lint 和 production build。
   - 完成日期：2026-08-29；已执行 `pnpm type-check`、`pnpm lint`、`pnpm build:full`。
-- [ ] 浏览器级 VoLTE Profile 对话框交互测试。
+- [x] 浏览器级 VoLTE Profile 对话框交互测试（2026-08-29，提交 `af6b819`）。
+  - 引入 Playwright（`@playwright/test` 1.62.1 + Chromium）作为前端第一个测试框架，此前 `frontend/package.json` 连 `test` script 都没有。
+  - 位置：`frontend/e2e/volte-profile-dialog.spec.ts`、`frontend/playwright.config.ts`、`frontend/tsconfig.e2e.json`。
+  - 运行方式：`E2E_PASSWORD=... pnpm test:e2e`。被测前端是**本地工作副本**（Vite 提供），其 dev server 已把 `/api` 代理到设备（`VITE_API_PROXY_TARGET`，默认 `http://192.168.100.13:3000`），所以改 UI 不必为测试重新部署前端。不设 `E2E_PASSWORD` 时全部跳过且退出码 0，无设备的机器上仍为绿。
+  - 五个用例，全部对真实 410 通过：
+    1. 对话框声明"不是全局设置"并显示三个槽位
+    2. 排序按钮首尾禁用，且点击后槽位顺序真的交换（含第三槽位不受影响）
+    3. 槽位来源切到派生后，该槽位的 Profile 选择器变为禁用
+    4. 某来源没有 LTE-ready profile 时显示"将使用派生配置兜底"，且仍允许保存
+    5. 保存按钮发出的 PUT 请求体被拦截检查，`attempts` 恰好三项
+  - 新增 `data-testid="volte-profile-config"`（`ModemLinesPanel.tsx`）。一张线路卡上有四个写着"配置"的按钮（数据代理、VoLTE、VoWiFi、Trunk），侧边栏还有"基本配置"；按 label 匹配会点错并**真的执行**——写这批测试时它点到了数据代理的配置并在实机上触发了一次保存（事后核对 `config.sqlite3` 与部署前备份逐字节相同，是一次值未变的空保存，无实际影响）。
+  - 两处选择器只能从运行中的应用学到、读源码不够：VoLTE 区块只在线路工作台的"IMS 与 Trunk" tab 下渲染，所以测试要先选线路再切 tab；每个槽位渲染两个 combobox（来源 + Profile 选择器），MUI 的关联方式让 `getByLabel` 取不到，所以来源按偶数下标读取。
+  - e2e 代码是**被类型检查的**，不是排除在 lint 之外：`tsconfig.e2e.json` 从 `tsconfig.json` 引用，并加入 eslint 的 parser projects。`pnpm lint`、`pnpm type-check`、`pnpm build:full` 全部通过。
 
 **本轮自动验证记录（2026-08-29）：**
 
@@ -555,11 +590,18 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - [x] 410 实机故障注入确认运行时确实使用线路级 DNS：配置不可达的 `192.0.2.1` 后日志记录该地址并返回 ePDG DNS 超时（2026-08-29）。
 - [x] 显式 DNS 全部失败时追加系统 resolver 兜底：`live_dns_attempts()` 始终在“线路 DNS -> profile DNS”之后加入 `None`，由系统 resolver 接管；新增单元测试 `live_dns_attempts_end_with_system_resolver_fallback` 通过（2026-08-29）。
   - 410 实机故障注入：临时将 ePDG host 设为 `localhost`、端口设为 `9`，仅配置不可达 `192.0.2.1`；日志记录自定义 DNS 超时但未产生最终 `epdg_dns_resolution_failed`，流程继续到 IKE 阶段，随后因测试端点失败而结束。该记录证明系统 resolver 兜底生效，但不代表运营商网络验收。
+- [x] 第二次部署：commit `726823d` 已构建、校验并部署到 410（2026-08-29 深夜）。
+  - 推送到 CI 触发分支 `feat/catalog-free-iphone-fallback`（`f44aac8..726823d`，快进），GitHub Actions 重新上传 v1.1.5 release 资产。
+  - 制品 SHA-256 `2d2e32a0...9782a03` 与 `SHA256SUMS.txt` 一致；包内 `meta.json` 的 commit 为 `726823d`。
+  - 部署前备份到 `/opt/simadmin-backup-20260829-234808`（`data.db`、`config.sqlite3`、`config.yaml`、`meta.json`、两个 carrier 数据库）。
+  - **部署注意**：直接 `cp` 二进制会因 `simadmin-secondary-qmi.service` 也在运行同一可执行文件而报"文本文件忙"。必须同时停这两个 unit，并用 `mv` 替换。
+  - 部署后：`/opt/simadmin/simadmin` 的 md5 与 `meta.json` 的 `binary_md5` 一致（`a7cdbb92...`），两个 service 均 active，`/api/health` 返回 `version: 1.1.5`，`data.db`/`config.sqlite3`/`config.yaml` 均保留且 `config.sqlite3` 与备份逐字节相同。
+  - 调试用的临时 systemd drop-in 已删除，`RUST_LOG` 恢复为 unit 默认值；`/tmp` 下的制品和 staging 目录已清理。
 - [x] v1.1.5 ARM64 制品已构建、校验并部署到 410（2026-08-29）。
   - GitHub Actions Run `33236459920` 成功；制品 `aarch64-unknown-linux-musl`，commit `f44aac8`，SHA-256 已与 `SHA256SUMS.txt` 一致。
   - `/api/health` 返回 `version: 1.1.5`；三个 systemd 服务/定时器均为 active；管理员密码登录验证成功（明文密码不写入文档）；既有 `data.db`、`config.sqlite3`、carrier 数据库和 `config.yaml` 均保留。
   - 恢复后的 `ims_vowifi.dns` 仍为 `1.1.1.1`、`8.8.8.8`，重新连接后 ePDG/IKE/Child SA/ESP readiness 均达到 true；当前运营商仍在 IMS REGISTER 阶段返回 SIP `400`，所以完整 VoWiFi 注册仍未完成。
-- [x] 自定义 DNS 端口在运行时真正生效（2026-08-29，未提交）。
+- [x] 自定义 DNS 端口在运行时真正生效（2026-08-29，提交 `2f2606a`；实机验证见本节末）。
   - 问题：前端和 `parse_dns_server` 都支持 `1.1.1.1:5353`、`[IPv6]:5353`，但 live 层调用 `parse_dns_server(...).ip()` 丢弃端口，`epdg.rs` 又用 `SocketAddr::new(dns_server, 53)` 重建目标，导致自定义端口被静默改回 53。
   - 修复：DNS 候选类型由 `Vec<IpAddr>` 改为 `Vec<SocketAddr>`，贯穿 `live_dns_candidates()`、`live_dns_attempts()`、`resolve_epdg_with_dns_override()`、`resolve_epdg_via_socks5()` 和 `query_dns_records()`。
     - 位置：`backend/src/connectivity/modems/ims/vowifi/live.rs`、`backend/src/connectivity/modems/ims/vowifi/epdg.rs`
@@ -573,7 +615,18 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
 - [x] 前端帮助文本明确端口有效：输入项标签改为“自定义 ePDG DNS（地址或地址:端口）”，helper text 说明 `IPv4:端口` / `[IPv6]:端口`，省略端口默认 53（2026-08-29，未提交）。
   - 位置：`frontend/src/pages/sim/VowifiLineDialog.tsx`
   - 自动测试：`pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过。
-- [ ] 410 实机验证自定义 DNS 端口：需在设备上配置 `ip:非 53 端口` 并抓包确认查询发往该端口。
-  - 本项尚未执行；当前仅有本地单元测试证据。
+- [x] 410 实机验证自定义 DNS 端口（2026-08-29，v1.1.5 / commit `726823d`）。
+  - 步骤：把线路的 `ims_vowifi.dns` 设为不可达的 `192.0.2.1:5353`（非 53 端口），读回确认持久化为 `['192.0.2.1:5353']`，然后触发一次 VoWiFi 重连。
+  - 设备日志（关键证据，端口是 **5353** 而不是 53）：
+    ```text
+    WARN ePDG resolution failed on this DNS server; trying the next candidate
+         line_id=line-50ad5391cd09c09936f1081bd479139c
+         dns_server=Some(192.0.2.1:5353) error=DNS resolution failed: fallback_timeout
+    ```
+  - 同时验证了兜底链路：自定义 DNS 超时后继续走下去，最终仍解析出真实 ePDG 地址
+    `[202.75.146.42:500, 202.75.146.43:500, 202.75.146.41:500]` 并进入 IKE 阶段。
+  - 修复前（commit `f44aac8` 及更早）这里会打印 `192.0.2.1:53`——端口被静默改回 53。
+  - 测试后已把 DNS 恢复为 `['1.1.1.1', '8.8.8.8']`。
+  - 说明：未用 tcpdump 抓包，设备上没有该工具；证据是运行时日志打印的目标 `SocketAddr`，它就是 `send_to()` 的实际目标。
 - [ ] 真实设备/运营商网络完整验收：指定 DNS 已能解析 ePDG，但当前 `50212` 派生 profile 在后续 IKE/IMS REGISTER 阶段收到网络 `400/421`，尚未完成 IKEv2、Child SA、ESP 和 VoWiFi 注册闭环。
   - 说明：本项不能仅因 `epdg_ready` 勾选；需要可用 carrier profile 或运营商允许的真实 VoWiFi 参数后重新验收。
