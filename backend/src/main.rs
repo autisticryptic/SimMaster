@@ -2550,6 +2550,134 @@ mod http_router_tests {
         (status, headers, body)
     }
 
+    /// POST a JSON body, optionally replaying a session cookie.
+    ///
+    /// The cookie is carried by hand rather than with `reqwest`'s cookie store,
+    /// which needs the `cookies` feature that this crate does not enable.
+    async fn post_json(
+        served: &Served,
+        path: &str,
+        body: serde_json::Value,
+        cookie: Option<&str>,
+    ) -> (StatusCode, reqwest::header::HeaderMap, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let mut request = client.post(format!("{}{path}", served.base)).json(&body);
+        if let Some(cookie) = cookie {
+            request = request.header(reqwest::header::COOKIE, cookie);
+        }
+        let response = request.send().await.expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let headers = response.headers().clone();
+        let text = response.text().await.unwrap_or_default();
+        (status, headers, text)
+    }
+
+    /// GET with a session cookie.
+    async fn get_with_cookie(served: &Served, path: &str, cookie: &str) -> (StatusCode, String) {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("build client");
+        let response = client
+            .get(format!("{}{path}", served.base))
+            .header(reqwest::header::COOKIE, cookie)
+            .send()
+            .await
+            .expect("router must answer");
+        let status = StatusCode::from_u16(response.status().as_u16()).expect("valid status");
+        let text = response.text().await.unwrap_or_default();
+        (status, text)
+    }
+
+    /// Set the admin password on a fresh install and return the session cookie.
+    ///
+    /// A fresh database has no admin configured, which is why the protected
+    /// routes answer 401 with "管理员密码尚未设置" until this runs.
+    async fn authenticate(served: &Served) -> String {
+        let password = "test-only-password-ck2fF9";
+        let (status, headers, body) = post_json(
+            served,
+            "/api/auth/setup",
+            serde_json::json!({ "password": password }),
+            None,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "setup must succeed on a fresh database, got {status}: {body}"
+        );
+
+        // Setup already returns a session; prove login issues one too, since
+        // that is the path a returning operator takes.
+        let (status, headers_login, body) = post_json(
+            served,
+            "/api/auth/login",
+            serde_json::json!({ "password": password }),
+            None,
+        )
+        .await;
+        assert!(
+            status.is_success(),
+            "login must succeed with the password just set, got {status}: {body}"
+        );
+
+        let cookie = headers_login
+            .get(reqwest::header::SET_COOKIE)
+            .or_else(|| headers.get(reqwest::header::SET_COOKIE))
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).to_string())
+            .expect("login must set a session cookie");
+        assert!(
+            cookie.starts_with("simadmin_session="),
+            "unexpected session cookie: {cookie}"
+        );
+        cookie
+    }
+
+    /// The whole auth gate end to end: a fresh install refuses, setup and login
+    /// issue a session, and that session opens the protected routes.
+    ///
+    /// This is what makes the harness useful beyond smoke tests -- every
+    /// authenticated endpoint test can now start from `authenticate`.
+    #[tokio::test]
+    async fn a_session_from_login_opens_the_protected_routes() {
+        let Some(state) = build_test_router().await else {
+            return;
+        };
+        let served = serve(state.router.clone()).await;
+
+        let (status, _headers, body) = send(&served, reqwest::Method::GET, "/api/modems").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a fresh install must refuse first: {body}"
+        );
+
+        let cookie = authenticate(&served).await;
+
+        let (status, body) = get_with_cookie(&served, "/api/modems", &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the session must open a protected route, got {status}: {body}"
+        );
+
+        // A wrong cookie must still be refused, or the check above would pass
+        // for any string at all.
+        let (status, body) =
+            get_with_cookie(&served, "/api/modems", "simadmin_session=not-a-real-token").await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a forged session must be refused, got {status}: {body}"
+        );
+    }
+
     /// `/api/health` is public and must answer before any login. This is the
     /// first test to exercise the assembled router over HTTP rather than
     /// calling a handler directly.
