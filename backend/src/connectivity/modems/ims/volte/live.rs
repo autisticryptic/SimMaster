@@ -6994,6 +6994,130 @@ mod tests {
         }
     }
 
+    /// A SIM override must not be able to resurrect an omitted header.
+    ///
+    /// This is structural rather than incidental: `ImsAccessOverride` carries
+    /// only addressing, DNS and IMSI fields, and the override path resolves to
+    /// `EffectiveImsProfile`, which has no register policy at all. The builder
+    /// takes header policy from `&CarrierProfile` and addressing from a separate
+    /// `RegisterTarget`, so an override can change *where* REGISTER is sent but
+    /// never *which headers* it carries.
+    ///
+    /// The override here is deliberately populated and its effect asserted, so
+    /// the test cannot pass merely because the override was ignored.
+    #[test]
+    fn a_sim_override_cannot_resurrect_an_omitted_register_header() {
+        use crate::connectivity::core::context::{ImsIdentity, ImsRoute, SipTransport};
+        use crate::connectivity::modems::ims::effective_profile::{
+            resolve_effective_ims_profile_for_access, EffectiveImsAccess,
+        };
+        use crate::connectivity::modems::ims::profile_override::{ImsAccessOverride, SimOverride};
+        use crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord;
+
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.meta.profile_id = "test-omit-vs-override".to_string();
+        record.ims.register.include_pani_initial = false;
+        record.ims.register.include_pani_authenticated = false;
+        record.ims.register.include_route_header = false;
+        record.ims.register.include_p_preferred_identity = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.enable_cellular_network_info = false;
+        record.ims.register.require_sec_agree_headers = false;
+        record.ims.register.proxy_require_sec_agree_headers = false;
+        record.ims.register.sec_agree_mode = "disabled".to_string();
+        record.validate().expect("omit record must stay valid");
+        let profile = record.intern();
+
+        let override_ = SimOverride {
+            ims_volte: ImsAccessOverride {
+                domain: Some("override.ims.example".to_string()),
+                realm: Some("override.realm.example".to_string()),
+                registrar: Some("sip:registrar.override.example".to_string()),
+                pcscf: Some(vec!["10.9.9.9:5060".to_string()]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let effective = resolve_effective_ims_profile_for_access(
+            profile,
+            Some(&override_),
+            EffectiveImsAccess::Volte,
+        );
+
+        // Prove the override really is in force before asserting what it cannot
+        // reach. Without this the test would pass on an ignored override.
+        assert_eq!(effective.domain.value, "override.ims.example");
+        assert_eq!(effective.realm.value, "override.realm.example");
+        assert_eq!(
+            effective.registrar.as_ref().map(|field| &field.value),
+            Some(&"sip:registrar.override.example".to_string())
+        );
+
+        let identity = ImsIdentity {
+            private_user: "234331234567890@ims.mnc033.mcc234.3gppnetwork.org".to_string(),
+            public_uri: "sip:+447700900000@ims.mnc033.mcc234.3gppnetwork.org".to_string(),
+            contact_user: "+447700900000".to_string(),
+            home_domain: "ims.mnc033.mcc234.3gppnetwork.org".to_string(),
+            contact_user_phone: true,
+        };
+        let route = ImsRoute {
+            local_addr: "10.0.0.2:5060".parse().expect("local addr"),
+            pcscf_addr: "10.0.0.1:5060".parse().expect("pcscf addr"),
+            transport: SipTransport::Udp,
+        };
+
+        for variant in &register_variants(profile) {
+            for phase in [
+                sip::RegisterPhase::Initial,
+                sip::RegisterPhase::Authenticated,
+                sip::RegisterPhase::Refresh,
+            ] {
+                let frame = sip::build_register_from_profile_with_target_visited_and_access(
+                    profile,
+                    effective_register_target(&effective),
+                    phase,
+                    &identity,
+                    &route,
+                    &sip::RequestIds::fresh(1),
+                    profile.ims.register.expires_seconds,
+                    None,
+                    None,
+                    None,
+                    "urn:uuid:test-omit-vs-override",
+                    variant.policy,
+                    None,
+                    None,
+                );
+                let label = variant.label;
+                let where_ = format!("variant {label}, phase {phase:?}");
+
+                for header in [
+                    "P-Access-Network-Info",
+                    "Cellular-Network-Info",
+                    "P-Preferred-Identity",
+                    "Route",
+                    "Security-Client",
+                    "Security-Verify",
+                ] {
+                    assert_eq!(
+                        sip::header_value(&frame, header),
+                        None,
+                        "{header} must stay omitted under a SIM override ({where_})"
+                    );
+                }
+
+                // The override's addressing did land, which is what an override
+                // is allowed to change.
+                let text = String::from_utf8_lossy(&frame);
+                assert!(
+                    text.contains("override.ims.example")
+                        || text.contains("registrar.override.example"),
+                    "the override's addressing must reach the request ({where_}) in:\n{text}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn derived_profile_register_variants_do_not_originate_visited_network() {
         let profile =

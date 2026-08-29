@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1344 passed; 0 failed; 3 ignored（共 1347 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 6 个测试。
+  - 结果：1345 passed; 0 failed; 3 ignored（共 1348 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 7 个测试。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -222,8 +222,12 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 完成日期：2026-08-29
   - 早于某个开关存在的数据库行，缺该字段时不能被读成 `omit`：`always_add_sip_instance` 缺失归一化为 `true`（baseline），`enable_cellular_network_info` 缺失归一化为 `false`（CNI 可能泄露服务小区信息，绝不为旧行合成）。这是刻意的不对称，不是回归。
   - 测试：`profile_record::tests::a_legacy_row_missing_a_switch_is_not_read_as_an_omit`。
-- [ ] 检查 SIM override 路径。
-  - 初步判断：`ImsAccessOverride` 只承载寻址、DNS、IMSI 伪装和 QoS 类字段，不含这九个 REGISTER 开关，因此 override 结构上无法丢失 `omit`。此判断来自字段清单阅读，尚未用测试固定。
+- [x] 检查 SIM override 路径。
+  - 完成日期：2026-08-29
+  - 结论是结构性的，不只是"当前没实现"：`ImsAccessOverride` 的 13 个字段全部是寻址（`profile_id`、`apn`、`domain`、`realm`、`registrar`、`pcscf`、`epdg_host`、`epdg_port`、`ip_stack`）、DNS（`dns`）和 IMSI 伪装（`spoof_imsi`、`custom_imsi`），不含任何 REGISTER 开关。
+  - override 解析产物是 `EffectiveImsProfile`，该结构只有 8 个字段且完全不含 register policy；`effective_register_target()` 进一步只取 domain/realm/registrar。
+  - 报文构造时 header 策略来自 `&CarrierProfile`，寻址来自独立的 `RegisterTarget` 参数。所以 override 能改"发到哪里"，无法改"带哪些头"。
+  - 测试：`volte::live::tests::a_sim_override_cannot_resurrect_an_omitted_register_header`。测试里 override 填了 domain/realm/registrar/pcscf 并**先断言这些覆写确实生效**，再断言六个被 omit 的头仍然不存在——避免 override 被忽略时测试空转。
 - [ ] 检查配置导入导出路径。
   - 当前未发现 patch 语义的导入导出路径；若将来引入部分字段更新，必须重新评估丢字段风险。
 - [ ] 检查以下字段的端到端测试：
