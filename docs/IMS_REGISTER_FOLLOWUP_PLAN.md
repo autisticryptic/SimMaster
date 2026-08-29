@@ -113,47 +113,74 @@
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
-## 5. 尚未实现：真实接入网络上下文
+## 5. 真实接入网络上下文
 
-当前 CNI/PANI 某些路径仍使用静态模板或全零 cell-id。这只能用于兼容性探测，不能作为最终通用实现。
+> **2026-08-29 复核修正。** 本节原先整节标为未实现，但代码复核证明 ModemManager + LTE/NR 这条链路已经完整落地。原描述“当前 CNI/PANI 某些路径仍使用静态模板或全零 cell-id”对于 dynamic 路径已不成立：`core/access_network.rs` 模块文档明确写了 “it never manufactures a PLMN/TAC/cell-id placeholder”。
+>
+> 本次只做代码复核，未新增实现，也未做实机验收。下面逐项标注证据位置，未验证的项保持 `[ ]`。
 
 ### 5.1 统一数据模型
 
-- [ ] 定义可跨 VoLTE、VoWiFi、未来 VoNR 使用的运行时接入上下文。
-  - 当前注册 PLMN（MCC/MNC）。
-  - 归属 PLMN。
-  - RAT：E-UTRAN FDD/TDD、NR NSA、NR SA、WLAN 等。
-  - LTE ECGI/ECI/TAC 或 NR NCGI/NCI/TAC。
-  - cell information age 与采集时间。
-  - roaming 状态及数据来源可信度。
-- [ ] 明确“数据未知”语义。
-  - 未知时应 omit、只发 access type，还是使用 profile 静态值，必须由 profile 策略决定。
-  - 禁止把未知 cell-id 静默伪装成真实的全零 cell-id。
-- [ ] 为每条线路隔离运行时接入上下文，禁止使用进程级共享可变全局状态。
-
-建议落点：
-
-- `backend/src/connectivity/core/access_network.rs`
-- `backend/src/connectivity/modems/ims/access_network.rs`
-
-这两个文件当前为新增文件，应先审阅现有内容，再扩展，避免创建重复模型。
+- [x] 定义可跨 VoLTE、VoWiFi、VoNR 使用的运行时接入上下文。
+  - 位置：`backend/src/connectivity/core/access_network.rs`（686 行）
+  - `ServingAccessSnapshot`：采集侧原始观测，含 MCC/MNC、technology、cell id、TAC、serving band、来源。
+  - `ImsAccessNetworkContext`：解析后的上下文，`age()` 提供采集时间差。
+  - `AccessNetworkSource` 标注数据来源可信度（含 `ModemManager`、`TestFixture`）。
+  - RAT 建模为 `ImsAccessType`：`EutranFdd`、`EutranTdd`、`NrFdd`、`NrTdd`、`Iwlan`。
+- [x] 明确“数据未知”语义。
+  - `ServingAccessSnapshot::new()` 返回 `Option`，字段不完整时直接构造失败，不产生上下文。
+  - `AccessIdentityPolicy` 四态决定未知时的行为：`Omit` / `Static` / `DynamicIfKnown` / `RequiredDynamic`。
+  - `AccessIdentityResolution::required_dynamic_missing()` 让 `RequiredDynamic` 在数据缺失时可被上层识别。
+  - 测试：`invalid_or_missing_identity_is_omitted`、`access_identity_policy_distinguishes_dynamic_static_and_missing_required`。
+- [x] 为每条线路隔离运行时接入上下文，未使用进程级共享可变全局状态。
+  - `ImsAccessNetworkRuntime` 实例挂在 `LineRuntime.ims_access_network` 上（`services/line_registry.rs`），每条线路一份。
+  - 测试：`per_line_runtime_does_not_share_snapshots`。
 
 ### 5.2 从 modem 获取真实数据
 
-- [ ] 从 ModemManager/QMI 读取 serving system、RAT、注册 PLMN、TAC 和 cell identity。
+- [x] 从 ModemManager 读取 serving system、RAT、注册 PLMN、TAC 和 cell identity。
+  - 位置：`backend/src/connectivity/modems/ims/access_network.rs` 的 `serving_access_snapshot()`。
+  - 并发查询 network info 与 cells data；注册状态不属于 `registered`/`roaming`/`attached` 时返回 `access_network_not_registered:<status>`。
+  - serving cell 字段为 0 时回退到 cells 列表里标记 `is_serving` 的那一项。
+- [x] 将数据按 `line_id` 注入 IMS access leg，不由 SIP builder 主动访问全局 modem。
+  - `refresh_ims_access_network()`（`line_registry.rs:862`）按 line 发布；SIP builder 只接收 `Option<&ImsAccessNetworkContext>` 参数。
+  - reader 类型线路和不存在的 modem 直接 `clear("access_network_unavailable_for_line_kind")`。
+- [x] 过期处理。
+  - `ImsAccessNetworkRuntime::context()` 走 `context_with_max_age()`，TTL 为 `DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE = 30s`；超龄上下文不会被当成当前小区。
+  - 两个 VoLTE 消费点（`volte/live.rs:2227`、`:3893`）都走 `.context()`，因此都受 TTL 约束。
+- [x] 对无服务、字段缺失和查询失败提供可观察错误，而不是 panic。
+  - 确认的无服务/不完整观测立即 `clear(reason)`；瞬时查询失败只 `record_refresh_error(reason)`，旧上下文保留到 TTL 到期。
+  - 错误串区分 `access_network_modem_path_invalid`、`access_network_network_query_failed`、`access_network_cell_query_failed`、`access_network_not_registered`、`access_network_snapshot_incomplete`（后者列出 tech/plmn/cell/tac 各自 present 还是 missing）。
+  - 状态可读：`AccessNetworkRuntimeStatus`，经 `line_registry.rs:268` 暴露。
+- [ ] 从 QMI 读取同一组字段。
+  - 当前只有 ModemManager 路径。QMI 侧未接入，这是本节剩下的主要实现缺口。
 - [ ] 明确 QCM410 当前固件能稳定提供哪些字段，以及字段刷新事件。
-- [ ] 将数据按 `line_id` 注入 IMS access leg，而不是由 SIP builder 主动访问全局 modem。
-- [ ] 增加过期和切换处理：小区切换、漫游切换、LTE/NR 切换后刷新上下文。
-- [ ] 对无权限、无服务、字段缺失和 modem 重启提供可观察错误，而不是 panic。
+  - 需要实机采样，尚未做。
+- [ ] 切换驱动的刷新：小区重选、漫游切换、LTE/NR 切换后立即刷新，而不是等注册表下一轮 refresh 或 TTL 到期。
+  - 当前刷新时机是注册表 refresh 循环（`line_registry.rs:789`、`:795`，覆盖新增和既有线路），加 30s TTL 兜底。会话中途换小区时，PANI 最长可能落后一个 refresh 周期。
 
 ### 5.3 动态生成 PANI/CNI
 
-- [ ] 用真实运行时上下文生成 VoLTE `P-Access-Network-Info`。
+- [x] 用真实运行时上下文生成 VoLTE `P-Access-Network-Info`。
+  - `ImsAccessNetworkContext::cellular_access_info()` 按 TS 24.229 表 7.2A.4-1 的固定宽度输出。
+  - 测试：`lte_context_formats_real_tac_and_eci_at_fixed_widths`、`modem_snapshot_uses_serving_band_before_profile_hint`。
+- [x] LTE 与 NR 分别使用正确的标识宽度。
+  - LTE：16-bit TAC + 28-bit E-UTRAN cell id。
+  - NR：24-bit TAC + 36-bit NR cell identity。
+  - 测试：`nr_snapshot_preserves_complete_36_bit_nci`。
+- [x] WLAN 接入类型与蜂窝辅助信息分别建模，未复用 LTE 字符串。
+  - `ImsAccessType::Iwlan` 的 `cellular_identity_widths()` 返回 `None`，结构上无法为 WLAN 生成蜂窝小区标识。
+- [x] 为 profile 提供明确策略：`omit`、`static`、`dynamic-if-known`、`required-dynamic`。
+  - `AccessIdentityPolicy` 四态，`resolve_access_identity()` 统一入口，PANI 与 CNI 各自独立持有策略（`pani_identity_policy` / `cni_identity_policy`）。
+- [x] 已无 `{PLMN}0000000` 占位生成逻辑。
+  - `core/access_network.rs` 模块文档明确声明不制造占位符；全仓库搜索 `0000000` 只剩 IMSI/nonce 测试夹具，与 cell-id 无关。
+- [x] 头部值注入防护。
+  - `sanitize_header_value()`、`access_type_token()` 拒绝注入；测试 `header_value_and_contact_token_reject_injection`。
 - [ ] 用真实运行时上下文生成 VoLTE `Cellular-Network-Info`。
-- [ ] 审核 VoWiFi PANI/CNI 语义：WLAN 接入类型与蜂窝辅助信息必须分别建模，不能复用 LTE 字符串。
-- [ ] 对 home/visited network、FDD/TDD、LTE/NR 分别增加单元测试。
-- [ ] 为 profile 提供明确策略：`omit`、`static`、`dynamic-if-known`、`required-dynamic`。
-- [ ] 删除或降级当前 `{PLMN}0000000` 占位生成逻辑；保留时必须明确标为 compatibility fallback 并由 profile 显式启用。
+  - CNI 有独立的 `cni_identity_policy` 和 `enable_cellular_network_info` 开关，且已被第 7 节的端到端测试覆盖"不发"的情形；但"发"的情形只有 `volte::sip::tests` 里基于测试夹具上下文的断言，尚未确认真实 ModemManager 快照driven 的 CNI 输出。
+- [ ] home/visited network 区分的单元测试。
+  - 现有测试覆盖 FDD/TDD 和 LTE/NR，未覆盖 home 与 visited 的差异。
+- [ ] 实机验收：真实 modem 上确认 PANI 内容与网络侧观测一致。
 
 ## 6. 尚未完成：VoWiFi refresh 对等性
 
