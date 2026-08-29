@@ -108,8 +108,9 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1350 passed; 0 failed; 3 ignored（共 1353 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 4 个 HTTP 集成测试。
+  - 结果：1352 passed; 0 failed; 3 ignored（共 1355 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 6 个 HTTP 集成测试。
+  - 前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过（2026-08-29）。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -486,8 +487,19 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
       cargo test --bin simadmin http_router
     ```
     无 bus 时每个用例带警告跳过而不是失败，保证无 D-Bus 机器上 `cargo test` 仍为绿。
-- [ ] 扩大 HTTP 集成测试覆盖面：登录后的读写、VoLTE profile-selection 端到端、错误码矩阵。
-  - 基础设施已就位，可直接复用 `build_test_router()`、`serve()`、`send()` 逐个端点补。
+- [x] 认证闭环的 HTTP 覆盖。
+  - 完成日期：2026-08-29
+  - 测试：`http_router_tests::a_session_from_login_opens_the_protected_routes`。
+  - 覆盖：全新安装先拒绝 → `/api/auth/setup` 设置管理员密码 → `/api/auth/login` 下发 `simadmin_session` cookie → 该 cookie 打开受保护路由 → **伪造 cookie 仍被拒绝**。最后一条是必要的：没有它，正向断言对任意字符串都会通过。
+  - 新增 helper：`authenticate()` 返回 session cookie，`post_json()`、`put_json()`、`get_with_cookie()`。cookie 手工回放，因为 `reqwest` 的 cookie store 需要本仓库未启用的 `cookies` feature。后续所有需要登录的端点用例都可以从 `authenticate()` 起步。
+- [x] `omit` 取消暴露面在端点层的证据。
+  - 完成日期：2026-08-29
+  - 测试：`http_router_tests::a_partial_put_body_cancels_an_omit_through_the_live_endpoint`。
+  - PUT 一个 `always_add_sip_instance` 显式为 false 但字段被删掉的 body，再经 `/resolve` 读回存储投影，断言该开关又变成了 `true`。这把第 7 节的 serde 层证据提升到了真实客户端会遇到的边界。
+  - 该测试**刻意断言当前行为**：handler 改成 presence-aware 后它必须失败，失败信息里写明了这一点，以免过期测试对两种行为都点头。
+  - 用 `/resolve` 而不是 list 端点，因为 list 只返回摘要，看不到开关。
+- [ ] 继续扩大 HTTP 集成测试覆盖面：VoLTE profile-selection 的保存路径、其余错误码矩阵。
+  - 基础设施与 helper 已就位，逐个端点补即可。
   - 注意：测试环境没有 modem 线路，凡校验 `line_id` 的端点都会拒绝，所以这类用例应断言错误码，happy path 留到实机验收。
 - [x] 前端 TypeScript 类型检查、lint 和 production build。
   - 完成日期：2026-08-29；已执行 `pnpm type-check`、`pnpm lint`、`pnpm build:full`。
