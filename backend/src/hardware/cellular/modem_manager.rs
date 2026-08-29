@@ -2493,7 +2493,7 @@ pub async fn get_network_info_for_modem(
         .get("OperatorCode")
         .map(extract_string)
         .unwrap_or_default();
-    let (mut mcc, mut mnc) = if operator_code.len() >= 5 {
+    let (mcc, mnc) = if operator_code.len() >= 5 {
         (
             Some(operator_code[..3].to_string()),
             Some(operator_code[3..].to_string()),
@@ -2502,35 +2502,23 @@ pub async fn get_network_info_for_modem(
         (None, None)
     };
 
-    // Fall back to QMI when ModemManager has no 3GPP operator code. Without a
-    // serving PLMN `ServingAccessSnapshot::new` refuses to build, so the IMS
-    // access context stays empty and PANI drops to the profile's static
-    // template -- even though the modem knows the answer. Cell identity already
-    // prefers QMI (`get_cells_data_for_modem`); this closes the same gap for the
-    // PLMN. A failure here is not fatal: the caller still gets the ModemManager
-    // view, which is what it would have had anyway.
-    if mcc.is_none() || mnc.is_none() {
-        match get_serving_system_qmicli(conn, modem_path).await {
-            Ok(serving) => {
-                if let (Some(qmi_mcc), Some(qmi_mnc)) = (&serving.mcc, &serving.mnc) {
-                    tracing::debug!(
-                        modem_path = %modem_path,
-                        registration = %serving.registration_status,
-                        "Recovered the serving PLMN from QMI after ModemManager reported none"
-                    );
-                    mcc = Some(qmi_mcc.clone());
-                    mnc = Some(qmi_mnc.clone());
-                }
-            }
-            Err(error) => {
-                tracing::debug!(
-                    modem_path = %modem_path,
-                    error = %error,
-                    "QMI serving-system fallback did not yield a PLMN"
-                );
-            }
-        }
-    }
+    // NOTE: deliberately *not* falling back to `get_serving_system_qmicli` here.
+    //
+    // This function runs on the per-line refresh path, every 10 seconds, and
+    // `serving_access_snapshot` already `join!`s it with
+    // `get_cells_data_for_modem`, which shells out to `qmicli` itself.
+    // `run_recovery_command` spawns without any per-modem serialization, so a
+    // fallback here would put a *second* concurrent QMI client on the same
+    // control port on every refresh of every line that reports no operator code
+    // — on hardware whose QMI endpoint is deliberately held by
+    // `simadmin-secondary-qmi.service`. That contention is a real risk to the
+    // modem, and both the VoLTE and VoWiFi legs depend on it.
+    //
+    // The value was low anyway: a missing PLMN makes
+    // `ServingAccessSnapshot::new` refuse to build, so PANI falls back to the
+    // profile template rather than sending anything wrong. The reader
+    // (`get_serving_system_qmicli`) is kept and tested for a caller that can
+    // afford to serialize it — a one-shot diagnostic, not this hot path.
 
     let signal_strength = modem_props
         .get("SignalQuality")
