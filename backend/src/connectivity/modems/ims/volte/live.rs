@@ -995,10 +995,16 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     // Skipped when the profile already starts from an empty AKA, since then the
     // shapes above already carry one.
     if authorization == VolteInitialAuthorization::None {
+        // The empty AKA alone is not enough. The observed Maxis sequence is
+        // cumulative -- Security-Client, then Require, then Proxy-Require, then
+        // the empty AKA -- and a candidate carrying only the last step is
+        // answered 421 (Require: sec-agree missing), exactly as measured on the
+        // device. So this candidate stacks the sec-agree headers *and* the empty
+        // AKA, which together are step four of that sequence.
         variants.push(VolteRegisterVariant {
             label: "ims_features_empty_aka_last_resort",
             authorization: VolteInitialAuthorization::UriFirstEmptyAka,
-            ..primary
+            ..primary.requiring_sec_agree()
         });
     }
     variants
@@ -6920,6 +6926,13 @@ mod tests {
             last.authorization,
             VolteInitialAuthorization::UriFirstEmptyAka
         );
+        // The empty AKA must arrive *with* the sec-agree headers. Measured on the
+        // device: a candidate carrying only the empty AKA is answered 421
+        // (Require: sec-agree missing), because the working sequence is
+        // cumulative rather than a set of independent steps.
+        assert!(last.policy.advertise_sec_agree);
+        assert!(last.policy.require_sec_agree);
+        assert!(last.policy.proxy_require_sec_agree);
     }
 
     /// A profile that already starts from an empty AKA gains no extra candidate:
