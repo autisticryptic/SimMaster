@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1354 passed; 0 failed; 3 ignored（共 1357 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 8 个测试和第 14.7 节新增的 8 个 HTTP 集成测试。
+  - 结果：1355 passed; 0 failed; 3 ignored（共 1358 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 9 个测试和第 14.7 节新增的 8 个 HTTP 集成测试。
   - 前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过（2026-08-29）。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
@@ -253,9 +253,14 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 后果：body 里省掉 `include_pani_initial`、`include_pani_authenticated`、`include_p_preferred_identity`、`always_add_sip_instance` 时，serde 默认值把这四个开关翻回 `true`，运营商的 omit 被静默取消。`include_route_header` 和 `enable_cellular_network_info` 恰好因为默认值就是 `false` 而幸存，但这是巧合，不是 presence 判断。
   - 当前实际风险有限：前端 `saveVowifiCarrierProfile(record: CarrierProfileRecord)` 发送完整的强类型记录，`CarrierProfileRecord` 是非 Partial 接口，所以自家 UI 不会触发。暴露面主要是第三方或手工调用 API 的 read-modify-write。
   - 测试：`profile_record::tests::a_partial_api_body_silently_reenables_default_true_switches`，断言的是**当前行为**，让暴露面可见并可回归。
-- [ ] 决定是否修复 HTTP 部分 body 的暴露面。
-  - 建议修复方式：handler 改收 `Json<serde_json::Value>`，走 presence-aware 解析，body 缺少任一三态开关时直接报错并指名字段——与第 7 节第 6 项对 catalog bundle 非法值的处理方向一致（宁可报错，不要静默回落）。
-  - 这是 API 契约变更：目前省字段的客户端会从"静默得到错误行为"变成"收到明确错误"。需要产品决策，本轮未改。
+- [x] 修复 HTTP 部分 body 的暴露面。
+  - 完成日期：2026-08-29
+  - handler 改收 `Json<serde_json::Value>`，经新增的 `CarrierProfileRecord::from_api_value()` 解析。body 缺少八个三态开关中任意一个即返回 400 `carrier_profile_register_switch_missing:<逗号分隔的字段名>`；缺整个 register 段落单独报 `carrier_profile_register_section_missing`，不混淆成"缺开关"。
+  - 位置：`backend/src/api/handlers.rs` 的 `upsert_vowifi_carrier_profile_handler`，`backend/src/connectivity/modems/ims/vowifi/profile_record.rs` 的 `from_api_value()` / `from_api_json()` / `REQUIRED_REGISTER_SWITCHES`。
+  - 理由与第 7 节第 6 项一致：PUT 语义是整体替换，省字段属于调用方编写错误，宁可明确报错也不要让 serde 默认值替运营商做决定。错误一次列出全部缺失字段，调用方一个来回就能改对。
+  - **自家 UI 不受影响**：`contracts.ts` 的 `RegisterPolicyRecord` 里这八个字段全是非可选 `boolean`，前端在类型层就无法构造部分记录。前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 均通过。
+  - 测试：`profile_record::tests::the_api_parser_refuses_a_body_missing_register_switches`（逐字段删除各测一次、多字段一起缺时一并报出、缺整段单独报、完整 body 仍被接受）；`http_router_tests::a_partial_put_body_is_refused_by_the_live_endpoint`（真实端点断言拒绝 + 完整 body 仍接受 + `omit` 确实存活到存储状态）。
+  - 原先刻意断言旧行为的两个测试已翻转而非删除：serde 层那个改名为 `plain_deserialization_of_a_partial_body_reenables_default_true_switches`，保留"为什么需要 `from_api_value`"的证据。
 - [ ] 附带发现（不属于第 7 节，未处理）：前端 `current.ts:1172` 调用 `/vowifi/carrier-profiles/import`，但 `main.rs` 没有注册该路由，`aosp_apns`/`aosp_carrier_config`/`ipcc` 三种导入格式在后端没有实现。`contracts.ts` 的类型定义领先于实现。
 - [ ] 检查以下字段的端到端测试：
   - `security_agreement`

@@ -89,7 +89,11 @@ bundle config_json
 
 数据库加载路径是安全的：`from_database_json()` 先反序列化，再把**原始 JSON** 交给 `normalize_legacy_database_record()`，靠 presence 判断区分"缺失"和"authored false"。
 
-**但 HTTP 写入路径没有这个保护。** `PUT /api/vowifi/carrier-profiles` 以 `Json<CarrierProfileRecord>` 反序列化，拿不到原始 body，所以 body 省掉上面四个字段时它们会翻回 `true`。前端发送完整强类型记录，不会触发；第三方或手工 read-modify-write 会。已用 `a_partial_api_body_silently_reenables_default_true_switches` 固定当前行为。修复方向见 `IMS_REGISTER_FOLLOWUP_PLAN.md` 第 7 节。
+**HTTP 写入路径靠显式要求补上同样的保护（2026-08-29）。** `PUT /api/vowifi/carrier-profiles` 拿不到原始 body，无法做 presence 判断，所以改为**要求**八个三态开关全部出现：缺任一个返回 400 `carrier_profile_register_switch_missing:<字段名>`，缺整个 register 段落返回 `carrier_profile_register_section_missing`。入口是 `CarrierProfileRecord::from_api_value()`，字段清单在 `REQUIRED_REGISTER_SWITCHES`。
+
+PUT 是整体替换，所以"必须说清每个开关"本来就是这个动词的含义。前端不受影响：`contracts.ts` 里这八个字段都是非可选 `boolean`。
+
+回归测试：`the_api_parser_refuses_a_body_missing_register_switches`、`a_partial_put_body_is_refused_by_the_live_endpoint`。
 
 配置导入导出不受影响：`custom_carrier_profiles` 表不在 `CONFIG_TABLES` 导出范围内，二进制 restore 又是整表 `SELECT *` 原样复制。
 
