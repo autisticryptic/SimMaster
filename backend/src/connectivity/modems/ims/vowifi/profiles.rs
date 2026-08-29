@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 #[cfg(test)]
 use crate::connectivity::core::voice::AudioCodec;
 
@@ -116,9 +117,16 @@ pub struct RegisterPolicy {
     /// Value of the REGISTER `Expires` header. Some carriers reject the common
     /// 3600 default and demand their own value.
     pub expires_seconds: u32,
-    /// Base of the `P-Access-Network-Info` header, e.g. `IEEE-802.11` or
-    /// `IEEE-802.11a`. Carriers that validate it reject a wrong access type.
+    /// Base/static value of `P-Access-Network-Info`, e.g. `IEEE-802.11` or
+    /// `3GPP-E-UTRAN-FDD`. The source policy below decides whether this value,
+    /// a real serving-cell identity, or no header is emitted.
     pub access_network_info: &'static str,
+    pub pani_identity_policy: AccessIdentityPolicy,
+    /// Optional static `Cellular-Network-Info` value. This is deliberately
+    /// separate from the WLAN PANI so VoWiFi never reuses a Wi-Fi string as a
+    /// cellular identity.
+    pub cellular_network_info: Option<&'static str>,
+    pub cni_identity_policy: AccessIdentityPolicy,
     /// `android_default` or `legacy` — controls the shape of the Contact header.
     pub contact_mode: &'static str,
     /// Order of Contact header parameters. Empty means "use the built-in order
@@ -405,6 +413,9 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -504,6 +515,9 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -600,6 +614,9 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -696,6 +713,9 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -792,6 +812,9 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -888,6 +911,9 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
             sec_agree_mode: "auto",
             expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
             access_network_info: DEFAULT_ACCESS_NETWORK_INFO,
+            pani_identity_policy: AccessIdentityPolicy::Static,
+            cellular_network_info: None,
+            cni_identity_policy: AccessIdentityPolicy::Omit,
             contact_mode: "android_default",
             contact_param_order: &[],
             temporary_status_codes: DEFAULT_TEMPORARY_STATUS_CODES,
@@ -927,16 +953,15 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
 static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
-/// Generate an iPhone/IPCC-shaped fallback from public 3GPP naming rules.
+/// Generate a conservative profile from public 3GPP naming rules.
 ///
-/// This is an explicitly unverified last resort. The registration envelope is
-/// deliberately modelled on the smallest interoperable shape observed in the
-/// iPhone/IPCC catalog: PANI and Cellular-Network-Info are present, the Contact
-/// stays compact, and sec-agree is negotiated without adding the Pixel-style
-/// MMTEL feature set. The stable +sip.instance is retained as required by the
-/// iPhone bundle's flow-binding policy. It still does
-/// not guess a static P-CSCF, entitlement/XCAP endpoints or carrier-specific
-/// identities.
+/// This is an explicitly unverified last resort. It derives only standard
+/// domains and a portable IMS registration envelope: stable flow identity,
+/// access-type PANI and MMTEL capability for voice. On untrusted Wi-Fi, CNI is
+/// enabled only as a capability gate and is emitted only when a real serving-cell
+/// snapshot exists. Initial empty Authorization, visited-network identity and
+/// mandatory sec-agree remain disabled until a database/catalog profile opts in
+/// or the network challenges the UE.
 pub fn derive_standard_3gpp_profile(
     mcc: &str,
     mnc: &str,
@@ -1053,26 +1078,33 @@ pub fn derive_standard_3gpp_profile(
                 request_uri_policy: "home_domain",
                 include_pani_initial: true,
                 include_pani_authenticated: true,
-                initial_authorization: "aka_empty",
-                // LTE uses the conventional MMTEL Contact declaration.  The
-                // generic Wi-Fi fallback stays compact: field testing found a
-                // successful IPCC-derived terminating binding with SMS-only
-                // Contact tags, PANI and Cellular-Network-Info, while the
-                // Pixel-shaped full feature set received 200 OK but no INVITE.
-                include_mmtel_features: matches!(access, Standard3gppAccess::LteEpc),
+                initial_authorization: "none",
+                // Voice-capable fallback registrations advertise MMTEL/audio.
+                // A carrier-specific database profile can deliberately select
+                // an SMS-only Contact (as observed with some IPCC profiles).
+                include_mmtel_features: true,
                 include_route_header: false,
                 include_visited_network: false,
                 include_p_preferred_identity: true,
                 visited_network_header: None,
                 allow_methods: None,
-                strict_security_server_offer: true,
+                strict_security_server_offer: false,
                 enable_initial_reject_fallback: false,
                 use_plain_digest_placeholder: false,
-                require_sec_agree_headers: true,
-                proxy_require_sec_agree_headers: true,
-                sec_agree_mode: "required",
+                require_sec_agree_headers: false,
+                proxy_require_sec_agree_headers: false,
+                sec_agree_mode: "auto",
                 expires_seconds: DEFAULT_REGISTER_EXPIRES_SECONDS,
                 access_network_info: access.access_network_info(),
+                pani_identity_policy: match access {
+                    Standard3gppAccess::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
+                    Standard3gppAccess::WifiEpdg => AccessIdentityPolicy::Static,
+                },
+                cellular_network_info: None,
+                cni_identity_policy: match access {
+                    Standard3gppAccess::LteEpc => AccessIdentityPolicy::Omit,
+                    Standard3gppAccess::WifiEpdg => AccessIdentityPolicy::DynamicIfKnown,
+                },
                 contact_mode: "standard",
                 contact_param_order: match access {
                     Standard3gppAccess::LteEpc => &[
@@ -1087,9 +1119,9 @@ pub fn derive_standard_3gpp_profile(
                 initial_reject_fallback_status_codes: DEFAULT_INITIAL_REJECT_FALLBACK_STATUS_CODES,
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
                 always_add_sip_instance: true,
-                enable_cellular_network_info: true,
+                enable_cellular_network_info: matches!(access, Standard3gppAccess::WifiEpdg),
                 security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
-                live_header_variant_set: "iphone_ipcc_fallback",
+                live_header_variant_set: "standard_3gpp_conservative",
             },
         },
         sms: SmsPolicy {
@@ -1642,12 +1674,12 @@ mod tests {
         assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
         assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
         assert_eq!(lte.ims.transport, "udp");
-        assert_eq!(lte.ims.register.sec_agree_mode, "required");
-        assert!(lte.ims.register.require_sec_agree_headers);
-        assert!(lte.ims.register.proxy_require_sec_agree_headers);
+        assert_eq!(lte.ims.register.sec_agree_mode, "auto");
+        assert!(!lte.ims.register.require_sec_agree_headers);
+        assert!(!lte.ims.register.proxy_require_sec_agree_headers);
         assert!(lte.ims.register.include_pani_initial);
         assert!(lte.ims.register.include_pani_authenticated);
-        assert!(lte.ims.register.enable_cellular_network_info);
+        assert!(!lte.ims.register.enable_cellular_network_info);
         assert!(lte.ims.register.always_add_sip_instance);
         assert!(lte.ims.register.include_mmtel_features);
         assert!(!lte.ims.register.include_route_header);
@@ -1662,8 +1694,12 @@ mod tests {
         );
         assert_eq!(
             lte.ims.register.live_header_variant_set,
-            "iphone_ipcc_fallback"
+            "standard_3gpp_conservative"
         );
+        let wifi = derive_standard_3gpp_profile("502", "12", Standard3gppAccess::WifiEpdg)
+            .expect("derive standard Wi-Fi profile");
+        assert!(wifi.ims.register.enable_cellular_network_info);
+        assert_eq!(wifi.ims.register.access_network_info, "IEEE-802.11");
         assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
     }
 

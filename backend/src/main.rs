@@ -35,7 +35,7 @@ use api::handlers::*;
 use hardware::cellular::modem_manager::ensure_nm_modem_profile;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
-use platform::config_maintenance::{backup_database, export_json, import_json, restore_database};
+use platform::config_maintenance;
 use platform::db::Database;
 use services::event_bus::AppEventBus;
 use services::network::device_network::DdnsManager;
@@ -722,9 +722,11 @@ async fn main() -> Result<()> {
         return run_extract_zip(archive, target);
     }
     if let Some(CliCommand::Auth { command }) = &cli.command {
-        let db = Database::new(get_data_db_path())?;
-        let config_manager =
-            ConfigManager::try_new(get_default_config_path()).map_err(anyhow::Error::msg)?;
+        // One database instance serves both the auth tables and the
+        // configuration's per-line half.
+        let db = Arc::new(Database::new(get_data_db_path())?);
+        let config_manager = ConfigManager::try_new(get_default_config_path(), Arc::clone(&db))
+            .map_err(anyhow::Error::msg)?;
         let security = config_manager.get_security();
         return match command {
             AuthCommand::ResetPassword => {
@@ -734,50 +736,64 @@ async fn main() -> Result<()> {
         };
     }
     if let Some(CliCommand::Config { command }) = &cli.command {
+        // Configuration spans the text file and the application database, so
+        // every command below names both.
         let config_path = get_default_config_path();
+        let database_path = get_data_db_path();
+        let report_rollback = |rollback: &config_maintenance::RollbackPaths, verb: &str| {
+            match (&rollback.database, &rollback.config_file) {
+                (None, None) => println!("Configuration {verb} onto a device with nothing to keep"),
+                _ => {
+                    println!("Configuration {verb}. Kept for rollback:");
+                    if let Some(path) = &rollback.database {
+                        println!("  database:    {}", path.display());
+                    }
+                    if let Some(path) = &rollback.config_file {
+                        println!("  config file: {}", path.display());
+                    }
+                }
+            }
+        };
         return match command {
             ConfigCommand::Backup { output } => {
-                let override_rows =
-                    backup_database(&config_path, output).map_err(anyhow::Error::msg)?;
+                let summary = config_maintenance::backup(&config_path, &database_path, output)
+                    .map_err(anyhow::Error::msg)?;
+                println!("Configuration backed up to {}", output.display());
                 println!(
-                    "Configuration backup created at {} ({} SIM override rows)",
-                    output.display(),
-                    override_rows
+                    "  {} line profiles, {} modem slots, {} reader slots, {} SIM overrides",
+                    summary.line_profiles,
+                    summary.modem_slots,
+                    summary.standalone_sim_slots,
+                    summary.overrides
                 );
+                if config_path.exists() {
+                    println!("  the config file was saved beside the snapshot");
+                }
                 Ok(())
             }
             ConfigCommand::Export { output } => {
-                let override_rows =
-                    export_json(&config_path, output).map_err(anyhow::Error::msg)?;
+                let summary = config_maintenance::export_json(&config_path, &database_path, output)
+                    .map_err(anyhow::Error::msg)?;
+                println!("Configuration exported to {}", output.display());
                 println!(
-                    "Configuration export created at {} ({} SIM override rows)",
-                    output.display(),
-                    override_rows
+                    "  {} line profiles, {} modem slots, {} reader slots, {} SIM overrides",
+                    summary.line_profiles,
+                    summary.modem_slots,
+                    summary.standalone_sim_slots,
+                    summary.overrides
                 );
                 Ok(())
             }
             ConfigCommand::Import { input } => {
-                let rollback = import_json(&config_path, input).map_err(anyhow::Error::msg)?;
-                if let Some(rollback) = rollback {
-                    println!(
-                        "Configuration imported; rollback snapshot retained at {}",
-                        rollback.display()
-                    );
-                } else {
-                    println!("Configuration imported into a new database");
-                }
+                let rollback = config_maintenance::import_json(&config_path, &database_path, input)
+                    .map_err(anyhow::Error::msg)?;
+                report_rollback(&rollback, "imported");
                 Ok(())
             }
             ConfigCommand::Restore { input } => {
-                let rollback = restore_database(&config_path, input).map_err(anyhow::Error::msg)?;
-                if let Some(rollback) = rollback {
-                    println!(
-                        "Configuration restored; previous database retained at {}",
-                        rollback.display()
-                    );
-                } else {
-                    println!("Configuration restored into a new database");
-                }
+                let rollback = config_maintenance::restore(&config_path, &database_path, input)
+                    .map_err(anyhow::Error::msg)?;
+                report_rollback(&rollback, "restored");
                 Ok(())
             }
         };
@@ -837,9 +853,6 @@ async fn main() -> Result<()> {
         ),
     }
 
-    let sim_overrides =
-        Arc::new(connectivity::modems::ims::profile_override::SimOverrideStore::default());
-
     let e911 = Arc::new(services::e911::orchestrator::E911Orchestrator::new(
         services::e911::state_store::E911StateStore::default(),
         services::e911::registry::E911ProviderRegistry::default(),
@@ -854,14 +867,32 @@ async fn main() -> Result<()> {
     let device_kind = hardware::devices::detect_device_kind();
     info!(?device_kind, "Detected hardware device kind");
 
-    // 创建 SMS 数据库（存储在可执行文件同级目录）
+    // 创建应用数据库（存储在可执行文件同级目录）
+    //
+    // This has to come before both the override store and the configuration
+    // manager: per-SIM IMS overrides are rows in it, and the configuration's
+    // per-line half is read from it at load time.
     let db_path = get_data_db_path();
     let app_db = Arc::new(Database::new(db_path)?);
 
+    // Per-SIM IMS overrides live beside the other per-line records, so a device
+    // backup captures them. `SIMADMIN_OVERRIDES_DIR` still selects the file
+    // backend for recovery.
+    let sim_overrides = Arc::new(
+        connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(
+            &app_db,
+        )),
+    );
+
     // 初始化配置管理器
+    //
+    // The main program settings come from the text file; per-line profiles, slot
+    // maps, notification and automation records come from the database.
     let config_path = get_default_config_path();
     info!(path = ?config_path, "Loading config");
-    let config_manager = Arc::new(ConfigManager::try_new(config_path).map_err(anyhow::Error::msg)?);
+    let config_manager = Arc::new(
+        ConfigManager::try_new(config_path, Arc::clone(&app_db)).map_err(anyhow::Error::msg)?,
+    );
     let cell_monitoring_active =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
@@ -1691,6 +1722,12 @@ async fn main() -> Result<()> {
         .route(
             "/api/volte/lines/{line_id}",
             get(get_volte_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/volte/lines/{line_id}/profile-selection",
+            get(get_volte_profile_selection_handler)
+                .put(set_volte_profile_selection_handler)
+                .options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/connection",

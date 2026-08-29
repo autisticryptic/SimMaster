@@ -57,6 +57,8 @@ import type {
   SimImsOverride,
   TrunkProfileResponse,
   VolteLineControlResponse,
+  VolteProfileSelectionConfig,
+  VolteProfileSelectionResponse,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -683,6 +685,19 @@ class SimAdminCurrentAPI {
 
   async getVolteLine(lineId: string) {
     return request<ApiResponse<VolteLineControlResponse>>(`/volte/lines/${encodeURIComponent(lineId)}`)
+  }
+
+  async getVolteProfileSelection(lineId: string) {
+    return request<ApiResponse<VolteProfileSelectionResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+    )
+  }
+
+  async setVolteProfileSelection(lineId: string, selection: VolteProfileSelectionConfig) {
+    return request<ApiResponse<VolteProfileSelectionResponse>>(
+      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+      { method: 'PUT', body: JSON.stringify(selection) },
+    )
   }
 
   async setVolteLineConnection(lineId: string, enabled: boolean) {

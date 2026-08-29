@@ -16,12 +16,22 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use super::profiles::{
     self, CarrierProfile, CarrierProfileMeta, E911Policy, EpdgPolicy, Ikev2Policy, ImsPolicy,
     ProfileIdentityPolicy, RegisterPolicy, SmsPolicy, UtPolicy, VoiceCodecPolicy, VoicePolicy,
 };
 use crate::connectivity::core::voice::AudioCodec;
+
+/// Version of the JSON shape persisted in `custom_carrier_profiles`.
+///
+/// Version `0` denotes a row written before the field existed. Such rows are
+/// normalized by [`CarrierProfileRecord::from_database_json`] using presence
+/// checks against the original JSON so an explicit `false` is never confused
+/// with a serde default.
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarrierProfileMetaRecord {
@@ -125,6 +135,12 @@ pub struct RegisterPolicyRecord {
     pub expires_seconds: u32,
     #[serde(default = "default_access_network_info")]
     pub access_network_info: String,
+    #[serde(default = "default_static_access_identity_policy")]
+    pub pani_identity_policy: AccessIdentityPolicy,
+    #[serde(default)]
+    pub cellular_network_info: Option<String>,
+    #[serde(default = "default_omit_access_identity_policy")]
+    pub cni_identity_policy: AccessIdentityPolicy,
     /// `android_default` | `legacy`.
     #[serde(default = "default_contact_mode")]
     pub contact_mode: String,
@@ -132,7 +148,7 @@ pub struct RegisterPolicyRecord {
     pub contact_param_order: Vec<String>,
     #[serde(default = "default_true")]
     pub always_add_sip_instance: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enable_cellular_network_info: bool,
     #[serde(default = "default_temporary_status_codes")]
     pub temporary_status_codes: Vec<u16>,
@@ -145,7 +161,7 @@ pub struct RegisterPolicyRecord {
 }
 
 fn default_sec_agree_mode() -> String {
-    "required".to_string()
+    "auto".to_string()
 }
 
 fn default_request_uri_policy() -> String {
@@ -166,6 +182,14 @@ fn default_expires_seconds() -> u32 {
 
 fn default_access_network_info() -> String {
     profiles::DEFAULT_ACCESS_NETWORK_INFO.to_string()
+}
+
+fn default_static_access_identity_policy() -> AccessIdentityPolicy {
+    AccessIdentityPolicy::Static
+}
+
+fn default_omit_access_identity_policy() -> AccessIdentityPolicy {
+    AccessIdentityPolicy::Omit
 }
 
 fn default_contact_mode() -> String {
@@ -332,6 +356,8 @@ impl Default for UtPolicyRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarrierProfileRecord {
+    #[serde(default)]
+    pub schema_version: u32,
     pub meta: CarrierProfileMetaRecord,
     pub identity: ProfileIdentityPolicyRecord,
     pub epdg: EpdgPolicyRecord,
@@ -391,6 +417,102 @@ fn intern_voice_codec_policies(values: &[VoiceCodecPolicyRecord]) -> &'static [V
 }
 
 impl CarrierProfileRecord {
+    /// Parse a database row while preserving the distinction between a field
+    /// that was absent in an old schema and a field explicitly set to `false`.
+    ///
+    /// Runtime code only consumes the normalized [`CarrierProfile`], so this
+    /// migration path applies equally to manually-created database profiles,
+    /// copied catalog rows and profiles written by older SimAdmin releases.
+    pub fn from_database_json(json: &str) -> Result<Self, String> {
+        let value = serde_json::from_str::<Value>(json)
+            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+        let mut record = serde_json::from_value::<Self>(value.clone())
+            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+        record.normalize_legacy_database_record(&value)?;
+        record.validate()?;
+        Ok(record)
+    }
+
+    fn normalize_legacy_database_record(&mut self, source: &Value) -> Result<(), String> {
+        if self.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(format!(
+                "carrier_profile_schema_unsupported:{}:{}",
+                self.schema_version, CURRENT_SCHEMA_VERSION
+            ));
+        }
+
+        let register = source.pointer("/ims/register");
+        let has = |field: &str| {
+            register
+                .and_then(Value::as_object)
+                .is_some_and(|object| object.contains_key(field))
+        };
+
+        // Old records inherited these values from serde defaults. Normalize
+        // only missing fields; an operator-authored `false`, `disabled`, or
+        // `omit` has higher priority and must survive unchanged.
+        if !has("always_add_sip_instance") {
+            self.ims.register.always_add_sip_instance = true;
+        }
+        if !has("enable_cellular_network_info") {
+            // CNI can expose serving-cell information and is conditionally
+            // applicable. Never synthesize it merely because an old row did
+            // not know about the switch.
+            self.ims.register.enable_cellular_network_info = false;
+        }
+        if !has("pani_identity_policy") {
+            let access_type = self
+                .ims
+                .register
+                .access_network_info
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_uppercase();
+            self.ims.register.pani_identity_policy = if access_type.starts_with("3GPP-E-UTRAN")
+                || access_type.starts_with("3GPP-NR")
+            {
+                AccessIdentityPolicy::DynamicIfKnown
+            } else {
+                AccessIdentityPolicy::Static
+            };
+        }
+        if !has("cni_identity_policy") {
+            self.ims.register.cni_identity_policy = if self
+                .ims
+                .register
+                .enable_cellular_network_info
+            {
+                AccessIdentityPolicy::DynamicIfKnown
+            } else {
+                AccessIdentityPolicy::Omit
+            };
+        }
+        if !has("include_mmtel_features") {
+            // Legacy rows predate the explicit capability switch. Treat them
+            // as voice-capable so a normal database profile remains eligible
+            // for MMTEL terminating service on either LTE or Wi-Fi. An
+            // operator-authored SMS-only/IPCC shape must store an explicit
+            // `false`, which the presence check above preserves.
+            self.ims.register.include_mmtel_features = true;
+        }
+        if !has("sec_agree_mode") {
+            self.ims.register.sec_agree_mode = if self.ims.register.require_sec_agree_headers
+                || self.ims.register.proxy_require_sec_agree_headers
+            {
+                "required".to_string()
+            } else if self.ims.register.security_client_mechanisms.is_empty() {
+                "disabled".to_string()
+            } else {
+                "auto".to_string()
+            };
+        }
+
+        self.schema_version = CURRENT_SCHEMA_VERSION;
+        Ok(())
+    }
+
     /// Turn this record into a `&'static CarrierProfile`.
     ///
     /// Repeated calls for the same `profile_id` return the same reference, so
@@ -504,6 +626,11 @@ impl CarrierProfileRecord {
                     live_header_variant_set: intern_str(&self.ims.register.live_header_variant_set),
                     expires_seconds: self.ims.register.expires_seconds,
                     access_network_info: intern_str(&self.ims.register.access_network_info),
+                    pani_identity_policy: self.ims.register.pani_identity_policy,
+                    cellular_network_info: intern_opt(
+                        self.ims.register.cellular_network_info.as_ref(),
+                    ),
+                    cni_identity_policy: self.ims.register.cni_identity_policy,
                     contact_mode: intern_str(&self.ims.register.contact_mode),
                     contact_param_order: intern_list(&self.ims.register.contact_param_order),
                     always_add_sip_instance: self.ims.register.always_add_sip_instance,
@@ -565,6 +692,7 @@ impl CarrierProfileRecord {
         let to_owned_list =
             |values: &'static [&'static str]| values.iter().map(|v| v.to_string()).collect();
         Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
             meta: CarrierProfileMetaRecord {
                 profile_id: profile.meta.profile_id.to_string(),
                 mcc: profile.meta.mcc.to_string(),
@@ -650,6 +778,13 @@ impl CarrierProfileRecord {
                         .to_string(),
                     expires_seconds: profile.ims.register.expires_seconds,
                     access_network_info: profile.ims.register.access_network_info.to_string(),
+                    pani_identity_policy: profile.ims.register.pani_identity_policy,
+                    cellular_network_info: profile
+                        .ims
+                        .register
+                        .cellular_network_info
+                        .map(str::to_string),
+                    cni_identity_policy: profile.ims.register.cni_identity_policy,
                     contact_mode: profile.ims.register.contact_mode.to_string(),
                     contact_param_order: to_owned_list(profile.ims.register.contact_param_order),
                     always_add_sip_instance: profile.ims.register.always_add_sip_instance,
@@ -766,6 +901,56 @@ impl CarrierProfileRecord {
         if self.ims.domain.trim().is_empty() || self.ims.realm.trim().is_empty() {
             return Err("ims_domain_and_realm_required".to_string());
         }
+        for (field, value) in [
+            (
+                "identity.device_model_hint",
+                self.identity.device_model_hint.as_str(),
+            ),
+            ("ims.domain", self.ims.domain.as_str()),
+            ("ims.realm", self.ims.realm.as_str()),
+            ("ims.user_agent", self.ims.user_agent.as_str()),
+            (
+                "ims.register.supported_header",
+                self.ims.register.supported_header.as_str(),
+            ),
+            (
+                "ims.register.access_network_info",
+                self.ims.register.access_network_info.as_str(),
+            ),
+        ] {
+            validate_single_line_wire_value(field, value)?;
+        }
+        for (field, value) in [
+            ("ims.registrar", self.ims.registrar.as_deref()),
+            ("ims.pcscf", self.ims.pcscf.as_deref()),
+            (
+                "ims.register.visited_network_header",
+                self.ims.register.visited_network_header.as_deref(),
+            ),
+            (
+                "ims.register.allow_methods",
+                self.ims.register.allow_methods.as_deref(),
+            ),
+            (
+                "ims.register.cellular_network_info",
+                self.ims.register.cellular_network_info.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                validate_single_line_wire_value(field, value)?;
+            }
+        }
+        for value in &self.ims.register.security_client_mechanisms {
+            validate_single_line_wire_value("ims.register.security_client_mechanisms", value)?;
+        }
+        for value in &self.ims.register.contact_param_order {
+            validate_single_line_wire_value("ims.register.contact_param_order", value)?;
+        }
+        for policy in &self.voice.codec_policies {
+            if let Some(fmtp) = policy.fmtp.as_deref() {
+                validate_single_line_wire_value("voice.codec_policies.fmtp", fmtp)?;
+            }
+        }
         if !matches!(self.ims.transport.as_str(), "tcp" | "udp") {
             return Err("ims_transport_must_be_tcp_or_udp".to_string());
         }
@@ -821,9 +1006,21 @@ impl CarrierProfileRecord {
             return Err("register_user_agent_required".to_string());
         }
         if (self.ims.register.include_pani_initial || self.ims.register.include_pani_authenticated)
+            && self.ims.register.pani_identity_policy != AccessIdentityPolicy::Omit
             && self.ims.register.access_network_info.trim().is_empty()
         {
             return Err("access_network_info_required".to_string());
+        }
+        if self.ims.register.enable_cellular_network_info
+            && self.ims.register.cni_identity_policy == AccessIdentityPolicy::Static
+            && self
+                .ims
+                .register
+                .cellular_network_info
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("cellular_network_info_required_for_static_policy".to_string());
         }
         if (self.ims.register.sec_agree_mode == "required"
             || self.ims.register.require_sec_agree_headers
@@ -992,6 +1189,13 @@ impl CarrierProfileRecord {
     }
 }
 
+fn validate_single_line_wire_value(field: &str, value: &str) -> Result<(), String> {
+    if value.chars().any(char::is_control) {
+        return Err(format!("wire_value_contains_control:{field}"));
+    }
+    Ok(())
+}
+
 /// Accept `1.1.1.1` or `1.1.1.1:53`, defaulting the port when omitted.
 pub fn parse_dns_server(value: &str) -> Option<std::net::SocketAddr> {
     let value = value.trim();
@@ -1075,7 +1279,10 @@ mod tests {
     #[test]
     fn sec_agree_mode_and_contact_mode_are_constrained() {
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
-        assert_eq!(record.ims.register.sec_agree_mode, "required");
+        assert!(matches!(
+            record.ims.register.sec_agree_mode.as_str(),
+            "disabled" | "auto" | "required"
+        ));
         record.ims.register.sec_agree_mode = "maybe".to_string();
         assert_eq!(record.validate().unwrap_err(), "sec_agree_mode_invalid");
 
@@ -1156,13 +1363,19 @@ mod tests {
     }
 
     #[test]
-    fn older_json_without_the_new_fields_still_loads_with_defaults() {
-        // A record written before the auth fields existed must keep working.
+    fn older_database_json_without_new_fields_is_normalized() {
+        // A row written before these fields existed must keep working, but
+        // migration must happen through the database parser so field presence
+        // can be distinguished from serde defaults.
         let record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         let mut value = serde_json::to_value(&record).expect("serialize");
+        value.as_object_mut().unwrap().remove("schema_version");
         let register = value["ims"]["register"].as_object_mut().unwrap();
         for key in [
             "sec_agree_mode",
+            "include_mmtel_features",
+            "always_add_sip_instance",
+            "enable_cellular_network_info",
             "expires_seconds",
             "access_network_info",
             "contact_mode",
@@ -1177,13 +1390,77 @@ mod tests {
         ims.remove("tcp_keepalive_seconds");
         ims.remove("options_ping_interval_seconds");
 
-        let parsed: CarrierProfileRecord = serde_json::from_value(value).expect("deserialize");
-        parsed.validate().expect("defaults must be valid");
-        assert_eq!(parsed.ims.register.sec_agree_mode, "required");
+        let json = serde_json::to_string(&value).expect("serialize legacy row");
+        let parsed = CarrierProfileRecord::from_database_json(&json).expect("migrate database row");
+        assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(parsed.ims.register.sec_agree_mode, "auto");
+        assert!(parsed.ims.register.include_mmtel_features);
+        assert!(parsed.ims.register.always_add_sip_instance);
+        assert!(!parsed.ims.register.enable_cellular_network_info);
         assert_eq!(parsed.ims.register.expires_seconds, 3600);
         assert_eq!(parsed.ims.register.access_network_info, "IEEE-802.11");
         assert_eq!(parsed.ims.tcp_keepalive_seconds, 30);
         assert_eq!(parsed.ims.register.forbidden_status_codes, vec![403]);
+    }
+
+    #[test]
+    fn database_migration_preserves_explicit_optional_header_disables() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.schema_version = 0;
+        record.ims.register.include_mmtel_features = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.enable_cellular_network_info = false;
+        record.ims.register.sec_agree_mode = "disabled".to_string();
+        record.ims.register.require_sec_agree_headers = false;
+        record.ims.register.proxy_require_sec_agree_headers = false;
+        let json = serde_json::to_string(&record).expect("serialize legacy row");
+
+        let parsed = CarrierProfileRecord::from_database_json(&json).expect("load database row");
+        assert_eq!(parsed.schema_version, CURRENT_SCHEMA_VERSION);
+        assert!(!parsed.ims.register.include_mmtel_features);
+        assert!(!parsed.ims.register.always_add_sip_instance);
+        assert!(!parsed.ims.register.enable_cellular_network_info);
+        assert_eq!(parsed.ims.register.sec_agree_mode, "disabled");
+    }
+
+    #[test]
+    fn database_parser_rejects_future_schema_versions() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        let json = serde_json::to_string(&record).expect("serialize future row");
+        assert_eq!(
+            CarrierProfileRecord::from_database_json(&json).unwrap_err(),
+            format!(
+                "carrier_profile_schema_unsupported:{}:{}",
+                CURRENT_SCHEMA_VERSION + 1,
+                CURRENT_SCHEMA_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn database_parser_rejects_control_characters_in_wire_values() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.user_agent = "SimAdmin IMS\r\nX-Injected: yes".to_string();
+        let json = serde_json::to_string(&record).expect("serialize malicious database row");
+        assert_eq!(
+            CarrierProfileRecord::from_database_json(&json).unwrap_err(),
+            "wire_value_contains_control:ims.user_agent"
+        );
+
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.contact_param_order = vec!["audio\nX-Injected: yes".to_string()];
+        assert_eq!(
+            record.validate_ims_only().unwrap_err(),
+            "wire_value_contains_control:ims.register.contact_param_order"
+        );
+
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.ims.register.access_network_info = "IEEE-802.11\u{7f}".to_string();
+        assert_eq!(
+            record.validate_ims_only().unwrap_err(),
+            "wire_value_contains_control:ims.register.access_network_info"
+        );
     }
 
     #[test]

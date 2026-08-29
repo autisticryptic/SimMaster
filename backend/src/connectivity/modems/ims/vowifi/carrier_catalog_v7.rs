@@ -15,8 +15,10 @@ use super::{
     normalize_home_plmn, normalize_ip_family, CatalogAccessKind, CatalogIdentityMatch,
     CatalogProfile, CatalogProfileIcon, CatalogRelease, CatalogServiceCapabilities, ProfileMetaRow,
 };
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::modems::ims::vowifi::profile_record::{
     CarrierProfileMetaRecord, CarrierProfileRecord, E911PolicyRecord, EpdgPolicyRecord,
+    CURRENT_SCHEMA_VERSION,
     Ikev2PolicyRecord, ImsPolicyRecord, ProfileIdentityPolicyRecord, RegisterPolicyRecord,
     SmsPolicyRecord, UtPolicyRecord, VoiceCodecPolicyRecord, VoicePolicyRecord,
 };
@@ -694,6 +696,7 @@ fn project_config(
     };
 
     let record = CarrierProfileRecord {
+        schema_version: CURRENT_SCHEMA_VERSION,
         meta: CarrierProfileMetaRecord {
             profile_id: profile_id.to_string(),
             mcc: meta.mcc.clone(),
@@ -1196,12 +1199,13 @@ fn project_register(
     let register = config
         .pointer("/sip/common/register")
         .unwrap_or(&Value::Null);
-    // A missing security-agreement field is an incomplete bundle, not an
-    // instruction to omit RFC 3329.  Use the interoperable baseline and keep
-    // the challenge-first variant available for cores that reject an initial
-    // Require header.  An explicit `auto` or `disabled` remains authoritative.
-    let sec_agree_mode = match string_at(register, "/security_agreement").unwrap_or("required") {
+    // Missing carrier data is not permission to demand sec-agree. Offer a
+    // compatible Security-Client proposal in `auto` mode and only add
+    // Require/Proxy-Require when the bundle explicitly requires it or the
+    // P-CSCF answers 421/494. Explicit `disabled`/`omit` remains authoritative.
+    let sec_agree_mode = match string_at(register, "/security_agreement").unwrap_or("auto") {
         value @ ("auto" | "required" | "disabled") => value.to_string(),
+        "omit" => "disabled".to_string(),
         unsupported => {
             return Err(format!(
                 "carrier_catalog_sec_agree_unsupported:{profile_id}:{unsupported}"
@@ -1212,14 +1216,10 @@ fn project_register(
     if sec_agree_mode != "disabled" && security_client.is_empty() {
         security_client.push(BASELINE_SECURITY_CLIENT.to_string());
     }
-    // Offering ipsec-3gpp through Security-Client commits the UE to the
-    // security agreement, so the same REGISTER has to advertise and demand it:
-    // RFC 3329 §2.3 requires Supported/Require/Proxy-Require to travel with the
-    // offer, and TS 24.229 §5.1.1.2.2 requires the empty AKA Authorization.
-    // Bundles extracted from real handsets frequently omit
-    // `security_agreement`, which lands here as "auto"; sending the offer
-    // without the declaration makes the request self-contradictory and IMS
-    // cores answer 421 Extension Required.
+    // Keep `sec-agree` in Supported when a Security-Client proposal exists.
+    // Require and Proxy-Require are controlled independently below; an `auto`
+    // profile starts without demanding the extension and can be upgraded after
+    // a 421/494 response.
     let offers_sec_agree = !security_client.is_empty();
     let mut supported = string_array_or_csv(register, "/supported")
         .unwrap_or_else(|| vec!["path".to_string(), "gruu".to_string()]);
@@ -1240,16 +1240,39 @@ fn project_register(
     let baseline_includes_pani = match country_of_origination_format.as_str() {
         "PANI" | "BOTH" => true,
         "NONE" => false,
-        _ => true,
+        // LTE catalog rows use the standard access-type-only PANI fallback.
+        // Wi-Fi rows must opt in because handset bundles differ substantially.
+        _ => matches!(access, CatalogAccessKind::LteEpc),
     };
     let include_pani_initial =
-        bool_at(register, "/include_pani_initial").unwrap_or(baseline_includes_pani);
+        bool_at_or_omit(register, "/include_pani_initial").unwrap_or(baseline_includes_pani);
     let include_pani_authenticated =
-        bool_at(register, "/include_pani_authenticated").unwrap_or(baseline_includes_pani);
+        bool_at_or_omit(register, "/include_pani_authenticated").unwrap_or(baseline_includes_pani);
     let pani = string_at(register, "/access_network_info")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_access_network_info"))
         .transpose()?
         .unwrap_or_else(|| default_access_network_info(access).to_string());
+    let pani_identity_policy = access_identity_policy_at(register, "/pani_identity_policy")?
+        .unwrap_or(match access {
+            CatalogAccessKind::LteEpc => AccessIdentityPolicy::DynamicIfKnown,
+            CatalogAccessKind::WifiEpdg => AccessIdentityPolicy::Static,
+        });
+    let enable_cellular_network_info = bool_at_or_omit(
+        register,
+        "/enable_cellular_network_info",
+    )
+    .unwrap_or(false);
+    let cellular_network_info = string_at(register, "/cellular_network_info")
+        .map(|value| {
+            expand_ims_static_template(value, meta, domain, "sip_cellular_network_info")
+        })
+        .transpose()?;
+    let cni_identity_policy = access_identity_policy_at(register, "/cni_identity_policy")?
+        .unwrap_or(if enable_cellular_network_info {
+            AccessIdentityPolicy::DynamicIfKnown
+        } else {
+            AccessIdentityPolicy::Omit
+        });
     let visited_network_header = string_at(register, "/visited_network_header")
         .map(|value| expand_ims_static_template(value, meta, domain, "sip_visited_network_id"))
         .transpose()?;
@@ -1266,20 +1289,17 @@ fn project_register(
             "audio" | "+g.3gpp.icsi-ref"
         )
     });
-    // Contact feature tags are not a reliable substitute for access identity.
-    // A field-tested iOS VoWiFi binding is deliberately SMS-only, while a
-    // Pixel-shaped binding with the full MMTEL set receives 200 OK but is not
-    // selected by the TAS for terminating calls.  Preserve explicit bundle
-    // tags; otherwise use the compact iOS-shaped baseline on Wi-Fi and the
-    // normal MMTEL baseline on LTE.
+    // Contact feature tags describe service capability; they are not a
+    // substitute for access identity. Preserve an explicit bundle list exactly,
+    // otherwise advertise MMTEL for any access whose service declaration says
+    // it is voice-capable. Carrier-specific SMS-only/IPCC bindings must opt out
+    // explicitly instead of becoming the global Wi-Fi default.
     let declares_voice_service = match access {
         CatalogAccessKind::LteEpc => bool_at(config, "/services/volte").unwrap_or(true),
         CatalogAccessKind::WifiEpdg => bool_at(config, "/services/vowifi").unwrap_or(true),
     };
-    let include_mmtel_features = contact_declares_mmtel
-        || (contact_param_order.is_empty()
-            && declares_voice_service
-            && matches!(access, CatalogAccessKind::LteEpc));
+    let include_mmtel_features =
+        contact_declares_mmtel || (contact_param_order.is_empty() && declares_voice_service);
     Ok(RegisterPolicyRecord {
         supported_header: supported.join(","),
         request_uri_policy: string_at(register, "/request_uri_policy")
@@ -1293,53 +1313,52 @@ fn project_register(
         // Offering ipsec-3gpp means we are doing IMS AKA, so default to that
         // shape; a core that demands sec-agree has no way to start the
         // challenge without it and answers 400. The explicit JSON value still
-        // wins, and hardcoded profiles in profiles.rs are unaffected.
+        // Empty AKA Authorization is carrier/profile specific. Unknown
+        // bundles use challenge-first Digest/AKA and may opt in explicitly.
         initial_authorization: string_at(register, "/initial_authorization")
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if offers_sec_agree {
-                    "aka_empty".to_string()
-                } else {
-                    "none".to_string()
-                }
-            }),
+            .unwrap_or("none")
+            .to_string(),
         include_mmtel_features,
-        include_route_header: bool_at(register, "/include_route_header").unwrap_or(false),
+        include_route_header: bool_at_or_omit(register, "/include_route_header").unwrap_or(false),
         include_visited_network: visited_network_header.is_some(),
-        include_p_preferred_identity: bool_at(register, "/include_p_preferred_identity")
+        include_p_preferred_identity: bool_at_or_omit(register, "/include_p_preferred_identity")
             .unwrap_or(true),
         visited_network_header,
         allow_methods: string_array_or_csv(register, "/allow_methods")
             .map(|methods| methods.join(",")),
         strict_security_server_offer: !security_client.is_empty(),
-        enable_initial_reject_fallback: false,
+        enable_initial_reject_fallback: bool_at_or_omit(
+            register,
+            "/enable_initial_reject_fallback",
+        )
+        .unwrap_or(false),
         use_plain_digest_placeholder: false,
-        require_sec_agree_headers: bool_at(register, "/require_sec_agree_headers").unwrap_or(false),
-        // RFC 3329 §2.3: Require and Proxy-Require travel together. The
-        // builder already gates this on require_sec_agree, so defaulting it on
-        // only takes effect once we actually send Require -- either because
-        // the bundle marks security_agreement=required or because the core
-        // answered 421 and we escalated. Maxis answers 400 Bad Request to a
-        // Require without the matching Proxy-Require.
-        proxy_require_sec_agree_headers: bool_at(register, "/proxy_require_sec_agree_headers")
-            .unwrap_or(true),
+        require_sec_agree_headers: bool_at_or_omit(register, "/require_sec_agree_headers")
+            .unwrap_or(false),
+        proxy_require_sec_agree_headers: bool_at_or_omit(
+            register,
+            "/proxy_require_sec_agree_headers",
+        )
+        .unwrap_or(false),
         sec_agree_mode,
         security_client_mechanisms: security_client,
         live_header_variant_set: "catalog_v7".to_string(),
         expires_seconds: u32_at(register, "/requested_expires_seconds")
             .unwrap_or(profiles::DEFAULT_REGISTER_EXPIRES_SECONDS),
         access_network_info: pani,
+        pani_identity_policy,
+        cellular_network_info,
+        cni_identity_policy,
         contact_mode: string_at(register, "/contact_mode")
             .unwrap_or("standard")
             .to_string(),
         contact_param_order,
         // Stable flow identity is part of the generic registration baseline.
-        // Cellular-Network-Info is an interoperability hint used by successful
-        // IPCC-derived profiles rather than a 3GPP mandatory header; it is on
-        // for incomplete bundles, while an explicit carrier value still wins.
-        always_add_sip_instance: bool_at(register, "/always_add_sip_instance").unwrap_or(true),
-        enable_cellular_network_info: bool_at(register, "/enable_cellular_network_info")
+        // CNI is conditionally applicable and may disclose serving-cell data;
+        // only an explicit carrier/database policy enables it.
+        always_add_sip_instance: bool_at_or_omit(register, "/always_add_sip_instance")
             .unwrap_or(true),
+        enable_cellular_network_info,
         temporary_status_codes: u16_array_at(register, "/temporary_status_codes")
             .unwrap_or_else(|| profiles::DEFAULT_TEMPORARY_STATUS_CODES.to_vec()),
         forbidden_status_codes: u16_array_at(register, "/forbidden_status_codes")
@@ -1478,6 +1497,45 @@ fn string_at<'a>(value: &'a Value, pointer: &str) -> Option<&'a str> {
 
 fn bool_at(value: &Value, pointer: &str) -> Option<bool> {
     value.pointer(pointer).and_then(Value::as_bool)
+}
+
+fn access_identity_policy_at(
+    value: &Value,
+    pointer: &str,
+) -> Result<Option<AccessIdentityPolicy>, String> {
+    let Some(raw) = string_at(value, pointer) else {
+        return Ok(None);
+    };
+    let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+    let policy = match normalized.as_str() {
+        "omit" => AccessIdentityPolicy::Omit,
+        "static" => AccessIdentityPolicy::Static,
+        "dynamic_if_known" => AccessIdentityPolicy::DynamicIfKnown,
+        "required_dynamic" => AccessIdentityPolicy::RequiredDynamic,
+        _ => {
+            return Err(format!(
+                "carrier_catalog_access_identity_policy_invalid:{pointer}:{raw}"
+            ));
+        }
+    };
+    Ok(Some(policy))
+}
+
+/// Database bundles express "explicitly do not send this header" as the
+/// string `omit`.  Treat that exactly like `false`: the caller receives
+/// `Some(false)` and its default no longer kicks in, while a missing field
+/// still returns `None` so the baseline default applies.  `"true"`/`"false"`
+/// strings are accepted as well for bundles that store booleans as text.
+fn bool_at_or_omit(value: &Value, pointer: &str) -> Option<bool> {
+    match value.pointer(pointer) {
+        Some(Value::Bool(flag)) => Some(*flag),
+        Some(Value::String(text)) => match text.to_ascii_lowercase().as_str() {
+            "true" => Some(true),
+            "false" | "omit" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn u16_at(value: &Value, pointer: &str) -> Option<u16> {
@@ -1861,12 +1919,11 @@ mod tests {
     }
 
     #[test]
-    fn voice_service_declaration_uses_access_specific_contact_baseline() {
+    fn voice_service_declaration_enables_mmtel_on_each_voice_access() {
         let (catalog, path) = fixture();
-        // The fixture bundle declares services.volte/vowifi but carries no
-        // sip.common.contact_parameters. LTE advertises the conventional
-        // MMTEL tags; Wi-Fi uses the field-tested compact IPCC binding and
-        // relies on PANI/Cellular-Network-Info for access classification.
+        // The fixture declares services.volte/vowifi but carries no explicit
+        // Contact parameters. Both voice-capable access legs use the standard
+        // MMTEL baseline; an SMS-only binding must be explicit in the bundle.
         for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
             let resolved = catalog
                 .resolve_for_imsi("234330123456789", None, access)
@@ -1877,10 +1934,9 @@ mod tests {
                 "fixture should carry no explicit Contact parameters for {}",
                 access.as_str()
             );
-            assert_eq!(
+            assert!(
                 resolved.record.ims.register.include_mmtel_features,
-                matches!(access, CatalogAccessKind::LteEpc),
-                "{} should use the access-specific Contact baseline",
+                "{} should advertise MMTEL for a declared voice service",
                 access.as_str()
             );
         }
@@ -2084,17 +2140,77 @@ mod tests {
         // are filtered out; the supported AES-CBC/SHA1 entry remains.
         assert_eq!(wifi.record.ikev2.ike_proposals, ["aes128-sha1-modp2048"]);
         assert_eq!(wifi.record.ikev2.esp_proposals, ["aes128-sha1"]);
-        // security_agreement removed -> required baseline -> Security-Client applied.
-        assert_eq!(wifi.record.ims.register.sec_agree_mode, "required");
-        assert!(wifi.record.ims.register.include_pani_initial);
-        assert!(wifi.record.ims.register.include_pani_authenticated);
-        assert!(wifi.record.ims.register.enable_cellular_network_info);
+        // Missing security_agreement is challenge-driven rather than forced.
+        assert_eq!(wifi.record.ims.register.sec_agree_mode, "auto");
+        assert!(!wifi.record.ims.register.include_pani_initial);
+        assert!(!wifi.record.ims.register.include_pani_authenticated);
+        assert!(!wifi.record.ims.register.enable_cellular_network_info);
         assert!(wifi.record.ims.register.always_add_sip_instance);
         assert_eq!(
             wifi.record.ims.register.security_client_mechanisms,
             ["hmac-sha-1-96/aes-cbc/esp/trans"]
         );
 
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn explicit_omit_in_database_bundle_disables_optional_register_headers() {
+        let (catalog, path) = fixture();
+        {
+            let conn = Connection::open(&path).expect("open fixture for mutation");
+            conn.execute_batch(
+                "INSERT INTO carrier_profiles(
+                     profile_id, carrier_id, display_name, profile_kind,
+                     priority, confidence, lte_ims_status, nr_ims_status,
+                     vowifi_status, profile_asset_id, config_json
+                 )
+                 SELECT 'test-v7-23438', carrier_id, 'Test v7 omit', profile_kind,
+                        20, confidence, lte_ims_status, nr_ims_status,
+                        'ready', profile_asset_id,
+                        json_set(
+                            config_json,
+                            '$.sip.common.register.security_agreement', 'omit',
+                            '$.sip.common.register.include_pani_initial', 'omit',
+                            '$.sip.common.register.include_pani_authenticated', 'omit',
+                            '$.sip.common.register.include_route_header', 'omit',
+                            '$.sip.common.register.include_p_preferred_identity', 'omit',
+                            '$.sip.common.register.always_add_sip_instance', 'omit',
+                            '$.sip.common.register.enable_cellular_network_info', 'omit',
+                            '$.sip.common.register.require_sec_agree_headers', 'omit',
+                            '$.sip.common.register.proxy_require_sec_agree_headers', 'omit'
+                        )
+                 FROM carrier_profiles WHERE profile_id = 'test-v7-23433';
+                 INSERT INTO profile_match_rules VALUES (
+                     7, 'test-v7-23438', 1, '23438', '234380', NULL, NULL, NULL, NULL, 0
+                 );",
+            )
+            .expect("insert omit profile");
+        }
+
+        let lte = catalog
+            .resolve_for_imsi("234380123456789", None, CatalogAccessKind::LteEpc)
+            .expect("query")
+            .expect("profile");
+        let register = &lte.record.ims.register;
+        // `omit` is an explicit instruction, not a missing field: the
+        // baseline defaults (PANI on, CNI on, sip.instance on, sec-agree
+        // required) must not kick in for these switches.
+        assert_eq!(register.sec_agree_mode, "disabled");
+        assert!(!register.include_pani_initial);
+        assert!(!register.include_pani_authenticated);
+        assert!(!register.include_route_header);
+        assert!(!register.include_p_preferred_identity);
+        assert!(!register.require_sec_agree_headers);
+        assert!(!register.proxy_require_sec_agree_headers);
+        assert!(!register.always_add_sip_instance);
+        assert!(!register.enable_cellular_network_info);
+        // The source bundle's explicit Security-Client list is preserved, but
+        // `disabled` means the live layer never sends the RFC 3329 offer.
+        assert_eq!(
+            register.security_client_mechanisms,
+            ["hmac-sha-1-96/aes-cbc/esp/trans"]
+        );
         std::fs::remove_file(path).expect("remove fixture");
     }
 

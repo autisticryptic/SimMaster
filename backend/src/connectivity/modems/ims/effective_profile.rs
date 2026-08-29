@@ -16,7 +16,10 @@
 //! editing an override does not accumulate permanent objects. The source map
 //! lets the API explain where each effective value came from.
 
-use crate::connectivity::modems::ims::vowifi::profiles::CarrierProfile;
+use crate::connectivity::modems::ims::vowifi::{
+    profile_record::parse_dns_server,
+    profiles::CarrierProfile,
+};
 
 use super::profile_override::{ImsAccessOverride, OverrideSource, SimOverride};
 
@@ -451,6 +454,15 @@ fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<St
             problems.push(format!("{name}.pcscf_must_not_contain_empty_entry"));
         }
     }
+    if name == "ims_vowifi"
+        && access.dns.as_ref().is_some_and(|servers| {
+            servers.iter().any(|server| {
+                parse_dns_server(server).is_none_or(|address| address.port() == 0)
+            })
+        })
+    {
+        problems.push("ims_vowifi.dns_server_invalid".to_string());
+    }
     for (field, value) in [
         ("domain", access.domain.as_deref()),
         ("realm", access.realm.as_deref()),
@@ -669,6 +681,26 @@ mod tests {
         assert!(!is_valid_imei("12345"));
         assert!(!is_valid_imei("35123456789012a"));
         assert!(!is_valid_imei("3512345678901234"));
+    }
+
+    #[test]
+    fn vowifi_dns_override_accepts_ip_addresses_and_rejects_invalid_servers() {
+        let mut override_ = SimOverride::default();
+        override_.ims_vowifi.dns = Some(vec![
+            "1.1.1.1".to_string(),
+            "1.1.1.1:53".to_string(),
+            "2001:4860:4860::8888".to_string(),
+            "[2001:4860:4860::8888]:53".to_string(),
+        ]);
+        assert!(validate_override(&override_).is_empty());
+
+        override_.ims_vowifi.dns = Some(vec!["not-a-dns-server".to_string()]);
+        assert!(validate_override(&override_)
+            .contains(&"ims_vowifi.dns_server_invalid".to_string()));
+
+        override_.ims_vowifi.dns = Some(vec!["1.1.1.1:0".to_string()]);
+        assert!(validate_override(&override_)
+            .contains(&"ims_vowifi.dns_server_invalid".to_string()));
     }
 
     #[test]

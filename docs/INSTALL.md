@@ -190,12 +190,20 @@ SimAdmin 没有默认初始密码。首次访问会进入管理员密码设置�
 ```bash
 systemctl stop simadmin.service
 install -d -m 0700 /opt/simadmin/manual-backup
+# data.db 现在同时保存运行数据和每线路配置，必须备份
 cp -a /opt/simadmin/data.db* /opt/simadmin/manual-backup/
-cp -a /opt/simadmin/config.sqlite3* /opt/simadmin/manual-backup/ 2>/dev/null || true
-cp -a /data/config.sqlite3* /opt/simadmin/manual-backup/ 2>/dev/null || true
-cp -a /opt/simadmin/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
-cp -a /data/config.json /opt/simadmin/manual-backup/ 2>/dev/null || true
+# 主程序配置文本文件（两个候选路径，含保存前留下的 .bak）
+cp -a /data/config.yaml* /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /opt/simadmin/config.yaml* /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /data/config.json* /opt/simadmin/manual-backup/ 2>/dev/null || true
+cp -a /opt/simadmin/config.json* /opt/simadmin/manual-backup/ 2>/dev/null || true
 cp -a /data/simadmin/e911 /opt/simadmin/manual-backup/ 2>/dev/null || true
+```
+
+或者用内置命令一次拿到两半（会把文件半存在快照旁边）：
+
+```bash
+simadmin config backup /opt/simadmin/manual-backup/config-snapshot.db
 ```
 
 然后按第 3、4 节重新传输并覆盖后端、前端和经过审核的 catalog，最后启动并检查日志：
@@ -206,9 +214,13 @@ systemctl status simadmin --no-pager
 journalctl -u simadmin -n 100 --no-pager
 ```
 
-`data.db`、`config.sqlite3` 和 E911 secret state 是用户数据，不要用发布包中的同名文件覆盖。
+`data.db`、`config.yaml` 和 E911 secret state 是用户数据，不要用发布包中的同名文件覆盖。
 复制 SQLite 文件前必须先停止服务，不能在 WAL 活跃时只复制主文件。catalog 是独立只读制品，
 升级时需要同时验证 schema、config contract 与 sealed 状态。
+
+配置文件和 `data.db` 必须成对备份、成对恢复。配置分两半：主程序设置在文本文件里，每条线路的
+基带/读卡器配置、通知规则和自动化任务在 `data.db` 里。只恢复一半会得到设备从未处于过的状态
+——线路配置在，但它依赖的安全策略和 DDNS 设置不见了，或者反过来。
 
 ## 9. 暂停使用的功能
 

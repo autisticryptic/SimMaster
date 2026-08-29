@@ -1,5 +1,5 @@
-//! IMS Digest-AKA computation (RFC 3310 AKAv1-MD5, RFC 4169 AKAv2-MD5) plus SIP
-//! digest-challenge parsing and Authorization header assembly.
+//! IMS Digest-AKA computation (RFC 3310 AKAv1-MD5 and RFC 4169 AKAv2 with
+//! MD5/SHA-256) plus SIP digest-challenge parsing and Authorization assembly.
 //!
 //! Clean-room from public specifications: RFC 2617 (HTTP Digest), RFC 2104
 //! (HMAC), RFC 3310 (Digest AKAv1), RFC 4169 (Digest AKAv2), 3GPP TS 33.203.
@@ -100,8 +100,9 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, ImsError> {
 }
 
 /// Derive the digest "password" from AKA material per RFC 3310 / RFC 4169.
-///   - AKAv1-MD5 (and plain MD5): password = RES bytes.
-///   - AKAv2-MD5: password = base64( HMAC-MD5( RES||IK||CK, "http-digest-akav2-password" ) ).
+///   - AKAv1-MD5 (and carrier-gated plain MD5): password = RES bytes.
+///   - AKAv2-MD5: base64(HMAC-MD5(RES||IK||CK, fixed-label)).
+///   - AKAv2-SHA-256: base64(HMAC-SHA-256(RES||IK||CK, fixed-label)).
 pub fn aka_digest_password(algorithm: &str, aka: &AkaMaterial<'_>) -> Result<Vec<u8>, ImsError> {
     if algorithm.eq_ignore_ascii_case("AKAv1-MD5") || algorithm.eq_ignore_ascii_case("MD5") {
         if aka.res.is_empty() {
@@ -109,7 +110,9 @@ pub fn aka_digest_password(algorithm: &str, aka: &AkaMaterial<'_>) -> Result<Vec
         }
         return Ok(aka.res.to_vec());
     }
-    if algorithm.eq_ignore_ascii_case("AKAv2-MD5") {
+    if algorithm.eq_ignore_ascii_case("AKAv2-MD5")
+        || algorithm.eq_ignore_ascii_case("AKAv2-SHA-256")
+    {
         if aka.res.is_empty() || aka.ik.len() != 16 || aka.ck.len() != 16 {
             return Err(ImsError::new("aka_material_invalid"));
         }
@@ -117,13 +120,17 @@ pub fn aka_digest_password(algorithm: &str, aka: &AkaMaterial<'_>) -> Result<Vec
         key.extend_from_slice(aka.res);
         key.extend_from_slice(aka.ik);
         key.extend_from_slice(aka.ck);
-        let digest = hmac_md5(&key, b"http-digest-akav2-password");
+        let digest = if algorithm.eq_ignore_ascii_case("AKAv2-SHA-256") {
+            hmac_sha256(&key, b"http-digest-akav2-password")
+        } else {
+            hmac_md5(&key, b"http-digest-akav2-password").to_vec()
+        };
         return Ok(BASE64_STANDARD.encode(digest).into_bytes());
     }
     Err(ImsError::new("digest_algorithm_unsupported"))
 }
 
-/// Compute the RFC 2617 digest response using the AKA-derived password.
+/// Compute the RFC 2617/RFC 7616 digest response using the AKA-derived password.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_aka_response(
     username: &str,
@@ -144,14 +151,15 @@ pub fn compute_aka_response(
     a1.extend_from_slice(realm.as_bytes());
     a1.push(b':');
     a1.extend_from_slice(&password);
-    let ha1 = md5_hex(&a1);
-    let ha2 = md5_hex(format!("{method}:{digest_uri}").as_bytes());
+    let hash = digest_hash_for_algorithm(algorithm)?;
+    let ha1 = hash.hex(&a1);
+    let ha2 = hash.hex(format!("{method}:{digest_uri}").as_bytes());
     let proof = match qop {
         Some("auth") => format!("{ha1}:{nonce}:{nc}:{cnonce}:auth:{ha2}"),
         Some(_) => return Err(ImsError::new("digest_qop_unsupported")),
         None => format!("{ha1}:{nonce}:{ha2}"),
     };
-    Ok(md5_hex(proof.as_bytes()))
+    Ok(hash.hex(proof.as_bytes()))
 }
 
 /// Assemble a full `Authorization`/`Proxy-Authorization` header line (no CRLF).
@@ -261,13 +269,84 @@ pub fn build_resync_authorization_header_with_digest(
     header
 }
 
+/// Split one `WWW-Authenticate` / `Proxy-Authenticate` field value into its
+/// individual Digest challenges while preserving wire order. Commas inside
+/// quoted parameters (notably `qop="auth,auth-int"`) are not separators.
+pub fn split_digest_challenge_values(value: &str) -> Vec<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Vec::new();
+    }
+
+    let mut values = Vec::new();
+    let mut start = 0usize;
+    let mut escaped = false;
+    let mut in_quote = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            ',' if !in_quote => {
+                if let Some(next_start) = digest_scheme_start_after_comma(value, index) {
+                    let item = value[start..index].trim();
+                    if !item.is_empty() {
+                        values.push(item.to_string());
+                    }
+                    start = next_start;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let item = value[start..].trim();
+    if !item.is_empty() {
+        values.push(item.to_string());
+    }
+    values
+}
+
+/// Select the first syntactically valid Digest challenge this stack can
+/// actually answer. All WWW fields are considered in their original order,
+/// followed by Proxy fields, preserving the previous WWW-before-Proxy policy.
+/// Unsupported or malformed earlier challenges do not hide a later usable AKA
+/// challenge. Plain MD5 is considered only when explicitly enabled by carrier
+/// policy and when the caller has a real implementation for it.
+pub fn select_digest_challenge(
+    www_values: &[String],
+    proxy_values: &[String],
+    allow_plain_md5: bool,
+) -> Result<DigestChallenge, ImsError> {
+    let mut last_error = None;
+    let mut saw_candidate = false;
+
+    for (proxy, values) in [(false, www_values), (true, proxy_values)] {
+        for header_value in values {
+            for value in split_digest_challenge_values(header_value) {
+                saw_candidate = true;
+                match parse_digest_challenge(&value, proxy).and_then(|challenge| {
+                    validate_digest_challenge_support(challenge, allow_plain_md5)
+                }) {
+                    Ok(challenge) => return Ok(challenge),
+                    Err(error) => last_error = Some(error),
+                }
+            }
+        }
+    }
+
+    if !saw_candidate {
+        return Err(ImsError::new("digest_challenge_missing"));
+    }
+    Err(last_error.unwrap_or_else(|| ImsError::new("digest_challenge_missing")))
+}
+
 /// Parse a digest challenge from a header value (text after `WWW-Authenticate:`).
 pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChallenge, ImsError> {
-    let trimmed = value.trim();
-    let params = trimmed
-        .strip_prefix("Digest ")
-        .or_else(|| trimmed.strip_prefix("digest "))
-        .ok_or(ImsError::new("digest_challenge_missing"))?;
+    let params = strip_digest_scheme(value).ok_or(ImsError::new("digest_challenge_missing"))?;
     let map = parse_digest_params(params);
     let realm = map
         .iter()
@@ -297,6 +376,54 @@ pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChalleng
         opaque,
         proxy,
     })
+}
+
+fn validate_digest_challenge_support(
+    challenge: DigestChallenge,
+    allow_plain_md5: bool,
+) -> Result<DigestChallenge, ImsError> {
+    let algorithm_supported = challenge.algorithm.eq_ignore_ascii_case("AKAv1-MD5")
+        || challenge.algorithm.eq_ignore_ascii_case("AKAv2-MD5")
+        || challenge.algorithm.eq_ignore_ascii_case("AKAv2-SHA-256")
+        || (allow_plain_md5 && challenge.algorithm.eq_ignore_ascii_case("MD5"));
+    if !algorithm_supported {
+        return Err(ImsError::new("digest_algorithm_unsupported"));
+    }
+    if !matches!(challenge.qop.as_deref(), None | Some("auth")) {
+        return Err(ImsError::new("digest_qop_unsupported"));
+    }
+    Ok(challenge)
+}
+
+fn strip_digest_scheme(value: &str) -> Option<&str> {
+    let value = value.trim();
+    let scheme = value.get(..6)?;
+    if !scheme.eq_ignore_ascii_case("Digest") {
+        return None;
+    }
+    let rest = value.get(6..)?;
+    rest.chars()
+        .next()
+        .is_some_and(char::is_whitespace)
+        .then(|| rest.trim_start())
+}
+
+fn digest_scheme_start_after_comma(value: &str, comma_index: usize) -> Option<usize> {
+    let rest = value.get(comma_index + 1..)?;
+    let trimmed = rest.trim_start();
+    let skipped = rest.len() - trimmed.len();
+    starts_with_digest_scheme(trimmed).then_some(comma_index + 1 + skipped)
+}
+
+fn starts_with_digest_scheme(value: &str) -> bool {
+    let Some(prefix) = value.get(..6) else {
+        return false;
+    };
+    prefix.eq_ignore_ascii_case("Digest")
+        && value
+            .get(6..)
+            .and_then(|rest| rest.chars().next())
+            .is_some_and(char::is_whitespace)
 }
 
 fn select_qop(params: &[(String, String)]) -> Option<String> {
@@ -360,8 +487,46 @@ fn quote(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn md5_hex(bytes: &[u8]) -> String {
-    format!("{:x}", md5::compute(bytes))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DigestHash {
+    Md5,
+    Sha256,
+}
+
+impl DigestHash {
+    fn hex(self, bytes: &[u8]) -> String {
+        match self {
+            Self::Md5 => format!("{:x}", md5::compute(bytes)),
+            Self::Sha256 => hex_lower(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref()),
+        }
+    }
+}
+
+fn digest_hash_for_algorithm(algorithm: &str) -> Result<DigestHash, ImsError> {
+    if algorithm.eq_ignore_ascii_case("AKAv1-MD5")
+        || algorithm.eq_ignore_ascii_case("AKAv2-MD5")
+        || algorithm.eq_ignore_ascii_case("MD5")
+    {
+        return Ok(DigestHash::Md5);
+    }
+    if algorithm.eq_ignore_ascii_case("AKAv2-SHA-256") {
+        return Ok(DigestHash::Sha256);
+    }
+    Err(ImsError::new("digest_algorithm_unsupported"))
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut out, "{byte:02x}");
+    }
+    out
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    ring::hmac::sign(&key, data).as_ref().to_vec()
 }
 
 /// HMAC-MD5 (RFC 2104). The `md5` crate has no HMAC and `ring` has no MD5, so
@@ -418,7 +583,7 @@ mod tests {
     }
 
     #[test]
-    fn akav2_password_is_base64_hmac() {
+    fn akav2_md5_password_is_base64_hmac() {
         let res = [0x11u8; 8];
         let ck = [0x22u8; 16];
         let ik = [0x33u8; 16];
@@ -432,6 +597,35 @@ mod tests {
             .encode(hmac_md5(&key, b"http-digest-akav2-password"))
             .into_bytes();
         assert_eq!(pw, expected);
+    }
+
+    #[test]
+    fn akav2_sha256_password_and_digest_response_match_independent_vector() {
+        let res = [0x11u8; 8];
+        let ck = [0x22u8; 16];
+        let ik = [0x33u8; 16];
+        let aka = material(&res, &ck, &ik);
+        let password = aka_digest_password("AKAv2-SHA-256", &aka).unwrap();
+        assert_eq!(
+            password.as_slice(),
+            b"y1XGaxmHAuuo8s2MPYfXz/CZeEa1RBiLycGrpY293pQ="
+        );
+        assert_eq!(
+            compute_aka_response(
+                "user@example.com",
+                "ims.example",
+                &aka,
+                "AKAv2-SHA-256",
+                "REGISTER",
+                "sip:ims.example",
+                "nonce",
+                Some("auth"),
+                "cafebabe",
+                "00000001",
+            )
+            .unwrap(),
+            "7b1e4b6f0343c2970757c768727ff7d3ad8e0f8d4c815b2d68b38f9784cb11c5"
+        );
     }
 
     #[test]
@@ -486,6 +680,84 @@ mod tests {
         assert_eq!(c.qop.as_deref(), Some("auth"));
         assert_eq!(c.opaque.as_deref(), Some("xyz"));
         assert_eq!(c.authorization_header_name(), "Proxy-Authorization");
+    }
+
+    #[test]
+    fn digest_challenge_splitter_preserves_quoted_qop_commas() {
+        let values = split_digest_challenge_values(
+            "Digest realm=\"one\", qop=\"auth,auth-int\", nonce=\"a\", Digest realm=\"two\", nonce=\"b\"",
+        );
+
+        assert_eq!(values.len(), 2);
+        assert!(values[0].contains("qop=\"auth,auth-int\""));
+        assert!(values[1].starts_with("Digest realm=\"two\""));
+    }
+
+    #[test]
+    fn challenge_selector_skips_unsupported_and_malformed_candidates() {
+        let www = vec![
+            "Digest realm=\"unsupported\", nonce=\"one\", algorithm=SHA-512".to_string(),
+            "Digest nonce=\"missing-realm\", algorithm=AKAv1-MD5".to_string(),
+            "Digest realm=\"selected\", nonce=\"three\", algorithm=AKAv2-SHA-256, qop=\"auth\""
+                .to_string(),
+        ];
+
+        let challenge = select_digest_challenge(&www, &[], false).unwrap();
+        assert_eq!(challenge.realm, "selected");
+        assert_eq!(challenge.algorithm, "AKAv2-SHA-256");
+        assert!(!challenge.proxy);
+    }
+
+    #[test]
+    fn challenge_selector_handles_repeated_and_compound_header_values() {
+        let www = vec![format!(
+            "Basic realm=\"legacy\", Digest realm=\"plain\", nonce=\"one\", algorithm=MD5, Digest realm=\"aka\", nonce=\"two\", algorithm=AKAv1-MD5, qop=\"auth,auth-int\""
+        )];
+
+        let challenge = select_digest_challenge(&www, &[], false).unwrap();
+        assert_eq!(challenge.realm, "aka");
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn challenge_selector_keeps_topmost_supported_wire_order() {
+        let www = vec![
+            "Digest realm=\"first\", nonce=\"one\", algorithm=AKAv1-MD5".to_string(),
+            "Digest realm=\"stronger-but-later\", nonce=\"two\", algorithm=AKAv2-SHA-256"
+                .to_string(),
+        ];
+
+        let challenge = select_digest_challenge(&www, &[], false).unwrap();
+        assert_eq!(challenge.realm, "first");
+        assert_eq!(challenge.algorithm, "AKAv1-MD5");
+    }
+
+    #[test]
+    fn challenge_selector_uses_proxy_after_unusable_www_and_gates_plain_md5() {
+        let www = vec!["Digest realm=\"www\", nonce=\"one\", algorithm=MD5".to_string()];
+        let proxy = vec!["Digest realm=\"proxy\", nonce=\"two\", algorithm=AKAv2-MD5".to_string()];
+
+        let challenge = select_digest_challenge(&www, &proxy, false).unwrap();
+        assert_eq!(challenge.realm, "proxy");
+        assert!(challenge.proxy);
+
+        let plain = select_digest_challenge(&www, &[], true).unwrap();
+        assert_eq!(plain.realm, "www");
+        assert_eq!(plain.algorithm, "MD5");
+        assert!(!plain.proxy);
+    }
+
+    #[test]
+    fn challenge_selector_skips_unsupported_qop() {
+        let www = vec![
+            "Digest realm=\"auth-int-only\", nonce=\"one\", algorithm=AKAv1-MD5, qop=\"auth-int\""
+                .to_string(),
+            "dIgEsT realm=\"auth\", nonce=\"two\", algorithm=AKAv1-MD5, qop=\"auth\"".to_string(),
+        ];
+
+        let challenge = select_digest_challenge(&www, &[], false).unwrap();
+        assert_eq!(challenge.realm, "auth");
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
     }
 
     #[test]

@@ -128,9 +128,17 @@ cargo run -- serve \
   --carrier-catalog /path/to/carrier-bundles.sqlite3
 ```
 
-等价环境变量为 `HOST`、`PORT` 和 `SIMADMIN_CARRIER_CATALOG`。生产配置数据库可通过
-`SIMADMIN_CONFIG_DB` 覆盖；该路径必须指向 SQLite 数据库，不支持旧 JSON 配置导入。
-日志级别通过 `RUST_LOG` 控制。
+等价环境变量为 `HOST`、`PORT` 和 `SIMADMIN_CARRIER_CATALOG`。日志级别通过 `RUST_LOG` 控制。
+
+配置分两处：主程序设置在文本文件里（`SIMADMIN_CONFIG` 覆盖路径，旧变量 `SIMADMIN_CONFIG_DB`
+仍然读取但现在指向文本文件），每线路/每槽位配置和通知、自动化、按 SIM 的 IMS 覆写在 `data.db`
+里。扩展名决定格式——`.yaml` / `.yml` 推荐，因为保存时会保留注释；`.json` 可用但不支持注释；
+其他扩展名报错而不是猜测。不支持导入旧 `config.json` 或 `config.sqlite3`。
+
+代码上的分工：`platform::config_file` 是唯一接触 YAML 库的地方（`serde-saphyr` 读、`yaml-edit`
+写，写完用 `serde-saphyr` 复核）；`platform::config_store` 拥有 `data.db` 里的配置表；
+`ConfigManager` 在内存里仍然是一个完整的 `AppConfig`，只有持久化知道拆分。
+`SIMADMIN_OVERRIDES_DIR` 把 IMS 覆写切到文件后端，供恢复和测试使用。
 
 普通开发机没有 ModemManager、真实 modem、QMI 端点或 `/dev/net/tun` 时，纯逻辑测试仍可
 运行，但服务启动和硬件接口可能失败。真机网络、P-CSCF、IMS 注册、RTP、eSIM 和 Trunk

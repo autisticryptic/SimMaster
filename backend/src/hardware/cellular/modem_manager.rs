@@ -1226,6 +1226,10 @@ fn parse_hex_u32(value: &str) -> u32 {
     u32::from_str_radix(value.trim(), 16).unwrap_or(0)
 }
 
+fn parse_hex_u64(value: &str) -> u64 {
+    u64::from_str_radix(value.trim(), 16).unwrap_or(0)
+}
+
 fn parse_cell_metric(value: Option<&OwnedValue>) -> String {
     value
         .map(extract_f64)
@@ -2560,15 +2564,24 @@ fn signal_metric_to_centi_db(text: &str) -> String {
 }
 
 fn parse_u32_auto(text: &str) -> u32 {
-    let value = text.trim().trim_start_matches("0x");
+    u32::try_from(parse_u64_auto(text)).unwrap_or(0)
+}
+
+fn parse_u64_auto(text: &str) -> u64 {
+    let text = text.trim();
+    let (value, explicit_hex) = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or((text, false), |value| (value, true));
     if value.is_empty() {
         return 0;
     }
-    if value
-        .chars()
-        .any(|c| c.is_ascii_hexdigit() && c.is_ascii_alphabetic())
+    if explicit_hex
+        || value
+            .chars()
+            .any(|c| c.is_ascii_hexdigit() && c.is_ascii_alphabetic())
     {
-        u32::from_str_radix(value, 16).unwrap_or(0)
+        u64::from_str_radix(value, 16).unwrap_or(0)
     } else {
         value.parse().unwrap_or(0)
     }
@@ -2867,7 +2880,7 @@ fn parse_qmicli_cell_location_output(output: &str) -> CellsResponse {
         }
         if trimmed.starts_with("Global Cell ID:") {
             if let Some(value) = value_after_colon(trimmed) {
-                serving_cell.cell_id = parse_u32_auto(&value);
+                serving_cell.cell_id = parse_u64_auto(&value);
             }
             continue;
         }
@@ -3553,12 +3566,12 @@ fn mmcli_signal_section_to_tech(section: &str) -> &'static str {
     }
 }
 
-async fn read_mmcli_location_output() -> Result<String, String> {
-    run_recovery_command("mmcli", &["-m", "any", "--location-get"]).await
+async fn read_mmcli_location_output(modem_path: &str) -> Result<String, String> {
+    run_recovery_command("mmcli", &["-m", modem_path, "--location-get"]).await
 }
 
-async fn read_mmcli_signal_output() -> Result<String, String> {
-    run_recovery_command("mmcli", &["-m", "any", "--signal-get"]).await
+async fn read_mmcli_signal_output(modem_path: &str) -> Result<String, String> {
+    run_recovery_command("mmcli", &["-m", modem_path, "--signal-get"]).await
 }
 
 pub async fn start_cell_monitoring_for_modem(modem_path: &str) -> Result<(), String> {
@@ -3577,10 +3590,10 @@ async fn get_cells_data_mmcli_fallback(
     conn: &Connection,
     modem_path: &str,
 ) -> zbus::Result<CellsResponse> {
-    let location_output = read_mmcli_location_output()
+    let location_output = read_mmcli_location_output(modem_path)
         .await
         .map_err(zbus::fdo::Error::Failed)?;
-    let signal_output = read_mmcli_signal_output()
+    let signal_output = read_mmcli_signal_output(modem_path)
         .await
         .map_err(zbus::fdo::Error::Failed)?;
 
@@ -3597,7 +3610,7 @@ async fn get_cells_data_mmcli_fallback(
         .unwrap_or_default();
     let cid_text = location.get("cell id").cloned().unwrap_or_default();
     let tac = parse_hex_u32(&tac_text);
-    let cell_id = parse_hex_u32(&cid_text);
+    let cell_id = parse_hex_u64(&cid_text);
 
     if tac == 0 && cell_id == 0 {
         return Ok(CellsResponse::default());
@@ -3679,7 +3692,7 @@ pub async fn get_cells_data_for_modem(
         if is_serving {
             serving_cell = ServingCell {
                 tech: tech.clone(),
-                cell_id: parse_hex_u32(cell_id_hex.trim_start_matches("0x")),
+                cell_id: parse_hex_u64(cell_id_hex.trim_start_matches("0x")),
                 tac: parse_hex_u32(tac_hex.trim_start_matches("0x")),
             };
         }
@@ -3716,7 +3729,7 @@ pub async fn get_cells_data_for_modem(
             tech.to_uppercase()
         };
 
-        let cell_id_u = parse_hex_u32(cell_id_hex.trim_start_matches("0x"));
+        let cell_id_u = parse_hex_u64(cell_id_hex.trim_start_matches("0x"));
         parsed_cells.push(CellInfo {
             is_serving,
             band: single_current_band_label(&current_bands, &tech).unwrap_or_default(),

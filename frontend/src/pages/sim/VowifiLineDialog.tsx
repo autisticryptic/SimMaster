@@ -25,23 +25,94 @@ const proxyHints: Record<VowifiProxyMode, string> = {
   udp_relay: '暂未实现。要自建转发请在远端跑标准 SOCKS5（sing-box / mihomo / gost），再用上面的 SOCKS5 模式',
 }
 
+function isValidIpv4(value: string): boolean {
+  const octets = value.split('.')
+  return octets.length === 4 && octets.every((octet) => {
+    if (!/^(0|[1-9]\d{0,2})$/.test(octet)) return false
+    const number = Number(octet)
+    return number >= 0 && number <= 255
+  })
+}
+
+function isValidIpv6(value: string): boolean {
+  if (!value.includes(':') || !/^[0-9a-f:.]+$/i.test(value)) return false
+
+  // Rust's IpAddr parser accepts IPv4-embedded IPv6 addresses. Replace the
+  // dotted-quad tail with its two equivalent hextets before counting groups.
+  let normalized = value
+  if (value.includes('.')) {
+    const lastColon = value.lastIndexOf(':')
+    const embeddedIpv4 = value.slice(lastColon + 1)
+    if (!isValidIpv4(embeddedIpv4)) return false
+    normalized = `${value.slice(0, lastColon + 1)}0:0`
+  }
+
+  const compressionCount = (normalized.match(/::/g) ?? []).length
+  if (compressionCount > 1) return false
+  const [left = '', right = ''] = compressionCount === 1
+    ? normalized.split('::')
+    : [normalized, '']
+  const validHextets = (part: string) =>
+    part.length === 0 || part.split(':').every((hextet) => /^[0-9a-f]{1,4}$/i.test(hextet))
+  if (!validHextets(left) || !validHextets(right)) return false
+
+  const groupCount = (part: string) => (part.length === 0 ? 0 : part.split(':').length)
+  const groups = groupCount(left) + groupCount(right)
+  return compressionCount === 1 ? groups < 8 : groups === 8
+}
+
+function isValidDnsPort(value: string): boolean {
+  if (!/^\d+$/.test(value)) return false
+  const port = Number(value)
+  return port >= 1 && port <= 65535
+}
+
+/** Accept bare IP addresses, IPv4:port, or bracketed IPv6:port. */
+function isValidDnsServer(value: string): boolean {
+  const server = value.trim()
+  if (!server) return false
+
+  if (server.startsWith('[')) {
+    const match = /^\[([^\]]+)\]:(\d+)$/.exec(server)
+    return Boolean(match && isValidIpv6(match[1]) && isValidDnsPort(match[2]))
+  }
+  if (isValidIpv4(server) || isValidIpv6(server)) return true
+
+  const ipv4WithPort = /^([^:]+):(\d+)$/.exec(server)
+  return Boolean(ipv4WithPort && isValidIpv4(ipv4WithPort[1]) && isValidDnsPort(ipv4WithPort[2]))
+}
+
+function parseDnsServers(value: string): string[] {
+  return value
+    .split(/\r?\n/)
+    .map((server) => server.trim())
+    .filter((server) => server.length > 0)
+}
+
+
 export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props) {
   const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [override, setOverride] = useState<SimImsOverride | null>(null)
+  const [dnsText, setDnsText] = useState('')
   const [overrideLoading, setOverrideLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (line) setDraft({ ...line.config })
     setOverride(null)
+    setDnsText('')
     setError(null)
     if (!line || !open) return
     let active = true
     setOverrideLoading(true)
     void api.getImsOverride(line.line_id)
       .then((response) => {
-        if (active && response.data) setOverride(response.data.override_)
+        if (active && response.data) {
+          const nextOverride = response.data.override_
+          setOverride(nextOverride)
+          setDnsText(nextOverride.ims_vowifi.dns?.join('\n') ?? '')
+        }
       })
       .catch((err) => {
         if (active) setError(err instanceof Error ? err.message : String(err))
@@ -58,8 +129,11 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     const customImsi = override?.ims_vowifi.custom_imsi?.trim() ?? ''
     if (override?.ims_vowifi.spoof_imsi && !customImsi) return '启用伪装 IMSI 后必须填写 IMSI'
     if (customImsi && !/^\d{5,16}$/.test(customImsi)) return 'IMSI 必须是 5-16 位数字'
+    const dnsServers = parseDnsServers(dnsText)
+    const invalidDnsIndex = dnsServers.findIndex((server) => !isValidDnsServer(server))
+    if (invalidDnsIndex >= 0) return `自定义 ePDG DNS 格式不正确（第 ${invalidDnsIndex + 1} 行）`
     return null
-  }, [draft, override])
+  }, [draft, override, dnsText])
 
   const update = <K extends keyof LineVowifiConfig>(key: K, value: LineVowifiConfig[K]) => {
     setDraft((current) => current ? { ...current, [key]: value } : current)
@@ -70,10 +144,12 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     setSaving(true)
     setError(null)
     try {
+      const dnsServers = parseDnsServers(dnsText)
       await api.setImsOverride(line.line_id, {
         ...override,
         ims_vowifi: {
           ...override.ims_vowifi,
+          dns: dnsServers.length > 0 ? dnsServers : null,
           custom_imsi: override.ims_vowifi.spoof_imsi
             ? override.ims_vowifi.custom_imsi?.trim() || null
             : null,
@@ -131,6 +207,18 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
               onChange={(event) => patchVowifiOverride({ custom_imsi: event.target.value })}
             />
           </Stack>
+          <TextField
+            fullWidth
+            label="自定义 ePDG DNS"
+            value={dnsText}
+            disabled={overrideLoading || !override}
+            multiline
+            minRows={2}
+            maxRows={6}
+            placeholder={'1.1.1.1\n8.8.8.8\n2001:4860:4860::8888'}
+            helperText="每行一个 IPv4/IPv6 地址，按填写顺序依次尝试。留空则回退到运营商 profile DNS 或系统 DNS；修改后需重新连接 VoWiFi 生效"
+            onChange={(event) => setDnsText(event.target.value)}
+          />
           <FormControl fullWidth>
             <InputLabel>代理模式</InputLabel>
             <Select

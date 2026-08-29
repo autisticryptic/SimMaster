@@ -17,6 +17,9 @@ use tokio::sync::{Mutex, RwLock as AsyncRwLock};
 use zbus::Connection;
 
 use crate::{
+    connectivity::core::access_network::{
+        AccessNetworkRuntimeStatus, ImsAccessNetworkRuntime, DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE,
+    },
     connectivity::modems::ims::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
     hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
@@ -112,6 +115,9 @@ pub struct LineRuntime {
     pub ue_worker: UeWorkerHandle,
     pub volte: Arc<VolteRuntime>,
     pub volte_live: VolteLiveHandle,
+    /// Serving-cell identity owned by this physical line and shared by its
+    /// VoLTE and VoWiFi REGISTER builders. No process-global lookup is used.
+    pub ims_access_network: ImsAccessNetworkRuntime,
     /// Serializes every PDP/bearer transition on this physical SIM line.
     /// DATA6 and IMS use different QMI endpoints, but the baseband policy engine
     /// still rejects or deactivates sessions when both are started concurrently.
@@ -173,7 +179,11 @@ impl LineRuntime {
             ],
         );
         let operator = voice_access.operator_link();
-        let vowifi = Arc::new(VowifiRuntime::for_line(&binding.line_id));
+        let ims_access_network = ImsAccessNetworkRuntime::default();
+        let vowifi = Arc::new(VowifiRuntime::for_line_with_access_network(
+            &binding.line_id,
+            ims_access_network.clone(),
+        ));
         let supplementary = Arc::new(SupplementaryRuntime::for_line(&binding.line_id));
         volte_live.bind_supplementary(Arc::clone(&supplementary));
         crate::connectivity::modems::ims::vowifi::operator::bind_supplementary_for_line(
@@ -192,6 +202,7 @@ impl LineRuntime {
             ue_worker: UeWorkerHandle::for_line(&line_id, namespace),
             volte,
             volte_live,
+            ims_access_network,
             bearer_operation_lock: Mutex::new(()),
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),
@@ -252,6 +263,9 @@ impl LineRuntime {
             ue: self.ue(),
             ue_worker: self.ue_worker.status().await,
             volte: self.volte.status().await,
+            ims_access_network: self
+                .ims_access_network
+                .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE),
             trunk: self.trunk.status().await,
             supplementary: self.supplementary.snapshot().await,
         }
@@ -395,6 +409,7 @@ pub struct LineRuntimeStatus {
     pub ue: UeContext,
     pub ue_worker: UeWorkerStatus,
     pub volte: VolteRuntimeStatus,
+    pub ims_access_network: AccessNetworkRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,
     pub supplementary: SupplementarySnapshot,
 }
@@ -771,11 +786,13 @@ impl LineRuntimeRegistry {
         let mut prepared_new = Vec::with_capacity(new_lines.len());
         for (_, line) in &new_lines {
             let binding = line.binding();
+            Self::refresh_ims_access_network(line, &binding, conn).await;
             prepared_new.push(self.reconcile_ue_context(line, &binding).await);
         }
 
         let mut prepared_existing = Vec::with_capacity(existing_lines.len());
         for (line, binding) in &existing_lines {
+            Self::refresh_ims_access_network(line, binding, conn).await;
             prepared_existing.push(self.reconcile_ue_context(line, binding).await);
         }
 
@@ -796,6 +813,7 @@ impl LineRuntimeRegistry {
             }
             for line in &absent_lines {
                 line.mark_absent();
+                line.ims_access_network.clear("access_network_line_absent");
             }
             for ((line_id, line), prepared) in new_lines.iter().zip(prepared_new) {
                 Self::publish_sim_device_mapping(&line.binding());
@@ -839,6 +857,52 @@ impl LineRuntimeRegistry {
             );
         }
         Ok(present_count)
+    }
+
+    async fn refresh_ims_access_network(
+        line: &LineRuntime,
+        binding: &ModemBinding,
+        conn: &Connection,
+    ) {
+        if !binding.present || binding.line_kind == "reader" || binding.modem_path.trim().is_empty() {
+            line.ims_access_network
+                .clear("access_network_unavailable_for_line_kind");
+            return;
+        }
+
+        match crate::connectivity::modems::ims::access_network::serving_access_snapshot(
+            conn,
+            &binding.modem_path,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                let technology = snapshot.technology.clone();
+                line.ims_access_network.publish(snapshot);
+                tracing::debug!(
+                    line_id = %binding.line_id,
+                    technology = %technology,
+                    "Refreshed per-line IMS serving access context"
+                );
+            }
+            Err(reason) => {
+                // A confirmed no-service/incomplete observation invalidates the
+                // old cell immediately. A transient query failure may retain it
+                // only until the runtime TTL expires.
+                if reason.starts_with("access_network_not_registered:")
+                    || reason.starts_with("access_network_snapshot_incomplete:")
+                {
+                    line.ims_access_network.clear(reason.clone());
+                } else {
+                    line.ims_access_network.record_refresh_error(reason.clone());
+                }
+                tracing::debug!(
+                    line_id = %binding.line_id,
+                    reason = %reason,
+                    "IMS serving access context unavailable"
+                );
+            }
+        }
     }
 
     /// Publish the SIM/reader mapping only alongside the line binding. Keeping

@@ -18,7 +18,10 @@ use super::{
     identity::VowifiSimIdentity,
     restore::RestoreProgress,
 };
-use crate::hardware::cellular::modem_manager::sim_identity_for_modem;
+use crate::{
+    connectivity::core::access_network::ImsAccessNetworkRuntime,
+    hardware::cellular::modem_manager::sim_identity_for_modem,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimePhase {
@@ -117,6 +120,10 @@ pub struct VowifiRuntime {
     /// operators (and different proxies) can therefore run concurrently without
     /// reading each other's settings.
     line_id: Arc<str>,
+    /// Per-line serving-cell identity shared with the VoLTE runtime. The live
+    /// REGISTER path reads only this handle and never opens its own D-Bus
+    /// connection, so concurrent lines cannot borrow each other's PLMN/cell.
+    access_network: ImsAccessNetworkRuntime,
 }
 
 #[derive(Debug)]
@@ -128,10 +135,37 @@ impl VowifiRuntime {
     /// Build a runtime bound to one line, so its executor stages use that line's
     /// network overrides.
     pub fn for_line(line_id: impl AsRef<str>) -> Self {
-        Self::for_line_with_gate(line_id, LiveExecutorGateReport::from_environment())
+        Self::for_line_with_gate_and_access_network(
+            line_id,
+            LiveExecutorGateReport::from_environment(),
+            ImsAccessNetworkRuntime::default(),
+        )
+    }
+
+    pub fn for_line_with_access_network(
+        line_id: impl AsRef<str>,
+        access_network: ImsAccessNetworkRuntime,
+    ) -> Self {
+        Self::for_line_with_gate_and_access_network(
+            line_id,
+            LiveExecutorGateReport::from_environment(),
+            access_network,
+        )
     }
 
     pub fn for_line_with_gate(line_id: impl AsRef<str>, live_gate: LiveExecutorGateReport) -> Self {
+        Self::for_line_with_gate_and_access_network(
+            line_id,
+            live_gate,
+            ImsAccessNetworkRuntime::default(),
+        )
+    }
+
+    pub fn for_line_with_gate_and_access_network(
+        line_id: impl AsRef<str>,
+        live_gate: LiveExecutorGateReport,
+        access_network: ImsAccessNetworkRuntime,
+    ) -> Self {
         let line_id = line_id.as_ref().trim();
         assert!(!line_id.is_empty(), "VoWiFi runtime requires a line_id");
         let snapshot = RuntimeSnapshot {
@@ -145,12 +179,17 @@ impl VowifiRuntime {
             })),
             live_generation: Arc::new(AtomicU64::new(0)),
             line_id: Arc::from(line_id),
+            access_network,
         }
     }
 
     /// The line this runtime serves.
     pub fn line_id(&self) -> &str {
         &self.line_id
+    }
+
+    pub fn access_network(&self) -> &ImsAccessNetworkRuntime {
+        &self.access_network
     }
 
     /// Read the SIM identity of the modem this runtime is bound to. A runtime
@@ -235,6 +274,31 @@ impl VowifiRuntime {
         self.live_generation.fetch_add(1, Ordering::SeqCst);
         let mut snapshot = RuntimeSnapshot::default();
         snapshot.executor = self.snapshot.read().await.executor.clone();
+        snapshot.degraded_reason = Some(reason.into());
+        *self.snapshot.write().await = snapshot.clone();
+        snapshot
+    }
+
+    /// Invalidate only the IMS registration portion of a live WLAN access leg.
+    ///
+    /// A proactive REGISTER refresh must be allowed to retry over the existing
+    /// ePDG/IKE/Child-SA/ESP path. Calling `reset_runtime` here would tear down
+    /// the bearer on the first transient SIP failure and would also interrupt
+    /// an active operator session. The next connect pass therefore starts at
+    /// `ImsRegister` while retaining the already established lower layers.
+    pub async fn prepare_live_ims_registration_refresh(
+        &self,
+        reason: impl Into<String>,
+    ) -> RuntimeSnapshot {
+        let mut snapshot = self.snapshot().await;
+        if !snapshot.profile.matched {
+            return snapshot;
+        }
+        snapshot.phase = RuntimePhase::ProfileMatched;
+        snapshot.live_readiness.ims_registered = false;
+        snapshot.live_readiness.sms_ready = false;
+        snapshot.live_readiness.voice_ready = false;
+        snapshot.live_readiness.normalize_protocol_prerequisites();
         snapshot.degraded_reason = Some(reason.into());
         *self.snapshot.write().await = snapshot.clone();
         snapshot
@@ -349,7 +413,10 @@ impl VowifiRuntime {
             return snapshot;
         }
 
-        let executor = LiveRuntimeExecutor::from_gate(snapshot.executor.live_gate.clone());
+        let executor = LiveRuntimeExecutor::from_gate_with_access_network(
+            snapshot.executor.live_gate.clone(),
+            self.access_network.clone(),
+        );
         let mut next = snapshot;
         let previous_degraded_reason = next.degraded_reason.clone();
         next.degraded_reason = None;

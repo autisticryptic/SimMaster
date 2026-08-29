@@ -731,19 +731,20 @@ mod tests {
     }
 
     #[test]
-    fn bearer_netdev_errors_are_terminal_and_not_family_fallbacks() {
-        for code in [
-            code::BEARER_NETDEV_RUNTIME_ERROR,
-            code::BEARER_NETDEV_NOT_UP,
-            code::BEARER_NETDEV_NOT_READY,
-        ] {
+    fn bearer_netdev_errors_have_explicit_retry_safety() {
+        let runtime_error =
+            VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, "interface=wwan0");
+        let runtime_class = FailureClass::from_error(&runtime_error);
+        assert_eq!(runtime_class, FailureClass::BasebandWedged);
+        assert!(!runtime_class.is_retryable_family());
+        assert!(runtime_class.is_unsafe_to_retry());
+
+        for code in [code::BEARER_NETDEV_NOT_UP, code::BEARER_NETDEV_NOT_READY] {
             let error = VolteError::with_detail(code, "interface=wwan0");
-            assert_eq!(
-                FailureClass::from_error(&error),
-                FailureClass::BasebandWedged
-            );
-            assert!(!FailureClass::from_error(&error).is_retryable_family());
-            assert!(FailureClass::from_error(&error).is_unsafe_to_retry());
+            let class = FailureClass::from_error(&error);
+            assert_eq!(class, FailureClass::Other);
+            assert!(!class.is_retryable_family());
+            assert!(!class.is_unsafe_to_retry());
         }
     }
 

@@ -44,12 +44,17 @@ use super::{
     voice,
 };
 use crate::connectivity::core::{
+    access::ImsChannel,
+    access_network::{
+        access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
+        ImsAccessNetworkContext, ImsAccessNetworkRuntime,
+    },
     contact::{complete_contact_parameters, ContactCompletion},
     media::OperatorSocketCreator,
     register::{
         run_register_observed, status_is_terminal_register_failure, RegisterAuthenticator,
-        RegisterFailure, MAX_MIN_EXPIRES_ROUNDS, MAX_REGISTER_PROVISIONAL_RESPONSES,
-        MIN_EXPIRES_CAP,
+        RegisterFailure, RegisterTransactionKey, MAX_MIN_EXPIRES_ROUNDS,
+        MAX_REGISTER_IGNORED_FRAMES, MAX_REGISTER_PROVISIONAL_RESPONSES, MIN_EXPIRES_CAP,
     },
     register_response::RegisterArtifacts,
     registration::{
@@ -103,12 +108,16 @@ const IKE_NAT_T_PORT: u16 = 4500;
 /// present one stable `+sip.instance`, and RFC 5626 §6 keys a binding on
 /// (AOR, instance-id, reg-id) -- equal reg-ids would make whichever leg
 /// registers second silently *replace* the other's binding (§3.2).
-const WLAN_REG_ID: u32 =
-    crate::connectivity::core::ims_access::ImsAccess::Wlan.reg_id();
+const WLAN_REG_ID: u32 = crate::connectivity::core::ims_access::ImsAccess::Wlan.reg_id();
 const DEFAULT_QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const DEFAULT_LIVE_TUN_NAME: &str = "sa_vwf0";
 const LIVE_IMS_TCP_TIMEOUT: Duration = Duration::from_secs(8);
 const LIVE_IMS_REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// A refresh is a lease-maintenance operation, not a reason to tear down a
+/// healthy ePDG/IKE/ESP access leg after the first transient SIP failure. Keep
+/// the old access path alive for two failed refresh cycles and rebuild it only
+/// on the third consecutive cycle.
+pub(crate) const LIVE_IMS_REFRESH_REBUILD_FAILURES: u8 = 3;
 /// Shorter budget for alternate ESP policy candidates: if the first mapping
 /// was silently dropped, the alternate is a probe and a long wait only stalls
 /// the whole registration sweep.
@@ -151,6 +160,13 @@ static LIVE_XCAP_BINDING: OnceLock<Mutex<HashMap<String, LiveXcapBinding>>> = On
 static LIVE_IMS_REGISTER_SUCCESS_VARIANT: OnceLock<
     Mutex<HashMap<String, LiveImsRegisterSuccessVariant>>,
 > = OnceLock::new();
+/// Consecutive VoWiFi REGISTER *refresh-cycle* failures, keyed by line. This
+/// is deliberately separate from the registration cache: the cache expires at
+/// the proactive refresh deadline, while this state must survive the failed
+/// attempts that follow that deadline without being mistaken for a new access
+/// connection.
+static LIVE_IMS_REFRESH_FAILURE: OnceLock<Mutex<HashMap<String, LiveImsRefreshFailure>>> =
+    OnceLock::new();
 /// Per-line network overrides, keyed by `line_id`.
 ///
 /// Deliberately a map rather than a single value: each SIM may sit on a different
@@ -567,6 +583,20 @@ struct LiveImsRegisterSuccessVariant {
     profile_id: &'static str,
     label: &'static str,
     captured_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LiveImsRefreshFailure {
+    consecutive_failures: u8,
+    last_failure_reason: String,
+    rebuild_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveImsRefreshFailureDecision {
+    Retry,
+    RebuildAccess,
+    RebuildPending,
 }
 
 #[derive(Debug)]
@@ -1721,12 +1751,21 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
 #[derive(Debug, Clone, Default)]
 pub struct SystemLiveDatagramAdapter {
     line_id: String,
+    access_network: ImsAccessNetworkRuntime,
 }
 
 impl SystemLiveDatagramAdapter {
     pub fn for_line(line_id: impl Into<String>) -> Self {
+        Self::for_line_with_access_network(line_id, ImsAccessNetworkRuntime::default())
+    }
+
+    pub fn for_line_with_access_network(
+        line_id: impl Into<String>,
+        access_network: ImsAccessNetworkRuntime,
+    ) -> Self {
         Self {
             line_id: line_id.into(),
+            access_network,
         }
     }
 }
@@ -1748,10 +1787,14 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
                     run_live_esp_until(&self.line_id, profile).await
                 }
                 ExecutorStage::ImsRegister => {
-                    run_live_ims_register_until(&self.line_id, profile).await
+                    run_live_ims_register_until(&self.line_id, profile, &self.access_network).await
                 }
-                ExecutorStage::Sms => run_live_sms_until(&self.line_id, profile).await,
-                ExecutorStage::Voice => run_live_voice_until(&self.line_id, profile).await,
+                ExecutorStage::Sms => {
+                    run_live_sms_until(&self.line_id, profile, &self.access_network).await
+                }
+                ExecutorStage::Voice => {
+                    run_live_voice_until(&self.line_id, profile, &self.access_network).await
+                }
                 _ => Err(live_stage_error("packet_transport_stage_not_implemented")),
             }
         })
@@ -2479,8 +2522,9 @@ fn pcscf_candidates(
 async fn run_live_ims_register_until(
     line_id: &str,
     profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
-    let attempt = attempt_live_ims_registration(line_id, profile).await;
+    let attempt = attempt_live_ims_registration(line_id, profile, access_network).await;
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
         Err(error) => {
@@ -2511,9 +2555,28 @@ async fn run_live_ims_register_until(
     }
 }
 
+fn log_vowifi_register_binding_diagnostics(artifacts: &RegisterArtifacts) {
+    if artifacts.contact_binding_count > 1 {
+        warn!(
+            contact_binding_count = artifacts.contact_binding_count,
+            "Registrar returned multiple current Contact bindings; terminating routing may select another flow"
+        );
+    }
+    if artifacts.contact_expiry_ambiguous {
+        warn!(
+            contact_binding_count = artifacts.contact_binding_count,
+            "Contact expiry differs or is missing across registrar bindings; using response Expires or the profile fallback"
+        );
+    }
+    if artifacts.wildcard_contact_present {
+        warn!("Successful REGISTER response unexpectedly included a wildcard Contact");
+    }
+}
+
 async fn attempt_live_ims_registration(
     line_id: &str,
     profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<RegisteredImsContext, LiveStageError> {
     info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS TCP path...");
     run_live_esp_until(line_id, profile)
@@ -2526,7 +2589,8 @@ async fn attempt_live_ims_registration(
         .map_err(|error| {
             error.with_registration_loss(RegistrationLossReason::AccessTransportLost)
         })?;
-    let response = run_register_exchange_over_tunnel(line_id, profile, &gateway).await?;
+    let response =
+        run_register_exchange_over_tunnel(line_id, profile, &gateway, access_network).await?;
     let parsed = ims::parse_sip_response(&response, &live_ims_target(line_id, profile).realm)
         .map_err(|_| {
             live_registration_error(
@@ -2534,16 +2598,28 @@ async fn attempt_live_ims_registration(
                 RegistrationLossReason::NetworkRejected,
             )
         })?;
-    let registered = RegisteredImsContext::from_response(
+    let artifacts = RegisterArtifacts::parse(response.as_bytes());
+    let service_route_count = artifacts.service_route_count;
+    let contact_binding_count = artifacts.contact_binding_count;
+    let contact_expiry_ambiguous = artifacts.contact_expiry_ambiguous;
+    let wildcard_contact_present = artifacts.wildcard_contact_present;
+    if parsed.status_code == 200 {
+        log_vowifi_register_binding_diagnostics(&artifacts);
+    }
+    let registered = RegisteredImsContext::from_artifacts(
         ImsRegistrationAccess::Vowifi,
-        response.as_bytes(),
+        artifacts,
         profile.ims.register.expires_seconds,
     );
     info!(
         status_code = parsed.status_code,
         reason = parsed.reason.as_str(),
         service_route_present = registered.service_route.is_some(),
+        service_route_count,
         associated_uri_count = registered.associated_uris.len(),
+        contact_binding_count,
+        contact_expiry_ambiguous,
+        wildcard_contact_present,
         warning_present = parsed.warning_present,
         unsupported = ?parsed.unsupported,
         require = ?parsed.require,
@@ -2567,6 +2643,7 @@ async fn attempt_live_ims_registration(
 async fn run_live_sms_until(
     line_id: &str,
     profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
     info!("Live Sms stage check: verifying protected IMS registration and SMSIP readiness...");
     match profile.sms.receiver_transport {
@@ -2575,7 +2652,7 @@ async fn run_live_sms_until(
     }
 
     if !cached_live_ims_register_ready(line_id, profile).await {
-        run_live_ims_register_until(line_id, profile).await?;
+        run_live_ims_register_until(line_id, profile, access_network).await?;
     }
 
     let mut sms_state = sms::SmsRuntimeStateMachine::new(profile);
@@ -2600,6 +2677,7 @@ async fn run_live_sms_until(
 async fn run_live_voice_until(
     line_id: &str,
     profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
     info!("Live Voice stage check: verifying IMS registration and voice leg readiness...");
     if !profile.voice.vowifi_enabled && !profile.voice.carrier_fallback_enabled {
@@ -2607,7 +2685,7 @@ async fn run_live_voice_until(
     }
 
     if !cached_live_ims_register_ready(line_id, profile).await {
-        run_live_ims_register_until(line_id, profile).await?;
+        run_live_ims_register_until(line_id, profile, access_network).await?;
     }
 
     let mut voice_state = voice::VoiceCallStateMachine::new(profile);
@@ -2646,6 +2724,7 @@ async fn run_live_voice_until(
 pub async fn place_live_voice_call_for_line(
     line_id: &str,
     callee: &str,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveCallResult, LiveStageError> {
     if line_id.trim().is_empty() {
         return Err(live_stage_error("line_id_required"));
@@ -2672,7 +2751,7 @@ pub async fn place_live_voice_call_for_line(
 
     match tokio::time::timeout(
         LIVE_VOICE_INVITE_TOTAL_TIMEOUT,
-        place_live_voice_call_for_profile(line_id, profile, callee),
+        place_live_voice_call_for_profile(line_id, profile, callee, access_network),
     )
     .await
     {
@@ -2693,6 +2772,7 @@ async fn place_live_voice_call_for_profile(
     line_id: &str,
     profile: &'static CarrierProfile,
     callee: &str,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveCallResult, LiveStageError> {
     // Reject malformed destinations synchronously instead of reporting a
     // queued call which the operator task can only fail asynchronously.
@@ -2702,7 +2782,7 @@ async fn place_live_voice_call_for_profile(
             profile_id = profile.meta.profile_id,
             "VoWiFi voice call refreshing IMS registration before INVITE"
         );
-        run_live_ims_register_until(line_id, profile).await?;
+        run_live_ims_register_until(line_id, profile, access_network).await?;
     }
     // REGISTER transfers ownership of the protected socket to this per-line
     // operator session. Opening a second socket on the same negotiated local
@@ -2941,6 +3021,77 @@ fn ims_register_variant_cache() -> &'static Mutex<HashMap<String, LiveImsRegiste
     LIVE_IMS_REGISTER_SUCCESS_VARIANT.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn ims_refresh_failure_cache() -> &'static Mutex<HashMap<String, LiveImsRefreshFailure>> {
+    LIVE_IMS_REFRESH_FAILURE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Record one completed refresh cycle. The caller must invoke this once after
+/// its configured per-cycle retries are exhausted; counting individual socket
+/// or header attempts would make the three-cycle policy equivalent to the old
+/// three-identical-attempt policy.
+pub(crate) async fn record_live_ims_refresh_failure(
+    line_id: &str,
+    reason: &str,
+) -> LiveImsRefreshFailureDecision {
+    let mut failures = ims_refresh_failure_cache().lock().await;
+    let state = failures
+        .entry(line_id.to_string())
+        .or_insert_with(|| LiveImsRefreshFailure {
+            consecutive_failures: 0,
+            last_failure_reason: String::new(),
+            rebuild_pending: false,
+        });
+    state.consecutive_failures = state
+        .consecutive_failures
+        .saturating_add(1)
+        .min(LIVE_IMS_REFRESH_REBUILD_FAILURES);
+    state.last_failure_reason = reason.trim().to_string();
+    if state.rebuild_pending {
+        return LiveImsRefreshFailureDecision::RebuildPending;
+    }
+    if state.consecutive_failures >= LIVE_IMS_REFRESH_REBUILD_FAILURES {
+        LiveImsRefreshFailureDecision::RebuildAccess
+    } else {
+        LiveImsRefreshFailureDecision::Retry
+    }
+}
+
+/// Mark a threshold breach as deferred because an active/held call still owns
+/// the current operator session. The state remains line-scoped until the call
+/// monitor observes that the line has no protected call left.
+pub(crate) async fn mark_live_ims_refresh_rebuild_pending(line_id: &str) {
+    let mut failures = ims_refresh_failure_cache().lock().await;
+    let state = failures
+        .entry(line_id.to_string())
+        .or_insert_with(|| LiveImsRefreshFailure {
+            consecutive_failures: LIVE_IMS_REFRESH_REBUILD_FAILURES,
+            last_failure_reason: "vowifi_refresh_rebuild_pending".to_string(),
+            rebuild_pending: false,
+        });
+    state.rebuild_pending = true;
+}
+
+pub(crate) async fn live_ims_refresh_failure_count_for_line(line_id: &str) -> u8 {
+    ims_refresh_failure_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .map(|state| state.consecutive_failures)
+        .unwrap_or(0)
+}
+
+pub(crate) async fn live_ims_refresh_rebuild_pending_for_line(line_id: &str) -> bool {
+    ims_refresh_failure_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .is_some_and(|state| state.rebuild_pending)
+}
+
+pub(crate) async fn clear_live_ims_refresh_failure_for_line(line_id: &str) {
+    ims_refresh_failure_cache().lock().await.remove(line_id);
+}
+
 async fn record_live_ims_register_ready(
     line_id: &str,
     profile: &'static CarrierProfile,
@@ -2959,6 +3110,10 @@ async fn record_live_ims_register_ready(
             receiver_transport: profile.sms.receiver_transport,
         },
     );
+    // Any successful REGISTER, including one initiated by SMS/voice after a
+    // stale lease, proves that this line recovered. Do not let an old refresh
+    // failure count force a later access rebuild.
+    clear_live_ims_refresh_failure_for_line(line_id).await;
     info!(
         line_id,
         profile_id = profile.meta.profile_id,
@@ -3139,6 +3294,7 @@ pub async fn clear_live_runtime_for_line(line_id: &str) {
     ims_register_ready_cache().lock().await.remove(line_id);
     ims_security_verify_cache().lock().await.remove(line_id);
     ims_register_variant_cache().lock().await.remove(line_id);
+    clear_live_ims_refresh_failure_for_line(line_id).await;
     xcap_binding_cache().lock().await.remove(line_id);
     if let Some(gateway) = tun_gateway_cache().lock().await.remove(line_id) {
         gateway.shutdown();
@@ -3195,6 +3351,7 @@ pub async fn send_live_sms_over_ims_for_line(
     line_id: &str,
     recipient: &str,
     text: &str,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveSmsSendResult, LiveStageError> {
     if line_id.trim().is_empty() {
         return Err(live_stage_error("line_id_required"));
@@ -3217,7 +3374,14 @@ pub async fn send_live_sms_over_ims_for_line(
 
     match tokio::time::timeout(
         LIVE_SMS_SEND_TOTAL_TIMEOUT,
-        send_live_sms_over_ims_for_profile(&conn, line_id, profile, recipient, text),
+        send_live_sms_over_ims_for_profile(
+            &conn,
+            line_id,
+            profile,
+            recipient,
+            text,
+            access_network,
+        ),
     )
     .await
     {
@@ -3240,13 +3404,14 @@ async fn send_live_sms_over_ims_for_profile(
     profile: &'static CarrierProfile,
     recipient: &str,
     text: &str,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveSmsSendResult, LiveStageError> {
     if !cached_live_ims_register_ready(line_id, profile).await {
         info!(
             profile_id = profile.meta.profile_id,
             "VoWiFi SMS send refreshing IMS registration before MESSAGE"
         );
-        run_live_ims_register_until(line_id, profile).await?;
+        run_live_ims_register_until(line_id, profile, access_network).await?;
     }
     let gateway = cached_tun_gateway(line_id, profile).await?;
     let route = gateway
@@ -3302,7 +3467,7 @@ async fn send_live_sms_over_ims_for_profile(
                 "VoWiFi MO SMS refreshing IMS session after retryable send failure"
             );
             clear_live_ims_session(line_id, profile).await;
-            run_live_ims_register_until(line_id, profile).await?;
+            run_live_ims_register_until(line_id, profile, access_network).await?;
             let gateway = cached_tun_gateway(line_id, profile).await?;
             let route = gateway
                 .ims_client_tcp_route()
@@ -3327,10 +3492,19 @@ async fn run_register_exchange_over_tunnel(
     line_id: &str,
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
     for pcscf_addr in register_pcscf_candidates(gateway) {
-        match run_register_exchange_with_pcscf(line_id, profile, gateway, pcscf_addr).await {
+        match run_register_exchange_with_pcscf(
+            line_id,
+            profile,
+            gateway,
+            pcscf_addr,
+            access_network,
+        )
+        .await
+        {
             Ok(response) => return Ok(response),
             Err(error) => {
                 warn!(
@@ -3363,12 +3537,18 @@ async fn run_register_exchange_with_pcscf(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
     let variants = live_register_header_variants_for_attempt(line_id, profile).await;
     for variant in variants {
         match run_register_exchange_with_pcscf_variant(
-            line_id, profile, gateway, pcscf_addr, variant,
+            line_id,
+            profile,
+            gateway,
+            pcscf_addr,
+            variant,
+            access_network,
         )
         .await
         {
@@ -3390,13 +3570,18 @@ async fn run_register_exchange_with_pcscf(
                 // The core told us which extension it wants. Satisfying it is
                 // strictly better than moving on to the next shape, which
                 // would be rejected the same way.
-                if let Some(upgraded) = sec_agree_retry_variant(variant, &err) {
+                if let Some(upgraded) = sec_agree_retry_variant(profile, variant, &err) {
                     info!(
                         register_variant = upgraded.label,
                         "Retrying IMS REGISTER with sec-agree after 421 Extension Required"
                     );
                     match run_register_exchange_with_pcscf_variant(
-                        line_id, profile, gateway, pcscf_addr, upgraded,
+                        line_id,
+                        profile,
+                        gateway,
+                        pcscf_addr,
+                        upgraded,
+                        access_network,
                     )
                     .await
                     {
@@ -3428,16 +3613,19 @@ async fn run_register_exchange_with_pcscf(
 
 /// Upgrade a variant that was refused with `421 Extension Required: sec-agree`.
 ///
-/// An explicit `auto` profile offers `Security-Client` without declaring
-/// `Require`/`Proxy-Require`. Cores that mandate the security agreement answer
-/// 421 and name the extension, so the same shape plus the declaration is the
-/// correct next attempt. Missing catalog fields now resolve to the required
-/// baseline before reaching this path.
+/// An `auto` profile starts challenge-first. If the registrar explicitly
+/// demands RFC 3329 with 421/494, retry the same shape with Security-Client and
+/// Require/Proxy-Require. An explicit database/catalog `disabled` is final and
+/// can never be upgraded by the candidate ladder.
 fn sec_agree_retry_variant(
+    profile: &CarrierProfile,
     variant: LiveRegisterHeaderVariant,
     error: &LiveStageError,
 ) -> Option<LiveRegisterHeaderVariant> {
-    if !error.server_required_sec_agree || variant.force_sec_agree_headers {
+    if profile.ims.register.sec_agree_mode == "disabled"
+        || !error.server_required_sec_agree
+        || variant.force_sec_agree_headers
+    {
         return None;
     }
     Some(LiveRegisterHeaderVariant {
@@ -3466,8 +3654,10 @@ fn live_register_header_variants(
         }
         _ => LiveInitialAuthorizationFormat::None,
     };
+    // `auto` is challenge driven: do not emit Security-Client until a 421/494
+    // or a concrete Security-Server offer proves the network expects it.
     let include_security_client =
-        register.sec_agree_mode != "disabled" && !register.security_client_mechanisms.is_empty();
+        register.sec_agree_mode == "required" && !register.security_client_mechanisms.is_empty();
     let contact_features = if register.include_mmtel_features {
         LiveContactFeatureSet::MmtelSmsSipInstance
     } else {
@@ -3493,7 +3683,7 @@ fn live_register_header_variants(
         user_agent: LiveUserAgentFormat::ProfileDefault,
         compact_register,
     };
-    let full = LiveRegisterHeaderVariant {
+    let exact = LiveRegisterHeaderVariant {
         label: register.live_header_variant_set,
         force_sec_agree_headers: register.sec_agree_mode == "required",
         suppress_sec_agree_headers: false,
@@ -3509,61 +3699,59 @@ fn live_register_header_variants(
         identity_format: LiveRegisterIdentityFormat::ImsiHomeDomain,
         header_profile,
     };
-    // Challenge-first fallback: some P-CSCFs reject an initial REGISTER that
-    // already carries Security-Client/Require and only start sec-agree after a
-    // 401 challenge. The authenticated round is forced to include
-    // Security-Client (and Security-Verify) regardless, so this variant still
-    // completes the full ipsec-3gpp flow when the server challenges it.
-    let challenge_first = LiveRegisterHeaderVariant {
-        label: "catalog_v7_challenge_first",
-        force_sec_agree_headers: false,
-        suppress_sec_agree_headers: true,
-        include_route_header: register.include_route_header,
-        include_security_client: false,
-        initial_authorization,
-        security_client_format: LiveSecurityClientFormat::FullSpaced,
-        request_uri: full.request_uri,
-        identity_format: full.identity_format,
-        header_profile,
-    };
-    // IPCC-shaped access baseline for bundles whose Android/Pixel Contact and
-    // network-info flags are incomplete. This candidate deliberately uses the
-    // compact SMS-only Contact while retaining PANI, Cellular-Network-Info and
-    // the same security/identity negotiation.
-    let ipcc_fallback = LiveRegisterHeaderVariant {
-        label: "catalog_v7_ipcc_access_baseline",
-        force_sec_agree_headers: true,
-        suppress_sec_agree_headers: false,
-        include_route_header: register.include_route_header,
-        include_security_client: true,
-        initial_authorization,
-        security_client_format: LiveSecurityClientFormat::FullSpaced,
-        request_uri: full.request_uri,
-        identity_format: full.identity_format,
-        header_profile: LiveRegisterHeaderProfile {
-            contact_features: LiveContactFeatureSet::SmsOnly,
-            include_accept_contact: false,
-            include_p_preferred_identity: register.include_p_preferred_identity,
-            visited_network: if register.include_visited_network {
-                LiveVisitedNetworkFormat::QuotedHome
-            } else {
-                LiveVisitedNetworkFormat::Omit
-            },
-            pani: LivePaniFormat::ProfileDefault,
-            include_cellular_network_info: !compact_register,
-            user_agent: LiveUserAgentFormat::ProfileDefault,
-            compact_register,
-        },
-    };
-    let incomplete_access_identity = !register.include_pani_initial
-        || !register.include_pani_authenticated
-        || !register.enable_cellular_network_info
-        || register.sec_agree_mode == "auto";
-    if incomplete_access_identity {
-        vec![ipcc_fallback, full, challenge_first]
-    } else {
-        vec![full, challenge_first, ipcc_fallback]
+
+    // The exact database/catalog policy is always attempted first. Optional
+    // candidates are bounded and never reinterpret an explicit false as a
+    // missing field.
+    let mut variants = vec![exact];
+    if register.sec_agree_mode == "required" {
+        variants.push(LiveRegisterHeaderVariant {
+            label: "catalog_v7_challenge_first",
+            force_sec_agree_headers: false,
+            suppress_sec_agree_headers: true,
+            include_route_header: register.include_route_header,
+            include_security_client: false,
+            initial_authorization,
+            security_client_format: LiveSecurityClientFormat::FullSpaced,
+            request_uri: exact.request_uri,
+            identity_format: exact.identity_format,
+            header_profile,
+        });
     }
+
+    let allow_ipcc_fallback = matches!(
+        register.live_header_variant_set,
+        "iphone_ipcc_fallback" | "catalog_v7_ipcc_access_fallback"
+    );
+    if allow_ipcc_fallback {
+        variants.push(LiveRegisterHeaderVariant {
+            label: "catalog_v7_ipcc_access_baseline",
+            force_sec_agree_headers: exact.force_sec_agree_headers,
+            suppress_sec_agree_headers: false,
+            include_route_header: register.include_route_header,
+            include_security_client,
+            initial_authorization,
+            security_client_format: LiveSecurityClientFormat::FullSpaced,
+            request_uri: exact.request_uri,
+            identity_format: exact.identity_format,
+            header_profile: LiveRegisterHeaderProfile {
+                contact_features: LiveContactFeatureSet::SmsOnly,
+                include_accept_contact: false,
+                include_p_preferred_identity: register.include_p_preferred_identity,
+                visited_network: if register.include_visited_network {
+                    LiveVisitedNetworkFormat::QuotedHome
+                } else {
+                    LiveVisitedNetworkFormat::Omit
+                },
+                pani,
+                include_cellular_network_info: register.enable_cellular_network_info
+                    && !compact_register,
+                user_agent: LiveUserAgentFormat::ProfileDefault,
+                compact_register,
+            },
+        });
+    }
+    variants
 }
 
 async fn live_register_header_variants_for_attempt(
@@ -3590,13 +3778,20 @@ async fn live_register_header_variants_for_attempt(
         return variants;
     };
 
+    let Some(exact) = variants.first().copied() else {
+        return variants;
+    };
+    if success.label == exact.label {
+        return variants;
+    }
     let mut ordered = Vec::with_capacity(variants.len());
+    ordered.push(exact);
     ordered.push(success);
     ordered.extend(
         variants
             .iter()
             .copied()
-            .filter(|variant| variant.label != cached.label),
+            .filter(|variant| variant.label != exact.label && variant.label != cached.label),
     );
     ordered
 }
@@ -3622,6 +3817,7 @@ async fn run_register_exchange_with_pcscf_variant(
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
     variant: LiveRegisterHeaderVariant,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
     let target = SocketAddr::new(pcscf_addr, profile.ims.local_port);
     let transport = ims_transport(profile);
@@ -3657,6 +3853,7 @@ async fn run_register_exchange_with_pcscf_variant(
         local_addr,
         pcscf_addr,
         variant,
+        access_network,
     )
     .await
     {
@@ -3677,12 +3874,34 @@ async fn run_register_exchange_on_connected_stream(
     local_addr: SocketAddr,
     pcscf_addr: IpAddr,
     variant: LiveRegisterHeaderVariant,
+    access_network_runtime: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
     let identity = live_ims_register_identity(line_id, profile, variant.identity_format).await?;
     let identity_shape = identity.shape;
+    let access_network = (profile.ims.register.enable_cellular_network_info
+        && variant.header_profile.include_cellular_network_info)
+        .then(|| access_network_runtime.context(profile.ims.register.access_network_info))
+        .flatten();
+    if profile.ims.register.enable_cellular_network_info
+        && variant.header_profile.include_cellular_network_info
+        && profile.ims.register.cni_identity_policy == AccessIdentityPolicy::RequiredDynamic
+        && access_network.is_none()
+    {
+        return Err(live_stage_error("ims_cni_required_dynamic_unavailable"));
+    }
+    if profile.ims.register.pani_identity_policy == AccessIdentityPolicy::RequiredDynamic
+        && !matches!(variant.header_profile.pani, LivePaniFormat::Omit)
+        && (profile.ims.register.include_pani_initial
+            || profile.ims.register.include_pani_authenticated)
+    {
+        // The current VoWiFi adapter has a dynamic cellular snapshot for CNI,
+        // but no trustworthy Wi-Fi BSSID/node-id provider for PANI.
+        return Err(live_stage_error("ims_pani_required_dynamic_unavailable"));
+    }
     let mut context = LiveRegisterRequestContext::new_for_line(
         line_id, profile, identity, local_addr, pcscf_addr,
     )?;
+    context.access_network = access_network;
     let request = context.build_initial_request(profile, variant);
     info!(
         pcscf_family = ip_family_name(pcscf_addr),
@@ -3697,7 +3916,7 @@ async fn run_register_exchange_on_connected_stream(
         p_preferred_identity_present = variant.header_profile.include_p_preferred_identity,
         visited_network_format = variant.header_profile.visited_network.label(),
         pani_format = variant.header_profile.pani.label(),
-        cellular_network_info_present = variant.header_profile.include_cellular_network_info,
+        cellular_network_info_present = request.contains("Cellular-Network-Info:"),
         user_agent_format = variant.header_profile.user_agent.label(),
         request_uri = variant.request_uri.label(),
         identity_format = variant.identity_format.label(),
@@ -3748,7 +3967,11 @@ async fn run_register_exchange_on_connected_stream(
         auth_rounds = registration.auth_rounds,
         expires_seconds = artifacts.expires_seconds,
         service_route_present = artifacts.service_route.is_some(),
+        service_route_count = artifacts.service_route_count,
         associated_uri_count = artifacts.associated_uris.len(),
+        contact_binding_count = artifacts.contact_binding_count,
+        contact_expiry_ambiguous = artifacts.contact_expiry_ambiguous,
+        wildcard_contact_present = artifacts.wildcard_contact_present,
         security_server_offers = summary.security_server_offers.len(),
         warning_present = summary.warning_present,
         unsupported = ?summary.unsupported,
@@ -3856,8 +4079,9 @@ impl RegisterAuthenticator<SipChannel> for VowifiRegisterAuthenticator<'_> {
         }
         // Re-send the same initial shape (including its empty-AKA
         // Authorization, if any) with a lease that satisfies Min-Expires.
-        let initial_authorization =
-            self.context.build_initial_authorization_header(self.profile, self.variant);
+        let initial_authorization = self
+            .context
+            .build_initial_authorization_header(self.profile, self.variant);
         let request = self.context.build_register_request_with_expires(
             self.profile,
             self.variant,
@@ -3891,9 +4115,7 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         }
         "ims_register_authenticated_min_expires_invalid"
         | "ims_register_authenticated_min_expires_exhausted"
-        | "ims_register_authenticated_min_expires_unsupported" => {
-            "ims_register_unexpected_status"
-        }
+        | "ims_register_authenticated_min_expires_unsupported" => "ims_register_unexpected_status",
         "sip_status_line_missing" | "sip_status_code_invalid" => {
             "ims_register_response_parse_failed"
         }
@@ -4026,7 +4248,7 @@ async fn run_authenticated_register_exchange(
         );
         info!("IMS REGISTER AKA resync request ready");
         write_sip_request(initial_channel, &resync_request).await?;
-        let response = read_final_register_response(initial_channel).await?;
+        let response = read_final_register_response(initial_channel, &resync_request).await?;
         let summary = ims::parse_sip_response(&response, &context.target.realm)
             .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
         if !matches!(summary.status_code, 401 | 407) {
@@ -4069,7 +4291,7 @@ async fn run_authenticated_register_exchange(
                 expires,
             );
             write_sip_request(initial_channel, &authenticated).await?;
-            let response = read_final_register_response(initial_channel).await?;
+            let response = read_final_register_response(initial_channel, &authenticated).await?;
             let summary = ims::parse_sip_response(&response, &context.target.realm)
                 .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
             if summary.status_code == 423 && min_expires_rounds < MAX_MIN_EXPIRES_ROUNDS {
@@ -4432,6 +4654,7 @@ async fn run_protected_authenticated_register_candidates(
                 };
                 let mut response = match read_final_register_response_with_timeout(
                     &mut protected_channel,
+                    &authenticated,
                     candidate_timeout,
                 )
                 .await
@@ -4498,8 +4721,7 @@ async fn run_protected_authenticated_register_candidates(
                         .await;
                         return Ok(response);
                     }
-                    if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS
-                    {
+                    if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS {
                         protected_channel.abort();
                         return Ok(response);
                     }
@@ -4531,6 +4753,7 @@ async fn run_protected_authenticated_register_candidates(
                     write_sip_request(&mut protected_channel, &authenticated).await?;
                     response = match read_final_register_response_with_timeout(
                         &mut protected_channel,
+                        &authenticated,
                         candidate_timeout,
                     )
                     .await
@@ -5674,30 +5897,69 @@ async fn read_sip_response(channel: &mut SipChannel) -> Result<String, LiveStage
     read_sip_response_with_timeout(channel, LIVE_IMS_REGISTER_READ_TIMEOUT).await
 }
 
-async fn read_final_register_response(channel: &mut SipChannel) -> Result<String, LiveStageError> {
-    read_final_register_response_with_timeout(channel, LIVE_IMS_REGISTER_READ_TIMEOUT).await
+async fn read_final_register_response(
+    channel: &mut SipChannel,
+    request: &str,
+) -> Result<String, LiveStageError> {
+    read_final_register_response_with_timeout(channel, request, LIVE_IMS_REGISTER_READ_TIMEOUT)
+        .await
 }
 
 async fn read_final_register_response_with_timeout(
     channel: &mut SipChannel,
+    request: &str,
     timeout: Duration,
 ) -> Result<String, LiveStageError> {
-    for provisional_count in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
-        let response = read_sip_response_with_timeout(channel, timeout).await?;
-        let status = sip_frame::parse_status(response.as_bytes())
+    let expected_transaction = RegisterTransactionKey::from_register_request(request.as_bytes());
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut provisional_count = 0u8;
+    let mut ignored_frames = 0u8;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(live_stage_error("ims_register_read_timeout"));
+        }
+        let frame = channel
+            .recv_sip_fresh(remaining)
+            .await
+            .map_err(|error| live_stage_error(error.code()))?;
+        let is_response = frame.starts_with(b"SIP/2.0");
+        let transaction_matches = expected_transaction
+            .as_ref()
+            .map(|expected| expected.matches_response(&frame))
+            .unwrap_or(is_response);
+        if !transaction_matches {
+            ignored_frames += 1;
+            channel.requeue(frame);
+            if ignored_frames >= MAX_REGISTER_IGNORED_FRAMES {
+                return Err(live_stage_error("ims_register_read_timeout"));
+            }
+            debug!(
+                is_response,
+                transaction_key_available = expected_transaction.is_some(),
+                "VoWiFi adapter-owned REGISTER skipping unrelated SIP frame"
+            );
+            continue;
+        }
+
+        let status = sip_frame::parse_status(&frame)
             .map_err(|_| live_stage_error("ims_register_response_parse_failed"))?;
         if !(100..=199).contains(&status) {
-            return Ok(response);
+            return String::from_utf8(frame)
+                .map_err(|_| live_stage_error("ims_register_response_not_utf8"));
+        }
+        provisional_count += 1;
+        if provisional_count >= MAX_REGISTER_PROVISIONAL_RESPONSES {
+            return Err(live_stage_error(
+                "ims_register_authenticated_unexpected_status",
+            ));
         }
         debug!(
             sip_status = status,
-            provisional_count = provisional_count + 1,
-            "VoWiFi adapter-owned REGISTER provisional response received"
+            provisional_count, "VoWiFi adapter-owned REGISTER provisional response received"
         );
     }
-    Err(live_stage_error(
-        "ims_register_authenticated_unexpected_status",
-    ))
 }
 
 async fn read_sip_response_with_timeout(
@@ -5869,6 +6131,9 @@ struct LiveRegisterRequestContext {
     /// both headers even though the request is sourced from port_uc. None means
     /// the round is unprotected and headers use the normal SIP port.
     protected_header_port: Option<u16>,
+    /// Real serving-cell snapshot used only for CNI while the SIP access itself
+    /// remains IWLAN. It is fixed for initial/authenticated/refresh/unregister.
+    access_network: Option<ImsAccessNetworkContext>,
     video_capability_enabled: bool,
 }
 
@@ -5956,6 +6221,7 @@ impl LiveRegisterRequestContext {
                 &security_client_state,
             ),
             protected_header_port: None,
+            access_network: None,
             video_capability_enabled,
         })
     }
@@ -6047,17 +6313,19 @@ impl LiveRegisterRequestContext {
             profile.ims.register.include_pani_initial
         } else {
             profile.ims.register.include_pani_authenticated
-        } || variant.label == "catalog_v7_ipcc_access_baseline";
+        };
         let pani = match variant.header_profile.pani {
-            LivePaniFormat::ProfileDefault => {
-                phase_includes_pani.then(|| build_p_access_network_info(profile))
-            }
-            #[cfg(test)]
-            LivePaniFormat::PlainWifi => {
-                Some("IEEE-802.11;i-wlan-node-id=000000000000".to_string())
-            }
-            #[cfg(not(test))]
-            LivePaniFormat::PlainWifi => None,
+            LivePaniFormat::ProfileDefault => phase_includes_pani
+                .then(|| {
+                    resolve_access_identity(
+                        profile.ims.register.pani_identity_policy,
+                        Some(profile.ims.register.access_network_info),
+                        None,
+                    )
+                    .value
+                })
+                .flatten(),
+            LivePaniFormat::PlainWifi => Some("IEEE-802.11".to_string()),
             LivePaniFormat::Omit => None,
         };
         #[allow(unused_mut)]
@@ -6102,20 +6370,32 @@ impl LiveRegisterRequestContext {
                 .then(|| self.build_initial_authorization_header(profile, variant))
                 .flatten()
         });
-        // The authenticated/authorized round is cseq > 1. The initial REGISTER
-        // may carry an empty-AKA Authorization (TS 24.229) without becoming an
-        // authenticated round; the Security-Client forcing below must not
-        // trigger on it.
-        let authenticated_round = cseq > 1;
         let contact = self.build_contact_header(profile, &local_host, variant.header_profile);
         let contact = contact
             .trim_end_matches(['\r', '\n'])
             .strip_prefix("Contact: ")
             .unwrap_or(contact.as_str())
             .to_string();
-        // The authenticated round always carries Security-Client: round 2 of a
-        // sec-agree flow must propose the client side even when the initial
-        // REGISTER used the challenge-first variant without one.
+        // TS 24.229 only permits Cellular-Network-Info in messages where the
+        // access-network information is also present. Keep this phase-aware:
+        // a profile may intentionally omit both headers on the initial request
+        // and add them only after authentication.
+        let cellular_network_info = (params.pani.is_some()
+            && profile.ims.register.enable_cellular_network_info
+            && variant.header_profile.include_cellular_network_info)
+            .then(|| {
+                resolve_access_identity(
+                    profile.ims.register.cni_identity_policy,
+                    profile.ims.register.cellular_network_info,
+                    self.access_network.as_ref(),
+                )
+                .value
+            })
+            .flatten();
+        // A security-protected authenticated round repeats Security-Client only
+        // when this candidate advertised it or the response supplied an actual
+        // Security-Server offer (represented by Security-Verify). A plain AKA
+        // 401 must not silently turn an `auto`/`disabled` profile into sec-agree.
         let to_value = format!("<{}>", self.identity.public_uri);
         let frame = crate::connectivity::core::register_message::build_register(
             &crate::connectivity::core::register_message::RegisterRequest {
@@ -6159,7 +6439,8 @@ impl LiveRegisterRequestContext {
                     require_sec_agree: params.require_sec_agree,
                     // RFC 3329 §2.3: Require and Proxy-Require travel together.
                     proxy_require_sec_agree: params.require_sec_agree
-                        && profile.ims.register.proxy_require_sec_agree_headers,
+                        && (profile.ims.register.proxy_require_sec_agree_headers
+                            || variant.label == "catalog_v7_sec_agree_required"),
                     allow: Some(params.allow_header),
                     preferred_service: None,
                     preferred_identity: variant
@@ -6168,17 +6449,16 @@ impl LiveRegisterRequestContext {
                         .then(|| format!("<{}>", self.identity.public_uri)),
                     visited_network: params.visited_network,
                     access_network_info: params.pani,
-                    cellular_network_info: variant
-                        .header_profile
-                        .include_cellular_network_info
-                        .then(|| build_cellular_network_info(profile)),
-                    security_client: (variant.include_security_client || authenticated_round).then(
-                        || {
-                            self.security_client_header(variant.security_client_format)
-                                .to_string()
-                        },
-                    ),
-                    security_verify: security_verify.map(str::to_string),
+                    cellular_network_info,
+                    security_client: (profile.ims.register.sec_agree_mode != "disabled"
+                        && (variant.include_security_client || security_verify.is_some()))
+                    .then(|| {
+                        self.security_client_header(variant.security_client_format)
+                            .to_string()
+                    }),
+                    security_verify: (profile.ims.register.sec_agree_mode != "disabled")
+                        .then(|| security_verify.map(str::to_string))
+                        .flatten(),
                     user_agent: params.user_agent,
                 },
             },
@@ -6275,10 +6555,12 @@ impl LiveRegisterRequestContext {
         if header_profile.compact_register {
             return 0;
         }
+        let contact_access_type = access_type_token(profile.ims.register.access_network_info)
+            .unwrap_or_else(|| "IEEE-802.11".to_string());
         complete_contact_parameters(ContactCompletion {
             mode: profile.ims.register.contact_mode,
             explicit: profile.ims.register.contact_param_order,
-            access_network_info: profile.ims.register.access_network_info,
+            access_network_info: &contact_access_type,
             include_mmtel: matches!(
                 header_profile.contact_features,
                 LiveContactFeatureSet::MmtelSmsSipInstance
@@ -6326,10 +6608,12 @@ impl LiveRegisterRequestContext {
         // voice capable. contact_features already mirrors
         // register.include_mmtel_features, so honour it in all builds.
         if !header_profile.compact_register {
+            let contact_access_type = access_type_token(profile.ims.register.access_network_info)
+                .unwrap_or_else(|| "IEEE-802.11".to_string());
             let parameters = complete_contact_parameters(ContactCompletion {
                 mode: profile.ims.register.contact_mode,
                 explicit: profile.ims.register.contact_param_order,
-                access_network_info: profile.ims.register.access_network_info,
+                access_network_info: &contact_access_type,
                 include_mmtel: matches!(
                     header_profile.contact_features,
                     LiveContactFeatureSet::MmtelSmsSipInstance
@@ -6630,7 +6914,7 @@ async fn build_live_register_auth_material(
             if aka_result.res.is_empty() {
                 return Err(live_stage_error("ims_aka_empty_response"));
             }
-            let response = compute_aka_md5_response(
+            let response = compute_aka_digest_response(
                 &context.identity.private_user,
                 &challenge.realm,
                 &aka_result,
@@ -6794,6 +7078,7 @@ fn parse_live_digest_challenge_value(
     let algorithm = param("algorithm").unwrap_or("AKAv1-MD5").to_string();
     if !algorithm.eq_ignore_ascii_case("AKAv1-MD5")
         && !algorithm.eq_ignore_ascii_case("AKAv2-MD5")
+        && !algorithm.eq_ignore_ascii_case("AKAv2-SHA-256")
         && !algorithm.eq_ignore_ascii_case("MD5")
     {
         warn!(
@@ -7111,59 +7396,7 @@ fn split_sip_header_values(value: &str) -> Vec<String> {
 }
 
 fn split_digest_challenge_values(value: &str) -> Vec<String> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Vec::new();
-    }
-
-    let mut values = Vec::new();
-    let mut start = 0usize;
-    let mut escaped = false;
-    let mut in_quote = false;
-    for (index, ch) in value.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_quote => escaped = true,
-            '"' => in_quote = !in_quote,
-            ',' if !in_quote => {
-                if let Some(next_start) = digest_scheme_start_after_comma(value, index) {
-                    let item = value[start..index].trim();
-                    if !item.is_empty() {
-                        values.push(item.to_string());
-                    }
-                    start = next_start;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let item = value[start..].trim();
-    if !item.is_empty() {
-        values.push(item.to_string());
-    }
-    values
-}
-
-fn digest_scheme_start_after_comma(value: &str, comma_index: usize) -> Option<usize> {
-    let rest = value.get(comma_index + 1..)?;
-    let trimmed = rest.trim_start();
-    let skipped = rest.len() - trimmed.len();
-    starts_with_digest_scheme(trimmed).then_some(comma_index + 1 + skipped)
-}
-
-fn starts_with_digest_scheme(value: &str) -> bool {
-    let Some(prefix) = value.get(..6) else {
-        return false;
-    };
-    prefix.eq_ignore_ascii_case("Digest")
-        && value
-            .get(6..)
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(char::is_whitespace)
+    crate::connectivity::core::digest_aka::split_digest_challenge_values(value)
 }
 
 fn parse_live_digest_params(value: &str) -> Vec<(String, String)> {
@@ -7280,7 +7513,7 @@ fn digest_nonce_shape(value: &str) -> DigestNonceShape {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn compute_aka_md5_response(
+fn compute_aka_digest_response(
     username: &str,
     realm: &str,
     aka: &super::qmi_uim::UsimAkaApduResult,
@@ -7312,26 +7545,20 @@ pub(crate) async fn build_line_sip_aka_authorization(
     digest_uri: &str,
     challenge_frame: &[u8],
 ) -> Result<String, LiveStageError> {
-    let (challenge_value, proxy) = if let Some(value) =
-        crate::connectivity::core::sip_frame::header_value(challenge_frame, "WWW-Authenticate")
-    {
-        (value, false)
-    } else if let Some(value) =
-        crate::connectivity::core::sip_frame::header_value(challenge_frame, "Proxy-Authenticate")
-    {
-        (value, true)
-    } else {
-        return Err(live_stage_error("ims_digest_challenge_missing"));
-    };
-    build_line_digest_aka_authorization(
-        line_id,
-        username,
-        method,
-        digest_uri,
-        &challenge_value,
-        proxy,
+    let www_values =
+        crate::connectivity::core::sip_frame::header_values(challenge_frame, "WWW-Authenticate");
+    let proxy_values =
+        crate::connectivity::core::sip_frame::header_values(challenge_frame, "Proxy-Authenticate");
+    // Non-REGISTER transactions on this path always authenticate through the
+    // USIM. Plain MD5 has no credential source here and must not be selected.
+    let challenge = crate::connectivity::core::digest_aka::select_digest_challenge(
+        &www_values,
+        &proxy_values,
+        false,
     )
-    .await
+    .map_err(map_shared_digest_error)?;
+    build_line_parsed_digest_aka_authorization(line_id, username, method, digest_uri, challenge)
+        .await
 }
 
 async fn build_line_digest_aka_authorization(
@@ -7345,6 +7572,17 @@ async fn build_line_digest_aka_authorization(
     let challenge =
         crate::connectivity::core::digest_aka::parse_digest_challenge(challenge_value, proxy)
             .map_err(map_shared_digest_error)?;
+    build_line_parsed_digest_aka_authorization(line_id, username, method, digest_uri, challenge)
+        .await
+}
+
+async fn build_line_parsed_digest_aka_authorization(
+    line_id: &str,
+    username: &str,
+    method: &str,
+    digest_uri: &str,
+    challenge: crate::connectivity::core::digest_aka::DigestChallenge,
+) -> Result<String, LiveStageError> {
     let aka_challenge = crate::connectivity::core::digest_aka::decode_aka_nonce(&challenge.nonce)
         .map_err(map_shared_digest_error)?;
     let aka = authenticate_live_sim_for_line(line_id, &aka_challenge.rand, &aka_challenge.autn)
@@ -7363,7 +7601,7 @@ async fn build_line_digest_aka_authorization(
             ),
         );
     }
-    let response = compute_aka_md5_response(
+    let response = compute_aka_digest_response(
         username,
         &challenge.realm,
         &aka,
@@ -7697,14 +7935,8 @@ fn sec_agree_headers_required(
 /// because carriers that validate this header reject a wrong one, and the
 /// correct value differs per carrier (`IEEE-802.11`, `IEEE-802.11a`, …).
 fn build_p_access_network_info(profile: &'static CarrierProfile) -> String {
-    profile.ims.register.access_network_info.trim().to_string()
-}
-
-fn build_cellular_network_info(profile: &'static CarrierProfile) -> String {
-    format!(
-        "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp={}0000000;cell-info-age=0",
-        profile.meta.plmn
-    )
+    sanitize_header_value(profile.ims.register.access_network_info)
+        .unwrap_or_else(|| "IEEE-802.11".to_string())
 }
 
 fn three_digit_mnc(profile: &'static CarrierProfile) -> String {
@@ -8202,6 +8434,54 @@ fn stage_result(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn refresh_failure_state_is_line_scoped_and_thresholded() {
+        let line_a = "test-vowifi-refresh-failure-line-a";
+        let line_b = "test-vowifi-refresh-failure-line-b";
+        clear_live_ims_refresh_failure_for_line(line_a).await;
+        clear_live_ims_refresh_failure_for_line(line_b).await;
+
+        assert_eq!(
+            record_live_ims_refresh_failure(line_a, "first").await,
+            LiveImsRefreshFailureDecision::Retry
+        );
+        assert_eq!(
+            record_live_ims_refresh_failure(line_a, "second").await,
+            LiveImsRefreshFailureDecision::Retry
+        );
+        assert_eq!(live_ims_refresh_failure_count_for_line(line_a).await, 2);
+        assert_eq!(live_ims_refresh_failure_count_for_line(line_b).await, 0);
+
+        assert_eq!(
+            record_live_ims_refresh_failure(line_a, "third").await,
+            LiveImsRefreshFailureDecision::RebuildAccess
+        );
+        assert_eq!(
+            live_ims_refresh_failure_count_for_line(line_a).await,
+            LIVE_IMS_REFRESH_REBUILD_FAILURES
+        );
+        assert_eq!(
+            record_live_ims_refresh_failure(line_a, "saturated").await,
+            LiveImsRefreshFailureDecision::RebuildAccess
+        );
+        assert_eq!(
+            live_ims_refresh_failure_count_for_line(line_a).await,
+            LIVE_IMS_REFRESH_REBUILD_FAILURES
+        );
+
+        mark_live_ims_refresh_rebuild_pending(line_a).await;
+        assert!(live_ims_refresh_rebuild_pending_for_line(line_a).await);
+        assert_eq!(
+            record_live_ims_refresh_failure(line_a, "pending").await,
+            LiveImsRefreshFailureDecision::RebuildPending
+        );
+
+        clear_live_ims_refresh_failure_for_line(line_a).await;
+        assert_eq!(live_ims_refresh_failure_count_for_line(line_a).await, 0);
+        assert!(!live_ims_refresh_rebuild_pending_for_line(line_a).await);
+        clear_live_ims_refresh_failure_for_line(line_b).await;
+    }
+
     #[test]
     fn named_sim_devices_never_inherit_global_fallbacks() {
         let missing = sim_device_for_line("");
@@ -8606,7 +8886,8 @@ mod tests {
 
         let variant = register_variant("ims_features_aka_uri_first_full_sec_client");
         assert!(!variant.force_sec_agree_headers);
-        let upgraded = sec_agree_retry_variant(variant, &error).expect("variant is upgraded");
+        let upgraded =
+            sec_agree_retry_variant(&GB_EE_23433, variant, &error).expect("variant is upgraded");
         assert!(upgraded.force_sec_agree_headers);
         assert!(!upgraded.suppress_sec_agree_headers);
         assert!(upgraded.include_security_client);
@@ -8626,6 +8907,23 @@ mod tests {
     }
 
     #[test]
+    fn explicit_sec_agree_disabled_is_never_upgraded_by_421_or_494() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.sec_agree_mode = "disabled";
+        profile.ims.register.require_sec_agree_headers = false;
+        profile.ims.register.proxy_require_sec_agree_headers = false;
+        let variant = register_variant("ims_features_aka_uri_first_full_sec_client");
+        for response in [
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            "SIP/2.0 494 Security Agreement Required\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let error = map_shared_register_failure(&register_failure_with(response, 0));
+            assert!(error.server_required_sec_agree);
+            assert!(sec_agree_retry_variant(&profile, variant, &error).is_none());
+        }
+    }
+
+    #[test]
     fn sec_agree_421_upgrade_does_not_loop_or_fire_on_other_rejections() {
         let sec_agree_421 = map_shared_register_failure(&register_failure_with(
             "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
@@ -8634,7 +8932,7 @@ mod tests {
         // Already declaring sec-agree: a second identical attempt would loop.
         let mut forcing = register_variant("ims_features_aka_uri_first_full_sec_client");
         forcing.force_sec_agree_headers = true;
-        assert!(sec_agree_retry_variant(forcing, &sec_agree_421).is_none());
+        assert!(sec_agree_retry_variant(&GB_EE_23433, forcing, &sec_agree_421).is_none());
 
         // A 421 naming a different extension is not ours to satisfy.
         let other_ext = map_shared_register_failure(&register_failure_with(
@@ -8961,9 +9259,10 @@ mod tests {
     }
 
     #[test]
-    fn catalog_variants_include_ipcc_access_identity_fallback() {
+    fn generic_catalog_variants_keep_exact_policy_first_without_implicit_ipcc() {
         let mut profile = GB_EE_23433;
         profile.ims.register.live_header_variant_set = "catalog_v7";
+        profile.ims.register.enable_initial_reject_fallback = true;
         profile.ims.register.include_pani_initial = false;
         profile.ims.register.include_pani_authenticated = false;
         profile.ims.register.enable_cellular_network_info = false;
@@ -8971,16 +9270,40 @@ mod tests {
         let profile = Box::leak(Box::new(profile));
 
         let variants = live_register_header_variants(profile);
-        assert_eq!(variants[0].label, "catalog_v7_ipcc_access_baseline");
+        assert_eq!(variants[0].label, "catalog_v7");
+        assert!(!variants
+            .iter()
+            .any(|variant| variant.label == "catalog_v7_ipcc_access_baseline"));
+        assert!(matches!(
+            variants[0].header_profile.pani,
+            LivePaniFormat::Omit
+        ));
+        assert!(!variants[0].header_profile.include_cellular_network_info);
+        assert!(matches!(
+            variants[0].header_profile.contact_features,
+            LiveContactFeatureSet::MmtelSmsSipInstance
+        ));
+    }
+
+    #[test]
+    fn named_ipcc_fallback_is_after_exact_and_respects_access_header_disables() {
+        let mut profile = GB_EE_23433;
+        profile.ims.register.live_header_variant_set = "catalog_v7_ipcc_access_fallback";
+        profile.ims.register.include_pani_initial = false;
+        profile.ims.register.include_pani_authenticated = false;
+        profile.ims.register.enable_cellular_network_info = false;
+        profile.ims.register.include_mmtel_features = true;
+        let profile = Box::leak(Box::new(profile));
+
+        let variants = live_register_header_variants(profile);
+        assert_eq!(variants[0].label, "catalog_v7_ipcc_access_fallback");
         let fallback = variants
             .iter()
+            .skip(1)
             .find(|variant| variant.label == "catalog_v7_ipcc_access_baseline")
-            .expect("IPCC access fallback");
-        assert!(matches!(
-            fallback.header_profile.pani,
-            LivePaniFormat::ProfileDefault
-        ));
-        assert!(fallback.header_profile.include_cellular_network_info);
+            .expect("named IPCC access fallback");
+        assert!(matches!(fallback.header_profile.pani, LivePaniFormat::Omit));
+        assert!(!fallback.header_profile.include_cellular_network_info);
         assert!(matches!(
             fallback.header_profile.contact_features,
             LiveContactFeatureSet::SmsOnly
@@ -9055,7 +9378,7 @@ mod tests {
             ik: vec![0x44; 16],
             auts: None,
         };
-        let proof = compute_aka_md5_response(
+        let proof = compute_aka_digest_response(
             "redacted@ims.example",
             GB_EE_23433.ims.realm,
             &aka,
@@ -9070,6 +9393,43 @@ mod tests {
 
         assert_eq!(challenge.algorithm, "AKAv2-MD5");
         assert_eq!(proof.len(), 32);
+        assert!(proof.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn akav2_sha256_challenge_is_accepted_and_emits_a_sha256_proof() {
+        let nonce = BASE64_STANDARD.encode([0x11u8; 32]);
+        let response = format!(
+            concat!(
+                "SIP/2.0 401 Unauthorized\r\n",
+                "WWW-Authenticate: Digest realm=\"{}\", algorithm=AKAv2-SHA-256, nonce=\"{}\", qop=\"auth\"\r\n",
+                "Content-Length: 0\r\n\r\n"
+            ),
+            GB_EE_23433.ims.realm, nonce
+        );
+        let challenge = parse_live_digest_challenge(&response, GB_EE_23433.ims.realm)
+            .expect("parse AKAv2-SHA-256 challenge");
+        let aka = crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult {
+            res: vec![0x22; 8],
+            ck: vec![0x33; 16],
+            ik: vec![0x44; 16],
+            auts: None,
+        };
+        let proof = compute_aka_digest_response(
+            "redacted@ims.example",
+            GB_EE_23433.ims.realm,
+            &aka,
+            &challenge.algorithm,
+            "REGISTER",
+            "sip:ims.example",
+            &challenge.nonce,
+            challenge.qop,
+            "abcdef0123456789",
+        )
+        .expect("compute AKAv2-SHA-256 proof");
+
+        assert_eq!(challenge.algorithm, "AKAv2-SHA-256");
+        assert_eq!(proof.len(), 64);
         assert!(proof.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
@@ -9092,7 +9452,7 @@ mod tests {
             ik: vec![0x88; 16],
             auts: None,
         };
-        let proof = compute_aka_md5_response(
+        let proof = compute_aka_digest_response(
             "redacted@ims.example",
             GB_EE_23433.ims.realm,
             &aka,
@@ -9182,7 +9542,7 @@ mod tests {
         assert!(initial.contains("Route: <sip:[::1]:5060;lr>\r\n"));
         assert!(initial.contains("+g.3gpp.accesstype=\"IEEE-802.11\""));
         assert!(initial.contains("+g.3gpp.smsip"));
-        assert!(!initial.contains("+sip.instance="));
+        assert!(initial.contains("+sip.instance="));
         assert!(!initial.contains(";reg-id="));
         assert!(initial.contains("P-Access-Network-Info: IEEE-802.11\r\n"));
         assert!(!initial.contains("i-wlan-node-id"));
@@ -9196,6 +9556,122 @@ mod tests {
         assert!(!authenticated.contains("Require: sec-agree\r\n"));
         assert!(!authenticated.contains("Proxy-Require: sec-agree\r\n"));
         assert!(authenticated.contains("Security-Verify: ipsec-3gpp;"));
+    }
+
+    #[test]
+    fn vowifi_cni_requires_profile_opt_in_and_a_real_cell_snapshot() {
+        let mut configured = GB_EE_23433;
+        configured.ims.register.enable_cellular_network_info = true;
+        configured.ims.register.cni_identity_policy = AccessIdentityPolicy::DynamicIfKnown;
+        let profile = Box::leak(Box::new(configured));
+        let mut variant = register_variant("profile_default_spaced_sec_client");
+        variant.header_profile.include_cellular_network_info = true;
+        let mut context = LiveRegisterRequestContext::new(
+            profile,
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "fixture",
+            },
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        )
+        .expect("register context");
+
+        let no_snapshot = context.build_initial_request(profile, variant);
+        assert!(!no_snapshot.contains("Cellular-Network-Info:"));
+
+        context.access_network = ImsAccessNetworkContext::new(
+            crate::connectivity::core::access_network::ImsAccessType::EutranFdd,
+            "50212",
+            0x1234567,
+            0x00ab,
+            Some(0),
+            crate::connectivity::core::access_network::AccessNetworkSource::TestFixture,
+        );
+        let with_snapshot = context.build_initial_request(profile, variant);
+        assert!(with_snapshot.contains("P-Access-Network-Info: IEEE-802.11\r\n"));
+        assert!(with_snapshot.contains(concat!(
+            "Cellular-Network-Info: ",
+            "3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=5021200AB1234567;",
+            "cell-info-age=0\r\n"
+        )));
+
+        let mut auth_phase_only = *profile;
+        auth_phase_only.ims.register.include_pani_initial = false;
+        auth_phase_only.ims.register.include_pani_authenticated = true;
+        let auth_phase_only = Box::leak(Box::new(auth_phase_only));
+        let initial_without_pani = context.build_initial_request(auth_phase_only, variant);
+        assert!(!initial_without_pani.contains("P-Access-Network-Info:"));
+        assert!(
+            !initial_without_pani.contains("Cellular-Network-Info:"),
+            "CNI must not be emitted in a phase that intentionally omits PANI"
+        );
+        let authenticated_with_pani = context.build_authenticated_request(
+            auth_phase_only,
+            variant,
+            "Authorization: Digest username=\"redacted\",realm=\"ims.example\",nonce=\"redacted\",uri=\"sip:ims.example\",response=\"00000000000000000000000000000000\",algorithm=AKAv1-MD5",
+            None,
+        );
+        assert!(authenticated_with_pani.contains("P-Access-Network-Info: IEEE-802.11\r\n"));
+        assert!(authenticated_with_pani.contains("Cellular-Network-Info:"));
+
+        let mut omit_pani_variant = variant;
+        omit_pani_variant.header_profile.pani = LivePaniFormat::Omit;
+        let omitted_by_variant = context.build_initial_request(profile, omit_pani_variant);
+        assert!(!omitted_by_variant.contains("P-Access-Network-Info:"));
+        assert!(
+            !omitted_by_variant.contains("Cellular-Network-Info:"),
+            "CNI must not bypass a variant that explicitly omits PANI"
+        );
+
+        let mut disabled = *profile;
+        disabled.ims.register.enable_cellular_network_info = false;
+        let disabled = Box::leak(Box::new(disabled));
+        let explicitly_disabled = context.build_initial_request(disabled, variant);
+        assert!(
+            !explicitly_disabled.contains("Cellular-Network-Info:"),
+            "database/catalog false must suppress CNI even when a snapshot exists"
+        );
+    }
+
+    #[test]
+    fn contact_access_type_does_not_copy_pani_parameters() {
+        let mut configured = GB_EE_23433;
+        configured.ims.register.access_network_info =
+            "IEEE-802.11;i-wlan-node-id=operator-specific";
+        let profile = Box::leak(Box::new(configured));
+        let context = LiveRegisterRequestContext::new(
+            profile,
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "001010123456789@ims.example".to_string(),
+                    public_uri: "sip:001010123456789@ims.example".to_string(),
+                    contact_user: "001010123456789".to_string(),
+                    home_domain: "ims.example".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "fixture",
+            },
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        )
+        .expect("register context");
+
+        let request = context.build_initial_request(
+            profile,
+            register_variant("profile_default_spaced_sec_client"),
+        );
+        assert!(request
+            .contains("P-Access-Network-Info: IEEE-802.11;i-wlan-node-id=operator-specific\r\n"));
+        assert!(request.contains("+g.3gpp.accesstype=\"IEEE-802.11\""));
+        assert!(!request
+            .contains("+g.3gpp.accesstype=\"IEEE-802.11;i-wlan-node-id=operator-specific\""));
     }
 
     #[test]
@@ -9366,7 +9842,7 @@ mod tests {
             "Authorization: Digest username=\"x\",realm=\"r\",nonce=\"n\",uri=\"sip:r\",response=\"00000000000000000000000000000000\",algorithm=AKAv1-MD5",
             None,
         );
-        assert!(authenticated.contains("Security-Client: ipsec-3gpp;"));
+        assert!(!authenticated.contains("Security-Client:"));
     }
 
     #[test]
@@ -9849,6 +10325,10 @@ mod tests {
 
         assert_eq!(
             variants.first().map(|variant| variant.label),
+            Some("gb_ee_aka_uri_first_sec_client")
+        );
+        assert_eq!(
+            variants.get(1).map(|variant| variant.label),
             Some(success.label)
         );
         assert_eq!(variants.len(), GB_EE_REGISTER_HEADER_VARIANTS.len());
@@ -9939,6 +10419,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_requeues_mwi_message_options_and_invite_for_session_loop() {
+        let peer = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let local = tokio::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let local_addr = local.local_addr().unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        local.connect(peer_addr).await.unwrap();
+        let route = crate::connectivity::core::context::ImsRoute {
+            local_addr,
+            pcscf_addr: peer_addr,
+            transport: crate::connectivity::core::context::SipTransport::Udp,
+        };
+        let mut channel = SipChannel::new(SipChannelSocket::Udp(local), Vec::new(), route, None);
+
+        let request =
+            "REGISTER sip:ims.example SIP/2.0\r\nCall-ID: refresh@dev\r\nCSeq: 8 REGISTER\r\nContent-Length: 0\r\n\r\n";
+        let frames: [&[u8]; 5] = [
+            b"NOTIFY sip:user@ims.example SIP/2.0\r\nCall-ID: mwi@dev\r\nCSeq: 1 NOTIFY\r\nEvent: message-summary\r\nContent-Length: 0\r\n\r\n",
+            b"MESSAGE sip:user@ims.example SIP/2.0\r\nCall-ID: message@dev\r\nCSeq: 1 MESSAGE\r\nContent-Length: 0\r\n\r\n",
+            b"OPTIONS sip:user@ims.example SIP/2.0\r\nCall-ID: options@dev\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+            b"INVITE sip:user@ims.example SIP/2.0\r\nCall-ID: invite@dev\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n",
+            b"SIP/2.0 200 OK\r\nCall-ID: refresh@dev\r\nCSeq: 8 REGISTER\r\nContact: <sip:user@192.0.2.2>;expires=120\r\nContent-Length: 0\r\n\r\n",
+        ];
+        for frame in frames {
+            peer.send_to(frame, local_addr).await.unwrap();
+        }
+
+        let response = read_final_register_response_with_timeout(
+            &mut channel,
+            request,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sip_frame::parse_status(response.as_bytes()).unwrap(), 200);
+
+        for (method, expected_call_id) in [
+            ("NOTIFY", "mwi@dev"),
+            ("MESSAGE", "message@dev"),
+            ("OPTIONS", "options@dev"),
+            ("INVITE", "invite@dev"),
+        ] {
+            let frame = channel
+                .recv_sip(Duration::from_secs(1))
+                .await
+                .expect("requeued SIP frame");
+            assert!(sip_frame::is_request(&frame, method), "expected {method}");
+            assert_eq!(
+                sip_frame::header_value(&frame, "Call-ID").as_deref(),
+                Some(expected_call_id)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn shared_register_contract_covers_vowifi_exchange_shape() {
         crate::connectivity::core::register::contract::assert_register_contract(
             crate::connectivity::core::register::contract::AuthenticatedExchangeStyle::AdapterOwned,
@@ -9965,19 +10503,23 @@ mod tests {
         };
         let mut channel = SipChannel::new(SipChannelSocket::Udp(local), Vec::new(), route, None);
 
+        let request = "REGISTER sip:ims.example SIP/2.0\r\nCall-ID: adapter@dev\r\nCSeq: 4 REGISTER\r\nContent-Length: 0\r\n\r\n";
         for frame in [
-            b"SIP/2.0 100 Trying\r\nContent-Length: 0\r\n\r\n".as_slice(),
-            b"SIP/2.0 183 Session Progress\r\nContent-Length: 0\r\n\r\n".as_slice(),
-            b"SIP/2.0 200 OK\r\nContact: <sip:user@192.0.2.2>;expires=120\r\nContent-Length: 0\r\n\r\n"
+            b"SIP/2.0 100 Trying\r\nCall-ID: adapter@dev\r\nCSeq: 4 REGISTER\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"SIP/2.0 183 Session Progress\r\nCall-ID: adapter@dev\r\nCSeq: 4 REGISTER\r\nContent-Length: 0\r\n\r\n".as_slice(),
+            b"SIP/2.0 200 OK\r\nCall-ID: adapter@dev\r\nCSeq: 4 REGISTER\r\nContact: <sip:user@192.0.2.2>;expires=120\r\nContent-Length: 0\r\n\r\n"
                 .as_slice(),
         ] {
             peer.send_to(frame, local_addr).await.unwrap();
         }
 
-        let response =
-            read_final_register_response_with_timeout(&mut channel, Duration::from_secs(1))
-                .await
-                .unwrap();
+        let response = read_final_register_response_with_timeout(
+            &mut channel,
+            request,
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
         assert_eq!(sip_frame::parse_status(response.as_bytes()).unwrap(), 200);
         assert_eq!(
             RegisterArtifacts::parse(response.as_bytes()).expires_seconds,

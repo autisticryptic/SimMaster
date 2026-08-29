@@ -4,6 +4,8 @@ use std::{env, future::Future, pin::Pin};
 
 use serde::Serialize;
 
+use crate::connectivity::core::access_network::ImsAccessNetworkRuntime;
+
 use super::{
     dataplane::{ChildSaPublicState, ChildSaStateMachine},
     ike_state::IkePublicSnapshot,
@@ -462,11 +464,22 @@ impl RuntimeExecutor for DryRunRuntimeExecutor {
 #[derive(Debug, Clone)]
 pub struct LiveRuntimeExecutor {
     gate: LiveExecutorGateReport,
+    access_network: ImsAccessNetworkRuntime,
 }
 
 impl LiveRuntimeExecutor {
     pub fn from_gate(gate: LiveExecutorGateReport) -> Self {
-        Self { gate }
+        Self::from_gate_with_access_network(gate, ImsAccessNetworkRuntime::default())
+    }
+
+    pub fn from_gate_with_access_network(
+        gate: LiveExecutorGateReport,
+        access_network: ImsAccessNetworkRuntime,
+    ) -> Self {
+        Self {
+            gate,
+            access_network,
+        }
     }
 
     fn stage_enabled(&self, stage: ExecutorStage) -> bool {
@@ -532,7 +545,10 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
             let adapter = LiveNetworkStageAdapter::for_line(
                 request.line_id.clone(),
                 SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
-                SystemLiveDatagramAdapter::for_line(request.line_id.clone()),
+                SystemLiveDatagramAdapter::for_line_with_access_network(
+                    request.line_id.clone(),
+                    self.access_network.clone(),
+                ),
             );
             LiveStageRunner::new(self.gate.clone(), profile, adapter)
                 .run(request)

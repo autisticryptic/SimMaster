@@ -17,6 +17,7 @@
 #![allow(dead_code)]
 
 pub mod access;
+pub mod access_network;
 pub mod contact;
 pub mod context;
 pub mod device_identity;

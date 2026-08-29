@@ -178,7 +178,7 @@ pub struct EsimDownloadRequest {
 #[derive(Debug, Default, Serialize, Clone)]
 pub struct ServingCell {
     pub tech: String,
-    pub cell_id: u32,
+    pub cell_id: u64,
     pub tac: u32,
 }
 
@@ -187,7 +187,7 @@ pub struct CellInfo {
     pub is_serving: bool,
     pub tech: String,
     #[serde(default)]
-    pub cell_id: u32,
+    pub cell_id: u64,
     pub band: String,
     pub arfcn: String,
     pub pci: String,
@@ -741,7 +741,7 @@ pub struct CellLocationInfo {
     pub mcc: String,
     pub mnc: String,
     pub lac: u32,
-    pub cid: u32,
+    pub cid: u64,
     pub signal_strength: i32,
     pub radio_type: String,
     #[serde(skip_serializing_if = "Option::is_none")]

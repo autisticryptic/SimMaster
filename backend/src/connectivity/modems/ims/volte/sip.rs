@@ -15,7 +15,11 @@ use std::net::IpAddr;
 
 use super::errors::VolteError;
 use crate::connectivity::core::{
-    contact::{complete_contact_parameters, ContactCompletion},
+    access_network::{
+        AccessIdentityPolicy, ImsAccessNetworkContext, access_type_token,
+        resolve_access_identity, sanitize_header_value,
+    },
+    contact::{ContactCompletion, complete_contact_parameters},
     register_message::{RegisterHeaderFields, RegisterRequest},
     sip_message::{SipHeader, SipRequest},
 };
@@ -266,6 +270,7 @@ pub fn build_register_with_policy(
         sip_instance,
         policy,
         None,
+        None,
     )
 }
 
@@ -356,6 +361,45 @@ pub fn build_register_from_profile_with_target_and_visited(
     policy: RegisterRequestPolicy,
     visited_network_override: Option<&str>,
 ) -> Vec<u8> {
+    build_register_from_profile_with_target_visited_and_access(
+        profile,
+        target,
+        phase,
+        identity,
+        route,
+        ids,
+        expires,
+        authorization,
+        security_client,
+        security_verify,
+        sip_instance,
+        policy,
+        visited_network_override,
+        None,
+    )
+}
+
+/// Build REGISTER with runtime roaming and serving-cell snapshots.
+///
+/// A missing snapshot is intentionally not replaced with a synthetic PLMN/TAC/
+/// cell id. Profile policy still controls whether PANI/CNI is emitted at all.
+#[allow(clippy::too_many_arguments)]
+pub fn build_register_from_profile_with_target_visited_and_access(
+    profile: &CarrierProfile,
+    target: RegisterTarget<'_>,
+    phase: RegisterPhase,
+    identity: &ImsIdentity,
+    route: &SipRoute,
+    ids: &RequestIds,
+    expires: u32,
+    authorization: Option<&str>,
+    security_client: Option<&str>,
+    security_verify: Option<&str>,
+    sip_instance: &str,
+    policy: RegisterRequestPolicy,
+    visited_network_override: Option<&str>,
+    access_network: Option<&ImsAccessNetworkContext>,
+) -> Vec<u8> {
     build_register_internal(
         Some(profile),
         Some(target),
@@ -370,6 +414,7 @@ pub fn build_register_from_profile_with_target_and_visited(
         sip_instance,
         policy,
         visited_network_override,
+        access_network,
     )
 }
 
@@ -403,6 +448,17 @@ pub fn register_request_uri_with_target(
     }
 }
 
+fn cellular_profile_access_identity(value: &str) -> Option<String> {
+    let value = sanitize_header_value(value)?;
+    let token = access_type_token(&value)?;
+    let token = token.to_ascii_uppercase();
+    (token.starts_with("3GPP-E-UTRAN")
+        || token.starts_with("3GPP-NR")
+        || token.starts_with("3GPP-UTRAN")
+        || token.starts_with("3GPP-GERAN"))
+    .then_some(value)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_register_internal(
     profile: Option<&CarrierProfile>,
@@ -418,24 +474,63 @@ fn build_register_internal(
     sip_instance: &str,
     policy: RegisterRequestPolicy,
     visited_network_override: Option<&str>,
+    access_network: Option<&ImsAccessNetworkContext>,
 ) -> Vec<u8> {
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
     let local_port = route.local_addr.port();
-    // An MMTEL-capable cellular binding must identify its radio access. Some
-    // imported carrier bundles omit the PANI booleans even though they enable
-    // MMTEL, which can leave a 200-OK registration ineligible for MT routing.
+    // An MMTEL-capable cellular binding should identify its radio access, but
+    // an explicit per-phase PANI decision (including "omit", both booleans
+    // false) always wins over the MMTEL heuristic: some operators reject the
+    // header or want it absent on refresh even when MMTEL is advertised.
     let include_pani = policy.include_access_network_info
-        && (policy.include_mmtel_features
-            || profile.is_none_or(|profile| match phase {
-                RegisterPhase::Initial => profile.ims.register.include_pani_initial,
-                RegisterPhase::Authenticated | RegisterPhase::Refresh => {
-                    profile.ims.register.include_pani_authenticated
-                }
-            }));
-    let access_network_info = profile
+        && profile.is_none_or(|profile| match phase {
+            RegisterPhase::Initial => profile.ims.register.include_pani_initial,
+            RegisterPhase::Authenticated | RegisterPhase::Refresh => {
+                profile.ims.register.include_pani_authenticated
+            }
+        });
+    let profile_access_network_info = profile
         .map(|profile| profile.ims.register.access_network_info)
         .unwrap_or(PANI_EUTRAN);
+    let profile_cellular_access_network_info =
+        cellular_profile_access_identity(profile_access_network_info);
+    let contact_access_network_info = access_network
+        .map(|context| context.access_type.as_3gpp_token().to_string())
+        .or_else(|| {
+            profile_cellular_access_network_info
+                .as_deref()
+                .and_then(access_type_token)
+        })
+        .unwrap_or_else(|| PANI_EUTRAN.to_string());
+    let pani_policy = profile
+        .map(|profile| profile.ims.register.pani_identity_policy)
+        .unwrap_or(AccessIdentityPolicy::DynamicIfKnown);
+    let pani = include_pani
+        .then(|| {
+            resolve_access_identity(
+                pani_policy,
+                profile_cellular_access_network_info.as_deref(),
+                access_network,
+            )
+            .value
+        })
+        .flatten();
+    let cellular_network_info = (policy.include_access_network_info
+        && profile.is_some_and(|profile| profile.ims.register.enable_cellular_network_info))
+    .then(|| {
+        let register = &profile.expect("CNI requires a carrier profile").ims.register;
+        let static_cellular_network_info = register
+            .cellular_network_info
+            .and_then(cellular_profile_access_identity);
+        resolve_access_identity(
+            register.cni_identity_policy,
+            static_cellular_network_info.as_deref(),
+            access_network,
+        )
+        .value
+    })
+    .flatten();
     let params = ImsRegisterParams {
         realm: target
             .map(|target| target.realm)
@@ -466,7 +561,7 @@ fn build_register_internal(
             .map(|profile| profile.ims.user_agent)
             .unwrap_or(USER_AGENT)
             .to_string(),
-        pani: include_pani.then(|| access_network_info.to_string()),
+        pani,
         visited_network: None,
         allow_header: profile
             .and_then(|profile| profile.ims.register.allow_methods)
@@ -520,7 +615,7 @@ fn build_register_internal(
     let completed_parameters = complete_contact_parameters(ContactCompletion {
         mode,
         explicit: explicit_parameters,
-        access_network_info,
+        access_network_info: &contact_access_network_info,
         include_mmtel: policy.include_mmtel_features,
         include_video: policy.include_video_feature,
         include_sip_instance: policy.include_sip_instance,
@@ -592,7 +687,10 @@ fn build_register_internal(
                 .then(|| format!("<{}>", identity.public_uri)),
             visited_network,
             access_network_info: params.pani,
-            cellular_network_info: None,
+            // CNI is off for normal VoLTE profiles. A carrier/database may
+            // explicitly enable it as an interop exception; when enabled, the
+            // independent CNI policy still forbids fabricated cell identities.
+            cellular_network_info,
             security_client: security_client.map(str::to_string),
             security_verify: security_verify.map(str::to_string),
             user_agent: params.user_agent,
@@ -1415,6 +1513,7 @@ pub fn sip_header_uri(frame: &[u8], header_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::core::access_network::{AccessNetworkSource, ImsAccessType};
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     fn ident() -> ImsIdentity {
@@ -1672,7 +1771,7 @@ mod tests {
     }
 
     #[test]
-    fn mmtel_register_keeps_lte_pani_across_registration_phases() {
+    fn mmtel_register_respects_explicit_pani_omit_across_registration_phases() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.include_pani_initial = false;
         profile.ims.register.include_pani_authenticated = false;
@@ -1701,10 +1800,78 @@ mod tests {
             );
             assert_eq!(
                 header_value(&frame, "P-Access-Network-Info").as_deref(),
-                Some("3GPP-E-UTRAN-FDD"),
-                "missing PANI during {phase:?} REGISTER"
+                None,
+                "PANI must stay omitted during {phase:?} REGISTER"
             );
         }
+    }
+
+    #[test]
+    fn volte_never_emits_non_cellular_access_cellular_network_info() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.enable_cellular_network_info = true;
+        profile.ims.register.pani_identity_policy = AccessIdentityPolicy::DynamicIfKnown;
+        let snapshot = ImsAccessNetworkContext::new(
+            ImsAccessType::EutranFdd,
+            "50212",
+            0x1234567,
+            0x00ab,
+            Some(0),
+            AccessNetworkSource::TestFixture,
+        )
+        .expect("valid serving-cell fixture");
+
+        let frame = build_register_from_profile_with_target_visited_and_access(
+            &profile,
+            RegisterTarget::from_profile(&profile),
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+            None,
+            Some(&snapshot),
+        );
+
+        assert_eq!(header_value(&frame, "Cellular-Network-Info"), None);
+        assert_eq!(
+            header_value(&frame, "P-Access-Network-Info").as_deref(),
+            Some("3GPP-E-UTRAN-FDD;utran-cell-id-3gpp=5021200AB1234567;cell-info-age=0")
+        );
+    }
+
+    #[test]
+    fn volte_static_identity_policy_rejects_wlan_values() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.enable_cellular_network_info = true;
+        profile.ims.register.pani_identity_policy = AccessIdentityPolicy::Static;
+        profile.ims.register.cni_identity_policy = AccessIdentityPolicy::Static;
+        profile.ims.register.cellular_network_info = Some("IEEE-802.11");
+
+        let frame = build_register_from_profile_with_target_visited_and_access(
+            &profile,
+            RegisterTarget::from_profile(&profile),
+            RegisterPhase::Initial,
+            &ident(),
+            &route_udp(),
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            None,
+            None,
+            None,
+            "urn:uuid:test",
+            RegisterRequestPolicy::LEGACY,
+            None,
+            None,
+        );
+
+        assert_eq!(header_value(&frame, "P-Access-Network-Info"), None);
+        assert_eq!(header_value(&frame, "Cellular-Network-Info"), None);
     }
 
     #[test]
@@ -1756,7 +1923,12 @@ mod tests {
             RegisterRequestPolicy::LEGACY,
         );
         assert!(header_value(&frame, "P-Access-Network-Info").is_none());
-        assert!(header_value(&frame, "Allow").is_none());
+        // GB_EE_23433 explicitly declares its Allow methods, so the header is
+        // still emitted even though the MMTEL feature tags are not forced.
+        assert_eq!(
+            header_value(&frame, "Allow").as_deref(),
+            Some("INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS")
+        );
     }
 
     #[test]
@@ -1964,7 +2136,8 @@ mod tests {
         );
         let text = String::from_utf8(frame).unwrap();
 
-        assert!(text.contains(";audio;+g.3gpp.smsip;+g.3gpp.icsi-ref=\""));
+        assert!(text.contains(";audio;+g.3gpp.icsi-ref="));
+        assert!(text.contains(";+g.3gpp.smsip;+sip.instance="));
         assert!(text.contains(";+sip.instance=\"<urn:uuid:"));
         assert!(!text.contains("Accept-Contact:"));
         assert!(!text.contains("P-Preferred-Service:"));
@@ -2235,27 +2408,31 @@ mod tests {
     #[test]
     fn dtmf_info_rejects_invalid_digit_and_duration() {
         let dialog = DialogIds::fresh();
-        assert!(build_dtmf_info(
-            &ident(),
-            &route_udp(),
-            None,
-            &dialog,
-            "sip:+8613800138000@h",
-            2,
-            'Z',
-            160,
-        )
-        .is_err());
-        assert!(build_dtmf_info(
-            &ident(),
-            &route_udp(),
-            None,
-            &dialog,
-            "sip:+8613800138000@h",
-            2,
-            '1',
-            10,
-        )
-        .is_err());
+        assert!(
+            build_dtmf_info(
+                &ident(),
+                &route_udp(),
+                None,
+                &dialog,
+                "sip:+8613800138000@h",
+                2,
+                'Z',
+                160,
+            )
+            .is_err()
+        );
+        assert!(
+            build_dtmf_info(
+                &ident(),
+                &route_udp(),
+                None,
+                &dialog,
+                "sip:+8613800138000@h",
+                2,
+                '1',
+                10,
+            )
+            .is_err()
+        );
     }
 }

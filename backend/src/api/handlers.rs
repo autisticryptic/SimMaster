@@ -8,7 +8,7 @@ use axum::{
     Json,
 };
 use base64::Engine;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashSet;
 use std::fs;
@@ -28,8 +28,11 @@ use crate::{
     connectivity::modems::ims::vowifi::restore::RestorePhase,
     connectivity::modems::ims::vowifi::{
         live::{
-            clear_live_runtime_for_line, live_xcap_access_for_line,
+            clear_live_runtime_for_line, live_ims_refresh_failure_count_for_line,
+            live_ims_refresh_rebuild_pending_for_line, live_xcap_access_for_line,
+            mark_live_ims_refresh_rebuild_pending, record_live_ims_refresh_failure,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
+            LiveImsRefreshFailureDecision, LIVE_IMS_REFRESH_REBUILD_FAILURES,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
@@ -54,7 +57,7 @@ use crate::{
         AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
         GithubDownloadProxyConfig, ImsVideoConfig, LineDataProxyConfig, LineProfileConfig,
         LineVowifiConfig, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
-        VoicePathPolicy,
+        VoicePathPolicy, VolteProfileCandidate, VolteProfileSelectionConfig, VolteProfileSource,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -4313,8 +4316,12 @@ pub(crate) async fn publish_sms_to_trunk(app: &AppState, sms: &crate::platform::
     if sms.direction != "incoming" {
         return;
     }
-    let Some(line_id) = sms.line_id.as_deref() else { return; };
-    let Some(line) = app.line_registry.get(line_id).await else { return; };
+    let Some(line_id) = sms.line_id.as_deref() else {
+        return;
+    };
+    let Some(line) = app.line_registry.get(line_id).await else {
+        return;
+    };
     let profile = app.config_manager.get_line_profile(line_id);
     // Trunk 的 "仅允许 VoWiFi" 门控对入向短信同样生效：开关开启时，只有
     // VoWiFi（vowifi_ims）路径收到的短信才推送给 trunk；VoLTE/CS 短信
@@ -4322,13 +4329,13 @@ pub(crate) async fn publish_sms_to_trunk(app: &AppState, sms: &crate::platform::
     if profile.trunk.vowifi_only && sms.transport != "vowifi_ims" {
         return;
     }
-    line.trunk.operator_link().send_sms_delivery(
-        crate::services::trunk::operator::SmsDelivery {
+    line.trunk
+        .operator_link()
+        .send_sms_delivery(crate::services::trunk::operator::SmsDelivery {
             from: sms.phone_number.clone(),
             to: profile.trunk.incoming_binding.clone(),
             body: sms.content.clone(),
-        },
-    );
+        });
 }
 
 async fn send_sms_over_vowifi_path(
@@ -4380,10 +4387,14 @@ async fn send_sms_over_vowifi_path(
     if !ready {
         return Err("sms_ready_not_reached".to_string());
     }
-    let send_result =
-        send_live_sms_over_ims_for_line(scope.line_id(), &payload.phone_number, &payload.content)
-            .await
-            .map_err(|error| error.reason)?;
+    let send_result = send_live_sms_over_ims_for_line(
+        scope.line_id(),
+        &payload.phone_number,
+        &payload.content,
+        scope.runtime().access_network(),
+    )
+    .await
+    .map_err(|error| error.reason)?;
     let outcome = send_result.outcome;
     let api_sms_id = app
         .database
@@ -4453,35 +4464,29 @@ async fn send_sms_over_volte_path(
         return Err("line_volte_connection_disabled".to_string());
     }
     if !line.volte.status().await.registered {
-        let (_, sim_override) = ims_override_for_line(app, line_id).await?;
-        let ip_families = app.config_manager.get_line_volte_ip_families(line_id);
-        let device =
-            crate::connectivity::modems::ims::volte::live::VolteDeviceBinding::from_modem(&binding)
-                .map_err(|error| error.to_string())?;
-        let _bearer_guard = line.bearer_operation_lock.lock().await;
-        let data_slot_mode = prepare_line_data_slot_for_volte(app, &line, &profile)
-            .await
-            .map_err(|error| error.to_string())?;
-        let _guard = line.volte_connect_lock.lock().await;
-        if !line.volte.status().await.registered {
-            crate::connectivity::modems::ims::volte::live::connect_live_for_line(
-                &line.volte_live,
-                &device,
-                &line.volte,
-                &ip_families,
-                app.config_manager.get_line_volte_ip_families_auto(line_id),
-                profile.roaming_allowed,
-                data_slot_mode,
-                app.config_manager
-                    .get_line_sms_path_policy(line_id)
-                    .dedupe_enabled,
-                profile_store(app),
-                sim_override,
-                Arc::clone(&app.database),
-                Arc::clone(&app.notification_sender),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+        if !line.begin_volte_retry() {
+            return Err("volte_profile_restore_in_progress".to_string());
+        }
+        let retry_max = profile.volte_profile_selection.attempts.len() as u32;
+        line.volte
+            .update(|state| {
+                state.recovery_state =
+                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
+                state.recovery_source = Some("sms".to_string());
+                state.retry_attempt = 0;
+                state.retry_max = retry_max;
+                state.manual_retry_available = false;
+                state.next_retry_at = None;
+                state.last_error = None;
+            })
+            .await;
+        run_line_volte_restore_batch(app, &line, "sms").await;
+        line.finish_volte_retry();
+        let status = line.volte.status().await;
+        if !status.registered {
+            return Err(status
+                .last_error
+                .unwrap_or_else(|| "volte_profile_attempts_exhausted".to_string()));
         }
     }
     let sim =
@@ -5029,11 +5034,11 @@ async fn finish_tracked_call(
     path: &str,
     answered_now: bool,
 ) -> Option<crate::platform::db::CallRecord> {
-    let mut record = {
+    let record = {
         let mut active = app.active_calls.lock().await;
         active.remove(path)
     };
-    if let Some(ref mut record) = record {
+    if let Some(mut record) = record {
         if answered_now && record.answered_at.is_none() {
             record.answered_at = Some(std::time::Instant::now());
         }
@@ -5064,6 +5069,14 @@ async fn finish_tracked_call(
                     );
                 }
             });
+        }
+        // A refresh threshold reached during an active/held call is deliberately
+        // deferred so the current operator session is not torn down underneath
+        // media. Once this terminal event removes the last protected call, let a
+        // background task perform the queued access rebuild.
+        let line_id = record.line_id.clone();
+        if live_ims_refresh_rebuild_pending_for_line(&line_id).await {
+            spawn_pending_vowifi_rebuild(app, &line_id);
         }
         return call;
     }
@@ -6255,10 +6268,62 @@ fn disabled_vowifi_status(reason: &str) -> VowifiStatusResponse {
     }
 }
 fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
-    matches!(
-        reason,
-        Some("vowifi_connect_already_running" | "live_connect_already_running")
-    )
+    reason.is_some_and(|reason| {
+        matches!(
+            reason,
+            "vowifi_connect_already_running" | "live_connect_already_running"
+        ) || reason.starts_with("vowifi_registration_refresh_retry_pending")
+            || reason.starts_with("vowifi_registration_refresh_rebuild_pending")
+    })
+}
+
+fn active_call_state_protects_vowifi_rebuild(state: &str) -> bool {
+    matches!(state, "active" | "held")
+}
+
+async fn line_has_protected_active_call(app: &AppState, line_id: &str) -> bool {
+    let active = app.active_calls.lock().await;
+    active.values().any(|record| {
+        record.line_id == line_id && active_call_state_protects_vowifi_rebuild(&record.state)
+    })
+}
+
+fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
+    let line_id = line_id.to_string();
+    let app = app.clone();
+    tokio::spawn(async move {
+        // Let the terminal call event finish removing its record before taking
+        // the snapshot. A simultaneous second call will be detected below and
+        // keep the rebuild deferred until its own terminal event.
+        tokio::task::yield_now().await;
+        if !live_ims_refresh_rebuild_pending_for_line(&line_id).await
+            || line_has_protected_active_call(&app, &line_id).await
+        {
+            return;
+        }
+        let Some(line) = app.line_registry.get(&line_id).await else {
+            return;
+        };
+        let profile = app.config_manager.get_line_profile(&line_id);
+        if !profile.enabled || !profile.vowifi.enabled || !line.binding().present {
+            return;
+        }
+        let scope = VowifiScope::for_line(line);
+        let _ = reset_vowifi_runtime_for_scope(
+            &app,
+            &scope,
+            "vowifi_registration_refresh_rebuild_after_call",
+        )
+        .await;
+        let _ = connect_vowifi_on_line(
+            &app,
+            &scope,
+            VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+            Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+            true,
+        )
+        .await;
+    });
 }
 
 /// One explicitly selected line and its private VoWiFi runtime.
@@ -7029,6 +7094,23 @@ async fn connect_vowifi_on_line(
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
     }
+    if live_ims_refresh_rebuild_pending_for_line(scope.line_id()).await {
+        if line_has_protected_active_call(app, scope.line_id()).await {
+            let mut status = current;
+            status.degraded_reason =
+                Some("vowifi_registration_refresh_rebuild_pending_active_call".to_string());
+            persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+            return status;
+        }
+        // The terminal-call path normally owns this transition. If a caller
+        // reaches connect after the last call has already disappeared, queue the
+        // same one-line rebuild here rather than attempting another refresh.
+        spawn_pending_vowifi_rebuild(app, scope.line_id());
+        let mut status = current;
+        status.degraded_reason = Some("vowifi_registration_refresh_rebuild_pending".to_string());
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+        return status;
+    }
 
     // Resolve and publish SIM-bound values only after proving that this call is
     // starting a new session. PATCHing SimOverrideStore while a session is
@@ -7058,30 +7140,46 @@ async fn connect_vowifi_on_line(
             scope.line_id(),
         )
         .await;
+    let refresh_failure_count = live_ims_refresh_failure_count_for_line(scope.line_id()).await;
+    let refresh_cycle = refresh_due
+        && operator_ready
+        && (current.readiness.ims_registered || refresh_failure_count > 0);
     if current.readiness.sms_ready && operator_ready && !refresh_due {
         persist_vowifi_runtime_snapshot(app, scope.line_id(), &current);
         return current;
     }
-    if (refresh_due || !operator_ready)
+    if live_ims_refresh_rebuild_pending_for_line(scope.line_id()).await {
+        if line_has_protected_active_call(app, scope.line_id()).await {
+            let mut status = current;
+            status.degraded_reason =
+                Some("vowifi_registration_refresh_rebuild_pending_active_call".to_string());
+            persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+            return status;
+        }
+        spawn_pending_vowifi_rebuild(app, scope.line_id());
+        let mut status = current;
+        status.degraded_reason = Some("vowifi_registration_refresh_rebuild_pending".to_string());
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+        return status;
+    }
+    if refresh_cycle {
+        // Keep the ePDG/IKE/ESP path and the old operator channel alive while
+        // the refresh-specific REGISTER is retried. The operator layer already
+        // defers channel handover when a call is active.
+        scope
+            .runtime()
+            .prepare_live_ims_registration_refresh("vowifi_registration_refresh_due")
+            .await;
+    } else if !operator_ready
         && (current.readiness.ims_registered
             || current.readiness.sms_ready
             || current.readiness.voice_ready)
     {
         // The SIP task clears the operator link when REGISTER expires, while
         // the runtime snapshot still contains the last successful readiness.
-        // The same invalidation is required at the proactive refresh deadline,
-        // otherwise the executor would skip REGISTER and falsely report that
-        // the lease was renewed.
-        let reason = if operator_ready {
-            "vowifi_registration_refresh_due"
-        } else {
-            "vowifi_registration_expired"
-        };
-        // Release the old operator channel, protected UDP port pair and ePDG
-        // gateway before binding the replacement registration. Resetting only
-        // the public snapshot leaves port_us/port_uc occupied and makes every
-        // refresh fail with ims_udp_bind_failed.
-        let _ = reset_vowifi_runtime_for_scope(app, scope, reason).await;
+        // There is no safe channel to refresh on, so a genuinely expired access
+        // leg still gets the old full teardown path.
+        let _ = reset_vowifi_runtime_for_scope(app, scope, "vowifi_registration_expired").await;
     }
 
     let profile_meta = current.profile.profile.as_ref();
@@ -7130,6 +7228,71 @@ async fn connect_vowifi_on_line(
         }
         if attempt < attempts {
             tokio::time::sleep(retry_delay).await;
+        }
+    }
+
+    if refresh_cycle {
+        // A refresh cycle may contain several socket/header attempts. Count the
+        // exhausted cycle once, rather than treating every internal attempt as
+        // a separate access failure. The first two failed cycles deliberately
+        // retain ePDG/IKE/ESP so the next REGISTER can reuse the live access leg.
+        let refresh_reason = last_status
+            .degraded_reason
+            .clone()
+            .as_deref()
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("vowifi_registration_refresh_failed")
+            .to_string();
+        let decision = record_live_ims_refresh_failure(scope.line_id(), &refresh_reason).await;
+        match decision {
+            LiveImsRefreshFailureDecision::Retry => {
+                let mut status = last_status;
+                status.degraded_reason = Some(format!(
+                    "vowifi_registration_refresh_retry_pending:{refresh_reason}"
+                ));
+                persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+                return status;
+            }
+            LiveImsRefreshFailureDecision::RebuildAccess => {
+                if line_has_protected_active_call(app, scope.line_id()).await {
+                    mark_live_ims_refresh_rebuild_pending(scope.line_id()).await;
+                    let mut status = last_status;
+                    status.degraded_reason = Some(format!(
+                        "vowifi_registration_refresh_rebuild_pending:{refresh_reason}"
+                    ));
+                    persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+                    return status;
+                }
+
+                let rebuild_reason = format!(
+                    "vowifi_registration_refresh_rebuild_after_{}failures:{refresh_reason}",
+                    LIVE_IMS_REFRESH_REBUILD_FAILURES
+                );
+                warn!(
+                    line_id = scope.line_id(),
+                    failures = LIVE_IMS_REFRESH_REBUILD_FAILURES,
+                    reason = refresh_reason,
+                    "VoWiFi IMS refresh failure threshold reached; rebuilding access"
+                );
+                last_status = if fallback_to_cellular_on_failure {
+                    restore_cellular_and_reset_vowifi(app, scope, &rebuild_reason).await
+                } else {
+                    reset_vowifi_runtime_for_scope(app, scope, &rebuild_reason).await
+                };
+                return last_status;
+            }
+            LiveImsRefreshFailureDecision::RebuildPending => {
+                // Another path may have marked this line pending between the
+                // entry check and the failure accounting. Never tear down a
+                // session in that state; let the terminal-call path retry the
+                // rebuild once media is no longer protected.
+                let mut status = last_status;
+                status.degraded_reason = Some(format!(
+                    "vowifi_registration_refresh_rebuild_pending:{refresh_reason}"
+                ));
+                persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+                return status;
+            }
         }
     }
 
@@ -7624,6 +7787,249 @@ pub async fn get_volte_line_handler(
             build_volte_line_response(&app, line.status().await),
         )),
     )
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VolteProfileSelectionRequest {
+    pub attempts: Vec<VolteProfileCandidateRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VolteProfileCandidateRequest {
+    pub source: String,
+    #[serde(default)]
+    pub profile_id: Option<String>,
+}
+
+impl TryFrom<VolteProfileSelectionRequest> for VolteProfileSelectionConfig {
+    type Error = String;
+
+    fn try_from(request: VolteProfileSelectionRequest) -> Result<Self, Self::Error> {
+        let attempts = request
+            .attempts
+            .into_iter()
+            .map(|candidate| {
+                let source = match candidate.source.trim() {
+                    "database" => VolteProfileSource::Database,
+                    "carrier_catalog" => VolteProfileSource::CarrierCatalog,
+                    "derived" => VolteProfileSource::Derived,
+                    _ => return Err("volte_profile_source_unsupported".to_string()),
+                };
+                Ok(VolteProfileCandidate {
+                    source,
+                    profile_id: candidate.profile_id,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self { attempts })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct VolteProfileSelectionResponse {
+    pub line_id: String,
+    pub selection: VolteProfileSelectionConfig,
+    pub profiles: Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>,
+    pub runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub legacy_pinned_profile_id: Option<String>,
+}
+
+fn assemble_volte_profile_selection_response(
+    line_id: &str,
+    selection: VolteProfileSelectionConfig,
+    profiles: Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>,
+    runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+    legacy_pinned_profile_id: Option<String>,
+) -> VolteProfileSelectionResponse {
+    VolteProfileSelectionResponse {
+        line_id: line_id.to_string(),
+        selection,
+        profiles,
+        runtime,
+        legacy_pinned_profile_id,
+    }
+}
+
+async fn build_volte_profile_selection_response(
+    app: &AppState,
+    line_id: &str,
+    runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+) -> Result<VolteProfileSelectionResponse, String> {
+    let profiles = profile_store(app).list_for_access(
+        crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogAccessKind::LteEpc,
+    )?;
+    let legacy_pinned_profile_id = ims_override_for_line(app, line_id)
+        .await
+        .ok()
+        .and_then(|(_, override_)| override_.ims_volte.profile_id);
+    Ok(assemble_volte_profile_selection_response(
+        line_id,
+        app.config_manager.get_line_volte_profile_selection(line_id),
+        profiles,
+        runtime,
+        legacy_pinned_profile_id,
+    ))
+}
+
+fn validate_and_save_volte_profile_selection(
+    config_manager: &ConfigManager,
+    store: &crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore,
+    line_id: &str,
+    request: VolteProfileSelectionRequest,
+) -> Result<LineProfileConfig, (StatusCode, String)> {
+    let mut selection = VolteProfileSelectionConfig::try_from(request)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    selection
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+
+    for candidate in &selection.attempts {
+        let Some(profile_id) = candidate.profile_id.as_deref() else {
+            continue;
+        };
+        match store.volte_reference_state(candidate.source, profile_id) {
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Ready,
+            ) => {}
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::NotLteReady,
+            ) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "volte_profile_not_lte_ready:{}:{profile_id}",
+                        candidate.source.as_str()
+                    ),
+                ));
+            }
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Missing,
+            ) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "volte_profile_not_found_in_source:{}:{profile_id}",
+                        candidate.source.as_str()
+                    ),
+                ));
+            }
+            Err(error) => return Err((StatusCode::SERVICE_UNAVAILABLE, error)),
+        }
+    }
+
+    config_manager
+        .set_line_volte_profile_selection(line_id, selection)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+fn should_restart_after_volte_profile_selection_put(
+    line_present: bool,
+    saved: &LineProfileConfig,
+) -> bool {
+    line_present && saved.enabled && saved.volte_connection_enabled
+}
+
+pub async fn get_volte_profile_selection_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+) -> (StatusCode, Json<ApiResponse<VolteProfileSelectionResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let line = app.line_registry.get(&line_id).await;
+    let configured = app
+        .config_manager
+        .get_line_profiles()
+        .iter()
+        .any(|profile| profile.line_id == line_id);
+    if line.is_none() && !configured {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+    let runtime = match line {
+        Some(line) => line.volte.status().await,
+        None => crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default(),
+    };
+    match build_volte_profile_selection_response(&app, &line_id, runtime).await {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", response)),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(error)),
+        ),
+    }
+}
+
+pub async fn set_volte_profile_selection_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(request): Json<VolteProfileSelectionRequest>,
+) -> (StatusCode, Json<ApiResponse<VolteProfileSelectionResponse>>) {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let line = app.line_registry.get(&line_id).await;
+    if line.is_none()
+        && !app
+            .config_manager
+            .get_line_profiles()
+            .iter()
+            .any(|profile| profile.line_id == line_id)
+    {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("line_not_found")),
+        );
+    }
+
+    let store = profile_store(&app);
+    let saved = match validate_and_save_volte_profile_selection(
+        app.config_manager.as_ref(),
+        &store,
+        &line_id,
+        request,
+    ) {
+        Ok(profile) => profile,
+        Err((status, error)) => return (status, Json(ApiResponse::error(error))),
+    };
+
+    if let Some(line) = line.as_ref() {
+        if should_restart_after_volte_profile_selection_put(line.binding().present, &saved) {
+            let restart_generation = {
+                let _bearer_guard = line.bearer_operation_lock.lock().await;
+                let _guard = line.volte_connect_lock.lock().await;
+                crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
+                    &line.volte_live,
+                    &line.volte,
+                    "volte_profile_selection_changed",
+                )
+                .await;
+                line.volte.generation()
+            };
+            schedule_line_volte_profile_selection_restart(
+                app.clone(),
+                Arc::clone(line),
+                saved.volte_profile_selection.clone(),
+                restart_generation,
+            );
+        }
+    }
+
+    let runtime = match line {
+        Some(line) => line.volte.status().await,
+        None => crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default(),
+    };
+    match build_volte_profile_selection_response(&app, &line_id, runtime).await {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", response)),
+        ),
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ApiResponse::error(error)),
+        ),
+    }
 }
 
 pub async fn set_volte_line_connection_handler(
@@ -8862,13 +9268,11 @@ async fn start_line_volte_restore(
         return false;
     }
     let line_id = line.binding().line_id;
-    let retry_max = u32::from(
-        app.config_manager
-            .get_line_profile(&line_id)
-            .volte_auto_restore
-            .attempts
-            .clamp(1, 5),
-    );
+    let retry_max = app
+        .config_manager
+        .get_line_volte_profile_selection(&line_id)
+        .attempts
+        .len() as u32;
     let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
     line.voice_access
         .set_backend_video_enabled(AccessPathKind::Volte, ims_video.volte_enabled);
@@ -8915,12 +9319,136 @@ fn line_volte_restore_enabled(
     profile.enabled && profile.volte_connection_enabled && !profile.airplane_mode_enabled
 }
 
+fn volte_profile_restart_is_current(
+    expected_generation: u64,
+    current_generation: u64,
+    expected_selection: &VolteProfileSelectionConfig,
+    current_selection: &VolteProfileSelectionConfig,
+    restore_enabled: bool,
+    line_present: bool,
+) -> bool {
+    expected_generation == current_generation
+        && expected_selection == current_selection
+        && restore_enabled
+        && line_present
+}
+
+/// Restart a line after a profile-selection update without racing the previous
+/// recovery task. `disconnect_live_for_line` invalidates the old generation, but
+/// that task owns the retry flag until it observes cancellation and unwinds. A
+/// waiter tied to both the saved selection and the new generation starts exactly
+/// one replacement batch; a later PUT/disable/hot-unplug makes the waiter stale.
+fn schedule_line_volte_profile_selection_restart(
+    app: AppState,
+    line: Arc<crate::services::line_registry::LineRuntime>,
+    expected_selection: VolteProfileSelectionConfig,
+    expected_generation: u64,
+) {
+    tokio::spawn(async move {
+        let line_id = line.binding().line_id;
+        loop {
+            let current_selection = app
+                .config_manager
+                .get_line_volte_profile_selection(&line_id);
+            if !volte_profile_restart_is_current(
+                expected_generation,
+                line.volte.generation(),
+                &expected_selection,
+                &current_selection,
+                line_volte_restore_enabled(&app, &line),
+                line.binding().present,
+            ) {
+                tracing::debug!(
+                    line_id = %line_id,
+                    expected_generation,
+                    current_generation = line.volte.generation(),
+                    "Discarding stale VoLTE profile-selection restart"
+                );
+                return;
+            }
+            if !line.volte_retry_in_progress() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        if start_line_volte_restore(app.clone(), Arc::clone(&line), "profile_selection_changed")
+            .await
+        {
+            return;
+        }
+
+        if line.volte_retry_in_progress() {
+            tracing::debug!(
+                line_id = %line_id,
+                "VoLTE profile-selection restart was claimed by another recovery workflow"
+            );
+        } else {
+            tracing::warn!(
+                line_id = %line_id,
+                "VoLTE profile-selection restart could not be started after the previous workflow stopped"
+            );
+        }
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VolteProfileBatchAction {
+    Succeeded,
+    Continue,
+    Exhausted,
+    AbortUnsafe,
+    Cancelled,
+}
+
+fn volte_profile_batch_action(
+    generation_current: bool,
+    attempt: u32,
+    max_attempts: u32,
+    error: Option<&crate::connectivity::modems::ims::volte::VolteError>,
+) -> VolteProfileBatchAction {
+    if !generation_current {
+        return VolteProfileBatchAction::Cancelled;
+    }
+    let Some(error) = error else {
+        return VolteProfileBatchAction::Succeeded;
+    };
+    if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(error)
+        == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
+    {
+        VolteProfileBatchAction::AbortUnsafe
+    } else if attempt < max_attempts {
+        VolteProfileBatchAction::Continue
+    } else {
+        VolteProfileBatchAction::Exhausted
+    }
+}
+
+async fn wait_for_volte_batch_delay(
+    line: &crate::services::line_registry::LineRuntime,
+    batch_generation: u64,
+    delay: Duration,
+) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if line.volte.generation() != batch_generation {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
 async fn wait_for_line_modem(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
+    batch_generation: u64,
 ) -> LineModemWait {
     for poll in 0..VOLTE_MODEM_MISSING_POLLS {
-        if !line_volte_restore_enabled(app, line) {
+        if line.volte.generation() != batch_generation || !line_volte_restore_enabled(app, line) {
             return LineModemWait::Cancelled;
         }
         let refreshed = app
@@ -8946,8 +9474,15 @@ async fn wait_for_line_modem(
                     Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
             })
             .await;
-        if poll + 1 < VOLTE_MODEM_MISSING_POLLS {
-            tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+        if poll + 1 < VOLTE_MODEM_MISSING_POLLS
+            && !wait_for_volte_batch_delay(
+                line,
+                batch_generation,
+                Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS),
+            )
+            .await
+        {
+            return LineModemWait::Cancelled;
         }
     }
 
@@ -8973,7 +9508,8 @@ async fn run_line_volte_restore_batch(
     line: &Arc<crate::services::line_registry::LineRuntime>,
     source: &'static str,
 ) {
-    match wait_for_line_modem(app, line).await {
+    let batch_generation = line.volte.generation();
+    match wait_for_line_modem(app, line, batch_generation).await {
         LineModemWait::Ready => {}
         LineModemWait::Cancelled => {
             line.volte
@@ -8990,12 +9526,41 @@ async fn run_line_volte_restore_batch(
         LineModemWait::Deferred => return,
     }
 
-    let restore_policy = app
-        .config_manager
-        .get_line_profile(&line.binding().line_id)
-        .volte_auto_restore;
-    let max_attempts = u32::from(restore_policy.attempts.clamp(1, 5));
-    for attempt in 1..=max_attempts {
+    let line_id = line.binding().line_id;
+    let line_profile = app.config_manager.get_line_profile(&line_id);
+    let restore_policy = line_profile.volte_auto_restore;
+    let candidates = line_profile.volte_profile_selection.attempts;
+    let max_attempts = candidates.len() as u32;
+    line.volte.begin_profile_attempt_batch().await;
+    line.volte
+        .update(|state| {
+            state.retry_attempt = 0;
+            state.retry_max = max_attempts;
+        })
+        .await;
+
+    for (candidate_offset, candidate) in candidates.iter().enumerate() {
+        if line.volte.generation() != batch_generation {
+            return;
+        }
+        if candidate_offset > 0 {
+            // The previous slot may have left a deliberately retained bearer
+            // inside the Qualcomm firmware crash-avoidance window. Release it,
+            // along with P-CSCF reporting, profile leases and any temporary
+            // security/dialog state, before resolving the next source. Keep the
+            // generation stable so this remains one ordered recovery batch.
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
+            let _guard = line.volte_connect_lock.lock().await;
+            if line.volte.generation() != batch_generation {
+                return;
+            }
+            crate::connectivity::modems::ims::volte::live::cleanup_live_for_profile_switch(
+                &line.volte_live,
+                &line.volte,
+            )
+            .await;
+        }
+        let attempt = candidate_offset as u32 + 1;
         let profile = app.config_manager.get_line_profile(&line.binding().line_id);
         if !profile.enabled || !profile.volte_connection_enabled {
             line.volte
@@ -9009,27 +9574,44 @@ async fn run_line_volte_restore_batch(
                 .await;
             return;
         }
+
+        line.volte.begin_profile_attempt(attempt, candidate).await;
         let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
         if let Err(error) = refreshed {
+            let attempt_error = crate::connectivity::modems::ims::volte::VolteError::with_detail(
+                "volte_modem_refresh_failed",
+                error.to_string(),
+            );
             line.volte
                 .update(|state| {
                     state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
                     state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
                     state.recovery_state =
                         crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
-                    state.last_error = Some(format!("volte_modem_refresh_failed:{error}"));
+                    state.last_error = Some(attempt_error.to_string());
                     state.next_retry_at =
                         Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
                 })
                 .await;
+            line.volte
+                .finish_profile_attempt(attempt, candidate, "failed", Some(&attempt_error))
+                .await;
             if attempt < max_attempts {
-                tokio::time::sleep(Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS)).await;
+                if !wait_for_volte_batch_delay(
+                    line,
+                    batch_generation,
+                    Duration::from_secs(VOLTE_MODEM_MISSING_POLL_DELAY_SECS),
+                )
+                .await
+                {
+                    return;
+                }
                 continue;
             }
             break;
         }
         if !line.binding().present {
-            match wait_for_line_modem(app, line).await {
+            match wait_for_line_modem(app, line, batch_generation).await {
                 LineModemWait::Ready => {}
                 LineModemWait::Cancelled | LineModemWait::Deferred => return,
             }
@@ -9043,6 +9625,9 @@ async fn run_line_volte_restore_batch(
                 Err(error) => {
                     line.volte
                         .update(|state| state.last_error = Some(error.to_string()))
+                        .await;
+                    line.volte
+                        .finish_profile_attempt(attempt, candidate, "failed", Some(&error))
                         .await;
                     continue;
                 }
@@ -9072,36 +9657,51 @@ async fn run_line_volte_restore_batch(
                     Ok((_, sim_override)) => {
                         let _guard = line.volte_connect_lock.lock().await;
                         if line.volte.status().await.registered {
-                            return;
+                            Ok(line.volte.status().await)
+                        } else {
+                            let ip_families = app
+                                .config_manager
+                                .get_line_volte_ip_families(&binding.line_id);
+                            crate::connectivity::modems::ims::volte::live::connect_live_for_line(
+                                &line.volte_live,
+                                &device,
+                                &line.volte,
+                                &line.ims_access_network,
+                                candidate,
+                                &ip_families,
+                                app.config_manager
+                                    .get_line_volte_ip_families_auto(&binding.line_id),
+                                profile.roaming_allowed,
+                                data_slot_mode,
+                                app.config_manager
+                                    .get_line_sms_path_policy(&binding.line_id)
+                                    .dedupe_enabled,
+                                profile_store(app),
+                                sim_override,
+                                Arc::clone(&app.database),
+                                Arc::clone(&app.notification_sender),
+                            )
+                            .await
                         }
-                        let ip_families = app
-                            .config_manager
-                            .get_line_volte_ip_families(&binding.line_id);
-                        crate::connectivity::modems::ims::volte::live::connect_live_for_line(
-                            &line.volte_live,
-                            &device,
-                            &line.volte,
-                            &ip_families,
-                            app.config_manager
-                                .get_line_volte_ip_families_auto(&binding.line_id),
-                            profile.roaming_allowed,
-                            data_slot_mode,
-                            app.config_manager
-                                .get_line_sms_path_policy(&binding.line_id)
-                                .dedupe_enabled,
-                            profile_store(app),
-                            sim_override,
-                            Arc::clone(&app.database),
-                            Arc::clone(&app.notification_sender),
-                        )
-                        .await
                     }
                 },
                 Err(error) => Err(error),
             }
         };
+        let batch_action = volte_profile_batch_action(
+            line.volte.generation() == batch_generation,
+            attempt,
+            max_attempts,
+            result.as_ref().err(),
+        );
+        if batch_action == VolteProfileBatchAction::Cancelled {
+            return;
+        }
         match result {
             Ok(_) => {
+                line.volte
+                    .finish_profile_attempt(attempt, candidate, "succeeded", None)
+                    .await;
                 // This baseband accepted an IMS session, so any earlier wedge was
                 // a transient firmware race rather than a standing refusal. Drop
                 // the backoff so the next failure starts from the base window.
@@ -9114,18 +9714,34 @@ async fn run_line_volte_restore_batch(
                         state.next_retry_at = None;
                     })
                     .await;
-                info!(line_id = %binding.line_id, attempt, source, "VoLTE IMS restore registered");
+                info!(
+                    line_id = %binding.line_id,
+                    attempt,
+                    source,
+                    requested_profile_source = candidate.source.as_str(),
+                    requested_profile_id = ?candidate.profile_id,
+                    "VoLTE IMS restore registered"
+                );
                 return;
             }
             Err(error) => {
-                warn!(line_id = %binding.line_id, attempt, source, error = %error, "VoLTE IMS restore attempt failed");
+                line.volte
+                    .finish_profile_attempt(attempt, candidate, "failed", Some(&error))
+                    .await;
+                warn!(
+                    line_id = %binding.line_id,
+                    attempt,
+                    source,
+                    requested_profile_source = candidate.source.as_str(),
+                    requested_profile_id = ?candidate.profile_id,
+                    error = %error,
+                    "VoLTE IMS restore attempt failed"
+                );
                 // A wedged baseband must not be retried. Re-issuing IMS PDP
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(&error)
-                    == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
-                {
+                if batch_action == VolteProfileBatchAction::AbortUnsafe {
                     // The crash this abort guards against re-enumerates the
                     // modem, and that hotplug resets the VoLTE snapshot. Record
                     // the cooldown on the line instead, where it survives.
@@ -9157,12 +9773,20 @@ async fn run_line_volte_restore_batch(
                         .await;
                     return;
                 }
-                if attempt < max_attempts {
+                if batch_action == VolteProfileBatchAction::Continue {
                     let delay = restore_policy.retry_delay_secs.clamp(5, 180);
                     line.volte
                         .update(|state| state.next_retry_at = Some(volte_next_retry_at(delay)))
                         .await;
-                    tokio::time::sleep(Duration::from_secs(delay)).await;
+                    if !wait_for_volte_batch_delay(
+                        line,
+                        batch_generation,
+                        Duration::from_secs(delay),
+                    )
+                    .await
+                    {
+                        return;
+                    }
                 }
             }
         }
@@ -9176,7 +9800,7 @@ async fn run_line_volte_restore_batch(
             state.manual_retry_available = true;
             state.next_retry_at = None;
             if state.last_error.is_none() {
-                state.last_error = Some("volte_restore_attempts_exhausted".to_string());
+                state.last_error = Some("volte_profile_attempts_exhausted".to_string());
             }
         })
         .await;
@@ -12396,6 +13020,394 @@ pub async fn delete_e911_address_handler(
 mod tests {
     use super::*;
     use crate::hardware::cellular::modem_manager::SimIdentity;
+
+    #[test]
+    fn vowifi_refresh_rebuild_protects_only_active_or_held_calls() {
+        assert!(active_call_state_protects_vowifi_rebuild("active"));
+        assert!(active_call_state_protects_vowifi_rebuild("held"));
+        assert!(!active_call_state_protects_vowifi_rebuild("ringing"));
+        assert!(!active_call_state_protects_vowifi_rebuild("incoming"));
+        assert!(!active_call_state_protects_vowifi_rebuild("dialing"));
+        assert!(!active_call_state_protects_vowifi_rebuild("ended"));
+    }
+
+    #[test]
+    fn vowifi_refresh_failure_statuses_are_soft_retries() {
+        assert!(vowifi_restore_reason_is_soft_retry(Some(
+            "vowifi_registration_refresh_retry_pending:ims_register_read_failed"
+        )));
+        assert!(vowifi_restore_reason_is_soft_retry(Some(
+            "vowifi_registration_refresh_rebuild_pending:ims_register_read_failed"
+        )));
+        assert!(!vowifi_restore_reason_is_soft_retry(Some(
+            "vowifi_registration_refresh_rebuild_after_3failures:ims_register_read_failed"
+        )));
+    }
+
+    fn volte_profile_handler_fixture() -> (
+        ConfigManager,
+        crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let (catalog, catalog_path) =
+            crate::connectivity::modems::ims::vowifi::carrier_catalog::test_catalog_fixture();
+        let database = Arc::new(
+            crate::platform::db::Database::new(std::path::PathBuf::from(":memory:"))
+                .expect("create VoLTE profile handler database"),
+        );
+        let config_path = std::env::temp_dir().join(format!(
+            "simadmin-volte-profile-handler-{}-{}.yaml",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let config_manager = ConfigManager::try_new(config_path.clone(), Arc::clone(&database))
+            .expect("create VoLTE profile handler config");
+        let store = crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore::new(
+            Arc::new(catalog),
+            database,
+        );
+        (config_manager, store, config_path, catalog_path)
+    }
+
+    fn remove_volte_profile_handler_fixture(
+        config_path: std::path::PathBuf,
+        catalog_path: std::path::PathBuf,
+    ) {
+        let _ = std::fs::remove_file(config_path);
+        let _ = std::fs::remove_file(catalog_path);
+    }
+
+    fn candidate_request(source: &str, profile_id: Option<&str>) -> VolteProfileCandidateRequest {
+        VolteProfileCandidateRequest {
+            source: source.to_string(),
+            profile_id: profile_id.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn volte_profile_selection_request_rejects_unknown_source() {
+        let request = VolteProfileSelectionRequest {
+            attempts: vec![
+                candidate_request("database", None),
+                candidate_request("downloaded", None),
+                candidate_request("derived", None),
+            ],
+        };
+
+        assert_eq!(
+            VolteProfileSelectionConfig::try_from(request),
+            Err("volte_profile_source_unsupported".to_string())
+        );
+    }
+
+    #[test]
+    fn volte_profile_selection_request_validates_shape_before_profile_lookup() {
+        let mut derived_with_id =
+            VolteProfileSelectionConfig::try_from(VolteProfileSelectionRequest {
+                attempts: vec![
+                    candidate_request("database", None),
+                    candidate_request("carrier_catalog", None),
+                    candidate_request("derived", Some("not-allowed")),
+                ],
+            })
+            .expect("supported source names");
+        assert_eq!(
+            derived_with_id.validate(),
+            Err("volte_derived_profile_id_not_allowed".to_string())
+        );
+
+        let mut wrong_count = VolteProfileSelectionConfig::try_from(VolteProfileSelectionRequest {
+            attempts: vec![
+                candidate_request("database", None),
+                candidate_request("derived", None),
+            ],
+        })
+        .expect("supported source names");
+        assert_eq!(
+            wrong_count.validate(),
+            Err("volte_profile_attempt_count_invalid".to_string())
+        );
+    }
+
+    #[test]
+    fn volte_profile_selection_response_preserves_get_payload_fields() {
+        let mut runtime = crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default();
+        runtime.profile_id = Some("effective-profile".to_string());
+        runtime.profile_source = Some("database".to_string());
+        let selection = VolteProfileSelectionConfig::default();
+        let response = assemble_volte_profile_selection_response(
+            "line-0123456789abcdef0123456789abcdef",
+            selection.clone(),
+            Vec::new(),
+            runtime,
+            Some("legacy-profile".to_string()),
+        );
+
+        assert_eq!(response.line_id, "line-0123456789abcdef0123456789abcdef");
+        assert_eq!(response.selection, selection);
+        assert!(response.profiles.is_empty());
+        assert_eq!(
+            response.runtime.profile_id.as_deref(),
+            Some("effective-profile")
+        );
+        assert_eq!(response.runtime.profile_source.as_deref(), Some("database"));
+        assert_eq!(
+            response.legacy_pinned_profile_id.as_deref(),
+            Some("legacy-profile")
+        );
+    }
+
+    #[test]
+    fn volte_profile_selection_put_persists_source_bound_ids_without_crossing_lines() {
+        let _resolver_guard =
+            crate::connectivity::modems::ims::vowifi::profiles::profile_resolver_test_guard();
+        let (config_manager, store, config_path, catalog_path) = volte_profile_handler_fixture();
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+
+        let mut custom = store
+            .list()
+            .expect("list catalog profiles")
+            .into_iter()
+            .find(|profile| {
+                profile.origin
+                    == crate::connectivity::modems::ims::vowifi::profile_store::ProfileOrigin::Catalog
+                    && profile.profile_id == "test-v7-23433"
+            })
+            .expect("catalog LTE profile")
+            .record;
+        custom.meta.brand = "User shadow profile".to_string();
+        store.upsert(custom).expect("save same-id database profile");
+
+        let saved = validate_and_save_volte_profile_selection(
+            &config_manager,
+            &store,
+            line_a,
+            VolteProfileSelectionRequest {
+                attempts: vec![
+                    candidate_request("database", Some("test-v7-23433")),
+                    candidate_request("carrier_catalog", Some("test-v7-23433")),
+                    candidate_request("derived", None),
+                ],
+            },
+        )
+        .expect("save source-bound selection");
+
+        assert_eq!(
+            saved.volte_profile_selection.attempts[0].source,
+            VolteProfileSource::Database
+        );
+        assert_eq!(
+            saved.volte_profile_selection.attempts[1].source,
+            VolteProfileSource::CarrierCatalog
+        );
+        assert_eq!(
+            saved.volte_profile_selection.attempts[0]
+                .profile_id
+                .as_deref(),
+            Some("test-v7-23433")
+        );
+        assert_eq!(
+            config_manager.get_line_volte_profile_selection(line_a),
+            saved.volte_profile_selection
+        );
+        assert_eq!(
+            config_manager.get_line_volte_profile_selection(line_b),
+            VolteProfileSelectionConfig::default(),
+            "a PUT for one physical line must not alter another line"
+        );
+
+        remove_volte_profile_handler_fixture(config_path, catalog_path);
+    }
+
+    #[test]
+    fn volte_profile_selection_put_rejects_missing_and_non_lte_explicit_profiles() {
+        let (config_manager, store, config_path, catalog_path) = volte_profile_handler_fixture();
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+
+        let missing_database = validate_and_save_volte_profile_selection(
+            &config_manager,
+            &store,
+            line_id,
+            VolteProfileSelectionRequest {
+                attempts: vec![
+                    candidate_request("database", Some("missing-user-profile")),
+                    candidate_request("carrier_catalog", None),
+                    candidate_request("derived", None),
+                ],
+            },
+        )
+        .expect_err("missing database profile must be rejected");
+        assert_eq!(missing_database.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            missing_database.1,
+            "volte_profile_not_found_in_source:database:missing-user-profile"
+        );
+
+        {
+            let connection = rusqlite::Connection::open(&catalog_path)
+                .expect("open carrier catalog fixture for mutation");
+            connection
+                .execute(
+                    "UPDATE carrier_profiles SET lte_ims_status = 'partial' WHERE profile_id = 'test-v7-23433'",
+                    [],
+                )
+                .expect("mark catalog profile non-LTE-ready");
+        }
+        let non_lte_catalog = validate_and_save_volte_profile_selection(
+            &config_manager,
+            &store,
+            line_id,
+            VolteProfileSelectionRequest {
+                attempts: vec![
+                    candidate_request("database", None),
+                    candidate_request("carrier_catalog", Some("test-v7-23433")),
+                    candidate_request("derived", None),
+                ],
+            },
+        )
+        .expect_err("non-LTE catalog profile must be rejected");
+        assert_eq!(non_lte_catalog.0, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            non_lte_catalog.1,
+            "volte_profile_not_lte_ready:carrier_catalog:test-v7-23433"
+        );
+
+        remove_volte_profile_handler_fixture(config_path, catalog_path);
+    }
+
+    #[test]
+    fn volte_profile_selection_put_only_restarts_an_online_enabled_volte_line() {
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+        let mut saved = LineProfileConfig::for_line(line_id);
+
+        assert!(!should_restart_after_volte_profile_selection_put(
+            false, &saved
+        ));
+        assert!(!should_restart_after_volte_profile_selection_put(
+            true, &saved
+        ));
+
+        saved.volte_connection_enabled = true;
+        assert!(should_restart_after_volte_profile_selection_put(
+            true, &saved
+        ));
+        assert!(!should_restart_after_volte_profile_selection_put(
+            false, &saved
+        ));
+
+        saved.enabled = false;
+        assert!(!should_restart_after_volte_profile_selection_put(
+            true, &saved
+        ));
+    }
+
+    #[test]
+    fn volte_profile_restart_waiter_is_bound_to_generation_selection_and_line_state() {
+        let expected = VolteProfileSelectionConfig::default();
+        let mut changed = expected.clone();
+        changed.attempts.swap(0, 1);
+
+        assert!(volte_profile_restart_is_current(
+            7, 7, &expected, &expected, true, true
+        ));
+        assert!(!volte_profile_restart_is_current(
+            7, 8, &expected, &expected, true, true
+        ));
+        assert!(!volte_profile_restart_is_current(
+            7, 7, &expected, &changed, true, true
+        ));
+        assert!(!volte_profile_restart_is_current(
+            7, 7, &expected, &expected, false, true
+        ));
+        assert!(!volte_profile_restart_is_current(
+            7, 7, &expected, &expected, true, false
+        ));
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockVolteProfileOutcome {
+        Success,
+        Failure,
+        BasebandWedged,
+    }
+
+    fn simulate_volte_profile_batch(
+        outcomes: &[MockVolteProfileOutcome],
+    ) -> (Vec<usize>, VolteProfileBatchAction) {
+        let max_attempts = outcomes.len() as u32;
+        let mut attempted = Vec::new();
+        for (offset, outcome) in outcomes.iter().enumerate() {
+            let attempt = offset as u32 + 1;
+            attempted.push(attempt as usize);
+            let error = match outcome {
+                MockVolteProfileOutcome::Success => None,
+                MockVolteProfileOutcome::Failure => Some(
+                    crate::connectivity::modems::ims::volte::VolteError::new(
+                        crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
+                    ),
+                ),
+                MockVolteProfileOutcome::BasebandWedged => Some(
+                    crate::connectivity::modems::ims::volte::VolteError::new(
+                        crate::connectivity::modems::ims::volte::errors::code::BEARER_NETDEV_RUNTIME_ERROR,
+                    ),
+                ),
+            };
+            let action = volte_profile_batch_action(true, attempt, max_attempts, error.as_ref());
+            if action != VolteProfileBatchAction::Continue {
+                return (attempted, action);
+            }
+        }
+        unreachable!("a non-empty batch always terminates")
+    }
+
+    #[test]
+    fn volte_profile_batch_advances_in_order_until_success_or_exhaustion() {
+        assert_eq!(
+            simulate_volte_profile_batch(&[
+                MockVolteProfileOutcome::Failure,
+                MockVolteProfileOutcome::Success,
+                MockVolteProfileOutcome::Failure,
+            ]),
+            (vec![1, 2], VolteProfileBatchAction::Succeeded)
+        );
+        assert_eq!(
+            simulate_volte_profile_batch(&[
+                MockVolteProfileOutcome::Failure,
+                MockVolteProfileOutcome::Failure,
+                MockVolteProfileOutcome::Success,
+            ]),
+            (vec![1, 2, 3], VolteProfileBatchAction::Succeeded)
+        );
+        assert_eq!(
+            simulate_volte_profile_batch(&[
+                MockVolteProfileOutcome::Failure,
+                MockVolteProfileOutcome::Failure,
+                MockVolteProfileOutcome::Failure,
+            ]),
+            (vec![1, 2, 3], VolteProfileBatchAction::Exhausted)
+        );
+    }
+
+    #[test]
+    fn volte_profile_batch_aborts_on_baseband_wedge_or_generation_change() {
+        assert_eq!(
+            simulate_volte_profile_batch(&[
+                MockVolteProfileOutcome::BasebandWedged,
+                MockVolteProfileOutcome::Success,
+                MockVolteProfileOutcome::Success,
+            ]),
+            (vec![1], VolteProfileBatchAction::AbortUnsafe)
+        );
+        let error = crate::connectivity::modems::ims::volte::VolteError::new(
+            crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
+        );
+        assert_eq!(
+            volte_profile_batch_action(false, 1, 3, Some(&error)),
+            VolteProfileBatchAction::Cancelled
+        );
+    }
 
     #[test]
     fn call_monitor_requires_consecutive_missing_polls() {

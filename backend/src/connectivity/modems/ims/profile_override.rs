@@ -1,4 +1,4 @@
-//! Per-SIM user overrides for IMS connection facts.
+﻿//! Per-SIM user overrides for IMS connection facts.
 //!
 //! The read-only carrier catalog is the baseline. A user may explicitly
 //! override a small set of connection facts for one physical SIM. Those edits
@@ -28,7 +28,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, TransactionBehavior};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::platform::utils::normalize_iccid;
@@ -382,12 +382,48 @@ impl OverrideFile {
     }
 }
 
-/// Persistent store for per-SIM overrides. Each binding owns one JSON file.
-#[derive(Debug, Clone)]
+/// Persistent store for per-SIM overrides.
+///
+/// Production keeps one row per binding in the application database, beside the
+/// other per-line records, so a normal device backup captures overrides and no
+/// separate file needs its own lifecycle. The file backend remains for recovery
+/// and tests, where being able to read or hand-edit a single override matters
+/// more than sharing a transaction with the rest of the configuration.
+#[derive(Clone)]
 pub struct SimOverrideStore {
-    dir: PathBuf,
-    sqlite_path: Option<PathBuf>,
-    write_lock: Arc<Mutex<()>>,
+    backend: Backend,
+}
+
+#[derive(Clone)]
+enum Backend {
+    /// One `<binding-sha256>.json` per override. The lock serializes writers,
+    /// which the filesystem does not do for us.
+    File {
+        dir: PathBuf,
+        write_lock: Arc<Mutex<()>>,
+    },
+    /// Rows in `ims_sim_overrides`. No lock here: the shared connection is
+    /// already behind a mutex, and each operation is a single statement or an
+    /// immediate transaction.
+    Database(Arc<crate::platform::db::Database>),
+}
+
+// `Database` does not implement `Debug`, so the derive cannot be used. The
+// manual impl reports which backend is active, which is what a log line needs.
+impl std::fmt::Debug for SimOverrideStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.backend {
+            Backend::File { dir, .. } => formatter
+                .debug_struct("SimOverrideStore")
+                .field("backend", &"file")
+                .field("dir", dir)
+                .finish(),
+            Backend::Database(_) => formatter
+                .debug_struct("SimOverrideStore")
+                .field("backend", &"database")
+                .finish(),
+        }
+    }
 }
 
 impl SimOverrideStore {
@@ -395,60 +431,60 @@ impl SimOverrideStore {
     /// first write; reads against a missing directory simply report no file.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self {
-            dir: dir.into(),
-            sqlite_path: None,
-            write_lock: Arc::new(Mutex::new(())),
+            backend: Backend::File {
+                dir: dir.into(),
+                write_lock: Arc::new(Mutex::new(())),
+            },
         }
     }
 
-    /// Create the production SQLite-backed store. One row is owned by each
-    /// `SimBindingKey`; the binding hash is only an index and the full binding
-    /// snapshot is still checked on every read.
-    pub fn sqlite(path: impl Into<PathBuf>) -> Self {
+    /// The production store. One row per `SimBindingKey`; the binding hash is
+    /// only an index, and the full binding snapshot is still checked on read.
+    pub fn database(database: Arc<crate::platform::db::Database>) -> Self {
         Self {
-            dir: PathBuf::new(),
-            sqlite_path: Some(path.into()),
-            write_lock: Arc::new(Mutex::new(())),
+            backend: Backend::Database(database),
         }
     }
 
-    /// Production shares the user-configuration SQLite database with
-    /// `ConfigManager`, but uses its own table and lifecycle. The old directory
-    /// variable explicitly selects the file backend for recovery/tests.
-    pub fn default() -> Self {
+    /// Pick the backend for this process.
+    ///
+    /// `SIMADMIN_OVERRIDES_DIR` is the recovery escape hatch: it selects the file
+    /// backend so an operator can inspect or hand-edit one override without a
+    /// SQL client. Otherwise overrides live in the application database.
+    pub fn resolve(database: Arc<crate::platform::db::Database>) -> Self {
         if let Some(dir) = std::env::var_os("SIMADMIN_OVERRIDES_DIR") {
             if !dir.is_empty() {
                 return Self::new(PathBuf::from(dir));
             }
         }
-        let path = crate::platform::config::get_default_config_path();
-        Self::sqlite(if is_sqlite_path(&path) {
-            path
-        } else {
-            path.with_extension("sqlite3")
-        })
+        Self::database(database)
     }
 
+    /// Directory backing this store, or an empty path when it is database-backed.
     pub fn dir(&self) -> &Path {
-        &self.dir
+        match &self.backend {
+            Backend::File { dir, .. } => dir,
+            Backend::Database(_) => Path::new(""),
+        }
     }
 
     fn path_for(&self, key: &SimBindingKey) -> PathBuf {
-        self.dir.join(format!("{}.json", key.sha256()))
+        self.dir().join(format!("{}.json", key.sha256()))
     }
 
     /// Load the override for `key`, returning `Ok(None)` when the SIM has no
-    /// override file (the normal state). Corrupt JSON, an unsupported schema or
-    /// a binding mismatch fail closed.
+    /// override (the normal state). Corrupt JSON, an unsupported schema or a
+    /// binding mismatch fail closed.
     pub fn load(&self, key: &SimBindingKey) -> Result<Option<SimOverride>, OverrideError> {
-        let _guard = self
-            .write_lock
+        let (dir, write_lock) = match &self.backend {
+            Backend::Database(database) => return self.load_from_database(database, key),
+            Backend::File { dir, write_lock } => (dir, write_lock),
+        };
+        let _guard = write_lock
             .lock()
             .map_err(|_| OverrideError::new("sim_override_lock_poisoned"))?;
-        if let Some(path) = &self.sqlite_path {
-            return self.load_sqlite_unlocked(path, key);
-        }
         self.ensure_safe_dir(false)?;
+        let _ = dir;
         let path = self.path_for(key);
         if !safe_regular_file_exists(&path)? {
             return Ok(None);
@@ -473,24 +509,29 @@ impl SimOverrideStore {
         Ok(Some(file.into_override()))
     }
 
-    /// Persist `override_` for `key`. An empty override deletes the file. This
-    /// is the only path that writes user override files.
+    /// Persist `override_` for `key`. An empty override removes the record: no
+    /// override is the normal state, so an emptied one leaves nothing behind.
     pub fn save(&self, key: &SimBindingKey, override_: &SimOverride) -> Result<(), OverrideError> {
-        let _guard = self
-            .write_lock
+        let (dir, write_lock) = match &self.backend {
+            Backend::Database(database) => {
+                if override_.is_empty() {
+                    return self.delete_from_database(database, key);
+                }
+                return self.save_to_database(database, key, override_);
+            }
+            Backend::File { dir, write_lock } => (dir, write_lock),
+        };
+        let _guard = write_lock
             .lock()
             .map_err(|_| OverrideError::new("sim_override_lock_poisoned"))?;
-        if let Some(path) = &self.sqlite_path {
-            return self.save_sqlite_unlocked(path, key, override_);
-        }
         if override_.is_empty() {
             return self.delete_unlocked(key);
         }
-        std::fs::create_dir_all(&self.dir)
+        std::fs::create_dir_all(dir)
             .map_err(|error| OverrideError::new(format!("sim_override_mkdir_failed:{error}")))?;
         self.ensure_safe_dir(true)?;
         #[cfg(unix)]
-        set_dir_permissions(&self.dir)?;
+        set_dir_permissions(dir)?;
 
         let file = OverrideFile::from_override(key, override_);
         let content = serde_json::to_string_pretty(&file).map_err(|error| {
@@ -499,7 +540,7 @@ impl SimOverrideStore {
 
         let path = self.path_for(key);
         let _ = safe_regular_file_exists(&path)?;
-        let (temp_path, mut temp_file) = create_unique_temp_file(&self.dir, &key.sha256())?;
+        let (temp_path, mut temp_file) = create_unique_temp_file(dir, &key.sha256())?;
         use std::io::Write;
         if let Err(error) = temp_file.write_all(content.as_bytes()) {
             let _ = std::fs::remove_file(&temp_path);
@@ -528,120 +569,100 @@ impl SimOverrideStore {
             }
         }
         #[cfg(unix)]
-        sync_dir(&self.dir)?;
+        sync_dir(self.dir())?;
         Ok(())
     }
 
-    /// Remove the override for `key`. Missing file is not an error.
+    /// Remove the override for `key`. A missing record is not an error.
     pub fn delete(&self, key: &SimBindingKey) -> Result<(), OverrideError> {
-        let _guard = self
-            .write_lock
+        let write_lock = match &self.backend {
+            Backend::Database(database) => return self.delete_from_database(database, key),
+            Backend::File { write_lock, .. } => write_lock,
+        };
+        let _guard = write_lock
             .lock()
             .map_err(|_| OverrideError::new("sim_override_lock_poisoned"))?;
-        if let Some(path) = &self.sqlite_path {
-            return self.delete_sqlite_unlocked(path, key);
-        }
         self.delete_unlocked(key)
     }
 
-    fn load_sqlite_unlocked(
+    fn load_from_database(
         &self,
-        path: &Path,
+        database: &Arc<crate::platform::db::Database>,
         key: &SimBindingKey,
     ) -> Result<Option<SimOverride>, OverrideError> {
-        let connection = open_override_database(path)?;
-        let row = connection
-            .query_row(
-                "SELECT schema_version, document_json
-                 FROM ims_sim_overrides WHERE binding_hash = ?1",
-                [key.sha256()],
-                |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
-            )
-            .optional()
+        let binding_hash = key.sha256();
+        let row = database
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT schema_version, document_json
+                     FROM ims_sim_overrides WHERE binding_hash = ?1",
+                    [&binding_hash],
+                    |row| Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()
+            })
             .map_err(|error| {
-                OverrideError::new(format!("sim_override_sqlite_read_failed:{error}"))
+                OverrideError::new(format!("sim_override_database_read_failed:{error}"))
             })?;
         let Some((schema_version, document)) = row else {
             return Ok(None);
         };
-        if schema_version != OVERRIDE_SCHEMA_VERSION {
-            return Err(OverrideError::new(format!(
-                "sim_override_unsupported_schema:{schema_version}"
-            )));
-        }
-        let file = parse_override_file(document.as_bytes()).map_err(|error| {
-            OverrideError::new(format!(
-                "sim_override_corrupt:{}",
-                redact_json_error(&error)
-            ))
-        })?;
-        if file.schema_version != schema_version {
-            return Err(OverrideError::new("sim_override_schema_mismatch"));
-        }
-        if !file.binding.matches(key) {
-            return Err(OverrideError::new("sim_override_binding_mismatch"));
-        }
-        Ok(Some(file.into_override()))
+        read_stored_override(schema_version, &document, key).map(Some)
     }
 
-    fn save_sqlite_unlocked(
+    fn save_to_database(
         &self,
-        path: &Path,
+        database: &Arc<crate::platform::db::Database>,
         key: &SimBindingKey,
         override_: &SimOverride,
     ) -> Result<(), OverrideError> {
-        if override_.is_empty() {
-            return self.delete_sqlite_unlocked(path, key);
-        }
-        let document = serde_json::to_string(&OverrideFile::from_override(key, override_))
+        let binding_hash = key.sha256();
+        let file = OverrideFile::from_override(key, override_);
+        let document = serde_json::to_string(&file).map_err(|error| {
+            OverrideError::new(format!("sim_override_serialize_failed:{error}"))
+        })?;
+        let updated_at = chrono::Utc::now().to_rfc3339();
+        database
+            .with_connection(|conn| {
+                conn.execute(
+                    "INSERT INTO ims_sim_overrides
+                         (binding_hash, schema_version, document_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(binding_hash) DO UPDATE SET
+                         schema_version = excluded.schema_version,
+                         document_json = excluded.document_json,
+                         updated_at = excluded.updated_at",
+                    rusqlite::params![
+                        &binding_hash,
+                        OVERRIDE_SCHEMA_VERSION,
+                        &document,
+                        &updated_at
+                    ],
+                )
+                .map(|_| ())
+            })
             .map_err(|error| {
-                OverrideError::new(format!("sim_override_serialize_failed:{error}"))
-            })?;
-        let mut connection = open_override_database(path)?;
-        let transaction = connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| {
-                OverrideError::new(format!("sim_override_sqlite_begin_failed:{error}"))
-            })?;
-        transaction
-            .execute(
-                "INSERT INTO ims_sim_overrides (
-                     binding_hash, schema_version, document_json, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(binding_hash) DO UPDATE SET
-                     schema_version = excluded.schema_version,
-                     document_json = excluded.document_json,
-                     updated_at = excluded.updated_at",
-                params![
-                    key.sha256(),
-                    OVERRIDE_SCHEMA_VERSION,
-                    document,
-                    chrono::Utc::now().to_rfc3339(),
-                ],
-            )
-            .map_err(|error| {
-                OverrideError::new(format!("sim_override_sqlite_write_failed:{error}"))
-            })?;
-        transaction.commit().map_err(|error| {
-            OverrideError::new(format!("sim_override_sqlite_commit_failed:{error}"))
-        })
+                OverrideError::new(format!("sim_override_database_write_failed:{error}"))
+            })
     }
 
-    fn delete_sqlite_unlocked(
+    fn delete_from_database(
         &self,
-        path: &Path,
+        database: &Arc<crate::platform::db::Database>,
         key: &SimBindingKey,
     ) -> Result<(), OverrideError> {
-        let connection = open_override_database(path)?;
-        connection
-            .execute(
-                "DELETE FROM ims_sim_overrides WHERE binding_hash = ?1",
-                [key.sha256()],
-            )
+        let binding_hash = key.sha256();
+        database
+            .with_connection(|conn| {
+                conn.execute(
+                    "DELETE FROM ims_sim_overrides WHERE binding_hash = ?1",
+                    [&binding_hash],
+                )
+                .map(|_| ())
+            })
             .map_err(|error| {
-                OverrideError::new(format!("sim_override_sqlite_delete_failed:{error}"))
-            })?;
-        Ok(())
+                OverrideError::new(format!("sim_override_database_delete_failed:{error}"))
+            })
     }
 
     fn delete_unlocked(&self, key: &SimBindingKey) -> Result<(), OverrideError> {
@@ -652,13 +673,13 @@ impl SimOverrideStore {
                 OverrideError::new(format!("sim_override_delete_failed:{error}"))
             })?;
             #[cfg(unix)]
-            sync_dir(&self.dir)?;
+            sync_dir(self.dir())?;
         }
         Ok(())
     }
 
     fn ensure_safe_dir(&self, must_exist: bool) -> Result<(), OverrideError> {
-        match std::fs::symlink_metadata(&self.dir) {
+        match std::fs::symlink_metadata(self.dir()) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 Err(OverrideError::new("sim_override_dir_symlink_rejected"))
             }
@@ -676,6 +697,37 @@ impl SimOverrideStore {
 
 fn parse_override_file(bytes: &[u8]) -> Result<OverrideFile, serde_json::Error> {
     serde_json::from_slice(bytes)
+}
+
+/// Validate and decode one stored override document for a live SIM.
+///
+/// Shared by both backends so a row and a file are held to the same standard.
+/// The binding is checked with `matches`, not by comparing hashes: the hash is
+/// only an index, and confirming the full snapshot is what stops a stored
+/// override from ever being applied to a different SIM.
+fn read_stored_override(
+    schema_version: u32,
+    document: &str,
+    key: &SimBindingKey,
+) -> Result<SimOverride, OverrideError> {
+    if schema_version != OVERRIDE_SCHEMA_VERSION {
+        return Err(OverrideError::new(format!(
+            "sim_override_unsupported_schema:{schema_version}"
+        )));
+    }
+    let file = parse_override_file(document.as_bytes()).map_err(|error| {
+        OverrideError::new(format!(
+            "sim_override_corrupt:{}",
+            redact_json_error(&error)
+        ))
+    })?;
+    if file.schema_version != schema_version {
+        return Err(OverrideError::new("sim_override_schema_mismatch"));
+    }
+    if !file.binding.matches(key) {
+        return Err(OverrideError::new("sim_override_binding_mismatch"));
+    }
+    Ok(file.into_override())
 }
 
 /// Validate one serialized SQLite override row without loading it for a
@@ -701,81 +753,6 @@ pub(crate) fn validate_stored_override_document(
     Ok(())
 }
 
-fn is_sqlite_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            matches!(
-                extension.to_ascii_lowercase().as_str(),
-                "sqlite" | "sqlite3" | "db"
-            )
-        })
-}
-
-fn open_override_database(path: &Path) -> Result<SqliteConnection, OverrideError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            OverrideError::new(format!("sim_override_sqlite_mkdir_failed:{error}"))
-        })?;
-    }
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(OverrideError::new("sim_override_sqlite_symlink_rejected"));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(OverrideError::new("sim_override_sqlite_not_regular_file"));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == ErrorKind::NotFound => {
-            let mut options = std::fs::OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            options.open(path).map_err(|error| {
-                OverrideError::new(format!("sim_override_sqlite_create_failed:{error}"))
-            })?;
-        }
-        Err(error) => {
-            return Err(OverrideError::new(format!(
-                "sim_override_sqlite_metadata_failed:{error}"
-            )));
-        }
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-            |error| OverrideError::new(format!("sim_override_sqlite_permissions_failed:{error}")),
-        )?;
-    }
-    let connection = SqliteConnection::open(path)
-        .map_err(|error| OverrideError::new(format!("sim_override_sqlite_open_failed:{error}")))?;
-    connection
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| {
-            OverrideError::new(format!("sim_override_sqlite_timeout_failed:{error}"))
-        })?;
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(|error| OverrideError::new(format!("sim_override_sqlite_wal_failed:{error}")))?;
-    connection
-        .execute_batch(
-            "PRAGMA synchronous = FULL;
-             CREATE TABLE IF NOT EXISTS ims_sim_overrides (
-                 binding_hash TEXT PRIMARY KEY CHECK (length(binding_hash) = 64),
-                 schema_version INTEGER NOT NULL,
-                 document_json TEXT NOT NULL CHECK (json_valid(document_json)),
-                 updated_at TEXT NOT NULL
-             );",
-        )
-        .map_err(|error| {
-            OverrideError::new(format!("sim_override_sqlite_schema_failed:{error}"))
-        })?;
-    Ok(connection)
-}
 
 fn safe_regular_file_exists(path: &Path) -> Result<bool, OverrideError> {
     match std::fs::symlink_metadata(path) {
@@ -1037,7 +1014,7 @@ mod tests {
     fn corrupt_file_fails_closed() {
         let store = temp_store();
         let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
-        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::create_dir_all(store.dir()).unwrap();
         std::fs::write(store.path_for(&key), b"{not json").unwrap();
         let error = store.load(&key).unwrap_err();
         assert!(error.code().starts_with("sim_override_corrupt"));
@@ -1047,7 +1024,7 @@ mod tests {
     fn unsupported_schema_fails_closed() {
         let store = temp_store();
         let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
-        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::create_dir_all(store.dir()).unwrap();
         std::fs::write(
             store.path_for(&key),
             r#"{"schema_version":999,"binding":{"kind":"plain","iccid":"8986001234567890123"}}"#,
@@ -1064,7 +1041,7 @@ mod tests {
         let other = SimBindingKey::resolve(Some("8986009999999999999"), None).unwrap();
         // Simulate a file copied from another SIM onto this binding's path: the
         // stored binding snapshot must not match the lookup key.
-        std::fs::create_dir_all(&store.dir).unwrap();
+        std::fs::create_dir_all(store.dir()).unwrap();
         let file = OverrideFile {
             schema_version: OVERRIDE_SCHEMA_VERSION,
             binding: StoredBinding::from(&other),
@@ -1195,21 +1172,33 @@ mod tests {
         assert_eq!(temp_files, 0);
     }
 
-    fn temp_sqlite_store(name: &str) -> (SimOverrideStore, PathBuf) {
+    /// A database-backed store on a throwaway `data.db`.
+    ///
+    /// Returns the `Arc<Database>` as well so a test can reopen the same store
+    /// (modelling rediscovery after hotplug) without a second connection to the
+    /// file competing for write locks.
+    fn temp_database_store(name: &str) -> (SimOverrideStore, Arc<crate::platform::db::Database>, PathBuf) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "simadmin-override-sqlite-{name}-{}-{}",
+            "simadmin-override-db-{name}-{}-{}",
             std::process::id(),
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
-        let path = dir.join("config.sqlite3");
-        (SimOverrideStore::sqlite(path), dir)
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let database = Arc::new(
+            crate::platform::db::Database::new(dir.join("data.db")).expect("open test database"),
+        );
+        (
+            SimOverrideStore::database(Arc::clone(&database)),
+            database,
+            dir,
+        )
     }
 
     #[test]
-    fn sqlite_store_round_trips_distinct_bindings() {
-        let (store, dir) = temp_sqlite_store("roundtrip");
+    fn database_store_round_trips_distinct_bindings() {
+        let (store, database, dir) = temp_database_store("roundtrip");
         let first = SimBindingKey::resolve(Some("8986001111111111111"), None).unwrap();
         let second = SimBindingKey::resolve(Some("8986002222222222222"), None).unwrap();
         let mut first_override = sample_override();
@@ -1240,19 +1229,22 @@ mod tests {
             Some("222")
         );
 
-        let connection = SqliteConnection::open(dir.join("config.sqlite3")).unwrap();
-        let count: i64 = connection
-            .query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| {
-                row.get(0)
+        // Count through the same handle: a second connection to a WAL database
+        // may not see the writes yet.
+        let count = database
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })
             })
             .unwrap();
         assert_eq!(count, 2);
-        drop(connection);
+        drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn automatic_resolution_does_not_rewrite_sqlite_override_row() {
+    fn automatic_resolution_does_not_rewrite_the_override_row() {
         use crate::connectivity::modems::ims::{
             effective_profile::{
                 resolve_effective_device_identity, resolve_effective_emergency,
@@ -1262,20 +1254,21 @@ mod tests {
             vowifi::profiles::GB_EE_23433,
         };
 
-        let (store, dir) = temp_sqlite_store("read-only-resolution");
-        let path = dir.join("config.sqlite3");
+        let (store, database, dir) = temp_database_store("read-only-resolution");
         let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
         let override_ = sample_override();
         store.save(&key, &override_).unwrap();
 
         let row = || {
-            let connection = SqliteConnection::open(&path).unwrap();
-            connection
-                .query_row(
-                    "SELECT document_json, updated_at FROM ims_sim_overrides WHERE binding_hash = ?1",
-                    [key.sha256()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
+            database
+                .with_connection(|conn| {
+                    conn.query_row(
+                        "SELECT document_json, updated_at FROM ims_sim_overrides
+                         WHERE binding_hash = ?1",
+                        [key.sha256()],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    )
+                })
                 .unwrap()
         };
         let before = row();
@@ -1290,6 +1283,7 @@ mod tests {
         }
 
         assert_eq!(row(), before);
+        drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -1303,8 +1297,7 @@ mod tests {
             vowifi::profiles::GB_EE_23433,
         };
 
-        let (store, dir) = temp_sqlite_store("multi-sim-contract");
-        let path = dir.join("config.sqlite3");
+        let (store, database, dir) = temp_database_store("multi-sim-contract");
         let first = SimBindingKey::resolve(Some("8986001111111111111"), None).unwrap();
         let second = SimBindingKey::resolve(Some("8986002222222222222"), None).unwrap();
         let make_override = |imei: &str, suffix: &str| SimOverride {
@@ -1335,7 +1328,7 @@ mod tests {
 
         // A new store instance models rediscovery after reader/modem hotplug:
         // the lookup is repeated from the SIM key rather than a previous line.
-        let reconnected = SimOverrideStore::sqlite(path);
+        let reconnected = SimOverrideStore::database(Arc::clone(&database));
         let first_loaded = reconnected.load(&first).unwrap().unwrap();
         let second_loaded = reconnected.load(&second).unwrap().unwrap();
         for (loaded, suffix, imei) in [
@@ -1382,12 +1375,45 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_empty_override_deletes_row() {
-        let (store, dir) = temp_sqlite_store("delete");
+    fn database_empty_override_deletes_row() {
+        let (store, database, dir) = temp_database_store("delete");
         let key = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
         store.save(&key, &sample_override()).unwrap();
         store.save(&key, &SimOverride::default()).unwrap();
         assert!(store.load(&key).unwrap().is_none());
+        // Emptying an override must remove the row, not leave an empty document
+        // behind: no record is how "this SIM has no override" is represented.
+        let count = database
+            .with_connection(|conn| {
+                conn.query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(count, 0);
+        drop(database);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `SIMADMIN_OVERRIDES_DIR` is the documented recovery escape hatch, so the
+    /// selector must actually honour it rather than always returning the
+    /// database backend.
+    #[test]
+    fn resolve_prefers_the_override_dir_escape_hatch() {
+        let (_, database, dir) = temp_database_store("resolve");
+        let override_dir = dir.join("overrides");
+
+        // Not set: database backend, so `dir()` is empty.
+        std::env::remove_var("SIMADMIN_OVERRIDES_DIR");
+        let from_database = SimOverrideStore::resolve(Arc::clone(&database));
+        assert_eq!(from_database.dir(), Path::new(""));
+
+        std::env::set_var("SIMADMIN_OVERRIDES_DIR", &override_dir);
+        let from_env = SimOverrideStore::resolve(Arc::clone(&database));
+        assert_eq!(from_env.dir(), override_dir.as_path());
+        std::env::remove_var("SIMADMIN_OVERRIDES_DIR");
+
+        drop(database);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

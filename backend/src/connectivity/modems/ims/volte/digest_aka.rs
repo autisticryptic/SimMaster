@@ -65,7 +65,7 @@ pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, VolteError> {
     core::decode_aka_nonce(nonce).map_err(map_err)
 }
 
-/// Derive the digest "password" from AKA material (AKAv1/AKAv2-MD5).
+/// Derive the digest password from AKA material (AKAv1-MD5 or AKAv2 MD5/SHA-256).
 pub fn aka_digest_password(
     algorithm: &str,
     aka: &UsimAkaApduResult,
@@ -73,7 +73,7 @@ pub fn aka_digest_password(
     core::aka_digest_password(algorithm, &material(aka)).map_err(map_err)
 }
 
-/// Compute the RFC 2617 digest response using the AKA-derived password.
+/// Compute the RFC 2617/RFC 7616 digest response using the AKA-derived password.
 #[allow(clippy::too_many_arguments)]
 pub fn compute_aka_response(
     username: &str,
@@ -105,6 +105,16 @@ pub fn compute_aka_response(
 /// Parse a digest challenge from a header value.
 pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChallenge, VolteError> {
     core::parse_digest_challenge(value, proxy).map_err(map_err)
+}
+
+/// Select the first supported challenge across repeated/compound WWW and
+/// Proxy-Authenticate fields while preserving their wire order.
+pub fn select_digest_challenge(
+    www_values: &[String],
+    proxy_values: &[String],
+    allow_plain_md5: bool,
+) -> Result<DigestChallenge, VolteError> {
+    core::select_digest_challenge(www_values, proxy_values, allow_plain_md5).map_err(map_err)
 }
 
 /// HMAC-MD5 (RFC 2104) — re-exported from the shared core.
@@ -148,6 +158,30 @@ mod tests {
             aka_digest_password("AKAv2-MD5", &a).unwrap_err().code(),
             code::AKA_MATERIAL_INVALID
         );
+        assert_eq!(
+            aka_digest_password("AKAv2-SHA-256", &a).unwrap_err().code(),
+            code::AKA_MATERIAL_INVALID
+        );
+    }
+
+    #[test]
+    fn akav2_sha256_is_supported_by_the_shared_digest_core() {
+        let a = aka(vec![0x11; 8], vec![0x22; 16], vec![0x33; 16]);
+        let response = compute_aka_response(
+            "user@example.com",
+            "ims.example",
+            &a,
+            "AKAv2-SHA-256",
+            "REGISTER",
+            "sip:ims.example",
+            "nonce",
+            Some("auth"),
+            "cafebabe",
+            "00000001",
+        )
+        .unwrap();
+        assert_eq!(response.len(), 64);
+        assert!(response.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

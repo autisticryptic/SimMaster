@@ -3239,11 +3239,33 @@ impl Database {
             [],
         )?;
 
+        // Settings the program rewrites on its own — per-line profiles, the
+        // modem/reader slot map, notification and automation records — live in
+        // this database rather than the text configuration file. See
+        // `platform::config_store` for why.
+        crate::platform::config_store::initialize_schema(&conn)?;
+
         let (app_event_tx, _) = broadcast::channel(512);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             app_event_tx,
         })
+    }
+
+    /// Run `operation` against the shared connection.
+    ///
+    /// Exposed narrowly so `platform::config_store` can own its own SQL without
+    /// that schema being pulled into this already-large module, and without a
+    /// second connection to the same file competing for write locks.
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidParameterName("db_lock_poisoned".to_string()))?;
+        operation(&conn)
     }
 
     pub fn list_custom_carrier_profiles(&self) -> Result<Vec<CustomCarrierProfileEntry>> {

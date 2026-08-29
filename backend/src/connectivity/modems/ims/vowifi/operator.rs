@@ -508,10 +508,35 @@ async fn run_session(
     channel: SipChannel,
     link: OperatorLink,
     commands: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
+    replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
+    unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
+    supplementary: Option<Arc<SupplementaryRuntime>>,
+    mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
+) -> Result<(), String> {
+    run_session_with_initial_mwi_subscription(
+        context,
+        channel,
+        link,
+        commands,
+        replacements,
+        unregister_requests,
+        supplementary,
+        mt_sms,
+        None,
+    )
+    .await
+}
+
+async fn run_session_with_initial_mwi_subscription(
+    context: RegisteredVoiceContext,
+    channel: SipChannel,
+    link: OperatorLink,
+    commands: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
     mut replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
     mut unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
     supplementary: Option<Arc<SupplementaryRuntime>>,
     mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
+    initial_mwi_subscription: Option<MwiSubscription>,
 ) -> Result<(), String> {
     let mut session = VoiceSession {
         next_tcp_keepalive: next_interval(context.tcp_keepalive_interval),
@@ -521,9 +546,11 @@ async fn run_session(
         channel,
         calls: HashMap::new(),
         supplementary,
-        mwi_subscription: None,
+        mwi_subscription: initial_mwi_subscription,
     };
-    start_mwi_subscription(&mut session).await;
+    if session.mwi_subscription.is_none() {
+        start_mwi_subscription(&mut session).await;
+    }
     let mut pending_replacement = None;
     let mut maintenance = tokio::time::interval(Duration::from_millis(250));
     maintenance.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -3978,6 +4005,185 @@ mod tests {
         assert!(summary.messages_waiting);
         assert_eq!(summary.voice.unwrap().new, 2);
         disconnect_line(line_id).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_requeued_mwi_message_options_and_invite_reach_session_loop() {
+        let (client, mut server) = tcp_pair().await;
+        let line_id = "operator-test-refresh-requeue";
+        let link = operator_link_for_line(line_id);
+        // OperatorLink::is_available also requires the trunk command channel
+        // to have a consumer. The test drives the session with its own command
+        // channel, so keep a no-op link subscriber alive for incoming-call gating.
+        let _link_command_consumer = link.subscribe_commands();
+        link.set_ready(true);
+        link.set_trunk_local_ip(Some("127.0.0.1".parse().unwrap()));
+        let mut events = link.subscribe_events();
+        let supplementary = Arc::new(SupplementaryRuntime::for_line(line_id));
+        supplementary
+            .begin_mwi_subscription(ImsRegistrationAccess::Vowifi)
+            .await;
+        let mut mt_sms = subscribe_mt_sms_for_line(line_id);
+        let route_installer = Arc::new(RecordingMediaRouteInstaller::default());
+        let mut route_context = context(line_id, &client, &server);
+        route_context.media_route_installer = Some(route_installer);
+
+        let mwi_call_id = "refresh-mwi-dialog";
+        let mwi_body = "Messages-Waiting: yes\r\nMessage-Account: sip:mailbox@ims.example\r\nVoice-Message: 2/1 (1/0)\r\n";
+        let mwi = format!(
+            "NOTIFY sip:+601100000001@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKrefresh-mwi\r\n\
+             From: <sip:+601100000001@ims.example>;tag=mwi-network\r\n\
+             To: <sip:+601100000001@ims.example>;tag=mwi-client\r\n\
+             Call-ID: {mwi_call_id}\r\n\
+             CSeq: 1 NOTIFY\r\n\
+             Event: message-summary\r\n\
+             Content-Type: application/simple-message-summary\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            mwi_body.len(),
+            mwi_body,
+        )
+        .into_bytes();
+
+        // This is a valid network RP-DATA containing a one-byte binary TPDU.
+        // Keeping it inline avoids coupling the operator test to private SMS
+        // codec fixtures while still exercising the RP-ACK and MT event path.
+        let sms_body = vec![
+            0x01, 0x37, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x00, 0xf4, 0x62, 0x80, 0x71, 0x12, 0x34,
+            0x65, 0x23, 0x01, 0x41,
+        ];
+        let mut message = format!(
+            "MESSAGE sip:+601100000001@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKrefresh-message\r\n\
+             From: <sip:+601200000000@ims.example>;tag=sms-network\r\n\
+             To: <sip:+601100000001@ims.example>\r\n\
+             Call-ID: refresh-message-dialog\r\n\
+             CSeq: 1 MESSAGE\r\n\
+             Content-Type: application/vnd.3gpp.sms\r\n\
+             Content-Length: {}\r\n\r\n",
+            sms_body.len(),
+        )
+        .into_bytes();
+        message.extend_from_slice(&sms_body);
+
+        let options = b"OPTIONS sip:+601100000001@127.0.0.1 SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4Krefresh-options\r\nFrom: <sip:+601200000000@ims.example>;tag=options-network\r\nTo: <sip:+601100000001@ims.example>\r\nCall-ID: refresh-options-dialog\r\nCSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n";
+
+        let operator_rtp = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let offer = format!(
+            "v=0\r\no=- 3 3 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 96\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:96 telephone-event/8000\r\na=sendrecv\r\n",
+            operator_rtp.local_addr().unwrap().port()
+        );
+        let invite = format!(
+            "INVITE sip:+601100000001@127.0.0.1 SIP/2.0\r\n\
+             Via: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4Krefresh-invite\r\n\
+             From: <sip:+601112023012@ims.example>;tag=refresh-remote\r\n\
+             To: <sip:+601100000001@ims.example>\r\n\
+             Contact: <sip:+601112023012@127.0.0.1:5060;transport=tcp>\r\n\
+             Call-ID: refresh-invite-dialog\r\n\
+             CSeq: 1 INVITE\r\n\
+             Content-Type: application/sdp\r\n\
+             Content-Length: {}\r\n\r\n{}",
+            offer.len(),
+            offer,
+        )
+        .into_bytes();
+
+        let mut channel = EpdgSipChannel::new(
+            client,
+            Vec::new(),
+            route_context.route,
+            route_context.security_verify.clone(),
+        );
+        // The adapter-owned REGISTER refresh would have put these complete
+        // frames back on the channel before handing it to the operator task.
+        // Run the real session loop so the assertions cover consumption by
+        // handle_frame, not only channel FIFO behavior.
+        channel.requeue(mwi);
+        channel.requeue(message);
+        channel.requeue(options.to_vec());
+        channel.requeue(invite);
+
+        let initial_mwi_subscription = MwiSubscription {
+            ids: SubscribeIds {
+                branch: "z9hG4bKrefresh-mwi-subscribe".to_string(),
+                from_tag: "refresh-mwi-client".to_string(),
+                to_tag: Some("refresh-mwi-network".to_string()),
+                call_id: mwi_call_id.to_string(),
+                cseq: 1,
+            },
+            refresh_at: Instant::now() + Duration::from_secs(3600),
+            authenticated: true,
+        };
+        let (command_tx, mut command_rx) = broadcast::channel(8);
+        let (_replacement_tx, replacement_rx) = mpsc::unbounded_channel();
+        let (_unregister_tx, unregister_rx) = mpsc::unbounded_channel();
+        let mt_sms_sender = handle_for_line(line_id).mt_sms.clone();
+        let supplementary_for_task = Arc::clone(&supplementary);
+        let task = tokio::spawn(async move {
+            run_session_with_initial_mwi_subscription(
+                route_context,
+                SipChannel::Tcp(channel),
+                link,
+                &mut command_rx,
+                replacement_rx,
+                unregister_rx,
+                Some(supplementary_for_task),
+                mt_sms_sender,
+                Some(initial_mwi_subscription),
+            )
+            .await
+        });
+
+        let mut pending = Vec::new();
+        let mwi_ok = read_frame(&mut server, &mut pending).await;
+        assert!(mwi_ok.starts_with(b"SIP/2.0 200 OK"));
+        assert_eq!(
+            sip_frame::header_value(&mwi_ok, "Call-ID").as_deref(),
+            Some(mwi_call_id)
+        );
+
+        let message_ok = read_frame(&mut server, &mut pending).await;
+        assert!(message_ok.starts_with(b"SIP/2.0 200 OK"));
+        assert_eq!(
+            sip_frame::header_value(&message_ok, "Call-ID").as_deref(),
+            Some("refresh-message-dialog")
+        );
+        let rp_ack = read_frame(&mut server, &mut pending).await;
+        assert!(rp_ack.starts_with(b"MESSAGE sip:+601200000000@ims.example SIP/2.0"));
+        assert_eq!(sip_frame::body(&rp_ack), &[0x02, 0x37]);
+        let delivered = tokio::time::timeout(Duration::from_secs(1), mt_sms.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.rp_message_reference, 0x37);
+        assert_eq!(delivered.text, "0x41");
+
+        let options_ok = read_frame(&mut server, &mut pending).await;
+        assert!(options_ok.starts_with(b"SIP/2.0 200 OK"));
+        assert_eq!(
+            sip_frame::header_value(&options_ok, "Call-ID").as_deref(),
+            Some("refresh-options-dialog")
+        );
+
+        let trying = read_frame(&mut server, &mut pending).await;
+        assert!(
+            trying.starts_with(b"SIP/2.0 100 Trying"),
+            "{}",
+            String::from_utf8_lossy(&trying)
+        );
+        let incoming = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(incoming, OperatorEvent::Incoming { .. }));
+        let snapshot = supplementary.snapshot().await;
+        assert!(snapshot.mwi_capability.ready);
+        assert!(snapshot
+            .message_waiting
+            .is_some_and(|summary| summary.messages_waiting));
+
+        drop(command_tx);
+        assert_eq!(task.await.unwrap(), Ok(()));
     }
 
     #[tokio::test]

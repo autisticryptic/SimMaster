@@ -4,9 +4,56 @@
 //! enums rather than trait objects. The traits below provide the common
 //! contract; the enums retain exhaustive, allocation-free dispatch.
 
-use std::{net::IpAddr, time::Duration};
+use std::{collections::VecDeque, net::IpAddr, time::Duration};
 
 use super::{context::ImsRoute, ImsError};
+
+/// A channel-local queue for complete SIP frames temporarily set aside by a
+/// REGISTER transaction. The queue is deliberately bounded independently of
+/// the per-transaction ignored-frame limit: a long-running session may execute
+/// many REGISTER/refresh transactions before a stalled consumer recovers.
+pub(crate) const MAX_REQUEUED_SIP_FRAMES: usize = 64;
+pub(crate) const MAX_REQUEUED_SIP_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, Default)]
+pub(crate) struct ImsRequeue {
+    frames: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl ImsRequeue {
+    pub(crate) fn pop_front(&mut self) -> Option<Vec<u8>> {
+        let frame = self.frames.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(frame.len());
+        Some(frame)
+    }
+
+    /// Append a frame without evicting older traffic. Returning `false` means
+    /// the newest frame was dropped because retaining it would exceed either
+    /// the frame-count or byte budget.
+    pub(crate) fn push_back(&mut self, frame: Vec<u8>) -> bool {
+        if self.frames.len() >= MAX_REQUEUED_SIP_FRAMES
+            || self.bytes.saturating_add(frame.len()) > MAX_REQUEUED_SIP_BYTES
+        {
+            return false;
+        }
+        self.bytes += frame.len();
+        self.frames.push_back(frame);
+        true
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    pub(crate) fn into_frames(self) -> VecDeque<Vec<u8>> {
+        self.frames
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessLegKind {
@@ -34,6 +81,23 @@ impl LegReadiness {
 pub trait ImsChannel: Send {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError>;
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError>;
+    /// Read the next complete SIP frame from the transport itself, ignoring
+    /// any frames previously handed back through [`ImsChannel::requeue`].
+    ///
+    /// A REGISTER transaction must keep waiting for its own response while
+    /// unrelated traffic (NOTIFY/MESSAGE/MWI) shares the same IMS signaling
+    /// path; those frames are requeued for the session loop. Reading them
+    /// again inside the same transaction loop would spin forever, so the
+    /// transaction reader uses this fresh-read path. Channels without a
+    /// requeue queue can rely on the default.
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.recv_sip(timeout).await
+    }
+    /// Hand a complete SIP frame back to the channel so a later reader (for
+    /// example the session loop after REGISTER completes) can process it.
+    /// The default drops the frame, which is the safe behavior for adapters
+    /// without a side queue.
+    fn requeue(&mut self, _frame: Vec<u8>) {}
     fn route(&self) -> ImsRoute;
     fn security_verify(&self) -> Option<&str>;
 }
@@ -118,6 +182,20 @@ where
         }
     }
 
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        match self {
+            Self::Vowifi(channel) => channel.recv_sip_fresh(timeout).await,
+            Self::Volte(channel) => channel.recv_sip_fresh(timeout).await,
+        }
+    }
+
+    fn requeue(&mut self, frame: Vec<u8>) {
+        match self {
+            Self::Vowifi(channel) => channel.requeue(frame),
+            Self::Volte(channel) => channel.requeue(frame),
+        }
+    }
+
     fn route(&self) -> ImsRoute {
         match self {
             Self::Vowifi(channel) => channel.route(),
@@ -184,5 +262,34 @@ mod tests {
             *b"SIP/2.0"
         );
         assert_eq!(channel.route().transport, SipTransport::Udp);
+    }
+
+    #[test]
+    fn requeue_is_fifo_and_releases_its_byte_budget_when_drained() {
+        let mut queue = ImsRequeue::default();
+        assert!(queue.push_back(b"first".to_vec()));
+        assert!(queue.push_back(b"second".to_vec()));
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.bytes(), 11);
+        assert_eq!(queue.pop_front().as_deref(), Some(b"first".as_slice()));
+        assert_eq!(queue.bytes(), 6);
+        assert_eq!(queue.pop_front().as_deref(), Some(b"second".as_slice()));
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    #[test]
+    fn requeue_drops_the_newest_frame_at_count_and_byte_limits() {
+        let mut queue = ImsRequeue::default();
+        for index in 0..MAX_REQUEUED_SIP_FRAMES {
+            assert!(queue.push_back(vec![index as u8]));
+        }
+        assert!(!queue.push_back(b"overflow".to_vec()));
+        assert_eq!(queue.len(), MAX_REQUEUED_SIP_FRAMES);
+        assert_eq!(queue.pop_front(), Some(vec![0]));
+
+        let mut byte_limited = ImsRequeue::default();
+        assert!(byte_limited.push_back(vec![0; MAX_REQUEUED_SIP_BYTES]));
+        assert!(!byte_limited.push_back(vec![1]));
+        assert_eq!(byte_limited.bytes(), MAX_REQUEUED_SIP_BYTES);
     }
 }

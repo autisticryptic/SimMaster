@@ -499,6 +499,31 @@ export interface ModemBinding {
   line_kind?: string
 }
 
+export type VolteProfileSource = 'database' | 'carrier_catalog' | 'derived'
+
+export interface VolteProfileCandidate {
+  source: VolteProfileSource
+  /** Missing/null means automatic IMSI/Home-PLMN matching inside the selected source. */
+  profile_id?: string | null
+}
+
+export interface VolteProfileSelectionConfig {
+  /** Exactly three ordered logical attempts, stored independently on each physical line. */
+  attempts: VolteProfileCandidate[]
+}
+
+export interface VolteProfileAttemptResult {
+  index: number
+  requested_source: VolteProfileSource
+  requested_profile_id?: string
+  effective_source?: VolteProfileSource
+  effective_profile_id?: string
+  fallback_reason?: string
+  outcome: string
+  error_code?: string
+  at: string
+}
+
 export interface VolteConnectionAttempt {
   sequence: number
   stage: string
@@ -557,6 +582,10 @@ export interface VolteRuntimeStatus {
   profile_id?: string
   profile_source?: 'carrier_catalog' | 'database' | 'derived'
   profile_fallback_reason?: string
+  profile_candidate_index?: number
+  profile_candidate_source?: VolteProfileSource
+  profile_candidate_profile_id?: string
+  profile_attempt_results: VolteProfileAttemptResult[]
   usim_aid?: string
   isim_aid?: string
   connection_attempts: VolteConnectionAttempt[]
@@ -655,6 +684,7 @@ export interface LineProfileConfig {
   enabled: boolean
   volte_connection_enabled: boolean
   volte_auto_restore: AutoRestoreConfig
+  volte_profile_selection: VolteProfileSelectionConfig
   vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
@@ -749,6 +779,11 @@ export interface Ikev2PolicyRecord {
 export type RequestUriPolicy = 'home_domain' | 'registrar' | 'pcscf' | 'configured'
 export type InitialAuthorization = 'none' | 'aka_empty' | 'digest_empty' | 'implementation_variant'
 export type ContactMode = 'standard' | 'android_default' | 'legacy' | 'custom'
+export type AccessIdentityPolicy =
+  | 'omit'
+  | 'static'
+  | 'dynamic_if_known'
+  | 'required_dynamic'
 
 export interface RegisterPolicyRecord {
   supported_header: string
@@ -772,6 +807,9 @@ export interface RegisterPolicyRecord {
   live_header_variant_set: string
   expires_seconds: number
   access_network_info: string
+  pani_identity_policy: AccessIdentityPolicy
+  cellular_network_info: string | null
+  cni_identity_policy: AccessIdentityPolicy
   contact_mode: ContactMode
   contact_param_order: string[]
   always_add_sip_instance: boolean
@@ -905,6 +943,14 @@ export interface StoredCarrierProfile {
   ut_xcap_enabled: boolean
 }
 
+export interface VolteProfileSelectionResponse {
+  line_id: string
+  selection: VolteProfileSelectionConfig
+  profiles: StoredCarrierProfile[]
+  runtime: VolteRuntimeStatus
+  legacy_pinned_profile_id?: string
+}
+
 export interface ResolvedCarrierProfile {
   origin: ProfileOrigin
   /** Whether emergency configuration is expected for this carrier's country. */
@@ -1032,9 +1078,19 @@ export interface VowifiLineConfigResponse {
   matched_profile_fallback_reason?: string | null
 }
 
+export interface AccessNetworkRuntimeStatus {
+  available: boolean
+  stale: boolean
+  technology?: string | null
+  serving_plmn?: string | null
+  age_seconds?: number | null
+  last_error?: string | null
+}
+
 export interface LineRuntimeStatus {
   modem: ModemBinding
   volte: VolteRuntimeStatus
+  ims_access_network: AccessNetworkRuntimeStatus
   trunk: TrunkRuntimeStatus
   supplementary: SupplementarySnapshot
 }

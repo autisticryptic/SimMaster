@@ -33,6 +33,25 @@ regex-automata = "0.4.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+# The main program configuration is a hand-editable text file, which needs two
+# different YAML capabilities. They are deliberately split by risk:
+#
+#   serde-saphyr  reads it. Parsing decides what the device is configured to do,
+#                 so this side uses the mature, serde-native parser: `AppConfig`
+#                 deserializes through its own derives, `deny_unknown_fields`
+#                 behaves exactly as it does with serde_json, and errors carry
+#                 line/column. No hand-written conversion layer sits in the path
+#                 where a misparse would silently mis-provision a SIM.
+#
+#   yaml-edit     writes it, and nothing else. It is the only crate that can
+#                 replace one value while preserving operator comments, key
+#                 order and blank lines, which `save()` needs because the web UI
+#                 rewrites settings on every change. It is young (0.x), so every
+#                 write is verified by re-reading with serde-saphyr and
+#                 comparing against the intended config; a mismatch restores the
+#                 backup instead of leaving a damaged file.
+serde-saphyr = "1.1"
+yaml-edit = "0.3"
 
 [profile.release]
 strip = true

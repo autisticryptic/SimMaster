@@ -1263,7 +1263,7 @@ mod tests {
             ..Default::default()
         };
 
-        let matched = match_profile_from_parts(sim, None, "460001234567890", "");
+        let matched = match_profile_from_parts(sim, None, "460001234567890", "46000");
 
         assert!(matched.matched);
         assert_eq!(matched.profile_source.as_deref(), Some("derived"));

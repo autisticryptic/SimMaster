@@ -15,7 +15,11 @@ use std::{
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 
-use crate::connectivity::core::{access::ImsChannel, context::ImsRoute, ImsError};
+use crate::connectivity::core::{
+    access::{ImsChannel, ImsRequeue},
+    context::ImsRoute,
+    ImsError,
+};
 use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 const MAX_SIP_DATAGRAM: usize = 65_535;
@@ -24,6 +28,10 @@ pub struct VolteSipChannel {
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
     reserved_receive_socket: Option<ReservedReceiveSocket>,
+    /// Complete frames set aside by a REGISTER transaction because they belong
+    /// to a different dialog (NOTIFY/MESSAGE/MWI). They are handed back to the
+    /// session loop after the transaction completes.
+    requeued: ImsRequeue,
     route: ImsRoute,
     /// Port to advertise in Via/Contact once a security association is active.
     /// TS 24.229 §5.1.1.2.2 b)/c): a UDP request protected by an SA is sourced
@@ -57,6 +65,7 @@ impl VolteSipChannel {
             send_socket: Some(socket),
             receive_socket: None,
             reserved_receive_socket: None,
+            requeued: ImsRequeue::default(),
             route,
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
@@ -113,6 +122,7 @@ impl VolteSipChannel {
             send_socket: Some(socket),
             receive_socket: None,
             reserved_receive_socket: None,
+            requeued: ImsRequeue::default(),
             route,
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
@@ -287,6 +297,21 @@ impl VolteSipChannel {
     pub fn interface(&self) -> Option<&str> {
         self.interface.as_deref()
     }
+
+    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        let mut frame = vec![0u8; MAX_SIP_DATAGRAM];
+        let socket = self
+            .receive_socket
+            .as_ref()
+            .or(self.send_socket.as_ref())
+            .ok_or_else(|| ImsError::new("volte_channel_receive_socket_missing"))?;
+        let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
+            .await
+            .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
+            .map_err(|_| ImsError::new("volte_channel_read_failed"))?;
+        frame.truncate(read);
+        Ok(frame)
+    }
 }
 
 impl ImsChannel for VolteSipChannel {
@@ -305,18 +330,26 @@ impl ImsChannel for VolteSipChannel {
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
-        let mut frame = vec![0u8; MAX_SIP_DATAGRAM];
-        let socket = self
-            .receive_socket
-            .as_ref()
-            .or(self.send_socket.as_ref())
-            .ok_or_else(|| ImsError::new("volte_channel_receive_socket_missing"))?;
-        let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
-            .await
-            .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
-            .map_err(|_| ImsError::new("volte_channel_read_failed"))?;
-        frame.truncate(read);
-        Ok(frame)
+        if let Some(frame) = self.requeued.pop_front() {
+            return Ok(frame);
+        }
+        self.recv_fresh(timeout).await
+    }
+
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.recv_fresh(timeout).await
+    }
+
+    fn requeue(&mut self, frame: Vec<u8>) {
+        let frame_bytes = frame.len();
+        if !self.requeued.push_back(frame) {
+            tracing::warn!(
+                frame_bytes,
+                queued_frames = self.requeued.len(),
+                queued_bytes = self.requeued.bytes(),
+                "VoLTE SIP requeue full; dropping newest frame"
+            );
+        }
     }
 
     fn route(&self) -> ImsRoute {
@@ -482,6 +515,35 @@ mod tests {
             .unwrap();
         let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
         assert_eq!(response, b"protected response");
+    }
+
+    #[tokio::test]
+    async fn requeued_datagrams_are_delivered_fifo_before_fresh_transport_data() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let route = ImsRoute {
+            local_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            pcscf_addr: server.local_addr().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+        let client_addr = channel.local_addr().unwrap();
+
+        channel.requeue(b"first".to_vec());
+        channel.requeue(b"second".to_vec());
+        server.send_to(b"fresh", client_addr).await.unwrap();
+
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            b"fresh"
+        );
     }
 
     #[test]

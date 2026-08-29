@@ -5,14 +5,12 @@
 //! Production stores the canonical `AppConfig` document in SQLite. JSON is
 //! retained only as an internal test backend and is never imported at startup.
 
-use rusqlite::{params, Connection as SqliteConnection, OptionalExtension, TransactionBehavior};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::connectivity::core::ims_access::ImsAccessPreference;
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use tracing::info;
@@ -552,7 +550,10 @@ impl<'de> Deserialize<'de> for NotificationConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `PartialEq` is load-bearing, not incidental: `save()` compares the desired
+// `MainConfig` against what the file already says to decide which keys to
+// rewrite. Without it every save would touch every key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub struct DeviceNetworkConfig {
@@ -808,7 +809,7 @@ pub struct SecurityConfig {
     pub idle_timeout_seconds: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DdnsConfig {
     #[serde(default)]
@@ -829,7 +830,7 @@ pub struct DdnsConfig {
     pub ipv6: DdnsIpConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct DdnsIpConfig {
     #[serde(default)]
@@ -1910,35 +1911,94 @@ mod tests {
     }
 
     #[test]
-    fn per_line_media_config_is_explicit_and_persists() {
+    fn per_line_volte_profile_selection_is_independent_and_persists() {
         let path = std::env::temp_dir().join(format!(
-            "simadmin-line-media-migration-{}-{}.json",
+            "simadmin-line-profile-selection-{}-{}.json",
             std::process::id(),
             chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
         ));
-        let line_id = "line-0123456789abcdef0123456789abcdef";
-        let mut config = AppConfig::default();
-        let mut profile = LineProfileConfig::for_line(line_id);
-        profile.ims_video.video_payload_type = 111;
-        config.line_profiles.push(profile);
-        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-
         let manager = ConfigManager::new(path.clone());
+        let line_a = "line-0123456789abcdef0123456789abcdef";
+        let line_b = "line-fedcba9876543210fedcba9876543210";
+        let selection = VolteProfileSelectionConfig {
+            attempts: vec![
+                VolteProfileCandidate {
+                    source: VolteProfileSource::CarrierCatalog,
+                    profile_id: Some("  catalog-a  ".to_string()),
+                },
+                VolteProfileCandidate {
+                    source: VolteProfileSource::Database,
+                    profile_id: Some("custom-a".to_string()),
+                },
+                VolteProfileCandidate::automatic(VolteProfileSource::Derived),
+            ],
+        };
+        let saved = manager
+            .set_line_volte_profile_selection(line_a, selection)
+            .unwrap();
+        assert_eq!(
+            saved.volte_profile_selection.attempts[0]
+                .profile_id
+                .as_deref(),
+            Some("catalog-a")
+        );
+        assert_eq!(
+            manager.get_line_volte_profile_selection(line_b),
+            VolteProfileSelectionConfig::default()
+        );
+
+        let reloaded = ConfigManager::new(path.clone());
+        assert_eq!(
+            reloaded.get_line_volte_profile_selection(line_a).attempts[1]
+                .profile_id
+                .as_deref(),
+            Some("custom-a")
+        );
+        assert_eq!(
+            reloaded.get_line_volte_profile_selection(line_b),
+            VolteProfileSelectionConfig::default()
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// An explicit per-line media value must survive reconciliation and a
+    /// restart. The profile is seeded through the manager because line profiles
+    /// are database-owned; the file never carries them.
+    #[test]
+    fn per_line_media_config_is_explicit_and_persists() {
+        let dir = text_config_test_dir("line-media");
+        let (manager, path) = text_manager(&dir);
+        let line_id = "line-0123456789abcdef0123456789abcdef";
+
+        let mut video = manager.get_line_ims_video_config(line_id);
+        video.video_payload_type = 111;
+        manager.set_line_ims_video_config(line_id, video).unwrap();
+
+        // Reconciling a line that already has an explicit profile changes
+        // nothing.
         assert!(!manager
             .reconcile_line_profiles(&[line_id.to_string()])
             .unwrap());
-        let profile = manager.get_line_profile(line_id);
-        assert_eq!(profile.ims_video.video_payload_type, 111);
-
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(
-            persisted["line_profiles"][0]["ims_video"]["video_payload_type"],
-            serde_json::Value::from(111)
+            manager
+                .get_line_profile(line_id)
+                .ims_video
+                .video_payload_type,
+            111
         );
 
-        let _ = std::fs::remove_file(path.with_extension("bak"));
-        let _ = std::fs::remove_file(path);
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_line_profile(line_id)
+                .ims_video
+                .video_payload_type,
+            111
+        );
+
+        drop(manager);
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2719,6 +2779,85 @@ mod tests {
     }
 
     #[test]
+    fn legacy_line_profile_gets_default_volte_profile_attempt_order() {
+        let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
+            "line_id": "line-0123456789abcdef0123456789abcdef"
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.volte_profile_selection,
+            VolteProfileSelectionConfig::default()
+        );
+        assert_eq!(
+            profile
+                .volte_profile_selection
+                .attempts
+                .iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>(),
+            vec![
+                VolteProfileSource::Database,
+                VolteProfileSource::CarrierCatalog,
+                VolteProfileSource::Derived,
+            ]
+        );
+    }
+
+    #[test]
+    fn volte_profile_selection_preserves_order_and_duplicate_sources_and_validates_slots() {
+        let mut repeated_sources = VolteProfileSelectionConfig {
+            attempts: vec![
+                VolteProfileCandidate {
+                    source: VolteProfileSource::Database,
+                    profile_id: Some("  database-first  ".to_string()),
+                },
+                VolteProfileCandidate {
+                    source: VolteProfileSource::Database,
+                    profile_id: Some("database-second".to_string()),
+                },
+                VolteProfileCandidate::automatic(VolteProfileSource::Database),
+            ],
+        };
+        assert_eq!(
+            validate_volte_profile_selection(&mut repeated_sources),
+            Ok(())
+        );
+        assert_eq!(
+            repeated_sources,
+            VolteProfileSelectionConfig {
+                attempts: vec![
+                    VolteProfileCandidate {
+                        source: VolteProfileSource::Database,
+                        profile_id: Some("database-first".to_string()),
+                    },
+                    VolteProfileCandidate {
+                        source: VolteProfileSource::Database,
+                        profile_id: Some("database-second".to_string()),
+                    },
+                    VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                ],
+            }
+        );
+
+        let mut too_short = VolteProfileSelectionConfig {
+            attempts: vec![VolteProfileCandidate::automatic(
+                VolteProfileSource::Derived,
+            )],
+        };
+        assert_eq!(
+            validate_volte_profile_selection(&mut too_short),
+            Err("volte_profile_attempt_count_invalid".to_string())
+        );
+
+        let mut invalid = VolteProfileSelectionConfig::default();
+        invalid.attempts[2].profile_id = Some("not-allowed".to_string());
+        assert_eq!(
+            validate_volte_profile_selection(&mut invalid),
+            Err("volte_derived_profile_id_not_allowed".to_string())
+        );
+    }
+
+    #[test]
     fn removed_global_root_keys_are_rejected() {
         for legacy_field in [
             "webhook",
@@ -2740,59 +2879,6 @@ mod tests {
                 "removed global field {legacy_field} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn invalid_root_settings_block_config_load_without_rewriting_file() {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin_invalid_root_config_{}_{}.json",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        let original = r#"{"volte":{"enabled":true}}"#;
-        std::fs::write(&path, original).unwrap();
-
-        let error = match ConfigManager::try_new(path.clone()) {
-            Ok(_) => panic!("removed root setting must block configuration load"),
-            Err(error) => error,
-        };
-        assert!(error.contains("unknown field `volte`"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
-
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("tmp"));
-        let _ = std::fs::remove_file(path.with_extension("bak"));
-    }
-
-    #[test]
-    fn old_line_config_version_blocks_load_without_rewriting_file() {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin-old-line-config-{}-{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let line_id = "line-0123456789abcdef0123456789abcdef";
-        let mut config = AppConfig::default();
-        config.line_config_version = 1;
-        config
-            .line_profiles
-            .push(LineProfileConfig::for_line(line_id));
-        let original = serde_json::to_vec_pretty(&config).unwrap();
-        std::fs::write(&path, &original).unwrap();
-
-        let error = match ConfigManager::try_new(path.clone()) {
-            Ok(_) => panic!("old line config version must block configuration load"),
-            Err(error) => error,
-        };
-        assert!(error.contains("Unsupported line config version 1"));
-        assert!(error.contains(&format!("expected {CURRENT_LINE_CONFIG_VERSION}")));
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-
-        let _ = std::fs::remove_file(path.with_extension("bak"));
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -2891,78 +2977,91 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// IMS video gates mirror the access legs, so a row where a leg is on but
+    /// its gate is off is stale and must be corrected at load.
+    ///
+    /// The stale row is written straight through `config_store`, because every
+    /// `ConfigManager` setter already syncs the gates and so cannot produce the
+    /// inconsistent state an older release left behind.
     #[test]
     fn stale_ims_video_gates_are_normalized_when_config_loads() {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin_vilte_normalize_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        let dir = text_config_test_dir("video-normalize");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let database_path = path.with_extension("test.db");
         let line_id = "line-0123456789abcdef0123456789abcdef";
-        let mut config = AppConfig::default();
-        let mut profile = LineProfileConfig::for_line(line_id);
-        profile.volte_connection_enabled = true;
-        profile.vowifi.enabled = true;
-        assert!(!profile.ims_video.volte_enabled);
-        assert!(!profile.ims_video.vowifi_enabled);
-        config.line_profiles.push(profile);
-        std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
 
-        let manager = ConfigManager::new(path.clone());
+        {
+            let database = Arc::new(
+                crate::platform::db::Database::new(database_path.clone()).expect("test database"),
+            );
+            let mut profile = LineProfileConfig::for_line(line_id);
+            profile.volte_connection_enabled = true;
+            profile.vowifi.enabled = true;
+            // The stale part: both legs are on, both gates are off.
+            assert!(!profile.ims_video.volte_enabled);
+            assert!(!profile.ims_video.vowifi_enabled);
+            let stored = crate::platform::config_store::StoredConfig {
+                line_profiles: vec![profile],
+                ..Default::default()
+            };
+            crate::platform::config_store::save(&database, &stored).unwrap();
+        }
+
+        // `try_new_for_test` derives exactly this database path.
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
         let normalized = manager.get_line_ims_video_config(line_id);
         assert!(normalized.volte_enabled);
         assert!(normalized.vowifi_enabled);
-        let persisted: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert_eq!(
-            persisted["line_profiles"][0]["ims_video"]["volte_enabled"],
-            serde_json::Value::Bool(true)
-        );
-        assert_eq!(
-            persisted["line_profiles"][0]["ims_video"]["vowifi_enabled"],
-            serde_json::Value::Bool(true)
-        );
 
-        let _ = std::fs::remove_file(path.with_extension("bak"));
-        let _ = std::fs::remove_file(path);
+        // The correction is persisted, not just applied in memory.
+        drop(manager);
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        let persisted = reloaded.get_line_ims_video_config(line_id);
+        assert!(persisted.volte_enabled);
+        assert!(persisted.vowifi_enabled);
+
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A file written by an older release names keys this schema no longer has.
+    ///
+    /// `line_profiles` moved to the database, so a file that still carries it is
+    /// an old file: report the key and leave the operator's bytes alone rather
+    /// than quietly discarding settings it describes.
     #[test]
-    fn legacy_vilte_schema_is_rejected_without_rewriting_source() {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin_vilte_migration_{}_{}.json",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        // Old schema: `vilte.feature_enabled` under the per-line profile.
-        let json = format!(
-            r#"{{
-                "line_profiles": [{{
-                    "line_id": "line-0123456789abcdef0123456789abcdef",
-                    "volte_voice_enabled": true,
-                    "vilte": {{ "feature_enabled": true, "video_payload_type": 111 }}
-                }}]
-            }}"#
-        );
-        std::fs::write(&path, &json).unwrap();
-        let error = ConfigManager::try_new(path.clone())
-            .err()
-            .expect("legacy schema must be rejected");
-        assert!(error.contains("Unsupported line config version"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), json);
+    fn legacy_line_profile_keys_in_the_file_are_rejected_without_rewriting() {
+        let dir = text_config_test_dir("legacy-keys");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let original = "\
+config_version: 4
+line_profiles:
+  - line_id: line-0123456789abcdef0123456789abcdef
+    volte_connection_enabled: true
+";
+        std::fs::write(&path, original).unwrap();
 
-        let _ = std::fs::remove_file(path);
+        let error = ConfigManager::try_new_for_test(path.clone())
+            .err()
+            .expect("a file carrying database-owned keys must be rejected");
+        assert!(
+            error.contains("line_profiles"),
+            "the error must name the offending key, got: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a rejected file must be left exactly as written"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn trunk_test_manager() -> (ConfigManager, PathBuf) {
+        // `.yaml` so the shared helper exercises the production format.
         let path = std::env::temp_dir().join(format!(
-            "simadmin_trunk_{}_{}.json",
+            "simadmin_trunk_{}_{}.yaml",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3322,9 +3421,9 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
-    fn sqlite_config_test_dir(name: &str) -> PathBuf {
+    fn text_config_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
-            "simadmin-config-sqlite-{name}-{}-{}",
+            "simadmin-config-text-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3333,182 +3432,420 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn sqlite_config_persists_one_versioned_document() {
-        let dir = sqlite_config_test_dir("persist");
-        let path = dir.join("config.sqlite3");
-        let manager = ConfigManager::try_new(path.clone()).unwrap();
-        let mut security = manager.get_security();
-        security.session_ttl_seconds = 7_200;
-        manager.set_security(security).unwrap();
-        drop(manager);
+    fn text_manager(dir: &Path) -> (ConfigManager, PathBuf) {
+        std::fs::create_dir_all(dir).unwrap();
+        let path = dir.join("config.yaml");
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        (manager, path)
+    }
 
-        let reloaded = ConfigManager::try_new(path.clone()).unwrap();
-        assert_eq!(reloaded.get_security().session_ttl_seconds, 7_200);
+    /// A first run must leave a file a person can actually read and edit.
+    #[test]
+    fn first_run_writes_a_documented_yaml_file() {
+        let dir = text_config_test_dir("first-run");
+        let (manager, path) = text_manager(&dir);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.starts_with("# SimAdmin main program configuration."));
+        assert!(content.contains("config_version: 4"));
+        assert!(content.contains("security:"));
+        // Database-owned blocks must not appear in the file. Matched as
+        // top-level keys, because `version_update_notifications` legitimately
+        // contains the substring "notifications".
+        for key in [
+            "line_profiles:",
+            "modem_slots:",
+            "standalone_sim_slots:",
+            "\nnotifications:",
+            "\nautomation:",
+            "\nesim:",
+        ] {
+            assert!(
+                !content.contains(key),
+                "database-owned key {key:?} leaked into the operator file"
+            );
+        }
+        // And the file-owned block that merely looks similar is present.
+        assert!(content.contains("version_update_notifications:"));
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                0o600
+                0o600,
+                "the file holds DDNS credentials"
             );
         }
-        let connection = SqliteConnection::open(&path).unwrap();
-        let row: (u32, u32, i64) = connection
-            .query_row(
-                "SELECT storage_schema_version, line_config_version, COUNT(*)
-                 FROM app_config WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(
-            row,
-            (
-                CONFIG_STORAGE_SCHEMA_VERSION,
-                CURRENT_LINE_CONFIG_VERSION,
-                1
-            )
-        );
-        drop(connection);
+        drop(manager);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole reason for the text backend: saving must not eat what an
+    /// operator wrote by hand.
+    #[test]
+    fn saving_preserves_operator_comments_and_untouched_lines() {
+        let dir = text_config_test_dir("comments");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let handwritten = "\
+# Managed by the night shift. Ask before changing session_ttl_seconds.
+config_version: 4
+
+security:
+  # Deliberately long: the kiosk in bay 3 must not log out mid-shift.
+  session_ttl_seconds: 604800
+  password_min_length: 12
+
+device_network:
+  ddns:
+    enabled: true
+    provider: tencentcloud
+    access_id: \"100012345678\"   # numeric, must stay a string
+";
+        std::fs::write(&path, handwritten).unwrap();
+
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        // A change made from an unrelated screen.
+        let mut diagnostic = manager.get_diagnostic_log();
+        diagnostic.retention_days = 14;
+        manager.set_diagnostic_log(diagnostic).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        for comment in [
+            "# Managed by the night shift. Ask before changing session_ttl_seconds.",
+            "# Deliberately long: the kiosk in bay 3 must not log out mid-shift.",
+            "# numeric, must stay a string",
+        ] {
+            assert!(after.contains(comment), "lost comment: {comment}");
+        }
+        // Hand-set values the program did not change are untouched.
+        assert!(after.contains("session_ttl_seconds: 604800"));
+        assert!(after.contains("password_min_length: 12"));
+        // And the numeric-looking credential is still a string, not an integer.
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(reloaded.get_ddns_config().access_id, "100012345678");
+        assert_eq!(reloaded.get_diagnostic_log().retention_days, 14);
+        assert_eq!(reloaded.get_security().session_ttl_seconds, 604_800);
+
+        drop(manager);
         drop(reloaded);
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    #[cfg(unix)]
+    /// A typo must be reported, not silently ignored, and must not cost the
+    /// operator their file.
     #[test]
-    fn sqlite_config_rejects_symlink_database_path() {
-        use std::os::unix::fs::symlink;
-
-        let dir = sqlite_config_test_dir("symlink");
+    fn unknown_top_level_key_fails_closed_without_rewriting() {
+        let dir = text_config_test_dir("typo");
         std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.sqlite3");
-        std::fs::write(&target, b"not a database").unwrap();
-        let path = dir.join("config.sqlite3");
-        symlink(&target, &path).unwrap();
+        let path = dir.join("config.yaml");
+        let original = "config_version: 4\nsecurty:\n  password_min_length: 8\n";
+        std::fs::write(&path, original).unwrap();
 
-        let error = match ConfigManager::try_new(path) {
-            Ok(_) => panic!("symlink database must not be followed"),
+        let error = match ConfigManager::try_new_for_test(path.clone()) {
+            Ok(_) => panic!("a misspelled top-level key must not load"),
             Err(error) => error,
         };
-        assert!(error.contains("Refusing symlink config database"));
-        assert_eq!(std::fs::read(&target).unwrap(), b"not a database");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn sqlite_config_ignores_sibling_json_and_uses_defaults() {
-        let dir = sqlite_config_test_dir("no-legacy-import");
-        std::fs::create_dir_all(&dir).unwrap();
-        let legacy_path = dir.join("config.json");
-        let sqlite_path = dir.join("config.sqlite3");
-        let mut legacy = AppConfig::default();
-        legacy.security.session_ttl_seconds = 9_000;
-        let original = serde_json::to_vec_pretty(&legacy).unwrap();
-        std::fs::write(&legacy_path, &original).unwrap();
-
-        let manager = ConfigManager::try_new(sqlite_path.clone()).unwrap();
-        assert_eq!(
-            manager.get_security().session_ttl_seconds,
-            AppConfig::default().security.session_ttl_seconds
+        assert!(
+            error.contains("secur"),
+            "the error must name the offending key, got: {error}"
         );
-        assert_eq!(std::fs::read(&legacy_path).unwrap(), original);
-        assert!(!legacy_path.with_extension("json.migrated.bak").exists());
-        assert!(sqlite_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "a rejected file must be left exactly as the operator wrote it"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unsupported_config_version_fails_closed() {
+        let dir = text_config_test_dir("version");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(&path, "config_version: 99\n").unwrap();
+
+        let error = match ConfigManager::try_new_for_test(path.clone()) {
+            Ok(_) => panic!("an unknown schema version must not load"),
+            Err(error) => error,
+        };
+        assert!(error.contains("Unsupported config_version 99"), "{error}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An extension we cannot classify is an error, not a guess: parsing YAML as
+    /// JSON reports a baffling error at a random offset.
+    #[test]
+    fn unknown_extension_is_rejected() {
+        let dir = text_config_test_dir("ext");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.conf");
+        let database = Arc::new(
+            crate::platform::db::Database::new(dir.join("data.db")).expect("test database"),
+        );
+        let error = match ConfigManager::try_new(path, database) {
+            Ok(_) => panic!("an unclassifiable extension must not load"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("Unsupported configuration file extension"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Per-line settings must survive a restart even though they never appear in
+    /// the text file.
+    #[test]
+    fn line_settings_persist_through_the_database_half() {
+        let dir = text_config_test_dir("db-half");
+        let (manager, path) = text_manager(&dir);
+        let line = "line-0123456789abcdef0123456789abcdef";
+
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_vowifi_connection_enabled(line, true)
+            .unwrap();
+        manager
+            .set_line_ims_access_preference(line, ImsAccessPreference::WlanPreferred)
+            .unwrap();
+        let mut apn = ApnConfig::default();
+        apn.apn = "ims.example".to_string();
+        manager.set_line_apn_config(line, apn).unwrap();
+
+        let file_content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !file_content.contains(line),
+            "a line id must never leak into the operator file"
+        );
+
+        // Reload through the same paths, as a restart would.
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        let profile = reloaded.get_line_profile(line);
+        assert!(profile.volte_connection_enabled);
+        assert!(profile.vowifi.enabled);
+        assert_eq!(
+            profile.ims_access_preference,
+            ImsAccessPreference::WlanPreferred
+        );
+        assert_eq!(reloaded.get_line_apn_config(line).apn, "ims.example");
+
         drop(manager);
+        drop(reloaded);
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// The update checker writes state on a timer. If that state lived in the
+    /// file, a background poll would rewrite a file nobody edited.
     #[test]
-    fn sqlite_config_invalid_document_fails_closed() {
-        let dir = sqlite_config_test_dir("invalid");
-        let path = dir.join("config.sqlite3");
-        drop(ConfigManager::try_new(path.clone()).unwrap());
-        let connection = SqliteConnection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE app_config SET config_json = ?1 WHERE singleton = 1",
-                [r#"{"unknown_root_setting":true}"#],
-            )
-            .unwrap();
-        drop(connection);
+    fn update_check_state_does_not_touch_the_operator_file() {
+        let dir = text_config_test_dir("update-state");
+        let (manager, path) = text_manager(&dir);
+        let before = std::fs::read_to_string(&path).unwrap();
 
-        let error = match ConfigManager::try_new(path.clone()) {
-            Ok(_) => panic!("invalid SQLite config must not fall back to defaults"),
-            Err(error) => error,
-        };
-        assert!(error.contains("unknown field `unknown_root_setting`"));
-        let connection = SqliteConnection::open(&path).unwrap();
-        let stored: String = connection
-            .query_row(
-                "SELECT config_json FROM app_config WHERE singleton = 1",
-                [],
-                |row| row.get(0),
-            )
+        manager
+            .set_last_notified_update_version("1.1.8".to_string())
             .unwrap();
-        assert_eq!(stored, r#"{"unknown_root_setting":true}"#);
-        drop(connection);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "recording a notified version must not rewrite the file"
+        );
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_version_update_notifications()
+                .last_notified_version
+                .as_deref(),
+            Some("1.1.8")
+        );
+        drop(manager);
+        drop(reloaded);
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Hardware discovery reconciles slots on every hotplug. That churn must
+    /// land in the database, never in the file.
     #[test]
-    fn sqlite_config_unknown_storage_schema_fails_closed() {
-        let dir = sqlite_config_test_dir("schema");
-        let path = dir.join("config.sqlite3");
-        drop(ConfigManager::try_new(path.clone()).unwrap());
-        let connection = SqliteConnection::open(&path).unwrap();
-        connection
-            .execute(
-                "UPDATE app_config SET storage_schema_version = 999 WHERE singleton = 1",
-                [],
-            )
-            .unwrap();
-        drop(connection);
+    fn hardware_discovery_never_rewrites_the_operator_file() {
+        let dir = text_config_test_dir("hotplug");
+        let (manager, path) = text_manager(&dir);
+        let before = std::fs::read_to_string(&path).unwrap();
 
-        let error = match ConfigManager::try_new(path.clone()) {
-            Ok(_) => panic!("unknown storage schema must not load"),
-            Err(error) => error,
-        };
-        assert!(error.contains("Unsupported config storage schema version 999"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn sqlite_config_and_sim_overrides_share_file_without_clobbering() {
-        use crate::connectivity::modems::ims::profile_override::{
-            ImsCommonOverride, SimBindingKey, SimOverride, SimOverrideStore,
-        };
-
-        let dir = sqlite_config_test_dir("shared");
-        let path = dir.join("config.sqlite3");
-        let manager = ConfigManager::try_new(path.clone()).unwrap();
-        let overrides = SimOverrideStore::sqlite(path.clone());
-        let binding = SimBindingKey::resolve(Some("8986001234567890123"), None).unwrap();
-        let override_ = SimOverride {
-            ims_common: ImsCommonOverride {
-                voicemail_number: Some("123".to_string()),
+        manager
+            .reconcile_modem_slots(&[ModemSlotObservation {
+                slot_id: "usb-path-a".to_string(),
+                equipment_identifier: "imei-a".to_string(),
+                uim_slot: 1,
                 ..Default::default()
-            },
-            ..Default::default()
-        };
-        overrides.save(&binding, &override_).unwrap();
+            }])
+            .unwrap();
+        manager
+            .reconcile_line_profiles(&["line-0123456789abcdef0123456789abcdef".to_string()])
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a hotplug must not touch the operator's file"
+        );
+
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(reloaded.get_line_profiles().len(), 1);
+        drop(manager);
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Deleting the file resets file-owned settings only. Line settings are the
+    /// expensive ones to recreate, so they must survive.
+    #[test]
+    fn deleting_the_file_keeps_line_settings() {
+        let dir = text_config_test_dir("delete");
+        let (manager, path) = text_manager(&dir);
+        let line = "line-0123456789abcdef0123456789abcdef";
+        manager
+            .set_line_volte_connection_enabled(line, true)
+            .unwrap();
         let mut security = manager.get_security();
-        security.session_ttl_seconds = 10_000;
+        security.session_ttl_seconds = 999;
         manager.set_security(security).unwrap();
         drop(manager);
 
-        let reloaded = ConfigManager::try_new(path.clone()).unwrap();
-        assert_eq!(reloaded.get_security().session_ttl_seconds, 10_000);
+        std::fs::remove_file(&path).unwrap();
+
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
         assert_eq!(
-            overrides
-                .load(&binding)
-                .unwrap()
-                .unwrap()
-                .ims_common
-                .voicemail_number
-                .as_deref(),
-            Some("123")
+            reloaded.get_security().session_ttl_seconds,
+            SecurityConfig::default().session_ttl_seconds,
+            "file-owned settings reset"
         );
+        assert!(
+            reloaded.get_line_profile(line).volte_connection_enabled,
+            "line settings must not be lost with the file"
+        );
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The whole operator-facing promise, on a realistic file: a hand-authored
+    /// config survives repeated saves from unrelated screens with its comments,
+    /// key order, blank lines and quoting intact, and only the edited lines
+    /// change.
+    ///
+    /// This is the regression test for the writer bug where a newly created
+    /// nested block indented only its first child and left the rest at top
+    /// level, producing a file that no longer parsed.
+    #[test]
+    fn a_hand_authored_file_survives_repeated_saves_byte_for_byte() {
+        let dir = text_config_test_dir("handwritten");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        let handwritten = "\
+# ==========================================================
+#  Bay 3 kiosk. Ask the night shift before touching timeouts.
+# ==========================================================
+config_version: 4
+
+security:
+  # 7 days: the kiosk must not log out mid-shift.
+  session_ttl_seconds: 604800
+  password_min_length: 12
+
+device_network:
+  ddns:
+    enabled: true
+    provider: tencentcloud
+    access_id: \"100012345678\"     # numeric, must stay a string
+    ipv4:
+      enabled: true
+      urls:
+        - https://api.ipify.org
+      domains:
+        - kiosk3.example.net
+";
+        std::fs::write(&path, handwritten).unwrap();
+
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
+
+        // Three edits from three unrelated screens. The second one writes a
+        // block the file does not contain at all, which is what broke before.
+        let mut diagnostic = manager.get_diagnostic_log();
+        diagnostic.retention_days = 21;
+        manager.set_diagnostic_log(diagnostic).unwrap();
+
+        let mut proxy = manager.get_github_download_proxy();
+        proxy.proxy_prefix = "https://mirror.example/".to_string();
+        manager.set_github_download_proxy(proxy).unwrap();
+
+        let mut isolation = manager.get_ue_isolation();
+        isolation.enabled = true;
+        manager.set_ue_isolation(isolation).unwrap();
+
+        let after = std::fs::read_to_string(&path).unwrap();
+
+        // 1. Still valid, and reads back as intended.
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(reloaded.get_diagnostic_log().retention_days, 21);
+        assert_eq!(
+            reloaded.get_github_download_proxy().proxy_prefix,
+            "https://mirror.example/"
+        );
+        assert!(reloaded.get_ue_isolation().enabled);
+
+        // 2. Nothing the operator wrote was disturbed.
+        assert_eq!(reloaded.get_security().session_ttl_seconds, 604_800);
+        assert_eq!(reloaded.get_security().password_min_length, 12);
+        assert_eq!(reloaded.get_ddns_config().access_id, "100012345678");
+        assert_eq!(reloaded.get_ddns_config().provider, "tencentcloud");
+        assert_eq!(
+            reloaded.get_ddns_config().ipv4.domains,
+            vec!["kiosk3.example.net".to_string()]
+        );
+
+        // 3. Every original comment line is still byte-identical.
+        for line in handwritten.lines().filter(|line| line.contains('#')) {
+            assert!(
+                after.contains(line),
+                "lost or altered comment line:\n  {line}\nfile now reads:\n{after}"
+            );
+        }
+
+        // 4. Every line the operator wrote and the program did not change is
+        //    still present verbatim, blank lines and indentation included.
+        for line in handwritten.lines() {
+            assert!(
+                after.contains(line),
+                "line changed that should not have:\n  {line:?}\nfile now reads:\n{after}"
+            );
+        }
+
+        drop(manager);
+        drop(reloaded);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// JSON stays available for anyone who prefers it; it just cannot keep
+    /// comments.
+    #[test]
+    fn json_configuration_round_trips() {
+        let dir = text_config_test_dir("json");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        let mut security = manager.get_security();
+        security.session_ttl_seconds = 4_242;
+        manager.set_security(security).unwrap();
+        drop(manager);
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.trim_start().starts_with('{'));
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(reloaded.get_security().session_ttl_seconds, 4_242);
         drop(reloaded);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3743,6 +4080,90 @@ impl Default for AutoRestoreConfig {
             attempts: default_volte_auto_restore_attempts(),
             retry_delay_secs: default_volte_auto_restore_retry_delay_secs(),
         }
+    }
+}
+
+/// Source used by one outer VoLTE carrier-profile connection attempt.
+///
+/// This is deliberately stored on the physical line rather than in the
+/// SIM-bound override. A modem/reader therefore keeps its own ordered recovery
+/// policy when SIMs are swapped, while an optional profile id still selects one
+/// concrete row inside the requested source.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VolteProfileSource {
+    Database,
+    CarrierCatalog,
+    Derived,
+}
+
+impl VolteProfileSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::CarrierCatalog => "carrier_catalog",
+            Self::Derived => "derived",
+        }
+    }
+}
+
+/// One logical slot in the three-step VoLTE profile recovery sequence.
+///
+/// `profile_id = None` means automatic matching inside `source`. An explicit id
+/// never crosses source boundaries, which keeps a user profile and a downloaded
+/// catalog profile with the same id independently selectable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolteProfileCandidate {
+    pub source: VolteProfileSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+impl VolteProfileCandidate {
+    pub fn automatic(source: VolteProfileSource) -> Self {
+        Self {
+            source,
+            profile_id: None,
+        }
+    }
+}
+
+fn default_volte_profile_attempts() -> Vec<VolteProfileCandidate> {
+    vec![
+        VolteProfileCandidate::automatic(VolteProfileSource::Database),
+        VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+        VolteProfileCandidate::automatic(VolteProfileSource::Derived),
+    ]
+}
+
+/// Per-physical-line outer carrier-profile attempt policy.
+///
+/// Exactly three logical slots are retained even when missing database/catalog
+/// rows make multiple slots resolve to the same derived profile. This preserves
+/// the operator-requested three-attempt behaviour instead of silently deduping
+/// the fallback to a single attempt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolteProfileSelectionConfig {
+    #[serde(default = "default_volte_profile_attempts")]
+    pub attempts: Vec<VolteProfileCandidate>,
+}
+
+impl Default for VolteProfileSelectionConfig {
+    fn default() -> Self {
+        Self {
+            attempts: default_volte_profile_attempts(),
+        }
+    }
+}
+
+impl VolteProfileSelectionConfig {
+    /// Normalize and validate the public API/storage shape before any
+    /// source-bound profile lookup is attempted. Keeping this on the value
+    /// itself lets HTTP handlers reject malformed requests before persistence
+    /// while `ConfigManager` still enforces the same invariant for every other
+    /// caller.
+    pub fn validate(&mut self) -> Result<(), String> {
+        validate_volte_profile_selection(self)
     }
 }
 
@@ -4069,6 +4490,9 @@ pub struct LineProfileConfig {
     pub volte_connection_enabled: bool,
     #[serde(default)]
     pub volte_auto_restore: AutoRestoreConfig,
+    /// Ordered outer carrier-profile attempts for this physical line.
+    #[serde(default)]
+    pub volte_profile_selection: VolteProfileSelectionConfig,
     #[serde(default, alias = "vilte")]
     pub ims_video: ImsVideoConfig,
     #[serde(default)]
@@ -4234,6 +4658,7 @@ impl LineProfileConfig {
             enabled: true,
             volte_connection_enabled: false,
             volte_auto_restore: AutoRestoreConfig::default(),
+            volte_profile_selection: VolteProfileSelectionConfig::default(),
             ims_video: ImsVideoConfig::default(),
             volte_ip_families: default_line_volte_ip_families(),
             volte_ip_families_auto: default_line_volte_ip_families_auto(),
@@ -4289,6 +4714,32 @@ fn valid_line_id(line_id: &str) -> bool {
     line_id.strip_prefix("line-").is_some_and(|suffix| {
         suffix.len() == 32 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
     })
+}
+
+fn validate_volte_profile_selection(
+    selection: &mut VolteProfileSelectionConfig,
+) -> Result<(), String> {
+    if selection.attempts.len() != 3 {
+        return Err("volte_profile_attempt_count_invalid".to_string());
+    }
+    for candidate in &mut selection.attempts {
+        candidate.profile_id = candidate
+            .profile_id
+            .take()
+            .map(|profile_id| profile_id.trim().to_string())
+            .filter(|profile_id| !profile_id.is_empty());
+        if candidate.source == VolteProfileSource::Derived && candidate.profile_id.is_some() {
+            return Err("volte_derived_profile_id_not_allowed".to_string());
+        }
+        if candidate
+            .profile_id
+            .as_deref()
+            .is_some_and(|profile_id| profile_id.len() > 160)
+        {
+            return Err("volte_profile_id_too_long".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(), String> {
@@ -4742,7 +5193,215 @@ impl Default for AppConfig {
 }
 
 pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 4;
-pub(crate) const CONFIG_STORAGE_SCHEMA_VERSION: u32 = 1;
+// `CONFIG_STORAGE_SCHEMA_VERSION` used to version the SQLite envelope that held
+// the whole config document. The two halves now version themselves: the text
+// file through `config_version`, the database tables through
+// `config_store::CONFIG_STORE_SCHEMA_VERSION`.
+
+/// The half of the configuration that lives in the hand-editable text file.
+///
+/// These are settings an operator may reasonably want to read, diff or edit
+/// directly: the web-UI password policy, DDNS credentials, the per-UE isolation
+/// gates, log retention, and the download proxy. They change when a person
+/// decides something, not when hardware appears, so a text file suits them.
+///
+/// Everything else — per-line profiles, the modem/reader slot map, notification
+/// and automation records — is in `platform::config_store`, because the program
+/// rewrites those on its own and would churn the file. See that module's header
+/// for the full reasoning.
+///
+/// `deny_unknown_fields` is what turns a typo in a hand-edited file into a
+/// startup error naming the key, instead of a setting that silently does
+/// nothing. It applies at this level only, matching serde's semantics: an
+/// unknown key nested inside `security` is still accepted, exactly as it is
+/// today.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MainConfig {
+    /// Schema version of this file. A mismatch stops startup rather than
+    /// guessing what an older or newer layout meant.
+    #[serde(default = "default_config_version")]
+    pub config_version: u32,
+    #[serde(default)]
+    pub security: SecurityConfig,
+    #[serde(default)]
+    pub device_network: DeviceNetworkConfig,
+    #[serde(default)]
+    pub ue_isolation: UeIsolationConfig,
+    #[serde(default)]
+    pub diagnostic_log: DiagnosticLogConfig,
+    #[serde(default)]
+    pub github_download_proxy: GithubDownloadProxyConfig,
+    #[serde(default)]
+    pub version_update_notifications: MainVersionUpdateConfig,
+}
+
+fn default_config_version() -> u32 {
+    CURRENT_LINE_CONFIG_VERSION
+}
+
+impl Default for MainConfig {
+    fn default() -> Self {
+        Self {
+            config_version: CURRENT_LINE_CONFIG_VERSION,
+            security: SecurityConfig::default(),
+            device_network: DeviceNetworkConfig::default(),
+            ue_isolation: UeIsolationConfig::default(),
+            diagnostic_log: DiagnosticLogConfig::default(),
+            github_download_proxy: GithubDownloadProxyConfig::default(),
+            version_update_notifications: MainVersionUpdateConfig::default(),
+        }
+    }
+}
+
+/// The operator-owned part of the update-notification settings.
+///
+/// `last_notified_version` is deliberately absent: it is state the update
+/// checker writes, and keeping it here would make a background poll rewrite a
+/// file nobody edited. It lives in `config_store` instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct MainVersionUpdateConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub proxy_prefix: String,
+}
+
+impl Default for MainVersionUpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            proxy_prefix: String::new(),
+        }
+    }
+}
+
+impl AppConfig {
+    /// Divide the in-memory configuration into its two storage halves.
+    ///
+    /// `AppConfig` stays a single struct on purpose: 58 `ConfigManager` methods
+    /// and every caller in `line_registry`, the handlers and the services read
+    /// it as one value. Only persistence knows about the split.
+    pub(crate) fn split(&self) -> (MainConfig, crate::platform::config_store::StoredConfig) {
+        let main = MainConfig {
+            config_version: self.line_config_version,
+            security: self.security.clone(),
+            device_network: self.device_network.clone(),
+            ue_isolation: self.ue_isolation.clone(),
+            diagnostic_log: self.diagnostic_log.clone(),
+            github_download_proxy: self.github_download_proxy.clone(),
+            version_update_notifications: MainVersionUpdateConfig {
+                enabled: self.version_update_notifications.enabled,
+                proxy_prefix: self.version_update_notifications.proxy_prefix.clone(),
+            },
+        };
+        let stored = crate::platform::config_store::StoredConfig {
+            line_profiles: self.line_profiles.clone(),
+            modem_slots: self.modem_slots.clone(),
+            standalone_sim_slots: self.standalone_sim_slots.clone(),
+            notifications: self.notifications.clone(),
+            automation: self.automation.clone(),
+            esim: self.esim.clone(),
+            last_notified_update_version: self
+                .version_update_notifications
+                .last_notified_version
+                .clone(),
+        };
+        (main, stored)
+    }
+
+    /// Rejoin the two halves into the value the rest of the program uses.
+    pub(crate) fn merge(
+        main: MainConfig,
+        stored: crate::platform::config_store::StoredConfig,
+    ) -> Self {
+        Self {
+            line_config_version: main.config_version,
+            notifications: stored.notifications,
+            device_network: main.device_network,
+            ue_isolation: main.ue_isolation,
+            version_update_notifications: VersionUpdateNotificationConfig {
+                enabled: main.version_update_notifications.enabled,
+                proxy_prefix: main.version_update_notifications.proxy_prefix,
+                last_notified_version: stored.last_notified_update_version,
+            },
+            github_download_proxy: main.github_download_proxy,
+            diagnostic_log: main.diagnostic_log,
+            security: main.security,
+            esim: stored.esim,
+            automation: stored.automation,
+            line_profiles: stored.line_profiles,
+            modem_slots: stored.modem_slots,
+            standalone_sim_slots: stored.standalone_sim_slots,
+        }
+    }
+}
+
+/// Header comments written into a first-time configuration file.
+const CONFIG_FILE_HEADER: &[&str] = &[
+    "SimAdmin main program configuration.",
+    "",
+    "This file is meant to be edited by hand. Comments and key order are",
+    "preserved when SimAdmin saves, so notes written here survive.",
+    "",
+    "Per-line settings are NOT here. Each modem/SIM line's VoLTE, VoWiFi, IMS",
+    "registration preference, APN, data proxy, trunk and reader settings live in",
+    "the application database (data.db), because SimAdmin rewrites them whenever",
+    "hardware is added, moved or removed. The same applies to notification",
+    "channels, forwarding rules and automation tasks, which name specific lines.",
+    "",
+    "An unknown key at the top level stops startup and names the key, so a typo",
+    "is reported instead of silently ignored. Deleting this file resets every",
+    "setting below to its default; it does not touch the database.",
+];
+
+/// Per-section comments written into a first-time configuration file.
+const CONFIG_FILE_ANNOTATIONS: &[(&str, &[&str])] = &[
+    (
+        "config_version",
+        &["Schema version of this file. Do not edit."],
+    ),
+    (
+        "security",
+        &[
+            "Web UI authentication policy.",
+            "password_protection_enabled: false serves the UI with no password.",
+        ],
+    ),
+    (
+        "device_network",
+        &[
+            "Dynamic DNS. access_id/access_secret are provider credentials, which is",
+            "why this file is created mode 0600.",
+        ],
+    ),
+    (
+        "ue_isolation",
+        &[
+            "Per-UE Linux network namespaces. Staged rollout: the socket gates below",
+            "depend on three_gpp_ims_sockets_in_worker and are ignored without it.",
+        ],
+    ),
+    (
+        "diagnostic_log",
+        &[
+            "On-disk diagnostic log. Retention is enforced by whichever bound trips",
+            "first, age or total size, so a burst of retries cannot fill the flash.",
+        ],
+    ),
+    (
+        "github_download_proxy",
+        &["Prefix applied to GitHub downloads for update checks."],
+    ),
+    (
+        "version_update_notifications",
+        &[
+            "Update-check notifications. The last version an operator was notified",
+            "about is runtime state and is kept in the database, not here.",
+        ],
+    ),
+];
 
 fn migrate_template_string(template: &mut String) -> bool {
     let mut changed = false;
@@ -4846,374 +5505,124 @@ fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
 }
 
 /// 配置管理器
+///
+/// Holds the whole configuration in memory as one `AppConfig`, exactly as
+/// before, and writes it to two places: the operator-editable text file and the
+/// application database. Callers are unaffected by the division — every getter
+/// and setter keeps its previous signature and semantics.
 pub struct ConfigManager {
     config: Arc<RwLock<AppConfig>>,
-    storage: ConfigStorage,
+    file: ConfigFileBackend,
+    database: Arc<crate::platform::db::Database>,
     save_lock: Mutex<()>,
 }
 
+/// The text file half of persistence.
 #[derive(Debug, Clone)]
-enum ConfigStorage {
-    /// Internal test backend. Production paths are always SQLite.
-    Json(PathBuf),
-    /// Production backend. The carrier catalog and runtime/event database stay
-    /// separate; this database owns user configuration only.
-    Sqlite(PathBuf),
+struct ConfigFileBackend {
+    path: PathBuf,
+    format: crate::platform::config_file::TextFormat,
 }
 
-impl ConfigStorage {
-    fn from_path(path: PathBuf) -> Self {
-        let is_sqlite = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(
-                    extension.to_ascii_lowercase().as_str(),
-                    "sqlite" | "sqlite3" | "db"
-                )
-            });
-        if is_sqlite {
-            Self::Sqlite(path)
-        } else {
-            Self::Json(path)
-        }
-    }
-
-    fn path(&self) -> &PathBuf {
-        match self {
-            Self::Json(path) | Self::Sqlite(path) => path,
-        }
-    }
-}
-
-fn open_config_database(path: &Path) -> Result<SqliteConnection, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create config database directory {}: {error}",
-                parent.display()
-            )
-        })?;
-    }
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(format!(
-                "Refusing symlink config database {}",
-                path.display()
-            ));
-        }
-        Ok(metadata) if !metadata.is_file() => {
-            return Err(format!(
-                "Config database path is not a regular file: {}",
-                path.display()
-            ));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let mut options = OpenOptions::new();
-            options.create_new(true).write(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            options.open(path).map_err(|error| {
+impl ConfigFileBackend {
+    /// Resolve the backend for `path`, rejecting extensions whose format cannot
+    /// be determined. Guessing would risk parsing a file as the wrong format and
+    /// reporting a confusing error at a random line.
+    fn from_path(path: PathBuf) -> Result<Self, String> {
+        let format =
+            crate::platform::config_file::TextFormat::from_path(&path).ok_or_else(|| {
                 format!(
-                    "Failed to create config database {}: {error}",
+                    "Unsupported configuration file extension for {}. \
+                 Use .yaml (recommended, keeps comments), .yml or .json.",
                     path.display()
                 )
             })?;
-        }
-        Err(error) => {
-            return Err(format!(
-                "Failed to inspect config database {}: {error}",
-                path.display()
-            ));
-        }
+        Ok(Self { path, format })
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|error| {
-            format!(
-                "Failed to set config database permissions {}: {error}",
-                path.display()
-            )
-        })?;
-    }
-    let connection = SqliteConnection::open(path)
-        .map_err(|error| format!("Failed to open config database {}: {error}", path.display()))?;
-    connection
-        .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| format!("Failed to configure config database timeout: {error}"))?;
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(|error| format!("Failed to enable config database WAL: {error}"))?;
-    connection
-        .execute_batch(
-            "PRAGMA synchronous = FULL;
-             PRAGMA foreign_keys = ON;
-             CREATE TABLE IF NOT EXISTS app_config (
-                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                 storage_schema_version INTEGER NOT NULL,
-                 line_config_version INTEGER NOT NULL,
-                 config_json TEXT NOT NULL CHECK (json_valid(config_json)),
-                 updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS config_schema_journal (
-                 version INTEGER PRIMARY KEY,
-                 applied_at TEXT NOT NULL,
-                 note TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO config_schema_journal(version, applied_at, note)
-                 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'initial schema');",
-        )
-        .map_err(|error| format!("Failed to initialize config database schema: {error}"))?;
-    let quick_check = connection
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get::<_, String>(0))
-        .map_err(|error| format!("Failed to check config database integrity: {error}"))?;
-    if quick_check != "ok" {
-        return Err(format!(
-            "Config database integrity check failed: {quick_check}"
-        ));
-    }
-    Ok(connection)
-}
-
-fn load_config_document(
-    connection: &SqliteConnection,
-    path: &Path,
-) -> Result<Option<(AppConfig, bool)>, String> {
-    let row = connection
-        .query_row(
-            "SELECT storage_schema_version, line_config_version, config_json
-             FROM app_config WHERE singleton = 1",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, u32>(0)?,
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| format!("Failed to read config database {}: {error}", path.display()))?;
-    let Some((storage_version, stored_line_version, content)) = row else {
-        return Ok(None);
-    };
-    if storage_version != CONFIG_STORAGE_SCHEMA_VERSION {
-        return Err(format!(
-            "Unsupported config storage schema version {storage_version} in {}; expected {}",
-            path.display(),
-            CONFIG_STORAGE_SCHEMA_VERSION
-        ));
-    }
-    let config = parse_current_config(&content, path)?;
-    if stored_line_version != config.line_config_version {
-        return Err(format!(
-            "Config database version mismatch in {}: column={stored_line_version}, document={}",
-            path.display(),
-            config.line_config_version
-        ));
-    }
-    let canonical_rewrite_required = serde_json::from_str::<serde_json::Value>(&content)
-        .ok()
-        .zip(serde_json::to_value(&config).ok())
-        .is_some_and(|(stored, canonical)| stored != canonical);
-    Ok(Some((config, canonical_rewrite_required)))
-}
-
-fn parse_current_config(content: &str, source: &Path) -> Result<AppConfig, String> {
-    let config = serde_json::from_str::<AppConfig>(content).map_err(|error| {
-        format!(
-            "Failed to parse configuration {}: {error}",
-            source.display()
-        )
-    })?;
-    if config.line_config_version != CURRENT_LINE_CONFIG_VERSION {
-        return Err(format!(
-            "Unsupported line config version {} in {}; expected {}",
-            config.line_config_version,
-            source.display(),
-            CURRENT_LINE_CONFIG_VERSION
-        ));
-    }
-    Ok(config)
-}
-
-fn save_config_document(path: &Path, content: &str) -> Result<(), String> {
-    let mut connection = open_config_database(path)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("Failed to begin config transaction: {error}"))?;
-    transaction
-        .execute(
-            "INSERT INTO app_config (
-                 singleton, storage_schema_version, line_config_version, config_json, updated_at
-             ) VALUES (1, ?1, ?2, ?3, ?4)
-             ON CONFLICT(singleton) DO UPDATE SET
-                 storage_schema_version = excluded.storage_schema_version,
-                 line_config_version = excluded.line_config_version,
-                 config_json = excluded.config_json,
-                 updated_at = excluded.updated_at",
-            params![
-                CONFIG_STORAGE_SCHEMA_VERSION,
-                CURRENT_LINE_CONFIG_VERSION,
-                content,
-                chrono::Utc::now().to_rfc3339(),
-            ],
-        )
-        .map_err(|error| format!("Failed to write config document: {error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("Failed to commit config transaction: {error}"))
-}
-
-fn save_json_document(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("Failed to create config directory: {error}"))?;
-    }
-
-    let temp_path = path.with_extension("tmp");
-    let backup_path = path.with_extension("bak");
-    let mut temp_file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp_path)
-        .map_err(|error| format!("Failed to open temporary config file: {error}"))?;
-    temp_file
-        .write_all(content.as_bytes())
-        .map_err(|error| format!("Failed to write temporary config file: {error}"))?;
-    temp_file
-        .sync_all()
-        .map_err(|error| format!("Failed to sync temporary config file: {error}"))?;
-    drop(temp_file);
-
-    if path.exists() {
-        fs::copy(path, &backup_path)
-            .map_err(|error| format!("Failed to back up config file: {error}"))?;
-    }
-    if let Err(rename_error) = fs::rename(&temp_path, path) {
-        if cfg!(windows) && path.exists() {
-            fs::copy(&temp_path, path)
-                .map_err(|error| format!("Failed to replace config file: {error}"))?;
-            fs::remove_file(&temp_path)
-                .map_err(|error| format!("Failed to remove temporary config file: {error}"))?;
-        } else {
-            return Err(format!(
-                "Failed to atomically replace config file: {rename_error}"
-            ));
-        }
-    }
-
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
-            let _ = directory.sync_all();
-        }
-    }
-    Ok(())
 }
 
 impl ConfigManager {
-    /// Load a persisted configuration. An existing file must parse exactly as
-    /// the current schema; silently replacing it with defaults hides invalid
-    /// per-line settings and can direct operations to the wrong SIM.
-    pub fn try_new(config_path: PathBuf) -> Result<Self, String> {
-        match ConfigStorage::from_path(config_path) {
-            ConfigStorage::Json(path) => Self::try_new_json(path),
-            ConfigStorage::Sqlite(path) => Self::try_new_sqlite(path),
-        }
-    }
+    /// Load the persisted configuration from its two halves.
+    ///
+    /// An existing file must parse exactly as the current schema. Silently
+    /// replacing it with defaults would hide invalid per-line settings and could
+    /// direct operations to the wrong SIM, so a bad document stops startup with
+    /// the offending key named and the file left untouched for inspection.
+    pub fn try_new(
+        config_path: PathBuf,
+        database: Arc<crate::platform::db::Database>,
+    ) -> Result<Self, String> {
+        let file = ConfigFileBackend::from_path(config_path)?;
+        crate::platform::config_file::ensure_regular_file(&file.path)?;
 
-    fn try_new_json(config_path: PathBuf) -> Result<Self, String> {
-        let mut canonical_rewrite_required = false;
-        let mut config = if config_path.exists() {
-            let content = fs::read_to_string(&config_path).map_err(|error| {
+        let (main, file_existed) = if file.path.exists() {
+            let content = fs::read_to_string(&file.path).map_err(|error| {
                 format!(
                     "Failed to read config file {}: {error}",
-                    config_path.display()
+                    file.path.display()
                 )
             })?;
-            let config = serde_json::from_str::<AppConfig>(&content).map_err(|error| {
-                format!(
-                    "Failed to parse config file {}: {error}",
-                    config_path.display()
-                )
-            })?;
-            if config.line_config_version != CURRENT_LINE_CONFIG_VERSION {
+            let main = crate::platform::config_file::parse::<MainConfig>(
+                &content,
+                file.format,
+                &file.path,
+            )?;
+            if main.config_version != CURRENT_LINE_CONFIG_VERSION {
                 return Err(format!(
-                    "Unsupported line config version {} in {}; expected {}",
-                    config.line_config_version,
-                    config_path.display(),
+                    "Unsupported config_version {} in {}; expected {}. \
+                     The file was not modified.",
+                    main.config_version,
+                    file.path.display(),
                     CURRENT_LINE_CONFIG_VERSION
                 ));
             }
-            canonical_rewrite_required = serde_json::from_str::<serde_json::Value>(&content)
-                .ok()
-                .zip(serde_json::to_value(&config).ok())
-                .is_some_and(|(stored, canonical)| stored != canonical);
-            config
+            (main, true)
         } else {
-            info!("No config file found, using defaults");
-            AppConfig::default()
+            info!(path = ?file.path, "No configuration file found, writing defaults");
+            (MainConfig::default(), false)
         };
+
+        let stored = crate::platform::config_store::load(&database)?;
+        let mut config = AppConfig::merge(main, stored);
 
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
-            storage: ConfigStorage::Json(config_path),
+            file,
+            database,
             save_lock: Mutex::new(()),
         };
 
-        // Rewrite only current-schema files that need canonical formatting.
-        if !manager.storage.path().exists() || changed {
+        if !file_existed || templates_changed || video_gates_changed {
             manager.save()?;
         }
-        // `vowifi-profiles.conf` is no longer created or rewritten here. Custom
-        // carrier profiles live in the database; an existing file is migrated
-        // once at startup and then archived.
-
         Ok(manager)
     }
 
-    fn try_new_sqlite(config_path: PathBuf) -> Result<Self, String> {
-        let connection = open_config_database(&config_path)?;
-        let stored = load_config_document(&connection, &config_path)?;
-        let database_was_empty = stored.is_none();
-
-        let (mut config, canonical_rewrite_required) = match stored {
-            Some((config, rewrite)) => (config, rewrite),
-            None => {
-                info!(path = ?config_path, "No SQLite configuration found, using defaults");
-                (AppConfig::default(), false)
-            }
-        };
-
-        let templates_changed = migrate_templates_to_remove_md5(&mut config);
-        let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let changed = templates_changed || video_gates_changed || canonical_rewrite_required;
-        let manager = Self {
-            config: Arc::new(RwLock::new(config)),
-            storage: ConfigStorage::Sqlite(config_path.clone()),
-            save_lock: Mutex::new(()),
-        };
-
-        if database_was_empty || changed {
-            manager.save()?;
-        }
-        Ok(manager)
+    /// Test constructor. Derives the database beside the configuration file so a
+    /// test can reload from the same path and see what it saved, which is the
+    /// pattern the existing tests already use.
+    #[cfg(test)]
+    fn new(config_path: PathBuf) -> Self {
+        Self::try_new_for_test(config_path).expect("test configuration must load")
     }
 
     #[cfg(test)]
-    fn new(config_path: PathBuf) -> Self {
-        Self::try_new(config_path).expect("test configuration must load")
+    fn try_new_for_test(config_path: PathBuf) -> Result<Self, String> {
+        let config_path =
+            if crate::platform::config_file::TextFormat::from_path(&config_path).is_none() {
+                config_path.with_extension("yaml")
+            } else {
+                config_path
+            };
+        let database_path = config_path.with_extension("test.db");
+        let database = Arc::new(
+            crate::platform::db::Database::new(database_path)
+                .map_err(|error| format!("test database must open: {error}"))?,
+        );
+        Self::try_new(config_path, database)
     }
 
     /// 获取通知配置
@@ -5829,6 +6238,21 @@ impl ConfigManager {
 
     pub fn get_line_volte_ip_families_auto(&self, line_id: &str) -> bool {
         self.get_line_profile(line_id).volte_ip_families_auto
+    }
+
+    pub fn get_line_volte_profile_selection(&self, line_id: &str) -> VolteProfileSelectionConfig {
+        self.get_line_profile(line_id).volte_profile_selection
+    }
+
+    pub fn set_line_volte_profile_selection(
+        &self,
+        line_id: &str,
+        mut selection: VolteProfileSelectionConfig,
+    ) -> Result<LineProfileConfig, String> {
+        selection.validate()?;
+        self.update_line_profile(line_id, |profile| {
+            profile.volte_profile_selection = selection;
+        })
     }
 
     pub fn set_line_vowifi_config(
@@ -6464,41 +6888,101 @@ impl ConfigManager {
         self.save()
     }
 
-    /// Persist the complete typed configuration through the selected backend.
-    /// Production always uses one SQLite transaction; JSON is test-only.
+    /// Persist the configuration to both of its homes.
+    ///
+    /// The database half is written first. If the file write then fails, the
+    /// database holds settings the file does not yet mention — which is
+    /// recoverable, because the file half is the one a human can inspect and
+    /// fix. The reverse order would leave the file advertising line profiles
+    /// that were never stored.
+    ///
+    /// The file half re-reads what is on disk and uses it as the diff baseline,
+    /// rather than remembering what was last written. That way an operator's
+    /// hand edits to keys the program did not change are carried forward instead
+    /// of being reverted by a save triggered from an unrelated screen.
     pub fn save(&self) -> Result<(), String> {
         let _save_guard = self.save_lock.lock().unwrap();
-        let content = {
+        let (main, stored) = {
             let config = self.config.read().unwrap();
-            serde_json::to_string_pretty(&*config)
-                .map_err(|e| format!("Failed to serialize config: {}", e))?
+            config.split()
         };
-        match &self.storage {
-            ConfigStorage::Json(path) => save_json_document(path, &content),
-            ConfigStorage::Sqlite(path) => save_config_document(path, &content),
+
+        crate::platform::config_store::save(&self.database, &stored)?;
+        self.save_main_config(&main)
+    }
+
+    fn save_main_config(&self, main: &MainConfig) -> Result<(), String> {
+        use crate::platform::config_file as text;
+
+        text::ensure_regular_file(&self.file.path)?;
+        let existing = if self.file.path.exists() {
+            fs::read_to_string(&self.file.path).map_err(|error| {
+                format!(
+                    "Failed to read config file {}: {error}",
+                    self.file.path.display()
+                )
+            })?
+        } else {
+            String::new()
+        };
+
+        // The baseline is what the file currently says, so untouched keys keep
+        // their existing bytes, comments included.
+        let baseline = if existing.trim().is_empty() {
+            MainConfig::default()
+        } else {
+            text::parse::<MainConfig>(&existing, self.file.format, &self.file.path)?
+        };
+
+        if !existing.trim().is_empty() && &baseline == main {
+            return Ok(());
         }
+
+        let rendered = text::apply_update(
+            &existing,
+            &baseline,
+            main,
+            self.file.format,
+            &self.file.path,
+            CONFIG_FILE_HEADER,
+            CONFIG_FILE_ANNOTATIONS,
+        )?;
+        text::write_atomically(&self.file.path, &rendered)
+    }
+
+    /// Path of the operator-editable configuration file.
+    pub fn config_file_path(&self) -> &Path {
+        &self.file.path
     }
 }
 
 /// 获取默认配置文件路径
+///
+/// The main program configuration is a text file an operator can edit. Per-line
+/// and event-bound settings are not here; they live in the application database
+/// (see `platform::config_store`).
 pub fn get_default_config_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("SIMADMIN_CONFIG_DB") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
+    // `SIMADMIN_CONFIG` is the current name. `SIMADMIN_CONFIG_DB` is still read
+    // so an existing unit file or script keeps working, but it now names a text
+    // file: the extension selects the format, and an unrecognized one is an
+    // error rather than a guess.
+    for variable in ["SIMADMIN_CONFIG", "SIMADMIN_CONFIG_DB"] {
+        if let Some(path) = std::env::var_os(variable) {
+            if !path.is_empty() {
+                return PathBuf::from(path);
+            }
         }
     }
 
-    // Production default. An empty database receives the current default
-    // document; no legacy file is consulted.
-    let device_path = PathBuf::from("/data/config.sqlite3");
+    let device_path = PathBuf::from("/data/config.yaml");
     if device_path.parent().map(|p| p.exists()).unwrap_or(false) {
         return device_path;
     }
 
-    // 回退到当前目录
+    // 回退到可执行文件同级目录
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("config.sqlite3")
+        .join("config.yaml")
 }

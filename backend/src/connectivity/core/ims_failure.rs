@@ -121,20 +121,15 @@ pub struct ImsServiceVerdict {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImsServiceState {
-    /// The registrar accepted this registration for MMTEL voice: it published a
-    /// telephone identity and a Service-Route.
-    ///
-    /// This is what the REGISTER answer can prove, and no more. It says the
-    /// S-CSCF holds a voice-capable binding for this identity; it does **not**
-    /// say a terminating INVITE will be delivered to it. Delivery additionally
-    /// depends on the TAS, on call-forwarding and voicemail settings, and — when
-    /// the same IMPU is registered from more than one access leg — on which
-    /// binding the TAS selects. Observed on this device: registration reports a
-    /// telephone identity and a Service-Route while terminating calls go to
-    /// voicemail without ever reaching the UE.
+    /// The registrar returned a telephone-form associated identity and a
+    /// Service-Route. This is deliberately weaker than "available": neither
+    /// artifact proves MMTEL provisioning or that the TAS will select this
+    /// binding for a terminating call. Observed on this device: both artifacts
+    /// were present while terminating calls still went to voicemail.
     RegistrarAccepted,
-    /// The network accepted the registration but published no telephone
-    /// identity, so terminating calls have no address to reach.
+    /// The REGISTER succeeded, but no telephone-form `P-Associated-URI` was
+    /// observed. Some operators use a regular SIP IMPU for voice, so this is a
+    /// diagnostic observation rather than evidence of messaging-only service.
     WithoutTelephoneIdentity,
     /// The network refused: not provisioned, barred, or redirected to CS.
     Denied,
@@ -170,7 +165,9 @@ impl ImsServiceVerdict {
         }
     }
 
-    /// Classify a successful REGISTER (`200 OK`) for voice capability.
+    /// Classify the call-related artifacts observed in a successful REGISTER.
+    /// This never proves end-to-end voice capability; only an explicit network
+    /// refusal is allowed to become a local call gate.
     pub fn from_register_success(frame: &[u8]) -> Self {
         let associated = sip_frame::header_values(frame, "P-Associated-URI");
         let has_service_route = !sip_frame::header_values(frame, "Service-Route").is_empty();
@@ -180,11 +177,10 @@ impl ImsServiceVerdict {
             .any(uri_is_telephone_identity);
 
         if has_telephone_identity && has_service_route {
-            // The registrar's answer is the limit of what this proves: a
-            // voice-capable binding exists. Whether a terminating INVITE
-            // actually arrives is decided later, by the TAS and by whichever
-            // binding it picks, so the code says "registrar accepted" rather
-            // than claiming the service works end to end.
+            // The registrar's answer is the limit of what this proves: it
+            // returned call-related identity/routing artifacts. Whether a
+            // terminating INVITE arrives is decided later by the TAS and by
+            // whichever current Contact binding it picks.
             return Self {
                 voice: ImsServiceState::RegistrarAccepted,
                 code: "ims_voice_registrar_accepted",
@@ -194,9 +190,10 @@ impl ImsServiceVerdict {
             };
         }
         if has_telephone_identity {
-            // A telephone identity with no Service-Route cannot originate
-            // through the S-CSCF, so treat it as not yet usable rather than
-            // available.
+            // A missing Service-Route means the registrar did not publish an
+            // originating route set. Some deployments still use a configured
+            // outbound proxy, so keep the result unknown rather than denying
+            // calls or claiming availability.
             return Self {
                 voice: ImsServiceState::Unknown,
                 code: "ims_voice_service_route_missing",
@@ -355,9 +352,7 @@ fn uri_is_telephone_identity(value: &str) -> bool {
             && lower.split(';').skip(1).any(|parameter| {
                 parameter
                     .split_once('=')
-                    .is_some_and(|(name, value)| {
-                        name.trim() == "user" && value.trim() == "phone"
-                    })
+                    .is_some_and(|(name, value)| name.trim() == "user" && value.trim() == "phone")
             })
 }
 
@@ -661,14 +656,15 @@ mod tests {
     }
 
     #[test]
-    fn register_success_without_telephone_identity_has_no_call_address() {
-        // Registered, but only a SIP-URI identity: messaging works, terminating
-        // calls have no E.164 address to reach. Reported, not guessed at.
+    fn register_success_without_telephone_identity_remains_observational() {
+        // A regular SIP IMPU may still be voice-capable on some operators. Keep
+        // the legacy diagnostic state, but it must continue permitting calls.
         let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <sip:460001234567890@ims.example>\r\nService-Route: <sip:orig@scscf.example:5060;lr>\r\n\r\n";
         let verdict = ImsServiceVerdict::from_register_success(response);
 
         assert_eq!(verdict.voice, ImsServiceState::WithoutTelephoneIdentity);
         assert_eq!(verdict.code, "ims_voice_no_telephone_identity");
+        assert!(verdict.voice.permits_calls());
     }
 
     #[test]
@@ -706,7 +702,8 @@ mod tests {
     fn own_numbers_keep_registrar_order_and_survive_folded_headers() {
         // A registrar may fold several URIs onto one line or split them across
         // header lines; both must yield the same list, default identity first.
-        let folded = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>, <tel:+60199999999>\r\n\r\n";
+        let folded =
+            b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>, <tel:+60199999999>\r\n\r\n";
         let split = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60174231067>\r\nP-Associated-URI: <tel:+60199999999>\r\n\r\n";
         let expected = vec!["+60174231067".to_string(), "+60199999999".to_string()];
         assert_eq!(telephone_numbers_from_register_success(folded), expected);
@@ -716,7 +713,8 @@ mod tests {
     #[test]
     fn tel_uri_visual_separators_and_parameters_are_normalised_away() {
         // RFC 3966 §3 permits visual separators, and phone-context is common.
-        let response = b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60-17-423.1067;phone-context=+60>\r\n\r\n";
+        let response =
+            b"SIP/2.0 200 OK\r\nP-Associated-URI: <tel:+60-17-423.1067;phone-context=+60>\r\n\r\n";
         assert_eq!(
             telephone_numbers_from_register_success(response),
             vec!["+60174231067".to_string()]
@@ -767,8 +765,7 @@ mod tests {
     fn register_403_is_an_observed_voice_denial() {
         // With the local switches gone, a carrier that does not provision MMTEL
         // must be recognised from its own answer.
-        let verdict =
-            ImsServiceVerdict::from_register_failure(b"SIP/2.0 403 Forbidden\r\n\r\n");
+        let verdict = ImsServiceVerdict::from_register_failure(b"SIP/2.0 403 Forbidden\r\n\r\n");
 
         assert_eq!(verdict.voice, ImsServiceState::Denied);
         assert_eq!(verdict.code, "ims_voice_forbidden");

@@ -12,6 +12,7 @@
 //! unit rather than independent legs. A future CS/baseband leg or ViLTE video
 //! leg reusing VoLTE belongs here too.
 
+pub mod access_network;
 pub mod effective_profile;
 pub mod profile_override;
 pub mod volte;

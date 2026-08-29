@@ -16,13 +16,19 @@ use tokio::{
     net::{TcpStream, UdpSocket},
 };
 
-use crate::connectivity::core::{access::ImsChannel, context::ImsRoute, sip_frame, ImsError};
+use crate::connectivity::core::{
+    access::{ImsChannel, ImsRequeue},
+    context::ImsRoute,
+    sip_frame, ImsError,
+};
 
 const MAX_PENDING_BYTES: usize = 64 * 1024;
 
 pub struct EpdgSipChannel {
     stream: TcpStream,
     pending: Vec<u8>,
+    /// Complete frames set aside by a REGISTER transaction (other dialogs).
+    requeued: ImsRequeue,
     route: ImsRoute,
     security_verify: Option<String>,
 }
@@ -37,13 +43,14 @@ impl EpdgSipChannel {
         Self {
             stream,
             pending,
+            requeued: ImsRequeue::default(),
             route,
             security_verify,
         }
     }
 
     pub fn into_parts(self) -> (TcpStream, Vec<u8>) {
-        (self.stream, self.pending)
+        (self.stream, merge_requeued(self.pending, self.requeued))
     }
 
     pub async fn send_keepalive(&mut self) -> Result<(), ImsError> {
@@ -57,29 +64,7 @@ impl EpdgSipChannel {
             .map_err(|_| ImsError::new("ims_channel_keepalive_flush_failed"))
     }
 
-    fn discard_keepalive_frames(&mut self) {
-        while self.pending.starts_with(b"\r\n") {
-            self.pending.drain(..2);
-        }
-        while self.pending.starts_with(b"\n") {
-            self.pending.drain(..1);
-        }
-    }
-}
-
-impl ImsChannel for EpdgSipChannel {
-    async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
-        self.stream
-            .write_all(frame)
-            .await
-            .map_err(|_| ImsError::new("ims_channel_write_failed"))?;
-        self.stream
-            .flush()
-            .await
-            .map_err(|_| ImsError::new("ims_channel_flush_failed"))
-    }
-
-    async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         self.discard_keepalive_frames();
         if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
             return Ok(self.pending.drain(..frame_len).collect());
@@ -110,6 +95,43 @@ impl ImsChannel for EpdgSipChannel {
         .map_err(|_| ImsError::new("ims_channel_read_timeout"))?
     }
 
+    fn discard_keepalive_frames(&mut self) {
+        while self.pending.starts_with(b"\r\n") {
+            self.pending.drain(..2);
+        }
+        while self.pending.starts_with(b"\n") {
+            self.pending.drain(..1);
+        }
+    }
+}
+
+impl ImsChannel for EpdgSipChannel {
+    async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        self.stream
+            .write_all(frame)
+            .await
+            .map_err(|_| ImsError::new("ims_channel_write_failed"))?;
+        self.stream
+            .flush()
+            .await
+            .map_err(|_| ImsError::new("ims_channel_flush_failed"))
+    }
+
+    async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        if let Some(frame) = self.requeued.pop_front() {
+            return Ok(frame);
+        }
+        self.recv_fresh(timeout).await
+    }
+
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.recv_fresh(timeout).await
+    }
+
+    fn requeue(&mut self, frame: Vec<u8>) {
+        retain_requeued_frame(&mut self.requeued, frame, "TCP");
+    }
+
     fn route(&self) -> ImsRoute {
         self.route
     }
@@ -126,6 +148,8 @@ pub struct UdpSipChannel {
     socket: UdpSocket,
     receive_socket: Option<UdpSocket>,
     pending: Vec<u8>,
+    /// Complete frames set aside by a REGISTER transaction (other dialogs).
+    requeued: ImsRequeue,
     route: ImsRoute,
     security_verify: Option<String>,
 }
@@ -141,6 +165,7 @@ impl UdpSipChannel {
             socket,
             receive_socket: None,
             pending,
+            requeued: ImsRequeue::default(),
             route,
             security_verify,
         }
@@ -164,13 +189,18 @@ impl UdpSipChannel {
             socket,
             receive_socket: Some(receive_socket),
             pending,
+            requeued: ImsRequeue::default(),
             route,
             security_verify,
         }
     }
 
     pub fn into_parts(self) -> (UdpSocket, Option<UdpSocket>, Vec<u8>) {
-        (self.socket, self.receive_socket, self.pending)
+        (
+            self.socket,
+            self.receive_socket,
+            merge_requeued(self.pending, self.requeued),
+        )
     }
 
     pub async fn send_keepalive(&mut self) -> Result<(), ImsError> {
@@ -213,27 +243,8 @@ impl UdpSipChannel {
             Ok(buf.len())
         }
     }
-}
 
-impl ImsChannel for UdpSipChannel {
-    async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
-        // TS 33.203 protected UDP uses two flows. UE-originated requests use
-        // port_uc -> port_ps, while responses to network-originated requests
-        // must use port_us -> port_pc. The latter is the dedicated receive
-        // socket kept after REGISTER succeeds.
-        let socket = if frame.starts_with(b"SIP/2.0") {
-            self.receive_socket.as_ref().unwrap_or(&self.socket)
-        } else {
-            &self.socket
-        };
-        socket
-            .send(frame)
-            .await
-            .map(|_| ())
-            .map_err(|_| ImsError::new("ims_channel_write_failed"))
-    }
-
-    async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         self.discard_keepalive_frames();
         if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
             return Ok(self.pending.drain(..frame_len).collect());
@@ -261,6 +272,40 @@ impl ImsChannel for UdpSipChannel {
         })
         .await
         .map_err(|_| ImsError::new("ims_channel_read_timeout"))?
+    }
+}
+
+impl ImsChannel for UdpSipChannel {
+    fn requeue(&mut self, frame: Vec<u8>) {
+        retain_requeued_frame(&mut self.requeued, frame, "UDP");
+    }
+
+    async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        // TS 33.203 protected UDP uses two flows. UE-originated requests use
+        // port_uc -> port_ps, while responses to network-originated requests
+        // must use port_us -> port_pc. The latter is the dedicated receive
+        // socket kept after REGISTER succeeds.
+        let socket = if frame.starts_with(b"SIP/2.0") {
+            self.receive_socket.as_ref().unwrap_or(&self.socket)
+        } else {
+            &self.socket
+        };
+        socket
+            .send(frame)
+            .await
+            .map(|_| ())
+            .map_err(|_| ImsError::new("ims_channel_write_failed"))
+    }
+
+    async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        if let Some(frame) = self.requeued.pop_front() {
+            return Ok(frame);
+        }
+        self.recv_fresh(timeout).await
+    }
+
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.recv_fresh(timeout).await
     }
 
     fn route(&self) -> ImsRoute {
@@ -465,6 +510,20 @@ impl ImsChannel for SipChannel {
         }
     }
 
+    async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        match self {
+            Self::Tcp(channel) => channel.recv_sip_fresh(timeout).await,
+            Self::Udp(channel) => channel.recv_sip_fresh(timeout).await,
+        }
+    }
+
+    fn requeue(&mut self, frame: Vec<u8>) {
+        match self {
+            Self::Tcp(channel) => channel.requeue(frame),
+            Self::Udp(channel) => channel.requeue(frame),
+        }
+    }
+
     fn route(&self) -> ImsRoute {
         match self {
             Self::Tcp(channel) => channel.route(),
@@ -477,6 +536,29 @@ impl ImsChannel for SipChannel {
             Self::Tcp(channel) => channel.security_verify(),
             Self::Udp(channel) => channel.security_verify(),
         }
+    }
+}
+
+/// Merge complete frames that a REGISTER transaction set aside into the
+/// transport's byte buffer so `into_parts` never loses them. Requeued frames
+/// are prepended in arrival order ahead of any partial transport bytes.
+fn merge_requeued(mut pending: Vec<u8>, requeued: ImsRequeue) -> Vec<u8> {
+    for frame in requeued.into_frames().into_iter().rev() {
+        pending.splice(..0, frame);
+    }
+    pending
+}
+
+fn retain_requeued_frame(requeued: &mut ImsRequeue, frame: Vec<u8>, transport: &'static str) {
+    let frame_bytes = frame.len();
+    if !requeued.push_back(frame) {
+        tracing::warn!(
+            transport,
+            frame_bytes,
+            queued_frames = requeued.len(),
+            queued_bytes = requeued.bytes(),
+            "VoWiFi SIP requeue full; dropping newest frame"
+        );
     }
 }
 
@@ -508,6 +590,15 @@ mod tests {
     use super::*;
     use crate::connectivity::core::context::SipTransport;
     use std::net::SocketAddr;
+    use tokio::net::TcpListener;
+
+    const REQUEUED_FIRST: &[u8] =
+        b"NOTIFY sip:user@ims.example SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+    const REQUEUED_SECOND: &[u8] =
+        b"MESSAGE sip:user@ims.example SIP/2.0\r\nContent-Length: 0\r\n\r\n";
+    const PARTIAL_PREFIX: &[u8] =
+        b"INVITE sip:user@ims.example SIP/2.0\r\nContent-Length: 4\r\n\r\nbo";
+    const PARTIAL_SUFFIX: &[u8] = b"dy";
 
     async fn udp_pair() -> (UdpSocket, UdpSocket, SocketAddr) {
         let peer = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
@@ -523,6 +614,117 @@ mod tests {
             pcscf_addr: remote,
             transport: SipTransport::Udp,
         }
+    }
+
+    fn expected_merged_pending() -> Vec<u8> {
+        [REQUEUED_FIRST, REQUEUED_SECOND, PARTIAL_PREFIX].concat()
+    }
+
+    #[tokio::test]
+    async fn tcp_into_parts_preserves_requeue_fifo_and_partial_frame() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(listener_addr);
+        let (accepted, client) = tokio::join!(listener.accept(), connect);
+        let (mut peer, _) = accepted.unwrap();
+        let client = client.unwrap();
+        let route = ImsRoute {
+            local_addr: client.local_addr().unwrap(),
+            pcscf_addr: listener_addr,
+            transport: SipTransport::Tcp,
+        };
+        let mut channel = EpdgSipChannel::new(client, PARTIAL_PREFIX.to_vec(), route, None);
+        channel.requeue(REQUEUED_FIRST.to_vec());
+        channel.requeue(REQUEUED_SECOND.to_vec());
+
+        let (stream, pending) = channel.into_parts();
+        assert_eq!(pending, expected_merged_pending());
+        let mut channel = EpdgSipChannel::new(stream, pending, route, None);
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_FIRST
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_SECOND
+        );
+        peer.write_all(PARTIAL_SUFFIX).await.unwrap();
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            [PARTIAL_PREFIX, PARTIAL_SUFFIX].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn udp_into_parts_preserves_requeue_fifo_and_partial_frame() {
+        let (peer, local, peer_addr) = udp_pair().await;
+        let local_addr = local.local_addr().unwrap();
+        let route = udp_route(local_addr, peer_addr);
+        let mut channel = UdpSipChannel::new(local, PARTIAL_PREFIX.to_vec(), route, None);
+        channel.requeue(REQUEUED_FIRST.to_vec());
+        channel.requeue(REQUEUED_SECOND.to_vec());
+
+        let (socket, receive, pending) = channel.into_parts();
+        assert!(receive.is_none());
+        assert_eq!(pending, expected_merged_pending());
+        let mut channel = UdpSipChannel::new(socket, pending, route, None);
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_FIRST
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_SECOND
+        );
+        peer.send_to(PARTIAL_SUFFIX, local_addr).await.unwrap();
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            [PARTIAL_PREFIX, PARTIAL_SUFFIX].concat()
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_udp_into_parts_preserves_requeue_fifo_and_partial_frame() {
+        let (_send_peer, send, send_peer_addr) = udp_pair().await;
+        let (receive_peer, receive, _) = udp_pair().await;
+        let send_local_addr = send.local_addr().unwrap();
+        let receive_local_addr = receive.local_addr().unwrap();
+        let route = udp_route(send_local_addr, send_peer_addr);
+        let mut channel = UdpSipChannel::new_with_receive_socket(
+            send,
+            receive,
+            PARTIAL_PREFIX.to_vec(),
+            route,
+            Some("ipsec-3gpp".to_string()),
+        );
+        channel.requeue(REQUEUED_FIRST.to_vec());
+        channel.requeue(REQUEUED_SECOND.to_vec());
+
+        let (send, receive, pending) = channel.into_parts();
+        assert_eq!(pending, expected_merged_pending());
+        let mut channel = UdpSipChannel::new_with_receive_socket(
+            send,
+            receive.expect("protected receive socket"),
+            pending,
+            route,
+            Some("ipsec-3gpp".to_string()),
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_FIRST
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_SECOND
+        );
+        receive_peer
+            .send_to(PARTIAL_SUFFIX, receive_local_addr)
+            .await
+            .unwrap();
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            [PARTIAL_PREFIX, PARTIAL_SUFFIX].concat()
+        );
     }
 
     #[tokio::test]

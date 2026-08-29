@@ -19,7 +19,9 @@ use std::sync::{
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
-use crate::connectivity::core::ims_failure::ImsServiceState;
+use crate::{
+    connectivity::core::ims_failure::ImsServiceState, platform::config::VolteProfileCandidate,
+};
 
 /// Connection sub-stage. String values MUST match `volteStatus.js` `b()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,6 +85,7 @@ impl VolteStage {
 /// (Bearer family fallback and REGISTER) without allowing a busy line to grow
 /// the in-memory status response indefinitely.
 const MAX_CONNECTION_ATTEMPTS: usize = 100;
+const MAX_PROFILE_ATTEMPT_RESULTS: usize = 12;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct VolteConnectionAttempt {
@@ -109,6 +112,28 @@ pub struct VolteConnectionAttempt {
     pub interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pcscf: Option<String>,
+    pub at: String,
+}
+
+/// Outcome of one logical carrier-profile slot in the per-line VoLTE batch.
+/// Requested and effective identities are kept separate because an unavailable
+/// database/catalog slot intentionally resolves to the standards-derived
+/// fallback without changing the configured order.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct VolteProfileAttemptResult {
+    pub index: u32,
+    pub requested_source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     pub at: String,
 }
 
@@ -245,6 +270,10 @@ pub struct VolteSnapshot {
     pub profile_id: Option<String>,
     pub profile_source: Option<String>,
     pub profile_fallback_reason: Option<String>,
+    pub profile_candidate_index: Option<u32>,
+    pub profile_candidate_source: Option<String>,
+    pub profile_candidate_profile_id: Option<String>,
+    pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
     pub usim_aid: Option<String>,
     pub isim_aid: Option<String>,
     pub connection_attempts: Vec<VolteConnectionAttempt>,
@@ -296,6 +325,10 @@ impl Default for VolteSnapshot {
             profile_id: None,
             profile_source: None,
             profile_fallback_reason: None,
+            profile_candidate_index: None,
+            profile_candidate_source: None,
+            profile_candidate_profile_id: None,
+            profile_attempt_results: Vec::new(),
             usim_aid: None,
             isim_aid: None,
             connection_attempts: Vec::new(),
@@ -397,10 +430,10 @@ pub struct VolteRuntimeStatus {
     /// entry here is the only observable source of the line's own number.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub associated_uris: Vec<String>,
-    /// MMTEL voice entitlement as reported by the network: `available`,
-    /// `without_telephone_identity`, `denied` or `unknown`. Replaces the removed
-    /// local voice switches — a client that wants to know whether calls will
-    /// work reads this, not a configuration flag.
+    /// Call-related registration observation: `registrar_accepted`,
+    /// `without_telephone_identity`, `denied` or `unknown`. Only `denied` is an
+    /// explicit network refusal; the other states do not prove whether the TAS
+    /// will deliver a terminating call to this binding.
     pub voice_service: String,
     pub voice_service_code: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,6 +446,13 @@ pub struct VolteRuntimeStatus {
     pub profile_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_fallback_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_candidate_index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_candidate_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_candidate_profile_id: Option<String>,
+    pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usim_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -466,6 +506,10 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             profile_id: s.profile_id.clone(),
             profile_source: s.profile_source.clone(),
             profile_fallback_reason: s.profile_fallback_reason.clone(),
+            profile_candidate_index: s.profile_candidate_index,
+            profile_candidate_source: s.profile_candidate_source.clone(),
+            profile_candidate_profile_id: s.profile_candidate_profile_id.clone(),
+            profile_attempt_results: s.profile_attempt_results.clone(),
             usim_aid: s.usim_aid.clone(),
             isim_aid: s.isim_aid.clone(),
             connection_attempts: s.connection_attempts.clone(),
@@ -573,6 +617,109 @@ impl VolteRuntime {
         .await;
     }
 
+    /// Start a fresh outer profile-selection batch. Candidate history is
+    /// intentionally scoped to one batch so a manual retry or policy change
+    /// never mixes results from the previous ordering with the new one.
+    pub async fn begin_profile_attempt_batch(&self) {
+        self.update(|snapshot| {
+            snapshot.profile_candidate_index = None;
+            snapshot.profile_candidate_source = None;
+            snapshot.profile_candidate_profile_id = None;
+            snapshot.profile_attempt_results.clear();
+        })
+        .await;
+    }
+
+    /// Clear every session-scoped value before advancing to another configured
+    /// profile slot, without invalidating the outer recovery batch generation.
+    ///
+    /// The live layer releases the bearer, P-CSCF reporting lease, modem profile
+    /// lease and temporary security association first; this projection reset is
+    /// the matching guard against exposing a previous slot's REGISTER dialog,
+    /// endpoint or public identity while the next slot is starting. Batch
+    /// counters and completed slot results deliberately survive.
+    pub async fn prepare_profile_switch(&self) {
+        self.update(|snapshot| {
+            snapshot.phase = VoltePhase::Starting;
+            snapshot.stage = VolteStage::Starting;
+            snapshot.registration_mode = RegistrationMode::None;
+            snapshot.pcscf = None;
+            snapshot.session_started_at = None;
+            snapshot.registered_at = None;
+            snapshot.last_register_refresh_at = None;
+            snapshot.last_rx_at = None;
+            snapshot.last_tx_at = None;
+            snapshot.data_path_mode = None;
+            snapshot.secondary_qmi_device = None;
+            snapshot.secondary_qmi_channel = None;
+            snapshot.bearer_interface = None;
+            snapshot.bearer_ip_type = None;
+            snapshot.bearer_path = None;
+            snapshot.at_cid = None;
+            snapshot.current_ip_family = None;
+            snapshot.identity_source = None;
+            snapshot.public_uri = None;
+            snapshot.associated_uris.clear();
+            snapshot.voice_service = ImsServiceState::Unknown.as_str();
+            snapshot.voice_service_code = "ims_voice_service_unknown";
+            snapshot.voice_service_reason = None;
+            snapshot.voice_alternative_service = None;
+            snapshot.profile_id = None;
+            snapshot.profile_source = None;
+            snapshot.profile_fallback_reason = None;
+            snapshot.usim_aid = None;
+            snapshot.isim_aid = None;
+        })
+        .await;
+    }
+
+    /// Start one configured profile slot. The current effective profile is
+    /// cleared so an identity-stage failure cannot accidentally report values
+    /// inherited from the previous slot.
+    pub async fn begin_profile_attempt(&self, index: u32, candidate: &VolteProfileCandidate) {
+        self.update(|snapshot| {
+            snapshot.profile_candidate_index = Some(index);
+            snapshot.profile_candidate_source = Some(candidate.source.as_str().to_string());
+            snapshot.profile_candidate_profile_id = candidate.profile_id.clone();
+            snapshot.profile_id = None;
+            snapshot.profile_source = None;
+            snapshot.profile_fallback_reason = None;
+        })
+        .await;
+    }
+
+    /// Finish the current logical profile slot with source-bound diagnostics.
+    /// Only identifiers and error codes are retained; IMSI, AKA nonce and SIP
+    /// Authorization values never enter the runtime status.
+    pub async fn finish_profile_attempt(
+        &self,
+        index: u32,
+        candidate: &VolteProfileCandidate,
+        outcome: &str,
+        error: Option<&crate::connectivity::modems::ims::volte::errors::VolteError>,
+    ) {
+        self.update(|snapshot| {
+            snapshot
+                .profile_attempt_results
+                .push(VolteProfileAttemptResult {
+                    index,
+                    requested_source: candidate.source.as_str().to_string(),
+                    requested_profile_id: candidate.profile_id.clone(),
+                    effective_source: snapshot.profile_source.clone(),
+                    effective_profile_id: snapshot.profile_id.clone(),
+                    fallback_reason: snapshot.profile_fallback_reason.clone(),
+                    outcome: outcome.to_string(),
+                    error_code: error.map(|error| error.code().to_string()),
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
+            if snapshot.profile_attempt_results.len() > MAX_PROFILE_ATTEMPT_RESULTS {
+                let excess = snapshot.profile_attempt_results.len() - MAX_PROFILE_ATTEMPT_RESULTS;
+                snapshot.profile_attempt_results.drain(..excess);
+            }
+        })
+        .await;
+    }
+
     /// Acquire the advance serialization lock. Drivers hold this for the
     /// duration of a stage-progression pass so two passes don't interleave.
     pub async fn advance_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -669,6 +816,210 @@ mod tests {
         assert_eq!(status.recovery_state, "idle");
         assert_eq!(status.retry_max, 3);
         assert_eq!(status.modem_restart_max, 3);
+    }
+
+    #[tokio::test]
+    async fn profile_attempt_records_requested_and_effective_identity() {
+        let rt = VolteRuntime::new();
+        let candidate = VolteProfileCandidate {
+            source: crate::platform::config::VolteProfileSource::Database,
+            profile_id: Some("user-profile-a".to_string()),
+        };
+
+        rt.begin_profile_attempt(2, &candidate).await;
+        let started = rt.status().await;
+        assert_eq!(started.profile_candidate_index, Some(2));
+        assert_eq!(
+            started.profile_candidate_source.as_deref(),
+            Some("database")
+        );
+        assert_eq!(
+            started.profile_candidate_profile_id.as_deref(),
+            Some("user-profile-a")
+        );
+        assert!(started.profile_id.is_none());
+        assert!(started.profile_attempt_results.is_empty());
+
+        rt.update(|snapshot| {
+            snapshot.profile_source = Some("derived".to_string());
+            snapshot.profile_id = Some("derived-00101".to_string());
+            snapshot.profile_fallback_reason = Some("database_profile_not_found".to_string());
+        })
+        .await;
+        let error = crate::connectivity::modems::ims::volte::errors::VolteError::with_detail(
+            crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
+            "fixture",
+        );
+        rt.finish_profile_attempt(2, &candidate, "failed", Some(&error))
+            .await;
+
+        let result = rt
+            .status()
+            .await
+            .profile_attempt_results
+            .into_iter()
+            .next()
+            .expect("profile attempt result");
+        assert_eq!(result.index, 2);
+        assert_eq!(result.requested_source, "database");
+        assert_eq!(
+            result.requested_profile_id.as_deref(),
+            Some("user-profile-a")
+        );
+        assert_eq!(result.effective_source.as_deref(), Some("derived"));
+        assert_eq!(
+            result.effective_profile_id.as_deref(),
+            Some("derived-00101")
+        );
+        assert_eq!(
+            result.fallback_reason.as_deref(),
+            Some("database_profile_not_found")
+        );
+        assert_eq!(result.outcome, "failed");
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some(crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING)
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_attempt_batch_clears_history_and_history_is_bounded() {
+        let rt = VolteRuntime::new();
+        let candidate =
+            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Derived);
+
+        for index in 1..=(MAX_PROFILE_ATTEMPT_RESULTS as u32 + 3) {
+            rt.begin_profile_attempt(index, &candidate).await;
+            rt.finish_profile_attempt(index, &candidate, "failed", None)
+                .await;
+        }
+        let status = rt.status().await;
+        assert_eq!(
+            status.profile_attempt_results.len(),
+            MAX_PROFILE_ATTEMPT_RESULTS
+        );
+        assert_eq!(status.profile_attempt_results[0].index, 4);
+
+        rt.begin_profile_attempt_batch().await;
+        let cleared = rt.status().await;
+        assert!(cleared.profile_candidate_index.is_none());
+        assert!(cleared.profile_candidate_source.is_none());
+        assert!(cleared.profile_candidate_profile_id.is_none());
+        assert!(cleared.profile_attempt_results.is_empty());
+
+        rt.begin_profile_attempt(1, &candidate).await;
+        let restarted = rt.status().await;
+        assert_eq!(restarted.profile_candidate_index, Some(1));
+        assert_eq!(restarted.profile_attempt_results.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn profile_switch_clears_session_ownership_without_cancelling_the_batch() {
+        let rt = VolteRuntime::new();
+        let candidate =
+            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Database);
+        rt.begin_profile_attempt(1, &candidate).await;
+        rt.update(|snapshot| {
+            snapshot.phase = VoltePhase::Registered;
+            snapshot.stage = VolteStage::Registered;
+            snapshot.registration_mode = RegistrationMode::Ipsec;
+            snapshot.pcscf = Some("192.0.2.10:5060".to_string());
+            snapshot.session_started_at = Some("started".to_string());
+            snapshot.registered_at = Some("registered".to_string());
+            snapshot.last_register_refresh_at = Some("refresh".to_string());
+            snapshot.last_rx_at = Some("rx".to_string());
+            snapshot.last_tx_at = Some("tx".to_string());
+            snapshot.data_path_mode = Some("native".to_string());
+            snapshot.secondary_qmi_device = Some("/dev/cdc-wdm9".to_string());
+            snapshot.secondary_qmi_channel = Some("DATA6_CNTL".to_string());
+            snapshot.bearer_interface = Some("rmnet_ims0".to_string());
+            snapshot.bearer_ip_type = Some("ipv6".to_string());
+            snapshot.bearer_path = Some("/bearer/ims".to_string());
+            snapshot.at_cid = Some(5);
+            snapshot.current_ip_family = Some("ipv6".to_string());
+            snapshot.identity_source = Some("isim".to_string());
+            snapshot.public_uri = Some("sip:old@ims.example".to_string());
+            snapshot.associated_uris = vec!["sip:old@ims.example".to_string()];
+            snapshot.voice_service = ImsServiceState::RegistrarAccepted.as_str();
+            snapshot.voice_service_code = "ims_voice_service_available";
+            snapshot.voice_service_reason = Some("old".to_string());
+            snapshot.voice_alternative_service = Some("iwlan".to_string());
+            snapshot.profile_id = Some("old-profile".to_string());
+            snapshot.profile_source = Some("database".to_string());
+            snapshot.profile_fallback_reason = Some("old-fallback".to_string());
+            snapshot.usim_aid = Some("old-usim".to_string());
+            snapshot.isim_aid = Some("old-isim".to_string());
+            snapshot.retry_attempt = 1;
+            snapshot.retry_max = 3;
+            snapshot.reconnect_count = 9;
+        })
+        .await;
+        rt.finish_profile_attempt(1, &candidate, "failed", None)
+            .await;
+        let generation = rt.generation();
+
+        rt.prepare_profile_switch().await;
+
+        assert_eq!(
+            rt.generation(),
+            generation,
+            "slot changes stay in one batch"
+        );
+        let status = rt.status().await;
+        assert_eq!(status.phase, "starting");
+        assert_eq!(status.stage, "starting");
+        assert_eq!(status.registration_mode, "");
+        assert!(status.pcscf.is_none());
+        assert!(status.session_started_at.is_none());
+        assert!(status.registered_at.is_none());
+        assert!(status.last_register_refresh_at.is_none());
+        assert!(status.last_rx_at.is_none());
+        assert!(status.last_tx_at.is_none());
+        assert!(status.data_path_mode.is_none());
+        assert!(status.secondary_qmi_device.is_none());
+        assert!(status.secondary_qmi_channel.is_none());
+        assert!(status.bearer_interface.is_none());
+        assert!(status.bearer_ip_type.is_none());
+        assert!(status.current_ip_family.is_none());
+        assert!(status.identity_source.is_none());
+        assert!(status.public_uri.is_none());
+        assert!(status.associated_uris.is_empty());
+        assert_eq!(status.voice_service, "unknown");
+        assert!(status.voice_service_reason.is_none());
+        assert!(status.voice_alternative_service.is_none());
+        assert!(status.profile_id.is_none());
+        assert!(status.profile_source.is_none());
+        assert!(status.profile_fallback_reason.is_none());
+        assert!(status.usim_aid.is_none());
+        assert!(status.isim_aid.is_none());
+        assert_eq!(status.retry_attempt, 1);
+        assert_eq!(status.retry_max, 3);
+        assert_eq!(status.reconnect_count, 9);
+        assert_eq!(status.profile_attempt_results.len(), 1);
+        let snapshot = rt.snapshot().await;
+        assert!(snapshot.bearer_path.is_none());
+        assert!(snapshot.at_cid.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_manual_retry_batch_restarts_at_slot_one() {
+        let rt = VolteRuntime::new();
+        let candidate =
+            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Derived);
+        rt.begin_profile_attempt(3, &candidate).await;
+        rt.finish_profile_attempt(3, &candidate, "failed", None)
+            .await;
+        rt.update(|snapshot| snapshot.retry_attempt = 3).await;
+
+        rt.begin_profile_attempt_batch().await;
+        rt.update(|snapshot| snapshot.retry_attempt = 0).await;
+        rt.begin_profile_attempt(1, &candidate).await;
+        rt.update(|snapshot| snapshot.retry_attempt = 1).await;
+
+        let status = rt.status().await;
+        assert_eq!(status.retry_attempt, 1);
+        assert_eq!(status.profile_candidate_index, Some(1));
+        assert!(status.profile_attempt_results.is_empty());
     }
 
     #[tokio::test]

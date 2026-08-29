@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -912,6 +912,7 @@ mod tests {
 
     #[test]
     fn audit_covers_all_profiles_without_live_permissions() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
         let report = build_readiness_audit_report(&NoopRuntimeExecutor.describe());
 
         assert_eq!(report.stage, "m10_multi_carrier_stability");
@@ -926,10 +927,12 @@ mod tests {
             .long_run_gates
             .iter()
             .any(|gate| gate.gate_id == "all_profiles_dry_run_runtime" && gate.status == "pass"));
-        assert!(report
-            .live_stage_readiness
-            .iter()
-            .any(|stage| { stage.stage_id == "identity_readonly" && stage.status == "ready" }));
+        assert!(
+            report
+                .live_stage_readiness
+                .iter()
+                .any(|stage| { stage.stage_id == "identity_readonly" && stage.status == "ready" })
+        );
         assert!(report.live_stage_readiness.iter().any(|stage| {
             stage.stage_id == "sms_over_ims"
                 && stage

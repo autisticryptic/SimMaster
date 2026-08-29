@@ -17,6 +17,10 @@ use tokio::{process::Command, sync::Mutex};
 use crate::{
     connectivity::core::{
         access::ImsChannel,
+        access_network::{
+            AccessIdentityPolicy, ImsAccessNetworkContext, ImsAccessNetworkRuntime,
+            resolve_access_identity,
+        },
         context::{ImsRoute, SipTransport},
         ims_failure::{ImsFailureDiagnostic, ImsServiceState, ImsServiceVerdict},
         ims_video::{negotiate_video, parse_video_sdp, VideoMediaDescription},
@@ -42,12 +46,13 @@ use crate::{
         ImsError,
     },
     connectivity::modems::ims::vowifi::{
-        carrier_catalog::CatalogAccessKind,
         profile_store::{ProfileOrigin, ProfileStore},
         profiles::CarrierProfile,
     },
     hardware::cellular::modem_manager::ModemBinding,
-    platform::config::{TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily},
+    platform::config::{
+        TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily, VolteProfileCandidate,
+    },
     platform::db::{Database, SmsMessage},
     services::trunk::{
         bridge::{
@@ -455,6 +460,10 @@ struct VolteLiveSession {
     /// Runtime `P-Visited-Network-ID` derived from the currently registered
     /// PLMN. The home carrier profile remains unchanged while roaming.
     visited_network_header: Option<String>,
+    /// Serving-cell snapshot captured once for the REGISTER lifecycle. It is
+    /// reused for authentication, refresh and unregister so one binding never
+    /// changes identity halfway through an exchange.
+    access_network: Option<ImsAccessNetworkContext>,
     /// Operator-side RTP factory fixed when this session is created. It is
     /// intentionally immutable for the lifetime of a dialog so an access
     /// switch cannot move an established call to another UE.
@@ -905,6 +914,10 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             .supported_header
             .split(',')
             .any(|token| token.trim().eq_ignore_ascii_case("sec-agree"));
+    // PANI follows the profile's per-phase decision; an explicit omit (both
+    // booleans false) suppresses the header even when MMTEL is advertised.
+    let profile_includes_pani = profile.ims.register.include_pani_initial
+        || profile.ims.register.include_pani_authenticated;
     let primary = VolteRegisterVariant {
         label: profile.ims.register.live_header_variant_set,
         authorization,
@@ -916,8 +929,8 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             include_video_feature: false,
             include_route_header: profile.ims.register.include_route_header,
             include_visited_network: profile.ims.register.include_visited_network,
-            include_access_network_info: true,
-            include_sip_instance: true,
+            include_access_network_info: profile_includes_pani,
+            include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
         server_required_sec_agree: required,
         security_client_offer: VolteSecurityClientOffer::Full,
@@ -934,12 +947,12 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             advertise_sec_agree: false,
             require_sec_agree: false,
             proxy_require_sec_agree: false,
-            include_mmtel_features: true,
+            include_mmtel_features: profile.ims.register.include_mmtel_features,
             include_video_feature: false,
-            include_route_header: true,
+            include_route_header: profile.ims.register.include_route_header,
             include_visited_network: profile.ims.register.include_visited_network,
-            include_access_network_info: true,
-            include_sip_instance: true,
+            include_access_network_info: profile_includes_pani,
+            include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
         server_required_sec_agree: false,
         security_client_offer: VolteSecurityClientOffer::Full,
@@ -956,9 +969,15 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     // These are deliberately linear, not a Cartesian product. They only run
     // after an authentication-free format rejection/timeout, within the
     // session-wide candidate budget, and never alter the selected PLMN.
-    variants.push(fallback.without_access_network_info());
-    variants.push(fallback.without_route_header());
-    variants.push(fallback.without_sip_instance());
+    if fallback.policy.include_access_network_info {
+        variants.push(fallback.without_access_network_info());
+    }
+    if fallback.policy.include_route_header {
+        variants.push(fallback.without_route_header());
+    }
+    if fallback.policy.include_sip_instance {
+        variants.push(fallback.without_sip_instance());
+    }
     variants
 }
 
@@ -1008,6 +1027,7 @@ struct VolteRegisterAuthenticator {
     profile: &'static CarrierProfile,
     effective_ims: EffectiveImsProfile,
     visited_network_header: Option<String>,
+    access_network: Option<ImsAccessNetworkContext>,
     expires_seconds: u32,
     /// CSeq of the most recent REGISTER actually emitted by this exchange.
     /// Min-Expires retries and AKA challenges all advance the sequence, so the
@@ -1042,10 +1062,12 @@ impl VolteRegisterAuthenticator {
         profile: &'static CarrierProfile,
         effective_ims: EffectiveImsProfile,
         visited_network_header: Option<String>,
+        access_network: Option<ImsAccessNetworkContext>,
         initial_authorization: Option<String>,
         initial_security_client: Option<String>,
         worker: Option<UeWorkerHandle>,
     ) -> Self {
+        let last_cseq = ids.cseq;
         Self {
             identity,
             ids,
@@ -1064,8 +1086,9 @@ impl VolteRegisterAuthenticator {
             profile,
             effective_ims,
             visited_network_header,
+            access_network,
             expires_seconds: profile.ims.register.expires_seconds,
-            last_cseq: ids.cseq,
+            last_cseq,
             initial_authorization,
             initial_security_client,
             worker,
@@ -1303,24 +1326,27 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
-        Ok(sip::build_register_from_profile_with_target_and_visited(
-            self.profile,
-            effective_register_target(&self.effective_ims),
-            sip::RegisterPhase::Authenticated,
-            &self.identity,
-            &self.route,
-            &ids,
-            self.expires_seconds,
-            Some(&prepared.authorization),
-            prepared.security_client.as_deref(),
-            prepared.security_verify.as_deref(),
-            &self.sip_instance,
-            sip::RegisterRequestPolicy {
-                require_sec_agree: prepared.require_sec_agree,
-                ..self.register_policy
-            },
-            self.visited_network_header.as_deref(),
-        ))
+        Ok(
+            sip::build_register_from_profile_with_target_visited_and_access(
+                self.profile,
+                effective_register_target(&self.effective_ims),
+                sip::RegisterPhase::Authenticated,
+                &self.identity,
+                &self.route,
+                &ids,
+                self.expires_seconds,
+                Some(&prepared.authorization),
+                prepared.security_client.as_deref(),
+                prepared.security_verify.as_deref(),
+                &self.sip_instance,
+                sip::RegisterRequestPolicy {
+                    require_sec_agree: prepared.require_sec_agree,
+                    ..self.register_policy
+                },
+                self.visited_network_header.as_deref(),
+                self.access_network.as_ref(),
+            ),
+        )
     }
 
     async fn rebuild_register_with_min_expires(
@@ -1340,21 +1366,24 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
-        Ok(sip::build_register_from_profile_with_target_and_visited(
-            self.profile,
-            effective_register_target(&self.effective_ims),
-            sip::RegisterPhase::Initial,
-            &self.identity,
-            &self.route,
-            &ids,
-            self.expires_seconds,
-            self.initial_authorization.as_deref(),
-            self.initial_security_client.as_deref(),
-            None,
-            &self.sip_instance,
-            self.register_policy,
-            self.visited_network_header.as_deref(),
-        ))
+        Ok(
+            sip::build_register_from_profile_with_target_visited_and_access(
+                self.profile,
+                effective_register_target(&self.effective_ims),
+                sip::RegisterPhase::Initial,
+                &self.identity,
+                &self.route,
+                &ids,
+                self.expires_seconds,
+                self.initial_authorization.as_deref(),
+                self.initial_security_client.as_deref(),
+                None,
+                &self.sip_instance,
+                self.register_policy,
+                self.visited_network_header.as_deref(),
+                self.access_network.as_ref(),
+            ),
+        )
     }
 }
 
@@ -1362,6 +1391,8 @@ pub async fn connect_live_for_line(
     live: &VolteLiveHandle,
     device: &VolteDeviceBinding,
     runtime: &Arc<VolteRuntime>,
+    access_network_runtime: &ImsAccessNetworkRuntime,
+    profile_candidate: &VolteProfileCandidate,
     line_ip_families: &[VolteIpFamily],
     line_ip_families_auto: bool,
     allow_roaming: bool,
@@ -1401,6 +1432,7 @@ pub async fn connect_live_for_line(
     match connect_inner(
         live,
         runtime,
+        access_network_runtime,
         generation,
         device,
         plan,
@@ -1408,6 +1440,7 @@ pub async fn connect_live_for_line(
         allow_roaming,
         data_slot_mode,
         &profile_store,
+        profile_candidate,
         &sim_override,
     )
     .await
@@ -1517,6 +1550,7 @@ fn failure_stage(error: &VolteError) -> Option<VolteStage> {
 async fn connect_inner(
     live: &VolteLiveHandle,
     runtime: &VolteRuntime,
+    access_network_runtime: &ImsAccessNetworkRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
     mut plan: ImsConnectionPlan,
@@ -1524,6 +1558,7 @@ async fn connect_inner(
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
+    profile_candidate: &VolteProfileCandidate,
     sim_override: &SimOverride,
 ) -> Result<VolteLiveSession, VolteError> {
     // The canonical connection plan is built by the caller from this line's
@@ -1547,8 +1582,14 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Identity)
         .await;
-    let device_identity =
-        load_device_identity(&device, runtime, profile_store, sim_override).await?;
+    let device_identity = load_device_identity(
+        &device,
+        runtime,
+        profile_store,
+        profile_candidate,
+        sim_override,
+    )
+    .await?;
     // A line's explicit order remains authoritative. The persisted default
     // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
     // `access.lte.ip_family` may provide a better first single-family hint;
@@ -1949,6 +1990,7 @@ async fn connect_inner(
                 local_addr,
                 &device,
                 live.operator.video_enabled(),
+                access_network_runtime,
             )
             .await
             {
@@ -2096,6 +2138,7 @@ async fn connect_family(
     local_addr: IpAddr,
     device: &VolteDeviceBinding,
     video_capability_enabled: bool,
+    access_network_runtime: &ImsAccessNetworkRuntime,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
@@ -2177,6 +2220,41 @@ async fn connect_family(
         profile,
         &device_identity.ims,
         device_identity.effective_device_identity.imei.as_deref(),
+    );
+    let access_network = (profile.ims.register.include_pani_initial
+        || profile.ims.register.include_pani_authenticated
+        || profile.ims.register.enable_cellular_network_info)
+        .then(|| access_network_runtime.context(profile.ims.register.access_network_info))
+        .flatten();
+    let requires_dynamic_pani = profile.ims.register.pani_identity_policy
+        == AccessIdentityPolicy::RequiredDynamic
+        && (profile.ims.register.include_pani_initial
+            || profile.ims.register.include_pani_authenticated);
+    let requires_dynamic_cni = profile.ims.register.enable_cellular_network_info
+        && profile.ims.register.cni_identity_policy == AccessIdentityPolicy::RequiredDynamic;
+    if access_network.is_none() && (requires_dynamic_pani || requires_dynamic_cni) {
+        return Err(VolteError::new(if requires_dynamic_pani {
+            "volte_pani_required_dynamic_unavailable"
+        } else {
+            "volte_cni_required_dynamic_unavailable"
+        }));
+    }
+    let pani_resolution = resolve_access_identity(
+        profile.ims.register.pani_identity_policy,
+        Some(profile.ims.register.access_network_info),
+        access_network.as_ref(),
+    );
+    let cni_resolution = resolve_access_identity(
+        profile.ims.register.cni_identity_policy,
+        profile.ims.register.cellular_network_info,
+        access_network.as_ref(),
+    );
+    tracing::debug!(
+        line_id = %device.line_id,
+        access_network_present = access_network.is_some(),
+        pani_identity_source = pani_resolution.source.as_str(),
+        cni_identity_source = cni_resolution.source.as_str(),
+        "Captured serving-cell context for the VoLTE REGISTER lifecycle"
     );
     let mut register_variants = register_variants(profile).into_iter().peekable();
     let mut last_error = None;
@@ -2280,8 +2358,8 @@ async fn connect_family(
         );
         let initial_security_client = (profile.ims.register.sec_agree_mode != "disabled"
             && !profile.ims.register.security_client_mechanisms.is_empty())
-        .then_some(negotiated_security.as_str());
-        let initial = sip::build_register_from_profile_with_target_and_visited(
+        .then_some(negotiated_security.clone());
+        let initial = sip::build_register_from_profile_with_target_visited_and_access(
             profile,
             effective_register_target(&device_identity.effective_ims),
             sip::RegisterPhase::Initial,
@@ -2290,11 +2368,12 @@ async fn connect_family(
             &ids,
             profile.ims.register.expires_seconds,
             initial_authorization.as_deref(),
-            initial_security_client,
+            initial_security_client.as_deref(),
             None,
             &sip_instance,
             variant.policy,
             device_identity.visited_network_header.as_deref(),
+            access_network.as_ref(),
         );
         log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
@@ -2321,8 +2400,9 @@ async fn connect_family(
             profile,
             device_identity.effective_ims.clone(),
             device_identity.visited_network_header.clone(),
+            access_network.clone(),
             initial_authorization.clone(),
-            initial_security_client.map(str::to_string),
+            initial_security_client,
             socket_worker,
         );
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
@@ -2349,12 +2429,15 @@ async fn connect_family(
                     )
                     .await;
                 let next_variant_available = register_variants.peek().is_some();
-                if let Some(upgraded_variant) = sec_agree_retry_variant(variant, &failure) {
+                if let Some(upgraded_variant) = sec_agree_retry_variant(profile, variant, &failure)
+                {
                     last_error = Some(error);
                     pending_variant = Some(upgraded_variant);
                     continue;
                 }
-                if let Some(timeout_variant) = sec_agree_timeout_retry_variant(variant, &failure) {
+                if let Some(timeout_variant) =
+                    sec_agree_timeout_retry_variant(profile, variant, &failure)
+                {
                     last_error = Some(error);
                     pending_variant = Some(timeout_variant);
                     continue;
@@ -2429,9 +2512,11 @@ async fn connect_family(
                 Some(format!("register_variant={}", variant.label)),
             )
             .await;
-        let registered = RegisteredImsContext::from_response(
+        let artifacts = RegisterArtifacts::parse(&registration.response);
+        log_volte_register_success_metadata("initial", variant, &artifacts);
+        let registered = RegisteredImsContext::from_artifacts(
             ImsRegistrationAccess::Volte,
-            &registration.response,
+            artifacts,
             authenticator.expires_seconds,
         );
         let associated_uri = registered.default_associated_uri();
@@ -2443,10 +2528,10 @@ async fn connect_family(
             // MSISDN-associated IMPU.
             registered_identity.public_uri = uri.to_string();
         }
-        // There is no local voice switch left to consult: the UE always
-        // advertises the MMTEL feature tags, so the network's answer is the only
-        // authority on whether calls will work. Classify it here and publish the
-        // verdict, so a refusal is a reported fact rather than an inference.
+        // Profile policy and local media capability decide what the UE advertises.
+        // A successful REGISTER only reports registrar artifacts; it does not
+        // prove that the TAS will select this binding for terminating calls.
+        // Publish the bounded observation without turning it into a local gate.
         let verdict = ImsServiceVerdict::from_register_success(&registration.response);
         tracing::info!(
             register_variant = variant.label,
@@ -2514,12 +2599,26 @@ async fn connect_family(
             profile,
             effective_ims: device_identity.effective_ims.clone(),
             visited_network_header: device_identity.visited_network_header.clone(),
+            access_network: authenticator.access_network,
             media_operator_creator,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
     }
     Err(last_error.unwrap_or_else(|| VolteError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)))
+}
+
+/// Release all resources owned by a failed profile slot before the recovery
+/// batch advances to another slot. Unlike a user disconnect this deliberately
+/// keeps the runtime generation stable, because the outer three-slot batch is
+/// still current; only bearer/P-CSCF/profile-lease/security/dialog ownership is
+/// discarded.
+pub async fn cleanup_live_for_profile_switch(live: &VolteLiveHandle, runtime: &Arc<VolteRuntime>) {
+    if let Some(listener) = live.listener.lock().await.take() {
+        listener.abort();
+    }
+    cleanup_live_session(live).await;
+    runtime.prepare_profile_switch().await;
 }
 
 pub async fn disconnect_live_for_line(
@@ -2577,7 +2676,7 @@ async fn unregister_live_session(
         require_sec_agree: security_verify.is_some(),
         ..session.register_variant.policy
     };
-    let request = sip::build_register_from_profile_with_target_and_visited(
+    let request = sip::build_register_from_profile_with_target_visited_and_access(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
@@ -2591,6 +2690,7 @@ async fn unregister_live_session(
         &session.sip_instance,
         register_policy,
         session.visited_network_header.as_deref(),
+        session.access_network.as_ref(),
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
         session.identity.clone(),
@@ -2610,6 +2710,7 @@ async fn unregister_live_session(
         session.profile,
         session.effective_ims.clone(),
         session.visited_network_header.clone(),
+        session.access_network.clone(),
         initial_authorization,
         security_client,
         None,
@@ -2907,7 +3008,7 @@ async fn live_receive_loop(
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             },
             LiveLoopInput::Sip(Err(error)) if error.code() == "volte_channel_read_timeout" => {
-                continue
+                continue;
             }
             LiveLoopInput::Sip(Err(error)) => {
                 tracing::warn!(error = %error, "VoLTE protected SIP receive failed");
@@ -3062,30 +3163,6 @@ async fn refresh_live_registration(
         )
         .await;
 
-    let mut ids = session.register_ids.clone();
-    ids.cseq = session.next_register_cseq;
-    let security_verify = session.channel.security_verify().map(str::to_string);
-    let security_client = security_verify.as_ref().map(|_| {
-        session
-            .register_variant
-            .security_client_offer
-            .build(session.security_binding, session.profile)
-    });
-    let require_sec_agree = security_verify.is_some();
-    let request_uri = sip::register_request_uri_with_target(
-        session.profile,
-        effective_register_target(&session.effective_ims),
-        &session.channel.route(),
-    );
-    let initial_authorization = session.register_variant.authorization.build(
-        &session.effective_ims.realm.value,
-        &session.identity,
-        &request_uri,
-    );
-    let register_policy = sip::RegisterRequestPolicy {
-        require_sec_agree,
-        ..session.register_variant.policy
-    };
     // A 423 negotiation on refresh may raise the accepted lease above the
     // profile default, so both the request and the fallback lease follow the
     // currently registered value (never below the profile floor).
@@ -3094,111 +3171,159 @@ async fn refresh_live_registration(
         .lease
         .expires_seconds
         .max(session.profile.ims.register.expires_seconds);
-    let initial = sip::build_register_from_profile_with_target_and_visited(
-        session.profile,
-        effective_register_target(&session.effective_ims),
-        sip::RegisterPhase::Refresh,
-        &session.identity,
-        &session.channel.route(),
-        &ids,
-        refresh_expires,
-        initial_authorization.as_deref(),
-        security_client.as_deref(),
-        security_verify.as_deref(),
-        &session.sip_instance,
-        register_policy,
-        session.visited_network_header.as_deref(),
-    );
-    log_volte_register_request_metadata(session.register_variant, &session.channel, &initial);
-    let mut authenticator = VolteRegisterAuthenticator::new(
-        session.identity.clone(),
-        ids.clone(),
-        session.sip_instance.clone(),
-        session.security_binding.clone(),
-        session
-            .register_variant
-            .security_client_offer
-            .build(session.security_binding, session.profile),
-        session.channel.route(),
-        session.device.clone(),
-        runtime.clone(),
-        true,
-        session.aka_aid.clone(),
-        register_policy,
-        session.profile,
-        session.effective_ims.clone(),
-        session.visited_network_header.clone(),
-        initial_authorization,
-        security_client,
-        None,
-    )
-    .with_expires_seconds(refresh_expires);
-    let registration =
-        match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
-            Ok(registration) => registration,
-            Err(failure) => {
-                log_volte_register_failure_metadata(
-                    session.register_variant,
-                    &failure,
-                    Some(&initial),
-                );
-                let loss_reason = RegistrationLossReason::from_register_failure(&failure);
-                let error = map_register_failure(&failure);
-                runtime
-                    .record_attempt(
-                        VolteStage::RegisterRefresh,
-                        Some(session.ip_family),
-                        "failed",
-                        Some(&error),
-                        None,
-                    )
-                    .await;
-                return VolteRefreshAttempt {
-                    outcome: RegistrationRefreshResult::RebuildAccess(loss_reason),
-                    error: Some(error),
-                };
-            }
+    // Refresh first retries the exact shape that registered, then drops PANI
+    // and finally the Route header. A P-CSCF whose expectations changed, or a
+    // refresh exchange disturbed by an unrelated frame, gets two cheap shape
+    // corrections before the access leg is rebuilt and the whole session
+    // restarts. The retries reuse the protected channel and keep the lease.
+    let candidates = [
+        session.register_variant,
+        session.register_variant.without_access_network_info(),
+        session.register_variant.without_route_header(),
+    ];
+    let mut last_failure: Option<(VolteRegisterVariant, RegisterFailure)> = None;
+    for (round, variant) in candidates.into_iter().enumerate() {
+        let mut ids = session.register_ids.clone();
+        ids.cseq = session.next_register_cseq.saturating_add(round as u32);
+        let security_verify = session.channel.security_verify().map(str::to_string);
+        let security_client = security_verify.as_ref().map(|_| {
+            variant
+                .security_client_offer
+                .build(session.security_binding, session.profile)
+        });
+        let require_sec_agree = security_verify.is_some();
+        let request_uri = sip::register_request_uri_with_target(
+            session.profile,
+            effective_register_target(&session.effective_ims),
+            &session.channel.route(),
+        );
+        let initial_authorization = variant.authorization.build(
+            &session.effective_ims.realm.value,
+            &session.identity,
+            &request_uri,
+        );
+        let register_policy = sip::RegisterRequestPolicy {
+            require_sec_agree,
+            ..variant.policy
         };
+        let initial = sip::build_register_from_profile_with_target_visited_and_access(
+            session.profile,
+            effective_register_target(&session.effective_ims),
+            sip::RegisterPhase::Refresh,
+            &session.identity,
+            &session.channel.route(),
+            &ids,
+            refresh_expires,
+            initial_authorization.as_deref(),
+            security_client.as_deref(),
+            security_verify.as_deref(),
+            &session.sip_instance,
+            register_policy,
+            session.visited_network_header.as_deref(),
+            session.access_network.as_ref(),
+        );
+        log_volte_register_request_metadata(variant, &session.channel, &initial);
+        let mut authenticator = VolteRegisterAuthenticator::new(
+            session.identity.clone(),
+            ids.clone(),
+            session.sip_instance.clone(),
+            session.security_binding.clone(),
+            variant
+                .security_client_offer
+                .build(session.security_binding, session.profile),
+            session.channel.route(),
+            session.device.clone(),
+            runtime.clone(),
+            true,
+            session.aka_aid.clone(),
+            register_policy,
+            session.profile,
+            session.effective_ims.clone(),
+            session.visited_network_header.clone(),
+            session.access_network.clone(),
+            initial_authorization,
+            security_client,
+            None,
+        )
+        .with_expires_seconds(refresh_expires);
+        let registration =
+            match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
+                Ok(registration) => registration,
+                Err(failure) => {
+                    log_volte_register_failure_metadata(variant, &failure, Some(&initial));
+                    last_failure = Some((variant, failure));
+                    continue;
+                }
+            };
 
-    session.next_register_cseq = authenticator.last_cseq.saturating_add(1);
-    let registered = RegisteredImsContext::from_response(
-        ImsRegistrationAccess::Volte,
-        &registration.response,
-        authenticator.expires_seconds,
-    );
-    if let Some(uri) = registered.default_associated_uri() {
-        session.identity.public_uri = uri.to_string();
+        session.next_register_cseq = authenticator.last_cseq.saturating_add(1);
+        // Remember the shape that refreshed so later refreshes do not repeat a
+        // rejected form; the session still carries the successfully bound one.
+        if session.register_variant != variant {
+            tracing::info!(
+                label = variant.label,
+                "VoLTE refresh settled on a different register variant"
+            );
+        }
+        session.register_variant = variant;
+        let artifacts = RegisterArtifacts::parse(&registration.response);
+        log_volte_register_success_metadata("refresh", variant, &artifacts);
+        let registered = RegisteredImsContext::from_artifacts(
+            ImsRegistrationAccess::Volte,
+            artifacts,
+            authenticator.expires_seconds,
+        );
+        if let Some(uri) = registered.default_associated_uri() {
+            session.identity.public_uri = uri.to_string();
+        }
+        session.registration = registered.clone();
+        // A refresh can hand back a different identity set than the initial
+        // register did, so republish rather than assuming the first one still holds.
+        let refreshed_public_uri = session.identity.public_uri.clone();
+        let refreshed_associated_uris = registered.associated_uris.clone();
+        runtime
+            .record_attempt(
+                VolteStage::RegisterRefresh,
+                Some(session.ip_family),
+                "succeeded",
+                None,
+                Some(format!("cseq={}", ids.cseq)),
+            )
+            .await;
+        runtime
+            .update(|state| {
+                state.phase = VoltePhase::Registered;
+                state.stage = VolteStage::Registered;
+                state.last_error = None;
+                state.last_register_refresh_at = Some(now());
+                state.last_tx_at = Some(now());
+                state.last_rx_at = Some(now());
+                state.register_refresh_count = state.register_refresh_count.saturating_add(1);
+                state.public_uri = Some(refreshed_public_uri);
+                state.associated_uris = refreshed_associated_uris;
+            })
+            .await;
+        return VolteRefreshAttempt {
+            outcome: RegistrationRefreshResult::Refreshed(registered),
+            error: None,
+        };
     }
-    session.registration = registered.clone();
-    // A refresh can hand back a different identity set than the initial
-    // register did, so republish rather than assuming the first one still holds.
-    let refreshed_public_uri = session.identity.public_uri.clone();
-    let refreshed_associated_uris = registered.associated_uris.clone();
+
+    let (variant, failure) = last_failure.expect("at least one refresh candidate");
+    let loss_reason = RegistrationLossReason::from_register_failure(&failure);
+    let error = map_register_failure(&failure);
     runtime
         .record_attempt(
             VolteStage::RegisterRefresh,
             Some(session.ip_family),
-            "succeeded",
-            None,
-            Some(format!("cseq={}", ids.cseq)),
+            "failed",
+            Some(&error),
+            Some(format!("label={}", variant.label)),
         )
         .await;
-    runtime
-        .update(|state| {
-            state.phase = VoltePhase::Registered;
-            state.stage = VolteStage::Registered;
-            state.last_error = None;
-            state.last_register_refresh_at = Some(now());
-            state.last_tx_at = Some(now());
-            state.last_rx_at = Some(now());
-            state.register_refresh_count = state.register_refresh_count.saturating_add(1);
-            state.public_uri = Some(refreshed_public_uri);
-            state.associated_uris = refreshed_associated_uris;
-        })
-        .await;
     VolteRefreshAttempt {
-        outcome: RegistrationRefreshResult::Refreshed(registered),
-        error: None,
+        outcome: RegistrationRefreshResult::RebuildAccess(loss_reason),
+        error: Some(error),
     }
 }
 
@@ -5599,19 +5724,19 @@ fn phone_uri(number: &str, domain: &str) -> Result<String, VolteError> {
 }
 
 fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, VolteError> {
-    if let Some(value) = sip::header_value(frame, "WWW-Authenticate") {
-        return digest_aka::parse_digest_challenge(&value, false);
-    }
-    if let Some(value) = sip::header_value(frame, "Proxy-Authenticate") {
-        return digest_aka::parse_digest_challenge(&value, true);
-    }
-    Err(VolteError::new(code::DIGEST_CHALLENGE_MISSING))
+    let www_values = sip::header_values(frame, "WWW-Authenticate");
+    let proxy_values = sip::header_values(frame, "Proxy-Authenticate");
+    // The VoLTE path currently has no plain-Digest credential implementation:
+    // it always derives the proof from a USIM AKA run. Do not select MD5 until
+    // such a carrier-gated implementation exists on this access leg.
+    digest_aka::select_digest_challenge(&www_values, &proxy_values, false)
 }
 
 async fn load_device_identity(
     device: &VolteDeviceBinding,
     runtime: &VolteRuntime,
     profile_store: &ProfileStore,
+    profile_candidate: &VolteProfileCandidate,
     sim_override: &SimOverride,
 ) -> Result<DeviceIdentity, VolteError> {
     let modem = command_output(
@@ -5757,11 +5882,11 @@ async fn load_device_identity(
         })
         .await;
     let resolved = profile_store
-        .resolve_for_imsi_access(
+        .resolve_volte_candidate(
+            profile_candidate,
             sim_override.ims_volte.profile_id.as_deref(),
             &imsi,
             home_plmn.as_deref(),
-            CatalogAccessKind::LteEpc,
         )
         .map_err(|detail| VolteError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
         .ok_or_else(|| {
@@ -6103,7 +6228,9 @@ fn map_register_error(error: ImsError) -> VolteError {
         | "ims_register_initial_unexpected_status"
         | "ims_register_initial_min_expires_invalid"
         | "ims_register_initial_min_expires_exhausted"
-        | "ims_register_initial_min_expires_unsupported" => code::REGISTER_INITIAL_UNEXPECTED_STATUS,
+        | "ims_register_initial_min_expires_unsupported" => {
+            code::REGISTER_INITIAL_UNEXPECTED_STATUS
+        }
         _ => code::REGISTER_AUTH_UNEXPECTED_STATUS,
     };
     VolteError::with_detail(stage, error.code())
@@ -6120,6 +6247,9 @@ fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
 /// candidate. Once AKA has started, credentials and security negotiation are
 /// fixed for this session and must not be hidden by header experimentation.
 fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
+    if failure.auth_rounds != 0 {
+        return false;
+    }
     // Format, lease, extension and transient server rejections may all be
     // cleared by a differently shaped REGISTER candidate. 423 itself is
     // negotiated inside the shared driver; the exhausted/min-expires errors
@@ -6137,10 +6267,12 @@ fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
 }
 
 fn sec_agree_retry_variant(
+    profile: &CarrierProfile,
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
 ) -> Option<VolteRegisterVariant> {
-    if variant.policy.require_sec_agree
+    if profile.ims.register.sec_agree_mode == "disabled"
+        || variant.policy.require_sec_agree
         || failure.auth_rounds != 0
         || !matches!(register_failure_status(failure), Some(421 | 494))
     {
@@ -6168,10 +6300,15 @@ fn sec_agree_retry_variant(
 /// carries a Security-Client offer, so a silent timeout is worth one compliant
 /// retry before moving on.
 fn sec_agree_timeout_retry_variant(
+    profile: &CarrierProfile,
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
 ) -> Option<VolteRegisterVariant> {
-    if variant.policy.require_sec_agree || failure.auth_rounds != 0 || failure.response.is_some() {
+    if profile.ims.register.sec_agree_mode == "disabled"
+        || variant.policy.require_sec_agree
+        || failure.auth_rounds != 0
+        || failure.response.is_some()
+    {
         return None;
     }
     (failure.error.code() == "ims_register_initial_receive_failed")
@@ -6339,6 +6476,49 @@ fn log_volte_register_request_metadata(
     );
 }
 
+fn log_volte_register_success_metadata(
+    register_phase: &'static str,
+    variant: VolteRegisterVariant,
+    artifacts: &RegisterArtifacts,
+) {
+    tracing::info!(
+        register_phase,
+        register_variant = variant.label,
+        expires_seconds = artifacts.expires_seconds,
+        service_route_count = artifacts.service_route_count,
+        associated_uri_count = artifacts.associated_uris.len(),
+        contact_binding_count = artifacts.contact_binding_count,
+        contact_expiry_ambiguous = artifacts.contact_expiry_ambiguous,
+        wildcard_contact_present = artifacts.wildcard_contact_present,
+        sensitive_values = "redacted",
+        "VoLTE IMS REGISTER success metadata received"
+    );
+
+    if artifacts.contact_binding_count > 1 {
+        tracing::warn!(
+            register_phase,
+            register_variant = variant.label,
+            contact_binding_count = artifacts.contact_binding_count,
+            "Registrar returned multiple current Contact bindings; terminating routing may select another flow"
+        );
+    }
+    if artifacts.contact_expiry_ambiguous {
+        tracing::warn!(
+            register_phase,
+            register_variant = variant.label,
+            contact_binding_count = artifacts.contact_binding_count,
+            "Contact expiry differs or is missing across registrar bindings; using response Expires or the profile fallback"
+        );
+    }
+    if artifacts.wildcard_contact_present {
+        tracing::warn!(
+            register_phase,
+            register_variant = variant.label,
+            "Successful REGISTER response unexpectedly included a wildcard Contact"
+        );
+    }
+}
+
 fn log_volte_register_failure_metadata(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -6405,6 +6585,69 @@ fn ip_family_name(address: IpAddr) -> &'static str {
 mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
+    use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[tokio::test]
+    async fn profile_switch_aborts_listener_and_releases_line_scoped_registration() {
+        let live = VolteLiveHandle::new();
+        let runtime = Arc::new(VolteRuntime::new());
+        let supplementary = Arc::new(SupplementaryRuntime::for_line("line-profile-switch"));
+        supplementary
+            .begin_mwi_subscription(ImsRegistrationAccess::Volte)
+            .await;
+        live.bind_supplementary(Arc::clone(&supplementary));
+
+        let candidate = VolteProfileCandidate {
+            source: crate::platform::config::VolteProfileSource::Database,
+            profile_id: Some("profile-a".to_string()),
+        };
+        runtime.begin_profile_attempt_batch().await;
+        runtime.begin_profile_attempt(1, &candidate).await;
+        runtime
+            .update(|state| {
+                state.phase = VoltePhase::Registered;
+                state.stage = VolteStage::Registered;
+                state.registration_mode = RegistrationMode::Ipsec;
+                state.pcscf = Some("192.0.2.10:5060".to_string());
+                state.profile_id = Some("effective-profile-a".to_string());
+                state.profile_source = Some("database".to_string());
+                state.public_uri = Some("sip:user@example.test".to_string());
+                state.retry_attempt = 1;
+                state.retry_max = 3;
+            })
+            .await;
+        runtime
+            .finish_profile_attempt(1, &candidate, "failed", None)
+            .await;
+        let generation = runtime.generation();
+
+        let listener = tokio::spawn(std::future::pending::<()>());
+        let listener_abort = listener.abort_handle();
+        *live.listener.lock().await = Some(listener);
+
+        cleanup_live_for_profile_switch(&live, &runtime).await;
+        tokio::task::yield_now().await;
+
+        assert!(live.listener.lock().await.is_none());
+        assert!(listener_abort.is_finished(), "old listener must be aborted");
+        assert!(
+            !supplementary
+                .owns_mwi_subscription(ImsRegistrationAccess::Volte)
+                .await,
+            "the old profile must not retain supplementary registration ownership"
+        );
+        assert_eq!(runtime.generation(), generation);
+        let status = runtime.status().await;
+        assert_eq!(status.profile_candidate_index, Some(1));
+        assert_eq!(status.profile_attempt_results.len(), 1);
+        assert_eq!(status.retry_attempt, 1);
+        assert_eq!(status.retry_max, 3);
+        assert_eq!(status.phase, "starting");
+        assert!(status.pcscf.is_none());
+        assert!(status.profile_id.is_none());
+        assert!(status.profile_source.is_none());
+        assert!(status.public_uri.is_none());
+    }
 
     #[test]
     fn carrier_profile_failures_are_not_reported_as_sim_identity_failures() {
@@ -6578,6 +6821,7 @@ mod tests {
             profile,
             effective_ims: resolve_effective_ims_profile(profile, None),
             visited_network_header: None,
+            access_network: None,
             media_operator_creator: None,
             voice_calls: HashMap::new(),
             mwi_subscription: None,
@@ -6599,7 +6843,7 @@ mod tests {
     fn production_register_variants_keep_a_generic_second_attempt() {
         let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         let variants = register_variants(&profile);
-        assert_eq!(variants.len(), 6);
+        assert_eq!(variants.len(), 5);
         assert_eq!(
             variants[0].label,
             profile.ims.register.live_header_variant_set
@@ -6614,7 +6858,31 @@ mod tests {
         assert!(!variants[2].policy.include_visited_network);
         assert!(!variants[3].policy.include_access_network_info);
         assert!(!variants[4].policy.include_route_header);
-        assert!(!variants[5].policy.include_sip_instance);
+        assert!(variants
+            .iter()
+            .all(|variant| !variant.policy.include_sip_instance));
+    }
+
+    #[test]
+    fn register_fallback_never_reenables_explicitly_disabled_profile_capabilities() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.include_mmtel_features = false;
+        profile.ims.register.include_route_header = false;
+        profile.ims.register.always_add_sip_instance = false;
+
+        let variants = register_variants(&profile);
+
+        assert!(variants.iter().all(|variant| {
+            !variant.policy.include_mmtel_features
+                && !variant.policy.include_route_header
+                && !variant.policy.include_sip_instance
+        }));
+        assert!(variants
+            .iter()
+            .all(|variant| variant.label != "generic_ims_register_no_route"));
+        assert!(variants
+            .iter()
+            .all(|variant| variant.label != "generic_ims_register_no_instance"));
     }
 
     #[test]
@@ -6628,7 +6896,7 @@ mod tests {
             .expect("derived LTE profile");
         let variants = register_variants(&profile);
 
-        assert_eq!(variants.len(), 5);
+        assert_eq!(variants.len(), 4);
         assert!(variants
             .iter()
             .all(|variant| !variant.policy.include_visited_network));
@@ -6956,6 +7224,55 @@ mod tests {
         assert!(!challenge.proxy);
     }
 
+    #[test]
+    fn digest_challenge_skips_unusable_earlier_www_values() {
+        let frame = b"SIP/2.0 401 Unauthorized\r\n\
+WWW-Authenticate: Digest realm=\"unsupported\",nonce=\"one\",algorithm=SHA-512\r\n\
+WWW-Authenticate: Digest nonce=\"missing-realm\",algorithm=AKAv1-MD5\r\n\
+WWW-Authenticate: Digest realm=\"selected\",nonce=\"three\",algorithm=AKAv2-SHA-256,qop=\"auth\"\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let challenge = parse_digest_challenge(frame).unwrap();
+        assert_eq!(challenge.realm, "selected");
+        assert_eq!(challenge.algorithm, "AKAv2-SHA-256");
+        assert!(!challenge.proxy);
+    }
+
+    #[test]
+    fn digest_challenge_splits_compound_value_without_splitting_quoted_qop() {
+        let frame = b"SIP/2.0 401 Unauthorized\r\n\
+WWW-Authenticate: Digest realm=\"plain\",nonce=\"one\",algorithm=MD5, Digest realm=\"aka\",nonce=\"two\",algorithm=AKAv1-MD5,qop=\"auth,auth-int\"\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let challenge = parse_digest_challenge(frame).unwrap();
+        assert_eq!(challenge.realm, "aka");
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn digest_challenge_keeps_topmost_supported_algorithm_order() {
+        let frame = b"SIP/2.0 401 Unauthorized\r\n\
+WWW-Authenticate: Digest realm=\"akav1-first\",nonce=\"one\",algorithm=AKAv1-MD5\r\n\
+WWW-Authenticate: Digest realm=\"akav2-later\",nonce=\"two\",algorithm=AKAv2-SHA-256\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let challenge = parse_digest_challenge(frame).unwrap();
+        assert_eq!(challenge.realm, "akav1-first");
+        assert_eq!(challenge.algorithm, "AKAv1-MD5");
+    }
+
+    #[test]
+    fn digest_challenge_falls_back_to_proxy_after_unusable_www() {
+        let frame = b"SIP/2.0 407 Proxy Authentication Required\r\n\
+WWW-Authenticate: Digest realm=\"plain-disabled\",nonce=\"one\",algorithm=MD5\r\n\
+Proxy-Authenticate: Digest realm=\"proxy-aka\",nonce=\"two\",algorithm=AKAv2-MD5\r\n\
+Content-Length: 0\r\n\r\n";
+
+        let challenge = parse_digest_challenge(frame).unwrap();
+        assert_eq!(challenge.realm, "proxy-aka");
+        assert!(challenge.proxy);
+    }
+
     /// Maxis drops a non-compliant REGISTER on the LTE leg instead of answering
     /// 421, so the 421-driven rung never fires and every retry repeats the
     /// rejected shape. A silent timeout must escalate too.
@@ -6969,14 +7286,15 @@ mod tests {
         let base = register_variant("ims_features_aka_uri_first");
         assert!(!base.policy.require_sec_agree);
 
-        let upgraded = sec_agree_timeout_retry_variant(base, &timeout).expect("escalates");
+        let upgraded =
+            sec_agree_timeout_retry_variant(&GB_EE_23433, base, &timeout).expect("escalates");
         assert!(upgraded.policy.require_sec_agree);
         assert!(upgraded.policy.proxy_require_sec_agree);
         assert!(upgraded.policy.advertise_sec_agree);
         assert!(upgraded.server_required_sec_agree);
 
         // Already compliant: a second identical attempt would loop.
-        assert!(sec_agree_timeout_retry_variant(upgraded, &timeout).is_none());
+        assert!(sec_agree_timeout_retry_variant(&GB_EE_23433, upgraded, &timeout).is_none());
 
         // A timeout after authentication is a different problem.
         let after_auth = RegisterFailure {
@@ -6984,7 +7302,7 @@ mod tests {
             response: None,
             auth_rounds: 1,
         };
-        assert!(sec_agree_timeout_retry_variant(base, &after_auth).is_none());
+        assert!(sec_agree_timeout_retry_variant(&GB_EE_23433, base, &after_auth).is_none());
 
         // A real response is the 421 rung's job, not this one.
         let answered = RegisterFailure {
@@ -6992,7 +7310,29 @@ mod tests {
             response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
             auth_rounds: 0,
         };
-        assert!(sec_agree_timeout_retry_variant(base, &answered).is_none());
+        assert!(sec_agree_timeout_retry_variant(&GB_EE_23433, base, &answered).is_none());
+    }
+
+    #[test]
+    fn explicit_sec_agree_disabled_blocks_status_and_timeout_escalation() {
+        let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        profile.ims.register.sec_agree_mode = "disabled";
+        let base = register_variant("ims_features_aka_uri_first");
+        let timeout = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        let required = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 494 Security Agreement Required\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ),
+            auth_rounds: 0,
+        };
+
+        assert!(sec_agree_timeout_retry_variant(&profile, base, &timeout).is_none());
+        assert!(sec_agree_retry_variant(&profile, base, &required).is_none());
     }
 
     #[test]
@@ -7006,7 +7346,7 @@ mod tests {
             auth_rounds: 0,
         };
         let base = register_variant("ims_features_aka_uri_first");
-        let upgraded = sec_agree_retry_variant(base, &failure).unwrap();
+        let upgraded = sec_agree_retry_variant(&GB_EE_23433, base, &failure).unwrap();
 
         assert_eq!(
             upgraded.label,
@@ -7203,6 +7543,7 @@ mod tests {
             };
 
             assert!(sec_agree_retry_variant(
+                &GB_EE_23433,
                 register_variant("ims_features_aka_uri_first"),
                 &failure
             )

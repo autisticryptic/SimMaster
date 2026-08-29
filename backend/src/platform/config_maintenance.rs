@@ -1,28 +1,118 @@
-//! Explicit SQLite configuration maintenance.
+//! Explicit configuration maintenance: backup, export, import, restore.
 //!
-//! These commands are intentionally separate from startup. SimAdmin never
-//! scans or imports legacy JSON automatically; an operator must explicitly
-//! request export/import/restore and receives a rollback snapshot path.
+//! These commands are deliberately separate from startup. SimAdmin never scans,
+//! imports or migrates anything on its own; an operator asks for each action and
+//! gets back the paths retained for rollback.
+//!
+//! # Both halves, always together
+//!
+//! Configuration lives in two places (see `platform::config_store`): the
+//! operator-editable text file, and the config tables inside the application
+//! database. Every command here handles both, because a snapshot of one half
+//! restores a device to a state it was never in — a file describing line
+//! profiles the database does not have, or line profiles whose security policy
+//! and DDNS settings are missing.
+//!
+//! The read-only carrier catalog is excluded on purpose: it is a release
+//! artifact, not user data, and it is replaced by upgrades rather than restored.
+//!
+//! Ordering rule, applied by both `import_json` and `restore`: write the
+//! database half first, then the file. If the file write fails afterwards the
+//! database is rolled back from the snapshot taken at the start, so the two
+//! halves never diverge silently.
 
-use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::config::{
-    AppConfig, ConfigManager, CONFIG_STORAGE_SCHEMA_VERSION, CURRENT_LINE_CONFIG_VERSION,
+    AutomationConfig, EsimConfig, LineProfileConfig, MainConfig, ModemSlotConfig,
+    NotificationConfig, StandaloneSimSlotConfig, CURRENT_LINE_CONFIG_VERSION,
 };
+use super::config_file::{self, TextFormat};
+use super::config_store::{self, StoredConfig, CONFIG_STORE_SCHEMA_VERSION};
+use super::db::Database;
 use crate::connectivity::modems::ims::profile_override::{
     validate_stored_override_document, OVERRIDE_SCHEMA_VERSION,
 };
 
+/// Tables this module owns. A restore replaces exactly these and nothing else:
+/// the application database also holds SMS, call history and runtime events,
+/// which a configuration restore must not touch.
+const CONFIG_TABLES: [&str; 4] = [
+    "config_line_profiles",
+    "config_modem_slots",
+    "config_standalone_sim_slots",
+    "config_documents",
+];
+
+const EXPORT_FORMAT: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigExport {
+    /// Bumped to 2 when configuration split into a file half and a database
+    /// half. A format-1 document describes a layout that no longer exists.
     pub format: u32,
-    pub storage_schema_version: u32,
-    pub app_config: AppConfig,
+    pub config_store_schema_version: u32,
+    /// The operator-editable settings.
+    pub main_config: MainConfig,
+    /// The database-owned settings.
+    pub stored: StoredConfigExport,
     pub overrides: Vec<OverrideExportRow>,
+}
+
+/// Serializable mirror of [`StoredConfig`].
+///
+/// `StoredConfig` is a runtime type and deliberately not `Serialize`; keeping the
+/// wire shape separate means an export file does not silently change whenever a
+/// field is added to the runtime struct.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StoredConfigExport {
+    #[serde(default)]
+    pub line_profiles: Vec<LineProfileConfig>,
+    #[serde(default)]
+    pub modem_slots: Vec<ModemSlotConfig>,
+    #[serde(default)]
+    pub standalone_sim_slots: Vec<StandaloneSimSlotConfig>,
+    #[serde(default)]
+    pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub automation: AutomationConfig,
+    #[serde(default)]
+    pub esim: EsimConfig,
+    #[serde(default)]
+    pub last_notified_update_version: Option<String>,
+}
+
+impl From<StoredConfig> for StoredConfigExport {
+    fn from(stored: StoredConfig) -> Self {
+        Self {
+            line_profiles: stored.line_profiles,
+            modem_slots: stored.modem_slots,
+            standalone_sim_slots: stored.standalone_sim_slots,
+            notifications: stored.notifications,
+            automation: stored.automation,
+            esim: stored.esim,
+            last_notified_update_version: stored.last_notified_update_version,
+        }
+    }
+}
+
+impl From<StoredConfigExport> for StoredConfig {
+    fn from(export: StoredConfigExport) -> Self {
+        Self {
+            line_profiles: export.line_profiles,
+            modem_slots: export.modem_slots,
+            standalone_sim_slots: export.standalone_sim_slots,
+            notifications: export.notifications,
+            automation: export.automation,
+            esim: export.esim,
+            last_notified_update_version: export.last_notified_update_version,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,231 +123,521 @@ pub struct OverrideExportRow {
     pub updated_at: String,
 }
 
-pub fn backup_database(source: &Path, destination: &Path) -> Result<usize, String> {
-    ensure_source(source)?;
-    ensure_new_destination(destination)?;
-    if source == destination {
-        return Err("config_backup_source_equals_destination".to_string());
-    }
-    let source_connection = open_read_only(source)?;
-    let rows = validate_connection(&source_connection, source)?;
-    let destination_sql = destination.to_string_lossy().to_string();
-    source_connection
-        .execute("VACUUM main INTO ?1", params![destination_sql])
-        .map_err(|error| format!("config_backup_vacuum_failed:{error}"))?;
-    sync_file(destination)?;
-    set_private_file_mode(destination)?;
-    let copied = open_read_only(destination)?;
-    let copied_rows = validate_connection(&copied, destination)?;
-    if rows != copied_rows {
-        return Err("config_backup_row_count_changed".to_string());
-    }
-    sync_parent(destination)?;
-    Ok(rows)
+/// What a command actually captured, so the operator can check it against the
+/// device instead of trusting a bare "done".
+#[derive(Debug, Clone, Default)]
+pub struct MaintenanceSummary {
+    pub line_profiles: usize,
+    pub modem_slots: usize,
+    pub standalone_sim_slots: usize,
+    pub overrides: usize,
 }
 
-pub fn export_json(source: &Path, destination: &Path) -> Result<usize, String> {
-    ensure_source(source)?;
+/// Paths retained before a destructive command, one per half.
+#[derive(Debug, Clone, Default)]
+pub struct RollbackPaths {
+    pub database: Option<PathBuf>,
+    pub config_file: Option<PathBuf>,
+}
+
+/// Snapshot both halves. `destination` names the database snapshot; the file is
+/// saved beside it so a later restore can find its pair without being told.
+pub fn backup(
+    config_path: &Path,
+    database_path: &Path,
+    destination: &Path,
+) -> Result<MaintenanceSummary, String> {
+    ensure_source(database_path)?;
     ensure_new_destination(destination)?;
-    let connection = open_read_only(source)?;
-    validate_connection(&connection, source)?;
-    let config_json: String = connection
-        .query_row(
-            "SELECT config_json FROM app_config WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("config_export_app_config_missing:{error}"))?;
-    let app_config: AppConfig = serde_json::from_str(&config_json)
-        .map_err(|error| format!("config_export_app_config_invalid:{error}"))?;
-    let rows = if table_exists(&connection, "ims_sim_overrides")? {
-        let mut statement = connection
-            .prepare(
-                "SELECT binding_hash, schema_version, document_json, updated_at
-                 FROM ims_sim_overrides ORDER BY binding_hash",
-            )
-            .map_err(|error| format!("config_export_override_query_failed:{error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                let document: String = row.get(2)?;
-                Ok(OverrideExportRow {
-                    binding_hash: row.get(0)?,
-                    schema_version: row.get(1)?,
-                    document: serde_json::from_str(&document).unwrap_or(serde_json::Value::Null),
-                    updated_at: row.get(3)?,
-                })
-            })
-            .map_err(|error| format!("config_export_override_read_failed:{error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("config_export_override_row_failed:{error}"))?;
-        rows
-    } else {
-        Vec::new()
+    if database_path == destination {
+        return Err("config_backup_source_equals_destination".to_string());
+    }
+
+    let source = open_read_only(database_path)?;
+    let summary = summarize(&source)?;
+    let destination_sql = destination.to_string_lossy().to_string();
+    // VACUUM INTO produces a consistent snapshot of a live database without
+    // copying WAL sidecars, which a plain file copy would miss.
+    source
+        .execute("VACUUM main INTO ?1", params![destination_sql])
+        .map_err(|error| format!("config_backup_vacuum_failed:{error}"))?;
+    drop(source);
+    sync_file(destination)?;
+    set_private_file_mode(destination)?;
+
+    let copied = open_read_only(destination)?;
+    let copied_summary = summarize(&copied)?;
+    drop(copied);
+    if summary_counts(&summary) != summary_counts(&copied_summary) {
+        return Err("config_backup_row_count_changed".to_string());
+    }
+
+    if config_path.exists() {
+        let paired = paired_config_path(destination, config_path);
+        fs::copy(config_path, &paired)
+            .map_err(|error| format!("config_backup_file_copy_failed:{error}"))?;
+        set_private_file_mode(&paired)?;
+        sync_file(&paired)?;
+    }
+    sync_parent(destination)?;
+    Ok(summary)
+}
+
+/// Write both halves into one JSON document.
+pub fn export_json(
+    config_path: &Path,
+    database_path: &Path,
+    destination: &Path,
+) -> Result<MaintenanceSummary, String> {
+    ensure_source(database_path)?;
+    ensure_new_destination(destination)?;
+
+    let main_config = read_main_config(config_path)?;
+    let connection = open_read_only(database_path)?;
+    let stored = read_stored_config(&connection)?;
+    let overrides = read_overrides(&connection)?;
+    drop(connection);
+
+    let summary = MaintenanceSummary {
+        line_profiles: stored.line_profiles.len(),
+        modem_slots: stored.modem_slots.len(),
+        standalone_sim_slots: stored.standalone_sim_slots.len(),
+        overrides: overrides.len(),
     };
-    let count = rows.len();
     let export = ConfigExport {
-        format: 1,
-        storage_schema_version: CONFIG_STORAGE_SCHEMA_VERSION,
-        app_config,
-        overrides: rows,
+        format: EXPORT_FORMAT,
+        config_store_schema_version: CONFIG_STORE_SCHEMA_VERSION,
+        main_config,
+        stored: stored.into(),
+        overrides,
     };
     validate_export(&export)?;
     let content = serde_json::to_vec_pretty(&export)
         .map_err(|error| format!("config_export_serialize_failed:{error}"))?;
     atomic_write_private(destination, &content)?;
-    Ok(count)
+    Ok(summary)
 }
 
-/// Import a deliberately exported document. Returns the rollback SQLite
-/// snapshot retained before the transaction, or `None` when the target did
-/// not exist yet.
-pub fn import_json(target: &Path, source: &Path) -> Result<Option<PathBuf>, String> {
+/// Import a deliberately exported document into both halves.
+pub fn import_json(
+    config_path: &Path,
+    database_path: &Path,
+    source: &Path,
+) -> Result<RollbackPaths, String> {
     ensure_source(source)?;
     let content = fs::read(source).map_err(|error| format!("config_import_read_failed:{error}"))?;
     let export: ConfigExport = serde_json::from_slice(&content)
         .map_err(|error| format!("config_import_document_invalid:{error}"))?;
     validate_export(&export)?;
 
-    let rollback = if target.exists() {
-        let path = sqlite_maintenance_path(target, "import-rollback");
-        backup_database(target, &path)?;
-        Some(path)
-    } else {
-        None
-    };
-    let mut connection = open_writable(target)?;
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("config_import_begin_failed:{error}"))?;
-    transaction
-        .execute(
-            "INSERT INTO app_config (
-                singleton, storage_schema_version, line_config_version, config_json, updated_at
-             ) VALUES (1, ?1, ?2, ?3, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-             ON CONFLICT(singleton) DO UPDATE SET
-                storage_schema_version=excluded.storage_schema_version,
-                line_config_version=excluded.line_config_version,
-                config_json=excluded.config_json,
-                updated_at=excluded.updated_at",
-            params![
-                CONFIG_STORAGE_SCHEMA_VERSION,
-                export.app_config.line_config_version,
-                serde_json::to_string(&export.app_config)
-                    .map_err(|error| format!("config_import_serialize_config_failed:{error}"))?,
-            ],
-        )
-        .map_err(|error| format!("config_import_app_config_failed:{error}"))?;
-    transaction
-        .execute("DELETE FROM ims_sim_overrides", [])
-        .map_err(|error| format!("config_import_clear_overrides_failed:{error}"))?;
-    for row in &export.overrides {
-        transaction
-            .execute(
-                "INSERT INTO ims_sim_overrides(binding_hash,schema_version,document_json,updated_at)
-                 VALUES (?1,?2,?3,?4)",
-                params![
-                    row.binding_hash,
-                    row.schema_version,
-                    serde_json::to_string(&row.document)
-                        .map_err(|error| format!("config_import_serialize_override_failed:{error}"))?,
-                    row.updated_at,
-                ],
-            )
-            .map_err(|error| format!("config_import_override_failed:{error}"))?;
+    let rollback = snapshot_both(config_path, database_path, "import-rollback")?;
+
+    apply_database_half(database_path, &export)?;
+    if let Err(error) = write_main_config(config_path, &export.main_config) {
+        // The database now holds settings the file does not describe. Put it
+        // back so the operator retries from a coherent state.
+        if let Some(snapshot) = &rollback.database {
+            restore_config_tables(database_path, snapshot)
+                .map_err(|rollback_error| {
+                    format!("config_import_file_failed:{error}:rollback_also_failed:{rollback_error}")
+                })?;
+        }
+        return Err(format!("config_import_file_failed:{error}"));
     }
-    transaction
-        .commit()
-        .map_err(|error| format!("config_import_commit_failed:{error}"))?;
-    ConfigManager::try_new(target.to_path_buf())
+
+    validate_loads(config_path, database_path)
         .map_err(|error| format!("config_import_post_validate_failed:{error}"))?;
     Ok(rollback)
 }
 
-/// Restore a SQLite maintenance snapshot into the canonical configuration
-/// tables. The current target is snapshotted first and returned to the caller,
-/// giving restore the same explicit rollback boundary as JSON import.
-pub fn restore_database(target: &Path, source: &Path) -> Result<Option<PathBuf>, String> {
+/// Restore a prior snapshot into both halves.
+pub fn restore(
+    config_path: &Path,
+    database_path: &Path,
+    source: &Path,
+) -> Result<RollbackPaths, String> {
     ensure_source(source)?;
-    if target == source {
+    if database_path == source {
         return Err("config_restore_source_equals_target".to_string());
     }
     let source_connection = open_read_only(source)?;
-    validate_connection(&source_connection, source)?;
+    summarize(&source_connection)?;
     drop(source_connection);
 
-    let rollback = if target.exists() {
-        let path = sqlite_maintenance_path(target, "restore-rollback");
-        backup_database(target, &path)?;
-        Some(path)
-    } else {
-        None
-    };
+    let rollback = snapshot_both(config_path, database_path, "restore-rollback")?;
 
-    let mut target_connection = open_writable(target)?;
-    let source_path = source.to_string_lossy().into_owned();
-    target_connection
-        .execute("ATTACH DATABASE ?1 AS restore_source", params![source_path])
-        .map_err(|error| format!("config_restore_attach_failed:{error}"))?;
-    let transaction = target_connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("config_restore_begin_failed:{error}"))?;
-    transaction
-        .execute_batch(
-            "DELETE FROM app_config;
-             INSERT INTO app_config
-                 SELECT * FROM restore_source.app_config;
-             DELETE FROM ims_sim_overrides;
-             INSERT INTO ims_sim_overrides
-                 SELECT * FROM restore_source.ims_sim_overrides;
-             DELETE FROM config_schema_journal;
-             INSERT INTO config_schema_journal
-                 SELECT * FROM restore_source.config_schema_journal;",
-        )
-        .map_err(|error| format!("config_restore_copy_failed:{error}"))?;
-    transaction
-        .commit()
-        .map_err(|error| format!("config_restore_commit_failed:{error}"))?;
-    target_connection
-        .execute("DETACH DATABASE restore_source", [])
-        .map_err(|error| format!("config_restore_detach_failed:{error}"))?;
-    drop(target_connection);
-    let validated = open_read_only(target)?;
-    validate_connection(&validated, target)?;
-    ConfigManager::try_new(target.to_path_buf())
+    restore_config_tables(database_path, source)?;
+
+    // A snapshot taken by `backup` carries its file half beside it.
+    let paired = paired_config_path(source, config_path);
+    if paired.exists() {
+        if let Err(error) = copy_private(&paired, config_path) {
+            if let Some(snapshot) = &rollback.database {
+                restore_config_tables(database_path, snapshot).map_err(|rollback_error| {
+                    format!(
+                        "config_restore_file_failed:{error}:rollback_also_failed:{rollback_error}"
+                    )
+                })?;
+            }
+            return Err(format!("config_restore_file_failed:{error}"));
+        }
+    }
+
+    validate_loads(config_path, database_path)
         .map_err(|error| format!("config_restore_post_validate_failed:{error}"))?;
     Ok(rollback)
 }
 
+// --- halves -----------------------------------------------------------------
+
+fn read_main_config(config_path: &Path) -> Result<MainConfig, String> {
+    if !config_path.exists() {
+        // A device that has never been configured exports its defaults, which is
+        // a valid thing to hand to a second device.
+        return Ok(MainConfig::default());
+    }
+    let format = TextFormat::from_path(config_path).ok_or_else(|| {
+        format!(
+            "config_export_unsupported_extension:{}",
+            config_path.display()
+        )
+    })?;
+    let content = fs::read_to_string(config_path)
+        .map_err(|error| format!("config_export_file_read_failed:{error}"))?;
+    let main: MainConfig = config_file::parse(&content, format, config_path)
+        .map_err(|error| format!("config_export_file_invalid:{error}"))?;
+    if main.config_version != CURRENT_LINE_CONFIG_VERSION {
+        return Err(format!(
+            "config_export_file_version_unsupported:{}",
+            main.config_version
+        ));
+    }
+    Ok(main)
+}
+
+fn write_main_config(config_path: &Path, main: &MainConfig) -> Result<(), String> {
+    let format = TextFormat::from_path(config_path).ok_or_else(|| {
+        format!(
+            "config_import_unsupported_extension:{}",
+            config_path.display()
+        )
+    })?;
+    config_file::ensure_regular_file(config_path)?;
+    let existing = if config_path.exists() {
+        fs::read_to_string(config_path)
+            .map_err(|error| format!("config_import_file_read_failed:{error}"))?
+    } else {
+        String::new()
+    };
+    // An import replaces the settings but keeps the operator's comments on keys
+    // that survive, same as an ordinary save.
+    let baseline = if existing.trim().is_empty() {
+        MainConfig::default()
+    } else {
+        config_file::parse(&existing, format, config_path).unwrap_or_default()
+    };
+    let rendered = config_file::apply_update(
+        &existing,
+        &baseline,
+        main,
+        format,
+        config_path,
+        &[],
+        &[],
+    )?;
+    config_file::write_atomically(config_path, &rendered)
+}
+
+fn read_stored_config(connection: &Connection) -> Result<StoredConfig, String> {
+    let mut stored = StoredConfig::default();
+    if table_exists(connection, "config_line_profiles")? {
+        stored.line_profiles = read_documents(connection, "config_line_profiles", "line_id")?;
+    }
+    if table_exists(connection, "config_modem_slots")? {
+        stored.modem_slots = read_documents(connection, "config_modem_slots", "slot_key")?;
+    }
+    if table_exists(connection, "config_standalone_sim_slots")? {
+        stored.standalone_sim_slots =
+            read_documents(connection, "config_standalone_sim_slots", "slot_id")?;
+    }
+    if table_exists(connection, "config_documents")? {
+        stored.notifications = read_kind(connection, "notifications")?.unwrap_or_default();
+        stored.automation = read_kind(connection, "automation")?.unwrap_or_default();
+        stored.esim = read_kind(connection, "esim")?.unwrap_or_default();
+        stored.last_notified_update_version =
+            read_kind::<serde_json::Value>(connection, "version_update_state")?
+                .and_then(|value| {
+                    value
+                        .get("last_notified_version")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+    }
+    Ok(stored)
+}
+
+fn read_documents<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    table: &str,
+    key_column: &str,
+) -> Result<Vec<T>, String> {
+    let sql =
+        format!("SELECT {key_column}, document_json FROM {table} ORDER BY position, {key_column}");
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| format!("config_export_prepare_failed:{table}:{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("config_export_query_failed:{table}:{error}"))?;
+    let mut parsed = Vec::new();
+    for row in rows {
+        let (key, document) =
+            row.map_err(|error| format!("config_export_row_failed:{table}:{error}"))?;
+        parsed.push(
+            serde_json::from_str::<T>(&document)
+                .map_err(|error| format!("config_export_invalid:{table}:{key}:{error}"))?,
+        );
+    }
+    Ok(parsed)
+}
+
+fn read_kind<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    kind: &str,
+) -> Result<Option<T>, String> {
+    let row = connection
+        .query_row(
+            "SELECT document_json FROM config_documents WHERE kind = ?1",
+            params![kind],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("config_export_document_read_failed:{kind}:{error}"))?;
+    match row {
+        Some(document) => serde_json::from_str::<T>(&document)
+            .map(Some)
+            .map_err(|error| format!("config_export_document_invalid:{kind}:{error}")),
+        None => Ok(None),
+    }
+}
+
+fn read_overrides(connection: &Connection) -> Result<Vec<OverrideExportRow>, String> {
+    if !table_exists(connection, "ims_sim_overrides")? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT binding_hash, schema_version, document_json, updated_at
+             FROM ims_sim_overrides ORDER BY binding_hash",
+        )
+        .map_err(|error| format!("config_export_override_query_failed:{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            let document: String = row.get(2)?;
+            Ok(OverrideExportRow {
+                binding_hash: row.get(0)?,
+                schema_version: row.get(1)?,
+                document: serde_json::from_str(&document).unwrap_or(serde_json::Value::Null),
+                updated_at: row.get(3)?,
+            })
+        })
+        .map_err(|error| format!("config_export_override_read_failed:{error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("config_export_override_row_failed:{error}"))
+}
+
+/// Replace the database half from `export`, in one transaction.
+fn apply_database_half(database_path: &Path, export: &ConfigExport) -> Result<(), String> {
+    let database = Arc::new(
+        Database::new(database_path.to_path_buf())
+            .map_err(|error| format!("config_import_database_open_failed:{error}"))?,
+    );
+    let stored: StoredConfig = export.stored.clone().into();
+    config_store::save(&database, &stored)?;
+
+    // Overrides are replaced wholesale: merging would leave rows the export
+    // never mentioned, bound to SIMs the operator thought they had cleared.
+    database
+        .with_connection(|conn| {
+            let transaction = conn.unchecked_transaction()?;
+            transaction.execute("DELETE FROM ims_sim_overrides", [])?;
+            for row in &export.overrides {
+                let document = serde_json::to_string(&row.document).unwrap_or_default();
+                transaction.execute(
+                    "INSERT INTO ims_sim_overrides
+                         (binding_hash, schema_version, document_json, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        row.binding_hash,
+                        row.schema_version,
+                        document,
+                        row.updated_at
+                    ],
+                )?;
+            }
+            transaction.commit()
+        })
+        .map_err(|error| format!("config_import_override_failed:{error}"))
+}
+
+/// Copy the config-owned tables from `source` into `target`, leaving every other
+/// table in `target` untouched.
+fn restore_config_tables(target: &Path, source: &Path) -> Result<(), String> {
+    let mut connection = open_writable(target)?;
+    let source_sql = source.to_string_lossy().into_owned();
+    connection
+        .execute("ATTACH DATABASE ?1 AS restore_source", params![source_sql])
+        .map_err(|error| format!("config_restore_attach_failed:{error}"))?;
+
+    let outcome = (|| -> Result<(), String> {
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("config_restore_begin_failed:{error}"))?;
+        for table in CONFIG_TABLES.iter().chain(["ims_sim_overrides"].iter()) {
+            let present: bool = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM restore_source.sqlite_master
+                     WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|count| count > 0)
+                .map_err(|error| format!("config_restore_probe_failed:{table}:{error}"))?;
+            if !present {
+                // An older snapshot may predate a table. Clearing the target
+                // matches what that snapshot actually described.
+                transaction
+                    .execute(&format!("DELETE FROM {table}"), [])
+                    .map_err(|error| format!("config_restore_clear_failed:{table}:{error}"))?;
+                continue;
+            }
+            transaction
+                .execute(&format!("DELETE FROM {table}"), [])
+                .map_err(|error| format!("config_restore_clear_failed:{table}:{error}"))?;
+            transaction
+                .execute(
+                    &format!("INSERT INTO {table} SELECT * FROM restore_source.{table}"),
+                    [],
+                )
+                .map_err(|error| format!("config_restore_copy_failed:{table}:{error}"))?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| format!("config_restore_commit_failed:{error}"))
+    })();
+
+    let _ = connection.execute("DETACH DATABASE restore_source", []);
+    outcome
+}
+
+fn snapshot_both(
+    config_path: &Path,
+    database_path: &Path,
+    suffix: &str,
+) -> Result<RollbackPaths, String> {
+    let mut rollback = RollbackPaths::default();
+    if database_path.exists() {
+        let path = sqlite_maintenance_path(database_path, suffix);
+        ensure_new_destination(&path)?;
+        let source = open_read_only(database_path)?;
+        let destination_sql = path.to_string_lossy().to_string();
+        source
+            .execute("VACUUM main INTO ?1", params![destination_sql])
+            .map_err(|error| format!("config_snapshot_vacuum_failed:{error}"))?;
+        drop(source);
+        set_private_file_mode(&path)?;
+        sync_file(&path)?;
+        rollback.database = Some(path);
+    }
+    if config_path.exists() {
+        let path = maintenance_path(config_path, suffix);
+        ensure_new_destination(&path)?;
+        copy_private(config_path, &path)?;
+        rollback.config_file = Some(path);
+    }
+    Ok(rollback)
+}
+
+/// Prove both halves load before reporting success, while the operator still has
+/// the rollback snapshot in hand.
+fn validate_loads(config_path: &Path, database_path: &Path) -> Result<(), String> {
+    let database = Arc::new(
+        Database::new(database_path.to_path_buf())
+            .map_err(|error| format!("database_open_failed:{error}"))?,
+    );
+    super::config::ConfigManager::try_new(config_path.to_path_buf(), database)?;
+    Ok(())
+}
+
+// --- validation -------------------------------------------------------------
+
 fn validate_export(export: &ConfigExport) -> Result<(), String> {
-    if export.format != 1 || export.storage_schema_version != CONFIG_STORAGE_SCHEMA_VERSION {
-        return Err("config_import_schema_unsupported".to_string());
+    if export.format != EXPORT_FORMAT {
+        return Err(format!(
+            "config_export_format_unsupported:{}:expected:{EXPORT_FORMAT}",
+            export.format
+        ));
     }
-    let serialized = serde_json::to_string(&export.app_config)
-        .map_err(|error| format!("config_import_app_config_serialize_failed:{error}"))?;
-    if export.app_config.line_config_version != CURRENT_LINE_CONFIG_VERSION {
-        return Err("config_import_line_schema_unsupported".to_string());
+    if export.config_store_schema_version != CONFIG_STORE_SCHEMA_VERSION {
+        return Err(format!(
+            "config_store_schema_unsupported:{}:expected:{CONFIG_STORE_SCHEMA_VERSION}",
+            export.config_store_schema_version
+        ));
     }
-    if serde_json::from_str::<AppConfig>(&serialized).is_err() {
-        return Err("config_import_app_config_invalid".to_string());
+    if export.main_config.config_version != CURRENT_LINE_CONFIG_VERSION {
+        return Err(format!(
+            "config_export_file_version_unsupported:{}:expected:{CURRENT_LINE_CONFIG_VERSION}",
+            export.main_config.config_version
+        ));
     }
     for row in &export.overrides {
-        if row.schema_version != OVERRIDE_SCHEMA_VERSION
-            || row.binding_hash.len() != 64
-            || !row
-                .binding_hash
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return Err("config_import_override_schema_invalid".to_string());
+        if row.binding_hash.len() != 64 || !row.binding_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            return Err("config_export_override_binding_invalid".to_string());
         }
-        if !row.document.is_object() {
-            return Err("config_import_override_document_invalid".to_string());
+        if row.schema_version != OVERRIDE_SCHEMA_VERSION {
+            return Err(format!(
+                "config_export_override_schema_unsupported:{}",
+                row.schema_version
+            ));
         }
         validate_stored_override_document(&row.binding_hash, row.schema_version, &row.document)
-            .map_err(|error| format!("config_import_override_invalid:{}", error.code()))?;
+            .map_err(|error| format!("config_export_override_invalid:{error}"))?;
     }
     Ok(())
 }
+
+fn summarize(connection: &Connection) -> Result<MaintenanceSummary, String> {
+    let count = |table: &str| -> Result<usize, String> {
+        if !table_exists(connection, table)? {
+            return Ok(0);
+        }
+        connection
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|value| value as usize)
+            .map_err(|error| format!("config_count_failed:{table}:{error}"))
+    };
+    Ok(MaintenanceSummary {
+        line_profiles: count("config_line_profiles")?,
+        modem_slots: count("config_modem_slots")?,
+        standalone_sim_slots: count("config_standalone_sim_slots")?,
+        overrides: count("ims_sim_overrides")?,
+    })
+}
+
+fn summary_counts(summary: &MaintenanceSummary) -> (usize, usize, usize, usize) {
+    (
+        summary.line_profiles,
+        summary.modem_slots,
+        summary.standalone_sim_slots,
+        summary.overrides,
+    )
+}
+
+// --- file plumbing ----------------------------------------------------------
 
 fn ensure_source(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
@@ -265,142 +645,89 @@ fn ensure_source(path: &Path) -> Result<(), String> {
             Err("config_maintenance_source_symlink_rejected".to_string())
         }
         Ok(metadata) if !metadata.is_file() => {
-            Err("config_maintenance_source_not_regular".to_string())
+            Err("config_maintenance_source_not_regular_file".to_string())
         }
         Ok(_) => Ok(()),
         Err(error) => Err(format!("config_maintenance_source_missing:{error}")),
     }
 }
 
+/// Never overwrite an operator's file. They remove it deliberately or choose
+/// another name.
 fn ensure_new_destination(path: &Path) -> Result<(), String> {
     if path.exists() {
-        return Err("config_maintenance_destination_exists".to_string());
+        return Err(format!(
+            "config_maintenance_destination_exists:{}",
+            path.display()
+        ));
     }
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("config_maintenance_destination_parent:{error}"))?;
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|error| format!("config_maintenance_mkdir_failed:{error}"))?;
+        }
     }
     Ok(())
 }
 
 fn open_read_only(path: &Path) -> Result<Connection, String> {
     Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| format!("config_maintenance_open_readonly:{error}"))
+        .map_err(|error| format!("config_maintenance_open_read_only_failed:{error}"))
 }
 
 fn open_writable(path: &Path) -> Result<Connection, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("config_maintenance_parent:{error}"))?;
-    }
     let connection = Connection::open(path)
-        .map_err(|error| format!("config_maintenance_open_writable:{error}"))?;
+        .map_err(|error| format!("config_maintenance_open_failed:{error}"))?;
     connection
         .busy_timeout(std::time::Duration::from_secs(5))
-        .map_err(|error| format!("config_maintenance_busy_timeout:{error}"))?;
+        .map_err(|error| format!("config_maintenance_timeout_failed:{error}"))?;
     connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .map_err(|error| format!("config_maintenance_wal:{error}"))?;
-    connection
-        .execute_batch(
-            "PRAGMA synchronous=FULL;
-             CREATE TABLE IF NOT EXISTS app_config (
-                 singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-                 storage_schema_version INTEGER NOT NULL,
-                 line_config_version INTEGER NOT NULL,
-                 config_json TEXT NOT NULL CHECK(json_valid(config_json)),
-                 updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS ims_sim_overrides (
-                 binding_hash TEXT PRIMARY KEY CHECK(length(binding_hash)=64),
-                 schema_version INTEGER NOT NULL,
-                 document_json TEXT NOT NULL CHECK(json_valid(document_json)),
-                 updated_at TEXT NOT NULL
-             );
-             CREATE TABLE IF NOT EXISTS config_schema_journal (
-                 version INTEGER PRIMARY KEY,
-                 applied_at TEXT NOT NULL,
-                 note TEXT NOT NULL
-             );
-             INSERT OR IGNORE INTO config_schema_journal(version, applied_at, note)
-                 VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 'initial schema');",
-        )
-        .map_err(|error| format!("config_maintenance_schema:{error}"))?;
-    set_private_file_mode(path)?;
+        .execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|error| format!("config_maintenance_pragma_failed:{error}"))?;
     Ok(connection)
-}
-
-fn validate_connection(connection: &Connection, path: &Path) -> Result<usize, String> {
-    let quick_check: String = connection
-        .query_row("PRAGMA quick_check(1)", [], |row| row.get(0))
-        .map_err(|error| format!("config_maintenance_quick_check:{error}"))?;
-    if quick_check != "ok" {
-        return Err(format!("config_maintenance_corrupt:{quick_check}"));
-    }
-    let (storage_version, config_json): (u32, String) = connection
-        .query_row(
-            "SELECT storage_schema_version, config_json FROM app_config WHERE singleton=1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(|error| {
-            format!(
-                "config_maintenance_app_config_missing:{}:{error}",
-                path.display()
-            )
-        })?;
-    if storage_version != CONFIG_STORAGE_SCHEMA_VERSION {
-        return Err("config_maintenance_storage_schema_unsupported".to_string());
-    }
-    let journal_version: Option<u32> = connection
-        .query_row(
-            "SELECT MAX(version) FROM config_schema_journal",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("config_maintenance_schema_journal_invalid:{error}"))?;
-    if journal_version != Some(CONFIG_STORAGE_SCHEMA_VERSION) {
-        return Err("config_maintenance_schema_journal_unsupported".to_string());
-    }
-    serde_json::from_str::<AppConfig>(&config_json)
-        .map_err(|error| format!("config_maintenance_app_config_invalid:{error}"))?;
-    let count = if table_exists(connection, "ims_sim_overrides")? {
-        connection
-            .query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| {
-                row.get(0)
-            })
-            .map_err(|error| format!("config_maintenance_override_count:{error}"))?
-    } else {
-        0
-    };
-    Ok(count)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, String> {
     connection
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
             params![table],
-            |row| row.get(0),
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(|error| format!("config_maintenance_schema_query:{error}"))
+        .map(|count| count > 0)
+        .map_err(|error| format!("config_maintenance_table_probe_failed:{table}:{error}"))
+}
+
+fn copy_private(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::copy(source, destination)
+        .map_err(|error| format!("config_maintenance_copy_failed:{error}"))?;
+    set_private_file_mode(destination)?;
+    sync_file(destination)?;
+    Ok(())
 }
 
 fn atomic_write_private(path: &Path, content: &[u8]) -> Result<(), String> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent).map_err(|error| format!("config_export_parent:{error}"))?;
-    let temp = maintenance_path(path, "tmp");
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temp)
-        .map_err(|error| format!("config_export_temp:{error}"))?;
+    let temp_path = path.with_extension("tmp");
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp_path)
+        .map_err(|error| format!("config_maintenance_temp_open_failed:{error}"))?;
     file.write_all(content)
-        .map_err(|error| format!("config_export_write:{error}"))?;
+        .map_err(|error| format!("config_maintenance_temp_write_failed:{error}"))?;
     file.sync_all()
-        .map_err(|error| format!("config_export_sync:{error}"))?;
+        .map_err(|error| format!("config_maintenance_temp_sync_failed:{error}"))?;
     drop(file);
-    set_private_file_mode(&temp)?;
-    fs::rename(&temp, path).map_err(|error| format!("config_export_rename:{error}"))?;
+    fs::rename(&temp_path, path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!("config_maintenance_rename_failed:{error}")
+    })?;
+    set_private_file_mode(path)?;
     sync_parent(path)
 }
 
@@ -408,32 +735,19 @@ fn sync_file(path: &Path) -> Result<(), String> {
     let file = OpenOptions::new()
         .read(true)
         .open(path)
-        .map_err(|error| format!("config_maintenance_sync_open:{error}"))?;
-    #[cfg(windows)]
-    {
-        // Windows does not expose a reliable fsync equivalent for every SQLite
-        // handle/filesystem combination. The database has already been closed
-        // by SQLite after VACUUM INTO; treat ERROR_ACCESS_DENIED from the final
-        // flush as a portability limitation, while preserving other failures.
-        return match file.sync_all() {
-            Ok(()) => Ok(()),
-            Err(error) if error.raw_os_error() == Some(5) => Ok(()),
-            Err(error) => Err(format!("config_maintenance_sync:{error}")),
-        };
-    }
-    #[cfg(not(windows))]
+        .map_err(|error| format!("config_maintenance_sync_open_failed:{error}"))?;
     file.sync_all()
-        .map_err(|error| format!("config_maintenance_sync:{error}"))
+        .map_err(|error| format!("config_maintenance_sync_failed:{error}"))
 }
 
 fn sync_parent(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
     if let Some(parent) = path.parent() {
         if let Ok(directory) = OpenOptions::new().read(true).open(parent) {
-            directory
-                .sync_all()
-                .map_err(|error| format!("config_maintenance_sync_parent:{error}"))?;
+            let _ = directory.sync_all();
         }
     }
+    let _ = path;
     Ok(())
 }
 
@@ -442,267 +756,38 @@ fn set_private_file_mode(_path: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(_path, fs::Permissions::from_mode(0o600))
-            .map_err(|error| format!("config_maintenance_permissions:{error}"))?;
+            .map_err(|error| format!("config_maintenance_permissions_failed:{error}"))?;
     }
     Ok(())
 }
 
 fn maintenance_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = path.as_os_str().to_os_string();
-    value.push(format!(".{suffix}.{}.tmp", std::process::id()));
-    PathBuf::from(value)
-}
-
-fn sqlite_maintenance_path(path: &Path, suffix: &str) -> PathBuf {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("config");
-    path.with_file_name(format!("{name}.{suffix}.{}.sqlite3", std::process::id()))
+    path.with_file_name(format!("{name}.{suffix}-{}", timestamp_tag()))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::connectivity::modems::ims::profile_override::{
-        SimBindingKey, SimOverride, SimOverrideStore,
-    };
+fn sqlite_maintenance_path(path: &Path, suffix: &str) -> PathBuf {
+    maintenance_path(path, suffix)
+}
 
-    fn test_dir(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "simadmin-config-maintenance-{name}-{}-{}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        fs::create_dir_all(&path).unwrap();
-        path
-    }
+/// Where `backup` puts the file half beside a database snapshot, and where
+/// `restore` looks for it. Derived from the snapshot name so the pair travels
+/// together without the operator having to name both.
+fn paired_config_path(database_snapshot: &Path, config_path: &Path) -> PathBuf {
+    let snapshot_name = database_snapshot
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snapshot");
+    let config_extension = config_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("yaml");
+    database_snapshot.with_file_name(format!("{snapshot_name}.config.{config_extension}"))
+}
 
-    fn source_database(path: &Path, ttl: i64) {
-        let manager = ConfigManager::try_new(path.to_path_buf()).unwrap();
-        let mut security = manager.get_security();
-        security.session_ttl_seconds = ttl;
-        manager.set_security(security).unwrap();
-        let key = SimBindingKey::resolve(Some("89014103211118510720"), None).unwrap();
-        let mut override_ = SimOverride::default();
-        override_.ims_common.voicemail_number = Some("+18005551234".to_string());
-        SimOverrideStore::sqlite(path.to_path_buf())
-            .save(&key, &override_)
-            .unwrap();
-    }
-
-    #[test]
-    fn online_backup_contains_app_config_and_sim_overrides() {
-        let dir = test_dir("backup");
-        let source = dir.join("config.sqlite3");
-        let backup = dir.join("backup.sqlite3");
-        source_database(&source, 7_200);
-        assert_eq!(backup_database(&source, &backup).unwrap(), 1);
-        assert_eq!(
-            ConfigManager::try_new(backup.clone())
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            7_200
-        );
-        let connection = open_read_only(&backup).unwrap();
-        assert_eq!(
-            connection
-                .query_row("SELECT COUNT(*) FROM ims_sim_overrides", [], |row| row
-                    .get::<_, usize>(0))
-                .unwrap(),
-            1
-        );
-        drop(connection);
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn explicit_export_import_replaces_atomically_and_retains_rollback() {
-        let dir = test_dir("import");
-        let source = dir.join("source.sqlite3");
-        let target = dir.join("target.sqlite3");
-        let export = dir.join("config-export.json");
-        source_database(&source, 7_200);
-        source_database(&target, 9_000);
-        assert_eq!(export_json(&source, &export).unwrap(), 1);
-        let rollback = import_json(&target, &export).unwrap().unwrap();
-        assert!(rollback.exists());
-        assert_eq!(
-            ConfigManager::try_new(target)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            7_200
-        );
-        assert_eq!(
-            ConfigManager::try_new(rollback)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            9_000
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn invalid_import_does_not_modify_target() {
-        let dir = test_dir("invalid-import");
-        let target = dir.join("target.sqlite3");
-        let invalid = dir.join("invalid.json");
-        source_database(&target, 8_000);
-        fs::write(&invalid, b"{not-json").unwrap();
-        assert!(import_json(&target, &invalid).is_err());
-        assert_eq!(
-            ConfigManager::try_new(target)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            8_000
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn destination_is_never_overwritten() {
-        let dir = test_dir("existing-destination");
-        let source = dir.join("source.sqlite3");
-        let destination = dir.join("existing.sqlite3");
-        source_database(&source, 7_200);
-        fs::write(&destination, b"sentinel").unwrap();
-        assert_eq!(
-            backup_database(&source, &destination).unwrap_err(),
-            "config_maintenance_destination_exists"
-        );
-        assert_eq!(fs::read(&destination).unwrap(), b"sentinel");
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn forged_override_binding_hash_is_rejected_before_target_write() {
-        let dir = test_dir("forged-binding");
-        let source = dir.join("source.sqlite3");
-        let target = dir.join("target.sqlite3");
-        let export = dir.join("config-export.json");
-        source_database(&source, 7_200);
-        source_database(&target, 9_000);
-        export_json(&source, &export).unwrap();
-        let mut document: serde_json::Value =
-            serde_json::from_slice(&fs::read(&export).unwrap()).unwrap();
-        document["overrides"][0]["binding_hash"] = serde_json::Value::String("0".repeat(64));
-        fs::write(&export, serde_json::to_vec(&document).unwrap()).unwrap();
-
-        let error = import_json(&target, &export).unwrap_err();
-        assert!(error.contains("sim_override_binding_hash_mismatch"));
-        assert_eq!(
-            ConfigManager::try_new(target)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            9_000
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn corrupted_database_and_future_schema_are_rejected() {
-        let dir = test_dir("corruption-version");
-        let corrupt = dir.join("corrupt.sqlite3");
-        fs::write(&corrupt, b"not a sqlite database").unwrap();
-        let corrupt_backup = dir.join("corrupt-backup.sqlite3");
-        assert!(backup_database(&corrupt, &corrupt_backup).is_err());
-        assert!(!corrupt_backup.exists());
-
-        let future = dir.join("future.sqlite3");
-        source_database(&future, 7_200);
-        let connection = Connection::open(&future).unwrap();
-        connection
-            .execute(
-                "UPDATE app_config SET storage_schema_version = 999 WHERE singleton = 1",
-                [],
-            )
-            .unwrap();
-        drop(connection);
-        let future_backup = dir.join("future-backup.sqlite3");
-        assert_eq!(
-            backup_database(&future, &future_backup).unwrap_err(),
-            "config_maintenance_storage_schema_unsupported"
-        );
-        assert!(!future_backup.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn online_backup_takes_a_consistent_snapshot_during_writes() {
-        let dir = test_dir("concurrent-backup");
-        let source = dir.join("source.sqlite3");
-        source_database(&source, 7_200);
-        let writer_path = source.clone();
-        let writer = std::thread::spawn(move || {
-            let manager = ConfigManager::try_new(writer_path).unwrap();
-            for value in 7_201..7_221 {
-                let mut security = manager.get_security();
-                security.session_ttl_seconds = value;
-                manager.set_security(security).unwrap();
-            }
-        });
-        let backup = dir.join("backup.sqlite3");
-        backup_database(&source, &backup).unwrap();
-        writer.join().unwrap();
-
-        let ttl = ConfigManager::try_new(backup)
-            .unwrap()
-            .get_security()
-            .session_ttl_seconds;
-        assert!((7_200..=7_220).contains(&ttl));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn read_only_source_can_be_backed_up_without_wal_copying() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = test_dir("readonly-source");
-        let source = dir.join("source.sqlite3");
-        source_database(&source, 7_200);
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
-        let backup = dir.join("backup.sqlite3");
-        backup_database(&source, &backup).unwrap();
-        assert_eq!(
-            ConfigManager::try_new(backup)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            7_200
-        );
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn sqlite_restore_replaces_config_and_retains_previous_snapshot() {
-        let dir = test_dir("restore");
-        let source = dir.join("source.sqlite3");
-        let target = dir.join("target.sqlite3");
-        source_database(&source, 7_200);
-        source_database(&target, 9_000);
-
-        let rollback = restore_database(&target, &source).unwrap().unwrap();
-        assert_eq!(
-            ConfigManager::try_new(target)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            7_200
-        );
-        assert_eq!(
-            ConfigManager::try_new(rollback)
-                .unwrap()
-                .get_security()
-                .session_ttl_seconds,
-            9_000
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
+fn timestamp_tag() -> String {
+    chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string()
 }

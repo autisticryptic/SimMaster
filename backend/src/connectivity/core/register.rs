@@ -10,6 +10,8 @@ use super::{access::ImsChannel, registration::UnregisterResult, sip_frame, ImsEr
 
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_AUTH_ROUNDS: u8 = 2;
+/// Safety valve for unrelated frames that share the IMS signaling path.
+pub(crate) const MAX_REGISTER_IGNORED_FRAMES: u8 = 32;
 /// Bounded `423 Interval Too Brief` negotiations per REGISTER exchange.
 ///
 /// RFC 3261 §21.4.4 lets the registrar refuse a short lease with 423 plus a
@@ -22,6 +24,50 @@ pub(crate) const MAX_MIN_EXPIRES_ROUNDS: u8 = 2;
 /// pin the session lease to an unusable value.
 pub(crate) const MIN_EXPIRES_CAP: u32 = 86_400;
 pub(crate) const MAX_REGISTER_PROVISIONAL_RESPONSES: u8 = 4;
+
+/// Identity of one SIP REGISTER client transaction.
+///
+/// A signaling connection is shared by REGISTER, NOTIFY, MESSAGE and dialog
+/// traffic. Call-ID alone identifies a registration/dialog family, not one
+/// request inside it; CSeq distinguishes the initial REGISTER from an
+/// authenticated retry, a 423 retry and a later refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RegisterTransactionKey {
+    call_id: String,
+    cseq: u32,
+}
+
+impl RegisterTransactionKey {
+    pub(crate) fn from_register_request(request: &[u8]) -> Option<Self> {
+        if !sip_frame::is_request(request, "REGISTER") {
+            return None;
+        }
+        Some(Self {
+            call_id: register_call_id(request)?,
+            cseq: register_cseq(request)?,
+        })
+    }
+
+    pub(crate) fn matches_response(&self, response: &[u8]) -> bool {
+        response.starts_with(b"SIP/2.0")
+            && register_call_id(response).as_deref() == Some(self.call_id.as_str())
+            && register_cseq(response) == Some(self.cseq)
+    }
+}
+
+fn register_call_id(frame: &[u8]) -> Option<String> {
+    // RFC 3261 defines `i` as the compact Call-ID form. IMS peers normally
+    // emit the long name, but accepting both avoids rejecting a legal response.
+    sip_frame::header_value(frame, "Call-ID").or_else(|| sip_frame::header_value(frame, "i"))
+}
+
+fn register_cseq(frame: &[u8]) -> Option<u32> {
+    let value = sip_frame::header_value(frame, "CSeq")?;
+    let mut fields = value.split_whitespace();
+    let number = fields.next()?.parse::<u32>().ok()?;
+    let method = fields.next()?;
+    method.eq_ignore_ascii_case("REGISTER").then_some(number)
+}
 
 /// Final-response statuses that a differently shaped REGISTER candidate (or a
 /// different P-CSCF) may clear. Format, lease, extension, routing and
@@ -190,8 +236,10 @@ where
     channel.send_sip(initial_request).await.map_err(|_| {
         RegisterFailure::new(ImsError::new("ims_register_initial_send_failed"), None, 0)
     })?;
+    let expected_transaction = RegisterTransactionKey::from_register_request(initial_request);
     let mut response = recv_final_register_response(
         channel,
+        expected_transaction.as_ref(),
         "ims_register_initial_receive_failed",
         "ims_register_initial_unexpected_status",
     )
@@ -242,8 +290,11 @@ where
                             auth_rounds,
                         )
                     })?;
+                    let expected_transaction =
+                        RegisterTransactionKey::from_register_request(&request);
                     response = recv_final_register_response(
                         channel,
+                        expected_transaction.as_ref(),
                         "ims_register_authenticated_receive_failed",
                         "ims_register_authenticated_unexpected_status",
                     )
@@ -315,8 +366,10 @@ where
                         auth_rounds,
                     )
                 })?;
+                let expected_transaction = RegisterTransactionKey::from_register_request(&request);
                 response = recv_final_register_response(
                     channel,
+                    expected_transaction.as_ref(),
                     receive_error,
                     unexpected_error,
                 )
@@ -390,24 +443,79 @@ where
 
 async fn recv_final_register_response<C>(
     channel: &mut C,
+    expected_transaction: Option<&RegisterTransactionKey>,
     receive_error: &'static str,
     provisional_exhausted_error: &'static str,
 ) -> Result<Vec<u8>, ImsError>
 where
     C: ImsChannel,
 {
-    for provisional_count in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
+    recv_final_register_response_with_timeout(
+        channel,
+        expected_transaction,
+        receive_error,
+        provisional_exhausted_error,
+        REGISTER_TIMEOUT,
+    )
+    .await
+}
+
+async fn recv_final_register_response_with_timeout<C>(
+    channel: &mut C,
+    expected_transaction: Option<&RegisterTransactionKey>,
+    receive_error: &'static str,
+    provisional_exhausted_error: &'static str,
+    timeout_budget: Duration,
+) -> Result<Vec<u8>, ImsError>
+where
+    C: ImsChannel,
+{
+    // One absolute budget for the whole transaction. Unrelated traffic and
+    // provisional responses must not restart the timer for each frame.
+    let deadline = tokio::time::Instant::now() + timeout_budget;
+    let mut provisional_count = 0u8;
+    let mut ignored_frames = 0u8;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ImsError::new(receive_error));
+        }
         let response = channel
-            .recv_sip(REGISTER_TIMEOUT)
+            .recv_sip_fresh(remaining)
             .await
             .map_err(|_| ImsError::new(receive_error))?;
+        // The IMS signaling path is shared with in-dialog requests (NOTIFY,
+        // MESSAGE, ...). Only a response for this REGISTER transaction may be
+        // consumed; anything else goes back to the caller's queue so the
+        // session loop can handle it instead of killing the exchange.
+        let is_response = response.starts_with(b"SIP/2.0");
+        let transaction_matches = expected_transaction
+            .map(|expected| expected.matches_response(&response))
+            .unwrap_or(is_response);
+        if !transaction_matches {
+            ignored_frames = ignored_frames.saturating_add(1);
+            channel.requeue(response);
+            if ignored_frames > MAX_REGISTER_IGNORED_FRAMES {
+                return Err(ImsError::new(receive_error));
+            }
+            tracing::debug!(
+                is_response,
+                transaction_key_available = expected_transaction.is_some(),
+                "IMS REGISTER skipping frame outside the current transaction"
+            );
+            continue;
+        }
         let status = sip_frame::parse_status(&response)?;
         if !(100..=199).contains(&status) {
             return Ok(response);
         }
+        provisional_count = provisional_count.saturating_add(1);
+        if provisional_count > MAX_REGISTER_PROVISIONAL_RESPONSES {
+            break;
+        }
         tracing::debug!(
             sip_status = status,
-            provisional_count = provisional_count + 1,
+            provisional_count,
             "IMS REGISTER provisional response received"
         );
     }
@@ -439,6 +547,7 @@ mod tests {
 
     struct FakeChannel {
         responses: VecDeque<Vec<u8>>,
+        requeued: VecDeque<Vec<u8>>,
         sends: Vec<Vec<u8>>,
         transport: SipTransport,
     }
@@ -449,9 +558,20 @@ mod tests {
             Ok(())
         }
         async fn recv_sip(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            if let Some(frame) = self.requeued.pop_front() {
+                return Ok(frame);
+            }
             self.responses
                 .pop_front()
                 .ok_or(ImsError::new("ims_test_response_missing"))
+        }
+        async fn recv_sip_fresh(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            self.responses
+                .pop_front()
+                .ok_or(ImsError::new("ims_test_response_missing"))
+        }
+        fn requeue(&mut self, frame: Vec<u8>) {
+            self.requeued.push_back(frame);
         }
         fn route(&self) -> ImsRoute {
             ImsRoute {
@@ -460,6 +580,49 @@ mod tests {
                 transport: self.transport,
             }
         }
+        fn security_verify(&self) -> Option<&str> {
+            None
+        }
+    }
+
+    struct TimedUnrelatedChannel {
+        requeued: VecDeque<Vec<u8>>,
+        completed_reads: usize,
+        frame_delay: Duration,
+    }
+
+    impl ImsChannel for TimedUnrelatedChannel {
+        async fn send_sip(&mut self, _frame: &[u8]) -> Result<(), ImsError> {
+            Ok(())
+        }
+
+        async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            if let Some(frame) = self.requeued.pop_front() {
+                return Ok(frame);
+            }
+            self.recv_sip_fresh(timeout).await
+        }
+
+        async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            tokio::time::timeout(timeout, tokio::time::sleep(self.frame_delay))
+                .await
+                .map_err(|_| ImsError::new("ims_channel_read_timeout"))?;
+            self.completed_reads += 1;
+            Ok(b"NOTIFY sip:ua@ims.example SIP/2.0\r\nCall-ID: other@dev\r\nContent-Length: 0\r\n\r\n".to_vec())
+        }
+
+        fn requeue(&mut self, frame: Vec<u8>) {
+            self.requeued.push_back(frame);
+        }
+
+        fn route(&self) -> ImsRoute {
+            ImsRoute {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                pcscf_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                transport: SipTransport::Udp,
+            }
+        }
+
         fn security_verify(&self) -> Option<&str> {
             None
         }
@@ -559,6 +722,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([response(401, "Unauthorized"), response(200, "OK")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -576,6 +740,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([response(401, "Unauthorized"), response(200, "OK")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut authenticator = FakeAuthenticator;
@@ -598,6 +763,7 @@ mod tests {
         let mut rejected = FakeChannel {
             responses: VecDeque::from([response(403, "Forbidden")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         assert_eq!(
@@ -608,6 +774,7 @@ mod tests {
         let mut lost = FakeChannel {
             responses: VecDeque::new(),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         assert_eq!(
@@ -626,6 +793,7 @@ mod tests {
                 response(200, "OK"),
             ]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -641,16 +809,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provisional_response_loop_is_bounded() {
+    async fn provisional_response_limit_allows_exactly_the_documented_count() {
+        let mut responses = VecDeque::new();
+        for _ in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
+            responses.push_back(response(100, "Trying"));
+        }
+        responses.push_back(response(200, "OK"));
         let mut channel = FakeChannel {
-            responses: VecDeque::from([
-                response(100, "Trying"),
-                response(100, "Trying"),
-                response(100, "Trying"),
-                response(100, "Trying"),
-                response(401, "Unauthorized"),
-            ]),
+            responses,
             sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+
+        run_register(&mut channel, b"REGISTER initial", &mut FakeAuthenticator)
+            .await
+            .unwrap();
+        assert!(channel.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provisional_response_loop_is_bounded() {
+        let mut responses = VecDeque::new();
+        for _ in 0..=MAX_REGISTER_PROVISIONAL_RESPONSES {
+            responses.push_back(response(100, "Trying"));
+        }
+        responses.push_back(response(401, "Unauthorized"));
+        let mut channel = FakeChannel {
+            responses,
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -665,6 +853,214 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ignored_and_provisional_limits_are_counted_independently() {
+        let mut responses = VecDeque::new();
+        for _ in 0..MAX_REGISTER_IGNORED_FRAMES {
+            responses.push_back(
+                b"OPTIONS sip:ua@ims.example SIP/2.0\r\nCall-ID: other@dev\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            );
+        }
+        for _ in 0..MAX_REGISTER_PROVISIONAL_RESPONSES {
+            responses.push_back(response(100, "Trying"));
+        }
+        responses.push_back(response(200, "OK"));
+        let mut channel = FakeChannel {
+            responses,
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+
+        run_register(&mut channel, b"REGISTER initial", &mut FakeAuthenticator)
+            .await
+            .unwrap();
+
+        assert_eq!(channel.requeued.len(), MAX_REGISTER_IGNORED_FRAMES as usize);
+        assert!(channel.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_frames_do_not_restart_the_absolute_register_deadline() {
+        let timeout_budget = Duration::from_millis(40);
+        let mut channel = TimedUnrelatedChannel {
+            requeued: VecDeque::new(),
+            completed_reads: 0,
+            frame_delay: Duration::from_millis(15),
+        };
+        let started = tokio::time::Instant::now();
+
+        let error = recv_final_register_response_with_timeout(
+            &mut channel,
+            None,
+            "ims_register_initial_receive_failed",
+            "ims_register_initial_unexpected_status",
+            timeout_budget,
+        )
+        .await
+        .unwrap_err();
+        let elapsed = tokio::time::Instant::now() - started;
+
+        assert_eq!(error.code(), "ims_register_initial_receive_failed");
+        assert!(elapsed >= timeout_budget, "elapsed only {elapsed:?}");
+        assert!(elapsed < Duration::from_millis(150), "elapsed {elapsed:?}");
+        assert_eq!(channel.completed_reads, 2);
+        assert_eq!(channel.requeued.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unrelated_frames_on_the_shared_path_are_requeued_not_consumed() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                b"NOTIFY sip:ua@ims.example SIP/2.0\r\nCall-ID: other@dev\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                response_with_header(
+                    200,
+                    "OK",
+                    "Call-ID: abc@dev\r\nCSeq: 1 REGISTER\r\n",
+                ),
+            ]),
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let result = run_register(
+            &mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc@dev\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n",
+            &mut auth,
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.authenticated);
+        assert!(channel.responses.is_empty());
+        assert_eq!(channel.requeued.len(), 1);
+        // The unrelated request is preserved for the session loop.
+        let frame = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+        assert!(frame.starts_with(b"NOTIFY"));
+    }
+
+    #[tokio::test]
+    async fn mismatched_call_id_response_is_requeued_and_matching_one_wins() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response_with_header(200, "OK", "Call-ID: stale@dev\r\nCSeq: 1 REGISTER\r\n"),
+                response_with_header(200, "OK", "Call-ID: abc@dev\r\nCSeq: 1 REGISTER\r\n"),
+            ]),
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        run_register(
+            &mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc@dev\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n",
+            &mut auth,
+        )
+        .await
+        .unwrap();
+
+        assert!(channel.responses.is_empty());
+        assert_eq!(channel.requeued.len(), 1);
+        let frame = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+        assert!(String::from_utf8_lossy(&frame).contains("stale@dev"));
+    }
+
+    #[tokio::test]
+    async fn only_matching_register_cseq_is_consumed() {
+        let mut channel = FakeChannel {
+            responses: VecDeque::from([
+                response_with_header(200, "OK", "CSeq: 8 REGISTER\r\n"),
+                response_with_header(200, "OK", "Call-ID: abc@dev\r\nCSeq: 7 INVITE\r\n"),
+                response_with_header(200, "OK", "Call-ID: abc@dev\r\nCSeq: 8 REGISTER\r\n"),
+                response_with_header(200, "OK", "Call-ID: abc@dev\r\nCSeq: 7 REGISTER\r\n"),
+            ]),
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+
+        run_register(
+            &mut channel,
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc@dev\r\nCSeq: 7 REGISTER\r\nContent-Length: 0\r\n\r\n",
+            &mut FakeAuthenticator,
+        )
+        .await
+        .unwrap();
+
+        assert!(channel.responses.is_empty());
+        assert_eq!(channel.requeued.len(), 3);
+    }
+
+    #[test]
+    fn register_transaction_key_requires_call_id_and_register_cseq() {
+        assert!(RegisterTransactionKey::from_register_request(
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc\r\nCSeq: 1 REGISTER\r\n\r\n"
+        )
+        .is_some());
+        assert!(RegisterTransactionKey::from_register_request(
+            b"REGISTER sip:ims.example SIP/2.0\r\nCSeq: 1 REGISTER\r\n\r\n"
+        )
+        .is_none());
+        assert!(RegisterTransactionKey::from_register_request(
+            b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: abc\r\nCSeq: 1 INVITE\r\n\r\n"
+        )
+        .is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_frame_limit_allows_exactly_the_documented_count() {
+        let mut responses: VecDeque<Vec<u8>> = (0..MAX_REGISTER_IGNORED_FRAMES)
+            .map(|_| {
+                b"NOTIFY sip:ua@ims.example SIP/2.0\r\nCall-ID: other@dev\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec()
+            })
+            .collect();
+        responses.push_back(response(200, "OK"));
+        let mut channel = FakeChannel {
+            responses,
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+
+        run_register(&mut channel, b"REGISTER initial", &mut FakeAuthenticator)
+            .await
+            .unwrap();
+        assert_eq!(channel.requeued.len(), MAX_REGISTER_IGNORED_FRAMES as usize);
+        assert!(channel.responses.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unrelated_frame_flood_bounds_the_register_wait() {
+        let mut channel = FakeChannel {
+            responses: (0..64)
+                .map(|_| {
+                    b"NOTIFY sip:ua@ims.example SIP/2.0\r\nCall-ID: other@dev\r\nContent-Length: 0\r\n\r\n"
+                        .to_vec()
+                })
+                .collect(),
+            sends: Vec::new(),
+            requeued: VecDeque::new(),
+            transport: SipTransport::Udp,
+        };
+        let mut auth = FakeAuthenticator;
+
+        let error = run_register(&mut channel, b"REGISTER initial", &mut auth)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), "ims_register_initial_receive_failed");
+        assert_eq!(
+            channel.requeued.len(),
+            MAX_REGISTER_IGNORED_FRAMES as usize + 1
+        );
+        assert_eq!(channel.responses.len(), 31);
+    }
+
+    #[tokio::test]
     async fn repeated_challenge_is_bounded() {
         let mut channel = FakeChannel {
             responses: VecDeque::from([
@@ -673,6 +1069,7 @@ mod tests {
                 response(401, "Unauthorized"),
             ]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -688,6 +1085,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([response(401, "Unauthorized"), response(200, "OK")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = SwitchingAuthenticator;
@@ -705,6 +1103,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([response(401, "Unauthorized")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = OwnedExchangeAuthenticator;
@@ -724,6 +1123,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::new(),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -742,6 +1142,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([terminal.clone()]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -764,6 +1165,7 @@ mod tests {
         let mut channel = FakeChannel {
             responses: VecDeque::from([response(401, "Unauthorized")]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
         let mut auth = FakeAuthenticator;
@@ -784,9 +1186,12 @@ mod tests {
                 response(200, "OK"),
             ]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
-        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let mut auth = MinExpiresAuthenticator {
+            rebuilds: Vec::new(),
+        };
 
         let result = run_register(&mut channel, b"REGISTER initial", &mut auth)
             .await
@@ -808,9 +1213,12 @@ mod tests {
                 response_with_header(423, "Interval Too Brief", "Min-Expires: 3600\r\n"),
             ]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
-        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let mut auth = MinExpiresAuthenticator {
+            rebuilds: Vec::new(),
+        };
 
         let error = run_register(&mut channel, b"REGISTER initial", &mut auth)
             .await
@@ -830,9 +1238,12 @@ mod tests {
                 response(200, "OK"),
             ]),
             sends: Vec::new(),
+            requeued: VecDeque::new(),
             transport: SipTransport::Udp,
         };
-        let mut auth = MinExpiresAuthenticator { rebuilds: Vec::new() };
+        let mut auth = MinExpiresAuthenticator {
+            rebuilds: Vec::new(),
+        };
 
         let result = run_register(&mut channel, b"REGISTER initial", &mut auth)
             .await
@@ -1105,11 +1516,7 @@ pub(crate) mod contract {
         let (negotiated, channel, _) = exchange(
             style,
             [
-                response(
-                    423,
-                    "Interval Too Brief",
-                    "Min-Expires: 1800\r\n",
-                ),
+                response(423, "Interval Too Brief", "Min-Expires: 1800\r\n"),
                 success(),
             ],
         )
