@@ -8945,12 +8945,24 @@ pub async fn list_vowifi_carrier_profiles_handler(
 ///
 /// Store an operator-authored override in `data.db`. The sealed catalog remains
 /// untouched, so downloading a newer release cannot overwrite local profiles.
+///
+/// Takes the raw body rather than a typed record on purpose. The REGISTER
+/// switches are tri-state in a carrier bundle but plain `bool` in the record, so
+/// only the unparsed JSON can tell an absent switch from an authored `false`.
+/// Four of them default to `true`, so accepting a partial body would let a
+/// caller silently cancel an operator's `omit`. `from_api_value` refuses that
+/// and names the missing fields.
 pub async fn upsert_vowifi_carrier_profile_handler(
     State(app): State<AppState>,
-    Json(record): Json<
-        crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord,
-    >,
+    Json(body): Json<serde_json::Value>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    let record =
+        match crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord::from_api_value(
+            body,
+        ) {
+            Ok(record) => record,
+            Err(error) => return (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
+        };
     match profile_store(&app).upsert(record) {
         Ok(profile) => (
             StatusCode::OK,

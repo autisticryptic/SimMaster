@@ -2709,19 +2709,18 @@ mod http_router_tests {
         );
     }
 
-    /// The partial-body exposure, at the boundary where it actually bites.
+    /// A partial PUT body is refused at the boundary.
     ///
-    /// `profile_record::tests::a_partial_api_body_silently_reenables_default_true_switches`
-    /// proves this at the serde layer. This proves it through the live endpoint:
-    /// a client that PUTs a record without the four switches whose serde default
-    /// is `true` cancels the operator's `omit` in stored state, because the
-    /// handler takes `Json<CarrierProfileRecord>` and never sees the raw body.
+    /// The switches are tri-state in a bundle but plain `bool` in the record, so
+    /// a body missing one would let serde's default decide -- and four default to
+    /// `true`, which would cancel an operator's `omit` and turn a header back on
+    /// with no error. The handler reads the raw body to prevent that.
     ///
-    /// Asserting today's behaviour on purpose. When the handler is made
-    /// presence-aware this test must fail, which is the point -- the API
-    /// contract change should be deliberate and visible, not silent.
+    /// Asserted through the live endpoint because that is where a real client
+    /// meets it; `profile_record::tests::the_api_parser_refuses_a_body_missing_register_switches`
+    /// covers the field-by-field detail.
     #[tokio::test]
-    async fn a_partial_put_body_cancels_an_omit_through_the_live_endpoint() {
+    async fn a_partial_put_body_is_refused_by_the_live_endpoint() {
         use crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord;
         use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
 
@@ -2749,13 +2748,21 @@ mod http_router_tests {
 
         let (status, response) =
             put_json(&served, "/api/vowifi/carrier-profiles", body, &cookie).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "a partial body must be refused: {response}"
+        );
         assert!(
-            status.is_success(),
-            "a partial body is accepted today, got {status}: {response}"
+            response.contains("carrier_profile_register_switch_missing"),
+            "the refusal must say a switch is missing: {response}"
+        );
+        assert!(
+            response.contains("always_add_sip_instance"),
+            "the refusal must name the missing switch: {response}"
         );
 
-        // Read the stored projection back. `/resolve` returns the full record;
-        // the list endpoint only carries summaries.
+        // Nothing was stored, so the omit was never cancelled.
         let (status, resolved) = get_with_cookie(
             &served,
             &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
@@ -2764,14 +2771,31 @@ mod http_router_tests {
         .await;
         assert_eq!(status, StatusCode::OK, "resolve must answer: {resolved}");
         assert!(
-            resolved.contains(&profile_id),
-            "resolve must return the profile just stored: {resolved}"
+            !resolved.contains(&profile_id) || !resolved.contains("\"source\":\"database\""),
+            "the refused body must not have been stored: {resolved}"
         );
+
+        // The same record with every switch present is accepted, so the refusal
+        // above is about the missing field and not about the record itself.
+        let complete = serde_json::to_value(&record).expect("serialize complete record");
+        let (status, response) =
+            put_json(&served, "/api/vowifi/carrier-profiles", complete, &cookie).await;
         assert!(
-            resolved.contains("\"always_add_sip_instance\":true"),
-            "the omitted switch is silently back on -- this is the exposure \
-             this test pins. If the handler became presence-aware, update it: \
-             {resolved}"
+            status.is_success(),
+            "a complete body must still be accepted, got {status}: {response}"
+        );
+
+        // And the operator's omit survived into stored state.
+        let (status, resolved) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "resolve must answer: {resolved}");
+        assert!(
+            resolved.contains("\"always_add_sip_instance\":false"),
+            "the stored record must keep the omit: {resolved}"
         );
     }
 

@@ -433,6 +433,66 @@ impl CarrierProfileRecord {
         Ok(record)
     }
 
+    /// REGISTER switches that a caller must state explicitly.
+    ///
+    /// These are tri-state in a carrier bundle -- `true`, `false`/`omit`, or
+    /// absent meaning "no opinion" -- but this record stores a plain `bool`, so
+    /// by the time a body is deserialized the distinction is gone. A stored
+    /// database row keeps it because `from_database_json` inspects the raw JSON;
+    /// an API caller has no such rescue.
+    pub const REQUIRED_REGISTER_SWITCHES: &'static [&'static str] = &[
+        "include_pani_initial",
+        "include_pani_authenticated",
+        "include_route_header",
+        "include_p_preferred_identity",
+        "always_add_sip_instance",
+        "enable_cellular_network_info",
+        "require_sec_agree_headers",
+        "proxy_require_sec_agree_headers",
+    ];
+
+    /// Parse a record submitted through the API, refusing a partial body.
+    ///
+    /// A PUT replaces the whole resource, so every REGISTER switch must be
+    /// stated. Accepting an absent one would let serde's default decide, and
+    /// four of these default to `true`: a caller doing read-modify-write that
+    /// dropped a field would silently cancel the operator's `omit` and turn a
+    /// header back on, on the registration path, with no error.
+    ///
+    /// Refusing is the same choice the catalog projection makes for an
+    /// unrecognised value -- a bad body is an authoring mistake and must be
+    /// visible. The error names every missing field so one round trip is enough
+    /// to fix the caller.
+    pub fn from_api_json(json: &str) -> Result<Self, String> {
+        let value = serde_json::from_str::<Value>(json)
+            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+        Self::from_api_value(value)
+    }
+
+    /// As `from_api_json`, for a body already parsed by the web framework.
+    pub fn from_api_value(value: Value) -> Result<Self, String> {
+        let register = value.pointer("/ims/register").and_then(Value::as_object);
+        let Some(register) = register else {
+            return Err("carrier_profile_register_section_missing".to_string());
+        };
+        let missing = Self::REQUIRED_REGISTER_SWITCHES
+            .iter()
+            .filter(|field| !register.contains_key(**field))
+            .copied()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!(
+                "carrier_profile_register_switch_missing:{}",
+                missing.join(",")
+            ));
+        }
+
+        let record = serde_json::from_value::<Self>(value)
+            .map_err(|error| format!("carrier_profile_json_invalid:{error}"))?;
+        record.validate()?;
+        Ok(record)
+    }
+
     fn normalize_legacy_database_record(&mut self, source: &Value) -> Result<(), String> {
         if self.schema_version > CURRENT_SCHEMA_VERSION {
             return Err(format!(
@@ -1485,18 +1545,12 @@ mod tests {
         assert_eq!(record.validate().unwrap_err(), "ike_proposals_required");
     }
 
-    /// `PUT /api/vowifi/carrier-profiles` deserializes `Json<CarrierProfileRecord>`
-    /// straight into `ProfileStore::upsert`, with no access to the raw body. So
-    /// unlike `from_database_json`, it cannot tell an absent switch from an
-    /// authored `false`, and the four switches whose serde default is `true`
-    /// come back `true`.
-    ///
-    /// This is the API-shaped form of the hazard the plan calls "中途变为缺失值":
-    /// a client doing read-modify-write that drops these fields silently
-    /// re-enables headers the operator had omitted. Pin the current behaviour so
-    /// the exposure is visible and a fix is a deliberate, test-visible change.
+    /// Plain `serde_json::from_value` cannot tell an absent switch from an
+    /// authored `false`, and four of these default to `true`. That is why the
+    /// API path must not use it -- kept as the demonstration of *why*
+    /// `from_api_value` exists, with the refusal asserted separately below.
     #[test]
-    fn a_partial_api_body_silently_reenables_default_true_switches() {
+    fn plain_deserialization_of_a_partial_body_reenables_default_true_switches() {
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         record.ims.register.include_pani_initial = false;
         record.ims.register.include_pani_authenticated = false;
@@ -1545,6 +1599,69 @@ mod tests {
         assert_ne!(
             parsed, record,
             "the record must differ, which is precisely the problem"
+        );
+    }
+
+    /// `from_api_value` closes the hazard above: a body missing any REGISTER
+    /// switch is refused, and the error names every one that is absent so a
+    /// caller needs one round trip to fix it.
+    #[test]
+    fn the_api_parser_refuses_a_body_missing_register_switches() {
+        let record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        let complete = serde_json::to_value(&record).expect("serialize");
+
+        // The complete body is still accepted, so the check cannot be passing
+        // by rejecting everything.
+        let parsed = CarrierProfileRecord::from_api_value(complete.clone())
+            .expect("a complete body must stay acceptable");
+        assert_eq!(parsed, record);
+
+        // Every switch is individually required.
+        for field in CarrierProfileRecord::REQUIRED_REGISTER_SWITCHES {
+            let mut value = complete.clone();
+            value
+                .pointer_mut("/ims/register")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("register object")
+                .remove(*field);
+            let error = CarrierProfileRecord::from_api_value(value)
+                .expect_err("a body missing {field} must be refused");
+            assert!(
+                error.starts_with("carrier_profile_register_switch_missing:"),
+                "unexpected error for a missing {field}: {error}"
+            );
+            assert!(
+                error.contains(field),
+                "the error must name the missing field {field}: {error}"
+            );
+        }
+
+        // Several missing at once are reported together, not one per round trip.
+        let mut value = complete.clone();
+        {
+            let register = value
+                .pointer_mut("/ims/register")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("register object");
+            register.remove("include_pani_initial");
+            register.remove("always_add_sip_instance");
+        }
+        let error =
+            CarrierProfileRecord::from_api_value(value).expect_err("must refuse a partial body");
+        assert!(error.contains("include_pani_initial"), "{error}");
+        assert!(error.contains("always_add_sip_instance"), "{error}");
+
+        // A body with no register section at all is refused distinctly, rather
+        // than blamed on a missing switch.
+        let mut value = complete;
+        value
+            .pointer_mut("/ims")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("ims object")
+            .remove("register");
+        assert_eq!(
+            CarrierProfileRecord::from_api_value(value).expect_err("must refuse"),
+            "carrier_profile_register_section_missing"
         );
     }
 
