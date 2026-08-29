@@ -1485,6 +1485,80 @@ mod tests {
         assert_eq!(record.validate().unwrap_err(), "ike_proposals_required");
     }
 
+    /// The store's load path is `from_database_json`, which deserializes and
+    /// then calls `normalize_legacy_database_record` with the *raw* JSON so it
+    /// can tell an absent field from an authored `false`.
+    ///
+    /// `database_migration_preserves_explicit_optional_header_disables` already
+    /// covers five switches on the legacy (`schema_version = 0`) path. This
+    /// covers the current-schema path and extends to all nine, adding the four
+    /// PANI/Route/P-Preferred-Identity switches, and asserts the whole record
+    /// is unchanged so nothing else drifts on the way through storage.
+    #[test]
+    fn stored_omit_survives_the_database_load_path() {
+        let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        record.meta.profile_id = "test-omit-store-load".to_string();
+        record.ims.register.include_pani_initial = false;
+        record.ims.register.include_pani_authenticated = false;
+        record.ims.register.include_route_header = false;
+        record.ims.register.include_p_preferred_identity = false;
+        record.ims.register.always_add_sip_instance = false;
+        record.ims.register.enable_cellular_network_info = false;
+        record.ims.register.require_sec_agree_headers = false;
+        record.ims.register.proxy_require_sec_agree_headers = false;
+        record.ims.register.sec_agree_mode = "disabled".to_string();
+
+        let stored = serde_json::to_string(&record).expect("serialize for storage");
+        let loaded =
+            CarrierProfileRecord::from_database_json(&stored).expect("load stored omit record");
+        let register = &loaded.ims.register;
+
+        // `always_add_sip_instance` is the dangerous one: its serde default is
+        // `true` and legacy normalization also forces `true` when the field is
+        // absent, so only presence-awareness keeps the authored `false`.
+        assert!(!register.always_add_sip_instance);
+        assert!(!register.enable_cellular_network_info);
+        assert!(!register.include_pani_initial);
+        assert!(!register.include_pani_authenticated);
+        assert!(!register.include_route_header);
+        assert!(!register.include_p_preferred_identity);
+        assert!(!register.require_sec_agree_headers);
+        assert!(!register.proxy_require_sec_agree_headers);
+        assert_eq!(register.sec_agree_mode, "disabled");
+        assert_eq!(loaded, record);
+    }
+
+    /// A row written before a switch existed cannot express an omit for it, and
+    /// must not be read as one. Absent `always_add_sip_instance` normalizes to
+    /// `true`; absent `enable_cellular_network_info` normalizes to `false`,
+    /// because CNI can disclose serving-cell data and must never be synthesized
+    /// for a row that predates the switch. This is the documented asymmetry, so
+    /// pin it — a future migration change has to be deliberate.
+    #[test]
+    fn a_legacy_row_missing_a_switch_is_not_read_as_an_omit() {
+        let record = CarrierProfileRecord::from_profile(&GB_EE_23433);
+        let mut value = serde_json::to_value(&record).expect("serialize to value");
+        let register = value
+            .pointer_mut("/ims/register")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("register object");
+        register.remove("always_add_sip_instance");
+        register.remove("enable_cellular_network_info");
+        assert!(!register.contains_key("always_add_sip_instance"));
+
+        let loaded = CarrierProfileRecord::from_database_json(&value.to_string())
+            .expect("legacy row must still load");
+
+        assert!(
+            loaded.ims.register.always_add_sip_instance,
+            "an absent switch is no opinion, so the baseline true applies"
+        );
+        assert!(
+            !loaded.ims.register.enable_cellular_network_info,
+            "CNI must never be synthesized for a row that predates the switch"
+        );
+    }
+
     /// A carrier bundle's explicit `omit` reaches this record as `false`. Four
     /// of these switches carry `#[serde(default = "default_true")]`, so any
     /// layer that drops the field on the way through — an export/import round

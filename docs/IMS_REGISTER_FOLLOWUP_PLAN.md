@@ -108,8 +108,8 @@
   - oversized fragmented UDP loopback 测试已明确标记 ignored；原因是 WSL2 loopback 在超过 MTU 时不投递该数据报，不是代码死锁。
   - 完成日期：2026-08-29
 - [x] 运行完整后端测试：`cargo test --bin simadmin -- --test-threads=1`。
-  - 结果：1342 passed; 0 failed; 3 ignored（共 1345 个测试）。
-  - 完成日期：2026-08-29；含第 7 节新增的 4 个测试。
+  - 结果：1344 passed; 0 failed; 3 ignored（共 1347 个测试）。
+  - 完成日期：2026-08-29；含第 7 节新增的 6 个测试。
 - [x] 在 Debian/aarch64 目标环境完成编译或 CI 构建。
   - GitHub Actions Run `33236459920` 的 ARM64 job 成功，生成 `aarch64-unknown-linux-musl` 制品（2026-08-29）。
 - [ ] Windows 原生编译仍受已知 `libc::IFF_UP` 平台问题影响；本项不作为本轮 IMS 修复的失败依据。
@@ -214,8 +214,18 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 完成日期：2026-08-29
   - 风险确认：`include_pani_initial`、`include_pani_authenticated`、`include_p_preferred_identity`、`always_add_sip_instance` 四个字段带 `#[serde(default = "default_true")]`，任何丢字段的中间层都会把 `false` 翻回 `true`。
   - 测试：`profile_record::tests::omitted_register_switches_survive_a_json_round_trip`（九个开关 + `sec_agree_mode` + 机制列表 + 整体相等）。
-- [ ] 检查 profile override、profile store 和配置导入导出路径是否保留 `omit`。
-  - record 层已覆盖；override/store/导入导出这三条路径尚未单独断言。
+- [x] 检查 profile store 的加载路径是否保留 `omit`。
+  - 完成日期：2026-08-29
+  - 机制确认：store 经 `custom_records()` → `CarrierProfileRecord::from_database_json()` 加载。该函数先反序列化，再把**原始 JSON** 交给 `normalize_legacy_database_record()`，因此能区分"字段缺失"和"运营商写了 false"。源码注释已明确：missing 才归一化，authored `false`/`disabled`/`omit` 优先级更高且必须原样保留。
+  - 测试：`profile_record::tests::stored_omit_survives_the_database_load_path`（九个开关全部 + 整体记录相等；既有 `database_migration_preserves_explicit_optional_header_disables` 已覆盖 legacy schema 路径的五个开关，本测试覆盖当前 schema 路径并补齐四个 PANI/Route/P-Preferred-Identity 开关）。
+- [x] 明确 legacy 行无法表达 `omit` 的既有限制，并用测试固定。
+  - 完成日期：2026-08-29
+  - 早于某个开关存在的数据库行，缺该字段时不能被读成 `omit`：`always_add_sip_instance` 缺失归一化为 `true`（baseline），`enable_cellular_network_info` 缺失归一化为 `false`（CNI 可能泄露服务小区信息，绝不为旧行合成）。这是刻意的不对称，不是回归。
+  - 测试：`profile_record::tests::a_legacy_row_missing_a_switch_is_not_read_as_an_omit`。
+- [ ] 检查 SIM override 路径。
+  - 初步判断：`ImsAccessOverride` 只承载寻址、DNS、IMSI 伪装和 QoS 类字段，不含这九个 REGISTER 开关，因此 override 结构上无法丢失 `omit`。此判断来自字段清单阅读，尚未用测试固定。
+- [ ] 检查配置导入导出路径。
+  - 当前未发现 patch 语义的导入导出路径；若将来引入部分字段更新，必须重新评估丢字段风险。
 - [ ] 检查以下字段的端到端测试：
   - `security_agreement`
   - `include_pani_initial`
