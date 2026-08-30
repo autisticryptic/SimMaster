@@ -331,6 +331,16 @@ pub struct AccessNetworkRuntimeStatus {
     pub last_error: Option<String>,
 }
 
+/// Fresh serving-area facts that may be used for standards-based ePDG
+/// selection. This deliberately excludes cell-id and profile-derived values:
+/// only a real per-line LTE/NR snapshot can produce it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EpdgLocationSnapshot {
+    pub serving_plmn: String,
+    pub technology: String,
+    pub tac: u32,
+}
+
 #[derive(Debug, Default)]
 struct AccessNetworkRuntimeState {
     snapshot: Option<ServingAccessSnapshot>,
@@ -412,6 +422,27 @@ impl ImsAccessNetworkRuntime {
             return None;
         }
         snapshot.resolve(profile_access_info)
+    }
+
+    pub fn epdg_location(&self) -> Option<EpdgLocationSnapshot> {
+        self.epdg_location_with_max_age(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE)
+    }
+
+    pub fn epdg_location_with_max_age(&self, max_age: Duration) -> Option<EpdgLocationSnapshot> {
+        let snapshot = self
+            .inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .snapshot
+            .clone()?;
+        if snapshot.age() > max_age || !matches!(snapshot.technology.as_str(), "lte" | "nr") {
+            return None;
+        }
+        Some(EpdgLocationSnapshot {
+            serving_plmn: snapshot.serving_plmn,
+            technology: snapshot.technology,
+            tac: snapshot.tac,
+        })
     }
 
     pub fn status(&self, max_age: Duration) -> AccessNetworkRuntimeStatus {
@@ -636,6 +667,33 @@ mod tests {
         assert!(second.context("3GPP-E-UTRAN-FDD").is_none());
         assert_ne!(first, second);
         assert_eq!(first, first.clone());
+    }
+
+    #[test]
+    fn epdg_location_exposes_only_fresh_per_line_serving_facts() {
+        let runtime = ImsAccessNetworkRuntime::default();
+        runtime.publish(
+            ServingAccessSnapshot::new(
+                "502",
+                "12",
+                "lte",
+                0x12345,
+                0x0b21,
+                Some("LTE B3".to_string()),
+                AccessNetworkSource::TestFixture,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            runtime.epdg_location(),
+            Some(EpdgLocationSnapshot {
+                serving_plmn: "50212".to_string(),
+                technology: "lte".to_string(),
+                tac: 0x0b21,
+            })
+        );
+        assert!(runtime.epdg_location_with_max_age(Duration::ZERO).is_none());
     }
 
     #[test]

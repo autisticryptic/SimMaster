@@ -410,6 +410,13 @@ async fn configure(interface: &str, config: &NetdevConfig) -> Result<(), Configu
 
 /// Whether the kernel has IFF_UP set on this interface.
 fn link_is_up(interface: &str) -> bool {
+    // `/sys/class/net/*/flags` exposes the Linux net-device ABI even when the
+    // crate is being type-checked on a non-Linux host. Keep the ABI value local
+    // instead of using the host-target `libc::IFF_UP`, which is not defined by
+    // `libc` on Windows. Linux has assigned bit 0 to IFF_UP since the original
+    // socket interface ABI.
+    const IFF_UP_FLAG: u32 = 0x1;
+
     let path = format!("/sys/class/net/{interface}/flags");
     let Ok(raw) = std::fs::read_to_string(&path) else {
         // Unreadable sysfs is not evidence of a down link; leave the verdict to
@@ -419,7 +426,7 @@ fn link_is_up(interface: &str) -> bool {
     let text = raw.trim();
     let digits = text.strip_prefix("0x").unwrap_or(text);
     match u32::from_str_radix(digits, 16) {
-        Ok(flags) => flags & libc::IFF_UP as u32 != 0,
+        Ok(flags) => flags & IFF_UP_FLAG != 0,
         Err(_) => true,
     }
 }

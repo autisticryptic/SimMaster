@@ -1,6 +1,10 @@
 #![allow(dead_code)]
 
-use std::{fmt, io, time::Duration};
+use std::{
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 
 #[cfg(unix)]
 use std::{
@@ -34,6 +38,9 @@ pub const USIM_AUTHENTICATE_CLA: u8 = 0x00;
 pub const USIM_AUTHENTICATE_INS: u8 = 0x88;
 pub const USIM_AUTHENTICATE_P2_3G: u8 = 0x81;
 pub const ISO_GET_RESPONSE_INS: u8 = 0xc0;
+pub const EF_EPDG_ID: u16 = 0x6ff3;
+pub const EF_EPDG_SELECTION: u16 = 0x6ff4;
+const MAX_OPTIONAL_EF_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QmiMessage {
@@ -82,6 +89,93 @@ pub struct UsimIdentity {
     pub mnc_length: Option<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UsimEpdgAddress {
+    Fqdn(String),
+    Ip(IpAddr),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpdgFqdnFormat {
+    OperatorIdentifier,
+    LocationBased,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UsimEpdgSelectionEntry {
+    /// MCC/MNC digits with `D` as the TS 31.102 wildcard. A two-digit MNC is
+    /// represented by five characters; `DDDDDD` is Any_PLMN.
+    pub plmn_pattern: String,
+    pub priority: u16,
+    pub fqdn_format: EpdgFqdnFormat,
+}
+
+impl UsimEpdgSelectionEntry {
+    /// Match a PLMN using the TS 31.102 digit/wildcard representation.
+    ///
+    /// The EF stores a two-digit MNC as a five-character PLMN pattern, while
+    /// DNS Operator Identifier names always encode that MNC as three digits
+    /// with a leading zero. Accept both forms so UICC selection continues to
+    /// work when the serving snapshot came from DNS/NAPTR rather than the
+    /// modem's original MCC/MNC fields.
+    pub fn matches_plmn(&self, plmn: &str) -> bool {
+        epdg_plmn_pattern_matches(&self.plmn_pattern, plmn)
+    }
+
+    pub fn is_any_plmn(&self) -> bool {
+        self.plmn_pattern == "DDDDDD"
+    }
+}
+
+/// Match an EF ePDG-selection PLMN pattern against a five- or six-digit PLMN.
+///
+/// For a five-digit PLMN, the two-digit MNC occupies the last two positions
+/// in the pattern. The canonical six-digit form used by 3GPP DNS names is
+/// `MCC + 0 + MNC2`, so the comparison maps pattern positions 3/4 to
+/// canonical positions 4/5 instead of treating the inserted zero as a real
+/// operator digit.
+pub fn epdg_plmn_pattern_matches(pattern: &str, plmn: &str) -> bool {
+    let pattern = pattern.trim().to_ascii_uppercase();
+    let plmn = plmn.trim();
+    if !matches!(pattern.len(), 5 | 6)
+        || !matches!(plmn.len(), 5 | 6)
+        || !plmn.bytes().all(|byte| byte.is_ascii_digit())
+        || !pattern
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'D')
+    {
+        return false;
+    }
+
+    if pattern == "DDDDDD" {
+        return true;
+    }
+
+    let canonical = if plmn.len() == 6 {
+        plmn.to_string()
+    } else {
+        format!("{}0{}", &plmn[..3], &plmn[3..])
+    };
+    let canonical = canonical.as_bytes();
+    let positions: &[usize] = if pattern.len() == 6 {
+        &[0, 1, 2, 3, 4, 5]
+    } else {
+        &[0, 1, 2, 4, 5]
+    };
+    pattern
+        .bytes()
+        .zip(positions.iter().copied())
+        .all(|(pattern_digit, position)| {
+            pattern_digit == b'D' || pattern_digit == canonical[position]
+        })
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UsimEpdgConfig {
+    pub home_identifiers: Vec<UsimEpdgAddress>,
+    pub selection: Vec<UsimEpdgSelectionEntry>,
+}
+
 #[derive(Debug)]
 pub enum QmiUimError {
     Io(io::Error),
@@ -93,6 +187,7 @@ pub enum QmiUimError {
     InvalidApduResponse,
     InvalidAkaResponse,
     InvalidIdentityResponse,
+    InvalidEpdgConfig,
 }
 
 impl fmt::Display for QmiUimError {
@@ -107,6 +202,7 @@ impl fmt::Display for QmiUimError {
             Self::InvalidApduResponse => write!(f, "invalid UIM APDU response"),
             Self::InvalidAkaResponse => write!(f, "invalid USIM AKA response"),
             Self::InvalidIdentityResponse => write!(f, "invalid USIM identity response"),
+            Self::InvalidEpdgConfig => write!(f, "invalid USIM ePDG configuration"),
         }
     }
 }
@@ -362,6 +458,409 @@ pub fn parse_ef_ad_mnc_length(data: &[u8]) -> Option<u8> {
     data.get(3)
         .map(|value| *value & 0x0f)
         .filter(|length| matches!(*length, 2 | 3))
+}
+
+/// Validate and canonicalize an ASCII ePDG FQDN read from a UICC or line
+/// setting. URI syntax, ports, control characters and IDNA are intentionally
+/// rejected: the DNS codec currently accepts DNS labels, not arbitrary URLs.
+pub fn normalize_epdg_fqdn(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if value.is_empty()
+        || value.len() > 253
+        || !value.is_ascii()
+        || !value.contains('.')
+        || value.starts_with("sos.")
+    {
+        return None;
+    }
+    for label in value.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || !label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            || !label
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !label
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+        {
+            return None;
+        }
+    }
+    Some(value)
+}
+
+/// Parse TS 31.102 EFePDGId (6FF3). Reserved address types are ignored, while
+/// malformed recognized values reject the file so an attacker-controlled UICC
+/// cannot smuggle a URI or host-header fragment into DNS/IKE processing.
+pub fn parse_ef_epdg_id(data: &[u8]) -> Result<Vec<UsimEpdgAddress>, QmiUimError> {
+    let mut cursor = 0usize;
+    let mut addresses = Vec::new();
+    while cursor < data.len() {
+        if data[cursor] == 0xff {
+            if data[cursor..].iter().all(|byte| *byte == 0xff) {
+                break;
+            }
+            return Err(QmiUimError::InvalidEpdgConfig);
+        }
+        if data[cursor] != 0x80 || cursor + 2 > data.len() {
+            return Err(QmiUimError::InvalidEpdgConfig);
+        }
+        let length = usize::from(data[cursor + 1]);
+        cursor += 2;
+        if length == 0 || cursor + length > data.len() {
+            return Err(QmiUimError::InvalidEpdgConfig);
+        }
+        let value = &data[cursor..cursor + length];
+        cursor += length;
+        let address = match value[0] {
+            0x00 => {
+                let fqdn = std::str::from_utf8(&value[1..])
+                    .ok()
+                    .and_then(normalize_epdg_fqdn)
+                    .ok_or(QmiUimError::InvalidEpdgConfig)?;
+                Some(UsimEpdgAddress::Fqdn(fqdn))
+            }
+            0x01 if value.len() == 5 => Some(UsimEpdgAddress::Ip(IpAddr::V4(Ipv4Addr::new(
+                value[1], value[2], value[3], value[4],
+            )))),
+            0x02 if value.len() == 17 => {
+                let octets: [u8; 16] = value[1..]
+                    .try_into()
+                    .map_err(|_| QmiUimError::InvalidEpdgConfig)?;
+                Some(UsimEpdgAddress::Ip(IpAddr::V6(Ipv6Addr::from(octets))))
+            }
+            // TS 31.102 reserves every other address type. It may be defined by
+            // a future release, so skip it rather than misinterpreting bytes.
+            _ if !matches!(value[0], 0x00..=0x02) => None,
+            _ => return Err(QmiUimError::InvalidEpdgConfig),
+        };
+        if let Some(address) = address {
+            if !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+    Ok(addresses)
+}
+
+/// Parse TS 31.102 EFePDGSelection (6FF4).
+pub fn parse_ef_epdg_selection(data: &[u8]) -> Result<Vec<UsimEpdgSelectionEntry>, QmiUimError> {
+    if data.is_empty() || data[0] != 0x80 {
+        return Err(QmiUimError::InvalidEpdgConfig);
+    }
+    let (length, length_bytes) = parse_ber_length(&data[1..])?;
+    let start = 1usize
+        .checked_add(length_bytes)
+        .ok_or(QmiUimError::InvalidEpdgConfig)?;
+    let end = start
+        .checked_add(length)
+        .filter(|end| *end <= data.len())
+        .ok_or(QmiUimError::InvalidEpdgConfig)?;
+    if data[end..].iter().any(|byte| *byte != 0xff) || length % 6 != 0 {
+        return Err(QmiUimError::InvalidEpdgConfig);
+    }
+
+    data[start..end]
+        .chunks_exact(6)
+        .map(|entry| {
+            let plmn_pattern = decode_epdg_selection_plmn(&entry[..3])?;
+            let priority = u16::from_be_bytes([entry[3], entry[4]]);
+            let fqdn_format = match entry[5] {
+                0x00 => EpdgFqdnFormat::OperatorIdentifier,
+                0x01 => EpdgFqdnFormat::LocationBased,
+                _ => return Err(QmiUimError::InvalidEpdgConfig),
+            };
+            Ok(UsimEpdgSelectionEntry {
+                plmn_pattern,
+                priority,
+                fqdn_format,
+            })
+        })
+        .collect()
+}
+
+fn parse_ber_length(data: &[u8]) -> Result<(usize, usize), QmiUimError> {
+    let first = data
+        .first()
+        .copied()
+        .ok_or(QmiUimError::InvalidEpdgConfig)?;
+    match first {
+        0x00..=0x7f => Ok((usize::from(first), 1)),
+        0x81 if data.len() >= 2 => Ok((usize::from(data[1]), 2)),
+        0x82 if data.len() >= 3 => Ok((usize::from(u16::from_be_bytes([data[1], data[2]])), 3)),
+        // Indefinite and wider lengths are unnecessary for these small EFs and
+        // would make bounds validation needlessly ambiguous.
+        _ => Err(QmiUimError::InvalidEpdgConfig),
+    }
+}
+
+fn decode_epdg_selection_plmn(data: &[u8]) -> Result<String, QmiUimError> {
+    if data.len() != 3 {
+        return Err(QmiUimError::InvalidEpdgConfig);
+    }
+    let digits = [
+        data[0] & 0x0f,
+        data[0] >> 4,
+        data[1] & 0x0f,
+        data[2] & 0x0f,
+        data[2] >> 4,
+        data[1] >> 4,
+    ];
+    if digits[..5]
+        .iter()
+        .any(|digit| !matches!(*digit, 0..=9 | 0x0d))
+        || !matches!(digits[5], 0..=9 | 0x0d | 0x0f)
+    {
+        return Err(QmiUimError::InvalidEpdgConfig);
+    }
+    let length = if digits[5] == 0x0f { 5 } else { 6 };
+    Ok(digits[..length]
+        .iter()
+        .map(|digit| {
+            if *digit == 0x0d {
+                'D'
+            } else {
+                char::from(b'0' + *digit)
+            }
+        })
+        .collect())
+}
+
+/// Read optional TS 31.102 ePDG configuration from the exact QMI/UIM slot.
+/// Missing 6FF3/6FF4 files are a normal empty result and never affect IMSI or
+/// AKA access.
+pub fn read_usim_epdg_config_via_proxy_reason(
+    proxy_socket: &str,
+    device_path: &str,
+    slot: u8,
+    aid: &[u8],
+    timeout: Duration,
+) -> Result<UsimEpdgConfig, &'static str> {
+    #[cfg(not(unix))]
+    {
+        let _ = (proxy_socket, device_path, slot, aid, timeout);
+        Err("sim_epdg_config_platform_unsupported")
+    }
+
+    #[cfg(unix)]
+    {
+        let mut conn = QmiProxyConnection::connect(proxy_socket, timeout)
+            .map_err(|_| "sim_epdg_config_proxy_connect_failed")?;
+        conn.proxy_open(device_path)
+            .map_err(|_| "sim_epdg_config_proxy_open_failed")?;
+        let client_id = conn
+            .allocate_uim_cid()
+            .map_err(|_| "sim_epdg_config_uim_client_failed")?;
+        let channel = match conn.open_logical_channel(client_id, slot, aid) {
+            Ok(channel) => channel,
+            Err(_) => {
+                let _ = conn.release_uim_cid(client_id);
+                return Err("sim_epdg_config_logical_channel_failed");
+            }
+        };
+
+        let result = (|| {
+            // 6FF3 and 6FF4 are independent optional files. Preserve a usable
+            // sibling when one file is absent, malformed or rejected instead
+            // of discarding the entire UICC contribution.
+            let home_identifiers = match read_optional_transparent_ef(
+                &mut conn,
+                client_id,
+                slot,
+                channel.channel_id,
+                EF_EPDG_ID,
+            ) {
+                Ok(Some(data)) => match parse_ef_epdg_id(&data) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        tracing::warn!(
+                            device_path,
+                            slot,
+                            error = %error,
+                            "Ignoring malformed optional UICC ePDG identifier file"
+                        );
+                        Vec::new()
+                    }
+                },
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        device_path,
+                        slot,
+                        error = %error,
+                        "Optional UICC ePDG identifier file could not be read"
+                    );
+                    Vec::new()
+                }
+            };
+            let selection = match read_optional_transparent_ef(
+                &mut conn,
+                client_id,
+                slot,
+                channel.channel_id,
+                EF_EPDG_SELECTION,
+            ) {
+                Ok(Some(data)) => match parse_ef_epdg_selection(&data) {
+                    Ok(values) => values,
+                    Err(error) => {
+                        tracing::warn!(
+                            device_path,
+                            slot,
+                            error = %error,
+                            "Ignoring malformed optional UICC ePDG selection file"
+                        );
+                        Vec::new()
+                    }
+                },
+                Ok(None) => Vec::new(),
+                Err(error) => {
+                    tracing::warn!(
+                        device_path,
+                        slot,
+                        error = %error,
+                        "Optional UICC ePDG selection file could not be read"
+                    );
+                    Vec::new()
+                }
+            };
+            Ok(UsimEpdgConfig {
+                home_identifiers,
+                selection,
+            })
+        })();
+
+        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        let _ = conn.release_uim_cid(client_id);
+        result
+    }
+}
+
+#[cfg(unix)]
+fn read_optional_transparent_ef(
+    conn: &mut QmiProxyConnection,
+    client_id: u8,
+    slot: u8,
+    channel_id: u8,
+    file_id: u16,
+) -> Result<Option<Vec<u8>>, QmiUimError> {
+    let [fid_high, fid_low] = file_id.to_be_bytes();
+    let selected = conn.send_apdu(
+        client_id,
+        slot,
+        channel_id,
+        &[0x00, 0xa4, 0x00, 0x04, 0x02, fid_high, fid_low, 0x00],
+    )?;
+    if matches!((selected.sw1, selected.sw2), (0x6a, 0x82 | 0x83)) {
+        return Ok(None);
+    }
+    if !matches!(selected.sw1, 0x90 | 0x61 | 0x9f) {
+        return Err(QmiUimError::InvalidApduResponse);
+    }
+    let fcp = if matches!(selected.sw1, 0x61 | 0x9f) {
+        conn.send_apdu(
+            client_id,
+            slot,
+            channel_id,
+            &build_get_response_apdu(selected.sw2),
+        )
+        .ok()
+        .filter(|response| (response.sw1, response.sw2) == (0x90, 0x00))
+        .map(|response| response.data)
+        .unwrap_or_default()
+    } else {
+        selected.data
+    };
+    let file_size = parse_fcp_file_size(&fcp);
+    if file_size.is_some_and(|size| size > MAX_OPTIONAL_EF_BYTES) {
+        return Err(QmiUimError::MessageTooLarge);
+    }
+
+    let mut data = Vec::new();
+    loop {
+        if file_size.is_some_and(|size| data.len() >= size) {
+            data.truncate(file_size.unwrap_or_default());
+            return Ok(Some(data));
+        }
+        if data.len() >= MAX_OPTIONAL_EF_BYTES || data.len() > 0x7fff {
+            return Err(QmiUimError::MessageTooLarge);
+        }
+        let remaining = file_size
+            .map(|size| size.saturating_sub(data.len()))
+            .unwrap_or(255);
+        let requested = remaining.min(255);
+        if requested == 0 {
+            return Ok(Some(data));
+        }
+        let offset = data.len();
+        let apdu = [
+            0x00,
+            0xb0,
+            ((offset >> 8) & 0x7f) as u8,
+            (offset & 0xff) as u8,
+            requested as u8,
+        ];
+        let mut response = conn.send_apdu(client_id, slot, channel_id, &apdu)?;
+        if response.sw1 == 0x6c {
+            let mut adjusted = apdu;
+            adjusted[4] = response.sw2;
+            response = conn.send_apdu(client_id, slot, channel_id, &adjusted)?;
+        }
+        let eof = (response.sw1, response.sw2) == (0x62, 0x82);
+        if (response.sw1, response.sw2) != (0x90, 0x00) && !eof {
+            // When FCP was absent, a read immediately beyond an exact chunked
+            // file may report an invalid offset. The bytes already read are a
+            // complete bounded file in that case.
+            if file_size.is_none()
+                && !data.is_empty()
+                && matches!((response.sw1, response.sw2), (0x6b, 0x00) | (0x6a, 0x86))
+            {
+                return Ok(Some(data));
+            }
+            return Err(QmiUimError::InvalidApduResponse);
+        }
+        let read_len = response.data.len();
+        data.extend_from_slice(&response.data);
+        if eof || read_len < requested || read_len == 0 {
+            if let Some(size) = file_size {
+                if data.len() < size {
+                    return Err(QmiUimError::InvalidApduResponse);
+                }
+                data.truncate(size);
+            }
+            return Ok(Some(data));
+        }
+    }
+}
+
+pub(crate) fn parse_fcp_file_size(data: &[u8]) -> Option<usize> {
+    let content = if data.first().copied() == Some(0x62) {
+        let (length, length_bytes) = parse_ber_length(&data[1..]).ok()?;
+        let start = 1 + length_bytes;
+        data.get(start..start.checked_add(length)?)?
+    } else {
+        data
+    };
+    let mut cursor = 0usize;
+    while cursor < content.len() {
+        let tag = *content.get(cursor)?;
+        cursor += 1;
+        let (length, length_bytes) = parse_ber_length(content.get(cursor..)?).ok()?;
+        cursor = cursor.checked_add(length_bytes)?;
+        let value = content.get(cursor..cursor.checked_add(length)?)?;
+        cursor += length;
+        if matches!(tag, 0x80 | 0x81) && matches!(value.len(), 1..=4) {
+            let size = value
+                .iter()
+                .fold(0usize, |size, byte| (size << 8) | usize::from(*byte));
+            return Some(size);
+        }
+    }
+    None
 }
 
 pub fn read_usim_identity_via_proxy_reason(
@@ -1025,6 +1524,117 @@ mod tests {
         assert_eq!(parse_ef_ad_mnc_length(&[0x00, 0x00, 0x00, 0x04]), None);
     }
 
+    #[test]
+    fn parses_uicc_epdg_identifiers_and_normalizes_fqdns() {
+        let fqdn = b"EPDG.Example.ORG.";
+        let mut data = vec![0x80, (fqdn.len() + 1) as u8, 0x00];
+        data.extend_from_slice(fqdn);
+        data.extend_from_slice(&[0x80, 0x05, 0x01, 192, 0, 2, 10]);
+        data.extend_from_slice(&[0x80, 0x11, 0x02]);
+        data.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+        data.extend_from_slice(&[0x80, 0x02, 0x7f, 0x00]);
+        data.extend_from_slice(&[0xff, 0xff]);
+
+        assert_eq!(
+            parse_ef_epdg_id(&data).unwrap(),
+            vec![
+                UsimEpdgAddress::Fqdn("epdg.example.org".to_string()),
+                UsimEpdgAddress::Ip("192.0.2.10".parse().unwrap()),
+                UsimEpdgAddress::Ip(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_unsafe_uicc_epdg_fqdns() {
+        for value in [
+            "https://epdg.example.org",
+            "epdg.example.org:500",
+            "epdg..example.org",
+            "-epdg.example.org",
+            "epdg_.example.org",
+            "sos.epdg.example.org",
+            "epdg.example.org\r\nignored",
+        ] {
+            assert!(normalize_epdg_fqdn(value).is_none(), "accepted {value:?}");
+        }
+        assert!(parse_ef_epdg_id(&[0x80, 0x03, 0x00, 0xff, 0xfe]).is_err());
+    }
+
+    #[test]
+    fn parses_uicc_epdg_selection_ber_length_plmn_and_priority() {
+        let data = [
+            0x80, 0x81, 0x0c, // top-level BER TLV, two entries
+            0x43, 0xf5, 0x21, 0x00, 0x10, 0x01, // 345-12, priority 16, TAI
+            0x13, 0x00, 0x62, 0x00, 0x01, 0x00, // 310-260, priority 1, OI
+            0xff, 0xff,
+        ];
+
+        let entries = parse_ef_epdg_selection(&data).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].plmn_pattern, "34512");
+        assert_eq!(entries[0].priority, 16);
+        assert_eq!(entries[0].fqdn_format, EpdgFqdnFormat::LocationBased);
+        assert!(entries[0].matches_plmn("34512"));
+        assert_eq!(entries[1].plmn_pattern, "310260");
+        assert_eq!(entries[1].priority, 1);
+        assert_eq!(entries[1].fqdn_format, EpdgFqdnFormat::OperatorIdentifier);
+    }
+
+    #[test]
+    fn parses_any_plmn_wildcard_and_fcp_file_size() {
+        let entries =
+            parse_ef_epdg_selection(&[0x80, 0x06, 0xdd, 0xdd, 0xdd, 0x00, 0x02, 0x00]).unwrap();
+        assert!(entries[0].is_any_plmn());
+        assert!(entries[0].matches_plmn("310260"));
+        assert_eq!(
+            parse_fcp_file_size(&[0x62, 0x04, 0x80, 0x02, 0x01, 0x2c]),
+            Some(300)
+        );
+    }
+
+    #[test]
+    fn matches_epdg_selection_wildcards_and_both_mnc_lengths() {
+        assert!(epdg_plmn_pattern_matches("34512", "34512"));
+        assert!(epdg_plmn_pattern_matches("34512", "345012"));
+        assert!(epdg_plmn_pattern_matches("310260", "310260"));
+        assert!(!epdg_plmn_pattern_matches("310260", "31026"));
+
+        // A six-digit wildcard pattern compares against the canonical six-digit
+        // PLMN form, while D matches an arbitrary BCD digit.
+        assert!(epdg_plmn_pattern_matches("34D12D", "345120"));
+        assert!(!epdg_plmn_pattern_matches("34D12D", "345012"));
+        assert!(epdg_plmn_pattern_matches("DDDDD", "31026"));
+        assert!(epdg_plmn_pattern_matches("DDDDDD", "310260"));
+        assert!(epdg_plmn_pattern_matches("DDDDDD", "31026"));
+
+        for (pattern, plmn) in [
+            ("", "310260"),
+            ("1234", "310260"),
+            ("1234567", "310260"),
+            ("31X260", "310260"),
+            ("310260", "31"),
+            ("310260", "31026x"),
+        ] {
+            assert!(
+                !epdg_plmn_pattern_matches(pattern, plmn),
+                "accepted invalid PLMN pair {pattern:?} / {plmn:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_epdg_selection_plmn_nibbles_and_tail() {
+        // Invalid BCD nibble in the MCC/MNC area.
+        assert!(
+            parse_ef_epdg_selection(&[0x80, 0x06, 0x4a, 0xf5, 0x21, 0x00, 0x01, 0x00]).is_err()
+        );
+        // A non-FF trailing byte is not an allowed transparent-EF tail.
+        assert!(
+            parse_ef_epdg_selection(&[0x80, 0x06, 0x43, 0xf5, 0x21, 0x00, 0x01, 0x00, 0x00])
+                .is_err()
+        );
+    }
     #[test]
     fn encodes_ctl_proxy_and_allocate_cid_frames() {
         let proxy = build_proxy_open_frame("/dev/wwan0qmi0", 1).expect("proxy frame");

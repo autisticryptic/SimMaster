@@ -534,7 +534,10 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
             if request.trace_id == "runtime-status-probe" && request.stage == ExecutorStage::Ike {
                 let adapter = LiveNetworkStageAdapter::for_line(
                     request.line_id.clone(),
-                    SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
+                    SystemLiveEpdgAdapter::for_line_with_access_network(
+                        request.line_id.clone(),
+                        self.access_network.clone(),
+                    ),
                     StatusProbeDatagramAdapter,
                 );
                 return LiveStageRunner::new(self.gate.clone(), profile, adapter)
@@ -544,7 +547,10 @@ impl RuntimeExecutor for LiveRuntimeExecutor {
 
             let adapter = LiveNetworkStageAdapter::for_line(
                 request.line_id.clone(),
-                SystemLiveEpdgAdapter::for_line(request.line_id.clone()),
+                SystemLiveEpdgAdapter::for_line_with_access_network(
+                    request.line_id.clone(),
+                    self.access_network.clone(),
+                ),
                 SystemLiveDatagramAdapter::for_line_with_access_network(
                     request.line_id.clone(),
                     self.access_network.clone(),

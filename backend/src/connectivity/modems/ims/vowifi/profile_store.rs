@@ -903,6 +903,57 @@ mod tests {
         (ProfileStore::new(Arc::new(catalog), database), path)
     }
 
+    fn explicit_private_record(profile_id: &str) -> CarrierProfileRecord {
+        let mut record = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
+        record.meta.profile_id = profile_id.to_string();
+        record.meta.mcc = "999".to_string();
+        record.meta.mnc = "99".to_string();
+        record.meta.mnc_len = 2;
+        record.meta.plmn = "99999".to_string();
+        record.meta.brand = "Private network".to_string();
+        record.ims.domain = "ims.private.example".to_string();
+        record.ims.realm = "ims.private.example".to_string();
+        record.ims.registrar = Some("sip:ims.private.example".to_string());
+        record.epdg.host = "epdg.private.example".to_string();
+        record.ikev2.identity_template = Some("private-{imsi}@{ims_realm}".to_string());
+        record
+    }
+
+    fn rewrite_catalog_fixture_as_private(path: &std::path::Path) {
+        let conn = rusqlite::Connection::open(path).expect("open catalog fixture");
+        conn.execute(
+            "UPDATE profile_match_rules
+                SET plmn = '99999', imsi_prefix = '999990'
+              WHERE profile_id = 'test-v7-23433'",
+            [],
+        )
+        .expect("rewrite catalog PLMN");
+        let config_json = conn
+            .query_row(
+                "SELECT config_json FROM carrier_profiles WHERE profile_id = 'test-v7-23433'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read catalog config");
+        let mut config: serde_json::Value =
+            serde_json::from_str(&config_json).expect("parse catalog config");
+        config["ims"]["home_domain"] = serde_json::json!("ims.private.example");
+        config["ims"]["realm"] = serde_json::json!("ims.private.example");
+        config["access"]["vowifi"]["epdg"] =
+            serde_json::json!([{ "address": "epdg.private.example", "port": 500 }]);
+        config["access"]["vowifi"]["ike"]["identities"]["idi"] = serde_json::json!([
+            {
+                "identity_type": "id_rfc822_addr",
+                "value_template": "private-{imsi}@{ims_realm}"
+            }
+        ]);
+        conn.execute(
+            "UPDATE carrier_profiles SET config_json = ?1 WHERE profile_id = 'test-v7-23433'",
+            [serde_json::to_string(&config).expect("serialize catalog config")],
+        )
+        .expect("write catalog config");
+    }
+
     #[test]
     fn catalog_is_listed_and_missing_carriers_use_derived_fallback() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
@@ -941,6 +992,100 @@ mod tests {
             .expect("published catalog match");
         assert_eq!(published.profile.meta.profile_id, "test-v7-23433");
         assert_eq!(published.matched_prefix, "234330");
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn private_plmn_never_receives_a_public_standard_fallback() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+
+        assert!(store.resolve_by_plmn("999", "99").is_none());
+        assert!(store
+            .resolve_for_imsi_access(
+                None,
+                "999990123456789",
+                Some("99999"),
+                CatalogAccessKind::WifiEpdg,
+            )
+            .expect("private automatic lookup")
+            .is_none());
+
+        for candidate in VolteProfileSelectionConfig::default().attempts {
+            assert!(store
+                .resolve_volte_candidate(&candidate, None, "999990123456789", Some("99999"),)
+                .expect("private VoLTE candidate lookup")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn explicit_database_profile_remains_available_for_private_plmn() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+        store
+            .upsert(explicit_private_record("private-db-99999"))
+            .expect("save explicit private database profile");
+
+        let by_plmn = store
+            .resolve_by_plmn("999", "99")
+            .expect("private database PLMN match");
+        assert_eq!(by_plmn.origin, ProfileOrigin::Database);
+        assert_eq!(by_plmn.profile.ims.domain, "ims.private.example");
+        assert_eq!(by_plmn.profile.epdg.host, "epdg.private.example");
+
+        let resolved = store
+            .resolve_volte_candidate(
+                &VolteProfileCandidate {
+                    source: VolteProfileSource::Database,
+                    profile_id: Some("private-db-99999".to_string()),
+                },
+                None,
+                "999990123456789",
+                Some("99999"),
+            )
+            .expect("private database candidate lookup")
+            .expect("private database profile");
+        assert_eq!(resolved.origin, ProfileOrigin::Database);
+    }
+
+    #[test]
+    fn explicit_catalog_profile_remains_available_for_private_plmn() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+        rewrite_catalog_fixture_as_private(&path);
+
+        let by_plmn = store
+            .resolve_by_plmn("999", "99")
+            .expect("private catalog PLMN match");
+        assert_eq!(by_plmn.origin, ProfileOrigin::Catalog);
+        assert_eq!(by_plmn.profile.ims.domain, "ims.private.example");
+        assert_eq!(by_plmn.profile.epdg.host, "epdg.private.example");
+
+        let resolved = store
+            .resolve_volte_candidate(
+                &VolteProfileCandidate {
+                    source: VolteProfileSource::CarrierCatalog,
+                    profile_id: Some("test-v7-23433".to_string()),
+                },
+                None,
+                "999990123456789",
+                Some("99999"),
+            )
+            .expect("private catalog candidate lookup")
+            .expect("private catalog profile");
+        assert_eq!(resolved.origin, ProfileOrigin::Catalog);
 
         std::fs::remove_file(path).expect("remove fixture");
     }

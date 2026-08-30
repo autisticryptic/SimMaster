@@ -34,10 +34,15 @@ use super::{
     profiles::{self, CarrierProfile},
     qmi_uim::{
         execute_usim_authenticate_via_proxy_reason_with_retry,
-        verify_usim_application_via_proxy_reason_with_retry, USIM_AID_PREFIX,
+        read_usim_epdg_config_via_proxy_reason,
+        verify_usim_application_via_proxy_reason_with_retry, EpdgFqdnFormat, UsimEpdgAddress,
+        UsimEpdgConfig, USIM_AID_PREFIX,
     },
     sms,
-    transport::{ResolvedEpdgEndpoint, TransportError, UdpSocketDatagramTransport},
+    transport::{
+        choose_route_policy, ProxyKind, ResolvedEpdgEndpoint, TransportError,
+        UdpSocketDatagramTransport,
+    },
     tun_gateway::{
         self, ImsEspFlowConfig, ImsEspPolicyConfig, TunGatewayConfig, TunGatewayRuntime,
     },
@@ -47,7 +52,7 @@ use crate::connectivity::core::{
     access::ImsChannel,
     access_network::{
         access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
-        ImsAccessNetworkContext, ImsAccessNetworkRuntime,
+        EpdgLocationSnapshot, ImsAccessNetworkContext, ImsAccessNetworkRuntime,
     },
     contact::{complete_contact_parameters, ContactCompletion},
     media::OperatorSocketCreator,
@@ -78,6 +83,8 @@ use tokio::{
 use tracing::{debug, error, info, warn};
 
 const LIVE_DNS_TIMEOUT: Duration = Duration::from_secs(8);
+const LIVE_EPDG_MAX_HOST_CANDIDATES: usize = 8;
+const LIVE_UICC_EPDG_CACHE_TTL: Duration = Duration::from_secs(300);
 
 impl super::operator::MediaRouteInstaller for TunGatewayRuntime {
     fn ensure_media_route(&self, remote: IpAddr) -> Result<(), String> {
@@ -178,6 +185,26 @@ static LIVE_IMS_REFRESH_FAILURE: OnceLock<Mutex<HashMap<String, LiveImsRefreshFa
 /// override would make configuring line A silently change line B.
 static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<HashMap<String, LiveNetworkOverrides>>> =
     OnceLock::new();
+static LIVE_UICC_EPDG_CONFIG: OnceLock<StdRwLock<HashMap<String, CachedLiveUiccEpdgConfig>>> =
+    OnceLock::new();
+
+#[derive(Debug, Clone)]
+struct CachedLiveUiccEpdgConfig {
+    device: LiveSimDevice,
+    loaded_at: Instant,
+    config: UsimEpdgConfig,
+}
+
+fn live_uicc_epdg_config_cache() -> &'static StdRwLock<HashMap<String, CachedLiveUiccEpdgConfig>> {
+    LIVE_UICC_EPDG_CONFIG.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+fn forget_live_uicc_epdg_config(line_id: &str) {
+    live_uicc_epdg_config_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct LiveNetworkOverrides {
@@ -383,7 +410,25 @@ fn live_ims_target(line_id: &str, profile: &CarrierProfile) -> LiveImsTarget {
 }
 
 fn live_ike_access(line_id: &str, profile: &CarrierProfile) -> IkeAccessConfig {
+    live_ike_access_for_epdg(line_id, profile, None)
+}
+
+fn live_ike_access_for_epdg(
+    line_id: &str,
+    profile: &CarrierProfile,
+    selected_epdg_host: Option<&str>,
+) -> IkeAccessConfig {
     let overrides = line_overrides(line_id);
+    let configured_host = overrides
+        .epdg_host
+        .clone()
+        .unwrap_or_else(|| profile.epdg.host.to_string());
+    // An IP address from EFePDGId is a transport destination, not a useful
+    // FQDN-shaped IKE responder identity. Keep the explicit/profile host for
+    // IDr in that case; a selected UICC/TAI FQDN becomes the actual IDr.
+    let epdg_host = selected_epdg_host
+        .and_then(|host| host.parse::<IpAddr>().err().map(|_| host.to_string()))
+        .unwrap_or(configured_host);
     IkeAccessConfig {
         ip_stack: overrides
             .ip_stack
@@ -391,9 +436,7 @@ fn live_ike_access(line_id: &str, profile: &CarrierProfile) -> IkeAccessConfig {
         apn: overrides
             .epdg_apn
             .or_else(|| profile.epdg.apn.map(str::to_string)),
-        epdg_host: overrides
-            .epdg_host
-            .unwrap_or_else(|| profile.epdg.host.to_string()),
+        epdg_host,
         device_identity: profile
             .identity
             .device_identity_enabled
@@ -445,6 +488,406 @@ fn live_epdg_settings(
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EpdgCandidateSource {
+    LineOverride,
+    UiccSelection,
+    UiccHomeIdentifier,
+    VisitedCountryNaptr,
+    CarrierProfile,
+    HomePlmnDerived,
+}
+
+impl EpdgCandidateSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::LineOverride => "line_override",
+            Self::UiccSelection => "uicc_selection",
+            Self::UiccHomeIdentifier => "uicc_home_identifier",
+            Self::VisitedCountryNaptr => "visited_country_naptr",
+            Self::CarrierProfile => "carrier_profile",
+            Self::HomePlmnDerived => "home_plmn_derived",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EpdgEndpointCandidate {
+    address: UsimEpdgAddress,
+    source: EpdgCandidateSource,
+}
+
+impl EpdgEndpointCandidate {
+    fn host(&self) -> String {
+        match &self.address {
+            UsimEpdgAddress::Fqdn(host) => host.clone(),
+            UsimEpdgAddress::Ip(ip) => ip.to_string(),
+        }
+    }
+}
+
+fn epdg_address_from_text(value: &str) -> Option<UsimEpdgAddress> {
+    value
+        .trim()
+        .parse::<IpAddr>()
+        .map(UsimEpdgAddress::Ip)
+        .ok()
+        .or_else(|| super::qmi_uim::normalize_epdg_fqdn(value).map(UsimEpdgAddress::Fqdn))
+}
+
+fn push_epdg_candidate(
+    candidates: &mut Vec<EpdgEndpointCandidate>,
+    address: UsimEpdgAddress,
+    source: EpdgCandidateSource,
+) {
+    let address = match address {
+        UsimEpdgAddress::Fqdn(host) => {
+            let Some(host) = super::qmi_uim::normalize_epdg_fqdn(&host) else {
+                return;
+            };
+            UsimEpdgAddress::Fqdn(host)
+        }
+        UsimEpdgAddress::Ip(ip) => UsimEpdgAddress::Ip(ip),
+    };
+    if candidates.len() >= LIVE_EPDG_MAX_HOST_CANDIDATES
+        || candidates
+            .iter()
+            .any(|candidate| candidate.address == address)
+    {
+        return;
+    }
+    candidates.push(EpdgEndpointCandidate { address, source });
+}
+
+/// Result of the visited-country NAPTR discovery attempt.  Keeping an empty
+/// DNS answer separate from a transport failure is important: an empty answer
+/// means that visited-country ePDG selection is not mandatory, while a missing
+/// DNS response terminates this selection procedure per TS 24.302.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum VisitedCountryNaptrState {
+    NotQueried,
+    EmptyResponse,
+    Records(Vec<epdg::NaptrReplacement>),
+    Failed(String),
+}
+
+fn canonical_plmn(plmn: &str) -> Option<String> {
+    let plmn = plmn.trim();
+    if !matches!(plmn.len(), 5 | 6) || !plmn.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if plmn.len() == 6 {
+        Some(plmn.to_string())
+    } else {
+        // A two-digit MNC is represented as MCC + MNC2 by the modem/UICC, but
+        // as MCC + 0 + MNC2 in a 3GPP Operator Identifier FQDN.
+        Some(format!("{}0{}", &plmn[..3], &plmn[3..]))
+    }
+}
+
+fn plmn_equivalent(left: &str, right: &str) -> bool {
+    canonical_plmn(left) == canonical_plmn(right)
+}
+
+fn selection_entry_address(
+    entry: &super::qmi_uim::UsimEpdgSelectionEntry,
+    target_plmn: &str,
+    location: Option<&EpdgLocationSnapshot>,
+) -> Option<UsimEpdgAddress> {
+    let canonical = canonical_plmn(target_plmn)?;
+    let mcc = &canonical[..3];
+    let mnc = &canonical[3..];
+    let host = match entry.fqdn_format {
+        EpdgFqdnFormat::OperatorIdentifier => profiles::standard_operator_epdg_fqdn(mcc, mnc),
+        EpdgFqdnFormat::LocationBased => location
+            .filter(|snapshot| plmn_equivalent(&snapshot.serving_plmn, &canonical))
+            .and_then(|snapshot| {
+                profiles::standard_tai_epdg_fqdn(mcc, mnc, snapshot.tac, &snapshot.technology)
+            }),
+    }?;
+    epdg_address_from_text(&host)
+}
+
+fn serving_is_roaming(location: Option<&EpdgLocationSnapshot>, home_plmn: &str) -> bool {
+    let Some(serving_plmn) = location.and_then(|snapshot| canonical_plmn(&snapshot.serving_plmn))
+    else {
+        return false;
+    };
+    canonical_plmn(home_plmn).is_some_and(|home_plmn| serving_plmn != home_plmn)
+}
+
+fn selection_entry_is_in_country(
+    entry: &super::qmi_uim::UsimEpdgSelectionEntry,
+    mcc: &str,
+) -> bool {
+    let pattern = entry.plmn_pattern.trim().as_bytes();
+    let mcc = mcc.as_bytes();
+    matches!(pattern.len(), 5 | 6)
+        && mcc.len() == 3
+        && pattern[..3]
+            .iter()
+            .zip(mcc)
+            .all(|(pattern_digit, country_digit)| {
+                *pattern_digit == b'D' || *pattern_digit == *country_digit
+            })
+}
+
+fn concrete_selection_plmn(entry: &super::qmi_uim::UsimEpdgSelectionEntry) -> Option<String> {
+    if entry.plmn_pattern.bytes().all(|byte| byte.is_ascii_digit()) {
+        canonical_plmn(&entry.plmn_pattern)
+    } else {
+        None
+    }
+}
+
+fn standard_epdg_record_plmn(record: &epdg::NaptrReplacement) -> Option<String> {
+    profiles::parse_standard_operator_epdg_fqdn(&record.replacement)
+        .map(|(mcc, mnc)| format!("{mcc}{mnc}"))
+}
+
+/// Build ordinary (non-emergency) ePDG candidates. A line override is strict.
+/// Database/catalog profiles keep their explicit host and never gain a blind
+/// public-DNS fallback. Standard-derived profiles may use TS 23.003 names, but
+/// a tracking-area name is emitted only when EFePDGSelection explicitly asks
+/// for the location-based format.
+fn build_live_epdg_candidates(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    uicc: &UsimEpdgConfig,
+    location: Option<&EpdgLocationSnapshot>,
+) -> Vec<EpdgEndpointCandidate> {
+    build_live_epdg_candidates_with_naptr(
+        line_id,
+        profile,
+        uicc,
+        location,
+        &VisitedCountryNaptrState::NotQueried,
+    )
+}
+
+fn build_live_epdg_candidates_with_naptr(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    uicc: &UsimEpdgConfig,
+    location: Option<&EpdgLocationSnapshot>,
+    visited_country: &VisitedCountryNaptrState,
+) -> Vec<EpdgEndpointCandidate> {
+    let overrides = line_overrides(line_id);
+    if let Some(host) = overrides.epdg_host.as_deref() {
+        return epdg_address_from_text(host)
+            .map(|address| {
+                vec![EpdgEndpointCandidate {
+                    address,
+                    source: EpdgCandidateSource::LineOverride,
+                }]
+            })
+            .unwrap_or_default();
+    }
+
+    let mut candidates = Vec::new();
+    let roaming = serving_is_roaming(location, profile.meta.plmn);
+    let serving_plmn = location.and_then(|snapshot| canonical_plmn(&snapshot.serving_plmn));
+    let home_plmn = canonical_plmn(profile.meta.plmn);
+    // If no fresh serving snapshot exists, an Operator Identifier UICC row can
+    // still be evaluated against the HPLMN. LocationBased rows intentionally
+    // remain unusable until a fresh TAC/technology snapshot is available.
+    let selection_plmn = serving_plmn.as_deref().or(home_plmn.as_deref());
+
+    // EFePDGSelection applies in both home and roaming states. An exact
+    // serving-PLMN row wins over Any_PLMN; preserving the selected rows before
+    // adding the later fallbacks lets a failed ePDG/IKE attempt advance to the
+    // UICC home identifier and finally the profile-derived host.
+    let mut selected_entries = selection_plmn
+        .map(|target_plmn| {
+            uicc.selection
+                .iter()
+                .filter(|entry| !entry.is_any_plmn() && entry.matches_plmn(target_plmn))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if selected_entries.is_empty() {
+        selected_entries = uicc
+            .selection
+            .iter()
+            .filter(|entry| entry.is_any_plmn())
+            .collect::<Vec<_>>();
+    }
+    selected_entries.sort_by_key(|entry| entry.priority);
+
+    if let Some(target_plmn) = selection_plmn {
+        for entry in selected_entries {
+            if let Some(address) = selection_entry_address(entry, target_plmn, location) {
+                push_epdg_candidate(&mut candidates, address, EpdgCandidateSource::UiccSelection);
+            }
+        }
+    }
+
+    // A selected EFePDGSelection row is authoritative for this PLMN. The
+    // visited-country NAPTR procedure is only consulted when it did not yield a
+    // directly usable UICC endpoint. Its failure is scoped to that discovery
+    // step; it must not suppress a separately configured UICC home identifier
+    // or carrier profile fallback.
+    if roaming && candidates.is_empty() {
+        match visited_country {
+            VisitedCountryNaptrState::Failed(_) | VisitedCountryNaptrState::NotQueried => {}
+            VisitedCountryNaptrState::Records(records) => {
+                let usable = records
+                    .iter()
+                    .filter(|record| standard_epdg_record_plmn(record).is_some())
+                    .collect::<Vec<_>>();
+                if let Some(serving_plmn) = serving_plmn.as_deref() {
+                    if usable
+                        .iter()
+                        .any(|record| standard_epdg_record_matches_plmn(record, serving_plmn))
+                    {
+                        // A serving VPLMN named by NAPTR is selected using its
+                        // standard Operator Identifier form, not the replacement
+                        // as an endpoint without first reconstructing the PLMN.
+                        if let Some((mcc, mnc)) = canonical_plmn(serving_plmn)
+                            .as_deref()
+                            .map(|plmn| (&plmn[..3], &plmn[3..]))
+                        {
+                            if let Some(host) = profiles::standard_operator_epdg_fqdn(mcc, mnc) {
+                                if let Some(address) = epdg_address_from_text(&host) {
+                                    push_epdg_candidate(
+                                        &mut candidates,
+                                        address,
+                                        EpdgCandidateSource::VisitedCountryNaptr,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if candidates.is_empty() {
+                    // If the response contains a PLMN covered by
+                    // EFePDGSelection, select the highest-priority matching
+                    // entry. DNS order is retained among records tied at that
+                    // UICC priority.
+                    let best_priority = uicc
+                        .selection
+                        .iter()
+                        .filter(|entry| !entry.is_any_plmn())
+                        .filter(|entry| {
+                            usable.iter().any(|record| {
+                                standard_epdg_record_plmn(record)
+                                    .is_some_and(|plmn| entry.matches_plmn(&plmn))
+                            })
+                        })
+                        .map(|entry| entry.priority)
+                        .min();
+                    if let Some(best_priority) = best_priority {
+                        for entry in uicc
+                            .selection
+                            .iter()
+                            .filter(|entry| !entry.is_any_plmn() && entry.priority == best_priority)
+                        {
+                            for record in &usable {
+                                let Some(target_plmn) = standard_epdg_record_plmn(record) else {
+                                    continue;
+                                };
+                                if entry.matches_plmn(&target_plmn) {
+                                    if let Some(address) =
+                                        selection_entry_address(entry, &target_plmn, location)
+                                    {
+                                        push_epdg_candidate(
+                                            &mut candidates,
+                                            address,
+                                            EpdgCandidateSource::VisitedCountryNaptr,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // A LocationBased format for a PLMN other than the
+                        // actual serving VPLMN cannot be constructed safely
+                        // because the available TAC belongs to the serving
+                        // cell. Do not invent a TAC, and do not bypass a
+                        // matching UICC row with a raw DNS replacement.
+                    } else {
+                        // No UICC row covers the DNS response. This is the
+                        // implementation-specific branch in TS 24.302; use
+                        // only DNS-provided public Operator Identifier records
+                        // in DNS order.
+                        for record in usable {
+                            if let Some(address) = epdg_address_from_text(&record.replacement) {
+                                push_epdg_candidate(
+                                    &mut candidates,
+                                    address,
+                                    EpdgCandidateSource::VisitedCountryNaptr,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            VisitedCountryNaptrState::EmptyResponse => {
+                // An authoritative empty answer means that visited-country
+                // selection is optional. Prefer the highest-priority concrete
+                // UICC row in the visited country before the home/profile
+                // fallback. Wildcard rows are omitted here because their MNC is
+                // not known and a fabricated public FQDN would be unsafe.
+                let serving_mcc = serving_plmn.as_deref().and_then(|plmn| plmn.get(..3));
+                let best_priority = serving_mcc.and_then(|mcc| {
+                    uicc.selection
+                        .iter()
+                        .filter(|entry| {
+                            !entry.is_any_plmn() && selection_entry_is_in_country(entry, mcc)
+                        })
+                        .map(|entry| entry.priority)
+                        .min()
+                });
+                if let Some(best_priority) = best_priority {
+                    for entry in uicc.selection.iter().filter(|entry| {
+                        !entry.is_any_plmn()
+                            && entry.priority == best_priority
+                            && serving_mcc
+                                .is_some_and(|mcc| selection_entry_is_in_country(entry, mcc))
+                    }) {
+                        let Some(target_plmn) = concrete_selection_plmn(entry) else {
+                            continue;
+                        };
+                        if let Some(address) =
+                            selection_entry_address(entry, &target_plmn, location)
+                        {
+                            push_epdg_candidate(
+                                &mut candidates,
+                                address,
+                                EpdgCandidateSource::UiccSelection,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // UICC home identifiers and the profile-derived/configured host are the
+    // final non-mandatory-country fallback path. In a private PLMN the profile
+    // host must already be explicit; standard helpers refuse MCC 999.
+    for address in &uicc.home_identifiers {
+        push_epdg_candidate(
+            &mut candidates,
+            address.clone(),
+            EpdgCandidateSource::UiccHomeIdentifier,
+        );
+    }
+
+    if let Some(address) = epdg_address_from_text(profile.epdg.host) {
+        push_epdg_candidate(
+            &mut candidates,
+            address,
+            if profiles::is_standard_derived_profile(profile) {
+                EpdgCandidateSource::HomePlmnDerived
+            } else {
+                EpdgCandidateSource::CarrierProfile
+            },
+        );
+    }
+    candidates
+}
+
 /// DNS servers to try, in order: this line's override first, then the carrier
 /// profile's list. Resolving the ePDG FQDN is a hard prerequisite for
 /// connecting at all, so a single unreachable resolver must not be fatal.
@@ -487,15 +930,103 @@ fn live_dns_attempts(line_id: &str, profile: &'static CarrierProfile) -> Vec<Opt
     attempts
 }
 
-async fn resolve_live_epdg(
+fn standard_epdg_record_matches_plmn(record: &epdg::NaptrReplacement, plmn: &str) -> bool {
+    let Some(record_plmn) = standard_epdg_record_plmn(record) else {
+        return false;
+    };
+    super::qmi_uim::epdg_plmn_pattern_matches(plmn, &record_plmn)
+}
+
+async fn resolve_live_visited_country_naptr(
+    line_id: &str,
+    _profile: &'static CarrierProfile,
+    uicc: &UsimEpdgConfig,
+    location: Option<&EpdgLocationSnapshot>,
+) -> VisitedCountryNaptrState {
+    let Some(location) = location else {
+        return VisitedCountryNaptrState::NotQueried;
+    };
+    let Some(serving_plmn) = canonical_plmn(&location.serving_plmn) else {
+        return VisitedCountryNaptrState::NotQueried;
+    };
+    let serving_mcc = &serving_plmn[..3];
+    let Some(serving_country_fqdn) = profiles::standard_visited_country_epdg_fqdn(serving_mcc)
+    else {
+        // This also rejects MCC 999, so a private serving PLMN never causes a
+        // public visited-country DNS name to be guessed.
+        return VisitedCountryNaptrState::NotQueried;
+    };
+    let roaming = serving_is_roaming(Some(location), _profile.meta.plmn);
+    if !roaming {
+        return VisitedCountryNaptrState::NotQueried;
+    }
+    let has_selected_plmn = uicc
+        .selection
+        .iter()
+        .any(|entry| entry.is_any_plmn() || entry.matches_plmn(&serving_plmn));
+    if has_selected_plmn {
+        // An explicit VPLMN/Any_PLMN UICC row has precedence over visited-
+        // country discovery and therefore suppresses the NAPTR query.
+        return VisitedCountryNaptrState::NotQueried;
+    }
+
+    let proxy = line_overrides(line_id).proxy;
+    let mut last_error = None;
+    for dns_server in live_dns_attempts(line_id, _profile) {
+        let result = match &proxy {
+            Some(LiveProxySetting::Socks5(endpoint)) => {
+                epdg::resolve_visited_country_naptr_via_socks5(
+                    &serving_country_fqdn,
+                    dns_server,
+                    endpoint,
+                )
+                .await
+            }
+            None => {
+                epdg::resolve_visited_country_naptr_with_dns_override(
+                    &serving_country_fqdn,
+                    dns_server,
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(records) if records.is_empty() => {
+                return VisitedCountryNaptrState::EmptyResponse;
+            }
+            Ok(records) => return VisitedCountryNaptrState::Records(records),
+            Err(error) => {
+                warn!(
+                    line_id = %line_id,
+                    dns_server = ?dns_server,
+                    fqdn = %serving_country_fqdn,
+                    error = %error,
+                    "visited-country NAPTR lookup failed; trying the next DNS candidate"
+                );
+                last_error = Some(error);
+            }
+        }
+    }
+
+    let error = last_error
+        .map(|error| error.to_string())
+        .unwrap_or_else(|| "no_dns_candidate_available".to_string());
+    warn!(
+        line_id = %line_id,
+        fqdn = %serving_country_fqdn,
+        error = %error,
+        "visited-country NAPTR discovery received no DNS response; terminating ePDG selection"
+    );
+    VisitedCountryNaptrState::Failed(error)
+}
+
+async fn resolve_live_epdg_candidate(
     line_id: &str,
     profile: &'static CarrierProfile,
+    candidate: &EpdgEndpointCandidate,
 ) -> Result<ResolvedEpdgEndpoint, TransportError> {
     let overrides = line_overrides(line_id);
-    let host = overrides
-        .epdg_host
-        .clone()
-        .unwrap_or_else(|| profile.epdg.host.to_string());
+    let host = candidate.host();
     let port = overrides.epdg_port.unwrap_or(profile.epdg.port);
     // DNS follows the proxy: when this line egresses through a proxy, the lookup
     // goes through it too, so the real client IP is not exposed to the resolver
@@ -505,9 +1036,22 @@ async fn resolve_live_epdg(
     // Always try the platform resolver last, even when explicit DNS servers
     // were configured. This preserves the documented custom -> profile ->
     // system fallback chain.
-    let candidates = live_dns_attempts(line_id, profile);
+    if let UsimEpdgAddress::Ip(ip) = &candidate.address {
+        let route_policy = choose_route_policy(
+            &profile.meta,
+            &host,
+            proxy.as_ref().map(|_| ProxyKind::Socks5UdpAssociate),
+        );
+        return Ok(ResolvedEpdgEndpoint {
+            host,
+            port,
+            addresses: vec![SocketAddr::new(*ip, port)],
+            route_policy,
+        });
+    }
+    let dns_attempts = live_dns_attempts(line_id, profile);
     let mut last_error = None;
-    for dns_server in candidates {
+    for dns_server in dns_attempts {
         let attempt = match &proxy {
             Some(LiveProxySetting::Socks5(endpoint)) => {
                 epdg::resolve_epdg_via_socks5(&profile.meta, &host, port, dns_server, endpoint)
@@ -532,6 +1076,82 @@ async fn resolve_live_epdg(
     }
     Err(last_error
         .unwrap_or_else(|| TransportError::DnsFailed("no_dns_candidate_available".to_string())))
+}
+
+async fn resolve_live_epdg_candidates(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
+) -> Result<Vec<ResolvedEpdgEndpoint>, TransportError> {
+    let uicc = live_uicc_epdg_config(line_id).await.unwrap_or_default();
+    let location = access_network.epdg_location();
+    let visited_country_records =
+        resolve_live_visited_country_naptr(line_id, profile, &uicc, location.as_ref()).await;
+    let candidates = build_live_epdg_candidates_with_naptr(
+        line_id,
+        profile,
+        &uicc,
+        location.as_ref(),
+        &visited_country_records,
+    );
+    if candidates.is_empty() {
+        return Err(TransportError::DnsFailed(
+            "no_valid_epdg_host_candidate".to_string(),
+        ));
+    }
+
+    let mut resolved = Vec::new();
+    let mut last_error = None;
+    for candidate in candidates {
+        let host = candidate.host();
+        let attempt = tokio::time::timeout(
+            LIVE_DNS_TIMEOUT,
+            resolve_live_epdg_candidate(line_id, profile, &candidate),
+        )
+        .await;
+        match attempt {
+            Ok(Ok(endpoint)) => resolved.push(endpoint),
+            Ok(Err(error)) => {
+                warn!(
+                    line_id = %line_id,
+                    candidate_source = candidate.source.as_str(),
+                    host = %host,
+                    error = %error,
+                    "ePDG candidate failed; trying the next standards/profile candidate"
+                );
+                last_error = Some(error);
+            }
+            Err(_) => {
+                warn!(
+                    line_id = %line_id,
+                    candidate_source = candidate.source.as_str(),
+                    host = %host,
+                    "ePDG candidate resolution timed out; trying the next candidate"
+                );
+                last_error = Some(TransportError::Timeout(
+                    "epdg_candidate_resolution_timeout".to_string(),
+                ));
+            }
+        }
+    }
+    if resolved.is_empty() {
+        Err(last_error
+            .unwrap_or_else(|| TransportError::DnsFailed("no_epdg_candidate_resolved".to_string())))
+    } else {
+        Ok(resolved)
+    }
+}
+
+async fn resolve_live_epdg(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
+) -> Result<ResolvedEpdgEndpoint, TransportError> {
+    resolve_live_epdg_candidates(line_id, profile, access_network)
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| TransportError::DnsFailed("no_epdg_candidate_resolved".to_string()))
 }
 
 #[derive(Debug, Clone)]
@@ -802,23 +1422,40 @@ pub(crate) fn operator_socket_creator_for_line(
     })
 }
 
+fn publish_line_sim_device(line_id: &str, device: LiveSimDevice) {
+    let changed = {
+        let mut devices = line_sim_devices()
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if devices.get(line_id) == Some(&device) {
+            false
+        } else {
+            devices.insert(line_id.to_string(), device);
+            true
+        }
+    };
+    // Discovery refreshes can repeat the same descriptor every few seconds.
+    // Keep the UICC optional-file cache in that common case; invalidate it only
+    // when the actual reader/slot/modem binding changes.
+    if changed {
+        forget_live_uicc_epdg_config(line_id);
+    }
+}
+
 /// Record which reader a line owns. Called when lines are discovered/refreshed.
 pub fn register_line_sim_device(line_id: &str, qmi_device: &str, uim_slot: u8, modem_path: &str) {
     if line_id.is_empty() || (qmi_device.is_empty() && modem_path.is_empty()) {
         return;
     }
-    line_sim_devices()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            line_id.to_string(),
-            LiveSimDevice {
-                qmi_device: qmi_device.to_string(),
-                uim_slot,
-                modem_path: modem_path.to_string(),
-                pcsc_reader: String::new(),
-            },
-        );
+    publish_line_sim_device(
+        line_id,
+        LiveSimDevice {
+            qmi_device: qmi_device.to_string(),
+            uim_slot,
+            modem_path: modem_path.to_string(),
+            pcsc_reader: String::new(),
+        },
+    );
 }
 
 /// Record a standalone PC/SC reader owned by one line.
@@ -828,18 +1465,15 @@ pub fn register_line_pcsc_reader(line_id: &str, reader_path: &str) {
     {
         return;
     }
-    line_sim_devices()
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(
-            line_id.to_string(),
-            LiveSimDevice {
-                qmi_device: String::new(),
-                uim_slot: 0,
-                modem_path: String::new(),
-                pcsc_reader: reader_path.trim().to_string(),
-            },
-        );
+    publish_line_sim_device(
+        line_id,
+        LiveSimDevice {
+            qmi_device: String::new(),
+            uim_slot: 0,
+            modem_path: String::new(),
+            pcsc_reader: reader_path.trim().to_string(),
+        },
+    );
 }
 
 /// Resolve this line's SIM identity (IMSI etc.) through ModemManager.
@@ -941,6 +1575,7 @@ pub fn forget_line_sim_device_mapping(line_id: &str) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
+    forget_live_uicc_epdg_config(line_id);
 }
 
 /// Forget all live state for a line (line removed or its UE torn down).
@@ -969,6 +1604,74 @@ pub(crate) fn sim_device_for_line(line_id: &str) -> LiveSimDevice {
         modem_path: String::new(),
         pcsc_reader: String::new(),
     }
+}
+
+/// Read optional TS 31.102 ePDG information from this line's exact UICC.
+///
+/// The cache is bound to the full reader descriptor, not merely the line id, so
+/// replacing a card/reader cannot reuse the former line's ePDG identifiers.
+/// Optional-file failures are deliberately non-fatal: user/catalog/profile
+/// candidates remain available and the failed read is cached briefly to avoid
+/// hammering a card that does not implement 6FF3/6FF4.
+async fn live_uicc_epdg_config(line_id: &str) -> Result<UsimEpdgConfig, &'static str> {
+    let device = sim_device_for_line(line_id);
+    if device.pcsc_reader.is_empty() && device.qmi_device.is_empty() {
+        return Ok(UsimEpdgConfig::default());
+    }
+
+    if let Some(cached) = live_uicc_epdg_config_cache()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .filter(|cached| {
+            cached.device == device && cached.loaded_at.elapsed() <= LIVE_UICC_EPDG_CACHE_TTL
+        })
+        .cloned()
+    {
+        return Ok(cached.config);
+    }
+
+    let proxy_socket = live_runtime_config().qmi_proxy_socket;
+    let read_device = device.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        if !read_device.pcsc_reader.is_empty() {
+            crate::hardware::devices::pcsc::read_epdg_config(&read_device.pcsc_reader)
+        } else {
+            read_usim_epdg_config_via_proxy_reason(
+                &proxy_socket,
+                &read_device.qmi_device,
+                read_device.uim_slot,
+                USIM_AID_PREFIX,
+                LIVE_SIM_AUTH_TIMEOUT,
+            )
+        }
+    })
+    .await
+    .map_err(|_| "sim_epdg_config_worker_failed")?;
+
+    let config = match result {
+        Ok(config) => config,
+        Err(reason) => {
+            warn!(
+                line_id = %line_id,
+                reason,
+                "Optional UICC ePDG configuration could not be read; continuing with configured and standard candidates"
+            );
+            UsimEpdgConfig::default()
+        }
+    };
+    live_uicc_epdg_config_cache()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(
+            line_id.to_string(),
+            CachedLiveUiccEpdgConfig {
+                device,
+                loaded_at: Instant::now(),
+                config: config.clone(),
+            },
+        );
+    Ok(config)
 }
 
 /// Verify SIM auth access for a specific line's reader.
@@ -1782,12 +2485,21 @@ pub trait LiveDatagramAdapter: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct SystemLiveEpdgAdapter {
     line_id: String,
+    access_network: ImsAccessNetworkRuntime,
 }
 
 impl SystemLiveEpdgAdapter {
     pub fn for_line(line_id: impl Into<String>) -> Self {
+        Self::for_line_with_access_network(line_id, ImsAccessNetworkRuntime::default())
+    }
+
+    pub fn for_line_with_access_network(
+        line_id: impl Into<String>,
+        access_network: ImsAccessNetworkRuntime,
+    ) -> Self {
         Self {
             line_id: line_id.into(),
+            access_network,
         }
     }
 }
@@ -1799,13 +2511,9 @@ impl LiveEpdgAdapter for SystemLiveEpdgAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedEpdgEndpoint, LiveStageError>> + Send + 'a>>
     {
         Box::pin(async move {
-            match tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(&self.line_id, profile))
+            resolve_live_epdg(&self.line_id, profile, &self.access_network)
                 .await
-            {
-                Ok(Ok(endpoint)) => Ok(endpoint),
-                Ok(Err(_err)) => Err(live_stage_error("epdg_dns_resolution_failed")),
-                Err(_) => Err(live_stage_error("epdg_dns_resolution_timeout")),
-            }
+                .map_err(|_| live_stage_error("epdg_dns_resolution_failed"))
         })
     }
 }
@@ -1842,13 +2550,16 @@ impl LiveDatagramAdapter for SystemLiveDatagramAdapter {
     ) -> Pin<Box<dyn Future<Output = Result<(), LiveStageError>> + Send + 'a>> {
         Box::pin(async move {
             match stage {
-                ExecutorStage::Ike => {
-                    run_live_ike_until(&self.line_id, profile, LiveIkeTarget::EapSuccess)
-                        .await
-                        .map(|_| ())
-                }
+                ExecutorStage::Ike => run_live_ike_until(
+                    &self.line_id,
+                    profile,
+                    LiveIkeTarget::EapSuccess,
+                    &self.access_network,
+                )
+                .await
+                .map(|_| ()),
                 ExecutorStage::ChildSa | ExecutorStage::Esp => {
-                    run_live_esp_until(&self.line_id, profile).await
+                    run_live_esp_until(&self.line_id, profile, &self.access_network).await
                 }
                 ExecutorStage::ImsRegister => {
                     run_live_ims_register_until(&self.line_id, profile, &self.access_network).await
@@ -1993,8 +2704,16 @@ async fn run_live_ike_until(
     line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    run_live_ike_until_depth(line_id, profile, target, LiveProbeDepth::FullHandshake).await
+    run_live_ike_until_depth(
+        line_id,
+        profile,
+        target,
+        LiveProbeDepth::FullHandshake,
+        access_network,
+    )
+    .await
 }
 
 async fn run_live_ike_until_depth(
@@ -2002,21 +2721,16 @@ async fn run_live_ike_until_depth(
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
     depth: LiveProbeDepth,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    let (epdg_host, epdg_port, _) = live_epdg_settings(line_id, profile);
-    info!("Resolving ePDG host: {} port: {}", epdg_host, epdg_port);
-    let endpoint = tokio::time::timeout(LIVE_DNS_TIMEOUT, resolve_live_epdg(line_id, profile))
+    let endpoints = resolve_live_epdg_candidates(line_id, profile, access_network)
         .await
-        .map_err(|_| live_stage_error("epdg_dns_resolution_timeout"))?
         .map_err(map_transport_error)?;
-    let addresses = endpoint.addresses;
-    info!("Resolved ePDG endpoint addresses: {:?}", addresses);
-    if addresses.is_empty() {
-        error!("No IP addresses found for ePDG");
+    if endpoints.is_empty() {
+        error!("No ePDG endpoint candidates resolved");
         return Err(live_stage_error("epdg_no_address"));
     }
 
-    let mut last_error = None;
     let endpoint_limit = match depth {
         LiveProbeDepth::StatusSaInit => 1,
         LiveProbeDepth::FullHandshake => LIVE_IKE_MAX_ENDPOINTS_PER_PASS,
@@ -2032,40 +2746,74 @@ async fn run_live_ike_until_depth(
         }
     };
     let proposal_groups = live_ike_proposal_groups(profile)?;
-    let addresses = addresses
-        .into_iter()
-        .take(endpoint_limit)
-        .collect::<Vec<_>>();
     let proposal_groups = proposal_groups
         .iter()
         .take(proposal_group_limit)
         .collect::<Vec<_>>();
-    for proposal_group in proposal_groups {
-        for mut destination in addresses.iter().copied() {
-            for path in transport_paths {
-                destination.set_port(path.destination_port);
-                info!("Attempting connection path to destination={:?}, local_port_preferred={:?}, initial_nat_t={:?}", destination, path.preferred_local_port, path.initial_nat_t);
-                match run_live_ike_with_destination(
-                    line_id,
-                    profile,
-                    target,
-                    destination,
-                    *path,
-                    proposal_group,
-                )
-                .await
-                {
-                    Ok(session) => {
-                        info!(
-                            selected_ike_proposals = ?proposal_group.proposals,
-                            "Successfully established IKE session with destination={:?}",
-                            destination,
-                        );
-                        return Ok(session);
-                    }
-                    Err(error) => {
-                        warn!("Failed connection path to destination={:?}, local_port_preferred={:?}, error={:?}", destination, path.preferred_local_port, error);
-                        last_error = Some(error);
+
+    let mut last_error = None;
+    // Preserve standards/profile priority all the way through IKE. DNS success
+    // alone does not prove that an ePDG accepts this SIM, so exhaust the selected
+    // host's addresses/proposals/transport paths before moving to the next UICC
+    // or profile-derived host.
+    for endpoint in endpoints {
+        let selected_epdg_host = endpoint.host;
+        let addresses = endpoint
+            .addresses
+            .into_iter()
+            .take(endpoint_limit)
+            .collect::<Vec<_>>();
+        if addresses.is_empty() {
+            warn!(host = %selected_epdg_host, "Resolved ePDG candidate had no addresses");
+            continue;
+        }
+        info!(
+            host = %selected_epdg_host,
+            addresses = ?addresses,
+            "Trying resolved ePDG candidate"
+        );
+        for address in addresses {
+            for proposal_group in &proposal_groups {
+                for path in transport_paths {
+                    let mut destination = address;
+                    destination.set_port(path.destination_port);
+                    info!(
+                        host = %selected_epdg_host,
+                        destination = ?destination,
+                        local_port_preferred = path.preferred_local_port,
+                        initial_nat_t = path.initial_nat_t,
+                        "Attempting IKE connection path"
+                    );
+                    match run_live_ike_with_destination(
+                        line_id,
+                        profile,
+                        target,
+                        &selected_epdg_host,
+                        destination,
+                        *path,
+                        proposal_group,
+                    )
+                    .await
+                    {
+                        Ok(session) => {
+                            info!(
+                                host = %selected_epdg_host,
+                                selected_ike_proposals = ?proposal_group.proposals,
+                                destination = ?destination,
+                                "Successfully established IKE session"
+                            );
+                            return Ok(session);
+                        }
+                        Err(error) => {
+                            warn!(
+                                host = %selected_epdg_host,
+                                destination = ?destination,
+                                local_port_preferred = path.preferred_local_port,
+                                error = ?error,
+                                "IKE connection path failed; continuing fallback ladder"
+                            );
+                            last_error = Some(error);
+                        }
                     }
                 }
             }
@@ -2074,11 +2822,11 @@ async fn run_live_ike_until_depth(
 
     Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
 }
-
 async fn run_live_ike_with_destination(
     line_id: &str,
     profile: &'static CarrierProfile,
     target: LiveIkeTarget,
+    selected_epdg_host: &str,
     destination: SocketAddr,
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
@@ -2144,7 +2892,7 @@ async fn run_live_ike_with_destination(
         .map_err(|_| live_stage_error("ike_dh_material_unavailable"))?;
     let mut machine = IkeStateMachine::new_with_dh_group_and_access(
         profile,
-        live_ike_access(line_id, profile),
+        live_ike_access_for_epdg(line_id, profile, Some(selected_epdg_host)),
         initiator_spi,
         initiator_nonce,
         dh.public_value().to_vec(),
@@ -2420,13 +3168,20 @@ async fn run_live_ike_with_destination(
 async fn run_live_esp_until(
     line_id: &str,
     profile: &'static CarrierProfile,
+    access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
     if cached_tun_gateway_matches(line_id, profile).await {
         return Ok(());
     }
 
     info!("Live ESP stage check: building full ePDG IKE/EAP-AKA/CHILD_SA path...");
-    let session = run_live_ike_until(line_id, profile, LiveIkeTarget::ChildSaReady).await?;
+    let session = run_live_ike_until(
+        line_id,
+        profile,
+        LiveIkeTarget::ChildSaReady,
+        access_network,
+    )
+    .await?;
     let child_sa = session
         .child_sa
         .as_ref()
@@ -2643,7 +3398,7 @@ async fn attempt_live_ims_registration(
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<RegisteredImsContext, LiveStageError> {
     info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS TCP path...");
-    run_live_esp_until(line_id, profile)
+    run_live_esp_until(line_id, profile, access_network)
         .await
         .map_err(|error| {
             error.with_registration_loss(RegistrationLossReason::AccessTransportLost)
@@ -8213,6 +8968,10 @@ fn map_identity_error(error: IkeIdentityError) -> LiveStageError {
     live_stage_error(match error {
         IkeIdentityError::EmptyImsi | IkeIdentityError::InvalidImsi => "ike_identity_unavailable",
         IkeIdentityError::ImsiPlmnMismatch => "ike_identity_profile_mismatch",
+        IkeIdentityError::PrivateIdentityTemplateRequired => {
+            "ike_identity_private_template_required"
+        }
+        IkeIdentityError::InvalidIdentityTemplate => "ike_identity_template_invalid",
     })
 }
 
@@ -8581,6 +9340,374 @@ fn stage_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn epdg_selection_entry(
+        plmn_pattern: &str,
+        priority: u16,
+        fqdn_format: EpdgFqdnFormat,
+    ) -> super::super::qmi_uim::UsimEpdgSelectionEntry {
+        super::super::qmi_uim::UsimEpdgSelectionEntry {
+            plmn_pattern: plmn_pattern.to_string(),
+            priority,
+            fqdn_format,
+        }
+    }
+
+    fn epdg_candidate_hosts(candidates: &[EpdgEndpointCandidate]) -> Vec<String> {
+        candidates.iter().map(EpdgEndpointCandidate::host).collect()
+    }
+
+    #[test]
+    fn line_epdg_override_is_strict_canonical_and_unique() {
+        let line_id = "test-vowifi-strict-epdg-override";
+        let config = LineVowifiConfig::default();
+        let sim_override = SimOverride {
+            ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
+                epdg_host: Some("Pinned.EPDG.Example.".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        configure_live_network_overrides(line_id, &config, Some(&sim_override))
+            .expect("publish strict ePDG override");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: vec![UsimEpdgAddress::Fqdn("epdg.from-uicc.example".to_string())],
+            selection: vec![epdg_selection_entry(
+                "23433",
+                1,
+                EpdgFqdnFormat::OperatorIdentifier,
+            )],
+        };
+
+        let candidates = build_live_epdg_candidates(
+            line_id,
+            &profiles::GB_EE_23433,
+            &uicc,
+            Some(&EpdgLocationSnapshot {
+                serving_plmn: "23433".to_string(),
+                technology: "lte".to_string(),
+                tac: 0x1234,
+            }),
+        );
+        assert_eq!(epdg_candidate_hosts(&candidates), ["pinned.epdg.example"]);
+        assert_eq!(candidates[0].source, EpdgCandidateSource::LineOverride);
+
+        forget_live_network_overrides(line_id);
+    }
+
+    #[test]
+    fn provisioned_profile_does_not_gain_an_unrequested_public_dns_guess() {
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-provisioned-profile-only",
+            &profiles::NZ_SPARK_53005,
+            &UsimEpdgConfig::default(),
+            None,
+        );
+        assert_eq!(
+            epdg_candidate_hosts(&candidates),
+            [profiles::NZ_SPARK_53005.epdg.host]
+        );
+        assert_eq!(candidates[0].source, EpdgCandidateSource::CarrierProfile);
+        assert_ne!(
+            profiles::NZ_SPARK_53005.epdg.host,
+            profiles::standard_operator_epdg_fqdn("530", "05").unwrap()
+        );
+    }
+
+    #[test]
+    fn derived_epdg_candidates_follow_uicc_selection_home_id_then_hplmn_order() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: vec![UsimEpdgAddress::Fqdn("epdg.from-uicc.example".to_string())],
+            selection: vec![epdg_selection_entry(
+                "50212",
+                1,
+                EpdgFqdnFormat::LocationBased,
+            )],
+        };
+        let location = EpdgLocationSnapshot {
+            serving_plmn: "50212".to_string(),
+            technology: "lte".to_string(),
+            tac: 0x0b21,
+        };
+
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-derived-order",
+            profile,
+            &uicc,
+            Some(&location),
+        );
+        assert_eq!(
+            epdg_candidate_hosts(&candidates),
+            [
+                "tac-lb21.tac-hb0b.tac.epdg.epc.mnc012.mcc502.pub.3gppnetwork.org",
+                "epdg.from-uicc.example",
+                "epdg.epc.mnc012.mcc502.pub.3gppnetwork.org",
+            ]
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>(),
+            [
+                EpdgCandidateSource::UiccSelection,
+                EpdgCandidateSource::UiccHomeIdentifier,
+                EpdgCandidateSource::HomePlmnDerived,
+            ]
+        );
+    }
+
+    #[test]
+    fn roaming_epdg_selection_prefers_exact_vplmn_over_any_plmn() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: vec![UsimEpdgAddress::Fqdn("epdg.home.example".to_string())],
+            selection: vec![
+                epdg_selection_entry("DDDDDD", 0, EpdgFqdnFormat::LocationBased),
+                epdg_selection_entry("310260", 10, EpdgFqdnFormat::OperatorIdentifier),
+                epdg_selection_entry("50212", 1, EpdgFqdnFormat::OperatorIdentifier),
+            ],
+        };
+        let location = EpdgLocationSnapshot {
+            serving_plmn: "310260".to_string(),
+            technology: "lte".to_string(),
+            tac: 0x1234,
+        };
+
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-roaming-exact-vplmn",
+            profile,
+            &uicc,
+            Some(&location),
+        );
+        assert_eq!(
+            epdg_candidate_hosts(&candidates),
+            [
+                "epdg.epc.mnc260.mcc310.pub.3gppnetwork.org",
+                "epdg.home.example",
+                profile.epdg.host,
+            ]
+        );
+        assert_eq!(candidates[0].source, EpdgCandidateSource::UiccSelection);
+    }
+
+    #[test]
+    fn roaming_epdg_selection_uses_any_plmn_format_for_the_serving_plmn() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: Vec::new(),
+            selection: vec![epdg_selection_entry(
+                "DDDDDD",
+                1,
+                EpdgFqdnFormat::LocationBased,
+            )],
+        };
+        let location = EpdgLocationSnapshot {
+            serving_plmn: "310260".to_string(),
+            technology: "nr".to_string(),
+            tac: 0x0b1a21,
+        };
+
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-roaming-any-plmn",
+            profile,
+            &uicc,
+            Some(&location),
+        );
+        assert_eq!(
+            epdg_candidate_hosts(&candidates),
+            [
+                "tac-lb21.tac-mb1a.tac-hb0b.5gstac.epdg.epc.mnc260.mcc310.pub.3gppnetwork.org",
+                profile.epdg.host,
+            ]
+        );
+    }
+
+    #[test]
+    fn roaming_private_plmn_never_receives_a_public_standard_epdg_name() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: vec![UsimEpdgAddress::Ip("192.0.2.55".parse().unwrap())],
+            selection: vec![epdg_selection_entry(
+                "DDDDDD",
+                1,
+                EpdgFqdnFormat::OperatorIdentifier,
+            )],
+        };
+        let location = EpdgLocationSnapshot {
+            serving_plmn: "99999".to_string(),
+            technology: "lte".to_string(),
+            tac: 0x0021,
+        };
+
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-roaming-private-plmn",
+            profile,
+            &uicc,
+            Some(&location),
+        );
+        let hosts = epdg_candidate_hosts(&candidates);
+        assert_eq!(hosts, ["192.0.2.55", profile.epdg.host]);
+        assert!(hosts.iter().all(|host| !host.contains("mcc999")));
+    }
+
+    #[test]
+    fn home_location_epdg_requires_fresh_explicit_hplmn_selection_and_ignores_any_plmn() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let uicc = UsimEpdgConfig {
+            home_identifiers: Vec::new(),
+            selection: vec![
+                epdg_selection_entry("50212", 1, EpdgFqdnFormat::LocationBased),
+                epdg_selection_entry("DDDDDD", 0, EpdgFqdnFormat::OperatorIdentifier),
+            ],
+        };
+
+        let no_snapshot =
+            build_live_epdg_candidates("test-vowifi-location-none", profile, &uicc, None);
+        assert_eq!(epdg_candidate_hosts(&no_snapshot), [profile.epdg.host]);
+        assert_eq!(no_snapshot[0].source, EpdgCandidateSource::HomePlmnDerived);
+
+        let runtime = ImsAccessNetworkRuntime::default();
+        runtime.publish(
+            crate::connectivity::core::access_network::ServingAccessSnapshot::new(
+                "502",
+                "12",
+                "lte",
+                0x12345,
+                0x0b21,
+                Some("B3".to_string()),
+                crate::connectivity::core::access_network::AccessNetworkSource::TestFixture,
+            )
+            .expect("fresh modem snapshot"),
+        );
+        std::thread::sleep(Duration::from_millis(1));
+        let stale = runtime.epdg_location_with_max_age(Duration::ZERO);
+        assert!(stale.is_none());
+        let stale_candidates = build_live_epdg_candidates(
+            "test-vowifi-location-stale",
+            profile,
+            &uicc,
+            stale.as_ref(),
+        );
+        assert_eq!(epdg_candidate_hosts(&stale_candidates), [profile.epdg.host]);
+    }
+
+    #[test]
+    fn epdg_candidates_reject_emergency_names_deduplicate_and_stay_bounded() {
+        let profile = profiles::derive_standard_3gpp_profile(
+            "502",
+            "12",
+            profiles::Standard3gppAccess::WifiEpdg,
+        )
+        .expect("public standard profile");
+        let mut home_identifiers = vec![
+            UsimEpdgAddress::Fqdn("sos.epdg.invalid.example".to_string()),
+            UsimEpdgAddress::Fqdn("EPDG0.EXAMPLE.ORG.".to_string()),
+            UsimEpdgAddress::Fqdn("epdg0.example.org".to_string()),
+        ];
+        home_identifiers.extend(
+            (1..=10).map(|index| UsimEpdgAddress::Fqdn(format!("epdg{index}.example.org"))),
+        );
+        let candidates = build_live_epdg_candidates(
+            "test-vowifi-candidate-bounds",
+            profile,
+            &UsimEpdgConfig {
+                home_identifiers,
+                selection: Vec::new(),
+            },
+            None,
+        );
+        let hosts = epdg_candidate_hosts(&candidates);
+        assert_eq!(hosts.len(), LIVE_EPDG_MAX_HOST_CANDIDATES);
+        assert!(hosts.iter().all(|host| !host.starts_with("sos.")));
+        let mut unique = hosts.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), hosts.len());
+    }
+
+    #[test]
+    fn unchanged_reader_refresh_preserves_only_its_lines_uicc_cache() {
+        let line_a = "test-vowifi-uicc-cache-line-a";
+        let line_b = "test-vowifi-uicc-cache-line-b";
+        register_line_sim_device(line_a, "/dev/qmi-a", 1, "/modem/a");
+        register_line_sim_device(line_b, "/dev/qmi-b", 2, "/modem/b");
+        let device_a = sim_device_for_line(line_a);
+        let device_b = sim_device_for_line(line_b);
+        {
+            let mut cache = live_uicc_epdg_config_cache()
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.insert(
+                line_a.to_string(),
+                CachedLiveUiccEpdgConfig {
+                    device: device_a.clone(),
+                    loaded_at: Instant::now(),
+                    config: UsimEpdgConfig {
+                        home_identifiers: vec![UsimEpdgAddress::Fqdn(
+                            "epdg.line-a.example".to_string(),
+                        )],
+                        selection: Vec::new(),
+                    },
+                },
+            );
+            cache.insert(
+                line_b.to_string(),
+                CachedLiveUiccEpdgConfig {
+                    device: device_b,
+                    loaded_at: Instant::now(),
+                    config: UsimEpdgConfig::default(),
+                },
+            );
+        }
+
+        register_line_sim_device(line_a, "/dev/qmi-a", 1, "/modem/a");
+        {
+            let cache = live_uicc_epdg_config_cache()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(cache.contains_key(line_a));
+            assert!(cache.contains_key(line_b));
+        }
+
+        register_line_sim_device(line_a, "/dev/qmi-a", 3, "/modem/a");
+        {
+            let cache = live_uicc_epdg_config_cache()
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            assert!(!cache.contains_key(line_a));
+            assert!(cache.contains_key(line_b));
+        }
+
+        forget_line_sim_device(line_a);
+        forget_line_sim_device(line_b);
+    }
 
     #[tokio::test]
     async fn refresh_failure_state_is_line_scoped_and_thresholded() {

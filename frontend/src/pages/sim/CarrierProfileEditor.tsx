@@ -141,6 +141,16 @@ function validate(record: CarrierProfileRecord): string | null {
   if (!ims.domain.trim() || !ims.realm.trim()) return 'IMS domain 与 realm 不能为空'
   if (ikev2.ike_proposals.length === 0) return 'IKE 提案不能为空'
   if (ikev2.esp_proposals.length === 0) return 'ESP 提案不能为空'
+  if (meta.mcc === '999' && !ikev2.identity_template?.trim()) {
+    return '私有网络（MCC 999）必须显式填写 IKE IDi 模板'
+  }
+  if (ikev2.identity_template) {
+    const remainder = ikev2.identity_template.replace(
+      /\{(?:imsi|mcc|mnc|mnc3|plmn|epdg_fqdn|ims_domain|ims_realm)\}/g,
+      '',
+    )
+    if (/[{}]/.test(remainder)) return 'IKE IDi 模板包含不支持的占位符'
+  }
   if (ims.register.expires_seconds <= 0) return 'REGISTER Expires 必须大于 0'
   for (const server of epdg.dns_servers) {
     // Accept `1.1.1.1` or `1.1.1.1:53`; IPv6 must be bracketed when a port is given.
@@ -427,6 +437,16 @@ export default function CarrierProfileEditor({
                 }
               />
             </Stack>
+            <TextField
+              fullWidth
+              label="IKE IDi 模板"
+              value={draft.ikev2.identity_template ?? ''}
+              placeholder="0{imsi}@nai.epc.mnc{mnc3}.mcc{mcc}.3gppnetwork.org"
+              helperText="公开 PLMN 留空时使用 3GPP permanent NAI；MCC 999 必填。可用 {imsi}、{mcc}、{mnc}、{mnc3}、{plmn}、{epdg_fqdn}、{ims_domain}、{ims_realm}，值会结合当前线路 SIM/基带身份展开"
+              onChange={(e) =>
+                patch('ikev2', { identity_template: e.target.value.trim() || null })
+              }
+            />
             <ListField
               label="IKE 提案"
               value={draft.ikev2.ike_proposals}

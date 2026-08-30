@@ -31,7 +31,7 @@ use crate::connectivity::core::voice::AudioCodec;
 /// normalized by [`CarrierProfileRecord::from_database_json`] using presence
 /// checks against the original JSON so an explicit `false` is never confused
 /// with a serde default.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CarrierProfileMetaRecord {
@@ -91,6 +91,10 @@ pub struct Ikev2PolicyRecord {
     pub aka_challenge_mode: String,
     #[serde(default)]
     pub include_epdg_idr: bool,
+    /// Optional RFC822 IDi template. Required for private PLMNs (MCC 999),
+    /// where SimAdmin must not invent a public 3GPP NAI realm.
+    #[serde(default)]
+    pub identity_template: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -638,6 +642,7 @@ impl CarrierProfileRecord {
                 esp_proposals: intern_list(&self.ikev2.esp_proposals),
                 aka_challenge_mode: intern_str(&self.ikev2.aka_challenge_mode),
                 include_epdg_idr: self.ikev2.include_epdg_idr,
+                identity_template: self.ikev2.identity_template.as_deref().map(intern_str),
             },
             ims: ImsPolicy {
                 domain: intern_str(&self.ims.domain),
@@ -784,6 +789,7 @@ impl CarrierProfileRecord {
                 esp_proposals: to_owned_list(profile.ikev2.esp_proposals),
                 aka_challenge_mode: profile.ikev2.aka_challenge_mode.to_string(),
                 include_epdg_idr: profile.ikev2.include_epdg_idr,
+                identity_template: profile.ikev2.identity_template.map(str::to_string),
             },
             ims: ImsPolicyRecord {
                 domain: profile.ims.domain.to_string(),
@@ -920,6 +926,15 @@ impl CarrierProfileRecord {
         if self.ikev2.esp_proposals.is_empty() {
             return Err("esp_proposals_required".to_string());
         }
+        if self.meta.mcc == "999"
+            && self
+                .ikev2
+                .identity_template
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+        {
+            return Err("private_plmn_ike_identity_template_required".to_string());
+        }
         if !matches!(self.epdg.ip_stack.as_str(), "ipv4" | "ipv6" | "ipv4v6") {
             return Err("epdg_ip_stack_invalid".to_string());
         }
@@ -956,6 +971,9 @@ impl CarrierProfileRecord {
         }
         if self.ims.domain.trim().is_empty() || self.ims.realm.trim().is_empty() {
             return Err("ims_domain_and_realm_required".to_string());
+        }
+        if let Some(template) = self.ikev2.identity_template.as_deref() {
+            validate_ike_identity_template(template)?;
         }
         for (field, value) in [
             (
@@ -1243,6 +1261,32 @@ impl CarrierProfileRecord {
             .map(|mcc| (310..=316).contains(&mcc))
             .unwrap_or(false)
     }
+}
+
+const IKE_IDENTITY_TEMPLATE_PLACEHOLDERS: &[&str] = &[
+    "{imsi}",
+    "{mcc}",
+    "{mnc}",
+    "{mnc3}",
+    "{plmn}",
+    "{epdg_fqdn}",
+    "{ims_domain}",
+    "{ims_realm}",
+];
+
+fn validate_ike_identity_template(template: &str) -> Result<(), String> {
+    let template = template.trim();
+    if template.is_empty() || template.len() > 512 || template.chars().any(char::is_control) {
+        return Err("ike_identity_template_invalid".to_string());
+    }
+    let mut remainder = template.to_string();
+    for placeholder in IKE_IDENTITY_TEMPLATE_PLACEHOLDERS {
+        remainder = remainder.replace(placeholder, "");
+    }
+    if remainder.contains('{') || remainder.contains('}') {
+        return Err("ike_identity_template_placeholder_unsupported".to_string());
+    }
+    Ok(())
 }
 
 fn validate_single_line_wire_value(field: &str, value: &str) -> Result<(), String> {

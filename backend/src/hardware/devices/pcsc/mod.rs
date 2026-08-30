@@ -14,12 +14,15 @@ use std::{
 use serde::Serialize;
 
 use crate::connectivity::modems::ims::vowifi::qmi_uim::{
-    build_usim_authenticate_apdu, parse_usim_authenticate_response_reason, UimApduResponse,
-    UsimAkaApduResult,
+    build_get_response_apdu, build_usim_authenticate_apdu, parse_ef_epdg_id,
+    parse_ef_epdg_selection, parse_fcp_file_size, parse_usim_authenticate_response_reason,
+    UimApduResponse, UsimAkaApduResult, UsimEpdgConfig, EF_EPDG_ID, EF_EPDG_SELECTION,
 };
 
 const COMMAND_TIMEOUT_SECS: u64 = 8;
 const IDENTITY_CACHE_TTL: Duration = Duration::from_secs(5);
+const MAX_OPTIONAL_EF_BYTES: usize = 4096;
+const OPTIONAL_EF_READ_CHUNK_BYTES: usize = 255;
 const USIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -138,6 +141,231 @@ pub fn read_identity(path: &str) -> Result<PcscIdentity, &'static str> {
         imsi,
         mnc_length,
     })
+}
+
+/// Read optional non-emergency ePDG configuration without coupling it to the
+/// mandatory identity path. Each optional EF is selected and read independently,
+/// so one absent, malformed or unsupported file cannot hide a usable sibling.
+/// Transparent files are bounded to 4096 bytes and read in short-APDU chunks.
+pub fn read_epdg_config(path: &str) -> Result<UsimEpdgConfig, &'static str> {
+    let reader = resolve_reader_blocking(path)?;
+
+    let home_identifiers = match read_optional_transparent_ef(reader.index, EF_EPDG_ID) {
+        Ok(Some(data)) => match parse_ef_epdg_id(&data) {
+            Ok(values) => values,
+            Err(_) => {
+                tracing::warn!(
+                    reader = %reader.selector,
+                    file_id = format_args!("{EF_EPDG_ID:04X}"),
+                    "Ignoring malformed optional USIM ePDG identifier file"
+                );
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(reason) => {
+            tracing::warn!(
+                reader = %reader.selector,
+                file_id = format_args!("{EF_EPDG_ID:04X}"),
+                reason,
+                "Optional USIM ePDG identifier file could not be read"
+            );
+            Vec::new()
+        }
+    };
+    let selection = match read_optional_transparent_ef(reader.index, EF_EPDG_SELECTION) {
+        Ok(Some(data)) => match parse_ef_epdg_selection(&data) {
+            Ok(values) => values,
+            Err(_) => {
+                tracing::warn!(
+                    reader = %reader.selector,
+                    file_id = format_args!("{EF_EPDG_SELECTION:04X}"),
+                    "Ignoring malformed optional USIM ePDG selection file"
+                );
+                Vec::new()
+            }
+        },
+        Ok(None) => Vec::new(),
+        Err(reason) => {
+            tracing::warn!(
+                reader = %reader.selector,
+                file_id = format_args!("{EF_EPDG_SELECTION:04X}"),
+                reason,
+                "Optional USIM ePDG selection file could not be read"
+            );
+            Vec::new()
+        }
+    };
+    Ok(UsimEpdgConfig {
+        home_identifiers,
+        selection,
+    })
+}
+
+fn read_optional_transparent_ef(
+    reader_index: u16,
+    file_id: u16,
+) -> Result<Option<Vec<u8>>, &'static str> {
+    let selected_responses = run_usim_file_apdus(reader_index, file_id, &[])?;
+    let application = selected_responses
+        .first()
+        .ok_or("pcsc_apdu_response_count_invalid")?;
+    require_success(application)?;
+    let selected = selected_responses
+        .get(1)
+        .ok_or("pcsc_apdu_response_count_invalid")?;
+    if matches!((selected.sw1, selected.sw2), (0x6a, 0x82 | 0x83)) {
+        return Ok(None);
+    }
+    if !matches!(selected.sw1, 0x90 | 0x61 | 0x9f) {
+        return Err("pcsc_optional_ef_select_rejected");
+    }
+
+    let mut fcp = selected.data.clone();
+    if matches!(selected.sw1, 0x61 | 0x9f) {
+        let get_response = build_get_response_apdu(selected.sw2);
+        if let Ok(responses) = run_usim_file_apdus(reader_index, file_id, &[get_response]) {
+            if let Some(response) = responses.get(2) {
+                if (response.sw1, response.sw2) == (0x90, 0x00) {
+                    fcp = response.data.clone();
+                }
+            }
+        }
+    }
+    let file_size = parse_fcp_file_size(&fcp);
+    read_optional_ef_contents(file_size, |offset, requested| {
+        read_transparent_ef_chunk(reader_index, file_id, offset, requested)
+    })
+    .map(Some)
+}
+
+/// Read one already-selected transparent optional EF through a transport
+/// callback. Keeping the bounded/chunked state machine independent from
+/// `opensc-tool` lets us verify EOF and corrected-length handling without a
+/// physical reader in the test environment.
+fn read_optional_ef_contents<F>(
+    file_size: Option<usize>,
+    mut read_chunk: F,
+) -> Result<Vec<u8>, &'static str>
+where
+    F: FnMut(usize, usize) -> Result<ApduResponse, &'static str>,
+{
+    if file_size.is_some_and(|size| size > MAX_OPTIONAL_EF_BYTES) {
+        return Err("pcsc_optional_ef_too_large");
+    }
+
+    let mut data = Vec::new();
+    loop {
+        if let Some(size) = file_size {
+            if data.len() >= size {
+                data.truncate(size);
+                return Ok(data);
+            }
+        }
+        if data.len() >= MAX_OPTIONAL_EF_BYTES || data.len() > 0x7fff {
+            return Err("pcsc_optional_ef_too_large");
+        }
+        let requested = file_size
+            .map(|size| size.saturating_sub(data.len()))
+            .unwrap_or(OPTIONAL_EF_READ_CHUNK_BYTES)
+            .min(OPTIONAL_EF_READ_CHUNK_BYTES);
+        if requested == 0 {
+            return Ok(data);
+        }
+
+        let offset = data.len();
+        let mut response = read_chunk(offset, requested)?;
+        let mut effective_requested = requested;
+        if response.sw1 == 0x6c {
+            effective_requested = decode_short_apdu_le(response.sw2);
+            response = read_chunk(offset, effective_requested)?;
+        }
+        let eof = (response.sw1, response.sw2) == (0x62, 0x82);
+        if (response.sw1, response.sw2) != (0x90, 0x00) && !eof {
+            if file_size.is_none()
+                && !data.is_empty()
+                && matches!((response.sw1, response.sw2), (0x6b, 0x00) | (0x6a, 0x86))
+            {
+                return Ok(data);
+            }
+            return Err("pcsc_optional_ef_read_rejected");
+        }
+        let read_len = response.data.len();
+        if data.len().saturating_add(read_len) > MAX_OPTIONAL_EF_BYTES {
+            return Err("pcsc_optional_ef_too_large");
+        }
+        data.extend_from_slice(&response.data);
+        if eof || read_len < effective_requested || read_len == 0 {
+            if let Some(size) = file_size {
+                if data.len() < size {
+                    return Err("pcsc_optional_ef_truncated");
+                }
+                data.truncate(size);
+            }
+            return Ok(data);
+        }
+    }
+}
+
+fn decode_short_apdu_le(le: u8) -> usize {
+    if le == 0 {
+        256
+    } else {
+        usize::from(le)
+    }
+}
+
+fn run_usim_file_apdus(
+    reader_index: u16,
+    file_id: u16,
+    trailing: &[Vec<u8>],
+) -> Result<Vec<ApduResponse>, &'static str> {
+    let [file_high, file_low] = file_id.to_be_bytes();
+    let mut apdus = vec![
+        select_application_apdu(USIM_AID_PREFIX)?,
+        vec![0x00, 0xa4, 0x00, 0x04, 0x02, file_high, file_low, 0x00],
+    ];
+    apdus.extend_from_slice(trailing);
+    run_apdus(reader_index, &apdus)
+}
+
+fn build_read_binary_apdu(offset: usize, le: usize) -> Result<Vec<u8>, &'static str> {
+    if offset > 0x7fff {
+        return Err("pcsc_optional_ef_offset_invalid");
+    }
+    if !(1..=256).contains(&le) {
+        return Err("pcsc_optional_ef_length_invalid");
+    }
+    Ok(vec![
+        0x00,
+        0xb0,
+        ((offset >> 8) & 0x7f) as u8,
+        (offset & 0xff) as u8,
+        if le == 256 { 0 } else { le as u8 },
+    ])
+}
+
+fn read_transparent_ef_chunk(
+    reader_index: u16,
+    file_id: u16,
+    offset: usize,
+    le: usize,
+) -> Result<ApduResponse, &'static str> {
+    let read = build_read_binary_apdu(offset, le)?;
+    let responses = run_usim_file_apdus(reader_index, file_id, &[read])?;
+    require_success(
+        responses
+            .first()
+            .ok_or("pcsc_apdu_response_count_invalid")?,
+    )?;
+    let selected = responses.get(1).ok_or("pcsc_apdu_response_count_invalid")?;
+    if !matches!(selected.sw1, 0x90 | 0x61 | 0x9f) {
+        return Err("pcsc_optional_ef_select_rejected");
+    }
+    responses
+        .get(2)
+        .cloned()
+        .ok_or("pcsc_apdu_response_count_invalid")
 }
 
 /// Read a PC/SC card identity without blocking the async runtime. OpenSC is a
@@ -509,5 +737,114 @@ mod tests {
         );
         assert!(selector_from_path("/dev/cdc-wdm0").is_none());
         assert!(selector_from_path("pcsc://").is_none());
+    }
+
+    #[test]
+    fn optional_ef_fcp_size_accepts_standard_80_and_81_tags() {
+        assert_eq!(
+            parse_fcp_file_size(&[0x62, 0x04, 0x80, 0x02, 0x01, 0x2c]),
+            Some(300)
+        );
+        assert_eq!(
+            parse_fcp_file_size(&[0x62, 0x05, 0x81, 0x03, 0x00, 0x10, 0x00]),
+            Some(MAX_OPTIONAL_EF_BYTES)
+        );
+    }
+
+    #[test]
+    fn read_binary_apdu_encodes_offset_and_short_apdu_lengths() {
+        assert_eq!(
+            build_read_binary_apdu(0x1234, 255).unwrap(),
+            vec![0x00, 0xb0, 0x12, 0x34, 0xff]
+        );
+        assert_eq!(
+            build_read_binary_apdu(0x7fff, 256).unwrap(),
+            vec![0x00, 0xb0, 0x7f, 0xff, 0x00]
+        );
+        assert_eq!(decode_short_apdu_le(0), 256);
+        assert_eq!(decode_short_apdu_le(17), 17);
+        assert_eq!(
+            build_read_binary_apdu(0x8000, 1),
+            Err("pcsc_optional_ef_offset_invalid")
+        );
+        assert_eq!(
+            build_read_binary_apdu(0, 0),
+            Err("pcsc_optional_ef_length_invalid")
+        );
+        assert_eq!(
+            build_read_binary_apdu(0, 257),
+            Err("pcsc_optional_ef_length_invalid")
+        );
+    }
+
+    #[test]
+    fn optional_ef_reader_honors_6c00_and_6282_eof() {
+        let mut calls = Vec::new();
+        let mut round = 0usize;
+        let data = read_optional_ef_contents(None, |offset, requested| {
+            calls.push((offset, requested));
+            round += 1;
+            Ok(match round {
+                1 => ApduResponse {
+                    data: Vec::new(),
+                    sw1: 0x6c,
+                    sw2: 0x00,
+                },
+                2 => ApduResponse {
+                    data: vec![0xa5; 256],
+                    sw1: 0x62,
+                    sw2: 0x82,
+                },
+                _ => panic!("unexpected extra READ BINARY"),
+            })
+        })
+        .expect("corrected read ending at EOF");
+
+        assert_eq!(calls, vec![(0, 255), (0, 256)]);
+        assert_eq!(data, vec![0xa5; 256]);
+    }
+
+    #[test]
+    fn optional_ef_reader_enforces_the_4096_byte_boundary() {
+        assert_eq!(
+            read_optional_ef_contents(Some(MAX_OPTIONAL_EF_BYTES + 1), |_, _| {
+                panic!("oversized FCP must fail before any READ BINARY")
+            }),
+            Err("pcsc_optional_ef_too_large")
+        );
+
+        let exact = read_optional_ef_contents(Some(MAX_OPTIONAL_EF_BYTES), |_, requested| {
+            Ok(ApduResponse {
+                data: vec![0x5a; requested],
+                sw1: 0x90,
+                sw2: 0x00,
+            })
+        })
+        .expect("4096-byte EF remains within the safety bound");
+        assert_eq!(exact.len(), MAX_OPTIONAL_EF_BYTES);
+
+        let mut reads = 0usize;
+        let oversized = read_optional_ef_contents(None, |_, _| {
+            reads += 1;
+            Ok(ApduResponse {
+                data: vec![0x33; if reads <= 16 { 255 } else { 17 }],
+                sw1: 0x90,
+                sw2: 0x00,
+            })
+        });
+        assert_eq!(oversized, Err("pcsc_optional_ef_too_large"));
+        assert_eq!(reads, 17);
+    }
+
+    #[test]
+    fn optional_ef_reader_reports_known_size_truncation_at_eof() {
+        let result = read_optional_ef_contents(Some(3), |_, _| {
+            Ok(ApduResponse {
+                data: vec![0x01, 0x02],
+                sw1: 0x62,
+                sw2: 0x82,
+            })
+        });
+        assert_eq!(result, Err("pcsc_optional_ef_truncated"));
     }
 }

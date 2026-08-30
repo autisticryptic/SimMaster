@@ -1,4 +1,4 @@
-# SimAdmin 未完成开发计划
+﻿# SimAdmin 未完成开发计划
 
 > 状态：2026-08-19 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
 >
@@ -93,6 +93,13 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 - [ ] 补齐 RTP/RTCP 配对、RTCP-mux、丢包、乱序、端口重启和长通话媒体指标验收。
 - [ ] 完成 hold/resume、双通话、媒体方向、失败 re-INVITE 保留原 relay 和资源回收的 VoLTE/VoWiFi 矩阵。
 
+## P1：eSIM MEP 预留接口
+
+- [ ] 按 `docs/ESIM_MEP_INTERFACE_PLAN.md` 预留 eUICC MEP capability、Port、Profile-to-Port、SIM 来源和可插拔 APDU/modem backend 接口。
+- [ ] 目标覆盖内置 eUICC/基带 MEP、410/724ug/EC20/EM05-G/EM7430 的后续适配，以及 PC/SC 读卡器 MEP；型号本身不视为能力证明。
+- [ ] 优先支持“一个 Port 走蜂窝 VoLTE、另一个 Port 只走 WiFi VoWiFi”的线路模型；读卡器不要求蜂窝联网。
+- [ ] 在没有真实 MEP eUICC 和读卡器前，只完成 Mock/能力未知回退/线路隔离测试，不标记真实 MEP 完成。
+- [ ] MEP 预留接口完成后，统一 IMS 与 Trunk 区域文案：移除 VoLTE 卡片中“独立于其他基带管理；连接阶段与地址族详情见线路活动日志”的重复说明，使 VoLTE IMS、VoWiFi 注册、Trunk 注册标题和辅助文案一致；详细连接阶段与地址族信息只保留在线路活动日志。
 ## P2：配置、故障和安全验收
 
 - [ ] 做真实掉电、磁盘满、只读文件系统、SQLite 损坏、WAL 恢复和服务强制终止测试。

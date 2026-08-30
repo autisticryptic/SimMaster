@@ -774,6 +774,8 @@ export interface Ikev2PolicyRecord {
   esp_proposals: string[]
   aka_challenge_mode: string
   include_epdg_idr: boolean
+  /** Optional RFC822 IDi template. MCC 999 profiles must set this explicitly. */
+  identity_template: string | null
 }
 
 export type RequestUriPolicy = 'home_domain' | 'registrar' | 'pcscf' | 'configured'

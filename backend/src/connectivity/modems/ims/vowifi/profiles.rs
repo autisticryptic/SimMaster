@@ -85,6 +85,14 @@ pub struct Ikev2Policy {
     pub esp_proposals: &'static [&'static str],
     pub aka_challenge_mode: &'static str,
     pub include_epdg_idr: bool,
+    /// Optional RFC822 IDi template used for EAP-AKA. Public PLMNs may omit
+    /// this and use the standards-derived permanent NAI. Private PLMNs (MCC
+    /// 999) must provide their deployment's real template because a public
+    /// `3gppnetwork.org` realm cannot be inferred for them.
+    ///
+    /// Supported runtime placeholders: `{imsi}`, `{mcc}`, `{mnc}`, `{mnc3}`,
+    /// `{plmn}`, `{epdg_fqdn}`, `{ims_domain}`, and `{ims_realm}`.
+    pub identity_template: Option<&'static str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -381,6 +389,7 @@ pub static GB_EE_23433: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256", "aes128-sha1", "aes256-sha512"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc033.mcc234.3gppnetwork.org",
@@ -483,6 +492,7 @@ pub static NL_VODAFONE_20404: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc004.mcc204.3gppnetwork.org",
@@ -582,6 +592,7 @@ pub static US_TMOBILE_310260: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256", "aes128-sha1"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc260.mcc310.3gppnetwork.org",
@@ -681,6 +692,7 @@ pub static US_ATT_310410: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes128-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc410.mcc310.3gppnetwork.org",
@@ -780,6 +792,7 @@ pub static DE_O2_26207: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc007.mcc262.3gppnetwork.org",
@@ -879,6 +892,7 @@ pub static NZ_SPARK_53005: CarrierProfile = CarrierProfile {
         esp_proposals: &["aes256-sha256"],
         aka_challenge_mode: "standard",
         include_epdg_idr: true,
+        identity_template: None,
     },
     ims: ImsPolicy {
         domain: "ims.mnc005.mcc530.3gppnetwork.org",
@@ -953,6 +967,106 @@ pub static BUILTIN_PROFILES: &[CarrierProfile] = &[
 static DERIVED_PROFILES: OnceLock<Mutex<HashMap<String, &'static CarrierProfile>>> =
     OnceLock::new();
 
+fn standard_public_plmn<'a>(mcc: &'a str, mnc: &str) -> Option<(&'a str, String)> {
+    let mcc = mcc.trim();
+    let mnc = mnc.trim();
+    if mcc.len() != 3
+        || !matches!(mnc.len(), 2 | 3)
+        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
+        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
+        // 3GPP reserves MCC 999 for private networks. Publishing an Internet
+        // fallback for it would turn a private deployment into a public-DNS
+        // guess, so those profiles must come from the user/catalog/UICC/modem.
+        || mcc == "999"
+    {
+        return None;
+    }
+    Some((mcc, format!("{:0>3}", mnc)))
+}
+
+/// Standard IMS home-network domain from 3GPP TS 23.003.
+pub fn standard_ims_home_domain(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!("ims.mnc{padded_mnc}.mcc{mcc}.3gppnetwork.org"))
+}
+
+/// Standard operator-identifier ePDG FQDN from 3GPP TS 23.003.
+pub fn standard_operator_epdg_fqdn(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!(
+        "epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org"
+    ))
+}
+
+/// Parse a standard operator-identifier ePDG FQDN and return its MCC plus
+/// three-digit MNC encoding. Only the public 3GPP operator form is accepted;
+/// private/extension domains and emergency `sos.*` names are rejected.
+pub fn parse_standard_operator_epdg_fqdn(host: &str) -> Option<(String, String)> {
+    let labels = host
+        .trim()
+        .trim_end_matches('.')
+        .split('.')
+        .map(|label| label.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    if labels.len() != 7
+        || labels[0] != "epdg"
+        || labels[1] != "epc"
+        || labels[4] != "pub"
+        || labels[5] != "3gppnetwork"
+        || labels[6] != "org"
+    {
+        return None;
+    }
+    let mnc = labels[2].strip_prefix("mnc")?;
+    let mcc = labels[3].strip_prefix("mcc")?;
+    if mcc.len() != 3
+        || mnc.len() != 3
+        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
+        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let (_, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some((mcc.to_string(), padded_mnc))
+}
+
+/// Standard EAP-AKA NAI realm from 3GPP TS 23.003.
+pub fn standard_epc_nai_realm(mcc: &str, mnc: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    Some(format!("nai.epc.mnc{padded_mnc}.mcc{mcc}.3gppnetwork.org"))
+}
+
+/// Visited-country discovery FQDN from 3GPP TS 23.003.
+pub fn standard_visited_country_epdg_fqdn(mcc: &str) -> Option<String> {
+    let (mcc, _) = standard_public_plmn(mcc, "00")?;
+    Some(format!(
+        "epdg.epc.mcc{mcc}.visited-country.pub.3gppnetwork.org"
+    ))
+}
+
+/// Standard tracking-area ePDG FQDN from 3GPP TS 23.003.
+///
+/// This only formats a name. Callers must not use it merely because a TAC is
+/// available: TS 24.302 requires operator/UICC selection information to choose
+/// the location-based format.
+pub fn standard_tai_epdg_fqdn(mcc: &str, mnc: &str, tac: u32, technology: &str) -> Option<String> {
+    let (mcc, padded_mnc) = standard_public_plmn(mcc, mnc)?;
+    match technology.trim().to_ascii_lowercase().as_str() {
+        "lte" if tac <= 0xffff => Some(format!(
+            "tac-lb{:02x}.tac-hb{:02x}.tac.epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org",
+            tac & 0xff,
+            (tac >> 8) & 0xff,
+        )),
+        "nr" if tac <= 0xff_ffff => Some(format!(
+            "tac-lb{:02x}.tac-mb{:02x}.tac-hb{:02x}.5gstac.epdg.epc.mnc{padded_mnc}.mcc{mcc}.pub.3gppnetwork.org",
+            tac & 0xff,
+            (tac >> 8) & 0xff,
+            (tac >> 16) & 0xff,
+        )),
+        _ => None,
+    }
+}
+
 /// Generate a conservative profile from public 3GPP naming rules.
 ///
 /// This is an explicitly unverified last resort. It derives only standard
@@ -967,13 +1081,10 @@ pub fn derive_standard_3gpp_profile(
     mnc: &str,
     access: Standard3gppAccess,
 ) -> Option<&'static CarrierProfile> {
-    if mcc.len() != 3
-        || !matches!(mnc.len(), 2 | 3)
-        || !mcc.bytes().all(|byte| byte.is_ascii_digit())
-        || !mnc.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
+    let mcc = mcc.trim();
+    let mnc = mnc.trim();
+    let epdg_host = standard_operator_epdg_fqdn(mcc, mnc)?;
+    let ims_domain = standard_ims_home_domain(mcc, mnc)?;
 
     let plmn = format!("{}{}", mcc, mnc);
     let cache_key = format!("{}:{plmn}", access.as_str());
@@ -986,13 +1097,8 @@ pub fn derive_standard_3gpp_profile(
         return Some(*profile);
     }
 
-    // 3GPP domains always pad the MNC to three digits.
-    let padded_mnc = format!("{:0>3}", mnc);
-    let epdg_host = Box::leak(
-        format!("epdg.epc.mnc{}.mcc{}.pub.3gppnetwork.org", padded_mnc, mcc).into_boxed_str(),
-    );
-    let ims_domain =
-        Box::leak(format!("ims.mnc{}.mcc{}.3gppnetwork.org", padded_mnc, mcc).into_boxed_str());
+    let epdg_host = Box::leak(epdg_host.into_boxed_str());
+    let ims_domain = Box::leak(ims_domain.into_boxed_str());
     let profile_id =
         Box::leak(format!("derived_3gpp_{}_{}", access.as_str(), plmn).into_boxed_str());
     let source_refs: &'static [&'static str] = match access {
@@ -1057,6 +1163,7 @@ pub fn derive_standard_3gpp_profile(
             ],
             aka_challenge_mode: "standard",
             include_epdg_idr: true,
+            identity_template: None,
         },
         ims: ImsPolicy {
             domain: ims_domain,
@@ -1701,6 +1808,37 @@ mod tests {
         assert!(wifi.ims.register.enable_cellular_network_info);
         assert_eq!(wifi.ims.register.access_network_info, "IEEE-802.11");
         assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
+    }
+
+    #[test]
+    fn standard_3gpp_domains_pad_mnc_and_reject_private_or_invalid_plmns() {
+        assert_eq!(
+            standard_ims_home_domain("502", "12").as_deref(),
+            Some("ims.mnc012.mcc502.3gppnetwork.org")
+        );
+        assert_eq!(
+            standard_operator_epdg_fqdn("310", "260").as_deref(),
+            Some("epdg.epc.mnc260.mcc310.pub.3gppnetwork.org")
+        );
+        assert!(standard_operator_epdg_fqdn("99", "01").is_none());
+        assert!(standard_operator_epdg_fqdn("310", "2a").is_none());
+        assert!(standard_operator_epdg_fqdn("999", "99").is_none());
+        assert!(derive_standard_3gpp_profile("999", "99", Standard3gppAccess::WifiEpdg).is_none());
+    }
+
+    #[test]
+    fn standard_tracking_area_epdg_names_use_3gpp_byte_order() {
+        assert_eq!(
+            standard_tai_epdg_fqdn("345", "12", 0x0b21, "lte").as_deref(),
+            Some("tac-lb21.tac-hb0b.tac.epdg.epc.mnc012.mcc345.pub.3gppnetwork.org")
+        );
+        assert_eq!(
+            standard_tai_epdg_fqdn("345", "12", 0x0b1a21, "nr").as_deref(),
+            Some("tac-lb21.tac-mb1a.tac-hb0b.5gstac.epdg.epc.mnc012.mcc345.pub.3gppnetwork.org")
+        );
+        assert!(standard_tai_epdg_fqdn("345", "12", 0x1_0000, "lte").is_none());
+        assert!(standard_tai_epdg_fqdn("345", "12", 0x100_0000, "nr").is_none());
+        assert!(standard_tai_epdg_fqdn("345", "12", 1, "wifi").is_none());
     }
 
     #[test]

@@ -690,3 +690,50 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
     - 本轮已经注册成功，因此没有执行与 `f44aac8` 的 A/B；若未来同一网络再次出现认证后 4xx，再按该基线比较。
   - [ ] REGISTER 200 OK 后仍需分别验收：VoLTE/VoWiFi 主叫与被叫、双向 RTP、SMS over IMS、MWI、refresh/重注册稳定性和多运营商矩阵。
   - 本项不能仅因 `epdg_ready`、IKE_AUTH、Child SA 或 ESP ready 勾选。
+
+## 16. 2026-08-30 本轮回归记录
+
+本节记录本轮在当前工作树上的最终验证结果。“通过”只代表自动化或编译验证通过，不替代第9节和第14.8节的真实运营商业务验收。
+
+- [x] WSL Debian 后端完整回归通过（2026-08-30）。
+  - 命令：`wsl.exe -d debian -- bash -lc "cd /mnt/d/Program/Learning/AI/ProjectOfRong-lilith/SimAdmin/backend && cargo test --bin simadmin -- --test-threads=1"`
+  - 结果：`1397 passed; 0 failed; 3 ignored`。
+  - 覆盖当前工作树中的 VoLTE、VoWiFi、profile 编排、UICC ePDG、HTTP API 和其余后端单元测试。
+- [x] VoWiFi live 定向回归通过（2026-08-30）。
+  - 命令：`cargo test connectivity::modems::ims::vowifi::live -- --nocapture`
+  - 结果：`81 passed; 0 failed`。
+  - 覆盖自定义 DNS 候选链、UICC/漫游 ePDG 选择、REGISTER 动态协商和非当前事务帧回交。
+- [x] UICC/QMI ePDG Selection 定向回归通过（2026-08-30）。
+  - 命令：`cargo test connectivity::modems::ims::vowifi::qmi_uim -- --nocapture`
+  - 结果：`15 passed; 0 failed`。
+  - 覆盖 5/6 位 PLMN、两位/三位 MNC、`D` wildcard、FCP 文件大小、分块读取、非法 BCD/tail 拒绝。
+- [x] ePDG DNS/解析定向回归通过（2026-08-30）。
+  - 命令：`cargo test connectivity::modems::ims::vowifi::epdg -- --nocapture`
+  - 结果：`4 passed; 0 failed`。
+  - 覆盖自定义 UDP DNS 端口和 SOCKS5/解析计划相关逻辑。
+- [x] profile 来源与私有 PLMN 边界定向回归通过（2026-08-30）。
+  - 命令：`cargo test connectivity::modems::ims::vowifi::profile_store -- --nocapture`
+  - 结果：`21 passed; 0 failed`。
+  - 覆盖用户数据库、下载 catalog、显式 profile、派生 profile、缺失来源逐槽位兜底，以及私有 PLMN 不猜测公网域名。
+- [x] 格式与编译检查通过（2026-08-30）。
+  - `cargo fmt --all -- --check` 通过。
+  - `cargo check` 通过；当前仍有既有 dead-code/unused 级别 warning，不影响构建结果，未在本轮扩大修改范围。
+  - `git diff --check` 通过。
+- [x] Windows 完整回归的失败原因已确认不是 IMS/VoWiFi 业务逻辑（2026-08-30）。
+  - Windows 结果为 `1386 passed; 2 failed; 3 ignored`；唯一实际失败为 VoLTE 双 dialog 测试调用 Linux `ip` 命令时返回 `ip:program not found`。
+  - 同一工作树在 WSL Debian 完整回归为 `1397 passed; 0 failed; 3 ignored`，因此不为规避 Windows 环境差异修改 VoLTE 业务代码。
+
+### 16.1 当前仍未完成的事项
+
+以下事项仍保持未勾选，不能因为本轮自动测试通过而提前标记完成：
+
+- [ ] 真实 bearer/QMI endpoint、AT CID、xfrm/IPsec、P-CSCF reporting 和 IMS profile lease 释放的完整集成测试。
+- [ ] 用户数据库 profile 在真实运营商网络完成 REGISTER、主叫、被叫、双向 RTP、短信和 refresh。
+- [ ] 下载 catalog profile 在真实运营商网络完成同样业务矩阵。
+- [ ] 前两来源均不可用时，使用派生 profile 完成真实设备注册并完成业务验收。
+- [ ] 切换候选时验证 Call-ID、CSeq、Route、安全关联、P-CSCF 和 profile lease 不跨 profile 污染。
+- [ ] 两条不同基带线路、独立读卡器线路的配置和重试顺序在真实并发运行中互不影响。
+- [ ] VoWiFi/VoLTE 主叫、被叫、双向 RTP、SMS over IMS、MWI、长时间 refresh/重注册及多运营商矩阵。
+- [ ] VoNR/5G SA IMS 实链路和 EPS fallback/RAT handover 验收。
+
+当前工作树仍未提交、未推送、未触发 GitHub Actions，也未进行新的 410 部署。

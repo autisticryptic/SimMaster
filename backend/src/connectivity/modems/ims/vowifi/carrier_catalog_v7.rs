@@ -601,12 +601,26 @@ fn project_config(
     access: CatalogAccessKind,
     config: &Value,
 ) -> Result<CarrierProfileRecord, String> {
-    let standard_domain = format!("ims.mnc{:0>3}.mcc{}.3gppnetwork.org", meta.mnc, meta.mcc);
-    let domain = string_at(config, "/ims/home_domain")
-        .map(|value| expand_static_template(value, meta, "ims_home_domain"))
-        .transpose()?
-        .unwrap_or(standard_domain);
-    let realm = string_at(config, "/ims/realm")
+    // A public PLMN has a standards-defined IMS home domain. MCC 999 is
+    // reserved for private networks, however, so a catalog row for it must
+    // carry the deployment's actual domain instead of leaking a public-DNS
+    // guess into registration. Empty strings are treated as absent so public
+    // rows can still receive the standards-derived baseline.
+    let explicit_domain = string_at(config, "/ims/home_domain")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let standard_domain_derived = explicit_domain.is_none();
+    let domain = match explicit_domain {
+        Some(value) => expand_static_template(value, meta, "ims_home_domain")?,
+        None => profiles::standard_ims_home_domain(&meta.mcc, &meta.mnc).ok_or_else(|| {
+            format!("carrier_catalog_private_ims_home_domain_required:{profile_id}")
+        })?,
+    };
+    let explicit_realm = string_at(config, "/ims/realm")
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let standard_realm_derived = explicit_realm.is_none();
+    let realm = explicit_realm
         .map(|value| expand_ims_static_template(value, meta, &domain, "ims_realm"))
         .transpose()?
         .unwrap_or_else(|| domain.clone());
@@ -648,8 +662,11 @@ fn project_config(
         .to_string();
     let ip_family = normalize_ip_family(string_at(access_config, "/ip_family").unwrap_or("ipv4v6"));
 
-    let (epdg, ikev2) = match access {
-        CatalogAccessKind::LteEpc => empty_non_wifi_access(&apn, &ip_family),
+    let (epdg, ikev2, standard_epdg_derived, standard_ike_identity_derived) = match access {
+        CatalogAccessKind::LteEpc => {
+            let (epdg, ikev2) = empty_non_wifi_access(&apn, &ip_family);
+            (epdg, ikev2, false, false)
+        }
         CatalogAccessKind::WifiEpdg => {
             project_vowifi_access(profile_id, meta, access_config, &apn, &ip_family)?
         }
@@ -695,6 +712,21 @@ fn project_config(
         preferred_codecs
     };
 
+    let mut source_refs = vec![format!("carrier_catalog:{}", release.release_id)];
+    if standard_domain_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:ims-home-domain".to_string());
+    }
+    if standard_realm_derived {
+        source_refs
+            .push("unverified-3gpp-standard-fallback:ims-realm-from-home-domain".to_string());
+    }
+    if standard_epdg_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:epdg-operator-identifier".to_string());
+    }
+    if standard_ike_identity_derived {
+        source_refs.push("unverified-3gpp-standard-fallback:ike-permanent-nai".to_string());
+    }
+
     let record = CarrierProfileRecord {
         schema_version: CURRENT_SCHEMA_VERSION,
         meta: CarrierProfileMetaRecord {
@@ -711,7 +743,7 @@ fn project_config(
             },
             operator_legal_name: meta.legal_name.clone(),
             aliases,
-            source_refs: vec![format!("carrier_catalog:{}", release.release_id)],
+            source_refs,
             last_verified: release.generated_at.chars().take(10).collect(),
         },
         identity: ProfileIdentityPolicyRecord {
@@ -949,6 +981,7 @@ fn empty_non_wifi_access(apn: &str, ip_family: &str) -> (EpdgPolicyRecord, Ikev2
             esp_proposals: Vec::new(),
             aka_challenge_mode: String::new(),
             include_epdg_idr: false,
+            identity_template: None,
         },
     )
 }
@@ -959,24 +992,28 @@ fn project_vowifi_access(
     access: &Value,
     apn: &str,
     ip_family: &str,
-) -> Result<(EpdgPolicyRecord, Ikev2PolicyRecord), String> {
+) -> Result<(EpdgPolicyRecord, Ikev2PolicyRecord, bool, bool), String> {
     let epdg = access
         .pointer("/epdg")
         .and_then(Value::as_array)
         .and_then(|values| values.first());
-    // Last-resort ePDG endpoint: when the catalog carries no ePDG entry (or no
-    // address), derive the TS 24.302 default FQDN from the profile PLMN, e.g.
-    // epdg.epc.mnc012.mcc502.pub.3gppnetwork.org. The runtime DNS resolution
-    // still decides whether the operator actually publishes the name.
-    let (host, epdg_port) = match epdg {
-        Some(entry) => match string_at(entry, "/address") {
-            Some(address) => (
-                expand_static_template(address, meta, "epdg_endpoint")?,
-                u16_at(entry, "/port"),
-            ),
-            None => (derived_epdg_fqdn(meta), u16_at(entry, "/port")),
-        },
-        None => (derived_epdg_fqdn(meta), None),
+    // Last-resort ePDG endpoint for public PLMNs: when the catalog carries no
+    // usable ePDG address, derive the TS 24.302 Operator Identifier FQDN. A
+    // private-network row (MCC 999) must provide its real endpoint; baseband
+    // PLMN/TAC facts are useful for selecting provisioned private data but are
+    // not enough to invent a globally resolvable private ePDG name.
+    let epdg_port = epdg.and_then(|entry| u16_at(entry, "/port"));
+    let explicit_host = epdg
+        .and_then(|entry| string_at(entry, "/address"))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|address| expand_static_template(address, meta, "epdg_endpoint"))
+        .transpose()?;
+    let standard_epdg_derived = explicit_host.is_none();
+    let host = match explicit_host {
+        Some(host) => host,
+        None => profiles::standard_operator_epdg_fqdn(&meta.mcc, &meta.mnc)
+            .ok_or_else(|| format!("carrier_catalog_private_epdg_required:{profile_id}"))?,
     };
     let ike = access.pointer("/ike").unwrap_or(&Value::Null);
     let dns_servers = string_array_at(access, "/dns_servers").unwrap_or_default();
@@ -1028,6 +1065,27 @@ fn project_vowifi_access(
     } else {
         baseline_esp()
     };
+    let identity_template = ike
+        .pointer("/identities/idi")
+        .and_then(Value::as_array)
+        .and_then(|rules| {
+            rules.iter().find_map(|rule| {
+                let identity_type = string_at(rule, "/identity_type").unwrap_or("id_rfc822_addr");
+                if !identity_type.eq_ignore_ascii_case("id_rfc822_addr") {
+                    return None;
+                }
+                string_at(rule, "/value_template")
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(|value| value.replace("{home_domain}", "{ims_domain}"))
+            })
+        });
+    if meta.mcc == "999" && identity_template.is_none() {
+        return Err(format!(
+            "carrier_catalog_private_ike_identity_required:{profile_id}"
+        ));
+    }
+    let standard_ike_identity_derived = identity_template.is_none();
     let include_epdg_idr = ike
         .pointer("/identities/idr")
         .and_then(Value::as_array)
@@ -1057,15 +1115,11 @@ fn project_vowifi_access(
             esp_proposals,
             aka_challenge_mode: eap_method.to_string(),
             include_epdg_idr,
+            identity_template,
         },
+        standard_epdg_derived,
+        standard_ike_identity_derived,
     ))
-}
-
-fn derived_epdg_fqdn(meta: &ProfileMetaRow) -> String {
-    format!(
-        "epdg.epc.mnc{:0>3}.mcc{}.pub.3gppnetwork.org",
-        meta.mnc, meta.mcc
-    )
 }
 
 fn structured_ike_proposals(proposals: &[Value], profile_id: &str) -> Vec<String> {
@@ -1875,6 +1929,169 @@ mod tests {
         drop(conn);
         let catalog = CarrierCatalog::open(&path).expect("open v7 fixture");
         (catalog, path)
+    }
+
+    fn rewrite_fixture_profile_network(
+        path: &std::path::Path,
+        plmn: &str,
+        home_domain: Option<&str>,
+        epdg_address: Option<&str>,
+    ) {
+        let conn = Connection::open(path).expect("open fixture for network rewrite");
+        conn.execute(
+            "UPDATE profile_match_rules
+                SET plmn = ?1, imsi_prefix = ?2
+              WHERE profile_id = 'test-v7-23433'",
+            params![plmn, format!("{plmn}0")],
+        )
+        .expect("rewrite fixture PLMN");
+        let config_json = conn
+            .query_row(
+                "SELECT config_json FROM carrier_profiles WHERE profile_id = 'test-v7-23433'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("read fixture config");
+        let mut config: Value = serde_json::from_str(&config_json).expect("parse fixture config");
+        let ims = config
+            .pointer_mut("/ims")
+            .and_then(Value::as_object_mut)
+            .expect("fixture IMS object");
+        match home_domain {
+            Some(domain) => {
+                ims.insert("home_domain".to_string(), Value::String(domain.to_string()));
+            }
+            None => {
+                ims.remove("home_domain");
+            }
+        }
+        let vowifi = config
+            .pointer_mut("/access/vowifi")
+            .and_then(Value::as_object_mut)
+            .expect("fixture VoWiFi access object");
+        if plmn.starts_with("999") {
+            let ike = vowifi
+                .get_mut("ike")
+                .and_then(Value::as_object_mut)
+                .expect("fixture VoWiFi IKE object");
+            ike.insert(
+                "identities".to_string(),
+                serde_json::json!({
+                    "idi": [{
+                        "identity_type": "id_rfc822_addr",
+                        "source": "configured_template",
+                        "value_template": "private-{imsi}@{ims_realm}"
+                    }],
+                    "idr": [{ "source": "epdg_fqdn" }]
+                }),
+            );
+        }
+        match epdg_address {
+            Some(address) => {
+                vowifi.insert(
+                    "epdg".to_string(),
+                    serde_json::json!([{ "address": address, "port": 500 }]),
+                );
+            }
+            None => {
+                vowifi.remove("epdg");
+            }
+        }
+        conn.execute(
+            "UPDATE carrier_profiles SET config_json = ?1 WHERE profile_id = 'test-v7-23433'",
+            [serde_json::to_string(&config).expect("serialize fixture config")],
+        )
+        .expect("write fixture config");
+    }
+
+    #[test]
+    fn private_catalog_projection_requires_and_preserves_explicit_network_endpoints() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(
+            &path,
+            "99999",
+            Some("ims.private.example"),
+            Some("epdg.private.example"),
+        );
+
+        let lte = catalog
+            .get("test-v7-23433", CatalogAccessKind::LteEpc)
+            .expect("explicit private LTE query")
+            .expect("explicit private LTE projection");
+        assert_eq!(lte.record.ims.domain, "ims.private.example");
+        assert!(!lte.record.ims.domain.contains("3gppnetwork.org"));
+        assert!(lte
+            .record
+            .meta
+            .source_refs
+            .iter()
+            .all(|source| !source.starts_with("unverified-3gpp-standard-fallback:")));
+
+        let wifi = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect("explicit private VoWiFi query")
+            .expect("explicit private VoWiFi projection");
+        assert_eq!(wifi.record.epdg.host, "epdg.private.example");
+        assert!(!wifi.record.epdg.host.contains("3gppnetwork.org"));
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn private_catalog_projection_rejects_missing_ims_home_domain() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "99999", None, Some("epdg.private.example"));
+
+        let error = catalog
+            .get("test-v7-23433", CatalogAccessKind::LteEpc)
+            .expect_err("private IMS domain must be explicit");
+        assert_eq!(
+            error,
+            "carrier_catalog_private_ims_home_domain_required:test-v7-23433"
+        );
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn private_catalog_projection_rejects_missing_vowifi_epdg() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "99999", Some("ims.private.example"), None);
+
+        let error = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect_err("private ePDG must be explicit");
+        assert_eq!(error, "carrier_catalog_private_epdg_required:test-v7-23433");
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn public_catalog_projection_derives_missing_standard_domain_and_epdg() {
+        let (catalog, path) = fixture();
+        rewrite_fixture_profile_network(&path, "23433", None, None);
+
+        let wifi = catalog
+            .get("test-v7-23433", CatalogAccessKind::WifiEpdg)
+            .expect("public standards-derived query")
+            .expect("public standards-derived projection");
+        assert_eq!(wifi.record.ims.domain, "ims.mnc033.mcc234.3gppnetwork.org");
+        assert_eq!(
+            wifi.record.epdg.host,
+            "epdg.epc.mnc033.mcc234.pub.3gppnetwork.org"
+        );
+        assert!(wifi
+            .record
+            .meta
+            .source_refs
+            .contains(&"unverified-3gpp-standard-fallback:ims-home-domain".to_string()));
+        assert!(wifi
+            .record
+            .meta
+            .source_refs
+            .contains(&"unverified-3gpp-standard-fallback:epdg-operator-identifier".to_string()));
+
+        std::fs::remove_file(path).expect("remove fixture");
     }
 
     #[test]
