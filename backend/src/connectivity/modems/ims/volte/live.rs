@@ -1488,7 +1488,7 @@ pub async fn connect_live_for_line(
     access_network_runtime: &ImsAccessNetworkRuntime,
     profile_candidate: &VolteProfileCandidate,
     line_ip_families: &[VolteIpFamily],
-    line_ip_families_auto: bool,
+    _line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     dedupe_enabled: bool,
@@ -1684,18 +1684,9 @@ async fn connect_inner(
         sim_override,
     )
     .await?;
-    // A line's explicit order remains authoritative. The persisted automatic
-    // default (`ipv4v6 -> ipv6 -> ipv4`) is the one case where the LTE catalog's
-    // `access.lte.ip_family` may provide a better first single-family hint;
-    // fallback still retains both families and is driven by network errors.
-    if line_ip_families_auto {
-        plan = plan.with_catalog_ip_stack_hint(&device_identity.effective_ims.ip_stack.value);
-        tracing::debug!(
-            ip_stack = %device_identity.effective_ims.ip_stack.value,
-            preference = ?plan.preference(),
-            "Applied LTE catalog IP-family hint to the default IMS plan"
-        );
-    }
+    // The line's ordered family list is authoritative. Catalog `ip_stack` is
+    // profile metadata and must not reorder the default dual -> IPv6 -> IPv4
+    // fallback sequence; only an explicit line setting changes that order.
     let ims_apn = device_identity
         .effective_ims
         .ims_apn
