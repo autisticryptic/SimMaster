@@ -113,6 +113,10 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// recovery budget. Keep the ladder bounded so a malformed profile cannot
 /// create an unbounded REGISTER storm on the QCM410.
 const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 24;
+/// 3GPP IMS uses the well-known SIP/UDP port for the unprotected initial
+/// REGISTER.  The negotiated ipsec-3gpp client/server ports replace this
+/// endpoint after the P-CSCF sends its Security-Server challenge.
+const VOLTE_SIP_PORT: u16 = 5060;
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -2283,7 +2287,7 @@ async fn connect_family(
         .await;
 
     let route = ImsRoute {
-        local_addr: SocketAddr::new(local_addr, 0),
+        local_addr: SocketAddr::new(local_addr, VOLTE_SIP_PORT),
         pcscf_addr: pcscf_socket(pcscf),
         transport: SipTransport::Udp,
     };
