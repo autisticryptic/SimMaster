@@ -628,8 +628,8 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 修复前（commit `f44aac8` 及更早）这里会打印 `192.0.2.1:53`——端口被静默改回 53。
   - 测试后已把 DNS 恢复为 `['1.1.1.1', '8.8.8.8']`。
   - 说明：未用 tcpdump 抓包，设备上没有该工具；证据是运行时日志打印的目标 `SocketAddr`，它就是 `send_to()` 的实际目标。
-- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但 IMS REGISTER 未闭环。
-  - **纠正一处此前写错的结论（2026-08-30）。** 本项原先写成"运营商阻塞在 `400/421`"，那是照抄更早 session 的说法，没有对照已有记录核实。实际上 **2026-08-22 这条线路曾拿到 `200 OK`**（修复提交 `97e982d`、`2818de0`、`dd4bb0f`，当时 SMS 与 Voice over IMS readiness 都验过）。所以这更可能是回归，不是运营商侧拒绝。把它记成"运营商阻塞"会让后续 session 放弃排查，这个错误说明必须留在文档里。
+- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但当前代码的 IMS REGISTER 修复尚未在 410 上闭环。
+  - **纠正一处此前写错的结论（2026-08-30）。** 本项原先写成“运营商阻塞在 `400/421`”，那是照抄更早 session 的说法，没有对照已有记录核实。实际上 **2026-08-22 这条线路曾拿到 `200 OK`**（修复提交 `97e982d`、`2818de0`、`dd4bb0f`，当时 SMS 与 Voice over IMS readiness 都验过）。所以这更可能是回归，不是运营商侧拒绝。把它记成“运营商阻塞”会让后续 session 放弃排查，这个错误说明必须留在文档里。
   - 当时确认过的 Maxis(50212) 四步握手：
     | 发送 | 运营商回 |
     |---|---|
@@ -637,15 +637,28 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
     | + Require | 400（RFC 3329 §2.3 还要 Proxy-Require） |
     | + Proxy-Require | 400（TS 24.229 §5.1.1.2.2 还要空 AKA Authorization） |
     | + 空 AKA Authorization | 401 → AKA → **200 OK** |
-  - **当前可疑点（尚未在设备上确认）**：410 的 REGISTER 日志里只出现两个 variant，且两者的 `initial_authorization` 都是 `"none"`：
-    ```text
-    register_variant="standard_3gpp_conservative"     initial_authorization="none"  sec_agree_headers_present=false
-    register_variant="catalog_v7_sec_agree_required"  initial_authorization="none"  sec_agree_headers_present=true
-    ```
-    也就是上表第 4 步那个空 AKA Authorization 没有被发出。
-  - 相关背景：`0444d58` 有意把 catalog 投影的 `initial_authorization` 默认值从 `"aka_empty"` 改成 `"none"`，理由是 TS 24.229 §5.1.1.2.2 要求首次 REGISTER 不带认证，某些运营商对预填的空 AKA 直接回 400；差异改由候选阶梯吸收。`vowifi/live.rs` 的阶梯里确实存在多个 `AkaEmpty*` 形态（约 1242–1395 行），但设备日志显示阶梯没有走到它们。
-  - 下一步需要的证据（都要在设备上取）：
-    1. 运营商现在实际回的状态码（是否仍是 421/400，还是别的）
-    2. 阶梯为何停在前两个 variant——是提前放弃、还是这个 profile 的候选列表本就不含 `AkaEmpty*`
-    3. 与 `f44aac8`（已知可注册的提交）做 A/B 对照
-  - 本项不能仅因 `epdg_ready` 勾选。
+  - [x] 代码侧恢复空 AKA 最后候选。
+    - `aa1d382`：给 `initial_authorization = none` 的 VoLTE profile 增加静态空 AKA 最后候选。
+    - `3329df2`：最后候选不再只加 Authorization，而是同时保留 `Security-Client`、`Require: sec-agree` 和 `Proxy-Require: sec-agree`，匹配上表的累积请求形态。
+  - [x] 400 后的动态候选顺序修复（2026-08-30，commit `0b3225a`，尚未实机验证）。
+    - 原流程会先消耗 spaced/compact/require-only 等 Security-Client 格式候选，空 AKA 只能在静态阶梯末端很晚才出现；在候选预算内可能根本走不到已知可工作的请求。
+    - 现在统一由 `next_dynamic_register_variant()` 推进：`421/494 或无响应 → 完整 sec-agree → 400 时补齐 Proxy-Require（若 profile 只有 Require）→ 保持同一形态补空 AKA → 再做 spaced/compact/require-only 格式兜底`。
+    - 动态补空 AKA 保留当前 variant 的 Route、PANI、MMTEL、SIP instance 和 Security-Client 形态，不再跳到另一个独立的静态候选。
+    - `auth_rounds > 0` 后禁止继续切换请求形态，避免用 header 试探掩盖 AKA/USIM 或已协商安全通道错误。
+    - `sec_agree_mode = disabled` 同时阻止动态升级和静态空 AKA/sec-agree 最后候选；即使历史导入记录残留 `require_sec_agree_headers` / `proxy_require_sec_agree_headers` 布尔值，显式禁用也不会被兜底重新打开。
+    - Proxy-Require 补齐仅作用于未变形的 full Security-Client；compact require-only 被拒后会进入下一静态候选，不会在“加回/移除 Proxy-Require”之间循环。全局候选预算仍为 `VOLTE_REGISTER_CANDIDATE_LIMIT = 24`。
+  - [x] 自动报文与状态机回归测试（2026-08-30）。
+    - `maxis_50212_dynamic_register_upgrade_is_cumulative_end_to_end` 使用 `derive_standard_3gpp_profile("502", "12", LteEpc)` 的真实派生 profile，覆盖 `421 → 完整 sec-agree → 400 → 累积空 AKA`。
+    - 初始 REGISTER 字节断言同时存在 `Security-Client`、`Require`、`Proxy-Require` 和空 AKA `Authorization`；认证 REGISTER 断言 Call-ID 不变、CSeq `1 → 2`，并保留 `Authorization`、`Security-Client`、`Security-Verify`、`Require`、`Proxy-Require`。
+    - 顺序边界覆盖：空 AKA 后仍 400 才进入 spaced → compact → require-only；已有认证轮次不再切换；显式禁用不升级；profile 只有 Require 时先补 Proxy-Require；require-only 不循环。
+    - WSL Debian 定向测试：`volte::live::tests` 为 `59 passed; 0 failed`。
+    - WSL Debian 完整后端：`cargo test --manifest-path backend/Cargo.toml --bin simadmin -- --test-threads=1` 为 `1363 passed; 0 failed; 3 ignored`。
+    - `git diff --check` 通过；本轮仅修改 `backend/src/connectivity/modems/ims/volte/live.rs` 与本计划文档，既有未跟踪构建制品不纳入提交。
+  - [ ] 410 实机验证新的动态顺序。必须从设备日志确认，而不能只凭自动测试勾选：
+    1. 无认证请求收到的实际状态码（421、494、400 或超时）。
+    2. 后续候选依次出现完整 sec-agree 与 `initial_authorization = aka_empty_uri_first`，且 candidate budget 未提前耗尽。
+    3. 空 AKA 请求得到 401/407，`auth_rounds >= 1`，challenge 中存在可用 Digest 与 Security-Server。
+    4. 硬件 USIM AKA 后的 REGISTER 保持同一 Call-ID、递增 CSeq，并最终收到 **200 OK**。
+    5. 若仍失败，再与 `f44aac8`（已知可注册版本）做 A/B，对照请求头、P-CSCF、端口和 xfrm 状态。
+  - [ ] REGISTER 200 OK 后仍需分别验收：VoLTE/VoWiFi 主叫与被叫、双向 RTP、SMS over IMS、MWI、refresh/重注册稳定性和多运营商矩阵。
+  - 本项不能仅因 `epdg_ready`、IKE_AUTH、Child SA 或 ESP ready 勾选。
