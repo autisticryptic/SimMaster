@@ -8836,11 +8836,10 @@ fn is_allowed_carrier_catalog_url(url: &str) -> bool {
 /// Deliberately mechanical: a hand-maintained label map is what went stale in
 /// the first place.
 fn carrier_catalog_asset_label(name: &str) -> String {
-    let trimmed = name
-        .strip_suffix(".sqlite3")
-        .unwrap_or(name)
-        .strip_prefix("carrier-bundles-")
-        .unwrap_or(name);
+    let stem = name.strip_suffix(".sqlite3").unwrap_or(name);
+    // Fall back to the stem, not the raw name: falling back to `name` would
+    // re-add the `.sqlite3` that was just removed.
+    let trimmed = stem.strip_prefix("carrier-bundles-").unwrap_or(stem);
     if trimmed.is_empty() {
         name.to_string()
     } else {
@@ -8856,9 +8855,11 @@ async fn fetch_carrier_catalog_assets(
 
     let client = crate::services::system::ota::build_ota_http_client()?;
     let mut last_error = String::new();
-    for url in
-        crate::services::system::ota::ota_request_urls(CARRIER_CATALOG_RELEASE_API, proxy_prefix, false)
-    {
+    for url in crate::services::system::ota::ota_request_urls(
+        CARRIER_CATALOG_RELEASE_API,
+        proxy_prefix,
+        false,
+    ) {
         let response = match client
             .get(&url)
             .header("Accept", "application/vnd.github+json")
@@ -8930,8 +8931,7 @@ pub async fn get_carrier_catalog_assets_handler(
     StatusCode,
     Json<ApiResponse<crate::api::models::CarrierCatalogAssetsResponse>>,
 ) {
-    let proxy_prefix =
-        requested_github_proxy_prefix(&app, params.get("proxy_prefix").cloned());
+    let proxy_prefix = requested_github_proxy_prefix(&app, params.get("proxy_prefix").cloned());
     match fetch_carrier_catalog_assets(&proxy_prefix).await {
         Ok(assets) => (
             StatusCode::OK,
@@ -14189,9 +14189,9 @@ mod tests {
             carrier_catalog_asset_label("carrier-bundles-xiaomi15ultra-xuanyuan-baseband.sqlite3"),
             "xiaomi15ultra xuanyuan baseband"
         );
-        // An unexpected shape falls back to the raw name rather than producing
-        // an empty picker entry.
-        assert_eq!(carrier_catalog_asset_label("odd-name.sqlite3"), "odd-name");
+        // A name without the usual prefix still loses its extension and gets
+        // dashes turned into spaces.
+        assert_eq!(carrier_catalog_asset_label("odd-name.sqlite3"), "odd name");
         assert_eq!(
             carrier_catalog_asset_label("carrier-bundles-.sqlite3"),
             "carrier-bundles-.sqlite3"

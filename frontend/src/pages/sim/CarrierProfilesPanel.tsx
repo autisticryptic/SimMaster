@@ -39,6 +39,7 @@ import {
 } from '@mui/icons-material'
 import {
   api,
+  type CarrierCatalogAsset,
   type CarrierCatalogStatusResponse,
   type CarrierProfileRecord,
   type ProfileOrigin,
@@ -54,20 +55,10 @@ const originLabels: Record<ProfileOrigin, string> = {
   derived: '推导',
 }
 
-const CATALOG_ASSETS = [
-  {
-    label: 'Pixel / Android（推荐）',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-pixel-mustang.sqlite3',
-  },
-  {
-    label: 'iPhone 16 Pro Max',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-iphone16promax-26.6.sqlite3',
-  },
-  {
-    label: 'iOS IPCC 汇总',
-    url: 'https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-ios-ipcc.sqlite3',
-  },
-]
+/** MB, one decimal. Sizes come from the release, so they are exact byte counts. */
+function formatAssetSize(bytes: number): string {
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
 
 export default function CarrierProfilesPanel() {
   const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
@@ -76,8 +67,14 @@ export default function CarrierProfilesPanel() {
   const [success, setSuccess] = useState<string | null>(null)
   const [busyKey, setBusyKey] = useState<string | null>(null)
   const [catalogStatus, setCatalogStatus] = useState<CarrierCatalogStatusResponse | null>(null)
-  const [catalogAssetUrl, setCatalogAssetUrl] = useState(CATALOG_ASSETS[0].url)
+  const [catalogAssetUrl, setCatalogAssetUrl] = useState('')
   const [catalogDialogOpen, setCatalogDialogOpen] = useState(false)
+  // Databases are read from the release when the dialog opens, not compiled in:
+  // the upstream set changes, and a pinned filename silently 404s after a rename.
+  const [catalogAssets, setCatalogAssets] = useState<CarrierCatalogAsset[]>([])
+  const [catalogAssetsLoading, setCatalogAssetsLoading] = useState(false)
+  const [catalogAssetsError, setCatalogAssetsError] = useState<string | null>(null)
+  const [catalogReleaseTag, setCatalogReleaseTag] = useState('')
 
   const [editing, setEditing] = useState<CarrierProfileRecord | null>(null)
   const [editorOpen, setEditorOpen] = useState(false)
@@ -114,6 +111,42 @@ export default function CarrierProfilesPanel() {
   useEffect(() => {
     if (page > 0 && page * rowsPerPage >= profiles.length) setPage(0)
   }, [page, profiles.length, rowsPerPage])
+
+  /** Read the release's databases. Called when the dialog opens so the list is
+   *  current, and available for a manual retry when GitHub is unreachable. */
+  const loadCatalogAssets = async () => {
+    setCatalogAssetsLoading(true)
+    setCatalogAssetsError(null)
+    try {
+      const response = await api.getCarrierCatalogAssets()
+      const listing = response.data
+      const assets = listing?.assets ?? []
+      setCatalogAssets(assets)
+      setCatalogReleaseTag(listing?.release_tag ?? '')
+      if (assets.length === 0) {
+        setCatalogAssetsError(listing?.message || '未能从 Release 读取到数据库文件')
+        setCatalogAssetUrl('')
+      } else {
+        // Keep the current pick only if the release still offers it; otherwise
+        // fall back to the first (largest) database.
+        setCatalogAssetUrl((current) =>
+          assets.some((asset) => asset.download_url === current)
+            ? current
+            : assets[0].download_url)
+      }
+    } catch (err) {
+      setCatalogAssets([])
+      setCatalogAssetUrl('')
+      setCatalogAssetsError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setCatalogAssetsLoading(false)
+    }
+  }
+
+  const openCatalogDialog = () => {
+    setCatalogDialogOpen(true)
+    void loadCatalogAssets()
+  }
 
   const installCatalog = async () => {
     setBusyKey('catalog')
@@ -197,7 +230,7 @@ export default function CarrierProfilesPanel() {
               size="small"
               variant="outlined"
               startIcon={<Download />}
-              onClick={() => setCatalogDialogOpen(true)}
+              onClick={openCatalogDialog}
             >
               数据库下载
             </Button>
@@ -399,12 +432,28 @@ export default function CarrierProfilesPanel() {
               size="small"
               label="数据库来源"
               value={catalogAssetUrl}
+              disabled={catalogAssetsLoading || catalogAssets.length === 0}
+              helperText={catalogAssetsLoading
+                ? '正在读取 Release 中的数据库…'
+                : catalogAssetsError
+                  ? catalogAssetsError
+                  : catalogReleaseTag
+                    ? `来自 Release ${catalogReleaseTag}，共 ${catalogAssets.length} 个数据库`
+                    : ' '}
+              error={Boolean(catalogAssetsError)}
               onChange={(event) => setCatalogAssetUrl(event.target.value)}
             >
-              {CATALOG_ASSETS.map((asset) => (
-                <MenuItem key={asset.url} value={asset.url}>{asset.label}</MenuItem>
+              {catalogAssets.map((asset) => (
+                <MenuItem key={asset.download_url} value={asset.download_url}>
+                  {asset.label} · {formatAssetSize(asset.size)}
+                </MenuItem>
               ))}
             </TextField>
+            {catalogAssetsError && (
+              <Button size="small" onClick={() => void loadCatalogAssets()} disabled={catalogAssetsLoading}>
+                重新读取数据库列表
+              </Button>
+            )}
             <GithubDownloadProxyControl compact />
             {catalogStatus?.path && (
               <Typography variant="caption" color="text.secondary">
@@ -419,7 +468,7 @@ export default function CarrierProfilesPanel() {
             variant="contained"
             startIcon={busyKey === 'catalog' ? <CircularProgress size={16} color="inherit" /> : <Download />}
             onClick={() => void installCatalog()}
-            disabled={busyKey !== null}
+            disabled={busyKey !== null || catalogAssetsLoading || !catalogAssetUrl}
           >
             {catalogStatus?.usable ? '下载并覆盖' : '下载并安装'}
           </Button>

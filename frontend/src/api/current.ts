@@ -12,6 +12,7 @@ import type {
   CallSettingsResponse,
   CarrierProfileImportRequest,
   CarrierProfileImportResult,
+  CarrierCatalogAssetsResponse,
   CarrierCatalogInstallRequest,
   CarrierCatalogInstallResponse,
   CarrierCatalogStatusResponse,
@@ -1136,6 +1137,14 @@ class SimAdminCurrentAPI {
   async getCarrierCatalogStatus() {
     return request<ApiResponse<CarrierCatalogStatusResponse>>('/vowifi/carrier-catalog/status', {
       timeoutMs: 15000,
+    })
+  }
+
+  /** List the databases in the upstream release. Reaches GitHub, so it is slower
+   *  than a local status read. */
+  async getCarrierCatalogAssets() {
+    return request<ApiResponse<CarrierCatalogAssetsResponse>>('/vowifi/carrier-catalog/assets', {
+      timeoutMs: 45000,
     })
   }
 

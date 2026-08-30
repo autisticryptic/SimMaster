@@ -156,6 +156,21 @@ export interface CarrierCatalogStatusResponse {
   message: string
 }
 
+export interface CarrierCatalogAsset {
+  name: string
+  label: string
+  size: number
+  download_url: string
+}
+
+/** Databases in the upstream release, enumerated at request time. */
+export interface CarrierCatalogAssetsResponse {
+  release_tag: string
+  published_at: string
+  assets: CarrierCatalogAsset[]
+  message: string
+}
+
 export interface CarrierCatalogInstallRequest {
   proxy_prefix?: string
   asset_url?: string
