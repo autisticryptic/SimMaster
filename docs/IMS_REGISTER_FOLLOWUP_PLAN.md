@@ -647,9 +647,15 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
     - `auth_rounds > 0` 后禁止继续切换请求形态，避免用 header 试探掩盖 AKA/USIM 或已协商安全通道错误。
     - `sec_agree_mode = disabled` 同时阻止动态升级和静态空 AKA/sec-agree 最后候选；即使历史导入记录残留 `require_sec_agree_headers` / `proxy_require_sec_agree_headers` 布尔值，显式禁用也不会被兜底重新打开。
     - Proxy-Require 补齐仅作用于未变形的 full Security-Client；compact require-only 被拒后会进入下一静态候选，不会在“加回/移除 Proxy-Require”之间循环。全局候选预算仍为 `VOLTE_REGISTER_CANDIDATE_LIMIT = 24`。
+  - [x] 修复认证 REGISTER 丢失累计 sec-agree 状态（2026-08-30，尚未实机验证）。
+    - 410 旧构建 `3329df2` 的实机日志已经证明空 AKA 候选进入了 AKA：`candidate_attempt=21`、`auth_rounds=1`、最终响应 `421`、`response_cseq="2 REGISTER"`。失败点不是初始空 AKA REGISTER，而是认证后的第二个 REGISTER。
+    - 根因在 `VolteRegisterAuthenticator::prepare_authenticated_channel()`：当 401/407 有可用 AKA Digest、但没有 `Security-Server` 且 profile 为 `sec_agree_mode=auto` 时，旧分支切到 UDP 后硬编码 `(None, None, false)`，使认证 REGISTER 丢掉初始候选已经声明的 `Security-Client` 与 `Require: sec-agree`；`Proxy-Require` 则仍由旧 policy 残留，形成不完整的 sec-agree 请求，P-CSCF 因而再次返回 421。
+    - 新逻辑把认证阶段保存为完整 `RegisterRequestPolicy`。没有 `Security-Server` 时继续使用初始 REGISTER 的 `Security-Client`、`Require` 和 `Proxy-Require`，但不会伪造 `Security-Verify`、不会安装不存在的 xfrm SA；只有 challenge 真正提供并选中 `Security-Server` 时才生成 `Security-Verify` 并进入 IPsec。
+    - AUTS 重同步请求也改为继承当前候选的初始 Security-Client 与完整 policy，不再从 profile 的静态布尔值重新推导并丢失动态 421/400 升级结果。
+    - 新增两组脱敏运行时元数据：challenge 的 `Security-Server` 数量/是否可用，以及认证 REGISTER 实际携带的 `Security-Client`、`Security-Verify`、`Require`、`Proxy-Require`、Call-ID 是否延续初始请求的布尔值与 CSeq，供 410 实机直接核对。
   - [x] 自动报文与状态机回归测试（2026-08-30）。
     - `maxis_50212_dynamic_register_upgrade_is_cumulative_end_to_end` 使用 `derive_standard_3gpp_profile("502", "12", LteEpc)` 的真实派生 profile，覆盖 `421 → 完整 sec-agree → 400 → 累积空 AKA`。
-    - 初始 REGISTER 字节断言同时存在 `Security-Client`、`Require`、`Proxy-Require` 和空 AKA `Authorization`；认证 REGISTER 断言 Call-ID 不变、CSeq `1 → 2`，并保留 `Authorization`、`Security-Client`、`Security-Verify`、`Require`、`Proxy-Require`。
+    - 初始 REGISTER 字节断言同时存在 `Security-Client`、`Require`、`Proxy-Require` 和空 AKA `Authorization`；模拟“401 有 AKA Digest、无 Security-Server”时，认证 REGISTER 断言 Call-ID 不变、CSeq `1 → 2`，保留 `Authorization`、`Security-Client`、`Require`、`Proxy-Require`，并明确断言不存在伪造的 `Security-Verify`。
     - 顺序边界覆盖：空 AKA 后仍 400 才进入 spaced → compact → require-only；已有认证轮次不再切换；显式禁用不升级；profile 只有 Require 时先补 Proxy-Require；require-only 不循环。
     - WSL Debian 定向测试：`volte::live::tests` 为 `59 passed; 0 failed`。
     - WSL Debian 完整后端：`cargo test --manifest-path backend/Cargo.toml --bin simadmin -- --test-threads=1` 为 `1363 passed; 0 failed; 3 ignored`。
@@ -657,8 +663,9 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - [ ] 410 实机验证新的动态顺序。必须从设备日志确认，而不能只凭自动测试勾选：
     1. 无认证请求收到的实际状态码（421、494、400 或超时）。
     2. 后续候选依次出现完整 sec-agree 与 `initial_authorization = aka_empty_uri_first`，且 candidate budget 未提前耗尽。
-    3. 空 AKA 请求得到 401/407，`auth_rounds >= 1`，challenge 中存在可用 Digest 与 Security-Server。
-    4. 硬件 USIM AKA 后的 REGISTER 保持同一 Call-ID、递增 CSeq，并最终收到 **200 OK**。
-    5. 若仍失败，再与 `f44aac8`（已知可注册版本）做 A/B，对照请求头、P-CSCF、端口和 xfrm 状态。
+    3. 空 AKA 请求得到 401/407，`auth_rounds >= 1`，challenge 中存在可用 AKA Digest；同时记录 `Security-Server` 是否存在，不能再把它错误地当作认证成功的必要前提。
+    4. 若 challenge 没有 `Security-Server`：认证 REGISTER 必须继续携带 `Security-Client`、`Require`、`Proxy-Require`，不带 `Security-Verify`，并保持 UDP；若 challenge 有可用 `Security-Server`：必须带 `Security-Verify` 并确认 xfrm/IPsec 激活。
+    5. 硬件 USIM AKA 后的 REGISTER 保持同一 Call-ID、递增 CSeq，并最终收到 **200 OK**。
+    6. 若仍失败，再与 `f44aac8`（已知可注册版本）做 A/B，对照请求头、P-CSCF、端口和 xfrm 状态。
   - [ ] REGISTER 200 OK 后仍需分别验收：VoLTE/VoWiFi 主叫与被叫、双向 RTP、SMS over IMS、MWI、refresh/重注册稳定性和多运营商矩阵。
   - 本项不能仅因 `epdg_ready`、IKE_AUTH、Child SA 或 ESP ready 勾选。

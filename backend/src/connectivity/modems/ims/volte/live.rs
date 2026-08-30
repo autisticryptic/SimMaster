@@ -636,7 +636,23 @@ struct PreparedAuth {
     authorization: String,
     security_client: Option<String>,
     security_verify: Option<String>,
-    require_sec_agree: bool,
+    register_policy: sip::RegisterRequestPolicy,
+}
+
+/// Preserve the sec-agree declaration that triggered an AKA challenge even
+/// when that challenge does not contain a Security-Server offer. In that case
+/// there is no negotiated SA and therefore no Security-Verify, but dropping
+/// Security-Client/Require from the authenticated REGISTER makes a P-CSCF that
+/// already answered 421 ask for sec-agree again.
+fn unnegotiated_authenticated_security(
+    initial_security_client: Option<&str>,
+    register_policy: sip::RegisterRequestPolicy,
+) -> (Option<String>, Option<String>, sip::RegisterRequestPolicy) {
+    (
+        initial_security_client.map(str::to_string),
+        None,
+        register_policy,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1189,13 +1205,11 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 effective_register_target(&self.effective_ims),
                 &self.route,
             );
-            let security_enabled = self.profile.ims.register.sec_agree_mode != "disabled"
-                && !self
-                    .profile
-                    .ims
-                    .register
-                    .security_client_mechanisms
-                    .is_empty();
+            let (security_client, security_verify, register_policy) =
+                unnegotiated_authenticated_security(
+                    self.initial_security_client.as_deref(),
+                    self.register_policy,
+                );
             self.pending = Some(PreparedAuth {
                 authorization: digest_aka::build_resync_authorization_header(
                     &challenge,
@@ -1203,10 +1217,9 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                     &request_uri,
                     auts,
                 ),
-                security_client: security_enabled.then(|| self.offered_security.clone()),
-                security_verify: None,
-                require_sec_agree: security_enabled
-                    && self.profile.ims.register.require_sec_agree_headers,
+                security_client,
+                security_verify,
+                register_policy,
             });
             return Ok(());
         }
@@ -1222,13 +1235,27 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 .ok()
                 .map(|sec| (sec, value.clone()))
         });
-        let (security_client, security_verify, require_sec_agree) = if self.reuse_security {
+        tracing::info!(
+            security_server_count = security_server_values.len(),
+            usable_security_server_present = security_server.is_some(),
+            initial_security_client_present = self.initial_security_client.is_some(),
+            declared_require_sec_agree = self.register_policy.require_sec_agree,
+            declared_proxy_require_sec_agree = self.register_policy.proxy_require_sec_agree,
+            sensitive_values = "redacted",
+            "VoLTE IMS REGISTER authentication challenge metadata received"
+        );
+        let (security_client, security_verify, register_policy) = if self.reuse_security {
             let security_verify = channel.security_verify().map(str::to_string);
             self.mode = if security_verify.is_some() {
                 RegistrationMode::Ipsec
             } else {
                 RegistrationMode::Udp
             };
+            let mut register_policy = self.register_policy;
+            register_policy.require_sec_agree = security_verify.is_some();
+            if security_verify.is_none() {
+                register_policy.proxy_require_sec_agree = false;
+            }
             // TS 24.229 section 5.1.1.4.2 requires a protected AKA
             // re-registration to repeat the negotiated Security-Client offer
             // and mirror it with Security-Verify. Omitting Security-Client
@@ -1238,7 +1265,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                     .as_ref()
                     .map(|_| self.offered_security.clone()),
                 security_verify.clone(),
-                security_verify.is_some(),
+                register_policy,
             )
         } else if let Some((selected, verify)) = security_server {
             self.runtime
@@ -1302,7 +1329,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             }
             self.xfrm_plan = Some(plan);
             self.mode = RegistrationMode::Ipsec;
-            (Some(self.offered_security.clone()), Some(verify), true)
+            let mut register_policy = self.register_policy;
+            register_policy.require_sec_agree = true;
+            (
+                Some(self.offered_security.clone()),
+                Some(verify),
+                register_policy,
+            )
         } else if self.profile.ims.register.sec_agree_mode == "required"
             || (self.profile.ims.register.strict_security_server_offer
                 && !security_server_values.is_empty())
@@ -1310,7 +1343,10 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         } else {
             self.mode = RegistrationMode::Udp;
-            (None, None, false)
+            unnegotiated_authenticated_security(
+                self.initial_security_client.as_deref(),
+                self.register_policy,
+            )
         };
         // `self.route` only ever feeds header construction (Via/Contact and the
         // Request-URI), never a socket, so it must carry the advertised route.
@@ -1351,7 +1387,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             authorization,
             security_client,
             security_verify,
-            require_sec_agree,
+            register_policy,
         });
         Ok(())
     }
@@ -1371,27 +1407,40 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
-        Ok(
-            sip::build_register_from_profile_with_target_visited_and_access(
-                self.profile,
-                effective_register_target(&self.effective_ims),
-                sip::RegisterPhase::Authenticated,
-                &self.identity,
-                &self.route,
-                &ids,
-                self.expires_seconds,
-                Some(&prepared.authorization),
-                prepared.security_client.as_deref(),
-                prepared.security_verify.as_deref(),
-                &self.sip_instance,
-                sip::RegisterRequestPolicy {
-                    require_sec_agree: prepared.require_sec_agree,
-                    ..self.register_policy
-                },
-                self.visited_network_header.as_deref(),
-                self.access_network.as_ref(),
-            ),
-        )
+        let request = sip::build_register_from_profile_with_target_visited_and_access(
+            self.profile,
+            effective_register_target(&self.effective_ims),
+            sip::RegisterPhase::Authenticated,
+            &self.identity,
+            &self.route,
+            &ids,
+            self.expires_seconds,
+            Some(&prepared.authorization),
+            prepared.security_client.as_deref(),
+            prepared.security_verify.as_deref(),
+            &self.sip_instance,
+            prepared.register_policy,
+            self.visited_network_header.as_deref(),
+            self.access_network.as_ref(),
+        );
+        tracing::info!(
+            registration_mode = self.mode.as_str(),
+            request_authorization_present =
+                !sip::header_values(&request, "Authorization").is_empty(),
+            request_security_client_present =
+                !sip::header_values(&request, "Security-Client").is_empty(),
+            request_security_verify_present =
+                !sip::header_values(&request, "Security-Verify").is_empty(),
+            request_require_present = !sip::header_values(&request, "Require").is_empty(),
+            request_proxy_require_present =
+                !sip::header_values(&request, "Proxy-Require").is_empty(),
+            request_call_id_matches_initial = sip::header_value(&request, "Call-ID").as_deref()
+                == Some(self.ids.call_id.as_str()),
+            request_cseq = sip::header_value(&request, "CSeq"),
+            sensitive_values = "redacted",
+            "VoLTE IMS authenticated REGISTER request metadata prepared"
+        );
+        Ok(request)
     }
 
     async fn rebuild_register_with_min_expires(
@@ -7984,9 +8033,12 @@ Content-Length: 0\r\n\r\n";
         );
         let call_id = sip::header_value(&initial, "Call-ID").expect("initial Call-ID");
 
-        // The hardware-backed authenticator computes the real digest after 401;
-        // this builder-level assertion locks the headers and transaction identity
-        // it receives from VolteRegisterAuthenticator::authenticated_request.
+        // The hardware-backed authenticator computes the real digest after 401.
+        // Maxis challenges this cumulative request without Security-Server, so
+        // the authenticated REGISTER must keep the declaration that caused the
+        // challenge while correctly omitting Security-Verify (no SA exists yet).
+        let (authenticated_security_client, authenticated_security_verify, auth_policy) =
+            unnegotiated_authenticated_security(Some(&security_client), cumulative.policy);
         let mut authenticated_ids = ids.clone();
         authenticated_ids.cseq = 2;
         let authenticated = sip::build_register_from_profile_with_target_visited_and_access(
@@ -7998,10 +8050,10 @@ Content-Length: 0\r\n\r\n";
             &authenticated_ids,
             profile.ims.register.expires_seconds,
             Some("Authorization: Digest username=\"impi\",realm=\"ims\",nonce=\"n\",uri=\"sip:ims\",response=\"proof\",algorithm=AKAv1-MD5"),
-            Some(&security_client),
-            Some("ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=5060;port-s=5062"),
+            authenticated_security_client.as_deref(),
+            authenticated_security_verify.as_deref(),
             "urn:uuid:maxis-register-flow-test",
-            cumulative.policy,
+            auth_policy,
             None,
             None,
         );
@@ -8016,7 +8068,6 @@ Content-Length: 0\r\n\r\n";
         for header in [
             "Authorization",
             "Security-Client",
-            "Security-Verify",
             "Require",
             "Proxy-Require",
         ] {
@@ -8025,6 +8076,10 @@ Content-Length: 0\r\n\r\n";
                 "authenticated REGISTER lost {header}"
             );
         }
+        assert!(
+            sip::header_value(&authenticated, "Security-Verify").is_none(),
+            "a 401 without Security-Server must not fabricate Security-Verify"
+        );
     }
 
     #[test]
