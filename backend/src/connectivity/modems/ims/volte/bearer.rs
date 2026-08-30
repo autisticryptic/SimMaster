@@ -299,6 +299,10 @@ where
     };
     let mut pending: VecDeque<&'static str> = VecDeque::from([initial]);
     let mut attempted: Vec<&'static str> = Vec::with_capacity(3);
+    // Some networks accept an IPV4V6 request but provision only one family.
+    // Keep that bearer available while trying the configured single-family
+    // fallbacks; it remains the last-resort connection if those attempts fail.
+    let mut deferred_dual = None;
     while let Some(ip_type) = pending.pop_front() {
         if attempted.contains(&ip_type) {
             continue;
@@ -320,6 +324,27 @@ where
                     error: None,
                 })
                 .await;
+                if ip_type == "ipv4v6"
+                    && plan
+                        .pcscf_order()
+                        .first()
+                        .is_some_and(|family| !bearer_has_family(&bearer, *family))
+                {
+                    let fallbacks = plan.single_family_fallbacks();
+                    if !fallbacks.is_empty() {
+                        for fallback in fallbacks {
+                            pending.push_back(fallback.as_mm_str());
+                        }
+                        deferred_dual = Some(bearer);
+                        continue;
+                    }
+                }
+                if ip_type != "ipv4v6" {
+                    if let Some(previous) = deferred_dual.take() {
+                        disconnect_bearer(&previous.path).await;
+                        let _ = delete_bearer(modem, &previous.path).await;
+                    }
+                }
                 return Ok(bearer);
             }
             Err(failure) => {
@@ -343,7 +368,17 @@ where
             }
         }
     }
+    if let Some(bearer) = deferred_dual {
+        return Ok(bearer);
+    }
     Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
+}
+
+fn bearer_has_family(bearer: &BearerConnection, family: IpFamily) -> bool {
+    match family {
+        IpFamily::Ipv4 => bearer.settings.ipv4_address.is_some(),
+        IpFamily::Ipv6 => bearer.settings.ipv6_address.is_some(),
+    }
 }
 
 fn is_dual_stack_bearer(details: &str) -> bool {
