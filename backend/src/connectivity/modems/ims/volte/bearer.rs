@@ -24,7 +24,7 @@ use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 use super::{
     errors::{code, VolteError},
     pcscf::ImsIpSettings,
-    plan::{FailureClass, ImsConnectionPlan, IpType},
+    plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
 };
 
 /// Test default only. Production registration receives the IMS APN from the
