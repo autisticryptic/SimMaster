@@ -271,19 +271,18 @@ where
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
-                        required_fallback =
-                            FailureClass::from_details(&after)
-                                .forced_family()
-                                .map(|f| {
-                                    match f {
-                                crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
-                                    IpType::Ipv6
-                                }
-                                crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
-                                    IpType::Ipv4
-                                }
+                        required_fallback = FailureClass::from_details(&format!(
+                            "{}\n{}", after, error
+                        ))
+                        .forced_family()
+                        .map(|f| match f {
+                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
+                                IpType::Ipv6
                             }
-                                });
+                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
+                                IpType::Ipv4
+                            }
+                        });
                         observe(BearerAttempt {
                             ip_type: "ipv4v6".to_string(),
                             source: "reconnected".to_string(),
@@ -343,6 +342,11 @@ where
                 return Ok(bearer);
             }
             Err(failure) => {
+                let class = if ip_type == "ipv4v6" {
+                    Some(classify_attempt_failure(&failure))
+                } else {
+                    None
+                };
                 observe(BearerAttempt {
                     ip_type: ip_type.to_string(),
                     source: "created".to_string(),
@@ -354,8 +358,7 @@ where
                 // Only fan out into single-family fallbacks after a dual-stack
                 // attempt fails. Single-family failures are terminal for that
                 // family; the plan already decided the order.
-                if ip_type == "ipv4v6" {
-                    let class = FailureClass::from_details(&failure.details);
+                if let Some(class) = class {
                     for fallback in plan.bearer_fallbacks_after(class) {
                         pending.push_back(fallback.as_mm_str());
                     }
@@ -419,6 +422,20 @@ struct BearerAttemptFailure {
     details: String,
 }
 
+/// Preserve an explicit network-family rejection even when `mmcli --create-bearer`
+/// fails before a bearer object exists. In that path there is no status dump to
+/// inspect, so the command error itself is the only source of the forced-family
+/// signal.
+fn classify_attempt_failure(failure: &BearerAttemptFailure) -> FailureClass {
+    let error = failure.error.to_string();
+    let details = if failure.details.is_empty() {
+        error
+    } else {
+        format!("{}\n{}", failure.details, error)
+    };
+    FailureClass::from_details(&details)
+}
+
 async fn create_and_connect_attempt(
     modem: &str,
     request: &BearerRequest,
@@ -431,8 +448,8 @@ async fn create_and_connect_attempt(
     )
     .await
     .map_err(|error| BearerAttemptFailure {
+        details: error.to_string(),
         error,
-        details: String::new(),
     })?;
     let path = parse_created_bearer_path(&created).ok_or_else(|| BearerAttemptFailure {
         error: VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
@@ -1290,6 +1307,35 @@ mod tests {
         assert_eq!(
             plan_v6.bearer_fallbacks_after(FailureClass::from_details(generic)),
             vec![super::IpType::Ipv6, super::IpType::Ipv4]
+        );
+    }
+
+    #[test]
+    fn create_command_family_rejection_is_not_replaced_by_default_fallback() {
+        let ipv6 = BearerAttemptFailure {
+            error: VolteError::with_detail(
+                code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed",
+            ),
+            details: String::new(),
+        };
+        let ipv4 = BearerAttemptFailure {
+            error: VolteError::with_detail(
+                code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed",
+            ),
+            details: String::new(),
+        };
+
+        assert_eq!(
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+                .bearer_fallbacks_after(classify_attempt_failure(&ipv6)),
+            vec![IpType::Ipv6]
+        );
+        assert_eq!(
+            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+                .bearer_fallbacks_after(classify_attempt_failure(&ipv4)),
+            vec![IpType::Ipv4]
         );
     }
 
