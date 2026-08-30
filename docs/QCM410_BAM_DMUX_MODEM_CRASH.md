@@ -5,8 +5,8 @@ modem 固件 `2022-11-05`。诊断时间 2026-08-22，地址 `192.168.100.13`。
 
 本文档针对**反复出现**的那一类故障：ModemManager 能看到 modem、能注册网络、
 短信和语音信令都正常，**唯独数据面完全用不了** —— VoLTE 起不来，数据代理拿不到
-接口。与 `QCM410_BASEBAND_DISAPPEARANCE.md` 描述的"基带整个消失"是不同的两件事，
-但根源同属这颗 Q6 modem 的固件崩溃。
+接口。这和"基带整个消失"（端口全部不见、`mmcli -L` 空）是不同的两件事，但根源同属
+这颗 Q6 modem 的固件崩溃——后者的现场恢复顺序见 §11。
 
 ---
 
@@ -624,3 +624,41 @@ MM 的 bearer 抖动时刻（22:01:11、22:07:16）与我们的失败时刻（22
   released` 就是这么进去的：它看起来触目，实际每次调用都有 —— 见 §10.8。
 - **修复要对准被证实的因果链。** §10.8 的分类器修复是对的，但它修的是 VoLTE IMS 恢复
   循环，不是数据面那 72 秒。把两件事混为一谈会让人以为待办已经清掉。
+
+## 11. 现场恢复顺序（基带消失时照这个走）
+
+症状是"基带不见了，重启 ModemManager 也找不到"。原因见上面两节——Q6 modem subsystem
+已经 crash/recover，WWAN/QMI 设备节点在恢复期间不存在。**ModemManager 只是上层观察者，
+单独重启它修不了内核/固件状态。**
+
+1. 确认 remoteproc 状态：
+
+   ```bash
+   cat /sys/class/remoteproc/remoteproc*/name
+   cat /sys/class/remoteproc/remoteproc*/state
+   ```
+
+   认准 `name == 4080000.remoteproc` 的那个才是 modem；`a204000.remoteproc` 是 Wi-Fi/BT
+   协处理器，和这个问题无关。
+
+2. 检查端口是否回来了：`/dev/wwan0qmi0`、`/dev/wwan0at*`、`mmcli -L`。等内核 remoteproc
+   自动恢复并重新发布端口。
+
+3. **端口全部回来之后**再刷新 ModemManager / SimAdmin 线路 inventory。
+
+   端口还没回来时不要反复执行 `mmcli --enable`、IMS bearer activate 或 DATA6 `qmicli`
+   —— 那只会在固件恢复期间继续冲击它。
+
+4. remoteproc 长时间不是 `running`、端口不再出现时，只能设备级重启或用厂商的 modem
+   subsystem recovery。进程级重启不够。
+
+不要直接往 remoteproc 的 `state` 写值或在有活动线路时重启设备——那会造成不可逆的无线中断。
+
+### 可以做但还没做的自动化
+
+- 只读健康快照：remoteproc name/state、端口列表、ModemManager object、最近一次 kernel
+  crash 时间与原因。
+- 按 baseband 归属的恢复状态机：`observed_crash → wait_ports → refresh_mm → rebind_data6
+  → restore_intents`，每步限次并写 system event。
+- 把 crash reason 和当时的 QMI correlation id 落库，用来区分开机固件故障、IMS teardown
+  竞态和 DATA6 操作故障。

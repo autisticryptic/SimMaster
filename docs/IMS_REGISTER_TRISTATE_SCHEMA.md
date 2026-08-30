@@ -4,7 +4,7 @@
 > 项目：SimAdmin<br>
 > 适用：carrier catalog v7 bundle → `RegisterPolicyRecord` → `CarrierProfile` → SIP REGISTER
 
-本文档是 `docs/IMS_REGISTER_FOLLOWUP_PLAN.md` 第 7 节第 1 项要求的唯一 schema 来源。列出 REGISTER 相关布尔开关的三态语义、合法取值、缺省行为和最终报文影响。
+本文档是 REGISTER 布尔开关三态语义的唯一来源：合法取值、缺省行为和最终报文影响。相关待办见 `DEVELOPMENT_PLAN.md`。
 
 ## 1. 什么叫三态
 

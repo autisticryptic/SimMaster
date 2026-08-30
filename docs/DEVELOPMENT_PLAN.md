@@ -1,6 +1,8 @@
 ﻿# SimAdmin 未完成开发计划
 
-> 状态：2026-08-19 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
+> 状态：2026-08-30 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
+>
+> 2026-08-30 合并了原先分散的四份清单（`IMS_REGISTER_FOLLOWUP_PLAN.md`、`BACKEND_REVIEW_TODO.md`、`IMS_ACCESS_REFACTOR_DEVICE_TESTS.md`、`HARDWARE_EXPANSION_TODO.md`）。已完成项和历史验收记录不再保留在文档里——那些在 git 历史中。架构设计说明移到 `ARCHITECTURE.md`。
 >
 > 本文不把代码中已有的基础能力直接视为产品完成。每项能力只有在对应的自动化测试、真实硬件、运营商网络或发布流程验收通过后，才能从本计划移除。
 
@@ -34,7 +36,7 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 - [x] 本地协议测试覆盖双向 RTP、SIP INFO DTMF、telephone-event、媒体方向、hold/resume 和资源清理；[ ] 真实 VoWiFi 运营商验收仍待执行。
 - [ ] 将普通号码测试结果按线路、access、codec、SIP 状态、RTP 计数和脱敏 trace 独立记录（需要授权的真实测试号码）。
 
-2026-08-19 已完成一轮 QCM410/50212 飞行模式实测：VoWiFi IMS、trunk、7201 绑定、`100/183` 和失败资源清理通过；运营商以 `480 Release Call received from CAP` 在接通前释放，故 RTP、DTMF、hold 和视频仍未验收。代码已补齐 trunk/API 呼叫的统一 `Started` 生命周期事件和历史记录竞态测试。完整证据见 [VoWiFi 通话实机测试记录](./VOWIFI_CALL_TEST_2026-08-19.md)。
+2026-08-19 已完成一轮 QCM410/50212 飞行模式实测：VoWiFi IMS、trunk、7201 绑定、`100/183` 和失败资源清理通过；运营商以 `480 Release Call received from CAP` 在接通前释放，故 RTP、DTMF、hold 和视频仍未验收。代码已补齐 trunk/API 呼叫的统一 `Started` 生命周期事件和历史记录竞态测试。
 
 ### 视频
 
@@ -82,7 +84,16 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 - [ ] 完成 `detect_device_kind()` 的真实 sysfs/DT/udev capability 探测；未知设备不得写 QCM410 DATA6 udev 规则或绑定 secondary QMI。
 - [ ] 将 QCM410 `ImsBearerTransport` 通过 provider/capability 注入 runtime；generic ModemManager 路径不能依赖 QCM410 类型。
 - [x] 已删除未实现的 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` stub；保留实际 `ImsBearerTransport` capability seam。
-- [ ] 为 EC20/EC25/EG25 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。
+- [ ] 为 EC20/EC25/EG25/EG600 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。逐型号矩阵：
+  - [ ] EC20：discovery、AT、SIM 身份、短信、通话、QMI 数据和代理流量。
+  - [ ] EC25：同上，加热插拔。
+  - [ ] EG25 家族：接口组成、QMI 数据、radio mode 控制。
+  - [ ] EG600：真实 USB/PCIe 组成、驻网、数据和支持的 radio 控制。
+  - [ ] USB 读卡器：无卡、实体 SIM、PIN 锁卡、USIM AKA、读卡器热插拔。
+  - [ ] USB eUICC 读卡器：经 PC/SC lpac 完成 profile 列出/下载/启用/停用。
+  - [ ] 用物理 eUICC 读卡器验证 lpac reader name/index 选择。
+- [ ] QCM410 逐项确认：DATA6 被 ModemManager 忽略且普通数据留在主 QMI 口；定时流量任务在持久化数据开关关闭时成功并恢复为关闭；定时通话能启动、自动挂机并容忍对端提前挂断。
+- [ ] 仅当 PC/SC 服务/包是 SimAdmin 自己安装的才卸载（需要 installer 状态追踪）。
 - [ ] 只有找到真实双向音频数据面后，才实现 CS trunk；仅有 ModemManager 呼叫控制不能标记为 CS trunk ready。
 - [ ] 验证 QCM410 数据与 IMS bearer 并发时的 slot allocator、baseband wedge guard、恢复和 modem 重启行为。
 
@@ -99,7 +110,71 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 - [ ] 目标覆盖内置 eUICC/基带 MEP、410/724ug/EC20/EM05-G/EM7430 的后续适配，以及 PC/SC 读卡器 MEP；型号本身不视为能力证明。
 - [ ] 优先支持“一个 Port 走蜂窝 VoLTE、另一个 Port 只走 WiFi VoWiFi”的线路模型；读卡器不要求蜂窝联网。
 - [ ] 在没有真实 MEP eUICC 和读卡器前，只完成 Mock/能力未知回退/线路隔离测试，不标记真实 MEP 完成。
-- [ ] MEP 预留接口完成后，统一 IMS 与 Trunk 区域文案：移除 VoLTE 卡片中“独立于其他基带管理；连接阶段与地址族详情见线路活动日志”的重复说明，使 VoLTE IMS、VoWiFi 注册、Trunk 注册标题和辅助文案一致；详细连接阶段与地址族信息只保留在线路活动日志。
+- [x] 统一 IMS 与 Trunk 区域文案（2026-08-30，提交 `6a34ee4`，已部署到 410）。已移除 VoLTE 卡片中“独立于其他基带管理；连接阶段与地址族详情见线路活动日志”。VoWiFi 与 Trunk 标题下保留的是**动态运行态**（VoWiFi 注册状态、Trunk `host:port`），只有 VoLTE 那行是静态说明，所以删掉它之后三者形态一致：标题加状态 chip。详细连接阶段与地址族信息只在线路活动日志。
+## P1：IMS REGISTER 收口
+
+代码层与本地回归已完成：REGISTER 事务过滤（Call-ID + CSeq + method）、channel requeue、候选阶梯、三态 `omit` 全链路端到端断言、自定义 DNS 端口、每线路动态接入上下文。2026-08-30 已在 410 上闭环 ePDG/IKE/Child SA/ESP 和 **IMS REGISTER 200 OK**。
+
+剩下的都是实机业务矩阵和少量代码缺口。
+
+### 代码缺口
+
+- [ ] VoLTE 与 VoWiFi 对相同 profile 字段的解释完全统一（当前只做了相关路径的局部修复）。
+- [ ] 用真实运行时上下文生成 VoLTE `Cellular-Network-Info`（PANI 已用真实上下文；CNI 只有测试夹具驱动的断言）。
+- [ ] home / visited network 区分的单元测试（现有测试覆盖 FDD/TDD 和 LTE/NR，不含漫游差异）。
+- [ ] 从 QMI 读取注册 PLMN 与注册状态作为 ModemManager 不可用时的兜底。解析器（`parse_qmicli_serving_system_output`）已完成并用真实设备输出做过夹具，但接线点被撤销——它原本挂在 10 秒刷新路径上，会和 `get_cells_data_for_modem` 并发抢同一个 QMI 控制口。需要一个能串行化 QMI 的调用点。
+- [ ] 明确 QCM410 固件能稳定提供哪些字段及其刷新事件（需实机采样）。
+- [ ] 是否用 ModemManager 信号替代 10 秒轮询（纯优化，当前 10s 采集 / 30s TTL 已有界）。
+- [ ] 前端 `current.ts` 调用 `/vowifi/carrier-profiles/import`，但 `main.rs` 未注册该路由，`aosp_apns`/`aosp_carrier_config`/`ipcc` 三种导入格式后端没有实现——类型定义领先于实现。
+- [ ] 全局 `cargo fmt --all -- --check`（当前工作树有大量既有跨平台/换行差异，只做过定向格式化）。
+
+### 可观察性
+
+- [ ] REGISTER 日志记录实际 PANI/CNI 来源：dynamic / static profile / compatibility fallback / omitted。
+- [ ] refresh 降级成功时记录被移除的头（不记录敏感字段）。
+- [ ] 每条线路分别统计 refresh 成功率和 access rebuild 次数。
+
+事务键脱敏摘要、跳过帧诊断和失败原因分类已经存在（`RegisterTransactionKey::summary()` 输出 Call-ID hash，五种失败原因串，`authorization_and_nonce_never_reach_the_transaction_log` 固定安全不变量）。
+
+### 实机验收矩阵
+
+REGISTER 路径：
+
+- [ ] 401/407 AKA challenge 后成功（当前 200 OK 是 registrar 直接接受，`auth_rounds=0`，没走 AKA 挑战——和历史记录的 `401 → AKA → 200 OK` 路径不同，需要确认是运营商行为变化还是实现问题）。
+- [ ] 423 Min-Expires 协商后成功。
+- [ ] 421/494 sec-agree 升级后成功。
+- [ ] refresh 等待期间收到 MWI NOTIFY / SMS MESSAGE / INVITE，不掉注册且该帧最终被处理。
+- [ ] refresh 首候选失败、降级候选成功时不重建 bearer/ePDG；全部失败才重建并有明确诊断。
+
+Profile 兼容性（至少两个不同运营商，避免为单一 Maxis 行为过拟合）：
+
+- [ ] 完整 MMTEL feature tags + 动态 PANI/CNI；SMS-only Contact；显式 omit PANI / omit CNI；sec-agree auto / required / disabled；有 Route 与无 Route；roaming visited network identity。
+
+业务能力：
+
+- [ ] VoLTE 主叫、被叫（不进语音信箱）、双向 RTP 与静音恢复、SMS over IMS、MWI SUBSCRIBE/NOTIFY。
+- [ ] VoWiFi 主叫、被叫、切换和 refresh；长时间 refresh / 重注册。
+- [ ] ViLTE capability 与视频媒体协商（若当前版本宣称支持）。
+- [ ] 实机抓包确认 REGISTER 里的 PANI 内容与网络侧观测一致（设备上没有 `tcpdump`，需先安装）。
+
+VoLTE profile 三槽位编排：
+
+- [ ] 用户数据库 profile / 下载 catalog profile / 派生兜底各自完成注册与完整业务矩阵。
+- [ ] 切换候选时抓包确认 Call-ID、CSeq、Route、安全关联、P-CSCF 和 profile lease 不跨 profile 污染。
+- [ ] 两条不同基带线路配置不同顺序并同时运行，以及独立读卡器线路保存/恢复自己的顺序，确认互不影响。
+- [ ] 真实 bearer/QMI endpoint、AT CID、xfrm/IPsec、P-CSCF reporting 和 IMS profile lease 释放的集成测试。
+
+### VoNR / 5G SA
+
+当前只有 LTE/NR 通用数据模型基础，**不代表支持 VoNR**。
+
+- [ ] NR SA IMS PDU session/bearer 建立；5GS QoS flow、QFI 和语音媒体承载映射。
+- [ ] 从 modem/provider 获取 NR serving cell、NCI、TAC、注册域与 IMS capability。
+- [ ] 生成符合 NR 接入的 PANI/CNI，禁止仍标记为 E-UTRAN。
+- [ ] EPS fallback、RAT handover 和 registration continuity。
+- [ ] VoNR capability 探测——不能仅凭设备支持 5G 就报告 VoNR ready。
+- [ ] NR SA 注册、主叫、被叫、双向 RTP、DTMF、BYE、短信及回落场景测试，并在支持 NR IMS 的真实硬件和运营商网络上验收。
+
 ## P2：配置、故障和安全验收
 
 - [ ] 做真实掉电、磁盘满、只读文件系统、SQLite 损坏、WAL 恢复和服务强制终止测试。
@@ -124,6 +199,11 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ## 相关现行说明
 
+- 架构总览（线路模型、路由隔离、profile 选择）：`docs/ARCHITECTURE.md`
+- REGISTER 三态字段契约：`docs/IMS_REGISTER_TRISTATE_SCHEMA.md`
+- 410 基带崩溃分析与现场恢复：`docs/QCM410_BAM_DMUX_MODEM_CRASH.md`
+- UE 隔离（netns/veth）迁移设计：`docs/ue-isolation-migration.md`
+- eSIM MEP 预留接口设计：`docs/ESIM_MEP_INTERFACE_PLAN.md`
 - 用户入口和能力概览：项目根目录 `README.md`
 - 手动安装与升级：`docs/INSTALL.md`
 - 运行环境与 systemd：`docs/ENVIRONMENT.md`
