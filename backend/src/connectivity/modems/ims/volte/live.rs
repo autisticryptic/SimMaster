@@ -795,6 +795,21 @@ impl VolteRegisterVariant {
         }
     }
 
+    /// Preserve the request shape selected by the core and add the empty AKA
+    /// identity hint that lets it issue a 401/407 challenge.
+    ///
+    /// This is intentionally cumulative: a core that has already required
+    /// sec-agree must not lose Require/Proxy-Require when Authorization is
+    /// added. Maxis (50212) rejects those independent partial shapes, but
+    /// challenges the stacked request.
+    fn with_empty_aka_authorization(self) -> Self {
+        Self {
+            authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+            ..self
+        }
+        .requiring_sec_agree()
+    }
+
     fn requiring_sec_agree_without_proxy(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -924,7 +939,8 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
         policy: sip::RegisterRequestPolicy {
             advertise_sec_agree: advertise,
             require_sec_agree: required,
-            proxy_require_sec_agree: profile.ims.register.proxy_require_sec_agree_headers,
+            proxy_require_sec_agree: required
+                && profile.ims.register.proxy_require_sec_agree_headers,
             include_mmtel_features: profile.ims.register.include_mmtel_features,
             include_video_feature: false,
             include_route_header: profile.ims.register.include_route_header,
@@ -994,7 +1010,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     // first attempt, and this only runs after every other shape was rejected.
     // Skipped when the profile already starts from an empty AKA, since then the
     // shapes above already carry one.
-    if authorization == VolteInitialAuthorization::None {
+    if authorization == VolteInitialAuthorization::None && !disabled {
         // The empty AKA alone is not enough. The observed Maxis sequence is
         // cumulative -- Security-Client, then Require, then Proxy-Require, then
         // the empty AKA -- and a candidate carrying only the last step is
@@ -2458,38 +2474,11 @@ async fn connect_family(
                     )
                     .await;
                 let next_variant_available = register_variants.peek().is_some();
-                if let Some(upgraded_variant) = sec_agree_retry_variant(profile, variant, &failure)
+                if let Some(upgraded_variant) =
+                    next_dynamic_register_variant(profile, variant, &failure)
                 {
                     last_error = Some(error);
                     pending_variant = Some(upgraded_variant);
-                    continue;
-                }
-                if let Some(timeout_variant) =
-                    sec_agree_timeout_retry_variant(profile, variant, &failure)
-                {
-                    last_error = Some(error);
-                    pending_variant = Some(timeout_variant);
-                    continue;
-                }
-                if let Some(spaced_security_variant) =
-                    sec_agree_spaced_security_retry_variant(variant, &failure)
-                {
-                    last_error = Some(error);
-                    pending_variant = Some(spaced_security_variant);
-                    continue;
-                }
-                if let Some(compact_security_variant) =
-                    sec_agree_compact_security_retry_variant(variant, &failure)
-                {
-                    last_error = Some(error);
-                    pending_variant = Some(compact_security_variant);
-                    continue;
-                }
-                if let Some(require_only_variant) =
-                    sec_agree_require_only_retry_variant(variant, &failure)
-                {
-                    last_error = Some(error);
-                    pending_variant = Some(require_only_variant);
                     continue;
                 }
                 if next_variant_available && sec_agree_require_only_was_rejected(variant, &failure)
@@ -6344,6 +6333,67 @@ fn sec_agree_timeout_retry_variant(
         .then(|| variant.requiring_sec_agree())
 }
 
+/// Advance one REGISTER request shape using only evidence from the response.
+///
+/// Ordering matters. Once a core has demanded sec-agree and rejects the fully
+/// declared unauthenticated request with 400, the field-tested next step is to
+/// add the empty AKA Authorization while preserving every sec-agree header.
+/// Security-Client formatting experiments come afterwards, so the known
+/// 421 -> 400 -> 401 path does not burn most of the bounded candidate budget.
+fn next_dynamic_register_variant(
+    profile: &CarrierProfile,
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    sec_agree_retry_variant(profile, variant, failure)
+        .or_else(|| sec_agree_timeout_retry_variant(profile, variant, failure))
+        .or_else(|| sec_agree_proxy_require_retry_variant(variant, failure))
+        .or_else(|| sec_agree_empty_aka_retry_variant(variant, failure))
+        .or_else(|| sec_agree_spaced_security_retry_variant(variant, failure))
+        .or_else(|| sec_agree_compact_security_retry_variant(variant, failure))
+        .or_else(|| sec_agree_require_only_retry_variant(variant, failure))
+}
+
+/// Some profiles already require sec-agree but omit Proxy-Require. A 400 on
+/// that initial full-format request is the measured signal to complete the
+/// declaration before adding Authorization or changing Security-Client syntax.
+///
+/// Restrict this transition to the untouched full offer. The final compact
+/// require-only fallback intentionally removes Proxy-Require; adding it back
+/// there would create a two-state retry loop until the candidate budget expires.
+fn sec_agree_proxy_require_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    (variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && !variant.policy.proxy_require_sec_agree
+        && variant.security_client_offer == VolteSecurityClientOffer::Full
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(400))
+    .then(|| variant.requiring_sec_agree())
+}
+
+/// A 400 after the network has explicitly required the complete sec-agree
+/// declaration is the observed signal that the core still needs the empty AKA
+/// identity hint before it can issue a challenge.
+///
+/// If the 400 was actually caused by Security-Client formatting, the resulting
+/// empty-AKA request may also receive 400; the next transition then proceeds to
+/// the spaced/compact formatting fallbacks without dropping Authorization.
+fn sec_agree_empty_aka_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    (variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && variant.authorization == VolteInitialAuthorization::None
+        && failure.auth_rounds == 0
+        && register_failure_status(failure) == Some(400))
+    .then(|| variant.with_empty_aka_authorization())
+}
+
 fn sec_agree_require_only_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -7657,6 +7707,10 @@ Content-Length: 0\r\n\r\n";
     fn explicit_sec_agree_disabled_blocks_status_and_timeout_escalation() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.sec_agree_mode = "disabled";
+        // Treat the explicit mode as authoritative even if a stale imported
+        // record still carries the legacy boolean switches.
+        profile.ims.register.require_sec_agree_headers = true;
+        profile.ims.register.proxy_require_sec_agree_headers = true;
         let base = register_variant("ims_features_aka_uri_first");
         let timeout = RegisterFailure {
             error: ImsError::new("ims_register_initial_receive_failed"),
@@ -7673,6 +7727,22 @@ Content-Length: 0\r\n\r\n";
 
         assert!(sec_agree_timeout_retry_variant(&profile, base, &timeout).is_none());
         assert!(sec_agree_retry_variant(&profile, base, &required).is_none());
+        assert!(next_dynamic_register_variant(&profile, base, &timeout).is_none());
+        assert!(next_dynamic_register_variant(&profile, base, &required).is_none());
+
+        // A static last-resort candidate must not silently override the same
+        // explicit disable when the profile starts without Authorization.
+        profile.ims.register.initial_authorization = "none";
+        let variants = register_variants(&profile);
+        assert!(variants.iter().all(|variant| {
+            !variant.policy.advertise_sec_agree
+                && !variant.policy.require_sec_agree
+                && !variant.policy.proxy_require_sec_agree
+                && !variant.server_required_sec_agree
+        }));
+        assert!(variants
+            .iter()
+            .all(|variant| variant.label != "ims_features_empty_aka_last_resort"));
     }
 
     #[test]
@@ -7758,6 +7828,242 @@ Content-Length: 0\r\n\r\n";
             sip::header_value(&request, "Proxy-Require").as_deref(),
             Some("sec-agree")
         );
+    }
+
+    /// Lock the exact request bytes for the known Maxis 50212 negotiation:
+    /// 421 asks for sec-agree, 400 asks for the empty AKA identity hint, then
+    /// the 401-authenticated request must retain the complete security headers.
+    #[test]
+    fn maxis_50212_dynamic_register_upgrade_is_cumulative_end_to_end() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "502",
+                "12",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("derived Maxis LTE profile");
+        let base = register_variants(profile)[0];
+        assert_eq!(base.authorization, VolteInitialAuthorization::None);
+        assert!(!base.policy.require_sec_agree);
+        assert!(!base.policy.proxy_require_sec_agree);
+
+        let requires_sec_agree = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n"
+                    .to_vec(),
+            ),
+            auth_rounds: 0,
+        };
+        let declared = next_dynamic_register_variant(profile, base, &requires_sec_agree)
+            .expect("421 must preserve the variant and declare sec-agree");
+        assert_eq!(declared.authorization, VolteInitialAuthorization::None);
+        assert!(declared.policy.advertise_sec_agree);
+        assert!(declared.policy.require_sec_agree);
+        assert!(declared.policy.proxy_require_sec_agree);
+
+        let needs_empty_aka = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        let cumulative = next_dynamic_register_variant(profile, declared, &needs_empty_aka)
+            .expect("400 after declared sec-agree must add empty AKA before format probes");
+        assert_eq!(
+            cumulative.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert_eq!(
+            cumulative.security_client_offer,
+            VolteSecurityClientOffer::Full,
+            "the empty-AKA transition must precede Security-Client format probes"
+        );
+        assert!(cumulative.policy.require_sec_agree);
+        assert!(cumulative.policy.proxy_require_sec_agree);
+
+        // If the cumulative request is still rejected, formatting fallbacks
+        // preserve Authorization and cannot cycle back from require-only to
+        // Proxy-Require.
+        let spaced = next_dynamic_register_variant(profile, cumulative, &needs_empty_aka)
+            .expect("a second 400 moves to the spaced Security-Client offer");
+        assert_eq!(
+            spaced.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert_eq!(
+            spaced.security_client_offer,
+            VolteSecurityClientOffer::FullSpaced
+        );
+        let compact = next_dynamic_register_variant(profile, spaced, &needs_empty_aka)
+            .expect("a third 400 moves to the compact Security-Client offer");
+        assert_eq!(
+            compact.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert_eq!(
+            compact.security_client_offer,
+            VolteSecurityClientOffer::Compact
+        );
+        let require_only = next_dynamic_register_variant(profile, compact, &needs_empty_aka)
+            .expect("a fourth 400 removes Proxy-Require as the final format fallback");
+        assert!(require_only.policy.require_sec_agree);
+        assert!(!require_only.policy.proxy_require_sec_agree);
+        assert_eq!(
+            require_only.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert!(
+            next_dynamic_register_variant(profile, require_only, &needs_empty_aka).is_none(),
+            "require-only rejection must advance to the next static candidate, not loop"
+        );
+
+        let after_auth = RegisterFailure {
+            auth_rounds: 1,
+            ..needs_empty_aka.clone()
+        };
+        assert!(next_dynamic_register_variant(profile, declared, &after_auth).is_none());
+
+        let identity = ImsIdentity {
+            private_user: "502121234567890@ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+            public_uri: "sip:502121234567890@ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+            contact_user: "502121234567890".to_string(),
+            home_domain: "ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+            contact_user_phone: false,
+        };
+        let route = ImsRoute {
+            local_addr: "192.0.2.2:5060".parse().unwrap(),
+            pcscf_addr: "192.0.2.1:5060".parse().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let ids = RequestIds::fresh(1);
+        let request_uri = sip::register_request_uri(profile, &route);
+        let initial_authorization = cumulative
+            .authorization
+            .build(profile.ims.realm, &identity, &request_uri)
+            .expect("cumulative request carries empty AKA Authorization");
+        let security_client = cumulative
+            .security_client_offer
+            .build(offered_security(5060, 5062), profile);
+        let initial = sip::build_register_from_profile_with_target_visited_and_access(
+            profile,
+            sip::RegisterTarget::from_profile(profile),
+            sip::RegisterPhase::Initial,
+            &identity,
+            &route,
+            &ids,
+            profile.ims.register.expires_seconds,
+            Some(&initial_authorization),
+            Some(&security_client),
+            None,
+            "urn:uuid:maxis-register-flow-test",
+            cumulative.policy,
+            None,
+            None,
+        );
+
+        assert!(sip::header_value(&initial, "Security-Client").is_some());
+        assert_eq!(
+            sip::header_value(&initial, "Require").as_deref(),
+            Some("sec-agree")
+        );
+        assert_eq!(
+            sip::header_value(&initial, "Proxy-Require").as_deref(),
+            Some("sec-agree")
+        );
+        assert!(
+            sip::header_value(&initial, "Authorization").is_some_and(|value| {
+                value.starts_with(&format!("Digest uri=\"{request_uri}\",username="))
+                    && value.contains("algorithm=AKAv1-MD5")
+                    && value.contains("response=\"\"")
+                    && value.contains("nonce=\"\"")
+            })
+        );
+        assert_eq!(
+            sip::header_value(&initial, "CSeq").as_deref(),
+            Some("1 REGISTER")
+        );
+        let call_id = sip::header_value(&initial, "Call-ID").expect("initial Call-ID");
+
+        // The hardware-backed authenticator computes the real digest after 401;
+        // this builder-level assertion locks the headers and transaction identity
+        // it receives from VolteRegisterAuthenticator::authenticated_request.
+        let mut authenticated_ids = ids.clone();
+        authenticated_ids.cseq = 2;
+        let authenticated = sip::build_register_from_profile_with_target_visited_and_access(
+            profile,
+            sip::RegisterTarget::from_profile(profile),
+            sip::RegisterPhase::Authenticated,
+            &identity,
+            &route,
+            &authenticated_ids,
+            profile.ims.register.expires_seconds,
+            Some("Authorization: Digest username=\"impi\",realm=\"ims\",nonce=\"n\",uri=\"sip:ims\",response=\"proof\",algorithm=AKAv1-MD5"),
+            Some(&security_client),
+            Some("ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;spi-c=1;spi-s=2;port-c=5060;port-s=5062"),
+            "urn:uuid:maxis-register-flow-test",
+            cumulative.policy,
+            None,
+            None,
+        );
+        assert_eq!(
+            sip::header_value(&authenticated, "Call-ID").as_deref(),
+            Some(call_id.as_str())
+        );
+        assert_eq!(
+            sip::header_value(&authenticated, "CSeq").as_deref(),
+            Some("2 REGISTER")
+        );
+        for header in [
+            "Authorization",
+            "Security-Client",
+            "Security-Verify",
+            "Require",
+            "Proxy-Require",
+        ] {
+            assert!(
+                sip::header_value(&authenticated, header).is_some(),
+                "authenticated REGISTER lost {header}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_required_sec_agree_400_completes_proxy_require_before_empty_aka() {
+        let profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let failure = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        let partial = register_variant("ims_features_no_initial_authorization")
+            .requiring_sec_agree()
+            .requiring_sec_agree_without_proxy();
+        assert_eq!(
+            partial.security_client_offer,
+            VolteSecurityClientOffer::Full
+        );
+        assert_eq!(partial.authorization, VolteInitialAuthorization::None);
+        assert!(partial.policy.require_sec_agree);
+        assert!(!partial.policy.proxy_require_sec_agree);
+
+        let complete = next_dynamic_register_variant(&profile, partial, &failure)
+            .expect("400 on a profile-level Require must add Proxy-Require first");
+        assert_eq!(complete.authorization, VolteInitialAuthorization::None);
+        assert!(complete.policy.require_sec_agree);
+        assert!(complete.policy.proxy_require_sec_agree);
+        assert_eq!(
+            complete.security_client_offer,
+            VolteSecurityClientOffer::Full
+        );
+
+        let with_empty_aka = next_dynamic_register_variant(&profile, complete, &failure)
+            .expect("the next 400 must add empty AKA after Proxy-Require");
+        assert_eq!(
+            with_empty_aka.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert!(with_empty_aka.policy.require_sec_agree);
+        assert!(with_empty_aka.policy.proxy_require_sec_agree);
     }
 
     #[test]
