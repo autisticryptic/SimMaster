@@ -266,6 +266,19 @@ where
                             error: None,
                         })
                         .await;
+                        let partial = plan
+                            .pcscf_order()
+                            .first()
+                            .is_some_and(|family| !bearer_has_family(&bearer, *family));
+                        if partial && !plan.single_family_fallbacks().is_empty() {
+                            // A reconnect can retain a bearer that the network
+                            // provisioned with only one address family. Treat
+                            // it like a partial newly-created dual bearer so
+                            // the configured single-family fallbacks run.
+                            disconnect_bearer(&path).await;
+                            delete_bearer(modem, &path).await?;
+                            continue;
+                        }
                         return Ok(bearer);
                     }
                     Err(error) => {
