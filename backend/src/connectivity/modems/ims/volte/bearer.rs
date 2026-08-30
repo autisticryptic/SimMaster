@@ -234,6 +234,20 @@ where
                         error: result.as_ref().err().cloned(),
                     })
                     .await;
+                    if let Ok(ref bearer) = result {
+                        let partial = plan
+                            .pcscf_order()
+                            .first()
+                            .is_some_and(|family| !bearer_has_family(bearer, *family));
+                        if partial && !plan.single_family_fallbacks().is_empty() {
+                            // A reused dual bearer can be just as partial as a
+                            // newly-created one. Remove it so the ordered queue
+                            // below can try the requested single-family bearer.
+                            disconnect_bearer(&path).await;
+                            delete_bearer(modem, &path).await?;
+                            continue;
+                        }
+                    }
                     return result;
                 }
                 observe(BearerAttempt {
