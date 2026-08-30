@@ -2779,6 +2779,52 @@ mod tests {
     }
 
     #[test]
+    fn legacy_automatic_ip_family_order_migrates_to_ipv6_first() {
+        let mut config = AppConfig::default();
+        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        profile.volte_ip_families = vec![
+            VolteIpFamily::Ipv4v6,
+            VolteIpFamily::Ipv4,
+            VolteIpFamily::Ipv6,
+        ];
+        profile.volte_ip_families_auto = true;
+        config.line_profiles.push(profile);
+
+        assert!(migrate_legacy_volte_ip_family_defaults(&mut config));
+        assert_eq!(
+            config.line_profiles[0].volte_ip_families,
+            vec![
+                VolteIpFamily::Ipv4v6,
+                VolteIpFamily::Ipv6,
+                VolteIpFamily::Ipv4,
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_ip_family_order_is_not_migrated() {
+        let mut config = AppConfig::default();
+        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        profile.volte_ip_families = vec![
+            VolteIpFamily::Ipv4v6,
+            VolteIpFamily::Ipv4,
+            VolteIpFamily::Ipv6,
+        ];
+        profile.volte_ip_families_auto = false;
+        config.line_profiles.push(profile);
+
+        assert!(!migrate_legacy_volte_ip_family_defaults(&mut config));
+        assert_eq!(
+            config.line_profiles[0].volte_ip_families,
+            vec![
+                VolteIpFamily::Ipv4v6,
+                VolteIpFamily::Ipv4,
+                VolteIpFamily::Ipv6,
+            ]
+        );
+    }
+
+    #[test]
     fn legacy_line_profile_gets_default_volte_profile_attempt_order() {
         let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
             "line_id": "line-0123456789abcdef0123456789abcdef"
@@ -4172,13 +4218,13 @@ impl VolteProfileSelectionConfig {
 /// tried first when the network does NOT force a specific one, and the order in
 /// which the bearer's local addresses are offered to SIP/REGISTER. When the
 /// network explicitly signals `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed`, that forced
-/// family is honored regardless of this preference. Default is `Ipv4First`:
-/// on an unclear failure, IPv4 is tried before IPv6.
+/// family is honored regardless of this preference. Default is `Ipv6First`:
+/// on an unclear failure, IPv6 is tried before IPv4.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum VolteIpFamilyPreference {
-    Ipv6First,
     #[default]
+    Ipv6First,
     Ipv4First,
     Ipv6Only,
     Ipv4Only,
@@ -4233,6 +4279,29 @@ impl VolteIpFamily {
 
 fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
     VolteIpFamilyPreference::default().to_families()
+}
+
+/// Older releases used `[ipv4v6, ipv4, ipv6]` for automatic lines. Keep
+/// explicit operator choices intact, but migrate that generated default to the
+/// current dual-stack -> IPv6 -> IPv4 order when loading persisted settings.
+fn migrate_legacy_volte_ip_family_defaults(config: &mut AppConfig) -> bool {
+    let legacy = vec![
+        VolteIpFamily::Ipv4v6,
+        VolteIpFamily::Ipv4,
+        VolteIpFamily::Ipv6,
+    ];
+    let current = default_line_volte_ip_families();
+    if legacy == current {
+        return false;
+    }
+    let mut changed = false;
+    for profile in &mut config.line_profiles {
+        if profile.volte_ip_families_auto && profile.volte_ip_families == legacy {
+            profile.volte_ip_families = current.clone();
+            changed = true;
+        }
+    }
+    changed
 }
 
 fn default_line_volte_ip_families_auto() -> bool {
@@ -4531,8 +4600,8 @@ pub struct LineProfileConfig {
     #[serde(default)]
     pub ims_access_preference: ImsAccessPreference,
     /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
-    /// enable, in fallback order. `[Ipv4v6, Ipv4, Ipv6]` tries dual-stack, then
-    /// IPv4, then IPv6; `[Ipv6]` is IPv6-only. An empty list is invalid.
+    /// enable, in fallback order. The default `[Ipv4v6, Ipv6, Ipv4]` tries dual-stack,
+    /// then IPv6, then IPv4; `[Ipv6]` is IPv6-only. An empty list is invalid.
     #[serde(default = "default_line_volte_ip_families")]
     pub volte_ip_families: Vec<VolteIpFamily>,
     /// Whether the family order is still automatic. Automatic lines may use
@@ -5587,6 +5656,7 @@ impl ConfigManager {
 
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
+        let volte_ip_family_defaults_changed = migrate_legacy_volte_ip_family_defaults(&mut config);
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -5595,7 +5665,11 @@ impl ConfigManager {
             save_lock: Mutex::new(()),
         };
 
-        if !file_existed || templates_changed || video_gates_changed {
+        if !file_existed
+            || templates_changed
+            || video_gates_changed
+            || volte_ip_family_defaults_changed
+        {
             manager.save()?;
         }
         Ok(manager)

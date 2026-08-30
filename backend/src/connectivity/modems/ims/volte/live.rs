@@ -1684,8 +1684,8 @@ async fn connect_inner(
         sim_override,
     )
     .await?;
-    // A line's explicit order remains authoritative. The persisted default
-    // (`ipv4v6 -> ipv4 -> ipv6`) is the one case where the LTE catalog's
+    // A line's explicit order remains authoritative. The persisted automatic
+    // default (`ipv4v6 -> ipv6 -> ipv4`) is the one case where the LTE catalog's
     // `access.lte.ip_family` may provide a better first single-family hint;
     // fallback still retains both families and is driven by network errors.
     if line_ip_families_auto {
