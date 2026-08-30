@@ -608,9 +608,13 @@ fn worker_host_route_op(
         .settings
         .local_addr_for_family(host)
         .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+    let via = bearer
+        .settings
+        .gateway_for_family(host)
+        .map(|gateway| gateway.to_string());
     Ok(NetConfigOp::RouteReplace {
         target: host_selector(host),
-        via: None,
+        via,
         dev: Some(bearer.interface.clone()),
         src: Some(source.to_string()),
         table: None,
@@ -843,19 +847,19 @@ async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result
     let destination = host_selector(host);
     let family = if host.is_ipv6() { Some("-6") } else { None };
     let table = table.to_string();
+    let gateway = bearer
+        .settings
+        .gateway_for_family(host)
+        .map(|gateway| gateway.to_string());
     let mut args = Vec::new();
     if let Some(family) = family {
         args.push(family);
     }
-    args.extend_from_slice(&[
-        "route",
-        "replace",
-        &destination,
-        "dev",
-        &bearer.interface,
-        "table",
-        &table,
-    ]);
+    args.extend_from_slice(&["route", "replace", &destination]);
+    if let Some(gateway) = gateway.as_deref() {
+        args.extend_from_slice(&["via", gateway]);
+    }
+    args.extend_from_slice(&["dev", &bearer.interface, "table", &table]);
     run_ip(&args).await.map(|_| ())
 }
 

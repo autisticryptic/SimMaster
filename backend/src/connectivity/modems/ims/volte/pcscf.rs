@@ -112,6 +112,19 @@ impl ImsIpSettings {
         }
     }
 
+    /// Select the modem-provided next hop for a destination family.
+    ///
+    /// QMI/WWAN links are point-to-point even though ModemManager reports a
+    /// prefix, so private IMS peers (P-CSCF, DNS and media) must be routed via
+    /// this gateway rather than treated as directly reachable on the netdev.
+    pub fn gateway_for_family(&self, destination: IpAddr) -> Option<IpAddr> {
+        if destination.is_ipv6() {
+            self.ipv6_gateway
+        } else {
+            self.ipv4_gateway
+        }
+    }
+
     /// Available bearer addresses in the plan's family order.
     pub fn ordered_local_addrs(&self, plan: &ImsConnectionPlan) -> Vec<IpAddr> {
         let mut addresses = Vec::with_capacity(2);
@@ -1072,6 +1085,19 @@ IPv4 primary DNS: 10.0.0.53";
             Some("2001:db8::2".parse().unwrap())
         );
         assert_eq!(settings.local_addr(), Some("2001:db8::2".parse().unwrap()));
+    }
+
+    #[test]
+    fn gateway_for_family_matches_destination_and_omits_cross_family() {
+        let settings = parse_ip_settings(SAMPLE);
+        assert_eq!(
+            settings.gateway_for_family("198.51.100.10".parse().unwrap()),
+            Some("10.0.0.1".parse().unwrap())
+        );
+        assert_eq!(
+            settings.gateway_for_family("2001:db8::10".parse().unwrap()),
+            Some("2001:db8::1".parse().unwrap())
+        );
     }
 
     #[test]
