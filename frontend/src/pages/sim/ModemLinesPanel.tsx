@@ -999,9 +999,6 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box minWidth={0}>
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
-                        <Typography variant="caption" color="text.secondary">
-                          独立于其他基带管理；连接阶段与地址族详情见线路活动日志
-                        </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
