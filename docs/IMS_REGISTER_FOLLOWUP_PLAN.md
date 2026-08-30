@@ -632,16 +632,22 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 修复前（commit `f44aac8` 及更早）这里会打印 `192.0.2.1:53`——端口被静默改回 53。
   - 测试后已把 DNS 恢复为 `['1.1.1.1', '8.8.8.8']`。
   - 说明：未用 tcpdump 抓包，设备上没有该工具；证据是运行时日志打印的目标 `SocketAddr`，它就是 `send_to()` 的实际目标。
-- [x] VoWiFi REGISTER 累计协商回归已在代码侧修复（2026-08-30，代码已完成，待构建部署）。
+- [x] VoWiFi REGISTER 累计协商回归已完成代码修复、构建部署和 410 实机闭环（2026-08-30，commit `d14a76d`）。
   - 410 旧版本已证明链路可达 `ePDG DNS → IKE → Child SA → ESP → SIP REGISTER`；本轮修复点是旧代码在 `standard_3gpp_conservative → 421`、完整 sec-agree → `400` 后退出当前候选，未继续累积到已知可工作的空 AKA 形态。
   - 新逻辑把请求形态作为单调状态累计推进：无 Authorization → 完整 sec-agree → 完整 sec-agree + URI-first 空 AKA → compact → minimal；每次只根据当前响应生成下一个候选，不重新从不相关静态候选起步。
   - 认证 REGISTER 继承网络已经要求的 sec-agree 声明；只有 challenge 真正提供并选择 `Security-Server` 时才生成 `Security-Verify`。
   - 新增端到端字节级测试 `maxis_50212_vowifi_dynamic_register_upgrade_is_cumulative_end_to_end`，使用真实派生 Maxis 50212 Wi-Fi profile 覆盖 `421 → 完整 sec-agree → 400 → sec-agree + aka_empty_uri_first → 401/407 → 认证 REGISTER`，并断言 Route、PANI、P-Preferred-Identity、Call-ID/CSeq 与安全头状态不丢失。
   - 新增缓存测试 `response_driven_register_success_cache_preserves_the_full_shape`，确认 refresh/重连能复用完整动态成功形态，同时不会跨越同 ID profile 的重新加载。
   - 验证结果：WSL Debian `vowifi::live::tests` 为 `72 passed; 0 failed`；完整后端为 `1365 passed; 0 failed; 3 ignored`；前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 全部通过。
-- [ ] 将本轮 VoWiFi 修复构建并部署到 410，实机确认完整顺序：`421 → full sec-agree → 400 → full sec-agree + aka_empty_uri_first → 401/407 → USIM AKA → authenticated REGISTER 200 OK`。
-  - REGISTER 成功后继续验收 SMS over IMS、主叫、被叫、双向 RTP，以及 refresh/重注册稳定性。
-- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但本轮本地 IMS REGISTER 修复尚未构建部署到 410 闭环。
+- [x] 将本轮 VoWiFi 修复构建并部署到 410，实机确认完整顺序：`421 → full sec-agree → 400 → full sec-agree + aka_empty_uri_first → 401/407 → USIM AKA → authenticated REGISTER 200 OK`（2026-08-30）。
+  - GitHub Actions `Build-Release` run `33291931876` 构建成功；发布版本为 `1.1.5`，ARM64 包 SHA-256 为 `3bc909c35ab23c7a93ecdf1ffd7bcbf519471d395c2d55b445fa0703500d0486`，包内 commit 为 `d14a76d`，运行二进制 MD5 为 `44f173d6b4727915697423ef2bbc41e1`。
+  - 部署前完整备份位于 `/opt/simadmin-backup-20260830-122557`，systemd 资源备份位于 `/root/simadmin-systemd-backup-20260830-122557`；部署只替换二进制、`www`、`system` 和 `meta.json`，保留线路配置、数据库和 carrier catalog。
+  - 部署后 `simadmin.service` 与 `simadmin-secondary-qmi.service` 均为 `active/running`、`NRestarts=0`，恢复定时器为 `active/waiting`，`/api/health` 返回 `status=ok`、`version=1.1.5`；管理员密码重置后已用登录 API 验证会话可正常建立（文档不记录凭据）。
+  - 服务启动自动恢复和随后一次手动 `enabled=false → enabled=true` 干净重连都成功。手动重连中：attempt 1 `standard_3gpp_conservative` 收到 `421`；attempt 2 `catalog_v7_sec_agree_required` 携带完整 sec-agree 后收到 `400`；attempt 3 `catalog_v7_sec_agree_required_aka_empty_uri_first` 同时保留 sec-agree 并设置 `initial_authorization="aka_empty_uri_first"`，随后收到 AKAv1-MD5 challenge 和一组 `Security-Server` offer。
+  - 硬件 USIM AKA 后生成带 `Authorization`、`Security-Verify` 和 `Security-Client` 的受保护 REGISTER，CSeq 为 `2`；最终收到 **200 OK**，包含 Service-Route、2 个 P-Associated-URI 和 2 个 Contact binding。API 在启用后的第二次轮询回到 `runtime_phase=voice_ready`、`runtime_registered=true`，匹配 profile 为 `derived_3gpp_vowifi_50212`。
+  - 已知遗留：禁用线路时显式 de-REGISTER 收到 `400`，记录 `VoWiFi explicit IMS unregister finished result=Rejected`；它没有阻断随后重连和注册，但优雅注销兼容性仍需单独调查。
+  - REGISTER 成功后仍需继续验收 SMS over IMS、主叫、被叫、双向 RTP，以及 refresh/重注册稳定性。
+- [ ] 真实设备/运营商网络完整业务验收：本轮已经闭环 ePDG/IKE/Child SA/ESP 和 IMS REGISTER 200 OK；尚缺 SMS、主被叫、双向 RTP、MWI、长时间 refresh/重注册和多运营商矩阵。
   - **纠正一处此前写错的结论（2026-08-30）。** 本项原先写成“运营商阻塞在 `400/421`”，那是照抄更早 session 的说法，没有对照已有记录核实。实际上 **2026-08-22 这条线路曾拿到 `200 OK`**（修复提交 `97e982d`、`2818de0`、`dd4bb0f`，当时 SMS 与 Voice over IMS readiness 都验过）。所以这更可能是回归，不是运营商侧拒绝。把它记成“运营商阻塞”会让后续 session 放弃排查，这个错误说明必须留在文档里。
   - 当时确认过的 Maxis(50212) 四步握手：
     | 发送 | 运营商回 |
