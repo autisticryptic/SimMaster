@@ -144,6 +144,29 @@ pub struct CarrierCatalogStatusResponse {
     pub message: String,
 }
 
+/// One downloadable catalog database offered by the upstream release.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct CarrierCatalogAsset {
+    pub name: String,
+    /// Human-readable name derived from the filename, for the picker.
+    pub label: String,
+    pub size: u64,
+    pub download_url: String,
+}
+
+/// Every catalog database in the upstream release, discovered at request time.
+///
+/// Enumerated rather than hardcoded: the release adds and renames databases
+/// (an `iphone16promax-26.6` became `26.6.1`, silently breaking a pinned URL),
+/// so a fixed list goes stale without any signal.
+#[derive(Debug, Default, Serialize)]
+pub struct CarrierCatalogAssetsResponse {
+    pub release_tag: String,
+    pub published_at: String,
+    pub assets: Vec<CarrierCatalogAsset>,
+    pub message: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct CarrierCatalogInstallRequest {
     pub proxy_prefix: Option<String>,

@@ -2018,6 +2018,10 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(get_carrier_catalog_status_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/carrier-catalog/assets",
+            get(get_carrier_catalog_assets_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/carrier-catalog/install",
             post(install_carrier_catalog_handler).options(options_handler),
         )

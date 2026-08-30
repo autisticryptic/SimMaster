@@ -102,12 +102,20 @@ const LINE_DATA_REGISTER_COOLDOWN_SECS: u64 = 120;
 const LINE_DATA_CONNECT_COOLDOWN_SECS: u64 = 60;
 const CALL_MONITOR_INTERVAL_SECS: u64 = 2;
 const CALL_END_MISSING_POLLS: u8 = 2;
-const DEFAULT_CARRIER_CATALOG_URL: &str = "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-pixel-mustang.sqlite3";
-const ALLOWED_CARRIER_CATALOG_URLS: &[&str] = &[
-    DEFAULT_CARRIER_CATALOG_URL,
-    "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-iphone16promax-26.6.sqlite3",
-    "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-ios-ipcc.sqlite3",
-];
+/// GitHub API endpoint for the carrier catalog releases.
+const CARRIER_CATALOG_RELEASE_API: &str =
+    "https://api.github.com/repos/autisticryptic/carrier_Bundles/releases/latest";
+/// Prefix every legitimate catalog asset URL shares.
+///
+/// Replaces the old exact-URL allowlist. That list pinned tag
+/// `v0.3.0-catalog-v7` and three filenames, which broke twice over: the release
+/// renamed `iphone16promax-26.6` to `26.6.1`, so that entry became a 404, and a
+/// fourth database (`xiaomi15ultra-xuanyuan-baseband`) was never reachable.
+/// Validating the prefix keeps the SSRF guard — downloads still cannot leave
+/// this repository's release assets — while letting the set of databases change
+/// upstream without a code change.
+const CARRIER_CATALOG_URL_PREFIX: &str =
+    "https://github.com/autisticryptic/carrier_Bundles/releases/download/";
 const MAX_CARRIER_CATALOG_BYTES: usize = 64 * 1024 * 1024;
 const MM_MODEM_STATE_SEARCHING: i32 = 7;
 /// Local sink used by HTTP-originated supplementary calls until a local audio
@@ -8801,8 +8809,149 @@ pub async fn get_carrier_catalog_status_handler(
     }
 }
 
+/// Whether a URL is a catalog database asset we are willing to fetch.
+///
+/// Two conditions, both required: it lives under this repository's release
+/// download path, and it names a `.sqlite3` file. The release also publishes
+/// build logs, manifests and checksum files; those are not databases and must
+/// not be installable as one.
+///
+/// The path check rejects `..` so a crafted URL cannot climb out of the release
+/// prefix while still appearing to start with it.
+fn is_allowed_carrier_catalog_url(url: &str) -> bool {
+    let Some(path) = url.strip_prefix(CARRIER_CATALOG_URL_PREFIX) else {
+        return false;
+    };
+    !path.is_empty()
+        && !path.contains("..")
+        && path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| name.ends_with(".sqlite3"))
+}
+
+/// Turn a catalog filename into something readable for the picker.
+///
+/// `carrier-bundles-iphone16promax-26.6.1.sqlite3` -> `iphone16promax 26.6.1`.
+/// Deliberately mechanical: a hand-maintained label map is what went stale in
+/// the first place.
+fn carrier_catalog_asset_label(name: &str) -> String {
+    let trimmed = name
+        .strip_suffix(".sqlite3")
+        .unwrap_or(name)
+        .strip_prefix("carrier-bundles-")
+        .unwrap_or(name);
+    if trimmed.is_empty() {
+        name.to_string()
+    } else {
+        trimmed.replace('-', " ")
+    }
+}
+
+/// List every catalog database in the upstream release.
+async fn fetch_carrier_catalog_assets(
+    proxy_prefix: &str,
+) -> Result<crate::api::models::CarrierCatalogAssetsResponse, String> {
+    use crate::api::models::{CarrierCatalogAsset, CarrierCatalogAssetsResponse};
+
+    let client = crate::services::system::ota::build_ota_http_client()?;
+    let mut last_error = String::new();
+    for url in
+        crate::services::system::ota::ota_request_urls(CARRIER_CATALOG_RELEASE_API, proxy_prefix, false)
+    {
+        let response = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = format!("carrier_catalog_release_request_failed:{error}");
+                continue;
+            }
+        };
+        if !response.status().is_success() {
+            last_error = format!("carrier_catalog_release_http_status:{}", response.status());
+            continue;
+        }
+        let release = match response
+            .json::<crate::api::models::OtaLatestReleaseResponse>()
+            .await
+        {
+            Ok(release) => release,
+            Err(error) => {
+                last_error = format!("carrier_catalog_release_parse_failed:{error}");
+                continue;
+            }
+        };
+
+        let mut assets = release
+            .assets
+            .into_iter()
+            .filter(|asset| is_allowed_carrier_catalog_url(&asset.browser_download_url))
+            .map(|asset| CarrierCatalogAsset {
+                label: carrier_catalog_asset_label(&asset.name),
+                name: asset.name,
+                size: asset.size,
+                download_url: asset.browser_download_url,
+            })
+            .collect::<Vec<_>>();
+        // Largest first: the bigger bundles carry more carriers, so the most
+        // broadly useful database is the default choice.
+        assets.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.name.cmp(&b.name)));
+
+        if assets.is_empty() {
+            return Err(format!(
+                "carrier_catalog_release_has_no_database:{}",
+                release.tag_name
+            ));
+        }
+        return Ok(CarrierCatalogAssetsResponse {
+            release_tag: release.tag_name,
+            published_at: release.published_at,
+            message: format!("{} database(s) available", assets.len()),
+            assets,
+        });
+    }
+    Err(if last_error.is_empty() {
+        "carrier_catalog_release_request_failed".to_string()
+    } else {
+        last_error
+    })
+}
+
+/// GET /api/vowifi/carrier-catalog/assets
+pub async fn get_carrier_catalog_assets_handler(
+    State(app): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<crate::api::models::CarrierCatalogAssetsResponse>>,
+) {
+    let proxy_prefix =
+        requested_github_proxy_prefix(&app, params.get("proxy_prefix").cloned());
+    match fetch_carrier_catalog_assets(&proxy_prefix).await {
+        Ok(assets) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", assets)),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "Carrier catalog release unavailable",
+                crate::api::models::CarrierCatalogAssetsResponse {
+                    message: error,
+                    ..Default::default()
+                },
+            )),
+        ),
+    }
+}
+
 async fn download_carrier_catalog(asset_url: &str, proxy_prefix: &str) -> Result<Vec<u8>, String> {
-    if !ALLOWED_CARRIER_CATALOG_URLS.contains(&asset_url) {
+    if !is_allowed_carrier_catalog_url(asset_url) {
         return Err("carrier_catalog_asset_not_allowed".to_string());
     }
 
@@ -8856,14 +9005,34 @@ pub async fn install_carrier_catalog_handler(
         profile_store::ProfileStore,
     };
 
-    let asset_url = payload
+    let requested_url = payload
         .asset_url
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_CARRIER_CATALOG_URL)
-        .to_string();
+        .map(str::to_string);
     let proxy_prefix = requested_github_proxy_prefix(&app, payload.proxy_prefix);
+
+    // No explicit choice: resolve the current release's largest database rather
+    // than a compiled-in URL, which is what used to go stale on a rename.
+    let asset_url = match requested_url {
+        Some(url) => url,
+        None => match fetch_carrier_catalog_assets(&proxy_prefix).await {
+            Ok(listing) => match listing.assets.into_iter().next() {
+                Some(asset) => asset.download_url,
+                None => {
+                    return (
+                        StatusCode::OK,
+                        Json(ApiResponse::error(
+                            "carrier_catalog_release_has_no_database".to_string(),
+                        )),
+                    )
+                }
+            },
+            Err(error) => return (StatusCode::OK, Json(ApiResponse::error(error))),
+        },
+    };
+
     let result = async {
         let bytes = download_carrier_catalog(&asset_url, &proxy_prefix).await?;
         let target = app.carrier_catalog.path();
@@ -13954,5 +14123,78 @@ mod tests {
         assert_eq!(first_identity.imei.as_deref(), Some("490154203237518"));
         assert_eq!(second_identity.imei.as_deref(), Some("351234567890124"));
         assert_ne!(first_identity.imei, second_identity.imei);
+    }
+
+    /// The catalog URL guard replaced an exact-URL allowlist, so it now carries
+    /// the whole SSRF boundary for this download. A prefix check is only safe if
+    /// it actually confines the request to the release path.
+    #[test]
+    fn carrier_catalog_url_guard_confines_downloads_to_release_databases() {
+        // Any database under the release prefix is accepted, including ones that
+        // did not exist when this code was written -- that is the point.
+        for url in [
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-pixel-mustang.sqlite3",
+            // The rename that broke the old pinned list.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-iphone16promax-26.6.1.sqlite3",
+            // Present in the release but unreachable before.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/carrier-bundles-xiaomi15ultra-xuanyuan-baseband.sqlite3",
+            // A future tag must work without a code change.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v9.9.9-catalog-v8/carrier-bundles-anything-new.sqlite3",
+        ] {
+            assert!(
+                is_allowed_carrier_catalog_url(url),
+                "should accept a release database: {url}"
+            );
+        }
+
+        for url in [
+            // Another host entirely.
+            "https://evil.example/carrier-bundles-pixel-mustang.sqlite3",
+            // Right host, wrong repository.
+            "https://github.com/someone-else/carrier_Bundles/releases/download/v1/carrier-bundles-x.sqlite3",
+            // Right repo, but not a release asset path.
+            "https://github.com/autisticryptic/carrier_Bundles/raw/main/carrier-bundles-x.sqlite3",
+            // Non-database assets in the same release: logs, manifests and
+            // checksums must never install as a catalog.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/SHA256SUMS",
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/ipcc-manifest.json",
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v0.3.0-catalog-v7/pixel-build.log",
+            // Traversal that still starts with the prefix.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/v1/../../../etc/passwd.sqlite3",
+            // Prefix present but no asset named.
+            "https://github.com/autisticryptic/carrier_Bundles/releases/download/",
+            // Prefix appearing later in the string rather than at the start.
+            "https://evil.example/?u=https://github.com/autisticryptic/carrier_Bundles/releases/download/v1/x.sqlite3",
+        ] {
+            assert!(
+                !is_allowed_carrier_catalog_url(url),
+                "should reject: {url}"
+            );
+        }
+    }
+
+    /// Labels are derived from the filename because a hand-maintained map is
+    /// exactly what went stale before.
+    #[test]
+    fn carrier_catalog_labels_are_derived_from_the_filename() {
+        assert_eq!(
+            carrier_catalog_asset_label("carrier-bundles-iphone16promax-26.6.1.sqlite3"),
+            "iphone16promax 26.6.1"
+        );
+        assert_eq!(
+            carrier_catalog_asset_label("carrier-bundles-pixel-mustang.sqlite3"),
+            "pixel mustang"
+        );
+        assert_eq!(
+            carrier_catalog_asset_label("carrier-bundles-xiaomi15ultra-xuanyuan-baseband.sqlite3"),
+            "xiaomi15ultra xuanyuan baseband"
+        );
+        // An unexpected shape falls back to the raw name rather than producing
+        // an empty picker entry.
+        assert_eq!(carrier_catalog_asset_label("odd-name.sqlite3"), "odd-name");
+        assert_eq!(
+            carrier_catalog_asset_label("carrier-bundles-.sqlite3"),
+            "carrier-bundles-.sqlite3"
+        );
     }
 }
