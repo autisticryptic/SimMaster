@@ -507,9 +507,9 @@ fn infer_nr_access_type(
     profile_access_info: &str,
     serving_band: Option<&str>,
 ) -> Option<ImsAccessType> {
-    if let Some(band) = serving_band.and_then(|value| {
-        parse_band_number(value, &["NR N", "NR BAND ", "N"])
-    }) {
+    if let Some(band) =
+        serving_band.and_then(|value| parse_band_number(value, &["NR N", "NR BAND ", "N"]))
+    {
         if matches!(band, 34 | 38..=41 | 46..=48 | 53 | 77..=79 | 90 | 96 | 102 | 104) {
             return Some(ImsAccessType::NrTdd);
         }
@@ -590,11 +590,9 @@ mod tests {
         .expect("LTE TDD context");
 
         assert_eq!(context.access_type, ImsAccessType::EutranTdd);
-        assert!(
-            context
-                .cellular_access_info()
-                .starts_with("3GPP-E-UTRAN-TDD;")
-        );
+        assert!(context
+            .cellular_access_info()
+            .starts_with("3GPP-E-UTRAN-TDD;"));
     }
 
     #[test]
@@ -659,7 +657,10 @@ mod tests {
 
         assert!(runtime.context("3GPP-E-UTRAN-TDD").is_none());
         assert_eq!(
-            runtime.status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE).last_error.as_deref(),
+            runtime
+                .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE)
+                .last_error
+                .as_deref(),
             Some("line_absent")
         );
     }
@@ -672,17 +673,15 @@ mod tests {
             ("50212", 0, 1),
             ("50212", 1, 0),
         ] {
-            assert!(
-                ImsAccessNetworkContext::new(
-                    ImsAccessType::EutranFdd,
-                    plmn,
-                    cell_id,
-                    tac,
-                    Some(0),
-                    AccessNetworkSource::TestFixture,
-                )
-                .is_none()
-            );
+            assert!(ImsAccessNetworkContext::new(
+                ImsAccessType::EutranFdd,
+                plmn,
+                cell_id,
+                tac,
+                Some(0),
+                AccessNetworkSource::TestFixture,
+            )
+            .is_none());
         }
     }
 
@@ -711,10 +710,7 @@ mod tests {
             Some("3GPP-E-UTRAN-FDD"),
             None,
         );
-        assert_eq!(
-            fallback.source,
-            AccessIdentitySource::CompatibilityFallback
-        );
+        assert_eq!(fallback.source, AccessIdentitySource::CompatibilityFallback);
         assert_eq!(fallback.value.as_deref(), Some("3GPP-E-UTRAN-FDD"));
 
         let required = resolve_access_identity(

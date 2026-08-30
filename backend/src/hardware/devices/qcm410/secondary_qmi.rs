@@ -366,7 +366,9 @@ pub async fn wait_for_primary_qmi_ports(timeout: Duration) -> Vec<String> {
     while tokio::time::Instant::now() < deadline {
         if !ports.is_empty() {
             match stable_since {
-                Some(since) if tokio::time::Instant::now().duration_since(since) >= PRIMARY_PORT_SETTLE => {
+                Some(since)
+                    if tokio::time::Instant::now().duration_since(since) >= PRIMARY_PORT_SETTLE =>
+                {
                     break;
                 }
                 Some(_) => {}
@@ -1649,7 +1651,12 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        for forbidden in ["DATA6_CNTL", "wwan0qmi1", "wwan0at2", "rpmsg_wwan_ctrl_multi"] {
+        for forbidden in [
+            "DATA6_CNTL",
+            "wwan0qmi1",
+            "wwan0at2",
+            "rpmsg_wwan_ctrl_multi",
+        ] {
             assert!(
                 !directives.contains(forbidden),
                 "the unit must not hardcode {forbidden}"

@@ -387,7 +387,8 @@ impl LineRuntime {
 
     pub async fn activate_trunk_profile(&self, profile: &TrunkProfileConfig) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
-        self.voice_access.set_trunk_vowifi_only(effective.vowifi_only);
+        self.voice_access
+            .set_trunk_vowifi_only(effective.vowifi_only);
         self.trunk.activate_profile(&effective).await;
         self.trunk.status().await
     }
@@ -397,7 +398,8 @@ impl LineRuntime {
         profile: &TrunkProfileConfig,
     ) -> TrunkRuntimeStatus {
         let effective = self.effective_trunk_profile(profile);
-        self.voice_access.set_trunk_vowifi_only(effective.vowifi_only);
+        self.voice_access
+            .set_trunk_vowifi_only(effective.vowifi_only);
         self.trunk.reconcile_profile(&effective).await;
         self.trunk.status().await
     }
@@ -864,7 +866,8 @@ impl LineRuntimeRegistry {
         binding: &ModemBinding,
         conn: &Connection,
     ) {
-        if !binding.present || binding.line_kind == "reader" || binding.modem_path.trim().is_empty() {
+        if !binding.present || binding.line_kind == "reader" || binding.modem_path.trim().is_empty()
+        {
             line.ims_access_network
                 .clear("access_network_unavailable_for_line_kind");
             return;

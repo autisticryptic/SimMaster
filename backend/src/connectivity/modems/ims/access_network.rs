@@ -44,8 +44,12 @@ pub async fn serving_access_snapshot(
         get_network_info_for_modem(conn, &modem_path),
         get_cells_data_for_modem(conn, &modem_path),
     );
-    let network = network.map_err(|error| format!("access_network_network_query_failed:{error}"))?;
-    if !matches!(network.registration_status.as_str(), "registered" | "roaming" | "attached") {
+    let network =
+        network.map_err(|error| format!("access_network_network_query_failed:{error}"))?;
+    if !matches!(
+        network.registration_status.as_str(),
+        "registered" | "roaming" | "attached"
+    ) {
         return Err(format!(
             "access_network_not_registered:{}",
             network.registration_status

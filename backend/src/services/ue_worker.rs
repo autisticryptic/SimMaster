@@ -2470,7 +2470,11 @@ mod tests {
     #[cfg(unix)]
     fn fd_is_nonblocking(fd: std::os::fd::RawFd) -> bool {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        assert!(flags >= 0, "F_GETFL failed: {}", std::io::Error::last_os_error());
+        assert!(
+            flags >= 0,
+            "F_GETFL failed: {}",
+            std::io::Error::last_os_error()
+        );
         flags & libc::O_NONBLOCK != 0
     }
 

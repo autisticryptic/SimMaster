@@ -18,8 +18,8 @@ use crate::{
     connectivity::core::{
         access::ImsChannel,
         access_network::{
-            AccessIdentityPolicy, ImsAccessNetworkContext, ImsAccessNetworkRuntime,
-            resolve_access_identity,
+            resolve_access_identity, AccessIdentityPolicy, ImsAccessNetworkContext,
+            ImsAccessNetworkRuntime,
         },
         context::{ImsRoute, SipTransport},
         ims_failure::{ImsFailureDiagnostic, ImsServiceState, ImsServiceVerdict},

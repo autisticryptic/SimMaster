@@ -427,7 +427,10 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         println!("secondary-qmi-init: no QMI control port found; nothing to do");
         if !dry_run && std::env::var_os("NOTIFY_SOCKET").is_some() {
             let _ = tokio::process::Command::new("systemd-notify")
-                .args(["--ready", "--status=no QMI control port; primary QMI fallback"])
+                .args([
+                    "--ready",
+                    "--status=no QMI control port; primary QMI fallback",
+                ])
                 .status()
                 .await;
         }
@@ -740,17 +743,18 @@ async fn main() -> Result<()> {
         // every command below names both.
         let config_path = get_default_config_path();
         let database_path = get_data_db_path();
-        let report_rollback = |rollback: &config_maintenance::RollbackPaths, verb: &str| {
-            match (&rollback.database, &rollback.config_file) {
-                (None, None) => println!("Configuration {verb} onto a device with nothing to keep"),
-                _ => {
-                    println!("Configuration {verb}. Kept for rollback:");
-                    if let Some(path) = &rollback.database {
-                        println!("  database:    {}", path.display());
-                    }
-                    if let Some(path) = &rollback.config_file {
-                        println!("  config file: {}", path.display());
-                    }
+        let report_rollback = |rollback: &config_maintenance::RollbackPaths, verb: &str| match (
+            &rollback.database,
+            &rollback.config_file,
+        ) {
+            (None, None) => println!("Configuration {verb} onto a device with nothing to keep"),
+            _ => {
+                println!("Configuration {verb}. Kept for rollback:");
+                if let Some(path) = &rollback.database {
+                    println!("  database:    {}", path.display());
+                }
+                if let Some(path) = &rollback.config_file {
+                    println!("  config file: {}", path.display());
                 }
             }
         };
@@ -879,9 +883,7 @@ async fn main() -> Result<()> {
     // backup captures them. `SIMADMIN_OVERRIDES_DIR` still selects the file
     // backend for recovery.
     let sim_overrides = Arc::new(
-        connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(
-            &app_db,
-        )),
+        connectivity::modems::ims::profile_override::SimOverrideStore::resolve(Arc::clone(&app_db)),
     );
 
     // 初始化配置管理器
@@ -942,8 +944,7 @@ async fn main() -> Result<()> {
     let diagnostic_log_sink =
         services::system::diagnostic_log::spawn_diagnostic_logger(Arc::clone(&config_manager));
     let event_bus = Arc::new(
-        AppEventBus::new(Arc::clone(&app_db))
-            .with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
+        AppEventBus::new(Arc::clone(&app_db)).with_diagnostic_log(Arc::clone(&diagnostic_log_sink)),
     );
     let system_event_emitter = Arc::new(SystemEventEmitter::new(
         Arc::clone(&notification_sender),
@@ -1583,7 +1584,9 @@ mod udev_rule_tests {
         assert_eq!(rules.len(), 1, "{rules:?}");
         assert!(rules[0].contains(r#"SUBSYSTEM=="wwan""#), "{rules:?}");
         assert!(
-            !rules.iter().any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
+            !rules
+                .iter()
+                .any(|rule| rule.contains(r#"SUBSYSTEM=="net""#)),
             "{rules:?}"
         );
         assert!(

@@ -218,7 +218,7 @@
 
 ## 6. 尚未完成：VoWiFi refresh 对等性
 
-共享 REGISTER driver 已提供事务过滤；本轮已完成 VoWiFi refresh 的代码层 requeue 和失败阈值修复，但仍未完成真实 ePDG/IKE 网络验收，也没有直接复制 VoLTE 的候选阶梯。
+共享 REGISTER driver 已提供事务过滤；VoWiFi refresh 的代码层 requeue、失败阈值和响应驱动的有限候选阶梯均已完成，但仍未完成本轮修复后的真实 ePDG/IKE/IMS 注册闭环验收。
 
 - [x] 已定位 VoWiFi registration refresh 的全部入口和定时器。
   - 完成日期：2026-08-29
@@ -228,8 +228,12 @@
 - [x] requeue 帧在 TCP/UDP channel 转换、IPsec 重协商和 `into_parts` 后不丢失。
   - 完成日期：2026-08-29
   - 自动测试：`vowifi::channel::tests`（6 passed; 0 failed; 1 ignored）。
-- [ ] 评估是否需要与 VoLTE 相同的有限候选阶梯。
-  - 不要直接复制 VoLTE 顺序；需要根据 VoWiFi profile 字段定义安全候选，并确保已认证或已建立安全关联后不回退到违反运营商策略的不安全形态。
+- [x] 已完成 VoWiFi 专用的响应驱动有限候选阶梯（2026-08-30，代码已完成，待构建部署）。
+  - 没有直接复制 VoLTE 的静态顺序；运行时按网络响应累计推进：`421 + Require: sec-agree` / `494` → 完整 sec-agree → `400` 时在保留 sec-agree 的基础上增加 URI-first 空 AKA → 再按需尝试 compact/minimal Security-Client。
+  - 服务器已经要求 sec-agree 后，后续初始和认证 REGISTER 均保留 `Security-Client`、`Require: sec-agree`、`Proxy-Require: sec-agree`；challenge 没有 `Security-Server` 时不会伪造 `Security-Verify`。
+  - `auth_rounds > 0` 后禁止继续切换请求形态；显式 `sec_agree_mode=disabled` 永不动态升级；显式 profile 的非空 Authorization 不会被空 AKA 兜底覆盖。
+  - 每个 P-CSCF 的静态与动态候选共享 8 次安全预算；动态成功缓存保存完整请求形态，并用 profile 对象地址隔离同 ID 的自定义 profile 重载。
+  - 自动测试：`vowifi::live::tests` 为 `72 passed; 0 failed`；完整后端为 `1365 passed; 0 failed; 3 ignored`。
 - [x] 已增加 VoWiFi refresh 与 MWI NOTIFY 同时到达的回归测试。
   - 完成日期：2026-08-29
 - [x] 已增加 refresh 与 inbound MESSAGE/INVITE 同时到达的回归测试。
@@ -628,7 +632,16 @@ catalog v7 投影已支持若干 REGISTER 字段的字符串 `omit`，但还需�
   - 修复前（commit `f44aac8` 及更早）这里会打印 `192.0.2.1:53`——端口被静默改回 53。
   - 测试后已把 DNS 恢复为 `['1.1.1.1', '8.8.8.8']`。
   - 说明：未用 tcpdump 抓包，设备上没有该工具；证据是运行时日志打印的目标 `SocketAddr`，它就是 `send_to()` 的实际目标。
-- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但当前代码的 IMS REGISTER 修复尚未在 410 上闭环。
+- [x] VoWiFi REGISTER 累计协商回归已在代码侧修复（2026-08-30，代码已完成，待构建部署）。
+  - 410 旧版本已证明链路可达 `ePDG DNS → IKE → Child SA → ESP → SIP REGISTER`；本轮修复点是旧代码在 `standard_3gpp_conservative → 421`、完整 sec-agree → `400` 后退出当前候选，未继续累积到已知可工作的空 AKA 形态。
+  - 新逻辑把请求形态作为单调状态累计推进：无 Authorization → 完整 sec-agree → 完整 sec-agree + URI-first 空 AKA → compact → minimal；每次只根据当前响应生成下一个候选，不重新从不相关静态候选起步。
+  - 认证 REGISTER 继承网络已经要求的 sec-agree 声明；只有 challenge 真正提供并选择 `Security-Server` 时才生成 `Security-Verify`。
+  - 新增端到端字节级测试 `maxis_50212_vowifi_dynamic_register_upgrade_is_cumulative_end_to_end`，使用真实派生 Maxis 50212 Wi-Fi profile 覆盖 `421 → 完整 sec-agree → 400 → sec-agree + aka_empty_uri_first → 401/407 → 认证 REGISTER`，并断言 Route、PANI、P-Preferred-Identity、Call-ID/CSeq 与安全头状态不丢失。
+  - 新增缓存测试 `response_driven_register_success_cache_preserves_the_full_shape`，确认 refresh/重连能复用完整动态成功形态，同时不会跨越同 ID profile 的重新加载。
+  - 验证结果：WSL Debian `vowifi::live::tests` 为 `72 passed; 0 failed`；完整后端为 `1365 passed; 0 failed; 3 ignored`；前端 `pnpm type-check`、`pnpm lint`、`pnpm build:full` 全部通过。
+- [ ] 将本轮 VoWiFi 修复构建并部署到 410，实机确认完整顺序：`421 → full sec-agree → 400 → full sec-agree + aka_empty_uri_first → 401/407 → USIM AKA → authenticated REGISTER 200 OK`。
+  - REGISTER 成功后继续验收 SMS over IMS、主叫、被叫、双向 RTP，以及 refresh/重注册稳定性。
+- [ ] 真实设备/运营商网络完整验收：ePDG/IKE/Child SA/ESP 均已就绪，但本轮本地 IMS REGISTER 修复尚未构建部署到 410 闭环。
   - **纠正一处此前写错的结论（2026-08-30）。** 本项原先写成“运营商阻塞在 `400/421`”，那是照抄更早 session 的说法，没有对照已有记录核实。实际上 **2026-08-22 这条线路曾拿到 `200 OK`**（修复提交 `97e982d`、`2818de0`、`dd4bb0f`，当时 SMS 与 Voice over IMS readiness 都验过）。所以这更可能是回归，不是运营商侧拒绝。把它记成“运营商阻塞”会让后续 session 放弃排查，这个错误说明必须留在文档里。
   - 当时确认过的 Maxis(50212) 四步握手：
     | 发送 | 运营商回 |

@@ -228,7 +228,10 @@ mod tests {
         let b = stable_sip_instance("502120000000002@ims.example", None, false);
         assert_ne!(a, b, "different IMPIs must not share an instance id");
         // Same input, computed again as a fresh process would: unchanged.
-        assert_eq!(a, stable_sip_instance("502120000000001@ims.example", None, false));
+        assert_eq!(
+            a,
+            stable_sip_instance("502120000000001@ims.example", None, false)
+        );
     }
 
     #[test]
@@ -238,7 +241,9 @@ mod tests {
         let fields: Vec<&str> = uuid.split('-').collect();
         let lengths: Vec<usize> = fields.iter().map(|field| field.len()).collect();
         assert_eq!(lengths, vec![8, 4, 4, 4, 12], "uuid shape: {uuid}");
-        assert!(uuid.bytes().all(|byte| byte == b'-' || byte.is_ascii_hexdigit()));
+        assert!(uuid
+            .bytes()
+            .all(|byte| byte == b'-' || byte.is_ascii_hexdigit()));
         // Version nibble (§4.3 step 4) and variant bits (step 5).
         assert!(fields[2].starts_with('3'), "version 3 expected, got {uuid}");
         assert!(

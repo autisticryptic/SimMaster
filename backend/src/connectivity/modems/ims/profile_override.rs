@@ -1,4 +1,4 @@
-﻿//! Per-SIM user overrides for IMS connection facts.
+//! Per-SIM user overrides for IMS connection facts.
 //!
 //! The read-only carrier catalog is the baseline. A user may explicitly
 //! override a small set of connection facts for one physical SIM. Those edits
@@ -753,7 +753,6 @@ pub(crate) fn validate_stored_override_document(
     Ok(())
 }
 
-
 fn safe_regular_file_exists(path: &Path) -> Result<bool, OverrideError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
@@ -1177,7 +1176,13 @@ mod tests {
     /// Returns the `Arc<Database>` as well so a test can reopen the same store
     /// (modelling rediscovery after hotplug) without a second connection to the
     /// file competing for write locks.
-    fn temp_database_store(name: &str) -> (SimOverrideStore, Arc<crate::platform::db::Database>, PathBuf) {
+    fn temp_database_store(
+        name: &str,
+    ) -> (
+        SimOverrideStore,
+        Arc<crate::platform::db::Database>,
+        PathBuf,
+    ) {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(

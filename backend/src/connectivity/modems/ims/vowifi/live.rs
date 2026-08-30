@@ -124,6 +124,10 @@ pub(crate) const LIVE_IMS_REFRESH_REBUILD_FAILURES: u8 = 3;
 const LIVE_IMS_REGISTER_CANDIDATE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 const LIVE_IMS_REGISTER_DEFAULT_TTL: Duration = Duration::from_secs(300);
 const LIVE_IMS_REGISTER_MAX_TTL: Duration = Duration::from_secs(3600);
+/// Global bound for static and response-driven REGISTER shapes on one P-CSCF.
+/// The dynamic ladder is monotonic, but the cap remains a safety valve against
+/// future carrier-specific candidates accidentally creating a retry cycle.
+const LIVE_IMS_REGISTER_MAX_VARIANT_ATTEMPTS: usize = 8;
 const LIVE_SMS_SEND_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 const LIVE_SMS_FOLLOWUP_WINDOW: Duration = Duration::from_secs(20);
 const LIVE_VOICE_INVITE_TOTAL_TIMEOUT: Duration = Duration::from_secs(32);
@@ -591,7 +595,15 @@ impl XcapDigestProvider for VowifiXcapDigestProvider {
 #[derive(Debug, Clone)]
 struct LiveImsRegisterSuccessVariant {
     profile_id: &'static str,
-    label: &'static str,
+    /// Runtime address of the exact immutable profile used for the successful
+    /// exchange. Custom profile reloads leak a new immutable value, so the
+    /// address prevents a cached request shape from crossing profile edits that
+    /// happen to reuse the same profile ID.
+    profile_address: usize,
+    /// Cache the full response-driven shape rather than only its label. Dynamic
+    /// variants do not exist in the static candidate table and otherwise cannot
+    /// be preferred during refresh or a reconnect.
+    variant: LiveRegisterHeaderVariant,
     captured_at: Instant,
 }
 
@@ -1038,6 +1050,11 @@ fn read_u16_config(value: Option<String>, default: u16) -> u16 {
 struct LiveRegisterHeaderVariant {
     label: &'static str,
     force_sec_agree_headers: bool,
+    /// True only after the registrar explicitly demanded sec-agree. This is
+    /// separate from a profile-level `required` policy so dynamic retries can
+    /// preserve the network-selected declaration without overriding an
+    /// explicitly disabled profile.
+    server_required_sec_agree: bool,
     /// Challenge-first fallback: keep sec-agree headers off the initial
     /// REGISTER even when the profile marks security_agreement as required.
     suppress_sec_agree_headers: bool,
@@ -1050,7 +1067,7 @@ struct LiveRegisterHeaderVariant {
     header_profile: LiveRegisterHeaderProfile,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LiveSecurityClientFormat {
     FullSpaced,
     FullCompact,
@@ -1236,6 +1253,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_uri_first_full_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1248,6 +1266,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_uri_first_minimal_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1260,6 +1279,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_uri_first_no_algorithm",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1272,6 +1292,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_uri_first_pcscf_uri",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: false,
         include_security_client: true,
@@ -1284,6 +1305,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "profile_default_spaced_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1296,6 +1318,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_spaced_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1308,6 +1331,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_placeholder",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1320,6 +1344,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_zero_placeholder",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1332,6 +1357,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_no_security_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: false,
@@ -1344,6 +1370,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_plain_pani",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1359,6 +1386,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_no_cellular",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1374,6 +1402,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_no_visited",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1389,6 +1418,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_aka_empty_route_omitted",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: false,
         include_security_client: true,
@@ -1401,6 +1431,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "msisdn_phone_uri_ims_features",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1413,6 +1444,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_plain_pani",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1428,6 +1460,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_no_cellular_info",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1443,6 +1476,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_no_preferred_identity",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1458,6 +1492,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_unquoted_visited_network",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1473,6 +1508,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_no_visited_network",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1488,6 +1524,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_device_model_ua",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1503,6 +1540,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "ims_features_security_client_omitted",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: false,
@@ -1515,6 +1553,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "phone_uri_identity_ims_features",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1527,6 +1566,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "prefixed_identity_ims_features",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1539,6 +1579,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "route_omitted_spaced_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: false,
         include_security_client: true,
@@ -1551,6 +1592,7 @@ const LIVE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "sec_agree_required_spaced_sec_client",
         force_sec_agree_headers: true,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1567,6 +1609,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_aka_uri_first_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1579,6 +1622,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_no_initial_auth_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1591,6 +1635,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_aka_empty_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1603,6 +1648,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_aka_zero_sec_client",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1615,6 +1661,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_aka_uri_first_required_sec_agree",
         force_sec_agree_headers: true,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1627,6 +1674,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_sec_agree_required",
         force_sec_agree_headers: true,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1639,6 +1687,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_prefixed_private_identity",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1651,6 +1700,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_phone_uri_identity",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1663,6 +1713,7 @@ const GB_EE_REGISTER_HEADER_VARIANTS: &[LiveRegisterHeaderVariant] = &[
     LiveRegisterHeaderVariant {
         label: "gb_ee_msisdn_public_identity",
         force_sec_agree_headers: false,
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: true,
         include_security_client: true,
@@ -1695,6 +1746,9 @@ pub struct LiveStageError {
     /// Recording the demand here lets the variant loop satisfy it instead of
     /// retrying the same rejected shape.
     server_required_sec_agree: bool,
+    /// Authentication rounds completed before the shared REGISTER engine gave
+    /// up. Dynamic request-shape changes are forbidden once AKA has started.
+    register_auth_rounds: u8,
 }
 
 pub trait LiveStageAdapter: Send + Sync {
@@ -3550,81 +3604,93 @@ async fn run_register_exchange_with_pcscf(
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
+    let mut attempt_count = 0usize;
     let variants = live_register_header_variants_for_attempt(line_id, profile).await;
-    for variant in variants {
-        match run_register_exchange_with_pcscf_variant(
-            line_id,
-            profile,
-            gateway,
-            pcscf_addr,
-            variant,
-            access_network,
-        )
-        .await
-        {
-            Ok(response) => {
-                record_live_ims_register_success_variant(line_id, profile, variant).await;
-                return Ok(response);
-            }
-            Err(err) => {
+    for base_variant in variants {
+        let mut variant = base_variant;
+        loop {
+            if attempt_count >= LIVE_IMS_REGISTER_MAX_VARIANT_ATTEMPTS {
                 warn!(
-                    register_variant = variant.label,
-                    reason = err.reason.as_str(),
-                    "IMS REGISTER header variant failed"
+                    attempts = attempt_count,
+                    "IMS REGISTER variant budget exhausted"
                 );
-                // A terminal rejection cannot be cleared by another shape or
-                // P-CSCF; stop the whole ladder instead of exhausting it.
-                if live_register_error_is_terminal(&err) {
-                    return Err(err);
+                return Err(last_error
+                    .unwrap_or_else(|| live_stage_error("ims_register_variant_budget_exhausted")));
+            }
+            attempt_count += 1;
+            match run_register_exchange_with_pcscf_variant(
+                line_id,
+                profile,
+                gateway,
+                pcscf_addr,
+                variant,
+                access_network,
+            )
+            .await
+            {
+                Ok(response) => {
+                    record_live_ims_register_success_variant(line_id, profile, variant).await;
+                    return Ok(response);
                 }
-                // The core told us which extension it wants. Satisfying it is
-                // strictly better than moving on to the next shape, which
-                // would be rejected the same way.
-                if let Some(upgraded) = sec_agree_retry_variant(profile, variant, &err) {
-                    info!(
-                        register_variant = upgraded.label,
-                        "Retrying IMS REGISTER with sec-agree after 421 Extension Required"
+                Err(err) => {
+                    warn!(
+                        register_variant = variant.label,
+                        register_attempt = attempt_count,
+                        reason = err.reason.as_str(),
+                        "IMS REGISTER header variant failed"
                     );
-                    match run_register_exchange_with_pcscf_variant(
-                        line_id,
-                        profile,
-                        gateway,
-                        pcscf_addr,
-                        upgraded,
-                        access_network,
-                    )
-                    .await
-                    {
-                        Ok(response) => {
-                            record_live_ims_register_success_variant(line_id, profile, upgraded)
-                                .await;
-                            return Ok(response);
-                        }
-                        Err(retry_err) => {
-                            warn!(
-                                register_variant = upgraded.label,
-                                reason = retry_err.reason.as_str(),
-                                "IMS REGISTER sec-agree retry failed"
-                            );
-                            if live_register_error_is_terminal(&retry_err) {
-                                return Err(retry_err);
-                            }
-                            last_error = Some(retry_err);
-                            continue;
-                        }
+                    // A terminal rejection cannot be cleared by another shape or
+                    // P-CSCF; stop the whole ladder instead of exhausting it.
+                    if live_register_error_is_terminal(&err) {
+                        return Err(err);
                     }
+                    // Response-driven variants are cumulative. In particular,
+                    // once 421/494 has required sec-agree, a following 400 is
+                    // retried with the same declaration plus an empty AKA
+                    // Authorization instead of dropping back to a partial shape.
+                    if let Some(upgraded) =
+                        next_dynamic_live_register_variant(profile, variant, &err)
+                    {
+                        info!(
+                            previous_register_variant = variant.label,
+                            register_variant = upgraded.label,
+                            register_attempt = attempt_count + 1,
+                            sip_status = live_register_error_status(&err),
+                            "Retrying IMS REGISTER with cumulative response-driven variant"
+                        );
+                        last_error = Some(err);
+                        variant = upgraded;
+                        continue;
+                    }
+                    last_error = Some(err);
+                    break;
                 }
-                last_error = Some(err);
             }
         }
     }
     Err(last_error.unwrap_or_else(|| live_stage_error("ims_register_variant_missing")))
 }
 
-/// Upgrade a variant that was refused with `421 Extension Required: sec-agree`.
+/// Advance one response-driven REGISTER shape while preserving all choices the
+/// registrar has already made. The ordering mirrors the field-verified VoLTE
+/// path: declare sec-agree first, add empty AKA after a 400, and only then probe
+/// bounded Security-Client formatting variants.
+fn next_dynamic_live_register_variant(
+    profile: &CarrierProfile,
+    variant: LiveRegisterHeaderVariant,
+    error: &LiveStageError,
+) -> Option<LiveRegisterHeaderVariant> {
+    sec_agree_retry_variant(profile, variant, error)
+        .or_else(|| sec_agree_empty_aka_retry_variant(profile, variant, error))
+        .or_else(|| sec_agree_compact_security_retry_variant(profile, variant, error))
+        .or_else(|| sec_agree_minimal_security_retry_variant(profile, variant, error))
+}
+
+/// Upgrade a variant that was refused with `421 Extension Required: sec-agree`
+/// or `494 Security Agreement Required`.
 ///
 /// An `auto` profile starts challenge-first. If the registrar explicitly
-/// demands RFC 3329 with 421/494, retry the same shape with Security-Client and
+/// demands RFC 3329, retry the same shape with Security-Client and both
 /// Require/Proxy-Require. An explicit database/catalog `disabled` is final and
 /// can never be upgraded by the candidate ladder.
 fn sec_agree_retry_variant(
@@ -3633,6 +3699,7 @@ fn sec_agree_retry_variant(
     error: &LiveStageError,
 ) -> Option<LiveRegisterHeaderVariant> {
     if profile.ims.register.sec_agree_mode == "disabled"
+        || error.register_auth_rounds != 0
         || !error.server_required_sec_agree
         || variant.force_sec_agree_headers
     {
@@ -3641,8 +3708,77 @@ fn sec_agree_retry_variant(
     Some(LiveRegisterHeaderVariant {
         label: "catalog_v7_sec_agree_required",
         force_sec_agree_headers: true,
+        server_required_sec_agree: true,
         suppress_sec_agree_headers: false,
         include_security_client: true,
+        ..variant
+    })
+}
+
+/// The measured Maxis VoWiFi sequence is 421 -> fully declared sec-agree ->
+/// 400. At that point the request shape is accepted far enough that the core is
+/// waiting for the AKA identity hint. Add URI-first empty AKA without dropping
+/// Security-Client, Require, Proxy-Require, routing or access headers.
+fn sec_agree_empty_aka_retry_variant(
+    profile: &CarrierProfile,
+    variant: LiveRegisterHeaderVariant,
+    error: &LiveStageError,
+) -> Option<LiveRegisterHeaderVariant> {
+    (profile.ims.register.sec_agree_mode != "disabled"
+        && variant.server_required_sec_agree
+        && variant.force_sec_agree_headers
+        && variant.include_security_client
+        && variant.initial_authorization == LiveInitialAuthorizationFormat::None
+        && error.register_auth_rounds == 0
+        && live_register_error_status(error) == Some(400))
+    .then_some(LiveRegisterHeaderVariant {
+        label: "catalog_v7_sec_agree_required_aka_empty_uri_first",
+        initial_authorization: LiveInitialAuthorizationFormat::AkaEmptyUriFirst,
+        ..variant
+    })
+}
+
+/// If the cumulative empty-AKA request is still rejected as malformed, retain
+/// Authorization and sec-agree while probing the compact full mechanism syntax.
+fn sec_agree_compact_security_retry_variant(
+    profile: &CarrierProfile,
+    variant: LiveRegisterHeaderVariant,
+    error: &LiveStageError,
+) -> Option<LiveRegisterHeaderVariant> {
+    (profile.ims.register.sec_agree_mode != "disabled"
+        && variant.server_required_sec_agree
+        && variant.force_sec_agree_headers
+        && variant.include_security_client
+        && variant.initial_authorization != LiveInitialAuthorizationFormat::None
+        && variant.security_client_format == LiveSecurityClientFormat::FullSpaced
+        && error.register_auth_rounds == 0
+        && live_register_error_status(error) == Some(400))
+    .then_some(LiveRegisterHeaderVariant {
+        label: "catalog_v7_sec_agree_required_aka_compact_security",
+        security_client_format: LiveSecurityClientFormat::FullCompact,
+        ..variant
+    })
+}
+
+/// Final response-driven format probe. There is deliberately no transition out
+/// of MinimalSpaced, so repeated 400 responses cannot cycle back to an earlier
+/// shape; the outer global budget is an additional safety valve.
+fn sec_agree_minimal_security_retry_variant(
+    profile: &CarrierProfile,
+    variant: LiveRegisterHeaderVariant,
+    error: &LiveStageError,
+) -> Option<LiveRegisterHeaderVariant> {
+    (profile.ims.register.sec_agree_mode != "disabled"
+        && variant.server_required_sec_agree
+        && variant.force_sec_agree_headers
+        && variant.include_security_client
+        && variant.initial_authorization != LiveInitialAuthorizationFormat::None
+        && variant.security_client_format == LiveSecurityClientFormat::FullCompact
+        && error.register_auth_rounds == 0
+        && live_register_error_status(error) == Some(400))
+    .then_some(LiveRegisterHeaderVariant {
+        label: "catalog_v7_sec_agree_required_aka_minimal_security",
+        security_client_format: LiveSecurityClientFormat::MinimalSpaced,
         ..variant
     })
 }
@@ -3696,6 +3832,7 @@ fn live_register_header_variants(
     let exact = LiveRegisterHeaderVariant {
         label: register.live_header_variant_set,
         force_sec_agree_headers: register.sec_agree_mode == "required",
+        server_required_sec_agree: false,
         suppress_sec_agree_headers: false,
         include_route_header: register.include_route_header,
         include_security_client,
@@ -3718,6 +3855,7 @@ fn live_register_header_variants(
         variants.push(LiveRegisterHeaderVariant {
             label: "catalog_v7_challenge_first",
             force_sec_agree_headers: false,
+            server_required_sec_agree: false,
             suppress_sec_agree_headers: true,
             include_route_header: register.include_route_header,
             include_security_client: false,
@@ -3737,6 +3875,7 @@ fn live_register_header_variants(
         variants.push(LiveRegisterHeaderVariant {
             label: "catalog_v7_ipcc_access_baseline",
             force_sec_agree_headers: exact.force_sec_agree_headers,
+            server_required_sec_agree: false,
             suppress_sec_agree_headers: false,
             include_route_header: register.include_route_header,
             include_security_client,
@@ -3776,32 +3915,27 @@ async fn live_register_header_variants_for_attempt(
         .cloned();
     let Some(cached) = cached.filter(|cached| {
         cached.profile_id == profile.meta.profile_id
+            && cached.profile_address == profile as *const CarrierProfile as usize
             && cached.captured_at.elapsed() <= LIVE_IMS_REGISTER_MAX_TTL
     }) else {
-        return variants;
-    };
-    let Some(success) = variants
-        .iter()
-        .copied()
-        .find(|variant| variant.label == cached.label)
-    else {
         return variants;
     };
 
     let Some(exact) = variants.first().copied() else {
         return variants;
     };
+    let success = cached.variant;
     if success.label == exact.label {
         return variants;
     }
-    let mut ordered = Vec::with_capacity(variants.len());
+    let mut ordered = Vec::with_capacity(variants.len() + 1);
     ordered.push(exact);
     ordered.push(success);
     ordered.extend(
         variants
             .iter()
             .copied()
-            .filter(|variant| variant.label != exact.label && variant.label != cached.label),
+            .filter(|variant| variant.label != exact.label && variant.label != success.label),
     );
     ordered
 }
@@ -3815,7 +3949,8 @@ async fn record_live_ims_register_success_variant(
         line_id.to_string(),
         LiveImsRegisterSuccessVariant {
             profile_id: profile.meta.profile_id,
-            label: variant.label,
+            profile_address: profile as *const CarrierProfile as usize,
+            variant,
             captured_at: Instant::now(),
         },
     );
@@ -4136,6 +4271,7 @@ fn map_shared_register_failure(failure: &RegisterFailure) -> LiveStageError {
         RegistrationLossReason::from_register_failure(failure),
     );
     error.server_required_sec_agree = register_failure_demands_sec_agree(failure);
+    error.register_auth_rounds = failure.auth_rounds;
     // Preserve the final SIP status in the reason so the candidate loops can
     // classify terminal rejections without touching the secret-bearing
     // response buffer.
@@ -6450,7 +6586,7 @@ impl LiveRegisterRequestContext {
                     // RFC 3329 §2.3: Require and Proxy-Require travel together.
                     proxy_require_sec_agree: params.require_sec_agree
                         && (profile.ims.register.proxy_require_sec_agree_headers
-                            || variant.label == "catalog_v7_sec_agree_required"),
+                            || variant.server_required_sec_agree),
                     allow: Some(params.allow_header),
                     preferred_service: None,
                     preferred_identity: variant
@@ -8186,6 +8322,7 @@ fn live_stage_error(reason: impl Into<String>) -> LiveStageError {
         reason: reason.into(),
         registration_loss: None,
         server_required_sec_agree: false,
+        register_auth_rounds: 0,
     }
 }
 
@@ -8197,6 +8334,7 @@ fn live_registration_error(
         reason: reason.into(),
         registration_loss: Some(registration_loss),
         server_required_sec_agree: false,
+        register_auth_rounds: 0,
     }
 }
 
@@ -8922,6 +9060,7 @@ mod tests {
         let upgraded =
             sec_agree_retry_variant(&GB_EE_23433, variant, &error).expect("variant is upgraded");
         assert!(upgraded.force_sec_agree_headers);
+        assert!(upgraded.server_required_sec_agree);
         assert!(!upgraded.suppress_sec_agree_headers);
         assert!(upgraded.include_security_client);
         // The rest of the proven shape must survive the upgrade.
@@ -8937,6 +9076,229 @@ mod tests {
             format!("{:?}", upgraded.security_client_format),
             format!("{:?}", variant.security_client_format)
         );
+    }
+
+    /// Lock the field-observed Maxis 50212 VoWiFi sequence at the variant and
+    /// final SIP-byte layers: 421 adds the complete security agreement, 400
+    /// adds URI-first empty AKA without losing it, and the authenticated round
+    /// keeps the negotiated declaration.
+    #[test]
+    fn maxis_50212_vowifi_dynamic_register_upgrade_is_cumulative_end_to_end() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "502",
+                "12",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::WifiEpdg,
+            )
+            .expect("derived Maxis Wi-Fi profile");
+        let base = live_register_header_variants(profile)[0];
+        assert_eq!(
+            base.initial_authorization,
+            LiveInitialAuthorizationFormat::None
+        );
+        assert!(!base.force_sec_agree_headers);
+        assert!(!base.server_required_sec_agree);
+        assert!(!base.include_security_client);
+
+        let requires_sec_agree = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        let declared = next_dynamic_live_register_variant(profile, base, &requires_sec_agree)
+            .expect("421 must preserve the base request and declare sec-agree");
+        assert_eq!(
+            declared.initial_authorization,
+            LiveInitialAuthorizationFormat::None
+        );
+        assert!(declared.force_sec_agree_headers);
+        assert!(declared.server_required_sec_agree);
+        assert!(declared.include_security_client);
+        assert_eq!(
+            declared.security_client_format,
+            LiveSecurityClientFormat::FullSpaced
+        );
+        assert_eq!(declared.include_route_header, base.include_route_header);
+        assert_eq!(
+            format!("{:?}", declared.request_uri),
+            format!("{:?}", base.request_uri)
+        );
+        assert_eq!(
+            format!("{:?}", declared.identity_format),
+            format!("{:?}", base.identity_format)
+        );
+        assert_eq!(
+            format!("{:?}", declared.header_profile),
+            format!("{:?}", base.header_profile)
+        );
+
+        let bad_request = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        let cumulative = next_dynamic_live_register_variant(profile, declared, &bad_request)
+            .expect("400 after sec-agree must add the empty AKA hint cumulatively");
+        assert_eq!(
+            cumulative.initial_authorization,
+            LiveInitialAuthorizationFormat::AkaEmptyUriFirst
+        );
+        assert!(cumulative.force_sec_agree_headers);
+        assert!(cumulative.server_required_sec_agree);
+        assert!(cumulative.include_security_client);
+        assert_eq!(
+            cumulative.security_client_format,
+            LiveSecurityClientFormat::FullSpaced,
+            "empty AKA must be tried before Security-Client formatting fallbacks"
+        );
+
+        let context = LiveRegisterRequestContext::new(
+            profile,
+            LiveImsRegisterIdentity {
+                shared: crate::connectivity::core::context::ImsIdentity {
+                    private_user: "502121234567890@ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+                    public_uri: "sip:502121234567890@ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+                    contact_user: "502121234567890".to_string(),
+                    home_domain: "ims.mnc012.mcc502.3gppnetwork.org".to_string(),
+                    contact_user_phone: false,
+                },
+                shape: "maxis_derived_fixture",
+            },
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5060),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        )
+        .expect("register context");
+
+        let base_request = context.build_initial_request(profile, base);
+        let declared_request = context.build_initial_request(profile, declared);
+        let cumulative_request = context.build_initial_request(profile, cumulative);
+        assert!(!base_request.contains("Authorization: Digest"));
+        assert!(!base_request.contains("Security-Client:"));
+        assert!(!base_request.contains("Require: sec-agree"));
+        assert!(!declared_request.contains("Authorization: Digest"));
+        for header in [
+            "Security-Client:",
+            "Require: sec-agree",
+            "Proxy-Require: sec-agree",
+        ] {
+            assert!(
+                declared_request.contains(header),
+                "declared request missing {header}"
+            );
+            assert!(
+                cumulative_request.contains(header),
+                "cumulative request missing {header}"
+            );
+        }
+        assert!(cumulative_request
+            .contains("Authorization: Digest uri=\"sip:ims.mnc012.mcc502.3gppnetwork.org\""));
+        assert!(cumulative_request
+            .contains("username=\"502121234567890@ims.mnc012.mcc502.3gppnetwork.org\""));
+        assert!(cumulative_request.contains("nonce=\"\""));
+        assert!(cumulative_request.contains("response=\"\""));
+        assert!(cumulative_request.contains("algorithm=AKAv1-MD5"));
+        assert_eq!(
+            cumulative_request.lines().next(),
+            base_request.lines().next(),
+            "dynamic upgrades must not change the REGISTER request URI"
+        );
+        assert_eq!(
+            cumulative_request.contains("Route:"),
+            base_request.contains("Route:"),
+            "dynamic upgrades must preserve the Route policy"
+        );
+        assert!(cumulative_request.contains("P-Access-Network-Info: IEEE-802.11\r\n"));
+        assert!(cumulative_request.contains("P-Preferred-Identity:"));
+
+        let authenticated = context.build_authenticated_request(
+            profile,
+            cumulative,
+            "Authorization: Digest username=\"impi\",realm=\"ims\",nonce=\"n\",uri=\"sip:ims\",response=\"proof\",algorithm=AKAv1-MD5",
+            None,
+        );
+        for header in [
+            "Authorization: Digest",
+            "Security-Client:",
+            "Require: sec-agree",
+            "Proxy-Require: sec-agree",
+        ] {
+            assert!(
+                authenticated.contains(header),
+                "authenticated request missing {header}"
+            );
+        }
+        assert!(
+            !authenticated.contains("Security-Verify:"),
+            "a 401 without Security-Server must not fabricate Security-Verify"
+        );
+
+        let compact = next_dynamic_live_register_variant(profile, cumulative, &bad_request)
+            .expect("second 400 must retain AKA/sec-agree and compact Security-Client");
+        assert_eq!(
+            compact.initial_authorization,
+            cumulative.initial_authorization
+        );
+        assert!(compact.server_required_sec_agree);
+        assert_eq!(
+            compact.security_client_format,
+            LiveSecurityClientFormat::FullCompact
+        );
+        let minimal = next_dynamic_live_register_variant(profile, compact, &bad_request)
+            .expect("third 400 must retain AKA/sec-agree and use the final minimal offer");
+        assert_eq!(
+            minimal.initial_authorization,
+            cumulative.initial_authorization
+        );
+        assert!(minimal.server_required_sec_agree);
+        assert_eq!(
+            minimal.security_client_format,
+            LiveSecurityClientFormat::MinimalSpaced
+        );
+        assert!(
+            next_dynamic_live_register_variant(profile, minimal, &bad_request).is_none(),
+            "the final response-driven shape must not cycle"
+        );
+
+        let after_auth = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            1,
+        ));
+        assert!(next_dynamic_live_register_variant(profile, declared, &after_auth).is_none());
+
+        let mut disabled_profile = *profile;
+        disabled_profile.ims.register.sec_agree_mode = "disabled";
+        assert!(
+            next_dynamic_live_register_variant(&disabled_profile, base, &requires_sec_agree)
+                .is_none()
+        );
+
+        let mut explicit_authorization = declared;
+        explicit_authorization.initial_authorization = LiveInitialAuthorizationFormat::AkaEmpty;
+        let preserved =
+            next_dynamic_live_register_variant(profile, explicit_authorization, &bad_request)
+                .expect("an explicit Authorization shape may advance formatting only");
+        assert_eq!(
+            preserved.initial_authorization,
+            LiveInitialAuthorizationFormat::AkaEmpty,
+            "the ladder must not overwrite an explicitly selected Authorization format"
+        );
+        assert_eq!(
+            preserved.security_client_format,
+            LiveSecurityClientFormat::FullCompact
+        );
+
+        let mut profile_required = *profile;
+        profile_required.ims.register.sec_agree_mode = "required";
+        let profile_required = Box::leak(Box::new(profile_required));
+        let explicit_required = live_register_header_variants(profile_required)[0];
+        assert!(!explicit_required.server_required_sec_agree);
+        assert!(
+            next_dynamic_live_register_variant(profile_required, explicit_required, &bad_request)
+                .is_none(),
+            "a profile-level required policy alone is not evidence to rewrite Authorization"
+        );
+
+        // One base attempt plus the four monotonic transitions above remains
+        // below the global safety budget.
+        assert!(5 <= LIVE_IMS_REGISTER_MAX_VARIANT_ATTEMPTS);
     }
 
     #[test]
@@ -10149,6 +10511,7 @@ mod tests {
             LiveRegisterHeaderVariant {
                 label: "pcscf_uri_unit_test",
                 force_sec_agree_headers: false,
+                server_required_sec_agree: false,
                 suppress_sec_agree_headers: false,
                 include_route_header: false,
                 include_security_client: true,
@@ -10373,6 +10736,70 @@ mod tests {
             1
         );
         clear_live_runtime_for_line(line_b).await;
+    }
+
+    #[tokio::test]
+    async fn response_driven_register_success_cache_preserves_the_full_shape() {
+        let line_id = "line-register-dynamic-variant-cache";
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "502",
+                "12",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::WifiEpdg,
+            )
+            .expect("derived Maxis Wi-Fi profile");
+        ims_register_variant_cache().lock().await.remove(line_id);
+
+        let base = live_register_header_variants(profile)[0];
+        let requires_sec_agree = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 421 Extension Required\r\nRequire: sec-agree\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        let declared = next_dynamic_live_register_variant(profile, base, &requires_sec_agree)
+            .expect("421 upgrade");
+        let bad_request = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        let success = next_dynamic_live_register_variant(profile, declared, &bad_request)
+            .expect("cumulative empty-AKA upgrade");
+        record_live_ims_register_success_variant(line_id, profile, success).await;
+
+        let variants = live_register_header_variants_for_attempt(line_id, profile).await;
+        assert_eq!(
+            variants.first().map(|variant| variant.label),
+            Some(base.label)
+        );
+        let cached = variants
+            .get(1)
+            .expect("dynamic success is preferred after exact policy");
+        assert_eq!(cached.label, success.label);
+        assert!(cached.force_sec_agree_headers);
+        assert!(cached.server_required_sec_agree);
+        assert!(cached.include_security_client);
+        assert_eq!(
+            cached.initial_authorization,
+            LiveInitialAuthorizationFormat::AkaEmptyUriFirst
+        );
+        assert_eq!(
+            variants.len(),
+            live_register_header_variants(profile).len() + 1
+        );
+
+        // Reusing a profile ID after a database edit must not replay a request
+        // shape captured from the previous immutable profile object.
+        let reloaded_profile = Box::leak(Box::new(*profile));
+        let after_reload =
+            live_register_header_variants_for_attempt(line_id, reloaded_profile).await;
+        assert_eq!(
+            after_reload.len(),
+            live_register_header_variants(reloaded_profile).len()
+        );
+        assert!(after_reload
+            .iter()
+            .all(|variant| variant.label != success.label));
+
+        ims_register_variant_cache().lock().await.remove(line_id);
     }
 
     #[test]

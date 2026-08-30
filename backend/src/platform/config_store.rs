@@ -157,9 +157,8 @@ fn read_ordered<T: DeserializeOwned>(
     table: &str,
     key_column: &str,
 ) -> Result<Vec<T>, String> {
-    let sql = format!(
-        "SELECT {key_column}, document_json FROM {table} ORDER BY position, {key_column}"
-    );
+    let sql =
+        format!("SELECT {key_column}, document_json FROM {table} ORDER BY position, {key_column}");
     let mut statement = conn
         .prepare(&sql)
         .map_err(|error| format!("config_store_prepare_failed:{table}:{error}"))?;
@@ -173,17 +172,15 @@ fn read_ordered<T: DeserializeOwned>(
     for row in rows {
         let (key, document) =
             row.map_err(|error| format!("config_store_row_failed:{table}:{error}"))?;
-        parsed.push(serde_json::from_str::<T>(&document).map_err(|error| {
-            format!("config_store_document_invalid:{table}:{key}:{error}")
-        })?);
+        parsed.push(
+            serde_json::from_str::<T>(&document)
+                .map_err(|error| format!("config_store_document_invalid:{table}:{key}:{error}"))?,
+        );
     }
     Ok(parsed)
 }
 
-fn read_document<T: DeserializeOwned>(
-    conn: &Connection,
-    kind: &str,
-) -> Result<Option<T>, String> {
+fn read_document<T: DeserializeOwned>(conn: &Connection, kind: &str) -> Result<Option<T>, String> {
     let row = conn
         .query_row(
             "SELECT schema_version, document_json FROM config_documents WHERE kind = ?1",
@@ -395,8 +392,7 @@ fn keyed_rows<T: Serialize>(
 }
 
 fn serialize<T: Serialize>(value: &T) -> Result<String, String> {
-    serde_json::to_string(value)
-        .map_err(|error| format!("config_store_serialize_failed:{error}"))
+    serde_json::to_string(value).map_err(|error| format!("config_store_serialize_failed:{error}"))
 }
 
 fn timestamp() -> String {

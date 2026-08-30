@@ -81,7 +81,9 @@ impl ExecutionContext {
     /// The scope of the current task, defaulting to [`Self::Main`] outside a
     /// per-line scope.
     pub fn current() -> Self {
-        CURRENT_CONTEXT.try_with(|value| *value).unwrap_or(Self::Main)
+        CURRENT_CONTEXT
+            .try_with(|value| *value)
+            .unwrap_or(Self::Main)
     }
 }
 
@@ -123,7 +125,11 @@ pub struct DiagnosticRecord {
 }
 
 impl DiagnosticRecord {
-    pub fn new(severity: DiagnosticLogSeverity, subsystem: impl Into<String>, event: impl Into<String>) -> Self {
+    pub fn new(
+        severity: DiagnosticLogSeverity,
+        subsystem: impl Into<String>,
+        event: impl Into<String>,
+    ) -> Self {
         Self {
             timestamp: Utc::now().with_timezone(&log_offset()),
             severity,
@@ -155,7 +161,12 @@ impl DiagnosticRecord {
     /// numbers, message bodies and P-CSCF addresses.
     fn render(&self, redact: bool) -> String {
         let mut line = String::with_capacity(160);
-        line.push_str(&self.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f%:z").to_string());
+        line.push_str(
+            &self
+                .timestamp
+                .format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+                .to_string(),
+        );
         line.push_str(&format!(" [{:<5}]", self.severity.as_label()));
         line.push_str(&format!(" [{}]", self.subsystem));
         line.push_str(&format!(" [{}]", self.context.as_label()));
@@ -164,13 +175,21 @@ impl DiagnosticRecord {
         }
         line.push_str(&format!(" event={}", sanitize_field(&self.event)));
         if let Some(detail) = &self.detail {
-            let detail = if redact { redact_text(detail) } else { detail.clone() };
+            let detail = if redact {
+                redact_text(detail)
+            } else {
+                detail.clone()
+            };
             line.push_str(&format!(" detail={}", sanitize_field(&detail)));
         }
         if let Some(raw_error) = &self.raw_error {
             // Kept verbatim apart from newline flattening: the nested
             // `volte_command_failed:...` chain is the whole point of the file.
-            let raw_error = if redact { redact_text(raw_error) } else { raw_error.clone() };
+            let raw_error = if redact {
+                redact_text(raw_error)
+            } else {
+                raw_error.clone()
+            };
             line.push_str(&format!(" raw_error={}", sanitize_field(&raw_error)));
         }
         line.push('\n');
@@ -289,15 +308,39 @@ fn sanitize_field(value: &str) -> String {
 
 /// JSON keys whose values are subscriber-identifying.
 const SENSITIVE_KEYS: &[&str] = &[
-    "imsi", "impi", "impu", "msisdn", "iccid", "imei", "eid",
-    "phone_number", "phone", "number", "caller", "callee", "from", "to",
-    "content", "text", "body", "message", "sms_content",
-    "pcscf", "p_cscf", "pcscf_address", "password", "secret", "token", "key",
+    "imsi",
+    "impi",
+    "impu",
+    "msisdn",
+    "iccid",
+    "imei",
+    "eid",
+    "phone_number",
+    "phone",
+    "number",
+    "caller",
+    "callee",
+    "from",
+    "to",
+    "content",
+    "text",
+    "body",
+    "message",
+    "sms_content",
+    "pcscf",
+    "p_cscf",
+    "pcscf_address",
+    "password",
+    "secret",
+    "token",
+    "key",
 ];
 
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    SENSITIVE_KEYS.iter().any(|candidate| key == *candidate || key.ends_with(&format!("_{candidate}")))
+    SENSITIVE_KEYS
+        .iter()
+        .any(|candidate| key == *candidate || key.ends_with(&format!("_{candidate}")))
 }
 
 /// Mask a value, keeping enough of it to correlate records.
@@ -608,7 +651,9 @@ pub fn spawn_diagnostic_logger(config_manager: Arc<ConfigManager>) -> Arc<Diagno
                 }
             }
 
-            let Some(handle) = file.as_mut() else { continue };
+            let Some(handle) = file.as_mut() else {
+                continue;
+            };
 
             let mut buffer = String::new();
             for record in &batch {
@@ -663,8 +708,14 @@ mod tests {
         let payload = r#"{"imsi":"460010123456789","stage":"register","sip_status":403}"#;
         let redacted = redact_text(payload);
         assert!(!redacted.contains("460010123456789"));
-        assert!(redacted.contains("register"), "stage must survive: {redacted}");
-        assert!(redacted.contains("403"), "SIP status must survive: {redacted}");
+        assert!(
+            redacted.contains("register"),
+            "stage must survive: {redacted}"
+        );
+        assert!(
+            redacted.contains("403"),
+            "SIP status must survive: {redacted}"
+        );
     }
 
     #[test]
@@ -679,15 +730,26 @@ mod tests {
 
     #[test]
     fn record_renders_one_line_with_context_and_raw_error() {
-        let record = DiagnosticRecord::new(DiagnosticLogSeverity::Error, "VoLTE", "bearer.connect.failed")
-            .with_line("79139C")
-            .with_raw_error("volte_command_failed:mmcli:1\nerror: couldn't find modem");
+        let record = DiagnosticRecord::new(
+            DiagnosticLogSeverity::Error,
+            "VoLTE",
+            "bearer.connect.failed",
+        )
+        .with_line("79139C")
+        .with_raw_error("volte_command_failed:mmcli:1\nerror: couldn't find modem");
         let rendered = record.render(false);
-        assert_eq!(rendered.matches('\n').count(), 1, "must be exactly one line");
+        assert_eq!(
+            rendered.matches('\n').count(),
+            1,
+            "must be exactly one line"
+        );
         assert!(rendered.contains("[ERROR]"));
         assert!(rendered.contains("[main]"));
         assert!(rendered.contains("line=79139C"));
-        assert!(rendered.contains("couldn't find modem"), "raw error must survive verbatim");
+        assert!(
+            rendered.contains("couldn't find modem"),
+            "raw error must survive verbatim"
+        );
     }
 
     #[test]
@@ -714,7 +776,8 @@ mod tests {
         // scope column useless on a multi-SIM device.
         let payload = serde_json::json!({ "attempt": { "error": "volte_bearer_failed" } });
 
-        let device_wide = record_for_app_event("system.service_started", None, Some("system"), &payload);
+        let device_wide =
+            record_for_app_event("system.service_started", None, Some("system"), &payload);
         assert_eq!(device_wide.context, ExecutionContext::Main);
 
         let per_line = with_ue_worker_context(async {

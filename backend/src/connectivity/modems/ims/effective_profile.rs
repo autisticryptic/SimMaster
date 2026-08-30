@@ -17,8 +17,7 @@
 //! lets the API explain where each effective value came from.
 
 use crate::connectivity::modems::ims::vowifi::{
-    profile_record::parse_dns_server,
-    profiles::CarrierProfile,
+    profile_record::parse_dns_server, profiles::CarrierProfile,
 };
 
 use super::profile_override::{ImsAccessOverride, OverrideSource, SimOverride};
@@ -456,9 +455,9 @@ fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<St
     }
     if name == "ims_vowifi"
         && access.dns.as_ref().is_some_and(|servers| {
-            servers.iter().any(|server| {
-                parse_dns_server(server).is_none_or(|address| address.port() == 0)
-            })
+            servers
+                .iter()
+                .any(|server| parse_dns_server(server).is_none_or(|address| address.port() == 0))
         })
     {
         problems.push("ims_vowifi.dns_server_invalid".to_string());
@@ -695,12 +694,14 @@ mod tests {
         assert!(validate_override(&override_).is_empty());
 
         override_.ims_vowifi.dns = Some(vec!["not-a-dns-server".to_string()]);
-        assert!(validate_override(&override_)
-            .contains(&"ims_vowifi.dns_server_invalid".to_string()));
+        assert!(
+            validate_override(&override_).contains(&"ims_vowifi.dns_server_invalid".to_string())
+        );
 
         override_.ims_vowifi.dns = Some(vec!["1.1.1.1:0".to_string()]);
-        assert!(validate_override(&override_)
-            .contains(&"ims_vowifi.dns_server_invalid".to_string()));
+        assert!(
+            validate_override(&override_).contains(&"ims_vowifi.dns_server_invalid".to_string())
+        );
     }
 
     #[test]

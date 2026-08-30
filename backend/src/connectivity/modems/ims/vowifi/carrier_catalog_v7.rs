@@ -18,9 +18,9 @@ use super::{
 use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::modems::ims::vowifi::profile_record::{
     CarrierProfileMetaRecord, CarrierProfileRecord, E911PolicyRecord, EpdgPolicyRecord,
-    CURRENT_SCHEMA_VERSION,
     Ikev2PolicyRecord, ImsPolicyRecord, ProfileIdentityPolicyRecord, RegisterPolicyRecord,
     SmsPolicyRecord, UtPolicyRecord, VoiceCodecPolicyRecord, VoicePolicyRecord,
+    CURRENT_SCHEMA_VERSION,
 };
 use crate::connectivity::modems::ims::vowifi::profiles;
 

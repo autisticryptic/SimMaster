@@ -66,7 +66,6 @@ impl TextFormat {
             _ => None,
         }
     }
-
 }
 
 /// Deserialize `content` into `T`.
@@ -124,9 +123,7 @@ where
                 out.push('\n');
             }
             for (key, child) in object {
-                if let Some((_, comment_lines)) =
-                    annotations.iter().find(|(name, _)| name == key)
-                {
+                if let Some((_, comment_lines)) = annotations.iter().find(|(name, _)| name == key) {
                     for line in *comment_lines {
                         push_comment(&mut out, line, 0);
                     }
@@ -537,10 +534,7 @@ fn needs_quoting(value: &str) -> bool {
         return true;
     }
     const RESERVED: [&str; 8] = ["true", "false", "yes", "no", "on", "off", "null", "~"];
-    if RESERVED
-        .iter()
-        .any(|word| value.eq_ignore_ascii_case(word))
-    {
+    if RESERVED.iter().any(|word| value.eq_ignore_ascii_case(word)) {
         return true;
     }
     if value.parse::<i64>().is_ok() || value.parse::<f64>().is_ok() {

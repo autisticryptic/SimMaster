@@ -661,10 +661,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
         };
         VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, detail)
     };
-    if !faults
-        .inspect_data_interface(interface)
-        .permits_bring_up()
-    {
+    if !faults.inspect_data_interface(interface).permits_bring_up() {
         return Err(latched_error(interface, "runtime_status=error before OPEN"));
     }
 
@@ -676,10 +673,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
             return Ok(());
         }
         return Err(
-            if !faults
-                .inspect_data_interface(interface)
-                .permits_bring_up()
-            {
+            if !faults.inspect_data_interface(interface).permits_bring_up() {
                 latched_error(interface, &error.to_string())
             } else {
                 VolteError::with_detail(
@@ -694,10 +688,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
         if interface_is_up(interface).await {
             return Ok(());
         }
-        if !faults
-            .inspect_data_interface(interface)
-            .permits_bring_up()
-        {
+        if !faults.inspect_data_interface(interface).permits_bring_up() {
             return Err(latched_error(interface, "runtime_status=error after OPEN"));
         }
         if attempt < 3 {

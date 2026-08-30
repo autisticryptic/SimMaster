@@ -237,10 +237,9 @@ pub fn import_json(
         // The database now holds settings the file does not describe. Put it
         // back so the operator retries from a coherent state.
         if let Some(snapshot) = &rollback.database {
-            restore_config_tables(database_path, snapshot)
-                .map_err(|rollback_error| {
-                    format!("config_import_file_failed:{error}:rollback_also_failed:{rollback_error}")
-                })?;
+            restore_config_tables(database_path, snapshot).map_err(|rollback_error| {
+                format!("config_import_file_failed:{error}:rollback_also_failed:{rollback_error}")
+            })?;
         }
         return Err(format!("config_import_file_failed:{error}"));
     }
@@ -336,15 +335,8 @@ fn write_main_config(config_path: &Path, main: &MainConfig) -> Result<(), String
     } else {
         config_file::parse(&existing, format, config_path).unwrap_or_default()
     };
-    let rendered = config_file::apply_update(
-        &existing,
-        &baseline,
-        main,
-        format,
-        config_path,
-        &[],
-        &[],
-    )?;
+    let rendered =
+        config_file::apply_update(&existing, &baseline, main, format, config_path, &[], &[])?;
     config_file::write_atomically(config_path, &rendered)
 }
 
@@ -365,13 +357,12 @@ fn read_stored_config(connection: &Connection) -> Result<StoredConfig, String> {
         stored.automation = read_kind(connection, "automation")?.unwrap_or_default();
         stored.esim = read_kind(connection, "esim")?.unwrap_or_default();
         stored.last_notified_update_version =
-            read_kind::<serde_json::Value>(connection, "version_update_state")?
-                .and_then(|value| {
-                    value
-                        .get("last_notified_version")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                });
+            read_kind::<serde_json::Value>(connection, "version_update_state")?.and_then(|value| {
+                value
+                    .get("last_notified_version")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
     }
     Ok(stored)
 }
@@ -593,7 +584,8 @@ fn validate_export(export: &ConfigExport) -> Result<(), String> {
         ));
     }
     for row in &export.overrides {
-        if row.binding_hash.len() != 64 || !row.binding_hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        if row.binding_hash.len() != 64 || !row.binding_hash.chars().all(|c| c.is_ascii_hexdigit())
+        {
             return Err("config_export_override_binding_invalid".to_string());
         }
         if row.schema_version != OVERRIDE_SCHEMA_VERSION {

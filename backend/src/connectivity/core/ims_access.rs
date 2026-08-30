@@ -343,7 +343,10 @@ mod tests {
         // no voice path and the router with no fallback. Introducing a
         // single-registration default here would reintroduce exactly that, so
         // the default must stay Concurrent.
-        assert_eq!(ImsAccessPreference::default(), ImsAccessPreference::Concurrent);
+        assert_eq!(
+            ImsAccessPreference::default(),
+            ImsAccessPreference::Concurrent
+        );
         let decision = decide(both_up(ImsAccessPreference::default()));
         assert!(decision.cellular_registers);
         assert!(decision.wlan_registers);
@@ -386,7 +389,10 @@ mod tests {
         // both legs registered at once is the normal case. A default that tore
         // the cellular leg down when Wi-Fi came up would reintroduce the fixed
         // bug where a Wi-Fi drop left the line with no voice path at all.
-        assert_eq!(ImsAccessPreference::default(), ImsAccessPreference::Concurrent);
+        assert_eq!(
+            ImsAccessPreference::default(),
+            ImsAccessPreference::Concurrent
+        );
         let decision = decide(both_up(ImsAccessPreference::Concurrent));
         assert!(decision.cellular_registers && decision.wlan_registers);
         assert_eq!(decision.code, "ims_access_concurrent_both_legs");
@@ -427,7 +433,10 @@ mod tests {
                 "cellular must stay down under {preference:?}"
             );
             assert!(decision.wlan_registers);
-            assert_eq!(decision.code, "ims_access_wlan_only_spoofed_device_identity");
+            assert_eq!(
+                decision.code,
+                "ims_access_wlan_only_spoofed_device_identity"
+            );
         }
     }
 
@@ -440,7 +449,10 @@ mod tests {
         inputs.wlan_available = false;
         let decision = decide(inputs);
         assert!(!decision.cellular_registers && !decision.wlan_registers);
-        assert_eq!(decision.code, "ims_access_none_spoofed_identity_requires_wlan");
+        assert_eq!(
+            decision.code,
+            "ims_access_none_spoofed_identity_requires_wlan"
+        );
     }
 
     #[test]

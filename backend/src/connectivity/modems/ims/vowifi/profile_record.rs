@@ -18,11 +18,11 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use super::profiles::{
     self, CarrierProfile, CarrierProfileMeta, E911Policy, EpdgPolicy, Ikev2Policy, ImsPolicy,
     ProfileIdentityPolicy, RegisterPolicy, SmsPolicy, UtPolicy, VoiceCodecPolicy, VoicePolicy,
 };
+use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::core::voice::AudioCodec;
 
 /// Version of the JSON shape persisted in `custom_carrier_profiles`.
@@ -530,24 +530,20 @@ impl CarrierProfileRecord {
                 .unwrap_or_default()
                 .trim()
                 .to_ascii_uppercase();
-            self.ims.register.pani_identity_policy = if access_type.starts_with("3GPP-E-UTRAN")
-                || access_type.starts_with("3GPP-NR")
-            {
-                AccessIdentityPolicy::DynamicIfKnown
-            } else {
-                AccessIdentityPolicy::Static
-            };
+            self.ims.register.pani_identity_policy =
+                if access_type.starts_with("3GPP-E-UTRAN") || access_type.starts_with("3GPP-NR") {
+                    AccessIdentityPolicy::DynamicIfKnown
+                } else {
+                    AccessIdentityPolicy::Static
+                };
         }
         if !has("cni_identity_policy") {
-            self.ims.register.cni_identity_policy = if self
-                .ims
-                .register
-                .enable_cellular_network_info
-            {
-                AccessIdentityPolicy::DynamicIfKnown
-            } else {
-                AccessIdentityPolicy::Omit
-            };
+            self.ims.register.cni_identity_policy =
+                if self.ims.register.enable_cellular_network_info {
+                    AccessIdentityPolicy::DynamicIfKnown
+                } else {
+                    AccessIdentityPolicy::Omit
+                };
         }
         if !has("include_mmtel_features") {
             // Legacy rows predate the explicit capability switch. Treat them

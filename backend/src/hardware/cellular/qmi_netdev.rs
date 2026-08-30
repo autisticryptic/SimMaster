@@ -865,10 +865,8 @@ mod tests {
         // establishing, and the VoLTE REGISTER then leaves over Wi-Fi toward a
         // carrier-private P-CSCF that cannot answer. Filtering the input means
         // the fallback has no way to select it.
-        let candidates = usable_candidates(
-            vec!["wwan0".to_string(), "wwan2".to_string()],
-            &["wwan0"],
-        );
+        let candidates =
+            usable_candidates(vec!["wwan0".to_string(), "wwan2".to_string()], &["wwan0"]);
         let assumed = candidates.first().cloned();
         assert_eq!(assumed.as_deref(), Some("wwan2"));
     }
@@ -919,7 +917,10 @@ mod tests {
         // because "Device for nexthop is not up" is what used to surface instead.
         let detail = error.to_string();
         for index in 0..3 {
-            assert!(detail.contains(&format!("wwan{index}")), "missing wwan{index} in {detail}");
+            assert!(
+                detail.contains(&format!("wwan{index}")),
+                "missing wwan{index} in {detail}"
+            );
         }
         assert!(detail.contains("RTNETLINK answers: Invalid argument"));
     }

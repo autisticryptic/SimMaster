@@ -144,10 +144,7 @@ mod tests {
         // platform quirks from gating generic paths.
         let policy = fault_policy_for(super::super::DeviceKind::Unknown);
         assert_eq!(policy.platform(), "generic");
-        assert_eq!(
-            policy.inspect_data_interface("wwan0"),
-            BasebandFault::None
-        );
+        assert_eq!(policy.inspect_data_interface("wwan0"), BasebandFault::None);
         assert!(policy.inspect_data_interface("wwan0").permits_bring_up());
     }
 

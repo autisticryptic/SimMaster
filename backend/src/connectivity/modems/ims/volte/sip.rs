@@ -16,10 +16,10 @@ use std::net::IpAddr;
 use super::errors::VolteError;
 use crate::connectivity::core::{
     access_network::{
-        AccessIdentityPolicy, ImsAccessNetworkContext, access_type_token,
-        resolve_access_identity, sanitize_header_value,
+        access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
+        ImsAccessNetworkContext,
     },
-    contact::{ContactCompletion, complete_contact_parameters},
+    contact::{complete_contact_parameters, ContactCompletion},
     register_message::{RegisterHeaderFields, RegisterRequest},
     sip_message::{SipHeader, SipRequest},
 };
@@ -519,7 +519,10 @@ fn build_register_internal(
     let cellular_network_info = (policy.include_access_network_info
         && profile.is_some_and(|profile| profile.ims.register.enable_cellular_network_info))
     .then(|| {
-        let register = &profile.expect("CNI requires a carrier profile").ims.register;
+        let register = &profile
+            .expect("CNI requires a carrier profile")
+            .ims
+            .register;
         let static_cellular_network_info = register
             .cellular_network_info
             .and_then(cellular_profile_access_identity);
@@ -2408,31 +2411,27 @@ mod tests {
     #[test]
     fn dtmf_info_rejects_invalid_digit_and_duration() {
         let dialog = DialogIds::fresh();
-        assert!(
-            build_dtmf_info(
-                &ident(),
-                &route_udp(),
-                None,
-                &dialog,
-                "sip:+8613800138000@h",
-                2,
-                'Z',
-                160,
-            )
-            .is_err()
-        );
-        assert!(
-            build_dtmf_info(
-                &ident(),
-                &route_udp(),
-                None,
-                &dialog,
-                "sip:+8613800138000@h",
-                2,
-                '1',
-                10,
-            )
-            .is_err()
-        );
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            None,
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            'Z',
+            160,
+        )
+        .is_err());
+        assert!(build_dtmf_info(
+            &ident(),
+            &route_udp(),
+            None,
+            &dialog,
+            "sip:+8613800138000@h",
+            2,
+            '1',
+            10,
+        )
+        .is_err());
     }
 }

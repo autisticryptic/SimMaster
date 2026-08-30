@@ -2,7 +2,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{atomic::{AtomicBool, Ordering}, Arc, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, RwLock,
+    },
     time::Duration,
 };
 
@@ -344,7 +347,13 @@ async fn run_router(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
-        refresh_router_state(&trunk, &policy, &backends, &routes, trunk_vowifi_only.load(Ordering::SeqCst));
+        refresh_router_state(
+            &trunk,
+            &policy,
+            &backends,
+            &routes,
+            trunk_vowifi_only.load(Ordering::SeqCst),
+        );
         tokio::select! {
             command = commands.recv() => match command {
                 Ok(command) => route_command(command, &trunk, &policy, &backends, &mut routes, trunk_vowifi_only.load(Ordering::SeqCst)),
@@ -462,7 +471,10 @@ fn route_plan_for_trunk(
 ) -> Vec<AccessPathKind> {
     let candidates = route_plan(policy, backends, video_required);
     if vowifi_only {
-        candidates.into_iter().filter(|kind| *kind == AccessPathKind::Vowifi).collect()
+        candidates
+            .into_iter()
+            .filter(|kind| *kind == AccessPathKind::Vowifi)
+            .collect()
     } else {
         candidates
     }
@@ -545,7 +557,12 @@ fn route_command(
             &command,
             OperatorCommand::StartCall { offer, .. } if offer.video.is_some()
         );
-        let candidates = route_plan_for_trunk(&current_policy(policy), backends, video_required, vowifi_only);
+        let candidates = route_plan_for_trunk(
+            &current_policy(policy),
+            backends,
+            video_required,
+            vowifi_only,
+        );
         let mut remaining = candidates.clone();
         while let Some(kind) = remaining.first().copied() {
             remaining.remove(0);
@@ -616,7 +633,8 @@ fn route_event(
             }
             return;
         }
-        let allowed = route_plan_for_trunk(&current_policy(policy), backends, false, vowifi_only).contains(&kind);
+        let allowed = route_plan_for_trunk(&current_policy(policy), backends, false, vowifi_only)
+            .contains(&kind);
         if !allowed {
             reject_incoming_collision(kind, &call_id, backends);
             return;

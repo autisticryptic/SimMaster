@@ -587,12 +587,18 @@ async fn handle_inbound(
             .map_err(|_| "trunk_message_body_not_utf8".to_string())?
             .to_string();
         let from = sip_user_from_header(frame, "From").unwrap_or_default();
-        let to = sip_request_user(frame).or_else(|| sip_user_from_header(frame, "To")).unwrap_or_default();
+        let to = sip_request_user(frame)
+            .or_else(|| sip_user_from_header(frame, "To"))
+            .unwrap_or_default();
         let response = sip::build_response(frame, 202, "Accepted")?;
         transport.send(&response).await?;
         record_sip_tx(state, &response).await;
         if let Some(operator) = operator {
-            operator.send_sms_request(crate::services::trunk::operator::SmsRequest { from, to, body });
+            operator.send_sms_request(crate::services::trunk::operator::SmsRequest {
+                from,
+                to,
+                body,
+            });
         }
         return Ok(());
     }
@@ -683,13 +689,21 @@ fn sip_user_from_header(frame: &[u8], header: &str) -> Option<String> {
         .split_once('<')
         .and_then(|(_, rest)| rest.split_once('>').map(|(uri, _)| uri))
         .unwrap_or(value.as_str());
-    uri.strip_prefix("sip:")?.split(['@', ';']).next().filter(|v| !v.is_empty()).map(str::to_string)
+    uri.strip_prefix("sip:")?
+        .split(['@', ';'])
+        .next()
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 fn sip_request_user(frame: &[u8]) -> Option<String> {
     let line = std::str::from_utf8(frame).ok()?.lines().next()?;
     let uri = line.split_whitespace().nth(1)?;
-    uri.strip_prefix("sip:")?.split(['@', ';']).next().filter(|v| !v.is_empty()).map(str::to_string)
+    uri.strip_prefix("sip:")?
+        .split(['@', ';'])
+        .next()
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
 }
 
 async fn handle_operator_event(

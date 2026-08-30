@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use chrono::NaiveDate;
 use serde::Serialize;
@@ -927,12 +927,10 @@ mod tests {
             .long_run_gates
             .iter()
             .any(|gate| gate.gate_id == "all_profiles_dry_run_runtime" && gate.status == "pass"));
-        assert!(
-            report
-                .live_stage_readiness
-                .iter()
-                .any(|stage| { stage.stage_id == "identity_readonly" && stage.status == "ready" })
-        );
+        assert!(report
+            .live_stage_readiness
+            .iter()
+            .any(|stage| { stage.stage_id == "identity_readonly" && stage.status == "ready" }));
         assert!(report.live_stage_readiness.iter().any(|stage| {
             stage.stage_id == "sms_over_ims"
                 && stage
