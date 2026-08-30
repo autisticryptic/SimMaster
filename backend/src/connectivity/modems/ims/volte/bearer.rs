@@ -1312,6 +1312,8 @@ mod tests {
 
     #[test]
     fn create_command_family_rejection_is_not_replaced_by_default_fallback() {
+        use crate::platform::config::VolteIpFamilyPreference;
+
         let ipv6 = BearerAttemptFailure {
             error: VolteError::with_detail(
                 code::RUNTIME_MM_BEARER_CONNECT_FAILED,
