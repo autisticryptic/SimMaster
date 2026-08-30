@@ -234,20 +234,13 @@ where
                         error: result.as_ref().err().cloned(),
                     })
                     .await;
-                    if let Ok(ref bearer) = result {
-                        let partial = plan
-                            .pcscf_order()
-                            .first()
-                            .is_some_and(|family| !bearer_has_family(bearer, *family));
-                        if partial && !plan.single_family_fallbacks().is_empty() {
-                            // A reused dual bearer can be just as partial as a
-                            // newly-created one. Remove it so the ordered queue
-                            // below can try the requested single-family bearer.
-                            disconnect_bearer(&path).await;
-                            delete_bearer(modem, &path).await?;
-                            continue;
-                        }
-                    }
+                    // A connected dual-stack bearer may legitimately carry
+                    // only one family (for example, Maxis often rejects the
+                    // IPv6 leg with `prefix-unavailable`). It still has a
+                    // usable IMS data path, and creating another bearer while
+                    // this one is connected can exhaust the 410's small
+                    // WDS/DHCP pool. The SIP family loop below selects the
+                    // address that was actually delivered.
                     return result;
                 }
                 observe(BearerAttempt {
@@ -266,19 +259,12 @@ where
                             error: None,
                         })
                         .await;
-                        let partial = plan
-                            .pcscf_order()
-                            .first()
-                            .is_some_and(|family| !bearer_has_family(&bearer, *family));
-                        if partial && !plan.single_family_fallbacks().is_empty() {
-                            // A reconnect can retain a bearer that the network
-                            // provisioned with only one address family. Treat
-                            // it like a partial newly-created dual bearer so
-                            // the configured single-family fallbacks run.
-                            disconnect_bearer(&path).await;
-                            delete_bearer(modem, &path).await?;
-                            continue;
-                        }
+                        // Keep a reconnected partial dual bearer for the same
+                        // reason as a reused one: it already owns the IMS WDS
+                        // session and has at least one usable address. Starting
+                        // additional single-family bearers here can crash the
+                        // QCM410 DHCP manager; family selection happens later
+                        // in the SIP loop.
                         return Ok(bearer);
                     }
                     Err(error) => {
@@ -326,10 +312,6 @@ where
     };
     let mut pending: VecDeque<&'static str> = VecDeque::from([initial]);
     let mut attempted: Vec<&'static str> = Vec::with_capacity(3);
-    // Some networks accept an IPV4V6 request but provision only one family.
-    // Keep that bearer available while trying the configured single-family
-    // fallbacks; it remains the last-resort connection if those attempts fail.
-    let mut deferred_dual = None;
     while let Some(ip_type) = pending.pop_front() {
         if attempted.contains(&ip_type) {
             continue;
@@ -351,27 +333,13 @@ where
                     error: None,
                 })
                 .await;
-                if ip_type == "ipv4v6"
-                    && plan
-                        .pcscf_order()
-                        .first()
-                        .is_some_and(|family| !bearer_has_family(&bearer, *family))
-                {
-                    let fallbacks = plan.single_family_fallbacks();
-                    if !fallbacks.is_empty() {
-                        for fallback in fallbacks {
-                            pending.push_back(fallback.as_mm_str());
-                        }
-                        deferred_dual = Some(bearer);
-                        continue;
-                    }
-                }
-                if ip_type != "ipv4v6" {
-                    if let Some(previous) = deferred_dual.take() {
-                        disconnect_bearer(&previous.path).await;
-                        let _ = delete_bearer(modem, &previous.path).await;
-                    }
-                }
+                // `ipv4v6` can be reported connected with only one address
+                // family. That is a successful bearer, not a reason to open
+                // more WDS sessions: the 410 firmware can fault when a second
+                // IMS bearer is created while the first remains connected.
+                // Single-family fallbacks are reserved for a dual-stack
+                // connection failure (the Err branch below); a partial dual
+                // bearer proceeds to the per-family SIP loop.
                 return Ok(bearer);
             }
             Err(failure) => {
@@ -395,17 +363,7 @@ where
             }
         }
     }
-    if let Some(bearer) = deferred_dual {
-        return Ok(bearer);
-    }
     Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
-}
-
-fn bearer_has_family(bearer: &BearerConnection, family: IpFamily) -> bool {
-    match family {
-        IpFamily::Ipv4 => bearer.settings.ipv4_address.is_some(),
-        IpFamily::Ipv6 => bearer.settings.ipv6_address.is_some(),
-    }
 }
 
 fn is_dual_stack_bearer(details: &str) -> bool {
