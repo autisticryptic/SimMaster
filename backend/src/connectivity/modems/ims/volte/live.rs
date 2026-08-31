@@ -563,6 +563,7 @@ struct DeviceIdentity {
     effective_ims: EffectiveImsProfile,
     effective_device_identity: EffectiveDeviceIdentity,
     visited_network_header: Option<String>,
+    dynamic_visited_network_fallback: bool,
     aka_aid: Vec<u8>,
     usim_aid: String,
     isim_aid: Option<String>,
@@ -691,6 +692,25 @@ struct VolteRegisterVariant {
 }
 
 impl VolteRegisterVariant {
+    fn with_visited_network(self) -> Self {
+        let label = match self.authorization {
+            VolteInitialAuthorization::UriFirstEmptyAka => {
+                "ims_features_aka_uri_first_roaming_visited_network"
+            }
+            VolteInitialAuthorization::None => {
+                "ims_features_no_initial_authorization_roaming_visited_network"
+            }
+        };
+        Self {
+            label,
+            policy: sip::RegisterRequestPolicy {
+                include_visited_network: true,
+                ..self.policy
+            },
+            ..self
+        }
+    }
+
     fn without_visited_network(self) -> Self {
         let label = match self.authorization {
             VolteInitialAuthorization::UriFirstEmptyAka => {
@@ -2242,9 +2262,12 @@ async fn connect_family(
                     )
                     .await;
                 let next_variant_available = register_variants.peek().is_some();
-                if let Some(upgraded_variant) =
-                    next_dynamic_register_variant(profile, variant, &failure)
-                {
+                if let Some(upgraded_variant) = next_dynamic_register_variant_with_roaming(
+                    profile,
+                    variant,
+                    &failure,
+                    device_identity.dynamic_visited_network_fallback,
+                ) {
                     last_error = Some(error);
                     pending_variant = Some(upgraded_variant);
                     continue;
@@ -5682,15 +5705,20 @@ async fn load_device_identity(
         })
         .await;
     let effective_ims = resolve_effective_ims_profile(profile, Some(sim_override));
+    let derived_visited_network_candidate = resolved.origin == ProfileOrigin::Derived;
     let visited_network_header = visited_network_header(
         &imsi,
         home_plmn.as_deref(),
         registered_plmn.as_deref(),
         // The visited PLMN never changes the selected home IMS profile.  It is
-        // exposed to SIP only for an explicit, carrier-tested exception;
-        // standards-derived fallback leaves P-Visited-Network-ID to the P-CSCF.
-        resolved.origin != ProfileOrigin::Derived && profile.ims.register.include_visited_network,
+        // exposed immediately only for an explicit, carrier-tested exception.
+        // A standards-derived profile keeps the value as a bounded fallback
+        // candidate after the visited P-CSCF has required sec-agree and then
+        // rejected or dropped the otherwise compliant request.
+        profile.ims.register.include_visited_network || derived_visited_network_candidate,
     );
+    let dynamic_visited_network_fallback =
+        derived_visited_network_candidate && visited_network_header.is_some();
     let effective_device_identity = resolve_effective_device_identity(
         Some(sim_override),
         (!device.equipment_identifier.trim().is_empty())
@@ -5720,6 +5748,7 @@ async fn load_device_identity(
         effective_ims,
         effective_device_identity,
         visited_network_header,
+        dynamic_visited_network_fallback,
         aka_aid,
         usim_aid,
         source: identity_source,
@@ -6093,18 +6122,42 @@ fn sec_agree_timeout_retry_variant(
 /// add the empty AKA Authorization while preserving every sec-agree header.
 /// Security-Client formatting experiments come afterwards, so the known
 /// 421 -> 400 -> 401 path does not burn most of the bounded candidate budget.
-fn next_dynamic_register_variant(
+fn next_dynamic_register_variant_with_roaming(
     profile: &CarrierProfile,
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
+    dynamic_visited_network_fallback: bool,
 ) -> Option<VolteRegisterVariant> {
     sec_agree_retry_variant(profile, variant, failure)
         .or_else(|| sec_agree_timeout_retry_variant(profile, variant, failure))
         .or_else(|| sec_agree_proxy_require_retry_variant(variant, failure))
         .or_else(|| sec_agree_empty_aka_retry_variant(variant, failure))
+        .or_else(|| {
+            roaming_visited_network_empty_aka_retry_variant(
+                variant,
+                failure,
+                dynamic_visited_network_fallback,
+            )
+        })
+        .or_else(|| {
+            roaming_visited_network_retry_variant(
+                variant,
+                failure,
+                dynamic_visited_network_fallback,
+            )
+        })
         .or_else(|| sec_agree_spaced_security_retry_variant(variant, failure))
         .or_else(|| sec_agree_compact_security_retry_variant(variant, failure))
         .or_else(|| sec_agree_require_only_retry_variant(variant, failure))
+}
+
+#[cfg(test)]
+fn next_dynamic_register_variant(
+    profile: &CarrierProfile,
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+) -> Option<VolteRegisterVariant> {
+    next_dynamic_register_variant_with_roaming(profile, variant, failure, false)
 }
 
 /// Some profiles already require sec-agree but omit Proxy-Require. A 400 on
@@ -6148,6 +6201,46 @@ fn sec_agree_empty_aka_retry_variant(
         && failure.auth_rounds == 0
         && matches!(register_failure_status(failure), Some(400 | 403)))
     .then(|| variant.with_empty_aka_authorization())
+}
+
+fn roaming_visited_network_empty_aka_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+    dynamic_visited_network_fallback: bool,
+) -> Option<VolteRegisterVariant> {
+    (dynamic_visited_network_fallback
+        && variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && variant.policy.include_visited_network
+        && variant.authorization == VolteInitialAuthorization::None
+        && failure.auth_rounds == 0
+        && failure.response.is_none()
+        && failure.error.code() == "ims_register_initial_receive_failed")
+        .then(|| variant.with_empty_aka_authorization())
+}
+
+/// Some visited P-CSCFs require the UE-provided roaming network identifier
+/// before they will route a home-operator identity to an AKA challenge. RFC
+/// 3455 normally leaves this header to the P-CSCF, so the standards-derived
+/// profile only enables it after the core has explicitly required sec-agree
+/// and then rejects or drops that compliant pre-authentication request.
+fn roaming_visited_network_retry_variant(
+    variant: VolteRegisterVariant,
+    failure: &RegisterFailure,
+    dynamic_visited_network_fallback: bool,
+) -> Option<VolteRegisterVariant> {
+    let rejected_before_aka = register_failure_status(failure) == Some(403)
+        || (failure.response.is_none()
+            && failure.error.code() == "ims_register_initial_receive_failed");
+    (dynamic_visited_network_fallback
+        && variant.server_required_sec_agree
+        && variant.policy.require_sec_agree
+        && variant.policy.proxy_require_sec_agree
+        && !variant.policy.include_visited_network
+        && failure.auth_rounds == 0
+        && rejected_before_aka)
+        .then(|| variant.with_visited_network())
 }
 
 fn sec_agree_require_only_retry_variant(
@@ -7763,7 +7856,10 @@ Content-Length: 0\r\n\r\n";
 
         let retry = next_dynamic_register_variant(profile, declared, &forbidden)
             .expect("server-required sec-agree 403 before AKA gets one identity-hint retry");
-        assert_eq!(retry.authorization, VolteInitialAuthorization::UriFirstEmptyAka);
+        assert_eq!(
+            retry.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
         assert!(retry.policy.require_sec_agree);
         assert!(retry.policy.proxy_require_sec_agree);
 
@@ -7773,6 +7869,91 @@ Content-Length: 0\r\n\r\n";
             ..forbidden
         };
         assert!(next_dynamic_register_variant(profile, declared, &after_auth).is_none());
+    }
+
+    #[test]
+    fn derived_roaming_timeout_tries_visited_network_then_empty_aka() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "255",
+                "03",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("derived Kyivstar LTE profile");
+        let timeout = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        let declared = register_variants(profile)[0].requiring_sec_agree();
+
+        assert!(
+            next_dynamic_register_variant_with_roaming(profile, declared, &timeout, false,)
+                .is_none()
+        );
+
+        let with_visited =
+            next_dynamic_register_variant_with_roaming(profile, declared, &timeout, true)
+                .expect("a derived roaming timeout gets one visited-network candidate");
+        assert!(with_visited.policy.include_visited_network);
+        assert_eq!(with_visited.authorization, VolteInitialAuthorization::None);
+        assert!(with_visited.server_required_sec_agree);
+
+        let with_empty_aka =
+            next_dynamic_register_variant_with_roaming(profile, with_visited, &timeout, true)
+                .expect("a silent visited-network request retains one empty-AKA fallback");
+        assert!(with_empty_aka.policy.include_visited_network);
+        assert_eq!(
+            with_empty_aka.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+        assert!(next_dynamic_register_variant_with_roaming(
+            profile,
+            with_empty_aka,
+            &timeout,
+            true,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn derived_roaming_403_keeps_empty_aka_before_visited_network() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "255",
+                "03",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("derived Kyivstar LTE profile");
+        let forbidden = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        let timeout = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        let declared = register_variants(profile)[0].requiring_sec_agree();
+
+        let with_empty_aka =
+            next_dynamic_register_variant_with_roaming(profile, declared, &forbidden, true)
+                .expect("403 first adds the AKA identity hint");
+        assert!(!with_empty_aka.policy.include_visited_network);
+        assert_eq!(
+            with_empty_aka.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
+
+        let with_visited =
+            next_dynamic_register_variant_with_roaming(profile, with_empty_aka, &timeout, true)
+                .expect("a subsequent timeout adds the roaming network without losing AKA");
+        assert!(with_visited.policy.include_visited_network);
+        assert_eq!(
+            with_visited.authorization,
+            VolteInitialAuthorization::UriFirstEmptyAka
+        );
     }
 
     #[test]
