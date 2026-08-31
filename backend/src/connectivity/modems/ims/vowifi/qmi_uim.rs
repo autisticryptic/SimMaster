@@ -21,6 +21,7 @@ const QMI_UIM_SEND_APDU: u16 = 0x003b;
 const QMI_UIM_GET_CARD_STATUS: u16 = 0x002f;
 const QMI_UIM_OPEN_LOGICAL_CHANNEL: u16 = 0x0042;
 const QMI_UIM_LOGICAL_CHANNEL: u16 = 0x003f;
+const QMI_UIM_LOGICAL_CHANNEL_INDICATION: u16 = 0x0043;
 
 const TLV_RESULT: u8 = 0x02;
 const TLV_PROXY_DEVICE_PATH: u8 = 0x01;
@@ -1366,7 +1367,17 @@ impl QmiProxyConnection {
     ) -> Result<(), QmiUimError> {
         let tx = self.take_service_transaction();
         let frame = build_close_logical_channel_frame(client_id, tx, slot, channel_id)?;
-        let response = self.send_and_recv(&frame)?;
+        let mut response = self.send_and_recv(&frame)?;
+        // The 410 modem emits a Logical Channel indication (0x0043) before
+        // the close response. qmicli consumes that indication and keeps
+        // waiting for 0x003F; do the same so the following CTL release does
+        // not accidentally read the delayed close response.
+        for _ in 0..8 {
+            if response.message_id != QMI_UIM_LOGICAL_CHANNEL_INDICATION {
+                break;
+            }
+            response = read_qmi_message(&mut self.stream)?;
+        }
         if response.message_id != QMI_UIM_LOGICAL_CHANNEL {
             return Err(QmiUimError::InvalidFrame);
         }
