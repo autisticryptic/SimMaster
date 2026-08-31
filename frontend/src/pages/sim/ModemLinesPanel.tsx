@@ -193,6 +193,7 @@ const vowifiStageLabels: Record<string, string> = {
 function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
   if (!line?.config.enabled) return 'VoWiFi未启用'
   if (line.runtime_registered) return 'VoWiFi IMS 已注册'
+  if (line.runtime_error === 'vowifi_auto_restore_exhausted') return 'VoWiFi连接失败'
   const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage
   if (line.runtime_restore_in_progress) return stage
   if (line.runtime_stage === 'reconnecting') return 'IMS 注册失效，等待下一次重试'
@@ -202,6 +203,7 @@ function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
 function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
   if (!line) return '等待匹配运营商 profile'
   if (line.runtime_restore_in_progress) return '后台正在执行自动重连'
+  if (line.runtime_error === 'vowifi_auto_restore_exhausted') return '自动重连已达上限，已停止'
   if (line.matched_profile_source === 'derived') {
     return line.runtime_error
       ? '数据库无可用配置，标准自动推断本轮连接失败'

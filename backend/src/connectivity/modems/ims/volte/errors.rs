@@ -69,6 +69,8 @@ pub mod code {
     pub const RUNTIME_UE_WORKER_UNAVAILABLE: &str = "volte_runtime_ue_worker_unavailable";
     pub const RUNTIME_MM_BEARER_PATH_MISSING: &str = "volte_runtime_mm_bearer_path_missing";
     pub const RUNTIME_MM_MODEM_WAIT_TIMEOUT: &str = "volte_runtime_mm_modem_wait_timeout";
+    pub const RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED: &str =
+        "volte_runtime_cellular_network_not_registered";
     pub const RUNTIME_ALL_PCSCF_FAILED: &str = "volte_runtime_all_pcscf_failed";
     /// No P-CSCF was prefetched from a stored IMS profile for this line. Not a
     /// hard failure on its own — discovery falls through to the live bearer /

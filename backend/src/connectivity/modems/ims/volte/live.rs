@@ -104,7 +104,10 @@ use super::{
 };
 
 const QMI_PROXY_SOCKET: &str = "@qmi-proxy";
-const MM_MODEM_WAIT_ATTEMPTS: usize = 10;
+// An eSIM profile switch re-enumerates the modem before cellular registration
+// has necessarily completed. Give ModemManager one full registration window,
+// while keeping the wait cancellable through the VoLTE generation.
+const MM_MODEM_WAIT_ATTEMPTS: usize = 46;
 const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// SIP interoperability candidates are separate from the outer bearer
@@ -1566,6 +1569,7 @@ fn failure_stage(error: &VolteError) -> Option<VolteStage> {
         | code::AKA_MATERIAL_INVALID
         | code::AKA_RES_EMPTY => VolteStage::IdentityAka,
         code::RUNTIME_MM_MODEM_WAIT_TIMEOUT => VolteStage::Modem,
+        code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED => VolteStage::Radio,
         code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
         | code::RUNTIME_MM_BEARER_NOT_CONNECTED
         | code::RUNTIME_MM_BEARER_CONNECT_FAILED
@@ -1614,7 +1618,10 @@ async fn connect_inner(
     // explicit ordered families. All family-selection consumers (AT probe
     // order, bearer fallback, IPv6 preflight hint, SIP local-address order)
     // derive from this one object.
-    let mut device = resolve_device_binding(device).await?;
+    runtime
+        .update(|state| state.stage = VolteStage::Radio)
+        .await;
+    let mut device = resolve_device_binding(device, runtime, generation).await?;
 
     // beta2 readiness gate: wait for the QMI auto-activate marker to settle before
     // driving the modem, so IMS setup does not race the initial UIM provisioning.
@@ -1659,7 +1666,7 @@ async fn connect_inner(
     // can move into the line namespace. There is no ModemManager/host bearer
     // fallback.
     ensure_generation(runtime, generation)?;
-    device = resolve_device_binding(&device).await?;
+    device = resolve_device_binding(&device, runtime, generation).await?;
 
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
@@ -5804,16 +5811,22 @@ struct FallbackImsi {
 
 async fn resolve_device_binding(
     requested: &VolteDeviceBinding,
+    runtime: &VolteRuntime,
+    generation: u64,
 ) -> Result<VolteDeviceBinding, VolteError> {
+    let mut current = requested.clone();
+    let mut modem_seen = false;
     for attempt in 0..MM_MODEM_WAIT_ATTEMPTS {
+        ensure_generation(runtime, generation)?;
         if let Ok(details) = command_output(
             "mmcli",
-            &["-m", requested.modem_id.as_str(), "--output-keyvalue"],
+            &["-m", current.modem_id.as_str(), "--output-keyvalue"],
         )
         .await
         {
+            modem_seen = true;
             if modem_is_ready(&details) {
-                return Ok(requested.clone());
+                return Ok(current);
             }
         }
 
@@ -5822,35 +5835,46 @@ async fn resolve_device_binding(
         // walked modem6 -> modem9 -> modem10 across three restarts. A cached
         // index therefore goes stale routinely, and polling it cannot recover:
         // `mmcli -m <stale>` fails with "couldn't find modem" every time, so
-        // all ten attempts burn 20s and report a timeout for a modem that was
-        // registered throughout. The IMEI survives renumbering, so use it to
-        // find the modem's current index before spending another delay.
-        if let Some(found) = relocate_modem_by_equipment_id(requested).await {
-            tracing::info!(
-                previous_modem_id = %requested.modem_id,
-                modem_id = %found.modem_id,
-                attempt,
-                "Modem index changed; re-resolved the VoLTE binding by equipment id"
-            );
-            return Ok(found);
+        // the whole wait window reports a timeout for a modem that may already
+        // have reappeared under a new index. The IMEI survives renumbering, so
+        // use it to find the modem's current index before another delay.
+        if let Some((found, ready)) = relocate_modem_by_equipment_id(requested).await {
+            modem_seen = true;
+            if found.modem_id != current.modem_id {
+                tracing::info!(
+                    previous_modem_id = %current.modem_id,
+                    modem_id = %found.modem_id,
+                    attempt,
+                    "Modem index changed; re-resolved the VoLTE binding by equipment id"
+                );
+            }
+            current = found;
+            if ready {
+                return Ok(current);
+            }
         }
 
         if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
             tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
         }
     }
-    Err(VolteError::new(code::RUNTIME_MM_MODEM_WAIT_TIMEOUT))
+    Err(VolteError::new(if modem_seen {
+        code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED
+    } else {
+        code::RUNTIME_MM_MODEM_WAIT_TIMEOUT
+    }))
 }
 
 /// Find the modem that currently carries this binding's equipment id (IMEI).
 ///
-/// Returns `None` when the id is unknown, no listed modem matches, or the match
-/// is not yet ready -- all of which leave the ordinary wait loop in charge.
-/// Matching on the IMEI rather than the index is the point: the index is
-/// ModemManager's own enumeration order and is not stable across a re-probe.
+/// Returns the matching binding plus its current registration readiness. A
+/// matching but not-yet-registered modem is still useful because subsequent
+/// polls should follow its new index. Matching on the IMEI rather than the
+/// index is the point: the index is ModemManager's own enumeration order and
+/// is not stable across a re-probe.
 async fn relocate_modem_by_equipment_id(
     requested: &VolteDeviceBinding,
-) -> Option<VolteDeviceBinding> {
+) -> Option<(VolteDeviceBinding, bool)> {
     let wanted = requested.equipment_identifier.trim();
     if wanted.is_empty() {
         return None;
@@ -5877,11 +5901,14 @@ async fn relocate_modem_by_equipment_id(
             .as_deref()
             .map(str::trim)
             == Some(wanted);
-        if matches_equipment && modem_is_ready(&details) {
-            return Some(VolteDeviceBinding {
-                modem_id: candidate.to_string(),
-                ..requested.clone()
-            });
+        if matches_equipment {
+            return Some((
+                VolteDeviceBinding {
+                    modem_id: candidate.to_string(),
+                    ..requested.clone()
+                },
+                modem_is_ready(&details),
+            ));
         }
     }
     None
@@ -7319,6 +7346,12 @@ mod tests {
         assert!(modem_is_ready("modem.generic.state : connected\n"));
         assert!(!modem_is_ready("modem.generic.state : enabling\n"));
         assert!(!modem_is_ready("modem.generic.state : disabled\n"));
+    }
+
+    #[test]
+    fn cellular_registration_timeout_is_reported_at_the_radio_stage() {
+        let error = VolteError::new(code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED);
+        assert_eq!(failure_stage(&error), Some(VolteStage::Radio));
     }
 
     #[test]

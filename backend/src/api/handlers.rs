@@ -92,8 +92,8 @@ const VOWIFI_RESTORE_IDENTITY_GATE_ATTEMPTS: u8 = 5;
 const VOLTE_MODEM_MISSING_POLLS: u32 = 6;
 const VOLTE_MODEM_MISSING_POLL_DELAY_SECS: u64 = 5;
 const VOWIFI_RESTORE_IDENTITY_GATE_DELAY_SECS: u64 = 2;
-const VOWIFI_PROFILE_SWITCH_CONNECT_ATTEMPTS: u8 = 2;
 const VOWIFI_PROFILE_SWITCH_CONNECT_RETRY_DELAY_SECS: u64 = 1;
+const VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON: &str = "vowifi_auto_restore_exhausted";
 const SMS_DB_MAINTENANCE_DELETE_THRESHOLD: usize = 100;
 const SMS_DB_MAINTENANCE_DELAY_SECS: u64 = 60;
 const LINE_DATA_WATCHDOG_INTERVAL_SECS: u64 = 15;
@@ -6266,6 +6266,10 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
     })
 }
 
+fn vowifi_auto_restore_is_exhausted(reason: Option<&str>) -> bool {
+    reason == Some(VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON)
+}
+
 fn active_call_state_protects_vowifi_rebuild(state: &str) -> bool {
     matches!(state, "active" | "held")
 }
@@ -6534,7 +6538,6 @@ struct VowifiRestoreWorkflow {
     connect_retry_delay: Duration,
     start_reason: &'static str,
     disabled_reason: &'static str,
-    fallback_reason: &'static str,
 }
 
 #[derive(Clone)]
@@ -6551,13 +6554,12 @@ impl VowifiRestoreWorkflow {
             initial_delay: Duration::from_secs(VOWIFI_PROFILE_SWITCH_RESTORE_INITIAL_DELAY_SECS),
             attempts: VOWIFI_PROFILE_SWITCH_RESTORE_ATTEMPTS,
             retry_delay: Duration::from_secs(VOWIFI_PROFILE_SWITCH_RESTORE_RETRY_DELAY_SECS),
-            connect_attempts: VOWIFI_PROFILE_SWITCH_CONNECT_ATTEMPTS,
+            connect_attempts: 1,
             connect_retry_delay: Duration::from_secs(
                 VOWIFI_PROFILE_SWITCH_CONNECT_RETRY_DELAY_SECS,
             ),
             start_reason: "vowifi_profile_switch_teardown",
             disabled_reason: "vowifi_profile_switch_connection_disabled",
-            fallback_reason: "vowifi_profile_switch_restore_failed_cellular_fallback",
         }
     }
 
@@ -6568,11 +6570,13 @@ impl VowifiRestoreWorkflow {
             initial_delay: Duration::from_secs(config.initial_delay_secs.clamp(30, 300)),
             attempts: config.attempts.clamp(1, 5),
             retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
-            connect_attempts: config.attempts.clamp(1, 5),
+            // `attempts` is the total restore budget. Nesting the same value in
+            // `connect_vowifi_on_line` multiplied the default 3 into 9 live
+            // connection attempts before the outer scheduler started over.
+            connect_attempts: 1,
             connect_retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
             start_reason: "vowifi_auto_restore_start",
             disabled_reason: "vowifi_auto_restore_connection_disabled",
-            fallback_reason: "vowifi_auto_restore_failed_cellular_fallback",
         }
     }
 
@@ -6796,10 +6800,12 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         reason = last_status.degraded_reason.as_deref().unwrap_or("unknown"),
         "WiFi Calling restore workflow failed after retries"
     );
-    // A transient route, DNS, or ePDG failure must not overwrite the user's
-    // per-line enable intent. Reset only the failed runtime so a later manual
-    // attempt or boot restore can retry after connectivity returns.
-    let _ = restore_cellular_and_reset_vowifi(&app, &scope, workflow.fallback_reason).await;
+    // Preserve the user's enable intent but mark this restore budget as
+    // exhausted. The outer 10-second scheduler must not create a fresh budget
+    // forever. A config edit, explicit off/on, profile switch, or process
+    // restart clears the marker and permits a new bounded batch.
+    let _ =
+        restore_cellular_and_reset_vowifi(&app, &scope, VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON).await;
 }
 
 async fn schedule_vowifi_restore_retry(
@@ -7264,7 +7270,12 @@ async fn connect_vowifi_on_line(
                     "VoWiFi IMS refresh failure threshold reached; rebuilding access"
                 );
                 last_status = if fallback_to_cellular_on_failure {
-                    restore_cellular_and_reset_vowifi(app, scope, &rebuild_reason).await
+                    restore_cellular_and_reset_vowifi(
+                        app,
+                        scope,
+                        VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON,
+                    )
+                    .await
                 } else {
                     reset_vowifi_runtime_for_scope(app, scope, &rebuild_reason).await
                 };
@@ -7295,10 +7306,12 @@ async fn connect_vowifi_on_line(
             reason = fallback_reason.as_str(),
             "WiFi Calling connection attempts exhausted; falling back to cellular"
         );
-        // Preserve the configured enable intent. The current runtime is
-        // degraded and cellular data is restored, but the operator should not
-        // have to re-enable VoWiFi after a temporary DNS or route outage.
-        last_status = restore_cellular_and_reset_vowifi(app, scope, &fallback_reason).await;
+        // Preserve the configured enable intent, but expose only the bounded
+        // retry result in runtime status. The detailed terminal reason above is
+        // retained in logs and runtime events.
+        last_status =
+            restore_cellular_and_reset_vowifi(app, scope, VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON)
+                .await;
     }
     last_status
 }
@@ -7474,6 +7487,11 @@ pub async fn set_vowifi_line_config_handler(
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {error}"))),
         );
+    }
+    let current = line.vowifi.snapshot().await.status_response();
+    if vowifi_auto_restore_is_exhausted(current.degraded_reason.as_deref()) {
+        let scope = VowifiScope::for_line(Arc::clone(&line));
+        let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_config_updated").await;
     }
     sync_line_video_capabilities(&app).await;
     (
@@ -9386,8 +9404,10 @@ async fn schedule_vowifi_auto_restore(
             &line_id,
         )
         .await;
+    let snapshot = line.vowifi.snapshot().await;
     if line.vowifi_restore_in_progress()
-        || (line.vowifi.snapshot().await.readiness().sms_ready && operator_ready && !refresh_due)
+        || vowifi_auto_restore_is_exhausted(snapshot.degraded_reason.as_deref())
+        || (snapshot.readiness().sms_ready && operator_ready && !refresh_due)
     {
         return;
     }
@@ -9599,6 +9619,7 @@ fn schedule_line_volte_profile_selection_restart(
 enum VolteProfileBatchAction {
     Succeeded,
     Continue,
+    WaitForNetwork,
     Exhausted,
     AbortUnsafe,
     Cancelled,
@@ -9616,7 +9637,11 @@ fn volte_profile_batch_action(
     let Some(error) = error else {
         return VolteProfileBatchAction::Succeeded;
     };
-    if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(error)
+    if error.code()
+        == crate::connectivity::modems::ims::volte::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED
+    {
+        VolteProfileBatchAction::WaitForNetwork
+    } else if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(error)
         == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
     {
         VolteProfileBatchAction::AbortUnsafe
@@ -9940,6 +9965,28 @@ async fn run_line_volte_restore_batch(
                     error = %error,
                     "VoLTE IMS restore attempt failed"
                 );
+                // The modem exists, but the SIM has not registered on a
+                // cellular network yet. This prerequisite is independent of
+                // the IMS profile source, so do not waste the remaining
+                // database/catalog/derived attempts. Leave automatic recovery
+                // enabled; the periodic restore loop will resume after the
+                // modem reaches registered/connected.
+                if batch_action == VolteProfileBatchAction::WaitForNetwork {
+                    let delay = 30;
+                    line.volte
+                        .update(|state| {
+                            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                            state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Radio;
+                            state.recovery_state =
+                                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
+                            state.manual_retry_available = false;
+                            state.next_retry_at = Some(volte_next_retry_at(delay));
+                            state.last_error = Some(error.to_string());
+                            state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+                        })
+                        .await;
+                    return;
+                }
                 // A wedged baseband must not be retried. Re-issuing IMS PDP
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
@@ -13534,6 +13581,7 @@ mod tests {
     enum MockVolteProfileOutcome {
         Success,
         Failure,
+        NetworkNotRegistered,
         BasebandWedged,
     }
 
@@ -13550,6 +13598,11 @@ mod tests {
                 MockVolteProfileOutcome::Failure => Some(
                     crate::connectivity::modems::ims::volte::VolteError::new(
                         crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
+                    ),
+                ),
+                MockVolteProfileOutcome::NetworkNotRegistered => Some(
+                    crate::connectivity::modems::ims::volte::VolteError::new(
+                        crate::connectivity::modems::ims::volte::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED,
                     ),
                 ),
                 MockVolteProfileOutcome::BasebandWedged => Some(
@@ -13610,6 +13663,18 @@ mod tests {
         assert_eq!(
             volte_profile_batch_action(false, 1, 3, Some(&error)),
             VolteProfileBatchAction::Cancelled
+        );
+    }
+
+    #[test]
+    fn volte_profile_batch_waits_for_cellular_registration_without_fallback() {
+        assert_eq!(
+            simulate_volte_profile_batch(&[
+                MockVolteProfileOutcome::NetworkNotRegistered,
+                MockVolteProfileOutcome::Success,
+                MockVolteProfileOutcome::Success,
+            ]),
+            (vec![1], VolteProfileBatchAction::WaitForNetwork)
         );
     }
 
@@ -13676,6 +13741,27 @@ mod tests {
         offline.vowifi.enabled = true;
 
         assert!(line_vowifi_restore_enabled(&offline));
+    }
+
+    #[test]
+    fn vowifi_auto_restore_exhaustion_is_a_terminal_scheduler_state() {
+        assert!(vowifi_auto_restore_is_exhausted(Some(
+            VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON
+        )));
+        assert!(!vowifi_auto_restore_is_exhausted(Some("vowifi_dns_failed")));
+        assert!(!vowifi_auto_restore_is_exhausted(None));
+    }
+
+    #[test]
+    fn vowifi_auto_restore_attempt_budget_is_not_multiplied() {
+        let config = AutoRestoreConfig {
+            initial_delay_secs: 30,
+            attempts: 3,
+            retry_delay_secs: 10,
+        };
+        let workflow = VowifiRestoreWorkflow::boot_auto_restore(&config, "line-a".to_string());
+        assert_eq!(workflow.attempts, 3);
+        assert_eq!(workflow.connect_attempts, 1);
     }
 
     #[test]

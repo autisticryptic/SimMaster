@@ -61,6 +61,9 @@ export function volteErrorMessage(error?: string | null) {
   if (error.includes('volte_carrier_ims_apn_missing')) {
     return '已匹配运营商 Profile，但其中缺少 IMS APN，无法建立 VoLTE Bearer。'
   }
+  if (error.includes('volte_runtime_cellular_network_not_registered')) {
+    return '蜂窝网络未注册'
+  }
   if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) {
     return '当前 SIM 未订阅 IMS 服务，或当前漫游网络不允许该 SIM 建立 IMS APN。该拒绝发生在运营商网络/套餐侧，尚未进入 P-CSCF、AKA 或 SIP REGISTER。'
   }
@@ -84,6 +87,7 @@ export function volteErrorMessage(error?: string | null) {
 
 export function volteErrorStatusLabel(error?: string | null) {
   if (!error) return null
+  if (error.includes('volte_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) return '未订阅 IMS 服务'
   return null
 }
