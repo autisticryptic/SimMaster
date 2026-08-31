@@ -394,7 +394,6 @@ fn retained_allocate_args(device: &str) -> Vec<&str> {
         "-d",
         device,
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         "--client-no-release-cid",
         "--wds-noop",
@@ -406,7 +405,6 @@ fn retained_action_args<'a>(device: &'a str, cid: &'a str, action: &'a str) -> V
         "-d",
         device,
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         cid,
         "--client-no-release-cid",
@@ -469,7 +467,6 @@ async fn read_current_settings(
         "-d",
         endpoint.device_path.as_str(),
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
@@ -614,7 +611,6 @@ async fn stop_retained_session(endpoint: &SecondaryQmiEndpoint, session: &Retain
         "-d",
         endpoint.device_path.as_str(),
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
@@ -631,7 +627,6 @@ async fn release_retained_client(endpoint: &SecondaryQmiEndpoint, client_id: &st
         "-d",
         endpoint.device_path.as_str(),
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--wds-noop",
@@ -645,7 +640,6 @@ async fn retained_session_is_active(session: &SecondaryDataSession) -> bool {
         "-d",
         session.endpoint.device_path.as_str(),
         "--device-open-qmi",
-        "--device-open-proxy",
         secondary_qmi::QMI_OPEN_NET_ARG,
         cid.as_str(),
         "--client-no-release-cid",
@@ -751,8 +745,11 @@ mod tests {
         assert!(allocation.contains(&"--wds-noop"));
         assert!(allocation.contains(&"--client-no-release-cid"));
         assert!(allocation.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(!allocation.contains(&"--device-open-proxy"));
         assert!(family_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(!family_args.contains(&"--device-open-proxy"));
         assert!(start_args.contains(&secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(!start_args.contains(&"--device-open-proxy"));
         assert!(family_args.contains(&family));
         assert!(family_args.contains(&cid));
         assert!(!family_args.contains(&action.as_str()));

@@ -186,9 +186,9 @@ impl QmiOpenMode {
         }
     }
 
-    /// Beta8's boot probe is direct and forces QMI because the stock driver
-    /// advertises DATA6 as an UNKNOWN/AT-style port. Proxy sharing starts only
-    /// for the retained runtime WDS client.
+    /// Beta8 forces direct QMI because the stock driver advertises DATA6 as an
+    /// UNKNOWN/AT-style port. qmi-proxy rejects that advertised transport on
+    /// later retained-CID calls even though direct QMI works.
     pub fn probe_order() -> [Self; 1] {
         [Self::ForceQmi]
     }
@@ -1295,7 +1295,6 @@ async fn allocate_wds_client(endpoint: &SecondaryQmiEndpoint) -> Result<String, 
         "-d",
         &endpoint.device_path,
         "--device-open-qmi",
-        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         "--client-no-release-cid",
         "--wds-noop",
@@ -1323,7 +1322,6 @@ async fn run_retained_wds_action(
         "-d",
         &endpoint.device_path,
         "--device-open-qmi",
-        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         &cid,
         "--client-no-release-cid",
@@ -1349,7 +1347,6 @@ async fn release_wds_client(endpoint: &SecondaryQmiEndpoint, client_id: &str) {
         "-d",
         &endpoint.device_path,
         "--device-open-qmi",
-        "--device-open-proxy",
         QMI_OPEN_NET_ARG,
         &cid,
         "--wds-noop",

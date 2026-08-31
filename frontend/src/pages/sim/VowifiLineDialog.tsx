@@ -156,6 +156,30 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             这里配置<strong>这条线路</strong>的代理出口和 Profile 重试顺序。ePDG、DNS 与 IMS 参数只从运营商
             Profile 读取；详细内容请在“运营商 IMS Profile”中维护。
           </Alert>
+          <Stack spacing={1}>
+            <FormControlLabel
+              control={
+                <Switch
+                  checked={override?.ims_vowifi.spoof_imsi ?? false}
+                  disabled={overrideLoading || !override}
+                  onChange={(_, spoof_imsi) => patchVowifiOverride({
+                    spoof_imsi,
+                    custom_imsi: spoof_imsi ? override?.ims_vowifi.custom_imsi ?? null : null,
+                  })}
+                />
+              }
+              label="伪装 IMSI"
+            />
+            <TextField
+              label="伪装 IMSI"
+              value={override?.ims_vowifi.custom_imsi ?? ''}
+              disabled={overrideLoading || !override?.ims_vowifi.spoof_imsi}
+              placeholder="460001234567890"
+              helperText="用于 VoWiFi 的运营商匹配、IKE NAI 与 IMS 注册身份；SIM AKA 仍由当前卡片完成，重连后生效"
+              inputProps={{ inputMode: 'numeric', maxLength: 16 }}
+              onChange={(event) => patchVowifiOverride({ custom_imsi: event.target.value })}
+            />
+          </Stack>
           <FormControl fullWidth>
             <InputLabel>代理模式</InputLabel>
             <Select
@@ -256,30 +280,6 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
             </Stack>
           </Box>
 
-          <Stack spacing={1}>
-            <FormControlLabel
-              control={
-                <Switch
-                  checked={override?.ims_vowifi.spoof_imsi ?? false}
-                  disabled={overrideLoading || !override}
-                  onChange={(_, spoof_imsi) => patchVowifiOverride({
-                    spoof_imsi,
-                    custom_imsi: spoof_imsi ? override?.ims_vowifi.custom_imsi ?? null : null,
-                  })}
-                />
-              }
-              label="伪装 IMSI"
-            />
-            <TextField
-              label="伪装 IMSI"
-              value={override?.ims_vowifi.custom_imsi ?? ''}
-              disabled={overrideLoading || !override?.ims_vowifi.spoof_imsi}
-              placeholder="460001234567890"
-              helperText="用于 VoWiFi 的运营商匹配、IKE NAI 与 IMS 注册身份；SIM AKA 仍由当前卡片完成，重连后生效"
-              inputProps={{ inputMode: 'numeric', maxLength: 16 }}
-              onChange={(event) => patchVowifiOverride({ custom_imsi: event.target.value })}
-            />
-          </Stack>
           <Alert severity="info">
             每条线路各自持有独立的 VoWiFi 运行时、TUN 网卡与代理出口，多张不同国家的 SIM 可以同时注册，互不影响。
             普通 HTTP CONNECT 无法转发 IKEv2 的 UDP 500/4500，所以只提供直连与 SOCKS5 两种模式。
