@@ -13,7 +13,8 @@ use serde_json::Value;
 use super::{
     db_error, default_access_network_info, expand_ims_static_template, expand_static_template,
     normalize_home_plmn, normalize_ip_family, CatalogAccessKind, CatalogIdentityMatch,
-    CatalogProfile, CatalogProfileIcon, CatalogRelease, CatalogServiceCapabilities, ProfileMetaRow,
+    CatalogProfile, CatalogProfileIcon, CatalogProfileSummary, CatalogRelease,
+    CatalogServiceCapabilities, ProfileMetaRow,
 };
 use crate::connectivity::core::access_network::AccessIdentityPolicy;
 use crate::connectivity::modems::ims::vowifi::profile_record::{
@@ -201,6 +202,90 @@ pub(super) fn list(
         }
     }
     Ok(profiles)
+}
+
+pub(super) fn list_summaries(conn: &Connection) -> Result<Vec<CatalogProfileSummary>, String> {
+    let release = read_release(conn)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT cp.profile_id,
+                    (SELECT mr.plmn
+                       FROM profile_match_rules AS mr
+                      WHERE mr.profile_id = cp.profile_id
+                        AND mr.is_exclusion = 0 AND mr.plmn IS NOT NULL
+                      ORDER BY mr.priority, length(mr.plmn) DESC
+                      LIMIT 1),
+                    COALESCE(c.brand_name, c.canonical_name, cp.display_name),
+                    COALESCE(c.aliases_json, '[]'),
+                    cp.lte_ims_status = 'ready',
+                    cp.vowifi_status = 'ready',
+                    COALESCE(json_extract(cp.config_json, '$.services.vilte'), 0),
+                    COALESCE(json_extract(cp.config_json, '$.services.smsoip'), 0),
+                    COALESCE(json_extract(cp.config_json, '$.services.ut_xcap'), 0)
+               FROM carrier_profiles AS cp
+               LEFT JOIN carriers AS c ON c.carrier_id = cp.carrier_id
+              WHERE cp.lte_ims_status = 'ready' OR cp.vowifi_status = 'ready'
+              ORDER BY cp.priority, cp.profile_id",
+        )
+        .map_err(db_error)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)? != 0,
+                row.get::<_, i64>(5)? != 0,
+                row.get::<_, i64>(6)? != 0,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, i64>(8)? != 0,
+            ))
+        })
+        .map_err(db_error)?;
+    let mut summaries = Vec::new();
+    for row in rows {
+        let (
+            profile_id,
+            plmn,
+            brand,
+            aliases_json,
+            volte_ready,
+            vowifi_ready,
+            vilte_enabled,
+            smsoip_enabled,
+            ut_xcap_enabled,
+        ) = row.map_err(db_error)?;
+        let Some(plmn) = plmn else {
+            tracing::warn!(profile_id, "Skipping catalog summary without a PLMN rule");
+            continue;
+        };
+        if !matches!(plmn.len(), 5 | 6) || !plmn.bytes().all(|byte| byte.is_ascii_digit()) {
+            tracing::warn!(
+                profile_id,
+                plmn,
+                "Skipping catalog summary with invalid PLMN"
+            );
+            continue;
+        }
+        let aliases = serde_json::from_str::<Vec<String>>(&aliases_json)
+            .map_err(|error| format!("carrier_catalog_v7_aliases_invalid:{profile_id}:{error}"))?;
+        summaries.push(CatalogProfileSummary {
+            profile_id,
+            mcc: plmn[..3].to_string(),
+            plmn,
+            operator_legal_name: brand.clone(),
+            brand,
+            aliases,
+            release: release.clone(),
+            volte_ready,
+            vowifi_ready,
+            vilte_enabled,
+            smsoip_enabled,
+            ut_xcap_enabled,
+        });
+    }
+    Ok(summaries)
 }
 
 pub(super) fn service_capabilities(

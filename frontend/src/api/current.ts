@@ -17,6 +17,7 @@ import type {
   CarrierCatalogInstallResponse,
   CarrierCatalogStatusResponse,
   CarrierProfileRecord,
+  CarrierProfileSummary,
   CellLocationResponse,
   ResolvedCarrierProfile,
   StoredCarrierProfile,
@@ -1125,13 +1126,20 @@ class SimAdminCurrentAPI {
   }
 
   // ---- VoWiFi carrier profile database ----
-  // These replace the compiled-in carrier constants. Carriers with no row fall
-  // back to the built-ins, and finally to 3GPP-derived defaults.
+  // The browser receives a lightweight stored-only index. Complete records are
+  // loaded from their source database only when the operator opens one.
 
   async listVowifiCarrierProfiles() {
-    return request<ApiResponse<StoredCarrierProfile[]>>('/vowifi/carrier-profiles', {
+    return request<ApiResponse<CarrierProfileSummary[]>>('/vowifi/carrier-profiles', {
       timeoutMs: 15000,
     })
+  }
+
+  async getVowifiCarrierProfile(origin: 'database' | 'carrier_catalog', profileId: string) {
+    return request<ApiResponse<StoredCarrierProfile>>(
+      `/vowifi/carrier-profiles/detail/${origin}/${encodeURIComponent(profileId)}`,
+      { timeoutMs: 15000 },
+    )
   }
 
   async getCarrierCatalogStatus() {

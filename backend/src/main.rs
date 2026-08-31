@@ -2014,6 +2014,10 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(get_vowifi_carrier_profile_icon_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/carrier-profiles/detail/{origin}/{profile_id}",
+            get(get_vowifi_carrier_profile_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/carrier-catalog/status",
             get(get_carrier_catalog_status_handler).options(options_handler),
         )
@@ -2810,6 +2814,29 @@ mod http_router_tests {
             "the stored record must keep the omit: {resolved}"
         );
 
+        let (status, summaries) =
+            get_with_cookie(&served, "/api/vowifi/carrier-profiles", &cookie).await;
+        assert_eq!(status, StatusCode::OK, "summary list must answer: {summaries}");
+        assert!(
+            summaries.contains(&profile_id) && summaries.contains("\"origin\":\"database\""),
+            "summary list must contain the custom profile: {summaries}"
+        );
+        assert!(
+            !summaries.contains("\"record\":"),
+            "summary list must not transfer complete records: {summaries}"
+        );
+
+        let (status, detail) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/detail/database/{profile_id}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "database detail must answer: {detail}");
+        assert!(
+            detail.contains("\"always_add_sip_instance\":false"),
+            "detail lookup must return the stored record: {detail}"
+        );
     }
 
     /// The profile-selection PUT error matrix, over HTTP.

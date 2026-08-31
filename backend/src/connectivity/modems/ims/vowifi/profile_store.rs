@@ -311,6 +311,123 @@ impl ProfileStore {
         self.list_for_access(CatalogAccessKind::WifiEpdg)
     }
 
+    pub fn list_stored_profile_summaries(&self) -> Result<Vec<StoredProfileSummary>, String> {
+        let mut summaries = Vec::new();
+        match self.catalog.list_summaries() {
+            Ok(catalog) => {
+                summaries.extend(catalog.into_iter().map(|profile| StoredProfileSummary {
+                    profile_id: profile.profile_id,
+                    plmn: profile.plmn,
+                    mcc: profile.mcc,
+                    brand: profile.brand,
+                    operator_legal_name: profile.operator_legal_name,
+                    aliases: profile.aliases,
+                    origin: ProfileOrigin::Catalog,
+                    source: format!("carrier_catalog:{}", profile.release.release_id),
+                    updated_at: profile.release.generated_at,
+                    volte_ready: profile.volte_ready,
+                    vowifi_ready: profile.vowifi_ready,
+                    vilte_enabled: profile.vilte_enabled,
+                    smsoip_enabled: profile.smsoip_enabled,
+                    ut_xcap_enabled: profile.ut_xcap_enabled,
+                }))
+            }
+            Err(error) => tracing::debug!(
+                error = %error,
+                "Carrier catalog unavailable while listing profile summaries"
+            ),
+        }
+        for (entry, record) in self.custom_records()?.valid {
+            summaries.push(StoredProfileSummary {
+                profile_id: entry.profile_id,
+                plmn: entry.plmn,
+                mcc: record.meta.mcc.clone(),
+                brand: record.meta.brand.clone(),
+                operator_legal_name: record.meta.operator_legal_name.clone(),
+                aliases: record.meta.aliases.clone(),
+                origin: ProfileOrigin::Database,
+                source: "manual".to_string(),
+                updated_at: entry.updated_at,
+                volte_ready: record.validate_ims_only().is_ok(),
+                vowifi_ready: record.voice.vowifi_enabled,
+                vilte_enabled: false,
+                smsoip_enabled: true,
+                ut_xcap_enabled: record.ut.enabled,
+            });
+        }
+        summaries.sort_by(|left, right| {
+            profile_origin_rank(left.origin)
+                .cmp(&profile_origin_rank(right.origin))
+                .then(left.plmn.cmp(&right.plmn))
+                .then(left.brand.cmp(&right.brand))
+                .then(left.profile_id.cmp(&right.profile_id))
+        });
+        Ok(summaries)
+    }
+
+    pub fn get_stored_profile(
+        &self,
+        origin: ProfileOrigin,
+        profile_id: &str,
+    ) -> Result<Option<StoredProfile>, String> {
+        let profile_id = profile_id.trim();
+        if profile_id.is_empty() {
+            return Ok(None);
+        }
+        match origin {
+            ProfileOrigin::Database => Ok(self
+                .custom_records()?
+                .valid
+                .into_iter()
+                .find(|(entry, _)| entry.profile_id == profile_id)
+                .map(|(entry, record)| StoredProfile {
+                    profile_id: entry.profile_id,
+                    plmn: entry.plmn,
+                    origin: ProfileOrigin::Database,
+                    source: "manual".to_string(),
+                    updated_at: entry.updated_at,
+                    volte_ready: record.validate_ims_only().is_ok(),
+                    vowifi_ready: record.voice.vowifi_enabled,
+                    vilte_enabled: false,
+                    smsoip_enabled: true,
+                    ut_xcap_enabled: record.ut.enabled,
+                    record,
+                })),
+            ProfileOrigin::Catalog => {
+                let Some(summary) = self
+                    .catalog
+                    .list_summaries()?
+                    .into_iter()
+                    .find(|profile| profile.profile_id == profile_id)
+                else {
+                    return Ok(None);
+                };
+                let access = if summary.vowifi_ready {
+                    CatalogAccessKind::WifiEpdg
+                } else {
+                    CatalogAccessKind::LteEpc
+                };
+                let Some(profile) = self.catalog.get(profile_id, access)? else {
+                    return Ok(None);
+                };
+                Ok(Some(StoredProfile {
+                    profile_id: summary.profile_id,
+                    plmn: summary.plmn,
+                    origin: ProfileOrigin::Catalog,
+                    source: format!("carrier_catalog:{}", summary.release.release_id),
+                    updated_at: summary.release.generated_at,
+                    record: profile.record,
+                    volte_ready: summary.volte_ready,
+                    vowifi_ready: summary.vowifi_ready,
+                    vilte_enabled: summary.vilte_enabled,
+                    smsoip_enabled: summary.smsoip_enabled,
+                    ut_xcap_enabled: summary.ut_xcap_enabled,
+                }))
+            }
+            ProfileOrigin::Derived => Ok(None),
+        }
+    }
+
     /// Search only operator-authored rows and downloaded catalog rows.
     ///
     /// This is intentionally separate from the runtime resolvers below: the
@@ -950,6 +1067,24 @@ pub struct StoredProfile {
     pub ut_xcap_enabled: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StoredProfileSummary {
+    pub profile_id: String,
+    pub plmn: String,
+    pub mcc: String,
+    pub brand: String,
+    pub operator_legal_name: String,
+    pub aliases: Vec<String>,
+    pub origin: ProfileOrigin,
+    pub source: String,
+    pub updated_at: String,
+    pub volte_ready: bool,
+    pub vowifi_ready: bool,
+    pub vilte_enabled: bool,
+    pub smsoip_enabled: bool,
+    pub ut_xcap_enabled: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1147,6 +1282,50 @@ mod tests {
         assert_eq!(matches[0].profile_id, "test-v7-23433");
         assert_eq!(matches[1].origin, ProfileOrigin::Catalog);
         assert_eq!(matches[1].profile_id, "test-v7-23433");
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn profile_summaries_keep_sources_distinct_and_details_source_bound() {
+        let (store, path) = store_with_catalog();
+        let mut custom = store
+            .list()
+            .expect("list catalog profiles")
+            .into_iter()
+            .find(|profile| profile.profile_id == "test-v7-23433")
+            .expect("catalog fixture profile")
+            .record;
+        custom.meta.brand = "User Summary Override".to_string();
+        store.upsert(custom).expect("save same-id custom profile");
+
+        let summaries = store
+            .list_stored_profile_summaries()
+            .expect("list lightweight summaries");
+        let same_id = summaries
+            .iter()
+            .filter(|profile| profile.profile_id == "test-v7-23433")
+            .collect::<Vec<_>>();
+        assert_eq!(same_id.len(), 2);
+        assert_eq!(same_id[0].origin, ProfileOrigin::Database);
+        assert_eq!(same_id[0].brand, "User Summary Override");
+        assert_eq!(same_id[1].origin, ProfileOrigin::Catalog);
+        assert_eq!(same_id[1].mcc, "234");
+        assert!(serde_json::to_value(same_id[0])
+            .expect("serialize summary")
+            .get("record")
+            .is_none());
+
+        let database = store
+            .get_stored_profile(ProfileOrigin::Database, "test-v7-23433")
+            .expect("load database detail")
+            .expect("database detail exists");
+        let catalog = store
+            .get_stored_profile(ProfileOrigin::Catalog, "test-v7-23433")
+            .expect("load catalog detail")
+            .expect("catalog detail exists");
+        assert_eq!(database.record.meta.brand, "User Summary Override");
+        assert_ne!(catalog.record.meta.brand, "User Summary Override");
 
         std::fs::remove_file(path).expect("remove fixture");
     }

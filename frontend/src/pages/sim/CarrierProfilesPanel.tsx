@@ -41,9 +41,9 @@ import {
   api,
   type CarrierCatalogAsset,
   type CarrierCatalogStatusResponse,
+  type CarrierProfileSummary,
   type CarrierProfileRecord,
   type ProfileOrigin,
-  type StoredCarrierProfile,
 } from '../../api/current'
 import CarrierProfileEditor from './CarrierProfileEditor'
 import GithubDownloadProxyControl from '../../components/GithubDownloadProxyControl'
@@ -69,8 +69,8 @@ function formatAssetSize(bytes: number): string {
 }
 
 export default function CarrierProfilesPanel() {
-  const [allProfiles, setAllProfiles] = useState<StoredCarrierProfile[]>([])
-  const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
+  const [allProfiles, setAllProfiles] = useState<CarrierProfileSummary[]>([])
+  const [profiles, setProfiles] = useState<CarrierProfileSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [success, setSuccess] = useState<string | null>(null)
@@ -89,7 +89,7 @@ export default function CarrierProfilesPanel() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [editorReadOnly, setEditorReadOnly] = useState(true)
   const [profileIdLocked, setProfileIdLocked] = useState(true)
-  const [deleteTarget, setDeleteTarget] = useState<StoredCarrierProfile | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<CarrierProfileSummary | null>(null)
 
   const [searchMode, setSearchMode] = useState<SearchMode>('plmn')
   const [searchValue, setSearchValue] = useState('')
@@ -195,6 +195,25 @@ export default function CarrierProfilesPanel() {
     setEditorOpen(true)
   }
 
+  const openStoredProfile = async (
+    profile: CarrierProfileSummary,
+    options: { readOnly: boolean; lockProfileId: boolean },
+  ) => {
+    if (profile.origin !== 'database' && profile.origin !== 'carrier_catalog') return
+    const key = `open:${profile.origin}:${profile.profile_id}`
+    setBusyKey(key)
+    setError(null)
+    try {
+      const response = await api.getVowifiCarrierProfile(profile.origin, profile.profile_id)
+      if (!response.data) throw new Error('后端未返回 Profile 详情')
+      openEditor(response.data.record, options)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setBusyKey(null)
+    }
+  }
+
   const searchProfiles = () => {
     const value = searchValue.trim()
     if (searchMode === 'plmn' && !/^\d{5,6}$/.test(value)) {
@@ -214,9 +233,8 @@ export default function CarrierProfilesPanel() {
     const normalizedName = value.toLocaleLowerCase()
     const matches = allProfiles.filter((profile) => {
       if (searchMode === 'plmn') return profile.plmn === value
-      if (searchMode === 'mcc') return profile.record.meta.mcc === value
-      const meta = profile.record.meta
-      return [meta.brand, meta.operator_legal_name, profile.profile_id, ...meta.aliases]
+      if (searchMode === 'mcc') return profile.mcc === value
+      return [profile.brand, profile.operator_legal_name, profile.profile_id, ...profile.aliases]
         .some((candidate) => candidate.toLocaleLowerCase().includes(normalizedName))
     })
     setProfiles(matches)
@@ -236,7 +254,7 @@ export default function CarrierProfilesPanel() {
     setError(null)
     try {
       await api.deleteVowifiCarrierProfile(deleteTarget.profile_id)
-      setSuccess(`已删除自定义 Profile：${deleteTarget.record.meta.brand || deleteTarget.profile_id}`)
+      setSuccess(`已删除自定义 Profile：${deleteTarget.brand || deleteTarget.profile_id}`)
       setDeleteTarget(null)
       await load()
     } catch (err) {
@@ -361,7 +379,7 @@ export default function CarrierProfilesPanel() {
                         </TableCell>
                         <TableCell>
                           <Typography variant="body2" fontWeight={600}>
-                            {profile.record.meta.brand || profile.profile_id}
+                            {profile.brand || profile.profile_id}
                           </Typography>
                           <Typography variant="caption" color="text.secondary">
                             {profile.profile_id}
@@ -396,9 +414,12 @@ export default function CarrierProfilesPanel() {
                               <Tooltip title="编辑自定义 Profile">
                                 <IconButton
                                   size="small"
-                                  onClick={() => openEditor(profile.record, { readOnly: false, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: false, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
-                                  <Edit fontSize="small" />
+                                  {busyKey === `open:${profile.origin}:${profile.profile_id}`
+                                    ? <CircularProgress size={16} />
+                                    : <Edit fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                               <Tooltip title="删除自定义 Profile">
@@ -412,16 +433,20 @@ export default function CarrierProfilesPanel() {
                               <Tooltip title="查看 Profile">
                                 <IconButton
                                   size="small"
-                                  onClick={() => openEditor(profile.record, { readOnly: true, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: true, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
-                                  <Visibility fontSize="small" />
+                                  {busyKey === `open:${profile.origin}:${profile.profile_id}`
+                                    ? <CircularProgress size={16} />
+                                    : <Visibility fontSize="small" />}
                                 </IconButton>
                               </Tooltip>
                               <Tooltip title="复制为自定义 Profile">
                                 <IconButton
                                   size="small"
                                   color="primary"
-                                  onClick={() => openEditor(profile.record, { readOnly: false, lockProfileId: true })}
+                                  onClick={() => void openStoredProfile(profile, { readOnly: false, lockProfileId: true })}
+                                  disabled={busyKey !== null}
                                 >
                                   <ContentCopy fontSize="small" />
                                 </IconButton>

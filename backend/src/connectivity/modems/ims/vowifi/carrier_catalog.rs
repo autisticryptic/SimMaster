@@ -59,6 +59,22 @@ pub struct CatalogProfile {
 }
 
 #[derive(Debug, Clone)]
+pub struct CatalogProfileSummary {
+    pub profile_id: String,
+    pub plmn: String,
+    pub mcc: String,
+    pub brand: String,
+    pub operator_legal_name: String,
+    pub aliases: Vec<String>,
+    pub release: CatalogRelease,
+    pub volte_ready: bool,
+    pub vowifi_ready: bool,
+    pub vilte_enabled: bool,
+    pub smsoip_enabled: bool,
+    pub ut_xcap_enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct CatalogIdentityMatch {
     pub profile: CatalogProfile,
     pub match_prefix: String,
@@ -113,6 +129,10 @@ impl CarrierCatalog {
 
     pub fn list(&self, access: CatalogAccessKind) -> Result<Vec<CatalogProfile>, String> {
         v7::list(&self.validated_connection()?, access)
+    }
+
+    pub fn list_summaries(&self) -> Result<Vec<CatalogProfileSummary>, String> {
+        v7::list_summaries(&self.validated_connection()?)
     }
 
     pub fn service_capabilities(

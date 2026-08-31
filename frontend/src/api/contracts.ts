@@ -960,6 +960,23 @@ export interface StoredCarrierProfile {
   ut_xcap_enabled: boolean
 }
 
+export interface CarrierProfileSummary {
+  profile_id: string
+  plmn: string
+  mcc: string
+  brand: string
+  operator_legal_name: string
+  aliases: string[]
+  origin: ProfileOrigin
+  source: string
+  updated_at: string
+  volte_ready: boolean
+  vowifi_ready: boolean
+  vilte_enabled: boolean
+  smsoip_enabled: boolean
+  ut_xcap_enabled: boolean
+}
+
 export interface VolteProfileSelectionResponse {
   line_id: string
   selection: VolteProfileSelectionConfig

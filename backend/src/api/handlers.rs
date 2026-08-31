@@ -8760,8 +8760,6 @@ fn profile_store(
 }
 
 fn carrier_catalog_status(app: &AppState) -> Result<CarrierCatalogStatusResponse, String> {
-    use crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogAccessKind;
-
     let release = app.carrier_catalog.release()?;
     if !release.sealed {
         return Err(format!(
@@ -8769,8 +8767,15 @@ fn carrier_catalog_status(app: &AppState) -> Result<CarrierCatalogStatusResponse
             release.release_id
         ));
     }
-    let volte_profiles = app.carrier_catalog.list(CatalogAccessKind::LteEpc)?.len();
-    let vowifi_profiles = app.carrier_catalog.list(CatalogAccessKind::WifiEpdg)?.len();
+    let summaries = app.carrier_catalog.list_summaries()?;
+    let volte_profiles = summaries
+        .iter()
+        .filter(|profile| profile.volte_ready)
+        .count();
+    let vowifi_profiles = summaries
+        .iter()
+        .filter(|profile| profile.vowifi_ready)
+        .count();
     Ok(CarrierCatalogStatusResponse {
         installed: true,
         usable: true,
@@ -9099,14 +9104,51 @@ pub async fn list_vowifi_carrier_profiles_handler(
     State(app): State<AppState>,
 ) -> (
     StatusCode,
-    Json<ApiResponse<Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>>>,
+    Json<
+        ApiResponse<
+            Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfileSummary>,
+        >,
+    >,
 ) {
-    match profile_store(&app).list_stored_profiles() {
+    match profile_store(&app).list_stored_profile_summaries() {
         Ok(profiles) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", profiles)),
         ),
         Err(error) => (StatusCode::OK, Json(ApiResponse::error(error))),
+    }
+}
+
+/// GET /api/vowifi/carrier-profiles/detail/{origin}/{profile_id}
+pub async fn get_vowifi_carrier_profile_handler(
+    State(app): State<AppState>,
+    Path((origin, profile_id)): Path<(String, String)>,
+) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
+    use crate::connectivity::modems::ims::vowifi::profile_store::ProfileOrigin;
+
+    let origin = match origin.as_str() {
+        "database" => ProfileOrigin::Database,
+        "carrier_catalog" => ProfileOrigin::Catalog,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ApiResponse::error("stored_profile_origin_invalid")),
+            )
+        }
+    };
+    match profile_store(&app).get_stored_profile(origin, &profile_id) {
+        Ok(Some(profile)) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", json!(profile))),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error("stored_carrier_profile_not_found")),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(error)),
+        ),
     }
 }
 
