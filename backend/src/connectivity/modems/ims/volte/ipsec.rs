@@ -148,6 +148,24 @@ fn ip_str(ip: IpAddr) -> String {
     ip.to_string()
 }
 
+/// Render an XFRM argv for diagnostics without exposing AKA-derived key
+/// material. `ip xfrm` places the key two arguments after each algorithm
+/// selector (`auth`, `auth-trunc`, `enc`, or `aead`).
+pub(crate) fn redacted_xfrm_argv(argv: &[String]) -> String {
+    let mut rendered = argv.to_vec();
+    for index in 0..rendered.len() {
+        if matches!(
+            rendered[index].as_str(),
+            "auth" | "auth-trunc" | "enc" | "aead"
+        ) {
+            if let Some(key) = rendered.get_mut(index + 2) {
+                *key = "[redacted]".to_string();
+            }
+        }
+    }
+    rendered.join(" ")
+}
+
 /// Build `ip xfrm state add ...` for one SA direction (transport mode,
 /// integrity-only). Returns the argv (without the leading `ip`).
 pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
@@ -385,16 +403,24 @@ pub fn locate_ip_binary() -> Result<&'static str, VolteError> {
 #[cfg(unix)]
 pub fn run_ip(argv: &[String]) -> Result<(), VolteError> {
     let ip = locate_ip_binary()?;
-    let status = std::process::Command::new(ip)
+    let output = std::process::Command::new(ip)
         .args(argv)
-        .status()
+        .output()
         .map_err(|e| VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("ip:{e}")))?;
-    if status.success() {
+    if output.status.success() {
         Ok(())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim();
+        let command = redacted_xfrm_argv(argv);
+        let exit_code = output.status.code().unwrap_or(-1);
         Err(VolteError::with_detail(
             code::COMMAND_FAILED,
-            format!("ip:{}", status.code().unwrap_or(-1)),
+            if stderr.is_empty() {
+                format!("ip {command}: exit {exit_code}")
+            } else {
+                format!("ip {command}: exit {exit_code}: {stderr}")
+            },
         ))
     }
 }
@@ -640,6 +666,29 @@ mod tests {
     #[test]
     fn hex_key_prefixes_0x() {
         assert_eq!(hex_key(&[0x0a, 0xff]), "0x0aff");
+    }
+
+    #[test]
+    fn xfrm_diagnostics_redact_integrity_and_encryption_keys() {
+        let argv = vec![
+            "xfrm".into(),
+            "state".into(),
+            "add".into(),
+            "auth-trunc".into(),
+            "hmac(sha1)".into(),
+            "0x00112233".into(),
+            "96".into(),
+            "enc".into(),
+            "cbc(aes)".into(),
+            "0xaabbccdd".into(),
+        ];
+        let rendered = redacted_xfrm_argv(&argv);
+        assert_eq!(
+            rendered,
+            "xfrm state add auth-trunc hmac(sha1) [redacted] 96 enc cbc(aes) [redacted]"
+        );
+        assert!(!rendered.contains("00112233"));
+        assert!(!rendered.contains("aabbccdd"));
     }
 
     #[test]

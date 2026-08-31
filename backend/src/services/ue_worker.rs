@@ -1962,6 +1962,7 @@ async fn execute_net_config(ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Option
             Ok(argv) => argv,
             Err(error) => return (false, output, Some(error)),
         };
+        let diagnostic_argv = net_config_diagnostic_argv(&op, &argv);
         let result = Command::new(&ip_path).args(&argv).output().await;
         match result {
             Ok(command_output) if command_output.status.success() => {
@@ -1982,19 +1983,27 @@ async fn execute_net_config(ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Option
                 return (
                     false,
                     output,
-                    Some(format!("{} {}: {reason}", ip_path, argv.join(" "))),
+                    Some(format!("{ip_path} {diagnostic_argv}: {reason}")),
                 );
             }
             Err(error) => {
                 return (
                     false,
                     output,
-                    Some(format!("{} {}: {error}", ip_path, argv.join(" "))),
+                    Some(format!("{ip_path} {diagnostic_argv}: {error}")),
                 );
             }
         }
     }
     (true, output, None)
+}
+
+fn net_config_diagnostic_argv(op: &NetConfigOp, argv: &[String]) -> String {
+    if matches!(op, NetConfigOp::Xfrm { .. }) {
+        crate::connectivity::modems::ims::volte::ipsec::redacted_xfrm_argv(argv)
+    } else {
+        argv.join(" ")
+    }
 }
 
 #[cfg(not(unix))]
@@ -2348,6 +2357,31 @@ mod tests {
             best_effort: true,
         };
         assert!(net_config_argv(&ignored_add).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn xfrm_net_config_diagnostics_do_not_expose_keys() {
+        let op = NetConfigOp::Xfrm {
+            args: vec![
+                "xfrm".into(),
+                "state".into(),
+                "add".into(),
+                "auth-trunc".into(),
+                "hmac(md5)".into(),
+                "0xsecret-ik".into(),
+                "96".into(),
+                "enc".into(),
+                "cipher_null".into(),
+                String::new(),
+            ],
+            best_effort: false,
+        };
+        let argv = net_config_argv(&op).unwrap();
+        let diagnostic = net_config_diagnostic_argv(&op, &argv);
+        assert!(diagnostic.contains("auth-trunc hmac(md5) [redacted] 96"));
+        assert!(diagnostic.contains("enc cipher_null [redacted]"));
+        assert!(!diagnostic.contains("secret-ik"));
     }
 
     #[test]
