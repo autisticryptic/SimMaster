@@ -69,6 +69,7 @@ function formatAssetSize(bytes: number): string {
 }
 
 export default function CarrierProfilesPanel() {
+  const [allProfiles, setAllProfiles] = useState<StoredCarrierProfile[]>([])
   const [profiles, setProfiles] = useState<StoredCarrierProfile[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -104,7 +105,9 @@ export default function CarrierProfilesPanel() {
         api.listVowifiCarrierProfiles(),
         api.getCarrierCatalogStatus(),
       ])
-      setProfiles(profileResponse.data ?? [])
+      const loadedProfiles = profileResponse.data ?? []
+      setAllProfiles(loadedProfiles)
+      setProfiles(loadedProfiles)
       setCatalogStatus(statusResponse.data ?? null)
       setActiveSearch(null)
     } catch (err) {
@@ -192,7 +195,7 @@ export default function CarrierProfilesPanel() {
     setEditorOpen(true)
   }
 
-  const searchProfiles = async () => {
+  const searchProfiles = () => {
     const value = searchValue.trim()
     if (searchMode === 'plmn' && !/^\d{5,6}$/.test(value)) {
       setError('PLMN 必须是 5 或 6 位数字，例如 46001')
@@ -206,25 +209,25 @@ export default function CarrierProfilesPanel() {
       setError('请输入运营商名称')
       return
     }
-    setBusyKey('lookup')
     setError(null)
     setSuccess(null)
-    try {
-      const params = searchMode === 'plmn'
-        ? { plmn: value }
-        : searchMode === 'mcc'
-          ? { mcc: value }
-          : { name: value }
-      const response = await api.searchVowifiCarrierProfiles(params)
-      const matches = response.data ?? []
-      setProfiles(matches)
-      setPage(0)
-      setActiveSearch(`${searchModeLabels[searchMode]}：${value}`)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
-    } finally {
-      setBusyKey(null)
-    }
+    const normalizedName = value.toLocaleLowerCase()
+    const matches = allProfiles.filter((profile) => {
+      if (searchMode === 'plmn') return profile.plmn === value
+      if (searchMode === 'mcc') return profile.record.meta.mcc === value
+      const meta = profile.record.meta
+      return [meta.brand, meta.operator_legal_name, profile.profile_id, ...meta.aliases]
+        .some((candidate) => candidate.toLocaleLowerCase().includes(normalizedName))
+    })
+    setProfiles(matches)
+    setPage(0)
+    setActiveSearch(`${searchModeLabels[searchMode]}：${value}`)
+  }
+
+  const showAllProfiles = () => {
+    setProfiles(allProfiles)
+    setActiveSearch(null)
+    setPage(0)
   }
 
   const deleteCustomProfile = async () => {
@@ -296,20 +299,20 @@ export default function CarrierProfilesPanel() {
               helperText="仅查找用户自定义和已下载数据库，不使用推断配置"
               onChange={(event) => setSearchValue(event.target.value)}
               onKeyDown={(event) => {
-                if (event.key === 'Enter') void searchProfiles()
+                if (event.key === 'Enter') searchProfiles()
               }}
               sx={{ minWidth: { xs: '100%', sm: 320 } }}
             />
             <Button
-              startIcon={busyKey === 'lookup' ? <CircularProgress size={16} /> : <Search />}
-              onClick={() => void searchProfiles()}
-              disabled={busyKey !== null}
+              startIcon={<Search />}
+              onClick={searchProfiles}
+              disabled={busyKey !== null || loading}
               sx={{ mt: 0.5 }}
             >
               查找
             </Button>
             {activeSearch && (
-              <Button onClick={() => void load()} disabled={busyKey !== null || loading} sx={{ mt: 0.5 }}>
+              <Button onClick={showAllProfiles} disabled={busyKey !== null || loading} sx={{ mt: 0.5 }}>
                 显示全部
               </Button>
             )}

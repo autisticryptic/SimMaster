@@ -2030,10 +2030,6 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(resolve_vowifi_carrier_profile_handler).options(options_handler),
         )
         .route(
-            "/api/vowifi/carrier-profiles/search",
-            get(search_vowifi_carrier_profiles_handler).options(options_handler),
-        )
-        .route(
             "/api/vowifi/lines",
             get(get_vowifi_lines_handler).options(options_handler),
         )
@@ -2814,17 +2810,6 @@ mod http_router_tests {
             "the stored record must keep the omit: {resolved}"
         );
 
-        let (status, searched) = get_with_cookie(
-            &served,
-            &format!("/api/vowifi/carrier-profiles/search?mcc={}", &plmn[..3]),
-            &cookie,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "MCC search must answer: {searched}");
-        assert!(
-            searched.contains(&profile_id) && searched.contains("\"origin\":\"database\""),
-            "MCC search must return the stored user profile: {searched}"
-        );
     }
 
     /// The profile-selection PUT error matrix, over HTTP.
