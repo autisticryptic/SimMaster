@@ -3,13 +3,9 @@
 //! A UE Context is the stable identity shared by every access leg of one
 //! physical line: the SIM slot (or PC/SC reader), the VoLTE bearer, the
 //! VoWiFi tunnel, the data proxy and the SIP trunk. Each UE owns its own
-//! Linux network namespace when isolation is enabled, so two SIMs can be
+//! Linux network namespace, so two SIMs can be
 //! handed identical IPv4/IPv6 addresses, P-CSCF addresses, XFRM state or
 //! netfilter rules without ever observing each other.
-//!
-//! This module is deliberately additive. Creating a UE Context and its
-//! namespace never changes how the existing host-namespace routing behaves
-//! while `ue_isolation.enabled` is false.
 
 use std::time::Instant;
 
@@ -17,10 +13,7 @@ use serde::Serialize;
 
 use crate::{
     hardware::cellular::modem_manager::ModemBinding,
-    platform::{
-        config::UeIsolationConfig,
-        netns::{self, NetnsError, NetnsName},
-    },
+    platform::netns::{self, NetnsError, NetnsName},
 };
 
 /// What kind of physical hardware anchors this UE.
@@ -66,11 +59,8 @@ pub struct UeContext {
     pub uim_slot: u8,
     /// Linux network namespace owned by this UE. Stable across restarts.
     pub namespace: NetnsName,
-    /// Snapshot of the isolation master switch when the context was last
-    /// reconciled.
-    pub isolation_enabled: bool,
     /// True after the namespace was created and loopback brought up in this
-    /// process run. False when isolation is disabled or creation failed.
+    /// process run.
     pub netns_ready: bool,
     #[serde(skip)]
     pub created_at: Instant,
@@ -78,34 +68,27 @@ pub struct UeContext {
 
 impl UeContext {
     /// Build the UE Context for a discovered modem/reader binding.
-    pub fn for_binding(binding: &ModemBinding, config: &UeIsolationConfig) -> Self {
-        let namespace = NetnsName::for_line(&config.namespace_prefix, &binding.line_id);
+    pub fn for_binding(binding: &ModemBinding) -> Self {
+        let namespace = NetnsName::for_line(netns::DEFAULT_NAMESPACE_PREFIX, &binding.line_id);
         Self {
             ue_id: binding.line_id.clone(),
             kind: UeKind::from_binding(binding),
             hardware_key: binding.hardware_key.clone(),
             uim_slot: binding.uim_slot,
             namespace,
-            isolation_enabled: config.enabled,
             netns_ready: false,
             created_at: Instant::now(),
         }
     }
 
-    /// Create the UE namespace and bring loopback up when isolation is
-    /// enabled. When disabled this is a no-op that also marks the context as
-    /// not ready, so toggling the switch off immediately stops namespace use.
-    pub async fn ensure_netns(&mut self, config: &UeIsolationConfig) -> Result<(), NetnsError> {
-        self.isolation_enabled = config.enabled;
+    /// Create the UE namespace and bring loopback up.
+    pub async fn ensure_netns(&mut self) -> Result<(), NetnsError> {
         // Never carry a previous successful generation's readiness across a
         // failed ensure attempt.  A stale `true` here would make the line
         // registry publish a worker/socket context for a namespace that was
         // removed or could not be recreated, allowing a later caller to bind
         // the wrong network path.
         self.netns_ready = false;
-        if !config.enabled {
-            return Ok(());
-        }
         netns::ensure(&self.namespace).await?;
         self.netns_ready = true;
         Ok(())
@@ -126,13 +109,14 @@ impl UeContext {
     }
 
     /// Suggested host-side veth link name for this UE's egress pair.
-    pub fn host_veth_name(&self, config: &UeIsolationConfig) -> String {
-        self.namespace.host_veth_name(&config.host_veth_prefix)
+    pub fn host_veth_name(&self) -> String {
+        self.namespace
+            .host_veth_name(netns::DEFAULT_HOST_VETH_PREFIX)
     }
 
     /// Suggested UE-side veth link name for this UE's egress pair.
-    pub fn ue_veth_name(&self, config: &UeIsolationConfig) -> String {
-        self.namespace.ue_veth_name(&config.ue_veth_prefix)
+    pub fn ue_veth_name(&self) -> String {
+        self.namespace.ue_veth_name(netns::DEFAULT_UE_VETH_PREFIX)
     }
 }
 
@@ -172,50 +156,32 @@ mod tests {
         }
     }
 
-    fn config(enabled: bool) -> UeIsolationConfig {
-        UeIsolationConfig {
-            enabled,
-            ..UeIsolationConfig::default()
-        }
-    }
-
     #[test]
     fn context_tracks_stable_namespace_and_kind() {
         let modem = binding("line-1", "baseband", "qcm410");
-        let config = config(true);
-        let ue = UeContext::for_binding(&modem, &config);
+        let ue = UeContext::for_binding(&modem);
         assert_eq!(ue.kind, UeKind::Modem);
         assert_eq!(ue.ue_id, "line-1");
         assert!(ue.namespace.as_str().starts_with("sa-ue"));
         assert!(!ue.netns_ready);
 
         let reader = binding("line-2", "reader", "pcsc://foo");
-        let ue = UeContext::for_binding(&reader, &config);
+        let ue = UeContext::for_binding(&reader);
         assert_eq!(ue.kind, UeKind::PcscReader);
 
         let legacy = binding("line-3", "reader", "at_reader");
-        let ue = UeContext::for_binding(&legacy, &config);
+        let ue = UeContext::for_binding(&legacy);
         assert_eq!(ue.kind, UeKind::LegacyUimAdapter);
     }
 
     #[tokio::test]
-    async fn disabled_isolation_is_noop_and_not_ready() {
-        let modem = binding("line-1", "baseband", "qcm410");
-        let mut ue = UeContext::for_binding(&modem, &config(true));
-        ue.netns_ready = true;
-        assert!(ue.ensure_netns(&config(false)).await.is_ok());
-        assert!(!ue.isolation_enabled);
-        assert!(!ue.netns_ready);
-    }
-
-    #[tokio::test]
     #[cfg(not(target_os = "linux"))]
-    async fn enabled_isolation_reports_unsupported_off_linux() {
+    async fn mandatory_namespace_reports_unsupported_off_linux() {
         let modem = binding("line-1", "baseband", "qcm410");
-        let mut ue = UeContext::for_binding(&modem, &config(true));
+        let mut ue = UeContext::for_binding(&modem);
         ue.netns_ready = true;
         assert!(matches!(
-            ue.ensure_netns(&config(true)).await,
+            ue.ensure_netns().await,
             Err(NetnsError {
                 kind: netns::NetnsErrorKind::Unsupported,
                 ..
@@ -227,10 +193,9 @@ mod tests {
     #[test]
     fn veth_names_derive_from_the_ue_namespace() {
         let modem = binding("line-1", "baseband", "qcm410");
-        let config = config(true);
-        let ue = UeContext::for_binding(&modem, &config);
-        let host = ue.host_veth_name(&config);
-        let ue_if = ue.ue_veth_name(&config);
+        let ue = UeContext::for_binding(&modem);
+        let host = ue.host_veth_name();
+        let ue_if = ue.ue_veth_name();
         assert!(host.len() < 16 && ue_if.len() < 16);
         assert!(host.starts_with(netns::DEFAULT_HOST_VETH_PREFIX));
         assert!(ue_if.starts_with(netns::DEFAULT_UE_VETH_PREFIX));

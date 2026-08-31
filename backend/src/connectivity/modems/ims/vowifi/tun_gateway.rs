@@ -39,11 +39,8 @@ pub(crate) struct TunGatewayConfig {
     pub secrets: ChildSaSecretPair,
     pub transport: UdpSocketDatagramTransport,
     pub remote: SocketAddr,
-    /// When present, the TUN interface is moved into this UE network
-    /// namespace after creation (the open fd stays in this process), and all
-    /// address/route configuration is executed inside that namespace instead
-    /// of the host policy/routing-table mechanism.
-    pub ue_namespace: Option<String>,
+    /// Mandatory UE network namespace that owns this TUN interface.
+    pub ue_namespace: String,
 }
 
 pub(crate) struct TunGatewayRuntime {
@@ -55,7 +52,7 @@ pub(crate) struct TunGatewayRuntime {
     started_at: Instant,
     ims_esp_policy: Arc<StdMutex<Option<ImsEspRuntimePolicy>>>,
     shutdown: Arc<AtomicBool>,
-    ue_namespace: Option<String>,
+    ue_namespace: String,
     #[cfg(target_os = "linux")]
     _tun_file: std::fs::File,
 }
@@ -69,11 +66,7 @@ impl Drop for TunGatewayRuntime {
 impl TunGatewayRuntime {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        platform_shutdown_tun(
-            &self.tun_name,
-            self.inner_addr,
-            self.ue_namespace.as_deref(),
-        );
+        platform_shutdown_tun(&self.tun_name, &self.ue_namespace);
     }
 
     pub fn is_for_profile(&self, profile_id: &str) -> bool {
@@ -110,12 +103,7 @@ impl TunGatewayRuntime {
         if remote.is_unspecified() || remote.is_multicast() {
             return Err(tun_error("tun_gateway_media_route_invalid"));
         }
-        platform_ensure_tun_host_route(
-            &self.tun_name,
-            self.inner_addr,
-            remote,
-            self.ue_namespace.as_deref(),
-        )?;
+        platform_ensure_tun_route(&self.tun_name, self.inner_addr, remote, &self.ue_namespace)?;
         tracing::info!(
             tun_name = %self.tun_name,
             inner_addr = %self.inner_addr,
@@ -344,29 +332,29 @@ fn tun_error(reason: &'static str) -> TunGatewayError {
 }
 
 #[cfg(target_os = "linux")]
-fn platform_shutdown_tun(tun_name: &str, inner_addr: IpAddr, ue_namespace: Option<&str>) {
-    imp::shutdown_tun(tun_name, inner_addr, ue_namespace);
+fn platform_shutdown_tun(tun_name: &str, ue_namespace: &str) {
+    imp::shutdown_tun(tun_name, ue_namespace);
 }
 
 #[cfg(not(target_os = "linux"))]
-fn platform_shutdown_tun(_tun_name: &str, _inner_addr: IpAddr, _ue_namespace: Option<&str>) {}
+fn platform_shutdown_tun(_tun_name: &str, _ue_namespace: &str) {}
 
 #[cfg(target_os = "linux")]
-fn platform_ensure_tun_host_route(
+fn platform_ensure_tun_route(
     tun_name: &str,
     inner_addr: IpAddr,
     remote: IpAddr,
-    ue_namespace: Option<&str>,
+    ue_namespace: &str,
 ) -> Result<(), TunGatewayError> {
-    imp::ensure_tun_host_route(tun_name, inner_addr, remote, ue_namespace)
+    imp::ensure_tun_route(tun_name, inner_addr, remote, ue_namespace)
 }
 
 #[cfg(not(target_os = "linux"))]
-fn platform_ensure_tun_host_route(
+fn platform_ensure_tun_route(
     _tun_name: &str,
     _inner_addr: IpAddr,
     _remote: IpAddr,
-    _ue_namespace: Option<&str>,
+    _ue_namespace: &str,
 ) -> Result<(), TunGatewayError> {
     Err(tun_error("tun_gateway_platform_unsupported"))
 }
@@ -392,9 +380,7 @@ mod imp {
         unprotect_inner_packet_from_esp, unprotect_inner_packet_from_esp_with_mode,
         AntiReplayWindow,
     };
-    use crate::platform::network_routing::{
-        host_selector, route_table, rule_priority, source_selector, RouteDomain,
-    };
+    use crate::platform::network_routing::host_selector;
 
     #[cfg(target_env = "musl")]
     const TUNSETIFF: libc::c_int = 0x4004_54ca;
@@ -751,14 +737,18 @@ mod imp {
         // The open fd stays with this process, so the existing userspace ESP
         // forwarders keep working while the interface (address, routes,
         // neighbour) belongs exclusively to the UE.
-        if let Some(namespace) = &config.ue_namespace {
-            run_command(
-                &["ip", "/sbin/ip", "/usr/sbin/ip"],
-                &["link", "set", &config.tun_name, "netns", namespace],
-                "tun_gateway_move_namespace_failed",
-                false,
-            )?;
-        }
+        run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &[
+                "link",
+                "set",
+                &config.tun_name,
+                "netns",
+                &config.ue_namespace,
+            ],
+            "tun_gateway_move_namespace_failed",
+            false,
+        )?;
         configure_tun(&config)?;
         let read_file = tun_file
             .try_clone()
@@ -798,43 +788,44 @@ mod imp {
         }))
     }
 
-    pub(crate) fn shutdown_tun(tun_name: &str, inner_addr: IpAddr, ue_namespace: Option<&str>) {
+    pub(crate) fn shutdown_tun(tun_name: &str, ue_namespace: &str) {
         if tun_name.is_empty()
             || tun_name.len() >= IFNAMSIZ
             || !tun_name.bytes().all(valid_ifname_byte)
         {
             return;
         }
-        if let Some(namespace) = ue_namespace {
-            let _ = run_command(
-                &["ip", "/sbin/ip", "/usr/sbin/ip"],
-                &[
-                    "netns", "exec", namespace, "ip", "link", "set", "dev", tun_name, "down",
-                ],
-                "tun_gateway_ifconfig_mtu_failed",
-                true,
-            );
-            let _ = run_command(
-                &["ip", "/sbin/ip", "/usr/sbin/ip"],
-                &[
-                    "netns", "exec", namespace, "ip", "link", "del", "dev", tun_name,
-                ],
-                "tun_gateway_ifconfig_mtu_failed",
-                true,
-            );
-            return;
-        }
-        teardown_tun_policy(tun_name, inner_addr);
-        let _ = Command::new("ip")
-            .args(["link", "set", "dev", tun_name, "down"])
-            .output();
-        let _ = Command::new("ifconfig").args([tun_name, "down"]).output();
-        // The interface name is stable per line (see tun_name_for_line), so a
-        // reconnect must be able to recreate it. TUNSETIFF fails with EEXIST
-        // while the old device is still around, so delete it best-effort.
-        let _ = Command::new("ip")
-            .args(["link", "del", "dev", tun_name])
-            .output();
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &[
+                "netns",
+                "exec",
+                ue_namespace,
+                "ip",
+                "link",
+                "set",
+                "dev",
+                tun_name,
+                "down",
+            ],
+            "tun_gateway_ifconfig_mtu_failed",
+            true,
+        );
+        let _ = run_command(
+            &["ip", "/sbin/ip", "/usr/sbin/ip"],
+            &[
+                "netns",
+                "exec",
+                ue_namespace,
+                "ip",
+                "link",
+                "del",
+                "dev",
+                tun_name,
+            ],
+            "tun_gateway_ifconfig_mtu_failed",
+            true,
+        );
     }
 
     fn open_tun(name: &str) -> Result<File, TunGatewayError> {
@@ -860,48 +851,7 @@ mod imp {
     }
 
     fn configure_tun(config: &TunGatewayConfig) -> Result<(), TunGatewayError> {
-        if let Some(namespace) = &config.ue_namespace {
-            return configure_tun_in_namespace(config, namespace);
-        }
-        run_command(
-            &["ifconfig", "/sbin/ifconfig", "/usr/sbin/ifconfig"],
-            &[&config.tun_name, "mtu", &DEFAULT_TUN_MTU.to_string(), "up"],
-            "tun_gateway_ifconfig_mtu_failed",
-            false,
-        )?;
-
-        match config.inner_addr {
-            IpAddr::V6(addr) => {
-                let prefix = config.inner_prefix_len.unwrap_or(128).clamp(1, 128);
-                let cidr = format!("{addr}/{prefix}");
-                run_command(
-                    &["ifconfig", "/sbin/ifconfig", "/usr/sbin/ifconfig"],
-                    &[&config.tun_name, "inet6", "add", &cidr, "up"],
-                    "tun_gateway_ifconfig_address_failed",
-                    true,
-                )?;
-            }
-            IpAddr::V4(addr) => {
-                let addr_text = addr.to_string();
-                run_command(
-                    &["ifconfig", "/sbin/ifconfig", "/usr/sbin/ifconfig"],
-                    &[
-                        &config.tun_name,
-                        &addr_text,
-                        "netmask",
-                        "255.255.255.255",
-                        "up",
-                    ],
-                    "tun_gateway_ifconfig_address_failed",
-                    true,
-                )?;
-            }
-        }
-        configure_tun_policy(config)?;
-        for pcscf_addr in route_targets(config) {
-            ensure_tun_host_route(&config.tun_name, config.inner_addr, pcscf_addr, None)?;
-        }
-        Ok(())
+        configure_tun_in_namespace(config, &config.ue_namespace)
     }
 
     /// Configure the TUN inside the UE namespace. The namespace is exclusive
@@ -951,137 +901,38 @@ mod imp {
             true,
         )?;
         for pcscf_addr in route_targets(config) {
-            ensure_tun_host_route(
-                &config.tun_name,
-                config.inner_addr,
-                pcscf_addr,
-                Some(namespace),
-            )?;
+            ensure_tun_route(&config.tun_name, config.inner_addr, pcscf_addr, namespace)?;
         }
         Ok(())
     }
 
-    pub(super) fn ensure_tun_host_route(
+    pub(super) fn ensure_tun_route(
         tun_name: &str,
         inner_addr: IpAddr,
         remote: IpAddr,
-        ue_namespace: Option<&str>,
+        ue_namespace: &str,
     ) -> Result<(), TunGatewayError> {
         let route_target = host_selector(remote);
         let inner_addr_text = inner_addr.to_string();
-        let mut args = Vec::new();
-        let table = if ue_namespace.is_none() {
-            Some(route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string())
-        } else {
-            None
-        };
-        if let Some(namespace) = ue_namespace {
-            args.extend_from_slice(&["netns", "exec", namespace, "ip"]);
-            if remote.is_ipv6() {
-                args.push("-6");
-            }
-            args.extend_from_slice(&[
-                "route",
-                "replace",
-                &route_target,
-                "dev",
-                tun_name,
-                "src",
-                &inner_addr_text,
-            ]);
-        } else {
-            if remote.is_ipv6() {
-                args.push("-6");
-            }
-            args.extend_from_slice(&[
-                "route",
-                "replace",
-                &route_target,
-                "dev",
-                tun_name,
-                "src",
-                &inner_addr_text,
-                "table",
-                table.as_deref().unwrap_or_default(),
-            ]);
+        let mut args = vec!["netns", "exec", ue_namespace, "ip"];
+        if remote.is_ipv6() {
+            args.push("-6");
         }
+        args.extend_from_slice(&[
+            "route",
+            "replace",
+            &route_target,
+            "dev",
+            tun_name,
+            "src",
+            &inner_addr_text,
+        ]);
         run_command(
             &["ip", "/sbin/ip", "/usr/sbin/ip"],
             &args,
             "tun_gateway_media_route_failed",
             false,
         )
-    }
-
-    fn configure_tun_policy(config: &TunGatewayConfig) -> Result<(), TunGatewayError> {
-        let table =
-            route_table(RouteDomain::VowifiIms, &config.tun_name, config.inner_addr).to_string();
-        let priority =
-            rule_priority(RouteDomain::VowifiIms, &config.tun_name, config.inner_addr).to_string();
-        let source = source_selector(config.inner_addr);
-        let mut family = Vec::new();
-        if config.inner_addr.is_ipv6() {
-            family.push("-6");
-        }
-
-        let mut flush = family.clone();
-        flush.extend_from_slice(&["route", "flush", "table", &table]);
-        let _ = run_command(
-            &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &flush,
-            "tun_gateway_route_failed",
-            false,
-        );
-
-        let mut delete = family.clone();
-        delete.extend_from_slice(&[
-            "rule", "del", "priority", &priority, "from", &source, "table", &table,
-        ]);
-        let _ = run_command(
-            &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &delete,
-            "tun_gateway_rule_failed",
-            false,
-        );
-
-        let mut add = family;
-        add.extend_from_slice(&[
-            "rule", "add", "priority", &priority, "from", &source, "table", &table,
-        ]);
-        run_command(
-            &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &add,
-            "tun_gateway_rule_failed",
-            false,
-        )
-    }
-
-    fn teardown_tun_policy(tun_name: &str, inner_addr: IpAddr) {
-        let table = route_table(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
-        let priority = rule_priority(RouteDomain::VowifiIms, tun_name, inner_addr).to_string();
-        let source = source_selector(inner_addr);
-        let mut family = Vec::new();
-        if inner_addr.is_ipv6() {
-            family.push("-6");
-        }
-        let mut flush = family.clone();
-        flush.extend_from_slice(&["route", "flush", "table", &table]);
-        let _ = run_command(
-            &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &flush,
-            "tun_gateway_route_failed",
-            false,
-        );
-        let mut delete = family;
-        delete.extend_from_slice(&[
-            "rule", "del", "priority", &priority, "from", &source, "table", &table,
-        ]);
-        let _ = run_command(
-            &["ip", "/sbin/ip", "/usr/sbin/ip"],
-            &delete,
-            "tun_gateway_rule_failed",
-            false,
-        );
     }
 
     fn route_targets(config: &TunGatewayConfig) -> Vec<IpAddr> {

@@ -384,8 +384,9 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
 
     if !secondary_qmi::secondary_qmi_enabled() {
         // Do not enumerate, bind, probe, or open DATA6 on firmware where the
-        // AT-labelled endpoint is known to take down the modem DSP.  The
-        // ModemManager primary QMI bearer remains the supported IMS fallback.
+        // AT-labelled endpoint is known to take down the modem DSP. UE-only
+        // cellular data and VoLTE remain unavailable; there is no primary-QMI
+        // host-namespace fallback.
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_STATE_FILE);
         let _ = std::fs::remove_file(secondary_qmi::SECONDARY_QMI_ENDPOINTS_STATE_FILE);
         // Drop any rule from an earlier run: with DATA6 off, every port belongs
@@ -393,10 +394,13 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         if write_udev_rule && !dry_run {
             reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &[]).await;
         }
-        println!("secondary-qmi-init: DATA6 disabled; using the ModemManager primary QMI bearer");
+        println!("secondary-qmi-init: DATA6 disabled; UE-native cellular paths unavailable");
         if std::env::var_os("NOTIFY_SOCKET").is_some() {
             let _ = tokio::process::Command::new("systemd-notify")
-                .args(["--ready", "--status=DATA6 disabled; primary QMI fallback"])
+                .args([
+                    "--ready",
+                    "--status=DATA6 disabled; UE-native paths unavailable",
+                ])
                 .status()
                 .await;
         }
@@ -416,11 +420,9 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
         secondary_qmi::wait_for_primary_qmi_ports(secondary_qmi::PRIMARY_PORT_WAIT).await
     };
     if primaries.is_empty() {
-        // Not an error: plenty of supported hardware has no spare QMI channel,
-        // and every line falls back to the ModemManager bearer. Still has to
-        // reconcile and report ready -- the unit is Type=notify, so returning
-        // silently here would stall it until TimeoutStartSec and then restart it
-        // on a loop for the rest of the boot.
+        // Still reconcile and report ready: the unit is Type=notify, so
+        // returning silently would stall it until TimeoutStartSec. Cellular
+        // paths remain unavailable because no host-namespace fallback exists.
         if write_udev_rule && !dry_run {
             reconcile_secondary_qmi_udev_rules(UDEV_RULE_PATH, &[]).await;
         }
@@ -429,7 +431,7 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
             let _ = tokio::process::Command::new("systemd-notify")
                 .args([
                     "--ready",
-                    "--status=no QMI control port; primary QMI fallback",
+                    "--status=no QMI control port; UE-native paths unavailable",
                 ])
                 .status()
                 .await;
@@ -927,7 +929,10 @@ async fn main() -> Result<()> {
         profile_store.publish();
     }
 
-    let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
+    let esim_supervisor = Arc::new(EsimSupervisor::new(
+        Arc::clone(&config_manager),
+        Arc::clone(&app_db),
+    ));
 
     let nm_result = ensure_nm_modem_profile().await;
     tracing::info!(result = %nm_result, "NetworkManager modem profile setup completed");
@@ -2459,7 +2464,10 @@ mod http_router_tests {
             Arc::clone(&config_manager),
             Arc::clone(&app_db),
         ));
-        let esim_supervisor = Arc::new(EsimSupervisor::new(Arc::clone(&config_manager)));
+        let esim_supervisor = Arc::new(EsimSupervisor::new(
+            Arc::clone(&config_manager),
+            Arc::clone(&app_db),
+        ));
         let notification_sender = Arc::new(NotificationSender::new(
             Arc::clone(&config_manager),
             Arc::clone(&dbus_conn),

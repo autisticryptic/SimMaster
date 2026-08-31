@@ -6,13 +6,12 @@
 //! protected SIP. A 401/407 sec-agree challenge may replace the socket with a
 //! channel bound to the negotiated client port.
 
-use std::{
-    io,
-    net::{SocketAddr, UdpSocket as StdUdpSocket},
-    time::Duration,
-};
+use std::{net::SocketAddr, time::Duration};
 
+#[cfg(test)]
 use socket2::{Domain, Protocol, Socket, Type};
+#[cfg(test)]
+use std::{io, net::UdpSocket as StdUdpSocket};
 use tokio::net::UdpSocket;
 
 use crate::connectivity::core::{
@@ -45,11 +44,13 @@ pub struct VolteSipChannel {
 }
 
 enum ReservedReceiveSocket {
+    #[cfg(test)]
     Host(Socket),
     Worker(UdpSocket),
 }
 
 impl VolteSipChannel {
+    #[cfg(test)]
     pub fn bind(
         route: ImsRoute,
         interface: Option<&str>,
@@ -73,6 +74,7 @@ impl VolteSipChannel {
         })
     }
 
+    #[cfg(test)]
     /// Reserve a second local UDP port for protected packets sent by the
     /// P-CSCF.  The initial REGISTER socket remains the protected send socket.
     pub fn reserve_security_receive_port(&mut self) -> Result<u16, ImsError> {
@@ -93,11 +95,7 @@ impl VolteSipChannel {
         Ok(port)
     }
 
-    /// Create the initial SIP channel inside a per-line UE worker.  The
-    /// bearer/QMI lifecycle remains in the parent; only the socket's kernel
-    /// network namespace is moved.  Callers must retain the host path as a
-    /// fallback because a worker cannot reach a bearer interface that has not
-    /// yet been bridged or moved into its namespace.
+    /// Create the initial SIP channel inside the mandatory per-line UE worker.
     pub async fn bind_in_worker(
         route: ImsRoute,
         worker: &UeWorkerHandle,
@@ -137,6 +135,7 @@ impl VolteSipChannel {
     ) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
             return match socket {
+                #[cfg(test)]
                 ReservedReceiveSocket::Host(socket) => socket_port(socket),
                 ReservedReceiveSocket::Worker(socket) => socket
                     .local_addr()
@@ -159,6 +158,7 @@ impl VolteSipChannel {
         Ok(port)
     }
 
+    #[cfg(test)]
     /// Activate the two protected UDP directions negotiated by sec-agree:
     /// UE send -> P-CSCF client port, and P-CSCF send -> UE receive port.
     pub fn activate_security(
@@ -173,6 +173,7 @@ impl VolteSipChannel {
             .take()
             .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
         let receive_socket = match reserved {
+            #[cfg(test)]
             ReservedReceiveSocket::Host(reserved) => {
                 if socket_addr(&reserved)? != receive_local {
                     return Err(ImsError::new("volte_channel_receive_port_mismatch"));
@@ -238,6 +239,7 @@ impl VolteSipChannel {
                     .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?;
                 socket
             }
+            #[cfg(test)]
             ReservedReceiveSocket::Host(_) => {
                 return Err(ImsError::new("volte_channel_worker_receive_mismatch"));
             }
@@ -259,7 +261,7 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
-        // Same rule as the host path: advertise the protected server port.
+        // Advertise the protected server port rather than the send port.
         self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
         Ok(())
@@ -361,6 +363,7 @@ impl ImsChannel for VolteSipChannel {
     }
 }
 
+#[cfg(test)]
 fn build_socket(
     local: SocketAddr,
     remote: SocketAddr,
@@ -376,6 +379,7 @@ fn build_socket(
     connect_bound_socket(socket, remote)
 }
 
+#[cfg(test)]
 fn build_bound_socket(local: SocketAddr, interface: Option<&str>) -> io::Result<Socket> {
     let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -384,6 +388,7 @@ fn build_bound_socket(local: SocketAddr, interface: Option<&str>) -> io::Result<
     Ok(socket)
 }
 
+#[cfg(test)]
 fn connect_bound_socket(socket: Socket, remote: SocketAddr) -> io::Result<UdpSocket> {
     socket.connect(&remote.into())?;
     socket.set_nonblocking(true)?;
@@ -391,6 +396,7 @@ fn connect_bound_socket(socket: Socket, remote: SocketAddr) -> io::Result<UdpSoc
     UdpSocket::from_std(std_socket)
 }
 
+#[cfg(test)]
 fn socket_addr(socket: &Socket) -> Result<SocketAddr, ImsError> {
     socket
         .local_addr()
@@ -399,11 +405,12 @@ fn socket_addr(socket: &Socket) -> Result<SocketAddr, ImsError> {
         .ok_or_else(|| ImsError::new("volte_channel_local_addr_failed"))
 }
 
+#[cfg(test)]
 fn socket_port(socket: &Socket) -> Result<u16, ImsError> {
     Ok(socket_addr(socket)?.port())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn bind_to_interface(socket: &Socket, interface: Option<&str>) -> io::Result<()> {
     use std::{ffi::CString, os::fd::AsRawFd};
 
@@ -428,7 +435,7 @@ fn bind_to_interface(socket: &Socket, interface: Option<&str>) -> io::Result<()>
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn bind_to_interface(_socket: &Socket, interface: Option<&str>) -> io::Result<()> {
     if interface.is_some() {
         return Err(io::Error::new(

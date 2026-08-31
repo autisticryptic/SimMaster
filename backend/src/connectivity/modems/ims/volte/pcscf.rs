@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{net::UdpSocket, process::Command, time::sleep};
+use tokio::{process::Command, time::sleep};
 
 use crate::{
     platform::config::VolteIpFamilyPreference,
@@ -559,39 +559,6 @@ pub fn parse_cgcontrdp_pcscf(output: &str, expected_cid: u8, apn: &str) -> Vec<I
     candidates
 }
 
-/// Discover a P-CSCF without changing the system resolver. IMS APNs commonly
-/// provide private DNS servers that are reachable only through the dedicated
-/// bearer, so queries are sent directly from the bearer address.
-pub async fn discover_pcscf(
-    settings: &ImsIpSettings,
-    home_domain: &str,
-    configured_pcscf: Option<&str>,
-    local: IpAddr,
-) -> Result<IpAddr, VolteError> {
-    discover_pcscf_on_interface(settings, home_domain, configured_pcscf, local, None).await
-}
-
-/// Variant used by a live bearer. DNS queries must carry the bearer interface
-/// as well as the source address: source-address policy rules are ambiguous if
-/// two modem interfaces happen to receive the same address.
-pub async fn discover_pcscf_on_interface(
-    settings: &ImsIpSettings,
-    home_domain: &str,
-    configured_pcscf: Option<&str>,
-    local: IpAddr,
-    interface: Option<&str>,
-) -> Result<IpAddr, VolteError> {
-    discover_pcscf_on_path(
-        settings,
-        home_domain,
-        configured_pcscf,
-        local,
-        interface,
-        None,
-    )
-    .await
-}
-
 pub async fn discover_pcscf_in_worker(
     settings: &ImsIpSettings,
     home_domain: &str,
@@ -605,8 +572,8 @@ pub async fn discover_pcscf_in_worker(
         home_domain,
         configured_pcscf,
         local,
-        Some(interface),
-        Some(worker),
+        interface,
+        worker,
     )
     .await
 }
@@ -616,8 +583,8 @@ async fn discover_pcscf_on_path(
     home_domain: &str,
     configured_pcscf: Option<&str>,
     local: IpAddr,
-    interface: Option<&str>,
-    worker: Option<&UeWorkerHandle>,
+    interface: &str,
+    worker: &UeWorkerHandle,
 ) -> Result<IpAddr, VolteError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
@@ -753,90 +720,31 @@ async fn query_dns(
     server: IpAddr,
     name: &str,
     record_type: u16,
-    interface: Option<&str>,
-    worker: Option<&UeWorkerHandle>,
+    interface: &str,
+    worker: &UeWorkerHandle,
 ) -> Result<DnsRecords, VolteError> {
     let query_id = dns_query_id(name, record_type);
     let query = build_dns_query(query_id, name, record_type)?;
     let remote = SocketAddr::new(server, DNS_PORT);
-    let socket = if let Some(worker) = worker {
-        let spec = UeSocketSpec::udp_connected(
-            SocketAddr::new(local, 0),
-            remote,
-            interface.map(str::to_string),
-        );
-        match worker.create_socket(spec).await {
-            Ok(UeSocket::Udp(socket)) => socket,
-            _ => return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
-        }
-    } else {
-        bind_dns_socket(SocketAddr::new(local, 0), interface)
-            .await
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+    let spec = UeSocketSpec::udp_connected(
+        SocketAddr::new(local, 0),
+        remote,
+        Some(interface.to_string()),
+    );
+    let socket = match worker.create_socket(spec).await {
+        Ok(UeSocket::Udp(socket)) => socket,
+        _ => return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
     };
-    if worker.is_some() {
-        socket
-            .send(&query)
-            .await
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    } else {
-        socket
-            .send_to(&query, remote)
-            .await
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
-    }
+    socket
+        .send(&query)
+        .await
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
     let mut response = [0u8; 4096];
-    let read = if worker.is_some() {
-        tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
-            .await
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-    } else {
-        tokio::time::timeout(DNS_TIMEOUT, socket.recv_from(&mut response))
-            .await
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-            .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-            .0
-    };
+    let read = tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
+        .await
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
     parse_dns_response(query_id, &response[..read])
-}
-
-async fn bind_dns_socket(local: SocketAddr, interface: Option<&str>) -> std::io::Result<UdpSocket> {
-    let Some(interface) = interface.filter(|name| !name.trim().is_empty()) else {
-        return Ok(UdpSocket::bind(local).await?);
-    };
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(local),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_reuse_address(true)?;
-    #[cfg(target_os = "linux")]
-    {
-        use std::{ffi::CString, os::fd::AsRawFd};
-        let name = CString::new(interface).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
-        })?;
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr().cast(),
-                name.as_bytes_with_nul().len() as libc::socklen_t,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = interface;
-    }
-    socket.bind(&local.into())?;
-    socket.set_nonblocking(true)?;
-    UdpSocket::from_std(socket.into())
 }
 
 fn dns_query_id(name: &str, record_type: u16) -> u16 {

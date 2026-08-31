@@ -309,8 +309,9 @@ class SimAdminCurrentAPI {
     })
   }
 
-  async getEsimEuicc(lineId: string) {
-    return request<ApiResponse<EsimEuiccInfo>>(modemLinePath(lineId, '/esim/euicc'), {
+  async getEsimEuicc(lineId: string, refresh = false) {
+    const suffix = refresh ? '/esim/euicc?refresh=true' : '/esim/euicc'
+    return request<ApiResponse<EsimEuiccInfo>>(modemLinePath(lineId, suffix), {
       timeoutMs: 30000,
     })
   }

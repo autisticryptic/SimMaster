@@ -158,6 +158,6 @@ profile 以 **SIM 的归属 PLMN** 为准，绝不把 `modem.3gpp.operator-code`
 | `DEVELOPMENT_PLAN.md` | 待办与验收计划（唯一的 TODO 来源） |
 | `IMS_REGISTER_TRISTATE_SCHEMA.md` | REGISTER 三态字段（`true`/`false`/`omit`）契约 |
 | `QCM410_BAM_DMUX_MODEM_CRASH.md` | 410 基带崩溃分析与恢复 |
-| `ue-isolation-migration.md` | UE 隔离（netns/veth）迁移设计 |
+| `ue-network-namespaces.md` | 强制 per-UE 网络命名空间架构 |
 | `CARRIER_PROFILES.md` | carrier catalog 来源与限制 |
 | `INSTALL.md` / `ENVIRONMENT.md` / `DEVELOPER.md` | 安装、运行环境、开发构建 |

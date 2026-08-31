@@ -76,10 +76,7 @@ use crate::services::trunk::bridge::{
     DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
 };
 use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
-use tokio::{
-    net::TcpSocket,
-    sync::{mpsc, Mutex},
-};
+use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
 const LIVE_DNS_TIMEOUT: Duration = Duration::from_secs(8);
@@ -1375,8 +1372,7 @@ fn line_ue_socket_contexts() -> &'static StdRwLock<HashMap<String, LiveUeSocketC
     LIVE_UE_SOCKET_CONTEXTS.get_or_init(|| StdRwLock::new(HashMap::new()))
 }
 
-/// Record (or clear) the UE socket context for a line. Called during every
-/// line refresh so a config toggle applies on the next VoWiFi reconnect.
+/// Record or clear the mandatory UE socket context for a line.
 pub(crate) fn register_line_ue_socket_context(line_id: &str, context: Option<LiveUeSocketContext>) {
     let mut guard = line_ue_socket_contexts()
         .write()
@@ -1391,14 +1387,18 @@ pub(crate) fn register_line_ue_socket_context(line_id: &str, context: Option<Liv
     }
 }
 
-/// Resolve the UE socket context for a line. `None` keeps the current
-/// host-namespace socket creation path.
+/// Resolve the UE socket context for a line.
 pub(crate) fn ue_socket_context_for_line(line_id: &str) -> Option<LiveUeSocketContext> {
     line_ue_socket_contexts()
         .read()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(line_id)
         .cloned()
+}
+
+fn required_ue_socket_context(line_id: &str) -> Result<LiveUeSocketContext, LiveStageError> {
+    ue_socket_context_for_line(line_id)
+        .ok_or_else(|| live_stage_error("ue_socket_context_unavailable"))
 }
 
 /// Resolve the UE namespace this line's VoWiFi tunnel should live in. The
@@ -2831,56 +2831,33 @@ async fn run_live_ike_with_destination(
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
 ) -> Result<LiveIkeSession, LiveStageError> {
-    let ue_socket = ue_socket_context_for_line(line_id);
-    let local_addr = match &ue_socket {
-        Some(_) => {
-            let base = unspecified_local_addr_for(destination);
-            SocketAddr::new(base.ip(), path.preferred_local_port)
-        }
-        None => local_bind_addr_for_destination(destination, path.preferred_local_port)
-            .await
-            .unwrap_or_else(|_| unspecified_local_addr_for(destination)),
-    };
+    let ue_socket = required_ue_socket_context(line_id)?;
+    let base = unspecified_local_addr_for(destination);
+    let local_addr = SocketAddr::new(base.ip(), path.preferred_local_port);
     info!(
         "run_live_ike_with_destination: binding local_addr={:?} for destination={:?}",
         local_addr, destination
     );
-    let transport = match &ue_socket {
-        Some(context) => {
-            // Use udp_bound (not udp_connected) because IKE switches from
-            // port 500 to port 4500 during NAT-T. A connect()ed UDP socket
-            // on Linux rejects sendto() to a different peer and recvfrom()
-            // only accepts from the connected peer - both break NAT-T.
-            let spec = UeSocketSpec::udp_bound(
-                local_addr,
-                Some(context.ue_veth.clone()),
+    // Use udp_bound (not udp_connected) because IKE switches from port 500 to
+    // port 4500 during NAT-T.
+    let spec = UeSocketSpec::udp_bound(local_addr, Some(ue_socket.ue_veth.clone()));
+    let transport = match ue_socket.worker.create_socket(spec).await {
+        Ok(UeSocket::Udp(socket)) => {
+            info!(
+                line_id,
+                ue_veth = %ue_socket.ue_veth,
+                "IKE transport socket created inside UE namespace"
             );
-            match context.worker.create_socket(spec).await {
-                Ok(UeSocket::Udp(socket)) => {
-                    info!(
-                        line_id,
-                        ue_veth = %context.ue_veth,
-                        "IKE transport socket created inside UE namespace"
-                    );
-                    UdpSocketDatagramTransport::from_socket(socket)
-                }
-                Ok(_) => return Err(live_stage_error("ike_ue_socket_family_mismatch")),
-                Err(error) => {
-                    warn!(
-                        line_id,
-                        error = %error,
-                        "UE worker IKE socket creation failed; VoWiFi path aborted for this destination"
-                    );
-                    return Err(live_stage_error("ike_ue_socket_creation_failed"));
-                }
-            }
+            UdpSocketDatagramTransport::from_socket(socket)
         }
-        None => UdpSocketDatagramTransport::bind(local_addr)
-            .await
-            .map_err(map_transport_error)?,
+        Ok(_) => return Err(live_stage_error("ike_ue_socket_family_mismatch")),
+        Err(error) => {
+            warn!(line_id, error = %error, "UE worker IKE socket creation failed");
+            return Err(live_stage_error("ike_ue_socket_creation_failed"));
+        }
     }
-        .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
-        .with_max_datagram_bytes(8192);
+    .with_recv_timeout(LIVE_IKE_SA_INIT_TIMEOUT)
+    .with_max_datagram_bytes(8192);
 
     let initiator_spi = generate_initiator_spi()?;
     let initiator_nonce = generate_nonce()?;
@@ -3261,7 +3238,7 @@ async fn ensure_live_tun_gateway(
         secrets: child_sa.secrets.clone(),
         transport,
         remote,
-        ue_namespace: ue_namespace_for_line(line_id),
+        ue_namespace: required_ue_socket_context(line_id)?.namespace,
     })
     .await
     .map_err(|error| live_stage_error(error.reason()))?;
@@ -4031,7 +4008,7 @@ async fn record_live_ims_channel(
     register_context: LiveRegisterRequestContext,
     register_variant: LiveRegisterHeaderVariant,
     next_register_cseq: u32,
-) {
+) -> Result<(), LiveStageError> {
     let route = channel.route();
     let expires_at = Instant::now() + registration.lease.expires_after;
     let media_route_installer: Option<Arc<dyn super::operator::MediaRouteInstaller>> =
@@ -4039,12 +4016,10 @@ async fn record_live_ims_channel(
             .await
             .ok()
             .map(|gateway| gateway as Arc<dyn super::operator::MediaRouteInstaller>);
-    let media_operator_creator: Option<Arc<dyn OperatorSocketCreator>> =
-        ue_socket_context_for_line(line_id).map(|context| {
-            Arc::new(super::operator::UeWorkerOperatorSocketCreator::new(
-                context.worker,
-            )) as Arc<dyn OperatorSocketCreator>
-        });
+    let context = required_ue_socket_context(line_id)?;
+    let media_operator_creator = Arc::new(super::operator::UeWorkerOperatorSocketCreator::new(
+        context.worker,
+    )) as Arc<dyn OperatorSocketCreator>;
     xcap_binding_cache().lock().await.insert(
         line_id.to_string(),
         LiveXcapBinding {
@@ -4083,6 +4058,7 @@ async fn record_live_ims_channel(
         channel,
     )
     .await;
+    Ok(())
 }
 
 async fn clear_live_ims_channel(line_id: &str, profile: &'static CarrierProfile) {
@@ -4721,14 +4697,14 @@ async fn run_register_exchange_with_pcscf_variant(
 ) -> Result<String, LiveStageError> {
     let target = SocketAddr::new(pcscf_addr, profile.ims.local_port);
     let transport = ims_transport(profile);
-    let ue_socket = ue_socket_context_for_line(line_id);
+    let ue_socket = required_ue_socket_context(line_id)?;
     let socket = connect_sip_socket(
         gateway.inner_addr(),
         target,
         profile.ims.local_port,
         transport,
         Some(gateway.tun_name()),
-        ue_socket.as_ref(),
+        &ue_socket,
     )
     .await?;
     let local_addr = match socket.local_addr() {
@@ -5434,14 +5410,14 @@ async fn run_protected_authenticated_register_candidates(
         );
         let target = SocketAddr::new(context.route_addr, candidate.client_flow_remote_port);
         let transport = ims_transport(profile);
-        let ue_socket = ue_socket_context_for_line(line_id);
+        let ue_socket = required_ue_socket_context(line_id)?;
         match connect_sip_socket(
             gateway.inner_addr(),
             target,
             candidate.client_flow_local_port,
             transport,
             Some(gateway.tun_name()),
-            ue_socket.as_ref(),
+            &ue_socket,
         )
         .await
         {
@@ -5476,7 +5452,7 @@ async fn run_protected_authenticated_register_candidates(
                                 local_security.port_s,
                                 transport,
                                 Some(gateway.tun_name()),
-                                ue_socket.as_ref(),
+                                &ue_socket,
                             )
                             .await
                             {
@@ -5619,7 +5595,7 @@ async fn run_protected_authenticated_register_candidates(
                             variant,
                             retry_cseq.saturating_add(1),
                         )
-                        .await;
+                        .await?;
                         return Ok(response);
                     }
                     if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS {
@@ -5816,14 +5792,14 @@ async fn send_live_sms_message_variant(
     let target = SocketAddr::new(route.remote_addr, route.remote_port);
     let transport = ims_transport(profile);
     let tun_name = tun_name_for_line(&live_runtime_config().tun_name, line_id);
-    let ue_socket = ue_socket_context_for_line(line_id);
+    let ue_socket = required_ue_socket_context(line_id)?;
     let socket = connect_sip_socket(
         route.local_addr,
         target,
         route.local_port,
         transport,
         Some(&tun_name),
-        ue_socket.as_ref(),
+        &ue_socket,
     )
     .await?;
     let mut pending = Vec::new();
@@ -6616,172 +6592,46 @@ async fn connect_sip_socket(
     preferred_local_port: u16,
     transport: crate::connectivity::core::context::SipTransport,
     interface: Option<&str>,
-    ue_socket: Option<&LiveUeSocketContext>,
+    ue_socket: &LiveUeSocketContext,
 ) -> Result<SipChannelSocket, LiveStageError> {
-    if let Some(context) = ue_socket {
-        let local = SocketAddr::new(inner_addr, preferred_local_port);
-        let device = interface.map(str::to_string);
-        return match transport {
-            crate::connectivity::core::context::SipTransport::Tcp => {
-                let spec = UeSocketSpec::tcp_connected(
-                    local,
-                    target,
-                    device,
-                    LIVE_IMS_TCP_TIMEOUT.as_secs().max(1),
-                );
-                match context.worker.create_socket(spec).await {
-                    Ok(UeSocket::Tcp(stream)) => Ok(SipChannelSocket::Tcp(stream)),
-                    Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
-                    Err(error) => {
-                        warn!(
-                            line_id = %context.namespace,
-                            error = %error,
-                            "UE worker SIP TCP socket creation failed"
-                        );
-                        Err(live_stage_error("ims_ue_tcp_socket_creation_failed"))
-                    }
-                }
-            }
-            crate::connectivity::core::context::SipTransport::Udp => {
-                let spec = UeSocketSpec::udp_connected(local, target, device);
-                match context.worker.create_socket(spec).await {
-                    Ok(UeSocket::Udp(socket)) => Ok(SipChannelSocket::Udp(socket)),
-                    Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
-                    Err(error) => {
-                        warn!(
-                            line_id = %context.namespace,
-                            error = %error,
-                            "UE worker SIP UDP socket creation failed"
-                        );
-                        Err(live_stage_error("ims_ue_udp_socket_creation_failed"))
-                    }
-                }
-            }
-        };
-    }
+    let local = SocketAddr::new(inner_addr, preferred_local_port);
+    let device = interface.map(str::to_string);
     match transport {
         crate::connectivity::core::context::SipTransport::Tcp => {
-            let socket = match target {
-                SocketAddr::V4(_) => TcpSocket::new_v4(),
-                SocketAddr::V6(_) => TcpSocket::new_v6(),
+            let spec = UeSocketSpec::tcp_connected(
+                local,
+                target,
+                device,
+                LIVE_IMS_TCP_TIMEOUT.as_secs().max(1),
+            );
+            match ue_socket.worker.create_socket(spec).await {
+                Ok(UeSocket::Tcp(stream)) => Ok(SipChannelSocket::Tcp(stream)),
+                Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
+                Err(error) => {
+                    warn!(
+                        namespace = %ue_socket.namespace,
+                        error = %error,
+                        "UE worker SIP TCP socket creation failed"
+                    );
+                    Err(live_stage_error("ims_ue_tcp_socket_creation_failed"))
+                }
             }
-            .map_err(|_| live_stage_error("ims_tcp_socket_failed"))?;
-            bind_socket_to_interface(&socket, interface)
-                .map_err(|_| live_stage_error("ims_tcp_bind_interface_failed"))?;
-            let _ = socket.set_reuseaddr(true);
-            if preferred_local_port != 0 {
-                socket
-                    .bind(SocketAddr::new(inner_addr, preferred_local_port))
-                    .map_err(|_| live_stage_error("ims_tcp_bind_preferred_port_failed"))?;
-            } else {
-                socket
-                    .bind(SocketAddr::new(inner_addr, 0))
-                    .map_err(|_| live_stage_error("ims_tcp_bind_failed"))?;
-            }
-            tokio::time::timeout(LIVE_IMS_TCP_TIMEOUT, socket.connect(target))
-                .await
-                .map_err(|_| live_stage_error("ims_tcp_connect_timeout"))?
-                .map_err(|_| live_stage_error("ims_tcp_connect_failed"))
-                .map(SipChannelSocket::Tcp)
         }
         crate::connectivity::core::context::SipTransport::Udp => {
-            let local_port = if preferred_local_port != 0 {
-                preferred_local_port
-            } else {
-                0
-            };
-            let socket =
-                bind_udp_socket_to_interface(SocketAddr::new(inner_addr, local_port), interface)
-                    .await
-                    .map_err(|_| live_stage_error("ims_udp_bind_failed"))?;
-            socket
-                .connect(target)
-                .await
-                .map_err(|_| live_stage_error("ims_udp_connect_failed"))?;
-            Ok(SipChannelSocket::Udp(socket))
+            let spec = UeSocketSpec::udp_connected(local, target, device);
+            match ue_socket.worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => Ok(SipChannelSocket::Udp(socket)),
+                Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
+                Err(error) => {
+                    warn!(
+                        namespace = %ue_socket.namespace,
+                        error = %error,
+                        "UE worker SIP UDP socket creation failed"
+                    );
+                    Err(live_stage_error("ims_ue_udp_socket_creation_failed"))
+                }
+            }
         }
-    }
-}
-
-async fn bind_udp_socket_to_interface(
-    local: SocketAddr,
-    interface: Option<&str>,
-) -> std::io::Result<tokio::net::UdpSocket> {
-    let Some(interface) = interface.filter(|value| !value.trim().is_empty()) else {
-        return tokio::net::UdpSocket::bind(local).await;
-    };
-    let socket = socket2::Socket::new(
-        socket2::Domain::for_address(local),
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-    socket.set_reuse_address(true)?;
-    bind_raw_socket_to_interface(&socket, interface)?;
-    socket.bind(&local.into())?;
-    socket.set_nonblocking(true)?;
-    tokio::net::UdpSocket::from_std(socket.into())
-}
-
-fn bind_socket_to_interface(
-    _socket: &tokio::net::TcpSocket,
-    interface: Option<&str>,
-) -> std::io::Result<()> {
-    let Some(interface) = interface.filter(|value| !value.trim().is_empty()) else {
-        return Ok(());
-    };
-    #[cfg(target_os = "linux")]
-    {
-        use std::{ffi::CString, os::fd::AsRawFd};
-        let name = CString::new(interface).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
-        })?;
-        let result = unsafe {
-            libc::setsockopt(
-                _socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr().cast(),
-                name.as_bytes_with_nul().len() as libc::socklen_t,
-            )
-        };
-        if result == 0 {
-            return Ok(());
-        }
-        return Err(std::io::Error::last_os_error());
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = interface;
-        Ok(())
-    }
-}
-
-fn bind_raw_socket_to_interface(socket: &socket2::Socket, interface: &str) -> std::io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::{ffi::CString, os::fd::AsRawFd};
-        let name = CString::new(interface).map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "interface contains NUL")
-        })?;
-        let result = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_BINDTODEVICE,
-                name.as_ptr().cast(),
-                name.as_bytes_with_nul().len() as libc::socklen_t,
-            )
-        };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (socket, interface);
-        Ok(())
     }
 }
 
@@ -9021,29 +8871,6 @@ fn unspecified_local_addr_for(remote: SocketAddr) -> SocketAddr {
     }
 }
 
-async fn local_bind_addr_for_destination(
-    remote: SocketAddr,
-    preferred_port: u16,
-) -> Result<SocketAddr, TransportError> {
-    let probe = tokio::net::UdpSocket::bind(unspecified_local_addr_for(remote))
-        .await
-        .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-    probe
-        .connect(remote)
-        .await
-        .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-    let local = probe
-        .local_addr()
-        .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-    let preferred = SocketAddr::new(local.ip(), preferred_port);
-    match tokio::net::UdpSocket::bind(preferred).await {
-        Ok(socket) => Ok(socket
-            .local_addr()
-            .map_err(|err| TransportError::Io(err.kind().to_string()))?),
-        Err(_) => Ok(SocketAddr::new(local.ip(), 0)),
-    }
-}
-
 fn map_transport_error(error: TransportError) -> LiveStageError {
     let reason = match error {
         TransportError::DnsFailed(_) => "epdg_dns_resolution_failed",
@@ -10717,17 +10544,6 @@ mod tests {
             .expect_err("status probe should only cover IKE readiness");
 
         assert_eq!(err.reason, "status_probe_stage_not_supported");
-    }
-
-    #[tokio::test]
-    async fn local_bind_can_choose_ephemeral_source_port_for_nat_paths() {
-        let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 500);
-        let local = local_bind_addr_for_destination(remote, 0)
-            .await
-            .expect("ephemeral local bind address");
-
-        assert_ne!(local.port(), 0);
-        assert_eq!(local.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 
     #[test]

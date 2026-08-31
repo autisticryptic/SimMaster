@@ -22,8 +22,7 @@ use tokio::{
 
 use crate::platform::config::LineDataProxyConfig;
 use crate::services::ue_worker::{
-    worker_for_line_feature, UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerFeatures,
-    UeWorkerHandle,
+    worker_for_line, UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerHandle,
 };
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -300,6 +299,7 @@ impl DataProxyRuntime {
         self.traffic().await
     }
 
+    #[cfg(test)]
     pub async fn start(
         &self,
         interface_name: &str,
@@ -308,44 +308,34 @@ impl DataProxyRuntime {
         self.start_with_worker(interface_name, config, None).await
     }
 
-    /// Start a proxy with an optional per-line worker for outbound sockets.
-    /// The listener remains host-side so existing clients keep the same API;
-    /// only the cellular egress is moved into the UE namespace.
+    /// Start a proxy whose cellular outbound sockets are created by the
+    /// mandatory per-line UE worker. The listener remains host-side so LAN
+    /// clients keep the same endpoint.
     pub async fn start_for_line(
         &self,
         line_id: &str,
         interface_name: &str,
         config: &LineDataProxyConfig,
     ) -> Result<DataProxyStatus, String> {
-        let worker = match worker_for_line_feature(line_id, data_proxy_worker_enabled) {
-            Some(worker) => {
-                let status = worker.status().await;
-                if !status.ready {
-                    None
-                } else {
-                    // Capture the generation before probing so a worker that
-                    // restarts mid-check yields a stale binding rather than a
-                    // fresh one backed by an unverified namespace.
-                    let binding = worker.bind();
-                    // Do not trust a cached namespace snapshot here. A
-                    // worker can restart, or a bearer can move back to the
-                    // host, since the last reconcile.
-                    match worker.refresh_net_status().await {
-                        Ok(snapshot)
-                            if snapshot
-                                .interfaces
-                                .iter()
-                                .any(|name| name == interface_name) =>
-                        {
-                            Some(binding)
-                        }
-                        _ => None,
-                    }
-                }
-            }
-            None => None,
-        };
-        self.start_with_worker(interface_name, config, worker).await
+        let worker = worker_for_line(line_id)
+            .ok_or_else(|| "data_proxy_ue_worker_unavailable".to_string())?;
+        if !worker.status().await.ready {
+            return Err("data_proxy_ue_worker_not_ready".to_string());
+        }
+        let binding = worker.bind();
+        let snapshot = worker
+            .refresh_net_status()
+            .await
+            .map_err(|error| format!("data_proxy_ue_worker_status_failed:{error}"))?;
+        if !snapshot
+            .interfaces
+            .iter()
+            .any(|name| name == interface_name)
+        {
+            return Err("data_proxy_ue_interface_missing".to_string());
+        }
+        self.start_with_worker(interface_name, config, Some(binding))
+            .await
     }
 
     async fn start_with_worker(
@@ -476,10 +466,6 @@ impl DataProxyRuntime {
         let state = self.state.lock().await;
         state.status.running && worker_binding_matches_state(state.worker.as_ref(), expected)
     }
-}
-
-fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
-    features.data_proxy
 }
 
 async fn stop_locked(state: &mut ProxyState) {

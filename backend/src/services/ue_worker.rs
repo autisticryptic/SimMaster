@@ -42,49 +42,21 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
-/// Registry of live workers keyed by the stable line id.  The registry is
-/// intentionally independent from the VoWiFi module: data proxy, VoLTE and
-/// future 5G access legs all need the same UE owner, while VoWiFi may choose
-/// to enable its TUN/socket path separately.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct UeWorkerFeatures {
-    /// Shared LTE/NR 3GPP IMS data plane. The worker does not care which radio
-    /// access created the bearer; both use the same namespace/socket contract.
-    pub three_gpp_ims: bool,
-    pub data_proxy: bool,
-    pub trunk_sockets: bool,
-}
-
-#[derive(Clone)]
-struct RegisteredLineWorker {
-    handle: UeWorkerHandle,
-    features: UeWorkerFeatures,
-}
-
-static LINE_WORKERS: std::sync::OnceLock<StdMutex<HashMap<String, RegisteredLineWorker>>> =
+/// Registry of mandatory live workers keyed by the stable line id.
+static LINE_WORKERS: std::sync::OnceLock<StdMutex<HashMap<String, UeWorkerHandle>>> =
     std::sync::OnceLock::new();
 
-fn line_workers() -> &'static StdMutex<HashMap<String, RegisteredLineWorker>> {
+fn line_workers() -> &'static StdMutex<HashMap<String, UeWorkerHandle>> {
     LINE_WORKERS.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
-pub fn register_line_worker(
-    line_id: &str,
-    worker: Option<UeWorkerHandle>,
-    features: UeWorkerFeatures,
-) {
+pub fn register_line_worker(line_id: &str, worker: Option<UeWorkerHandle>) {
     let mut workers = line_workers()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     match worker {
         Some(worker) => {
-            workers.insert(
-                line_id.to_string(),
-                RegisteredLineWorker {
-                    handle: worker,
-                    features,
-                },
-            );
+            workers.insert(line_id.to_string(), worker);
         }
         None => {
             workers.remove(line_id);
@@ -97,19 +69,7 @@ pub fn worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .get(line_id)
-        .map(|worker| worker.handle.clone())
-}
-
-pub fn worker_for_line_feature(
-    line_id: &str,
-    feature: fn(UeWorkerFeatures) -> bool,
-) -> Option<UeWorkerHandle> {
-    line_workers()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .get(line_id)
-        .filter(|worker| feature(worker.features))
-        .map(|worker| worker.handle.clone())
+        .cloned()
 }
 
 #[cfg(not(unix))]
@@ -653,6 +613,38 @@ impl UeWorkerHandle {
         }
     }
 
+    /// Install an in-process control responder for unit tests that exercise
+    /// higher-level UE routing without creating a Linux namespace or child
+    /// process. Production code has no host-path equivalent.
+    #[cfg(test)]
+    pub async fn enable_test_net_config(&self) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *self.core.tx.lock().unwrap() = Some(tx);
+        let core = Arc::clone(&self.core);
+        tokio::spawn(async move {
+            while let Some(message) = rx.recv().await {
+                let UeWorkerMessage::NetConfigRequest { request_id, ops } = message else {
+                    continue;
+                };
+                let outcome = NetConfigOutcome {
+                    request_id,
+                    ok: true,
+                    output: vec![format!("test applied {} net-config operations", ops.len())],
+                    error: None,
+                };
+                let sender = core.pending.lock().unwrap().remove(&request_id);
+                {
+                    let mut state = core.state.lock().unwrap();
+                    state.last_net_config_ok = true;
+                    state.last_net_config_error = None;
+                }
+                if let Some(PendingRequest::NetConfig(sender)) = sender {
+                    let _ = sender.send(outcome);
+                }
+            }
+        });
+    }
+
     /// Ask the worker for an immediate namespace snapshot and wait briefly for
     /// the reader task to publish it. This is used after moving a native WWAN
     /// interface so feature gates never rely on a stale pre-migration view.
@@ -807,12 +799,14 @@ impl UeWorkerHandle {
 
     /// True when the process is alive and the control channel is up.
     pub async fn is_running(&self) -> bool {
-        let mut status = self.status().await;
+        let status = self.status().await;
         #[cfg(unix)]
-        if !status.ready && status.pid.is_some() && status.last_error.is_some() {
+        let status = if !status.ready && status.pid.is_some() && status.last_error.is_some() {
             self.reap_failed_generation(&status).await;
-            status = self.status().await;
-        }
+            self.status().await
+        } else {
+            status
+        };
         status.ready || status.pid.is_some()
     }
 

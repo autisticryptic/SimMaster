@@ -74,7 +74,7 @@ use crate::{
         status as system_event_status,
     },
     services::trunk::bridge::{DtmfSignal, DtmfSource, OperatorCommand},
-    services::ue_worker::{worker_for_line_feature, UeWorkerBinding, UeWorkerFeatures},
+    services::ue_worker::{worker_for_line, UeWorkerBinding},
     state::AppState,
 };
 
@@ -194,12 +194,36 @@ fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemB
         )
 }
 
+fn esim_detection_identity_key(
+    app: &AppState,
+    line_id: &str,
+    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+) -> Option<String> {
+    let iccid = crate::platform::utils::normalize_iccid(&binding.sim_iccid);
+    if iccid.is_empty() {
+        return None;
+    }
+    let reader = app.config_manager.get_line_esim_reader_config(line_id);
+    let reader_json = serde_json::to_string(&reader).ok()?;
+    let material = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}",
+        line_id.trim(),
+        binding.hardware_key.trim(),
+        binding.qmi_device.as_deref().unwrap_or_default().trim(),
+        binding.uim_slot,
+        iccid,
+        reader_json,
+    );
+    Some(format!("{:x}", md5::compute(material.as_bytes())))
+}
+
 /// Returns the explicitly named line when it is allowed to run eSIM operations.
 /// A missing or unknown line is never allowed to fall through to a different
 /// reader or modem.
 async fn resolve_line_esim_gate(
     app: &AppState,
     line_id: &str,
+    force_refresh: bool,
 ) -> Result<
     (
         Arc<crate::services::line_registry::LineRuntime>,
@@ -222,12 +246,20 @@ async fn resolve_line_esim_gate(
         Some(false) => Err(EsimApiError::Disabled),
         Some(true) => Ok((line, None)),
         None => {
-            if line_reports_euicc(&line.binding())
-                || app.esim_supervisor.euicc_detected_for_line(line_id)
+            let binding = line.binding();
+            let identity_key = esim_detection_identity_key(app, line_id, &binding);
+            if !force_refresh
+                && (line_reports_euicc(&binding)
+                    || app
+                        .esim_supervisor
+                        .euicc_detected_for_identity(identity_key.as_deref()))
             {
                 Ok((line, None))
             } else {
-                let info = app.esim_supervisor.get_euicc_info_for_line(line_id).await?;
+                let info = app
+                    .esim_supervisor
+                    .get_euicc_info_for_line(line_id, identity_key.as_deref(), force_refresh)
+                    .await?;
                 Ok((line, Some(info)))
             }
         }
@@ -735,24 +767,34 @@ pub async fn set_line_esim_reader_handler(
         .config_manager
         .set_line_esim_reader_config(&line_id, payload)
     {
-        Ok(reader) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "eSIM reader config updated",
-                reader,
-            )),
-        ),
+        Ok(reader) => {
+            let _ = app.database.delete_esim_detection_cache_for_line(&line_id);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "eSIM reader config updated",
+                    reader,
+                )),
+            )
+        }
         Err(error) => (StatusCode::BAD_REQUEST, Json(ApiResponse::error(error))),
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct EsimEuiccQuery {
+    #[serde(default)]
+    refresh: bool,
 }
 
 /// GET /api/modem/lines/{line_id}/esim/euicc
 pub async fn get_esim_euicc_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
+    Query(query): Query<EsimEuiccQuery>,
 ) -> impl IntoResponse {
-    let probed_info = match resolve_line_esim_gate(&app, &line_id).await {
-        Ok((_, probed_info)) => probed_info,
+    let (line, probed_info) = match resolve_line_esim_gate(&app, &line_id, query.refresh).await {
+        Ok(result) => result,
         Err(err) => return esim_error_response::<EsimEuiccInfo>(err),
     };
     if let Some(data) = probed_info {
@@ -761,7 +803,13 @@ pub async fn get_esim_euicc_handler(
             Json(ApiResponse::success_with_message("Success", data)),
         );
     }
-    match app.esim_supervisor.get_euicc_info_for_line(&line_id).await {
+    let binding = line.binding();
+    let identity_key = esim_detection_identity_key(&app, &line_id, &binding);
+    match app
+        .esim_supervisor
+        .get_euicc_info_for_line(&line_id, identity_key.as_deref(), query.refresh)
+        .await
+    {
         Ok(data) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", data)),
@@ -796,7 +844,7 @@ pub async fn get_esim_profiles_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let line = match resolve_line_esim_gate(&app, &line_id).await {
+    let line = match resolve_line_esim_gate(&app, &line_id, false).await {
         Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimProfilesResponse>(err),
     };
@@ -861,7 +909,7 @@ pub async fn enable_esim_profile_handler(
     State(app): State<AppState>,
     Path((line_id, iccid)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    let line = match resolve_line_esim_gate(&app, &line_id).await {
+    let line = match resolve_line_esim_gate(&app, &line_id, false).await {
         Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimCommandResponse>(err).into_response(),
     };
@@ -1055,7 +1103,7 @@ pub async fn rename_esim_profile_handler(
     Path((line_id, iccid)): Path<(String, String)>,
     Json(payload): Json<EsimRenameRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = resolve_line_esim_gate(&app, &line_id).await {
+    if let Err(err) = resolve_line_esim_gate(&app, &line_id, false).await {
         return esim_error_response::<EsimCommandResponse>(err);
     }
     let name = payload.name.trim().to_string();
@@ -1085,7 +1133,7 @@ pub async fn delete_esim_profile_handler(
     State(app): State<AppState>,
     Path((line_id, iccid)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    if let Err(err) = resolve_line_esim_gate(&app, &line_id).await {
+    if let Err(err) = resolve_line_esim_gate(&app, &line_id, false).await {
         return esim_error_response::<EsimCommandResponse>(err);
     }
     match app
@@ -1143,7 +1191,7 @@ pub async fn download_esim_profile_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<EsimDownloadRequest>,
 ) -> impl IntoResponse {
-    if let Err(err) = resolve_line_esim_gate(&app, &line_id).await {
+    if let Err(err) = resolve_line_esim_gate(&app, &line_id, false).await {
         return esim_error_response::<EsimCommandResponse>(err);
     }
     let smdp = payload.smdp.trim().to_string();
@@ -2950,15 +2998,7 @@ async fn build_line_network_controls(
 ) -> LineNetworkControlsResponse {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    let connected = if binding.present {
-        line.secondary_data.interface().await.is_some()
-            || modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-                .unwrap_or(None)
-                .is_some()
-    } else {
-        false
-    };
+    let connected = binding.present && line.secondary_data.interface().await.is_some();
     let observed_airplane = if binding.present {
         modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
@@ -3106,27 +3146,9 @@ async fn start_line_data_runtime_locked(
         return Err("cellular_data_roaming_forbidden".to_string());
     }
 
-    // A DATA6 session is the dedicated user-data bearer. Prefer it whenever it
-    // is already alive, especially when IMS was restored first and qmi0 now
-    // exposes an IMS bearer to ModemManager. Reusing this interface keeps the
-    // proxy on the data path and avoids allocating a duplicate WDS session.
+    // A native secondary session is the only supported cellular data bearer.
+    // Reuse it when it is already alive and visible inside this line's worker.
     if let Some(interface) = line.secondary_data.interface().await {
-        line.data_proxy
-            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
-            .await?;
-        return Ok(());
-    }
-
-    // Last resort: adopt an ordinary-data bearer still sitting on qmi0. The
-    // caller normally releases it first so IMS can own that port -- reaching
-    // here means that release failed, and some data is better than none. IMS
-    // will fail on this firmware while it stays, which the VoLTE activation
-    // reports on its own.
-    if let Some(interface) =
-        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-            .await
-            .map_err(|error| error.to_string())?
-    {
         line.data_proxy
             .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
@@ -3153,43 +3175,11 @@ async fn start_line_data_runtime_locked(
                     .await?;
                 return Ok(());
             }
-            Err(error) if profile.volte_connection_enabled => return Err(error),
-            Err(error) => warn!(
-                line_id = %binding.line_id,
-                error = %error,
-                "Secondary DATA unavailable; VoLTE is disabled so ModemManager fallback is allowed"
-            ),
+            Err(error) => return Err(error),
         }
-    } else if profile.volte_connection_enabled {
+    } else {
         return Err("cellular_secondary_qmi_device_unavailable".to_string());
     }
-
-    // Single-slot fallback. This is intentionally forbidden above while VoLTE
-    // is enabled because a normal MM bearer deactivates the IMS bearer on this
-    // firmware.
-    modem_manager::connect_data_via_modem(
-        app.dbus_conn.as_ref(),
-        &binding.modem_path,
-        profile.roaming_allowed,
-        Some(&apn),
-    )
-    .await?;
-    let mut interface = None;
-    for _ in 0..15 {
-        interface =
-            modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-                .unwrap_or(None);
-        if interface.is_some() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let interface = interface.ok_or_else(|| "cellular_data_interface_unavailable".to_string())?;
-    line.data_proxy
-        .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
-        .await?;
-    Ok(())
 }
 
 /// GET /api/modem/lines/{line_id}/data
@@ -3267,10 +3257,6 @@ fn cooldown_elapsed(last_attempt: Option<Instant>, cooldown_secs: u64) -> bool {
         .unwrap_or(true)
 }
 
-fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
-    features.data_proxy
-}
-
 /// Resolve the worker generation that can currently see a data interface.
 ///
 /// A worker handle in the line registry is not sufficient by itself: the
@@ -3283,7 +3269,7 @@ async fn current_data_proxy_worker(
     interface: Option<&str>,
 ) -> Option<UeWorkerBinding> {
     let interface = interface?;
-    let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
+    let worker = worker_for_line(line_id)?;
     if !worker.status().await.ready {
         return None;
     }
@@ -3367,13 +3353,7 @@ async fn reconcile_line_data_health(
         return;
     }
 
-    let interface = if let Some(interface) = line.secondary_data.interface().await {
-        Some(interface)
-    } else {
-        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-            .await
-            .unwrap_or(None)
-    };
+    let interface = line.secondary_data.interface().await;
     let proxy = line.data_proxy.status().await;
     let current_worker = current_data_proxy_worker(&binding.line_id, interface.as_deref()).await;
     let worker_binding_matches = line
@@ -3467,21 +3447,18 @@ async fn stop_line_data_runtime_locked(
 ) {
     let binding = line.binding();
     line.data_proxy.stop().await;
-    let had_secondary = line.secondary_data.interface().await.is_some();
     line.secondary_data.stop().await;
-    if !had_secondary {
-        if let Err(error) =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
-        {
-            warn!(line_id = %binding.line_id, error = %error, "Per-line data disconnect failed");
-        }
+    // Clean up any bearer created by an older build. It is never adopted or
+    // used by the UE-only runtime.
+    if let Err(error) =
+        modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path).await
+    {
+        warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed");
     }
 }
 
-/// Prepare beta8's dynamic allocation. Existing qmi0 data is preserved and IMS
-/// moves to DATA6; otherwise ordinary data is prepared on DATA6 and IMS stays on
-/// qmi0. The caller must hold `bearer_operation_lock` through IMS activation.
+/// Prepare the UE-only native bearer allocation. The caller must hold
+/// `bearer_operation_lock` through IMS activation.
 async fn prepare_line_data_slot_for_volte(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
@@ -3491,29 +3468,15 @@ async fn prepare_line_data_slot_for_volte(
     crate::connectivity::modems::ims::volte::VolteError,
 > {
     use crate::connectivity::modems::ims::volte::data_slot::{
-        select_data_slot_mode, DataSlotInputs, DataSlotMode,
+        select_data_slot_mode, DataSlotInputs,
     };
 
-    if !profile.data_connection_enabled {
-        return Ok(DataSlotMode::PrimaryImsOnly);
-    }
-
     let binding = line.binding();
-    let primary_data_interface =
-        modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-            .await
-            .unwrap_or(None);
-    let primary_data_active = primary_data_interface.is_some();
-    let mut secondary_data_active = line.secondary_data.interface().await.is_some();
-
     let inputs = DataSlotInputs {
-        data_requested: true,
-        primary_data_active,
-        secondary_data_active,
-        secondary_endpoint_available: secondary_data_active
-            || binding.qmi_device.as_deref().is_some_and(
-                crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
-            ),
+        data_requested: profile.data_connection_enabled,
+        native_endpoint_available: binding.qmi_device.as_deref().is_some_and(
+            crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
+        ),
     };
     let mode = match select_data_slot_mode(inputs) {
         Ok(mode) => mode,
@@ -3524,41 +3487,35 @@ async fn prepare_line_data_slot_for_volte(
         }
     };
 
-    // IMS needs qmi0 to itself: an ordinary ModemManager bearer on that port
-    // deactivates the IMS bearer on this firmware. Move the user data to DATA6
-    // rather than moving IMS -- IMS cannot run on DATA6 while secondary-qmi-init
-    // holds that character device open, and trying strands a WDS client per
-    // attempt until the baseband faults.
-    if mode.requires_primary_data_release(primary_data_active) {
-        info!(
-            line_id = %binding.line_id,
-            interface = primary_data_interface.as_deref().unwrap_or("unknown"),
-            "Releasing the qmi0 data bearer so IMS can own the primary port"
-        );
+    // An older build may have left ordinary data on qmi0. It is not a valid
+    // allocation in UE-only mode and must not remain active as a hidden host
+    // fallback.
+    if modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+        .await
+        .unwrap_or(None)
+        .is_some()
+    {
         line.data_proxy.stop().await;
         if let Err(error) =
             modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
                 .await
         {
-            // Not fatal on its own: DATA6 may still come up below, and the IMS
-            // activation that follows reports the real consequence.
-            warn!(line_id = %binding.line_id, error = %error, "Could not release the qmi0 data bearer");
+            warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed before VoLTE");
         }
     }
 
-    // Establish user data on DATA6, or adopt the session already there.
-    let data_start_error = start_line_data_runtime_locked(app, line, profile)
-        .await
-        .err();
-    secondary_data_active = line.secondary_data.interface().await.is_some();
-    if let Some(error) = data_start_error {
-        line.data_proxy.record_error(error.clone()).await;
-        if secondary_data_active {
-            // The DATA6 bearer can be healthy even when the local proxy
-            // listener fails. Keep the real allocation in that case.
-            warn!(line_id = %binding.line_id, error = %error, "DATA6 is active but its local proxy is unavailable");
-        } else {
-            warn!(line_id = %binding.line_id, error = %error, "DATA6 preparation failed; the line has no data exit");
+    if profile.data_connection_enabled {
+        let data_start_error = start_line_data_runtime_locked(app, line, profile)
+            .await
+            .err();
+        let secondary_data_active = line.secondary_data.interface().await.is_some();
+        if let Some(error) = data_start_error {
+            line.data_proxy.record_error(error.clone()).await;
+            if secondary_data_active {
+                warn!(line_id = %binding.line_id, error = %error, "Native data bearer is active but its UE proxy is unavailable");
+            } else {
+                warn!(line_id = %binding.line_id, error = %error, "Native data bearer preparation failed");
+            }
         }
     }
 
@@ -11672,8 +11629,9 @@ async fn resolve_ims_binding(
         Some(binding.sim_iccid.as_str())
     };
     let eid = if binding.sim_type == "esim" {
+        let identity_key = esim_detection_identity_key(app, line_id, &binding);
         app.esim_supervisor
-            .get_euicc_info_for_line(line_id)
+            .get_euicc_info_for_line(line_id, identity_key.as_deref(), false)
             .await
             .ok()
             .map(|info| info.eid)

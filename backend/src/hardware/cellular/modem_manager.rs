@@ -4476,22 +4476,6 @@ fn insert_simple_connect_settings<'a>(
     }
 }
 
-/// Activate the data profile using a selected modem's bearer settings. The
-/// profile remains NetworkManager-managed, but APN/IP settings are resolved
-/// from the selected ModemManager object instead of the primary modem.
-pub async fn connect_data_via_modem(
-    conn: &Connection,
-    modem_path: &str,
-    allow_roaming: bool,
-    configured_apn: Option<&ApnConfig>,
-) -> Result<(), String> {
-    // Per-line data connections are isolated from the host default route. The
-    // line's HTTP/SOCKS5 proxy is the only supported egress for this bearer.
-    simple_connect_for_baseband_restart(conn, modem_path, allow_roaming, configured_apn, true)
-        .await
-        .map(|_| ())
-}
-
 /// Resolve the APN used by a normal user-data bearer. An empty per-line APN is
 /// filled from the modem's non-IMS/default-attach bearer; `ims` is never
 /// returned because routing user traffic through it would break registration.

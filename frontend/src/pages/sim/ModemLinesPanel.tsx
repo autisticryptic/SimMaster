@@ -37,7 +37,7 @@ import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
 import VolteProfileDialog from './VolteProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
-import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
+import { standardDerivedProfileMessage, volteErrorMessage, volteErrorStatusLabel } from './volteErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
 const volteStageStatusLabels: Record<string, string> = {
@@ -69,6 +69,8 @@ const volteStageStatusLabels: Record<string, string> = {
 function imsConnectionSummary(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
   if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
+  const errorStatus = volteErrorStatusLabel(line.runtime.last_error)
+  if (errorStatus) return errorStatus
   const label = volteStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
   if (line.runtime.last_error) return `${label.replace(/^正在/, '').replace(/ IMS$/, '')}失败`
   return label

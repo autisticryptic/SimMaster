@@ -355,7 +355,7 @@ lsmod | grep rpmsg                                                        # 不�
   数据面卡死时 VoWiFi 仍可正常注册、收发短信与通话。
 - 数据面恢复之后，VoLTE 的失败点会前移到 IMS 层
   （`ims_register_initial_receive_failed`、P-CSCF 可达性），那是另一个问题，
-  见 `ue-isolation-migration.md` §8.7。
+  见 `ue-network-namespaces.md`。
 
 ## 10. 第二种崩溃：`dhcp_client_mgr.c:263` —— SimAdmin 把固件打死的（2026-08-23）
 
@@ -431,29 +431,19 @@ commit `9bb0913`：`is_baseband_wedge()` 现在同时匹配两种拼写（`'Call
 同一个 commit 还把 `client id not released` **单独**列为楔死信号，那部分是错的，已由
 `330f059` 撤销 —— 见 §10.8。
 
-### 10.5 已修复：分配策略固定为 IMS→qmi0、DATA6→数据
+### 10.5 当前策略：所有蜂窝承载进入 per-UE namespace
 
-`secondary-qmi-init` 持有那个字符设备期间，**IMS-on-DATA6 根本不可能成功** —— 分配器
-在选一个本设备无法履行的分配。当时列了两条路（让 holder 交接设备，或永不选它），
-采用的是后者，因为它不需要引入交接协议这种新的失败模式。
+配置版本 5 删除了宿主网络命名空间下的 IMS 和数据承载路径。当前不变量是：
 
-commit `d081601`：**IMS 必定在 ModemManager 持有的端口（qmi0）上注册，DATA6 端口固定
-分配给数据流量。** 这是本项目的不变量，不再从"哪个端点恰好忙"推导：
+- VoLTE 只能使用 SimAdmin 创建的原生 QMI bearer；
+- 普通蜂窝数据只能使用原生 secondary QMI bearer；
+- 两类 bearer 的数据网卡都必须迁入对应线路的 per-UE namespace；
+- `wwan0` 等 ModemManager 主网卡被明确排除，不能被原生 bearer 解析或接管；
+- secondary QMI 端点、UE worker、网卡迁移或 namespace 内网络配置任一步失败，线路直接
+  不可用，不回退到宿主 qmi0。
 
-- `DataSlotMode::SecondaryImsPrimaryData` 这个变体被**整个删除**，而不是"尽量不选" ——
-  一个绝不该被选中的枚举值留在类型里，只会等着下一个人再把它选出来；
-- `ims_on_primary()` 恒为 `true`，于是 `native_ims_bearer_required()` 恒为 `false`，
-  原生 QMI IMS 承载那条（撞 holder 的）路径不再被触发；
-- `primary_data_active=true` 不再翻转 IMS，而是通过新增的
-  `requires_primary_data_release()` 要求**把放错位置的数据从 qmi0 释放掉**，让它回到
-  DATA6 —— 触发条件相同，但修的是错位的那个 bearer，而不是把 IMS 挪到一个被别人
-  占着的端点上；
-- `both_data_slots_active` 这个冲突也随之消失：在固定策略下，qmi0 上有普通数据不是
-  "没有空闲端点"，而是"数据放错了地方"，是个可修复的前置条件。
-
-实测（`d081601`，开机 9 分钟）：`fatal count` **0**、`mode="secondary_qmi_data"`、
-VoLTE `IMS restore registered`、VoWiFi 200 OK、bearer 抖动 0、
-`secondary-qmi` 端点丢失 0。对比修复前**每 50-120 秒崩一次**。
+`DataSlotMode` 只描述 `ue_native_ims` 和 `ue_native_ims_with_data` 两种 UE 内意图，
+不再包含 IMS-on-primary、host fallback 或动态交换主副端点的分支。
 
 ### 10.6 同一台设备上的第二场争用：数据网卡 `wwan1`
 

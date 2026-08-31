@@ -8,15 +8,12 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 
-use crate::{
-    platform::{config::UeIsolationConfig, netns::NetnsName},
-    services::ue_worker::NetConfigOp,
-};
+use crate::{platform::netns, services::ue_worker::NetConfigOp};
 
 /// Deterministic /30 pair for a UE veth egress, derived from the stable
 /// namespace suffix: `10.200.<a>.<b&0xFC>` (host) and `+1` (UE peer).
 /// The /16 gives up to 16k independent UE egress pairs before collision.
-pub fn veth_addrs_for(namespace: &NetnsName) -> (Ipv4Addr, Ipv4Addr) {
+pub fn veth_addrs_for(namespace: &netns::NetnsName) -> (Ipv4Addr, Ipv4Addr) {
     let suffix = namespace.suffix_hex();
     let mut bytes = [0u8; 2];
     for (index, chunk) in suffix.as_bytes().chunks(2).take(2).enumerate() {
@@ -43,15 +40,15 @@ pub struct UeVethPlan {
     pub mtu: u32,
 }
 
-/// Build the plan for a UE egress veth pair from the isolation config.
-pub fn plan_veth(namespace: &NetnsName, config: &UeIsolationConfig) -> UeVethPlan {
+/// Build the fixed plan for a UE egress veth pair.
+pub fn plan_veth(namespace: &netns::NetnsName) -> UeVethPlan {
     let (host_addr, ue_addr) = veth_addrs_for(namespace);
     UeVethPlan {
-        host_if: namespace.host_veth_name(&config.host_veth_prefix),
-        ue_if: namespace.ue_veth_name(&config.ue_veth_prefix),
+        host_if: namespace.host_veth_name(netns::DEFAULT_HOST_VETH_PREFIX),
+        ue_if: namespace.ue_veth_name(netns::DEFAULT_UE_VETH_PREFIX),
         host_addr,
         ue_addr,
-        mtu: config.veth_mtu,
+        mtu: netns::DEFAULT_VETH_MTU,
     }
 }
 
@@ -139,12 +136,8 @@ pub fn tun_ue_side_ops(
 mod tests {
     use super::*;
 
-    fn namespace(line_id: &str) -> NetnsName {
-        NetnsName::for_line("sa-ue", line_id)
-    }
-
-    fn config() -> UeIsolationConfig {
-        UeIsolationConfig::default()
+    fn namespace(line_id: &str) -> netns::NetnsName {
+        netns::NetnsName::for_line(netns::DEFAULT_NAMESPACE_PREFIX, line_id)
     }
 
     #[test]
@@ -164,8 +157,7 @@ mod tests {
     #[test]
     fn veth_plan_produces_worker_side_ops() {
         let ns = namespace("line-a-11111111111111111111111");
-        let cfg = config();
-        let plan = plan_veth(&ns, &cfg);
+        let plan = plan_veth(&ns);
         let ops = veth_ue_side_ops(&plan);
         assert_eq!(
             ops,

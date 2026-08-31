@@ -50,7 +50,7 @@ pub struct EsimCommandResponse {
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Default, Serialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct EsimEuiccInfo {
     pub eid: String,
     pub status: String,

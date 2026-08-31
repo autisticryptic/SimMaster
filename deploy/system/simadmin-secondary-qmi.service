@@ -6,9 +6,9 @@ Before=ModemManager.service simadmin.service
 [Service]
 Type=notify
 NotifyAccess=all
-# Opt-in. A secondary QMI endpoint is only needed to run data and IMS at the
-# same time; with it off, both fall back to the ModemManager primary QMI bearer,
-# which is the supported configuration on every platform.
+# Opt-in at the service layer. The SimAdmin runtime itself is UE-only: without
+# a validated native QMI endpoint, cellular data and VoLTE remain unavailable;
+# they never fall back to a ModemManager bearer in the host namespace.
 #
 # This does NOT default to 0 because DATA6 is dangerous. The boot-time baseband
 # crash once blamed on it came from an out-of-tree rpmsg_wwan_ctrl_multi module

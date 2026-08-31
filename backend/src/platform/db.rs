@@ -18,6 +18,7 @@ use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
 
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+const ESIM_DETECTION_CACHE_MAX_ROWS: i64 = 64;
 
 fn required_line_id(line_id: &str) -> Result<&str> {
     let line_id = line_id.trim();
@@ -634,6 +635,43 @@ mod tests {
 
     fn test_database() -> Database {
         Database::new(PathBuf::from(":memory:")).expect("create test database")
+    }
+
+    #[test]
+    fn esim_detection_cache_replaces_line_identity_and_stays_bounded() {
+        let db = test_database();
+        db.upsert_esim_detection_cache("old-card", "line-a", r#"{"eid":"1"}"#)
+            .expect("cache old card");
+        db.upsert_esim_detection_cache("new-card", "line-a", r#"{"eid":"2"}"#)
+            .expect("replace card");
+        assert!(db
+            .get_esim_detection_cache("old-card")
+            .expect("read old card")
+            .is_none());
+        assert_eq!(
+            db.get_esim_detection_cache("new-card")
+                .expect("read new card")
+                .as_deref(),
+            Some(r#"{"eid":"2"}"#)
+        );
+
+        for index in 0..(ESIM_DETECTION_CACHE_MAX_ROWS + 8) {
+            db.upsert_esim_detection_cache(
+                &format!("card-{index}"),
+                &format!("line-{index}"),
+                r#"{"eid":"cached"}"#,
+            )
+            .expect("cache bounded line");
+        }
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM esim_detection_cache", [], |row| {
+                row.get(0)
+            })
+            .expect("count cache rows");
+        assert_eq!(count, ESIM_DETECTION_CACHE_MAX_ROWS);
     }
 
     #[test]
@@ -2899,6 +2937,16 @@ impl Database {
                 isdp_aid TEXT,
                 mcc TEXT,
                 mnc TEXT,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS esim_detection_cache (
+                identity_key TEXT PRIMARY KEY,
+                line_id TEXT NOT NULL UNIQUE,
+                info_json TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )",
             [],
@@ -5637,6 +5685,76 @@ impl Database {
     }
 
     // ==================== eSIM Profile cache ====================
+
+    /// Return cached eUICC chip information for the exact current reader/SIM
+    /// identity. Callers derive `identity_key` from the physical line, ICCID
+    /// and reader configuration, so a card or reader change is a cache miss.
+    pub fn get_esim_detection_cache(&self, identity_key: &str) -> Result<Option<String>> {
+        let identity_key = identity_key.trim();
+        if identity_key.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT info_json FROM esim_detection_cache WHERE identity_key = ?1",
+            params![identity_key],
+            |row| row.get(0),
+        )
+        .optional()
+    }
+
+    /// Persist one successful eUICC detection. A line keeps only its current
+    /// identity, and a global cap removes abandoned hardware rows, so repeated
+    /// SIM swaps cannot grow the database without bound.
+    pub fn upsert_esim_detection_cache(
+        &self,
+        identity_key: &str,
+        line_id: &str,
+        info_json: &str,
+    ) -> Result<()> {
+        let identity_key = identity_key.trim();
+        let line_id = required_line_id(line_id)?;
+        if identity_key.is_empty() || info_json.trim().is_empty() {
+            return Ok(());
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM esim_detection_cache
+             WHERE line_id = ?1 AND identity_key <> ?2",
+            params![line_id, identity_key],
+        )?;
+        tx.execute(
+            "INSERT INTO esim_detection_cache (identity_key, line_id, info_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(identity_key) DO UPDATE SET
+                line_id = excluded.line_id,
+                info_json = excluded.info_json,
+                updated_at = excluded.updated_at",
+            params![identity_key, line_id, info_json, Utc::now().to_rfc3339()],
+        )?;
+        tx.execute(
+            "DELETE FROM esim_detection_cache
+             WHERE identity_key NOT IN (
+                SELECT identity_key FROM esim_detection_cache
+                ORDER BY updated_at DESC, identity_key ASC
+                LIMIT ?1
+             )",
+            params![ESIM_DETECTION_CACHE_MAX_ROWS],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_esim_detection_cache_for_line(&self, line_id: &str) -> Result<usize> {
+        let line_id = required_line_id(line_id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM esim_detection_cache WHERE line_id = ?1",
+            params![line_id],
+        )
+    }
 
     pub fn upsert_esim_profile_cache(&self, entry: &EsimProfileCacheEntry) -> Result<()> {
         let iccid = crate::platform::utils::normalize_iccid(&entry.iccid);

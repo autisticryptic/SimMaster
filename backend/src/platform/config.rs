@@ -561,106 +561,6 @@ pub struct DeviceNetworkConfig {
     pub ddns: DdnsConfig,
 }
 
-/// Per-UE isolation configuration (Linux network namespaces).
-///
-/// This is the master switch for the multi-UE architecture documented in
-/// `multi_ue_ims_volte_vowifi_architecture.md`. When enabled, every line gets
-/// its own UE Context and Linux network namespace so identical IPs, P-CSCF
-/// addresses and route state can never leak between SIMs. The data planes
-/// (VoLTE bearer netdev, VoWiFi TUN, per-UE proxy) are migrated into the
-/// namespace incrementally behind this switch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct UeIsolationConfig {
-    /// Master switch. Defaults to false: behaviour is exactly the current
-    /// host-namespace routing until the migration is complete.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Prefix for per-UE network namespace names.
-    #[serde(default = "default_ue_namespace_prefix")]
-    pub namespace_prefix: String,
-    /// Prefix for the host side of each UE egress veth pair.
-    #[serde(default = "default_ue_host_veth_prefix")]
-    pub host_veth_prefix: String,
-    /// Prefix for the UE side of each UE egress veth pair.
-    #[serde(default = "default_ue_veth_prefix")]
-    pub ue_veth_prefix: String,
-    /// MTU used for the egress veth pairs.
-    #[serde(default = "default_ue_veth_mtu")]
-    pub veth_mtu: u32,
-    /// Stage 2b gate: move the VoWiFi TUN device into the UE namespace after
-    /// creation. Defaults to false because the host-side SIP/RTP sockets still
-    /// bind by device name and cannot follow the TUN into another namespace
-    /// yet; enable only after the VoWiFi sockets are migrated into the worker.
-    #[serde(default)]
-    pub vowifi_tun_in_namespace: bool,
-    /// Stage 3 gate: place 3GPP IMS (LTE today, NR later) bearer networking,
-    /// SIP/XFRM and RTP sockets in the per-line worker namespace. The hardware
-    /// bearer stays device-owned and the host path remains the safe fallback.
-    #[serde(default)]
-    pub three_gpp_ims_sockets_in_worker: bool,
-    /// Stage 4 gate: run per-line proxy outbound sockets through its worker.
-    #[serde(default)]
-    pub data_proxy_in_worker: bool,
-    /// Stage 4 gate for trunk media sockets. Signalling and dialog ownership
-    /// are already line-scoped; this controls only operator RTP socket creation.
-    /// Depends on `three_gpp_ims_sockets_in_worker`; read it through
-    /// [`UeIsolationConfig::effective_trunk_sockets_in_worker`].
-    #[serde(default)]
-    pub trunk_sockets_in_worker: bool,
-}
-
-impl UeIsolationConfig {
-    /// Whether operator RTP sockets may actually be created inside the worker.
-    ///
-    /// Trunk media can only follow a bearer that already lives in the UE
-    /// namespace. Enabling this gate alone would advertise a worker that cannot
-    /// see the bearer interface, so the RTP socket would either fail to bind or
-    /// silently egress through an ambiguous host route — a half-migrated state
-    /// that reads as "enabled" while traffic still leaves via the host.
-    pub fn effective_trunk_sockets_in_worker(&self) -> bool {
-        self.trunk_sockets_in_worker && self.three_gpp_ims_sockets_in_worker
-    }
-
-    /// True when the trunk gate is set but suppressed by its missing
-    /// dependency. Callers use this to explain the ignored setting.
-    pub fn trunk_sockets_gate_suppressed(&self) -> bool {
-        self.trunk_sockets_in_worker && !self.three_gpp_ims_sockets_in_worker
-    }
-}
-
-impl Default for UeIsolationConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            namespace_prefix: default_ue_namespace_prefix(),
-            host_veth_prefix: default_ue_host_veth_prefix(),
-            ue_veth_prefix: default_ue_veth_prefix(),
-            veth_mtu: default_ue_veth_mtu(),
-            vowifi_tun_in_namespace: false,
-            three_gpp_ims_sockets_in_worker: false,
-            data_proxy_in_worker: false,
-            trunk_sockets_in_worker: false,
-        }
-    }
-}
-
-fn default_ue_namespace_prefix() -> String {
-    crate::platform::netns::DEFAULT_NAMESPACE_PREFIX.to_string()
-}
-
-fn default_ue_host_veth_prefix() -> String {
-    crate::platform::netns::DEFAULT_HOST_VETH_PREFIX.to_string()
-}
-
-fn default_ue_veth_prefix() -> String {
-    crate::platform::netns::DEFAULT_UE_VETH_PREFIX.to_string()
-}
-
-fn default_ue_veth_mtu() -> u32 {
-    crate::platform::netns::DEFAULT_VETH_MTU
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct VersionUpdateNotificationConfig {
@@ -1569,26 +1469,6 @@ pub enum AutomationAction {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Trunk media cannot enter a worker the bearer has not moved into, so the
-    /// trunk gate alone must never advertise a worker-backed RTP path.
-    #[test]
-    fn trunk_socket_gate_requires_the_three_gpp_bearer_gate() {
-        let mut isolation = UeIsolationConfig {
-            trunk_sockets_in_worker: true,
-            ..UeIsolationConfig::default()
-        };
-        assert!(!isolation.effective_trunk_sockets_in_worker());
-        assert!(isolation.trunk_sockets_gate_suppressed());
-
-        isolation.three_gpp_ims_sockets_in_worker = true;
-        assert!(isolation.effective_trunk_sockets_in_worker());
-        assert!(!isolation.trunk_sockets_gate_suppressed());
-
-        isolation.trunk_sockets_in_worker = false;
-        assert!(!isolation.effective_trunk_sockets_in_worker());
-        assert!(!isolation.trunk_sockets_gate_suppressed());
-    }
 
     #[test]
     fn notification_channel_accepts_frontend_pushplus_key() {
@@ -2915,6 +2795,7 @@ mod tests {
             "vilte",
             "sms_path",
             "voice_path",
+            "ue_isolation",
         ] {
             let error = serde_json::from_str::<AppConfig>(&format!(r#"{{"{legacy_field}":null}}"#))
                 .unwrap_err();
@@ -2925,6 +2806,15 @@ mod tests {
                 "removed global field {legacy_field} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn removed_ue_isolation_block_is_rejected_in_yaml() {
+        let error = serde_saphyr::from_str::<MainConfig>(
+            "config_version: 5\nue_isolation:\n  enabled: true\n",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ue_isolation"));
     }
 
     #[test]
@@ -3082,7 +2972,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
         let original = "\
-config_version: 4
+config_version: 5
 line_profiles:
   - line_id: line-0123456789abcdef0123456789abcdef
     volte_connection_enabled: true
@@ -3493,7 +3383,7 @@ line_profiles:
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.starts_with("# SimAdmin main program configuration."));
-        assert!(content.contains("config_version: 4"));
+        assert!(content.contains("config_version: 5"));
         assert!(content.contains("security:"));
         // Database-owned blocks must not appear in the file. Matched as
         // top-level keys, because `version_update_notifications` legitimately
@@ -3536,7 +3426,7 @@ line_profiles:
         let path = dir.join("config.yaml");
         let handwritten = "\
 # Managed by the night shift. Ask before changing session_ttl_seconds.
-config_version: 4
+config_version: 5
 
 security:
   # Deliberately long: the kiosk in bay 3 must not log out mid-shift.
@@ -3586,7 +3476,7 @@ device_network:
         let dir = text_config_test_dir("typo");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.yaml");
-        let original = "config_version: 4\nsecurty:\n  password_min_length: 8\n";
+        let original = "config_version: 5\nsecurty:\n  password_min_length: 8\n";
         std::fs::write(&path, original).unwrap();
 
         let error = match ConfigManager::try_new_for_test(path.clone()) {
@@ -3795,7 +3685,7 @@ device_network:
 # ==========================================================
 #  Bay 3 kiosk. Ask the night shift before touching timeouts.
 # ==========================================================
-config_version: 4
+config_version: 5
 
 security:
   # 7 days: the kiosk must not log out mid-shift.
@@ -3818,8 +3708,8 @@ device_network:
 
         let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
 
-        // Three edits from three unrelated screens. The second one writes a
-        // block the file does not contain at all, which is what broke before.
+        // Two edits from unrelated screens. The second one writes a block the
+        // file does not contain at all, which is what broke before.
         let mut diagnostic = manager.get_diagnostic_log();
         diagnostic.retention_days = 21;
         manager.set_diagnostic_log(diagnostic).unwrap();
@@ -3827,10 +3717,6 @@ device_network:
         let mut proxy = manager.get_github_download_proxy();
         proxy.proxy_prefix = "https://mirror.example/".to_string();
         manager.set_github_download_proxy(proxy).unwrap();
-
-        let mut isolation = manager.get_ue_isolation();
-        isolation.enabled = true;
-        manager.set_ue_isolation(isolation).unwrap();
 
         let after = std::fs::read_to_string(&path).unwrap();
 
@@ -3841,7 +3727,6 @@ device_network:
             reloaded.get_github_download_proxy().proxy_prefix,
             "https://mirror.example/"
         );
-        assert!(reloaded.get_ue_isolation().enabled);
 
         // 2. Nothing the operator wrote was disturbed.
         assert_eq!(reloaded.get_security().session_ttl_seconds, 604_800);
@@ -5220,8 +5105,6 @@ pub struct AppConfig {
     #[serde(default)]
     pub device_network: DeviceNetworkConfig,
     #[serde(default)]
-    pub ue_isolation: UeIsolationConfig,
-    #[serde(default)]
     pub version_update_notifications: VersionUpdateNotificationConfig,
     #[serde(default)]
     pub github_download_proxy: GithubDownloadProxyConfig,
@@ -5247,7 +5130,6 @@ impl Default for AppConfig {
             line_config_version: CURRENT_LINE_CONFIG_VERSION,
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
-            ue_isolation: UeIsolationConfig::default(),
             version_update_notifications: VersionUpdateNotificationConfig::default(),
             github_download_proxy: GithubDownloadProxyConfig::default(),
             diagnostic_log: DiagnosticLogConfig::default(),
@@ -5261,7 +5143,7 @@ impl Default for AppConfig {
     }
 }
 
-pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 4;
+pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 5;
 // `CONFIG_STORAGE_SCHEMA_VERSION` used to version the SQLite envelope that held
 // the whole config document. The two halves now version themselves: the text
 // file through `config_version`, the database tables through
@@ -5270,8 +5152,8 @@ pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 4;
 /// The half of the configuration that lives in the hand-editable text file.
 ///
 /// These are settings an operator may reasonably want to read, diff or edit
-/// directly: the web-UI password policy, DDNS credentials, the per-UE isolation
-/// gates, log retention, and the download proxy. They change when a person
+/// directly: the web-UI password policy, DDNS credentials, log retention, and
+/// the download proxy. They change when a person
 /// decides something, not when hardware appears, so a text file suits them.
 ///
 /// Everything else — per-line profiles, the modem/reader slot map, notification
@@ -5296,8 +5178,6 @@ pub struct MainConfig {
     #[serde(default)]
     pub device_network: DeviceNetworkConfig,
     #[serde(default)]
-    pub ue_isolation: UeIsolationConfig,
-    #[serde(default)]
     pub diagnostic_log: DiagnosticLogConfig,
     #[serde(default)]
     pub github_download_proxy: GithubDownloadProxyConfig,
@@ -5315,7 +5195,6 @@ impl Default for MainConfig {
             config_version: CURRENT_LINE_CONFIG_VERSION,
             security: SecurityConfig::default(),
             device_network: DeviceNetworkConfig::default(),
-            ue_isolation: UeIsolationConfig::default(),
             diagnostic_log: DiagnosticLogConfig::default(),
             github_download_proxy: GithubDownloadProxyConfig::default(),
             version_update_notifications: MainVersionUpdateConfig::default(),
@@ -5357,7 +5236,6 @@ impl AppConfig {
             config_version: self.line_config_version,
             security: self.security.clone(),
             device_network: self.device_network.clone(),
-            ue_isolation: self.ue_isolation.clone(),
             diagnostic_log: self.diagnostic_log.clone(),
             github_download_proxy: self.github_download_proxy.clone(),
             version_update_notifications: MainVersionUpdateConfig {
@@ -5389,7 +5267,6 @@ impl AppConfig {
             line_config_version: main.config_version,
             notifications: stored.notifications,
             device_network: main.device_network,
-            ue_isolation: main.ue_isolation,
             version_update_notifications: VersionUpdateNotificationConfig {
                 enabled: main.version_update_notifications.enabled,
                 proxy_prefix: main.version_update_notifications.proxy_prefix,
@@ -5443,13 +5320,6 @@ const CONFIG_FILE_ANNOTATIONS: &[(&str, &[&str])] = &[
         &[
             "Dynamic DNS. access_id/access_secret are provider credentials, which is",
             "why this file is created mode 0600.",
-        ],
-    ),
-    (
-        "ue_isolation",
-        &[
-            "Per-UE Linux network namespaces. Staged rollout: the socket gates below",
-            "depend on three_gpp_ims_sockets_in_worker and are ignored without it.",
         ],
     ),
     (
@@ -6918,20 +6788,6 @@ impl ConfigManager {
         {
             let mut c = self.config.write().unwrap();
             c.security = security;
-        }
-        self.save()
-    }
-
-    /// Return the current per-UE isolation configuration.
-    pub fn get_ue_isolation(&self) -> UeIsolationConfig {
-        self.config.read().unwrap().ue_isolation.clone()
-    }
-
-    /// Replace the per-UE isolation configuration and persist it.
-    pub fn set_ue_isolation(&self, ue_isolation: UeIsolationConfig) -> Result<(), String> {
-        {
-            let mut c = self.config.write().unwrap();
-            c.ue_isolation = ue_isolation;
         }
         self.save()
     }

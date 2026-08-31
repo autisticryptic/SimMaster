@@ -1,11 +1,9 @@
 //! Normal mobile data on a spare Qualcomm DATA channel.
 //!
-//! The MSM8916 firmware cannot keep IMS and Internet bearers alive through the
-//! same ModemManager data slot: starting one regularly deactivates the other.
-//! When IMS uses the primary QMI port, this runtime keeps a
-//! retained WDS CID alive through qmi-proxy on DATA6 for user data. If an
-//! ordinary-data bearer already exists on qmi0, the allocator leaves it there
-//! and moves IMS to DATA6 instead, so this runtime is not started.
+//! The MSM8916 firmware cannot safely share the ModemManager host bearer between
+//! IMS and Internet traffic. This runtime therefore starts a retained native
+//! WDS session and moves its resolved secondary netdev into the line's mandatory
+//! UE namespace. It never adopts or falls back to the primary host netdev.
 
 use std::{net::IpAddr, time::Duration};
 
@@ -18,9 +16,7 @@ use crate::{
         qmi_wds,
     },
     platform::{config::ApnConfig, netns},
-    services::ue_worker::{
-        worker_for_line_feature, NetConfigOp, UeWorkerBinding, UeWorkerFeatures, UeWorkerHandle,
-    },
+    services::ue_worker::{worker_for_line, NetConfigOp, UeWorkerBinding, UeWorkerHandle},
 };
 
 use super::secondary_qmi::{self, SecondaryQmiEndpoint};
@@ -51,21 +47,6 @@ impl SecondaryDataRuntime {
             .map(|session| session.netdev.interface.clone())
     }
 
-    /// True when the retained DATA session lives inside a UE worker namespace.
-    ///
-    /// Only such a session is tied to the isolation lifecycle: its interface sits
-    /// in a namespace that disappears with the worker. A host-side session
-    /// belongs to the legacy path and has to survive isolation teardown, or
-    /// simply running with `ue_isolation.enabled = false` would destroy working
-    /// cellular data on every line refresh.
-    pub async fn is_worker_bound(&self) -> bool {
-        self.session
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|session| session.worker.is_some())
-    }
-
     pub async fn start(
         &self,
         line_id: &str,
@@ -74,61 +55,35 @@ impl SecondaryDataRuntime {
     ) -> Result<String, String> {
         let mut guard = self.session.lock().await;
         if guard.is_some() {
-            let (active, host_namespace, interface) = {
+            let (active, interface) = {
                 let session = guard.as_ref().expect("session checked above");
                 (
                     retained_session_is_active(session).await,
-                    session.worker.is_none(),
                     session.netdev.interface.clone(),
                 )
             };
             if active {
-                // Isolation can be enabled after the DATA6 session was
-                // created. In that case migrate the still-healthy host
-                // session into the newly ready line worker instead of
-                // silently keeping the old namespace path forever.
-                if host_namespace {
-                    if let Some(worker) = data_worker_for_line(line_id).await {
-                        let mut existing = guard
-                            .take()
-                            .expect("secondary DATA session disappeared while locked");
-                        if let Err(error) =
-                            move_data_session_into_worker(&mut existing, worker).await
-                        {
-                            warn!(
-                                line_id,
-                                interface = %interface,
-                                error = %error,
-                                "Existing secondary DATA session stayed in host namespace"
-                            );
-                        }
-                        *guard = Some(existing);
-                        return Ok(interface);
-                    }
-                    // No worker is currently available; preserve the healthy
-                    // host-namespace session and let a later call migrate it
-                    // when the feature worker becomes ready.
+                let usable = {
+                    let session = guard.as_ref().expect("session checked above");
+                    retained_session_worker_is_usable(line_id, session).await
+                };
+                if usable {
                     return Ok(interface);
-                } else {
-                    let usable = {
-                        let session = guard.as_ref().expect("session checked above");
-                        retained_session_worker_is_usable(line_id, session).await
-                    };
-                    if usable {
-                        return Ok(interface);
-                    }
-                    warn!(
-                        line_id,
-                        interface = %interface,
-                        "Retained secondary DATA session is bound to a stale worker"
-                    );
                 }
+                warn!(
+                    line_id,
+                    interface = %interface,
+                    "Retained secondary DATA session is not owned by the current UE worker"
+                );
             }
         }
         if let Some(session) = guard.take() {
             stop_session(session).await;
         }
 
+        let worker = data_worker_for_line(line_id)
+            .await
+            .ok_or_else(|| "cellular_secondary_data_ue_worker_unavailable".to_string())?;
         let endpoint = secondary_qmi::runtime_endpoint(primary_qmi)
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
@@ -156,12 +111,13 @@ impl SecondaryDataRuntime {
         for family in families {
             match start_family(&endpoint, &baseband, apn, &apn_name, family).await {
                 Ok(mut session) => {
-                    if let Some(worker) = data_worker_for_line(line_id).await {
-                        if let Err(error) =
-                            move_data_session_into_worker(&mut session, worker).await
-                        {
-                            warn!(line_id, error = %error, "Secondary DATA worker migration failed; retaining host namespace");
-                        }
+                    if let Err(error) =
+                        move_data_session_into_worker(&mut session, worker.clone()).await
+                    {
+                        warn!(line_id, error = %error, "Secondary DATA UE migration failed");
+                        stop_session(session).await;
+                        errors.push(error);
+                        continue;
                     }
                     let interface = session.netdev.interface.clone();
                     info!(
@@ -195,11 +151,10 @@ impl SecondaryDataRuntime {
 
 /// The netdev DATA6 must never land on.
 ///
-/// `wwan0` is the netdev of the primary QMI port, which ModemManager holds and
-/// IMS registers through. If a DATA6 session takes it, the IMS PDN cannot come
-/// up at all, and the VoLTE REGISTER then has no policy route to its P-CSCF --
-/// it falls through to the host default and leaves over Wi-Fi toward a
-/// carrier-private address that can never answer.
+/// `wwan0` is the netdev of the primary QMI port held by ModemManager. A native
+/// session must use a secondary interface that can move into the UE namespace;
+/// adopting `wwan0` would both break ModemManager ownership and recreate the
+/// prohibited host-network data path.
 const DATA_RESERVED_NETDEVS: &[&str] = &["wwan0"];
 
 /// The sysfs key every candidate netdev of this endpoint's baseband contains.
@@ -261,12 +216,8 @@ async fn start_family(
     })
 }
 
-fn data_proxy_worker_enabled(features: UeWorkerFeatures) -> bool {
-    features.data_proxy
-}
-
 async fn data_worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
-    let worker = worker_for_line_feature(line_id, data_proxy_worker_enabled)?;
+    let worker = worker_for_line(line_id)?;
     worker.status().await.ready.then_some(worker)
 }
 
@@ -276,8 +227,7 @@ async fn data_worker_for_line(line_id: &str) -> Option<UeWorkerHandle> {
 /// would return an interface that no caller can reach.
 async fn retained_session_worker_is_usable(line_id: &str, session: &SecondaryDataSession) -> bool {
     let Some(session_worker) = session.worker.as_ref() else {
-        // Host-namespace sessions do not depend on a worker generation.
-        return true;
+        return false;
     };
     let Some(current_worker) = data_worker_for_line(line_id).await else {
         return false;
@@ -325,7 +275,6 @@ async fn move_data_session_into_worker(
     // retained WDS session remains alive and owns the raw-IP data channel.
     qmi_netdev::teardown(interface, &session.netdev_config).await;
     if let Err(error) = netns::move_iface_in(worker.namespace(), interface).await {
-        let _ = qmi_netdev::configure_host_data_path(interface, &session.netdev_config).await;
         return Err(format!("cellular_data_move_into_worker_failed:{error}"));
     }
     let config = &session.netdev_config;
@@ -358,7 +307,6 @@ async fn move_data_session_into_worker(
         .map_err(|error| format!("cellular_data_worker_config_failed:{error}"));
     if !matches!(&outcome, Ok(result) if result.ok) {
         let _ = netns::move_iface_out(worker.namespace(), interface).await;
-        let _ = qmi_netdev::configure_host_data_path(interface, config).await;
         return Err(outcome
             .err()
             .unwrap_or_else(|| "cellular_data_worker_config_failed".to_string()));
@@ -367,13 +315,11 @@ async fn move_data_session_into_worker(
         Ok(snapshot) => snapshot,
         Err(error) => {
             let _ = netns::move_iface_out(worker.namespace(), interface).await;
-            let _ = qmi_netdev::configure_host_data_path(interface, config).await;
             return Err(format!("cellular_data_worker_status_failed:{error}"));
         }
     };
     if !snapshot.interfaces.iter().any(|name| name == interface) {
         let _ = netns::move_iface_out(worker.namespace(), interface).await;
-        let _ = qmi_netdev::configure_host_data_path(interface, config).await;
         return Err("cellular_data_worker_interface_missing".to_string());
     }
     session.worker = Some(binding);

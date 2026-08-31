@@ -1,12 +1,13 @@
 //! Native IMS bearer *strategy*: which family to attempt, in what order, and how
 //! to turn a device-agnostic result into the stack's `BearerConnection`.
 //!
-//! # Why this exists, and where the IMS session actually runs (beta8 alignment)
+//! # Why this exists, and where the IMS session actually runs
 //!
-//! beta8 does not run the IMS bearer on the primary QMI control port when qmi0
-//! already carries ordinary data. The binary
-//! logs `Native VoLTE secondary QMI IMS WDS bearer started` (`volte.rs:1976`) and
-//! retains one WDS CID per family for set-family, start, settings and teardown.
+//! SimAdmin never runs IMS through the primary ModemManager host bearer. The
+//! device driver starts a native secondary QMI WDS bearer and its netdev is
+//! moved into the line's UE namespace before SIP or media sockets are created.
+//! The runtime retains one WDS CID per family for set-family, start, settings
+//! and teardown.
 //! The IMS path also reads its authoritative IP configuration and P-CSCF from
 //! **`AT+CGCONTRDP`** on the active IMS context
 //! (`Native VoLTE P-CSCF candidates discovered from active IMS bearer`,

@@ -57,7 +57,7 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 - [ ] 一条线路停止、断网、认证失败或 bearer 重建时，另一条线路的 REGISTER、通话、RTP relay 和历史记录不受影响。
 - [ ] 两条线路同时使用 Asterisk trunk，验证 AOR、auth username、local port、Call-ID、RTP socket 和 incoming/outgoing binding 不冲突。
 
-UE 隔离（netns/veth/worker）本身的分阶段验收清单不在这里重复——它带着 feature flag 名称、每项的日期/提交号证据和被阻塞原因，见 `ue-isolation-migration.md` 第 8 节。
+per-UE netns/veth/worker 已是强制架构，不再使用 feature flag 或分阶段开关，见 `ue-network-namespaces.md`。
 
 ## P1：IMS 补充业务和运营商回读
 
@@ -205,7 +205,7 @@ VoLTE profile 三槽位编排：
 - 架构总览（线路模型、路由隔离、profile 选择）：`docs/ARCHITECTURE.md`
 - REGISTER 三态字段契约：`docs/IMS_REGISTER_TRISTATE_SCHEMA.md`
 - 410 基带崩溃分析与现场恢复：`docs/QCM410_BAM_DMUX_MODEM_CRASH.md`
-- UE 隔离（netns/veth）迁移设计：`docs/ue-isolation-migration.md`
+- 强制 per-UE 网络命名空间架构：`docs/ue-network-namespaces.md`
 - eSIM MEP 预留接口设计：`docs/ESIM_MEP_INTERFACE_PLAN.md`
 - 用户入口和能力概览：项目根目录 `README.md`
 - 手动安装与升级：`docs/INSTALL.md`

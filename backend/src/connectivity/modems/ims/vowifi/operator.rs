@@ -127,10 +127,8 @@ pub struct RegisteredVoiceContext {
     /// the registered context lets media sockets remain distinguishable even
     /// when two tunnels receive the same inner IMS address.
     pub(crate) media_interface: Option<String>,
-    /// Worker-backed socket factory used when the line's VoWiFi TUN lives in
-    /// its own UE network namespace. `None` keeps the host-namespace socket
-    /// creation path (Linux `SO_BINDTODEVICE` on the host TUN).
-    pub(crate) media_operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+    /// Worker-backed socket factory for operator-facing RTP sockets.
+    pub(crate) media_operator_creator: Arc<dyn OperatorSocketCreator>,
 }
 
 pub(crate) trait MediaRouteInstaller: Send + Sync {
@@ -2758,7 +2756,8 @@ mod tests {
             unregister: None,
             media_route_installer: None,
             media_interface: None,
-            media_operator_creator: None,
+            media_operator_creator:
+                crate::connectivity::core::media::test_operator_socket_creator(),
         }
     }
 

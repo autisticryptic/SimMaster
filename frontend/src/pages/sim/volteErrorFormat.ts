@@ -1,5 +1,6 @@
 const PROFILE_NOT_READY = /carrier_catalog_profile_not_ready:([^:]+):lte_epc:([^:]+)/
 const PROFILE_PLMN = /(?:home_plmn|imsi_prefix):([0-9]{5,6}|unknown):access:lte_epc:no_ready_profile/
+const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|option-unsubscribed|Requested service option not subscribed/i
 
 function profileStatusLabel(status: string) {
   switch (status) {
@@ -60,6 +61,9 @@ export function volteErrorMessage(error?: string | null) {
   if (error.includes('volte_carrier_ims_apn_missing')) {
     return '已匹配运营商 Profile，但其中缺少 IMS APN，无法建立 VoLTE Bearer。'
   }
+  if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) {
+    return '当前 SIM 未订阅 IMS 服务，或当前漫游网络不允许该 SIM 建立 IMS APN。该拒绝发生在运营商网络/套餐侧，尚未进入 P-CSCF、AKA 或 SIP REGISTER。'
+  }
   if (error.includes('volte_mm_imsi_missing') || error.includes('volte_imsi_missing')) {
     return 'ModemManager SIM 属性与 AT+CIMI 均未返回有效 IMSI。请确认 SIM 已就绪，并检查基带 AT 端口状态。'
   }
@@ -76,4 +80,10 @@ export function volteErrorMessage(error?: string | null) {
     return 'IMS Bearer 已建立，但其网卡没有完成 OPEN/UP 握手。系统已停止继续安装路由和重复重试，避免把底层链路故障误报成 P-CSCF 失败。'
   }
   return error
+}
+
+export function volteErrorStatusLabel(error?: string | null) {
+  if (!error) return null
+  if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) return '未订阅 IMS 服务'
+  return null
 }

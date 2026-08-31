@@ -889,7 +889,7 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
       }
 
       setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(scope), 'euicc')
+      const euiccRes = await requestOrNull(api.getEsimEuicc(scope, true), 'euicc')
       setEuiccLoading(false)
       if (euiccRes?.data) {
         setEuicc(euiccRes.data)

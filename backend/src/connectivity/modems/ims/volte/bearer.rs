@@ -34,9 +34,11 @@ pub const IMS_APN: &str = "ims";
 
 /// Environment override for the bearer object path (matches the reference's
 /// `SIMADMIN_MM_IMS_BEARER`), letting an operator/tester pin a specific bearer.
+#[cfg(test)]
 pub const BEARER_ENV: &str = "SIMADMIN_MM_IMS_BEARER";
 
 /// ModemManager bearer object-path prefix.
+#[cfg(test)]
 pub const BEARER_PATH_PREFIX: &str = "/org/freedesktop/ModemManager1/Bearer/";
 
 /// Requested IMS bearer parameters.
@@ -62,6 +64,7 @@ pub struct BearerConnection {
     pub mtu: Option<u32>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BearerAttempt {
     pub ip_type: String,
@@ -116,6 +119,7 @@ impl BearerRequest {
 }
 
 /// Validate a ModemManager bearer object path.
+#[cfg(test)]
 pub fn is_valid_bearer_path(path: &str) -> bool {
     path.starts_with(BEARER_PATH_PREFIX)
         && path[BEARER_PATH_PREFIX.len()..]
@@ -125,6 +129,7 @@ pub fn is_valid_bearer_path(path: &str) -> bool {
 }
 
 /// Read the bearer-path override from the environment, if set and valid.
+#[cfg(test)]
 pub fn bearer_path_override() -> Option<String> {
     let raw = std::env::var(BEARER_ENV).ok()?;
     let trimmed = raw.trim();
@@ -137,6 +142,7 @@ pub fn bearer_path_override() -> Option<String> {
 
 /// Roaming gate: if the network is roaming and roaming is not allowed, the IMS
 /// bearer must not be brought up (mirrors `bearer_roaming_forbidden`).
+#[cfg(test)]
 pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteError> {
     if is_roaming && !allow_roaming {
         return Err(VolteError::new(code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN));
@@ -151,6 +157,7 @@ pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteE
 /// always v4→v6. An explicit `Ipv6OnlyAllowed`/`Ipv4OnlyAllowed` response from
 /// the network still collapses the fallback to that one family, regardless of
 /// preference. Every failed temporary bearer is deleted before the next attempt.
+#[cfg(test)]
 pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
@@ -159,6 +166,7 @@ pub async fn ensure_ims_bearer(
     ensure_ims_bearer_observed(modem, request, plan, |_| async {}).await
 }
 
+#[cfg(test)]
 pub async fn ensure_ims_bearer_observed<F, Fut>(
     modem: &str,
     request: &BearerRequest,
@@ -369,15 +377,18 @@ where
     Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
 }
 
+#[cfg(test)]
 fn is_dual_stack_bearer(details: &str) -> bool {
     value(details, "bearer.properties.ip-type")
         .is_some_and(|ip_type| ip_type.eq_ignore_ascii_case("ipv4v6"))
 }
 
+#[cfg(test)]
 fn bearer_roaming_policy_matches(details: &str, allow_roaming: bool) -> bool {
     bearer_allows_roaming(details).map_or(true, |actual| actual == allow_roaming)
 }
 
+#[cfg(test)]
 fn bearer_allows_roaming(details: &str) -> Option<bool> {
     for key in [
         "bearer.properties.roaming-allowance",
@@ -398,6 +409,7 @@ fn bearer_allows_roaming(details: &str) -> Option<bool> {
     None
 }
 
+#[cfg(test)]
 fn bearer_profile_matches(details: &str, expected: Option<u32>) -> bool {
     let Some(expected) = expected else {
         return true;
@@ -405,6 +417,7 @@ fn bearer_profile_matches(details: &str, expected: Option<u32>) -> bool {
     number_value::<u32>(details, "bearer.properties.profile-id") == Some(expected)
 }
 
+#[cfg(test)]
 fn create_bearer_properties(request: &BearerRequest, ip_type: &str) -> String {
     let mut properties = match request.profile_id {
         Some(profile_id) => format!("profile-id={profile_id},apn={}", request.apn),
@@ -417,6 +430,7 @@ fn create_bearer_properties(request: &BearerRequest, ip_type: &str) -> String {
     properties
 }
 
+#[cfg(test)]
 struct BearerAttemptFailure {
     error: VolteError,
     details: String,
@@ -426,6 +440,7 @@ struct BearerAttemptFailure {
 /// fails before a bearer object exists. In that path there is no status dump to
 /// inspect, so the command error itself is the only source of the forced-family
 /// signal.
+#[cfg(test)]
 fn classify_attempt_failure(failure: &BearerAttemptFailure) -> FailureClass {
     let error = failure.error.to_string();
     let details = if failure.details.is_empty() {
@@ -436,6 +451,7 @@ fn classify_attempt_failure(failure: &BearerAttemptFailure) -> FailureClass {
     FailureClass::from_details(&details)
 }
 
+#[cfg(test)]
 async fn create_and_connect_attempt(
     modem: &str,
     request: &BearerRequest,
@@ -472,12 +488,14 @@ async fn create_and_connect_attempt(
     }
 }
 
+#[cfg(test)]
 async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
     run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
         .await
         .map(|_| ())
 }
 
+#[cfg(test)]
 async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
     let before = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
     if value(&before, "bearer.status.connected").as_deref() != Some("yes") {
@@ -491,6 +509,7 @@ async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
     parse_bearer_connection(path, &connected)
 }
 
+#[cfg(test)]
 pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnection, VolteError> {
     if value(output, "bearer.status.connected").as_deref() != Some("yes") {
         return Err(VolteError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
@@ -528,6 +547,7 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
+#[cfg(test)]
 pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
     ensure_bearer_interface_ready(&bearer.interface).await?;
     if let Some(mtu) = bearer.mtu {
@@ -780,6 +800,7 @@ fn link_output_is_up(output: &str) -> bool {
 /// REGISTER misses the bearer's table entirely and follows the host default
 /// route out of the wrong interface, where a private P-CSCF address is
 /// unroutable and the transaction simply times out.
+#[cfg(test)]
 pub(crate) async fn interface_still_holds_address(interface: &str, address: IpAddr) -> bool {
     let Ok(output) = run_command("ip", &["-json", "address", "show", "dev", interface]).await
     else {
@@ -788,6 +809,7 @@ pub(crate) async fn interface_still_holds_address(interface: &str, address: IpAd
     addr_output_contains(&output, address)
 }
 
+#[cfg(test)]
 fn addr_output_contains(output: &str, address: IpAddr) -> bool {
     let Ok(links) = serde_json::from_str::<Vec<serde_json::Value>>(output) else {
         return false;
@@ -807,6 +829,7 @@ fn addr_output_contains(output: &str, address: IpAddr) -> bool {
     })
 }
 
+#[cfg(test)]
 async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
     let Some(address @ IpAddr::V6(_)) = bearer.settings.ipv6_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
@@ -829,6 +852,7 @@ async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
     Ok(())
 }
 
+#[cfg(test)]
 async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
     let Some(address @ IpAddr::V4(_)) = bearer.settings.ipv4_address else {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
@@ -850,6 +874,7 @@ async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
     Ok(())
 }
 
+#[cfg(test)]
 pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
     route_host_on_bearer(bearer, pcscf).await
 }
@@ -858,6 +883,7 @@ pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(),
 /// bearer. RTP/RTCP and video endpoints are supplied dynamically in SDP and
 /// are not necessarily the P-CSCF address; without this route Linux may send
 /// media through the management/Wi-Fi default route.
+#[cfg(test)]
 pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
     route_host_on_bearer(bearer, host).await
 }
@@ -865,6 +891,7 @@ pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result
 /// IMS traffic must be selected by the bearer source address, not by the
 /// process-wide main route table. Multiple modems can receive the same remote
 /// RTP address, and a main-table `/32` would let the last line win.
+#[cfg(test)]
 async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
     // A dual-stack ModemManager bearer has two independent local addresses.
     // `BearerConnection::local_addr()` intentionally returns the preferred
@@ -900,6 +927,7 @@ async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result
     run_ip(&args).await.map(|_| ())
 }
 
+#[cfg(test)]
 async fn configure_source_policy(
     interface: &str,
     address: IpAddr,
@@ -946,6 +974,7 @@ async fn configure_source_policy(
 /// Remove network state only from the dedicated bearer interface. This is
 /// used on failed registration and normal teardown so stale IPv6 addresses or
 /// host routes cannot accumulate across long-running retries.
+#[cfg(test)]
 pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     for (address, _prefix) in [
         (bearer.settings.ipv4_address, bearer.ipv4_prefix),
@@ -1020,6 +1049,7 @@ pub async fn teardown_bearer_network_in_worker(bearer: &BearerConnection, worker
 /// torn down through `native_bearer::release_native_ims_bearer` instead, which
 /// owns the session handle; this guard means a caller that does not yet know the
 /// difference cannot silently leak a PDP context.
+#[cfg(test)]
 pub async fn disconnect_bearer(path: &str) {
     if super::native_bearer::is_native_bearer(path) {
         tracing::debug!(
@@ -1065,6 +1095,7 @@ fn command_output(program: &str, args: &[&str], output: Output) -> Result<String
     }
 }
 
+#[cfg(test)]
 fn parse_bearer_paths(output: &str) -> Vec<String> {
     output
         .lines()
@@ -1075,6 +1106,7 @@ fn parse_bearer_paths(output: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn parse_created_bearer_path(output: &str) -> Option<String> {
     output
         .split_whitespace()

@@ -66,6 +66,7 @@ pub mod code {
     pub const RUNTIME_IMS_ENDPOINT_UNAVAILABLE: &str = "volte_runtime_ims_endpoint_unavailable";
     /// The IMS data session could not be started on the secondary QMI endpoint.
     pub const RUNTIME_IMS_BEARER_START_FAILED: &str = "volte_runtime_ims_bearer_start_failed";
+    pub const RUNTIME_UE_WORKER_UNAVAILABLE: &str = "volte_runtime_ue_worker_unavailable";
     pub const RUNTIME_MM_BEARER_PATH_MISSING: &str = "volte_runtime_mm_bearer_path_missing";
     pub const RUNTIME_MM_MODEM_WAIT_TIMEOUT: &str = "volte_runtime_mm_modem_wait_timeout";
     pub const RUNTIME_ALL_PCSCF_FAILED: &str = "volte_runtime_all_pcscf_failed";
@@ -90,18 +91,10 @@ pub mod code {
     pub const BEARER_ADDRESS_CHANGED: &str = "volte_bearer_address_changed";
     pub const PCSCF_FAMILY_MISMATCH: &str = "volte_pcscf_family_mismatch";
 
-    // Data slot allocation (beta2 alignment). The IMS bearer and the normal
-    // mobile-data bearer each need a QMI endpoint; on this firmware they cannot
-    // share one. `select_data_slot_mode` decides which endpoint carries IMS and
-    // which carries data (see `data_slot.rs`).
-    /// No data-slot mode could be resolved for the line — neither the configured
-    /// preference nor the endpoint capabilities yielded a usable allocation.
-    /// Mirrors beta2's `volte_data_slot_mode_missing`.
+    // UE-only native bearer allocation.
+    /// This line has no prepared native endpoint whose interface can be moved
+    /// into its UE namespace.
     pub const DATA_SLOT_MODE_MISSING: &str = "volte_data_slot_mode_missing";
-    /// The requested IMS and data allocations collide (e.g. both demand the
-    /// primary port, or a secondary endpoint the other already holds). Mirrors
-    /// beta2's `volte_data_slot_conflict`.
-    pub const DATA_SLOT_CONFLICT: &str = "volte_data_slot_conflict";
 
     // Registration.
     pub const REGISTER_SEND_FAILED: &str = "volte_register_send_failed";

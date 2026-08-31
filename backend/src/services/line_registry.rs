@@ -190,10 +190,7 @@ impl LineRuntime {
             &binding.line_id,
             Arc::clone(&supplementary),
         );
-        let ue_context = UeContext::for_binding(
-            &binding,
-            &crate::platform::config::UeIsolationConfig::default(),
-        );
+        let ue_context = UeContext::for_binding(&binding);
         let line_id = binding.line_id.clone();
         let namespace = ue_context.namespace.clone();
         Self {
@@ -423,7 +420,6 @@ pub struct LineRuntimeStatus {
 struct PreparedUePublication {
     ue: Option<UeContext>,
     worker: Option<UeWorkerHandle>,
-    features: crate::services::ue_worker::UeWorkerFeatures,
     socket_context: Option<crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext>,
 }
 
@@ -432,7 +428,6 @@ impl Default for PreparedUePublication {
         Self {
             ue: None,
             worker: None,
-            features: crate::services::ue_worker::UeWorkerFeatures::default(),
             socket_context: None,
         }
     }
@@ -456,8 +451,8 @@ enum EgressError {
     /// finds it running; nothing is torn down.
     WorkerNotReady(String),
     /// The veth pair could not be created, or the worker rejected the
-    /// configuration. The namespace cannot carry traffic, so the line has to
-    /// fall back to the host path.
+    /// configuration. The namespace cannot carry traffic, so the line remains
+    /// unavailable until a later refresh repairs it.
     Terminal(String),
 }
 
@@ -852,7 +847,7 @@ impl LineRuntimeRegistry {
                     );
                 }
             }
-            self.teardown_ue_isolation_locked(line, &binding.line_id)
+            self.teardown_ue_runtime_locked(line, &binding.line_id)
                 .await;
             crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device_mapping(
                 &binding.line_id,
@@ -1028,27 +1023,15 @@ impl LineRuntimeRegistry {
             .count()
     }
 
-    /// Keep a line's UE context in sync with its binding and the isolation
-    /// master switch. Namespace creation is idempotent; a failure only drops
-    /// the isolation guarantee and leaves the existing host-namespace path
-    /// fully functional.
+    /// Keep a line's mandatory UE namespace and worker in sync with its
+    /// binding. Namespace creation is idempotent; a failure leaves this line
+    /// unavailable instead of allowing traffic through the host namespace.
     async fn reconcile_ue_context(
         &self,
         line: &LineRuntime,
         binding: &ModemBinding,
     ) -> PreparedUePublication {
         let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
-        let isolation = self
-            .config_manager
-            .as_ref()
-            .map(|config| config.get_ue_isolation())
-            .unwrap_or_default();
-        // Capture this before changing the registry.  A missing worker is
-        // common on the legacy host path (isolation disabled, or the worker
-        // failed before the first isolated VoWiFi runtime was published), and
-        // must not tear down an otherwise healthy host VoWiFi session.  Only a
-        // line that actually had the shared isolated socket context needs the
-        // expensive live-runtime cleanup below.
         let had_ue_socket_context =
             crate::connectivity::modems::ims::vowifi::live::ue_socket_context_for_line(
                 &binding.line_id,
@@ -1056,20 +1039,32 @@ impl LineRuntimeRegistry {
             .is_some();
         let mut ue = line.ue();
         ue.update_binding(binding);
-        if let Err(error) = ue.ensure_netns(&isolation).await {
+        if let Err(error) = ue.ensure_netns().await {
             tracing::warn!(
                 line_id = %binding.line_id,
                 error = %error,
-                "Failed to prepare per-UE network namespace"
+                "Mandatory per-UE network namespace is unavailable"
             );
+            if had_ue_socket_context {
+                crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
+                    &binding.line_id,
+                )
+                .await;
+            }
+            line.secondary_data.stop().await;
+            if line.ue_worker.is_running().await {
+                let _ = line.ue_worker.shutdown().await;
+            }
+            self.teardown_ue_runtime_locked(line, &binding.line_id)
+                .await;
+            return PreparedUePublication {
+                ue: Some(ue),
+                ..PreparedUePublication::default()
+            };
         }
-        let ue_ready = ue.isolation_enabled && ue.netns_ready;
         let worker = line.ue_worker.clone();
-        // A worker spawned in this pass has not completed its handshake yet.
-        // Reconciling its egress in the same pass would only wait out the ready
-        // timeout, and the timeout is what used to dismantle the line.
         let mut worker_spawned_this_pass = false;
-        if ue_ready && !worker.is_running().await {
+        if !worker.is_running().await {
             // Clear the egress fingerprint so the freshly spawned worker
             // receives its initial net-config even if the plan is unchanged.
             {
@@ -1082,70 +1077,36 @@ impl LineRuntimeRegistry {
                     tracing::warn!(
                         line_id = %binding.line_id,
                         error = %error,
-                        "Failed to start per-UE worker inside its namespace"
+                        "Failed to start mandatory per-UE worker"
                     );
+                    self.teardown_ue_runtime_locked(line, &binding.line_id)
+                        .await;
+                    return PreparedUePublication {
+                        ue: Some(ue),
+                        ..PreparedUePublication::default()
+                    };
                 }
-            }
-        } else if !ue_ready && worker.is_running().await {
-            // Release the DATA6 bearer first so its in-namespace address and
-            // routes are removed over a control channel that is still up. Only
-            // a worker-bound session needs this; a host-side one keeps running.
-            if line.secondary_data.is_worker_bound().await {
-                line.secondary_data.stop().await;
-            }
-            if let Err(error) = worker.shutdown().await {
-                tracing::warn!(
-                    line_id = %binding.line_id,
-                    error = %error,
-                    "Failed to stop per-UE worker after isolation was disabled"
-                );
-            }
-            // Clear the egress fingerprint so re-enabling isolation
-            // re-applies the net-config rather than skipping it.
-            {
-                let mut fp = line.egress_fingerprint.lock().await;
-                *fp = None;
             }
         }
         let line_id = binding.line_id.clone();
-        // Publish the worker through the generic UE registry.  Other access
-        // legs (VoLTE, data proxy and the future 5G bearer) resolve the same
-        // line owner instead of maintaining another per-module map.
-        let worker_registration = if ue_ready && worker.is_running().await {
+        let worker_registration = if worker.is_running().await {
             Some(worker.clone())
         } else {
             None
         };
-        let worker_available = worker_registration.is_some();
-        // Operator RTP can only enter a worker after the 3GPP bearer itself
-        // has moved there.  Warn once per process rather than on every line
-        // refresh, which would bury real failures during regression runs.
-        if isolation.trunk_sockets_gate_suppressed() {
-            static SUPPRESSED_TRUNK_GATE: std::sync::Once = std::sync::Once::new();
-            SUPPRESSED_TRUNK_GATE.call_once(|| {
-                tracing::warn!(
-                    "Ignoring trunk_sockets_in_worker until three_gpp_ims_sockets_in_worker is enabled"
-                );
-            });
-        }
-        let features = crate::services::ue_worker::UeWorkerFeatures {
-            three_gpp_ims: isolation.three_gpp_ims_sockets_in_worker,
-            data_proxy: isolation.data_proxy_in_worker,
-            trunk_sockets: isolation.effective_trunk_sockets_in_worker(),
-        };
-        if !worker_available {
-            // A cached TUN/SIP channel may still belong to the dead worker's
-            // namespace. Tear the live access runtime down before allowing a
-            // host-path retry, otherwise a host socket can bind a UE-only TUN
-            // and reproduce ENODEV even though the context registry is clear.
+        if worker_registration.is_none() {
             if had_ue_socket_context {
                 crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
                     &line_id,
                 )
                 .await;
             }
+            return PreparedUePublication {
+                ue: Some(ue),
+                ..PreparedUePublication::default()
+            };
         }
-        if ue_ready && worker_spawned_this_pass {
+        if worker_spawned_this_pass {
             // Let the worker finish its handshake on its own time. Everything
             // this pass built -- namespace, veth, a running child -- stays, and
             // the next refresh reconciles the egress against a ready worker.
@@ -1158,98 +1119,57 @@ impl LineRuntimeRegistry {
                 ..PreparedUePublication::default()
             };
         }
-        if ue_ready {
-            if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
-                // A worker that has not finished its handshake yet is not a
-                // failure of this line's isolation, and the next refresh is ten
-                // seconds away. Returning without publishing the worker leaves
-                // the bearer, the namespace and the veth exactly as they are so
-                // that retry is free. Tearing them down instead would make this
-                // path self-sustaining: the data watchdog rebuilds DATA6, the
-                // following refresh spawns a worker and times out on it again,
-                // and every turn drives another QMI stop/start pair into a
-                // baseband whose firmware does not survive that treatment.
-                if error.is_transient() {
-                    tracing::debug!(
-                        line_id = %line_id,
-                        error = %error,
-                        "UE worker not ready for egress apply; retrying on the next refresh"
-                    );
-                    return PreparedUePublication {
-                        ue: Some(ue),
-                        ..PreparedUePublication::default()
-                    };
-                }
-                // Egress preparation may have created a new worker, veth,
-                // NAT rule or namespace before failing.  Falling back by
-                // merely publishing `None` would orphan those resources and
-                // leave a stale worker/data session alive.  Only clear the
-                // live runtime when a UE socket context was already
-                // published; a first isolated reconcile can still be serving
-                // the legacy host path and must not tear that runtime down.
-                if had_ue_socket_context {
-                    crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
-                        &line_id,
-                    )
-                    .await;
-                }
-                // Stop the DATA6 bearer while the worker is still alive: its
-                // teardown deletes the in-namespace address and routes over
-                // the control channel before moving the interface back to the
-                // host.  Then stop the worker so the shared teardown can
-                // remove a namespace nothing is running in, and clear the
-                // registry/context entries, NAT, veth and egress fingerprint.
-                // A host-side session is untouched -- the line is falling back
-                // to the host path, which is exactly where that session lives.
-                if line.secondary_data.is_worker_bound().await {
-                    line.secondary_data.stop().await;
-                }
-                if worker.is_running().await {
-                    if let Err(shutdown_error) = worker.shutdown().await {
-                        tracing::warn!(
-                            line_id = %line_id,
-                            error = %shutdown_error,
-                            "Failed to stop UE worker after egress reconcile failure"
-                        );
-                    }
-                }
-                self.teardown_ue_isolation_locked(line, &line_id).await;
-                tracing::warn!(
+        if let Err(error) = self.reconcile_ue_egress(line, &ue).await {
+            if error.is_transient() {
+                tracing::debug!(
                     line_id = %line_id,
                     error = %error,
-                    "Failed to reconcile UE egress/worker net-config; falling back to host path"
+                    "UE worker not ready for egress apply; retrying on the next refresh"
                 );
                 return PreparedUePublication {
                     ue: Some(ue),
                     ..PreparedUePublication::default()
                 };
             }
-        } else {
-            // Fall back to the host-namespace VoWiFi path and best-effort
-            // remove all resources from a previous isolated run.
-            self.teardown_ue_isolation_locked(line, &line_id).await;
+            if had_ue_socket_context {
+                crate::connectivity::modems::ims::vowifi::live::clear_live_runtime_for_line(
+                    &line_id,
+                )
+                .await;
+            }
+            line.secondary_data.stop().await;
+            if worker.is_running().await {
+                if let Err(shutdown_error) = worker.shutdown().await {
+                    tracing::warn!(
+                        line_id = %line_id,
+                        error = %shutdown_error,
+                        "Failed to stop UE worker after egress failure"
+                    );
+                }
+            }
+            self.teardown_ue_runtime_locked(line, &line_id).await;
+            tracing::warn!(
+                line_id = %line_id,
+                error = %error,
+                "Mandatory UE egress configuration failed"
+            );
             return PreparedUePublication {
                 ue: Some(ue),
                 ..PreparedUePublication::default()
             };
         }
 
-        let socket_context = if isolation.vowifi_tun_in_namespace && worker_available {
-            let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
-            Some(
-                crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
-                    namespace: ue.namespace.as_str().to_string(),
-                    ue_veth: plan.ue_if,
-                    worker: worker.clone(),
-                },
-            )
-        } else {
-            None
-        };
+        let plan = ue_netcfg::plan_veth(&ue.namespace);
+        let socket_context = Some(
+            crate::connectivity::modems::ims::vowifi::live::LiveUeSocketContext {
+                namespace: ue.namespace.as_str().to_string(),
+                ue_veth: plan.ue_if,
+                worker: worker.clone(),
+            },
+        );
         PreparedUePublication {
             ue: Some(ue),
             worker: worker_registration,
-            features,
             socket_context,
         }
     }
@@ -1261,48 +1181,21 @@ impl LineRuntimeRegistry {
                 .write()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = ue;
         }
-        crate::services::ue_worker::register_line_worker(
-            line_id,
-            prepared.worker,
-            prepared.features,
-        );
+        crate::services::ue_worker::register_line_worker(line_id, prepared.worker);
         crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
             line_id,
             prepared.socket_context,
         );
     }
 
-    async fn teardown_ue_isolation(&self, line: &LineRuntime, line_id: &str) {
-        let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
-        self.teardown_ue_isolation_locked(line, line_id).await;
-    }
-
-    async fn teardown_ue_isolation_locked(&self, line: &LineRuntime, line_id: &str) {
-        let isolation = self
-            .config_manager
-            .as_ref()
-            .map(|config| config.get_ue_isolation())
-            .unwrap_or_default();
+    async fn teardown_ue_runtime_locked(&self, line: &LineRuntime, line_id: &str) {
         let ue = line.ue();
-        // Only a DATA session that was actually migrated into the worker
-        // namespace is tied to this lifecycle: its interface lives in a
-        // namespace that is about to disappear. A host-side session belongs to
-        // the legacy path, and stopping it here would tear down healthy
-        // cellular data on every single line refresh whenever isolation is
-        // disabled -- the watchdog rebuilds it, this runs again, and the bearer
-        // churns instead of ever carrying traffic.
-        if line.secondary_data.is_worker_bound().await {
-            line.secondary_data.stop().await;
-        }
-        crate::services::ue_worker::register_line_worker(
-            line_id,
-            None,
-            crate::services::ue_worker::UeWorkerFeatures::default(),
-        );
+        line.secondary_data.stop().await;
+        crate::services::ue_worker::register_line_worker(line_id, None);
         crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
             line_id, None,
         );
-        let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
+        let plan = ue_netcfg::plan_veth(&ue.namespace);
         if let Err(error) = crate::platform::netns::remove_host_veth_nat(plan.host_addr).await {
             tracing::debug!(
                 line_id,
@@ -1340,12 +1233,7 @@ impl LineRuntimeRegistry {
     ) -> Result<(), EgressError> {
         use std::time::Duration;
 
-        let isolation = self
-            .config_manager
-            .as_ref()
-            .map(|config| config.get_ue_isolation())
-            .unwrap_or_default();
-        let plan = ue_netcfg::plan_veth(&ue.namespace, &isolation);
+        let plan = ue_netcfg::plan_veth(&ue.namespace);
         crate::platform::netns::ensure_veth_pair_host_side(
             &ue.namespace,
             &plan.host_if,
@@ -1356,16 +1244,11 @@ impl LineRuntimeRegistry {
         .await
         .map_err(|error| EgressError::Terminal(error.to_string()))?;
 
-        // Build a fingerprint from the plan + isolation settings so we can
-        // skip the worker net-config batch when nothing has changed.
+        // Build a fingerprint from the fixed plan so we can skip the worker
+        // net-config batch when nothing has changed.
         let fingerprint = format!(
-            "{}|{}|{}|{}|{}|{}",
-            plan.host_if,
-            plan.ue_if,
-            plan.host_addr,
-            plan.ue_addr,
-            plan.mtu,
-            isolation.vowifi_tun_in_namespace,
+            "{}|{}|{}|{}|{}",
+            plan.host_if, plan.ue_if, plan.host_addr, plan.ue_addr, plan.mtu,
         );
         let worker = line.ue_worker.clone();
         if !worker.is_running().await {
@@ -1401,22 +1284,9 @@ impl LineRuntimeRegistry {
             let mut slot = line.egress_fingerprint.lock().await;
             *slot = Some(fingerprint);
         }
-        // Host-side SNAT for the UE egress subnet. Worker-created sockets
-        // inside the UE namespace egress through this veth pair; without
-        // MASQUERADE their source address would not be routable on the host
-        // primary interface. Best-effort: routing still works for equal-subnet
-        // deployments, so a failure only degrades reachability logging.
-        if let Err(error) = crate::platform::netns::ensure_host_veth_nat(plan.host_addr).await {
-            tracing::warn!(
-                line_id = %ue.ue_id,
-                host_addr = %plan.host_addr,
-                error = %error,
-                "Failed to ensure UE veth host SNAT"
-            );
-        }
-        // Stage 2b is deliberately gated: only with this flag do the VoWiFi
-        // TUN and every IKE/SIP/RTP socket move into the UE namespace through
-        // the worker. Disabling keeps the previous host-namespace path.
+        crate::platform::netns::ensure_host_veth_nat(plan.host_addr)
+            .await
+            .map_err(|error| EgressError::Terminal(error.to_string()))?;
         tracing::info!(
             line_id = %ue.ue_id,
             netns = %ue.namespace,

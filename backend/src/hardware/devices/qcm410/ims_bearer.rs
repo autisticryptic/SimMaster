@@ -23,6 +23,11 @@ use crate::hardware::devices::transport::{
     ImsBearerTransport,
 };
 
+/// The primary ModemManager netdev must never be adopted by a native IMS
+/// session. Native IMS is valid only on a secondary interface that SimAdmin can
+/// move into the line's UE namespace.
+const IMS_RESERVED_NETDEVS: &[&str] = &["wwan0"];
+
 /// The qcm410 IMS bearer driver. Stateless; one instance serves every line.
 pub struct Qcm410ImsBearer;
 
@@ -146,10 +151,7 @@ async fn establish_bearer(
             "native_ims_session_has_no_address".to_string(),
         ));
     };
-    // IMS is the runtime that legitimately owns the primary netdev, so nothing is
-    // reserved against it. The reservation exists to keep the *data* runtime off
-    // this interface; see DATA_RESERVED_NETDEVS in secondary_qmi_data.
-    let resolution = match qmi_netdev::resolve(baseband, &config, &[]).await {
+    let resolution = match qmi_netdev::resolve(baseband, &config, IMS_RESERVED_NETDEVS).await {
         Ok(resolution) => resolution,
         Err(error) => {
             stop_sessions(endpoint, &sessions).await;

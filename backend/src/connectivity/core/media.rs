@@ -29,6 +29,7 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(test)]
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::{net::UdpSocket, sync::watch, task::JoinHandle};
 
@@ -347,17 +348,16 @@ pub fn rewrite_rtp_payload_type(datagram: &[u8], payload_type: u8) -> Option<Vec
 pub struct PendingRtpRelay {
     operator_socket: Arc<UdpSocket>,
     internal_socket: Arc<UdpSocket>,
-    /// Keeps a UE worker (if any) alive for the lifetime of the relay so the
+    /// Keeps the UE worker alive for the lifetime of the relay so the
     /// operator-side socket stays bound to its namespace-owned fd.
-    _operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+    _operator_creator: Arc<dyn OperatorSocketCreator>,
 }
 
 /// Creates the operator-facing UDP socket on behalf of a media relay.
 ///
-/// The host path binds in the current namespace; the per-UE isolation path
-/// asks the line's UE worker to create the socket inside the UE network
-/// namespace and returns the fd. Keeping the creator in the relay prevents
-/// the worker handle from being dropped while the socket is still in use.
+/// The line's UE worker creates the socket inside the UE network namespace and
+/// returns the fd. Keeping the creator in the relay prevents the worker handle
+/// from being dropped while the socket is still in use.
 pub trait OperatorSocketCreator: Send + Sync {
     fn create_udp<'a>(
         &'a self,
@@ -367,10 +367,18 @@ pub trait OperatorSocketCreator: Send + Sync {
 }
 
 impl PendingRtpRelay {
+    #[cfg(test)]
     pub async fn bind(operator_ip: IpAddr, internal_ip: IpAddr) -> std_io::Result<Self> {
-        Self::bind_with_operator_interface(operator_ip, internal_ip, None).await
+        Self::bind_with_operator_source(
+            operator_ip,
+            internal_ip,
+            None,
+            Arc::new(TestHostOperatorSocketCreator),
+        )
+        .await
     }
 
+    #[cfg(test)]
     /// Bind the operator-facing socket to the access interface as well as its
     /// local address. The address alone is not a unique selector when two
     /// modem interfaces receive the same private IP, so Linux must carry the
@@ -380,26 +388,29 @@ impl PendingRtpRelay {
         internal_ip: IpAddr,
         operator_interface: Option<&str>,
     ) -> std_io::Result<Self> {
-        Self::bind_with_operator_source(operator_ip, internal_ip, operator_interface, None).await
+        Self::bind_with_operator_source(
+            operator_ip,
+            internal_ip,
+            operator_interface,
+            Arc::new(TestHostOperatorSocketCreator),
+        )
+        .await
     }
 
-    /// Bind the operator-facing socket either in this namespace or inside the
-    /// UE namespace through `operator_creator`. The internal (Asterisk/Trunk)
-    /// socket always stays in the host namespace.
+    /// Bind the operator-facing socket inside the UE namespace through
+    /// `operator_creator`. The internal Asterisk/Trunk socket stays with the
+    /// local service plane.
     pub async fn bind_with_operator_source(
         operator_ip: IpAddr,
         internal_ip: IpAddr,
         operator_interface: Option<&str>,
-        operator_creator: Option<Arc<dyn OperatorSocketCreator>>,
+        operator_creator: Arc<dyn OperatorSocketCreator>,
     ) -> std_io::Result<Self> {
-        let operator_socket = Arc::new(match &operator_creator {
-            Some(creator) => {
-                creator
-                    .create_udp(SocketAddr::new(operator_ip, 0), operator_interface)
-                    .await?
-            }
-            None => bind_udp_socket(SocketAddr::new(operator_ip, 0), operator_interface)?,
-        });
+        let operator_socket = Arc::new(
+            operator_creator
+                .create_udp(SocketAddr::new(operator_ip, 0), operator_interface)
+                .await?,
+        );
         let internal_socket = Arc::new(UdpSocket::bind(SocketAddr::new(internal_ip, 0)).await?);
         Ok(Self {
             operator_socket,
@@ -479,6 +490,26 @@ impl PendingRtpRelay {
     }
 }
 
+#[cfg(test)]
+struct TestHostOperatorSocketCreator;
+
+#[cfg(test)]
+impl OperatorSocketCreator for TestHostOperatorSocketCreator {
+    fn create_udp<'a>(
+        &'a self,
+        local: SocketAddr,
+        bind_to_device: Option<&'a str>,
+    ) -> Pin<Box<dyn Future<Output = std_io::Result<UdpSocket>> + Send + 'a>> {
+        Box::pin(async move { bind_udp_socket(local, bind_to_device) })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_operator_socket_creator() -> Arc<dyn OperatorSocketCreator> {
+    Arc::new(TestHostOperatorSocketCreator)
+}
+
+#[cfg(test)]
 fn bind_udp_socket(local: SocketAddr, interface: Option<&str>) -> std_io::Result<UdpSocket> {
     let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -489,7 +520,7 @@ fn bind_udp_socket(local: SocketAddr, interface: Option<&str>) -> std_io::Result
     UdpSocket::from_std(std_socket)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn bind_socket_to_interface(socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
     use std::{ffi::CString, os::fd::AsRawFd};
 
@@ -515,7 +546,7 @@ fn bind_socket_to_interface(socket: &Socket, interface: Option<&str>) -> std_io:
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn bind_socket_to_interface(_socket: &Socket, interface: Option<&str>) -> std_io::Result<()> {
     if interface.is_some() {
         return Err(std_io::Error::new(

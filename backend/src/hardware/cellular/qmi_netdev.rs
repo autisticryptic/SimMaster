@@ -499,19 +499,6 @@ async fn configure_addressing(interface: &str, config: &NetdevConfig) -> Result<
     Ok(())
 }
 
-/// Restore a session interface in the host namespace after an attempted UE
-/// namespace migration. This is the public counterpart of the resolver's
-/// private candidate setup and includes the proxy default route.
-pub async fn configure_host_data_path(
-    interface: &str,
-    config: &NetdevConfig,
-) -> Result<(), String> {
-    configure(interface, config)
-        .await
-        .map_err(|error| error.to_string())?;
-    install_default_route(interface, config).await
-}
-
 /// Turn per-candidate failures into the error the caller acts on.
 ///
 /// A refused UP on *every* candidate is the baseband, not the interfaces: they

@@ -4,12 +4,11 @@
 //! on a physical eUICC SIM card inserted in the device. It does not switch
 //! board-level SIM hardware and does not start background workers.
 
-use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -21,6 +20,7 @@ use crate::api::models::{
 };
 use crate::platform::config::ConfigManager;
 use crate::platform::config::EsimReaderConfig;
+use crate::platform::db::Database;
 
 const ESIM_SHORT_TIMEOUT_SECS: u64 = 20;
 const ESIM_LONG_TIMEOUT_SECS: u64 = 60;
@@ -59,24 +59,23 @@ impl EsimApiError {
 
 pub struct EsimSupervisor {
     config_manager: Arc<ConfigManager>,
+    database: Arc<Database>,
     lpac_lock: Mutex<()>,
-    detected_euicc_lines: StdMutex<HashSet<String>>,
 }
 
 impl EsimSupervisor {
-    pub fn new(config_manager: Arc<ConfigManager>) -> Self {
+    pub fn new(config_manager: Arc<ConfigManager>, database: Arc<Database>) -> Self {
         Self {
             config_manager,
+            database,
             lpac_lock: Mutex::new(()),
-            detected_euicc_lines: StdMutex::new(HashSet::new()),
         }
     }
 
-    pub fn euicc_detected_for_line(&self, line_id: &str) -> bool {
-        self.detected_euicc_lines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains(line_id)
+    pub fn euicc_detected_for_identity(&self, identity_key: Option<&str>) -> bool {
+        identity_key
+            .and_then(|key| self.database.get_esim_detection_cache(key).ok().flatten())
+            .is_some()
     }
 
     pub async fn get_lpac_status(&self) -> Result<EsimLpacStatusResponse, EsimApiError> {
@@ -228,7 +227,21 @@ impl EsimSupervisor {
     pub async fn get_euicc_info_for_line(
         &self,
         line_id: &str,
+        identity_key: Option<&str>,
+        force_refresh: bool,
     ) -> Result<EsimEuiccInfo, EsimApiError> {
+        if !force_refresh {
+            if let Some(cached) = identity_key
+                .and_then(|key| self.database.get_esim_detection_cache(key).ok().flatten())
+            {
+                if let Ok(info) = serde_json::from_str::<EsimEuiccInfo>(&cached) {
+                    if !info.eid.trim().is_empty() {
+                        return Ok(info);
+                    }
+                }
+            }
+        }
+
         let response = self
             .call_lpac_on_line(line_id, "info", &["chip", "info"], ESIM_SHORT_TIMEOUT_SECS)
             .await?;
@@ -245,10 +258,16 @@ impl EsimSupervisor {
         } else {
             info.memory_total_customizable = Some(false);
         }
-        self.detected_euicc_lines
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(line_id.to_string());
+        if info.eid.trim().is_empty() {
+            return Err(EsimApiError::Unavailable("esim_eid_missing".to_string()));
+        }
+        if let Some(identity_key) = identity_key {
+            if let Ok(info_json) = serde_json::to_string(&info) {
+                let _ =
+                    self.database
+                        .upsert_esim_detection_cache(identity_key, line_id, &info_json);
+            }
+        }
         Ok(info)
     }
 
