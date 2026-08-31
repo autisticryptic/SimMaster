@@ -46,13 +46,18 @@ pub struct Qcm410ImsBearerHandle {
 impl ImsBearerHandle for Qcm410ImsBearerHandle {
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         Box::pin(async move {
-            for (interface, config) in &self.configured_netdevs {
+            let Qcm410ImsBearerHandle {
+                endpoint,
+                sessions,
+                configured_netdevs,
+            } = *self;
+            for (interface, config) in &configured_netdevs {
                 qmi_netdev::teardown(interface, config).await;
             }
-            for session in &self.sessions {
-                secondary_qmi::stop_ims_session(&self.endpoint, session).await;
+            for session in sessions {
+                secondary_qmi::stop_ims_session(session).await;
             }
-            secondary_qmi::release_endpoint(&self.endpoint).await;
+            secondary_qmi::release_endpoint(&endpoint).await;
         })
     }
 }
@@ -134,7 +139,7 @@ async fn establish_bearer(
     let settings = match read_settings(modem_id, cid, apn).await {
         Ok(settings) => settings,
         Err(error) => {
-            stop_sessions(endpoint, &sessions).await;
+            stop_sessions(sessions).await;
             return Err(error);
         }
     };
@@ -145,7 +150,7 @@ async fn establish_bearer(
         4
     };
     let Some(config) = netdev_config_for(&settings, netdev_family) else {
-        stop_sessions(endpoint, &sessions).await;
+        stop_sessions(sessions).await;
         return Err(settings_missing(
             "native_ims_session_has_no_address".to_string(),
         ));
@@ -153,7 +158,7 @@ async fn establish_bearer(
     let resolution = match qmi_netdev::resolve(baseband, &config, IMS_RESERVED_NETDEVS).await {
         Ok(resolution) => resolution,
         Err(error) => {
-            stop_sessions(endpoint, &sessions).await;
+            stop_sessions(sessions).await;
             return Err(ImsBearerError {
                 kind: ImsBearerErrorKind::NetdevUnresolved,
                 detail: format!("native_ims_netdev_unresolved:{error}"),
@@ -236,9 +241,9 @@ async fn read_settings(
     Ok(settings)
 }
 
-async fn stop_sessions(endpoint: &SecondaryQmiEndpoint, sessions: &[ImsSession]) {
+async fn stop_sessions(sessions: Vec<ImsSession>) {
     for session in sessions {
-        secondary_qmi::stop_ims_session(endpoint, session).await;
+        secondary_qmi::stop_ims_session(session).await;
     }
 }
 

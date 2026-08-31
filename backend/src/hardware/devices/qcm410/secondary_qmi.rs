@@ -50,11 +50,17 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Output,
+    process::{Output, Stdio},
     time::Duration,
 };
 
-use tokio::{process::Command, time::sleep};
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+    sync::mpsc,
+    task::JoinHandle,
+    time::sleep,
+};
 use tracing::{debug, info};
 
 /// Beta8 deliberately migrated DATA6 away from the kernel-specific multi-port
@@ -204,12 +210,13 @@ impl QmiOpenMode {
 pub const QMI_OPEN_NET_ARG: &str = "--device-open-net=net-raw-ip|net-no-qos-header";
 
 /// Result of bringing up an IMS data session on a secondary endpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ImsSession {
-    /// Retained WDS client id. DATA6 requires every follow-up operation to use
-    /// the same CID that started the packet-data session.
-    pub client_id: String,
-    /// WDS packet data handle, needed to stop the session.
+    /// Long-running qmicli process that owns both the WDS client and packet-data
+    /// call. DATA6 cannot safely transfer either across direct-QMI opens.
+    child: Child,
+    output_tasks: Vec<JoinHandle<()>>,
+    /// WDS packet data handle, retained for status and diagnostics.
     pub packet_data_handle: String,
     /// Family actually established.
     pub ip_family: String,
@@ -1159,39 +1166,11 @@ fn endpoint_identity(path: &Path) -> std::io::Result<EndpointIdentity> {
     }
 }
 
-/// Keep the boot initializer alive after DATA6 is ready. Beta8 records the
-/// device identity and polls it; ModemManager is allowed to start only while the
-/// same character node remains present.
+/// Keep the boot initializer alive after DATA6 is ready. The monitor deliberately
+/// does not open the character device: a second direct-QMI file descriptor can
+/// reset the DATA6 transport while a runtime WDS session is active.
 pub async fn hold_endpoint(endpoint: &SecondaryQmiEndpoint) -> Result<(), SecondaryQmiError> {
     let path = Path::new(&endpoint.device_path);
-    // Keeping the character device open is part of Beta8's DATA6 contract. The
-    // stock rpmsg_wwan_ctrl driver tears down retained QMI client ids when its
-    // last file descriptor closes, even when qmicli used
-    // --client-no-release-cid. A passive metadata monitor is therefore not
-    // enough: one long-lived O_RDWR descriptor must survive across all qmicli
-    // invocations made by the runtime.
-    #[cfg(unix)]
-    let _held_device = {
-        use std::os::unix::fs::OpenOptionsExt;
-
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-    };
-    #[cfg(not(unix))]
-    let _held_device = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path);
-    let _held_device = _held_device.map_err(|error| {
-        SecondaryQmiError::EndpointLost(format!(
-            "failed to hold secondary QMI endpoint {} open: {error}",
-            endpoint.device_path
-        ))
-    })?;
-
     let expected = endpoint_identity(path).map_err(|error| {
         SecondaryQmiError::EndpointLost(format!(
             "failed to inspect secondary QMI endpoint {}: {error}",
@@ -1242,38 +1221,62 @@ pub async fn start_ims_session(
     profile_id: Option<u32>,
 ) -> Result<ImsSession, String> {
     let start = ims_start_action(apn, family, profile_id);
-    let output = run_qmicli(&[
-        "--verbose",
-        "-d",
-        &endpoint.device_path,
-        "--device-open-qmi",
-        QMI_OPEN_NET_ARG,
-        "--client-no-release-cid",
-        &start,
-    ])
+    let mut command = Command::new("qmicli");
+    command
+        .args(ims_session_args(&endpoint.device_path, &start))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("secondary_qmi_start_spawn_failed:{error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "secondary_qmi_start_stdout_missing".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "secondary_qmi_start_stderr_missing".to_string())?;
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let output_tasks = vec![
+        spawn_qmicli_output_reader(stdout, sender.clone()),
+        spawn_qmicli_output_reader(stderr, sender),
+    ];
+    let mut output = String::new();
+    let handle = match tokio::time::timeout(Duration::from_secs(65), async {
+        while let Some(line) = receiver.recv().await {
+            output.push_str(&line);
+            output.push('\n');
+            if let Some(handle) = parse_packet_data_handle(&line) {
+                return Some(handle);
+            }
+        }
+        None
+    })
     .await
-    .ok_or_else(|| "secondary_qmi_start_spawn_failed".to_string())?;
-
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if !output.status.success() {
-        let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
-        return Err(format!("secondary_qmi_start_failed:{reason}"));
-    }
-    let handle = match parse_packet_data_handle(&text) {
-        Some(handle) => handle,
-        None => {
-            let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
+    {
+        Ok(Some(handle)) => handle,
+        Ok(None) => {
+            let _ = child.wait().await;
+            await_output_tasks(output_tasks).await;
+            let reason =
+                parse_call_end_reason(&output).unwrap_or_else(|| output.trim().to_string());
             return Err(format!("secondary_qmi_start_failed:{reason}"));
         }
+        Err(_) => {
+            terminate_qmicli(&mut child).await;
+            await_output_tasks(output_tasks).await;
+            return Err(format!(
+                "secondary_qmi_start_failed:timeout:{}",
+                output.trim()
+            ));
+        }
     };
-    let client_id = parse_wds_client_id(&text)
-        .ok_or_else(|| format!("secondary_qmi_start_cid_missing:{}", text.trim()))?;
     Ok(ImsSession {
-        client_id,
+        child,
+        output_tasks,
         packet_data_handle: handle,
         ip_family: family
             .map(|family| format!("ipv{family}"))
@@ -1288,6 +1291,58 @@ pub async fn start_ims_session(
     })
 }
 
+fn ims_session_args<'a>(device: &'a str, start: &'a str) -> [&'a str; 7] {
+    [
+        "--verbose",
+        "-d",
+        device,
+        "--device-open-qmi",
+        QMI_OPEN_NET_ARG,
+        start,
+        "--wds-follow-network",
+    ]
+}
+
+fn spawn_qmicli_output_reader<R>(reader: R, sender: mpsc::UnboundedSender<String>) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(reader).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            debug!(output = %line, "Secondary QMI session output");
+            let _ = sender.send(line);
+        }
+    })
+}
+
+async fn await_output_tasks(tasks: Vec<JoinHandle<()>>) {
+    for task in tasks {
+        let _ = task.await;
+    }
+}
+
+async fn terminate_qmicli(child: &mut Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        // qmicli handles SIGINT by stopping the followed WDS call before exit.
+        // SAFETY: `pid` comes directly from the live child process.
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGINT);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = child.start_kill();
+
+    if tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+}
+
 fn ims_start_action(apn: &str, family: Option<u8>, profile_id: Option<u32>) -> String {
     let mut action = format!("--wds-start-network=apn={apn}");
     if let Some(profile) = profile_id {
@@ -1299,53 +1354,10 @@ fn ims_start_action(apn: &str, family: Option<u8>, profile_id: Option<u32>) -> S
     action
 }
 
-async fn run_retained_wds_action(
-    endpoint: &SecondaryQmiEndpoint,
-    client_id: &str,
-    action: &str,
-) -> Result<Output, String> {
-    let cid = format!("--client-cid={client_id}");
-    let output = run_qmicli(&[
-        "-d",
-        &endpoint.device_path,
-        "--device-open-qmi",
-        QMI_OPEN_NET_ARG,
-        &cid,
-        "--client-no-release-cid",
-        action,
-    ])
-    .await
-    .ok_or_else(|| "secondary_qmi_action_spawn_failed".to_string())?;
-    if output.status.success() {
-        Ok(output)
-    } else {
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Err(format!("secondary_qmi_action_failed:{}", text.trim()))
-    }
-}
-
-async fn release_wds_client(endpoint: &SecondaryQmiEndpoint, client_id: &str) {
-    let cid = format!("--client-cid={client_id}");
-    let _ = run_qmicli(&[
-        "-d",
-        &endpoint.device_path,
-        "--device-open-qmi",
-        QMI_OPEN_NET_ARG,
-        &cid,
-        "--wds-noop",
-    ])
-    .await;
-}
-
-/// Tear down an IMS session and release the retained WDS CID.
-pub async fn stop_ims_session(endpoint: &SecondaryQmiEndpoint, session: &ImsSession) {
-    let stop = format!("--wds-stop-network={}", session.packet_data_handle);
-    let _ = run_retained_wds_action(endpoint, &session.client_id, &stop).await;
-    release_wds_client(endpoint, &session.client_id).await;
+/// Tear down an IMS session in the process that owns its WDS client.
+pub async fn stop_ims_session(mut session: ImsSession) {
+    terminate_qmicli(&mut session.child).await;
+    await_output_tasks(session.output_tasks).await;
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1569,6 +1581,16 @@ mod tests {
     fn open_mode_args_and_probe_order() {
         assert_eq!(QmiOpenMode::ForceQmi.as_arg(), "--device-open-qmi");
         assert_eq!(QmiOpenMode::probe_order(), [QmiOpenMode::ForceQmi]);
+    }
+
+    #[test]
+    fn ims_session_is_owned_by_one_following_qmicli_process() {
+        let start = ims_start_action("ims", Some(6), Some(2));
+        let args = ims_session_args("/dev/wwan0at2", &start);
+        assert!(args.contains(&"--wds-follow-network"));
+        assert!(args.contains(&QMI_OPEN_NET_ARG));
+        assert!(args.contains(&start.as_str()));
+        assert!(!args.contains(&"--client-no-release-cid"));
     }
 
     #[test]

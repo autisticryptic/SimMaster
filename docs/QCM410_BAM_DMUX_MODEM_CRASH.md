@@ -575,7 +575,46 @@ MM 的 bearer 抖动时刻（22:01:11、22:07:16）与我们的失败时刻（22
 > 两个 family 都被尝试过的原因。分类器修复对 VoLTE IMS 恢复循环是必要且正确的，
 > 但它不是数据面那 72 秒的修复。恢复间隔由 watchdog 周期决定，仍是待办。
 
-### 10.9 这次留下的通用教训
+### 10.9 最终根因：独立 holder 与 WDS 进程不能并存（2026-09-01）
+
+后续在干净状态下把 `simadmin-secondary-qmi.service` 停掉，直接用一个进程测试 DATA6：
+
+```bash
+qmicli -d /dev/wwan0at2 --device-open-qmi \
+  --device-open-net='net-raw-ip|net-no-qos-header' \
+  --wds-start-network='apn=ims,3gpp-profile=2,ip-type=6' \
+  --wds-follow-network
+```
+
+IPv6 成功并持续保持网络；IPv4 则由网络明确返回
+`[3gpp] ipv6-only-allowed`，基带没有崩溃。重新启动旧的 initializer/holder 后，IMS
+再从另一个 direct-QMI 文件描述符启动 WDS，随即出现：
+
+```text
+fatal error received: dhcp_client_mgr.c:263
+endpoint hangup
+```
+
+因此 §10.3 的完整根因不是“设备被打开时 WDS 必然失败”，而是 stock
+`rpmsg_wwan_ctrl` 上**不能由一个独立进程长期 O_RDWR 持有端点，再让另一个 direct-QMI
+进程管理 WDS**。同时，最后一个文件描述符关闭后 retained CID 也不可靠，所以把
+allocate/start/stop 分散到多个短命 `qmicli` 进程同样不成立。
+
+当前实现采用单一所有者模型：
+
+- `secondary-qmi-init` 只通过元数据监视设备节点，不再打开 `/dev/wwan0at2`；
+- 每个 IMS bearer 由一个 `qmicli --wds-start-network ... --wds-follow-network` 子进程
+  从启动一直持有到释放；
+- bearer teardown 向该进程发送 SIGINT，让 qmicli 在自己的 WDS client 上停止网络，
+  超时后才强制结束；
+- 不再用第二个 direct-QMI 进程执行 stop-network、get-current-settings 或释放 CID；
+- IMS 地址、DNS 和 P-CSCF 继续由 `AT+CGCONTRDP` 读取。
+
+这也解释了为什么“同一进程完成 allocate + start”的中间修复仍不够：启动进程退出后，
+会话所有权已经丢失，后续 stop/query 仍会重新打开 DATA6。正确的生命周期边界必须覆盖
+整个 bearer，而不只是 start-network 调用。
+
+### 10.10 这次留下的通用教训
 
 - **无界重试是可以把硬件打坏的**，不只是浪费时间。任何对基带的重试都必须有明确的
   "不可重试"分类，且该分类的**默认方向应当是保守的** —— 认不出来的失败应倾向于放弃，

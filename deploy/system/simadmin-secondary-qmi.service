@@ -1,5 +1,5 @@
 [Unit]
-Description=SimAdmin secondary QMI endpoint initializer and holder
+Description=SimAdmin secondary QMI endpoint initializer and monitor
 After=systemd-udevd.service systemd-modules-load.service
 Before=ModemManager.service simadmin.service
 

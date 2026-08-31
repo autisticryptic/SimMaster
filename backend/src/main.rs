@@ -563,8 +563,8 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     }
 
     // Type=notify service remains alive and verifies that the endpoint is still
-    // the same character node. A disappearance/replacement makes systemd retry
-    // initialization instead of letting ModemManager run against stale state.
+    // the same character node. The monitor never opens the device: the runtime
+    // qmicli process must be its sole direct-QMI owner while WDS is active.
     let mut monitors = tokio::task::JoinSet::new();
     for endpoint in prepared {
         monitors.spawn(async move { secondary_qmi::hold_endpoint(&endpoint).await });
