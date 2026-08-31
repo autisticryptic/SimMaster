@@ -16,9 +16,7 @@
 //! editing an override does not accumulate permanent objects. The source map
 //! lets the API explain where each effective value came from.
 
-use crate::connectivity::modems::ims::vowifi::{
-    profile_record::parse_dns_server, profiles::CarrierProfile,
-};
+use crate::connectivity::modems::ims::vowifi::profiles::CarrierProfile;
 
 use super::profile_override::{ImsAccessOverride, OverrideSource, SimOverride};
 
@@ -122,28 +120,19 @@ pub fn resolve_effective_vowifi_profile(
     override_: Option<&SimOverride>,
 ) -> EffectiveVowifiProfile {
     let access = override_.map(|o| &o.ims_vowifi);
-    let dns_override = access
-        .and_then(|a| a.dns.as_ref())
-        .filter(|dns| !dns.is_empty());
-    let dns_servers = match dns_override {
-        Some(servers) => servers
-            .iter()
-            .map(|s| EffectiveField::override_(s.clone()))
-            .collect(),
-        None => catalog
-            .epdg
-            .dns_servers
-            .iter()
-            .map(|s| EffectiveField::catalog(*s))
-            .chain(
-                catalog
-                    .epdg
-                    .dns_server
-                    .iter()
-                    .map(|s| EffectiveField::catalog(*s)),
-            )
-            .collect(),
-    };
+    let dns_servers = catalog
+        .epdg
+        .dns_servers
+        .iter()
+        .map(|s| EffectiveField::catalog(*s))
+        .chain(
+            catalog
+                .epdg
+                .dns_server
+                .iter()
+                .map(|s| EffectiveField::catalog(*s)),
+        )
+        .collect();
     let ip_stack = access
         .and_then(|a| a.ip_stack.as_deref())
         .filter(|s| !s.is_empty())
@@ -453,15 +442,6 @@ fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<St
             problems.push(format!("{name}.pcscf_must_not_contain_empty_entry"));
         }
     }
-    if name == "ims_vowifi"
-        && access.dns.as_ref().is_some_and(|servers| {
-            servers
-                .iter()
-                .any(|server| parse_dns_server(server).is_none_or(|address| address.port() == 0))
-        })
-    {
-        problems.push("ims_vowifi.dns_server_invalid".to_string());
-    }
     for (field, value) in [
         ("domain", access.domain.as_deref()),
         ("realm", access.realm.as_deref()),
@@ -593,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn dns_override_replaces_catalog_servers() {
+    fn legacy_line_dns_is_ignored_in_favor_of_profile_servers() {
         let override_ = SimOverride {
             ims_vowifi: ImsAccessOverride {
                 dns: Some(vec!["9.9.9.9".to_string()]),
@@ -602,9 +582,14 @@ mod tests {
             ..Default::default()
         };
         let effective = resolve_effective_vowifi_profile(&GB_EE_23433, Some(&override_));
-        assert_eq!(effective.dns_servers.len(), 1);
-        assert_eq!(effective.dns_servers[0].value, "9.9.9.9");
-        assert_eq!(effective.dns_servers[0].source, OverrideSource::SimOverride);
+        assert!(!effective
+            .dns_servers
+            .iter()
+            .any(|server| server.value == "9.9.9.9"));
+        assert!(effective
+            .dns_servers
+            .iter()
+            .all(|server| server.source == OverrideSource::Catalog));
     }
 
     #[test]

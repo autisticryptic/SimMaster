@@ -1,16 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
-  Alert, Button, Dialog, DialogActions, DialogContent, DialogTitle,
-  FormControl, FormControlLabel, InputLabel, MenuItem, Select, Stack, Switch, TextField,
+  Alert, Box, Button, CircularProgress, Dialog, DialogActions, DialogContent, DialogTitle,
+  FormControl, FormControlLabel, IconButton, InputLabel, MenuItem, Select, Stack, Switch,
+  TextField, Tooltip, Typography,
 } from '@mui/material'
+import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
 import {
   api,
+  type CarrierProfileSummary,
   type LineVowifiConfig,
+  type VolteProfileCandidate,
+  type VolteProfileSource,
   type VowifiLineConfigResponse,
   type VowifiProxyMode,
   type SimImsOverride,
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
+import { loadCarrierProfileSummaries } from './carrierProfileSummaryCache'
 
 interface Props {
   open: boolean
@@ -25,68 +31,19 @@ const proxyHints: Record<VowifiProxyMode, string> = {
   udp_relay: '暂未实现。要自建转发请在远端跑标准 SOCKS5（sing-box / mihomo / gost），再用上面的 SOCKS5 模式',
 }
 
-function isValidIpv4(value: string): boolean {
-  const octets = value.split('.')
-  return octets.length === 4 && octets.every((octet) => {
-    if (!/^(0|[1-9]\d{0,2})$/.test(octet)) return false
-    const number = Number(octet)
-    return number >= 0 && number <= 255
-  })
+const sourceLabels: Record<VolteProfileSource, string> = {
+  database: '用户数据库',
+  carrier_catalog: '下载的只读数据库',
+  derived: '自动派生配置',
 }
 
-function isValidIpv6(value: string): boolean {
-  if (!value.includes(':') || !/^[0-9a-f:.]+$/i.test(value)) return false
-
-  // Rust's IpAddr parser accepts IPv4-embedded IPv6 addresses. Replace the
-  // dotted-quad tail with its two equivalent hextets before counting groups.
-  let normalized = value
-  if (value.includes('.')) {
-    const lastColon = value.lastIndexOf(':')
-    const embeddedIpv4 = value.slice(lastColon + 1)
-    if (!isValidIpv4(embeddedIpv4)) return false
-    normalized = `${value.slice(0, lastColon + 1)}0:0`
-  }
-
-  const compressionCount = (normalized.match(/::/g) ?? []).length
-  if (compressionCount > 1) return false
-  const [left = '', right = ''] = compressionCount === 1
-    ? normalized.split('::')
-    : [normalized, '']
-  const validHextets = (part: string) =>
-    part.length === 0 || part.split(':').every((hextet) => /^[0-9a-f]{1,4}$/i.test(hextet))
-  if (!validHextets(left) || !validHextets(right)) return false
-
-  const groupCount = (part: string) => (part.length === 0 ? 0 : part.split(':').length)
-  const groups = groupCount(left) + groupCount(right)
-  return compressionCount === 1 ? groups < 8 : groups === 8
+function cloneAttempts(attempts: VolteProfileCandidate[]) {
+  return attempts.map((attempt) => ({ ...attempt, profile_id: attempt.profile_id || null }))
 }
 
-function isValidDnsPort(value: string): boolean {
-  if (!/^\d+$/.test(value)) return false
-  const port = Number(value)
-  return port >= 1 && port <= 65535
-}
-
-/** Accept bare IP addresses, IPv4:port, or bracketed IPv6:port. */
-function isValidDnsServer(value: string): boolean {
-  const server = value.trim()
-  if (!server) return false
-
-  if (server.startsWith('[')) {
-    const match = /^\[([^\]]+)\]:(\d+)$/.exec(server)
-    return Boolean(match && isValidIpv6(match[1]) && isValidDnsPort(match[2]))
-  }
-  if (isValidIpv4(server) || isValidIpv6(server)) return true
-
-  const ipv4WithPort = /^([^:]+):(\d+)$/.exec(server)
-  return Boolean(ipv4WithPort && isValidIpv4(ipv4WithPort[1]) && isValidDnsPort(ipv4WithPort[2]))
-}
-
-function parseDnsServers(value: string): string[] {
-  return value
-    .split(/\r?\n/)
-    .map((server) => server.trim())
-    .filter((server) => server.length > 0)
+function profilesForSource(profiles: CarrierProfileSummary[], source: VolteProfileSource) {
+  const origin = source === 'database' ? 'database' : source === 'carrier_catalog' ? 'carrier_catalog' : null
+  return origin ? profiles.filter((profile) => profile.origin === origin && profile.vowifi_ready) : []
 }
 
 
@@ -94,31 +51,31 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
   const [draft, setDraft] = useState<LineVowifiConfig | null>(null)
   const [saving, setSaving] = useState(false)
   const [override, setOverride] = useState<SimImsOverride | null>(null)
-  const [dnsText, setDnsText] = useState('')
+  const [profiles, setProfiles] = useState<CarrierProfileSummary[]>([])
   const [overrideLoading, setOverrideLoading] = useState(false)
+  const [profilesLoading, setProfilesLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
     if (line) setDraft({ ...line.config })
     setOverride(null)
-    setDnsText('')
+    setProfiles([])
     setError(null)
     if (!line || !open) return
     let active = true
     setOverrideLoading(true)
-    void api.getImsOverride(line.line_id)
-      .then((response) => {
-        if (active && response.data) {
-          const nextOverride = response.data.override_
-          setOverride(nextOverride)
-          setDnsText(nextOverride.ims_vowifi.dns?.join('\n') ?? '')
-        }
+    setProfilesLoading(true)
+    void Promise.all([api.getImsOverride(line.line_id), loadCarrierProfileSummaries()])
+      .then(([response, loadedProfiles]) => {
+        if (!active) return
+        if (response.data) setOverride(response.data.override_)
+        setProfiles(loadedProfiles)
       })
-      .catch((err) => {
-        if (active) setError(err instanceof Error ? err.message : String(err))
-      })
+      .catch((err) => active && setError(err instanceof Error ? err.message : String(err)))
       .finally(() => {
-        if (active) setOverrideLoading(false)
+        if (!active) return
+        setOverrideLoading(false)
+        setProfilesLoading(false)
       })
     return () => { active = false }
   }, [line, open])
@@ -129,11 +86,12 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     const customImsi = override?.ims_vowifi.custom_imsi?.trim() ?? ''
     if (override?.ims_vowifi.spoof_imsi && !customImsi) return '启用伪装 IMSI 后必须填写 IMSI'
     if (customImsi && !/^\d{5,16}$/.test(customImsi)) return 'IMSI 必须是 5-16 位数字'
-    const dnsServers = parseDnsServers(dnsText)
-    const invalidDnsIndex = dnsServers.findIndex((server) => !isValidDnsServer(server))
-    if (invalidDnsIndex >= 0) return `自定义 ePDG DNS 格式不正确（第 ${invalidDnsIndex + 1} 行）`
+    if (draft.profile_selection.attempts.length !== 3) return '必须保留恰好三个 Profile 尝试槽位'
+    if (draft.profile_selection.attempts.some((attempt) => attempt.source === 'derived' && attempt.profile_id)) {
+      return '自动派生配置不能指定 Profile ID'
+    }
     return null
-  }, [draft, override, dnsText])
+  }, [draft, override])
 
   const update = <K extends keyof LineVowifiConfig>(key: K, value: LineVowifiConfig[K]) => {
     setDraft((current) => current ? { ...current, [key]: value } : current)
@@ -144,12 +102,11 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     setSaving(true)
     setError(null)
     try {
-      const dnsServers = parseDnsServers(dnsText)
       await api.setImsOverride(line.line_id, {
         ...override,
         ims_vowifi: {
           ...override.ims_vowifi,
-          dns: dnsServers.length > 0 ? dnsServers : null,
+          dns: null,
           custom_imsi: override.ims_vowifi.spoof_imsi
             ? override.ims_vowifi.custom_imsi?.trim() || null
             : null,
@@ -174,15 +131,131 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     } : current)
   }
 
+  const patchAttempt = (index: number, patch: Partial<VolteProfileCandidate>) => {
+    update('profile_selection', {
+      attempts: draft.profile_selection.attempts.map((attempt, offset) => offset === index
+        ? { ...attempt, ...patch }
+        : attempt),
+    })
+  }
+
+  const moveAttempt = (index: number, delta: -1 | 1) => {
+    const target = index + delta
+    if (target < 0 || target >= draft.profile_selection.attempts.length) return
+    const attempts = cloneAttempts(draft.profile_selection.attempts)
+    ;[attempts[index], attempts[target]] = [attempts[target], attempts[index]]
+    update('profile_selection', { attempts })
+  }
+
   return (
-    <Dialog open={open} onClose={saving ? undefined : onClose} fullWidth maxWidth="sm">
+    <Dialog open={open} onClose={saving ? undefined : onClose} fullWidth maxWidth="md">
       <DialogTitle>WiFi Calling 配置 · {shortLineId(line.line_id)}</DialogTitle>
       <DialogContent dividers>
         <Stack spacing={2}>
           <Alert severity="info">
-            这里仅配置<strong>这条线路</strong>的运行方式。运营商 profile、DNS、ePDG 和 IMS 覆写跟随 SIM 卡保存，
-            换卡或移动 SIM 时不会与物理线路配置混用。
+            这里配置<strong>这条线路</strong>的代理出口和 Profile 重试顺序。ePDG、DNS 与 IMS 参数只从运营商
+            Profile 读取；详细内容请在“运营商 IMS Profile”中维护。
           </Alert>
+          <FormControl fullWidth>
+            <InputLabel>代理模式</InputLabel>
+            <Select
+              label="代理模式"
+              value={draft.proxy_mode}
+              onChange={(event) => update('proxy_mode', event.target.value as VowifiProxyMode)}
+            >
+              <MenuItem value="direct">直连</MenuItem>
+              <MenuItem value="socks5_udp_associate">SOCKS5 UDP Associate</MenuItem>
+              <MenuItem value="udp_relay" disabled>UDP Relay（未实现，建议自建 SOCKS5 代替）</MenuItem>
+            </Select>
+          </FormControl>
+          <TextField
+            label="代理端点"
+            value={draft.proxy_endpoint}
+            disabled={draft.proxy_mode === 'direct'}
+            placeholder={proxyHints[draft.proxy_mode]}
+            helperText={proxyHints[draft.proxy_mode]}
+            onChange={(event) => update('proxy_endpoint', event.target.value)}
+          />
+
+          <Box>
+            <Stack direction="row" alignItems="center" justifyContent="space-between" mb={1}>
+              <Box>
+                <Typography variant="subtitle2" fontWeight={700}>Profile 读取与重试顺序</Typography>
+                <Typography variant="caption" color="text.secondary">
+                  每个槽位尝试一次；失败后按顺序切换，三个槽位耗尽后停止自动重连。
+                </Typography>
+              </Box>
+              {profilesLoading && <CircularProgress size={18} />}
+            </Stack>
+            <Stack spacing={1}>
+              {draft.profile_selection.attempts.map((attempt, index) => {
+                const options = profilesForSource(profiles, attempt.source)
+                const explicitProfile = attempt.profile_id
+                  ? options.find((profile) => profile.profile_id === attempt.profile_id)
+                  : null
+                return (
+                  <Box key={`${index}-${attempt.source}`} sx={{ p: 1.25, border: 1, borderColor: 'divider', borderRadius: 1 }}>
+                    <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1} alignItems={{ sm: 'center' }}>
+                      <Stack direction="row" alignItems="center" minWidth={112}>
+                        <Typography variant="body2" fontWeight={700}>第 {index + 1} 次</Typography>
+                        <Tooltip title="上移">
+                          <span>
+                            <IconButton size="small" disabled={index === 0} onClick={() => moveAttempt(index, -1)}>
+                              <ArrowUpward fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                        <Tooltip title="下移">
+                          <span>
+                            <IconButton size="small" disabled={index === draft.profile_selection.attempts.length - 1} onClick={() => moveAttempt(index, 1)}>
+                              <ArrowDownward fontSize="small" />
+                            </IconButton>
+                          </span>
+                        </Tooltip>
+                      </Stack>
+                      <FormControl size="small" sx={{ minWidth: 180 }}>
+                        <InputLabel>Profile 来源</InputLabel>
+                        <Select
+                          value={attempt.source}
+                          label="Profile 来源"
+                          onChange={(event) => patchAttempt(index, {
+                            source: event.target.value as VolteProfileSource,
+                            profile_id: null,
+                          })}
+                        >
+                          {(Object.keys(sourceLabels) as VolteProfileSource[]).map((source) => (
+                            <MenuItem key={source} value={source}>{sourceLabels[source]}</MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                      <FormControl size="small" fullWidth disabled={attempt.source === 'derived' || profilesLoading}>
+                        <InputLabel>自动匹配 / 指定 Profile</InputLabel>
+                        <Select
+                          value={attempt.profile_id ?? ''}
+                          label="自动匹配 / 指定 Profile"
+                          onChange={(event) => patchAttempt(index, { profile_id: event.target.value || null })}
+                        >
+                          <MenuItem value="">按 IMSI / Home PLMN 自动匹配</MenuItem>
+                          {attempt.profile_id && !explicitProfile && (
+                            <MenuItem value={attempt.profile_id} disabled>{attempt.profile_id} · 已不存在或不支持 VoWiFi</MenuItem>
+                          )}
+                          {options.map((profile) => (
+                            <MenuItem key={`${profile.origin}:${profile.profile_id}`} value={profile.profile_id}>
+                              {profile.brand || profile.operator_legal_name || profile.profile_id} · PLMN {profile.plmn}
+                            </MenuItem>
+                          ))}
+                        </Select>
+                      </FormControl>
+                    </Stack>
+                    {attempt.source === 'derived' && (
+                      <Typography variant="caption" color="text.secondary">根据当前 SIM 的 Home PLMN 生成标准 ePDG/IMS 配置。</Typography>
+                    )}
+                  </Box>
+                )
+              })}
+            </Stack>
+          </Box>
+
           <Stack spacing={1}>
             <FormControlLabel
               control={
@@ -207,38 +280,6 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
               onChange={(event) => patchVowifiOverride({ custom_imsi: event.target.value })}
             />
           </Stack>
-          <TextField
-            fullWidth
-            label="自定义 ePDG DNS（地址或地址:端口）"
-            value={dnsText}
-            disabled={overrideLoading || !override}
-            multiline
-            minRows={2}
-            maxRows={6}
-            placeholder={'1.1.1.1\n8.8.8.8:53\n[2001:4860:4860::8888]:5353'}
-            helperText="每行一个 DNS 服务器：IPv4/IPv6 地址，或 IPv4:端口 / [IPv6]:端口；省略端口默认 53，按填写顺序依次尝试。留空则回退到运营商 profile DNS 或系统 DNS；修改后需重新连接 VoWiFi 生效"
-            onChange={(event) => setDnsText(event.target.value)}
-          />
-          <FormControl fullWidth>
-            <InputLabel>代理模式</InputLabel>
-            <Select
-              label="代理模式"
-              value={draft.proxy_mode}
-              onChange={(event) => update('proxy_mode', event.target.value as VowifiProxyMode)}
-            >
-              <MenuItem value="direct">直连</MenuItem>
-              <MenuItem value="socks5_udp_associate">SOCKS5 UDP Associate</MenuItem>
-              <MenuItem value="udp_relay" disabled>UDP Relay（未实现，建议自建 SOCKS5 代替）</MenuItem>
-            </Select>
-          </FormControl>
-          <TextField
-            label="代理端点"
-            value={draft.proxy_endpoint}
-            disabled={draft.proxy_mode === 'direct'}
-            placeholder={proxyHints[draft.proxy_mode]}
-            helperText={proxyHints[draft.proxy_mode]}
-            onChange={(event) => update('proxy_endpoint', event.target.value)}
-          />
           <Alert severity="info">
             每条线路各自持有独立的 VoWiFi 运行时、TUN 网卡与代理出口，多张不同国家的 SIM 可以同时注册，互不影响。
             普通 HTTP CONNECT 无法转发 IKEv2 的 UDP 500/4500，所以只提供直连与 SOCKS5 两种模式。
@@ -249,7 +290,7 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose} disabled={saving}>取消</Button>
-        <Button variant="contained" onClick={() => void save()} disabled={saving || overrideLoading || !override || Boolean(validationError)}>
+        <Button variant="contained" onClick={() => void save()} disabled={saving || overrideLoading || profilesLoading || !override || Boolean(validationError)}>
           {saving ? '保存中...' : '保存配置'}
         </Button>
       </DialogActions>

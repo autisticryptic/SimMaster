@@ -218,11 +218,15 @@ impl VowifiRuntime {
                     identity
                 };
                 let pinned = super::live::line_pinned_profile_id(&self.line_id);
-                let profile = diagnostics::match_profile_for_line(&identity, pinned.as_deref());
+                let profile =
+                    match_profile_for_runtime(&self.line_id, &identity, pinned.as_deref());
                 let previous = self.snapshot().await;
                 let same_profile = same_matched_profile(&previous.profile, &profile);
-                let live_readiness =
-                    previous.live_readiness_for_profile(&identity, pinned.as_deref());
+                let live_readiness = previous.live_readiness_for_profile(
+                    &self.line_id,
+                    &identity,
+                    pinned.as_deref(),
+                );
                 RuntimeSnapshot {
                     phase: if profile.matched {
                         RuntimePhase::ProfileMatched
@@ -634,6 +638,23 @@ fn same_matched_profile(
     previous_profile_id.is_some() && previous_profile_id == current_profile_id
 }
 
+fn match_profile_for_runtime(
+    line_id: &str,
+    identity: &VowifiSimIdentity,
+    pinned_profile_id: Option<&str>,
+) -> VowifiProfileMatchResponse {
+    if let Some(selected) = super::live::live_profile_selection(line_id) {
+        diagnostics::match_selected_profile_for_line(
+            identity,
+            selected.profile,
+            &selected.source,
+            selected.fallback_reason,
+        )
+    } else {
+        diagnostics::match_profile_for_line(identity, pinned_profile_id)
+    }
+}
+
 fn reset_identity_preserving_runtime(previous: RuntimeSnapshot) -> RuntimeSnapshot {
     if previous.profile.matched {
         return previous;
@@ -652,6 +673,7 @@ fn reset_identity_preserving_runtime(previous: RuntimeSnapshot) -> RuntimeSnapsh
 impl RuntimeSnapshot {
     fn live_readiness_for_profile(
         &self,
+        line_id: &str,
         identity: &VowifiSimIdentity,
         pinned_profile_id: Option<&str>,
     ) -> RuntimeLiveReadiness {
@@ -664,7 +686,7 @@ impl RuntimeSnapshot {
             .profile
             .as_ref()
             .map(|profile| profile.profile_id);
-        let current_profile = diagnostics::match_profile_for_line(identity, pinned_profile_id);
+        let current_profile = match_profile_for_runtime(line_id, identity, pinned_profile_id);
         let current_profile_id = current_profile
             .profile
             .as_ref()

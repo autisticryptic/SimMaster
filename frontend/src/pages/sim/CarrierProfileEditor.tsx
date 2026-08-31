@@ -49,23 +49,32 @@ function ListField({
   placeholder?: string
   onChange: (next: string[]) => void
 }) {
+  const externalText = value.join('\n')
+  const [editor, setEditor] = useState(() => ({ externalText, text: externalText }))
+  let text = editor.text
+  if (editor.externalText !== externalText) {
+    text = externalText
+    setEditor({ externalText, text: externalText })
+  }
+
   return (
     <TextField
       label={label}
-      value={value.join('\n')}
+      value={text}
       multiline
       minRows={2}
       maxRows={10}
       placeholder={placeholder}
       helperText={helperText ? `${helperText}（每行一条）` : '每行一条'}
-      onChange={(event) =>
-        onChange(
-          event.target.value
-            .split('\n')
-            .map((line) => line.trim())
-            .filter((line) => line.length > 0),
-        )
-      }
+      onChange={(event) => {
+        const nextText = event.target.value
+        const nextValue = nextText
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+        setEditor({ externalText: nextValue.join('\n'), text: nextText })
+        onChange(nextValue)
+      }}
     />
   )
 }

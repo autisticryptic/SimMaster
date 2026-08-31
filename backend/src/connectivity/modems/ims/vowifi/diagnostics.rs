@@ -1123,12 +1123,27 @@ fn matched_response(
     sim: MaskedSimIdentity,
 ) -> VowifiProfileMatchResponse {
     let derived = profiles::is_standard_derived_profile(profile);
+    matched_response_with_source(
+        profile,
+        matched_prefix,
+        sim,
+        if derived { "derived" } else { "database" },
+        derived.then(|| "carrier_database_no_usable_profile:access:wifi_epdg".to_string()),
+    )
+}
+
+fn matched_response_with_source(
+    profile: &'static profiles::CarrierProfile,
+    matched_prefix: String,
+    sim: MaskedSimIdentity,
+    source: &str,
+    fallback_reason: Option<String>,
+) -> VowifiProfileMatchResponse {
     VowifiProfileMatchResponse {
         matched: true,
         matched_prefix: Some(matched_prefix),
-        profile_source: Some(if derived { "derived" } else { "database" }.to_string()),
-        profile_fallback_reason: derived
-            .then(|| "carrier_database_no_usable_profile:access:wifi_epdg".to_string()),
+        profile_source: Some(source.to_string()),
+        profile_fallback_reason: fallback_reason,
         profile: Some(PublicCarrierProfile::from_profile(profile)),
         sim_auth: Some(PublicAkaAdapterPlan::from_profile(profile)),
         epdg: Some(PublicEpdgPlan::from_profile(profile)),
@@ -1137,6 +1152,21 @@ fn matched_response(
         ims: Some(PublicImsPlan::from_profile(profile)),
         sim,
     }
+}
+
+pub fn match_selected_profile_for_line(
+    identity: &VowifiSimIdentity,
+    profile: &'static CarrierProfile,
+    source: &str,
+    fallback_reason: Option<String>,
+) -> VowifiProfileMatchResponse {
+    matched_response_with_source(
+        profile,
+        profile.meta.plmn.to_string(),
+        identity.masked(),
+        source,
+        fallback_reason,
+    )
 }
 
 fn match_profile_from_parts(

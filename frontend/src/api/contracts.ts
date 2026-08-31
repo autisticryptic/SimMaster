@@ -1056,6 +1056,7 @@ export interface LineVowifiConfig {
   enabled: boolean
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
+  profile_selection: VolteProfileSelectionConfig
   auto_restore: AutoRestoreConfig
 }
 
@@ -1108,7 +1109,7 @@ export interface VowifiLineConfigResponse {
   runtime_restore_in_progress: boolean
   runtime_error?: string | null
   matched_profile_id?: string | null
-  matched_profile_source?: 'database' | 'derived' | null
+  matched_profile_source?: VolteProfileSource | null
   matched_profile_fallback_reason?: string | null
 }
 

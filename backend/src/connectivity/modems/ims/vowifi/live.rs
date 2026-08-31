@@ -182,6 +182,8 @@ static LIVE_IMS_REFRESH_FAILURE: OnceLock<Mutex<HashMap<String, LiveImsRefreshFa
 /// override would make configuring line A silently change line B.
 static LIVE_NETWORK_OVERRIDES: OnceLock<StdRwLock<HashMap<String, LiveNetworkOverrides>>> =
     OnceLock::new();
+static LIVE_PROFILE_SELECTIONS: OnceLock<StdRwLock<HashMap<String, LiveSelectedProfile>>> =
+    OnceLock::new();
 static LIVE_UICC_EPDG_CONFIG: OnceLock<StdRwLock<HashMap<String, CachedLiveUiccEpdgConfig>>> =
     OnceLock::new();
 
@@ -209,7 +211,6 @@ struct LiveNetworkOverrides {
     /// resolves the profile automatically from the SIM's IMSI. A pinned id is
     /// strict and must never be replaced by a standard-derived fallback.
     profile_id: Option<String>,
-    dns_servers: Vec<SocketAddr>,
     epdg_host: Option<String>,
     epdg_port: Option<u16>,
     epdg_apn: Option<String>,
@@ -226,6 +227,13 @@ struct LiveNetworkOverrides {
     proxy: Option<LiveProxySetting>,
 }
 
+#[derive(Clone)]
+pub(crate) struct LiveSelectedProfile {
+    pub profile: &'static CarrierProfile,
+    pub source: String,
+    pub fallback_reason: Option<String>,
+}
+
 /// A validated egress proxy for one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LiveProxySetting {
@@ -234,6 +242,32 @@ enum LiveProxySetting {
 
 fn network_overrides_map() -> &'static StdRwLock<HashMap<String, LiveNetworkOverrides>> {
     LIVE_NETWORK_OVERRIDES.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+fn profile_selections_map() -> &'static StdRwLock<HashMap<String, LiveSelectedProfile>> {
+    LIVE_PROFILE_SELECTIONS.get_or_init(|| StdRwLock::new(HashMap::new()))
+}
+
+pub(crate) fn configure_live_profile_selection(
+    line_id: &str,
+    selected: LiveSelectedProfile,
+) -> Result<(), String> {
+    if line_id.trim().is_empty() {
+        return Err("line_id_required".to_string());
+    }
+    profile_selections_map()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(line_id.to_string(), selected);
+    Ok(())
+}
+
+pub(crate) fn live_profile_selection(line_id: &str) -> Option<LiveSelectedProfile> {
+    profile_selections_map()
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(line_id)
+        .cloned()
 }
 
 /// Validate a prospective connection snapshot without publishing it.
@@ -282,6 +316,10 @@ pub fn forget_live_network_overrides(line_id: &str) {
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(line_id);
+    profile_selections_map()
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(line_id);
 }
 
 fn build_live_network_overrides(
@@ -303,17 +341,7 @@ fn build_live_network_overrides(
         }
     };
     let access = sim_override.map(|override_| &override_.ims_vowifi);
-    let dns_servers = access
-        .and_then(|access| access.dns.as_ref())
-        .into_iter()
-        .flatten()
-        .map(|server| {
-            super::profile_record::parse_dns_server(server)
-                .ok_or_else(|| "vowifi_dns_server_invalid".to_string())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     Ok(LiveNetworkOverrides {
-        dns_servers,
         proxy,
         profile_id: access
             .and_then(|access| access.profile_id.as_ref())
@@ -455,6 +483,12 @@ pub fn resolve_profile_for_line(
 ) -> Option<profiles::CarrierMatch> {
     if line_id.trim().is_empty() {
         return None;
+    }
+    if let Some(selected) = live_profile_selection(line_id) {
+        return Some(profiles::CarrierMatch {
+            profile: selected.profile,
+            matched_prefix: selected.profile.meta.plmn.to_string(),
+        });
     }
     let pinned = line_pinned_profile_id(line_id);
     let effective_imsi = effective_imsi_for_line(line_id, imsi);
@@ -885,16 +919,11 @@ fn build_live_epdg_candidates_with_naptr(
     candidates
 }
 
-/// DNS servers to try, in order: this line's override first, then the carrier
-/// profile's list. Resolving the ePDG FQDN is a hard prerequisite for
-/// connecting at all, so a single unreachable resolver must not be fatal.
-fn live_dns_candidates(line_id: &str, profile: &'static CarrierProfile) -> Vec<SocketAddr> {
+/// DNS servers come only from the selected carrier profile. Per-line DNS was
+/// removed because it silently overrode the profile editor's value and made
+/// the same operator configuration resolve differently between access paths.
+fn live_dns_candidates(_line_id: &str, profile: &'static CarrierProfile) -> Vec<SocketAddr> {
     let mut candidates = Vec::new();
-    for server in line_overrides(line_id).dns_servers {
-        if !candidates.contains(&server) {
-            candidates.push(server);
-        }
-    }
     for server in profile.epdg.dns_servers {
         if let Some(addr) = super::profile_record::parse_dns_server(server) {
             if !candidates.contains(&addr) {
@@ -9677,18 +9706,15 @@ mod tests {
         };
 
         configure_live_network_overrides(line_id, &config, Some(&sim_override))
-            .expect("publish DNS override");
+            .expect("publish line overrides");
         let attempts = live_dns_attempts(line_id, &GB_EE_23433);
-        assert_eq!(
-            attempts.first(),
-            Some(&Some("192.0.2.1:53".parse().unwrap()))
-        );
+        assert!(!attempts.contains(&Some("192.0.2.1:53".parse().unwrap())));
         assert_eq!(attempts.last(), Some(&None));
         forget_live_network_overrides(line_id);
     }
 
     #[test]
-    fn line_network_overrides_apply_custom_dns_and_profile_pin() {
+    fn line_network_overrides_ignore_legacy_dns_and_apply_other_fields() {
         let config = LineVowifiConfig::default();
         let sim_override = SimOverride {
             ims_vowifi: crate::connectivity::modems::ims::profile_override::ImsAccessOverride {
@@ -9711,10 +9737,6 @@ mod tests {
             .expect("valid network overrides");
 
         assert_eq!(overrides.profile_id.as_deref(), Some("gb_ee_23433"));
-        assert_eq!(
-            overrides.dns_servers,
-            vec!["[2001:4860:4860::8888]:5353".parse::<SocketAddr>().unwrap()]
-        );
         assert_eq!(overrides.ims_domain.as_deref(), Some("ims.example"));
 
         let line_id = "line-effective-vowifi-snapshot";
@@ -9725,7 +9747,9 @@ mod tests {
             (
                 "epdg.example".to_string(),
                 4500,
-                Some("2001:4860:4860::8888".parse::<IpAddr>().unwrap())
+                live_dns_candidates(line_id, &GB_EE_23433)
+                    .first()
+                    .map(SocketAddr::ip)
             )
         );
         assert_eq!(
@@ -9831,7 +9855,7 @@ mod tests {
     #[test]
     fn per_line_overrides_do_not_leak_between_lines() {
         // The whole point of keying overrides by line: two SIMs on different
-        // operators, each with its own proxy and DNS, must stay independent.
+        // operators, each with its own proxy and profile pin, must stay independent.
         let japan = LineVowifiConfig {
             enabled: true,
             proxy_mode: VowifiProxyMode::Socks5UdpAssociate,
@@ -9870,20 +9894,6 @@ mod tests {
         let my = line_overrides("line-my");
         assert_eq!(jp.profile_id.as_deref(), Some("jp_carrier"));
         assert_eq!(my.profile_id.as_deref(), Some("my_carrier"));
-        assert_eq!(
-            jp.dns_servers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec!["1.1.1.1:53"]
-        );
-        assert_eq!(
-            my.dns_servers
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            vec!["8.8.8.8:53"]
-        );
         // Only the Japanese line is proxied.
         assert!(jp.proxy.is_some());
         assert!(my.proxy.is_none());

@@ -47,6 +47,10 @@ import {
 } from '../../api/current'
 import CarrierProfileEditor from './CarrierProfileEditor'
 import GithubDownloadProxyControl from '../../components/GithubDownloadProxyControl'
+import {
+  invalidateCarrierProfileSummaryCache,
+  loadCarrierProfileSummaries,
+} from './carrierProfileSummaryCache'
 
 const originLabels: Record<ProfileOrigin, string> = {
   carrier_catalog: '运营商数据库',
@@ -97,15 +101,15 @@ export default function CarrierProfilesPanel() {
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceProfiles = false) => {
     setLoading(true)
     setError(null)
     try {
       const [profileResponse, statusResponse] = await Promise.all([
-        api.listVowifiCarrierProfiles(),
+        loadCarrierProfileSummaries(forceProfiles),
         api.getCarrierCatalogStatus(),
       ])
-      const loadedProfiles = profileResponse.data ?? []
+      const loadedProfiles = profileResponse
       setAllProfiles(loadedProfiles)
       setProfiles(loadedProfiles)
       setCatalogStatus(statusResponse.data ?? null)
@@ -173,7 +177,8 @@ export default function CarrierProfilesPanel() {
         ? `已覆盖并启用 ${installed.release_id}：VoLTE ${installed.volte_profiles} 条，VoWiFi ${installed.vowifi_profiles} 条`
         : '运营商数据库安装完成')
       setCatalogDialogOpen(false)
-      await load()
+      invalidateCarrierProfileSummaryCache()
+      await load(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -256,7 +261,8 @@ export default function CarrierProfilesPanel() {
       await api.deleteVowifiCarrierProfile(deleteTarget.profile_id)
       setSuccess(`已删除自定义 Profile：${deleteTarget.brand || deleteTarget.profile_id}`)
       setDeleteTarget(null)
-      await load()
+      invalidateCarrierProfileSummaryCache()
+      await load(true)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -279,7 +285,7 @@ export default function CarrierProfilesPanel() {
             >
               数据库下载
             </Button>
-            <Button size="small" startIcon={<Refresh />} onClick={() => void load()} disabled={loading}>
+            <Button size="small" startIcon={<Refresh />} onClick={() => void load(true)} disabled={loading}>
               刷新
             </Button>
           </Stack>
@@ -583,7 +589,8 @@ export default function CarrierProfilesPanel() {
         onClose={() => setEditorOpen(false)}
         onSaved={() => {
           setSuccess('自定义 Profile 已保存到 data.db，并已应用到运行时解析')
-          void load()
+          invalidateCarrierProfileSummaryCache()
+          void load(true)
         }}
       />
     </Card>

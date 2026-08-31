@@ -2730,6 +2730,28 @@ mod tests {
     }
 
     #[test]
+    fn legacy_vowifi_config_gets_default_profile_attempt_order() {
+        let config: LineVowifiConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(
+            config.profile_selection,
+            VolteProfileSelectionConfig::default()
+        );
+        assert_eq!(
+            config
+                .profile_selection
+                .attempts
+                .iter()
+                .map(|candidate| candidate.source)
+                .collect::<Vec<_>>(),
+            vec![
+                VolteProfileSource::Database,
+                VolteProfileSource::CarrierCatalog,
+                VolteProfileSource::Derived,
+            ]
+        );
+    }
+
+    #[test]
     fn volte_profile_selection_preserves_order_and_duplicate_sources_and_validates_slots() {
         let mut repeated_sources = VolteProfileSelectionConfig {
             attempts: vec![
@@ -4394,9 +4416,9 @@ pub enum VowifiProxyMode {
     UdpRelay,
 }
 
-/// Per-line WiFi Calling runtime intent. SIM-bound carrier selection, DNS,
-/// ePDG and IMS values live exclusively in `SimOverrideStore`; only the host
-/// egress proxy remains attached to the physical line.
+/// Per-line WiFi Calling runtime intent. The physical line owns the egress
+/// proxy and ordered profile attempts; DNS, ePDG and IMS values come from the
+/// selected carrier profile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LineVowifiConfig {
     #[serde(default)]
@@ -4405,6 +4427,9 @@ pub struct LineVowifiConfig {
     pub proxy_mode: VowifiProxyMode,
     #[serde(default)]
     pub proxy_endpoint: String,
+    /// Ordered carrier-profile attempts for this physical line's WLAN IMS leg.
+    #[serde(default)]
+    pub profile_selection: VolteProfileSelectionConfig,
     #[serde(default)]
     pub auto_restore: AutoRestoreConfig,
 }
@@ -4415,6 +4440,7 @@ impl Default for LineVowifiConfig {
             enabled: false,
             proxy_mode: VowifiProxyMode::Direct,
             proxy_endpoint: String::new(),
+            profile_selection: VolteProfileSelectionConfig::default(),
             auto_restore: AutoRestoreConfig::default(),
         }
     }
@@ -4712,6 +4738,7 @@ fn validate_line_data_proxy_config(config: &mut LineDataProxyConfig) -> Result<(
 }
 
 fn validate_line_vowifi_config(config: &mut LineVowifiConfig) -> Result<(), String> {
+    config.profile_selection.validate()?;
     config.proxy_endpoint = config.proxy_endpoint.trim().to_string();
     match config.proxy_mode {
         VowifiProxyMode::Direct => config.proxy_endpoint.clear(),

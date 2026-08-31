@@ -249,6 +249,66 @@ impl ProfileStore {
         }
     }
 
+    /// Validate one explicit Wi-Fi/ePDG profile reference without crossing
+    /// source boundaries or silently accepting a profile that has no VoWiFi
+    /// projection.
+    pub fn vowifi_reference_state(
+        &self,
+        source: VolteProfileSource,
+        profile_id: &str,
+    ) -> Result<VolteProfileReferenceState, String> {
+        let profile_id = profile_id.trim();
+        if profile_id.is_empty() {
+            return Ok(VolteProfileReferenceState::Missing);
+        }
+        match source {
+            VolteProfileSource::Database => {
+                let records = self.custom_records()?;
+                if let Some((_, record)) = records
+                    .valid
+                    .iter()
+                    .find(|(_, record)| record.meta.profile_id == profile_id)
+                {
+                    return Ok(if record.voice.vowifi_enabled {
+                        VolteProfileReferenceState::Ready
+                    } else {
+                        VolteProfileReferenceState::NotLteReady
+                    });
+                }
+                if records
+                    .invalid
+                    .iter()
+                    .any(|invalid| invalid.entry.profile_id == profile_id)
+                {
+                    return Ok(VolteProfileReferenceState::NotLteReady);
+                }
+                Ok(VolteProfileReferenceState::Missing)
+            }
+            VolteProfileSource::CarrierCatalog => {
+                let capabilities = self.catalog.service_capabilities()?;
+                let Some(capability) = capabilities.get(profile_id) else {
+                    return Ok(VolteProfileReferenceState::Missing);
+                };
+                if !capability.vowifi_ready {
+                    return Ok(VolteProfileReferenceState::NotLteReady);
+                }
+                match self.catalog.get(profile_id, CatalogAccessKind::WifiEpdg) {
+                    Ok(Some(_)) => Ok(VolteProfileReferenceState::Ready),
+                    Ok(None) => Ok(VolteProfileReferenceState::Missing),
+                    Err(error) => {
+                        tracing::warn!(
+                            profile_id,
+                            error = %error,
+                            "Catalog marks a profile VoWiFi-ready but its Wi-Fi projection is unusable"
+                        );
+                        Ok(VolteProfileReferenceState::NotLteReady)
+                    }
+                }
+            }
+            VolteProfileSource::Derived => Ok(VolteProfileReferenceState::Missing),
+        }
+    }
+
     /// List the profiles the catalog makes available for VoWiFi.
     pub fn list(&self) -> Result<Vec<StoredProfile>, String> {
         let mut merged = BTreeMap::new();
@@ -855,6 +915,183 @@ impl ProfileStore {
         ))
     }
 
+    /// Resolve one source-constrained VoWiFi candidate. Each logical slot is
+    /// independent: an unavailable database/catalog source falls back to the
+    /// standard Wi-Fi/ePDG profile for that slot, matching the VoLTE recovery
+    /// contract without crossing into the other stored source.
+    pub fn resolve_vowifi_candidate(
+        &self,
+        candidate: &VolteProfileCandidate,
+        imsi: &str,
+        home_plmn: Option<&str>,
+    ) -> Result<Option<ResolvedProfile>, String> {
+        let digits = imsi.trim();
+        let explicit_home_plmn = normalized_home_plmn(digits, home_plmn);
+        let inferred_home_plmn = explicit_home_plmn
+            .clone()
+            .or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
+        let source = candidate.source;
+        let explicit_profile_id = candidate
+            .profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile_id| !profile_id.is_empty());
+
+        let requested = match source {
+            VolteProfileSource::Database => {
+                let records = match self.custom_records() {
+                    Ok(records) => records,
+                    Err(error) => {
+                        return Ok(derive_standard_fallback(
+                            digits,
+                            inferred_home_plmn.as_deref(),
+                            CatalogAccessKind::WifiEpdg,
+                            format!("vowifi_profile_database_lookup_failed:{error}"),
+                        ));
+                    }
+                };
+                if let Some(profile_id) = explicit_profile_id {
+                    if let Some((_, record)) = records.valid.iter().find(|(_, record)| {
+                        record.meta.profile_id == profile_id && record.voice.vowifi_enabled
+                    }) {
+                        return Ok(Some(ResolvedProfile {
+                            profile: record.clone().intern(),
+                            origin: ProfileOrigin::Database,
+                            fallback_reason: None,
+                        }));
+                    }
+                    let reason = records
+                        .invalid
+                        .iter()
+                        .find(|invalid| invalid.entry.profile_id == profile_id)
+                        .map(|invalid| invalid.error.clone())
+                        .unwrap_or_else(|| {
+                            format!("vowifi_profile_database_profile_not_ready:{profile_id}")
+                        });
+                    return Ok(derive_standard_fallback(
+                        digits,
+                        inferred_home_plmn.as_deref(),
+                        CatalogAccessKind::WifiEpdg,
+                        reason,
+                    ));
+                }
+                let mut matches = records
+                    .valid
+                    .into_iter()
+                    .filter(|(_, record)| {
+                        record.voice.vowifi_enabled
+                            && explicit_home_plmn.as_deref().map_or_else(
+                                || digits.starts_with(&record.meta.plmn),
+                                |plmn| record.meta.plmn == plmn,
+                            )
+                    })
+                    .collect::<Vec<_>>();
+                matches.sort_by(|left, right| {
+                    right
+                        .1
+                        .meta
+                        .plmn
+                        .len()
+                        .cmp(&left.1.meta.plmn.len())
+                        .then(left.1.meta.profile_id.cmp(&right.1.meta.profile_id))
+                });
+                matches
+                    .into_iter()
+                    .next()
+                    .map(|(_, record)| ResolvedProfile {
+                        profile: record.intern(),
+                        origin: ProfileOrigin::Database,
+                        fallback_reason: None,
+                    })
+            }
+            VolteProfileSource::CarrierCatalog => {
+                if let Some(profile_id) = explicit_profile_id {
+                    match self.catalog.get(profile_id, CatalogAccessKind::WifiEpdg) {
+                        Ok(Some(profile)) => {
+                            return Ok(Some(ResolvedProfile {
+                                profile: profile.record.intern(),
+                                origin: ProfileOrigin::Catalog,
+                                fallback_reason: None,
+                            }));
+                        }
+                        Ok(None) => {
+                            return Ok(derive_standard_fallback(
+                                digits,
+                                inferred_home_plmn.as_deref(),
+                                CatalogAccessKind::WifiEpdg,
+                                format!(
+                                    "vowifi_profile_carrier_catalog_profile_not_found:{profile_id}"
+                                ),
+                            ));
+                        }
+                        Err(error) => {
+                            return Ok(derive_standard_fallback(
+                                digits,
+                                inferred_home_plmn.as_deref(),
+                                CatalogAccessKind::WifiEpdg,
+                                format!(
+                                    "vowifi_profile_carrier_catalog_profile_lookup_failed:{profile_id}:{error}"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                match self.catalog.imsi_has_ambiguous_plmn(digits) {
+                    Ok(true) if inferred_home_plmn.is_none() => None,
+                    Ok(_) => match self.catalog.resolve_for_imsi(
+                        digits,
+                        inferred_home_plmn.as_deref(),
+                        CatalogAccessKind::WifiEpdg,
+                    ) {
+                        Ok(profile) => profile.map(|profile| ResolvedProfile {
+                            profile: profile.record.intern(),
+                            origin: ProfileOrigin::Catalog,
+                            fallback_reason: None,
+                        }),
+                        Err(error) => {
+                            return Ok(derive_standard_fallback(
+                                digits,
+                                inferred_home_plmn.as_deref(),
+                                CatalogAccessKind::WifiEpdg,
+                                error,
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        return Ok(derive_standard_fallback(
+                            digits,
+                            inferred_home_plmn.as_deref(),
+                            CatalogAccessKind::WifiEpdg,
+                            error,
+                        ));
+                    }
+                }
+            }
+            VolteProfileSource::Derived => {
+                return Ok(derive_standard_fallback(
+                    digits,
+                    inferred_home_plmn.as_deref(),
+                    CatalogAccessKind::WifiEpdg,
+                    "vowifi_profile_derived_requested".to_string(),
+                )
+                .map(|mut resolved| {
+                    resolved.fallback_reason = None;
+                    resolved
+                }));
+            }
+        };
+
+        if let Some(resolved) = requested {
+            return Ok(Some(resolved));
+        }
+        Ok(derive_standard_fallback(
+            digits,
+            inferred_home_plmn.as_deref(),
+            CatalogAccessKind::WifiEpdg,
+            format!("vowifi_profile_source_unavailable:{}", source.as_str()),
+        ))
+    }
+
     /// Resolve a profile for one registration access. A pinned profile id is
     /// looked up directly in the catalog; otherwise the catalog access row
     /// (`wifi_epdg` or `lte_epc`) is loaded for this attempt.
@@ -1392,6 +1629,47 @@ mod tests {
             .expect("private database candidate lookup")
             .expect("private database profile");
         assert_eq!(resolved.origin, ProfileOrigin::Database);
+    }
+
+    #[test]
+    fn explicit_database_vowifi_profile_is_source_bound() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+        store
+            .upsert(explicit_private_record("private-wifi-99999"))
+            .expect("save explicit private database profile");
+
+        assert_eq!(
+            store
+                .vowifi_reference_state(VolteProfileSource::Database, "private-wifi-99999")
+                .expect("database reference state"),
+            VolteProfileReferenceState::Ready
+        );
+        assert_eq!(
+            store
+                .vowifi_reference_state(VolteProfileSource::CarrierCatalog, "private-wifi-99999")
+                .expect("catalog reference state"),
+            VolteProfileReferenceState::Missing
+        );
+
+        let resolved = store
+            .resolve_vowifi_candidate(
+                &VolteProfileCandidate {
+                    source: VolteProfileSource::Database,
+                    profile_id: Some("private-wifi-99999".to_string()),
+                },
+                "999990123456789",
+                Some("99999"),
+            )
+            .expect("private database VoWiFi candidate lookup")
+            .expect("private database VoWiFi profile");
+        assert_eq!(resolved.origin, ProfileOrigin::Database);
+        assert_eq!(resolved.profile.meta.profile_id, "private-wifi-99999");
     }
 
     #[test]

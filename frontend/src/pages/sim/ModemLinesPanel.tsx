@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   Alert,
   Box,
@@ -41,7 +41,7 @@ import { standardDerivedProfileMessage, volteErrorMessage, volteErrorStatusLabel
 import { formatBytes } from '../Dashboard/utils'
 
 const volteStageStatusLabels: Record<string, string> = {
-  disabled: 'IMS 未连接',
+  disabled: 'IMS 未启用',
   starting: '正在准备 IMS 连接',
   identity: '正在读取 SIM 身份',
   carrier_profile: '正在匹配运营商 Profile',
@@ -68,7 +68,7 @@ const volteStageStatusLabels: Record<string, string> = {
 
 function imsConnectionSummary(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
-  if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
+  if (!line.profile.volte_connection_enabled) return 'IMS 未启用'
   const errorStatus = volteErrorStatusLabel(line.runtime.last_error)
   if (errorStatus) return errorStatus
   const label = volteStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
@@ -191,7 +191,7 @@ const vowifiStageLabels: Record<string, string> = {
 }
 
 function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
-  if (!line?.config.enabled) return 'VoWiFi未启用'
+  if (!line?.config.enabled) return '未启用'
   if (line.runtime_registered) return 'VoWiFi IMS 已注册'
   if (line.runtime_error === 'vowifi_auto_restore_exhausted') return 'VoWiFi连接失败'
   const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage
@@ -202,6 +202,7 @@ function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
 
 function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
   if (!line) return '等待匹配运营商 profile'
+  if (!line.config.enabled) return 'VoWiFi 当前未启用'
   if (line.runtime_restore_in_progress) return '后台正在执行自动重连'
   const restoreExhausted = line.runtime_error === 'vowifi_auto_restore_exhausted'
   if (line.matched_profile_source === 'derived') {
@@ -280,8 +281,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [lineSearch, setLineSearch] = useState('')
   const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>('overview')
   const [basebandRestartLine, setBasebandRestartLine] = useState<string | null>(null)
+  const loadVersion = useRef(0)
 
   const load = useCallback(async (background = false) => {
+    const requestVersion = ++loadVersion.current
+    const isCurrent = () => requestVersion === loadVersion.current
     if (!background) {
       setLoading(true)
       setSupplementalStatus(INITIAL_SUPPLEMENTAL_STATUS)
@@ -289,11 +293,13 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     }
 
     const updateSupplementalStatus = (section: SupplementalSection, status: LoadStatus) => {
+      if (!isCurrent()) return
       setSupplementalStatus((current) => ({ ...current, [section]: status }))
     }
 
     const trunkRequest = api.getTrunkLines()
       .then((response) => {
+        if (!isCurrent()) return
         setTrunkLines(stableModemSort(response.data ?? []))
         updateSupplementalStatus('trunk', 'ready')
       })
@@ -303,6 +309,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       })
     const vowifiRequest = api.getVowifiLines()
       .then((response) => {
+        if (!isCurrent()) return
         setVowifiLines(stableModemSort(response.data ?? []))
         updateSupplementalStatus('vowifi', 'ready')
       })
@@ -312,6 +319,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       })
     const networkRequest = api.getLineNetworkControls()
       .then((response) => {
+        if (!isCurrent()) return
         setNetworkControls(response.data ?? [])
         updateSupplementalStatus('network', 'ready')
       })
@@ -323,16 +331,16 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     let lineFailed = false
     try {
       const lineResponse = await api.getVolteLines()
-      setLines(stableModemSort(lineResponse.data ?? []))
+      if (isCurrent()) setLines(stableModemSort(lineResponse.data ?? []))
     } catch (err) {
       lineFailed = true
-      if (!background) setError(err instanceof Error ? err.message : String(err))
+      if (!background && isCurrent()) setError(err instanceof Error ? err.message : String(err))
     } finally {
-      if (!background) setLoading(false)
+      if (!background && isCurrent()) setLoading(false)
     }
 
     const supplementalResults = await Promise.allSettled([trunkRequest, vowifiRequest, networkRequest])
-    if (!background && !lineFailed) {
+    if (!background && !lineFailed && isCurrent()) {
       const failedSections = supplementalResults
         .map((result, index) => result.status === 'rejected' ? ['Trunk', 'VoWiFi', '网络控制'][index] : null)
         .filter((name): name is string => name !== null)
@@ -536,11 +544,13 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleLine = async (lineId: string, enabled: boolean) => {
+    loadVersion.current += 1
     setSavingKey(`volte:${lineId}`)
     setError(null)
     setSuccess(null)
     try {
       const response = await api.setVolteLineConnection(lineId, enabled)
+      loadVersion.current += 1
       if (response.data) {
         const updatedLine = response.data
         setLines((current) => current.map((line) => (
@@ -559,11 +569,13 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   }
 
   const toggleVowifi = async (lineId: string, enabled: boolean) => {
+    loadVersion.current += 1
     setSavingKey(`vowifi:${lineId}`)
     setError(null)
     setSuccess(null)
     try {
       const response = await api.setVowifiLineConnection(lineId, enabled)
+      loadVersion.current += 1
       if (response.data) {
         const updatedLine = response.data
         setVowifiLines((current) => current.map((line) => line.line_id === lineId ? updatedLine : line))
@@ -1005,7 +1017,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
-                        <Chip size="small" label={imsConnectionSummary(line)} color={line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : line.profile.volte_connection_enabled ? 'warning' : 'default'} variant="outlined" />
+                        <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.volte_connection_enabled ? 'default' : line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : 'warning'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"
@@ -1056,7 +1068,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         </Typography>
                       </Box>
                       <Box display="flex" alignItems="center" gap={0.5}>
-                        <Chip size="small" label={vowifiLoadLabel || vowifiRuntimeLabel(vowifiLine)} color={vowifiLine?.runtime_registered ? 'success' : vowifiLine?.runtime_error || supplementalStatus.vowifi === 'error' ? 'error' : vowifiLine?.config.enabled ? 'warning' : 'default'} variant="outlined" />
+                        <Chip size="small" label={vowifiLoadLabel || vowifiRuntimeLabel(vowifiLine)} color={!vowifiLine?.config.enabled ? 'default' : vowifiLine.runtime_registered ? 'success' : vowifiLine.runtime_error || supplementalStatus.vowifi === 'error' ? 'error' : 'warning'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"

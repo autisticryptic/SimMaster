@@ -32,7 +32,7 @@ use crate::{
             live_ims_refresh_rebuild_pending_for_line, live_xcap_access_for_line,
             mark_live_ims_refresh_rebuild_pending, record_live_ims_refresh_failure,
             send_live_sms_over_ims_for_line, verify_live_sim_auth_access_for_line,
-            LiveImsRefreshFailureDecision, LIVE_IMS_REFRESH_REBUILD_FAILURES,
+            LiveImsRefreshFailureDecision, LiveSelectedProfile, LIVE_IMS_REFRESH_REBUILD_FAILURES,
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
@@ -86,8 +86,6 @@ const VOWIFI_LIVE_STAGE_TIMEOUT_SECS: u64 = 90;
 const VOWIFI_MANUAL_CONNECT_ATTEMPTS: u8 = 3;
 const VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS: u64 = 1;
 const VOWIFI_PROFILE_SWITCH_RESTORE_INITIAL_DELAY_SECS: u64 = 1;
-const VOWIFI_PROFILE_SWITCH_RESTORE_ATTEMPTS: u8 = 3;
-const VOWIFI_PROFILE_SWITCH_RESTORE_RETRY_DELAY_SECS: u64 = 3;
 const VOWIFI_RESTORE_IDENTITY_GATE_ATTEMPTS: u8 = 5;
 const VOLTE_MODEM_MISSING_POLLS: u32 = 6;
 const VOLTE_MODEM_MISSING_POLL_DELAY_SECS: u64 = 5;
@@ -6532,8 +6530,6 @@ struct VowifiRestoreWorkflow {
     trigger: VowifiRestoreTrigger,
     line_id: String,
     initial_delay: Duration,
-    attempts: u8,
-    retry_delay: Duration,
     connect_attempts: u8,
     connect_retry_delay: Duration,
     start_reason: &'static str,
@@ -6552,8 +6548,6 @@ impl VowifiRestoreWorkflow {
             trigger: VowifiRestoreTrigger::ProfileSwitch { switch_token },
             line_id,
             initial_delay: Duration::from_secs(VOWIFI_PROFILE_SWITCH_RESTORE_INITIAL_DELAY_SECS),
-            attempts: VOWIFI_PROFILE_SWITCH_RESTORE_ATTEMPTS,
-            retry_delay: Duration::from_secs(VOWIFI_PROFILE_SWITCH_RESTORE_RETRY_DELAY_SECS),
             connect_attempts: 1,
             connect_retry_delay: Duration::from_secs(
                 VOWIFI_PROFILE_SWITCH_CONNECT_RETRY_DELAY_SECS,
@@ -6568,11 +6562,6 @@ impl VowifiRestoreWorkflow {
             trigger: VowifiRestoreTrigger::BootAutoRestore,
             line_id,
             initial_delay: Duration::from_secs(config.initial_delay_secs.clamp(30, 300)),
-            attempts: config.attempts.clamp(1, 5),
-            retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
-            // `attempts` is the total restore budget. Nesting the same value in
-            // `connect_vowifi_on_line` multiplied the default 3 into 9 live
-            // connection attempts before the outer scheduler started over.
             connect_attempts: 1,
             connect_retry_delay: Duration::from_secs(config.retry_delay_secs.clamp(10, 180)),
             start_reason: "vowifi_auto_restore_start",
@@ -6702,75 +6691,44 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         return;
     }
 
-    let mut last_status = disabled_vowifi_status("vowifi_restore_not_attempted");
-    let attempts = workflow.attempts.max(1);
-    for attempt in 1..=attempts {
-        if !vowifi_restore_intent_enabled(&app, &workflow) || !scope.is_present() {
-            return;
-        }
-        let retry_count = attempt.saturating_sub(1);
-        let identity_status =
-            wait_for_vowifi_identity_gate(&app, &scope, Some(&workflow), retry_count).await;
-        if !identity_status.readiness.identity_ready || !identity_status.readiness.profile_matched {
-            last_status = identity_status;
-            if attempt < attempts {
-                schedule_vowifi_restore_retry(&app, &workflow, &last_status, attempt).await;
-                continue;
-            }
-            break;
-        }
-
-        if let Err(status) =
-            wait_for_vowifi_sim_auth_gate(&app, &scope, Some(&workflow), retry_count).await
-        {
-            last_status = status;
-            if attempt < attempts {
-                schedule_vowifi_restore_retry(&app, &workflow, &last_status, attempt).await;
-                continue;
-            }
-            break;
-        }
-
-        let runtime_started_at = Instant::now();
+    let attempts = app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .vowifi
+        .profile_selection
+        .attempts
+        .len()
+        .max(1) as u8;
+    let runtime_started_at = Instant::now();
+    persist_optional_vowifi_restore_phase(
+        &app,
+        &workflow,
+        RestorePhase::RuntimeRestore,
+        runtime_started_at,
+        true,
+        true,
+        None,
+        0,
+    );
+    let last_status =
+        connect_vowifi_on_line(&app, &scope, attempts, workflow.connect_retry_delay, false).await;
+    let readiness = &last_status.readiness;
+    if readiness.sms_ready {
         persist_optional_vowifi_restore_phase(
             &app,
             &workflow,
-            RestorePhase::RuntimeRestore,
+            RestorePhase::SmsReady,
             runtime_started_at,
-            true,
-            true,
+            readiness.identity_ready,
+            readiness.sim_auth_ready,
             None,
-            retry_count,
+            attempts.saturating_sub(1),
         );
-        last_status = connect_vowifi_on_line(
-            &app,
-            &scope,
-            workflow.connect_attempts,
-            workflow.connect_retry_delay,
-            false,
-        )
-        .await;
-        let readiness = &last_status.readiness;
-        if readiness.sms_ready {
-            persist_optional_vowifi_restore_phase(
-                &app,
-                &workflow,
-                RestorePhase::SmsReady,
-                runtime_started_at,
-                readiness.identity_ready,
-                readiness.sim_auth_ready,
-                None,
-                retry_count,
-            );
-            info!(
-                trigger = workflow.label(),
-                "WiFi Calling restore workflow completed"
-            );
-            return;
-        }
-        if attempt < attempts {
-            schedule_vowifi_restore_retry(&app, &workflow, &last_status, attempt).await;
-        }
+        info!(
+            trigger = workflow.label(),
+            "WiFi Calling restore workflow completed"
+        );
+        return;
     }
 
     if vowifi_restore_reason_is_soft_retry(last_status.degraded_reason.as_deref()) {
@@ -6806,25 +6764,6 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
     // restart clears the marker and permits a new bounded batch.
     let _ =
         restore_cellular_and_reset_vowifi(&app, &scope, VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON).await;
-}
-
-async fn schedule_vowifi_restore_retry(
-    app: &AppState,
-    workflow: &VowifiRestoreWorkflow,
-    last_status: &VowifiStatusResponse,
-    retry_count: u8,
-) {
-    persist_optional_vowifi_restore_phase(
-        app,
-        workflow,
-        RestorePhase::RetryScheduled,
-        Instant::now(),
-        last_status.readiness.identity_ready,
-        last_status.readiness.sim_auth_ready,
-        last_status.degraded_reason.as_deref(),
-        retry_count,
-    );
-    tokio::time::sleep(workflow.retry_delay).await;
 }
 
 async fn wait_for_vowifi_identity_gate(
@@ -7066,6 +7005,34 @@ async fn configure_vowifi_live_overrides(
     )
 }
 
+async fn select_vowifi_profile_candidate(
+    app: &AppState,
+    scope: &VowifiScope,
+    candidate: &VolteProfileCandidate,
+) -> Result<(), String> {
+    let modem_path = scope
+        .modem_path()
+        .ok_or_else(|| "vowifi_line_not_present".to_string())?;
+    let identity = sim_identity_for_modem(app.dbus_conn.as_ref(), &modem_path)
+        .await
+        .ok_or_else(|| "vowifi_sim_identity_not_ready".to_string())?;
+    let imsi = crate::connectivity::modems::ims::vowifi::live::effective_imsi_for_line(
+        scope.line_id(),
+        &identity.imsi,
+    );
+    let resolved = profile_store(app)
+        .resolve_vowifi_candidate(candidate, &imsi, Some(&identity.operator_id))?
+        .ok_or_else(|| format!("vowifi_profile_not_resolved:{}", candidate.source.as_str()))?;
+    crate::connectivity::modems::ims::vowifi::live::configure_live_profile_selection(
+        scope.line_id(),
+        LiveSelectedProfile {
+            profile: resolved.profile,
+            source: resolved.origin.as_str().to_string(),
+            fallback_reason: resolved.fallback_reason,
+        },
+    )
+}
+
 async fn connect_vowifi_on_line(
     app: &AppState,
     scope: &VowifiScope,
@@ -7177,21 +7144,6 @@ async fn connect_vowifi_on_line(
         let _ = reset_vowifi_runtime_for_scope(app, scope, "vowifi_registration_expired").await;
     }
 
-    let profile_meta = current.profile.profile.as_ref();
-    let profile_id = profile_meta.map(|p| p.profile_id);
-    let _ = app
-        .database
-        .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
-            line_id: scope.line_id(),
-            trace_id: Some("runtime-connect"),
-            level: "info",
-            phase: "connect_start",
-            profile_id,
-            event_type: "connect_start",
-            detail_json: "{}",
-        });
-
-    let attempts = attempts.max(1);
     if let Err(err) = pause_cellular_data_for_vowifi(app, scope).await {
         let mut status = disabled_vowifi_status("vowifi_cellular_data_pause_failed");
         status.degraded_reason = Some(format!("vowifi_cellular_data_pause_failed:{err}"));
@@ -7199,22 +7151,84 @@ async fn connect_vowifi_on_line(
         return status;
     }
 
-    let prepared = wait_for_vowifi_identity_gate(app, scope, None, 0).await;
-    if !prepared.readiness.identity_ready || !prepared.readiness.profile_matched {
-        persist_vowifi_runtime_snapshot(app, scope.line_id(), &prepared);
-        return prepared;
-    }
-
-    if let Err(status) = wait_for_vowifi_sim_auth_gate(app, scope, None, 0).await {
-        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
-        return status;
-    }
-
+    let profile_candidates = app
+        .config_manager
+        .get_line_profile(scope.line_id())
+        .vowifi
+        .profile_selection
+        .attempts;
+    let attempts = if refresh_cycle {
+        attempts.max(1)
+    } else {
+        profile_candidates.len().max(1) as u8
+    };
     let mut last_status = disabled_vowifi_status("vowifi_connect_not_attempted");
     for attempt in 1..=attempts {
+        let candidate = (!refresh_cycle)
+            .then(|| profile_candidates.get(usize::from(attempt - 1)))
+            .flatten();
+        if let Some(candidate) = candidate {
+            if attempt > 1 {
+                let _ =
+                    reset_vowifi_runtime_for_scope(app, scope, "vowifi_profile_candidate_changed")
+                        .await;
+            }
+            if let Err(error) = select_vowifi_profile_candidate(app, scope, candidate).await {
+                last_status = disabled_vowifi_status("vowifi_profile_candidate_failed");
+                last_status.degraded_reason = Some(error.clone());
+                persist_vowifi_runtime_snapshot(app, scope.line_id(), &last_status);
+                warn!(
+                    line_id = scope.line_id(),
+                    attempt,
+                    requested_profile_source = candidate.source.as_str(),
+                    requested_profile_id = ?candidate.profile_id,
+                    error = %error,
+                    "WiFi Calling profile candidate could not be resolved"
+                );
+                if attempt < attempts {
+                    tokio::time::sleep(retry_delay).await;
+                }
+                continue;
+            }
+        }
+
+        let prepared = wait_for_vowifi_identity_gate(app, scope, None, attempt - 1).await;
+        if !prepared.readiness.identity_ready || !prepared.readiness.profile_matched {
+            last_status = prepared;
+            if attempt < attempts {
+                tokio::time::sleep(retry_delay).await;
+            }
+            continue;
+        }
+        if let Err(status) = wait_for_vowifi_sim_auth_gate(app, scope, None, attempt - 1).await {
+            last_status = status;
+            if attempt < attempts {
+                tokio::time::sleep(retry_delay).await;
+            }
+            continue;
+        }
+
+        let profile_id = prepared
+            .profile
+            .profile
+            .as_ref()
+            .map(|profile| profile.profile_id);
+        let _ =
+            app.database
+                .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
+                    line_id: scope.line_id(),
+                    trace_id: Some("runtime-connect"),
+                    level: "info",
+                    phase: "connect_start",
+                    profile_id,
+                    event_type: "connect_start",
+                    detail_json: "{}",
+                });
         info!(
             attempt = attempt,
             attempts = attempts,
+            requested_profile_source = candidate.map(|value| value.source.as_str()),
+            requested_profile_id = ?candidate.and_then(|value| value.profile_id.as_deref()),
             "WiFi Calling connection attempt started"
         );
         last_status = attempt_vowifi_connect_once(app, scope, false).await;
@@ -7389,7 +7403,9 @@ async fn build_vowifi_line_response(
         matched_profile_source,
         matched_profile_fallback_reason,
     ) = {
-        let stage = if config.enabled && status.phase == "not_started" {
+        let stage = if !config.enabled {
+            "disabled".to_string()
+        } else if status.phase == "not_started" {
             "starting".to_string()
         } else if config.enabled && status.readiness.ims_registered && !operator_ready {
             "reconnecting".to_string()
@@ -7397,10 +7413,16 @@ async fn build_vowifi_line_response(
             status.phase.to_string()
         };
         (
-            status.phase.to_string(),
+            if config.enabled {
+                status.phase.to_string()
+            } else {
+                "disabled".to_string()
+            },
             stage,
-            status.readiness.ims_registered && operator_ready,
-            if !operator_ready && status.readiness.ims_registered {
+            config.enabled && status.readiness.ims_registered && operator_ready,
+            if !config.enabled {
+                None
+            } else if !operator_ready && status.readiness.ims_registered {
                 Some("vowifi_registration_expired".to_string())
             } else {
                 status.degraded_reason
@@ -7482,16 +7504,36 @@ pub async fn set_vowifi_line_config_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    if let Err(error) = app.config_manager.set_line_vowifi_config(&line_id, payload) {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::error(format!("Failed: {error}"))),
-        );
+    if let Err((status, error)) = validate_vowifi_profile_selection_references(
+        &profile_store(&app),
+        &payload.profile_selection,
+    ) {
+        return (status, Json(ApiResponse::error(error)));
     }
-    let current = line.vowifi.snapshot().await.status_response();
-    if vowifi_auto_restore_is_exhausted(current.degraded_reason.as_deref()) {
-        let scope = VowifiScope::for_line(Arc::clone(&line));
-        let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_config_updated").await;
+    let saved = match app.config_manager.set_line_vowifi_config(&line_id, payload) {
+        Ok(saved) => saved,
+        Err(error) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            )
+        }
+    };
+    let scope = VowifiScope::for_line(Arc::clone(&line));
+    crate::connectivity::modems::ims::vowifi::live::forget_live_network_overrides(&line_id);
+    let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_config_updated").await;
+    if saved.enabled && saved.vowifi.enabled && line.binding().present {
+        let connect_app = app.clone();
+        tokio::spawn(async move {
+            let _ = connect_vowifi_on_line(
+                &connect_app,
+                &scope,
+                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+                Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+                true,
+            )
+            .await;
+        });
     }
     sync_line_video_capabilities(&app).await;
     (
@@ -7928,6 +7970,50 @@ fn validate_and_save_volte_profile_selection(
     config_manager
         .set_line_volte_profile_selection(line_id, selection)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))
+}
+
+fn validate_vowifi_profile_selection_references(
+    store: &crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore,
+    selection: &VolteProfileSelectionConfig,
+) -> Result<(), (StatusCode, String)> {
+    let mut normalized = selection.clone();
+    normalized
+        .validate()
+        .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
+    for candidate in &normalized.attempts {
+        let Some(profile_id) = candidate.profile_id.as_deref() else {
+            continue;
+        };
+        match store.vowifi_reference_state(candidate.source, profile_id) {
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Ready,
+            ) => {}
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::NotLteReady,
+            ) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "vowifi_profile_not_ready:{}:{profile_id}",
+                        candidate.source.as_str()
+                    ),
+                ));
+            }
+            Ok(
+                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Missing,
+            ) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "vowifi_profile_not_found_in_source:{}:{profile_id}",
+                        candidate.source.as_str()
+                    ),
+                ));
+            }
+            Err(error) => return Err((StatusCode::SERVICE_UNAVAILABLE, error)),
+        }
+    }
+    Ok(())
 }
 
 fn should_restart_after_volte_profile_selection_put(
@@ -9412,10 +9498,17 @@ async fn schedule_vowifi_auto_restore(
         return;
     }
     let workflow = VowifiRestoreWorkflow::boot_auto_restore(config, line_id);
+    let attempts = app
+        .config_manager
+        .get_line_profile(&line.binding().line_id)
+        .vowifi
+        .profile_selection
+        .attempts
+        .len();
     info!(
         line_id = %line.binding().line_id,
         initial_delay_secs = workflow.initial_delay.as_secs(),
-        attempts = workflow.attempts,
+        attempts,
         "WiFi Calling line auto-restore scheduled"
     );
     let restore_app = app.clone();
@@ -13753,14 +13846,13 @@ mod tests {
     }
 
     #[test]
-    fn vowifi_auto_restore_attempt_budget_is_not_multiplied() {
+    fn vowifi_auto_restore_uses_one_connect_pass_for_the_profile_batch() {
         let config = AutoRestoreConfig {
             initial_delay_secs: 30,
             attempts: 3,
             retry_delay_secs: 10,
         };
         let workflow = VowifiRestoreWorkflow::boot_auto_restore(&config, "line-a".to_string());
-        assert_eq!(workflow.attempts, 3);
         assert_eq!(workflow.connect_attempts, 1);
     }
 
