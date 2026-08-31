@@ -128,10 +128,12 @@ async fn establish_bearer(
             detail: "native_ims_no_address_family".to_string(),
         });
     };
-    let dual = families.len() > 1;
-    // qmicli accepts only `ip-type=4` or `ip-type=6`. Omitting the field lets
-    // the prepared IPv4v6 3GPP profile drive a real dual-stack attempt.
-    let requested_family = (!dual).then_some(first_family);
+    // qmicli accepts only `ip-type=4` or `ip-type=6`. On this DATA6 transport,
+    // omitting the field for an IPv4v6 profile crashes the modem's DHCP manager.
+    // A logical dual-stack attempt is therefore a safe probe of its preferred
+    // family. The upper plan still handles a network-forced opposite family and
+    // the remaining single-stack fallback attempts.
+    let requested_family = Some(first_family);
     let session = start_session(endpoint, apn, requested_family, profile_id).await?;
     let sessions = vec![session];
 
@@ -169,7 +171,7 @@ async fn establish_bearer(
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
         netdev_method: resolution.method.as_str(),
-        ip_type: ip_type_for(dual, first_family).to_string(),
+        ip_type: ip_type_for(first_family).to_string(),
         path_device: endpoint.device_path.clone(),
         path_handle: joined_handles(&sessions),
         ipv4_address: settings.ipv4_address,
@@ -194,10 +196,8 @@ async fn establish_bearer(
     })
 }
 
-fn ip_type_for(dual: bool, first_family: u8) -> &'static str {
-    if dual {
-        "ipv4v6"
-    } else if first_family == 6 {
+fn ip_type_for(first_family: u8) -> &'static str {
+    if first_family == 6 {
         "ipv6"
     } else {
         "ipv4"
@@ -316,10 +316,8 @@ mod tests {
     }
 
     #[test]
-    fn ip_type_reflects_single_vs_dual() {
-        assert_eq!(ip_type_for(false, 4), "ipv4");
-        assert_eq!(ip_type_for(false, 6), "ipv6");
-        assert_eq!(ip_type_for(true, 4), "ipv4v6");
-        assert_eq!(ip_type_for(true, 6), "ipv4v6");
+    fn ip_type_reflects_the_actual_safe_data6_family() {
+        assert_eq!(ip_type_for(4), "ipv4");
+        assert_eq!(ip_type_for(6), "ipv6");
     }
 }

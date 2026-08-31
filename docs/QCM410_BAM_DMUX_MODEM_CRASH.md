@@ -610,6 +610,13 @@ allocate/start/stop 分散到多个短命 `qmicli` 进程同样不成立。
 - 不再用第二个 direct-QMI 进程执行 stop-network、get-current-settings 或释放 CID；
 - IMS 地址、DNS 和 P-CSCF 继续由 `AT+CGCONTRDP` 读取。
 
+设备复测还确认，qmicli 只接受显式 `ip-type=4` 或 `ip-type=6`；对 IPv4v6 profile
+省略 `ip-type` 会再次触发 `dhcp_client_mgr.c:263`。因此 QCM410 的逻辑
+`ipv4v6` 尝试由配置顺序中的首选 family 做安全探测，状态记录实际建立的单栈类型；网络
+若返回 `ipv4-only-allowed` / `ipv6-only-allowed`，上层仍直接跳到指定 family，其他失败
+继续执行剩余单栈兜底。配置语义和尝试顺序不变，但不会再向这块固件发送危险的
+unspecified-family WDS 请求。
+
 这也解释了为什么“同一进程完成 allocate + start”的中间修复仍不够：启动进程退出后，
 会话所有权已经丢失，后续 stop/query 仍会重新打开 DATA6。正确的生命周期边界必须覆盖
 整个 bearer，而不只是 start-network 调用。
