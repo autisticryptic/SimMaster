@@ -630,6 +630,12 @@ Vodafone DE 实机随后把失败推进到路由阶段：bearer 正常获得 IPv
 IMS bearer 的 DNS、P-CSCF 和媒体 host route 现在在显式 next-hop 存在时附加 `onlink`；
 作用域只限 per-UE namespace 内的 raw-IP bearer 路由，不改变 WiFi/veth 默认路由。
 
+路由修复后的 Vodafone DE 漫游注册序列是 `494 -> sec-agree REGISTER -> 403`。动态
+REGISTER 梯子此前先加空 AKA Authorization，晚于 `P-Visited-Network-ID`，导致核心返回
+带空 nonce 的 401 后认证无法继续。派生漫游 profile 现在在“visited P-CSCF 已要求
+sec-agree 但仍拒绝”的窄条件下先加入已知 visited PLMN，若仍被拒绝再保留该标识加入
+空 AKA hint；非漫游、数据库 profile 和已经进入 AKA 的失败顺序不变。
+
 这也解释了为什么“同一进程完成 allocate + start”的中间修复仍不够：启动进程退出后，
 会话所有权已经丢失，后续 stop/query 仍会重新打开 DATA6。正确的生命周期边界必须覆盖
 整个 bearer，而不只是 start-network 调用。

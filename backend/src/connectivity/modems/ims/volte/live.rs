@@ -6124,16 +6124,20 @@ fn next_dynamic_register_variant_with_roaming(
     sec_agree_retry_variant(profile, variant, failure)
         .or_else(|| sec_agree_timeout_retry_variant(profile, variant, failure))
         .or_else(|| sec_agree_proxy_require_retry_variant(variant, failure))
-        .or_else(|| sec_agree_empty_aka_retry_variant(variant, failure))
+        // A derived roaming profile already knows the visited PLMN. Once that
+        // P-CSCF has required sec-agree and still rejects the request, identify
+        // the visited network before adding an empty AKA header. Otherwise some
+        // cores answer the identity-less hint with a 401 carrying an empty nonce.
         .or_else(|| {
-            roaming_visited_network_empty_aka_retry_variant(
+            roaming_visited_network_retry_variant(
                 variant,
                 failure,
                 dynamic_visited_network_fallback,
             )
         })
+        .or_else(|| sec_agree_empty_aka_retry_variant(variant, failure))
         .or_else(|| {
-            roaming_visited_network_retry_variant(
+            roaming_visited_network_empty_aka_retry_variant(
                 variant,
                 failure,
                 dynamic_visited_network_fallback,
@@ -7916,7 +7920,7 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[test]
-    fn derived_roaming_403_keeps_empty_aka_before_visited_network() {
+    fn derived_roaming_403_identifies_visited_network_before_empty_aka() {
         let profile =
             crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
                 "255",
@@ -7936,23 +7940,28 @@ Content-Length: 0\r\n\r\n";
         };
         let declared = register_variants(profile)[0].requiring_sec_agree();
 
-        let with_empty_aka =
+        let with_visited =
             next_dynamic_register_variant_with_roaming(profile, declared, &forbidden, true)
-                .expect("403 first adds the AKA identity hint");
-        assert!(!with_empty_aka.policy.include_visited_network);
+                .expect("403 first identifies the visited network");
+        assert!(with_visited.policy.include_visited_network);
+        assert_eq!(with_visited.authorization, VolteInitialAuthorization::None);
+
+        let with_empty_aka =
+            next_dynamic_register_variant_with_roaming(profile, with_visited, &forbidden, true)
+                .expect("a second rejection adds the AKA identity hint");
+        assert!(with_empty_aka.policy.include_visited_network);
         assert_eq!(
             with_empty_aka.authorization,
             VolteInitialAuthorization::UriFirstEmptyAka
         );
 
-        let with_visited =
-            next_dynamic_register_variant_with_roaming(profile, with_empty_aka, &timeout, true)
-                .expect("a subsequent timeout adds the roaming network without losing AKA");
-        assert!(with_visited.policy.include_visited_network);
-        assert_eq!(
-            with_visited.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
-        );
+        assert!(next_dynamic_register_variant_with_roaming(
+            profile,
+            with_empty_aka,
+            &timeout,
+            true,
+        )
+        .is_none());
     }
 
     #[test]
