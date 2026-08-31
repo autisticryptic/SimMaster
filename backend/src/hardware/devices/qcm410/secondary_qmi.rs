@@ -74,8 +74,8 @@ pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qm
 /// DATA6 is an optional hardware capability, not a safe default on every
 /// MSM8916 firmware.  In particular, the 410 firmware used by SimAdmin can
 /// crash the modem when the AT-labelled DATA6 channel is force-opened as QMI.
-/// Keep the primary ModemManager QMI path usable unless an operator explicitly
-/// opts in after validating the device firmware.
+/// Operators must explicitly opt in after validating the device firmware;
+/// disabling it makes UE-native cellular data and VoLTE unavailable.
 pub fn secondary_qmi_enabled() -> bool {
     std::env::var("SIMADMIN_ENABLE_SECONDARY_QMI")
         .ok()
@@ -264,8 +264,7 @@ enum RuntimeEndpointMapLookup {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecondaryQmiError {
-    /// Platform lacks the sysfs/driver needed. Callers fall back to the
-    /// ModemManager-managed bearer.
+    /// Platform lacks the sysfs/driver needed for UE-native cellular sessions.
     Unsupported(String),
     /// The primary port could not be resolved to an owning baseband.
     PrimaryUnresolved(String),

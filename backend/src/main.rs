@@ -359,9 +359,9 @@ async fn reconcile_secondary_qmi_udev_rules(path: &str, rules: &[String]) {
 /// speaks QMI (`wds` present). Endpoint state is published under `/run/simadmin/`
 /// so the service can pick it up without re-probing.
 ///
-/// The allocator can place either ordinary data or IMS on DATA6. The other
-/// bearer remains on qmi0, so both functions coexist without sharing one WDS
-/// slot.
+/// The prepared endpoint carries SimAdmin-owned UE-native IMS and, when
+/// enabled, ordinary data sessions. ModemManager's primary qmi0 path is not a
+/// runtime fallback.
 ///
 /// Only ports this function actually bound are hidden. Hiding anything else
 /// would take a port away from ModemManager on hardware whose channel layout we
@@ -555,10 +555,10 @@ async fn run_secondary_qmi_init(write_udev_rule: bool, dry_run: bool) -> Result<
     );
     if prepared.is_empty() {
         // A stock kernel may expose DATA6_CNTL without creating a second QMI
-        // character port. This is an explicit per-line fallback condition, not
-        // a service crash: retrying every few seconds cannot change the driver
+        // character port. This is a stable unsupported state, not a transient
+        // service crash: retrying every few seconds cannot change the driver
         // capability and needlessly churns systemd and the baseband netdevs.
-        println!("secondary-qmi-init: DATA6 unavailable; using the ModemManager bearer fallback");
+        println!("secondary-qmi-init: DATA6 unavailable; UE-native cellular paths unavailable");
         return Ok(());
     }
 
@@ -654,12 +654,12 @@ enum CliCommand {
     },
     /// Read-only JSON inventory of every ModemManager modem/SIM line.
     InspectModems,
-    /// Prepare the per-baseband secondary QMI endpoints that carry IMS/VoLTE.
+    /// Prepare the per-baseband secondary QMI endpoints for UE-native cellular sessions.
     ///
     /// Runs before ModemManager (see the shipped systemd unit) so each baseband's
-    /// spare QMI channel is bound and hidden from ModemManager via udev. The IMS
-    /// bearer then lives on its own endpoint instead of contending with the
-    /// primary port that ModemManager uses for normal mobile data.
+    /// spare QMI channel is bound and hidden from ModemManager via udev. IMS and
+    /// optional ordinary data sessions then remain owned by the per-line UE
+    /// runtime instead of using the host primary port.
     SecondaryQmiInit {
         /// Write the udev ignore rule and reload udev (default: yes).
         #[arg(long, default_value_t = true)]

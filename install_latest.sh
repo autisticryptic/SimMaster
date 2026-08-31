@@ -270,7 +270,7 @@ activate_secondary_qmi_runtime() {
   if systemctl restart simadmin-secondary-qmi.service; then
     echo "==> DATA6 secondary QMI endpoint is active"
   else
-    echo "warning: DATA6 secondary QMI is unavailable on this device; continuing with the primary modem path" >&2
+    echo "warning: DATA6 secondary QMI is unavailable; cellular data and VoLTE will remain unavailable" >&2
   fi
   systemctl restart ModemManager.service >/dev/null 2>&1 || true
 }

@@ -15,7 +15,8 @@
   - `/dev/net/tun` 设备支持（VoWiFi 用户态 IPsec 报文传输必需）
 - **eSIM 芯片管理**：每线路 eUICC/Profile 管理依赖开源的 `lpac` 辅助程序。
 - **VoLTE 独立 bearer**：多线路 VoLTE 需要设备为每个基带暴露可用的副 QMI 控制端点；
-  随仓库提供的 `simadmin-secondary-qmi.service` 与 udev 规则面向支持 DATA6 的目标内核。
+  随仓库提供的 `simadmin-secondary-qmi.service` 面向支持 DATA6 的目标内核，实际端口对应的
+  udev 忽略规则由该服务在每次启动时动态生成。
 - **运营商配置库**：服务启动时必须能读取由 `carrier_Bundles` 生成、已封存且契约兼容的
   schema v7 SQLite catalog。默认文件名为后端二进制同目录的 `carrier-bundles.sqlite3`，
   也可通过 `--carrier-catalog` 或 `SIMADMIN_CARRIER_CATALOG` 指定。
@@ -38,7 +39,7 @@
 | `/tmp/ota_staging` | 旧 OTA 流程的临时目录；当前手动部署不使用 |
 | `/run/simadmin/secondary-qmi-endpoints.json` | 各基带副 QMI 端点的临时运行态映射，重启后重建 |
 | `/etc/systemd/system/simadmin.service` | SimAdmin 后端主服务守护单元 |
-| `/etc/systemd/system/simadmin-secondary-qmi.service` | 可选的开机副 QMI/DATA6 准备服务 |
+| `/etc/systemd/system/simadmin-secondary-qmi.service` | 蜂窝数据/VoLTE 所需的开机副 QMI/DATA6 准备服务 |
 | `/etc/systemd/system/simadmin-modem-recovery.service` | 开机 modem 搜网异常自愈恢复服务单元 |
 | `/usr/local/bin/simadmin-modem-recovery.sh` | 开机自愈监控与搜网状态恢复的执行脚本 |
 | `/etc/NetworkManager/conf.d/99-simadmin-unmanaged-modem.conf` | NetworkManager 忽略托管 `wwan*` 接口配置，避免与主服务抢占调制解调器控制权 |
