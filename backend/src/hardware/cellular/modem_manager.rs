@@ -1174,6 +1174,16 @@ pub fn cache_own_numbers_for_identity(
     );
 }
 
+pub fn clear_non_manual_own_numbers_for_iccid(db: &Database, iccid: &str) {
+    let normalized = crate::platform::utils::normalize_iccid(iccid);
+    if normalized.is_empty() {
+        return;
+    }
+    if let Err(error) = db.clear_non_manual_own_number_cache_for_iccid(&normalized) {
+        tracing::warn!(iccid = %normalized, %error, "Failed to clear stale eSIM own-number cache");
+    }
+}
+
 #[allow(dead_code)]
 fn cached_own_numbers_for_identity(db: &Database, identity: &SimIdentity) -> Vec<String> {
     let Some(identity_key) = own_number_identity_key(identity) else {

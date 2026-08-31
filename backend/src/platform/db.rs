@@ -671,6 +671,46 @@ mod tests {
     }
 
     #[test]
+    fn clearing_non_manual_own_number_cache_preserves_manual_entries() {
+        let db = test_database();
+        db.upsert_own_number_cache(
+            "iccid:123",
+            "123",
+            "001010000000001",
+            "00101",
+            &["+10001".to_string()],
+            "ims_associated_uri",
+        )
+        .expect("insert observed number");
+        db.upsert_own_number_cache(
+            "iccid:456",
+            "456",
+            "001010000000002",
+            "00101",
+            &["+10002".to_string()],
+            "manual",
+        )
+        .expect("insert manual number");
+
+        assert_eq!(
+            db.clear_non_manual_own_number_cache_for_iccid("123")
+                .expect("clear observed number"),
+            1
+        );
+        assert!(db
+            .get_own_number_cache(&["iccid:123".to_string()])
+            .expect("read observed number")
+            .is_none());
+        assert_eq!(
+            db.get_own_number_cache(&["iccid:456".to_string()])
+                .expect("read manual number")
+                .expect("manual entry")
+                .phone_numbers,
+            vec!["+10002"]
+        );
+    }
+
+    #[test]
     fn call_history_and_stats_are_isolated_by_line() {
         let db = test_database();
         let first = db
@@ -5577,6 +5617,23 @@ impl Database {
             }
         }
         Ok(None)
+    }
+
+    /// Remove numbers learned from the modem or IMS for an ICCID before that
+    /// profile becomes active again. Manual entries are user-authored and must
+    /// remain authoritative across eSIM profile switches.
+    pub fn clear_non_manual_own_number_cache_for_iccid(&self, iccid: &str) -> Result<usize> {
+        let iccid = crate::platform::utils::normalize_iccid(iccid);
+        if iccid.is_empty() {
+            return Ok(0);
+        }
+        let conn = self.conn.lock().unwrap();
+        let deleted = conn.execute(
+            "DELETE FROM own_number_cache
+             WHERE iccid = ?1 AND source <> 'manual'",
+            params![iccid],
+        )?;
+        Ok(deleted)
     }
 
     // ==================== eSIM Profile cache ====================

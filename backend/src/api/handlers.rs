@@ -868,6 +868,14 @@ pub async fn enable_esim_profile_handler(
     let event_entity = mask_identifier(&iccid);
     let bg_line_id = line_id.clone();
     let bg_binding = line.binding();
+
+    // A registrar number is scoped to the currently active eSIM profile. Drop
+    // both the in-memory IMS observation and any previously learned cache for
+    // the target ICCID before ModemManager starts re-enumerating the modem.
+    // Manual numbers intentionally survive this cleanup.
+    crate::connectivity::core::own_numbers::clear(&line_id);
+    modem_manager::clear_non_manual_own_numbers_for_iccid(&app.database, &iccid);
+
     let line_vowifi_before_switch = app.config_manager.get_line_profile(&line_id).vowifi;
     let switch_token = new_vowifi_switch_token("profile-switch");
     if line_vowifi_before_switch.enabled {
