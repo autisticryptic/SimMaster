@@ -2,8 +2,8 @@
 //!
 //! Implements [`ImsBearerTransport`] over the spare `DATA*_CNTL` rpmsg channels:
 //! this is the "DATA6" path. It binds/obtains the secondary QMI endpoint for the
-//! device's baseband, starts a retained WDS IMS session (one per family, or one
-//! dual-stack), reads the IMS context's IP configuration and P-CSCF from
+//! device's baseband, starts one retained WDS IMS session per bearer attempt,
+//! reads the IMS context's IP configuration and P-CSCF from
 //! `AT+CGCONTRDP`, resolves the bam-dmux netdev that carries the session and
 //! hands the result back to the strategy layer as a device-agnostic
 //! [`ImsBearerInfo`] plus an opaque [`ImsBearerHandle`].
@@ -36,8 +36,7 @@ pub struct Qcm410ImsBearerHandle {
     /// Secondary QMI endpoint the session(s) run on. Held so teardown can stop
     /// the sessions and release the endpoint.
     endpoint: SecondaryQmiEndpoint,
-    /// Retained WDS clients to stop and release on teardown. One per family for
-    /// a dual-stack bearer; exactly one for a single-family bearer.
+    /// Retained WDS client to stop and release on teardown.
     sessions: Vec<ImsSession>,
     /// Family-specific addresses and policy routes installed for the retained
     /// WDS session(s). They must be removed without flushing the shared netdev.
@@ -107,7 +106,7 @@ struct Established {
     handle: Qcm410ImsBearerHandle,
 }
 
-/// Start the retained WDS session(s) for `families`, read the IMS context
+/// Start one retained WDS session for `families`, read the IMS context
 /// settings, resolve the netdev and assemble the device-agnostic result.
 async fn establish_bearer(
     endpoint: &SecondaryQmiEndpoint,
@@ -118,20 +117,20 @@ async fn establish_bearer(
     cid: u8,
     families: &[u8],
 ) -> Result<Established, ImsBearerError> {
+    let Some(first_family) = families.first().copied() else {
+        return Err(ImsBearerError {
+            kind: ImsBearerErrorKind::SessionStartFailed,
+            detail: "native_ims_no_address_family".to_string(),
+        });
+    };
     let dual = families.len() > 1;
-    let mut sessions = Vec::with_capacity(families.len());
-    for family in families.iter().copied() {
-        match start_session(endpoint, apn, family, profile_id).await {
-            Ok(session) => sessions.push(session),
-            Err(error) => {
-                stop_sessions(endpoint, &sessions).await;
-                return Err(error);
-            }
-        }
-    }
+    // qmicli accepts only `ip-type=4` or `ip-type=6`. Omitting the field lets
+    // the prepared IPv4v6 3GPP profile drive a real dual-stack attempt.
+    let requested_family = (!dual).then_some(first_family);
+    let session = start_session(endpoint, apn, requested_family, profile_id).await?;
+    let sessions = vec![session];
 
-    // Both retained sessions are up; the modem now describes the merged context.
-    // Read it once from AT, which is beta8's IMS source of truth.
+    // Read the active context once from AT, which is beta8's IMS source of truth.
     let settings = match read_settings(modem_id, cid, apn).await {
         Ok(settings) => settings,
         Err(error) => {
@@ -165,7 +164,7 @@ async fn establish_bearer(
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
         netdev_method: resolution.method.as_str(),
-        ip_type: ip_type_for(dual, families[0]).to_string(),
+        ip_type: ip_type_for(dual, first_family).to_string(),
         path_device: endpoint.device_path.clone(),
         path_handle: joined_handles(&sessions),
         ipv4_address: settings.ipv4_address,
@@ -200,13 +199,13 @@ fn ip_type_for(dual: bool, first_family: u8) -> &'static str {
     }
 }
 
-/// Start one retained IMS WDS session on the secondary endpoint. The driver
-/// allocates a CID with `wds-noop`, sets the family, starts the network and
-/// keeps that CID for settings and teardown.
+/// Start one retained IMS WDS session on the secondary endpoint. CID allocation
+/// and network activation happen in the same qmicli process because DATA6 cannot
+/// carry a retained CID across separate direct-QMI opens.
 async fn start_session(
     endpoint: &SecondaryQmiEndpoint,
     apn: &str,
-    family: u8,
+    family: Option<u8>,
     profile_id: Option<u32>,
 ) -> Result<ImsSession, ImsBearerError> {
     secondary_qmi::start_ims_session(endpoint, apn, family, profile_id)

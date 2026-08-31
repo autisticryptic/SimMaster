@@ -1225,71 +1225,23 @@ pub async fn hold_endpoint(endpoint: &SecondaryQmiEndpoint) -> Result<(), Second
     }
 }
 
-/// Start the IMS data session on this endpoint for one address family.
+/// Start the IMS data session in one direct QMI process.
 ///
-/// `family` is the QMI `ip-type` value: `4` or `6`. On success the session's IP
-/// configuration is read back with `--wds-get-current-settings`, which is also
-/// where the P-CSCF (delivered via PCO) shows up.
+/// DATA6 is exposed as an AT-typed WWAN port even though it speaks QMI. Opening
+/// it in a second qmicli process sends a fresh QMI sync and invalidates a CID
+/// retained by the first process. The start request must therefore allocate the
+/// WDS client and activate the packet-data call in the same invocation.
+///
+/// `family` is `Some(4)` or `Some(6)` for a forced single-stack attempt. `None`
+/// omits the WDS IP-family preference so the prepared 3GPP profile's IPv4v6 PDP
+/// type is used for the dual-stack attempt.
 pub async fn start_ims_session(
     endpoint: &SecondaryQmiEndpoint,
     apn: &str,
-    family: u8,
+    family: Option<u8>,
     profile_id: Option<u32>,
 ) -> Result<ImsSession, String> {
-    let mut start = format!("--wds-start-network=apn={apn}");
-    if let Some(profile) = profile_id {
-        start.push_str(&format!(",3gpp-profile={profile}"));
-    }
-    start.push_str(&format!(",ip-type={family}"));
-
-    let client_id = allocate_wds_client(endpoint).await?;
-    let family_action = format!("--wds-set-ip-family={family}");
-    if let Err(error) = run_retained_wds_action(endpoint, &client_id, &family_action).await {
-        release_wds_client(endpoint, &client_id).await;
-        return Err(error);
-    }
-    let output = match run_retained_wds_action(endpoint, &client_id, &start).await {
-        Ok(output) => output,
-        Err(error) => {
-            release_wds_client(endpoint, &client_id).await;
-            return Err(error);
-        }
-    };
-
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let handle = match parse_packet_data_handle(&text) {
-        Some(handle) => handle,
-        None => {
-            // Surface the modem's own verbose reason: it distinguishes "network wants
-            // the other family" from a real failure.
-            let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
-            release_wds_client(endpoint, &client_id).await;
-            return Err(format!("secondary_qmi_start_failed:{reason}"));
-        }
-    };
-
-    let settings = read_current_settings(endpoint, &client_id)
-        .await
-        .unwrap_or_default();
-    Ok(ImsSession {
-        client_id,
-        packet_data_handle: handle,
-        ip_family: settings.ip_family.unwrap_or_else(|| format!("ipv{family}")),
-        ipv4_address: settings.ipv4_address,
-        ipv4_gateway: settings.ipv4_gateway,
-        ipv4_dns: settings.ipv4_dns,
-        ipv6_address: settings.ipv6_address,
-        ipv6_gateway: settings.ipv6_gateway,
-        ipv6_dns: settings.ipv6_dns,
-        mtu: settings.mtu,
-    })
-}
-
-async fn allocate_wds_client(endpoint: &SecondaryQmiEndpoint) -> Result<String, String> {
+    let start = ims_start_action(apn, family, profile_id);
     let output = run_qmicli(&[
         "--verbose",
         "-d",
@@ -1297,19 +1249,54 @@ async fn allocate_wds_client(endpoint: &SecondaryQmiEndpoint) -> Result<String, 
         "--device-open-qmi",
         QMI_OPEN_NET_ARG,
         "--client-no-release-cid",
-        "--wds-noop",
+        &start,
     ])
     .await
-    .ok_or_else(|| "secondary_qmi_cid_allocate_spawn_failed".to_string())?;
+    .ok_or_else(|| "secondary_qmi_start_spawn_failed".to_string())?;
+
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     if !output.status.success() {
-        return Err(format!("secondary_qmi_cid_allocate_failed:{}", text.trim()));
+        let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
+        return Err(format!("secondary_qmi_start_failed:{reason}"));
     }
-    parse_wds_client_id(&text).ok_or_else(|| format!("secondary_qmi_cid_missing:{}", text.trim()))
+    let handle = match parse_packet_data_handle(&text) {
+        Some(handle) => handle,
+        None => {
+            let reason = parse_call_end_reason(&text).unwrap_or_else(|| text.trim().to_string());
+            return Err(format!("secondary_qmi_start_failed:{reason}"));
+        }
+    };
+    let client_id = parse_wds_client_id(&text)
+        .ok_or_else(|| format!("secondary_qmi_start_cid_missing:{}", text.trim()))?;
+    Ok(ImsSession {
+        client_id,
+        packet_data_handle: handle,
+        ip_family: family
+            .map(|family| format!("ipv{family}"))
+            .unwrap_or_else(|| "ipv4v6".to_string()),
+        ipv4_address: None,
+        ipv4_gateway: None,
+        ipv4_dns: Vec::new(),
+        ipv6_address: None,
+        ipv6_gateway: None,
+        ipv6_dns: Vec::new(),
+        mtu: None,
+    })
+}
+
+fn ims_start_action(apn: &str, family: Option<u8>, profile_id: Option<u32>) -> String {
+    let mut action = format!("--wds-start-network=apn={apn}");
+    if let Some(profile) = profile_id {
+        action.push_str(&format!(",3gpp-profile={profile}"));
+    }
+    if let Some(family) = family {
+        action.push_str(&format!(",ip-type={family}"));
+    }
+    action
 }
 
 async fn run_retained_wds_action(
@@ -1373,21 +1360,6 @@ pub struct CurrentSettings {
     pub mtu: Option<u32>,
     /// P-CSCF addresses if the network delivered them via PCO.
     pub pcscf: Vec<String>,
-}
-
-async fn read_current_settings(
-    endpoint: &SecondaryQmiEndpoint,
-    client_id: &str,
-) -> Option<CurrentSettings> {
-    let output = run_retained_wds_action(endpoint, client_id, "--wds-get-current-settings")
-        .await
-        .ok()?;
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(parse_current_settings(&text))
 }
 
 /// Parse the WDS CID printed by qmicli's retained-client output or verbose log.
@@ -1760,6 +1732,25 @@ mod tests {
         assert!(parse_packet_data_handle(output).is_none());
         let reason = parse_call_end_reason(output).unwrap();
         assert!(reason.contains("ipv4-only-allowed"), "got: {reason}");
+    }
+
+    #[test]
+    fn ims_start_action_uses_profile_default_for_dual_stack() {
+        let action = ims_start_action("ims", None, Some(2));
+        assert_eq!(action, "--wds-start-network=apn=ims,3gpp-profile=2");
+        assert!(!action.contains("ip-type="));
+    }
+
+    #[test]
+    fn ims_start_action_forces_only_explicit_single_stack() {
+        assert_eq!(
+            ims_start_action("ims", Some(6), None),
+            "--wds-start-network=apn=ims,ip-type=6"
+        );
+        assert_eq!(
+            ims_start_action("ims", Some(4), Some(2)),
+            "--wds-start-network=apn=ims,3gpp-profile=2,ip-type=4"
+        );
     }
 
     #[test]
