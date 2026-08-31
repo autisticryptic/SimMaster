@@ -6127,13 +6127,16 @@ fn sec_agree_proxy_require_retry_variant(
     .then(|| variant.requiring_sec_agree())
 }
 
-/// A 400 after the network has explicitly required the complete sec-agree
-/// declaration is the observed signal that the core still needs the empty AKA
-/// identity hint before it can issue a challenge.
+/// A 400 or authentication-free 403 after the network has explicitly required
+/// the complete sec-agree declaration is the observed signal that the core may
+/// still need the empty AKA identity hint before it can issue a challenge.
 ///
-/// If the 400 was actually caused by Security-Client formatting, the resulting
-/// empty-AKA request may also receive 400; the next transition then proceeds to
-/// the spaced/compact formatting fallbacks without dropping Authorization.
+/// The 403 case is intentionally narrow: it only applies to the dynamic variant
+/// that a preceding 421/494 marked as server-required, before any AKA round.
+/// An ordinary 403 remains terminal. If the response was actually caused by
+/// Security-Client formatting, the resulting empty-AKA request may also fail;
+/// the next transition then proceeds to the formatting fallbacks without
+/// dropping Authorization.
 fn sec_agree_empty_aka_retry_variant(
     variant: VolteRegisterVariant,
     failure: &RegisterFailure,
@@ -6143,7 +6146,7 @@ fn sec_agree_empty_aka_retry_variant(
         && variant.policy.proxy_require_sec_agree
         && variant.authorization == VolteInitialAuthorization::None
         && failure.auth_rounds == 0
-        && register_failure_status(failure) == Some(400))
+        && matches!(register_failure_status(failure), Some(400 | 403)))
     .then(|| variant.with_empty_aka_authorization())
 }
 
@@ -7739,6 +7742,37 @@ Content-Length: 0\r\n\r\n";
             sip::header_value(&authenticated, "Security-Verify").is_none(),
             "a 401 without Security-Server must not fabricate Security-Verify"
         );
+    }
+
+    #[test]
+    fn sec_agree_403_before_aka_gets_one_identity_hint_retry() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "255",
+                "03",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("derived Kyivstar LTE profile");
+        let base = register_variants(profile)[0];
+        let declared = base.requiring_sec_agree();
+        let forbidden = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+
+        let retry = next_dynamic_register_variant(profile, declared, &forbidden)
+            .expect("server-required sec-agree 403 before AKA gets one identity-hint retry");
+        assert_eq!(retry.authorization, VolteInitialAuthorization::UriFirstEmptyAka);
+        assert!(retry.policy.require_sec_agree);
+        assert!(retry.policy.proxy_require_sec_agree);
+
+        assert!(next_dynamic_register_variant(profile, base, &forbidden).is_none());
+        let after_auth = RegisterFailure {
+            auth_rounds: 1,
+            ..forbidden
+        };
+        assert!(next_dynamic_register_variant(profile, declared, &after_auth).is_none());
     }
 
     #[test]
