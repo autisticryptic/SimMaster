@@ -276,14 +276,8 @@ export function LineVowifiDetails({ vowifi }: { vowifi?: VowifiLineConfigRespons
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理模式" value={vowifi.config.proxy_mode} /></Grid>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="代理端点" value={vowifi.config.proxy_endpoint || '直连'} /></Grid>
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
-      {vowifi.runtime_error && (
-        <Grid size={12}>
-          <Alert severity="warning">
-            {vowifi.runtime_error === 'vowifi_auto_restore_exhausted'
-              ? 'VoWiFi 自动重连已达上限'
-              : vowifi.runtime_error}
-          </Alert>
-        </Grid>
+      {vowifi.runtime_error && vowifi.runtime_error !== 'vowifi_auto_restore_exhausted' && (
+        <Grid size={12}><Alert severity="warning">{vowifi.runtime_error}</Alert></Grid>
       )}
     </Grid>
   )
