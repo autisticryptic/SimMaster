@@ -602,12 +602,13 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
           runtime: updated.runtime,
         }
       : line))
+    setEditingVolteProfileLineId(null)
     setSuccess(`${shortLineId(updated.line_id)} 的 VoLTE Profile 顺序已保存`)
   }
 
   const handleVowifiSaved = (updated: VowifiLineConfigResponse) => {
     setVowifiLines((current) => current.map((line) => line.line_id === updated.line_id ? updated : line))
-    setEditingVowifiLine(updated)
+    setEditingVowifiLine(null)
     setSuccess(`${shortLineId(updated.line_id)} 的 VoWiFi 配置已保存`)
   }
 
