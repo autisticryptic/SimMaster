@@ -1177,6 +1177,17 @@ class SimAdminCurrentAPI {
     )
   }
 
+  async searchVowifiCarrierProfiles(params: { plmn?: string; mcc?: string; name?: string }) {
+    const query = new URLSearchParams()
+    if (params.plmn) query.set('plmn', params.plmn)
+    if (params.mcc) query.set('mcc', params.mcc)
+    if (params.name) query.set('name', params.name)
+    return request<ApiResponse<StoredCarrierProfile[]>>(
+      `/vowifi/carrier-profiles/search?${query.toString()}`,
+      { timeoutMs: 15000 },
+    )
+  }
+
   async importVowifiCarrierProfiles(payload: CarrierProfileImportRequest) {
     return request<ApiResponse<CarrierProfileImportResult>>('/vowifi/carrier-profiles/import', {
       method: 'POST',

@@ -55,6 +55,14 @@ const originLabels: Record<ProfileOrigin, string> = {
   derived: '推导',
 }
 
+type SearchMode = 'plmn' | 'mcc' | 'name'
+
+const searchModeLabels: Record<SearchMode, string> = {
+  plmn: 'PLMN',
+  mcc: 'MCC',
+  name: '运营商名称',
+}
+
 /** MB, one decimal. Sizes come from the release, so they are exact byte counts. */
 function formatAssetSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -82,7 +90,9 @@ export default function CarrierProfilesPanel() {
   const [profileIdLocked, setProfileIdLocked] = useState(true)
   const [deleteTarget, setDeleteTarget] = useState<StoredCarrierProfile | null>(null)
 
-  const [lookupPlmn, setLookupPlmn] = useState('')
+  const [searchMode, setSearchMode] = useState<SearchMode>('plmn')
+  const [searchValue, setSearchValue] = useState('')
+  const [activeSearch, setActiveSearch] = useState<string | null>(null)
   const [page, setPage] = useState(0)
   const [rowsPerPage, setRowsPerPage] = useState(20)
 
@@ -96,6 +106,7 @@ export default function CarrierProfilesPanel() {
       ])
       setProfiles(profileResponse.data ?? [])
       setCatalogStatus(statusResponse.data ?? null)
+      setActiveSearch(null)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -181,21 +192,34 @@ export default function CarrierProfilesPanel() {
     setEditorOpen(true)
   }
 
-  const openForPlmn = async (plmn: string) => {
-    const digits = plmn.replace(/\D/g, '')
-    if (digits.length < 5 || digits.length > 6) {
+  const searchProfiles = async () => {
+    const value = searchValue.trim()
+    if (searchMode === 'plmn' && !/^\d{5,6}$/.test(value)) {
       setError('PLMN 必须是 5 或 6 位数字，例如 46001')
+      return
+    }
+    if (searchMode === 'mcc' && !/^\d{3}$/.test(value)) {
+      setError('MCC 必须是 3 位数字，例如 460')
+      return
+    }
+    if (searchMode === 'name' && !value) {
+      setError('请输入运营商名称')
       return
     }
     setBusyKey('lookup')
     setError(null)
+    setSuccess(null)
     try {
-      const response = await api.resolveVowifiCarrierProfile(digits)
-      const resolved = response.data
-      if (!resolved) throw new Error('未能解析该 PLMN')
-      const readOnly = resolved.origin !== 'database'
-      openEditor(resolved.record, { readOnly, lockProfileId: true })
-      setSuccess(`${digits} 当前来自「${originLabels[resolved.origin]}」`)
+      const params = searchMode === 'plmn'
+        ? { plmn: value }
+        : searchMode === 'mcc'
+          ? { mcc: value }
+          : { name: value }
+      const response = await api.searchVowifiCarrierProfiles(params)
+      const matches = response.data ?? []
+      setProfiles(matches)
+      setPage(0)
+      setActiveSearch(`${searchModeLabels[searchMode]}：${value}`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -250,25 +274,52 @@ export default function CarrierProfilesPanel() {
 
           <Stack direction={{ xs: 'column', sm: 'row' }} spacing={1.5} alignItems="flex-start">
             <TextField
+              select
               size="small"
-              label="按 PLMN 查找"
-              value={lookupPlmn}
-              placeholder="46001"
-              helperText="填入 MCC+MNC，打开当前生效的配置"
-              onChange={(event) => setLookupPlmn(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter') void openForPlmn(lookupPlmn)
+              label="查找方式"
+              value={searchMode}
+              onChange={(event) => {
+                setSearchMode(event.target.value as SearchMode)
+                setSearchValue('')
               }}
+              sx={{ minWidth: 140 }}
+            >
+              <MenuItem value="plmn">PLMN</MenuItem>
+              <MenuItem value="mcc">MCC（国家）</MenuItem>
+              <MenuItem value="name">运营商名称</MenuItem>
+            </TextField>
+            <TextField
+              size="small"
+              label={`按${searchModeLabels[searchMode]}查找`}
+              value={searchValue}
+              placeholder={searchMode === 'plmn' ? '46001' : searchMode === 'mcc' ? '460' : 'China Mobile'}
+              helperText="仅查找用户自定义和已下载数据库，不使用推断配置"
+              onChange={(event) => setSearchValue(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === 'Enter') void searchProfiles()
+              }}
+              sx={{ minWidth: { xs: '100%', sm: 320 } }}
             />
             <Button
               startIcon={busyKey === 'lookup' ? <CircularProgress size={16} /> : <Search />}
-              onClick={() => void openForPlmn(lookupPlmn)}
+              onClick={() => void searchProfiles()}
               disabled={busyKey !== null}
               sx={{ mt: 0.5 }}
             >
-              打开
+              查找
             </Button>
+            {activeSearch && (
+              <Button onClick={() => void load()} disabled={busyKey !== null || loading} sx={{ mt: 0.5 }}>
+                显示全部
+              </Button>
+            )}
           </Stack>
+
+          {activeSearch && (
+            <Typography variant="caption" color="text.secondary">
+              当前结果：{activeSearch}，共 {profiles.length} 条
+            </Typography>
+          )}
 
           {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
           {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
@@ -294,7 +345,7 @@ export default function CarrierProfilesPanel() {
                   </TableHead>
                   <TableBody>
                     {pagedProfiles.map((profile) => (
-                      <TableRow key={profile.profile_id} hover>
+                      <TableRow key={`${profile.origin}:${profile.profile_id}`} hover>
                         <TableCell padding="checkbox">
                           <Avatar
                             variant="rounded"
@@ -380,7 +431,7 @@ export default function CarrierProfilesPanel() {
                     {profiles.length === 0 && (
                       <TableRow>
                         <TableCell colSpan={7} align="center">
-                          尚无可用 Profile
+                          {activeSearch ? '数据库中没有匹配的 Profile' : '尚无可用 Profile'}
                         </TableCell>
                       </TableRow>
                     )}

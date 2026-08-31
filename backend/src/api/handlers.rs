@@ -9101,7 +9101,7 @@ pub async fn list_vowifi_carrier_profiles_handler(
     StatusCode,
     Json<ApiResponse<Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>>>,
 ) {
-    match profile_store(&app).list() {
+    match profile_store(&app).list_stored_profiles() {
         Ok(profiles) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message("Success", profiles)),
@@ -9191,50 +9191,116 @@ pub async fn get_vowifi_carrier_profile_icon_handler(
     }
 }
 
+/// GET /api/vowifi/carrier-profiles/search?plmn=23433
+/// GET /api/vowifi/carrier-profiles/search?mcc=234
+/// GET /api/vowifi/carrier-profiles/search?name=EE
+///
+/// Search only `data.db` and the downloaded carrier catalog. Derived runtime
+/// fallback profiles are deliberately outside this database-browser endpoint.
+pub async fn search_vowifi_carrier_profiles_handler(
+    State(app): State<AppState>,
+    Query(query): Query<std::collections::HashMap<String, String>>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>>>,
+) {
+    let plmn = query
+        .get("plmn")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let mcc = query
+        .get("mcc")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    let name = query
+        .get("name")
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty());
+    if usize::from(plmn.is_some()) + usize::from(mcc.is_some()) + usize::from(name.is_some()) != 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error(
+                "exactly_one_of_plmn_mcc_or_name_is_required",
+            )),
+        );
+    }
+    if plmn.is_some_and(|value| {
+        !matches!(value.len(), 5 | 6) || !value.bytes().all(|byte| byte.is_ascii_digit())
+    }) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("plmn_must_be_five_or_six_digits")),
+        );
+    }
+    if mcc.is_some_and(|value| value.len() != 3 || !value.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("mcc_must_be_three_digits")),
+        );
+    }
+    if name.is_some_and(|value| value.chars().count() > 100) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("carrier_name_query_too_long")),
+        );
+    }
+
+    match profile_store(&app).search_stored_profiles(plmn, mcc, name) {
+        Ok(profiles) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", profiles)),
+        ),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(error)),
+        ),
+    }
+}
+
 /// GET /api/vowifi/carrier-profiles/resolve?plmn=23433
 ///
-/// Show which profile a PLMN actually resolves to and where it came from
-/// (carrier catalog).
+/// Compatibility lookup for one stored PLMN. This endpoint used to call the
+/// runtime resolver and could therefore return a derived profile; database
+/// browsing must now be strict, while live registration keeps its fallback.
 pub async fn resolve_vowifi_carrier_profile_handler(
     State(app): State<AppState>,
     Query(query): Query<std::collections::HashMap<String, String>>,
 ) -> (StatusCode, Json<ApiResponse<serde_json::Value>>) {
     let plmn = query
         .get("plmn")
-        .map(|value| {
-            value
-                .chars()
-                .filter(|c| c.is_ascii_digit())
-                .collect::<String>()
-        })
+        .map(|value| value.trim())
         .unwrap_or_default();
-    if plmn.len() < 5 || plmn.len() > 6 {
+    if !matches!(plmn.len(), 5 | 6) || !plmn.bytes().all(|byte| byte.is_ascii_digit()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(ApiResponse::error("plmn_must_be_five_or_six_digits")),
         );
     }
-    let (mcc, mnc) = plmn.split_at(3);
-    match profile_store(&app).resolve_by_plmn(mcc, mnc) {
-        Some(resolved) => {
-            let record = crate::connectivity::modems::ims::vowifi::profile_record::CarrierProfileRecord::from_profile(
-                resolved.profile,
-            );
-            (
-                StatusCode::OK,
-                Json(ApiResponse::success_with_message(
-                    "Success",
-                    json!({
-                        "origin": resolved.origin.as_str(),
-                        "e911_expected": record.e911_expected(),
-                        "record": record,
-                    }),
-                )),
-            )
-        }
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(ApiResponse::error("profile_not_resolvable")),
+    match profile_store(&app).search_stored_profiles(Some(plmn), None, None) {
+        Ok(profiles) => match profiles.into_iter().next() {
+            Some(profile) => {
+                let e911_expected = profile.record.e911_expected();
+                (
+                    StatusCode::OK,
+                    Json(ApiResponse::success_with_message(
+                        "Success",
+                        json!({
+                            "origin": profile.origin.as_str(),
+                            "e911_expected": e911_expected,
+                            "record": profile.record,
+                        }),
+                    )),
+                )
+            }
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(ApiResponse::error("stored_carrier_profile_not_found")),
+            ),
+        },
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(error)),
         ),
     }
 }

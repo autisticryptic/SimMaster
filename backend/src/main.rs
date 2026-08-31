@@ -2030,6 +2030,10 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(resolve_vowifi_carrier_profile_handler).options(options_handler),
         )
         .route(
+            "/api/vowifi/carrier-profiles/search",
+            get(search_vowifi_carrier_profiles_handler).options(options_handler),
+        )
+        .route(
             "/api/vowifi/lines",
             get(get_vowifi_lines_handler).options(options_handler),
         )
@@ -2769,17 +2773,22 @@ mod http_router_tests {
             "the refusal must name the missing switch: {response}"
         );
 
-        // Nothing was stored, so the omit was never cancelled.
+        // Nothing was stored. Database browsing must answer 404 rather than
+        // manufacturing a derived runtime fallback for the PLMN.
         let (status, resolved) = get_with_cookie(
             &served,
             &format!("/api/vowifi/carrier-profiles/resolve?plmn={plmn}"),
             &cookie,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "resolve must answer: {resolved}");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "strict stored lookup must not derive a profile: {resolved}"
+        );
         assert!(
-            !resolved.contains(&profile_id) || !resolved.contains("\"source\":\"database\""),
-            "the refused body must not have been stored: {resolved}"
+            !resolved.contains(&profile_id) && !resolved.contains("derived"),
+            "the refused body must not be stored or inferred: {resolved}"
         );
 
         // The same record with every switch present is accepted, so the refusal
@@ -2803,6 +2812,18 @@ mod http_router_tests {
         assert!(
             resolved.contains("\"always_add_sip_instance\":false"),
             "the stored record must keep the omit: {resolved}"
+        );
+
+        let (status, searched) = get_with_cookie(
+            &served,
+            &format!("/api/vowifi/carrier-profiles/search?mcc={}", &plmn[..3]),
+            &cookie,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "MCC search must answer: {searched}");
+        assert!(
+            searched.contains(&profile_id) && searched.contains("\"origin\":\"database\""),
+            "MCC search must return the stored user profile: {searched}"
         );
     }
 

@@ -305,6 +305,67 @@ impl ProfileStore {
         Ok(merged.into_values().collect())
     }
 
+    /// List database-browser rows without merging identical profile ids across
+    /// the user database and downloaded catalog.
+    pub fn list_stored_profiles(&self) -> Result<Vec<StoredProfile>, String> {
+        self.list_for_access(CatalogAccessKind::WifiEpdg)
+    }
+
+    /// Search only operator-authored rows and downloaded catalog rows.
+    ///
+    /// This is intentionally separate from the runtime resolvers below: the
+    /// database browser must never manufacture a derived 3GPP profile when a
+    /// stored carrier does not match.
+    pub fn search_stored_profiles(
+        &self,
+        plmn: Option<&str>,
+        mcc: Option<&str>,
+        name: Option<&str>,
+    ) -> Result<Vec<StoredProfile>, String> {
+        let plmn = plmn.map(str::trim).filter(|value| !value.is_empty());
+        let mcc = mcc.map(str::trim).filter(|value| !value.is_empty());
+        let name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+
+        let mut profiles = self.list_stored_profiles()?;
+        profiles.retain(|profile| {
+            if plmn.is_some_and(|value| profile.plmn != value) {
+                return false;
+            }
+            if mcc.is_some_and(|value| profile.record.meta.mcc != value) {
+                return false;
+            }
+            if let Some(query) = name.as_deref() {
+                let meta = &profile.record.meta;
+                let matches_name = [
+                    meta.brand.as_str(),
+                    meta.operator_legal_name.as_str(),
+                    profile.profile_id.as_str(),
+                ]
+                .into_iter()
+                .chain(meta.aliases.iter().map(String::as_str))
+                .any(|candidate| candidate.to_lowercase().contains(query));
+                if !matches_name {
+                    return false;
+                }
+            }
+            matches!(
+                profile.origin,
+                ProfileOrigin::Database | ProfileOrigin::Catalog
+            )
+        });
+        profiles.sort_by(|left, right| {
+            profile_origin_rank(left.origin)
+                .cmp(&profile_origin_rank(right.origin))
+                .then(left.plmn.cmp(&right.plmn))
+                .then(left.record.meta.brand.cmp(&right.record.meta.brand))
+                .then(left.profile_id.cmp(&right.profile_id))
+        });
+        Ok(profiles)
+    }
+
     pub fn upsert(&self, mut record: CarrierProfileRecord) -> Result<StoredProfile, String> {
         record.schema_version = CURRENT_SCHEMA_VERSION;
         record.validate()?;
@@ -992,6 +1053,100 @@ mod tests {
             .expect("published catalog match");
         assert_eq!(published.profile.meta.profile_id, "test-v7-23433");
         assert_eq!(published.matched_prefix, "234330");
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn stored_profile_search_never_returns_a_derived_fallback() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let (store, path) = store_with_catalog();
+
+        let missing = store
+            .search_stored_profiles(Some("46001"), None, None)
+            .expect("search missing PLMN");
+        assert!(missing.is_empty());
+
+        let runtime = store
+            .resolve_by_plmn("460", "01")
+            .expect("runtime keeps its standard fallback");
+        assert_eq!(runtime.origin, ProfileOrigin::Derived);
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn stored_profile_search_supports_mcc_and_operator_name() {
+        let (store, path) = store_with_catalog();
+
+        let by_mcc = store
+            .search_stored_profiles(None, Some("234"), None)
+            .expect("search MCC");
+        assert_eq!(by_mcc.len(), 2);
+        assert!(by_mcc
+            .iter()
+            .all(|profile| profile.record.meta.mcc == "234"));
+
+        let by_alias = store
+            .search_stored_profiles(None, None, Some("tElEcOm"))
+            .expect("search alias");
+        assert_eq!(by_alias.len(), 2);
+        assert!(by_alias
+            .iter()
+            .all(|profile| profile.origin == ProfileOrigin::Catalog));
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn stored_profile_search_includes_custom_rows_by_mcc_and_name() {
+        let (store, path) = store_with_catalog();
+        let mut custom = explicit_private_record("private-db-99999");
+        custom.meta.brand = "Acme Private Wireless".to_string();
+        custom.meta.operator_legal_name = "Acme Network Limited".to_string();
+        custom.meta.aliases = vec!["APW".to_string()];
+        store.upsert(custom).expect("save custom profile");
+
+        let by_mcc = store
+            .search_stored_profiles(None, Some("999"), None)
+            .expect("search custom MCC");
+        assert_eq!(by_mcc.len(), 1);
+        assert_eq!(by_mcc[0].origin, ProfileOrigin::Database);
+        assert_eq!(by_mcc[0].profile_id, "private-db-99999");
+
+        for query in ["acme private", "NETWORK LIMITED", "apw"] {
+            let by_name = store
+                .search_stored_profiles(None, None, Some(query))
+                .expect("search custom operator name");
+            assert_eq!(by_name.len(), 1, "query: {query}");
+            assert_eq!(by_name[0].origin, ProfileOrigin::Database);
+            assert_eq!(by_name[0].profile_id, "private-db-99999");
+        }
+
+        std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn stored_profile_search_places_custom_rows_before_catalog_rows() {
+        let (store, path) = store_with_catalog();
+        let mut custom = store
+            .list()
+            .expect("list catalog profiles")
+            .into_iter()
+            .find(|profile| profile.profile_id == "test-v7-23433")
+            .expect("catalog fixture profile")
+            .record;
+        custom.meta.brand = "Local Test Mobile".to_string();
+        store.upsert(custom).expect("save custom profile");
+
+        let matches = store
+            .search_stored_profiles(Some("23433"), None, None)
+            .expect("search PLMN");
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].origin, ProfileOrigin::Database);
+        assert_eq!(matches[0].profile_id, "test-v7-23433");
+        assert_eq!(matches[1].origin, ProfileOrigin::Catalog);
+        assert_eq!(matches[1].profile_id, "test-v7-23433");
 
         std::fs::remove_file(path).expect("remove fixture");
     }
