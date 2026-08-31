@@ -5607,7 +5607,13 @@ impl ConfigManager {
             match &task.action {
                 AutomationAction::ConsumeData { bytes, unit } => {
                     let multiplier = match unit.as_str() {
-                        "auto" | "bytes" => Some(1u64),
+                        "auto" => Some(1u64),
+                        "bytes"
+                            if crate::services::automation::tasks::consume_data::is_supported_udp_byte_budget(*bytes) =>
+                        {
+                            Some(1u64)
+                        }
+                        "bytes" => None,
                         "kb" => Some(1024),
                         "mb" => Some(1024 * 1024),
                         _ => None,

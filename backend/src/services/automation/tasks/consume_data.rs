@@ -3,23 +3,31 @@ use crate::hardware::cellular::data_proxy::DataProxyStatus;
 use crate::platform::config::{LineDataProxyConfig, LineProfileConfig};
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
+use crate::services::ue_worker::{worker_for_line, UeSocket, UeSocketSpec};
 use crate::state::AppState;
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::{BoxFuture, FutureExt};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use tracing::{info, warn};
 
 pub struct ConsumeDataHandler;
 
 const DATA_CONSUMPTION_ENDPOINT: &str = "https://speed.cloudflare.com/__down";
 const DATA_CONSUMPTION_HOST: &str = "speed.cloudflare.com";
+const UDP_BYTE_BUDGETS: [u64; 4] = [32, 64, 128, 256];
+
+pub(crate) fn is_supported_udp_byte_budget(value: u64) -> bool {
+    UDP_BYTE_BUDGETS.contains(&value)
+}
 
 fn requested_bytes(value: u64, unit: &str) -> Result<u64> {
     if value == 0 {
         return Err(anyhow!("流量大小必须大于 0"));
     }
     let multiplier = match unit {
-        "auto" | "bytes" => 1u64,
+        "auto" => 1u64,
+        "bytes" if is_supported_udp_byte_budget(value) => 1u64,
+        "bytes" => return Err(anyhow!("Byte 模式仅支持 32、64、128 或 256")),
         "kb" => 1024,
         "mb" => 1024 * 1024,
         _ => return Err(anyhow!("不支持的流量单位")),
@@ -130,6 +138,69 @@ fn data_consumption_url(amount: u64) -> String {
     format!("{DATA_CONSUMPTION_ENDPOINT}?bytes={amount}")
 }
 
+fn udp_probe_payload(budget: u64) -> Result<(SocketAddr, Vec<u8>)> {
+    match budget {
+        // IPv4 (20-byte IP + 8-byte UDP header) plus a 4-byte payload.
+        32 => Ok((
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443)),
+            vec![0; 4],
+        )),
+        // IPv6 (40-byte IP + 8-byte UDP header) plus a 16-byte payload.
+        64 => Ok((
+            SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111),
+                443,
+                0,
+                0,
+            )),
+            vec![0; 16],
+        )),
+        // Larger budgets use one IPv4 datagram and reserve its 28-byte header.
+        128 | 256 => Ok((
+            SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 1, 1, 1), 443)),
+            vec![0; (budget - 28) as usize],
+        )),
+        _ => Err(anyhow!("Byte 模式仅支持 32、64、128 或 256")),
+    }
+}
+
+async fn send_udp_probe(line_id: &str, interface: &str, budget: u64) -> Result<()> {
+    let worker = worker_for_line(line_id).ok_or_else(|| anyhow!("数据 UE worker 不可用"))?;
+    if !worker.status().await.ready {
+        return Err(anyhow!("数据 UE worker 尚未就绪"));
+    }
+    let (remote, payload) = udp_probe_payload(budget)?;
+    let local = if remote.is_ipv4() {
+        "0.0.0.0:0".parse().expect("valid IPv4 wildcard")
+    } else {
+        "[::]:0".parse().expect("valid IPv6 wildcard")
+    };
+    let socket = worker
+        .create_socket(UeSocketSpec::udp_connected(
+            local,
+            remote,
+            Some(interface.to_string()),
+        ))
+        .await
+        .map_err(|error| anyhow!("创建 UDP 探测 socket 失败: {error}"))?;
+    let UeSocket::Udp(socket) = socket else {
+        return Err(anyhow!("UE worker 返回了非 UDP 探测 socket"));
+    };
+    socket
+        .send(&payload)
+        .await
+        .context("发送 UDP 低流量探测包失败")?;
+    info!(
+        line_id,
+        interface,
+        budget_bytes = budget,
+        payload_bytes = payload.len(),
+        remote = %remote,
+        "automation UDP cellular data probe sent"
+    );
+    Ok(())
+}
+
 impl AutomationTaskHandler for ConsumeDataHandler {
     fn task_type(&self) -> &'static str {
         "consume_data"
@@ -176,6 +247,15 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                         .await
                         .map_err(anyhow::Error::msg)
                         .context("目标线路的数据承载或代理启动失败")?;
+                    if unit == "bytes" {
+                        let interface = line
+                            .secondary_data
+                            .interface()
+                            .await
+                            .ok_or_else(|| anyhow!("数据承载接口不可用"))?;
+                        send_udp_probe(&target.line_id, &interface, amount).await?;
+                        return Ok(());
+                    }
                     let proxy_status = line.data_proxy.status().await;
                     let proxy_url = local_proxy_url(&proxy_status)?;
                     let client = proxy_client(
@@ -259,16 +339,39 @@ impl AutomationTaskHandler for ConsumeDataHandler {
 mod tests {
     use super::{
         automation_proxy_config, automation_runtime_profile, data_consumption_addresses,
-        data_consumption_url, execution_timeout_secs, local_proxy_url, requested_bytes,
+        data_consumption_url, execution_timeout_secs, is_supported_udp_byte_budget,
+        local_proxy_url, requested_bytes, udp_probe_payload,
     };
     use crate::hardware::cellular::data_proxy::DataProxyStatus;
     use crate::platform::config::{LineDataProxyConfig, LineProfileConfig};
 
     #[test]
     fn converts_small_data_units_without_rounding() {
-        assert_eq!(requested_bytes(100, "bytes").unwrap(), 100);
+        assert_eq!(requested_bytes(32, "bytes").unwrap(), 32);
         assert_eq!(requested_bytes(1, "kb").unwrap(), 1024);
         assert_eq!(requested_bytes(2, "mb").unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn byte_mode_accepts_only_supported_udp_budgets() {
+        assert!(is_supported_udp_byte_budget(32));
+        assert!(is_supported_udp_byte_budget(64));
+        assert!(is_supported_udp_byte_budget(128));
+        assert!(is_supported_udp_byte_budget(256));
+        assert!(!is_supported_udp_byte_budget(20));
+        assert!(requested_bytes(20, "bytes").is_err());
+    }
+
+    #[test]
+    fn udp_probe_reserves_ip_and_udp_headers() {
+        let (v4, payload4) = udp_probe_payload(32).unwrap();
+        assert!(v4.is_ipv4());
+        assert_eq!(payload4.len(), 4);
+        let (v6, payload6) = udp_probe_payload(64).unwrap();
+        assert!(v6.is_ipv6());
+        assert_eq!(payload6.len(), 16);
+        assert_eq!(udp_probe_payload(128).unwrap().1.len(), 100);
+        assert_eq!(udp_probe_payload(256).unwrap().1.len(), 228);
     }
 
     #[test]

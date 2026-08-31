@@ -239,7 +239,7 @@ export default function AutomationTaskCard({
             </Box>
           )}
           {task.action.type === 'consume_data' && (
-            <Box display="flex" justifyContent="space-between" mb={0.75}><Typography variant="body2" color="text.secondary">流量:</Typography><Typography variant="body2">{task.action.config.bytes} {task.action.config.unit}</Typography></Box>
+            <Box display="flex" justifyContent="space-between" mb={0.75}><Typography variant="body2" color="text.secondary">流量:</Typography><Typography variant="body2">{task.action.config.bytes} {task.action.config.unit === 'bytes' ? (task.action.config.bytes === 32 ? 'bytes（IPv4 + UDP）' : task.action.config.bytes === 64 ? 'bytes（IPv6 + UDP）' : 'bytes（UDP）') : task.action.config.unit}</Typography></Box>
           )}
           {task.action.type === 'dial_call' && (
             <Box display="flex" justifyContent="space-between" mb={0.75}><Typography variant="body2" color="text.secondary">拨号:</Typography><Typography variant="body2">{task.action.config.country_code}{task.action.config.phone_number} / {task.action.config.duration_seconds} 秒</Typography></Box>

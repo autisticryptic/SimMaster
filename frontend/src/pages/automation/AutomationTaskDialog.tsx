@@ -15,6 +15,8 @@ import {
 } from '@mui/material'
 import type { AutomationTask, AutomationAction, AutomationTrigger, AutomationTarget } from '../../api/contracts'
 
+const UDP_BYTE_BUDGETS = [32, 64, 128, 256] as const
+
 type AutomationTaskDialogProps = {
   open: boolean
   onClose: () => void
@@ -43,7 +45,7 @@ export default function AutomationTaskDialog({
   const [formSmsContent, setFormSmsContent] = useState('')
   const [formSmsDelay, setFormSmsDelay] = useState(120)
   const [formSmsRetries, setFormSmsRetries] = useState(3)
-  const [formDataBytes, setFormDataBytes] = useState(100)
+  const [formDataBytes, setFormDataBytes] = useState<number>(128)
   const [formDataUnit, setFormDataUnit] = useState<'auto' | 'bytes' | 'kb' | 'mb'>('bytes')
   const [formCountryCode, setFormCountryCode] = useState('+86')
   const [manualCountryCode, setManualCountryCode] = useState(false)
@@ -76,8 +78,11 @@ export default function AutomationTaskDialog({
           setFormSmsDelay(editingTask.action.config.random_delay_seconds ?? 0)
           setFormSmsRetries(editingTask.action.config.retry_limit ?? 0)
         } else if (editingTask.action.type === 'consume_data') {
-          setFormDataBytes(editingTask.action.config.bytes)
-          setFormDataUnit(editingTask.action.config.unit)
+          const unit = editingTask.action.config.unit
+          setFormDataUnit(unit)
+          setFormDataBytes(unit === 'bytes' && !UDP_BYTE_BUDGETS.includes(editingTask.action.config.bytes as typeof UDP_BYTE_BUDGETS[number])
+            ? 128
+            : editingTask.action.config.bytes)
         } else if (editingTask.action.type === 'dial_call') {
           setManualCountryCode(!['+86', '+1', '+44', '+81', '+82'].includes(editingTask.action.config.country_code))
           setFormCountryCode(editingTask.action.config.country_code)
@@ -103,7 +108,7 @@ export default function AutomationTaskDialog({
         setFormSmsContent('')
         setFormSmsDelay(120)
         setFormSmsRetries(3)
-        setFormDataBytes(100)
+        setFormDataBytes(128)
         setFormDataUnit('bytes')
         setFormCountryCode('+86')
         setManualCountryCode(false)
@@ -193,6 +198,10 @@ export default function AutomationTaskDialog({
     } else if (formActionType === 'consume_data') {
       if (!Number.isInteger(Number(formDataBytes)) || Number(formDataBytes) <= 0) {
         setDialogError('请输入大于 0 的流量大小')
+        return
+      }
+      if (formDataUnit === 'bytes' && !UDP_BYTE_BUDGETS.includes(Number(formDataBytes) as typeof UDP_BYTE_BUDGETS[number])) {
+        setDialogError('Byte 模式仅支持 32、64、128 或 256')
         return
       }
       action = { type: 'consume_data', config: { bytes: Number(formDataBytes), unit: formDataUnit } }
@@ -416,9 +425,24 @@ export default function AutomationTaskDialog({
 
           {formActionType === 'consume_data' && (
             <Box display="grid" gridTemplateColumns="1fr 1fr" gap={2}>
-              <TextField label="流量大小" type="number" value={formDataBytes} onChange={(e) => setFormDataBytes(Math.max(1, Number(e.target.value) || 1))} slotProps={{ htmlInput: { min: 1 } }} />
-              <TextField select label="单位" value={formDataUnit} onChange={(e) => setFormDataUnit(e.target.value as typeof formDataUnit)}>
-                <MenuItem value="auto">自动</MenuItem><MenuItem value="bytes">Byte</MenuItem><MenuItem value="kb">KiB</MenuItem><MenuItem value="mb">MiB</MenuItem>
+              {formDataUnit === 'bytes' ? (
+                <TextField select label="UDP 单包预算" value={formDataBytes} onChange={(e) => setFormDataBytes(Number(e.target.value))}>
+                  <MenuItem value={32}>32 bytes（IPv4 + UDP）</MenuItem>
+                  <MenuItem value={64}>64 bytes（IPv6 + UDP）</MenuItem>
+                  <MenuItem value={128}>128 bytes</MenuItem>
+                  <MenuItem value={256}>256 bytes</MenuItem>
+                </TextField>
+              ) : (
+                <TextField label="流量大小" type="number" value={formDataBytes} onChange={(e) => setFormDataBytes(Math.max(1, Number(e.target.value) || 1))} slotProps={{ htmlInput: { min: 1 } }} />
+              )}
+              <TextField select label="单位" value={formDataUnit} onChange={(e) => {
+                const unit = e.target.value as typeof formDataUnit
+                setFormDataUnit(unit)
+                if (unit === 'bytes' && !UDP_BYTE_BUDGETS.includes(formDataBytes as typeof UDP_BYTE_BUDGETS[number])) {
+                  setFormDataBytes(128)
+                }
+              }}>
+                <MenuItem value="auto">自动（HTTPS）</MenuItem><MenuItem value="bytes">Byte（UDP 单包）</MenuItem><MenuItem value="kb">KiB（HTTPS）</MenuItem><MenuItem value="mb">MiB（HTTPS）</MenuItem>
               </TextField>
             </Box>
           )}
