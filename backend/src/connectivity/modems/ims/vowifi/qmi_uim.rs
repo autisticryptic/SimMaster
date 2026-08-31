@@ -276,8 +276,8 @@ pub fn build_open_logical_channel_frame(
         transaction_id,
         message_id: QMI_UIM_OPEN_LOGICAL_CHANNEL,
         tlvs: vec![
-            tlv(TLV_UIM_SLOT, vec![slot]),
             tlv(TLV_UIM_OPEN_AID, aid_value),
+            tlv(TLV_UIM_SLOT, vec![slot]),
         ],
     })
 }
@@ -307,8 +307,8 @@ pub fn build_close_logical_channel_frame(
         transaction_id,
         message_id: QMI_UIM_LOGICAL_CHANNEL,
         tlvs: vec![
-            tlv(TLV_UIM_SLOT, vec![slot]),
             tlv(TLV_UIM_CLOSE_CHANNEL_ID, vec![channel_id]),
+            tlv(TLV_UIM_SLOT, vec![slot]),
         ],
     })
 }
@@ -1769,11 +1769,11 @@ mod tests {
         assert_eq!(
             open.tlvs,
             vec![
-                tlv(TLV_UIM_SLOT, vec![1]),
                 tlv(
                     TLV_UIM_OPEN_AID,
                     [vec![USIM_AID_PREFIX.len() as u8], USIM_AID_PREFIX.to_vec()].concat(),
                 ),
+                tlv(TLV_UIM_SLOT, vec![1]),
             ]
         );
 
@@ -1785,8 +1785,8 @@ mod tests {
         assert_eq!(
             close.tlvs,
             vec![
-                tlv(TLV_UIM_SLOT, vec![1]),
                 tlv(TLV_UIM_CLOSE_CHANNEL_ID, vec![4]),
+                tlv(TLV_UIM_SLOT, vec![1]),
             ]
         );
     }
