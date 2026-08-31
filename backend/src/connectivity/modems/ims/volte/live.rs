@@ -1654,7 +1654,7 @@ async fn connect_inner(
             tracing::info!(
                 cid,
                 pcscf_count = prefetched_pcscf.len(),
-                "Prepared Beta8 native IMS profile and retained its AT context"
+                "Prepared Beta8 native IMS profile and handed activation to WDS"
             );
             runtime.update(|state| state.at_cid = Some(cid)).await;
             ims_profile_lease = Some(prefetch.lease);
@@ -1693,9 +1693,10 @@ async fn connect_inner(
     let mut request = BearerRequest::for_apn(ims_apn, allow_roaming);
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
-    // The beta2 prefetch lease already armed reporting and activated its
-    // context. Only the compatibility fallback still needs the standalone
-    // reporting command.
+    // The beta2 prefetch lease already armed reporting and retained the profile
+    // definition, but its temporary AT activation has been stopped so WDS can
+    // own the bearer. Only the compatibility fallback still needs the
+    // standalone reporting command.
     let pcscf_reporting_cid = if ims_profile_lease.is_some() {
         None
     } else if let Some(profile) = ims_profile {

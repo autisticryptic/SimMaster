@@ -58,9 +58,11 @@ pub struct ImsProfileContext {
 
 /// A temporary IMS PDP definition kept alive for the lifetime of registration.
 ///
-/// The beta2 runtime activates this context before starting the WDS bearer and
-/// retains it while SIP is registered. Cleanup restores the definition that was
-/// present before the attempt so an Internet profile is not permanently changed.
+/// The AT context is activated only long enough to prefetch P-CSCF settings and
+/// is deactivated before WDS starts the real bearer. The definition and Qualcomm
+/// P-CSCF reporting flag remain armed while SIP is registered. Cleanup restores
+/// the definition that was present before the attempt so an Internet profile is
+/// not permanently changed.
 #[derive(Debug)]
 pub struct ImsProfileLease {
     modem: String,
@@ -264,8 +266,11 @@ pub async fn set_pcscf_reporting(modem: &str, cid: u8, enabled: bool) -> Result<
 ///
 /// IDA shows the working binary performing, for one profile and PDP type:
 /// `CGACT=0`, `CGDCONT=<cid>,<type>,ims`, `$QCPDPIMSCFGE=<cid>,1,1,1`,
-/// `CGACT=1`, then repeated `CGCONTRDP=<cid>` reads. The resulting P-CSCF list
-/// is preferred over the later WDS/active-bearer/DNS fallbacks.
+/// `CGACT=1`, then repeated `CGCONTRDP=<cid>` reads. Once the prefetch is done,
+/// the AT activation is stopped before the native WDS bearer takes ownership of
+/// the same profile. Keeping both active makes this firmware reject WDS with
+/// `(2,201) [internal] error`. The resulting P-CSCF list is preferred over the
+/// later WDS/active-bearer/DNS fallbacks.
 pub async fn prefetch_pcscf_from_ims_profile(
     modem: &str,
     plan: &ImsConnectionPlan,
@@ -322,6 +327,15 @@ pub async fn prefetch_pcscf_from_ims_profile(
                                 "IMS profile CGCONTRDP prefetch read failed"
                             ),
                         }
+                    }
+                    // AT activation is only a discovery probe. WDS must be the
+                    // sole activation owner for this profile; otherwise the
+                    // QCM410 firmware rejects both families as an internal
+                    // error instead of returning its useful family policy.
+                    if let Err(error) = run_at(modem, &format!("AT+CGACT=0,{cid}")).await {
+                        last_error = Some(error);
+                        cleanup_profile_context(modem, cid, &restore_command).await;
+                        continue;
                     }
                     return Ok(ImsProfilePrefetch {
                         candidates,
