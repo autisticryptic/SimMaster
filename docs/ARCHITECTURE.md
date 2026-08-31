@@ -13,13 +13,17 @@ SimAdmin 管理的最小单位不是"设备"也不是"SIM 卡"，而是**线路*
 - **基带线路** —— 一个物理卡槽加一个 UIM slot
 - **读卡器线路** —— 一个独立的 SIM/eSIM 读卡器
 
-线路 ID 的生成方式是这个设计的关键：
+线路 ID 的生成方式是这个设计的关键（`hardware/cellular/modem_manager.rs`）：
 
-```text
-line_id = hash(物理槽锚点 + UIM slot)
+```rust
+physical_line_id  = md5("physical-line" \0 hardware_key[#uimN])
 ```
 
-**注意里面没有 ICCID。** 同一个槽换一张卡，`line_id` 不变。这样"这个槽位的配置"（数据连接开关、代理、VoLTE profile 顺序、Trunk 端点）就跟着物理位置走，换卡不会丢。
+`hardware_key` 是物理槽锚点；`uim_slot` 只在 > 1 时以 `#uimN` 追加，所以单 UIM 设备的 ID 不会因为加了这个维度而变化。
+
+**注意 material 里没有 ICCID。** 同一个槽换一张卡，`line_id` 不变。这样"这个槽位的配置"（数据连接开关、代理、VoLTE profile 顺序、Trunk 端点）跟着物理位置走，换卡不丢。
+
+旧版是 `md5(line_key \0 sim_key)`——**含 SIM**，所以换卡就变成另一条线路。这些旧 ID 由 `physical_line_identity()` 算出来放进 `legacy_line_ids`，首次发现时迁移线路配置、自动化目标、通知作用域和累计流量（流量是事务合并后删除旧行，重复刷新不会二次累加）。
 
 反过来，跟 SIM 卡本身绑定的东西用另一个键：
 
@@ -32,7 +36,9 @@ IMS 覆写（自定义 IMSI、ePDG DNS、P-CSCF 覆盖）用这个键，所以�
 
 **两套键各管一摊，是刻意的。** 混用会导致换卡后要么丢配置，要么把上一张卡的 IMS 身份套到新卡上。
 
-历史遗留：旧版本用 `hash(物理槽锚点 + ICCID)`，这些 ID 保存在 `legacy_line_ids` 里，首次发现时迁移线路配置、自动化目标、通知作用域和累计流量，且不会重复累加。
+读卡器线路同理：`reader_line_id(reader_id, uim_slot)` 以读卡器本身为锚点，插入另一张卡不会顶掉用户已有的 VoWiFi/trunk/通知/自动化配置。
+
+短信、通话和诊断历史保留写入当时的原始 ID，作为历史审计事实，不做批量改写。
 
 ## 2. 前端信息架构
 
@@ -76,13 +82,15 @@ SIM 页面是两栏工作台：
 
 `backend/src/platform/network_routing.rs` 统一分配表号：
 
-| 域 | 表号 | 用途 |
-|---|---|---|
-| `ModemData` | `12000+` | 数据代理、流量任务 |
-| `VolteIms` | `14000+` | VoLTE P-CSCF、RTP、RTCP、视频 |
-| `VowifiIms` | `16000+` | VoWiFi ePDG TUN、P-CSCF、RTP、视频 |
+| 域 | 表号基址 | 规则优先级基址 | 用途 |
+|---|---|---|---|
+| `ModemData` | `12000` | `10000` | 数据代理、流量任务 |
+| `VolteIms` | `14000` | `14000` | VoLTE P-CSCF、RTP、RTCP、视频 |
+| `VowifiIms` | `16000` | `18000` | VoWiFi ePDG TUN、P-CSCF、RTP、视频 |
 
-同域内按接口名槽位和地址族生成**稳定**表号：`wwanN` 用 `N`，TUN/USB/MBIM 用接口名哈希。稳定很重要——线路重启后表号不能变。
+同域内的实际表号是 `table_base + 接口槽位 * 2 + (是否 IPv6)`：`wwanN` 用 `N` 作槽位，TUN/USB/MBIM 用接口名哈希。乘 2 再加地址族位，是为了让同一接口的 v4/v6 各占一个表号而不互相覆盖。
+
+**槽位必须稳定**——线路重启后表号不能变，否则旧规则会残留指向一个已经被别人用掉的表。
 
 每个承载建一条源地址规则：
 

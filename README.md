@@ -18,7 +18,7 @@
   <br/>
 
   <details>
-    <summary>查看 v1.1.3 界面截图（当前开发分支界面可能不同）</summary>
+    <summary>查看 v1.1.4 界面截图（当前开发分支界面可能不同）</summary>
     <br/>
   <picture>
     <img src="./static/Dashboard.png" width="100%" alt="Dashboard" />
@@ -54,7 +54,8 @@
 	<br/><br/>
   </picture>
   </details>
-  
+
+
 </div>
 
 # SimAdmin - 多线路 SIM/eSIM 与 IMS 管理中枢
@@ -189,28 +190,6 @@ systemctl enable --now simadmin.service
 
 严禁将本项目或其衍生版本闭源后作为专有软件分发。
 
-## 社区交流
-
-⚠️ 温馨提示：群聊仅限日常讨论和经验分享，如需反馈问题或提交新需求。
-
-<table>
-  <thead>
-    <tr>
-      <th width="50%">QQ 群</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td>
-        <picture>
-          <source media="(prefers-color-scheme: dark)" srcset="./static/Community/Community_QQ_Dark.png" />
-          <source media="(prefers-color-scheme: light)" srcset="./static/Community/Community_QQ_Light.png" />
-          <img src="./static/Community/Community_QQ_Light.png" />
-        </picture>
-      </td>
-    </tr>
-  </tbody>
-</table>
 
 ---
 

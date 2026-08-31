@@ -72,12 +72,6 @@ MEP Port、QMI/MBIM UIM slot、PC/SC reader index、物理基带槽和 SimAdmin 
 - [ ] 完成“蜂窝 VoLTE + WiFi-only VoWiFi”双线路真实注册、重连、通话、短信和资源清理验收。
 - [ ] 真实硬件未到位前，不把上述项目标记为完成；模拟测试通过只能标记软件接口和隔离逻辑完成。
 
-### 后续 UI 文案统一（在 MEP 预留接口完成后处理）
-
-- [ ] 在 `frontend/src/pages/sim/ModemLinesPanel.tsx` 统一 IMS 与 Trunk 配置/状态区域文案：删除 `VoLTE IMS 连接` 下过长的 `独立于其他基带管理；连接阶段与地址族详情见线路活动日志` 说明，改为与 `VoWiFi 注册`、`Trunk 注册` 一致的简短辅助状态文案。
-- [ ] 连接阶段、地址族和详细诊断只保留在线路活动日志中，不在卡片辅助文案中重复展示。
-- [ ] 完成 VoLTE IMS、VoWiFi 注册、Trunk 注册三处标题、状态色和辅助文案的一致性回归。
-
 ## 完成定义
 
 MEP 预留接口只有在以下条件全部满足后，才能从“预留阶段”进入“可实机适配”：

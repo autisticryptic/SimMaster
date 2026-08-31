@@ -21,7 +21,7 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 ## P0：回归门槛（本轮已恢复）
 
 - [x] 修复或隔离 `connectivity::modems::ims::vowifi::channel::tests::udp_channel_recv_chunk_reassembles_oversized_datagram` 长时间不结束的问题；当前单独运行与全量回归均结束。
-- [x] 完整 `cargo test --workspace --no-fail-fast`：1041 passed、1 ignored（需要外部 Asterisk/Linphone）、0 failed。
+- [x] 完整后端回归通过。数量随开发变化，不在文档里固化——以 `cargo test --bin simadmin -- --test-threads=1` 的当次输出为准（2026-08-30 为 1400 passed / 3 ignored，其中 ignored 需要外部 Asterisk/Linphone 或超 MTU 的 WSL2 loopback）。
 - [x] 清理默认 Linux binary 的 dead-code / unused warning；未接线的 E911 provider 仍以明确待办保留，不用 warning 掩盖状态。
 - [x] 增加前端 `pnpm lint`、`pnpm type-check`、`pnpm build` 的 CI 检查，并固定非交互依赖安装方式（`.github/workflows/frontend-checks.yml`）。
 
@@ -48,15 +48,16 @@ SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经�
 
 至少需要两条真实线路，最好两张相同 PLMN 和两张不同 PLMN 的 SIM，逐项验收：
 
-代码侧审计记录（不替代下面的实机验收）：VoWiFi TUN、IMS REGISTER、安全协商、XCAP、operator session 和 SIM device runtime 均以 `line_id` 为键；VoLTE/VoWiFi/Trunk、数据、漫游、飞行模式、视频、语音/SMS 路径以及 lpac reader 参数均已下沉到 `LineProfileConfig`。基带 `line_id` 只由稳定物理槽锚点和 UIM slot 生成，同槽换卡不再生成新线路；旧版“物理槽 + ICCID”ID会迁移线路配置、自动化目标、通知线路筛选和累计流量。SIM IMS 覆写仍独立使用 ICCID 或 EID + profile ICCID，不会误变成基带级配置。其中 lpac 旧全局 reader 参数只允许单线路迁移，并有双线路隔离测试。
+**这一整节被同一个前提阻塞：410 上目前只插了一张卡，`line_profiles` 只有一条线路。** 代码侧的按线路隔离已经落地（键的设计见 `ARCHITECTURE.md`，`line_id` 只由物理槽锚点 + UIM slot 生成，SIM 覆写另用 `SimBindingKey`），并有双线路单元测试，但没有第二条真实线路就无法验收。
 
-- [ ] 两条线路同时建立 VoLTE bearer 和 IMS REGISTER，分别使用自己的 QMI、netdev、P-CSCF、路由表和 runtime。
+- [ ] 两条线路同时建立 VoLTE bearer 和 IMS REGISTER，各自使用自己的 QMI、netdev、P-CSCF、路由表和 runtime。
 - [ ] 两条线路同时建立 VoWiFi TUN/ePDG/IKE/ESP/REGISTER，TUN、代理、DNS、route 和 operator session 不互相覆盖。
 - [ ] 相同 PLMN 的两张 SIM 使用不同 effective profile、IMEI、E911、UT、MWI 和 trunk 配置时不串值。
-- [ ] 独立读卡器换卡后按 ICCID/EID + eSIM profile ICCID 重新选择覆写；不能使用 reader `line_id` 误绑定旧 SIM。
-- [ ] 在两条真实线路上验证 SIM 从 modem A 移到 modem B、eSIM profile 切换、拔卡再插回和 modem 编号变化后，物理线路配置保持在槽位、SIM 覆写跟随 ICCID/EID + profile ICCID。
+- [ ] SIM 从 modem A 移到 modem B、eSIM profile 切换、拔卡再插回、modem 编号变化后：物理线路配置留在槽位，SIM 覆写跟随 ICCID / EID + profile ICCID。独立读卡器换卡同样按 SIM 键重选覆写，不得用 reader `line_id` 误绑旧 SIM。
 - [ ] 一条线路停止、断网、认证失败或 bearer 重建时，另一条线路的 REGISTER、通话、RTP relay 和历史记录不受影响。
 - [ ] 两条线路同时使用 Asterisk trunk，验证 AOR、auth username、local port、Call-ID、RTP socket 和 incoming/outgoing binding 不冲突。
+
+UE 隔离（netns/veth/worker）本身的分阶段验收清单不在这里重复——它带着 feature flag 名称、每项的日期/提交号证据和被阻塞原因，见 `ue-isolation-migration.md` 第 8 节。
 
 ## P1：IMS 补充业务和运营商回读
 
@@ -81,7 +82,9 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ## P2：设备抽象与 CS
 
-- [ ] 完成 `detect_device_kind()` 的真实 sysfs/DT/udev capability 探测；未知设备不得写 QCM410 DATA6 udev 规则或绑定 secondary QMI。
+- [ ] 让 `DeviceKind` 真正参与 DATA6 / secondary QMI 的准入判断。
+  - 现状：`detect_device_kind()`（`hardware/devices/mod.rs`）确实做了 sysfs 探测——按 remoteproc 的 `name` 认 `4080000.remoteproc`，刻意不把邻居 `a204000.remoteproc`（WCNSS Wi-Fi/BT）当基带，认不出就返回 `Unknown` 而不是默认 `Qcm410`。这部分是对的。
+  - 缺口：`DeviceKind` 目前**只**用于选择 baseband fault policy（`devices/baseband_faults.rs`）。DATA6 和 secondary QMI 的开关是环境变量 `SIMADMIN_ENABLE_SECONDARY_QMI`（systemd unit 里设的），与 `DeviceKind` 无关。也就是说在一台 `Unknown` 设备上，只要那个变量为 1，仍会去枚举/绑定 DATA6。应改为「`Unknown` 一律不进 DATA6 路径」，环境变量只能在已识别设备上作为额外开关。
 - [ ] 将 QCM410 `ImsBearerTransport` 通过 provider/capability 注入 runtime；generic ModemManager 路径不能依赖 QCM410 类型。
 - [x] 已删除未实现的 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` stub；保留实际 `ImsBearerTransport` capability seam。
 - [ ] 为 EC20/EC25/EG25/EG600 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。逐型号矩阵：
@@ -106,11 +109,11 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ## P1：eSIM MEP 预留接口
 
-- [ ] 按 `docs/ESIM_MEP_INTERFACE_PLAN.md` 预留 eUICC MEP capability、Port、Profile-to-Port、SIM 来源和可插拔 APDU/modem backend 接口。
-- [ ] 目标覆盖内置 eUICC/基带 MEP、410/724ug/EC20/EM05-G/EM7430 的后续适配，以及 PC/SC 读卡器 MEP；型号本身不视为能力证明。
+代码里目前**完全没有 MEP 相关实现**（全仓库搜不到 `MEP`/`mep_` 符号），所以这是一个尚未开工的模块，逐项任务清单在 `docs/ESIM_MEP_INTERFACE_PLAN.md`，此处不重复。
+
+- [ ] 按 `docs/ESIM_MEP_INTERFACE_PLAN.md` 完成预留接口（capability、Port、Profile-to-Port、SIM 来源、可插拔 APDU/modem backend）。
 - [ ] 优先支持“一个 Port 走蜂窝 VoLTE、另一个 Port 只走 WiFi VoWiFi”的线路模型；读卡器不要求蜂窝联网。
-- [ ] 在没有真实 MEP eUICC 和读卡器前，只完成 Mock/能力未知回退/线路隔离测试，不标记真实 MEP 完成。
-- [x] 统一 IMS 与 Trunk 区域文案（2026-08-30，提交 `6a34ee4`，已部署到 410）。已移除 VoLTE 卡片中“独立于其他基带管理；连接阶段与地址族详情见线路活动日志”。VoWiFi 与 Trunk 标题下保留的是**动态运行态**（VoWiFi 注册状态、Trunk `host:port`），只有 VoLTE 那行是静态说明，所以删掉它之后三者形态一致：标题加状态 chip。详细连接阶段与地址族信息只在线路活动日志。
+- [ ] 没有真实 MEP eUICC/读卡器之前，只做 Mock 与线路隔离测试，不标记真实 MEP 完成；型号本身不构成能力证明。
 ## P1：IMS REGISTER 收口
 
 代码层与本地回归已完成：REGISTER 事务过滤（Call-ID + CSeq + method）、channel requeue、候选阶梯、三态 `omit` 全链路端到端断言、自定义 DNS 端口、每线路动态接入上下文。2026-08-30 已在 410 上闭环 ePDG/IKE/Child SA/ESP 和 **IMS REGISTER 200 OK**。
@@ -130,9 +133,9 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ### 可观察性
 
-- [ ] REGISTER 日志记录实际 PANI/CNI 来源：dynamic / static profile / compatibility fallback / omitted。
+- [x] REGISTER 日志记录实际 PANI/CNI 来源。`volte/live.rs` 在 REGISTER 生命周期开始处输出 `pani_identity_source` 和 `cni_identity_source`，取值来自 `AccessIdentitySource`：`dynamic` / `static_profile` / `compatibility_fallback` / `omitted` / `required_dynamic_missing`。
 - [ ] refresh 降级成功时记录被移除的头（不记录敏感字段）。
-- [ ] 每条线路分别统计 refresh 成功率和 access rebuild 次数。
+- [ ] 每条线路统计 refresh 成功率和 access rebuild 次数。失败侧已有 `live_ims_refresh_failure_count_for_line()`（按 line_id 计数，API 已读取）；缺的是成功计数、成功率和 rebuild 次数。
 
 事务键脱敏摘要、跳过帧诊断和失败原因分类已经存在（`RegisterTransactionKey::summary()` 输出 Call-ID hash，五种失败原因串，`authorization_and_nonce_never_reach_the_transaction_log` 固定安全不变量）。
 

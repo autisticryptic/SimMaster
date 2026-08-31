@@ -92,9 +92,12 @@
 - **get_call_settings.bru** - 获取通话设置
 - **set_call_settings.bru** - 设置通话设置
 
-### APN 管理接口
-- **get_apn_list.bru** - 获取 APN 配置列表
-- **set_apn.bru** - 设置 APN 配置
+### APN 管理接口（后端已移除，请求文件待清理）
+> `/api/modem/lines/{line_id}/apn` 的 GET/POST 路由已从 `main.rs` 删除——APN 现在只作为
+> 线路内部的数据承载参数维护，不再提供独立编辑接口。下面两个 `.bru` 仍留在目录里但会 404，
+> 应连同 `get_volte_voice_status.bru` / `set_volte_voice.bru` 一起删除。
+- ~~**get_apn_list.bru** - 获取 APN 配置列表~~
+- ~~**set_apn.bru** - 设置 APN 配置~~
 
 ### 设备网络接口
 - **get_device_ddns_config.bru** - 获取 DDNS 配置
@@ -195,7 +198,7 @@
 | GET | `/api/volte/lines/{line_id}` | 指定线路的 VoLTE 配置和注册状态 |
 | POST | `/api/volte/lines/{line_id}/retry` | 手动启动五轮 IMS 恢复 |
 | GET | `/api/modem/lines/{line_id}/volte/call/status` | 指定线路的 VoLTE 语音状态 |
-| POST | `/api/modem/lines/{line_id}/volte/voice` | 设置设备语音能力并返回指定线路状态 |
+| ~~POST~~ | ~~`/api/modem/lines/{line_id}/volte/voice`~~ | **已移除**：路由不存在，`set_volte_voice.bru` / `get_volte_voice_status.bru` 会 404 |
 | GET/POST | `/api/modem/lines/{line_id}/voice/path-policy` | 指定线路的语音路径策略 |
 | GET | `/api/trunk/lines` | Trunk 配置和 runtime 诊断 |
 | POST | `/api/trunk/lines/{line_id}` | 保存线路 Trunk 配置 |
@@ -229,8 +232,7 @@
 | POST | `/api/modem/lines/{line_id}/calls/forwarding` | 设置指定线路的呼叫转移 |
 | GET | `/api/modem/lines/{line_id}/calls/settings` | 获取指定线路的通话设置 |
 | POST | `/api/modem/lines/{line_id}/calls/settings` | 设置指定线路的通话设置 |
-| GET | `/api/modem/lines/{line_id}/apn` | 获取指定线路的 APN 配置列表 |
-| POST | `/api/modem/lines/{line_id}/apn` | 设置指定线路的 APN 配置 |
+| ~~GET/POST~~ | ~~`/api/modem/lines/{line_id}/apn`~~ | **已移除**：APN 只作为线路内部数据承载参数，无独立接口 |
 | GET | `/api/device-network/ddns/config` | 获取 DDNS 配置 |
 | POST | `/api/device-network/ddns/config` | 保存 DDNS 配置 |
 | GET | `/api/device-network/ddns/status` | 获取 DDNS 状态 |
