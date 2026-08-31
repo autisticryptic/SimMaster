@@ -328,6 +328,7 @@ function WorkbenchOverview({ line }: { line: VolteLineControlResponse }) {
 }
 
 type EsimControlMode = 'auto' | 'enabled' | 'disabled'
+type EsimAutoProbe = 'idle' | 'probing' | 'detected' | 'not-detected'
 
 const DEFAULT_ESIM_READER_CONFIG: EsimReaderConfig = {
   apdu_backend: 'qmi',
@@ -344,9 +345,10 @@ const DEFAULT_ESIM_READER_CONFIG: EsimReaderConfig = {
 }
 
 function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControlResponse | null, onControlChanged: (control: boolean | null) => void }) {
-  const esimDetected = Boolean(line && (line.modem.sim_type === 'esim' || line.modem.esim_status === 'no-profiles' || line.modem.esim_status === 'with-profiles'))
+  const esimReported = Boolean(line && (line.modem.sim_type === 'esim' || line.modem.esim_status === 'no-profiles' || line.modem.esim_status === 'with-profiles'))
   const initialMode: EsimControlMode = line?.profile.esim_control === true ? 'enabled' : line?.profile.esim_control === false ? 'disabled' : 'auto'
   const [controlMode, setControlMode] = useState<EsimControlMode>(initialMode)
+  const [autoProbe, setAutoProbe] = useState<EsimAutoProbe>(esimReported ? 'detected' : 'idle')
   const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(null)
   const [profiles, setProfiles] = useState<EsimProfile[]>([])
   const [lpac, setLpac] = useState<EsimLpacStatusResponse | null>(null)
@@ -363,11 +365,12 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
   const [reloadKey, setReloadKey] = useState(0)
   const [managerOpen, setManagerOpen] = useState(false)
   const [lpacSettingsOpen, setLpacSettingsOpen] = useState(false)
-  const esimEnabled = controlMode === 'enabled' || (controlMode === 'auto' && esimDetected)
+  const esimEnabled = controlMode === 'enabled' || (controlMode === 'auto' && (esimReported || autoProbe === 'detected'))
   const lineId = line?.modem.line_id
 
   useEffect(() => {
     setControlMode(initialMode)
+    setAutoProbe(esimReported ? 'detected' : 'idle')
     setEuicc(null)
     setProfiles([])
     setLpac(null)
@@ -383,14 +386,19 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
         if (response.data) setLpacConfig(response.data)
       }).catch((err) => setLpacConfigError(err instanceof Error ? err.message : String(err)))
     }
-  }, [initialMode, lineId])
+  }, [esimReported, initialMode, lineId])
 
   useEffect(() => {
     let active = true
     if (!lineId) return () => { active = false }
-    setLoading(esimEnabled)
+    if (controlMode === 'disabled') {
+      setLoading(false)
+      return () => { active = false }
+    }
+    setLoading(true)
     setError(null)
     void (async () => {
+      let euiccConfirmed = false
       try {
         const lpacResponse = await api.getEsimLpacStatus()
         if (!active) return
@@ -400,23 +408,32 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
           setError('暂无法读取 lpac 状态，请稍后重试。')
           return
         }
-        if (!nextLpac.usable || !esimEnabled) return
+        if (!nextLpac.usable) {
+          if (controlMode === 'auto' && !esimReported) setAutoProbe('not-detected')
+          setError(nextLpac.message || 'lpac 当前不可用')
+          return
+        }
 
-        const [euiccResponse, profileResponse] = await Promise.all([
-          api.getEsimEuicc(lineId),
-          api.getEsimProfiles(lineId),
-        ])
+        if (controlMode === 'auto' && !esimReported) setAutoProbe('probing')
+        const euiccResponse = await api.getEsimEuicc(lineId)
+        if (!active) return
+        euiccConfirmed = true
+        if (controlMode === 'auto') setAutoProbe('detected')
+        const profileResponse = await api.getEsimProfiles(lineId)
         if (!active) return
         setEuicc(euiccResponse.data ?? null)
         setProfiles(profileResponse.data?.profiles ?? [])
       } catch (err) {
-        if (active) setError(err instanceof Error ? err.message : String(err))
+        if (active) {
+          if (controlMode === 'auto' && !esimReported && !euiccConfirmed) setAutoProbe('not-detected')
+          setError(err instanceof Error ? err.message : String(err))
+        }
       } finally {
         if (active) setLoading(false)
       }
     })()
     return () => { active = false }
-  }, [esimEnabled, lineId, reloadKey])
+  }, [controlMode, esimReported, lineId, reloadKey])
 
   const repairLpac = async () => {
     setLpacRepairing(true)
@@ -464,6 +481,7 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
     try {
       await api.setLineEsimControl(lineId, control)
       setControlMode(nextMode)
+      setAutoProbe(esimReported ? 'detected' : 'idle')
       setEuicc(null)
       setProfiles([])
       setError(null)
@@ -506,12 +524,17 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
         {controlSaving && <CircularProgress size={18} />}
         <Typography variant="caption" color="text.secondary">
           {controlMode === 'auto'
-            ? esimDetected ? '已自动检测到 eUICC，管理面板已启用' : '未检测到 eUICC，管理面板保持关闭'
+            ? esimReported || autoProbe === 'detected'
+              ? '已自动检测到 eUICC，管理面板已启用'
+              : autoProbe === 'probing' || autoProbe === 'idle'
+                ? '正在通过 lpac 自动探测 eUICC'
+                : 'lpac 未检测到 eUICC，管理面板保持关闭'
             : controlMode === 'enabled' ? '已强制显示并启用该线路的 eSIM 管理' : '已强制关闭该线路的 eSIM 管理'}
         </Typography>
       </Box>
       {controlError && <Alert severity="error" sx={{ mb: 1.5 }}>{controlError}</Alert>}
-      {!esimEnabled && <Alert severity={controlMode === 'disabled' ? 'warning' : 'info'}>{controlMode === 'disabled' ? 'eSIM 管理已强制关闭。' : '自动模式下未识别到 eSIM；可切换到“开启”以管理外置 eUICC。'}</Alert>}
+      {!esimEnabled && !loading && <Alert severity={controlMode === 'disabled' ? 'warning' : 'info'}>{controlMode === 'disabled' ? 'eSIM 管理已强制关闭。' : '自动模式下未识别到 eSIM；可切换到“开启”以检查自定义 lpac 接口配置。'}</Alert>}
+      {!esimEnabled && !loading && error && <Alert severity="warning" sx={{ mt: 1.5 }}>{error}</Alert>}
       {esimEnabled && loading && <Box display="grid" sx={{ placeItems: 'center', minHeight: 180 }}><CircularProgress size={26} /></Box>}
       {esimEnabled && !loading && error && <Alert severity="warning" sx={{ mb: 1.5 }}>{error}</Alert>}
       {esimEnabled && !loading && !error && lpac?.usable && <>

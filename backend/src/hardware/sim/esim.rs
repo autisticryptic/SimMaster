@@ -4,11 +4,12 @@
 //! on a physical eUICC SIM card inserted in the device. It does not switch
 //! board-level SIM hardware and does not start background workers.
 
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::{self, Cursor};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -59,6 +60,7 @@ impl EsimApiError {
 pub struct EsimSupervisor {
     config_manager: Arc<ConfigManager>,
     lpac_lock: Mutex<()>,
+    detected_euicc_lines: StdMutex<HashSet<String>>,
 }
 
 impl EsimSupervisor {
@@ -66,7 +68,15 @@ impl EsimSupervisor {
         Self {
             config_manager,
             lpac_lock: Mutex::new(()),
+            detected_euicc_lines: StdMutex::new(HashSet::new()),
         }
+    }
+
+    pub fn euicc_detected_for_line(&self, line_id: &str) -> bool {
+        self.detected_euicc_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains(line_id)
     }
 
     pub async fn get_lpac_status(&self) -> Result<EsimLpacStatusResponse, EsimApiError> {
@@ -191,11 +201,9 @@ impl EsimSupervisor {
         timeout_seconds: u64,
     ) -> Result<EsimCommandResponse, EsimApiError> {
         // A line whose owner explicitly opted out of eSIM control is treated as a
-        // plain SIM, so no lpac command ever reaches its reader. The automatic
-        // "only when a eUICC is detected" policy is enforced by the API layer,
-        // which can see the line's discovered `esim_status`; this defensive check
-        // covers the explicit `Some(false)` override the supervisor can see on its
-        // own.
+        // plain SIM, so no lpac command ever reaches its reader. In automatic
+        // mode the API may use this same line-scoped command as the fallback
+        // eUICC probe when ModemManager leaves SimType/EsimStatus unknown.
         if line_id.trim().is_empty() {
             return Err(EsimApiError::Unavailable("line_id_required".to_string()));
         }
@@ -237,6 +245,10 @@ impl EsimSupervisor {
         } else {
             info.memory_total_customizable = Some(false);
         }
+        self.detected_euicc_lines
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(line_id.to_string());
         Ok(info)
     }
 

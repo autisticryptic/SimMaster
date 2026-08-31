@@ -183,9 +183,9 @@ fn esim_error_response<T: Default>(error: EsimApiError) -> (StatusCode, Json<Api
 /// `Some(false)` on the profile forces the line to behave as a plain SIM, so no
 /// lpac command is ever issued. `Some(true)` force-enables management even when
 /// the SIM cannot advertise a eUICC (e.g. a bare reader). `None` is the auto
-/// policy: management is offered only when the line's SIM reports a eUICC chip
-/// through ModemManager (`sim_type`/`esim_status`), which is a cheap signal that
-/// costs no extra lpac probe.
+/// policy: trust ModemManager when it reports a eUICC, otherwise prove the card
+/// is a eUICC with a line-scoped lpac `chip info` probe. Removable eUICCs are
+/// commonly exposed as an ordinary SIM by older ModemManager versions.
 fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemBinding) -> bool {
     binding.sim_type == "esim"
         || matches!(
@@ -200,7 +200,13 @@ fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemB
 async fn resolve_line_esim_gate(
     app: &AppState,
     line_id: &str,
-) -> Result<Arc<crate::services::line_registry::LineRuntime>, EsimApiError> {
+) -> Result<
+    (
+        Arc<crate::services::line_registry::LineRuntime>,
+        Option<EsimEuiccInfo>,
+    ),
+    EsimApiError,
+> {
     let line_id = line_id.trim();
     if line_id.is_empty() {
         return Err(EsimApiError::Unavailable("line_id_required".to_string()));
@@ -214,12 +220,15 @@ async fn resolve_line_esim_gate(
 
     match app.config_manager.get_line_profile(line_id).esim_control {
         Some(false) => Err(EsimApiError::Disabled),
-        Some(true) => Ok(line),
+        Some(true) => Ok((line, None)),
         None => {
-            if line_reports_euicc(&line.binding()) {
-                Ok(line)
+            if line_reports_euicc(&line.binding())
+                || app.esim_supervisor.euicc_detected_for_line(line_id)
+            {
+                Ok((line, None))
             } else {
-                Err(EsimApiError::Disabled)
+                let info = app.esim_supervisor.get_euicc_info_for_line(line_id).await?;
+                Ok((line, Some(info)))
             }
         }
     }
@@ -742,8 +751,15 @@ pub async fn get_esim_euicc_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    if let Err(err) = resolve_line_esim_gate(&app, &line_id).await {
-        return esim_error_response::<EsimEuiccInfo>(err);
+    let probed_info = match resolve_line_esim_gate(&app, &line_id).await {
+        Ok((_, probed_info)) => probed_info,
+        Err(err) => return esim_error_response::<EsimEuiccInfo>(err),
+    };
+    if let Some(data) = probed_info {
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", data)),
+        );
     }
     match app.esim_supervisor.get_euicc_info_for_line(&line_id).await {
         Ok(data) => (
@@ -781,7 +797,7 @@ pub async fn get_esim_profiles_handler(
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
     let line = match resolve_line_esim_gate(&app, &line_id).await {
-        Ok(line) => line,
+        Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimProfilesResponse>(err),
     };
     match app.esim_supervisor.get_profiles_for_line(&line_id).await {
@@ -846,7 +862,7 @@ pub async fn enable_esim_profile_handler(
     Path((line_id, iccid)): Path<(String, String)>,
 ) -> impl IntoResponse {
     let line = match resolve_line_esim_gate(&app, &line_id).await {
-        Ok(line) => line,
+        Ok((line, _)) => line,
         Err(err) => return esim_error_response::<EsimCommandResponse>(err).into_response(),
     };
     let event_entity = mask_identifier(&iccid);
