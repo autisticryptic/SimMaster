@@ -601,6 +601,10 @@ pub async fn configure_bearer_network_in_worker(
     bearer: &BearerConnection,
     worker: &UeWorkerHandle,
 ) -> Result<(), VolteError> {
+    apply_worker_ops(worker, bearer_network_ops(bearer)?).await
+}
+
+fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, VolteError> {
     let mut ops = Vec::new();
     if let Some(mtu) = bearer.mtu {
         ops.push(NetConfigOp::LinkSetMtu {
@@ -608,6 +612,13 @@ pub async fn configure_bearer_network_in_worker(
             mtu,
         });
     }
+    // Moving a bam-dmux interface across namespaces clears its administrative
+    // UP state on this kernel. Bring it back before adding any routes; otherwise
+    // `ip route` fails with "Device for nexthop is not up" and the cleanup move
+    // triggers a second ModemManager re-enumeration.
+    ops.push(NetConfigOp::LinkSetUp {
+        ifname: bearer.interface.clone(),
+    });
     for (address, prefix, dns) in [
         (
             bearer.settings.ipv6_address,
@@ -635,10 +646,7 @@ pub async fn configure_bearer_network_in_worker(
     {
         return Err(VolteError::new(code::IP_SETTINGS_MISSING));
     }
-    ops.push(NetConfigOp::LinkSetUp {
-        ifname: bearer.interface.clone(),
-    });
-    apply_worker_ops(worker, ops).await
+    Ok(ops)
 }
 
 pub async fn route_pcscf_in_worker(
@@ -1146,6 +1154,34 @@ fn list_ip_values(output: &str, key_prefix: &str) -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_brings_moved_link_up_before_installing_routes() {
+        let bearer = BearerConnection {
+            path: "native-qmi://test".to_string(),
+            interface: "wwan1".to_string(),
+            ip_type: "ipv4".to_string(),
+            settings: ImsIpSettings {
+                ipv4_address: Some("10.233.164.16".parse().unwrap()),
+                ipv4_dns: vec!["193.41.60.16".parse().unwrap()],
+                ..Default::default()
+            },
+            ipv4_prefix: Some(32),
+            ipv6_prefix: None,
+            mtu: None,
+        };
+
+        let ops = bearer_network_ops(&bearer).unwrap();
+        let link_up = ops
+            .iter()
+            .position(|op| matches!(op, NetConfigOp::LinkSetUp { .. }))
+            .unwrap();
+        let first_route = ops
+            .iter()
+            .position(|op| matches!(op, NetConfigOp::RouteReplace { .. }))
+            .unwrap();
+        assert!(link_up < first_route);
+    }
 
     /// Maxis re-addresses the IMS PDN on every activation, so the source-based
     /// policy rule goes stale and SIP silently leaves via the host default

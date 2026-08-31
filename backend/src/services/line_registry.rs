@@ -284,6 +284,14 @@ impl LineRuntime {
         self.volte_retry_running.load(Ordering::SeqCst)
     }
 
+    /// A native bearer move temporarily removes a modem netdev from the host
+    /// namespace. ModemManager may briefly withdraw the whole modem object even
+    /// though the SIM and baseband never disappeared. Presence reconciliation
+    /// defers destructive hotplug cleanup while that controlled move is active.
+    pub fn bearer_operation_in_progress(&self) -> bool {
+        self.bearer_operation_lock.try_lock().is_err()
+    }
+
     /// Record that an IMS activation on this line wedged the baseband, opening
     /// (or widening) the window during which it must not be retried.
     pub fn note_baseband_wedged(&self) -> Duration {
@@ -754,6 +762,15 @@ impl LineRuntimeRegistry {
                 .collect::<Vec<_>>();
             (absent_lines, existing_lines, new_lines)
         };
+        let (deferred_absent_lines, absent_lines): (Vec<_>, Vec<_>) = absent_lines
+            .into_iter()
+            .partition(|line| line.bearer_operation_in_progress());
+        for line in &deferred_absent_lines {
+            tracing::debug!(
+                line_id = %line.binding().line_id,
+                "Deferring transient absent-line cleanup during native bearer operation"
+            );
+        }
 
         // Restore a new line's persisted counters before publishing it to the
         // registry. The persistence lock prevents a periodic flush from seeing
@@ -1362,6 +1379,20 @@ mod tests {
         line.mark_absent();
         assert_eq!(line.binding().line_id, "line-a");
         assert!(!line.binding().present);
+    }
+
+    #[tokio::test]
+    async fn controlled_bearer_move_defers_absent_line_cleanup() {
+        let line = LineRuntime::new(
+            binding("line-a", true),
+            Arc::new(VolteRuntime::new()),
+            VolteLiveHandle::new(),
+            VoicePathPolicy::default(),
+        );
+        assert!(!line.bearer_operation_in_progress());
+        let _guard = line.bearer_operation_lock.lock().await;
+        assert!(line.bearer_operation_in_progress());
+        assert!(line.binding().present);
     }
 
     fn wedge_line(line_id: &str) -> LineRuntime {
