@@ -140,13 +140,15 @@ pub enum NetConfigOp {
         ifname: String,
         cidr: String,
     },
-    /// `ip route replace <target> via <via> dev <dev> src <src> table <t>`.
+    /// `ip route replace <target> via <via> dev <dev> src <src> [onlink] table <t>`.
     RouteReplace {
         target: String,
         via: Option<String>,
         dev: Option<String>,
         src: Option<String>,
         table: Option<u32>,
+        #[serde(default)]
+        onlink: bool,
     },
     /// Best-effort `ip route del`; a missing route is not an error.
     RouteDel {
@@ -2049,6 +2051,7 @@ fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
             dev,
             src,
             table,
+            onlink,
         } => route_argv(
             "replace",
             target,
@@ -2056,6 +2059,7 @@ fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
             dev.as_deref(),
             src.as_deref(),
             *table,
+            *onlink,
         ),
         NetConfigOp::RouteDel {
             target,
@@ -2070,6 +2074,7 @@ fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
             dev.as_deref(),
             src.as_deref(),
             *table,
+            false,
         ),
         NetConfigOp::DefaultRouteReplace { via, dev } => vec![
             "route".into(),
@@ -2151,6 +2156,7 @@ fn route_argv(
     dev: Option<&str>,
     src: Option<&str>,
     table: Option<u32>,
+    onlink: bool,
 ) -> Vec<String> {
     let ipv6 = target.contains(':')
         || via.is_some_and(|value| value.contains(':'))
@@ -2171,6 +2177,9 @@ fn route_argv(
     if let Some(src) = src {
         argv.push("src".into());
         argv.push(src.into());
+    }
+    if onlink && via.is_some() && dev.is_some() {
+        argv.push("onlink".into());
     }
     if let Some(table) = table {
         argv.push("table".into());
@@ -2303,6 +2312,7 @@ mod tests {
                     dev: Some("sa_vwfabc".to_string()),
                     src: Some("10.0.0.5".to_string()),
                     table: None,
+                    onlink: false,
                 },
                 NetConfigOp::Xfrm {
                     args: vec![
@@ -2351,6 +2361,35 @@ mod tests {
             best_effort: true,
         };
         assert!(net_config_argv(&ignored_add).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn route_replace_emits_onlink_for_raw_ip_gateway() {
+        let op = NetConfigOp::RouteReplace {
+            target: "2a01:8f0:400:567::1b/128".into(),
+            via: Some("8000::100".into()),
+            dev: Some("wwan1".into()),
+            src: Some("2a00:20:4434:3582::1".into()),
+            table: None,
+            onlink: true,
+        };
+        assert_eq!(
+            net_config_argv(&op).unwrap(),
+            vec![
+                "-6",
+                "route",
+                "replace",
+                "2a01:8f0:400:567::1b/128",
+                "via",
+                "8000::100",
+                "dev",
+                "wwan1",
+                "src",
+                "2a00:20:4434:3582::1",
+                "onlink",
+            ]
+        );
     }
 
     #[cfg(unix)]

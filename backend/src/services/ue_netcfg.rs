@@ -127,6 +127,7 @@ pub fn tun_ue_side_ops(
             dev: Some(tun_name.to_string()),
             src: Some(inner_addr.to_string()),
             table: None,
+            onlink: false,
         });
     }
     ops
@@ -201,6 +202,7 @@ mod tests {
             dev: Some("sa_vwf05".to_string()),
             src: Some("10.10.0.5".to_string()),
             table: None,
+            onlink: false,
         }));
         assert_eq!(ops.len(), 4);
     }

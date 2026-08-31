@@ -624,6 +624,12 @@ AT 命令已经返回不代表固件内部的 DHCP context 已释放；WDS 在�
 `CGDCONT` 和 `$QCPDPIMSCFGE`，由长驻 WDS 进程唯一激活，随后再从 active context 的
 `CGCONTRDP` 读取地址、DNS 和 P-CSCF。
 
+Vodafone DE 实机随后把失败推进到路由阶段：bearer 正常获得 IPv6 地址、DNS 和 P-CSCF，
+但网关是 raw-IP 固件常见的伪 next-hop `8000::100`，不在 UE 地址的 `/64` 内。普通
+`ip -6 route replace ... via 8000::100 dev wwan1` 会被 Linux 以 `No route to host` 拒绝。
+IMS bearer 的 DNS、P-CSCF 和媒体 host route 现在在显式 next-hop 存在时附加 `onlink`；
+作用域只限 per-UE namespace 内的 raw-IP bearer 路由，不改变 WiFi/veth 默认路由。
+
 这也解释了为什么“同一进程完成 allocate + start”的中间修复仍不够：启动进程退出后，
 会话所有权已经丢失，后续 stop/query 仍会重新打开 DATA6。正确的生命周期边界必须覆盖
 整个 bearer，而不只是 start-network 调用。

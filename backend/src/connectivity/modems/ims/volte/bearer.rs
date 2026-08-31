@@ -279,18 +279,19 @@ where
                         let after = run_command("mmcli", &["-b", &path, "--output-keyvalue"])
                             .await
                             .unwrap_or_default();
-                        required_fallback = FailureClass::from_details(&format!(
-                            "{}\n{}", after, error
-                        ))
-                        .forced_family()
-                        .map(|f| match f {
+                        required_fallback =
+                            FailureClass::from_details(&format!("{}\n{}", after, error))
+                                .forced_family()
+                                .map(|f| {
+                                    match f {
                             crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
                                 IpType::Ipv6
                             }
                             crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
                                 IpType::Ipv4
                             }
-                        });
+                        }
+                                });
                         observe(BearerAttempt {
                             ip_type: "ipv4v6".to_string(),
                             source: "reconnected".to_string(),
@@ -679,6 +680,7 @@ fn worker_host_route_op(
         .map(|gateway| gateway.to_string());
     Ok(NetConfigOp::RouteReplace {
         target: host_selector(host),
+        onlink: via.is_some(),
         via,
         dev: Some(bearer.interface.clone()),
         src: Some(source.to_string()),
@@ -1181,6 +1183,35 @@ mod tests {
             .position(|op| matches!(op, NetConfigOp::RouteReplace { .. }))
             .unwrap();
         assert!(link_up < first_route);
+    }
+
+    #[test]
+    fn raw_ip_gateway_host_routes_are_marked_onlink() {
+        let bearer = BearerConnection {
+            path: "native-qmi://test".to_string(),
+            interface: "wwan1".to_string(),
+            ip_type: "ipv6".to_string(),
+            settings: ImsIpSettings {
+                ipv6_address: Some("2a00:20:4434:3582::1".parse().unwrap()),
+                ipv6_gateway: Some("8000::100".parse().unwrap()),
+                ..Default::default()
+            },
+            ipv4_prefix: None,
+            ipv6_prefix: Some(64),
+            mtu: None,
+        };
+
+        assert_eq!(
+            worker_host_route_op(&bearer, "2a01:8f0:400:567::1b".parse().unwrap()).unwrap(),
+            NetConfigOp::RouteReplace {
+                target: "2a01:8f0:400:567::1b/128".to_string(),
+                via: Some("8000::100".to_string()),
+                dev: Some("wwan1".to_string()),
+                src: Some("2a00:20:4434:3582::1".to_string()),
+                table: None,
+                onlink: true,
+            }
+        );
     }
 
     /// Maxis re-addresses the IMS PDN on every activation, so the source-based
