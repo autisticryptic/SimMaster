@@ -617,6 +617,13 @@ allocate/start/stop 分散到多个短命 `qmicli` 进程同样不成立。
 继续执行剩余单栈兜底。配置语义和尝试顺序不变，但不会再向这块固件发送危险的
 unspecified-family WDS 请求。
 
+自动路径还暴露了第二个竞态：旧实现为了提前拿 P-CSCF，会对 IMS CID 执行一次临时
+`CGACT=1`，读完 `CGCONTRDP` 后 `CGACT=0`，紧接着交给 WDS 再激活同一个 profile。
+AT 命令已经返回不代表固件内部的 DHCP context 已释放；WDS 在这个窗口内启动仍会触发
+`dhcp_client_mgr.c:263`。当前原生路径不再做临时 AT 激活，只在 inactive profile 上配置
+`CGDCONT` 和 `$QCPDPIMSCFGE`，由长驻 WDS 进程唯一激活，随后再从 active context 的
+`CGCONTRDP` 读取地址、DNS 和 P-CSCF。
+
 这也解释了为什么“同一进程完成 allocate + start”的中间修复仍不够：启动进程退出后，
 会话所有权已经丢失，后续 stop/query 仍会重新打开 DATA6。正确的生命周期边界必须覆盖
 整个 bearer，而不只是 start-network 调用。

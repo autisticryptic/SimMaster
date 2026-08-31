@@ -93,8 +93,7 @@ use super::{
     native_bearer::{self, NativeImsBearer},
     pcscf::{
         discover_pcscf_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
-        prefetch_pcscf_from_ims_profile, prepare_ims_profile_context, set_pcscf_reporting,
-        ImsProfileLease,
+        prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
@@ -1671,62 +1670,34 @@ async fn connect_inner(
     runtime
         .update(|state| state.stage = VolteStage::Bearer)
         .await;
-    let mut prefetched_pcscf = Vec::new();
-    let mut ims_profile_lease = None;
-    let ims_profile = match prefetch_pcscf_from_ims_profile(&device.modem_id, &plan, ims_apn).await
-    {
-        Ok(prefetch) => {
-            let cid = prefetch.lease.cid;
-            prefetched_pcscf = prefetch.candidates;
+    let mut ims_profile_lease: Option<ImsProfileLease> = None;
+    let ims_profile = match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
+        Ok(profile) => {
             tracing::info!(
-                cid,
-                pcscf_count = prefetched_pcscf.len(),
-                "Prepared Beta8 native IMS profile and handed activation to WDS"
+                cid = profile.cid,
+                created = profile.created,
+                "Prepared native IMS profile without AT activation"
             );
-            runtime.update(|state| state.at_cid = Some(cid)).await;
-            ims_profile_lease = Some(prefetch.lease);
-            Some(super::pcscf::ImsProfileContext {
-                cid,
-                created: false,
-            })
+            runtime
+                .update(|state| state.at_cid = Some(profile.cid))
+                .await;
+            Some(profile)
         }
-        Err(prefetch_error) => {
+        Err(error) => {
             tracing::warn!(
-                error = %prefetch_error,
-                "Native VoLTE profile P-CSCF prefetch failed; falling back to bearer discovery"
+                error = %error,
+                "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
             );
-            match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
-                Ok(profile) => {
-                    tracing::info!(
-                        cid = profile.cid,
-                        created = profile.created,
-                        "Selected fallback IMS 3GPP profile"
-                    );
-                    runtime
-                        .update(|state| state.at_cid = Some(profile.cid))
-                        .await;
-                    Some(profile)
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "Unable to select an IMS 3GPP profile; continuing with APN-only bearer setup"
-                    );
-                    None
-                }
-            }
+            None
         }
     };
     let mut request = BearerRequest::for_apn(ims_apn, allow_roaming);
     request.profile_id = ims_profile.map(|profile| u32::from(profile.cid));
 
-    // The beta2 prefetch lease already armed reporting and retained the profile
-    // definition, but its temporary AT activation has been stopped so WDS can
-    // own the bearer. Only the compatibility fallback still needs the
-    // standalone reporting command.
-    let pcscf_reporting_cid = if ims_profile_lease.is_some() {
-        None
-    } else if let Some(profile) = ims_profile {
+    // WDS must be the only activation owner. Arm P-CSCF reporting on the
+    // inactive profile, then read the resulting PCO through CGCONTRDP after the
+    // WDS session is established.
+    let pcscf_reporting_cid = if let Some(profile) = ims_profile {
         match set_pcscf_reporting(&device.modem_id, profile.cid, true).await {
             Ok(()) => {
                 tracing::info!(cid = profile.cid, "Enabled IMS P-CSCF reporting");
@@ -1805,15 +1776,10 @@ async fn connect_inner(
     ensure_bearer_interface_ready(&established.interface).await?;
     established.move_into_worker(worker.clone()).await?;
     let network_worker = worker;
-    for candidate in prefetched_pcscf.drain(..) {
-        if !bearer.settings.pcscf.contains(&candidate) {
-            bearer.settings.pcscf.push(candidate);
-        }
-    }
     if !bearer.settings.pcscf.is_empty() {
         tracing::info!(
             pcscf_count = bearer.settings.pcscf.len(),
-            "Native VoLTE using P-CSCF candidates prefetched from IMS profile"
+            "Native VoLTE using P-CSCF candidates delivered by the active IMS profile"
         );
     }
     // WDS PCO, the active context, and IMS DNS remain ordered fallbacks when
