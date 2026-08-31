@@ -18,6 +18,7 @@ const QMI_CTL_ALLOCATE_CID: u16 = 0x0022;
 const QMI_CTL_RELEASE_CID: u16 = 0x0023;
 const QMI_PROXY_OPEN: u16 = 0xff00;
 const QMI_UIM_SEND_APDU: u16 = 0x003b;
+const QMI_UIM_GET_CARD_STATUS: u16 = 0x002f;
 const QMI_UIM_OPEN_LOGICAL_CHANNEL: u16 = 0x0042;
 const QMI_UIM_LOGICAL_CHANNEL: u16 = 0x003f;
 
@@ -33,6 +34,7 @@ const TLV_UIM_CLOSE_CHANNEL_ID: u8 = 0x11;
 const TLV_UIM_PROCEDURE_BYTES: u8 = 0x11;
 const TLV_UIM_OPEN_AID: u8 = 0x10;
 const TLV_UIM_APDU_RESPONSE: u8 = 0x10;
+const TLV_UIM_CARD_STATUS: u8 = 0x10;
 
 pub const USIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
 pub const USIM_AUTHENTICATE_CLA: u8 = 0x00;
@@ -280,6 +282,19 @@ pub fn build_open_logical_channel_frame(
     })
 }
 
+pub fn build_get_card_status_frame(
+    client_id: u8,
+    transaction_id: u16,
+) -> Result<Vec<u8>, QmiUimError> {
+    encode_qmi_message(&QmiMessage {
+        service: QMUX_UIM_SERVICE,
+        client_id,
+        transaction_id,
+        message_id: QMI_UIM_GET_CARD_STATUS,
+        tlvs: Vec::new(),
+    })
+}
+
 pub fn build_close_logical_channel_frame(
     client_id: u8,
     transaction_id: u16,
@@ -306,6 +321,39 @@ pub fn parse_open_logical_channel(
         find_tlv(message, TLV_UIM_OPEN_CHANNEL_ID).ok_or(QmiUimError::MissingTlv("channel_id"))?;
     let channel_id = *value.first().ok_or(QmiUimError::InvalidFrame)?;
     Ok(LogicalChannelOpened { channel_id })
+}
+
+/// Extract the complete application identifier for an application prefix from
+/// the QMI UIM Card Status TLV. Application IDs on eSIMs commonly append a
+/// profile-specific suffix to the well-known USIM prefix; opening only the
+/// prefix makes the modem return `6A82 SimFileNotFound`.
+pub fn parse_application_id_from_card_status(
+    message: &QmiMessage,
+    application_prefix: &[u8],
+) -> Result<Option<Vec<u8>>, QmiUimError> {
+    ensure_success(message)?;
+    let Some(status) = find_tlv(message, TLV_UIM_CARD_STATUS) else {
+        return Ok(None);
+    };
+    let Some(offset) = status
+        .windows(application_prefix.len())
+        .position(|window| window == application_prefix)
+    else {
+        return Ok(None);
+    };
+    let length_offset = offset.checked_sub(1).ok_or(QmiUimError::InvalidFrame)?;
+    let application_length = usize::from(status[length_offset]);
+    if application_length < application_prefix.len() || application_length > 32 {
+        return Ok(None);
+    }
+    let application_start = offset;
+    let application_end = application_start
+        .checked_add(application_length)
+        .ok_or(QmiUimError::InvalidFrame)?;
+    let application_id = status
+        .get(application_start..application_end)
+        .ok_or(QmiUimError::InvalidFrame)?;
+    Ok(Some(application_id.to_vec()))
 }
 
 pub fn build_send_apdu_frame(
@@ -1277,14 +1325,32 @@ impl QmiProxyConnection {
         Ok(())
     }
 
+    fn resolve_application_aid(
+        &mut self,
+        client_id: u8,
+        aid: &[u8],
+    ) -> Result<Vec<u8>, QmiUimError> {
+        if aid.len() > USIM_AID_PREFIX.len() {
+            return Ok(aid.to_vec());
+        }
+        let tx = self.take_service_transaction();
+        let frame = build_get_card_status_frame(client_id, tx)?;
+        let response = self.send_and_recv(&frame)?;
+        if response.message_id != QMI_UIM_GET_CARD_STATUS {
+            return Err(QmiUimError::InvalidFrame);
+        }
+        Ok(parse_application_id_from_card_status(&response, aid)?.unwrap_or_else(|| aid.to_vec()))
+    }
+
     fn open_logical_channel(
         &mut self,
         client_id: u8,
         slot: u8,
         aid: &[u8],
     ) -> Result<LogicalChannelOpened, QmiUimError> {
+        let resolved_aid = self.resolve_application_aid(client_id, aid)?;
         let tx = self.take_service_transaction();
-        let frame = build_open_logical_channel_frame(client_id, tx, slot, aid)?;
+        let frame = build_open_logical_channel_frame(client_id, tx, slot, &resolved_aid)?;
         let response = self.send_and_recv(&frame)?;
         if response.message_id != QMI_UIM_OPEN_LOGICAL_CHANNEL {
             return Err(QmiUimError::InvalidFrame);
@@ -1722,6 +1788,34 @@ mod tests {
                 tlv(TLV_UIM_SLOT, vec![1]),
                 tlv(TLV_UIM_CLOSE_CHANNEL_ID, vec![4]),
             ]
+        );
+    }
+
+    #[test]
+    fn resolves_profile_specific_application_id_from_card_status() {
+        let application_id = [
+            0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02, 0xff, 0xff, 0xff, 0xff, 0x89,
+        ];
+        let mut card_status = vec![
+            0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x02, 0x07, 0x02, 0x0b, 0x00, 0x00, 0x0c,
+        ];
+        card_status.extend_from_slice(&application_id);
+        card_status.extend_from_slice(&[0x00, 0x03, 0x03, 0x0a, 0x01, 0x03, 0x0a]);
+        let message = QmiMessage {
+            service: QMUX_UIM_SERVICE,
+            client_id: 2,
+            transaction_id: 1,
+            message_id: QMI_UIM_GET_CARD_STATUS,
+            tlvs: vec![
+                tlv(TLV_RESULT, vec![0, 0, 0, 0]),
+                tlv(TLV_UIM_CARD_STATUS, card_status),
+            ],
+        };
+
+        assert_eq!(
+            parse_application_id_from_card_status(&message, USIM_AID_PREFIX).unwrap(),
+            Some(application_id.to_vec())
         );
     }
 
