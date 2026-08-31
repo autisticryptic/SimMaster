@@ -1,6 +1,6 @@
 const PROFILE_NOT_READY = /carrier_catalog_profile_not_ready:([^:]+):lte_epc:([^:]+)/
 const PROFILE_PLMN = /(?:home_plmn|imsi_prefix):([0-9]{5,6}|unknown):access:lte_epc:no_ready_profile/
-const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|option-unsubscribed|Requested service option not subscribed/i
+const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|service-option-not-subscribed|option-unsubscribed|Requested service option not subscribed/i
 
 function profileStatusLabel(status: string) {
   switch (status) {

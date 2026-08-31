@@ -160,11 +160,13 @@ impl FailureClass {
         if error.contains("ipv6onlyallowed")
             || error.contains("ipv6-only-allowed")
             || error.contains("only ipv6 allowed")
+            || error.contains("pdn-ipv4-call-disallowed")
         {
             FailureClass::NetworkForcedIpv6
         } else if error.contains("ipv4onlyallowed")
             || error.contains("ipv4-only-allowed")
             || error.contains("only ipv4 allowed")
+            || error.contains("pdn-ipv6-call-disallowed")
         {
             FailureClass::NetworkForcedIpv4
         } else if error.contains("prefix-unavailable") {
@@ -601,6 +603,18 @@ mod tests {
         assert_eq!(
             FailureClass::from_details("only ipv4 allowed"),
             FailureClass::NetworkForcedIpv4
+        );
+        assert_eq!(
+            FailureClass::from_details(
+                "verbose call end reason (2,210): [internal] pdn-ipv6-call-disallowed"
+            ),
+            FailureClass::NetworkForcedIpv4
+        );
+        assert_eq!(
+            FailureClass::from_details(
+                "verbose call end reason (2,209): [internal] pdn-ipv4-call-disallowed"
+            ),
+            FailureClass::NetworkForcedIpv6
         );
         assert_eq!(
             FailureClass::from_details("ipv6 error: prefix-unavailable"),
