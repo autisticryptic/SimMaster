@@ -21,7 +21,7 @@ SIMADMIN_INSTALL_HARDWARE_SUPPORT="${SIMADMIN_INSTALL_HARDWARE_SUPPORT:-1}"
 LPAC_REPO="${LPAC_REPO:-estkme-group/lpac}"
 LPAC_RELEASE_BASE_URL="${LPAC_RELEASE_BASE_URL:-https://github.com/${LPAC_REPO}/releases/latest/download}"
 LPAC_LATEST_RELEASE_URL="${LPAC_LATEST_RELEASE_URL:-https://github.com/${LPAC_REPO}/releases/latest}"
-LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/3899/SimAdmin/releases/download/lpac}"
+LPAC_COMPAT_RELEASE_BASE_URL="${LPAC_COMPAT_RELEASE_BASE_URL:-https://github.com/autisticryptic/SimMaster/releases/download/lpac}"
 LPAC_COMPAT_MANIFEST_NAME="${LPAC_COMPAT_MANIFEST_NAME:-lpac.json}"
 LPAC_TARGET_ARCH="${LPAC_TARGET_ARCH:-}"
 LPAC_TARGET_VERSION="${LPAC_TARGET_VERSION:-}"
@@ -385,12 +385,10 @@ resolve_lpac_asset_name() {
 
   case "$LPAC_ASSET_FLAVOR" in
     compat)
-      glibc_version="$(detect_glibc_version)"
-      if [ "$arch" = "aarch64" ] && version_le "2.31" "$glibc_version"; then
-        printf 'lpac-linux-aarch64-glibc2.31.zip\n'
-      else
-        printf 'lpac-linux-%s.zip\n' "$arch"
-      fi
+      case "$arch" in
+        aarch64|x86_64) printf 'lpac-linux-%s-glibc2.31.zip\n' "$arch" ;;
+        *) printf 'lpac-linux-%s.zip\n' "$arch" ;;
+      esac
       ;;
     ""|default)
       printf 'lpac-linux-%s.zip\n' "$arch"
@@ -416,7 +414,9 @@ resolve_lpac_asset_url() {
 
   arch="$(detect_lpac_arch)" || return 1
   asset_name="$(resolve_lpac_asset_name "$arch")" || return 1
-  if [ "$LPAC_ASSET_FLAVOR" = "compat" ] && [ "$asset_name" = "lpac-linux-aarch64-glibc2.31.zip" ]; then
+  if [ "$LPAC_ASSET_FLAVOR" = "compat" ] \
+    && { [ "$asset_name" = "lpac-linux-aarch64-glibc2.31.zip" ] \
+      || [ "$asset_name" = "lpac-linux-x86_64-glibc2.31.zip" ]; }; then
     printf '%s/%s\n' "$LPAC_COMPAT_RELEASE_BASE_URL" "$asset_name"
     return 0
   fi
@@ -599,7 +599,7 @@ lpac_asset_name_from_url() {
 lpac_url_source() {
   url="$1"
   case "$url" in
-    "$LPAC_COMPAT_RELEASE_BASE_URL"/*|https://github.com/3899/SimAdmin/releases/download/lpac/*)
+    "$LPAC_COMPAT_RELEASE_BASE_URL"/*|https://github.com/autisticryptic/SimMaster/releases/download/lpac/*)
       printf '%s\n' "compat"
       ;;
     "$LPAC_RELEASE_BASE_URL"/*|https://github.com/"$LPAC_REPO"/releases/latest/download/*|https://github.com/"$LPAC_REPO"/releases/download/*)
@@ -786,27 +786,42 @@ install_lpac() {
     return 0
   fi
 
-  current_lpac_path="$(find_current_lpac_path || true)"
-  if ! lpac_install_needed "$current_lpac_path" "$lpac_url"; then
-    return 0
+  # A custom URL is exclusive. Without one, try the SimMaster compatibility
+  # asset first and then the official lpac asset for the same architecture.
+  lpac_urls="$lpac_url"
+  if [ -z "$LPAC_ASSET_URL" ] && [ "$LPAC_ASSET_FLAVOR" = "compat" ]; then
+    case "$lpac_arch" in
+      aarch64) official_lpac_name='lpac-linux-aarch64.zip' ;;
+      x86_64) official_lpac_name='lpac-linux-x86_64.zip' ;;
+      *) official_lpac_name="" ;;
+    esac
+    if [ -n "$official_lpac_name" ]; then
+      lpac_urls="$lpac_url ${LPAC_RELEASE_BASE_URL}/${official_lpac_name}"
+    fi
   fi
 
-  if [ -z "$LPAC_TARGET_RELEASE_VERSION" ]; then
-    LPAC_TARGET_RELEASE_VERSION="$(resolve_lpac_target_version "$lpac_url" || true)"
-  fi
-
-  echo "==> installing lpac for ${lpac_arch} (${LPAC_INSTALL_REASON})"
-  if ! download_with_proxies "$lpac_url" "$lpac_archive"; then
-    echo "warning: failed to download lpac, keeping existing lpac if present" >&2
-    return 0
-  fi
-
-  if ! extract_lpac_archive "$lpac_archive" "$lpac_extract"; then
-    echo "warning: failed to extract lpac, keeping existing lpac if present" >&2
-    return 0
-  fi
-
-  if copy_lpac_tree "$lpac_extract" "$lpac_dst" "$lpac_url"; then
+  for candidate_url in $lpac_urls; do
+    current_lpac_path="$(find_current_lpac_path || true)"
+    if ! lpac_install_needed "$current_lpac_path" "$candidate_url"; then
+      return 0
+    fi
+    if [ -z "$LPAC_TARGET_RELEASE_VERSION" ]; then
+      LPAC_TARGET_RELEASE_VERSION="$(resolve_lpac_target_version "$candidate_url" || true)"
+    fi
+    echo "==> installing lpac for ${lpac_arch} (${LPAC_INSTALL_REASON}) from ${candidate_url}"
+    rm -rf "$lpac_extract"
+    if ! download_with_proxies "$candidate_url" "$lpac_archive"; then
+      echo "warning: failed to download ${candidate_url}, trying next lpac source" >&2
+      continue
+    fi
+    if ! extract_lpac_archive "$lpac_archive" "$lpac_extract"; then
+      echo "warning: failed to extract ${candidate_url}, trying next lpac source" >&2
+      continue
+    fi
+    if ! copy_lpac_tree "$lpac_extract" "$lpac_dst" "$candidate_url"; then
+      echo "warning: failed to install ${candidate_url}, trying next lpac source" >&2
+      continue
+    fi
     detected_version="$(lpac_command_version "${lpac_dst}/lpac" || true)"
     if [ -z "$detected_version" ]; then
       detected_version="$LPAC_TARGET_RELEASE_VERSION"
@@ -821,9 +836,9 @@ install_lpac() {
     else
       echo "warning: lpac was installed but may not be executable on this device; check glibc/architecture compatibility" >&2
     fi
-  else
-    echo "warning: failed to install lpac, keeping existing lpac if present" >&2
-  fi
+    return 0
+  done
+  echo "warning: all lpac sources failed, keeping existing lpac if present" >&2
 }
 
 
