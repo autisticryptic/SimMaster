@@ -544,6 +544,11 @@ fn translate_runtime_event(
                         "分配 USIM 逻辑通道失败".into(),
                         "无法为 USIM 鉴权分配逻辑通道。原因可能是基带辅助逻辑通道数被占满，请尝试重启设备或调制解调器。".into(),
                     ),
+                    "sim_auth_logical_channel_close_failed" => (
+                        "IMSI".into(),
+                        "关闭 USIM 逻辑通道失败".into(),
+                        "USIM 访问已结束，但基带未能释放逻辑通道。系统会停止本次连接，避免持续占用卡内通道。".into(),
+                    ),
                     "sim_auth_platform_unsupported" => (
                         "IMSI".into(),
                         "平台不支持物理卡鉴权".into(),

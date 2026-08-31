@@ -27,10 +27,11 @@ const TLV_CTL_SERVICE: u8 = 0x01;
 const TLV_CTL_ALLOCATION_INFO: u8 = 0x01;
 const TLV_UIM_SLOT: u8 = 0x01;
 const TLV_UIM_APDU: u8 = 0x02;
-const TLV_UIM_CHANNEL_ID: u8 = 0x10;
+const TLV_UIM_OPEN_CHANNEL_ID: u8 = 0x10;
+const TLV_UIM_APDU_CHANNEL_ID: u8 = 0x10;
+const TLV_UIM_CLOSE_CHANNEL_ID: u8 = 0x11;
 const TLV_UIM_PROCEDURE_BYTES: u8 = 0x11;
 const TLV_UIM_OPEN_AID: u8 = 0x10;
-const TLV_UIM_OPEN_FCI: u8 = 0x11;
 const TLV_UIM_APDU_RESPONSE: u8 = 0x10;
 
 pub const USIM_AID_PREFIX: &[u8] = &[0xa0, 0x00, 0x00, 0x00, 0x87, 0x10, 0x02];
@@ -275,7 +276,6 @@ pub fn build_open_logical_channel_frame(
         tlvs: vec![
             tlv(TLV_UIM_SLOT, vec![slot]),
             tlv(TLV_UIM_OPEN_AID, aid_value),
-            tlv(TLV_UIM_OPEN_FCI, vec![0x00]),
         ],
     })
 }
@@ -293,8 +293,7 @@ pub fn build_close_logical_channel_frame(
         message_id: QMI_UIM_LOGICAL_CHANNEL,
         tlvs: vec![
             tlv(TLV_UIM_SLOT, vec![slot]),
-            tlv(TLV_UIM_CHANNEL_ID, vec![channel_id]),
-            tlv(0x13, vec![0x01]),
+            tlv(TLV_UIM_CLOSE_CHANNEL_ID, vec![channel_id]),
         ],
     })
 }
@@ -304,7 +303,7 @@ pub fn parse_open_logical_channel(
 ) -> Result<LogicalChannelOpened, QmiUimError> {
     ensure_success(message)?;
     let value =
-        find_tlv(message, TLV_UIM_CHANNEL_ID).ok_or(QmiUimError::MissingTlv("channel_id"))?;
+        find_tlv(message, TLV_UIM_OPEN_CHANNEL_ID).ok_or(QmiUimError::MissingTlv("channel_id"))?;
     let channel_id = *value.first().ok_or(QmiUimError::InvalidFrame)?;
     Ok(LogicalChannelOpened { channel_id })
 }
@@ -327,7 +326,7 @@ pub fn build_send_apdu_frame(
         tlvs: vec![
             tlv(TLV_UIM_SLOT, vec![slot]),
             tlv(TLV_UIM_APDU, apdu_value),
-            tlv(TLV_UIM_CHANNEL_ID, vec![channel_id]),
+            tlv(TLV_UIM_APDU_CHANNEL_ID, vec![channel_id]),
             tlv(TLV_UIM_PROCEDURE_BYTES, vec![0x00]),
         ],
     })
@@ -734,9 +733,19 @@ pub fn read_usim_epdg_config_via_proxy_reason(
             })
         })();
 
-        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-        let _ = conn.release_uim_cid(client_id);
-        result
+        let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        if let Err(error) = conn.release_uim_cid(client_id) {
+            tracing::warn!(device_path, slot, error = %error, "Failed to release UIM client after reading ePDG configuration");
+        }
+        match (result, close_result) {
+            (Ok(config), Ok(())) => Ok(config),
+            (Ok(_), Err(_)) => Err("sim_epdg_config_logical_channel_close_failed"),
+            (Err(reason), Ok(())) => Err(reason),
+            (Err(reason), Err(error)) => {
+                tracing::warn!(device_path, slot, error = %error, "Failed to close UIM logical channel after ePDG configuration read failure");
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -943,9 +952,19 @@ pub fn read_usim_identity_via_proxy_reason(
             Ok(UsimIdentity { imsi, mnc_length })
         })();
 
-        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-        let _ = conn.release_uim_cid(client_id);
-        result
+        let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        if let Err(error) = conn.release_uim_cid(client_id) {
+            tracing::warn!(device_path, slot, error = %error, "Failed to release UIM client after reading USIM identity");
+        }
+        match (result, close_result) {
+            (Ok(identity), Ok(())) => Ok(identity),
+            (Ok(_), Err(_)) => Err("sim_identity_logical_channel_close_failed"),
+            (Err(reason), Ok(())) => Err(reason),
+            (Err(reason), Err(error)) => {
+                tracing::warn!(device_path, slot, error = %error, "Failed to close UIM logical channel after USIM identity read failure");
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -989,11 +1008,24 @@ pub fn execute_usim_authenticate_via_proxy(
         conn.proxy_open(device_path)?;
         let client_id = conn.allocate_uim_cid()?;
         let channel = conn.open_logical_channel(client_id, slot, aid)?;
-        let apdu = build_usim_authenticate_apdu(rand, autn)?;
-        let response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu);
-        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-        let _ = conn.release_uim_cid(client_id);
-        parse_usim_authenticate_response(&response?)
+        let result = (|| {
+            let apdu = build_usim_authenticate_apdu(rand, autn)?;
+            let response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu)?;
+            parse_usim_authenticate_response(&response)
+        })();
+        let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        if let Err(error) = conn.release_uim_cid(client_id) {
+            tracing::warn!(device_path, slot, error = %error, "Failed to release UIM client after USIM authentication");
+        }
+        match (result, close_result) {
+            (Ok(aka), Ok(())) => Ok(aka),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Ok(())) => Err(error),
+            (Err(error), Err(close_error)) => {
+                tracing::warn!(device_path, slot, error = %close_error, "Failed to close UIM logical channel after USIM authentication failure");
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1028,35 +1060,42 @@ pub fn execute_usim_authenticate_via_proxy_reason(
                 return Err("sim_auth_logical_channel_failed");
             }
         };
-        let apdu = match build_usim_authenticate_apdu(rand, autn) {
-            Ok(apdu) => apdu,
-            Err(_) => {
-                let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-                let _ = conn.release_uim_cid(client_id);
-                return Err("sim_auth_apdu_build_failed");
+        let result = (|| {
+            let apdu = build_usim_authenticate_apdu(rand, autn)
+                .map_err(|_| "sim_auth_apdu_build_failed")?;
+            let mut response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu);
+            if matches!(response.as_ref().map(|r| r.sw1), Ok(0x61)) {
+                let len = response.as_ref().map(|r| r.sw2).unwrap_or(0);
+                response = conn.send_apdu(
+                    client_id,
+                    slot,
+                    channel.channel_id,
+                    &build_get_response_apdu(len),
+                );
+            } else if matches!(response.as_ref().map(|r| r.sw1), Ok(0x6c)) {
+                let le = response.as_ref().map(|r| r.sw2).unwrap_or(0);
+                let mut adjusted = apdu.clone();
+                if let Some(last) = adjusted.last_mut() {
+                    *last = le;
+                }
+                response = conn.send_apdu(client_id, slot, channel.channel_id, &adjusted);
             }
-        };
-        let mut response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu);
-        if matches!(response.as_ref().map(|r| r.sw1), Ok(0x61)) {
-            let len = response.as_ref().map(|r| r.sw2).unwrap_or(0);
-            response = conn.send_apdu(
-                client_id,
-                slot,
-                channel.channel_id,
-                &build_get_response_apdu(len),
-            );
-        } else if matches!(response.as_ref().map(|r| r.sw1), Ok(0x6c)) {
-            let le = response.as_ref().map(|r| r.sw2).unwrap_or(0);
-            let mut adjusted = apdu.clone();
-            if let Some(last) = adjusted.last_mut() {
-                *last = le;
-            }
-            response = conn.send_apdu(client_id, slot, channel.channel_id, &adjusted);
+            let response = response.map_err(|_| "sim_auth_apdu_exchange_failed")?;
+            parse_usim_authenticate_response_reason(&response)
+        })();
+        let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        if let Err(error) = conn.release_uim_cid(client_id) {
+            tracing::warn!(device_path, slot, error = %error, "Failed to release UIM client after USIM authentication");
         }
-        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-        let _ = conn.release_uim_cid(client_id);
-        let response = response.map_err(|_| "sim_auth_apdu_exchange_failed")?;
-        parse_usim_authenticate_response_reason(&response)
+        match (result, close_result) {
+            (Ok(aka), Ok(())) => Ok(aka),
+            (Ok(_), Err(_)) => Err("sim_auth_logical_channel_close_failed"),
+            (Err(reason), Ok(())) => Err(reason),
+            (Err(reason), Err(error)) => {
+                tracing::warn!(device_path, slot, error = %error, "Failed to close UIM logical channel after USIM authentication failure");
+                Err(reason)
+            }
+        }
     }
 }
 
@@ -1128,9 +1167,11 @@ pub fn verify_usim_application_via_proxy_reason(
                 return Err("sim_auth_logical_channel_failed");
             }
         };
-        let _ = conn.close_logical_channel(client_id, slot, channel.channel_id);
-        let _ = conn.release_uim_cid(client_id);
-        Ok(())
+        let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
+        if let Err(error) = conn.release_uim_cid(client_id) {
+            tracing::warn!(device_path, slot, error = %error, "Failed to release UIM client after USIM application verification");
+        }
+        close_result.map_err(|_| "sim_auth_logical_channel_close_failed")
     }
 }
 
@@ -1649,6 +1690,57 @@ mod tests {
         })
         .expect("decode");
         assert_eq!(decoded.message_id, QMI_CTL_ALLOCATE_CID);
+    }
+
+    #[test]
+    fn builds_device_compatible_logical_channel_frames() {
+        let open = decode_qmi_frame(
+            &build_open_logical_channel_frame(3, 7, 1, USIM_AID_PREFIX)
+                .expect("open logical channel frame"),
+        )
+        .expect("decode open logical channel frame");
+        assert_eq!(open.message_id, QMI_UIM_OPEN_LOGICAL_CHANNEL);
+        assert_eq!(
+            open.tlvs,
+            vec![
+                tlv(TLV_UIM_SLOT, vec![1]),
+                tlv(
+                    TLV_UIM_OPEN_AID,
+                    [vec![USIM_AID_PREFIX.len() as u8], USIM_AID_PREFIX.to_vec()].concat(),
+                ),
+            ]
+        );
+
+        let close = decode_qmi_frame(
+            &build_close_logical_channel_frame(3, 8, 1, 4).expect("close logical channel frame"),
+        )
+        .expect("decode close logical channel frame");
+        assert_eq!(close.message_id, QMI_UIM_LOGICAL_CHANNEL);
+        assert_eq!(
+            close.tlvs,
+            vec![
+                tlv(TLV_UIM_SLOT, vec![1]),
+                tlv(TLV_UIM_CLOSE_CHANNEL_ID, vec![4]),
+            ]
+        );
+    }
+
+    #[test]
+    fn send_apdu_keeps_request_channel_on_tlv_0x10() {
+        let message = decode_qmi_frame(
+            &build_send_apdu_frame(3, 9, 1, 4, &[0x00, 0xc0, 0x00, 0x00, 0x00])
+                .expect("send APDU frame"),
+        )
+        .expect("decode send APDU frame");
+
+        assert_eq!(
+            find_tlv(&message, TLV_UIM_APDU_CHANNEL_ID),
+            Some([4].as_slice())
+        );
+        assert_eq!(
+            find_tlv(&message, TLV_UIM_PROCEDURE_BYTES),
+            Some([0].as_slice())
+        );
     }
 
     #[test]
