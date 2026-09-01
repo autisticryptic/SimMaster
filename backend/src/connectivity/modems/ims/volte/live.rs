@@ -2675,20 +2675,19 @@ async fn live_receive_loop(
                 options_failures = options_failures.saturating_add(1);
                 if options_failures >= OPTIONS_MAX_CONSECUTIVE_FAILURES {
                     let error = format!("volte_options_ping_timeout:failures={options_failures}");
-                    tracing::warn!(error = %error, "VoLTE SIP liveness ping timed out");
-                    live.operator.set_ready(false);
-                    runtime
-                        .update(|state| {
-                            state.phase = VoltePhase::Degraded;
-                            state.stage = VolteStage::Registered;
-                            state.last_error = Some(error);
-                            state.last_failure_at = Some(now());
-                        })
-                        .await;
-                    cleanup_live_session(&live).await;
-                    break;
+                    // OPTIONS is only an advisory probe. Some carrier IMS
+                    // cores accept protected REGISTER traffic but do not answer
+                    // out-of-dialog OPTIONS. REGISTER refresh remains the
+                    // authoritative health check for an established session.
+                    tracing::warn!(
+                        error = %error,
+                        "VoLTE SIP liveness probe unanswered; retaining registered session"
+                    );
+                    options_failures = 0;
+                    options_due = tokio::time::Instant::now() + OPTIONS_PING_INTERVAL;
+                } else {
+                    options_due = tokio::time::Instant::now() + OPTIONS_RETRY_INTERVAL;
                 }
-                options_due = tokio::time::Instant::now() + OPTIONS_RETRY_INTERVAL;
             }
         }
         if pending_options.is_none() && tokio::time::Instant::now() >= options_due {
