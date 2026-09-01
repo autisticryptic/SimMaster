@@ -102,7 +102,10 @@ impl ImsBearerTransport for Qcm410ImsBearer {
             )
             .await;
             match result {
-                Ok(established) => Ok((established.info, Box::new(established.handle))),
+                Ok(established) => Ok((
+                    established.info,
+                    Box::new(established.handle) as Box<dyn ImsBearerHandle + Send>,
+                )),
                 Err(error) => {
                     secondary_qmi::release_endpoint(&endpoint).await;
                     Err(error)
