@@ -375,10 +375,20 @@ export default function CarrierProfileEditor({
               label="ePDG 主机"
               value={draft.epdg.host}
               onChange={(e) => patch('epdg', { host: e.target.value })}
-              helperText="标准格式：epdg.epc.mncXXX.mccYYY.pub.3gppnetwork.org"
+              helperText="可填写标准 ePDG 域名或 IPv4 / IPv6 地址；填写 IP 时会跳过域名解析"
             />
-            <Stack direction={{ xs: 'column', sm: 'row' }} spacing={2}>
+            <Box
+              sx={{
+                display: 'grid',
+                gridTemplateColumns: {
+                  xs: 'minmax(0, 1fr)',
+                  sm: 'minmax(180px, 1.35fr) minmax(110px, 0.65fr) minmax(170px, 1fr)',
+                },
+                gap: 2,
+              }}
+            >
               <TextField
+                fullWidth
                 type="number"
                 label="IKE 端口"
                 value={draft.epdg.port}
@@ -406,12 +416,12 @@ export default function CarrierProfileEditor({
                   <MenuItem value="ipv6">仅 IPv6</MenuItem>
                 </Select>
               </FormControl>
-            </Stack>
+            </Box>
             <ListField
               label="DNS 服务器"
               value={draft.epdg.dns_servers}
               placeholder={'8.8.8.8\n1.1.1.1:53'}
-              helperText="按顺序尝试，前面的解析不出来自动换下一个；不写端口默认 :53。ePDG 域名解析不出来就完全连不上，所以建议填两个以上"
+              helperText="按顺序尝试；不写端口默认 :53。留空时使用本机系统解析（包含 /etc/hosts 和系统 DNS）"
               onChange={(dns_servers) => patch('epdg', { dns_servers })}
             />
           </Section>

@@ -756,22 +756,34 @@ impl IkeStateMachine {
         identity: &str,
         child_sa_initiator_spi: [u8; 4],
     ) -> Result<Vec<IkePayload>, IkeStateError> {
-        let first_esp_proposal =
-            self.profile
-                .ikev2
-                .esp_proposals
-                .first()
-                .ok_or(IkeStateError::InvalidResponse {
-                    reason: "profile_missing_esp_proposal",
-                })?;
+        if self.profile.ikev2.esp_proposals.is_empty() {
+            return Err(IkeStateError::InvalidResponse {
+                reason: "profile_missing_esp_proposal",
+            });
+        }
+        if self.profile.ikev2.esp_proposals.len() > u8::MAX as usize {
+            return Err(IkeStateError::InvalidResponse {
+                reason: "profile_has_too_many_esp_proposals",
+            });
+        }
+        let child_sa_proposals = self
+            .profile
+            .ikev2
+            .esp_proposals
+            .iter()
+            .enumerate()
+            .map(|(index, proposal)| {
+                child_sa_proposal_from_profile_string(
+                    proposal,
+                    (index + 1) as u8,
+                    &child_sa_initiator_spi,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let mut payloads = vec![
             build_identification_initiator_payload(identity),
             build_configuration_request_payload(&self.access.ip_stack),
-            build_sa_payload(&[child_sa_proposal_from_profile_string(
-                first_esp_proposal,
-                1,
-                &child_sa_initiator_spi,
-            )?])?,
+            build_sa_payload(&child_sa_proposals)?,
             build_traffic_selector_initiator_payload(&self.access.ip_stack),
             build_traffic_selector_responder_payload(&self.access.ip_stack),
             build_notify_payload(
@@ -2271,6 +2283,31 @@ mod tests {
         assert_eq!(idr.body[0], super::super::ike_payloads::IKE_ID_FQDN);
         assert_eq!(&idr.body[4..], b"ims");
         assert!(!idr.body.windows(4).any(|window| window == b"epdg"));
+    }
+
+    #[test]
+    fn auth_init_offers_all_profile_esp_proposals() {
+        let machine = machine(&GB_EE_23433);
+        let child_sa_spi = [1, 2, 3, 4];
+        let payloads = machine
+            .build_auth_init_payloads(
+                "0234331234567890@nai.epc.mnc033.mcc234.3gppnetwork.org",
+                child_sa_spi,
+            )
+            .expect("auth init payloads");
+        let sa = payloads
+            .iter()
+            .find(|payload| payload.payload_type == IkePayloadType::SecurityAssociation)
+            .expect("child SA payload");
+        let proposals = parse_sa_payload(&sa.body).expect("parse child SA proposals");
+
+        assert_eq!(proposals.len(), GB_EE_23433.ikev2.esp_proposals.len());
+        for (index, proposal) in proposals.iter().enumerate() {
+            assert_eq!(proposal.number, (index + 1) as u8);
+            assert_eq!(proposal.protocol_id, IkeProtocolId::Esp.as_u8());
+            assert_eq!(proposal.spi.as_slice(), child_sa_spi.as_slice());
+            assert!(matching_child_sa_profile_proposal(proposal, &GB_EE_23433).is_some());
+        }
     }
 
     #[test]
