@@ -4399,15 +4399,12 @@ async fn run_register_exchange_with_pcscf(
                         reason = err.reason.as_str(),
                         "IMS REGISTER header variant failed"
                     );
-                    // A terminal rejection cannot be cleared by another shape or
-                    // P-CSCF; stop the whole ladder instead of exhausting it.
-                    if live_register_error_is_terminal(&err) {
-                        return Err(err);
-                    }
                     // Response-driven variants are cumulative. In particular,
-                    // once 421/494 has required sec-agree, a following 400 is
-                    // retried with the same declaration plus an empty AKA
-                    // Authorization instead of dropping back to a partial shape.
+                    // once 421/494 has required sec-agree, a following pre-auth
+                    // 400/403 is retried with the same declaration plus an empty
+                    // AKA Authorization instead of dropping back to a partial
+                    // shape. This must run before the general terminal-status
+                    // check because an ordinary 403 remains terminal.
                     if let Some(upgraded) =
                         next_dynamic_live_register_variant(profile, variant, &err)
                     {
@@ -4421,6 +4418,12 @@ async fn run_register_exchange_with_pcscf(
                         last_error = Some(err);
                         variant = upgraded;
                         continue;
+                    }
+                    // A terminal rejection that did not qualify for the narrow
+                    // response-driven upgrade cannot be cleared by another shape
+                    // or P-CSCF; stop the whole ladder instead of exhausting it.
+                    if live_register_error_is_terminal(&err) {
+                        return Err(err);
                     }
                     last_error = Some(err);
                     break;
@@ -4475,10 +4478,14 @@ fn sec_agree_retry_variant(
     })
 }
 
-/// The measured Maxis VoWiFi sequence is 421 -> fully declared sec-agree ->
-/// 400. At that point the request shape is accepted far enough that the core is
-/// waiting for the AKA identity hint. Add URI-first empty AKA without dropping
-/// Security-Client, Require, Proxy-Require, routing or access headers.
+/// Field-observed VoWiFi cores use either 400 or an authentication-free 403
+/// after 421/494 -> fully declared sec-agree to request the AKA identity hint.
+/// Add URI-first empty AKA without dropping Security-Client, Require,
+/// Proxy-Require, routing or access headers.
+///
+/// The 403 case is deliberately narrow: only a dynamic variant marked by the
+/// immediately preceding server sec-agree demand, before any AKA round, can
+/// reach it. An ordinary 403 remains terminal.
 fn sec_agree_empty_aka_retry_variant(
     profile: &CarrierProfile,
     variant: LiveRegisterHeaderVariant,
@@ -4490,7 +4497,7 @@ fn sec_agree_empty_aka_retry_variant(
         && variant.include_security_client
         && variant.initial_authorization == LiveInitialAuthorizationFormat::None
         && error.register_auth_rounds == 0
-        && live_register_error_status(error) == Some(400))
+        && matches!(live_register_error_status(error), Some(400 | 403)))
     .then_some(LiveRegisterHeaderVariant {
         label: "catalog_v7_sec_agree_required_aka_empty_uri_first",
         initial_authorization: LiveInitialAuthorizationFormat::AkaEmptyUriFirst,
@@ -8126,15 +8133,7 @@ impl LiveDigestChallenge {
 }
 
 fn sip_header_values(response: &str, header_name: &str) -> Vec<String> {
-    response
-        .lines()
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.trim()
-                .eq_ignore_ascii_case(header_name)
-                .then(|| value.trim().to_string())
-        })
-        .collect()
+    crate::connectivity::core::sip_frame::header_values(response.as_bytes(), header_name)
 }
 
 fn split_sip_header_values(value: &str) -> Vec<String> {
@@ -10266,6 +10265,45 @@ mod tests {
     }
 
     #[test]
+    fn server_required_sec_agree_403_adds_empty_aka_but_plain_403_does_not() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "262",
+                "02",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::WifiEpdg,
+            )
+            .expect("derived Vodafone DE Wi-Fi profile");
+        let base = live_register_header_variants(profile)[0];
+        let forbidden = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        assert!(next_dynamic_live_register_variant(profile, base, &forbidden).is_none());
+
+        let required = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 494 Security Agreement Required\r\nContent-Length: 0\r\n\r\n",
+            0,
+        ));
+        let declared = next_dynamic_live_register_variant(profile, base, &required).unwrap();
+        let cumulative = next_dynamic_live_register_variant(profile, declared, &forbidden).unwrap();
+        assert!(cumulative.server_required_sec_agree);
+        assert_eq!(
+            cumulative.initial_authorization,
+            LiveInitialAuthorizationFormat::AkaEmptyUriFirst
+        );
+
+        let after_auth = map_shared_register_failure(&register_failure_with(
+            "SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n",
+            1,
+        ));
+        assert!(next_dynamic_live_register_variant(profile, declared, &after_auth).is_none());
+
+        let mut disabled = *profile;
+        disabled.ims.register.sec_agree_mode = "disabled";
+        assert!(next_dynamic_live_register_variant(&disabled, declared, &forbidden).is_none());
+    }
+
+    #[test]
     fn explicit_sec_agree_disabled_is_never_upgraded_by_421_or_494() {
         let mut profile = GB_EE_23433;
         profile.ims.register.sec_agree_mode = "disabled";
@@ -11520,6 +11558,31 @@ mod tests {
         assert_eq!(challenge.realm, GB_EE_23433.ims.realm);
         assert_eq!(challenge.rand, vec![0x20; 16]);
         assert_eq!(challenge.autn, vec![0x20; 16]);
+    }
+
+    #[test]
+    fn digest_challenge_parser_unfolds_vodafone_aka_parameters() {
+        let nonce = BASE64_STANDARD.encode([0x32u8; 32]);
+        let response = format!(
+            concat!(
+                "SIP/2.0 401 Unauthorized\r\n",
+                "WWW-Authenticate: Digest realm=\"{}\",\r\n",
+                "   nonce=\"{}\",\r\n",
+                "   algorithm=AKAv1-MD5,\r\n",
+                "   qop=\"auth\"\r\n",
+                "Security-Server: ipsec-3gpp; alg=hmac-sha-1-96; ealg=null\r\n",
+                "Content-Length: 0\r\n\r\n"
+            ),
+            GB_EE_23433.ims.realm, nonce
+        );
+
+        let challenge = parse_live_digest_challenge(&response, GB_EE_23433.ims.realm)
+            .expect("parse folded Vodafone AKA challenge");
+        assert_eq!(challenge.algorithm, "AKAv1-MD5");
+        assert_eq!(challenge.rand, vec![0x32; 16]);
+        assert_eq!(challenge.autn, vec![0x32; 16]);
+        assert_eq!(challenge.qop, Some("auth"));
+        assert_eq!(challenge.security_server_offers.len(), 1);
     }
 
     #[test]
