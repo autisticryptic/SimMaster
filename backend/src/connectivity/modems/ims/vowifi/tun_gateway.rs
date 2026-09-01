@@ -15,10 +15,10 @@ use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
 
-/// Inner IP packets larger than this (after the IMS ESP transform) are
-/// fragmented in software before the outer tunnel encapsulation, so every
-/// physical packet stays below the 1500-byte path MTU. 1356 bytes of inner
-/// IP yields an outer ESP-in-UDP packet of ~1456 bytes with margin.
+/// Diagnostic-only ceiling for fragmenting an IMS ESP packet before the outer
+/// tunnel encapsulation. Production traffic keeps the packet intact and lets
+/// Linux fragment the final UDP/IP datagram; set `SIMADMIN_AUTO_FRAGMENT=1`
+/// only when comparing the two fragmentation layers on a failing path.
 const AUTO_FRAGMENT_INNER_IP_MAX: usize = 1356;
 
 /// Identification counter for IPv6 fragment headers (RFC 8200 §4.5). A
@@ -1008,14 +1008,18 @@ mod imp {
                             continue;
                         }
                     };
-                // Software fragmentation is the default: it keeps the full
-                // REGISTER headers while guaranteeing every physical packet
-                // stays under the path MTU. Set SIMADMIN_AUTO_FRAGMENT=0 to
-                // disable (then either the packet must fit, or the carrier
-                // must handle IP-layer fragmentation of the outer ESP).
+                // Keep the IMS ESP packet intact by default and let Linux
+                // fragment the outer UDP/IP datagram. The ePDG is the outer IP
+                // destination, so it can reassemble those fragments before ESP
+                // decapsulation. Fragmenting here instead produces inner IMS-IP
+                // fragments that the ePDG merely forwards and that many carrier
+                // paths drop before they reach the P-CSCF.
+                //
+                // The old inner-fragment path remains an explicit diagnostic
+                // switch only; it must not be the production default.
                 let auto_fragment = std::env::var("SIMADMIN_AUTO_FRAGMENT")
-                    .map(|value| value != "0")
-                    .unwrap_or(true);
+                    .map(|value| value == "1")
+                    .unwrap_or(false);
                 let outbound_fragments = if auto_fragment {
                     let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
                     if fragments.len() > 1 {

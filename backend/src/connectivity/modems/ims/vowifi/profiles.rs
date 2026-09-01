@@ -26,6 +26,15 @@ pub const DEFAULT_IMS_TCP_KEEPALIVE_SECONDS: u16 = 30;
 /// SIP OPTIONS ping interval used to confirm the registration is still live.
 pub const DEFAULT_IMS_OPTIONS_PING_INTERVAL_SECONDS: u16 = 45;
 
+/// Conservative IMS IPsec mechanisms for a standards-derived VoWiFi profile.
+/// AES-CBC remains first so the initial Security-Client keeps the broadly
+/// interoperable offer, while integrity-only ESP is also accepted when the
+/// P-CSCF explicitly selects `ealg=null` (as observed on Vodafone Germany).
+const STANDARD_VOWIFI_SECURITY_CLIENT_MECHANISMS: &[&str] = &[
+    "hmac-sha-1-96/aes-cbc/esp/trans",
+    "hmac-sha-1-96/null/esp/trans",
+];
+
 #[cfg(test)]
 const TEST_ALLOW_METHODS: &str =
     "INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS";
@@ -1227,7 +1236,10 @@ pub fn derive_standard_3gpp_profile(
                 temporary_retry_seconds: DEFAULT_TEMPORARY_RETRY_SECONDS,
                 always_add_sip_instance: true,
                 enable_cellular_network_info: matches!(access, Standard3gppAccess::WifiEpdg),
-                security_client_mechanisms: &["hmac-sha-1-96/aes-cbc/esp/trans"],
+                security_client_mechanisms: match access {
+                    Standard3gppAccess::LteEpc => &["hmac-sha-1-96/aes-cbc/esp/trans"],
+                    Standard3gppAccess::WifiEpdg => STANDARD_VOWIFI_SECURITY_CLIENT_MECHANISMS,
+                },
                 live_header_variant_set: "standard_3gpp_conservative",
             },
         },
@@ -1807,6 +1819,13 @@ mod tests {
             .expect("derive standard Wi-Fi profile");
         assert!(wifi.ims.register.enable_cellular_network_info);
         assert_eq!(wifi.ims.register.access_network_info, "IEEE-802.11");
+        assert_eq!(
+            wifi.ims.register.security_client_mechanisms,
+            &[
+                "hmac-sha-1-96/aes-cbc/esp/trans",
+                "hmac-sha-1-96/null/esp/trans",
+            ]
+        );
         assert!(!lte.meta.source_refs[0].contains("legacy-test-profile"));
     }
 

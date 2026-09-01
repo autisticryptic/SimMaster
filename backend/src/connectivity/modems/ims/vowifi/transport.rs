@@ -138,11 +138,17 @@ impl UdpSocketDatagramTransport {
         let socket = UdpSocket::bind(local)
             .await
             .map_err(|err| TransportError::Io(err.kind().to_string()))?;
-        allow_udp_fragmentation(&socket);
         Ok(Self::from_socket(socket))
     }
 
     pub fn from_socket(socket: UdpSocket) -> Self {
+        if let Err(error) = allow_udp_fragmentation(&socket) {
+            tracing::warn!(
+                local_addr = ?socket.local_addr().ok(),
+                error = %error,
+                "Could not enable outer UDP/IP fragmentation for ePDG transport"
+            );
+        }
         Self {
             socket: Arc::new(socket),
             recv_timeout: Duration::from_secs(8),
@@ -295,30 +301,59 @@ impl UdpSocketDatagramTransport {
 
 /// Allow the kernel to fragment large outer ESP datagrams.
 ///
-/// Linux defaults UDP to PMTU discovery (DF=1). A full IMS REGISTER plus the
-/// ipsec-3gpp ESP and the outer ePDG ESP encapsulation routinely exceeds the
-/// 1500-byte access MTU, and the operator ePDG reassembles IP fragments before
-/// decapsulation. Disabling DF keeps `send_to` from failing with EMSGSIZE.
+/// A full IMS REGISTER plus ipsec-3gpp ESP and the outer ePDG ESP encapsulation
+/// routinely exceeds the 1500-byte access MTU. The outer IP packet must be
+/// fragmented and reassembled at the ePDG before ESP decapsulation.
+///
+/// This is deliberately applied in `from_socket`, not only in `bind`: the
+/// production UE-isolated path creates the socket in `ue-worker` and transfers
+/// its fd to the main process through SCM_RIGHTS before wrapping it here.
 #[cfg(target_os = "linux")]
-fn allow_udp_fragmentation(socket: &UdpSocket) {
+fn allow_udp_fragmentation(socket: &UdpSocket) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let fd = socket.as_raw_fd();
-    let value: libc::c_int = libc::IP_PMTUDISC_DONT;
-    // Best-effort: sockets without the option simply keep the platform default.
-    unsafe {
+    let local_addr = socket.local_addr()?;
+    let (level, option, value) = udp_fragmentation_socket_option(local_addr);
+    let result = unsafe {
         libc::setsockopt(
             fd,
-            libc::IPPROTO_IP,
-            libc::IP_MTU_DISCOVER,
+            level,
+            option,
             &value as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-        );
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn udp_fragmentation_socket_option(
+    local_addr: SocketAddr,
+) -> (libc::c_int, libc::c_int, libc::c_int) {
+    if local_addr.is_ipv4() {
+        (
+            libc::IPPROTO_IP,
+            libc::IP_MTU_DISCOVER,
+            libc::IP_PMTUDISC_DONT,
+        )
+    } else {
+        (
+            libc::IPPROTO_IPV6,
+            libc::IPV6_MTU_DISCOVER,
+            libc::IPV6_PMTUDISC_DONT,
+        )
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn allow_udp_fragmentation(_socket: &UdpSocket) {}
+fn allow_udp_fragmentation(_socket: &UdpSocket) -> std::io::Result<()> {
+    Ok(())
+}
 
 impl IkeDatagramTransport for UdpSocketDatagramTransport {
     async fn send_ike_datagram(
@@ -513,7 +548,7 @@ pub fn choose_route_policy(
 mod tests {
     use super::*;
     use crate::connectivity::modems::ims::vowifi::profiles::US_ATT_310410;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn direct_route_is_default() {
@@ -543,6 +578,57 @@ mod tests {
             "socks5_udp_associate"
         );
         assert_eq!(ProxyKind::UdpRelay.as_str(), "udp_relay");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn outer_fragmentation_option_matches_socket_address_family() {
+        assert_eq!(
+            udp_fragmentation_socket_option(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0,)),
+            (
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                libc::IP_PMTUDISC_DONT,
+            )
+        );
+        assert_eq!(
+            udp_fragmentation_socket_option(SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0,)),
+            (
+                libc::IPPROTO_IPV6,
+                libc::IPV6_MTU_DISCOVER,
+                libc::IPV6_PMTUDISC_DONT,
+            )
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn wrapping_worker_socket_disables_ipv4_pmtu_discovery() {
+        use std::os::fd::AsRawFd;
+
+        let socket = UdpSocket::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .await
+            .expect("bind worker-like socket");
+        let transport = UdpSocketDatagramTransport::from_socket(socket);
+        let mut value: libc::c_int = -1;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                transport.socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_MTU_DISCOVER,
+                &mut value as *mut libc::c_int as *mut libc::c_void,
+                &mut length,
+            )
+        };
+
+        assert_eq!(
+            result,
+            0,
+            "getsockopt failed: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(value, libc::IP_PMTUDISC_DONT);
     }
 
     #[tokio::test]
