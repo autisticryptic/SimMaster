@@ -261,7 +261,7 @@ fn audit_profile(
         let plan = ims::build_register_plan(profile);
         !plan.domain.is_empty()
             && !plan.security_client_mechanisms.is_empty()
-            && plan.transport == "tcp"
+            && matches!(plan.transport, "udp" | "tcp")
     });
     checks.push(check(
         "ims_register_sec_agree_plan_builds",

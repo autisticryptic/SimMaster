@@ -429,6 +429,20 @@ mod imp {
         created_at: Instant,
     }
 
+    /// IPv6 fragments must be reassembled before the inner ipsec-3gpp
+    /// transform as well.  The UE TUN is commonly 1500/1600 bytes while a
+    /// protected SIP REGISTER is larger; Linux therefore emits an IPv6
+    /// Fragment Header (next-header 44).  Encrypting each fragment as a
+    /// separate ESP packet leaves the P-CSCF with several independent ESP
+    /// frames instead of one SIP datagram.
+    struct Ipv6FragmentBuffer {
+        base_header: Option<Vec<u8>>,
+        next_header: Option<u8>,
+        pieces: Vec<(usize, Vec<u8>)>,
+        expected_len: Option<usize>,
+        created_at: Instant,
+    }
+
     #[derive(Debug)]
     enum FragmentReassemblyOutcome {
         Forward(Vec<u8>),
@@ -511,6 +525,112 @@ mod imp {
         header[10..12].copy_from_slice(&checksum.to_be_bytes());
         let mut reassembled = header;
         reassembled.extend_from_slice(&payload);
+        FragmentReassemblyOutcome::Forward(reassembled)
+    }
+
+    fn reassemble_outbound_ipv6_fragment(
+        packet: Vec<u8>,
+        buffers: &mut HashMap<(IpAddr, IpAddr, u32), Ipv6FragmentBuffer>,
+    ) -> FragmentReassemblyOutcome {
+        if packet.first().map(|byte| byte >> 4) != Some(6) || packet.len() < 48 || packet[6] != 44 {
+            return FragmentReassemblyOutcome::Forward(packet);
+        }
+
+        let payload_len = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
+        let packet_end = 40usize.saturating_add(payload_len);
+        if packet_end > packet.len() || packet_end < 48 {
+            return FragmentReassemblyOutcome::Dropped;
+        }
+
+        let src = IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&packet[8..24]).unwrap(),
+        ));
+        let dst = IpAddr::V6(Ipv6Addr::from(
+            <[u8; 16]>::try_from(&packet[24..40]).unwrap(),
+        ));
+        let offset_m = u16::from_be_bytes([packet[42], packet[43]]);
+        let offset_bytes = usize::from(offset_m >> 3) * 8;
+        let more_fragments = offset_m & 1 != 0;
+        let identification = u32::from_be_bytes([packet[44], packet[45], packet[46], packet[47]]);
+        let key = (src, dst, identification);
+        let fragment_payload = packet[48..packet_end].to_vec();
+
+        let now = Instant::now();
+        if buffers.len() >= 32 {
+            buffers
+                .retain(|_, buffer| now.duration_since(buffer.created_at) < Duration::from_secs(3));
+        }
+        let buffer = buffers.entry(key).or_insert_with(|| Ipv6FragmentBuffer {
+            base_header: None,
+            next_header: None,
+            pieces: Vec::new(),
+            expected_len: None,
+            created_at: now,
+        });
+
+        let piece_end = offset_bytes.saturating_add(fragment_payload.len());
+        if buffer.pieces.iter().any(|(start, payload)| {
+            let end = start.saturating_add(payload.len());
+            offset_bytes < end && *start < piece_end
+        }) {
+            warn!(
+                src = %src,
+                dst = %dst,
+                identification,
+                offset_bytes,
+                "IMS TUN outbound overlapping IPv6 fragment; dropping"
+            );
+            buffers.remove(&key);
+            return FragmentReassemblyOutcome::Dropped;
+        }
+
+        if offset_bytes == 0 {
+            buffer.base_header = Some(packet[..40].to_vec());
+            buffer.next_header = Some(packet[40]);
+        }
+        buffer.pieces.push((offset_bytes, fragment_payload));
+        if !more_fragments {
+            buffer.expected_len = Some(piece_end);
+        }
+
+        let Some(expected_len) = buffer.expected_len else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+        let Some(base_header) = buffer.base_header.clone() else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+        let Some(next_header) = buffer.next_header else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+
+        let mut pieces = buffer.pieces.clone();
+        pieces.sort_by_key(|(offset, _)| *offset);
+        let mut cursor = 0usize;
+        for (offset, payload) in &pieces {
+            if *offset != cursor {
+                return FragmentReassemblyOutcome::Buffered;
+            }
+            cursor = cursor.saturating_add(payload.len());
+        }
+        if cursor != expected_len || expected_len > usize::from(u16::MAX) {
+            return FragmentReassemblyOutcome::Dropped;
+        }
+
+        let mut header = base_header;
+        header[6] = next_header;
+        header[4..6].copy_from_slice(&(expected_len as u16).to_be_bytes());
+        let mut reassembled = header;
+        for (_, payload) in pieces {
+            reassembled.extend_from_slice(&payload);
+        }
+        buffers.remove(&key);
+        info!(
+            src = %src,
+            dst = %dst,
+            identification,
+            reassembled_bytes = reassembled.len(),
+            "IMS TUN outbound IPv6 fragments reassembled before ESP"
+        );
         FragmentReassemblyOutcome::Forward(reassembled)
     }
 
@@ -989,16 +1109,26 @@ mod imp {
         let outbound_shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             let mut sequence_number = 1u64;
-            let mut fragment_buffers = HashMap::<(IpAddr, IpAddr, u32), Ipv4FragmentBuffer>::new();
+            let mut ipv4_fragment_buffers =
+                HashMap::<(IpAddr, IpAddr, u32), Ipv4FragmentBuffer>::new();
+            let mut ipv6_fragment_buffers =
+                HashMap::<(IpAddr, IpAddr, u32), Ipv6FragmentBuffer>::new();
             while let Some(packet) = inner_rx.recv().await {
                 if outbound_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
-                let packet = match reassemble_outbound_ip_fragment(packet, &mut fragment_buffers) {
-                    FragmentReassemblyOutcome::Forward(packet) => packet,
-                    FragmentReassemblyOutcome::Buffered => continue,
-                    FragmentReassemblyOutcome::Dropped => continue,
-                };
+                let packet =
+                    match reassemble_outbound_ip_fragment(packet, &mut ipv4_fragment_buffers) {
+                        FragmentReassemblyOutcome::Forward(packet) => packet,
+                        FragmentReassemblyOutcome::Buffered => continue,
+                        FragmentReassemblyOutcome::Dropped => continue,
+                    };
+                let packet =
+                    match reassemble_outbound_ipv6_fragment(packet, &mut ipv6_fragment_buffers) {
+                        FragmentReassemblyOutcome::Forward(packet) => packet,
+                        FragmentReassemblyOutcome::Buffered => continue,
+                        FragmentReassemblyOutcome::Dropped => continue,
+                    };
                 log_tun_outbound_packet(&packet);
                 let packet =
                     match protect_ims_esp_outbound_if_needed(packet, &outbound_ims_esp_policy) {
@@ -1840,6 +1970,51 @@ mod imp {
                 computed.to_be_bytes(),
                 [reassembled[10], reassembled[11]],
                 "reassembled header checksum must validate"
+            );
+        }
+
+        #[test]
+        fn outbound_ipv6_fragment_stream_reassembles_before_ims_esp() {
+            let sip = vec![b'R'; 1535];
+            let mut original = vec![0u8; 40 + 8 + sip.len()];
+            original[0] = 0x60;
+            original[4..6].copy_from_slice(&((8 + sip.len()) as u16).to_be_bytes());
+            original[6] = 17; // UDP
+            original[7] = 64;
+            original[8..24].copy_from_slice(
+                b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
+            );
+            original[24..40].copy_from_slice(
+                b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
+            );
+            original[40..42].copy_from_slice(&5064u16.to_be_bytes());
+            original[42..44].copy_from_slice(&7777u16.to_be_bytes());
+            original[44..46].copy_from_slice(&((8 + sip.len()) as u16).to_be_bytes());
+            original[48..].copy_from_slice(&sip);
+
+            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            assert!(
+                fragments.len() >= 2,
+                "REGISTER-sized IPv6 packet must fragment"
+            );
+
+            let mut buffers = HashMap::new();
+            let mut forwards = Vec::new();
+            for fragment in fragments.into_iter().rev() {
+                match reassemble_outbound_ipv6_fragment(fragment, &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => forwards.push(packet),
+                    FragmentReassemblyOutcome::Buffered => {}
+                    FragmentReassemblyOutcome::Dropped => panic!("IPv6 fragment dropped"),
+                }
+            }
+
+            assert_eq!(forwards.len(), 1, "IPv6 fragments reassemble exactly once");
+            assert_eq!(forwards[0], original);
+            assert_eq!(forwards[0][6], 17, "UDP next-header must be restored");
+            assert_eq!(
+                u16::from_be_bytes([forwards[0][4], forwards[0][5]]) as usize,
+                forwards[0].len() - 40,
+                "IPv6 payload length must exclude the removed fragment header"
             );
         }
 
