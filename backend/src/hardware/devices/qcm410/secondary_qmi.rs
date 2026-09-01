@@ -77,22 +77,6 @@ const NET_CLASS_DIR: &str = "/sys/class/net";
 pub const SECONDARY_QMI_STATE_FILE: &str = "/run/simadmin/secondary-qmi-device";
 pub const SECONDARY_QMI_ENDPOINTS_STATE_FILE: &str = "/run/simadmin/secondary-qmi-endpoints.json";
 
-/// DATA6 is an optional hardware capability, not a safe default on every
-/// MSM8916 firmware.  In particular, the 410 firmware used by SimAdmin can
-/// crash the modem when the AT-labelled DATA6 channel is force-opened as QMI.
-/// Operators must explicitly opt in after validating the device firmware;
-/// disabling it makes UE-native cellular data and VoLTE unavailable.
-pub fn secondary_qmi_enabled() -> bool {
-    std::env::var("SIMADMIN_ENABLE_SECONDARY_QMI")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-}
-
 /// Timeout for the kernel to publish a port after `bind`.
 const PORT_APPEAR_TIMEOUT: Duration = Duration::from_secs(6);
 const PORT_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -304,7 +288,7 @@ impl std::error::Error for SecondaryQmiError {}
 /// Enumerate the primary QMI control ports present on this host, one per
 /// baseband, straight from sysfs.
 ///
-/// Used by `secondary-qmi-init`, which runs *before* ModemManager and therefore
+/// Used by the QCM410 `device-init`, which runs *before* ModemManager and therefore
 /// cannot ask it for the modem inventory. Ports whose advertised type is QMI are
 /// returned, deduplicated by owning baseband so a host with several modems yields
 /// one primary per modem.
@@ -350,7 +334,7 @@ pub fn discover_primary_qmi_ports() -> Vec<String> {
 
 /// Wait for the basebands to publish their primary QMI control ports.
 ///
-/// `secondary-qmi-init` is ordered before ModemManager, which puts it well ahead
+/// QCM410 `device-init` is ordered before ModemManager, which puts it well ahead
 /// of the modem: on this hardware the firmware finishes booting and attaches its
 /// wwan ports around 13 s after kernel start, and the rpmsg channels land later
 /// still. Enumerating immediately therefore finds nothing and the whole DATA6
@@ -605,11 +589,6 @@ async fn run_qmicli(args: &[&str]) -> Option<Output> {
 pub async fn ensure_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
-    if !secondary_qmi_enabled() {
-        return Err(SecondaryQmiError::Unsupported(
-            "DATA6 probing requires SIMADMIN_ENABLE_SECONDARY_QMI=1".to_string(),
-        ));
-    }
     let baseband = baseband_key_for_device(primary_device)?;
     let primary_port = primary_device
         .rsplit('/')
@@ -656,27 +635,21 @@ pub async fn ensure_endpoint(
 pub async fn runtime_endpoint(
     primary_device: &str,
 ) -> Result<SecondaryQmiEndpoint, SecondaryQmiError> {
-    if !secondary_qmi_enabled() {
-        return Err(SecondaryQmiError::Unsupported(
-            "DATA6 is disabled by default; set SIMADMIN_ENABLE_SECONDARY_QMI=1 after firmware validation".to_string(),
-        ));
-    }
     if let Some(endpoint) = endpoint_from_runtime_state(primary_device)? {
         return Ok(endpoint);
     }
     Err(SecondaryQmiError::Unsupported(
-        "DATA6 was not prepared by the opt-in secondary-QMI initializer".to_string(),
+        "DATA6 was not prepared by the QCM410 device initializer".to_string(),
     ))
 }
 
 /// Report whether the boot initializer published a valid secondary endpoint
 /// for this exact baseband.  This never binds or probes a channel.
 pub fn runtime_endpoint_available(primary_device: &str) -> bool {
-    secondary_qmi_enabled()
-        && endpoint_from_runtime_state(primary_device)
-            .ok()
-            .flatten()
-            .is_some()
+    endpoint_from_runtime_state(primary_device)
+        .ok()
+        .flatten()
+        .is_some()
 }
 
 fn endpoint_from_runtime_state(
@@ -1612,7 +1585,7 @@ mod tests {
     fn the_unit_allows_more_startup_time_than_the_port_wait_needs() {
         let unit = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../deploy/system/simadmin-secondary-qmi.service"),
+                .join("../deploy/devices/qcm410/system/simadmin-secondary-qmi.service"),
         )
         .expect("the packaged unit must exist");
 

@@ -6,18 +6,9 @@ Before=ModemManager.service simadmin.service
 [Service]
 Type=notify
 NotifyAccess=all
-# Opt-in at the service layer. The SimAdmin runtime itself is UE-only: without
-# a validated native QMI endpoint, cellular data and VoLTE remain unavailable;
-# they never fall back to a ModemManager bearer in the host namespace.
-#
-# This does NOT default to 0 because DATA6 is dangerous. The boot-time baseband
-# crash once blamed on it came from an out-of-tree rpmsg_wwan_ctrl_multi module
-# that kept auto-binding spare DATA*_CNTL channels; with that module purged,
-# DATA6 and IMS coexist with no firmware faults. See
-# docs/QCM410_BAM_DMUX_MODEM_CRASH.md. It defaults to 0 because the endpoint has
-# to be validated per platform before it is worth taking a channel away from
-# ModemManager.
-Environment=SIMADMIN_ENABLE_SECONDARY_QMI=0
+# The QCM410 driver is UE-only. It always prepares the validated DATA6 native
+# endpoint; when that hardware endpoint is absent, cellular data and VoLTE stay
+# unavailable rather than falling back to a host-namespace bearer.
 # Nothing here may name a channel, a driver, or a port. The initializer
 # discovers the baseband layout at runtime -- it reads /sys/class/wwan/*/type,
 # dedupes by baseband, and accepts an endpoint only after a QMI probe confirms
@@ -35,7 +26,7 @@ Environment=SIMADMIN_ENABLE_SECONDARY_QMI=0
 # later still). So this step only loads the driver, best-effort, because a
 # platform may have it built in or no rpmsg at all.
 ExecStartPre=-/bin/sh -c 'modprobe rpmsg_wwan_ctrl 2>/dev/null || true'
-ExecStart=/opt/simadmin/simadmin secondary-qmi-init
+ExecStart=/opt/simadmin/simadmin device-init
 Restart=on-failure
 RestartSec=2
 # Must exceed the initializer's own port wait (45 s) plus per-endpoint bind and

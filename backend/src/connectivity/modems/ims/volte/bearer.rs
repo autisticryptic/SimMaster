@@ -270,9 +270,9 @@ where
                         // Keep a reconnected partial dual bearer for the same
                         // reason as a reused one: it already owns the IMS WDS
                         // session and has at least one usable address. Starting
-                        // additional single-family bearers here can crash the
-                        // QCM410 DHCP manager; family selection happens later
-                        // in the SIP loop.
+                        // additional single-family bearers here can destabilize
+                        // some device-native data paths; family selection
+                        // happens later in the SIP loop.
                         return Ok(bearer);
                     }
                     Err(error) => {
@@ -613,8 +613,8 @@ fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, Vol
             mtu,
         });
     }
-    // Moving a bam-dmux interface across namespaces clears its administrative
-    // UP state on this kernel. Bring it back before adding any routes; otherwise
+    // Moving a modem data interface across namespaces may clear its
+    // administrative UP state. Bring it back before adding routes; otherwise
     // `ip route` fails with "Device for nexthop is not up" and the cleanup move
     // triggers a second ModemManager re-enumeration.
     ops.push(NetConfigOp::LinkSetUp {
@@ -715,10 +715,10 @@ async fn apply_worker_ops(
 ///
 /// The non-portable part -- whether this baseband has latched a permanent error
 /// state that makes OPEN impossible -- is asked of the platform's
-/// [`BasebandFaultPolicy`] rather than tested inline. The 410's bam-dmux latch
-/// used to be hard-coded here, which made a generic IMS path assert something
-/// true of exactly one SoC and left other hardware nowhere to describe its own
-/// firmware defects. See `hardware/devices/baseband_faults.rs`.
+/// [`BasebandFaultPolicy`] rather than tested inline. Device-specific latches
+/// must stay in their driver policy instead of making the generic IMS path
+/// assert something true of only one platform. See
+/// `hardware/devices/baseband_faults.rs`.
 pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
     if interface_is_up(interface).await {
         return Ok(());
@@ -1012,10 +1012,10 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
     let _ = run_ip(&["-6", "route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["route", "flush", "dev", &bearer.interface]).await;
     let _ = run_ip(&["address", "flush", "dev", &bearer.interface]).await;
-    // Let ModemManager/QMI own the bam-dmux CLOSE handshake when the bearer is
-    // disconnected. Sending `ip link down` here duplicates that operation and
-    // can race the firmware on Qualcomm SoCs, especially after a failed route
-    // setup. Ordinary interface state is cleaned up by the bearer disconnect.
+    // Let the bearer owner perform the device-native CLOSE handshake when the
+    // bearer is disconnected. Sending `ip link down` here can duplicate that
+    // operation and race firmware after a failed route setup. Ordinary
+    // interface state is cleaned up by the bearer disconnect.
 }
 
 /// Remove only network state owned by a native IMS interface in a UE worker.
@@ -1305,9 +1305,9 @@ mod tests {
         assert!(!link_output_is_up("not-json"));
     }
 
-    // Runtime-PM latch detection moved to
-    // hardware/devices/qcm410/baseband_faults.rs, which owns both the sysfs
-    // parsing and its tests. This module is platform-agnostic again.
+    // Runtime-PM latch detection belongs to each device's baseband-fault
+    // policy, including its sysfs parsing and tests. This module stays
+    // platform-agnostic.
 
     #[test]
     fn default_request_uses_ims_apn() {

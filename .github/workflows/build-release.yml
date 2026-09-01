@@ -178,7 +178,7 @@ jobs:
 
       - name: Compile tests without running them
         working-directory: backend
-        run: cargo test --no-run --locked
+        run: cargo test --no-run
 
   # ==================== 2. 后端构建 + 分架构打包 ====================
   build:
@@ -323,12 +323,16 @@ jobs:
           cp -r "$FRONTEND_DIR"/* "$TMP/www/"
           FRONTEND_MD5=$(find "$TMP/www" -type f -exec md5sum {} \; | cut -d' ' -f1 | sort | md5sum | cut -d' ' -f1)
 
-          # ---- DATA6 / secondary-QMI boot resources ----
-          mkdir -p "$TMP/system"
-          cp deploy/system/simadmin-secondary-qmi.service "$TMP/system/"
-          cp scripts/simadmin-modem-recovery.sh "$TMP/system/"
-          cp scripts/simadmin-modem-recovery.service "$TMP/system/"
-          cp scripts/simadmin-modem-recovery.timer "$TMP/system/"
+          # ---- Device-owned resources ----
+          # Preserve the driver directory boundary in the artifact. The generic
+          # OTA installer delegates installation to the detected device driver.
+          mkdir -p "$TMP/devices"
+          for DEVICE_DIR in deploy/devices/*; do
+            [ -d "$DEVICE_DIR/system" ] || continue
+            DEVICE_NAME=$(basename "$DEVICE_DIR")
+            mkdir -p "$TMP/devices/$DEVICE_NAME/system"
+            cp -R "$DEVICE_DIR/system/." "$TMP/devices/$DEVICE_NAME/system/"
+          done
 
           # ---- meta.json ----
           cat > "$TMP/meta.json" << EOF
@@ -346,9 +350,7 @@ jobs:
           mkdir -p release
           OUT="release/simadmin-linux-${ARCH}.tar.gz"
 
-          # system/ carries the unit that reserves the DATA6 endpoint before
-          # ModemManager starts. The udev rule it needs is generated at runtime.
-          ( cd "$TMP" && tar -czf - meta.json simadmin www system ) > "$OUT"
+          ( cd "$TMP" && tar -czf - meta.json simadmin www devices ) > "$OUT"
 
           echo ""
           echo "✅ 打包完成: $OUT"
@@ -441,7 +443,7 @@ jobs:
             | aarch64 (ARM64) | `simadmin-linux-arm64.tar.gz` | ARM64 Linux 设备 |
             | x86_64 (AMD64)  | `simadmin-linux-amd64.tar.gz` | AMD64/x86_64 Linux 设备 |
 
-            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端 + `system/` DATA6/secondary-QMI 启动资源。
+            每个包内容：`meta.json` + `simadmin` 二进制 + `www/` 前端 + `devices/` 设备驱动资源。
             校验值见 `SHA256SUMS.txt`。
 
             ### 安装 / 更新

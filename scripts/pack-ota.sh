@@ -78,12 +78,15 @@ echo "📋 复制前端文件..."
 mkdir -p "$OTA_TMP/www"
 cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
-# Include the resources that prepare DATA6 before ModemManager starts.
-mkdir -p "$OTA_TMP/system"
-cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
-cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
-cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"
-cp scripts/simadmin-modem-recovery.timer "$OTA_TMP/system/"
+# Preserve device-owned resources below their driver directory. The generic
+# OTA installer delegates their installation at runtime.
+mkdir -p "$OTA_TMP/devices"
+for DEVICE_DIR in deploy/devices/*; do
+    [ -d "$DEVICE_DIR/system" ] || continue
+    DEVICE_NAME=$(basename "$DEVICE_DIR")
+    mkdir -p "$OTA_TMP/devices/$DEVICE_NAME/system"
+    cp -R "$DEVICE_DIR/system/." "$OTA_TMP/devices/$DEVICE_NAME/system/"
+done
 
 # 计算前端 MD5（所有文件的 hash，与 Rust 验证逻辑一致）
 # 方式：每个文件的 MD5 排序后，用换行符连接，再计算整体 MD5
@@ -120,7 +123,7 @@ mkdir -p release
 OTA_FILE="release/simadmin_${VERSION}.tar.gz"
 echo "📦 打包 OTA 更新包..."
 cd "$OTA_TMP"
-tar -czf - meta.json simadmin www system > "$OLDPWD/$OTA_FILE"
+tar -czf - meta.json simadmin www devices > "$OLDPWD/$OTA_FILE"
 cd "$OLDPWD"
 
 # 显示结果

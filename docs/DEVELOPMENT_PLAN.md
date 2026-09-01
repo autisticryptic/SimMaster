@@ -82,10 +82,10 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ## P2：设备抽象与 CS
 
-- [ ] 让 `DeviceKind` 真正参与 DATA6 / secondary QMI 的准入判断。
-  - 现状：`detect_device_kind()`（`hardware/devices/mod.rs`）确实做了 sysfs 探测——按 remoteproc 的 `name` 认 `4080000.remoteproc`，刻意不把邻居 `a204000.remoteproc`（WCNSS Wi-Fi/BT）当基带，认不出就返回 `Unknown` 而不是默认 `Qcm410`。这部分是对的。
-  - 缺口：`DeviceKind` 目前**只**用于选择 baseband fault policy（`devices/baseband_faults.rs`）。DATA6 和 secondary QMI 的开关是环境变量 `SIMADMIN_ENABLE_SECONDARY_QMI`（systemd unit 里设的），与 `DeviceKind` 无关。也就是说在一台 `Unknown` 设备上，只要那个变量为 1，仍会去枚举/绑定 DATA6。应改为「`Unknown` 一律不进 DATA6 路径」，环境变量只能在已识别设备上作为额外开关。
-- [ ] 将 QCM410 `ImsBearerTransport` 通过 provider/capability 注入 runtime；generic ModemManager 路径不能依赖 QCM410 类型。
+- [x] 让 `DeviceKind` 真正参与 DATA6 / native bearer 的准入判断。
+  - `detect_device_kind()`（`hardware/devices/mod.rs`）按 remoteproc 的 `name` 识别 `4080000.remoteproc`，刻意不把邻居 `a204000.remoteproc`（WCNSS Wi-Fi/BT）当基带；认不出即返回 `Unknown`。
+  - 只有 QCM410 driver 会枚举和绑定 DATA6；`Unknown` 的 native IMS 和数据 transport 均明确不可用，不会回退宿主网络命名空间。旧的 `SIMADMIN_ENABLE_SECONDARY_QMI` 运行时开关已删除。
+- [x] 将 QCM410 `ImsBearerTransport` 与 `CellularDataTransport` 通过 driver/capability 注入 runtime；通用 IMS、线路、OTA 和安装层不依赖 QCM410 类型。
 - [x] 已删除未实现的 `DataTransport`、`VoiceTransport`、`SmsTransport`、`RegistrationTransport` stub；保留实际 `ImsBearerTransport` capability seam。
 - [ ] 为 EC20/EC25/EG25/EG600 与 USB SIM reader 完成真实设备验收；本轮只完成静态线路隔离审阅。逐型号矩阵：
   - [ ] EC20：discovery、AT、SIM 身份、短信、通话、QMI 数据和代理流量。

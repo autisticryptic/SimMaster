@@ -49,7 +49,7 @@ use crate::{
         profile_store::{ProfileOrigin, ProfileStore},
         profiles::CarrierProfile,
     },
-    hardware::cellular::modem_manager::ModemBinding,
+    hardware::{cellular::modem_manager::ModemBinding, devices::transport::ImsBearerTransport},
     platform::config::{
         TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily, VolteProfileCandidate,
     },
@@ -111,7 +111,7 @@ const MM_MODEM_WAIT_DELAY: Duration = Duration::from_secs(2);
 const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// SIP interoperability candidates are separate from the outer bearer
 /// recovery budget. Keep the ladder bounded so a malformed profile cannot
-/// create an unbounded REGISTER storm on the QCM410.
+/// create an unbounded REGISTER storm on a baseband.
 const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 24;
 /// 3GPP IMS uses the well-known SIP/UDP port for the unprotected initial
 /// REGISTER.  The negotiated ipsec-3gpp client/server ports replace this
@@ -1442,6 +1442,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
 pub async fn connect_live_for_line(
     live: &VolteLiveHandle,
     device: &VolteDeviceBinding,
+    ims_bearer_transport: Option<&dyn ImsBearerTransport>,
     runtime: &Arc<VolteRuntime>,
     access_network_runtime: &ImsAccessNetworkRuntime,
     profile_candidate: &VolteProfileCandidate,
@@ -1470,6 +1471,8 @@ pub async fn connect_live_for_line(
             state.session_started_at = Some(now());
             state.last_error = None;
             state.qmi_device = Some(device.qmi_device.clone());
+            state.native_bearer_endpoint = None;
+            state.native_bearer_session = None;
             state.bearer_interface = None;
             state.bearer_ip_type = None;
             state.bearer_path = None;
@@ -1487,6 +1490,7 @@ pub async fn connect_live_for_line(
         access_network_runtime,
         generation,
         device,
+        ims_bearer_transport,
         plan,
         line_ip_families_auto,
         allow_roaming,
@@ -1605,6 +1609,7 @@ async fn connect_inner(
     access_network_runtime: &ImsAccessNetworkRuntime,
     generation: u64,
     device: &VolteDeviceBinding,
+    ims_bearer_transport: Option<&dyn ImsBearerTransport>,
     plan: ImsConnectionPlan,
     _line_ip_families_auto: bool,
     allow_roaming: bool,
@@ -1721,7 +1726,14 @@ async fn connect_inner(
             Some(format!("native_qmi:{}", device.qmi_device)),
         )
         .await;
+    let ims_bearer_transport = ims_bearer_transport.ok_or_else(|| {
+        VolteError::with_detail(
+            code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
+            "native_ims_transport_unsupported_for_device",
+        )
+    })?;
     let mut native_bearer = match native_bearer::establish_native_ims_bearer(
+        ims_bearer_transport,
         &device.qmi_device,
         &device.modem_id,
         &request,
@@ -1763,6 +1775,16 @@ async fn connect_inner(
         .as_ref()
         .expect("native bearer was established")
         .connection
+        .clone();
+    let native_bearer_endpoint = native_bearer
+        .as_ref()
+        .expect("native bearer was established")
+        .provider_endpoint
+        .clone();
+    let native_bearer_session = native_bearer
+        .as_ref()
+        .expect("native bearer was established")
+        .provider_session
         .clone();
     let worker = ready_worker(&device.line_id).await.ok_or_else(|| {
         VolteError::with_detail(
@@ -1836,6 +1858,8 @@ async fn connect_inner(
         runtime
             .update(|state| {
                 state.stage = VolteStage::IpConfig;
+                state.native_bearer_endpoint = Some(native_bearer_endpoint.clone());
+                state.native_bearer_session = Some(native_bearer_session.clone());
                 state.bearer_interface = Some(bearer.interface.clone());
                 state.bearer_ip_type = Some(bearer.ip_type.clone());
                 state.bearer_path = Some(bearer.path.clone());
@@ -2638,7 +2662,7 @@ async fn live_receive_loop(
             .map(|session| tokio::time::Instant::now() + session.registration.lease.refresh_after)
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))
     };
-    // The native IMS bearer retains its WDS CID on the secondary QMI endpoint.
+    // The native IMS provider retains its device session until teardown.
     // REGISTER refresh remains the end-to-end bearer health signal because it
     // covers the IMS IP path and SIP service, not only WDS packet status.
     loop {

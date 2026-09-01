@@ -330,7 +330,7 @@ pub async fn prefetch_pcscf_from_ims_profile(
                     }
                     // AT activation is only a discovery probe. WDS must be the
                     // sole activation owner for this profile; otherwise the
-                    // QCM410 firmware rejects both families as an internal
+                    // Some modem firmware rejects both families as an internal
                     // error instead of returning its useful family policy.
                     if let Err(error) = run_at(modem, &format!("AT+CGACT=0,{cid}")).await {
                         last_error = Some(error);

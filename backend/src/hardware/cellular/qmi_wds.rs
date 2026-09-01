@@ -1,11 +1,9 @@
 //! Parsers for the QMI WDS text returned by `qmicli`.
 //!
-//! QCM410 DATA6 owns the live WDS session in
-//! `hardware::devices::qcm410::secondary_qmi_data`.  That driver keeps the
-//! client id and command sequencing local to the device-specific module; this
-//! shared module intentionally contains only the format-neutral parsers used
-//! when reading the resulting settings.  The former generic WDS session
-//! client was never wired into production and duplicated the QCM410 driver.
+//! Live WDS session ownership belongs to a device driver. Drivers keep client
+//! allocation and command sequencing inside their device-specific module;
+//! this shared module intentionally contains only format-neutral parsers for
+//! reading the resulting settings.
 
 /// IP configuration reported by `--wds-get-current-settings`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

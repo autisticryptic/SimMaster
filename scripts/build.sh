@@ -324,13 +324,15 @@ if [ "$SKIP_OTA" = false ] && [ "$BUILD_BACKEND" = true ] && [ "$BUILD_FRONTEND"
         mkdir -p "$OTA_TMP/www"
         cp -r "$FRONTEND_DIR"/* "$OTA_TMP/www/"
 
-        # Include boot-time DATA6/secondary-QMI resources. The udev rule these
-        # need is generated at runtime, so it is not packaged here.
-        mkdir -p "$OTA_TMP/system"
-        cp deploy/system/simadmin-secondary-qmi.service "$OTA_TMP/system/"
-        cp scripts/simadmin-modem-recovery.sh "$OTA_TMP/system/"
-        cp scripts/simadmin-modem-recovery.service "$OTA_TMP/system/"
-        cp scripts/simadmin-modem-recovery.timer "$OTA_TMP/system/"
+        # Preserve device-owned resources below their driver directory. The
+        # generic installer delegates their installation at runtime.
+        mkdir -p "$OTA_TMP/devices"
+        for DEVICE_DIR in deploy/devices/*; do
+            [ -d "$DEVICE_DIR/system" ] || continue
+            DEVICE_NAME=$(basename "$DEVICE_DIR")
+            mkdir -p "$OTA_TMP/devices/$DEVICE_NAME/system"
+            cp -R "$DEVICE_DIR/system/." "$OTA_TMP/devices/$DEVICE_NAME/system/"
+        done
 
         # 计算前端 MD5
         if is_macos; then
@@ -359,7 +361,7 @@ EOF
         OTA_FILE="release/simadmin_${VERSION}.tar.gz"
         echo "打包 OTA..."
         cd "$OTA_TMP"
-        tar -czf - meta.json simadmin www system > "$OLDPWD/$OTA_FILE"
+        tar -czf - meta.json simadmin www devices > "$OLDPWD/$OTA_FILE"
         cd "$OLDPWD"
         
         # 显示结果

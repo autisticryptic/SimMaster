@@ -1,10 +1,9 @@
 //! Per-hardware baseband fault mitigations.
 //!
 //! Some basebands have firmware defects that a portable IMS/data path must work
-//! around. Those workarounds are *platform* knowledge, not IMS knowledge: a
-//! Qualcomm 410 latches its bam-dmux runtime-PM state at `error` and refuses
-//! every subsequent netdev OPEN with `EINVAL`, while another modem may fail in
-//! an entirely different way or not at all.
+//! around. Those workarounds are *platform* knowledge, not IMS knowledge. Each
+//! concrete device driver owns its signatures and explanation; this module
+//! contains only the shared contract and the no-op policy.
 //!
 //! Keeping that knowledge inline in the IMS registration path (as
 //! `volte/bearer.rs` used to) has two costs. It makes the generic path assert
@@ -19,29 +18,14 @@
 //! Create `hardware/devices/<platform>/baseband_faults.rs` — a sibling of the
 //! 410's, inside that platform's own directory — implement
 //! [`BasebandFaultPolicy`] there, add the platform to [`super::DeviceKind`], and
-//! return the new policy from [`fault_policy_for`]. Implement nothing else:
+//! return the new policy from its [`super::DeviceDriver`] implementation. Implement nothing else:
 //! [`GenericBasebandFaults`] is the correct behaviour for a baseband with no
 //! known firmware defect, so a platform that needs no mitigation should not have
 //! such a file at all.
 //!
-//! # What belongs here, and what does not
-//!
-//! A mitigation belongs here when it is a workaround for *hardware or firmware*
-//! behaviour. It does not belong here when it is a bug in SimAdmin. The 410's
-//! two documented crashes divide exactly along that line
-//! (`docs/QCM410_BAM_DMUX_MODEM_CRASH.md`):
-//!
-//! * `smd_dsm_memcpy.c:297` — a cold-boot race between the mainline
-//!   `qcom_bam_dmux` probe and 2022-vintage firmware still initialising its Data
-//!   Services Memory pool. It happens before SimAdmin does anything, it latches
-//!   `bam-dmux` runtime-PM at `error`, and the only correct response from us is
-//!   to *observe and refuse*: the kernel answers `EINVAL` to OPEN, so retrying
-//!   just hammers the firmware. That observation is platform-specific, so it
-//!   lives here.
-//! * `dhcp_client_mgr.c:263` — SimAdmin's own unbounded retry loop exhausting a
-//!   small WDS client pool. Nothing platform-specific mitigates that; it was
-//!   fixed by classifying the failure as unsafe to retry. It does **not** belong
-//!   here, and adding a "mitigation" for it would hide the real fix.
+//! A mitigation belongs in a concrete driver only when it is a workaround for
+//! hardware or firmware behaviour. Application retry bugs and protocol policy
+//! remain in their own layers.
 
 use std::fmt;
 
@@ -83,10 +67,8 @@ impl fmt::Display for BasebandFault {
 /// What one hardware platform knows about its baseband's failure modes.
 ///
 /// Implementations must only *observe*. Nothing here may reset, rebind or power
-/// cycle a baseband: on the 410 those actions are documented as either
-/// ineffective (`power/control=on` after the latch) or far too broad
-/// (`remoteproc stop` resets the whole SoC). Recovery policy belongs to the
-/// caller, which has the session context to decide.
+/// cycle a baseband. Recovery policy belongs to the caller, which has the
+/// session context to decide.
 pub trait BasebandFaultPolicy: Send + Sync {
     /// Stable identifier for logs and runtime snapshots.
     fn platform(&self) -> &'static str;
@@ -122,10 +104,7 @@ impl BasebandFaultPolicy for GenericBasebandFaults {
 
 /// Resolve the fault policy for the running platform.
 pub fn fault_policy_for(kind: super::DeviceKind) -> &'static dyn BasebandFaultPolicy {
-    match kind {
-        super::DeviceKind::Qcm410 => &super::qcm410::baseband_faults::Qcm410BasebandFaults,
-        super::DeviceKind::Unknown => &GenericBasebandFaults,
-    }
+    super::baseband_fault_policy(kind)
 }
 
 /// Resolve the fault policy by detecting the platform.

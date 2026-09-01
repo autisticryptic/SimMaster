@@ -41,10 +41,10 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
       <Grid size={{ xs: 12, sm: 6 }}><Field label="数据 QMI 端口" value={line.runtime.qmi_device || line.modem.qmi_device || '未发现'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}>
         <Field
-          label="IMS QMI 端口"
-          value={line.runtime.secondary_qmi_device
-            ? `${line.runtime.secondary_qmi_device}${line.runtime.secondary_qmi_channel ? ` · ${line.runtime.secondary_qmi_channel}` : ''}`
-            : '未启用（IMS 与数据共用主端口）'}
+          label="原生 IMS 端点"
+          value={line.runtime.native_bearer_endpoint
+            ? `${line.runtime.native_bearer_endpoint}${line.runtime.native_bearer_session ? ` · ${line.runtime.native_bearer_session}` : ''}`
+            : '尚未建立'}
         />
       </Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="P-CSCF" value={line.runtime.pcscf || '尚未发现'} /></Grid>

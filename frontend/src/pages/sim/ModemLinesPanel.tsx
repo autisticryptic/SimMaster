@@ -41,7 +41,7 @@ import { standardDerivedProfileMessage, volteErrorMessage, volteErrorStatusLabel
 import { formatBytes } from '../Dashboard/utils'
 
 const volteStageStatusLabels: Record<string, string> = {
-  disabled: 'IMS 未启用',
+  disabled: 'IMS 未连接',
   starting: '正在准备 IMS 连接',
   identity: '正在读取 SIM 身份',
   carrier_profile: '正在匹配运营商 Profile',
@@ -68,7 +68,7 @@ const volteStageStatusLabels: Record<string, string> = {
 
 function imsConnectionSummary(line: VolteLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
-  if (!line.profile.volte_connection_enabled) return 'IMS 未启用'
+  if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
   const errorStatus = volteErrorStatusLabel(line.runtime.last_error)
   if (errorStatus) return errorStatus
   const label = volteStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
@@ -182,7 +182,7 @@ function trunkProfileCanEnable(line: TrunkProfileResponse) {
 }
 
 const vowifiStageLabels: Record<string, string> = {
-  disabled: '未启用', starting: '正在启动', identity_ready: 'SIM 身份已读取',
+  disabled: 'VoWiFi未启用', starting: '正在启动', identity_ready: 'SIM 身份已读取',
   reconnecting: 'IMS 注册已失效，正在重连',
   profile_matched: '运营商配置已匹配', sim_auth_ready: 'SIM AKA 已就绪',
   epdg_ready: 'ePDG 已连接', ike_ready: 'IKE 已建立', child_sa_ready: 'CHILD SA 已建立',
@@ -191,7 +191,7 @@ const vowifiStageLabels: Record<string, string> = {
 }
 
 function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
-  if (!line?.config.enabled) return '未启用'
+  if (!line?.config.enabled) return 'VoWiFi未启用'
   if (line.runtime_registered) return 'VoWiFi IMS 已注册'
   if (line.runtime_error === 'vowifi_auto_restore_exhausted') return 'VoWiFi连接失败'
   const stage = vowifiStageLabels[line.runtime_stage] ?? line.runtime_stage

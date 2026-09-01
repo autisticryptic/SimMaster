@@ -554,16 +554,6 @@ export interface VolteConnectionAttempt {
   at: string
 }
 
-/** A line's QMI endpoint pair. Both entries always belong to the same baseband. */
-export interface VolteQmiEndpoints {
-  /** Primary control port — ModemManager uses this for normal mobile data. */
-  primary?: string
-  /** Dedicated endpoint carrying IMS/VoLTE, when one has been prepared. */
-  secondary?: string
-  /** rpmsg channel backing the secondary endpoint, e.g. DATA6_CNTL. */
-  secondary_channel?: string
-}
-
 export interface VolteRuntimeStatus {
   phase: string
   stage: string
@@ -586,10 +576,10 @@ export interface VolteRuntimeStatus {
   data_path_mode?: string
   /** Primary QMI control port — ModemManager uses this for normal mobile data. */
   qmi_device?: string
-  /** Dedicated QMI endpoint carrying IMS/VoLTE; same baseband as qmi_device. */
-  secondary_qmi_device?: string
-  /** rpmsg channel backing the secondary endpoint, e.g. DATA6_CNTL. */
-  secondary_qmi_channel?: string
+  /** Opaque endpoint selected by the native IMS bearer provider. */
+  native_bearer_endpoint?: string
+  /** Opaque retained-session identifier selected by the provider. */
+  native_bearer_session?: string
   bearer_interface?: string
   bearer_ip_type?: string
   current_ip_family?: string

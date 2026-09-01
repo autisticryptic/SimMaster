@@ -228,12 +228,10 @@ pub struct VolteSnapshot {
     /// Primary QMI control port for this line — what ModemManager uses for normal
     /// mobile data.
     pub qmi_device: Option<String>,
-    /// Dedicated QMI endpoint carrying this line's IMS/VoLTE session, when one is
-    /// prepared. Always belongs to the same baseband as `qmi_device` (paired by
-    /// sysfs ancestor), so multi-baseband hosts never cross wires.
-    pub secondary_qmi_device: Option<String>,
-    /// rpmsg channel backing `secondary_qmi_device`, e.g. `DATA6_CNTL`.
-    pub secondary_qmi_channel: Option<String>,
+    /// Opaque endpoint selected by the native bearer provider.
+    pub native_bearer_endpoint: Option<String>,
+    /// Opaque retained-session identifier selected by the provider.
+    pub native_bearer_session: Option<String>,
     pub bearer_interface: Option<String>,
     pub bearer_ip_type: Option<String>,
     pub bearer_path: Option<String>,
@@ -308,8 +306,8 @@ impl Default for VolteSnapshot {
             register_refresh_count: 0,
             data_path_mode: None,
             qmi_device: None,
-            secondary_qmi_device: None,
-            secondary_qmi_channel: None,
+            native_bearer_endpoint: None,
+            native_bearer_session: None,
             at_cid: None,
             bearer_interface: None,
             bearer_path: None,
@@ -412,9 +410,9 @@ pub struct VolteRuntimeStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub qmi_device: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub secondary_qmi_device: Option<String>,
+    pub native_bearer_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub secondary_qmi_channel: Option<String>,
+    pub native_bearer_session: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bearer_interface: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -491,8 +489,8 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
             register_refresh_count: s.register_refresh_count,
             data_path_mode: s.data_path_mode.clone(),
             qmi_device: s.qmi_device.clone(),
-            secondary_qmi_device: s.secondary_qmi_device.clone(),
-            secondary_qmi_channel: s.secondary_qmi_channel.clone(),
+            native_bearer_endpoint: s.native_bearer_endpoint.clone(),
+            native_bearer_session: s.native_bearer_session.clone(),
             bearer_interface: s.bearer_interface.clone(),
             bearer_ip_type: s.bearer_ip_type.clone(),
             current_ip_family: s.current_ip_family.clone(),
@@ -650,8 +648,8 @@ impl VolteRuntime {
             snapshot.last_rx_at = None;
             snapshot.last_tx_at = None;
             snapshot.data_path_mode = None;
-            snapshot.secondary_qmi_device = None;
-            snapshot.secondary_qmi_channel = None;
+            snapshot.native_bearer_endpoint = None;
+            snapshot.native_bearer_session = None;
             snapshot.bearer_interface = None;
             snapshot.bearer_ip_type = None;
             snapshot.bearer_path = None;
@@ -930,8 +928,8 @@ mod tests {
             snapshot.last_rx_at = Some("rx".to_string());
             snapshot.last_tx_at = Some("tx".to_string());
             snapshot.data_path_mode = Some("native".to_string());
-            snapshot.secondary_qmi_device = Some("/dev/cdc-wdm9".to_string());
-            snapshot.secondary_qmi_channel = Some("DATA6_CNTL".to_string());
+            snapshot.native_bearer_endpoint = Some("native-endpoint-9".to_string());
+            snapshot.native_bearer_session = Some("session-7".to_string());
             snapshot.bearer_interface = Some("rmnet_ims0".to_string());
             snapshot.bearer_ip_type = Some("ipv6".to_string());
             snapshot.bearer_path = Some("/bearer/ims".to_string());
@@ -976,8 +974,8 @@ mod tests {
         assert!(status.last_rx_at.is_none());
         assert!(status.last_tx_at.is_none());
         assert!(status.data_path_mode.is_none());
-        assert!(status.secondary_qmi_device.is_none());
-        assert!(status.secondary_qmi_channel.is_none());
+        assert!(status.native_bearer_endpoint.is_none());
+        assert!(status.native_bearer_session.is_none());
         assert!(status.bearer_interface.is_none());
         assert!(status.bearer_ip_type.is_none());
         assert!(status.current_ip_family.is_none());

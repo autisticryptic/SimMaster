@@ -502,11 +502,10 @@ pub async fn links_in(namespace: &NetnsName) -> Result<Vec<String>, NetnsError> 
 /// `/sys/class/net` is network-namespace scoped, and a netdev's `device`
 /// symlink still resolves to its global bus path from inside the namespace.
 /// That makes the presence of `device` an exact, platform-independent split
-/// between hardware netdevs (the modem's bam-dmux interfaces, USB, WiFi) and
+/// between hardware netdevs (modem data interfaces, USB, WiFi) and
 /// the software links we create ourselves: veth, the VoWiFi tun and `lo` have
-/// no `device` at all. Verified on the reference 410 — from inside the UE
-/// namespace `wwan1/device` resolved to `4080000.remoteproc:bam-dmux` while
-/// `save*`, `sa_vwf*` and `lo` had none.
+/// no `device` at all. On the reference device, the modem interface retained a
+/// hardware-backed `device` link while `save*`, `sa_vwf*` and `lo` had none.
 ///
 /// Deliberately does not key off a name prefix or a baseband token. A name
 /// pattern would either miss hardware on a platform whose netdevs are not
@@ -588,7 +587,7 @@ pub async fn reclaim_stranded_hardware_links(
 /// `graceful shutdown exceeded 8s; forcing process exit` path — the netdev stays
 /// behind. Namespace names are deterministic per line, so the next process
 /// re-attaches to the very namespace still holding it, and `ensure` only brings
-/// `lo` up. Meanwhile `qmi_netdev::candidates_for_baseband` enumerates the
+/// `lo` up. Meanwhile the device driver's netdev resolver enumerates the
 /// *host's* `/sys/class/net`, so the interface is invisible: the resolver finds
 /// no candidate that answers, falls back to `Assumed`, and the session comes up
 /// unverified — which makes SIP fail silently. Observed on the reference 410,
@@ -603,7 +602,7 @@ pub async fn reclaim_stranded_hardware_links(
 /// protect. Call this once, before any line is discovered and therefore before
 /// any session can hold a netdev; at that point anything found inside a
 /// namespace is by definition a leftover. It is not enough to do this in the
-/// `secondary-qmi-init` unit either: that runs once per boot, whereas the leak
+/// `device-init` unit either: that runs once per boot, whereas the leak
 /// happens on any `systemctl restart simadmin` within the same boot.
 #[cfg(target_os = "linux")]
 pub async fn reclaim_all_stranded_hardware_links() {
@@ -810,7 +809,7 @@ pub async fn teardown_veth(host_if: &str) -> Result<(), NetnsError> {
 /// MASQUERADE makes that traffic routable when the host's primary interface
 /// uses a different subnet. Idempotent: the rule is only appended when the
 /// check finds it missing. `iptables` is preferred for compatibility with
-/// embedded images (including the QCM410 image); systems that only expose
+/// embedded images; systems that only expose
 /// nftables use the dedicated `simadmin_nat` table as a fallback.
 #[cfg(target_os = "linux")]
 pub async fn ensure_host_veth_nat(host_addr: Ipv4Addr) -> Result<(), NetnsError> {

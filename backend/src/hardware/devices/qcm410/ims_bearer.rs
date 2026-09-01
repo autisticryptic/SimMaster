@@ -16,11 +16,13 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::hardware::cellular::cgcontrdp::{self, CgcontrdpSettings};
-use crate::hardware::cellular::qmi_netdev::{self, NetdevConfig};
-use crate::hardware::devices::qcm410::secondary_qmi::{self, ImsSession, SecondaryQmiEndpoint};
+use crate::hardware::devices::qcm410::{
+    netdev::{self as qmi_netdev, NetdevConfig},
+    secondary_qmi::{self, ImsSession, SecondaryQmiEndpoint},
+};
 use crate::hardware::devices::transport::{
-    BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerHandle, ImsBearerInfo,
-    ImsBearerTransport,
+    BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint,
+    ImsBearerHandle, ImsBearerInfo, ImsBearerTransport, TransportFuture,
 };
 
 /// The primary ModemManager netdev must never be adopted by a native IMS
@@ -63,46 +65,50 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
 }
 
 impl ImsBearerTransport for Qcm410ImsBearer {
-    type Error = ImsBearerError;
-
-    async fn establish_ims_bearer(
-        &self,
-        primary_device: &str,
-        modem_id: &str,
-        apn: &str,
+    fn establish_ims_bearer<'a>(
+        &'a self,
+        primary_device: &'a str,
+        modem_id: &'a str,
+        apn: &'a str,
         profile_id: Option<u32>,
         cid: u8,
-        families: &[u8],
-    ) -> Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError> {
-        // `primary_device` is the line's primary QMI control port; it is used
-        // only to find the *baseband*, so the secondary endpoint and the netdev
-        // are paired to the same modem (multi-line correctness). The IMS session
-        // itself never touches the primary port — that stays with ModemManager.
-        let baseband = secondary_qmi::baseband_key_for_device(primary_device).map_err(|error| {
-            ImsBearerError {
-                kind: ImsBearerErrorKind::BasebandUnresolved,
-                detail: format!("native_ims_baseband_unresolved:{error}"),
-            }
-        })?;
+        families: &'a [u8],
+    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
+    {
+        Box::pin(async move {
+            // `primary_device` is the line's primary QMI control port; it is used
+            // only to find the *baseband*, so the secondary endpoint and the netdev
+            // are paired to the same modem (multi-line correctness). The IMS session
+            // itself never touches the primary port — that stays with ModemManager.
+            let baseband =
+                secondary_qmi::baseband_key_for_device(primary_device).map_err(|error| {
+                    ImsBearerError {
+                        kind: ImsBearerErrorKind::BasebandUnresolved,
+                        hint: ImsBearerFailureHint::None,
+                        detail: format!("native_ims_baseband_unresolved:{error}"),
+                    }
+                })?;
 
-        let endpoint = secondary_qmi::runtime_endpoint(primary_device)
-            .await
-            .map_err(|error| ImsBearerError {
-                kind: ImsBearerErrorKind::EndpointUnavailable,
-                detail: error.to_string(),
-            })?;
+            let endpoint = secondary_qmi::runtime_endpoint(primary_device)
+                .await
+                .map_err(|error| ImsBearerError {
+                    kind: ImsBearerErrorKind::EndpointUnavailable,
+                    hint: ImsBearerFailureHint::None,
+                    detail: error.to_string(),
+                })?;
 
-        let result = establish_bearer(
-            &endpoint, &baseband, modem_id, apn, profile_id, cid, families,
-        )
-        .await;
-        match result {
-            Ok(established) => Ok((established.info, Box::new(established.handle))),
-            Err(error) => {
-                secondary_qmi::release_endpoint(&endpoint).await;
-                Err(error)
+            let result = establish_bearer(
+                &endpoint, &baseband, modem_id, apn, profile_id, cid, families,
+            )
+            .await;
+            match result {
+                Ok(established) => Ok((established.info, Box::new(established.handle))),
+                Err(error) => {
+                    secondary_qmi::release_endpoint(&endpoint).await;
+                    Err(error)
+                }
             }
-        }
+        })
     }
 }
 
@@ -125,6 +131,7 @@ async fn establish_bearer(
     let Some(first_family) = families.first().copied() else {
         return Err(ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
+            hint: ImsBearerFailureHint::None,
             detail: "native_ims_no_address_family".to_string(),
         });
     };
@@ -163,6 +170,11 @@ async fn establish_bearer(
             stop_sessions(sessions).await;
             return Err(ImsBearerError {
                 kind: ImsBearerErrorKind::NetdevUnresolved,
+                hint: if matches!(error, qmi_netdev::NetdevError::LinkUnavailable(_)) {
+                    ImsBearerFailureHint::BasebandWedged
+                } else {
+                    ImsBearerFailureHint::None
+                },
                 detail: format!("native_ims_netdev_unresolved:{error}"),
             });
         }
@@ -183,7 +195,7 @@ async fn establish_bearer(
         ipv6_dns: settings.ipv6_dns,
         ipv6_prefix: settings.ipv6_prefix,
         pcscf: settings.pcscf,
-        interface_ownership: BearerInterfaceOwnership::SimAdminOwnedSecondary,
+        interface_ownership: BearerInterfaceOwnership::ApplicationOwnedNative,
         ..Default::default()
     };
     Ok(Established {
@@ -217,8 +229,38 @@ async fn start_session(
         .await
         .map_err(|detail| ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
+            hint: classify_session_failure(&detail),
             detail,
         })
+}
+
+fn classify_session_failure(detail: &str) -> ImsBearerFailureHint {
+    let error = detail.to_ascii_lowercase();
+    if error.contains("ipv6onlyallowed")
+        || error.contains("ipv6-only-allowed")
+        || error.contains("only ipv6 allowed")
+        || error.contains("pdn-ipv4-call-disallowed")
+    {
+        ImsBearerFailureHint::NetworkForcedIpv6
+    } else if error.contains("ipv4onlyallowed")
+        || error.contains("ipv4-only-allowed")
+        || error.contains("only ipv4 allowed")
+        || error.contains("pdn-ipv6-call-disallowed")
+    {
+        ImsBearerFailureHint::NetworkForcedIpv4
+    } else {
+        let call_failed = error.contains("call failed") || error.contains("callfailed");
+        let internal_error = error.contains("internal error") || error.contains("[internal] error");
+        if error.contains("interface-in-use-config-match")
+            || error.contains("endpoint hangup")
+            || error.contains("mobileequipment.unknown")
+            || (call_failed && internal_error)
+        {
+            ImsBearerFailureHint::BasebandWedged
+        } else {
+            ImsBearerFailureHint::None
+        }
+    }
 }
 
 /// Read the IMS context's IP configuration and P-CSCF from `AT+CGCONTRDP`.
@@ -250,6 +292,7 @@ async fn stop_sessions(sessions: Vec<ImsSession>) {
 fn settings_missing(detail: String) -> ImsBearerError {
     ImsBearerError {
         kind: ImsBearerErrorKind::SettingsMissing,
+        hint: ImsBearerFailureHint::None,
         detail,
     }
 }

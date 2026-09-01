@@ -177,7 +177,7 @@ impl FailureClass {
             || error.contains(code::BEARER_NETDEV_NOT_READY)
         {
             // Interface bring-up races are recoverable. Only the kernel's
-            // latched runtime-PM error is a confirmed permanent bam-dmux wedge.
+            // driver-classified runtime fault is a confirmed permanent wedge.
             FailureClass::Other
         } else if is_baseband_wedge(&error) {
             FailureClass::BasebandWedged

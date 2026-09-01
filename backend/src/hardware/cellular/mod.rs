@@ -8,13 +8,12 @@
 //!   - `cell_lock_store`: in-memory cell-lock UI state
 //!   - `serial`: low-level serial/AT port helpers
 //!
-//! Device-specific logic (spare-channel discovery/binding, DATA6 runtime) lives
-//! under [`crate::hardware::devices`], keyed by device name.
+//! Device-specific endpoint discovery, binding and retained-session behavior
+//! lives under [`crate::hardware::devices`], keyed by device name.
 
 pub mod cell_lock_store;
 pub mod cgcontrdp;
 pub mod data_proxy;
 pub mod modem_manager;
-pub mod qmi_netdev;
 pub mod qmi_wds;
 pub mod serial;

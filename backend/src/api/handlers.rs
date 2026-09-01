@@ -2996,7 +2996,7 @@ async fn build_line_network_controls(
 ) -> LineNetworkControlsResponse {
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    let connected = binding.present && line.secondary_data.interface().await.is_some();
+    let connected = binding.present && line.cellular_data.interface().await.is_some();
     let observed_airplane = if binding.present {
         modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
@@ -3146,7 +3146,7 @@ async fn start_line_data_runtime_locked(
 
     // A native secondary session is the only supported cellular data bearer.
     // Reuse it when it is already alive and visible inside this line's worker.
-    if let Some(interface) = line.secondary_data.interface().await {
+    if let Some(interface) = line.cellular_data.interface().await {
         line.data_proxy
             .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
             .await?;
@@ -3163,7 +3163,7 @@ async fn start_line_data_runtime_locked(
 
     if let Some(qmi_device) = binding.qmi_device.as_deref() {
         match line
-            .secondary_data
+            .cellular_data
             .start(&binding.line_id, qmi_device, &apn)
             .await
         {
@@ -3176,7 +3176,7 @@ async fn start_line_data_runtime_locked(
             Err(error) => return Err(error),
         }
     } else {
-        return Err("cellular_secondary_qmi_device_unavailable".to_string());
+        return Err("cellular_native_data_endpoint_unavailable".to_string());
     }
 }
 
@@ -3351,7 +3351,7 @@ async fn reconcile_line_data_health(
         return;
     }
 
-    let interface = line.secondary_data.interface().await;
+    let interface = line.cellular_data.interface().await;
     let proxy = line.data_proxy.status().await;
     let current_worker = current_data_proxy_worker(&binding.line_id, interface.as_deref()).await;
     let worker_binding_matches = line
@@ -3425,7 +3425,7 @@ pub(crate) async fn suspend_line_runtime_for_hotplug(
     {
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         line.data_proxy.stop().await;
-        line.secondary_data.stop().await;
+        line.cellular_data.stop().await;
         let _connect_guard = line.volte_connect_lock.lock().await;
         crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
             &line.volte_live,
@@ -3445,7 +3445,7 @@ async fn stop_line_data_runtime_locked(
 ) {
     let binding = line.binding();
     line.data_proxy.stop().await;
-    line.secondary_data.stop().await;
+    line.cellular_data.stop().await;
     // Clean up any bearer created by an older build. It is never adopted or
     // used by the UE-only runtime.
     if let Err(error) =
@@ -3472,9 +3472,10 @@ async fn prepare_line_data_slot_for_volte(
     let binding = line.binding();
     let inputs = DataSlotInputs {
         data_requested: profile.data_connection_enabled,
-        native_endpoint_available: binding.qmi_device.as_deref().is_some_and(
-            crate::hardware::devices::qcm410::secondary_qmi::runtime_endpoint_available,
-        ),
+        native_endpoint_available: binding
+            .qmi_device
+            .as_deref()
+            .is_some_and(|device| line.cellular_data.endpoint_available(device)),
     };
     let mode = match select_data_slot_mode(inputs) {
         Ok(mode) => mode,
@@ -3506,10 +3507,10 @@ async fn prepare_line_data_slot_for_volte(
         let data_start_error = start_line_data_runtime_locked(app, line, profile)
             .await
             .err();
-        let secondary_data_active = line.secondary_data.interface().await.is_some();
+        let cellular_data_active = line.cellular_data.interface().await.is_some();
         if let Some(error) = data_start_error {
             line.data_proxy.record_error(error.clone()).await;
-            if secondary_data_active {
+            if cellular_data_active {
                 warn!(line_id = %binding.line_id, error = %error, "Native data bearer is active but its UE proxy is unavailable");
             } else {
                 warn!(line_id = %binding.line_id, error = %error, "Native data bearer preparation failed");
@@ -8617,8 +8618,8 @@ async fn sync_line_video_capabilities(app: &AppState) {
 /// `voice_enabled` is retained as a response field for API compatibility and is
 /// now a mirror of `ims_connection_enabled`. A carrier that does not permit
 /// voice answers the REGISTER or the INVITE with a SIP error, which the runtime
-/// surfaces instead of pre-emptively refusing locally. `gateway_mode` is always
-/// true on this hardware class.
+/// surfaces instead of pre-emptively refusing locally. Media capabilities come
+/// from the detected device driver.
 #[derive(Debug, serde::Serialize, Default)]
 pub struct VolteVoiceStatusResponse {
     pub line_id: String,
@@ -8631,16 +8632,20 @@ pub struct VolteVoiceStatusResponse {
 }
 
 impl VolteVoiceStatusResponse {
-    fn build(line_id: String, line_enabled: bool, registered: bool) -> Self {
+    fn build(
+        line_id: String,
+        line_enabled: bool,
+        registered: bool,
+        capabilities: crate::hardware::devices::DeviceCapabilities,
+    ) -> Self {
         Self {
             line_id,
             enabled: line_enabled,
             ims_connection_enabled: line_enabled,
             voice_enabled: line_enabled,
             registered,
-            // Qualcomm 410 pocket-WiFi has no mic/speaker/PCM: relay only.
-            gateway_mode: true,
-            local_audio_capable: false,
+            gateway_mode: capabilities.gateway_mode,
+            local_audio_capable: capabilities.local_audio_capable,
         }
     }
 }
@@ -8651,7 +8656,12 @@ async fn current_volte_voice_status(
 ) -> VolteVoiceStatusResponse {
     let line_id = line.binding().line_id;
     let registered = line.volte.status().await.registered;
-    VolteVoiceStatusResponse::build(line_id, line_volte_enabled(app, line), registered)
+    VolteVoiceStatusResponse::build(
+        line_id,
+        line_volte_enabled(app, line),
+        registered,
+        crate::hardware::devices::capabilities(app.line_registry.device_kind()),
+    )
 }
 
 pub async fn get_volte_call_status_handler(
@@ -8754,14 +8764,14 @@ impl VilteStatusResponse {
         let line_id = line.binding().line_id;
         let ims_video = app.config_manager.get_line_ims_video_config(&line_id);
         let voice_ready = line_volte_enabled(app, line);
+        let capabilities = crate::hardware::devices::capabilities(app.line_registry.device_kind());
         Self {
             line_id,
             enabled: voice_ready && ims_video.volte_enabled,
             feature_enabled: ims_video.volte_enabled,
             registered: line.volte.status().await.registered,
-            // Qualcomm 410 pocket-WiFi has no camera/display/codec: relay only.
-            gateway_mode: true,
-            local_video_capable: false,
+            gateway_mode: capabilities.gateway_mode,
+            local_video_capable: capabilities.local_video_capable,
             config: ims_video,
         }
     }
@@ -9550,7 +9560,7 @@ async fn start_line_volte_restore(
         tracing::warn!(
             line_id = %line.binding().line_id,
             source,
-            "Skipping VoLTE restore: Qualcomm bam-dmux is latched until a full system reboot"
+            "Skipping VoLTE restore: baseband data path is latched until a full system reboot"
         );
         line.volte
             .update(|state| {
@@ -9986,6 +9996,7 @@ async fn run_line_volte_restore_batch(
                             crate::connectivity::modems::ims::volte::live::connect_live_for_line(
                                 &line.volte_live,
                                 &device,
+                                line.ims_bearer.as_deref(),
                                 &line.volte,
                                 &line.ims_access_network,
                                 candidate,
@@ -13876,15 +13887,22 @@ mod tests {
 
     #[test]
     fn volte_voice_status_uses_only_the_requested_line() {
+        let capabilities = crate::hardware::devices::DeviceCapabilities {
+            gateway_mode: true,
+            local_audio_capable: false,
+            local_video_capable: false,
+        };
         let enabled = VolteVoiceStatusResponse::build(
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             true,
+            capabilities,
         );
         let disabled = VolteVoiceStatusResponse::build(
             "line-fedcba9876543210fedcba9876543210".to_string(),
             false,
             false,
+            capabilities,
         );
 
         assert!(enabled.enabled);
@@ -13906,6 +13924,11 @@ mod tests {
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             false,
+            crate::hardware::devices::DeviceCapabilities {
+                gateway_mode: true,
+                local_audio_capable: false,
+                local_video_capable: false,
+            },
         );
 
         assert!(connected.enabled);

@@ -7,6 +7,11 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 
+use crate::platform::config::ApnConfig;
+
+/// Object-safe asynchronous return type shared by device contracts.
+pub type TransportFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
 /// Radio access technology carrying a 3GPP IMS bearer.
 ///
 /// This describes the bearer that was actually established.  It must not be
@@ -37,22 +42,22 @@ pub enum BearerDomain {
 /// Ownership of the network interface exposed by a bearer provider.
 ///
 /// Namespace migration must eventually key off this value instead of an
-/// interface name such as `wwan0`: a host-managed primary interface must stay
-/// with ModemManager, whereas a SimAdmin-owned secondary interface may be moved
-/// into the line worker.
+/// interface name such as `wwan0`: a host-managed interface must stay with its
+/// owner, whereas an application-owned native interface may move into the line
+/// worker.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BearerInterfaceOwnership {
     #[default]
     Unknown,
     HostManagedPrimary,
-    SimAdminOwnedSecondary,
+    ApplicationOwnedNative,
     WorkerNative,
 }
 
 /// Optional 5GS PDU-session metadata supplied by a capable bearer provider.
 ///
-/// Existing LTE/QMI providers leave this as `None`.  Keeping the fields
+/// Existing LTE providers leave this as `None`. Keeping the fields
 /// optional also lets ModemManager/MBIM implementations expose only the subset
 /// reported by their modem without inventing values.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,8 +84,8 @@ pub struct QosFlowInfo {
 ///
 /// This is what an upper protocol layer consumes: enough to build its own
 /// connection contract (addresses, DNS, P-CSCF, prefixes, interface) and to log
-/// how the interface was decided, plus the two strings the synthetic bearer path
-/// is made from. The WDS session handle itself stays opaque behind
+/// how the interface was decided, plus the two opaque strings the synthetic
+/// bearer path is made from. The provider session handle stays opaque behind
 /// [`ImsBearerHandle`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImsBearerInfo {
@@ -91,11 +96,9 @@ pub struct ImsBearerInfo {
     pub netdev_method: &'static str,
     /// `ipv4`, `ipv6` or `ipv4v6`.
     pub ip_type: String,
-    /// Device path the session's QMI endpoint bound (used for the synthetic
-    /// bearer path).
+    /// Provider endpoint identifier used for the synthetic bearer path.
     pub path_device: String,
-    /// Retained WDS packet-data handles, joined (used for the synthetic bearer
-    /// path).
+    /// Provider session identifier used for the synthetic bearer path.
     pub path_handle: String,
     pub ipv4_address: Option<IpAddr>,
     pub ipv4_gateway: Option<IpAddr>,
@@ -119,14 +122,14 @@ pub struct ImsBearerInfo {
 
 /// Opaque teardown handle for an established IMS bearer.
 ///
-/// Dropping it without calling [`Self::release`] would leak the WDS session and
-/// its endpoint, so callers are expected to drive teardown explicitly (the
+/// Dropping it without calling [`Self::release`] would leak the native session
+/// and its resources, so callers are expected to drive teardown explicitly (the
 /// strategy layer owns the handle until the call/session is over).
 ///
 /// The teardown is returned as a boxed future so the trait stays object-safe and
 /// can be held as `Box<dyn ImsBearerHandle + Send>` by upper layers.
 pub trait ImsBearerHandle: Send {
-    /// Stop the WDS session(s) and release the endpoint and netdev addresses.
+    /// Stop the provider session and release its endpoint and network state.
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
 
@@ -138,14 +141,25 @@ pub enum ImsBearerErrorKind {
     BasebandUnresolved,
     /// No secondary endpoint could be obtained (bound) for the device.
     EndpointUnavailable,
-    /// The WDS session failed to start. `detail` carries the stable
-    /// `secondary_qmi_start_failed:...` string the baseband-wedge classifier
-    /// keys off.
+    /// The device-native session failed to start.
     SessionStartFailed,
     /// The IMS context reported no usable IP configuration / P-CSCF.
     SettingsMissing,
-    /// The bam-dmux netdev for the session could not be resolved.
+    /// The data interface for the session could not be resolved.
     NetdevUnresolved,
+}
+
+/// Device-provided strategy hint accompanying an IMS bearer failure.
+///
+/// Upper layers must not parse QMI, MBIM or firmware-specific text to decide
+/// whether a retry is safe or which address family the network requires.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ImsBearerFailureHint {
+    #[default]
+    None,
+    BasebandWedged,
+    NetworkForcedIpv4,
+    NetworkForcedIpv6,
 }
 
 /// A device IMS bearer failure with a stable `detail` string for
@@ -153,6 +167,7 @@ pub enum ImsBearerErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImsBearerError {
     pub kind: ImsBearerErrorKind,
+    pub hint: ImsBearerFailureHint,
     pub detail: String,
 }
 
@@ -170,25 +185,43 @@ impl fmt::Display for ImsBearerError {
 /// that tears the session down again. On failure the implementation is
 /// responsible for releasing anything it bound.
 pub trait ImsBearerTransport: Send + Sync {
-    type Error: std::fmt::Display + Send + Sync + 'static;
-
     /// Establish one IMS bearer for the given address families.
     ///
-    /// `families` carries one QMI `ip-type` value (`4` or `6`) for a
-    /// single-family attempt, or both, in the plan's start order, for a
-    /// `ipv4v6` attempt. The driver is free to implement dual-stack as two
-    /// independent sessions on its own.
+    /// `families` carries one IP version (`4` or `6`) for a single-family
+    /// attempt, or both, in the plan's start order, for an `ipv4v6` attempt.
+    /// The driver is free to implement dual-stack as independent sessions.
     ///
-    /// `modem_id` is the mmcli selector used to read `+CGCONTRDP`;
-    /// `profile_id` is the `3gpp-profile` to start the WDS session with; `cid`
-    /// is the AT PDP context id whose settings describe the session.
-    async fn establish_ims_bearer(
-        &self,
-        primary_device: &str,
-        modem_id: &str,
-        apn: &str,
+    /// `modem_id` identifies the line to the provider; `profile_id` and `cid`
+    /// carry the selected 3GPP profile/context when the driver needs them.
+    fn establish_ims_bearer<'a>(
+        &'a self,
+        primary_device: &'a str,
+        modem_id: &'a str,
+        apn: &'a str,
         profile_id: Option<u32>,
         cid: u8,
-        families: &[u8],
-    ) -> Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), Self::Error>;
+        families: &'a [u8],
+    ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>;
+}
+
+/// Device-agnostic retained cellular-data bearer used by one UE line.
+///
+/// Implementations own every device-specific detail: endpoint allocation,
+/// session retention, interface discovery and teardown. The line registry and
+/// HTTP API only consume this contract, so adding another modem family does not
+/// require importing that driver's concrete runtime into service code.
+pub trait CellularDataTransport: Send + Sync {
+    fn interface(&self) -> TransportFuture<'_, Option<String>>;
+
+    fn start<'a>(
+        &'a self,
+        line_id: &'a str,
+        primary_device: &'a str,
+        apn: &'a ApnConfig,
+    ) -> TransportFuture<'a, Result<String, String>>;
+
+    fn stop(&self) -> TransportFuture<'_, ()>;
+
+    /// Cheap admission check for a prepared native endpoint on this device.
+    fn endpoint_available(&self, primary_device: &str) -> bool;
 }

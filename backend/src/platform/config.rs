@@ -5069,10 +5069,11 @@ fn default_voice_path_order() -> Vec<PathLayerConfig> {
 }
 
 /// Voice path selection is deliberately independent from the SMS policy.
-/// `gateway_mode` remains true on the Qualcomm 410 because the host has no
-/// microphone/speaker and hands media to the per-line Asterisk trunk. CS calls
-/// remain available through the line-scoped ModemManager call API, but are not
-/// exposed here because there is no CS media backend behind the SIP trunk.
+/// `gateway_mode` is the routing preference for handing media to the per-line
+/// trunk. Whether the detected host has local audio/video hardware is reported
+/// separately by its device driver. CS calls remain available through the
+/// line-scoped ModemManager call API, but are not exposed here because there is
+/// no CS media backend behind the SIP trunk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoicePathPolicy {
     #[serde(default = "default_voice_path_order")]

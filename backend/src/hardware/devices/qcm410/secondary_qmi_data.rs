@@ -11,9 +11,12 @@ use tokio::{process::Command, sync::Mutex};
 use tracing::{info, warn};
 
 use crate::{
-    hardware::cellular::{
-        qmi_netdev::{self, NetdevConfig, ResolvedNetdev},
-        qmi_wds,
+    hardware::{
+        cellular::qmi_wds,
+        devices::{
+            qcm410::netdev::{self as qmi_netdev, NetdevConfig, ResolvedNetdev},
+            transport::{CellularDataTransport, TransportFuture},
+        },
     },
     platform::{config::ApnConfig, netns},
     services::ue_worker::{worker_for_line, NetConfigOp, UeWorkerBinding, UeWorkerHandle},
@@ -146,6 +149,34 @@ impl SecondaryDataRuntime {
         if let Some(session) = self.session.lock().await.take() {
             stop_session(session).await;
         }
+    }
+}
+
+impl CellularDataTransport for SecondaryDataRuntime {
+    fn interface(&self) -> TransportFuture<'_, Option<String>> {
+        Box::pin(SecondaryDataRuntime::interface(self))
+    }
+
+    fn start<'a>(
+        &'a self,
+        line_id: &'a str,
+        primary_device: &'a str,
+        apn: &'a ApnConfig,
+    ) -> TransportFuture<'a, Result<String, String>> {
+        Box::pin(SecondaryDataRuntime::start(
+            self,
+            line_id,
+            primary_device,
+            apn,
+        ))
+    }
+
+    fn stop(&self) -> TransportFuture<'_, ()> {
+        Box::pin(SecondaryDataRuntime::stop(self))
+    }
+
+    fn endpoint_available(&self, primary_device: &str) -> bool {
+        secondary_qmi::runtime_endpoint_available(primary_device)
     }
 }
 

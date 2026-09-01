@@ -23,7 +23,7 @@ pub mod bearer;
 pub mod channel;
 // `data_path` (the direct-QMI IPv6 WDS preflight) was removed: it was disabled
 // by default behind an env var, hardcoded to IPv6-only, and probed
-// `a2-mux-rmnet*` MUX ports that do not exist on bam-dmux targets. It never ran,
+// device-specific MUX ports that were absent on the supported target. It never ran,
 // and running it would have contended with ModemManager for the primary QMI
 // port.
 //

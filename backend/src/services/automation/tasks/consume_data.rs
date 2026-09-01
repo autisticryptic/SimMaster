@@ -107,9 +107,9 @@ fn local_proxy_url(status: &DataProxyStatus) -> Result<String> {
 }
 
 fn data_consumption_addresses() -> [SocketAddr; 2] {
-    // DATA6 is intentionally isolated from the host's default DNS route. Give
-    // SOCKS5 numeric anycast destinations while TLS keeps validating the
-    // Cloudflare service hostname.
+    // The device-owned cellular bearer is intentionally isolated from the
+    // host's default DNS route. Give SOCKS5 numeric anycast destinations while
+    // TLS keeps validating the Cloudflare service hostname.
     [
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(172, 66, 0, 218), 443)),
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(162, 159, 140, 220), 443)),
@@ -249,7 +249,7 @@ impl AutomationTaskHandler for ConsumeDataHandler {
                         .context("目标线路的数据承载或代理启动失败")?;
                     if unit == "bytes" {
                         let interface = line
-                            .secondary_data
+                            .cellular_data
                             .interface()
                             .await
                             .ok_or_else(|| anyhow!("数据承载接口不可用"))?;

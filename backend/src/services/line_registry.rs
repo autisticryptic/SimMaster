@@ -24,7 +24,11 @@ use crate::{
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
     hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
     hardware::cellular::modem_manager::{discover_modem_bindings, ModemBinding},
-    hardware::devices::qcm410::secondary_qmi_data::SecondaryDataRuntime,
+    hardware::devices::{
+        self,
+        transport::{CellularDataTransport, ImsBearerTransport},
+        DeviceKind,
+    },
     platform::config::{
         AccessPathKind, ConfigManager, ModemSlotObservation, TrunkProfileConfig, VoicePathPolicy,
     },
@@ -82,9 +86,9 @@ struct BasebandWedgeState {
     observed_at: Option<Instant>,
     /// Consecutive wedges with no successful registration in between.
     consecutive: u32,
-    /// A confirmed Qualcomm bam-dmux runtime-PM latch survives every in-process
-    /// retry; only a full system reboot clears it. Keep this distinct from a
-    /// transient activation crash so manual retries cannot hammer wwan0.
+    /// A device driver may classify a baseband fault as permanent across every
+    /// in-process retry. Keep this distinct from a transient activation crash
+    /// so manual retries cannot hammer an unhealthy modem.
     permanent: bool,
 }
 
@@ -107,10 +111,10 @@ pub struct LineRuntime {
     binding: RwLock<ModemBinding>,
     /// Per-UE identity for this line. Every access leg (VoLTE, VoWiFi, data
     /// proxy, trunk) resolves through this context, which owns the line's
-    /// Linux network namespace when isolation is enabled.
+    /// mandatory Linux network namespace.
     pub ue: RwLock<UeContext>,
-    /// Per-UE worker process. When isolation is enabled the worker is spawned
-    /// inside the UE namespace (`setns`) and will host the UE's IMS/data
+    /// Per-UE worker process. The worker is spawned inside the mandatory UE
+    /// namespace (`setns`) and hosts the UE's IMS/data
     /// sockets, so identical IPs/P-CSCF/xfrm state can never cross lines.
     pub ue_worker: UeWorkerHandle,
     pub volte: Arc<VolteRuntime>,
@@ -119,8 +123,8 @@ pub struct LineRuntime {
     /// VoLTE and VoWiFi REGISTER builders. No process-global lookup is used.
     pub ims_access_network: ImsAccessNetworkRuntime,
     /// Serializes every PDP/bearer transition on this physical SIM line.
-    /// DATA6 and IMS use different QMI endpoints, but the baseband policy engine
-    /// still rejects or deactivates sessions when both are started concurrently.
+    /// Native data and IMS may use different device endpoints, while the
+    /// baseband policy engine can still reject concurrent session transitions.
     pub bearer_operation_lock: Mutex<()>,
     pub volte_connect_lock: Mutex<()>,
     pub volte_retry_running: AtomicBool,
@@ -145,10 +149,13 @@ pub struct LineRuntime {
     /// The scheduler uses `try_lock`, so overlapping ticks are dropped instead
     /// of queuing repeated registration or bearer operations.
     pub data_watchdog: Mutex<LineDataWatchdogState>,
-    /// Dedicated DATA6 bearer that feeds only this line's HTTP/SOCKS proxy.
-    /// It is separate from the proxy listener because the bearer must remain
-    /// alive while listeners are reconfigured.
-    pub secondary_data: Arc<SecondaryDataRuntime>,
+    /// Device-selected native IMS bearer provider. `None` means this device
+    /// does not expose a SimAdmin-owned bearer that can enter the UE namespace.
+    pub ims_bearer: Option<Arc<dyn ImsBearerTransport>>,
+    /// Device-selected retained cellular-data bearer. It is separate from the
+    /// proxy listener because the bearer must remain alive while listeners are
+    /// reconfigured.
+    pub cellular_data: Arc<dyn CellularDataTransport>,
     /// Fingerprint of the last successfully applied UE egress plan.
     /// When the plan is unchanged across reconcile calls the worker
     /// net-config batch is skipped to avoid flooding the worker with
@@ -166,6 +173,22 @@ impl LineRuntime {
         volte: Arc<VolteRuntime>,
         volte_live: VolteLiveHandle,
         voice_policy: VoicePathPolicy,
+    ) -> Self {
+        Self::new_for_device(
+            binding,
+            volte,
+            volte_live,
+            voice_policy,
+            devices::detect_device_kind(),
+        )
+    }
+
+    fn new_for_device(
+        binding: ModemBinding,
+        volte: Arc<VolteRuntime>,
+        volte_live: VolteLiveHandle,
+        voice_policy: VoicePathPolicy,
+        device_kind: DeviceKind,
     ) -> Self {
         let vowifi_operator =
             crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(
@@ -214,7 +237,8 @@ impl LineRuntime {
             supplementary,
             data_proxy: Arc::new(DataProxyRuntime::default()),
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
-            secondary_data: Arc::new(SecondaryDataRuntime::default()),
+            ims_bearer: devices::ims_bearer_transport(device_kind),
+            cellular_data: devices::cellular_data_transport(device_kind),
             egress_fingerprint: Mutex::new(None),
             ue_lifecycle_lock: Mutex::new(()),
         }
@@ -444,7 +468,7 @@ impl Default for PreparedUePublication {
 /// Why a UE egress reconcile did not finish, and whether that justifies
 /// dismantling the line's isolation.
 ///
-/// The distinction is not cosmetic. The failure path tears down the DATA6
+/// The distinction is not cosmetic. The failure path tears down the native
 /// bearer, stops the worker and removes the namespace, and a refresh runs every
 /// ten seconds. Treating a worker that simply has not finished its handshake as
 /// a terminal failure therefore builds a self-sustaining loop: teardown, the
@@ -478,7 +502,6 @@ impl std::fmt::Display for EgressError {
     }
 }
 
-#[derive(Default)]
 pub struct LineRuntimeRegistry {
     lines: AsyncRwLock<BTreeMap<String, Arc<LineRuntime>>>,
     /// Serializes hardware discovery passes without holding the registry write
@@ -491,9 +514,23 @@ pub struct LineRuntimeRegistry {
     /// Serializes periodic traffic flushes with an explicit session reset, so
     /// an in-flight flush cannot restore the just-cleared database row.
     traffic_persistence_lock: Mutex<()>,
+    /// Platform driver selected once at startup. Every line gets fresh
+    /// stateful transports from this provider family.
+    device_kind: DeviceKind,
+}
+
+impl Default for LineRuntimeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LineRuntimeRegistry {
+    /// Device driver selected once at process startup.
+    pub fn device_kind(&self) -> DeviceKind {
+        self.device_kind
+    }
+
     pub fn new() -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
@@ -501,16 +538,26 @@ impl LineRuntimeRegistry {
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
+            device_kind: devices::detect_device_kind(),
         }
     }
 
     pub fn with_config(config_manager: Arc<ConfigManager>, database: Arc<Database>) -> Self {
+        Self::with_config_for_device(config_manager, database, devices::detect_device_kind())
+    }
+
+    pub fn with_config_for_device(
+        config_manager: Arc<ConfigManager>,
+        database: Arc<Database>,
+        device_kind: DeviceKind,
+    ) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
             refresh_lock: Mutex::new(()),
             config_manager: Some(config_manager),
             database: Some(database),
             traffic_persistence_lock: Mutex::new(()),
+            device_kind,
         }
     }
 
@@ -751,7 +798,13 @@ impl LineRuntimeRegistry {
                     .as_ref()
                     .map(|config| config.get_line_voice_path_policy(&line_id))
                     .unwrap_or_default();
-                let line = Arc::new(LineRuntime::new(binding, runtime, live, voice_policy));
+                let line = Arc::new(LineRuntime::new_for_device(
+                    binding,
+                    runtime,
+                    live,
+                    voice_policy,
+                    self.device_kind,
+                ));
                 new_lines.push((line_id, line));
             }
 
@@ -851,10 +904,10 @@ impl LineRuntimeRegistry {
             let _lifecycle_guard = line.ue_lifecycle_lock.lock().await;
             let binding = line.binding();
             let worker = line.ue_worker.clone();
-            // Stop any DATA6 bearer before shutting down the namespace worker.
+            // Stop the device-owned data bearer before shutting down the worker.
             // Otherwise the retained QMI session can keep an interface bound
             // to a namespace that is about to disappear.
-            line.secondary_data.stop().await;
+            line.cellular_data.stop().await;
             if worker.is_running().await {
                 if let Err(error) = worker.shutdown().await {
                     tracing::warn!(
@@ -1068,7 +1121,7 @@ impl LineRuntimeRegistry {
                 )
                 .await;
             }
-            line.secondary_data.stop().await;
+            line.cellular_data.stop().await;
             if line.ue_worker.is_running().await {
                 let _ = line.ue_worker.shutdown().await;
             }
@@ -1154,7 +1207,7 @@ impl LineRuntimeRegistry {
                 )
                 .await;
             }
-            line.secondary_data.stop().await;
+            line.cellular_data.stop().await;
             if worker.is_running().await {
                 if let Err(shutdown_error) = worker.shutdown().await {
                     tracing::warn!(
@@ -1207,7 +1260,7 @@ impl LineRuntimeRegistry {
 
     async fn teardown_ue_runtime_locked(&self, line: &LineRuntime, line_id: &str) {
         let ue = line.ue();
-        line.secondary_data.stop().await;
+        line.cellular_data.stop().await;
         crate::services::ue_worker::register_line_worker(line_id, None);
         crate::connectivity::modems::ims::vowifi::live::register_line_ue_socket_context(
             line_id, None,

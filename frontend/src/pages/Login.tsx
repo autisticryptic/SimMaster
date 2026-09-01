@@ -447,16 +447,9 @@ export default function Login() {
           color="text.secondary"
           sx={{ fontSize: 13 }}
         >
-          <Link
-            href="https://github.com/3899/SimAdmin"
-            target="_blank"
-            rel="noopener noreferrer"
-            underline="none"
-            color="inherit"
-            sx={{ '&:hover': { color: 'primary.main' } }}
-          >
-            Copyright © 2026 GitHub 3899
-          </Link>
+          <Typography component="span" sx={{ font: 'inherit' }}>
+            Copyright © 2026
+          </Typography>
           <Typography component="span" color="text.disabled">|</Typography>
           <Typography component="span" sx={{ font: 'inherit' }}>v{__APP_VERSION__}</Typography>
         </Stack>

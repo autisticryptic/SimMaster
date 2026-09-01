@@ -3,7 +3,7 @@
 set -u
 
 test_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-recovery_script="$test_dir/../simadmin-modem-recovery.sh"
+recovery_script="$test_dir/../system/simadmin-modem-recovery.sh"
 mock_script="$test_dir/fixtures/modem-recovery-command-mock.sh"
 test_root="$(mktemp -d)"
 trap 'rm -rf "$test_root"' EXIT INT TERM

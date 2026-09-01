@@ -2520,9 +2520,9 @@ pub async fn get_network_info_for_modem(
     // `run_recovery_command` spawns without any per-modem serialization, so a
     // fallback here would put a *second* concurrent QMI client on the same
     // control port on every refresh of every line that reports no operator code
-    // — on hardware whose QMI endpoint is deliberately held by
-    // `simadmin-secondary-qmi.service`. That contention is a real risk to the
-    // modem, and both the VoLTE and VoWiFi legs depend on it.
+    // — on hardware whose additional QMI endpoint is deliberately owned by a
+    // device driver. That contention is a real risk to the modem, and both the
+    // VoLTE and VoWiFi legs depend on it.
     //
     // The value was low anyway: a missing PLMN makes
     // `ServingAccessSnapshot::new` refuse to build, so PANI falls back to the

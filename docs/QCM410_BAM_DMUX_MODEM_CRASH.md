@@ -292,26 +292,27 @@ Memory），此时 `_multi` 模块比标准模块**多绑定若干 DATA*_CNTL �
 自动去绑其余 `DATA*_CNTL` 通道 —— 这正是撞崩 DSM 的那些额外绑定。
 
 **已修复**（commit `f3308ed`）：新增 `purge_legacy_rpmsg_module()`，按 beta8 的做法
-`rmmod` + 删除 `.ko` + `depmod -a`，并且**放在 DATA6 开关判断之前**执行 ——
-`SIMADMIN_ENABLE_SECONDARY_QMI=0` 时旧代码会提前返回、完全不碰残留模块，而那恰恰是
-模块纯属负担的配置。
+`rmmod` + 删除 `.ko` + `depmod -a`。当前 QCM410 driver 已删除 DATA6 的运行时 opt-in
+开关：设备被识别为 QCM410 后始终准备 native endpoint；端点不存在时明确报告不可用，
+不会回退宿主网络命名空间。
 
-udev 规则也已经对齐 beta8 的做法：静态的 `deploy/system/99-simadmin-secondary-qmi.rules`
+udev 规则也已经对齐 beta8 的做法：旧的静态 `deploy/system/99-simadmin-secondary-qmi.rules`
 已从仓库删除，规则改为在运行时按实际出现的端口名生成到 `/run/udev/rules.d/`。原先那条
 静态规则匹配的是 `wwan[0-9]qmi1`/`qmi2`，而参考设备实际出现的端口叫 `wwan0at2` ——
 它从来就没生效过，只是让人误以为端口已经对 ModemManager 隐藏了。
 
 ### 8.2 后续开发中如何避免
 
-0. **升级到含 `f3308ed` 的版本**。`secondary-qmi-init` 现在会在每次启动时无条件
+0. **升级到含 `f3308ed` 的版本**。当前统一入口 `device-init`（当时名为
+   `secondary-qmi-init`）会在每次启动时无条件
    卸载并删除遗留的 `rpmsg_wwan_ctrl_multi`，所以从旧版本升级上来的设备会自动清掉
    这个隐患，不需要人工处理。
 
 1. **安装器已经不再碰内核层**（本轮修复）。`deploy/install.sh` 里那段
    "装 `.ko` / 从源码编译 / `modprobe rpmsg_wwan_ctrl_multi`" 的代码**已整段删除**。
-   它此前是最危险的一处：即使 `secondary-qmi-init` 每次开机都把模块清掉，安装器
+   它此前是最危险的一处：即使设备初始化器每次开机都把模块清掉，安装器
    仍会在安装结束时立刻 `modprobe` 把它加载回来 —— 自己的修复和自己的安装器对打。
-   静态 udev 规则同样删掉了，ModemManager 的避让规则改由 `secondary-qmi-init`
+   静态 udev 规则同样删掉了，ModemManager 的避让规则改由 QCM410 `device-init`
    在运行时按**实际出现的端口名**生成到 `/run/udev/rules.d/`（详见
    `docs/INSTALL.md` 第 5 节）。现在要装的只有二进制、前端、carrier catalog、主
    systemd unit，以及需要 DATA6 时的 secondary-qmi unit 和 modem-recovery。
@@ -602,7 +603,7 @@ allocate/start/stop 分散到多个短命 `qmicli` 进程同样不成立。
 
 当前实现采用单一所有者模型：
 
-- `secondary-qmi-init` 只通过元数据监视设备节点，不再打开 `/dev/wwan0at2`；
+- QCM410 `device-init` 只通过元数据监视设备节点，不再打开 `/dev/wwan0at2`；
 - 每个 IMS bearer 由一个 `qmicli --wds-start-network ... --wds-follow-network` 子进程
   从启动一直持有到释放；
 - bearer teardown 向该进程发送 SIGINT，让 qmicli 在自己的 WDS client 上停止网络，

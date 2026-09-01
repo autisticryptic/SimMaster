@@ -106,38 +106,37 @@ catalog 模式启动，Profile 页面会提供数据库选择和下载入口。�
 状态校验后原子安装到默认路径，并在当前进程中立即生效。如果使用其他位置，需要通过
 `serve --carrier-catalog <path>` 指定路径。
 
-## 5. 可选：安装副 QMI/VoLTE 服务
+## 5. 可选：安装设备专属资源
 
-只有目标硬件、内核和 RPMSG 布局符合要求时才执行本节。先在设备上验证：
+发布包把硬件资源保留在 `devices/<device>/system/` 下。先让统一设备入口检测硬件并
+报告将执行的初始化：
 
 ```bash
-/opt/simadmin/simadmin secondary-qmi-init --dry-run
+/opt/simadmin/simadmin device-init --dry-run
 ```
 
-在构建机上传文件：
+从完整发布包目录安装检测到的设备驱动资源：
 
 ```bash
-scp deploy/system/simadmin-secondary-qmi.service \
-  root@192.0.2.10:/tmp/simadmin-secondary-qmi.service
+/opt/simadmin/simadmin install-device-resources --staging-dir /path/to/unpacked-release
 ```
 
-在目标设备安装：
+QCM410 驱动会安装并启用自己的 DATA6 初始化与 modem recovery 单元；通用安装器和 OTA
+代码不保存这些文件名，也不会在未知设备上猜测兼容实现。需要立即激活资源时使用：
 
 ```bash
-install -m 0644 /tmp/simadmin-secondary-qmi.service \
-  /etc/systemd/system/simadmin-secondary-qmi.service
-systemctl daemon-reload
-systemctl enable simadmin-secondary-qmi.service
+/opt/simadmin/simadmin install-device-resources \
+  --staging-dir /path/to/unpacked-release --activate
 ```
 
 **不需要安装 udev 规则。** 让 ModemManager 避开 IMS 端点的规则由
-`secondary-qmi-init` 在运行时生成到 `/run/udev/rules.d/`，写入的是**实际出现的
+QCM410 驱动的 `device-init` 在运行时生成到 `/run/udev/rules.d/`，写入的是**实际出现的
 那个端口名**，并自动 `reload` + `trigger` 使其立即生效。端口名是平台相关的
 （同一个通道在一块基带上叫 `wwan0qmi1`，在另一块上叫 `wwan0at2`），预置一条静态
 规则要么完全不匹配，要么更糟 —— 在没见过的硬件上把 ModemManager 本该拥有的端口
 藏起来。规则写在 `/run` 而不是 `/etc`，因为端口名到基带的映射只在当前 boot 内有效。
 
-该服务必须在 ModemManager 之前准备 DATA6 端点。启用后建议在维护窗口重启设备，再检查：
+QCM410 服务必须在 ModemManager 之前准备 DATA6 端点。启用后建议在维护窗口重启设备，再检查：
 
 ```bash
 systemctl status simadmin-secondary-qmi --no-pager

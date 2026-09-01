@@ -152,9 +152,13 @@ simadmin serve [选项]                                 # 显式启动服务
 simadmin auth reset-password                          # 交互式重置管理员密码
 simadmin auth clear                                   # 清除密码，恢复首次设置
 simadmin inspect-modems                               # 脱敏输出 modem/SIM 线路清单
-simadmin secondary-qmi-init [--dry-run]               # 准备每基带独立 IMS QMI 端点
+simadmin device-init [--dry-run]                      # 调用检测到的设备驱动初始化 native bearer
+simadmin install-device-resources [选项]              # 安装检测到的设备驱动资源
 simadmin extract-zip <archive> <target>               # 安装脚本使用的 ZIP 解压器
 ```
+
+设备专属实现、上层接口边界以及新增设备的接入清单见
+[`DEVICE_DRIVERS.md`](DEVICE_DRIVERS.md)。
 
 ## 前后端契约与 API
 
@@ -204,7 +208,7 @@ cd ..
 - 与设备架构匹配的 `simadmin` 二进制。
 - `frontend/dist/`。
 - 经过审核、已封存且契约兼容的 `carrier-bundles.sqlite3`。
-- `scripts/simadmin.service`；需要 VoLTE 副 QMI 时再加入 `deploy/system/` 对应资源。
+- `scripts/simadmin.service`；设备资源按 `deploy/devices/<device>/` 原目录加入制品。
 
 文件传输、目标路径和 systemd 安装命令见[手动安装指南](./INSTALL.md)。
 

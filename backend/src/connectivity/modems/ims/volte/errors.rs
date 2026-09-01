@@ -64,7 +64,7 @@ pub mod code {
     /// No dedicated QMI endpoint is available for IMS. There is deliberately no
     /// fallback to the ModemManager bearer: that path wedges the baseband.
     pub const RUNTIME_IMS_ENDPOINT_UNAVAILABLE: &str = "volte_runtime_ims_endpoint_unavailable";
-    /// The IMS data session could not be started on the secondary QMI endpoint.
+    /// The device-selected IMS bearer session could not be started.
     pub const RUNTIME_IMS_BEARER_START_FAILED: &str = "volte_runtime_ims_bearer_start_failed";
     pub const RUNTIME_UE_WORKER_UNAVAILABLE: &str = "volte_runtime_ue_worker_unavailable";
     pub const RUNTIME_MM_BEARER_PATH_MISSING: &str = "volte_runtime_mm_bearer_path_missing";
@@ -84,7 +84,7 @@ pub mod code {
     pub const IPV6_GATEWAY_MISSING: &str = "volte_ipv6_gateway_missing";
     /// The connected bearer netdev did not complete its remote OPEN handshake.
     pub const BEARER_NETDEV_NOT_UP: &str = "volte_bearer_netdev_not_up";
-    /// Runtime PM reports an error for the bearer netdev's bam-dmux device.
+    /// The device driver reports a permanent runtime fault for the bearer netdev.
     pub const BEARER_NETDEV_RUNTIME_ERROR: &str = "volte_bearer_netdev_runtime_error";
     /// The bearer netdev was still unusable after the bounded readiness wait.
     pub const BEARER_NETDEV_NOT_READY: &str = "volte_bearer_netdev_not_ready";
