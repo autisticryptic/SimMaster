@@ -8018,8 +8018,14 @@ fn parse_live_security_server_offer(
     };
     let alg = required_param("alg")?.to_ascii_lowercase();
     let ealg = required_param("ealg")?.to_ascii_lowercase();
-    let protocol = required_param("prot")?.to_ascii_lowercase();
-    let mode = required_param("mod")?.to_ascii_lowercase();
+    // Deployed IMS cores (including Vodafone Germany) may omit `prot` and
+    // `mod` from an otherwise complete ipsec-3gpp offer. RFC 3329 leaves the
+    // mechanism-specific interpretation to 3GPP; for IMS IPsec the only
+    // interoperable values used by this implementation are ESP transport
+    // mode, so accept those omissions as their standard IMS defaults. Keep
+    // algorithms, SPIs and ports mandatory because they cannot be inferred.
+    let protocol = param("prot").unwrap_or("esp").to_ascii_lowercase();
+    let mode = param("mod").unwrap_or("trans").to_ascii_lowercase();
     let spi_c = parse_u32_param(param("spi-c"))
         .ok_or_else(|| live_stage_error("ims_security_server_spi_missing"))?;
     let spi_s = parse_u32_param(param("spi-s"))
@@ -11722,6 +11728,25 @@ mod tests {
                 .reason,
             "ims_security_server_port_missing"
         );
+    }
+
+    #[test]
+    fn security_server_offer_defaults_vodafone_omitted_protocol_and_mode() {
+        let offer = parse_live_security_server_offer(
+            "ipsec-3gpp; q=0.1; alg=hmac-sha-1-96; ealg=null; \
+             spi-c=7465725; spi-s=7465724; port-c=32821; port-s=6000",
+        )
+        .expect("Vodafone offer without prot/mod should use IMS IPsec defaults");
+
+        assert_eq!(offer.alg, "hmac-sha-1-96");
+        assert_eq!(offer.ealg, "null");
+        assert_eq!(offer.protocol, "esp");
+        assert_eq!(offer.mode, "trans");
+        assert_eq!(offer.spi_c, 7_465_725);
+        assert_eq!(offer.spi_s, 7_465_724);
+        assert_eq!(offer.port_c, 32_821);
+        assert_eq!(offer.port_s, 6_000);
+        assert_eq!(offer.q_milli, 100);
     }
 
     #[tokio::test]
