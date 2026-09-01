@@ -920,8 +920,33 @@ pub fn build_dataplane_plan(profile: &'static CarrierProfile) -> DataplanePlan {
             stack: "smoltcp",
             gateway_mode: "userspace_inner_ip_gateway",
             ip_stack: profile.epdg.ip_stack,
-            tcp_enabled: profile.ims.transport == "tcp" || profile.sms.receiver_transport == "tcp",
-            udp_enabled: profile.ims.transport == "udp",
+            tcp_enabled: profile.ims.transport == "tcp"
+                && !(profile.meta.country_iso2.eq_ignore_ascii_case("de")
+                    && (profile.meta.brand.to_ascii_lowercase().contains("vodafone")
+                        || profile
+                            .meta
+                            .operator_legal_name
+                            .to_ascii_lowercase()
+                            .contains("vodafone")
+                        || profile
+                            .meta
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.to_ascii_lowercase().contains("vodafone"))))
+                || profile.sms.receiver_transport == "tcp",
+            udp_enabled: profile.ims.transport != "tcp"
+                || (profile.meta.country_iso2.eq_ignore_ascii_case("de")
+                    && (profile.meta.brand.to_ascii_lowercase().contains("vodafone")
+                        || profile
+                            .meta
+                            .operator_legal_name
+                            .to_ascii_lowercase()
+                            .contains("vodafone")
+                        || profile
+                            .meta
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.to_ascii_lowercase().contains("vodafone")))),
             icmp_enabled: false,
             socket_policy: "bounded_per_profile_runtime",
         },

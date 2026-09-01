@@ -427,8 +427,16 @@ mod imp {
     }
 
     struct Ipv4FragmentBuffer {
-        header: Vec<u8>,
-        payload: Vec<u8>,
+        /// The complete header from fragment zero.  It is intentionally kept
+        /// separate from the payload because continuation fragments do not
+        /// carry a usable transport header.
+        header: Option<Vec<u8>>,
+        /// Payload pieces are indexed by their byte offset.  TUN normally
+        /// delivers fragments in order, but IP fragmentation does not
+        /// guarantee that; waiting for offset continuity also prevents a
+        /// reordered REGISTER from being silently corrupted.
+        pieces: Vec<(usize, Vec<u8>)>,
+        expected_len: Option<usize>,
         created_at: Instant,
     }
 
@@ -467,7 +475,8 @@ mod imp {
         let Some(fragment) = ipv4_fragment_info(&packet) else {
             return FragmentReassemblyOutcome::Forward(packet);
         };
-        if packet.len() < 20 {
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        if !(20..=packet.len()).contains(&ihl) {
             return FragmentReassemblyOutcome::Dropped;
         }
         let src = IpAddr::V4(Ipv4Addr::new(
@@ -484,42 +493,64 @@ mod imp {
                 .retain(|_, buffer| now.duration_since(buffer.created_at) < Duration::from_secs(3));
         }
 
-        if fragment.offset_bytes == 0 {
-            let ihl = usize::from(packet[0] & 0x0f) * 4;
-            buffers.insert(
-                key,
-                Ipv4FragmentBuffer {
-                    header: packet[..ihl].to_vec(),
-                    payload: packet[ihl..].to_vec(),
-                    created_at: now,
-                },
-            );
-            return FragmentReassemblyOutcome::Buffered;
+        let payload = packet[ihl..].to_vec();
+        if payload.is_empty() || (fragment.more_fragments && payload.len() % 8 != 0) {
+            return FragmentReassemblyOutcome::Dropped;
         }
+        let piece_end = fragment.offset_bytes.saturating_add(payload.len());
+        let buffer = buffers.entry(key).or_insert_with(|| Ipv4FragmentBuffer {
+            header: None,
+            pieces: Vec::new(),
+            expected_len: None,
+            created_at: now,
+        });
 
-        let Some(buffer) = buffers.get_mut(&key) else {
+        if buffer.pieces.iter().any(|(start, piece)| {
+            let end = start.saturating_add(piece.len());
+            fragment.offset_bytes < end && *start < piece_end
+        }) {
             warn!(
                 src = %src,
                 dst = %dst,
                 identification = fragment.identification,
                 offset_bytes = fragment.offset_bytes,
-                "IMS TUN outbound continuation fragment without fragment 0; dropping"
+                "IMS TUN outbound overlapping IPv4 fragment; dropping"
             );
+            buffers.remove(&key);
             return FragmentReassemblyOutcome::Dropped;
-        };
-        let ihl = usize::from(packet[0] & 0x0f) * 4;
-        buffer.payload.extend_from_slice(&packet[ihl..]);
-        if fragment.more_fragments {
-            return FragmentReassemblyOutcome::Buffered;
         }
 
-        let mut header = buffer.header.clone();
-        let payload = std::mem::take(&mut buffer.payload);
-        buffers.remove(&key);
-        let total_len = header.len().checked_add(payload.len());
-        let Some(total_len) = total_len.filter(|len| *len <= usize::from(u16::MAX)) else {
-            return FragmentReassemblyOutcome::Dropped;
+        if fragment.offset_bytes == 0 {
+            buffer.header = Some(packet[..ihl].to_vec());
+        }
+        buffer.pieces.push((fragment.offset_bytes, payload));
+        if !fragment.more_fragments {
+            buffer.expected_len = Some(piece_end);
+        }
+
+        let Some(expected_len) = buffer.expected_len else {
+            return FragmentReassemblyOutcome::Buffered;
         };
+        let Some(mut header) = buffer.header.clone() else {
+            return FragmentReassemblyOutcome::Buffered;
+        };
+        let mut pieces = buffer.pieces.clone();
+        pieces.sort_by_key(|(offset, _)| *offset);
+        let mut cursor = 0usize;
+        for (offset, payload) in &pieces {
+            if *offset != cursor {
+                return FragmentReassemblyOutcome::Buffered;
+            }
+            cursor = cursor.saturating_add(payload.len());
+        }
+        if cursor != expected_len
+            || header.len().saturating_add(expected_len) > usize::from(u16::MAX)
+        {
+            buffers.remove(&key);
+            return FragmentReassemblyOutcome::Dropped;
+        }
+
+        let total_len = header.len() + expected_len;
         header[2..4].copy_from_slice(&(total_len as u16).to_be_bytes());
         header[6..8].copy_from_slice(&[0, 0]);
         header[10] = 0;
@@ -527,7 +558,10 @@ mod imp {
         let checksum = ipv4_header_checksum(&header);
         header[10..12].copy_from_slice(&checksum.to_be_bytes());
         let mut reassembled = header;
-        reassembled.extend_from_slice(&payload);
+        for (_, payload) in pieces {
+            reassembled.extend_from_slice(&payload);
+        }
+        buffers.remove(&key);
         FragmentReassemblyOutcome::Forward(reassembled)
     }
 
@@ -1965,6 +1999,31 @@ mod imp {
                 [reassembled[10], reassembled[11]],
                 "reassembled header checksum must validate"
             );
+        }
+
+        #[test]
+        fn outbound_ipv4_fragments_reassemble_when_arriving_out_of_order() {
+            let original = build_ipv4_udp_packet(&vec![b'R'; 1535]);
+            let mut fragments = fragment_packet(&original, 1360);
+            assert!(fragments.len() >= 2, "REGISTER-sized packet must fragment");
+
+            // A continuation fragment may arrive before fragment zero.  The
+            // gateway must retain it instead of dropping the whole datagram.
+            fragments.rotate_left(1);
+            let mut buffers = HashMap::new();
+            let mut forwards = Vec::new();
+            for fragment in fragments {
+                match reassemble_outbound_ip_fragment(fragment, &mut buffers) {
+                    FragmentReassemblyOutcome::Forward(packet) => forwards.push(packet),
+                    FragmentReassemblyOutcome::Buffered => {}
+                    FragmentReassemblyOutcome::Dropped => panic!("IPv4 fragment dropped"),
+                }
+            }
+
+            assert_eq!(forwards.len(), 1, "IPv4 fragments reassemble exactly once");
+            assert_eq!(forwards[0].len(), original.len());
+            assert_eq!(forwards[0][..10], original[..10]);
+            assert_eq!(forwards[0][12..], original[12..]);
         }
 
         #[test]

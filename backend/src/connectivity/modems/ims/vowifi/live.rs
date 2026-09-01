@@ -2651,6 +2651,13 @@ struct LiveIkeSession {
     child_sa: Option<LiveChildSaMaterial>,
     transport: Option<UdpSocketDatagramTransport>,
     remote: Option<SocketAddr>,
+    /// Address-family policy that actually completed this IKE exchange.
+    ///
+    /// This can differ from the profile policy when the default `ipv4v6`
+    /// attempt falls back to a single-family exchange.  Downstream TUN and
+    /// P-CSCF selection must follow the successful exchange, not the original
+    /// configured value.
+    ip_stack: String,
 }
 
 struct LiveChildSaMaterial {
@@ -2750,6 +2757,80 @@ async fn run_live_ike_until_depth(
     depth: LiveProbeDepth,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveIkeSession, LiveStageError> {
+    let configured_ip_stack = live_ike_access(line_id, profile).ip_stack;
+    let mut last_error = None;
+
+    // The bearer family is independent from the IKE/SIP transport. Every
+    // attempt below still uses UDP/500 and UDP/4500; only the CFG/TS address
+    // family requested inside IKE_AUTH changes. A dual-stack request is always
+    // the first attempt, followed by both single-stack fallbacks when the
+    // network does not provide an explicit family hint.
+    for ip_stack in vowifi_ip_stack_attempts(&configured_ip_stack) {
+        info!(
+            line_id,
+            ip_stack,
+            configured_ip_stack = %configured_ip_stack,
+            "Trying VoWiFi IKE address-family policy"
+        );
+        match run_live_ike_until_depth_for_stack(
+            line_id,
+            profile,
+            target,
+            depth,
+            access_network,
+            ip_stack,
+        )
+        .await
+        {
+            Ok(session) => {
+                info!(
+                    line_id,
+                    ip_stack, "VoWiFi IKE address-family attempt succeeded"
+                );
+                return Ok(session);
+            }
+            Err(error) => {
+                if let Some(forced_stack) = vowifi_forced_ip_stack_from_error(&error) {
+                    if forced_stack != ip_stack {
+                        info!(
+                            line_id,
+                            failed_ip_stack = ip_stack,
+                            forced_stack,
+                            reason = %error.reason,
+                            "VoWiFi network explicitly selected a single IP family"
+                        );
+                        match run_live_ike_until_depth_for_stack(
+                            line_id,
+                            profile,
+                            target,
+                            depth,
+                            access_network,
+                            forced_stack,
+                        )
+                        .await
+                        {
+                            Ok(session) => return Ok(session),
+                            Err(forced_error) => last_error = Some(forced_error),
+                        }
+                        break;
+                    }
+                }
+                last_error = Some(error);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| live_stage_error("epdg_no_address")))
+}
+
+async fn run_live_ike_until_depth_for_stack(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+    target: LiveIkeTarget,
+    depth: LiveProbeDepth,
+    access_network: &ImsAccessNetworkRuntime,
+    ip_stack: &'static str,
+) -> Result<LiveIkeSession, LiveStageError> {
     let endpoints = resolve_live_epdg_candidates(line_id, profile, access_network)
         .await
         .map_err(map_transport_error)?;
@@ -2809,6 +2890,8 @@ async fn run_live_ike_until_depth(
                         destination = ?destination,
                         local_port_preferred = path.preferred_local_port,
                         initial_nat_t = path.initial_nat_t,
+                        transport = "udp",
+                        ip_stack,
                         "Attempting IKE connection path"
                     );
                     match run_live_ike_with_destination(
@@ -2819,6 +2902,7 @@ async fn run_live_ike_until_depth(
                         destination,
                         *path,
                         proposal_group,
+                        ip_stack,
                     )
                     .await
                     {
@@ -2857,6 +2941,7 @@ async fn run_live_ike_with_destination(
     destination: SocketAddr,
     path: LiveIkeTransportPath,
     proposal_group: &LiveIkeProposalGroup,
+    ip_stack: &'static str,
 ) -> Result<LiveIkeSession, LiveStageError> {
     let ue_socket = required_ue_socket_context(line_id)?;
     let base = unspecified_local_addr_for(destination);
@@ -2864,6 +2949,12 @@ async fn run_live_ike_with_destination(
     info!(
         "run_live_ike_with_destination: binding local_addr={:?} for destination={:?}",
         local_addr, destination
+    );
+    info!(
+        destination = ?destination,
+        ip_stack,
+        transport = "udp",
+        "VoWiFi IKE transport is UDP"
     );
     // Use udp_bound (not udp_connected) because IKE switches from port 500 to
     // port 4500 during NAT-T.
@@ -2894,9 +2985,11 @@ async fn run_live_ike_with_destination(
     );
     let dh = Modp2048Ephemeral::generate_for_group(proposal_group.dh_group)
         .map_err(|_| live_stage_error("ike_dh_material_unavailable"))?;
+    let mut ike_access = live_ike_access_for_epdg(line_id, profile, Some(selected_epdg_host));
+    ike_access.ip_stack = ip_stack.to_string();
     let mut machine = IkeStateMachine::new_with_dh_group_and_access(
         profile,
-        live_ike_access_for_epdg(line_id, profile, Some(selected_epdg_host)),
+        ike_access,
         initiator_spi,
         initiator_nonce,
         dh.public_value().to_vec(),
@@ -2943,6 +3036,7 @@ async fn run_live_ike_with_destination(
             child_sa: None,
             transport: Some(transport.clone()),
             remote: Some(destination),
+            ip_stack: ip_stack.to_string(),
         });
     }
     let mut ike_destination = destination;
@@ -3166,6 +3260,7 @@ async fn run_live_ike_with_destination(
             }),
         transport: Some(auth_transport.clone()),
         remote: Some(ike_destination),
+        ip_stack: ip_stack.to_string(),
     })
 }
 
@@ -3239,7 +3334,7 @@ async fn ensure_live_tun_gateway(
         .configuration
         .as_ref()
         .ok_or_else(|| live_stage_error("live_child_sa_configuration_missing"))?;
-    let inner_addr = select_inner_address(line_id, profile, configuration)
+    let inner_addr = select_inner_address(&session.ip_stack, configuration)
         .ok_or_else(|| live_stage_error("live_inner_address_missing"))?;
     let pcscf_addr = select_pcscf_address(line_id, profile, configuration, inner_addr)
         .ok_or_else(|| live_stage_error("live_pcscf_address_missing"))?;
@@ -3278,11 +3373,10 @@ async fn ensure_live_tun_gateway(
 }
 
 fn select_inner_address(
-    line_id: &str,
-    profile: &'static CarrierProfile,
+    ip_stack: &str,
     configuration: &IkeConfigurationMaterial,
 ) -> Option<IpAddr> {
-    if live_ike_access(line_id, profile).ip_stack.contains("ipv6") {
+    if ip_stack.contains("ipv6") {
         if let Some(addr) = configuration
             .assigned_inner_addresses
             .iter()
@@ -6741,10 +6835,27 @@ async fn connect_sip_socket(
 fn ims_transport(
     profile: &'static CarrierProfile,
 ) -> crate::connectivity::core::context::SipTransport {
+    if is_vodafone_germany_profile(profile) {
+        return crate::connectivity::core::context::SipTransport::Udp;
+    }
     match profile.ims.transport {
         "tcp" => crate::connectivity::core::context::SipTransport::Tcp,
         _ => crate::connectivity::core::context::SipTransport::Udp,
     }
+}
+
+fn is_vodafone_germany_profile(profile: &'static CarrierProfile) -> bool {
+    let meta = &profile.meta;
+    meta.country_iso2.eq_ignore_ascii_case("de")
+        && (meta.brand.to_ascii_lowercase().contains("vodafone")
+            || meta
+                .operator_legal_name
+                .to_ascii_lowercase()
+                .contains("vodafone")
+            || meta
+                .aliases
+                .iter()
+                .any(|alias| alias.to_ascii_lowercase().contains("vodafone")))
 }
 
 async fn read_sip_response(channel: &mut SipChannel) -> Result<String, LiveStageError> {
@@ -8848,6 +8959,49 @@ fn ip_family_name(addr: IpAddr) -> &'static str {
     }
 }
 
+/// Return the ordered IKE configuration/address-family attempts for one line.
+///
+/// `ipv4v6` is the normal default.  It requests both address families in the
+/// initial IKE_AUTH exchange, then keeps both single-family fallbacks available
+/// in the historical IPv6-first order.  A profile which explicitly requests a
+/// single family remains single-family; the opposite family must not be tried
+/// unless the network has explicitly told us to do so.
+fn vowifi_ip_stack_attempts(ip_stack: &str) -> Vec<&'static str> {
+    match ip_stack.trim().to_ascii_lowercase().as_str() {
+        "ipv4v6" => vec!["ipv4v6", "ipv6", "ipv4"],
+        "ipv6" => vec!["ipv6"],
+        "ipv4" => vec!["ipv4"],
+        _ => vec!["ipv4v6", "ipv6", "ipv4"],
+    }
+}
+
+/// Some ePDGs expose an address-family decision in an operator-specific error
+/// reason.  Keep this classifier deliberately narrow: generic timeouts and
+/// proposal/authentication failures do not prove that either family is wrong.
+/// The caller only applies the hint to a failed dual-stack attempt.
+fn vowifi_forced_ip_stack_from_error(error: &LiveStageError) -> Option<&'static str> {
+    let reason = error.reason.to_ascii_lowercase();
+    let ipv6 = [
+        "network_forced_ipv6",
+        "ipv6_only",
+        "ipv6_required",
+        "ipv6_address_required",
+    ];
+    if ipv6.iter().any(|marker| reason.contains(marker)) {
+        return Some("ipv6");
+    }
+    let ipv4 = [
+        "network_forced_ipv4",
+        "ipv4_only",
+        "ipv4_required",
+        "ipv4_address_required",
+    ];
+    if ipv4.iter().any(|marker| reason.contains(marker)) {
+        return Some("ipv4");
+    }
+    None
+}
+
 async fn recv_ike_response_with_retransmit(
     transport: &UdpSocketDatagramTransport,
     destination: SocketAddr,
@@ -9268,6 +9422,51 @@ fn stage_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vowifi_default_ip_stack_fallback_is_dual_then_ipv6_then_ipv4() {
+        assert_eq!(
+            vowifi_ip_stack_attempts("ipv4v6"),
+            vec!["ipv4v6", "ipv6", "ipv4"]
+        );
+        assert_eq!(
+            vowifi_ip_stack_attempts(" IPV4V6 "),
+            vec!["ipv4v6", "ipv6", "ipv4"]
+        );
+    }
+
+    #[test]
+    fn vowifi_single_stack_profile_does_not_silently_switch_family() {
+        assert_eq!(vowifi_ip_stack_attempts("ipv6"), vec!["ipv6"]);
+        assert_eq!(vowifi_ip_stack_attempts("ipv4"), vec!["ipv4"]);
+    }
+
+    #[test]
+    fn vowifi_forced_family_hints_are_narrow() {
+        let ipv6 = live_stage_error("ike_auth_notify_ipv6_required");
+        assert_eq!(vowifi_forced_ip_stack_from_error(&ipv6), Some("ipv6"));
+        let ipv4 = live_stage_error("network_forced_ipv4");
+        assert_eq!(vowifi_forced_ip_stack_from_error(&ipv4), Some("ipv4"));
+        let timeout = live_stage_error("ike_auth_challenge_timeout");
+        assert_eq!(vowifi_forced_ip_stack_from_error(&timeout), None);
+
+        // Generic IKEv2/CFG failures do not identify the usable address
+        // family. They must keep the normal ipv4v6 -> ipv6 -> ipv4 retry
+        // order instead of being guessed from a suffix or notify name.
+        for reason in [
+            "ike_auth_notify_ts_unacceptable_ipv6",
+            "ike_auth_notify_invalid_selectors_ipv4",
+            "ike_auth_notify_unacceptable_addresses_ipv6",
+            "ike_auth_notify_internal_address_failure_ipv4",
+            "ike_auth_notify_failed_cp_required_ipv6",
+        ] {
+            assert_eq!(
+                vowifi_forced_ip_stack_from_error(&live_stage_error(reason)),
+                None,
+                "generic IKE failure must not force {reason}"
+            );
+        }
+    }
 
     fn epdg_selection_entry(
         plmn_pattern: &str,
