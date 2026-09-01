@@ -7446,6 +7446,25 @@ mod tests {
     }
 
     #[test]
+    fn digest_challenge_accepts_folded_aka_parameters() {
+        let frame = concat!(
+            "SIP/2.0 401 Unauthorized\r\n",
+            "WWW-Authenticate: Digest realm=\"ims.example\",\r\n",
+            " nonce=\"YWJj\",algorithm=AKAv1-MD5,\r\n",
+            " qop=\"auth\"\r\n",
+            "Content-Length: 0\r\n\r\n",
+        )
+        .as_bytes();
+
+        let challenge = parse_digest_challenge(frame).unwrap();
+        assert_eq!(challenge.realm, "ims.example");
+        assert_eq!(challenge.nonce, "YWJj");
+        assert_eq!(challenge.algorithm, "AKAv1-MD5");
+        assert_eq!(challenge.qop.as_deref(), Some("auth"));
+        assert!(!challenge.proxy);
+    }
+
+    #[test]
     fn digest_challenge_skips_unusable_earlier_www_values() {
         let frame = b"SIP/2.0 401 Unauthorized\r\n\
 WWW-Authenticate: Digest realm=\"unsupported\",nonce=\"one\",algorithm=SHA-512\r\n\

@@ -76,20 +76,45 @@ pub fn is_request(frame: &[u8], method: &str) -> bool {
 }
 
 /// Collect all values of a header (case-insensitive name, first-colon split).
+///
+/// Some deployed IMS cores still use the obsolete RFC 3261/RFC 2616 header
+/// folding form, where a field continues on the next physical line when that
+/// line starts with SP/HTAB. Keep accepting it here: authentication parameters
+/// such as the AKA nonce are otherwise silently dropped before Digest parsing.
 pub fn header_values(frame: &[u8], header_name: &str) -> Vec<String> {
     let headers = match find_header_end(frame) {
         Some(end) => String::from_utf8_lossy(&frame[..end]),
         None => String::from_utf8_lossy(frame),
     };
-    headers
-        .lines()
-        .filter_map(|line| {
-            let (name, value) = line.split_once(':')?;
+    let mut values = Vec::new();
+    let mut current_value: Option<String> = None;
+
+    for line in headers.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            if let Some(value) = current_value.as_mut() {
+                let continuation = line.trim();
+                if !continuation.is_empty() {
+                    value.push(' ');
+                    value.push_str(continuation);
+                }
+            }
+            continue;
+        }
+
+        if let Some(value) = current_value.take() {
+            values.push(value);
+        }
+        current_value = line.split_once(':').and_then(|(name, value)| {
             name.trim()
                 .eq_ignore_ascii_case(header_name)
                 .then(|| value.trim().to_string())
-        })
-        .collect()
+        });
+    }
+
+    if let Some(value) = current_value {
+        values.push(value);
+    }
+    values
 }
 
 /// First value of a header, if present.
@@ -174,6 +199,24 @@ mod tests {
         let frame = b"SIP/2.0 200 OK\r\nVia: a\r\nvia: b\r\nContact: <sip:x@h>\r\n\r\n";
         assert_eq!(header_values(frame, "via"), vec!["a", "b"]);
         assert_eq!(header_value(frame, "CONTACT").as_deref(), Some("<sip:x@h>"));
+    }
+
+    #[test]
+    fn header_values_unfold_obsolete_continuation_lines() {
+        let frame = concat!(
+            "SIP/2.0 401 Unauthorized\r\n",
+            "WWW-Authenticate: Digest realm=\"ims.example\",\r\n",
+            " nonce=\"YWJj\",algorithm=AKAv1-MD5,\r\n",
+            "\tqop=\"auth\"\r\n",
+            "Security-Server: ipsec-3gpp\r\n\r\n",
+        )
+        .as_bytes();
+
+        assert_eq!(
+            header_values(frame, "www-authenticate"),
+            vec!["Digest realm=\"ims.example\", nonce=\"YWJj\",algorithm=AKAv1-MD5, qop=\"auth\""]
+        );
+        assert_eq!(header_values(frame, "security-server"), vec!["ipsec-3gpp"]);
     }
 
     #[test]
