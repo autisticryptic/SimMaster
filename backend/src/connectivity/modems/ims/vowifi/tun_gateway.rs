@@ -15,11 +15,14 @@ use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
 
-/// Diagnostic-only ceiling for fragmenting an IMS ESP packet before the outer
-/// tunnel encapsulation. Production traffic keeps the packet intact and lets
-/// Linux fragment the final UDP/IP datagram; set `SIMADMIN_AUTO_FRAGMENT=1`
-/// only when comparing the two fragmentation layers on a failing path.
-const AUTO_FRAGMENT_INNER_IP_MAX: usize = 1356;
+/// Maximum inner IP packet size carried by one protected IMS frame.
+///
+/// A complete SIP REGISTER is protected as one ESP packet and then split at
+/// the inner IP layer before it is sent through the UDP/4500 tunnel. This is
+/// required on paths where the ePDG or an intermediate NAT drops an outer
+/// IPv4 fragment instead of reassembling it. The value leaves room for the
+/// ESP-in-UDP overhead while preserving the complete (non-compact) REGISTER.
+const OUTER_TUNNEL_INNER_IP_MAX: usize = 1356;
 
 /// Identification counter for IPv6 fragment headers (RFC 8200 §4.5). A
 /// monotonic counter guarantees distinct values across fragmented packets,
@@ -1138,20 +1141,13 @@ mod imp {
                             continue;
                         }
                     };
-                // Keep the IMS ESP packet intact by default and let Linux
-                // fragment the outer UDP/IP datagram. The ePDG is the outer IP
-                // destination, so it can reassemble those fragments before ESP
-                // decapsulation. Fragmenting here instead produces inner IMS-IP
-                // fragments that the ePDG merely forwards and that many carrier
-                // paths drop before they reach the P-CSCF.
-                //
-                // The old inner-fragment path remains an explicit diagnostic
-                // switch only; it must not be the production default.
-                let auto_fragment = std::env::var("SIMADMIN_AUTO_FRAGMENT")
-                    .map(|value| value == "1")
-                    .unwrap_or(false);
-                let outbound_fragments = if auto_fragment {
-                    let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+                // Protect the complete SIP REGISTER first, then fragment the
+                // resulting inner IP packet for the UDP/4500 tunnel. This keeps
+                // the original SIP datagram intact for ESP authentication and
+                // avoids relying on outer IPv4 fragmentation through carrier
+                // NAT/ePDG paths. Small packets still produce one frame.
+                let outbound_fragments = {
+                    let fragments = fragment_inner_packet(&packet, OUTER_TUNNEL_INNER_IP_MAX);
                     if fragments.len() > 1 {
                         info!(
                             inner_packet_bytes = packet.len(),
@@ -1160,8 +1156,6 @@ mod imp {
                         );
                     }
                     fragments
-                } else {
-                    vec![packet]
                 };
                 for fragment in outbound_fragments {
                     let Some(next_header) = inner_next_header(&fragment) else {
@@ -1992,7 +1986,7 @@ mod imp {
             original[44..46].copy_from_slice(&((8 + sip.len()) as u16).to_be_bytes());
             original[48..].copy_from_slice(&sip);
 
-            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            let fragments = fragment_inner_packet(&original, OUTER_TUNNEL_INNER_IP_MAX);
             assert!(
                 fragments.len() >= 2,
                 "REGISTER-sized IPv6 packet must fragment"
@@ -2034,7 +2028,7 @@ mod imp {
             let checksum = ipv4_header_checksum(&packet[..20]);
             packet[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-            let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+            let fragments = fragment_inner_packet(&packet, OUTER_TUNNEL_INNER_IP_MAX);
             assert!(fragments.len() >= 2, "1608B packet must fragment");
             let mut offsets = Vec::new();
             for (index, fragment) in fragments.iter().enumerate() {
@@ -2097,7 +2091,7 @@ mod imp {
                 b"\x20\x01\x0d\xb8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02",
             );
 
-            let fragments = fragment_inner_packet(&packet, AUTO_FRAGMENT_INNER_IP_MAX);
+            let fragments = fragment_inner_packet(&packet, OUTER_TUNNEL_INNER_IP_MAX);
             assert!(fragments.len() >= 2, "1628B IPv6 packet must fragment");
             let mut seen_offsets = Vec::new();
             let mut identification = None;
@@ -2165,7 +2159,7 @@ mod imp {
             let checksum = ipv4_header_checksum(&original[..20]);
             original[10..12].copy_from_slice(&checksum.to_be_bytes());
 
-            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            let fragments = fragment_inner_packet(&original, OUTER_TUNNEL_INNER_IP_MAX);
             assert!(fragments.len() >= 2);
             let mut buffers = HashMap::new();
             let mut forwards = Vec::new();
@@ -2187,7 +2181,7 @@ mod imp {
         #[test]
         fn inbound_ipv6_fragments_reassemble_out_of_order() {
             let original = build_ipv6_esp_packet();
-            let fragments = fragment_inner_packet(&original, AUTO_FRAGMENT_INNER_IP_MAX);
+            let fragments = fragment_inner_packet(&original, OUTER_TUNNEL_INNER_IP_MAX);
             assert!(fragments.len() >= 2);
             let mut buffers = HashMap::new();
             let mut forwards = Vec::new();

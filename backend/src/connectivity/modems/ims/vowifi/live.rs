@@ -1884,11 +1884,9 @@ struct LiveRegisterHeaderProfile {
     pani: LivePaniFormat,
     include_cellular_network_info: bool,
     user_agent: LiveUserAgentFormat,
-    /// SIMADMIN_COMPACT_REGISTER=1 trims optional REGISTER headers
-    /// (Cellular-Network-Info, Contact feature tags, +sip.instance/reg-id)
-    /// so the whole tunnel packet fits in the path MTU without IP
-    /// fragmentation. Real VoWiFi handsets keep REGISTERs small for the
-    /// same reason.
+    /// Kept as an internal shape bit for the header builder. Production
+    /// REGISTERs are always complete; oversized UDP/ESP packets are handled
+    /// by the tunnel fragmenter instead of dropping capability headers.
     compact_register: bool,
 }
 
@@ -3349,6 +3347,32 @@ async fn run_live_ims_register_until(
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
+    // A refresh is identified by an existing lease for the same profile. The
+    // lease may already be past its local refresh deadline, so this check must
+    // not use `cached_live_ims_register_ready` (which intentionally rejects an
+    // expired entry). Keeping this distinction visible makes it possible to
+    // verify that a refresh reused the established ePDG/IKE/ESP/TUN access
+    // instead of silently looking like a brand-new registration.
+    let refresh_context = live_ims_refresh_context(line_id, profile).await;
+    info!(
+        line_id,
+        profile_id = profile.meta.profile_id,
+        transport = profile.ims.transport,
+        reused_access = refresh_context.is_some(),
+        "Live ImsRegister stage check: verifying outer ESP tunnel and IMS signaling path"
+    );
+    if let Some((previous_expires_seconds, previous_remaining_seconds)) = refresh_context {
+        info!(
+            line_id,
+            profile_id = profile.meta.profile_id,
+            transport = profile.ims.transport,
+            reused_access = true,
+            previous_expires_seconds,
+            previous_remaining_seconds,
+            "VoWiFi IMS REGISTER refresh sent"
+        );
+    }
+
     let attempt = attempt_live_ims_registration(line_id, profile, access_network).await;
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
@@ -3365,10 +3389,31 @@ async fn run_live_ims_register_until(
 
     match outcome {
         RegistrationRefreshResult::Refreshed(registered) => {
+            if refresh_context.is_some() {
+                info!(
+                    line_id,
+                    profile_id = profile.meta.profile_id,
+                    transport = profile.ims.transport,
+                    reused_access = true,
+                    expires_seconds = registered.lease.expires_seconds,
+                    refresh_after_seconds = registered.lease.refresh_after.as_secs(),
+                    "VoWiFi IMS REGISTER refresh succeeded"
+                );
+            }
             record_live_ims_register_ready(line_id, profile, true, registered).await;
             Ok(())
         }
         RegistrationRefreshResult::RebuildAccess(loss_reason) => {
+            if refresh_context.is_some() {
+                warn!(
+                    line_id,
+                    profile_id = profile.meta.profile_id,
+                    transport = profile.ims.transport,
+                    reused_access = true,
+                    registration_loss = loss_reason.as_str(),
+                    "VoWiFi IMS REGISTER refresh failed"
+                );
+            }
             warn!(
                 line_id,
                 profile_id = profile.meta.profile_id,
@@ -3378,6 +3423,24 @@ async fn run_live_ims_register_until(
             Err(error.expect("failed registration retains its adapter error"))
         }
     }
+}
+
+async fn live_ims_refresh_context(
+    line_id: &str,
+    profile: &'static CarrierProfile,
+) -> Option<(u32, u64)> {
+    let now = Instant::now();
+    ims_register_ready_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .filter(|ready| ready.profile_id == profile.meta.profile_id)
+        .map(|ready| {
+            (
+                ready.registration.lease.expires_seconds,
+                ready.expires_at.saturating_duration_since(now).as_secs(),
+            )
+        })
 }
 
 fn log_vowifi_register_binding_diagnostics(artifacts: &RegisterArtifacts) {
@@ -3403,7 +3466,7 @@ async fn attempt_live_ims_registration(
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<RegisteredImsContext, LiveStageError> {
-    info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS TCP path...");
+    info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS signaling path...");
     run_live_esp_until(line_id, profile, access_network)
         .await
         .map_err(|error| {
@@ -4581,7 +4644,11 @@ fn live_register_header_variants(
     } else {
         LivePaniFormat::Omit
     };
-    let compact_register = std::env::var("SIMADMIN_COMPACT_REGISTER").is_ok();
+    // Never trim a production REGISTER to avoid fragmentation. Complete
+    // capability and identity headers are required for the registrar to
+    // recognize an MMTEL-capable UE; the UDP/ESP tunnel fragments oversized
+    // packets below the outer path MTU.
+    let compact_register = false;
     let header_profile = LiveRegisterHeaderProfile {
         contact_features,
         include_accept_contact: false,
