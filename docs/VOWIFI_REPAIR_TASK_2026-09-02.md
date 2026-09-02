@@ -1,6 +1,6 @@
 # VoWiFi/VoLTE 修复任务跟踪
 
-更新时间：2026-09-02（北京时间）
+更新时间：2026-09-02 17:55（北京时间）
 适用设备：QCM410 `192.168.100.13`  相关线路：Vodafone Germany（PLMN `26202`）
 
 本文档是本轮修复工作的唯一任务清单。后续代码、测试、提交、部署和
@@ -220,9 +220,23 @@ IMS bearer，导致 modem 78→79→80 重枚举，并连带中断仍然正常�
   的持久化映射。
 - [x] 在项目根目录新增 `DNS_RESOLVER_HICKORY_MIGRATION_TASK.md`，记录后续
   使用 Hickory 统一 DNS 层的方案 A；本轮仅实施低风险方案 C。
-- [ ] GitHub Actions 执行新增 hosts 与会话 Profile 回归测试并完成双架构构建。
-- [ ] SCP 部署后验证无数据库派生 VoWiFi 通过 hosts 进入 IKE/ESP/TUN 并注册。
+- [x] GitHub Actions 执行新增 hosts 与会话 Profile 回归测试并完成双架构构建。
+  证据：commit `28a11d3`；GitHub Actions run `33612255723` 的测试代码编译、
+  ARM64、AMD64 和 Release job 均为 success。ARM64 产物
+  `simadmin-linux-arm64.tar.gz` 的 SHA256 为
+  `2ef0333aff8f4c591182039929a8d95a004caed6bae6ead7f1d5c0daa710b4bd`，
+  包内二进制 MD5 为 `ff4ff738bbc9d4e0346847a4cb2e4760`。
+- [x] SCP 部署后验证无数据库派生 VoWiFi 通过 hosts 进入 IKE/ESP/TUN 并注册。
+  证据：2026-09-02 17:22:58 CST，
+  `epdg.epc.mnc002.mcc262.pub.3gppnetwork.org` 通过当前 UE namespace 的
+  hosts 解析为 `139.7.117.168:500`；17:23:00 建立 UDP IKE/ESP/TUN，
+  17:23:02 完整 REGISTER 返回 `200 OK`，租期 `3303` 秒；运行时来源为
+  `profile_origin="derived"`，未依赖数据库 Profile。
 - [ ] 验证派生 VoWiFi 的自然 refresh 不回查已删除的数据库条目、不重建访问链路。
+
+本轮部署后的自然 refresh 预计在 2026-09-02 18:09–18:12 CST 触发；在获得
+`register_phase="refresh"`、`200 OK`、`reused_access=true` 等设备日志前，
+本项保持未完成。
 
 ## 当前结论
 
@@ -231,6 +245,9 @@ Vodafone Germany 的初始 VoWiFi/VoLTE 注册、连续 UDP refresh、缺失 TUN
 未响应属于诊断性保活现象，不能作为 TCP 或正式 REGISTER 失败依据。规范
 对照和无数据库兜底审查已完成；数据库、目录和派生候选现在共用
 access-aware 解析器，IMS-only 数据库记录不会再进入 VoWiFi live matcher。
-下一步是由 GitHub Actions 执行新增测试和双架构构建，再部署新的 ARM64
-产物复测。续期计数持久化/实时刷新和 eSIM 号码缓存失效的实现已经完成，
-尚待本轮 CI 与 410 实机验证；尚未实机触发的异常路径继续保留为未完成项。
+新增 hosts 与会话 Profile 回归测试已经由 GitHub Actions 在双架构上通过，
+并已用 ARM64 产物部署到 410。当前设备已证明删除数据库 Profile 后，派生
+VoWiFi 可以从 UE namespace 的 hosts 解析 ePDG 并完成完整 UDP REGISTER；
+剩余待办仅是等待这一轮自然 refresh 的设备级证据，以及连续 refresh 失败和
+UE socket 单独消失等尚未被实机触发的异常路径。续期计数持久化/实时刷新和
+eSIM 号码缓存失效的实现仍需按第 5 节的验收口径单独回归。
