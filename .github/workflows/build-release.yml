@@ -178,7 +178,21 @@ jobs:
 
       - name: Compile tests without running them
         working-directory: backend
-        run: cargo test --no-run
+        shell: bash
+        run: |
+          set +e
+          cargo test --no-run 2>&1 | tee test-compile.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            # Public check annotations remain readable even when GitHub hides
+            # the full job log behind repository-admin authentication.
+            details=$(tail -n 80 test-compile.log)
+            details=${details//'%'/'%25'}
+            details=${details//$'\r'/'%0D'}
+            details=${details//$'\n'/'%0A'}
+            echo "::error title=Rust test compile failed::$details"
+          fi
+          exit "$status"
 
   # ==================== 2. 后端构建 + 分架构打包 ====================
   build:
