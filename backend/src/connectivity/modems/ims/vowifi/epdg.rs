@@ -70,7 +70,17 @@ impl DnsResolver for SystemDnsResolver {
         host: &str,
         port: u16,
     ) -> Result<ResolvedEpdgEndpoint, TransportError> {
-        let addresses =
+        // Tokio's resolver normally follows NSS, but static musl builds have
+        // been observed to return an uncategorized error without consulting
+        // /etc/hosts inside the UE worker. An operator ePDG pinned there is an
+        // intentional local override, so honor it explicitly before DNS.
+        let hosts_addresses = match tokio::fs::read_to_string("/etc/hosts").await {
+            Ok(contents) => addresses_from_hosts_file(&contents, host, port),
+            Err(_) => Vec::new(),
+        };
+        let addresses = if !hosts_addresses.is_empty() {
+            hosts_addresses
+        } else {
             match tokio::time::timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await {
                 Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
                 Ok(Err(primary_error)) => resolve_epdg_via_dns_fallback(profile, host, port)
@@ -89,7 +99,8 @@ impl DnsResolver for SystemDnsResolver {
                             "system_resolver=timeout; fallback={fallback_error}"
                         ))
                     })?,
-            };
+            }
+        };
 
         if addresses.is_empty() {
             return Err(TransportError::DnsFailed("empty address set".to_string()));
@@ -102,6 +113,35 @@ impl DnsResolver for SystemDnsResolver {
             route_policy: choose_route_policy(profile, host, None),
         })
     }
+}
+
+fn normalized_hosts_name(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn addresses_from_hosts_file(contents: &str, host: &str, port: u16) -> Vec<SocketAddr> {
+    let requested = normalized_hosts_name(host);
+    if requested.is_empty() {
+        return Vec::new();
+    }
+
+    let mut addresses = Vec::new();
+    for line in contents.lines() {
+        let entry = line.split_once('#').map_or(line, |(entry, _)| entry);
+        let mut fields = entry.split_whitespace();
+        let Some(address) = fields.next() else {
+            continue;
+        };
+        if !fields.any(|alias| normalized_hosts_name(alias) == requested) {
+            continue;
+        }
+        if let Ok(address) = address.parse::<IpAddr>() {
+            addresses.push(SocketAddr::new(address, port));
+        }
+    }
+    addresses.sort();
+    addresses.dedup();
+    addresses
 }
 
 /// Resolve an ePDG through one explicitly selected DNS server. This bypasses
@@ -731,6 +771,21 @@ mod tests {
 
         assert_eq!(plan.route_policy.kind, ProxyKind::UdpRelay);
         assert_eq!(plan.route_policy.policy_id, "udp_relay_us_epdg");
+    }
+
+    #[test]
+    fn hosts_file_lookup_supports_aliases_comments_case_and_trailing_dot() {
+        let contents = "\n# comment\n139.7.117.168 gateway EPDG.EPC.MNC002.MCC262.PUB.3GPPNETWORK.ORG # pinned\n2001:db8::8 epdg.epc.mnc002.mcc262.pub.3gppnetwork.org\ninvalid epdg.epc.mnc002.mcc262.pub.3gppnetwork.org\n";
+        let addresses =
+            addresses_from_hosts_file(contents, "epdg.epc.mnc002.mcc262.pub.3gppnetwork.org.", 500);
+
+        assert_eq!(
+            addresses,
+            vec![
+                "139.7.117.168:500".parse().unwrap(),
+                "[2001:db8::8]:500".parse().unwrap(),
+            ]
+        );
     }
 
     #[test]

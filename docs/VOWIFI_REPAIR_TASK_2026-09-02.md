@@ -195,10 +195,34 @@ IMS bearer，导致 modem 78→79→80 重枚举，并连带中断仍然正常�
   同时把 `Security-Verify` 保留到会话结束，不再按刷新截止时间单独过期。
   用户关闭、IMS 会话清理或进程/设备重启后缓存失效，下次重新派生；不写入
   数据库，因此不存在持久化缓存无限增长问题。
-- [ ] GitHub Actions 测试编译、ARM64、AMD64 与 Release 构建通过。
-- [ ] SCP 部署新 ARM64 产物到 410，确认初始 VoLTE/VoWiFi 注册成功。
-- [ ] 等待一次完整自然续期，确认 VoLTE 返回 200 OK、续期计数增加，且 modem
+- [x] GitHub Actions 测试编译、ARM64、AMD64 与 Release 构建通过。
+  证据：commit `3a23779`，run `33603332348` 全部成功。
+- [x] SCP 部署新 ARM64 产物到 410，确认初始 VoLTE 注册成功。
+  证据：15:37:50 返回 200 OK，租期 3518 秒。
+- [x] 等待一次完整自然续期，确认 VoLTE 返回 200 OK、续期计数增加，且 modem
   ID、native bearer、UE worker 与 VoWiFi 会话均未被重建或中断。
+  证据：16:31:36 `register_phase=refresh` 返回 200 OK，新租期 3447 秒；
+  modem 保持 82，UE worker 保持 PID 552716。
+
+### 7. 删除数据库 Profile 后的派生 VoWiFi 回归
+
+- [x] 确认宿主与 UE namespace 均可通过系统工具从 `/etc/hosts` 解析
+  `epdg.epc.mnc002.mcc262.pub.3gppnetwork.org` 为 `139.7.117.168`。
+- [x] 定位 SimAdmin 失败点：Tokio `lookup_host` 在 ARM64 musl/UE worker
+  中返回 `uncategorized error`，随后手写 DNS fallback 绕过 `/etc/hosts`，
+  最终报告 `empty_fallback_answer`。
+- [x] 未指定自定义 DNS 时增加明确的 `/etc/hosts` 优先解析；未命中后仍按
+  系统 resolver、现有 DNS fallback 的顺序处理。
+- [x] 指定自定义 DNS 时保持原有严格路径，不用宿主 hosts 覆盖运营商 DNS。
+- [x] 修复 refresh 阶段只按 Profile ID 回查目录的问题：执行器现在优先使用
+  当前线路会话内保存的不可变 Profile，数据库条目删除只影响下一次新连接。
+- [x] 会话 Profile 继续随线路 live runtime 清理，不写数据库、不建立无限增长
+  的持久化映射。
+- [x] 在项目根目录新增 `DNS_RESOLVER_HICKORY_MIGRATION_TASK.md`，记录后续
+  使用 Hickory 统一 DNS 层的方案 A；本轮仅实施低风险方案 C。
+- [ ] GitHub Actions 执行新增 hosts 与会话 Profile 回归测试并完成双架构构建。
+- [ ] SCP 部署后验证无数据库派生 VoWiFi 通过 hosts 进入 IKE/ESP/TUN 并注册。
+- [ ] 验证派生 VoWiFi 的自然 refresh 不回查已删除的数据库条目、不重建访问链路。
 
 ## 当前结论
 

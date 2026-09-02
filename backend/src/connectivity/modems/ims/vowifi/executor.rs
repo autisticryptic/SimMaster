@@ -609,11 +609,21 @@ fn live_stage_reason(stage: ExecutorStage, gate: &LiveExecutorGateReport) -> &'s
 }
 
 fn profile_for_stage_request(request: &ExecutorStageRequest) -> Option<&'static CarrierProfile> {
-    request
-        .profile_id
-        .as_deref()
-        .and_then(profiles::resolve_by_profile_id)
-        .or_else(|| request.plmn.as_deref().and_then(profile_for_plmn))
+    // A selected database/custom/derived profile is part of the active IMS
+    // session. Refresh must keep using that immutable in-memory profile even
+    // if its backing database row is edited or deleted. The selection is
+    // cleared together with the line's live runtime on disconnect/restart.
+    (!request.line_id.trim().is_empty())
+        .then(|| super::live::live_profile_selection(&request.line_id))
+        .flatten()
+        .map(|selected| selected.profile)
+        .or_else(|| {
+            request
+                .profile_id
+                .as_deref()
+                .and_then(profiles::resolve_by_profile_id)
+                .or_else(|| request.plmn.as_deref().and_then(profile_for_plmn))
+        })
 }
 
 fn profile_for_plmn(plmn: &str) -> Option<&'static CarrierProfile> {
@@ -787,6 +797,32 @@ mod tests {
         assert!(gate.effective_live_network_allowed);
         assert!(gate.effective_device_state_changes_allowed);
         assert!(gate.blockers.is_empty());
+    }
+
+    #[test]
+    fn stage_request_keeps_active_line_profile() {
+        let line_id = "executor-session-profile-test";
+        let selected_profile =
+            profiles::resolve_by_profile_id("gb_ee_23433").expect("test profile should resolve");
+        super::live::configure_live_profile_selection(
+            line_id,
+            super::live::LiveSelectedProfile {
+                profile: selected_profile,
+                source: "test_session".to_string(),
+                fallback_reason: None,
+            },
+        )
+        .expect("configure active profile");
+        let profile = profile_for_stage_request(&ExecutorStageRequest {
+            stage: ExecutorStage::ImsRegister,
+            profile_id: Some("deleted_database_profile".to_string()),
+            plmn: Some("99999".to_string()),
+            trace_id: "session-profile-selection".to_string(),
+            line_id: line_id.to_string(),
+        })
+        .expect("active session profile should remain available");
+        assert_eq!(profile.meta.profile_id, "gb_ee_23433");
+        super::live::forget_live_network_overrides(line_id);
     }
 
     #[tokio::test]
