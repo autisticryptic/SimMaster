@@ -782,8 +782,8 @@ mod tests {
         assert_eq!(
             addresses,
             vec![
-                "139.7.117.168:500".parse().unwrap(),
-                "[2001:db8::8]:500".parse().unwrap(),
+                "139.7.117.168:500".parse::<SocketAddr>().unwrap(),
+                "[2001:db8::8]:500".parse::<SocketAddr>().unwrap(),
             ]
         );
     }
