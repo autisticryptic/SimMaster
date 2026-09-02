@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, type ReactNode } from 'react'
+import { useState, useEffect, useCallback, useRef, type ReactNode } from 'react'
 import {
   Box,
   Typography,
@@ -640,6 +640,9 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
   const [showSensitive, setShowSensitive] = useState(false)
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
   const [deviceInfo, setDeviceInfo] = useState<DeviceInfo | null>(null)
+  const loadVersion = useRef(0)
+  const pendingLoadMode = useRef<'background' | 'foreground' | null>(null)
+  const loadDrain = useRef<Promise<void> | null>(null)
 
   const [editingPhone, setEditingPhone] = useState(false)
   const [editingSmsc, setEditingSmsc] = useState(false)
@@ -663,24 +666,52 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
 
   const validatePhoneStr = (val: string) => /^\+?\d+$/.test(val.trim())
 
-  const loadData = useCallback(async () => {
-    setSimLoading(true)
-    setDeviceLoading(true)
-    setSimInfo(null)
-    setDeviceInfo(null)
-    setError(null)
+  const runLoadData = useCallback(async (background = false) => {
+    const requestVersion = ++loadVersion.current
+    const isCurrent = () => requestVersion === loadVersion.current
+    if (!background) {
+      setSimLoading(true)
+      setDeviceLoading(true)
+      setSimInfo(null)
+      setDeviceInfo(null)
+      setError(null)
+    }
     const simRequest = api.getSimInfo(lineId)
-      .then((response) => setSimInfo(response.data ?? null))
-      .finally(() => setSimLoading(false))
+      .then((response) => { if (isCurrent()) setSimInfo(response.data ?? null) })
+      .finally(() => { if (!background && isCurrent()) setSimLoading(false) })
     const deviceRequest = api.getDeviceInfo(lineId)
-      .then((response) => setDeviceInfo(response.data ?? null))
-      .finally(() => setDeviceLoading(false))
+      .then((response) => { if (isCurrent()) setDeviceInfo(response.data ?? null) })
+      .finally(() => { if (!background && isCurrent()) setDeviceLoading(false) })
     const results = await Promise.allSettled([simRequest, deviceRequest])
+    if (!isCurrent()) return
     const failures = results
       .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
       .map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason))
-    if (failures.length > 0) setError(failures.join('；'))
+    if (!background && failures.length > 0) setError(failures.join('；'))
   }, [lineId])
+
+  // Modem identity reads may outlive the polling interval while a profile is
+  // switching. Serialize them and merge arrivals into one follow-up request so
+  // a slow response cannot keep invalidating every newer refresh indefinitely.
+  const loadData = useCallback((background = false): Promise<void> => {
+    const requestedMode = background ? 'background' : 'foreground'
+    if (pendingLoadMode.current !== 'foreground') {
+      pendingLoadMode.current = requestedMode
+    }
+    if (loadDrain.current) return loadDrain.current
+
+    const drain: Promise<void> = (async () => {
+      while (pendingLoadMode.current) {
+        const mode = pendingLoadMode.current
+        pendingLoadMode.current = null
+        await runLoadData(mode === 'background')
+      }
+    })().finally(() => {
+      if (loadDrain.current === drain) loadDrain.current = null
+    })
+    loadDrain.current = drain
+    return drain
+  }, [runLoadData])
 
   const handleSavePhone = async () => {
     if (!phoneInput.trim()) {
@@ -728,6 +759,12 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
 
   useEffect(() => {
     void loadData()
+    const timer = window.setInterval(() => void loadData(true), 10_000)
+    return () => {
+      window.clearInterval(timer)
+      pendingLoadMode.current = null
+      loadVersion.current += 1
+    }
   }, [loadData])
 
   return (

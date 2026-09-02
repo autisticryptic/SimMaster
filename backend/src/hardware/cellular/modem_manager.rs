@@ -84,6 +84,32 @@ static SIM_IDENTITY_CACHE: OnceLock<
     std::sync::Mutex<HashMap<String, (Instant, CachedUsimIdentity)>>,
 > = OnceLock::new();
 
+fn invalidate_sim_identity_cache_entries(
+    cache: &mut HashMap<String, (Instant, CachedUsimIdentity)>,
+    prefix: &str,
+) -> usize {
+    let before = cache.len();
+    cache.retain(|key, _| !key.starts_with(prefix));
+    before.saturating_sub(cache.len())
+}
+
+/// Invalidate every cached UICC identity for one physical QMI slot. The SIM
+/// key is deliberately omitted because an eSIM switch changes that identity
+/// while keeping the same modem and UIM slot.
+pub fn invalidate_sim_identity_cache(qmi_device: Option<&str>, uim_slot: u8) -> usize {
+    let Some(device) = qmi_device.map(str::trim).filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    let prefix = format!("{device}:{uim_slot}:");
+    let Some(cache) = SIM_IDENTITY_CACHE.get() else {
+        return 0;
+    };
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    invalidate_sim_identity_cache_entries(&mut cache, &prefix)
+}
+
 tokio::task_local! {
     static BASEBAND_RESTART_PROGRESS_KEY: String;
 }
@@ -3116,6 +3142,24 @@ async fn get_cells_data_qmicli(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sim_identity_cache_invalidation_is_scoped_to_device_and_slot() {
+        let now = Instant::now();
+        let mut cache = HashMap::from([
+            ("/dev/cdc-wdm0:1:old".to_string(), (now, None)),
+            ("/dev/cdc-wdm0:1:new".to_string(), (now, None)),
+            ("/dev/cdc-wdm0:2:other-slot".to_string(), (now, None)),
+            ("/dev/cdc-wdm1:1:other-device".to_string(), (now, None)),
+        ]);
+
+        assert_eq!(
+            invalidate_sim_identity_cache_entries(&mut cache, "/dev/cdc-wdm0:1:"),
+            2
+        );
+        assert!(cache.contains_key("/dev/cdc-wdm0:2:other-slot"));
+        assert!(cache.contains_key("/dev/cdc-wdm1:1:other-device"));
+    }
 
     #[test]
     fn at_call_paths_include_modem_ownership() {

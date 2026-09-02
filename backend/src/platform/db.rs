@@ -19,6 +19,7 @@ use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const ESIM_DETECTION_CACHE_MAX_ROWS: i64 = 64;
+const VOLTE_REFRESH_STATS_MAX_ROWS: i64 = 256;
 
 fn required_line_id(line_id: &str) -> Result<&str> {
     let line_id = line_id.trim();
@@ -252,6 +253,13 @@ pub struct SmscCacheEntry {
 pub struct OwnNumberCacheEntry {
     pub phone_numbers: Vec<String>,
     pub source: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct VolteRefreshStatsEntry {
+    pub refresh_count: u64,
+    pub last_refresh_at: Option<String>,
     pub updated_at: String,
 }
 
@@ -746,6 +754,55 @@ mod tests {
                 .phone_numbers,
             vec!["+10002"]
         );
+    }
+
+    #[test]
+    fn volte_refresh_stats_increment_restore_clear_and_stay_bounded() {
+        let db = test_database();
+        let first = db
+            .increment_volte_refresh_stats("line-a", "2026-09-02T00:01:00Z")
+            .expect("increment first refresh");
+        assert_eq!(first.refresh_count, 1);
+        assert_eq!(
+            first.last_refresh_at.as_deref(),
+            Some("2026-09-02T00:01:00Z")
+        );
+
+        let second = db
+            .increment_volte_refresh_stats("line-a", "2026-09-02T00:02:00Z")
+            .expect("increment second refresh");
+        assert_eq!(second.refresh_count, 2);
+        assert_eq!(
+            db.get_volte_refresh_stats("line-a")
+                .expect("restore refresh stats")
+                .expect("stored refresh stats"),
+            second
+        );
+
+        assert!(db
+            .clear_volte_refresh_stats("line-a")
+            .expect("clear refresh stats"));
+        assert!(db
+            .get_volte_refresh_stats("line-a")
+            .expect("read cleared refresh stats")
+            .is_none());
+
+        for index in 0..(VOLTE_REFRESH_STATS_MAX_ROWS + 8) {
+            db.increment_volte_refresh_stats(
+                &format!("bounded-line-{index}"),
+                "2026-09-02T00:03:00Z",
+            )
+            .expect("insert bounded refresh stats");
+        }
+        let count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM volte_refresh_stats", [], |row| {
+                row.get(0)
+            })
+            .expect("count refresh stats rows");
+        assert_eq!(count, VOLTE_REFRESH_STATS_MAX_ROWS);
     }
 
     #[test]
@@ -2919,6 +2976,16 @@ impl Database {
                 operator_id TEXT,
                 phone_numbers TEXT NOT NULL,
                 source TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )?;
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS volte_refresh_stats (
+                line_id TEXT PRIMARY KEY,
+                refresh_count INTEGER NOT NULL DEFAULT 0,
+                last_refresh_at TEXT,
                 updated_at TEXT NOT NULL
             )",
             [],
@@ -5682,6 +5749,92 @@ impl Database {
             params![iccid],
         )?;
         Ok(deleted)
+    }
+
+    // ==================== VoLTE REGISTER refresh stats ====================
+
+    pub fn get_volte_refresh_stats(&self, line_id: &str) -> Result<Option<VolteRefreshStatsEntry>> {
+        let line_id = required_line_id(line_id)?;
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT refresh_count, last_refresh_at, updated_at
+             FROM volte_refresh_stats
+             WHERE line_id = ?1",
+            params![line_id],
+            |row| {
+                let refresh_count = row.get::<_, i64>(0)?.max(0) as u64;
+                Ok(VolteRefreshStatsEntry {
+                    refresh_count,
+                    last_refresh_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+    }
+
+    /// Atomically record a successful REGISTER refresh and return the durable
+    /// counter. The database value is authoritative so process restarts and
+    /// concurrent status updates cannot make the displayed count go backwards.
+    pub fn increment_volte_refresh_stats(
+        &self,
+        line_id: &str,
+        last_refresh_at: &str,
+    ) -> Result<VolteRefreshStatsEntry> {
+        let line_id = required_line_id(line_id)?;
+        let last_refresh_at = last_refresh_at.trim();
+        if last_refresh_at.is_empty() {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "last_refresh_at must not be empty".to_string(),
+            ));
+        }
+        let updated_at = Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO volte_refresh_stats (
+                line_id, refresh_count, last_refresh_at, updated_at
+             ) VALUES (?1, 1, ?2, ?3)
+             ON CONFLICT(line_id) DO UPDATE SET
+                refresh_count = MIN(volte_refresh_stats.refresh_count + 1, 9223372036854775807),
+                last_refresh_at = excluded.last_refresh_at,
+                updated_at = excluded.updated_at",
+            params![line_id, last_refresh_at, updated_at],
+        )?;
+        tx.execute(
+            "DELETE FROM volte_refresh_stats
+             WHERE line_id NOT IN (
+                SELECT line_id FROM volte_refresh_stats
+                ORDER BY updated_at DESC, line_id ASC
+                LIMIT ?1
+             )",
+            params![VOLTE_REFRESH_STATS_MAX_ROWS],
+        )?;
+        let entry = tx.query_row(
+            "SELECT refresh_count, last_refresh_at, updated_at
+             FROM volte_refresh_stats
+             WHERE line_id = ?1",
+            params![line_id],
+            |row| {
+                let refresh_count = row.get::<_, i64>(0)?.max(0) as u64;
+                Ok(VolteRefreshStatsEntry {
+                    refresh_count,
+                    last_refresh_at: row.get(1)?,
+                    updated_at: row.get(2)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok(entry)
+    }
+
+    pub fn clear_volte_refresh_stats(&self, line_id: &str) -> Result<bool> {
+        let line_id = required_line_id(line_id)?;
+        let conn = self.conn.lock().unwrap();
+        Ok(conn.execute(
+            "DELETE FROM volte_refresh_stats WHERE line_id = ?1",
+            params![line_id],
+        )? > 0)
     }
 
     // ==================== eSIM Profile cache ====================

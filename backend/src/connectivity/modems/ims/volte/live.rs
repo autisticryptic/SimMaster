@@ -2751,7 +2751,9 @@ async fn live_receive_loop(
             let refresh_result = {
                 let mut sessions = live.session.lock().await;
                 match sessions.as_mut() {
-                    Some(session) => refresh_live_registration(session, &runtime).await,
+                    Some(session) => {
+                        refresh_live_registration(session, &runtime, &line_id, &database).await
+                    }
                     None => break,
                 }
             };
@@ -2954,6 +2956,8 @@ async fn expire_volte_renegotiations(live: &VolteLiveHandle) -> Result<(), Volte
 async fn refresh_live_registration(
     session: &mut VolteLiveSession,
     runtime: &VolteRuntime,
+    line_id: &str,
+    database: &Database,
 ) -> VolteRefreshAttempt {
     runtime
         .update(|state| state.stage = VolteStage::RegisterRefresh)
@@ -3095,15 +3099,29 @@ async fn refresh_live_registration(
                 Some(format!("cseq={}", ids.cseq)),
             )
             .await;
+        let refreshed_at = now();
+        let persisted_count = match database.increment_volte_refresh_stats(line_id, &refreshed_at) {
+            Ok(stats) => Some(stats.refresh_count),
+            Err(error) => {
+                tracing::warn!(
+                    line_id = %line_id,
+                    %error,
+                    "Failed to persist successful VoLTE REGISTER refresh"
+                );
+                None
+            }
+        };
         runtime
-            .update(|state| {
+            .update(move |state| {
+                let next_count = persisted_count
+                    .unwrap_or_else(|| state.register_refresh_count.saturating_add(1));
                 state.phase = VoltePhase::Registered;
                 state.stage = VolteStage::Registered;
                 state.last_error = None;
-                state.last_register_refresh_at = Some(now());
+                state.last_register_refresh_at = Some(refreshed_at);
                 state.last_tx_at = Some(now());
                 state.last_rx_at = Some(now());
-                state.register_refresh_count = state.register_refresh_count.saturating_add(1);
+                state.register_refresh_count = next_count;
                 state.public_uri = Some(refreshed_public_uri);
                 state.associated_uris = refreshed_associated_uris;
             })

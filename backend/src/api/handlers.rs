@@ -915,12 +915,26 @@ pub async fn enable_esim_profile_handler(
     let bg_line_id = line_id.clone();
     let bg_binding = line.binding();
 
-    // A registrar number is scoped to the currently active eSIM profile. Drop
-    // both the in-memory IMS observation and any previously learned cache for
-    // the target ICCID before ModemManager starts re-enumerating the modem.
-    // Manual numbers intentionally survive this cleanup.
+    // A registrar number and REGISTER-refresh history are scoped to the active
+    // eSIM profile even though the stable line ID belongs to the physical slot.
+    // Clear both the old and target learned identities before ModemManager can
+    // re-enumerate the modem. Manual numbers intentionally survive this cleanup.
     crate::connectivity::core::own_numbers::clear(&line_id);
+    modem_manager::clear_non_manual_own_numbers_for_iccid(&app.database, &bg_binding.sim_iccid);
     modem_manager::clear_non_manual_own_numbers_for_iccid(&app.database, &iccid);
+    modem_manager::invalidate_sim_identity_cache(
+        bg_binding.qmi_device.as_deref(),
+        bg_binding.uim_slot,
+    );
+    if let Err(error) = app.database.clear_volte_refresh_stats(&line_id) {
+        warn!(line_id = %line_id, %error, "Failed to clear VoLTE refresh stats for eSIM switch");
+    }
+    line.volte
+        .update(|snapshot| {
+            snapshot.register_refresh_count = 0;
+            snapshot.last_register_refresh_at = None;
+        })
+        .await;
 
     let line_vowifi_before_switch = app.config_manager.get_line_profile(&line_id).vowifi;
     let switch_token = new_vowifi_switch_token("profile-switch");
@@ -950,6 +964,7 @@ pub async fn enable_esim_profile_handler(
     let bg_iccid = iccid.clone();
     let bg_event_entity = event_entity.clone();
     let bg_switch_token = switch_token.clone();
+    let bg_volte_runtime = Arc::clone(&line.volte);
 
     let progress_line_id = bg_line_id.clone();
     tokio::spawn(modem_manager::with_baseband_restart_progress(
@@ -990,6 +1005,39 @@ pub async fn enable_esim_profile_handler(
                             )
                             .await
                         };
+                        modem_manager::invalidate_sim_identity_cache(
+                            bg_binding.qmi_device.as_deref(),
+                            bg_binding.uim_slot,
+                        );
+                        crate::connectivity::core::own_numbers::clear(&bg_line_id);
+                        // A previous live listener can finish one last refresh
+                        // while the modem is switching profiles. Clear again
+                        // after recovery so that refresh history never leaks
+                        // from the old ICCID into the newly active profile.
+                        if let Err(error) = bg_app.database.clear_volte_refresh_stats(&bg_line_id) {
+                            warn!(
+                                line_id = %bg_line_id,
+                                %error,
+                                "Failed to clear VoLTE refresh stats after eSIM recovery"
+                            );
+                        }
+                        bg_volte_runtime
+                            .update(|snapshot| {
+                                snapshot.register_refresh_count = 0;
+                                snapshot.last_register_refresh_at = None;
+                            })
+                            .await;
+                        if let Err(error) = bg_app
+                            .line_registry
+                            .refresh(bg_app.dbus_conn.as_ref())
+                            .await
+                        {
+                            warn!(
+                                line_id = %bg_line_id,
+                                %error,
+                                "Failed to refresh line identity after eSIM profile switch"
+                            );
+                        }
                         match recovery {
                             Ok(_recovery) => {
                                 if bg_app.sms_resync.request_scan("profile-switch") {
@@ -8169,6 +8217,17 @@ pub async fn set_volte_line_connection_handler(
             )
         }
     };
+    if !payload.enabled {
+        if let Err(error) = app.database.clear_volte_refresh_stats(&line_id) {
+            warn!(line_id = %line_id, %error, "Failed to clear disabled VoLTE refresh stats");
+        }
+        line.volte
+            .update(|snapshot| {
+                snapshot.register_refresh_count = 0;
+                snapshot.last_register_refresh_at = None;
+            })
+            .await;
+    }
     if !binding.present {
         sync_line_video_capabilities(&app).await;
         return (

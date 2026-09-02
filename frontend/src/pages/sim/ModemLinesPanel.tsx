@@ -282,8 +282,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [workbenchTab, setWorkbenchTab] = useState<WorkbenchTab>('overview')
   const [basebandRestartLine, setBasebandRestartLine] = useState<string | null>(null)
   const loadVersion = useRef(0)
+  const pendingLoadMode = useRef<'background' | 'foreground' | null>(null)
+  const loadDrain = useRef<Promise<void> | null>(null)
 
-  const load = useCallback(async (background = false) => {
+  const runLoad = useCallback(async (background = false) => {
     const requestVersion = ++loadVersion.current
     const isCurrent = () => requestVersion === loadVersion.current
     if (!background) {
@@ -348,6 +350,31 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     }
   }, [])
 
+  // A full inventory refresh may take longer than the 10-second polling
+  // interval because it performs modem discovery. Serialize those requests and
+  // merge all arrivals during one request into at most one follow-up refresh.
+  // Foreground refreshes take priority so a user action is never swallowed by
+  // an older background poll.
+  const load = useCallback((background = false): Promise<void> => {
+    const requestedMode = background ? 'background' : 'foreground'
+    if (pendingLoadMode.current !== 'foreground') {
+      pendingLoadMode.current = requestedMode
+    }
+    if (loadDrain.current) return loadDrain.current
+
+    const drain: Promise<void> = (async () => {
+      while (pendingLoadMode.current) {
+        const mode = pendingLoadMode.current
+        pendingLoadMode.current = null
+        await runLoad(mode === 'background')
+      }
+    })().finally(() => {
+      if (loadDrain.current === drain) loadDrain.current = null
+    })
+    loadDrain.current = drain
+    return drain
+  }, [runLoad])
+
   useEffect(() => {
     setSelectedLineId((current) => {
       if (lines.some((line) => line.modem.line_id === current)) return current
@@ -358,7 +385,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   useEffect(() => {
     void load()
     const timer = window.setInterval(() => void load(true), 10_000)
-    return () => window.clearInterval(timer)
+    return () => {
+      window.clearInterval(timer)
+      pendingLoadMode.current = null
+      loadVersion.current += 1
+    }
   }, [load])
 
   const presentCount = useMemo(() => lines.filter((line) => line.modem.present).length, [lines])

@@ -99,8 +99,9 @@ has been exercised.
   私有 P-CSCF、私有 ePDG、运营商 DNS、AKA identity template 或非标准
   IPsec 参数。
 - [ ] 为新增兜底行为补充单元测试，并验证不污染数据库搜索结果。
-  测试代码已经补齐，且数据库浏览继续保留 IMS-only 自定义记录；实际执行
-  结果等待 GitHub Actions，CI 通过后再勾选完成。
+  测试代码已经补齐，且数据库浏览继续保留 IMS-only 自定义记录；GitHub
+  Actions 已通过 `cargo test --no-run` 编译全部测试代码，但尚未实际执行
+  profile-store 测试，因此本项继续保持未完成。
 
 代码审查与逐项依据见 `VOWIFI_REGISTRATION_FALLBACK_AUDIT.md`。本轮已新增
 数据库/目录/派生共用解析器，以及 IMS-only 数据库记录不得进入 VoWiFi
@@ -131,9 +132,19 @@ source-backed item-by-item comparison and tests for any safe gap found.
 
 - [x] 修改后执行 `cargo fmt --check` 与 `git diff --check`；禁止本地
   `cargo build/check/test`。
-- [ ] 提交并推送 GitHub，等待 Actions 成功生成 amd64/arm64。
-- [ ] 下载 ARM64 产物部署到 410，确认服务启动、版本和 commit 正确。
+- [x] 提交并推送 GitHub，等待 Actions 成功生成 amd64/arm64。
+  证据：commit `872d4cb`；GitHub Actions run `33591379418` 的测试代码编译、
+  ARM64、AMD64 和 Release 发布 job 均为 success。
+- [x] 下载 ARM64 产物部署到 410，确认服务启动、版本和 commit 正确。
+  证据：Release `v1.1.4` 包内 `meta.json` 为 commit `872d4cb`、
+  `aarch64-unknown-linux-musl`，设备二进制 MD5
+  `4448ce75527275523c14d5bb8e7a53d8` 与发布包一致；服务于
+  2026-09-02 12:51:00 CST 启动。
 - [ ] 重新执行 Vodafone Germany UDP-only 初始注册与 refresh 验证。
+  初始注册已经完成：VoWiFi 于 12:54:15 CST 返回 200 OK，租期 3220 秒；
+  VoLTE 在部署触发的 modem 72→73→74 重枚举稳定后，于 12:54:57 CST 返回
+  200 OK，租期 3344 秒。两者的本轮自动 refresh 尚待约 13:43–13:46 CST
+  实机日志确认。
 - [ ] 将最终源码、文档和 `.github/workflows` 覆盖同步到
   `D:\Program\AI\FileSystem\SimAdmin-Enhance`；不复制 `.git`、`target`、
   `.ci-dl`、`.ci-patch.txt` 或设备数据库。
@@ -150,9 +161,17 @@ source-backed item-by-item comparison and tests for any safe gap found.
   显示为“第一次续期”。需要核对后端计数生命周期、服务重启边界、状态
   API/WebSocket 推送以及前端响应式更新，确保次数与日志中的成功 refresh
   一致。
+  代码已完成：成功 refresh 会原子写入按线路持久化统计（最多 256 条），
+  新 runtime 会恢复计数；用户明确关闭 VoLTE 或切换 eSIM 时清零。线路
+  状态轮询已改成单飞并合并后续刷新，不再因慢请求持续互相作废。等待 CI
+  和 410 上的重启恢复、实时更新与关闭清零验证后勾选。
 - [ ] 修复切换 eSIM profile 后概述页手机号仍显示旧 profile 号码的问题。
   需要在 ICCID/profile 切换完成后使号码来源及相关缓存失效并重新读取，
   同时避免旧 Skinny/上一 profile 的 MSISDN 残留到新卡状态。
+  代码已完成：切换前后均清理线路 IMS 观察号码和物理 QMI slot 身份缓存，
+  同时删除旧/目标 ICCID 的非手动号码缓存并在基带恢复后刷新线路身份；
+  概述页 SIM/设备信息每 10 秒单飞刷新。手动号码仍按设计保留。等待 CI 与
+  410 多 profile 切换验证后勾选。
 
 ## 当前结论
 
@@ -162,4 +181,5 @@ Vodafone Germany 的初始 VoWiFi/VoLTE 注册、连续 UDP refresh、缺失 TUN
 对照和无数据库兜底审查已完成；数据库、目录和派生候选现在共用
 access-aware 解析器，IMS-only 数据库记录不会再进入 VoWiFi live matcher。
 下一步是由 GitHub Actions 执行新增测试和双架构构建，再部署新的 ARM64
-产物复测，尚未实机触发的异常路径继续保留为未完成项。
+产物复测。续期计数持久化/实时刷新和 eSIM 号码缓存失效的实现已经完成，
+尚待本轮 CI 与 410 实机验证；尚未实机触发的异常路径继续保留为未完成项。
