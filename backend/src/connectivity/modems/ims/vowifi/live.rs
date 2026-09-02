@@ -97,6 +97,12 @@ const LIVE_SIM_AUTH_RETRY_DELAY: Duration = Duration::from_millis(250);
 const LIVE_SIM_AUTH_GATE_TIMEOUT: Duration = Duration::from_secs(3);
 const LIVE_SIM_AUTH_GATE_ATTEMPTS: usize = 4;
 const LIVE_SIM_AUTH_GATE_RETRY_DELAY: Duration = Duration::from_millis(500);
+/// A worker can report its control handshake before the UE-side veth and route
+/// are visible to the namespace. Do not spend IKE/AKA retries during that
+/// short transition; wait for the complete data-plane view once per access
+/// attempt instead.
+const LIVE_UE_DATAPLANE_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const LIVE_UE_DATAPLANE_READY_POLL: Duration = Duration::from_millis(200);
 const LIVE_IKE_NONCE_BYTES: usize = 32;
 const LIVE_IKE_SA_INIT_ATTEMPTS: usize = 1;
 const LIVE_IKE_AUTH_ATTEMPTS: usize = 3;
@@ -2752,6 +2758,116 @@ async fn run_live_ike_until(
     .await
 }
 
+/// Wait for the complete per-UE data plane before starting an IKE access
+/// attempt.  The worker's control handshake can arrive before the UE-side
+/// veth, address and default route have been installed in the namespace.  If
+/// IKE starts in that small window, UDP timeouts look like an ePDG or operator
+/// failure and consume the access recovery budget even though the modem is
+/// still converging locally.
+///
+/// This gate intentionally validates only the local prerequisites that are
+/// owned by SimAdmin.  It does not probe the ePDG or send user traffic.  A
+/// successful poll is sufficient to begin one complete IKE attempt; refreshes
+/// that reuse an existing gateway do not call this function.
+async fn wait_for_vowifi_ue_dataplane_ready(
+    line_id: &str,
+    timeout: Duration,
+) -> Result<(), LiveStageError> {
+    let context = required_ue_socket_context(line_id)?;
+    let namespace = crate::platform::netns::NetnsName::adopt(&context.namespace)
+        .map_err(|_| live_stage_error("ue_namespace_unavailable"))?;
+    let plan = crate::services::ue_netcfg::plan_veth(&namespace);
+    if context.ue_veth != plan.ue_if {
+        warn!(
+            line_id,
+            namespace = %context.namespace,
+            expected_ue_veth = %plan.ue_if,
+            context_ue_veth = %context.ue_veth,
+            "VoWiFi UE socket context does not match the deterministic veth plan"
+        );
+        return Err(live_stage_error("ue_socket_context_mismatch"));
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_reason = "ue_worker_not_ready";
+    loop {
+        let worker_status = context.worker.status().await;
+        if !context.worker.is_running().await || !worker_status.ready {
+            last_reason = "ue_worker_not_ready";
+        } else {
+            match context.worker.refresh_net_status().await {
+                Ok(snapshot) => {
+                    let interface_present = snapshot
+                        .interfaces
+                        .iter()
+                        .any(|interface| interface == &plan.ue_if);
+                    let address_present = snapshot
+                        .addresses
+                        .iter()
+                        .any(|address| address == &plan.ue_addr.to_string());
+                    let default_route_present = snapshot.default_routes.iter().any(|route| {
+                        route
+                            .split_whitespace()
+                            .any(|part| part == plan.ue_if.as_str())
+                    });
+
+                    match crate::platform::netns::links_in(&namespace).await {
+                        Ok(links) => {
+                            let namespace_link_present =
+                                links.iter().any(|link| link == &plan.ue_if);
+                            if interface_present
+                                && address_present
+                                && default_route_present
+                                && namespace_link_present
+                            {
+                                info!(
+                                    line_id,
+                                    namespace = %context.namespace,
+                                    ue_veth = %plan.ue_if,
+                                    ue_addr = %plan.ue_addr,
+                                    "VoWiFi UE data plane is ready before IKE"
+                                );
+                                return Ok(());
+                            }
+                            last_reason = "ue_network_not_ready";
+                        }
+                        Err(error) => {
+                            debug!(
+                                line_id,
+                                namespace = %context.namespace,
+                                error = %error,
+                                "VoWiFi UE namespace link snapshot is not ready"
+                            );
+                            last_reason = "ue_namespace_unavailable";
+                        }
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        line_id,
+                        namespace = %context.namespace,
+                        error = %error,
+                        "VoWiFi UE worker network snapshot is not ready"
+                    );
+                    last_reason = "ue_network_not_ready";
+                }
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                line_id,
+                namespace = %context.namespace,
+                ue_veth = %plan.ue_if,
+                reason = last_reason,
+                "VoWiFi UE data plane did not become ready before IKE"
+            );
+            return Err(live_stage_error(last_reason));
+        }
+        tokio::time::sleep(LIVE_UE_DATAPLANE_READY_POLL).await;
+    }
+}
+
 async fn run_live_ike_until_depth(
     line_id: &str,
     profile: &'static CarrierProfile,
@@ -2759,6 +2875,7 @@ async fn run_live_ike_until_depth(
     depth: LiveProbeDepth,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<LiveIkeSession, LiveStageError> {
+    wait_for_vowifi_ue_dataplane_ready(line_id, LIVE_UE_DATAPLANE_READY_TIMEOUT).await?;
     let configured_ip_stack = live_ike_access(line_id, profile).ip_stack;
     let mut last_error = None;
 
@@ -3322,6 +3439,49 @@ async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProf
         return false;
     };
     if !gateway.is_for_profile(profile.meta.profile_id) {
+        // A profile/eSIM switch keeps the line key but invalidates the old
+        // Child-SA/TUN generation.  Remove it before opening the stable TUN
+        // name again, otherwise the new access attempt can race an old
+        // forwarder that still owns the interface and socket context.
+        let removed = {
+            let mut cache = tun_gateway_cache().lock().await;
+            if cache
+                .get(line_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+            {
+                cache.remove(line_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            gateway.shutdown();
+        }
+        return false;
+    }
+
+    if let Some(reason) = gateway.access_lost_reason() {
+        warn!(
+            line_id,
+            profile_id = profile.meta.profile_id,
+            tun_name = gateway.tun_name(),
+            reason,
+            "Discarding VoWiFi gateway reported unhealthy by ESP/TUN forwarders"
+        );
+        let removed = {
+            let mut cache = tun_gateway_cache().lock().await;
+            if cache
+                .get(line_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+            {
+                cache.remove(line_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            gateway.shutdown();
+        }
         return false;
     }
 
@@ -3331,6 +3491,20 @@ async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProf
     // non-existent interface (errno 19 / ENODEV).  The next ESP pass will
     // rebuild the complete access leg in the same UE namespace.
     let Some(socket_context) = ue_socket_context_for_line(line_id) else {
+        let removed = {
+            let mut cache = tun_gateway_cache().lock().await;
+            if cache
+                .get(line_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+            {
+                cache.remove(line_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            gateway.shutdown();
+        }
         return false;
     };
     let namespace = match crate::platform::netns::NetnsName::adopt(&socket_context.namespace) {
@@ -3343,6 +3517,20 @@ async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProf
                 error = %error,
                 "VoWiFi cached UE namespace name is invalid"
             );
+            let removed = {
+                let mut cache = tun_gateway_cache().lock().await;
+                if cache
+                    .get(line_id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+                {
+                    cache.remove(line_id).is_some()
+                } else {
+                    false
+                }
+            };
+            if removed {
+                gateway.shutdown();
+            }
             return false;
         }
     };
@@ -4385,13 +4573,31 @@ async fn cached_tun_gateway(
     line_id: &str,
     profile: &'static CarrierProfile,
 ) -> Result<Arc<TunGatewayRuntime>, LiveStageError> {
-    tun_gateway_cache()
+    let gateway = tun_gateway_cache()
         .lock()
         .await
         .get(line_id)
         .filter(|runtime| runtime.is_for_profile(profile.meta.profile_id))
         .cloned()
-        .ok_or_else(|| live_stage_error("live_tun_gateway_missing"))
+        .ok_or_else(|| live_stage_error("live_tun_gateway_missing"))?;
+    if let Some(reason) = gateway.access_lost_reason() {
+        let removed = {
+            let mut cache = tun_gateway_cache().lock().await;
+            if cache
+                .get(line_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+            {
+                cache.remove(line_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            gateway.shutdown();
+        }
+        return Err(live_stage_error(reason));
+    }
+    Ok(gateway)
 }
 
 /// Send an IMS SMS using one line's network overrides.

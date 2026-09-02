@@ -238,6 +238,32 @@ IMS bearer，导致 modem 78→79→80 重枚举，并连带中断仍然正常�
 `register_phase="refresh"`、`200 OK`、`reused_access=true` 等设备日志前，
 本项保持未完成。
 
+### 8. 本轮 VoWiFi/VoLTE 稳定性增强（当前提交）
+
+以下改动针对 410 日志中已经出现的短暂 UDP 发送失败、TUN 过期、基带
+重枚举以及 UE worker 控制面先于数据面就绪等问题。它们不改变 Vodafone
+Germany 的 UDP-only 和完整 REGISTER 测试口径，也不回退到宿主网络命名空间。
+
+- [x] 为 TUN reader、ESP outbound、ESP inbound 和 TUN writer 增加共享的
+  原子健康状态；单次瞬态错误不会立即拆除访问链路，连续三次同方向传输
+  失败才标记 gateway 失效。
+- [x] 对完整的 UDP/4500 protected frame 增加一次短延迟重试；重试复用同一
+  frame 和 sequence，不重新生成密文，不对单独 fragment 重新分配序号。
+- [x] inbound UDP timeout 不计入访问链路失败；TUN EOF、非 Interrupted
+  读错误以及 forwarder/channel 关闭则标记为终态失效。
+- [x] gateway 被标记 unhealthy 后不再允许迟到成功包复活；live cache 会
+  以 `Arc::ptr_eq` 校验并移除当前对象，然后触发完整 IKE/Child-SA/TUN 重建。
+- [x] 在每次完整 IKE access 建立前等待 UE worker、UE veth、UE 地址、默认
+  路由和 namespace 内 veth 同时就绪，避免把本地初始化窗口误判为 ePDG/运营商
+  超时。refresh 复用现有 gateway 时不重复等待。
+- [x] profile/eSIM 切换、UE socket context 消失或 namespace 无效时先原子移除
+  旧 gateway 并关闭其 TUN/forwarder，再允许新一代访问链路复用稳定的 TUN 名称。
+- [ ] 通过 GitHub Actions 完成本提交的测试编译、AMD64 与 ARM64 构建。
+- [ ] 下载本提交 ARM64 产物并通过 SCP 部署到 410，完成短窗口启动、UDP/500、
+  UDP/4500、UE namespace 和初始 REGISTER 验证。
+- [ ] 在后续较长观察窗口中确认自然 refresh、gateway 重建和 modem 重枚举
+  恢复；本轮短窗口不将长期续期稳定性提前标记为完成。
+
 ## 当前结论
 
 Vodafone Germany 的初始 VoWiFi/VoLTE 注册、连续 UDP refresh、缺失 TUN

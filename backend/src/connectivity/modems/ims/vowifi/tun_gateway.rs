@@ -4,16 +4,163 @@ use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
         Arc, Mutex as StdMutex,
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
 
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
+
+/// A single transient UDP error should not tear down an otherwise healthy
+/// access leg.  Repeated errors, however, mean that the ESP/TUN data plane is
+/// no longer usable and the live layer must discard the cached gateway.
+const GATEWAY_ACCESS_LOST_FAILURE_THRESHOLD: u32 = 3;
+const GATEWAY_OUTBOUND_RETRY_DELAY: Duration = Duration::from_millis(80);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum TunGatewayHealthState {
+    Healthy = 0,
+    OutboundTransportLost = 1,
+    InboundTransportLost = 2,
+    TunReaderLost = 3,
+    TunWriterLost = 4,
+}
+
+impl TunGatewayHealthState {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::OutboundTransportLost => "vowifi_esp_outbound_transport_lost",
+            Self::InboundTransportLost => "vowifi_esp_inbound_transport_lost",
+            Self::TunReaderLost => "vowifi_tun_reader_lost",
+            Self::TunWriterLost => "vowifi_tun_writer_lost",
+        }
+    }
+}
+
+/// Shared health state for the TUN and ESP forwarders.
+///
+/// The forwarders are deliberately detached Tokio tasks, so returning an
+/// error from them cannot reach the task that owns `TunGatewayRuntime`.  This
+/// small atomics-only object is the hand-off: transient failures are counted
+/// per direction, while the first direction that reaches the threshold marks
+/// the access leg lost.  No packet payload, SPI or subscriber data is stored.
+struct TunGatewayHealth {
+    state: AtomicU8,
+    outbound_failures: AtomicU32,
+    inbound_failures: AtomicU32,
+    tun_failures: AtomicU32,
+}
+
+impl TunGatewayHealth {
+    fn new() -> Self {
+        Self {
+            state: AtomicU8::new(TunGatewayHealthState::Healthy as u8),
+            outbound_failures: AtomicU32::new(0),
+            inbound_failures: AtomicU32::new(0),
+            tun_failures: AtomicU32::new(0),
+        }
+    }
+
+    fn state(&self) -> TunGatewayHealthState {
+        match self.state.load(Ordering::Acquire) {
+            1 => TunGatewayHealthState::OutboundTransportLost,
+            2 => TunGatewayHealthState::InboundTransportLost,
+            3 => TunGatewayHealthState::TunReaderLost,
+            4 => TunGatewayHealthState::TunWriterLost,
+            _ => TunGatewayHealthState::Healthy,
+        }
+    }
+
+    fn is_healthy(&self) -> bool {
+        self.state() == TunGatewayHealthState::Healthy
+    }
+
+    fn access_lost_reason(&self) -> Option<&'static str> {
+        let state = self.state();
+        (state != TunGatewayHealthState::Healthy).then_some(state.reason())
+    }
+
+    fn reset(counter: &AtomicU32) {
+        counter.store(0, Ordering::Release);
+    }
+
+    fn record_success(&self, counter: &AtomicU32) {
+        // Once access has been declared lost, a late packet must not revive
+        // the gateway.  The cache will remove it and the next pass rebuilds a
+        // fresh IKE/Child-SA/TUN path.
+        if self.is_healthy() {
+            Self::reset(counter);
+        }
+    }
+
+    fn record_failure(&self, counter: &AtomicU32, state: TunGatewayHealthState) -> u32 {
+        if !self.is_healthy() {
+            return counter.load(Ordering::Acquire);
+        }
+        let failures = counter.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if failures >= GATEWAY_ACCESS_LOST_FAILURE_THRESHOLD {
+            let _ = self.state.compare_exchange(
+                TunGatewayHealthState::Healthy as u8,
+                state as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        failures
+    }
+
+    /// Mark a failure that is definitive for this gateway generation.
+    ///
+    /// EOF and a non-interrupted TUN read error cannot be repaired by waiting
+    /// for another packet: the detached reader is already unable to observe
+    /// the interface.  Keep this separate from the thresholded transport
+    /// counters so the live cache never mistakes a stopped gateway for a
+    /// healthy one.
+    fn mark_terminal(&self, state: TunGatewayHealthState) {
+        let _ = self.state.compare_exchange(
+            TunGatewayHealthState::Healthy as u8,
+            state as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn record_outbound_success(&self) {
+        self.record_success(&self.outbound_failures);
+    }
+
+    fn record_outbound_failure(&self) -> u32 {
+        self.record_failure(
+            &self.outbound_failures,
+            TunGatewayHealthState::OutboundTransportLost,
+        )
+    }
+
+    fn record_inbound_success(&self) {
+        self.record_success(&self.inbound_failures);
+    }
+
+    fn record_inbound_failure(&self) -> u32 {
+        self.record_failure(
+            &self.inbound_failures,
+            TunGatewayHealthState::InboundTransportLost,
+        )
+    }
+
+    fn record_tun_success(&self) {
+        self.record_success(&self.tun_failures);
+    }
+
+    fn record_tun_failure(&self, state: TunGatewayHealthState) -> u32 {
+        self.record_failure(&self.tun_failures, state)
+    }
+}
 
 /// Maximum inner IP packet size carried by one protected IMS frame.
 ///
@@ -55,6 +202,7 @@ pub(crate) struct TunGatewayRuntime {
     started_at: Instant,
     ims_esp_policy: Arc<StdMutex<Option<ImsEspRuntimePolicy>>>,
     shutdown: Arc<AtomicBool>,
+    health: Arc<TunGatewayHealth>,
     ue_namespace: String,
     #[cfg(target_os = "linux")]
     _tun_file: std::fs::File,
@@ -70,6 +218,21 @@ impl TunGatewayRuntime {
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
         platform_shutdown_tun(&self.tun_name, &self.ue_namespace);
+    }
+
+    /// Whether the detached ESP/TUN forwarders still consider this access leg
+    /// usable.  A false value is terminal for this runtime; the live layer
+    /// must remove it from the cache and establish a new access leg.
+    pub(crate) fn is_healthy(&self) -> bool {
+        self.health.is_healthy()
+    }
+
+    pub(crate) fn access_lost_reason(&self) -> Option<&'static str> {
+        self.health.access_lost_reason().or_else(|| {
+            self.shutdown
+                .load(Ordering::Acquire)
+                .then_some("vowifi_gateway_shutdown")
+        })
     }
 
     pub fn is_for_profile(&self, profile_id: &str) -> bool {
@@ -916,12 +1079,14 @@ mod imp {
 
         let ims_esp_policy = Arc::new(StdMutex::new(None));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let health = Arc::new(TunGatewayHealth::new());
         spawn_forwarders(
             &config,
             read_file,
             write_file,
             Arc::clone(&ims_esp_policy),
             Arc::clone(&shutdown),
+            Arc::clone(&health),
         );
 
         info!(
@@ -940,6 +1105,7 @@ mod imp {
             started_at: Instant::now(),
             ims_esp_policy,
             shutdown,
+            health,
             ue_namespace: config.ue_namespace,
             _tun_file: tun_file,
         }))
@@ -1134,9 +1300,15 @@ mod imp {
         write_file: File,
         ims_esp_policy: Arc<StdMutex<Option<ImsEspRuntimePolicy>>>,
         shutdown: Arc<AtomicBool>,
+        health: Arc<TunGatewayHealth>,
     ) {
         let (inner_tx, mut inner_rx) = mpsc::channel::<Vec<u8>>(128);
-        spawn_tun_reader(read_file, inner_tx, Arc::clone(&shutdown));
+        spawn_tun_reader(
+            read_file,
+            inner_tx,
+            Arc::clone(&shutdown),
+            Arc::clone(&health),
+        );
 
         let outbound_transport = config.transport.clone();
         let outbound_remote = config.remote;
@@ -1144,13 +1316,14 @@ mod imp {
         let outbound_secrets = config.secrets.clone();
         let outbound_ims_esp_policy = Arc::clone(&ims_esp_policy);
         let outbound_shutdown = Arc::clone(&shutdown);
+        let outbound_health = Arc::clone(&health);
         tokio::spawn(async move {
             let mut sequence_number = 1u64;
             let mut ipv4_fragment_buffers =
                 HashMap::<(IpAddr, IpAddr, u32), Ipv4FragmentBuffer>::new();
             let mut ipv6_fragment_buffers =
                 HashMap::<(IpAddr, IpAddr, u32), Ipv6FragmentBuffer>::new();
-            while let Some(packet) = inner_rx.recv().await {
+            'forwarder: while let Some(packet) = inner_rx.recv().await {
                 if outbound_shutdown.load(Ordering::SeqCst) {
                     break;
                 }
@@ -1211,11 +1384,67 @@ mod imp {
                                 inner_packet_bytes = summary.inner_packet_bytes,
                                 "IMS ESP outbound frame sent through outer tunnel"
                             );
-                            if let Err(err) = outbound_transport
+                            let send_result = outbound_transport
                                 .send_esp_nat_t_metadata(outbound_remote, &frame)
-                                .await
-                            {
-                                warn!(reason = %err, "VoWiFi ESP outbound send failed");
+                                .await;
+                            let send_result = match send_result {
+                                Ok(metadata) => Ok(metadata),
+                                Err(first_error) => {
+                                    // A single EAGAIN/route transition is common
+                                    // while the modem is re-enumerating. Retry
+                                    // this complete protected fragment once;
+                                    // the retry reuses the same ciphertext and
+                                    // sequence number.
+                                    debug!(
+                                        channel = "esp_nat_t_udp_4500",
+                                        remote = ?outbound_remote,
+                                        frame_bytes = frame.len(),
+                                        error = %first_error,
+                                        "VoWiFi ESP outbound send failed; retrying frame"
+                                    );
+                                    tokio::time::sleep(GATEWAY_OUTBOUND_RETRY_DELAY).await;
+                                    outbound_transport
+                                        .send_esp_nat_t_metadata(outbound_remote, &frame)
+                                        .await
+                                        .map_err(|second_error| {
+                                            warn!(
+                                                channel = "esp_nat_t_udp_4500",
+                                                remote = ?outbound_remote,
+                                                frame_bytes = frame.len(),
+                                                first_error = %first_error,
+                                                error = %second_error,
+                                                "VoWiFi ESP outbound send failed after retry"
+                                            );
+                                            second_error
+                                        })
+                                }
+                            };
+                            match send_result {
+                                Ok(metadata) => {
+                                    outbound_health.record_outbound_success();
+                                    info!(
+                                        channel = metadata.channel,
+                                        remote = ?metadata.remote,
+                                        frame_bytes = metadata.bytes,
+                                        "VoWiFi ESP outbound frame delivered"
+                                    );
+                                }
+                                Err(error) => {
+                                    let failures = outbound_health.record_outbound_failure();
+                                    warn!(
+                                        channel = "esp_nat_t_udp_4500",
+                                        remote = ?outbound_remote,
+                                        frame_bytes = frame.len(),
+                                        consecutive_failures = failures,
+                                        access_lost = !outbound_health.is_healthy(),
+                                        reason = %error,
+                                        "VoWiFi ESP outbound transport failure"
+                                    );
+                                    if !outbound_health.is_healthy() {
+                                        outbound_shutdown.store(true, Ordering::SeqCst);
+                                        break 'forwarder;
+                                    }
+                                }
                             }
                         }
                         Err(err) => {
@@ -1269,6 +1498,7 @@ mod imp {
         let inbound_ims_esp_policy = Arc::clone(&ims_esp_policy);
         let writer = Arc::new(StdMutex::new(write_file));
         let inbound_shutdown = Arc::clone(&shutdown);
+        let inbound_health = Arc::clone(&health);
         tokio::spawn(async move {
             let mut replay = AntiReplayWindow::new(64);
             let mut inbound_fragment_buffers =
@@ -1278,10 +1508,24 @@ mod imp {
                     break;
                 }
                 let packet = match inbound_transport.recv_nat_t_raw_metadata().await {
-                    Ok((_remote, packet, _metadata)) => packet,
+                    Ok((_remote, packet, _metadata)) => {
+                        inbound_health.record_inbound_success();
+                        packet
+                    }
                     Err(super::super::transport::TransportError::Timeout(_)) => continue,
                     Err(err) => {
-                        warn!(reason = %err, "VoWiFi ESP inbound receive failed");
+                        let failures = inbound_health.record_inbound_failure();
+                        warn!(
+                            channel = "nat_t_udp_4500_raw",
+                            consecutive_failures = failures,
+                            access_lost = !inbound_health.is_healthy(),
+                            reason = %err,
+                            "VoWiFi ESP inbound transport failure"
+                        );
+                        if !inbound_health.is_healthy() {
+                            inbound_shutdown.store(true, Ordering::SeqCst);
+                            break;
+                        }
                         continue;
                     }
                 };
@@ -1319,9 +1563,39 @@ mod imp {
                                 continue;
                             }
                         };
-                        if let Ok(mut file) = writer.lock() {
-                            if let Err(err) = file.write_all(&inner) {
-                                warn!(reason = %err, "VoWiFi TUN inbound write failed");
+                        match writer.lock() {
+                            Ok(mut file) => {
+                                if let Err(err) = file.write_all(&inner) {
+                                    let failures = inbound_health
+                                        .record_tun_failure(TunGatewayHealthState::TunWriterLost);
+                                    warn!(
+                                        channel = "tun_inbound",
+                                        consecutive_failures = failures,
+                                        access_lost = !inbound_health.is_healthy(),
+                                        reason = %err,
+                                        "VoWiFi TUN inbound write failed"
+                                    );
+                                    if !inbound_health.is_healthy() {
+                                        inbound_shutdown.store(true, Ordering::SeqCst);
+                                        break;
+                                    }
+                                } else {
+                                    inbound_health.record_tun_success();
+                                }
+                            }
+                            Err(_) => {
+                                let failures = inbound_health
+                                    .record_tun_failure(TunGatewayHealthState::TunWriterLost);
+                                warn!(
+                                    channel = "tun_inbound",
+                                    consecutive_failures = failures,
+                                    access_lost = !inbound_health.is_healthy(),
+                                    "VoWiFi TUN inbound writer lock poisoned"
+                                );
+                                if !inbound_health.is_healthy() {
+                                    inbound_shutdown.store(true, Ordering::SeqCst);
+                                    break;
+                                }
                             }
                         }
                     }
@@ -1861,7 +2135,12 @@ mod imp {
         fragments
     }
 
-    fn spawn_tun_reader(mut file: File, tx: mpsc::Sender<Vec<u8>>, shutdown: Arc<AtomicBool>) {
+    fn spawn_tun_reader(
+        mut file: File,
+        tx: mpsc::Sender<Vec<u8>>,
+        shutdown: Arc<AtomicBool>,
+        health: Arc<TunGatewayHealth>,
+    ) {
         tokio::task::spawn_blocking(move || {
             let mut buffer = vec![0u8; 4096];
             loop {
@@ -1869,14 +2148,50 @@ mod imp {
                     break;
                 }
                 match file.read(&mut buffer) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        let failures =
+                            health.record_tun_failure(TunGatewayHealthState::TunReaderLost);
+                        health.mark_terminal(TunGatewayHealthState::TunReaderLost);
+                        warn!(
+                            channel = "tun_outbound",
+                            consecutive_failures = failures,
+                            access_lost = !health.is_healthy(),
+                            "VoWiFi TUN reader reached EOF"
+                        );
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
                     Ok(bytes) => {
+                        health.record_tun_success();
                         if tx.blocking_send(buffer[..bytes].to_vec()).is_err() {
+                            // The detached ESP forwarder has gone away.  Keep
+                            // the cache from reusing a gateway whose reader
+                            // can no longer deliver packets anywhere.
+                            health.mark_terminal(TunGatewayHealthState::TunReaderLost);
+                            shutdown.store(true, Ordering::SeqCst);
+                            warn!(
+                                channel = "tun_outbound",
+                                access_lost = !health.is_healthy(),
+                                "VoWiFi TUN reader lost its outbound forwarder"
+                            );
                             break;
                         }
                     }
                     Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+                    Err(err) => {
+                        let failures =
+                            health.record_tun_failure(TunGatewayHealthState::TunReaderLost);
+                        health.mark_terminal(TunGatewayHealthState::TunReaderLost);
+                        warn!(
+                            channel = "tun_outbound",
+                            consecutive_failures = failures,
+                            access_lost = !health.is_healthy(),
+                            reason = %err,
+                            "VoWiFi TUN reader failed"
+                        );
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
         });
@@ -1904,6 +2219,33 @@ mod imp {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn gateway_health_allows_transient_outbound_failure() {
+            let health = TunGatewayHealth::new();
+            assert_eq!(health.record_outbound_failure(), 1);
+            assert_eq!(health.record_outbound_failure(), 2);
+            assert!(health.is_healthy());
+            health.record_outbound_success();
+            assert!(health.is_healthy());
+            assert_eq!(health.access_lost_reason(), None);
+        }
+
+        #[test]
+        fn gateway_health_marks_repeated_transport_failure_terminal() {
+            let health = TunGatewayHealth::new();
+            for expected in 1..=GATEWAY_ACCESS_LOST_FAILURE_THRESHOLD {
+                assert_eq!(health.record_inbound_failure(), expected);
+            }
+            assert!(!health.is_healthy());
+            assert_eq!(
+                health.access_lost_reason(),
+                Some("vowifi_esp_inbound_transport_lost")
+            );
+            // A late packet cannot revive a gateway already being removed.
+            health.record_inbound_success();
+            assert!(!health.is_healthy());
+        }
 
         fn build_ipv4_udp_packet(payload: &[u8]) -> Vec<u8> {
             let mut packet = vec![0u8; 20 + 8 + payload.len()];
