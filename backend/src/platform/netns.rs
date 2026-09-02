@@ -729,23 +729,55 @@ pub async fn ensure_veth_pair_host_side(
     validate_link_name(ue_if)?;
     let host_cidr = format!("{host_addr}/30");
 
-    run_ip_host(
-        &[
-            "link",
-            "add",
-            host_if,
-            "type",
-            "veth",
-            "peer",
-            "name",
-            ue_if,
-            "mtu",
-            &mtu.to_string(),
-        ],
-        true,
-    )
-    .await?;
-    run_ip_host(&["link", "set", ue_if, "netns", namespace.as_str()], true).await?;
+    // `ip link add ...` with an "already exists"-style best-effort flag is
+    // not sufficient here.  It hides the important half of the failure: the
+    // host side may survive while its peer was removed from the namespace (or
+    // vice versa).  The next refresh would then keep publishing a context
+    // whose `SO_BINDTODEVICE` target can never be used.  Reconcile the pair as
+    // a pair and recreate it when only one side remains.
+    let host_exists = run_ip_host(&["link", "show", "dev", host_if], false)
+        .await
+        .is_ok();
+    let peer_exists = links_in(namespace)
+        .await
+        .map(|links| links.iter().any(|link| link == ue_if))
+        .unwrap_or(false);
+    if host_exists != peer_exists {
+        if host_exists {
+            // Deleting a veth host endpoint also deletes its peer, if the
+            // kernel still knows about one.  Ignore a concurrent teardown.
+            run_ip_host(&["link", "del", "dev", host_if], true).await?;
+        } else if peer_exists {
+            run_ip_in(namespace, &["link", "del", "dev", ue_if], true).await?;
+        }
+    }
+
+    let host_exists = run_ip_host(&["link", "show", "dev", host_if], false)
+        .await
+        .is_ok();
+    let peer_exists = links_in(namespace)
+        .await
+        .map(|links| links.iter().any(|link| link == ue_if))
+        .unwrap_or(false);
+    if !host_exists && !peer_exists {
+        run_ip_host(
+            &[
+                "link",
+                "add",
+                host_if,
+                "type",
+                "veth",
+                "peer",
+                "name",
+                ue_if,
+                "mtu",
+                &mtu.to_string(),
+            ],
+            false,
+        )
+        .await?;
+        run_ip_host(&["link", "set", ue_if, "netns", namespace.as_str()], false).await?;
+    }
     run_ip_host(&["address", "replace", &host_cidr, "dev", host_if], true).await?;
     run_ip_host(
         &["link", "set", host_if, "up", "mtu", &mtu.to_string()],

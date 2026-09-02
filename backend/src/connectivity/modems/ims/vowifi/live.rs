@@ -117,6 +117,11 @@ const DEFAULT_QMI_PROXY_SOCKET: &str = "@qmi-proxy";
 const DEFAULT_LIVE_TUN_NAME: &str = "sa_vwf0";
 const LIVE_IMS_TCP_TIMEOUT: Duration = Duration::from_secs(8);
 const LIVE_IMS_REGISTER_READ_TIMEOUT: Duration = Duration::from_secs(8);
+/// A namespace interface can briefly disappear while the UE worker and the
+/// TUN gateway are being reconciled.  Retry only that narrow socket-creation
+/// race; never fall back to a host-namespace socket or to another transport.
+const LIVE_IMS_UE_SOCKET_RETRY_ATTEMPTS: usize = 3;
+const LIVE_IMS_UE_SOCKET_RETRY_DELAY: Duration = Duration::from_millis(120);
 /// A refresh is a lease-maintenance operation, not a reason to tear down a
 /// healthy ePDG/IKE/ESP access leg after the first transient SIP failure. Keep
 /// the old access path alive for two failed refresh cycles and rebuild it only
@@ -3316,12 +3321,70 @@ fn tun_gateway_cache() -> &'static Mutex<HashMap<String, Arc<TunGatewayRuntime>>
 /// tunnel) and then checked against the profile (so a line that switched carriers
 /// rebuilds instead of reusing a stale tunnel).
 async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProfile) -> bool {
-    tun_gateway_cache()
-        .lock()
+    let Some(gateway) = tun_gateway_cache().lock().await.get(line_id).cloned() else {
+        return false;
+    };
+    if !gateway.is_for_profile(profile.meta.profile_id) {
+        return false;
+    }
+
+    // A worker restart or an unclean TUN teardown can leave the Arc cache
+    // alive while its namespace devices are gone.  Treat that entry as stale
+    // instead of trying to create a SIP socket with SO_BINDTODEVICE against a
+    // non-existent interface (errno 19 / ENODEV).  The next ESP pass will
+    // rebuild the complete access leg in the same UE namespace.
+    let Some(socket_context) = ue_socket_context_for_line(line_id) else {
+        return false;
+    };
+    let namespace = match crate::platform::netns::NetnsName::adopt(&socket_context.namespace) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            warn!(
+                line_id,
+                profile_id = profile.meta.profile_id,
+                namespace = %socket_context.namespace,
+                error = %error,
+                "VoWiFi cached UE namespace name is invalid"
+            );
+            return false;
+        }
+    };
+    let links = crate::platform::netns::links_in(&namespace)
         .await
-        .get(line_id)
-        .map(|runtime| runtime.is_for_profile(profile.meta.profile_id))
-        .unwrap_or(false)
+        .unwrap_or_default();
+    let tun_present = links.iter().any(|link| link == gateway.tun_name());
+    let veth_present = links.iter().any(|link| link == &socket_context.ue_veth);
+    let worker_present = socket_context.worker.is_running().await;
+    if tun_present && veth_present && worker_present {
+        return true;
+    }
+
+    warn!(
+        line_id,
+        profile_id = profile.meta.profile_id,
+        namespace = %socket_context.namespace,
+        tun_name = gateway.tun_name(),
+        ue_veth = %socket_context.ue_veth,
+        tun_present,
+        veth_present,
+        worker_present,
+        "Discarding stale VoWiFi UE access cache before REGISTER"
+    );
+    let removed = {
+        let mut cache = tun_gateway_cache().lock().await;
+        if cache
+            .get(line_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+        {
+            cache.remove(line_id).is_some()
+        } else {
+            false
+        }
+    };
+    if removed {
+        gateway.shutdown();
+    }
+    false
 }
 
 async fn ensure_live_tun_gateway(
@@ -3448,10 +3511,11 @@ async fn run_live_ims_register_until(
     // verify that a refresh reused the established ePDG/IKE/ESP/TUN access
     // instead of silently looking like a brand-new registration.
     let refresh_context = live_ims_refresh_context(line_id, profile).await;
+    let transport = ims_transport(profile).as_param();
     info!(
         line_id,
         profile_id = profile.meta.profile_id,
-        transport = profile.ims.transport,
+        transport,
         reused_access = refresh_context.is_some(),
         "Live ImsRegister stage check: verifying outer ESP tunnel and IMS signaling path"
     );
@@ -3459,7 +3523,7 @@ async fn run_live_ims_register_until(
         info!(
             line_id,
             profile_id = profile.meta.profile_id,
-            transport = profile.ims.transport,
+            transport,
             reused_access = true,
             previous_expires_seconds,
             previous_remaining_seconds,
@@ -3487,7 +3551,7 @@ async fn run_live_ims_register_until(
                 info!(
                     line_id,
                     profile_id = profile.meta.profile_id,
-                    transport = profile.ims.transport,
+                    transport,
                     reused_access = true,
                     expires_seconds = registered.lease.expires_seconds,
                     refresh_after_seconds = registered.lease.refresh_after.as_secs(),
@@ -6816,18 +6880,37 @@ async fn connect_sip_socket(
         }
         crate::connectivity::core::context::SipTransport::Udp => {
             let spec = UeSocketSpec::udp_connected(local, target, device);
-            match ue_socket.worker.create_socket(spec).await {
-                Ok(UeSocket::Udp(socket)) => Ok(SipChannelSocket::Udp(socket)),
-                Ok(_) => Err(live_stage_error("ims_ue_socket_family_mismatch")),
-                Err(error) => {
-                    warn!(
-                        namespace = %ue_socket.namespace,
-                        error = %error,
-                        "UE worker SIP UDP socket creation failed"
-                    );
-                    Err(live_stage_error("ims_ue_udp_socket_creation_failed"))
+            let mut last_error = None;
+            for attempt in 1..=LIVE_IMS_UE_SOCKET_RETRY_ATTEMPTS {
+                match ue_socket.worker.create_socket(spec.clone()).await {
+                    Ok(UeSocket::Udp(socket)) => return Ok(SipChannelSocket::Udp(socket)),
+                    Ok(_) => return Err(live_stage_error("ims_ue_socket_family_mismatch")),
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        let retryable = error_text.contains("No such device")
+                            || error_text.contains("not up")
+                            || error_text.contains("timed out");
+                        warn!(
+                            namespace = %ue_socket.namespace,
+                            interface = ?spec.bind_to_device,
+                            local = %local,
+                            target = %target,
+                            transport = "udp",
+                            attempt,
+                            retryable,
+                            error = %error,
+                            "UE worker SIP UDP socket creation failed"
+                        );
+                        last_error = Some(error);
+                        if !retryable || attempt == LIVE_IMS_UE_SOCKET_RETRY_ATTEMPTS {
+                            break;
+                        }
+                        tokio::time::sleep(LIVE_IMS_UE_SOCKET_RETRY_DELAY).await;
+                    }
                 }
             }
+            let _ = last_error;
+            Err(live_stage_error("ims_ue_udp_socket_creation_failed"))
         }
     }
 }
