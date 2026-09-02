@@ -746,6 +746,9 @@ pub fn readiness_key_for_stage(stage: ExecutorStage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectivity::modems::ims::vowifi::live::{
+        configure_live_profile_selection, forget_live_network_overrides, LiveSelectedProfile,
+    };
 
     #[test]
     fn noop_report_disables_all_runtime_stages() {
@@ -804,9 +807,9 @@ mod tests {
         let line_id = "executor-session-profile-test";
         let selected_profile =
             profiles::resolve_by_profile_id("gb_ee_23433").expect("test profile should resolve");
-        super::live::configure_live_profile_selection(
+        configure_live_profile_selection(
             line_id,
-            super::live::LiveSelectedProfile {
+            LiveSelectedProfile {
                 profile: selected_profile,
                 source: "test_session".to_string(),
                 fallback_reason: None,
@@ -822,7 +825,7 @@ mod tests {
         })
         .expect("active session profile should remain available");
         assert_eq!(profile.meta.profile_id, "gb_ee_23433");
-        super::live::forget_live_network_overrides(line_id);
+        forget_live_network_overrides(line_id);
     }
 
     #[tokio::test]
