@@ -124,6 +124,10 @@ const OPTIONS_PING_INTERVAL: Duration = Duration::from_secs(45);
 const OPTIONS_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const OPTIONS_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
+/// A missing refresh response does not invalidate an existing REGISTER
+/// binding. Retry over the same protected association while its lease remains
+/// valid instead of tearing down the native IMS bearer and modem session.
+const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 /// Keep two independent IMS dialogs for call waiting. A further call is
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
@@ -453,6 +457,26 @@ struct PendingOptionsPing {
     call_id: String,
     cseq: u32,
     deadline: tokio::time::Instant,
+}
+
+fn remaining_registration_lifetime(registration: &RegisteredImsContext) -> Duration {
+    let elapsed = registration.registered_at.elapsed().unwrap_or_default();
+    registration.lease.expires_after.saturating_sub(elapsed)
+}
+
+fn refresh_retry_delay(
+    registration: &RegisteredImsContext,
+    loss_reason: RegistrationLossReason,
+) -> Option<Duration> {
+    if loss_reason != RegistrationLossReason::SignalingTransportLost {
+        return None;
+    }
+    let remaining = remaining_registration_lifetime(registration);
+    (!remaining.is_zero()).then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
+}
+
+fn advance_register_cseq(current: u32, last_sent: u32) -> u32 {
+    current.max(last_sent.saturating_add(1))
 }
 
 struct RetainedFailedBearer {
@@ -2769,6 +2793,27 @@ async fn live_receive_loop(
                             loss_reason.as_str(),
                         )
                     });
+                    if let Some(retry_after) = refresh_result.retry_after {
+                        tracing::warn!(
+                            error = %error,
+                            registration_loss = loss_reason.as_str(),
+                            retry_after_seconds = retry_after.as_secs(),
+                            "VoLTE REGISTER refresh received no response; retaining the live bearer and registration"
+                        );
+                        runtime
+                            .update(|state| {
+                                state.phase = VoltePhase::Registered;
+                                state.stage = VolteStage::Registered;
+                                state.last_error = Some(format!(
+                                    "volte_register_refresh_retry:{}",
+                                    loss_reason.as_str()
+                                ));
+                                state.last_failure_at = Some(now());
+                            })
+                            .await;
+                        refresh_at = tokio::time::Instant::now() + retry_after;
+                        continue;
+                    }
                     tracing::warn!(
                         error = %error,
                         registration_loss = loss_reason.as_str(),
@@ -2981,19 +3026,18 @@ async fn refresh_live_registration(
         .expires_seconds
         .max(session.profile.ims.register.expires_seconds);
     // Refresh first retries the exact shape that registered, then drops PANI
-    // and finally the Route header. A P-CSCF whose expectations changed, or a
-    // refresh exchange disturbed by an unrelated frame, gets two cheap shape
-    // corrections before the access leg is rebuilt and the whole session
-    // restarts. The retries reuse the protected channel and keep the lease.
+    // and finally the Route header only after a complete SIP status explicitly
+    // permits interoperability fallback. A missing response is a transport
+    // condition, not evidence that changing headers will help.
     let candidates = [
         session.register_variant,
         session.register_variant.without_access_network_info(),
         session.register_variant.without_route_header(),
     ];
     let mut last_failure: Option<(VolteRegisterVariant, RegisterFailure)> = None;
-    for (round, variant) in candidates.into_iter().enumerate() {
+    for variant in candidates {
         let mut ids = session.register_ids.clone();
-        ids.cseq = session.next_register_cseq.saturating_add(round as u32);
+        ids.cseq = session.next_register_cseq;
         let security_verify = session.channel.security_verify().map(str::to_string);
         let security_client = security_verify.as_ref().map(|_| {
             variant
@@ -3055,17 +3099,28 @@ async fn refresh_live_registration(
             session.xfrm_worker.clone(),
         )
         .with_expires_seconds(refresh_expires);
-        let registration =
-            match run_register_observed(&mut session.channel, &initial, &mut authenticator).await {
-                Ok(registration) => registration,
-                Err(failure) => {
-                    log_volte_register_failure_metadata(variant, &failure, Some(&initial));
-                    last_failure = Some((variant, failure));
+        let registration_result =
+            run_register_observed(&mut session.channel, &initial, &mut authenticator).await;
+        // RFC 3261 requires monotonically increasing REGISTER CSeq values for
+        // one Call-ID. A timeout still consumed the emitted CSeq.
+        session.next_register_cseq =
+            advance_register_cseq(session.next_register_cseq, authenticator.last_cseq);
+        let registration = match registration_result {
+            Ok(registration) => registration,
+            Err(failure) => {
+                log_volte_register_failure_metadata(variant, &failure, Some(&initial));
+                let retry_variant = failure
+                    .response
+                    .as_deref()
+                    .and_then(|response| sip::parse_status(response).ok())
+                    .is_some_and(status_permits_register_variant_fallback);
+                last_failure = Some((variant, failure));
+                if retry_variant {
                     continue;
                 }
-            };
-
-        session.next_register_cseq = authenticator.last_cseq.saturating_add(1);
+                break;
+            }
+        };
         // Remember the shape that refreshed so later refreshes do not repeat a
         // rejected form; the session still carries the successfully bound one.
         if session.register_variant != variant {
@@ -3129,6 +3184,7 @@ async fn refresh_live_registration(
         return VolteRefreshAttempt {
             outcome: RegistrationRefreshResult::Refreshed(registered),
             error: None,
+            retry_after: None,
         };
     }
 
@@ -3147,12 +3203,14 @@ async fn refresh_live_registration(
     VolteRefreshAttempt {
         outcome: RegistrationRefreshResult::RebuildAccess(loss_reason),
         error: Some(error),
+        retry_after: refresh_retry_delay(&session.registration, loss_reason),
     }
 }
 
 struct VolteRefreshAttempt {
     outcome: RegistrationRefreshResult,
     error: Option<VolteError>,
+    retry_after: Option<Duration>,
 }
 
 async fn cleanup_live_session(live: &VolteLiveHandle) {
@@ -6552,6 +6610,43 @@ mod tests {
     use super::*;
     use crate::connectivity::core::voice::MediaDirection;
     use crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+
+    #[test]
+    fn refresh_transport_timeout_retains_unexpired_registration() {
+        let mut registration = RegisteredImsContext::from_response(
+            ImsRegistrationAccess::Volte,
+            b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
+            60,
+        );
+        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(10);
+        assert_eq!(
+            refresh_retry_delay(
+                &registration,
+                RegistrationLossReason::SignalingTransportLost
+            ),
+            Some(REGISTER_REFRESH_RETRY_INTERVAL)
+        );
+
+        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(61);
+        assert_eq!(
+            refresh_retry_delay(
+                &registration,
+                RegistrationLossReason::SignalingTransportLost
+            ),
+            None
+        );
+        assert_eq!(
+            refresh_retry_delay(&registration, RegistrationLossReason::NetworkRejected),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_cseq_advances_even_after_an_unanswered_request() {
+        assert_eq!(advance_register_cseq(42, 42), 43);
+        assert_eq!(advance_register_cseq(43, 42), 43);
+        assert_eq!(advance_register_cseq(u32::MAX, u32::MAX), u32::MAX);
+    }
 
     #[tokio::test]
     async fn profile_switch_aborts_listener_and_releases_line_scoped_registration() {

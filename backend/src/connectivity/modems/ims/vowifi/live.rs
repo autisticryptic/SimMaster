@@ -132,7 +132,6 @@ pub(crate) const LIVE_IMS_REFRESH_REBUILD_FAILURES: u8 = 3;
 /// the whole registration sweep.
 const LIVE_IMS_REGISTER_CANDIDATE_READ_TIMEOUT: Duration = Duration::from_secs(4);
 const LIVE_IMS_REGISTER_DEFAULT_TTL: Duration = Duration::from_secs(300);
-const LIVE_IMS_REGISTER_MAX_TTL: Duration = Duration::from_secs(3600);
 /// Global bound for static and response-driven REGISTER shapes on one P-CSCF.
 /// The dynamic ladder is monotonic, but the cap remains a safety valve against
 /// future carrier-specific candidates accidentally creating a retry cycle.
@@ -156,7 +155,7 @@ const ENV_IMS_SECURITY_PORT_S: &str = "SIMADMIN_VOWIFI_IMS_SECURITY_PORT_S";
 /// at once. A single shared slot would let the second line evict the first one's
 /// gateway while its tunnel was still in use.
 static LIVE_TUN_GATEWAY: OnceLock<Mutex<HashMap<String, Arc<TunGatewayRuntime>>>> = OnceLock::new();
-// The four IMS session caches below are keyed by `line_id`.
+// The IMS session caches below are keyed by `line_id`.
 //
 // They were single slots, which broke on a multi-SIM host: two lines on the same
 // carrier profile shared one entry (and one TTL), and two lines on different
@@ -1197,7 +1196,6 @@ struct LiveImsRegisterReady {
 #[derive(Debug, Clone)]
 struct LiveImsSecurityVerify {
     profile_id: &'static str,
-    expires_at: Instant,
     value: String,
 }
 
@@ -1253,9 +1251,8 @@ struct LiveImsRegisterSuccessVariant {
     profile_address: usize,
     /// Cache the full response-driven shape rather than only its label. Dynamic
     /// variants do not exist in the static candidate table and otherwise cannot
-    /// be preferred during refresh or a reconnect.
+    /// be reused during refresh.
     variant: LiveRegisterHeaderVariant,
-    captured_at: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3531,7 +3528,9 @@ async fn run_live_ims_register_until(
         );
     }
 
-    let attempt = attempt_live_ims_registration(line_id, profile, access_network).await;
+    let attempt =
+        attempt_live_ims_registration(line_id, profile, access_network, refresh_context.is_some())
+            .await;
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
         Err(error) => {
@@ -3623,6 +3622,7 @@ async fn attempt_live_ims_registration(
     line_id: &str,
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
+    reuse_registered_shape: bool,
 ) -> Result<RegisteredImsContext, LiveStageError> {
     info!("Live ImsRegister stage check: verifying outer ESP tunnel and IMS signaling path...");
     run_live_esp_until(line_id, profile, access_network)
@@ -3635,8 +3635,14 @@ async fn attempt_live_ims_registration(
         .map_err(|error| {
             error.with_registration_loss(RegistrationLossReason::AccessTransportLost)
         })?;
-    let response =
-        run_register_exchange_over_tunnel(line_id, profile, &gateway, access_network).await?;
+    let response = run_register_exchange_over_tunnel(
+        line_id,
+        profile,
+        &gateway,
+        access_network,
+        reuse_registered_shape,
+    )
+    .await?;
     let parsed = ims::parse_sip_response(&response, &live_ims_target(line_id, profile).realm)
         .map_err(|_| {
             live_registration_error(
@@ -4219,7 +4225,6 @@ async fn record_live_ims_security_verify(
     line_id: &str,
     profile: &'static CarrierProfile,
     security_verify: Option<&str>,
-    registration: &RegisteredImsContext,
 ) {
     let Some(value) = security_verify.filter(|value| !value.trim().is_empty()) else {
         return;
@@ -4228,7 +4233,6 @@ async fn record_live_ims_security_verify(
         line_id.to_string(),
         LiveImsSecurityVerify {
             profile_id: profile.meta.profile_id,
-            expires_at: Instant::now() + registration.lease.refresh_after,
             value: value.to_string(),
         },
     );
@@ -4243,7 +4247,6 @@ async fn cached_live_ims_security_verify(
         .await
         .get(line_id)
         .filter(|ready| ready.profile_id == profile.meta.profile_id)
-        .filter(|ready| ready.expires_at > Instant::now())
         .map(|ready| ready.value.clone())
 }
 
@@ -4538,6 +4541,7 @@ async fn run_register_exchange_over_tunnel(
     profile: &'static CarrierProfile,
     gateway: &TunGatewayRuntime,
     access_network: &ImsAccessNetworkRuntime,
+    reuse_registered_shape: bool,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
     for pcscf_addr in register_pcscf_candidates(gateway) {
@@ -4547,6 +4551,7 @@ async fn run_register_exchange_over_tunnel(
             gateway,
             pcscf_addr,
             access_network,
+            reuse_registered_shape,
         )
         .await
         {
@@ -4583,10 +4588,12 @@ async fn run_register_exchange_with_pcscf(
     gateway: &TunGatewayRuntime,
     pcscf_addr: IpAddr,
     access_network: &ImsAccessNetworkRuntime,
+    reuse_registered_shape: bool,
 ) -> Result<String, LiveStageError> {
     let mut last_error = None;
     let mut attempt_count = 0usize;
-    let variants = live_register_header_variants_for_attempt(line_id, profile).await;
+    let variants =
+        live_register_header_variants_for_attempt(line_id, profile, reuse_registered_shape).await;
     for base_variant in variants {
         let mut variant = base_variant;
         loop {
@@ -4644,6 +4651,14 @@ async fn run_register_exchange_with_pcscf(
                     // response-driven upgrade cannot be cleared by another shape
                     // or P-CSCF; stop the whole ladder instead of exhausting it.
                     if live_register_error_is_terminal(&err) {
+                        return Err(err);
+                    }
+                    if reuse_registered_shape {
+                        // A missing/transport response during refresh does not
+                        // prove that the already accepted REGISTER shape became
+                        // invalid. Keep that session shape and let the caller
+                        // retry the same form or another P-CSCF instead of
+                        // restarting the initial discovery ladder.
                         return Err(err);
                     }
                     last_error = Some(err);
@@ -4898,6 +4913,7 @@ fn live_register_header_variants(
 async fn live_register_header_variants_for_attempt(
     line_id: &str,
     profile: &'static CarrierProfile,
+    reuse_registered_shape: bool,
 ) -> Vec<LiveRegisterHeaderVariant> {
     let variants = live_register_header_variants(profile);
     let cached = ims_register_variant_cache()
@@ -4908,7 +4924,6 @@ async fn live_register_header_variants_for_attempt(
     let Some(cached) = cached.filter(|cached| {
         cached.profile_id == profile.meta.profile_id
             && cached.profile_address == profile as *const CarrierProfile as usize
-            && cached.captured_at.elapsed() <= LIVE_IMS_REGISTER_MAX_TTL
     }) else {
         return variants;
     };
@@ -4921,8 +4936,17 @@ async fn live_register_header_variants_for_attempt(
         return variants;
     }
     let mut ordered = Vec::with_capacity(variants.len() + 1);
-    ordered.push(exact);
-    ordered.push(success);
+    if reuse_registered_shape {
+        // A refresh belongs to the same IMS REGISTER lifecycle. Reuse the full
+        // response-driven shape that succeeded instead of replaying the
+        // discovery ladder. The cache is cleared with the IMS session, so a
+        // real disconnect or process restart derives the shape again.
+        ordered.push(success);
+        ordered.push(exact);
+    } else {
+        ordered.push(exact);
+        ordered.push(success);
+    }
     ordered.extend(
         variants
             .iter()
@@ -4943,7 +4967,6 @@ async fn record_live_ims_register_success_variant(
             profile_id: profile.meta.profile_id,
             profile_address: profile as *const CarrierProfile as usize,
             variant,
-            captured_at: Instant::now(),
         },
     );
 }
@@ -5838,13 +5861,7 @@ async fn run_protected_authenticated_register_candidates(
                                 response.as_bytes(),
                             ),
                         );
-                        record_live_ims_security_verify(
-                            line_id,
-                            profile,
-                            security_verify,
-                            &registered,
-                        )
-                        .await;
+                        record_live_ims_security_verify(line_id, profile, security_verify).await;
                         record_live_ims_channel(
                             line_id,
                             profile,
@@ -12107,7 +12124,7 @@ mod tests {
         record_live_ims_register_success_variant(line_a, &GB_EE_23433, success).await;
         record_live_ims_register_success_variant(line_b, &GB_EE_23433, success).await;
         clear_live_runtime_for_line(line_a).await;
-        let variants = live_register_header_variants_for_attempt(line_b, &GB_EE_23433).await;
+        let variants = live_register_header_variants_for_attempt(line_b, &GB_EE_23433, false).await;
 
         assert_eq!(
             variants.first().map(|variant| variant.label),
@@ -12155,7 +12172,7 @@ mod tests {
             .expect("cumulative empty-AKA upgrade");
         record_live_ims_register_success_variant(line_id, profile, success).await;
 
-        let variants = live_register_header_variants_for_attempt(line_id, profile).await;
+        let variants = live_register_header_variants_for_attempt(line_id, profile, false).await;
         assert_eq!(
             variants.first().map(|variant| variant.label),
             Some(base.label)
@@ -12176,11 +12193,22 @@ mod tests {
             live_register_header_variants(profile).len() + 1
         );
 
+        let refresh_variants =
+            live_register_header_variants_for_attempt(line_id, profile, true).await;
+        assert_eq!(
+            refresh_variants.first().map(|variant| variant.label),
+            Some(success.label)
+        );
+        assert_eq!(
+            refresh_variants.get(1).map(|variant| variant.label),
+            Some(base.label)
+        );
+
         // Reusing a profile ID after a database edit must not replay a request
         // shape captured from the previous immutable profile object.
         let reloaded_profile = Box::leak(Box::new(*profile));
         let after_reload =
-            live_register_header_variants_for_attempt(line_id, reloaded_profile).await;
+            live_register_header_variants_for_attempt(line_id, reloaded_profile, true).await;
         assert_eq!(
             after_reload.len(),
             live_register_header_variants(reloaded_profile).len()

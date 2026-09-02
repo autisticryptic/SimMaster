@@ -173,6 +173,33 @@ source-backed item-by-item comparison and tests for any safe gap found.
   概述页 SIM/设备信息每 10 秒单飞刷新。手动号码仍按设计保留。等待 CI 与
   410 多 profile 切换验证后勾选。
 
+### 6. 最新版本 VoLTE 自然续期回归修复
+
+2026-09-02 14:45 CST 的实机日志确认，`f55a2f2` 虽然准时发送了 VoLTE
+REGISTER refresh，但受保护通道只监听 `port_us`，没有监听 UE 发起事务所用
+的 `port_uc`。三个请求在 24 秒内均被误判为无响应，随后代码立即释放 native
+IMS bearer，导致 modem 78→79→80 重枚举，并连带中断仍然正常的 VoWiFi。
+14:47 CST 的 VoLTE 恢复属于完整重建后的重新注册，不是合格的自然续期。
+
+- [x] 受保护 VoLTE SIP channel 同时监听 client/send socket (`port_uc`) 与
+  server/receive socket (`port_us`)，并记录实际收包路径。
+- [x] 补充双端口回归测试：终结侧请求从 `port_us` 接收，REGISTER 响应从
+  `port_uc` 接收。
+- [x] 无完整 SIP 响应时停止请求头形状回退；只有收到允许兼容性回退的明确
+  SIP 状态后才尝试无 PANI/无 Route 变体。
+- [x] 每次实际发出 refresh REGISTER 后推进 CSeq，即使本次响应超时。
+- [x] 原 REGISTER 租期尚未耗尽时，信令超时保留现有 bearer、XFRM、worker
+  与 registered 状态，并在 15 秒后通过同一访问链路重试。
+- [x] VoLTE 与 VoWiFi 都按当前 IMS 注册会话保留最终成功的 REGISTER
+  请求形态；自然续期优先复用，不重新从派生候选梯子的默认项开始。VoWiFi
+  同时把 `Security-Verify` 保留到会话结束，不再按刷新截止时间单独过期。
+  用户关闭、IMS 会话清理或进程/设备重启后缓存失效，下次重新派生；不写入
+  数据库，因此不存在持久化缓存无限增长问题。
+- [ ] GitHub Actions 测试编译、ARM64、AMD64 与 Release 构建通过。
+- [ ] SCP 部署新 ARM64 产物到 410，确认初始 VoLTE/VoWiFi 注册成功。
+- [ ] 等待一次完整自然续期，确认 VoLTE 返回 200 OK、续期计数增加，且 modem
+  ID、native bearer、UE worker 与 VoWiFi 会话均未被重建或中断。
+
 ## 当前结论
 
 Vodafone Germany 的初始 VoWiFi/VoLTE 注册、连续 UDP refresh、缺失 TUN

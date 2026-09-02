@@ -301,19 +301,59 @@ impl VolteSipChannel {
     }
 
     async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
-        let mut frame = vec![0u8; MAX_SIP_DATAGRAM];
-        let socket = self
-            .receive_socket
-            .as_ref()
-            .or(self.send_socket.as_ref())
-            .ok_or_else(|| ImsError::new("volte_channel_receive_socket_missing"))?;
-        let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
-            .await
-            .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
-            .map_err(|_| ImsError::new("volte_channel_read_failed"))?;
-        frame.truncate(read);
-        Ok(frame)
+        match (self.receive_socket.as_ref(), self.send_socket.as_ref()) {
+            (Some(receive), Some(send)) => recv_protected(receive, send, timeout).await,
+            (Some(socket), None) | (None, Some(socket)) => recv_one(socket, timeout).await,
+            (None, None) => Err(ImsError::new("volte_channel_receive_socket_missing")),
+        }
     }
+}
+
+async fn recv_one(socket: &UdpSocket, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+    let mut frame = vec![0u8; MAX_SIP_DATAGRAM];
+    let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
+        .await
+        .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
+        .map_err(|_| ImsError::new("volte_channel_read_failed"))?;
+    frame.truncate(read);
+    Ok(frame)
+}
+
+/// A protected IMS association has two receive-capable tuples. Responses to
+/// UE-originated transactions can return to the client/send port, while
+/// terminating requests arrive on the server/receive port.
+async fn recv_protected(
+    receive_socket: &UdpSocket,
+    send_socket: &UdpSocket,
+    timeout: Duration,
+) -> Result<Vec<u8>, ImsError> {
+    let mut receive_frame = vec![0u8; MAX_SIP_DATAGRAM];
+    let mut send_frame = vec![0u8; MAX_SIP_DATAGRAM];
+    let (read, from_server) = tokio::time::timeout(timeout, async {
+        tokio::select! {
+            read = receive_socket.recv(&mut receive_frame) => {
+                (read, true)
+            }
+            read = send_socket.recv(&mut send_frame) => {
+                (read, false)
+            }
+        }
+    })
+    .await
+    .map_err(|_| ImsError::new("volte_channel_read_timeout"))?;
+    let read = read.map_err(|_| ImsError::new("volte_channel_read_failed"))?;
+    let (mut frame, receive_path) = if from_server {
+        (receive_frame, "protected_server")
+    } else {
+        (send_frame, "protected_client")
+    };
+    frame.truncate(read);
+    tracing::debug!(
+        receive_path,
+        frame_bytes = read,
+        "VoLTE protected SIP frame received"
+    );
+    Ok(frame)
 }
 
 impl ImsChannel for VolteSipChannel {
@@ -517,11 +557,19 @@ mod tests {
         assert_eq!(peer, local_send);
 
         pcscf_send
-            .send_to(b"protected response", local_receive)
+            .send_to(b"protected incoming request", local_receive)
+            .await
+            .unwrap();
+        let incoming = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+        assert_eq!(incoming, b"protected incoming request");
+
+        // Responses to UE-originated transactions return to port_uc.
+        pcscf_client
+            .send_to(b"protected register response", local_send)
             .await
             .unwrap();
         let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
-        assert_eq!(response, b"protected response");
+        assert_eq!(response, b"protected register response");
     }
 
     #[tokio::test]
