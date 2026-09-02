@@ -3566,7 +3566,7 @@ async fn run_live_ims_register_until(
                 warn!(
                     line_id,
                     profile_id = profile.meta.profile_id,
-                    transport = profile.ims.transport,
+                    transport,
                     reused_access = true,
                     registration_loss = loss_reason.as_str(),
                     "VoWiFi IMS REGISTER refresh failed"
