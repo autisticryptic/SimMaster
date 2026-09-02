@@ -7021,8 +7021,15 @@ async fn select_vowifi_profile_candidate(
         scope.line_id(),
         &identity.imsi,
     );
+    let legacy_pinned_profile_id =
+        crate::connectivity::modems::ims::vowifi::live::line_pinned_profile_id(scope.line_id());
     let resolved = profile_store(app)
-        .resolve_vowifi_candidate(candidate, &imsi, Some(&identity.operator_id))?
+        .resolve_vowifi_candidate(
+            candidate,
+            legacy_pinned_profile_id.as_deref(),
+            &imsi,
+            Some(&identity.operator_id),
+        )?
         .ok_or_else(|| format!("vowifi_profile_not_resolved:{}", candidate.source.as_str()))?;
     crate::connectivity::modems::ims::vowifi::live::configure_live_profile_selection(
         scope.line_id(),

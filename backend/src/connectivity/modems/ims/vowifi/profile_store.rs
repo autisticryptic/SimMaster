@@ -8,9 +8,9 @@
 //!
 //! Automatic matching may use a clearly marked, conservative 3GPP-derived
 //! fallback when neither source has a usable access profile. Legacy generic
-//! profile-resolution APIs keep explicit pins strict; the per-line VoLTE
-//! candidate API deliberately falls back inside the same logical slot when a
-//! previously selected source row disappears or loses its LTE projection.
+//! profile-resolution APIs keep explicit pins strict; the per-line VoLTE and
+//! VoWiFi candidate APIs deliberately share one access-aware fallback ladder
+//! when a previously selected source row disappears or loses its projection.
 
 use std::{collections::BTreeMap, sync::Arc};
 
@@ -595,6 +595,9 @@ impl ProfileStore {
             let mut resolver_matches = Vec::new();
             let custom_records = self.custom_records()?.valid;
             for (_, record) in &custom_records {
+                if !custom_profile_ready_for_access(record, CatalogAccessKind::WifiEpdg) {
+                    continue;
+                }
                 let profile = record.intern();
                 all_profiles.insert(record.meta.profile_id.clone(), profile);
                 resolver_matches.push((record.meta.plmn.clone(), profile));
@@ -629,6 +632,9 @@ impl ProfileStore {
                 resolver_matches,
                 custom_records
                     .into_iter()
+                    .filter(|(_, record)| {
+                        custom_profile_ready_for_access(record, CatalogAccessKind::WifiEpdg)
+                    })
                     .map(|(_, record)| record.meta.plmn)
                     .collect::<std::collections::HashSet<_>>(),
             ))
@@ -666,11 +672,10 @@ impl ProfileStore {
         let plmn = format!("{mcc}{mnc}");
         match self.custom_records() {
             Ok(records) => {
-                if let Some((_, record)) = records
-                    .valid
-                    .into_iter()
-                    .find(|(_, record)| record.meta.plmn == plmn)
-                {
+                if let Some((_, record)) = records.valid.into_iter().find(|(_, record)| {
+                    record.meta.plmn == plmn
+                        && custom_profile_ready_for_access(record, CatalogAccessKind::WifiEpdg)
+                }) {
                     return Some(ResolvedProfile {
                         profile: record.intern(),
                         origin: ProfileOrigin::Database,
@@ -720,11 +725,38 @@ impl ProfileStore {
         imsi: &str,
         home_plmn: Option<&str>,
     ) -> Result<Option<ResolvedProfile>, String> {
+        self.resolve_profile_candidate(
+            candidate,
+            legacy_pinned_profile_id,
+            imsi,
+            home_plmn,
+            CatalogAccessKind::LteEpc,
+        )
+    }
+
+    /// Shared database/catalog/derived resolver for both IMS access legs.
+    ///
+    /// Keeping the source ladder here is important: after an ePDG tunnel is
+    /// established, VoWiFi performs the same IMS registration as VoLTE, but
+    /// it must use the Wi-Fi projection and must never accept an IMS-only
+    /// custom record whose `vowifi_enabled` gate is off.
+    fn resolve_profile_candidate(
+        &self,
+        candidate: &VolteProfileCandidate,
+        legacy_pinned_profile_id: Option<&str>,
+        imsi: &str,
+        home_plmn: Option<&str>,
+        access: CatalogAccessKind,
+    ) -> Result<Option<ResolvedProfile>, String> {
         let digits = imsi.trim();
         let explicit_home_plmn = normalized_home_plmn(digits, home_plmn);
         let inferred_home_plmn = explicit_home_plmn
             .clone()
             .or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
+        let service = match access {
+            CatalogAccessKind::LteEpc => "volte",
+            CatalogAccessKind::WifiEpdg => "vowifi",
+        };
         let source = candidate.source;
         let explicit_profile_id = candidate
             .profile_id
@@ -743,216 +775,15 @@ impl ProfileStore {
                         return Ok(derive_standard_fallback(
                             digits,
                             inferred_home_plmn.as_deref(),
-                            CatalogAccessKind::LteEpc,
-                            format!("volte_profile_database_lookup_failed:{error}"),
-                        ));
-                    }
-                };
-                if let Some(profile_id) = explicit_profile_id {
-                    if let Some((_, record)) = records
-                        .valid
-                        .iter()
-                        .find(|(_, record)| record.meta.profile_id == profile_id)
-                    {
-                        return Ok(Some(ResolvedProfile {
-                            profile: record.clone().intern(),
-                            origin: ProfileOrigin::Database,
-                            fallback_reason: None,
-                        }));
-                    }
-                    let reason = records
-                        .invalid
-                        .iter()
-                        .find(|invalid| invalid.entry.profile_id == profile_id)
-                        .map(|invalid| invalid.error.clone())
-                        .unwrap_or_else(|| {
-                            format!("volte_profile_database_profile_not_found:{profile_id}")
-                        });
-                    return Ok(derive_standard_fallback(
-                        digits,
-                        inferred_home_plmn.as_deref(),
-                        CatalogAccessKind::LteEpc,
-                        reason,
-                    ));
-                }
-                if let Some(profile_id) = legacy_profile_id {
-                    if let Some((_, record)) = records
-                        .valid
-                        .iter()
-                        .find(|(_, record)| record.meta.profile_id == profile_id)
-                    {
-                        return Ok(Some(ResolvedProfile {
-                            profile: record.clone().intern(),
-                            origin: ProfileOrigin::Database,
-                            fallback_reason: None,
-                        }));
-                    }
-                }
-                let mut matches = records
-                    .valid
-                    .into_iter()
-                    .filter(|(_, record)| {
-                        explicit_home_plmn.as_deref().map_or_else(
-                            || digits.starts_with(&record.meta.plmn),
-                            |plmn| record.meta.plmn == plmn,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                matches.sort_by(|left, right| {
-                    right
-                        .1
-                        .meta
-                        .plmn
-                        .len()
-                        .cmp(&left.1.meta.plmn.len())
-                        .then(left.1.meta.profile_id.cmp(&right.1.meta.profile_id))
-                });
-                matches
-                    .into_iter()
-                    .next()
-                    .map(|(_, record)| ResolvedProfile {
-                        profile: record.intern(),
-                        origin: ProfileOrigin::Database,
-                        fallback_reason: None,
-                    })
-            }
-            VolteProfileSource::CarrierCatalog => {
-                if let Some(profile_id) = explicit_profile_id {
-                    match self.catalog.get(profile_id, CatalogAccessKind::LteEpc) {
-                        Ok(Some(profile)) => {
-                            return Ok(Some(ResolvedProfile {
-                                profile: profile.record.intern(),
-                                origin: ProfileOrigin::Catalog,
-                                fallback_reason: None,
-                            }));
-                        }
-                        Ok(None) => {
-                            return Ok(derive_standard_fallback(
-                                digits,
-                                inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::LteEpc,
-                                format!(
-                                    "volte_profile_carrier_catalog_profile_not_found:{profile_id}"
-                                ),
-                            ));
-                        }
-                        Err(error) => {
-                            return Ok(derive_standard_fallback(
-                                digits,
-                                inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::LteEpc,
-                                format!(
-                                    "volte_profile_carrier_catalog_profile_lookup_failed:{profile_id}:{error}"
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if let Some(profile_id) = legacy_profile_id {
-                    if let Ok(Some(profile)) =
-                        self.catalog.get(profile_id, CatalogAccessKind::LteEpc)
-                    {
-                        return Ok(Some(ResolvedProfile {
-                            profile: profile.record.intern(),
-                            origin: ProfileOrigin::Catalog,
-                            fallback_reason: None,
-                        }));
-                    }
-                }
-                match self.catalog.imsi_has_ambiguous_plmn(digits) {
-                    Ok(true) if inferred_home_plmn.is_none() => None,
-                    Ok(_) => match self.catalog.resolve_for_imsi(
-                        digits,
-                        inferred_home_plmn.as_deref(),
-                        CatalogAccessKind::LteEpc,
-                    ) {
-                        Ok(profile) => profile.map(|profile| ResolvedProfile {
-                            profile: profile.record.intern(),
-                            origin: ProfileOrigin::Catalog,
-                            fallback_reason: None,
-                        }),
-                        Err(error) => {
-                            return Ok(derive_standard_fallback(
-                                digits,
-                                inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::LteEpc,
-                                error,
-                            ));
-                        }
-                    },
-                    Err(error) => {
-                        return Ok(derive_standard_fallback(
-                            digits,
-                            inferred_home_plmn.as_deref(),
-                            CatalogAccessKind::LteEpc,
-                            error,
-                        ));
-                    }
-                }
-            }
-            VolteProfileSource::Derived => {
-                return Ok(derive_standard_fallback(
-                    digits,
-                    inferred_home_plmn.as_deref(),
-                    CatalogAccessKind::LteEpc,
-                    "volte_profile_derived_requested".to_string(),
-                )
-                .map(|mut resolved| {
-                    resolved.fallback_reason = None;
-                    resolved
-                }));
-            }
-        };
-
-        if let Some(resolved) = requested {
-            return Ok(Some(resolved));
-        }
-        Ok(derive_standard_fallback(
-            digits,
-            inferred_home_plmn.as_deref(),
-            CatalogAccessKind::LteEpc,
-            format!("volte_profile_source_unavailable:{}", source.as_str()),
-        ))
-    }
-
-    /// Resolve one source-constrained VoWiFi candidate. Each logical slot is
-    /// independent: an unavailable database/catalog source falls back to the
-    /// standard Wi-Fi/ePDG profile for that slot, matching the VoLTE recovery
-    /// contract without crossing into the other stored source.
-    pub fn resolve_vowifi_candidate(
-        &self,
-        candidate: &VolteProfileCandidate,
-        imsi: &str,
-        home_plmn: Option<&str>,
-    ) -> Result<Option<ResolvedProfile>, String> {
-        let digits = imsi.trim();
-        let explicit_home_plmn = normalized_home_plmn(digits, home_plmn);
-        let inferred_home_plmn = explicit_home_plmn
-            .clone()
-            .or_else(|| self.catalog.infer_home_plmn(digits).ok().flatten());
-        let source = candidate.source;
-        let explicit_profile_id = candidate
-            .profile_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|profile_id| !profile_id.is_empty());
-
-        let requested = match source {
-            VolteProfileSource::Database => {
-                let records = match self.custom_records() {
-                    Ok(records) => records,
-                    Err(error) => {
-                        return Ok(derive_standard_fallback(
-                            digits,
-                            inferred_home_plmn.as_deref(),
-                            CatalogAccessKind::WifiEpdg,
-                            format!("vowifi_profile_database_lookup_failed:{error}"),
+                            access,
+                            format!("{service}_profile_database_lookup_failed:{error}"),
                         ));
                     }
                 };
                 if let Some(profile_id) = explicit_profile_id {
                     if let Some((_, record)) = records.valid.iter().find(|(_, record)| {
-                        record.meta.profile_id == profile_id && record.voice.vowifi_enabled
+                        record.meta.profile_id == profile_id
+                            && custom_profile_ready_for_access(record, access)
                     }) {
                         return Ok(Some(ResolvedProfile {
                             profile: record.clone().intern(),
@@ -966,20 +797,37 @@ impl ProfileStore {
                         .find(|invalid| invalid.entry.profile_id == profile_id)
                         .map(|invalid| invalid.error.clone())
                         .unwrap_or_else(|| {
-                            format!("vowifi_profile_database_profile_not_ready:{profile_id}")
+                            let state = if access == CatalogAccessKind::WifiEpdg {
+                                "not_ready"
+                            } else {
+                                "not_found"
+                            };
+                            format!("{service}_profile_database_profile_{state}:{profile_id}")
                         });
                     return Ok(derive_standard_fallback(
                         digits,
                         inferred_home_plmn.as_deref(),
-                        CatalogAccessKind::WifiEpdg,
+                        access,
                         reason,
                     ));
+                }
+                if let Some(profile_id) = legacy_profile_id {
+                    if let Some((_, record)) = records.valid.iter().find(|(_, record)| {
+                        record.meta.profile_id == profile_id
+                            && custom_profile_ready_for_access(record, access)
+                    }) {
+                        return Ok(Some(ResolvedProfile {
+                            profile: record.clone().intern(),
+                            origin: ProfileOrigin::Database,
+                            fallback_reason: None,
+                        }));
+                    }
                 }
                 let mut matches = records
                     .valid
                     .into_iter()
                     .filter(|(_, record)| {
-                        record.voice.vowifi_enabled
+                        custom_profile_ready_for_access(record, access)
                             && explicit_home_plmn.as_deref().map_or_else(
                                 || digits.starts_with(&record.meta.plmn),
                                 |plmn| record.meta.plmn == plmn,
@@ -1006,7 +854,7 @@ impl ProfileStore {
             }
             VolteProfileSource::CarrierCatalog => {
                 if let Some(profile_id) = explicit_profile_id {
-                    match self.catalog.get(profile_id, CatalogAccessKind::WifiEpdg) {
+                    match self.catalog.get(profile_id, access) {
                         Ok(Some(profile)) => {
                             return Ok(Some(ResolvedProfile {
                                 profile: profile.record.intern(),
@@ -1018,9 +866,9 @@ impl ProfileStore {
                             return Ok(derive_standard_fallback(
                                 digits,
                                 inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::WifiEpdg,
+                                access,
                                 format!(
-                                    "vowifi_profile_carrier_catalog_profile_not_found:{profile_id}"
+                                    "{service}_profile_carrier_catalog_profile_not_found:{profile_id}"
                                 ),
                             ));
                         }
@@ -1028,12 +876,21 @@ impl ProfileStore {
                             return Ok(derive_standard_fallback(
                                 digits,
                                 inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::WifiEpdg,
+                                access,
                                 format!(
-                                    "vowifi_profile_carrier_catalog_profile_lookup_failed:{profile_id}:{error}"
+                                    "{service}_profile_carrier_catalog_profile_lookup_failed:{profile_id}:{error}"
                                 ),
                             ));
                         }
+                    }
+                }
+                if let Some(profile_id) = legacy_profile_id {
+                    if let Ok(Some(profile)) = self.catalog.get(profile_id, access) {
+                        return Ok(Some(ResolvedProfile {
+                            profile: profile.record.intern(),
+                            origin: ProfileOrigin::Catalog,
+                            fallback_reason: None,
+                        }));
                     }
                 }
                 match self.catalog.imsi_has_ambiguous_plmn(digits) {
@@ -1041,7 +898,7 @@ impl ProfileStore {
                     Ok(_) => match self.catalog.resolve_for_imsi(
                         digits,
                         inferred_home_plmn.as_deref(),
-                        CatalogAccessKind::WifiEpdg,
+                        access,
                     ) {
                         Ok(profile) => profile.map(|profile| ResolvedProfile {
                             profile: profile.record.intern(),
@@ -1052,7 +909,7 @@ impl ProfileStore {
                             return Ok(derive_standard_fallback(
                                 digits,
                                 inferred_home_plmn.as_deref(),
-                                CatalogAccessKind::WifiEpdg,
+                                access,
                                 error,
                             ));
                         }
@@ -1061,7 +918,7 @@ impl ProfileStore {
                         return Ok(derive_standard_fallback(
                             digits,
                             inferred_home_plmn.as_deref(),
-                            CatalogAccessKind::WifiEpdg,
+                            access,
                             error,
                         ));
                     }
@@ -1071,8 +928,8 @@ impl ProfileStore {
                 return Ok(derive_standard_fallback(
                     digits,
                     inferred_home_plmn.as_deref(),
-                    CatalogAccessKind::WifiEpdg,
-                    "vowifi_profile_derived_requested".to_string(),
+                    access,
+                    format!("{service}_profile_derived_requested"),
                 )
                 .map(|mut resolved| {
                     resolved.fallback_reason = None;
@@ -1087,9 +944,30 @@ impl ProfileStore {
         Ok(derive_standard_fallback(
             digits,
             inferred_home_plmn.as_deref(),
-            CatalogAccessKind::WifiEpdg,
-            format!("vowifi_profile_source_unavailable:{}", source.as_str()),
+            access,
+            format!("{service}_profile_source_unavailable:{}", source.as_str()),
         ))
+    }
+
+    /// Resolve one source-constrained VoWiFi candidate. Each logical slot is
+    /// independent: an unavailable database/catalog source falls back to the
+    /// standard Wi-Fi/ePDG profile for that slot, matching the VoLTE recovery
+    /// contract without crossing into the other stored source. The legacy
+    /// per-SIM profile pin is likewise considered only in its matching source.
+    pub fn resolve_vowifi_candidate(
+        &self,
+        candidate: &VolteProfileCandidate,
+        legacy_pinned_profile_id: Option<&str>,
+        imsi: &str,
+        home_plmn: Option<&str>,
+    ) -> Result<Option<ResolvedProfile>, String> {
+        self.resolve_profile_candidate(
+            candidate,
+            legacy_pinned_profile_id,
+            imsi,
+            home_plmn,
+            CatalogAccessKind::WifiEpdg,
+        )
     }
 
     /// Resolve a profile for one registration access. A pinned profile id is
@@ -1106,9 +984,15 @@ impl ProfileStore {
             let custom_records = self.custom_records()?;
             if let Some((_, record)) = custom_records
                 .valid
-                .into_iter()
+                .iter()
                 .find(|(_, record)| record.meta.profile_id == profile_id)
             {
+                if !custom_profile_ready_for_access(record, access) {
+                    return Err(format!(
+                        "custom_carrier_profile_not_ready:{profile_id}:{}",
+                        access.as_str()
+                    ));
+                }
                 return Ok(Some(ResolvedProfile {
                     profile: record.intern(),
                     origin: ProfileOrigin::Database,
@@ -1174,10 +1058,11 @@ impl ProfileStore {
         let mut custom_matches = custom_records
             .into_iter()
             .filter(|(_, record)| {
-                explicit_home_plmn.as_deref().map_or_else(
-                    || digits.starts_with(&record.meta.plmn),
-                    |plmn| record.meta.plmn == plmn,
-                )
+                custom_profile_ready_for_access(record, access)
+                    && explicit_home_plmn.as_deref().map_or_else(
+                        || digits.starts_with(&record.meta.plmn),
+                        |plmn| record.meta.plmn == plmn,
+                    )
             })
             .collect::<Vec<_>>();
         custom_matches.sort_by(|left, right| {
@@ -1241,6 +1126,20 @@ fn profile_origin_rank(origin: ProfileOrigin) -> u8 {
         ProfileOrigin::Database => 0,
         ProfileOrigin::Catalog => 1,
         ProfileOrigin::Derived => 2,
+    }
+}
+
+fn custom_profile_ready_for_access(
+    record: &CarrierProfileRecord,
+    access: CatalogAccessKind,
+) -> bool {
+    match access {
+        // `from_database_json` has already validated the shared IMS/SIP
+        // configuration, which is sufficient for the LTE projection.
+        CatalogAccessKind::LteEpc => true,
+        // Wi-Fi additionally needs the explicit ePDG/VoWiFi capability gate.
+        // Do not turn an IMS-only custom row into an implicit Wi-Fi policy.
+        CatalogAccessKind::WifiEpdg => record.voice.vowifi_enabled,
     }
 }
 
@@ -1663,6 +1562,7 @@ mod tests {
                     source: VolteProfileSource::Database,
                     profile_id: Some("private-wifi-99999".to_string()),
                 },
+                None,
                 "999990123456789",
                 Some("99999"),
             )
@@ -1670,6 +1570,118 @@ mod tests {
             .expect("private database VoWiFi profile");
         assert_eq!(resolved.origin, ProfileOrigin::Database);
         assert_eq!(resolved.profile.meta.profile_id, "private-wifi-99999");
+        assert_eq!(resolved.profile.epdg.host, "epdg.private.example");
+        assert_eq!(resolved.profile.ims.domain, "ims.private.example");
+        assert_eq!(resolved.profile.ims.realm, "ims.private.example");
+        assert_eq!(
+            resolved.profile.ims.registrar,
+            Some("sip:ims.private.example")
+        );
+        assert_eq!(
+            resolved.profile.ikev2.identity_template,
+            Some("private-{imsi}@{ims_realm}")
+        );
+
+        let legacy_pin = store
+            .resolve_vowifi_candidate(
+                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                Some("private-wifi-99999"),
+                "999990123456789",
+                Some("99999"),
+            )
+            .expect("legacy VoWiFi database pin lookup")
+            .expect("legacy VoWiFi database pin");
+        assert_eq!(legacy_pin.origin, ProfileOrigin::Database);
+        assert_eq!(legacy_pin.profile.meta.profile_id, "private-wifi-99999");
+
+        assert!(store
+            .resolve_vowifi_candidate(
+                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                Some("private-wifi-99999"),
+                "999990123456789",
+                Some("99999"),
+            )
+            .expect("legacy pin must remain source-bound")
+            .is_none());
+    }
+
+    #[test]
+    fn ims_only_database_profile_is_never_used_for_vowifi_registration() {
+        let _resolver_guard = profiles::profile_resolver_test_guard();
+        let catalog =
+            CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
+        let database = Arc::new(
+            Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
+        );
+        let store = ProfileStore::new(Arc::new(catalog), database);
+        let mut record = CarrierProfileRecord::from_profile(&profiles::GB_EE_23433);
+        record.meta.profile_id = "ims-only-db-50212".to_string();
+        record.meta.mcc = "502".to_string();
+        record.meta.mnc = "12".to_string();
+        record.meta.mnc_len = 2;
+        record.meta.plmn = "50212".to_string();
+        record.voice.vowifi_enabled = false;
+        store
+            .upsert(record)
+            .expect("save IMS-only database profile");
+
+        let volte = store
+            .resolve_volte_candidate(
+                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                None,
+                "502121234567890",
+                Some("50212"),
+            )
+            .expect("resolve VoLTE database candidate")
+            .expect("VoLTE may use the shared IMS profile");
+        assert_eq!(volte.origin, ProfileOrigin::Database);
+        assert_eq!(volte.profile.meta.profile_id, "ims-only-db-50212");
+
+        let vowifi = store
+            .resolve_vowifi_candidate(
+                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                None,
+                "502121234567890",
+                Some("50212"),
+            )
+            .expect("resolve VoWiFi database candidate")
+            .expect("derive a standards fallback");
+        assert_eq!(vowifi.origin, ProfileOrigin::Derived);
+        assert_eq!(vowifi.profile.meta.profile_id, "derived_3gpp_vowifi_50212");
+
+        let by_plmn = store
+            .resolve_by_plmn("502", "12")
+            .expect("PLMN lookup must derive a VoWiFi profile");
+        assert_eq!(by_plmn.origin, ProfileOrigin::Derived);
+        assert_eq!(by_plmn.profile.meta.profile_id, "derived_3gpp_vowifi_50212");
+
+        let explicit_wifi_error = store
+            .resolve_for_imsi_access(
+                Some("ims-only-db-50212"),
+                "502121234567890",
+                Some("50212"),
+                CatalogAccessKind::WifiEpdg,
+            )
+            .expect_err("an IMS-only database pin must not become a VoWiFi profile");
+        assert_eq!(
+            explicit_wifi_error,
+            "custom_carrier_profile_not_ready:ims-only-db-50212:wifi_epdg"
+        );
+
+        store.publish();
+        let published = profiles::resolve_for_line(None, "502121234567890", Some("50212"))
+            .expect("global VoWiFi matcher must retain the standard fallback");
+        assert_eq!(
+            published.profile.meta.profile_id,
+            "derived_3gpp_vowifi_50212"
+        );
+
+        let stored = store
+            .search_stored_profiles(Some("50212"), None, None)
+            .expect("database browser query");
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].origin, ProfileOrigin::Database);
+        assert!(!stored[0].vowifi_ready);
     }
 
     #[test]
@@ -1980,6 +1992,23 @@ mod tests {
         assert_eq!(resolved.origin, ProfileOrigin::Derived);
         assert_eq!(resolved.profile.meta.profile_id, "derived_3gpp_lte_50212");
         assert!(resolved
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("carrier_catalog_open_failed")));
+
+        let vowifi = store
+            .resolve_vowifi_candidate(
+                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                None,
+                "502121234567890",
+                Some("50212"),
+            )
+            .expect("missing VoWiFi catalog query")
+            .expect("derived VoWiFi profile");
+
+        assert_eq!(vowifi.origin, ProfileOrigin::Derived);
+        assert_eq!(vowifi.profile.meta.profile_id, "derived_3gpp_vowifi_50212");
+        assert!(vowifi
             .fallback_reason
             .as_deref()
             .is_some_and(|reason| reason.contains("carrier_catalog_open_failed")));
