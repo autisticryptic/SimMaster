@@ -128,6 +128,15 @@ const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// binding. Retry over the same protected association while its lease remains
 /// valid instead of tearing down the native IMS bearer and modem session.
 const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// Do not schedule another retry when the current network-side registration
+/// lease is nearly exhausted. A retry that can only happen after the lease
+/// expires leaves the UE advertising a stale IMS binding.
+const REGISTER_REFRESH_MIN_RETRY_LIFETIME: Duration = Duration::from_secs(30);
+/// A protected UDP/XFRM path can lose one or two packets without the bearer
+/// being broken. Beyond this bounded budget, repeatedly sending on the same
+/// channel is counterproductive: rebuild the access/session and obtain fresh
+/// sockets and IPsec state instead of retrying for the rest of the lease.
+const REGISTER_REFRESH_MAX_TRANSPORT_FAILURES: u8 = 4;
 /// Keep two independent IMS dialogs for call waiting. A further call is
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
@@ -472,7 +481,16 @@ fn refresh_retry_delay(
         return None;
     }
     let remaining = remaining_registration_lifetime(registration);
-    (!remaining.is_zero()).then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
+    (remaining > REGISTER_REFRESH_MIN_RETRY_LIFETIME)
+        .then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
+}
+
+fn refresh_transport_failure_requires_rebuild(
+    consecutive_failures: u8,
+    remaining_lifetime: Duration,
+) -> bool {
+    consecutive_failures >= REGISTER_REFRESH_MAX_TRANSPORT_FAILURES
+        || remaining_lifetime <= REGISTER_REFRESH_MIN_RETRY_LIFETIME
 }
 
 fn advance_register_cseq(current: u32, last_sent: u32) -> u32 {
@@ -2810,6 +2828,10 @@ async fn live_receive_loop(
             .map(|session| tokio::time::Instant::now() + session.registration.lease.refresh_after)
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))
     };
+    // Keep transient protected-transport loss from tearing down the Qualcomm
+    // bearer immediately, but do not keep reusing a dead SIP/XFRM channel for
+    // an hour as the previous implementation did.
+    let mut refresh_transport_failures = 0u8;
     // The native IMS provider retains its device session until teardown.
     // REGISTER refresh remains the end-to-end bearer health signal because it
     // covers the IMS IP path and SIP service, not only WDS packet status.
@@ -2900,13 +2922,21 @@ async fn live_receive_loop(
                 let mut sessions = live.session.lock().await;
                 match sessions.as_mut() {
                     Some(session) => {
-                        refresh_live_registration(session, &runtime, &line_id, &database).await
+                        refresh_live_registration(
+                            session,
+                            &runtime,
+                            &line_id,
+                            &database,
+                            &mut refresh_transport_failures,
+                        )
+                        .await
                     }
                     None => break,
                 }
             };
             match refresh_result.outcome {
                 RegistrationRefreshResult::Refreshed(registration) => {
+                    refresh_transport_failures = 0;
                     refresh_at = tokio::time::Instant::now() + registration.lease.refresh_after;
                     continue;
                 }
@@ -3130,6 +3160,7 @@ async fn refresh_live_registration(
     runtime: &VolteRuntime,
     line_id: &str,
     database: &Database,
+    consecutive_transport_failures: &mut u8,
 ) -> VolteRefreshAttempt {
     if let Err(error) = ensure_worker_binding_current(&session.worker_binding) {
         runtime
@@ -3257,9 +3288,16 @@ async fn refresh_live_registration(
                 log_volte_register_failure_metadata(variant, &failure, Some(&initial));
                 let error = map_refresh_register_failure(&failure);
                 if is_refresh_transport_failure(&failure) {
+                    *consecutive_transport_failures =
+                        (*consecutive_transport_failures).saturating_add(1);
+                    let remaining_lifetime = remaining_registration_lifetime(&session.registration);
                     let retry_after = refresh_retry_delay(
                         &session.registration,
                         RegistrationLossReason::SignalingTransportLost,
+                    );
+                    let requires_rebuild = refresh_transport_failure_requires_rebuild(
+                        *consecutive_transport_failures,
+                        remaining_lifetime,
                     );
                     runtime
                         .record_attempt(
@@ -3267,22 +3305,36 @@ async fn refresh_live_registration(
                             Some(session.ip_family),
                             "failed",
                             Some(&error),
-                            Some("transport_retry_without_rebuild".to_string()),
+                            Some(format!(
+                                "transport_failure_count={};remaining_lifetime_seconds={}",
+                                *consecutive_transport_failures,
+                                remaining_lifetime.as_secs()
+                            )),
                         )
                         .await;
-                    if let Some(retry_after) = retry_after {
-                        tracing::warn!(
-                            error = %error,
-                            retry_after_seconds = retry_after.as_secs(),
-                            register_variant = variant.label,
-                            "VoLTE REGISTER refresh transport failure; retaining bearer and session"
-                        );
-                        return VolteRefreshAttempt {
-                            outcome: RegistrationRefreshResult::Retry,
-                            error: Some(error),
-                            retry_after: Some(retry_after),
-                        };
+                    if !requires_rebuild {
+                        if let Some(retry_after) = retry_after {
+                            tracing::warn!(
+                                error = %error,
+                                retry_after_seconds = retry_after.as_secs(),
+                                register_variant = variant.label,
+                                consecutive_transport_failures = *consecutive_transport_failures,
+                                "VoLTE REGISTER refresh transport failure; retaining bearer and session"
+                            );
+                            return VolteRefreshAttempt {
+                                outcome: RegistrationRefreshResult::Retry,
+                                error: Some(error),
+                                retry_after: Some(retry_after),
+                            };
+                        }
                     }
+                    tracing::warn!(
+                        error = %error,
+                        register_variant = variant.label,
+                        consecutive_transport_failures = *consecutive_transport_failures,
+                        remaining_lifetime_seconds = remaining_lifetime.as_secs(),
+                        "VoLTE REGISTER refresh transport failures exhausted; rebuilding access"
+                    );
                     last_failure = Some((variant, failure));
                     break;
                 }
@@ -6903,6 +6955,30 @@ mod tests {
             refresh_retry_delay(&registration, RegistrationLossReason::NetworkRejected),
             None
         );
+        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(40);
+        assert_eq!(
+            refresh_retry_delay(
+                &registration,
+                RegistrationLossReason::SignalingTransportLost
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_transport_failures_have_a_bounded_rebuild_budget() {
+        assert!(!refresh_transport_failure_requires_rebuild(
+            REGISTER_REFRESH_MAX_TRANSPORT_FAILURES - 1,
+            Duration::from_secs(60),
+        ));
+        assert!(refresh_transport_failure_requires_rebuild(
+            REGISTER_REFRESH_MAX_TRANSPORT_FAILURES,
+            Duration::from_secs(60),
+        ));
+        assert!(refresh_transport_failure_requires_rebuild(
+            1,
+            REGISTER_REFRESH_MIN_RETRY_LIFETIME,
+        ));
     }
 
     #[test]
