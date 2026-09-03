@@ -133,6 +133,19 @@ impl VolteSipChannel {
         &mut self,
         worker: &UeWorkerHandle,
     ) -> Result<u16, ImsError> {
+        self.reserve_security_receive_port_in_worker_at(worker, 0)
+            .await
+    }
+
+    /// Reserve the protected server port selected by a previous security
+    /// association. TS 33.203 keeps `port_us` stable across authenticated
+    /// re-registration, so recovery must be able to bind that exact port
+    /// instead of silently allocating a new one.
+    pub async fn reserve_security_receive_port_in_worker_at(
+        &mut self,
+        worker: &UeWorkerHandle,
+        requested_port: u16,
+    ) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
             return match socket {
                 #[cfg(test)]
@@ -143,7 +156,7 @@ impl VolteSipChannel {
                     .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
             };
         }
-        let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+        let local = SocketAddr::new(self.route.local_addr.ip(), requested_port);
         let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
         let socket = match worker.create_socket(spec).await {
             Ok(UeSocket::Udp(socket)) => socket,
@@ -264,6 +277,53 @@ impl VolteSipChannel {
         // Advertise the protected server port rather than the send port.
         self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
+        Ok(())
+    }
+
+    /// Drop the protected sockets and return to a plain UDP channel without
+    /// touching the bearer. This is the TS 33.203 recovery path after the
+    /// network has stopped answering packets protected by an old SA: the next
+    /// REGISTER can be sent unprotected and negotiate a replacement SA.
+    ///
+    /// The replacement socket is created before the current sockets are
+    /// swapped out. A socket creation failure therefore leaves the working
+    /// protected channel intact and the caller can retry without rebuilding
+    /// access.
+    pub async fn deactivate_security_in_worker(
+        &mut self,
+        worker: &UeWorkerHandle,
+        route: ImsRoute,
+    ) -> Result<(), ImsError> {
+        // A security re-negotiation must use a fresh protected client port
+        // (`port_uc`) after the old SA is considered inactive.  The caller
+        // supplies the current address only to preserve the bearer/interface;
+        // bind port zero here so the worker allocates a new UDP source port.
+        let mut plain_route = route;
+        plain_route.local_addr.set_port(0);
+        let spec = UeSocketSpec::udp_connected(
+            plain_route.local_addr,
+            plain_route.pcscf_addr,
+            self.interface.clone(),
+        );
+        let send_socket = match worker.create_socket(spec).await {
+            Ok(UeSocket::Udp(socket)) => socket,
+            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+        };
+        let mut route = route;
+        route.local_addr = send_socket
+            .local_addr()
+            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+
+        // The old protected sockets and reservation are owned by this channel;
+        // dropping them closes the old protected path but leaves the UE worker,
+        // IP bearer and caller-owned XFRM cleanup untouched.
+        self.send_socket = Some(send_socket);
+        self.receive_socket = None;
+        self.reserved_receive_socket = None;
+        self.route = route;
+        self.advertised_local_port = None;
+        self.security_verify = None;
         Ok(())
     }
 
