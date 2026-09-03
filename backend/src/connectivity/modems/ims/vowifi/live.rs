@@ -2798,7 +2798,7 @@ async fn wait_for_vowifi_ue_dataplane_ready(
     }
 
     let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_reason = "ue_worker_not_ready";
+    let mut last_reason: &str;
     loop {
         let worker_status = context.worker.status().await;
         if !context.worker.is_running().await || !worker_status.ready {
@@ -3804,7 +3804,7 @@ async fn run_live_ims_register_until(
                 profile_id = profile.meta.profile_id,
                 transport,
                 reused_access = true,
-                error = %error,
+                error = %error.reason,
                 "VoWiFi IMS REGISTER refresh will retry on the existing access leg"
             );
             Err(error)
