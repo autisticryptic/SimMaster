@@ -146,6 +146,11 @@ impl RegistrationLossReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegistrationRefreshResult {
     Refreshed(RegisteredImsContext),
+    /// The existing registration/bearer is still usable, but this refresh
+    /// attempt did not complete (for example a transient UDP timeout).  The
+    /// access leg must remain intact and the caller should retry after a
+    /// bounded delay.
+    Retry,
     RebuildAccess(RegistrationLossReason),
 }
 

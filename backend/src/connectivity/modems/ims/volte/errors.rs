@@ -103,6 +103,17 @@ pub mod code {
     pub const REGISTER_AUTH_SEND_FAILED: &str = "volte_register_auth_send_failed";
     pub const REGISTER_AUTH_UNEXPECTED_STATUS: &str = "volte_register_auth_unexpected_status";
     pub const REGISTER_INITIAL_UNEXPECTED_STATUS: &str = "volte_register_initial_unexpected_status";
+    /// The protected REGISTER refresh did not complete.  Keep refresh failures
+    /// distinct from initial registration failures so the UI/logs do not make
+    /// a healthy bearer look as if its first registration failed.
+    pub const REGISTER_REFRESH_SEND_FAILED: &str = "volte_register_refresh_send_failed";
+    pub const REGISTER_REFRESH_RECEIVE_FAILED: &str = "volte_register_refresh_receive_failed";
+    pub const REGISTER_REFRESH_UNEXPECTED_STATUS: &str = "volte_register_refresh_unexpected_status";
+    pub const REGISTER_REFRESH_AUTH_FAILED: &str = "volte_register_refresh_auth_failed";
+    /// The line's UE worker was respawned after a socket/bearer was bound to it.
+    /// The access leg must be torn down and rebuilt against the new generation.
+    pub const RUNTIME_UE_WORKER_GENERATION_CHANGED: &str =
+        "volte_runtime_ue_worker_generation_changed";
 
     // SMS.
     pub const SMS_ENCODE_FAILED: &str = "volte_sms_encode_failed";

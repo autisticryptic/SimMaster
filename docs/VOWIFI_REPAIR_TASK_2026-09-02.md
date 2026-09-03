@@ -264,6 +264,34 @@ Germany 的 UDP-only 和完整 REGISTER 测试口径，也不回退到宿主网�
 - [ ] 在后续较长观察窗口中确认自然 refresh、gateway 重建和 modem 重枚举
   恢复；本轮短窗口不将长期续期稳定性提前标记为完成。
 
+### 9. VoLTE refresh 可靠性修补（2026-09-03）
+
+本节记录本轮针对“VoLTE refresh 每次失败都重建 bearer”的修复。目标是让
+短暂的 UDP/SIP 丢包只触发同一 bearer 上的受控重试，同时确保 UE worker
+重启后不会用旧会话的长期句柄清理新一代网络资源。
+
+- [x] refresh 优先复用当前已经成功注册的完整 REGISTER 形态；仅在收到明确
+  SIP 状态且状态允许互操作降级时，依次尝试原形态、去 PANI/CNI、去 Route。
+- [x] refresh 的 UDP 发送失败、接收超时等无完整响应错误不再立即重建
+  bearer、XFRM、socket 或 UE namespace；在租期尚未过期时返回 `Retry`，约
+  15 秒后通过原访问链路重试。
+- [x] refresh 成功后保存实际成功的 REGISTER variant；后续 refresh 不重复
+  已被明确拒绝的请求形态，并继续持久化 refresh 计数和最新身份集合。
+- [x] REGISTER CSeq 在每次实际发出请求后单调递增，即使该请求最终超时，
+  避免同一 Call-ID 下重试时复用过期 CSeq。
+- [x] VoLTE session、认证器、原生 QMI bearer、XFRM 清理和 VoWiFi
+  socket/gateway 均绑定 UE worker generation；worker respawn 后旧绑定失效，
+  由下一轮完整访问重建接管。
+- [x] 补齐 native bearer 在 worker 不可用、接口未就绪、移动过程中发生
+  generation 变化等早期失败路径的显式释放；避免只返回错误而遗留 modem
+  WDS 会话、P-CSCF reporting 或 IMS profile lease。
+- [ ] 通过 GitHub Actions 完成本轮测试编译、AMD64 与 ARM64 构建。
+- [ ] 下载 ARM64 产物并通过 SCP 部署到 410，完成启动、UE namespace、UDP/500、
+  UDP/4500 以及 VoLTE/VoWiFi 初始 REGISTER 短窗口验证。
+- [ ] 在下一次较长观察窗口中确认 VoLTE refresh 连续返回 200 OK、续期计数
+  正确增加，且短暂传输失败不会触发不必要的 bearer 重建；若出现连续失败，
+  再确认达到阈值后能够正确重建访问链路。
+
 ## 当前结论
 
 Vodafone Germany 的初始 VoWiFi/VoLTE 注册、连续 UDP refresh、缺失 TUN

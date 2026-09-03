@@ -67,7 +67,7 @@ use crate::{
             ut::{XcapAccessContext, XcapDigestProvider},
             SupplementaryRuntime,
         },
-        ue_worker::{worker_for_line, UeWorkerHandle},
+        ue_worker::{worker_for_line, UeWorkerBinding, UeWorkerHandle},
     },
 };
 
@@ -184,10 +184,6 @@ async fn worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWorkerHan
 async fn ready_worker(line_id: &str) -> Option<UeWorkerHandle> {
     let worker = worker_for_line(line_id)?;
     worker.status().await.ready.then_some(worker)
-}
-
-async fn volte_worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWorkerHandle> {
-    worker_for_bearer(line_id, interface).await
 }
 
 async fn trunk_worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWorkerHandle> {
@@ -406,6 +402,10 @@ struct VolteLiveSession {
     xfrm_worker: UeWorkerHandle,
     /// Worker namespace that owns the native bearer interface and routes.
     network_worker: UeWorkerHandle,
+    /// Generation of the UE worker that owns the bearer, XFRM state and SIP
+    /// socket. The handle itself survives respawns, so it cannot detect stale
+    /// resources on its own.
+    worker_binding: UeWorkerBinding,
     register_ids: RequestIds,
     next_register_cseq: u32,
     sip_instance: String,
@@ -483,6 +483,7 @@ struct RetainedFailedBearer {
     bearer: BearerConnection,
     native_bearer: Option<NativeImsBearer>,
     network_worker: UeWorkerHandle,
+    worker_binding: UeWorkerBinding,
     modem_id: String,
     pcscf_reporting_cid: Option<u8>,
     ims_profile_lease: Option<ImsProfileLease>,
@@ -1104,6 +1105,7 @@ struct VolteRegisterAuthenticator {
     initial_security_client: Option<String>,
     /// Mandatory per-line worker used for SIP/IPsec sockets.
     worker: UeWorkerHandle,
+    worker_binding: UeWorkerBinding,
 }
 
 impl VolteRegisterAuthenticator {
@@ -1151,6 +1153,7 @@ impl VolteRegisterAuthenticator {
             last_cseq,
             initial_authorization,
             initial_security_client,
+            worker_binding: worker.bind(),
             worker,
         }
     }
@@ -1159,6 +1162,27 @@ impl VolteRegisterAuthenticator {
         self.expires_seconds = expires_seconds;
         self
     }
+
+    /// Keep refresh/unregister tied to the exact worker process that owns the
+    /// live bearer. `UeWorkerHandle` survives respawns, so a fresh `bind()` at
+    /// refresh time would accidentally bless sockets/XFRM state belonging to
+    /// an already-dead generation.
+    fn with_worker_binding(mut self, worker_binding: UeWorkerBinding) -> Self {
+        self.worker_binding = worker_binding;
+        self
+    }
+}
+
+fn ensure_worker_binding_current(binding: &UeWorkerBinding) -> Result<(), VolteError> {
+    if binding.is_current() {
+        Ok(())
+    } else {
+        Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED))
+    }
+}
+
+fn ensure_worker_binding_current_ims(binding: &UeWorkerBinding) -> Result<(), ImsError> {
+    ensure_worker_binding_current(binding).map_err(to_ims_error)
 }
 
 impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
@@ -1167,6 +1191,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         challenge_response: &[u8],
         channel: &mut VolteSipChannel,
     ) -> Result<(), ImsError> {
+        ensure_worker_binding_current_ims(&self.worker_binding)?;
         self.runtime
             .update(|state| state.stage = VolteStage::IdentityAka)
             .await;
@@ -1306,7 +1331,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 )
                 .await;
             if let Err(error) = activation {
-                ipsec::uninstall_plan_in_worker(&plan, &self.worker).await;
+                if self.worker_binding.is_current() {
+                    ipsec::uninstall_plan_in_worker(&plan, &self.worker).await;
+                } else {
+                    tracing::warn!(
+                        "Skipping VoLTE XFRM cleanup after security activation failure on a stale UE worker generation"
+                    );
+                }
                 return Err(error);
             }
             self.xfrm_plan = Some(plan);
@@ -1379,6 +1410,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         _challenge_response: &[u8],
         cseq: u32,
     ) -> Result<Vec<u8>, ImsError> {
+        ensure_worker_binding_current_ims(&self.worker_binding)?;
         self.runtime
             .update(|state| state.stage = VolteStage::RegisterAuthenticated)
             .await;
@@ -1432,6 +1464,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         min_expires: u32,
         authenticated: bool,
     ) -> Result<Vec<u8>, ImsError> {
+        ensure_worker_binding_current_ims(&self.worker_binding)?;
         if authenticated {
             // Keep the negotiated security context and challenge proof; only
             // the lease floor changes for the retry.
@@ -1623,6 +1656,11 @@ fn failure_stage(error: &VolteError) -> Option<VolteStage> {
         code::REGISTER_AUTH_SEND_FAILED | code::REGISTER_AUTH_UNEXPECTED_STATUS => {
             VolteStage::RegisterAuthenticated
         }
+        code::REGISTER_REFRESH_SEND_FAILED
+        | code::REGISTER_REFRESH_RECEIVE_FAILED
+        | code::REGISTER_REFRESH_UNEXPECTED_STATUS
+        | code::REGISTER_REFRESH_AUTH_FAILED
+        | code::RUNTIME_UE_WORKER_GENERATION_CHANGED => VolteStage::RegisterRefresh,
         _ => return None,
     })
 }
@@ -1810,17 +1848,86 @@ async fn connect_inner(
         .expect("native bearer was established")
         .provider_session
         .clone();
-    let worker = ready_worker(&device.line_id).await.ok_or_else(|| {
-        VolteError::with_detail(
-            code::RUNTIME_UE_WORKER_UNAVAILABLE,
-            format!("line={}", device.line_id),
+    let worker = match ready_worker(&device.line_id).await {
+        Some(worker) => worker,
+        None => {
+            let error = VolteError::with_detail(
+                code::RUNTIME_UE_WORKER_UNAVAILABLE,
+                format!("line={}", device.line_id),
+            );
+            cleanup_pending_native_bearer(
+                &mut native_bearer,
+                &device.modem_id,
+                pcscf_reporting_cid,
+                &mut ims_profile_lease,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    let bearer_interface = native_bearer
+        .as_ref()
+        .expect("native bearer was established")
+        .interface
+        .clone();
+    if let Err(error) = ensure_bearer_interface_ready(&bearer_interface).await {
+        cleanup_pending_native_bearer(
+            &mut native_bearer,
+            &device.modem_id,
+            pcscf_reporting_cid,
+            &mut ims_profile_lease,
         )
-    })?;
-    let established = native_bearer
+        .await;
+        return Err(error);
+    }
+    if let Err(error) = native_bearer
         .as_mut()
-        .expect("native bearer was established");
-    ensure_bearer_interface_ready(&established.interface).await?;
-    established.move_into_worker(worker.clone()).await?;
+        .expect("native bearer was established")
+        .move_into_worker(worker.clone())
+        .await
+    {
+        cleanup_pending_native_bearer(
+            &mut native_bearer,
+            &device.modem_id,
+            pcscf_reporting_cid,
+            &mut ims_profile_lease,
+        )
+        .await;
+        return Err(error);
+    }
+    // Reuse the binding captured by the native bearer while it was moved into
+    // the namespace. Binding the long-lived handle here would race a worker
+    // respawn and could bless a replacement process that never received the
+    // interface, routes or sockets.
+    let network_worker_binding = match native_bearer
+        .as_ref()
+        .and_then(NativeImsBearer::worker_binding)
+        .cloned()
+    {
+        Some(binding) => binding,
+        None => {
+            let error = VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
+            cleanup_pending_native_bearer(
+                &mut native_bearer,
+                &device.modem_id,
+                pcscf_reporting_cid,
+                &mut ims_profile_lease,
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if !network_worker_binding.is_current() {
+        let error = VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
+        cleanup_pending_native_bearer(
+            &mut native_bearer,
+            &device.modem_id,
+            pcscf_reporting_cid,
+            &mut ims_profile_lease,
+        )
+        .await;
+        return Err(error);
+    }
     let network_worker = worker;
     if !bearer.settings.pcscf.is_empty() {
         tracing::info!(
@@ -1945,6 +2052,7 @@ async fn connect_inner(
                 &device,
                 live.operator.video_enabled(),
                 access_network_runtime,
+                &network_worker_binding,
             )
             .await
             {
@@ -2004,6 +2112,7 @@ async fn connect_inner(
                 bearer: bearer.clone(),
                 native_bearer: native_bearer.take(),
                 network_worker: network_worker.clone(),
+                worker_binding: network_worker_binding.clone(),
                 modem_id: device.modem_id.clone(),
                 pcscf_reporting_cid,
                 ims_profile_lease: ims_profile_lease.take(),
@@ -2016,8 +2125,13 @@ async fn connect_inner(
             // and WDS teardown. Avoid performing the same worker cleanup
             // twice here.
             native_bearer::release_native_ims_bearer(established).await;
-        } else {
+        } else if network_worker_binding.is_current() {
             super::bearer::teardown_bearer_network_in_worker(&bearer, &network_worker).await;
+        } else {
+            tracing::warn!(
+                interface = %bearer.interface,
+                "Skipping failed VoLTE bearer cleanup bound to a stale UE worker generation"
+            );
         }
         disable_pcscf_reporting(&device.modem_id, pcscf_reporting_cid).await;
         cleanup_ims_profile_lease(ims_profile_lease.take()).await;
@@ -2042,18 +2156,13 @@ async fn connect_family(
     device: &VolteDeviceBinding,
     video_capability_enabled: bool,
     access_network_runtime: &ImsAccessNetworkRuntime,
+    worker_binding: &UeWorkerBinding,
 ) -> Result<VolteLiveSession, VolteError> {
     runtime
         .update(|state| state.stage = VolteStage::Pcscf)
         .await;
-    let worker = volte_worker_for_bearer(&device.line_id, &bearer.interface)
-        .await
-        .ok_or_else(|| {
-            VolteError::with_detail(
-                code::RUNTIME_UE_WORKER_UNAVAILABLE,
-                format!("interface={}", bearer.interface),
-            )
-        })?;
+    ensure_worker_binding_current(worker_binding)?;
+    let worker = worker_binding.worker().clone();
     let configured_pcscf = device_identity
         .effective_ims
         .pcscf
@@ -2068,7 +2177,9 @@ async fn connect_family(
         &worker,
     )
     .await?;
+    ensure_worker_binding_current(worker_binding)?;
     route_pcscf_in_worker(bearer, pcscf, &worker).await?;
+    ensure_worker_binding_current(worker_binding)?;
     // The policy rule that steers SIP onto this bearer is keyed on the source
     // address captured when the bearer settings were read. Maxis hands out a
     // fresh address on every IMS PDN activation, so if the bearer re-addressed
@@ -2079,6 +2190,7 @@ async fn connect_family(
     let worker_status = worker.refresh_net_status().await.map_err(|error| {
         VolteError::with_detail(code::RUNTIME_UE_WORKER_UNAVAILABLE, error.to_string())
     })?;
+    ensure_worker_binding_current(worker_binding)?;
     if !worker_status
         .addresses
         .iter()
@@ -2183,11 +2295,13 @@ async fn connect_family(
             VolteSipChannel::bind_in_worker(route, &worker, Some(&bearer.interface), None)
                 .await
                 .map_err(map_channel_error)?;
+        ensure_worker_binding_current(worker_binding)?;
         let socket_worker = worker.clone();
         let receive_port = channel
             .reserve_security_receive_port_in_worker(&socket_worker)
             .await
             .map_err(map_channel_error)?;
+        ensure_worker_binding_current(worker_binding)?;
         let ids = RequestIds::fresh(1);
         // port_c is the port packets are actually sourced from, so this reads the
         // send route rather than the advertised one. They are identical here (no
@@ -2262,7 +2376,9 @@ async fn connect_family(
             initial_authorization.clone(),
             initial_security_client,
             socket_worker,
-        );
+        )
+        .with_worker_binding(worker_binding.clone());
+        ensure_worker_binding_current(worker_binding)?;
         let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
             .await
         {
@@ -2270,7 +2386,13 @@ async fn connect_family(
             Err(failure) => {
                 log_volte_register_failure_metadata(variant, &failure, None);
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
-                    ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
+                    if authenticator.worker_binding.is_current() {
+                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
+                    } else {
+                        tracing::warn!(
+                            "Skipping failed VoLTE REGISTER XFRM cleanup bound to a stale UE worker generation"
+                        );
+                    }
                 }
                 let error = map_register_failure(&failure);
                 runtime
@@ -2413,6 +2535,7 @@ async fn connect_family(
             xfrm_plan: authenticator.xfrm_plan,
             xfrm_worker: authenticator.worker.clone(),
             network_worker,
+            worker_binding: authenticator.worker_binding.clone(),
             // Attached by `connect_inner`, which owns it until the session is known
             // to be good.
             native_bearer: None,
@@ -2545,6 +2668,7 @@ async fn unregister_live_session(
         security_client,
         session.xfrm_worker.clone(),
     )
+    .with_worker_binding(session.worker_binding.clone())
     .with_expires_seconds(0);
     run_unregister(&mut session.channel, &request, &mut authenticator).await
 }
@@ -2786,6 +2910,30 @@ async fn live_receive_loop(
                     refresh_at = tokio::time::Instant::now() + registration.lease.refresh_after;
                     continue;
                 }
+                RegistrationRefreshResult::Retry => {
+                    let retry_after = refresh_result
+                        .retry_after
+                        .unwrap_or(REGISTER_REFRESH_RETRY_INTERVAL);
+                    let error = refresh_result
+                        .error
+                        .unwrap_or_else(|| VolteError::new(code::REGISTER_REFRESH_RECEIVE_FAILED));
+                    tracing::warn!(
+                        error = %error,
+                        retry_after_seconds = retry_after.as_secs(),
+                        "VoLTE REGISTER refresh will retry on the existing bearer"
+                    );
+                    runtime
+                        .update(|state| {
+                            state.phase = VoltePhase::Registered;
+                            state.stage = VolteStage::Registered;
+                            state.last_error =
+                                Some(format!("volte_register_refresh_retry:{}", error));
+                            state.last_failure_at = Some(now());
+                        })
+                        .await;
+                    refresh_at = tokio::time::Instant::now() + retry_after;
+                    continue;
+                }
                 RegistrationRefreshResult::RebuildAccess(loss_reason) => {
                     let error = refresh_result.error.unwrap_or_else(|| {
                         VolteError::with_detail(
@@ -2793,27 +2941,6 @@ async fn live_receive_loop(
                             loss_reason.as_str(),
                         )
                     });
-                    if let Some(retry_after) = refresh_result.retry_after {
-                        tracing::warn!(
-                            error = %error,
-                            registration_loss = loss_reason.as_str(),
-                            retry_after_seconds = retry_after.as_secs(),
-                            "VoLTE REGISTER refresh received no response; retaining the live bearer and registration"
-                        );
-                        runtime
-                            .update(|state| {
-                                state.phase = VoltePhase::Registered;
-                                state.stage = VolteStage::Registered;
-                                state.last_error = Some(format!(
-                                    "volte_register_refresh_retry:{}",
-                                    loss_reason.as_str()
-                                ));
-                                state.last_failure_at = Some(now());
-                            })
-                            .await;
-                        refresh_at = tokio::time::Instant::now() + retry_after;
-                        continue;
-                    }
                     tracing::warn!(
                         error = %error,
                         registration_loss = loss_reason.as_str(),
@@ -3004,6 +3131,24 @@ async fn refresh_live_registration(
     line_id: &str,
     database: &Database,
 ) -> VolteRefreshAttempt {
+    if let Err(error) = ensure_worker_binding_current(&session.worker_binding) {
+        runtime
+            .record_attempt(
+                VolteStage::RegisterRefresh,
+                Some(session.ip_family),
+                "failed",
+                Some(&error),
+                Some("worker_generation_changed".to_string()),
+            )
+            .await;
+        return VolteRefreshAttempt {
+            outcome: RegistrationRefreshResult::RebuildAccess(
+                RegistrationLossReason::AccessTransportLost,
+            ),
+            error: Some(error),
+            retry_after: None,
+        };
+    }
     runtime
         .update(|state| state.stage = VolteStage::RegisterRefresh)
         .await;
@@ -3098,6 +3243,7 @@ async fn refresh_live_registration(
             security_client,
             session.xfrm_worker.clone(),
         )
+        .with_worker_binding(session.worker_binding.clone())
         .with_expires_seconds(refresh_expires);
         let registration_result =
             run_register_observed(&mut session.channel, &initial, &mut authenticator).await;
@@ -3109,6 +3255,37 @@ async fn refresh_live_registration(
             Ok(registration) => registration,
             Err(failure) => {
                 log_volte_register_failure_metadata(variant, &failure, Some(&initial));
+                let error = map_refresh_register_failure(&failure);
+                if is_refresh_transport_failure(&failure) {
+                    let retry_after = refresh_retry_delay(
+                        &session.registration,
+                        RegistrationLossReason::SignalingTransportLost,
+                    );
+                    runtime
+                        .record_attempt(
+                            VolteStage::RegisterRefresh,
+                            Some(session.ip_family),
+                            "failed",
+                            Some(&error),
+                            Some("transport_retry_without_rebuild".to_string()),
+                        )
+                        .await;
+                    if let Some(retry_after) = retry_after {
+                        tracing::warn!(
+                            error = %error,
+                            retry_after_seconds = retry_after.as_secs(),
+                            register_variant = variant.label,
+                            "VoLTE REGISTER refresh transport failure; retaining bearer and session"
+                        );
+                        return VolteRefreshAttempt {
+                            outcome: RegistrationRefreshResult::Retry,
+                            error: Some(error),
+                            retry_after: Some(retry_after),
+                        };
+                    }
+                    last_failure = Some((variant, failure));
+                    break;
+                }
                 let retry_variant = failure
                     .response
                     .as_deref()
@@ -3190,7 +3367,7 @@ async fn refresh_live_registration(
 
     let (variant, failure) = last_failure.expect("at least one refresh candidate");
     let loss_reason = RegistrationLossReason::from_register_failure(&failure);
-    let error = map_register_failure(&failure);
+    let error = map_refresh_register_failure(&failure);
     runtime
         .record_attempt(
             VolteStage::RegisterRefresh,
@@ -3218,19 +3395,29 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
     let session = live.session.lock().await.take();
     if let Some(session) = session {
         if let Some(plan) = session.xfrm_plan.as_ref() {
-            ipsec::uninstall_plan_in_worker(plan, &session.xfrm_worker).await;
+            if session.worker_binding.is_current() {
+                ipsec::uninstall_plan_in_worker(plan, &session.xfrm_worker).await;
+            } else {
+                tracing::warn!("Skipping VoLTE XFRM cleanup bound to a stale UE worker generation");
+            }
         }
         // A native bearer has no ModemManager object: its WDS session must be
         // stopped through the handle we kept, or the PDP context stays up on
         // the modem after the line is disconnected.
         match session.native_bearer {
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
-            None => {
+            None if session.worker_binding.is_current() => {
                 super::bearer::teardown_bearer_network_in_worker(
                     &session.bearer,
                     &session.network_worker,
                 )
                 .await;
+            }
+            None => {
+                tracing::warn!(
+                    interface = %session.bearer.interface,
+                    "Skipping VoLTE bearer cleanup bound to a stale UE worker generation"
+                );
             }
         }
         disable_pcscf_reporting(&session.device.modem_id, session.pcscf_reporting_cid).await;
@@ -3254,12 +3441,23 @@ async fn cleanup_retained_failed_bearer(live: &VolteLiveHandle) {
     }
     match retained.native_bearer {
         Some(native) => native_bearer::release_native_ims_bearer(native).await,
-        None => {
+        None if retained.worker_binding.is_current() => {
             super::bearer::teardown_bearer_network_in_worker(
                 &retained.bearer,
                 &retained.network_worker,
             )
             .await;
+        }
+        None => {
+            // The old worker process may already have been replaced.  Sending
+            // cleanup through the long-lived handle would then target the new
+            // generation and could flush a newly reused interface/route.
+            // The retired namespace generation owns no live control channel,
+            // so leave its device-scoped state to worker teardown instead.
+            tracing::warn!(
+                interface = %retained.bearer.interface,
+                "Skipping retained VoLTE bearer network cleanup bound to a stale UE worker generation"
+            );
         }
     }
     disable_pcscf_reporting(&retained.modem_id, retained.pcscf_reporting_cid).await;
@@ -3270,6 +3468,27 @@ async fn cleanup_ims_profile_lease(lease: Option<ImsProfileLease>) {
     if let Some(lease) = lease {
         lease.cleanup().await;
     }
+}
+
+/// Release a native bearer while connection setup is still in progress.
+///
+/// Once a provider bearer has been established, every early-return path must
+/// release its device handle as well as the optional P-CSCF/profile state.  In
+/// particular, `move_into_worker` can return after a worker-generation change;
+/// dropping the bearer there would leave the provider session alive on the
+/// modem.  The native release routine already guards namespace cleanup against
+/// stale generations, so it is safe to call for both moved and unmoved bearers.
+async fn cleanup_pending_native_bearer(
+    native_bearer: &mut Option<NativeImsBearer>,
+    modem_id: &str,
+    pcscf_reporting_cid: Option<u8>,
+    ims_profile_lease: &mut Option<ImsProfileLease>,
+) {
+    if let Some(native) = native_bearer.take() {
+        native_bearer::release_native_ims_bearer(native).await;
+    }
+    disable_pcscf_reporting(modem_id, pcscf_reporting_cid).await;
+    cleanup_ims_profile_lease(ims_profile_lease.take()).await;
 }
 
 async fn disable_pcscf_reporting(modem: &str, cid: Option<u8>) {
@@ -6128,6 +6347,51 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
+fn is_refresh_transport_failure(failure: &RegisterFailure) -> bool {
+    matches!(
+        failure.error.code(),
+        "ims_register_initial_send_failed"
+            | "ims_register_initial_receive_failed"
+            | "ims_register_authenticated_send_failed"
+            | "ims_register_authenticated_receive_failed"
+    )
+}
+
+fn map_refresh_register_error(error: ImsError) -> VolteError {
+    let stage = match error.code() {
+        "ims_register_initial_send_failed" | "ims_register_authenticated_send_failed" => {
+            code::REGISTER_REFRESH_SEND_FAILED
+        }
+        "ims_register_initial_receive_failed" | "ims_register_authenticated_receive_failed" => {
+            code::REGISTER_REFRESH_RECEIVE_FAILED
+        }
+        "ims_register_auth_rejected" => code::REGISTER_REFRESH_AUTH_FAILED,
+        "ims_register_initial_unexpected_status"
+        | "ims_register_authenticated_unexpected_status"
+        | "ims_register_initial_min_expires_invalid"
+        | "ims_register_initial_min_expires_exhausted"
+        | "ims_register_initial_min_expires_unsupported"
+        | "ims_register_authenticated_min_expires_invalid"
+        | "ims_register_authenticated_min_expires_exhausted"
+        | "ims_register_authenticated_min_expires_unsupported" => {
+            code::REGISTER_REFRESH_UNEXPECTED_STATUS
+        }
+        _ => code::REGISTER_REFRESH_AUTH_FAILED,
+    };
+    VolteError::with_detail(stage, error.code())
+}
+
+fn map_refresh_register_failure(failure: &RegisterFailure) -> VolteError {
+    let mapped = map_refresh_register_error(failure.error);
+    match register_failure_status(failure) {
+        Some(status) => VolteError::with_detail(
+            mapped.code(),
+            format!("{}:sip_status={status}", failure.error.code()),
+        ),
+        None => mapped,
+    }
+}
+
 fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
     failure
         .response
@@ -6805,6 +7069,7 @@ mod tests {
             ),
         );
         test_worker.enable_test_net_config().await;
+        let test_binding = test_worker.bind();
         *live.session.lock().await = Some(VolteLiveSession {
             channel,
             identity: ImsIdentity {
@@ -6839,7 +7104,8 @@ mod tests {
             ip_family: "ipv4",
             xfrm_plan: None,
             xfrm_worker: test_worker.clone(),
-            network_worker: test_worker,
+            network_worker: test_worker.clone(),
+            worker_binding: test_binding,
             register_ids: RequestIds::fresh(1),
             next_register_cseq: 2,
             sip_instance: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),

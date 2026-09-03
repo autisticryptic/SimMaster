@@ -1251,6 +1251,7 @@ impl LineRuntimeRegistry {
                 namespace: ue.namespace.as_str().to_string(),
                 ue_veth: plan.ue_if,
                 worker: worker.clone(),
+                binding: worker.bind(),
             },
         );
         PreparedUePublication {

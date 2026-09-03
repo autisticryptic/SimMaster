@@ -11,6 +11,7 @@ use std::{
 };
 
 use super::{ike_keys::ChildSaSecretPair, transport::UdpSocketDatagramTransport};
+use crate::services::ue_worker::UeWorkerBinding;
 
 const IMS_ESP_CLIENT_FLOW: &str = "client_flow";
 const IMS_ESP_SERVER_FLOW: &str = "server_flow";
@@ -191,6 +192,8 @@ pub(crate) struct TunGatewayConfig {
     pub remote: SocketAddr,
     /// Mandatory UE network namespace that owns this TUN interface.
     pub ue_namespace: String,
+    /// Worker process generation that owns the namespace/veth/TUN access leg.
+    pub worker_binding: UeWorkerBinding,
 }
 
 pub(crate) struct TunGatewayRuntime {
@@ -204,6 +207,7 @@ pub(crate) struct TunGatewayRuntime {
     shutdown: Arc<AtomicBool>,
     health: Arc<TunGatewayHealth>,
     ue_namespace: String,
+    worker_binding: UeWorkerBinding,
     #[cfg(target_os = "linux")]
     _tun_file: std::fs::File,
 }
@@ -233,6 +237,14 @@ impl TunGatewayRuntime {
                 .load(Ordering::Acquire)
                 .then_some("vowifi_gateway_shutdown")
         })
+    }
+
+    pub(crate) fn worker_binding_is_current(&self) -> bool {
+        self.worker_binding.is_current()
+    }
+
+    pub(crate) fn worker_binding_matches(&self, other: &UeWorkerBinding) -> bool {
+        self.worker_binding.matches(other)
     }
 
     pub fn is_for_profile(&self, profile_id: &str) -> bool {
@@ -1107,6 +1119,7 @@ mod imp {
             shutdown,
             health,
             ue_namespace: config.ue_namespace,
+            worker_binding: config.worker_binding,
             _tun_file: tun_file,
         }))
     }

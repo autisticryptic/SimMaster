@@ -75,7 +75,7 @@ use crate::services::supplementary::ut::{XcapAccessContext, XcapDigestProvider};
 use crate::services::trunk::bridge::{
     DtmfCapabilities, DtmfSource, MediaOffer, OperatorCommand, OperatorEvent,
 };
-use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
+use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerBinding, UeWorkerHandle};
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, error, info, warn};
 
@@ -1400,6 +1400,9 @@ pub(crate) struct LiveUeSocketContext {
     pub namespace: String,
     pub ue_veth: String,
     pub worker: UeWorkerHandle,
+    /// Generation that received the veth/egress setup and owns sockets made
+    /// from this context. The handle itself survives worker respawns.
+    pub binding: UeWorkerBinding,
 }
 
 static LIVE_UE_SOCKET_CONTEXTS: OnceLock<StdRwLock<HashMap<String, LiveUeSocketContext>>> =
@@ -1434,8 +1437,14 @@ pub(crate) fn ue_socket_context_for_line(line_id: &str) -> Option<LiveUeSocketCo
 }
 
 fn required_ue_socket_context(line_id: &str) -> Result<LiveUeSocketContext, LiveStageError> {
-    ue_socket_context_for_line(line_id)
-        .ok_or_else(|| live_stage_error("ue_socket_context_unavailable"))
+    let context = ue_socket_context_for_line(line_id)
+        .ok_or_else(|| live_stage_error("ue_socket_context_unavailable"))?;
+    if !context.binding.is_current() {
+        return Err(live_stage_error(
+            "vowifi_runtime_ue_worker_generation_changed",
+        ));
+    }
+    Ok(context)
 }
 
 /// Resolve the UE namespace this line's VoWiFi tunnel should live in. The
@@ -3507,6 +3516,33 @@ async fn cached_tun_gateway_matches(line_id: &str, profile: &'static CarrierProf
         }
         return false;
     };
+    if !socket_context.binding.is_current()
+        || !gateway.worker_binding_is_current()
+        || !gateway.worker_binding_matches(&socket_context.binding)
+    {
+        warn!(
+            line_id,
+            profile_id = profile.meta.profile_id,
+            cached_worker_generation_current = gateway.worker_binding_is_current(),
+            socket_worker_generation_current = socket_context.binding.is_current(),
+            "Discarding VoWiFi gateway bound to a stale UE worker generation"
+        );
+        let removed = {
+            let mut cache = tun_gateway_cache().lock().await;
+            if cache
+                .get(line_id)
+                .is_some_and(|current| Arc::ptr_eq(current, &gateway))
+            {
+                cache.remove(line_id).is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            gateway.shutdown();
+        }
+        return false;
+    }
     let namespace = match crate::platform::netns::NetnsName::adopt(&socket_context.namespace) {
         Ok(namespace) => namespace,
         Err(error) => {
@@ -3593,6 +3629,7 @@ async fn ensure_live_tun_gateway(
     let remote = session
         .remote
         .ok_or_else(|| live_stage_error("live_remote_endpoint_missing"))?;
+    let socket_context = required_ue_socket_context(line_id)?;
 
     let gateway = tun_gateway::start_gateway(TunGatewayConfig {
         profile_id: profile.meta.profile_id,
@@ -3608,7 +3645,8 @@ async fn ensure_live_tun_gateway(
         secrets: child_sa.secrets.clone(),
         transport,
         remote,
-        ue_namespace: required_ue_socket_context(line_id)?.namespace,
+        ue_namespace: socket_context.namespace,
+        worker_binding: socket_context.binding,
     })
     .await
     .map_err(|error| live_stage_error(error.reason()))?;
@@ -3721,6 +3759,17 @@ async fn run_live_ims_register_until(
             .await;
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
+        Err(error)
+            if refresh_context.is_some_and(|(_, remaining_seconds)| remaining_seconds > 0)
+                && error.registration_loss
+                    == Some(RegistrationLossReason::SignalingTransportLost) =>
+        {
+            // A refresh that lost one UDP response does not prove that the
+            // ePDG/IKE/ESP/TUN path is dead. Keep the existing access leg and
+            // let the outer refresh-failure counter decide when a rebuild is
+            // warranted.
+            (RegistrationRefreshResult::Retry, Some(error))
+        }
         Err(error) => {
             let loss_reason = error
                 .registration_loss
@@ -3747,6 +3796,18 @@ async fn run_live_ims_register_until(
             }
             record_live_ims_register_ready(line_id, profile, true, registered).await;
             Ok(())
+        }
+        RegistrationRefreshResult::Retry => {
+            let error = error.expect("refresh retry retains its adapter error");
+            warn!(
+                line_id,
+                profile_id = profile.meta.profile_id,
+                transport,
+                reused_access = true,
+                error = %error,
+                "VoWiFi IMS REGISTER refresh will retry on the existing access leg"
+            );
+            Err(error)
         }
         RegistrationRefreshResult::RebuildAccess(loss_reason) => {
             if refresh_context.is_some() {
@@ -10225,7 +10286,8 @@ mod tests {
             Some(LiveUeSocketContext {
                 namespace: namespace.as_str().to_string(),
                 ue_veth: "save-test".to_string(),
-                worker,
+                worker: worker.clone(),
+                binding: worker.bind(),
             }),
         );
 

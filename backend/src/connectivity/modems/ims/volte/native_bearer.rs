@@ -29,7 +29,10 @@ use crate::hardware::devices::transport::{
     BearerInterfaceOwnership, ImsBearerError, ImsBearerErrorKind, ImsBearerFailureHint,
     ImsBearerHandle, ImsBearerInfo, ImsBearerTransport,
 };
-use crate::{platform::netns, services::ue_worker::UeWorkerHandle};
+use crate::{
+    platform::netns,
+    services::ue_worker::{UeWorkerBinding, UeWorkerHandle},
+};
 
 use super::{
     bearer::{teardown_bearer_network_in_worker, BearerConnection, BearerRequest},
@@ -84,6 +87,10 @@ pub struct NativeImsBearer {
     /// Device-owned teardown handle. This module never inspects it.
     handle: Box<dyn ImsBearerHandle + Send>,
     worker: Option<UeWorkerHandle>,
+    /// Generation that received the interface, routes and sockets. The
+    /// cloneable worker handle survives a respawn, so cleanup must not use it
+    /// after this binding becomes stale.
+    worker_binding: Option<UeWorkerBinding>,
     moved_to_worker: bool,
 }
 
@@ -93,6 +100,16 @@ impl NativeImsBearer {
     /// provider-declared application-owned bearer may cross the
     /// namespace boundary.
     pub async fn move_into_worker(&mut self, worker: UeWorkerHandle) -> Result<(), VolteError> {
+        let worker_binding = worker.bind();
+        if !worker_binding.is_current() {
+            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+        }
+        if self.moved_to_worker {
+            if self.worker_binding_is_current() {
+                return Ok(());
+            }
+            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+        }
         match self.interface_ownership {
             BearerInterfaceOwnership::HostManagedPrimary => {
                 return Err(VolteError::with_detail(
@@ -117,14 +134,12 @@ impl NativeImsBearer {
                 // worker. Record the worker for route/socket teardown, but do
                 // not attempt a second namespace move.
                 self.worker = Some(worker);
+                self.worker_binding = Some(worker_binding);
                 return Ok(());
             }
             BearerInterfaceOwnership::ApplicationOwnedNative => {}
         }
-        if self.moved_to_worker {
-            return Ok(());
-        }
-        netns::move_iface_in(worker.namespace(), &self.interface)
+        netns::move_iface_in(worker_binding.namespace(), &self.interface)
             .await
             .map_err(|error| {
                 VolteError::with_detail(
@@ -132,18 +147,18 @@ impl NativeImsBearer {
                     format!(
                         "move native bearer {} into {}: {error}",
                         self.interface,
-                        worker.namespace()
+                        worker_binding.namespace()
                     ),
                 )
             })?;
-        let status = worker.refresh_net_status().await;
+        let status = worker_binding.worker().refresh_net_status().await;
         if status.as_ref().ok().is_none_or(|snapshot| {
             !snapshot
                 .interfaces
                 .iter()
                 .any(|name| name == &self.interface)
         }) {
-            let _ = netns::move_iface_out(worker.namespace(), &self.interface).await;
+            let _ = netns::move_iface_out(worker_binding.namespace(), &self.interface).await;
             return Err(VolteError::with_detail(
                 code::COMMAND_FAILED,
                 format!(
@@ -152,7 +167,19 @@ impl NativeImsBearer {
                 ),
             ));
         }
+        if !worker_binding.is_current() {
+            // The worker respawned while the interface was being moved. Do not
+            // use the long-lived handle to clean the namespace: that would
+            // target the replacement generation. Its teardown owns the stale
+            // namespace state, while the provider handle is still released by
+            // the caller.
+            self.worker = Some(worker);
+            self.worker_binding = Some(worker_binding);
+            self.moved_to_worker = true;
+            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+        }
         self.worker = Some(worker);
+        self.worker_binding = Some(worker_binding);
         self.moved_to_worker = true;
         Ok(())
     }
@@ -161,16 +188,34 @@ impl NativeImsBearer {
         self.worker.as_ref()
     }
 
+    pub fn worker_binding(&self) -> Option<&UeWorkerBinding> {
+        self.worker_binding.as_ref()
+    }
+
     pub async fn restore_from_worker(&mut self) {
         if !self.moved_to_worker {
             return;
         }
-        if let Some(worker) = self.worker.as_ref() {
-            let _ = netns::move_iface_out(worker.namespace(), &self.interface).await;
-            let _ = worker.refresh_net_status().await;
+        if let Some(binding) = self.worker_binding.as_ref() {
+            if binding.is_current() {
+                let _ = netns::move_iface_out(binding.namespace(), &self.interface).await;
+                let _ = binding.worker().refresh_net_status().await;
+            } else {
+                tracing::warn!(
+                    interface = %self.interface,
+                    "Skipping native VoLTE interface restore bound to a stale UE worker generation"
+                );
+            }
         }
         self.moved_to_worker = false;
         self.worker = None;
+        self.worker_binding = None;
+    }
+
+    pub fn worker_binding_is_current(&self) -> bool {
+        self.worker_binding
+            .as_ref()
+            .is_none_or(UeWorkerBinding::is_current)
     }
 }
 
@@ -303,8 +348,15 @@ pub async fn establish_native_ims_bearer(
 
 /// Tear down a native bearer's WDS session(s) and release its endpoint.
 pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
-    if let Some(worker) = bearer.worker.as_ref() {
-        teardown_bearer_network_in_worker(&bearer.connection, worker).await;
+    if bearer.worker_binding_is_current() {
+        if let Some(worker) = bearer.worker.as_ref() {
+            teardown_bearer_network_in_worker(&bearer.connection, worker).await;
+        }
+    } else {
+        tracing::warn!(
+            interface = %bearer.interface,
+            "Skipping native VoLTE bearer network cleanup bound to a stale UE worker generation"
+        );
     }
     bearer.restore_from_worker().await;
     bearer.handle.release().await;
@@ -327,6 +379,7 @@ async fn adopt_bearer(
             interface_ownership: info.interface_ownership,
             handle,
             worker: None,
+            worker_binding: None,
             moved_to_worker: false,
         }),
         Err(error) => {
