@@ -12,9 +12,9 @@
 //! assembly; the real `ip` invocation is verified on the target device.
 //!
 //! IMS IPsec uses transport mode, integrity-only protection
-//! (`alg=hmac-md5-96; ealg=null`) over a pair of SAs bound to the negotiated
-//! client/server ports (`spi-c/spi-s/port-c/port-s`), per the P-CSCF
-//! Security-Server offer.
+//! (`alg=hmac-md5-96; ealg=null`) over the four transport-flow SAs bound to
+//! the negotiated client/server ports (`spi-c/spi-s/port-c/port-s`), per the
+//! P-CSCF Security-Server offer.
 
 use std::net::IpAddr;
 
@@ -316,39 +316,74 @@ pub fn build_install_plan_with_algs(
     if algs.enc != "cipher_null" && encryption_key.is_empty() {
         return Err(VolteError::new(code::IPSEC_IK_INVALID));
     }
-    // `-c` identifies packets sent by the client; `-s` identifies packets
-    // sent by the server. Each endpoint advertises its own ports/SPIs, so the
-    // two directions deliberately use values from different headers.
-    // Outbound: UE client/send port -> P-CSCF server/send port.
-    let out_sa = XfrmSa {
-        src: ue,
-        dst: pcscf,
-        spi: pcscf_sec.spi_s,
-        auth_key: auth_key.to_vec(),
-        enc_key: encryption_key.to_vec(),
-        algs,
-        sport: ue_sec.port_c,
-        dport: pcscf_sec.port_s,
-    };
-    // Inbound: P-CSCF client port -> UE server/receive port.
-    let in_sa = XfrmSa {
-        src: pcscf,
-        dst: ue,
-        spi: ue_sec.spi_s,
-        auth_key: auth_key.to_vec(),
-        enc_key: encryption_key.to_vec(),
-        algs,
-        sport: pcscf_sec.port_c,
-        dport: ue_sec.port_s,
-    };
+    // `-c` identifies the protected client flow and `-s` the protected server
+    // flow.  They are not interchangeable.  A REGISTER request leaves the UE
+    // on the client flow (UE port-c -> P-CSCF port-s), and its response comes
+    // back on that same flow.  Requests initiated by the P-CSCF use the server
+    // flow (P-CSCF port-c -> UE port-s), and the UE must be able to send their
+    // responses back on the reverse tuple.
+    //
+    // There are therefore four transport-mode SAs/policies, not just one
+    // outbound and one inbound entry.  The old two-entry plan protected the
+    // P-CSCF-initiated flow only on the inbound side; a normal REGISTER
+    // response on P-CSCF port-s -> UE port-c was discarded by XFRM before it
+    // could reach recv_sip().  Initial registration could appear to work when
+    // the core selected the other flow, while later refreshes silently timed
+    // out.  Keep the four tuples explicit so refresh and in-dialog traffic use
+    // the negotiated association in both directions.
+    let states = vec![
+        // UE client flow: UE port-c -> P-CSCF port-s.
+        XfrmSa {
+            src: ue,
+            dst: pcscf,
+            spi: pcscf_sec.spi_s,
+            auth_key: auth_key.to_vec(),
+            enc_key: encryption_key.to_vec(),
+            algs,
+            sport: ue_sec.port_c,
+            dport: pcscf_sec.port_s,
+        },
+        // Response on the same client flow: P-CSCF port-s -> UE port-c.
+        XfrmSa {
+            src: pcscf,
+            dst: ue,
+            spi: ue_sec.spi_c,
+            auth_key: auth_key.to_vec(),
+            enc_key: encryption_key.to_vec(),
+            algs,
+            sport: pcscf_sec.port_s,
+            dport: ue_sec.port_c,
+        },
+        // UE response flow: UE port-s -> P-CSCF port-c.
+        XfrmSa {
+            src: ue,
+            dst: pcscf,
+            spi: pcscf_sec.spi_c,
+            auth_key: auth_key.to_vec(),
+            enc_key: encryption_key.to_vec(),
+            algs,
+            sport: ue_sec.port_s,
+            dport: pcscf_sec.port_c,
+        },
+        // P-CSCF-initiated flow: P-CSCF port-c -> UE port-s.
+        XfrmSa {
+            src: pcscf,
+            dst: ue,
+            spi: ue_sec.spi_s,
+            auth_key: auth_key.to_vec(),
+            enc_key: encryption_key.to_vec(),
+            algs,
+            sport: pcscf_sec.port_c,
+            dport: ue_sec.port_s,
+        },
+    ];
     let policies = vec![
         build_xfrm_policy_add(ue, pcscf, ue_sec.port_c, pcscf_sec.port_s, PolicyDir::Out),
+        build_xfrm_policy_add(pcscf, ue, pcscf_sec.port_s, ue_sec.port_c, PolicyDir::In),
+        build_xfrm_policy_add(ue, pcscf, ue_sec.port_s, pcscf_sec.port_c, PolicyDir::Out),
         build_xfrm_policy_add(pcscf, ue, pcscf_sec.port_c, ue_sec.port_s, PolicyDir::In),
     ];
-    Ok(XfrmInstallPlan {
-        states: vec![out_sa, in_sa],
-        policies,
-    })
+    Ok(XfrmInstallPlan { states, policies })
 }
 
 /// Translate the negotiated Security-Server algorithms into Linux xfrm names.
@@ -634,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn install_plan_builds_two_sas_and_two_policies() {
+    fn install_plan_builds_four_flow_sas_and_policies() {
         let ue_sec = SecAgree {
             spi_c: 0x1111,
             spi_s: 0x2222,
@@ -648,16 +683,31 @@ mod tests {
             port_s: 7001,
         };
         let plan = build_install_plan(v6(2), v6(1), &ue_sec, &pcscf_sec, &[0x01; 16]).unwrap();
-        assert_eq!(plan.states.len(), 2);
-        assert_eq!(plan.policies.len(), 2);
-        // Outbound uses P-CSCF spi-s/port-s; inbound uses UE spi-s and
-        // P-CSCF port-c, matching the target kernel's successful runtime plan.
+        assert_eq!(plan.states.len(), 4);
+        assert_eq!(plan.policies.len(), 4);
+        // REGISTER request/response flow: UE port-c <-> P-CSCF port-s.
         assert_eq!(plan.states[0].spi, 0x4444);
         assert_eq!(plan.states[0].sport, 6000);
         assert_eq!(plan.states[0].dport, 7001);
-        assert_eq!(plan.states[1].spi, 0x2222);
-        assert_eq!(plan.states[1].sport, 7000);
-        assert_eq!(plan.states[1].dport, 6001);
+        assert_eq!(plan.states[1].spi, 0x1111);
+        assert_eq!(plan.states[1].sport, 7001);
+        assert_eq!(plan.states[1].dport, 6000);
+        // P-CSCF request/UE response flow: P-CSCF port-c <-> UE port-s.
+        assert_eq!(plan.states[2].spi, 0x3333);
+        assert_eq!(plan.states[2].sport, 6001);
+        assert_eq!(plan.states[2].dport, 7000);
+        assert_eq!(plan.states[3].spi, 0x2222);
+        assert_eq!(plan.states[3].sport, 7000);
+        assert_eq!(plan.states[3].dport, 6001);
+        let policy_text: Vec<String> = plan.policies.iter().map(|p| p.join(" ")).collect();
+        assert!(policy_text[0]
+            .contains("src 2001:db8::2 dst 2001:db8::1 proto udp sport 6000 dport 7001 dir out"));
+        assert!(policy_text[1]
+            .contains("src 2001:db8::1 dst 2001:db8::2 proto udp sport 7001 dport 6000 dir in"));
+        assert!(policy_text[2]
+            .contains("src 2001:db8::2 dst 2001:db8::1 proto udp sport 6001 dport 7000 dir out"));
+        assert!(policy_text[3]
+            .contains("src 2001:db8::1 dst 2001:db8::2 proto udp sport 7000 dport 6001 dir in"));
     }
 
     #[test]
