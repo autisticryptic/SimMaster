@@ -174,6 +174,14 @@ pub(crate) fn redacted_xfrm_argv(argv: &[String]) -> String {
 /// longer than every REGISTER lease and satisfies the TS 24.229 requirement
 /// that a successful refresh extend the SA to at least the lease plus 30 s
 /// without replacing the live association.
+///
+/// The transport selectors are not optional here. TS 33.203 binds every IMS
+/// SA to the source/destination UDP ports, and one UE/P-CSCF association has
+/// two simultaneous port tuples (`port_uc`/`port_ps` and
+/// `port_us`/`port_pc`). Leaving the state selector wildcarded makes Linux
+/// choose between otherwise identical SAs by SPI rather than by the SIP flow;
+/// a refresh can then be encrypted with the wrong SA or its response can fail
+/// ESP validation before it reaches the UDP socket.
 pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
     vec![
         "xfrm".into(),
@@ -189,6 +197,13 @@ pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
         format!("0x{:08x}", sa.spi),
         "mode".into(),
         "transport".into(),
+        "sel".into(),
+        "proto".into(),
+        "udp".into(),
+        "sport".into(),
+        sa.sport.to_string(),
+        "dport".into(),
+        sa.dport.to_string(),
         "auth-trunc".into(),
         sa.algs.auth.into(),
         hex_key(&sa.auth_key),
@@ -512,6 +527,14 @@ pub async fn install_plan_in_worker(
         VolteError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
     })?;
     if outcome.ok {
+        let port_summary = plan.states.first().map(|state| (state.sport, state.dport));
+        tracing::info!(
+            state_count = plan.states.len(),
+            policy_count = plan.policies.len(),
+            first_flow_sport = port_summary.map(|ports| ports.0),
+            first_flow_dport = port_summary.map(|ports| ports.1),
+            "VoLTE IMS XFRM plan installed"
+        );
         Ok(())
     } else {
         uninstall_plan_in_worker(plan, worker).await;
@@ -629,8 +652,7 @@ mod tests {
         assert!(joined.contains("mode transport"));
         assert!(joined.contains("auth-trunc hmac(md5) 0xaabbcc 96"));
         assert!(joined.contains("enc cipher_null"));
-        assert!(!joined.contains(" sel "));
-        assert!(!joined.contains(" sport "));
+        assert!(joined.contains("sel proto udp sport 6000 dport 6001"));
     }
 
     #[test]
