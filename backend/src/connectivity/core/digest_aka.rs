@@ -190,6 +190,68 @@ pub fn build_authorization_header(
     header
 }
 
+/// Extract the `nextnonce` value from one `Authentication-Info` field.
+///
+/// Authentication-Info is a comma-separated auth-param list and values may be
+/// quoted. We intentionally return only `nextnonce`; callers must recompute the
+/// digest response with it instead of editing an old Authorization header.
+pub fn parse_authentication_info_nextnonce(value: &str) -> Option<String> {
+    let mut in_quote = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quote => escaped = true,
+            '"' => in_quote = !in_quote,
+            ',' if !in_quote => {
+                parts.push(value[start..index].trim());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(value[start..].trim());
+
+    parts.into_iter().find_map(|part| {
+        let (name, raw) = part.split_once('=')?;
+        if !name.trim().eq_ignore_ascii_case("nextnonce") {
+            return None;
+        }
+        let raw = raw.trim();
+        if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+            Some(unescape_quoted_value(&raw[1..raw.len() - 1]))
+        } else if raw.is_empty() {
+            None
+        } else {
+            Some(raw.to_string())
+        }
+    })
+}
+
+fn unescape_quoted_value(value: &str) -> String {
+    let mut result = String::with_capacity(value.len());
+    let mut escaped = false;
+    for ch in value.chars() {
+        if escaped {
+            result.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            result.push(ch);
+        }
+    }
+    if escaped {
+        result.push('\\');
+    }
+    result
+}
+
 /// Build the initial empty-AKA Authorization header (before the 401).
 pub fn build_initial_authorization_header(username: &str, realm: &str, digest_uri: &str) -> String {
     format!(
@@ -769,6 +831,21 @@ mod tests {
         let c = decode_aka_nonce(&nonce).unwrap();
         assert_eq!(c.rand, (0u8..16).collect::<Vec<_>>());
         assert_eq!(c.autn, (16u8..32).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn parses_authentication_info_nextnonce_without_matching_other_params() {
+        assert_eq!(
+            parse_authentication_info_nextnonce(
+                "qop=auth, rspauth=deadbeef, nextnonce=\"new\\\"nonce\", cnonce=\"c\""
+            )
+            .as_deref(),
+            Some("new\"nonce")
+        );
+        assert_eq!(
+            parse_authentication_info_nextnonce("qop=auth, nc=00000001"),
+            None
+        );
     }
 
     #[test]

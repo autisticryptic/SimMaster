@@ -22,7 +22,7 @@ use super::errors::{code, VolteError};
 pub use core::{
     build_authorization_header, build_initial_authorization_header,
     build_initial_authorization_header_uri_first, build_resync_authorization_header,
-    DigestChallenge,
+    parse_authentication_info_nextnonce, DigestChallenge,
 };
 
 /// RAND/AUTN pair extracted from a decoded AKA nonce.

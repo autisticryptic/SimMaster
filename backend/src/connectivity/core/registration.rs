@@ -40,10 +40,17 @@ impl RegistrationLease {
     pub fn from_expires(expires_seconds: u32) -> Self {
         let expires_seconds = expires_seconds.max(1);
         let expires_after = Duration::from_secs(u64::from(expires_seconds));
-        // Preserve the established VoLTE policy: refresh at 11/12 of the
-        // negotiated lease. It leaves a bounded retry window without inventing
-        // a local minimum that could outlive a short network registration.
-        let refresh_seconds = (u64::from(expires_seconds).saturating_mul(11) / 12).max(1);
+        // 3GPP TS 24.229 §5.1.1.4.1 schedules re-registration before the
+        // binding expires: 600 seconds before expiry when the lease is longer
+        // than 1200 seconds, and halfway through shorter leases. The previous
+        // 11/12 policy left only 276 seconds for a 3306-second lease, so a
+        // transient SIP timeout could consume the entire recovery window.
+        let refresh_seconds = if expires_seconds > 1_200 {
+            u64::from(expires_seconds).saturating_sub(600)
+        } else {
+            u64::from(expires_seconds) / 2
+        }
+        .max(1);
         Self {
             expires_seconds,
             refresh_after: Duration::from_secs(refresh_seconds),
@@ -183,7 +190,7 @@ mod tests {
         );
 
         assert_eq!(context.lease.expires_seconds, 120);
-        assert_eq!(context.lease.refresh_after, Duration::from_secs(110));
+        assert_eq!(context.lease.refresh_after, Duration::from_secs(60));
         assert_eq!(context.lease.expires_after, Duration::from_secs(120));
         assert_eq!(
             context.service_route.as_deref(),
@@ -203,7 +210,7 @@ mod tests {
             600,
         );
         assert_eq!(context.lease.expires_seconds, 600);
-        assert_eq!(context.lease.refresh_after, Duration::from_secs(550));
+        assert_eq!(context.lease.refresh_after, Duration::from_secs(300));
     }
 
     #[test]

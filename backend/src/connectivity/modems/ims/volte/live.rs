@@ -128,15 +128,6 @@ const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// binding. Retry over the same protected association while its lease remains
 /// valid instead of tearing down the native IMS bearer and modem session.
 const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
-/// Do not schedule another retry when the current network-side registration
-/// lease is nearly exhausted. A retry that can only happen after the lease
-/// expires leaves the UE advertising a stale IMS binding.
-const REGISTER_REFRESH_MIN_RETRY_LIFETIME: Duration = Duration::from_secs(30);
-/// A protected UDP/XFRM path can lose one or two packets without the bearer
-/// being broken. Beyond this bounded budget, repeatedly sending on the same
-/// channel is counterproductive: rebuild the access/session and obtain fresh
-/// sockets and IPsec state instead of retrying for the rest of the lease.
-const REGISTER_REFRESH_MAX_TRANSPORT_FAILURES: u8 = 4;
 /// Keep two independent IMS dialogs for call waiting. A further call is
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
@@ -417,6 +408,14 @@ struct VolteLiveSession {
     worker_binding: UeWorkerBinding,
     register_ids: RequestIds,
     next_register_cseq: u32,
+    /// Authorization proof from the last successful IMS AKA exchange.
+    /// 3GPP TS 24.229 §5.1.1.4.2 requires reregistration to send the
+    /// previously calculated response instead of starting a fresh 401 round.
+    refresh_authorization: Option<VolteRefreshAuthorization>,
+    /// Exact Security-Client value used by the successful registration.
+    /// Protected refreshes must repeat this negotiated offer verbatim rather
+    /// than reconstructing it from mutable runtime/profile state.
+    security_client: Option<String>,
     sip_instance: String,
     security_binding: SecAgree,
     register_variant: VolteRegisterVariant,
@@ -480,17 +479,12 @@ fn refresh_retry_delay(
     if loss_reason != RegistrationLossReason::SignalingTransportLost {
         return None;
     }
+    // A missing SIP response is not proof that the access bearer is gone. Keep
+    // retrying the same REGISTER transaction on the same channel until the
+    // network lease actually expires. Rebuilding here hides a refresh defect
+    // and needlessly tears down an otherwise usable IMS bearer.
     let remaining = remaining_registration_lifetime(registration);
-    (remaining > REGISTER_REFRESH_MIN_RETRY_LIFETIME)
-        .then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
-}
-
-fn refresh_transport_failure_requires_rebuild(
-    consecutive_failures: u8,
-    remaining_lifetime: Duration,
-) -> bool {
-    consecutive_failures >= REGISTER_REFRESH_MAX_TRANSPORT_FAILURES
-        || remaining_lifetime <= REGISTER_REFRESH_MIN_RETRY_LIFETIME
+    (!remaining.is_zero()).then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
 }
 
 fn advance_register_cseq(current: u32, last_sent: u32) -> u32 {
@@ -632,8 +626,97 @@ pub struct VolteSmsSendResult {
 }
 
 #[derive(Clone)]
+struct VolteRefreshAuthorization {
+    challenge: digest_aka::DigestChallenge,
+    aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
+    cnonce: String,
+    nonce_count: u32,
+}
+
+impl VolteRefreshAuthorization {
+    fn new(
+        challenge: digest_aka::DigestChallenge,
+        aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
+    ) -> Self {
+        Self {
+            challenge,
+            aka,
+            cnonce: sip::hex_token(8),
+            nonce_count: 0,
+        }
+    }
+
+    /// Build a fresh Digest proof for one emitted REGISTER. The old code
+    /// replayed the complete Authorization header from the initial register;
+    /// that left `nc` and `response` stale. RFC 2617 requires a new digest
+    /// response for every request, with a monotonically increasing nonce-count
+    /// when the nonce is reused.
+    fn authorization_for(
+        &mut self,
+        identity: &ImsIdentity,
+        request_uri: &str,
+    ) -> Result<String, VolteError> {
+        // Do not consume a nonce-count until the complete Authorization value
+        // has been built. A local digest/AKA error must not make the next
+        // retry appear to have sent an unseen request.
+        let nonce_count = self
+            .nonce_count
+            .checked_add(1)
+            .ok_or_else(|| VolteError::new("volte_register_nonce_count_exhausted"))?;
+        let nc = format!("{nonce_count:08x}");
+        let response = digest_aka::compute_aka_response(
+            &identity.private_user,
+            &self.challenge.realm,
+            &self.aka,
+            &self.challenge.algorithm,
+            "REGISTER",
+            request_uri,
+            &self.challenge.nonce,
+            self.challenge.qop.as_deref(),
+            &self.cnonce,
+            &nc,
+        )?;
+        let authorization = digest_aka::build_authorization_header(
+            &self.challenge,
+            &identity.private_user,
+            request_uri,
+            &response,
+            &self.cnonce,
+            &nc,
+        );
+        self.nonce_count = nonce_count;
+        Ok(authorization)
+    }
+
+    /// Commit the nonce advertised by Authentication-Info only after the
+    /// REGISTER received a successful final response. A nextnonce starts a new
+    /// digest nonce sequence, so its nonce-count is reset; the next request will
+    /// calculate a new response rather than reusing the old response field.
+    fn apply_success_authentication_info(&mut self, response: &[u8]) -> bool {
+        let header_name = if self.challenge.proxy {
+            "Proxy-Authentication-Info"
+        } else {
+            "Authentication-Info"
+        };
+        let nextnonce = sip::header_values(response, header_name)
+            .into_iter()
+            .find_map(|value| digest_aka::parse_authentication_info_nextnonce(&value));
+        let Some(nextnonce) = nextnonce.filter(|value| !value.is_empty()) else {
+            return false;
+        };
+        if self.challenge.nonce == nextnonce {
+            return false;
+        }
+        self.challenge.nonce = nextnonce;
+        self.nonce_count = 0;
+        true
+    }
+}
+
+#[derive(Clone)]
 struct PreparedAuth {
     authorization: String,
+    refresh_authorization: Option<VolteRefreshAuthorization>,
     security_client: Option<String>,
     security_verify: Option<String>,
     register_policy: sip::RegisterRequestPolicy,
@@ -1119,8 +1202,14 @@ struct VolteRegisterAuthenticator {
     /// authenticator must remember what the first request looked like instead
     /// of reconstructing it from the 401 challenge.
     initial_authorization: Option<String>,
+    /// Digest AKA state used to construct each authenticated refresh request.
+    refresh_authorization: Option<VolteRefreshAuthorization>,
     /// Security-Client offered on the initial REGISTER, if any.
     initial_security_client: Option<String>,
+    /// Security-Verify carried by an already protected refresh. A 423 retry is
+    /// still part of that protected registration flow and must not fall back to
+    /// an unprotected "initial" header shape.
+    refresh_security_verify: Option<String>,
     /// Mandatory per-line worker used for SIP/IPsec sockets.
     worker: UeWorkerHandle,
     worker_binding: UeWorkerBinding,
@@ -1144,7 +1233,9 @@ impl VolteRegisterAuthenticator {
         visited_network_header: Option<String>,
         access_network: Option<ImsAccessNetworkContext>,
         initial_authorization: Option<String>,
+        refresh_authorization: Option<VolteRefreshAuthorization>,
         initial_security_client: Option<String>,
+        refresh_security_verify: Option<String>,
         worker: UeWorkerHandle,
     ) -> Self {
         let last_cseq = ids.cseq;
@@ -1170,7 +1261,9 @@ impl VolteRegisterAuthenticator {
             expires_seconds: profile.ims.register.expires_seconds,
             last_cseq,
             initial_authorization,
+            refresh_authorization,
             initial_security_client,
+            refresh_security_verify,
             worker_binding: worker.bind(),
             worker,
         }
@@ -1185,6 +1278,31 @@ impl VolteRegisterAuthenticator {
     /// live bearer. `UeWorkerHandle` survives respawns, so a fresh `bind()` at
     /// refresh time would accidentally bless sockets/XFRM state belonging to
     /// an already-dead generation.
+    /// Return the last challenge-bound Authorization generated by this
+    /// authenticator. It is intentionally copied only after a successful
+    /// REGISTER; a failed challenge must never poison the live session's
+    /// reregistration credentials.
+    fn refresh_authorization(&self) -> Option<VolteRefreshAuthorization> {
+        self.pending
+            .as_ref()
+            .and_then(|prepared| prepared.refresh_authorization.clone())
+            .or_else(|| self.refresh_authorization.clone())
+    }
+
+    /// Return the authenticator state emitted by the successful REGISTER and
+    /// commit a server-provided nextnonce to that state. This keeps the
+    /// challenge state transactional: a failed response cannot replace the
+    /// session's last known-good nonce, while a timeout still preserves the
+    /// already-emitted nonce-count through `refresh_authorization()`.
+    fn refresh_authorization_after_success(
+        &self,
+        response: &[u8],
+    ) -> Option<VolteRefreshAuthorization> {
+        let mut authorization = self.refresh_authorization()?;
+        authorization.apply_success_authentication_info(response);
+        Some(authorization)
+    }
+
     fn with_worker_binding(mut self, worker_binding: UeWorkerBinding) -> Self {
         self.worker_binding = worker_binding;
         self
@@ -1261,6 +1379,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 ),
                 security_client,
                 security_verify,
+                refresh_authorization: None,
                 register_policy,
             });
             return Ok(());
@@ -1406,16 +1525,26 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             nc,
         )
         .map_err(to_ims_error)?;
-        let authorization = digest_aka::build_authorization_header(
+        let refresh_authorization = VolteRefreshAuthorization {
+            challenge: challenge.clone(),
+            aka: aka.clone(),
+            cnonce,
+            nonce_count: 0,
+        };
+        // Validate the state once here, but defer consuming nonce-count 1 to
+        // authenticated_request(), which is the point at which the request is
+        // actually emitted.
+        let _ = digest_aka::build_authorization_header(
             &challenge,
             &self.identity.private_user,
             &request_uri,
             &proof,
-            &cnonce,
+            &refresh_authorization.cnonce,
             nc,
         );
         self.pending = Some(PreparedAuth {
-            authorization,
+            authorization: String::new(),
+            refresh_authorization: Some(refresh_authorization),
             security_client,
             security_verify,
             register_policy,
@@ -1432,13 +1561,25 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
         self.runtime
             .update(|state| state.stage = VolteStage::RegisterAuthenticated)
             .await;
-        let prepared = self
+        let mut prepared = self
             .pending
             .clone()
             .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
+        if let Some(mut refresh_authorization) = prepared.refresh_authorization.clone() {
+            let request_uri = sip::register_request_uri_with_target(
+                self.profile,
+                effective_register_target(&self.effective_ims),
+                &self.route,
+            );
+            prepared.authorization = refresh_authorization
+                .authorization_for(&self.identity, &request_uri)
+                .map_err(to_ims_error)?;
+            prepared.refresh_authorization = Some(refresh_authorization);
+            self.pending = Some(prepared.clone());
+        }
         let request = sip::build_register_from_profile_with_target_visited_and_access(
             self.profile,
             effective_register_target(&self.effective_ims),
@@ -1490,9 +1631,65 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             return self.authenticated_request(challenge_response, cseq).await;
         }
         self.expires_seconds = min_expires;
+        // A refresh request is already authenticated before the registrar can
+        // answer 423. RFC 3261/TS 24.229 require the Min-Expires retry to stay
+        // on the same REGISTER flow; rebuilding the unauthenticated initial
+        // shape here drops Security-Verify and sends a stale/empty digest. Keep
+        // the existing channel and recompute the digest for the new Expires.
+        if self.refresh_authorization.is_some() {
+            let mut ids = self.ids.clone();
+            ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
+            self.last_cseq = ids.cseq;
+            let request_uri = sip::register_request_uri_with_target(
+                self.profile,
+                effective_register_target(&self.effective_ims),
+                &self.route,
+            );
+            let mut refresh_authorization = self
+                .refresh_authorization
+                .clone()
+                .ok_or(ImsError::new("volte_register_auth_not_prepared"))?;
+            let authorization = refresh_authorization
+                .authorization_for(&self.identity, &request_uri)
+                .map_err(to_ims_error)?;
+            self.refresh_authorization = Some(refresh_authorization);
+            return Ok(
+                sip::build_register_from_profile_with_target_visited_and_access(
+                    self.profile,
+                    effective_register_target(&self.effective_ims),
+                    sip::RegisterPhase::Refresh,
+                    &self.identity,
+                    &self.route,
+                    &ids,
+                    self.expires_seconds,
+                    Some(&authorization),
+                    self.initial_security_client.as_deref(),
+                    self.refresh_security_verify.as_deref(),
+                    &self.sip_instance,
+                    self.register_policy,
+                    self.visited_network_header.as_deref(),
+                    self.access_network.as_ref(),
+                ),
+            );
+        }
         let mut ids = self.ids.clone();
         ids.cseq = self.ids.cseq.saturating_add(cseq.saturating_sub(1));
         self.last_cseq = ids.cseq;
+        let authorization =
+            if let Some(mut refresh_authorization) = self.refresh_authorization.clone() {
+                let request_uri = sip::register_request_uri_with_target(
+                    self.profile,
+                    effective_register_target(&self.effective_ims),
+                    &self.route,
+                );
+                let authorization = refresh_authorization
+                    .authorization_for(&self.identity, &request_uri)
+                    .map_err(to_ims_error)?;
+                self.refresh_authorization = Some(refresh_authorization);
+                Some(authorization)
+            } else {
+                self.initial_authorization.as_deref().map(str::to_string)
+            };
         Ok(
             sip::build_register_from_profile_with_target_visited_and_access(
                 self.profile,
@@ -1502,7 +1699,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 &self.route,
                 &ids,
                 self.expires_seconds,
-                self.initial_authorization.as_deref(),
+                authorization.as_deref(),
                 self.initial_security_client.as_deref(),
                 None,
                 &self.sip_instance,
@@ -2392,7 +2589,9 @@ async fn connect_family(
             device_identity.visited_network_header.clone(),
             access_network.clone(),
             initial_authorization.clone(),
+            None,
             initial_security_client,
+            None,
             socket_worker,
         )
         .with_worker_binding(worker_binding.clone());
@@ -2483,6 +2682,8 @@ async fn connect_family(
             )
             .await;
         let artifacts = RegisterArtifacts::parse(&registration.response);
+        let refresh_authorization =
+            authenticator.refresh_authorization_after_success(&registration.response);
         log_volte_register_success_metadata("initial", variant, &artifacts);
         let registered = RegisteredImsContext::from_artifacts(
             ImsRegistrationAccess::Volte,
@@ -2543,6 +2744,11 @@ async fn connect_family(
                 .update(|state| state.stage = VolteStage::RegisterUdp)
                 .await;
         }
+        if authenticator.xfrm_plan.is_some() {
+            // Keep the session's SIP route authoritative even if the socket
+            // activation path returned a stale/unprotected header port.
+            channel.sync_protected_advertised_port(authenticator.offered_security_binding.port_s);
+        }
         return Ok(VolteLiveSession {
             channel,
             identity: registered_identity,
@@ -2562,6 +2768,8 @@ async fn connect_family(
             ims_profile_lease: None,
             register_ids: authenticator.ids.clone(),
             next_register_cseq: authenticator.last_cseq.saturating_add(1),
+            refresh_authorization,
+            security_client: authenticator.initial_security_client.clone(),
             sip_instance: authenticator.sip_instance,
             security_binding: authenticator.offered_security_binding,
             register_variant: variant,
@@ -2627,12 +2835,9 @@ async fn unregister_live_session(
     let mut ids = session.register_ids.clone();
     ids.cseq = session.next_register_cseq;
     let security_verify = session.channel.security_verify().map(str::to_string);
-    let security_client = security_verify.as_ref().map(|_| {
-        session
-            .register_variant
-            .security_client_offer
-            .build(session.security_binding, session.profile)
-    });
+    let security_client = security_verify
+        .as_ref()
+        .and_then(|_| session.security_client.clone());
     let request_uri = sip::register_request_uri_with_target(
         session.profile,
         effective_register_target(&session.effective_ims),
@@ -2668,10 +2873,7 @@ async fn unregister_live_session(
         ids,
         session.sip_instance.clone(),
         session.security_binding,
-        session
-            .register_variant
-            .security_client_offer
-            .build(session.security_binding, session.profile),
+        session.security_client.clone().unwrap_or_default(),
         session.channel.route(),
         session.device.clone(),
         runtime.clone(),
@@ -2683,7 +2885,9 @@ async fn unregister_live_session(
         session.visited_network_header.clone(),
         session.access_network.clone(),
         initial_authorization,
+        None,
         security_client,
+        None,
         session.xfrm_worker.clone(),
     )
     .with_worker_binding(session.worker_binding.clone())
@@ -2828,10 +3032,8 @@ async fn live_receive_loop(
             .map(|session| tokio::time::Instant::now() + session.registration.lease.refresh_after)
             .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(60))
     };
-    // Keep transient protected-transport loss from tearing down the Qualcomm
-    // bearer immediately, but do not keep reusing a dead SIP/XFRM channel for
-    // an hour as the previous implementation did.
-    let mut refresh_transport_failures = 0u8;
+    // Refresh retries stay on this live channel. Rebuilding is reserved for
+    // an expired registration or a proven worker/access-generation loss.
     // The native IMS provider retains its device session until teardown.
     // REGISTER refresh remains the end-to-end bearer health signal because it
     // covers the IMS IP path and SIP service, not only WDS packet status.
@@ -2922,21 +3124,13 @@ async fn live_receive_loop(
                 let mut sessions = live.session.lock().await;
                 match sessions.as_mut() {
                     Some(session) => {
-                        refresh_live_registration(
-                            session,
-                            &runtime,
-                            &line_id,
-                            &database,
-                            &mut refresh_transport_failures,
-                        )
-                        .await
+                        refresh_live_registration(session, &runtime, &line_id, &database).await
                     }
                     None => break,
                 }
             };
             match refresh_result.outcome {
                 RegistrationRefreshResult::Refreshed(registration) => {
-                    refresh_transport_failures = 0;
                     refresh_at = tokio::time::Instant::now() + registration.lease.refresh_after;
                     continue;
                 }
@@ -3160,7 +3354,6 @@ async fn refresh_live_registration(
     runtime: &VolteRuntime,
     line_id: &str,
     database: &Database,
-    consecutive_transport_failures: &mut u8,
 ) -> VolteRefreshAttempt {
     if let Err(error) = ensure_worker_binding_current(&session.worker_binding) {
         runtime
@@ -3179,6 +3372,15 @@ async fn refresh_live_registration(
             error: Some(error),
             retry_after: None,
         };
+    }
+    // The live session owns the negotiated protected channel. Before every
+    // refresh, restore the header advertisement from the session's original
+    // client binding. This is a SIP-route repair only: do not tear down the
+    // bearer or rebuild access merely because an in-memory port marker drifted.
+    if session.channel.security_verify().is_some() {
+        session
+            .channel
+            .sync_protected_advertised_port(session.security_binding.port_s);
     }
     runtime
         .update(|state| state.stage = VolteStage::RegisterRefresh)
@@ -3215,22 +3417,45 @@ async fn refresh_live_registration(
         let mut ids = session.register_ids.clone();
         ids.cseq = session.next_register_cseq;
         let security_verify = session.channel.security_verify().map(str::to_string);
-        let security_client = security_verify.as_ref().map(|_| {
-            variant
-                .security_client_offer
-                .build(session.security_binding, session.profile)
-        });
+        let security_client = security_verify
+            .as_ref()
+            .and_then(|_| session.security_client.clone());
         let require_sec_agree = security_verify.is_some();
+        // 3GPP TS 24.229 §5.1.1.4.2 requires an IMS AKA reregistration to
+        // carry the last successful challenge response (same private user,
+        // realm, home-domain URI, nonce and calculated response). Starting
+        // refresh unauthenticated forces an unnecessary 401 exchange and is
+        // rejected by P-CSCFs that distinguish reregistration from initial
+        // registration. If the original registration was accepted without
+        // AKA, keep the header absent and retain the normal fallback path.
+        let mut refresh_authorization = session.refresh_authorization.clone();
         let request_uri = sip::register_request_uri_with_target(
             session.profile,
             effective_register_target(&session.effective_ims),
             &session.channel.route(),
         );
-        let initial_authorization = variant.authorization.build(
-            &session.effective_ims.realm.value,
-            &session.identity,
-            &request_uri,
-        );
+        let initial_authorization = refresh_authorization
+            .as_mut()
+            .map(|state| state.authorization_for(&session.identity, &request_uri))
+            .transpose();
+        let initial_authorization = match initial_authorization {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(error = %error, "VoLTE refresh digest state could not build Authorization");
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(
+                        RegistrationLossReason::AuthenticationRejected,
+                    ),
+                    error: Some(error),
+                    retry_after: None,
+                };
+            }
+        };
+        // `authorization_for` consumes nonce-count state. Move that updated
+        // state into the authenticator as well as the wire request; otherwise a
+        // successful refresh would store the pre-request clone and the next
+        // refresh would repeat the old `nc` (and potentially the old response).
+        let emitted_refresh_authorization = refresh_authorization;
         let register_policy = sip::RegisterRequestPolicy {
             require_sec_agree,
             ..variant.policy
@@ -3257,9 +3482,7 @@ async fn refresh_live_registration(
             ids.clone(),
             session.sip_instance.clone(),
             session.security_binding.clone(),
-            variant
-                .security_client_offer
-                .build(session.security_binding, session.profile),
+            session.security_client.clone().unwrap_or_default(),
             session.channel.route(),
             session.device.clone(),
             runtime.clone(),
@@ -3271,7 +3494,9 @@ async fn refresh_live_registration(
             session.visited_network_header.clone(),
             session.access_network.clone(),
             initial_authorization,
+            emitted_refresh_authorization,
             security_client,
+            security_verify,
             session.xfrm_worker.clone(),
         )
         .with_worker_binding(session.worker_binding.clone())
@@ -3286,18 +3511,15 @@ async fn refresh_live_registration(
             Ok(registration) => registration,
             Err(failure) => {
                 log_volte_register_failure_metadata(variant, &failure, Some(&initial));
+                if let Some(authorization) = authenticator.refresh_authorization() {
+                    session.refresh_authorization = Some(authorization);
+                }
                 let error = map_refresh_register_failure(&failure);
                 if is_refresh_transport_failure(&failure) {
-                    *consecutive_transport_failures =
-                        (*consecutive_transport_failures).saturating_add(1);
                     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
                     let retry_after = refresh_retry_delay(
                         &session.registration,
                         RegistrationLossReason::SignalingTransportLost,
-                    );
-                    let requires_rebuild = refresh_transport_failure_requires_rebuild(
-                        *consecutive_transport_failures,
-                        remaining_lifetime,
                     );
                     runtime
                         .record_attempt(
@@ -3306,37 +3528,41 @@ async fn refresh_live_registration(
                             "failed",
                             Some(&error),
                             Some(format!(
-                                "transport_failure_count={};remaining_lifetime_seconds={}",
-                                *consecutive_transport_failures,
+                                "transport_retry=existing_channel;remaining_lifetime_seconds={}",
                                 remaining_lifetime.as_secs()
                             )),
                         )
                         .await;
-                    if !requires_rebuild {
-                        if let Some(retry_after) = retry_after {
-                            tracing::warn!(
-                                error = %error,
-                                retry_after_seconds = retry_after.as_secs(),
-                                register_variant = variant.label,
-                                consecutive_transport_failures = *consecutive_transport_failures,
-                                "VoLTE REGISTER refresh transport failure; retaining bearer and session"
-                            );
-                            return VolteRefreshAttempt {
-                                outcome: RegistrationRefreshResult::Retry,
-                                error: Some(error),
-                                retry_after: Some(retry_after),
-                            };
-                        }
+                    if let Some(retry_after) = retry_after {
+                        tracing::warn!(
+                            error = %error,
+                            retry_after_seconds = retry_after.as_secs(),
+                            register_variant = variant.label,
+                            remaining_lifetime_seconds = remaining_lifetime.as_secs(),
+                            "VoLTE REGISTER refresh transport failure; retaining bearer and session"
+                        );
+                        return VolteRefreshAttempt {
+                            outcome: RegistrationRefreshResult::Retry,
+                            error: Some(error),
+                            retry_after: Some(retry_after),
+                        };
                     }
+                    // The lease has actually expired. This is no longer a
+                    // refresh failure while a registered binding is valid, so
+                    // recovery may establish a new registration.
                     tracing::warn!(
                         error = %error,
                         register_variant = variant.label,
-                        consecutive_transport_failures = *consecutive_transport_failures,
                         remaining_lifetime_seconds = remaining_lifetime.as_secs(),
-                        "VoLTE REGISTER refresh transport failures exhausted; rebuilding access"
+                        "VoLTE IMS registration lease expired while refresh was unanswered"
                     );
-                    last_failure = Some((variant, failure));
-                    break;
+                    return VolteRefreshAttempt {
+                        outcome: RegistrationRefreshResult::RebuildAccess(
+                            RegistrationLossReason::Expired,
+                        ),
+                        error: Some(error),
+                        retry_after: None,
+                    };
                 }
                 let retry_variant = failure
                     .response
@@ -3360,6 +3586,11 @@ async fn refresh_live_registration(
         }
         session.register_variant = variant;
         let artifacts = RegisterArtifacts::parse(&registration.response);
+        if let Some(authorization) =
+            authenticator.refresh_authorization_after_success(&registration.response)
+        {
+            session.refresh_authorization = Some(authorization);
+        }
         log_volte_register_success_metadata("refresh", variant, &artifacts);
         let registered = RegisteredImsContext::from_artifacts(
             ImsRegistrationAccess::Volte,
@@ -6956,29 +7187,30 @@ mod tests {
             None
         );
         registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(40);
-        assert_eq!(
-            refresh_retry_delay(
-                &registration,
-                RegistrationLossReason::SignalingTransportLost
-            ),
-            None
-        );
+        let delay = refresh_retry_delay(
+            &registration,
+            RegistrationLossReason::SignalingTransportLost,
+        )
+        .expect("an unexpired lease remains retryable");
+        assert!(delay <= REGISTER_REFRESH_RETRY_INTERVAL);
+        assert!(delay > Duration::from_secs(14));
     }
 
     #[test]
-    fn refresh_transport_failures_have_a_bounded_rebuild_budget() {
-        assert!(!refresh_transport_failure_requires_rebuild(
-            REGISTER_REFRESH_MAX_TRANSPORT_FAILURES - 1,
-            Duration::from_secs(60),
-        ));
-        assert!(refresh_transport_failure_requires_rebuild(
-            REGISTER_REFRESH_MAX_TRANSPORT_FAILURES,
-            Duration::from_secs(60),
-        ));
-        assert!(refresh_transport_failure_requires_rebuild(
-            1,
-            REGISTER_REFRESH_MIN_RETRY_LIFETIME,
-        ));
+    fn refresh_transport_retry_is_allowed_until_lease_expiry() {
+        let mut registration = RegisteredImsContext::from_response(
+            ImsRegistrationAccess::Volte,
+            b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
+            60,
+        );
+        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(50);
+        let delay = refresh_retry_delay(
+            &registration,
+            RegistrationLossReason::SignalingTransportLost,
+        )
+        .expect("the lease has not expired");
+        assert!(delay <= Duration::from_secs(10));
+        assert!(delay > Duration::from_secs(9));
     }
 
     #[test]
@@ -6986,6 +7218,75 @@ mod tests {
         assert_eq!(advance_register_cseq(42, 42), 43);
         assert_eq!(advance_register_cseq(43, 42), 43);
         assert_eq!(advance_register_cseq(u32::MAX, u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn refresh_authorization_recomputes_digest_and_commits_nextnonce() {
+        let challenge = digest_aka::DigestChallenge {
+            realm: "ims.example".to_string(),
+            nonce: "nonce-a".to_string(),
+            algorithm: "AKAv1-MD5".to_string(),
+            qop: Some("auth".to_string()),
+            opaque: None,
+            proxy: false,
+        };
+        let aka = crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult {
+            res: b"Circle Of Life".to_vec(),
+            ck: Vec::new(),
+            ik: Vec::new(),
+            auts: None,
+        };
+        let identity = ImsIdentity {
+            private_user: "user@ims.example".to_string(),
+            public_uri: "sip:+15551234567@ims.example".to_string(),
+            contact_user: "user".to_string(),
+            home_domain: "ims.example".to_string(),
+            contact_user_phone: false,
+        };
+        let mut authorization = VolteRefreshAuthorization::new(challenge, aka);
+
+        let first = authorization
+            .authorization_for(&identity, "sip:ims.example")
+            .unwrap();
+        let second = authorization
+            .authorization_for(&identity, "sip:ims.example")
+            .unwrap();
+        assert!(first.contains("nc=00000001"));
+        assert!(second.contains("nc=00000002"));
+        assert_ne!(first, second, "each refresh must carry a new digest proof");
+
+        assert!(authorization.apply_success_authentication_info(
+            b"SIP/2.0 200 OK\r\nAuthentication-Info: nextnonce=\"nonce-b\"\r\n\r\n"
+        ));
+        let after_nextnonce = authorization
+            .authorization_for(&identity, "sip:ims.example")
+            .unwrap();
+        assert!(after_nextnonce.contains("nonce=\"nonce-b\""));
+        assert!(after_nextnonce.contains("nc=00000001"));
+    }
+
+    #[test]
+    fn refresh_authorization_uses_proxy_authentication_info_for_407() {
+        let challenge = digest_aka::DigestChallenge {
+            realm: "ims.example".to_string(),
+            nonce: "nonce-a".to_string(),
+            algorithm: "AKAv1-MD5".to_string(),
+            qop: Some("auth".to_string()),
+            opaque: None,
+            proxy: true,
+        };
+        let aka = crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult {
+            res: b"Circle Of Life".to_vec(),
+            ck: Vec::new(),
+            ik: Vec::new(),
+            auts: None,
+        };
+        let mut authorization = VolteRefreshAuthorization::new(challenge, aka);
+        assert!(authorization.apply_success_authentication_info(
+            b"SIP/2.0 200 OK\r\nProxy-Authentication-Info: nextnonce=\"nonce-proxy\"\r\n\r\n"
+        ));
+        assert_eq!(authorization.challenge.nonce, "nonce-proxy");
+        assert_eq!(authorization.nonce_count, 0);
     }
 
     #[tokio::test]
@@ -7184,6 +7485,8 @@ mod tests {
             worker_binding: test_binding,
             register_ids: RequestIds::fresh(1),
             next_register_cseq: 2,
+            refresh_authorization: None,
+            security_client: Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c=1;spi-s=2;port-c=5064;port-s=5063".into()),
             sip_instance: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
             security_binding: SecAgree {
                 spi_c: 1,
@@ -7597,6 +7900,57 @@ mod tests {
     }
 
     #[test]
+    fn volte_refresh_starts_without_initial_empty_aka_authorization() {
+        let profile = &crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
+        let variant = register_variant("ims_features_aka_uri_first");
+        let identity = ImsIdentity {
+            private_user: "234330000000001@ims.example".into(),
+            public_uri: "sip:+441234567890@ims.example".into(),
+            contact_user: "234330000000001".into(),
+            home_domain: "ims.example".into(),
+            contact_user_phone: false,
+        };
+        let route = ImsRoute {
+            local_addr: "10.0.0.2:5063".parse().unwrap(),
+            pcscf_addr: "10.0.0.1:6000".parse().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let binding = SecAgree {
+            spi_c: 0x0102_0304,
+            spi_s: 0x0506_0708,
+            port_c: 5064,
+            port_s: 5063,
+        };
+        let security = binding.security_client_value();
+        let request = sip::build_register_from_profile_with_target_visited_and_access(
+            profile,
+            sip::RegisterTarget {
+                domain: "ims.example",
+                realm: "ims.example",
+                registrar: None,
+            },
+            sip::RegisterPhase::Refresh,
+            &identity,
+            &route,
+            &RequestIds::fresh(3),
+            3306,
+            None,
+            Some(&security),
+            Some(&security),
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            sip::RegisterRequestPolicy {
+                require_sec_agree: true,
+                proxy_require_sec_agree: true,
+                ..variant.policy
+            },
+            None,
+            None,
+        );
+        assert!(sip::header_value(&request, "Authorization").is_none());
+        assert!(sip::header_value(&request, "Security-Client").is_some());
+        assert!(sip::header_value(&request, "Security-Verify").is_some());
+    }
+    #[test]
     fn register_candidate_ladder_stops_after_authentication() {
         let failure = RegisterFailure {
             error: ImsError::new("ims_register_authenticated_unexpected_status"),
@@ -7609,9 +7963,7 @@ mod tests {
 
     #[test]
     fn register_candidate_ladder_advances_on_shaped_rejections() {
-        let retryable = [
-            400, 404, 408, 410, 415, 420, 421, 423, 430, 480, 491, 494, 500, 501, 502, 503, 504,
-        ];
+        let retryable = [400, 415, 420, 421, 494];
         for status in retryable {
             let failure = RegisterFailure {
                 error: ImsError::new("ims_register_initial_unexpected_status"),

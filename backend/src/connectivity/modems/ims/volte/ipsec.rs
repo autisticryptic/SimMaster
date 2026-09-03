@@ -168,6 +168,12 @@ pub(crate) fn redacted_xfrm_argv(argv: &[String]) -> String {
 
 /// Build `ip xfrm state add ...` for one SA direction (transport mode,
 /// integrity-only). Returns the argv (without the leading `ip`).
+///
+/// No XFRM soft/hard time limit is installed intentionally. Linux therefore
+/// keeps the SA alive until this session explicitly removes it, which is
+/// longer than every REGISTER lease and satisfies the TS 24.229 requirement
+/// that a successful refresh extend the SA to at least the lease plus 30 s
+/// without replacing the live association.
 pub fn build_xfrm_state_add(sa: &XfrmSa) -> Vec<String> {
     vec![
         "xfrm".into(),
@@ -602,6 +608,22 @@ mod tests {
         assert!(joined.contains("dport 6001"));
         assert!(joined.contains("tmpl src 2001:db8::2 dst 2001:db8::1 proto esp mode transport"));
         assert!(joined.contains("mode transport"));
+    }
+
+    #[test]
+    fn state_add_keeps_sa_lifetime_unbounded_for_registration_refreshes() {
+        let sa = XfrmSa {
+            src: v6(2),
+            dst: v6(1),
+            spi: 0x1122_3344,
+            auth_key: vec![1; 16],
+            enc_key: Vec::new(),
+            algs: XfrmAlgs::default(),
+            sport: 5064,
+            dport: 5063,
+        };
+        let command = build_xfrm_state_add(&sa);
+        assert!(!command.iter().any(|part| part == "limit"));
     }
 
     #[test]

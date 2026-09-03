@@ -69,31 +69,14 @@ fn register_cseq(frame: &[u8]) -> Option<u32> {
     method.eq_ignore_ascii_case("REGISTER").then_some(number)
 }
 
-/// Final-response statuses that a differently shaped REGISTER candidate (or a
-/// different P-CSCF) may clear. Format, lease, extension, routing and
-/// transient server failures are all candidates; anything that names a
-/// policy/identity problem is not. The candidate ladder is bounded by every
-/// adapter, so a broad retryable set costs at most a few extra attempts.
+/// Final-response statuses that can plausibly be fixed by a different
+/// REGISTER header shape. Do not classify a timeout, a server failure, a lease
+/// negotiation failure, or a policy/identity response as header compatibility:
+/// changing PANI/Route/security formatting after those responses only burns the
+/// existing registration's recovery window. `423` is handled in the shared
+/// driver on the same channel and must never enter this candidate ladder.
 pub(crate) fn status_permits_register_variant_fallback(status: u16) -> bool {
-    matches!(
-        status,
-        400 | 404
-            | 408
-            | 410
-            | 415
-            | 420
-            | 421
-            | 423
-            | 430
-            | 480
-            | 491
-            | 494
-            | 500
-            | 501
-            | 502
-            | 503
-            | 504
-    )
+    matches!(status, 400 | 415 | 420 | 421 | 494)
 }
 
 /// Final-response statuses for which retrying another REGISTER shape is

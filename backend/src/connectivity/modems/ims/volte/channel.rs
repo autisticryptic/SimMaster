@@ -282,6 +282,26 @@ impl VolteSipChannel {
         route
     }
 
+    /// Restore the local port used in Via/Contact after sec-agree from the
+    /// binding that was negotiated for this live session.
+    ///
+    /// The protected receive socket is deliberately kept separate from the
+    /// client/send socket. A refresh must continue to advertise `port_us`,
+    /// even when a worker/socket lifecycle path has lost the in-memory
+    /// advertised-port marker. This does not touch the bearer, sockets, or
+    /// XFRM state; it only repairs the SIP header route used by this channel.
+    pub fn sync_protected_advertised_port(&mut self, port: u16) {
+        let observed = self.advertised_route().local_addr.port();
+        if observed != port {
+            tracing::warn!(
+                observed_local_port = observed,
+                negotiated_server_port = port,
+                "VoLTE protected SIP advertised port drift detected; correcting refresh route"
+            );
+        }
+        self.advertised_local_port = Some(port);
+    }
+
     /// The route packets are actually sourced from: after sec-agree the
     /// protected client port (port_uc). Only the security offer needs this.
     pub fn send_route(&self) -> ImsRoute {
@@ -570,6 +590,18 @@ mod tests {
             .unwrap();
         let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
         assert_eq!(response, b"protected register response");
+
+        // A refresh can repair only the SIP advertisement without replacing
+        // either protected socket. Via/Contact use port_us, while the actual
+        // datagram must still leave the original port_uc send socket.
+        channel.sync_protected_advertised_port(local_receive.port());
+        assert_eq!(channel.route().local_addr, local_receive);
+        assert_eq!(channel.send_route().local_addr, local_send);
+        assert_eq!(channel.local_addr().unwrap(), local_send);
+        channel.send_sip(b"protected refresh").await.unwrap();
+        let (read, peer) = pcscf_client.recv_from(&mut request).await.unwrap();
+        assert_eq!(&request[..read], b"protected refresh");
+        assert_eq!(peer, local_send);
     }
 
     #[tokio::test]
