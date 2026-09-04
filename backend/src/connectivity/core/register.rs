@@ -6,9 +6,19 @@
 
 use std::time::Duration;
 
-use super::{access::ImsChannel, registration::UnregisterResult, sip_frame, ImsError};
+use super::{
+    access::ImsChannel, context::SipTransport, registration::UnregisterResult, sip_frame, ImsError,
+};
 
-const REGISTER_TIMEOUT: Duration = Duration::from_secs(8);
+/// RFC 3261 T1. IMS REGISTER is a non-INVITE transaction and must retransmit
+/// the identical request on an unreliable UDP transport when the response is
+/// lost.
+const REGISTER_T1: Duration = Duration::from_millis(500);
+/// RFC 3261 T2 bounds the non-INVITE retransmission interval.
+const REGISTER_T2: Duration = Duration::from_secs(4);
+/// RFC 3261 Timer F is 64*T1 for a UDP client transaction.
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(32);
+
 const MAX_AUTH_ROUNDS: u8 = 2;
 /// Safety valve for unrelated frames that share the IMS signaling path.
 pub(crate) const MAX_REGISTER_IGNORED_FRAMES: u8 = 32;
@@ -216,13 +226,10 @@ where
     C: ImsChannel,
     A: RegisterAuthenticator<C>,
 {
-    channel.send_sip(initial_request).await.map_err(|_| {
-        RegisterFailure::new(ImsError::new("ims_register_initial_send_failed"), None, 0)
-    })?;
-    let expected_transaction = RegisterTransactionKey::from_register_request(initial_request);
-    let mut response = recv_final_register_response(
+    let mut response = send_register_and_receive(
         channel,
-        expected_transaction.as_ref(),
+        initial_request,
+        "ims_register_initial_send_failed",
         "ims_register_initial_receive_failed",
         "ims_register_initial_unexpected_status",
     )
@@ -266,23 +273,17 @@ where
                         .map_err(|error| {
                             RegisterFailure::new(error, Some(response.clone()), auth_rounds)
                         })?;
-                    channel.send_sip(&request).await.map_err(|_| {
-                        RegisterFailure::new(
-                            ImsError::new("ims_register_authenticated_send_failed"),
-                            Some(response.clone()),
-                            auth_rounds,
-                        )
-                    })?;
-                    let expected_transaction =
-                        RegisterTransactionKey::from_register_request(&request);
-                    response = recv_final_register_response(
+                    response = send_register_and_receive(
                         channel,
-                        expected_transaction.as_ref(),
+                        &request,
+                        "ims_register_authenticated_send_failed",
                         "ims_register_authenticated_receive_failed",
                         "ims_register_authenticated_unexpected_status",
                     )
                     .await
-                    .map_err(|error| RegisterFailure::new(error, None, auth_rounds))?;
+                    .map_err(|error| {
+                        RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                    })?;
                 }
             }
             401 | 407 => {
@@ -342,22 +343,17 @@ where
                         "ims_register_authenticated_unexpected_status",
                     )
                 };
-                channel.send_sip(&request).await.map_err(|_| {
-                    RegisterFailure::new(
-                        ImsError::new(send_error),
-                        Some(response.clone()),
-                        auth_rounds,
-                    )
-                })?;
-                let expected_transaction = RegisterTransactionKey::from_register_request(&request);
-                response = recv_final_register_response(
+                response = send_register_and_receive(
                     channel,
-                    expected_transaction.as_ref(),
+                    &request,
+                    send_error,
                     receive_error,
                     unexpected_error,
                 )
                 .await
-                .map_err(|error| RegisterFailure::new(error, None, auth_rounds))?;
+                .map_err(|error| {
+                    RegisterFailure::new(error, Some(response.clone()), auth_rounds)
+                })?;
             }
             423 => {
                 let error = if auth_rounds == 0 {
@@ -424,6 +420,32 @@ where
     }
 }
 
+async fn send_register_and_receive<C>(
+    channel: &mut C,
+    request: &[u8],
+    send_error: &'static str,
+    receive_error: &'static str,
+    provisional_exhausted_error: &'static str,
+) -> Result<Vec<u8>, ImsError>
+where
+    C: ImsChannel,
+{
+    let expected_transaction = RegisterTransactionKey::from_register_request(request);
+    channel
+        .send_sip(request)
+        .await
+        .map_err(|_| ImsError::new(send_error))?;
+    recv_final_register_response_with_retransmit(
+        channel,
+        request,
+        expected_transaction.as_ref(),
+        send_error,
+        receive_error,
+        provisional_exhausted_error,
+    )
+    .await
+}
+
 async fn recv_final_register_response<C>(
     channel: &mut C,
     expected_transaction: Option<&RegisterTransactionKey>,
@@ -433,9 +455,35 @@ async fn recv_final_register_response<C>(
 where
     C: ImsChannel,
 {
-    recv_final_register_response_with_timeout(
+    recv_final_register_response_loop(
         channel,
+        None,
         expected_transaction,
+        None,
+        receive_error,
+        provisional_exhausted_error,
+        REGISTER_TIMEOUT,
+    )
+    .await
+}
+
+async fn recv_final_register_response_with_retransmit<C>(
+    channel: &mut C,
+    request: &[u8],
+    expected_transaction: Option<&RegisterTransactionKey>,
+    send_error: &'static str,
+    receive_error: &'static str,
+    provisional_exhausted_error: &'static str,
+) -> Result<Vec<u8>, ImsError>
+where
+    C: ImsChannel,
+{
+    let retransmit = (channel.route().transport == SipTransport::Udp).then_some(request);
+    recv_final_register_response_loop(
+        channel,
+        retransmit,
+        expected_transaction,
+        Some(send_error),
         receive_error,
         provisional_exhausted_error,
         REGISTER_TIMEOUT,
@@ -453,20 +501,76 @@ async fn recv_final_register_response_with_timeout<C>(
 where
     C: ImsChannel,
 {
+    recv_final_register_response_loop(
+        channel,
+        None,
+        expected_transaction,
+        None,
+        receive_error,
+        provisional_exhausted_error,
+        timeout_budget,
+    )
+    .await
+}
+
+async fn recv_final_register_response_loop<C>(
+    channel: &mut C,
+    retransmit_request: Option<&[u8]>,
+    expected_transaction: Option<&RegisterTransactionKey>,
+    send_error: Option<&'static str>,
+    receive_error: &'static str,
+    provisional_exhausted_error: &'static str,
+    timeout_budget: Duration,
+) -> Result<Vec<u8>, ImsError>
+where
+    C: ImsChannel,
+{
     // One absolute budget for the whole transaction. Unrelated traffic and
     // provisional responses must not restart the timer for each frame.
+    // For UDP, the same REGISTER transaction is retransmitted according to
+    // RFC 3261 Timer E/T2; retransmission keeps the same Call-ID, branch and
+    // CSeq. A refresh timeout must not be turned into a brand-new REGISTER
+    // transaction merely because one datagram was lost.
     let deadline = tokio::time::Instant::now() + timeout_budget;
+    let udp_retransmit = retransmit_request.is_some();
+    let mut retransmit_interval = REGISTER_T1;
+    let mut next_retransmit = tokio::time::Instant::now() + retransmit_interval;
     let mut provisional_count = 0u8;
     let mut ignored_frames = 0u8;
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
             return Err(ImsError::new(receive_error));
         }
-        let response = channel
-            .recv_sip_fresh(remaining)
-            .await
-            .map_err(|_| ImsError::new(receive_error))?;
+        if udp_retransmit && now >= next_retransmit {
+            let request = retransmit_request.expect("UDP retransmission request is present");
+            channel
+                .send_sip(request)
+                .await
+                .map_err(|_| ImsError::new(send_error.unwrap_or(receive_error)))?;
+            tracing::debug!(
+                register_cseq = sip_frame::header_value(request, "CSeq"),
+                interval_ms = retransmit_interval.as_millis(),
+                "IMS REGISTER retransmitting UDP transaction"
+            );
+            retransmit_interval = retransmit_interval.saturating_mul(2).min(REGISTER_T2);
+            next_retransmit = now + retransmit_interval;
+            continue;
+        }
+        let deadline_for_read = if udp_retransmit {
+            deadline.min(next_retransmit)
+        } else {
+            deadline
+        };
+        let remaining = deadline_for_read.saturating_duration_since(now);
+        if remaining.is_zero() {
+            continue;
+        }
+        let response = match channel.recv_sip_fresh(remaining).await {
+            Ok(response) => response,
+            Err(error) if udp_retransmit && is_register_read_timeout(&error) => continue,
+            Err(_) => return Err(ImsError::new(receive_error)),
+        };
         // The IMS signaling path is shared with in-dialog requests (NOTIFY,
         // MESSAGE, ...). Only a response for this REGISTER transaction may be
         // consumed; anything else goes back to the caller's queue so the
@@ -503,6 +607,13 @@ where
         );
     }
     Err(ImsError::new(provisional_exhausted_error))
+}
+
+fn is_register_read_timeout(error: &ImsError) -> bool {
+    matches!(
+        error.code(),
+        "ims_channel_read_timeout" | "volte_channel_read_timeout" | "ims_register_read_timeout"
+    )
 }
 
 /// Parse the `Min-Expires` header from a `423 Interval Too Brief` response.
@@ -611,7 +722,66 @@ mod tests {
         }
     }
 
+    struct RetransmittingChannel {
+        sends: Vec<Vec<u8>>,
+        timed_out: bool,
+    }
+
+    impl ImsChannel for RetransmittingChannel {
+        async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+            self.sends.push(frame.to_vec());
+            Ok(())
+        }
+
+        async fn recv_sip(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            self.recv_sip_fresh(Duration::from_secs(1)).await
+        }
+
+        async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            if !self.timed_out {
+                // Make the first read consume the transaction's first 500 ms
+                // receive window. The real UDP socket returns the same timeout
+                // after that window, which is what causes Timer E to fire the
+                // first retransmission before the response below is exposed.
+                tokio::time::sleep(timeout).await;
+                self.timed_out = true;
+                return Err(ImsError::new("ims_channel_read_timeout"));
+            }
+            Ok(response_with_header(
+                200,
+                "OK",
+                "Call-ID: refresh@dev\r\nCSeq: 7 REGISTER\r\n",
+            ))
+        }
+
+        fn route(&self) -> ImsRoute {
+            ImsRoute {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                pcscf_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                transport: SipTransport::Udp,
+            }
+        }
+
+        fn security_verify(&self) -> Option<&str> {
+            None
+        }
+    }
+
     struct FakeAuthenticator;
+
+    impl RegisterAuthenticator<RetransmittingChannel> for FakeAuthenticator {
+        async fn authenticated_request(
+            &mut self,
+            _challenge_response: &[u8],
+            cseq: u32,
+        ) -> Result<Vec<u8>, ImsError> {
+            Ok(format!(
+                "REGISTER sip:ims.example SIP/2.0\r\nCSeq: {cseq} REGISTER\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes())
+        }
+    }
+
     impl RegisterAuthenticator<FakeChannel> for FakeAuthenticator {
         async fn authenticated_request(
             &mut self,
@@ -698,6 +868,22 @@ mod tests {
 
     fn response_with_header(code: u16, reason: &str, headers: &str) -> Vec<u8> {
         format!("SIP/2.0 {code} {reason}\r\n{headers}Content-Length: 0\r\n\r\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn udp_register_retransmits_the_same_transaction_after_a_timeout() {
+        let request = b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: refresh@dev\r\nCSeq: 7 REGISTER\r\nContent-Length: 0\r\n\r\n";
+        let mut channel = RetransmittingChannel {
+            sends: Vec::new(),
+            timed_out: false,
+        };
+
+        run_register(&mut channel, request, &mut FakeAuthenticator)
+            .await
+            .unwrap();
+
+        assert_eq!(channel.sends.len(), 2);
+        assert_eq!(channel.sends[0], channel.sends[1]);
     }
 
     #[tokio::test]
