@@ -1493,6 +1493,10 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 self.offered_security = self
                     .security_client_offer
                     .build(self.offered_security_binding, self.profile);
+                // The replacement SA is now the binding that authenticated
+                // this refresh. Persist the exact rebuilt Security-Client so
+                // the next refresh does not advertise the retired port tuple.
+                self.initial_security_client = Some(self.offered_security.clone());
                 tracing::info!(
                     old_port_uc,
                     new_port_uc = send_port,
