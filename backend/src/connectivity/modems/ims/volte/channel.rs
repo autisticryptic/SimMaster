@@ -476,6 +476,14 @@ impl VolteSipChannel {
             .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))
     }
 
+    /// Release ports reserved for a standards-compliant protected refresh that
+    /// completed without an AKA challenge. In that case the existing SA stays
+    /// active and the new Security-Client offer is discarded.
+    pub fn discard_reserved_security_ports(&mut self) {
+        self.reserved_send_socket = None;
+        self.reserved_receive_socket = None;
+    }
+
     pub fn interface(&self) -> Option<&str> {
         self.interface.as_deref()
     }
@@ -536,8 +544,53 @@ async fn recv_protected(
     Ok(frame)
 }
 
+fn header_parameter_port(frame: &[u8], header_name: &str, parameter_name: &str) -> Option<u16> {
+    for value in super::sip::header_values(frame, header_name) {
+        for parameter in value.split(';') {
+            let Some((name, value)) = parameter.trim().split_once('=') else {
+                continue;
+            };
+            if name.trim().eq_ignore_ascii_case(parameter_name) {
+                if let Ok(port) = value.trim().trim_matches('"').parse() {
+                    return Some(port);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl ImsChannel for VolteSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        // Log the actual REGISTER transmit tuple, not only the route used to
+        // construct Via/Contact.  In a protected VoLTE session these are
+        // intentionally different: headers advertise port_us while the UDP
+        // packet leaves port_uc.  Keeping both values in one log record makes
+        // an unanswered refresh distinguishable from a SIP/header mismatch.
+        if super::sip::is_request(frame, "REGISTER") {
+            let advertised = self.advertised_route();
+            let send_route = self.send_route();
+            let actual_send = self
+                .send_socket
+                .as_ref()
+                .and_then(|socket| socket.local_addr().ok());
+            tracing::info!(
+                register_cseq = super::sip::header_value(frame, "CSeq"),
+                advertised_port = advertised.local_addr.port(),
+                actual_send_port = actual_send.map(|address| address.port()),
+                send_route_port = send_route.local_addr.port(),
+                advertised_pcscf = %advertised.pcscf_addr,
+                send_pcscf = %send_route.pcscf_addr,
+                security_client_port_c = header_parameter_port(frame, "Security-Client", "port-c"),
+                security_client_port_s = header_parameter_port(frame, "Security-Client", "port-s"),
+                security_verify_port_c = header_parameter_port(frame, "Security-Verify", "port-c"),
+                security_verify_port_s = header_parameter_port(frame, "Security-Verify", "port-s"),
+                security_client_present = !super::sip::header_values(frame, "Security-Client").is_empty(),
+                security_verify_present = !super::sip::header_values(frame, "Security-Verify").is_empty(),
+                protected_channel = self.security_verify.is_some(),
+                "VoLTE REGISTER transmit path"
+            );
+        }
         let written = self
             .send_socket
             .as_ref()
