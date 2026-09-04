@@ -646,7 +646,8 @@ pub async fn download_diagnostic_log_handler(State(app): State<AppState>) -> imp
     let mut body = Vec::new();
     let mut budget = DIAGNOSTIC_LOG_DOWNLOAD_MAX_BYTES;
     let mut omitted = 0usize;
-    // Newest first: `list_log_files` returns oldest-first.
+    // Newest first: `list_log_files` returns oldest-first, and each file is
+    // reversed as well so date order and time order point in the same direction.
     for file in files.iter().rev() {
         if budget == 0 {
             omitted += 1;
@@ -655,6 +656,7 @@ pub async fn download_diagnostic_log_handler(State(app): State<AppState>) -> imp
         match fs::read(&file.path) {
             Ok(bytes) => {
                 body.extend_from_slice(format!("===== {} =====\n", file.name).as_bytes());
+                let bytes = diagnostic_log::newest_first_log_bytes(&bytes);
                 let take = bytes.len().min(budget as usize);
                 body.extend_from_slice(&bytes[..take]);
                 if take < bytes.len() {

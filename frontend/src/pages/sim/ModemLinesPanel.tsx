@@ -590,7 +590,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       }
       setSuccess(lineIsPresent(lineId)
         ? `${shortLineId(lineId)} ${enabled ? '已请求连接 IMS' : '已断开 IMS'}`
-        : `${shortLineId(lineId)} 的 VoLTE IMS 配置已保存，设备恢复后应用`)
+        : `${shortLineId(lineId)} 的 4G/5G IMS 配置已保存，设备恢复后应用`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -655,7 +655,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
           line.modem.line_id === lineId ? updatedLine : line
         )))
       }
-      setSuccess(`${shortLineId(lineId)} 已开始新的 ${updatedLine?.runtime.retry_max ?? 3} 次 VoLTE 恢复批次`)
+      setSuccess(`${shortLineId(lineId)} 已开始新的 ${updatedLine?.runtime.retry_max ?? 3} 次 4G/5G IMS 恢复批次`)
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err))
       await load(true)
@@ -1046,7 +1046,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     <Box display="flex" flexDirection="column">
                     {!isReader && (!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems={{ xs: 'flex-start', sm: 'center' }} flexDirection={{ xs: 'column', sm: 'row' }} gap={1} mt={1.5} pt={1.5} borderTop={1} borderColor="divider">
                       <Box minWidth={0}>
-                        <Typography variant="body2" fontWeight={600}>VoLTE IMS 连接</Typography>
+                        <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
+                          <CellTower color="action" fontSize="small" />
+                          <Typography variant="body2" fontWeight={600}>4G/5G IMS 连接</Typography>
+                        </Box>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
                         <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.volte_connection_enabled ? 'default' : line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : 'warning'} variant="outlined" />
@@ -1152,7 +1155,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
                     )}
-                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoLTE IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
+                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>4G/5G IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
                     {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoWiFi 详情</Typography><LineVowifiDetails vowifi={vowifiLine} /></Box>}
                     {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
                     {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><LineActivityLog line={line} appEvents={appEvents} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} /></Box>}

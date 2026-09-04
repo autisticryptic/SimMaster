@@ -825,8 +825,8 @@ impl LineRuntimeRegistry {
             );
         }
 
-        // Restore a new line's persisted counters before publishing it to the
-        // registry. The persistence lock prevents a periodic traffic flush from
+        // Restore a new line's persisted traffic counters before publishing it
+        // to the registry. The persistence lock prevents a periodic traffic flush from
         // seeing the zero baseline and overwriting the stored cumulative total.
         {
             let _traffic_guard = self.traffic_persistence_lock.lock().await;
@@ -841,22 +841,6 @@ impl LineRuntimeRegistry {
                                 active_connections: 0,
                             })
                             .await;
-                    }
-                    match database.get_volte_refresh_stats(line_id) {
-                        Ok(Some(stored)) => {
-                            line.volte
-                                .update(|snapshot| {
-                                    snapshot.register_refresh_count = stored.refresh_count;
-                                    snapshot.last_register_refresh_at = stored.last_refresh_at;
-                                })
-                                .await;
-                        }
-                        Ok(None) => {}
-                        Err(error) => tracing::warn!(
-                            line_id = %line_id,
-                            %error,
-                            "Failed to restore persisted VoLTE refresh stats"
-                        ),
                     }
                 }
             }

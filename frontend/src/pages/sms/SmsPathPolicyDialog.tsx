@@ -44,7 +44,7 @@ export default function SmsPathPolicyDialog({ open, lineId, onClose }: Props) {
       <DialogTitle>短信发送设置</DialogTitle>
       <DialogContent dividers>
         <Alert severity="info" sx={{ mb: 2 }}>
-          开启后短信只通过 VoWiFi 发送，不会回落到可能产生漫游资费的 VoLTE 或基带短信。
+          开启后短信只通过 VoWiFi 发送，不会回落到可能产生漫游资费的 4G/5G IMS 或基带短信。
         </Alert>
         {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
         {loading || !policy ? (

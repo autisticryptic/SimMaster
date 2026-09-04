@@ -95,7 +95,7 @@ function smsTransportInfo(transport?: string) {
     case 'vowifi_ims':
       return { label: 'VoWiFi', color: '#2aae67' }
     case 'volte_ims':
-      return { label: 'VoLTE', color: '#1976d2' }
+      return { label: '4G/5G', color: '#1976d2' }
     default:
       return { label: 'CS', color: '#6b7280' }
   }

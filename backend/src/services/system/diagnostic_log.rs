@@ -524,6 +524,29 @@ pub struct LogFileInfo {
 }
 
 /// List log files, oldest first.
+/// Reverse complete records while retaining each record's original bytes.
+/// Diagnostic records are one physical line each, so reversing the lines makes
+/// a per-day file newest-first without trying to parse or rewrite its payload.
+pub fn newest_first_log_bytes(bytes: &[u8]) -> Vec<u8> {
+    let had_trailing_newline = bytes.ends_with(b"\n");
+    let mut lines: Vec<&[u8]> = bytes.split(|byte| *byte == b'\n').collect();
+    if had_trailing_newline {
+        let _ = lines.pop();
+    }
+    lines.reverse();
+    let mut output = Vec::with_capacity(bytes.len());
+    for (index, line) in lines.into_iter().enumerate() {
+        if index > 0 {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(line);
+    }
+    if had_trailing_newline && !output.is_empty() {
+        output.push(b'\n');
+    }
+    output
+}
+
 pub fn list_log_files(directory: &Path) -> Vec<LogFileInfo> {
     let Ok(entries) = std::fs::read_dir(directory) else {
         return Vec::new();
@@ -702,6 +725,15 @@ pub fn read_status(config: &DiagnosticLogConfig, dropped_records: u64) -> Diagno
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn newest_first_log_bytes_reverses_complete_records() {
+        assert_eq!(
+            newest_first_log_bytes(b"old\nnew\n"),
+            b"new\nold\n".to_vec()
+        );
+        assert_eq!(newest_first_log_bytes(b"old\nnew"), b"new\nold".to_vec());
+    }
 
     #[test]
     fn masks_sensitive_json_keys_and_leaves_diagnostics_readable() {

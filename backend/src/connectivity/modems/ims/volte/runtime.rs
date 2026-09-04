@@ -645,6 +645,7 @@ impl VolteRuntime {
             snapshot.session_started_at = None;
             snapshot.registered_at = None;
             snapshot.last_register_refresh_at = None;
+            snapshot.register_refresh_count = 0;
             snapshot.last_rx_at = None;
             snapshot.last_tx_at = None;
             snapshot.data_path_mode = None;
@@ -731,12 +732,10 @@ impl VolteRuntime {
         let reason = reason.into();
         self.update(|s| {
             let prev_reconnect = s.reconnect_count;
-            let prev_refresh = s.register_refresh_count;
             *s = VolteSnapshot {
                 phase: VoltePhase::Disabled,
                 stage: VolteStage::Disabled,
                 reconnect_count: prev_reconnect,
-                register_refresh_count: prev_refresh,
                 last_error: if reason.is_empty() {
                     None
                 } else {
@@ -993,6 +992,7 @@ mod tests {
         assert_eq!(status.retry_attempt, 1);
         assert_eq!(status.retry_max, 3);
         assert_eq!(status.reconnect_count, 9);
+        assert_eq!(status.register_refresh_count, 0);
         assert_eq!(status.profile_attempt_results.len(), 1);
         let snapshot = rt.snapshot().await;
         assert!(snapshot.bearer_path.is_none());
@@ -1028,6 +1028,7 @@ mod tests {
             s.phase = VoltePhase::Registered;
             s.stage = VolteStage::Registered;
             s.reconnect_count = 5;
+            s.register_refresh_count = 4;
         })
         .await;
         let snap = rt.reset_runtime("volte_disabled").await;
@@ -1036,6 +1037,10 @@ mod tests {
         assert_eq!(
             snap.reconnect_count, 5,
             "reconnect count is preserved across reset"
+        );
+        assert_eq!(
+            snap.register_refresh_count, 0,
+            "refresh count belongs to the ended IMS session"
         );
         assert_eq!(snap.last_error.as_deref(), Some("volte_disabled"));
         assert_eq!(rt.generation(), g0 + 1);

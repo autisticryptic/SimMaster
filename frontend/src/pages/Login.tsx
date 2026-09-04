@@ -15,10 +15,8 @@ import {
   useTheme,
 } from '@mui/material'
 import {
-  GitHub as GitHubIcon,
   KeyboardArrowRight as ArrowIcon,
   LockOutlined as LockIcon,
-  Star as StarIcon,
 } from '@mui/icons-material'
 import { api } from '../api/current'
 import type { SecurityConfig } from '../api/types'
@@ -398,25 +396,6 @@ export default function Login() {
               {error && <Alert severity="error" sx={{ width: '100%' }}>{error}</Alert>}
 
               <Box sx={{ width: '100%', minHeight: 24, position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                <Link
-                  href="https://github.com/3899/SimAdmin"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  underline="none"
-                  color="text.secondary"
-                  sx={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 0.75,
-                    fontSize: 14,
-                    fontWeight: 600,
-                    '&:hover': { color: 'primary.main' },
-                  }}
-                >
-                  <GitHubIcon sx={{ fontSize: 18 }} />
-                  点亮 Star
-                  <StarIcon sx={{ fontSize: 18, color: '#facc15' }} />
-                </Link>
                 {mode === 'login' && (
                   <Box
                     sx={{

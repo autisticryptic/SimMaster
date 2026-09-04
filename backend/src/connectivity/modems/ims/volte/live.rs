@@ -1750,6 +1750,9 @@ pub async fn connect_live_for_line(
             state.phase = VoltePhase::Starting;
             state.stage = VolteStage::Starting;
             state.session_started_at = Some(now());
+            state.registered_at = None;
+            state.last_register_refresh_at = None;
+            state.register_refresh_count = 0;
             state.last_error = None;
             state.qmi_device = Some(device.qmi_device.clone());
             state.native_bearer_endpoint = None;
@@ -2525,14 +2528,17 @@ async fn connect_family(
             .reserve_security_receive_port_in_worker(&socket_worker)
             .await
             .map_err(map_channel_error)?;
+        let send_port = channel
+            .reserve_security_send_port_in_worker(&socket_worker, receive_port)
+            .await
+            .map_err(map_channel_error)?;
         ensure_worker_binding_current(worker_binding)?;
         let ids = RequestIds::fresh(1);
-        // port_c is the port packets are actually sourced from, so this reads the
-        // send route rather than the advertised one. They are identical here (no
-        // SA is active yet), but being explicit keeps the offer correct if this
-        // ever runs on an already-protected channel.
-        let offered_binding =
-            offered_security(channel.send_route().local_addr.port(), receive_port);
+        // port_c is reserved before SM1 and is retained through activation. The
+        // plain 5060 socket remains only the unprotected SM1 transport; using it
+        // in Security-Client would make the offer disagree with the protected
+        // XFRM/socket selector and causes later REGISTER refreshes to disappear.
+        let offered_binding = offered_security(send_port, receive_port);
         // TS 24.229 / RFC 3329: the initial REGISTER already advertises the
         // full ipsec-3gpp offer (alg/ealg/prot/mod + client SPI/ports). The
         // 401 then supplies the server binding; the authenticated REGISTER
@@ -3474,17 +3480,34 @@ async fn refresh_live_registration(
                 };
             }
         };
-        Some(offered_security(
-            session.channel.send_route().local_addr.port(),
-            receive_port,
-        ))
+        let send_port = match session
+            .channel
+            .reserve_security_send_port_in_worker(&session.xfrm_worker, receive_port)
+            .await
+        {
+            Ok(port) => port,
+            Err(error) => {
+                let error = map_channel_error(error);
+                tracing::warn!(
+                    error = %error,
+                    requested_port = receive_port,
+                    "VoLTE IMS security renegotiation could not reserve a fresh port_uc"
+                );
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::Retry,
+                    error: Some(error),
+                    retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                };
+            }
+        };
+        Some(offered_security(send_port, receive_port))
     } else {
         None
     };
     if security_renegotiating {
         tracing::info!(
-            port_us = session.channel.advertised_route().local_addr.port(),
-            port_uc = session.channel.send_route().local_addr.port(),
+            port_us = renegotiation_binding.as_ref().map(|binding| binding.port_s),
+            port_uc = renegotiation_binding.as_ref().map(|binding| binding.port_c),
             "VoLTE IMS refresh entering same-bearer security renegotiation"
         );
     }
@@ -3839,21 +3862,16 @@ async fn refresh_live_registration(
             )
             .await;
         let refreshed_at = now();
-        let persisted_count = match database.increment_volte_refresh_stats(line_id, &refreshed_at) {
-            Ok(stats) => Some(stats.refresh_count),
-            Err(error) => {
-                tracing::warn!(
-                    line_id = %line_id,
-                    %error,
-                    "Failed to persist successful VoLTE REGISTER refresh"
-                );
-                None
-            }
-        };
+        if let Err(error) = database.increment_volte_refresh_stats(line_id, &refreshed_at) {
+            tracing::warn!(
+                line_id = %line_id,
+                %error,
+                "Failed to persist successful VoLTE REGISTER refresh"
+            );
+        }
         runtime
             .update(move |state| {
-                let next_count = persisted_count
-                    .unwrap_or_else(|| state.register_refresh_count.saturating_add(1));
+                let next_count = state.register_refresh_count.saturating_add(1);
                 state.phase = VoltePhase::Registered;
                 state.stage = VolteStage::Registered;
                 state.last_error = None;

@@ -64,7 +64,7 @@ const ACTIVITY_LOG_VISIBLE_LIMIT = 20
 
 type ActivityLogEntry = {
   at: string
-  source: 'VoLTE' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
+  source: '4G/5G IMS' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
   stage: string
   outcome: string
   detail?: string
@@ -154,7 +154,7 @@ export function LineActivityLog({
     const source = event.transport === 'vowifi_ims' || event.event_type.startsWith('vowifi.')
       ? 'VoWiFi'
       : event.transport === 'volte_ims' || event.event_type.startsWith('volte.')
-        ? 'VoLTE'
+        ? '4G/5G IMS'
         : event.transport === 'trunk' || event.event_type.startsWith('trunk.')
           ? 'Trunk'
           : event.event_type.startsWith('sms.') ? '短信' : event.event_type.startsWith('call.') ? '通话' : '系统'
@@ -171,7 +171,7 @@ export function LineActivityLog({
     ...(appEvents.length > 0 ? [] : [
     ...(line.runtime.connection_attempts ?? []).map((attempt) => ({
       at: attempt.at,
-      source: 'VoLTE' as const,
+      source: '4G/5G IMS' as const,
       stage: `${volteActivityStageLabels[attempt.stage] || attempt.stage}${attempt.ip_family ? ` · ${attempt.ip_family.toUpperCase()}` : ''}`,
       outcome: attempt.outcome,
       detail: [
@@ -239,7 +239,7 @@ export function LineActivityLog({
     <Box>
       <Typography variant="subtitle2" fontWeight={700} mb={0.25}>线路活动日志</Typography>
       <Typography variant="caption" color="text.secondary" display="block" mb={1.5}>
-        最近 {ACTIVITY_LOG_VISIBLE_LIMIT} 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
+        最新在上，显示最近 {ACTIVITY_LOG_VISIBLE_LIMIT} 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
         完整历史与未截断的错误串见后端诊断日志。
       </Typography>
       <Box sx={{ maxHeight: 360, overflowY: 'auto', borderTop: 1, borderColor: 'divider' }}>

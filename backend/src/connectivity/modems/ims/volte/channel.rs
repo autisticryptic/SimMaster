@@ -26,6 +26,10 @@ const MAX_SIP_DATAGRAM: usize = 65_535;
 pub struct VolteSipChannel {
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
+    /// Protected UE-originated traffic uses a separately reserved port_c.
+    /// Keeping this socket open from the initial SM1 until activation makes the
+    /// Security-Client offer, XFRM selector, and actual UDP source identical.
+    reserved_send_socket: Option<ReservedSendSocket>,
     reserved_receive_socket: Option<ReservedReceiveSocket>,
     /// Complete frames set aside by a REGISTER transaction because they belong
     /// to a different dialog (NOTIFY/MESSAGE/MWI). They are handed back to the
@@ -41,6 +45,12 @@ pub struct VolteSipChannel {
     advertised_local_port: Option<u16>,
     interface: Option<String>,
     security_verify: Option<String>,
+}
+
+enum ReservedSendSocket {
+    #[cfg(test)]
+    Host(Socket),
+    Worker(UdpSocket),
 }
 
 enum ReservedReceiveSocket {
@@ -65,6 +75,7 @@ impl VolteSipChannel {
         Ok(Self {
             send_socket: Some(socket),
             receive_socket: None,
+            reserved_send_socket: None,
             reserved_receive_socket: None,
             requeued: ImsRequeue::default(),
             route,
@@ -88,7 +99,7 @@ impl VolteSipChannel {
             };
         }
         let local = SocketAddr::new(self.route.local_addr.ip(), 0);
-        let socket = build_bound_socket(local, self.interface.as_deref())
+        let socket = build_bound_socket_excluding(local, self.interface.as_deref(), 0)
             .map_err(|_| ImsError::new("volte_channel_receive_reserve_failed"))?;
         let port = socket_port(&socket)?;
         self.reserved_receive_socket = Some(ReservedReceiveSocket::Host(socket));
@@ -119,6 +130,7 @@ impl VolteSipChannel {
         Ok(Self {
             send_socket: Some(socket),
             receive_socket: None,
+            reserved_send_socket: None,
             reserved_receive_socket: None,
             requeued: ImsRequeue::default(),
             route,
@@ -126,6 +138,67 @@ impl VolteSipChannel {
             interface: interface.map(ToOwned::to_owned),
             security_verify,
         })
+    }
+
+    /// Reserve the protected UE/client port (`port_uc`) before SM1 is sent.
+    ///
+    /// TS 33.203 requires the ports declared in Security-Client during the
+    /// initial unprotected REGISTER to be the same ports used after the
+    /// Security-Server negotiation. The plain 5060 socket is therefore kept
+    /// for SM1, while this independent socket is held until activation.
+    #[cfg(test)]
+    pub fn reserve_security_send_port(&mut self, avoid_port: u16) -> Result<u16, ImsError> {
+        if let Some(socket) = self.reserved_send_socket.as_ref() {
+            return match socket {
+                ReservedSendSocket::Host(socket) => socket_port(socket),
+                ReservedSendSocket::Worker(socket) => socket
+                    .local_addr()
+                    .map(|addr| addr.port())
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+            };
+        }
+        let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+        let socket = build_bound_socket_excluding(local, self.interface.as_deref(), avoid_port)
+            .map_err(|_| ImsError::new("volte_channel_send_reserve_failed"))?;
+        let port = socket_port(&socket)?;
+        self.reserved_send_socket = Some(ReservedSendSocket::Host(socket));
+        Ok(port)
+    }
+
+    /// Reserve the protected UE/client port (`port_uc`) inside the UE worker.
+    pub async fn reserve_security_send_port_in_worker(
+        &mut self,
+        worker: &UeWorkerHandle,
+        avoid_port: u16,
+    ) -> Result<u16, ImsError> {
+        if let Some(socket) = self.reserved_send_socket.as_ref() {
+            return match socket {
+                #[cfg(test)]
+                ReservedSendSocket::Host(socket) => socket_port(socket),
+                ReservedSendSocket::Worker(socket) => socket
+                    .local_addr()
+                    .map(|addr| addr.port())
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
+            };
+        }
+        for _ in 0..8 {
+            let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+            let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
+            let socket = match worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => socket,
+                Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+                Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+            };
+            let port = socket
+                .local_addr()
+                .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+                .port();
+            if port != 5060 && port != 5061 && port != avoid_port {
+                self.reserved_send_socket = Some(ReservedSendSocket::Worker(socket));
+                return Ok(port);
+            }
+        }
+        Err(ImsError::new("volte_channel_send_reserve_invalid_port"))
     }
 
     /// Reserve the protected receive port using the worker socket factory.
@@ -156,19 +229,28 @@ impl VolteSipChannel {
                     .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
             };
         }
-        let local = SocketAddr::new(self.route.local_addr.ip(), requested_port);
-        let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
-        let socket = match worker.create_socket(spec).await {
-            Ok(UeSocket::Udp(socket)) => socket,
-            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
-        };
-        let port = socket
-            .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
-            .port();
-        self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(socket));
-        Ok(port)
+        if requested_port != 0 && (requested_port == 5060 || requested_port == 5061) {
+            return Err(ImsError::new("volte_channel_receive_reserved_sip_port"));
+        }
+        let attempts = if requested_port == 0 { 8 } else { 1 };
+        for _ in 0..attempts {
+            let local = SocketAddr::new(self.route.local_addr.ip(), requested_port);
+            let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
+            let socket = match worker.create_socket(spec).await {
+                Ok(UeSocket::Udp(socket)) => socket,
+                Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
+                Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
+            };
+            let port = socket
+                .local_addr()
+                .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
+                .port();
+            if port != 5060 && port != 5061 {
+                self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(socket));
+                return Ok(port);
+            }
+        }
+        Err(ImsError::new("volte_channel_receive_reserve_invalid_port"))
     }
 
     #[cfg(test)]
@@ -181,34 +263,40 @@ impl VolteSipChannel {
         receive_remote: SocketAddr,
         security_verify: Option<String>,
     ) -> Result<(), ImsError> {
-        let reserved = self
+        let reserved_send = self
+            .reserved_send_socket
+            .take()
+            .ok_or_else(|| ImsError::new("volte_channel_send_not_reserved"))?;
+        let send_socket = match reserved_send {
+            ReservedSendSocket::Host(socket) => {
+                if socket_addr(&socket)? != send_route.local_addr {
+                    return Err(ImsError::new("volte_channel_send_port_mismatch"));
+                }
+                connect_bound_socket(socket, send_route.pcscf_addr)
+                    .map_err(|_| ImsError::new("volte_channel_send_connect_failed"))?
+            }
+            ReservedSendSocket::Worker(_) => {
+                return Err(ImsError::new("volte_channel_worker_send_requires_async"));
+            }
+        };
+        let reserved_receive = self
             .reserved_receive_socket
             .take()
             .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
-        let receive_socket = match reserved {
-            #[cfg(test)]
-            ReservedReceiveSocket::Host(reserved) => {
-                if socket_addr(&reserved)? != receive_local {
+        let receive_socket = match reserved_receive {
+            ReservedReceiveSocket::Host(socket) => {
+                if socket_addr(&socket)? != receive_local {
                     return Err(ImsError::new("volte_channel_receive_port_mismatch"));
                 }
-                connect_bound_socket(reserved, receive_remote)
+                connect_bound_socket(socket, receive_remote)
                     .map_err(|_| ImsError::new("volte_channel_receive_connect_failed"))?
             }
-            ReservedReceiveSocket::Worker(socket) => {
-                let _ = (socket, receive_local, receive_remote);
+            ReservedReceiveSocket::Worker(_) => {
                 return Err(ImsError::new("volte_channel_worker_receive_requires_async"));
             }
         };
 
-        // Release the initial connected socket before rebinding the same local
-        // send port to the P-CSCF protected client port.
         self.send_socket.take();
-        let send_socket = build_socket(
-            send_route.local_addr,
-            send_route.pcscf_addr,
-            self.interface.as_deref(),
-        )
-        .map_err(|_| ImsError::new("volte_channel_protected_send_bind_failed"))?;
         let mut send_route = send_route;
         send_route.local_addr = send_socket
             .local_addr()
@@ -216,29 +304,50 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
-        // Terminating requests arrive on the protected server port, so that is
-        // what Via/Contact must advertise from here on -- not the send port.
         self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
         Ok(())
     }
 
-    /// Worker equivalent of [`Self::activate_security`].  The protected send
-    /// socket is recreated in the worker after XFRM has been installed; the
-    /// already-reserved receive socket is connected locally in the parent.
+    /// Worker equivalent of [`Self::activate_security`]. Both protected sockets
+    /// were reserved before SM1; activation only connects them to the two
+    /// P-CSCF ports after XFRM has been installed.
     pub async fn activate_security_in_worker(
         &mut self,
         send_route: ImsRoute,
         receive_local: SocketAddr,
         receive_remote: SocketAddr,
         security_verify: Option<String>,
-        worker: &UeWorkerHandle,
+        _worker: &UeWorkerHandle,
     ) -> Result<(), ImsError> {
-        let reserved = self
+        let reserved_send = self
+            .reserved_send_socket
+            .take()
+            .ok_or_else(|| ImsError::new("volte_channel_send_not_reserved"))?;
+        let send_socket = match reserved_send {
+            ReservedSendSocket::Worker(socket) => {
+                let local = socket
+                    .local_addr()
+                    .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+                if local != send_route.local_addr {
+                    return Err(ImsError::new("volte_channel_send_port_mismatch"));
+                }
+                socket
+                    .connect(send_route.pcscf_addr)
+                    .await
+                    .map_err(|_| ImsError::new("volte_channel_send_connect_failed"))?;
+                socket
+            }
+            #[cfg(test)]
+            ReservedSendSocket::Host(_) => {
+                return Err(ImsError::new("volte_channel_worker_send_mismatch"));
+            }
+        };
+        let reserved_receive = self
             .reserved_receive_socket
             .take()
             .ok_or_else(|| ImsError::new("volte_channel_receive_not_reserved"))?;
-        let receive_socket = match reserved {
+        let receive_socket = match reserved_receive {
             ReservedReceiveSocket::Worker(socket) => {
                 let local = socket
                     .local_addr()
@@ -257,16 +366,8 @@ impl VolteSipChannel {
                 return Err(ImsError::new("volte_channel_worker_receive_mismatch"));
             }
         };
-        let spec = UeSocketSpec::udp_connected(
-            send_route.local_addr,
-            send_route.pcscf_addr,
-            self.interface.clone(),
-        );
-        let send_socket = match worker.create_socket(spec).await {
-            Ok(UeSocket::Udp(socket)) => socket,
-            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
-        };
+
+        self.send_socket.take();
         let mut send_route = send_route;
         send_route.local_addr = send_socket
             .local_addr()
@@ -274,7 +375,6 @@ impl VolteSipChannel {
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
         self.route = send_route;
-        // Advertise the protected server port rather than the send port.
         self.advertised_local_port = Some(receive_local.port());
         self.security_verify = security_verify;
         Ok(())
@@ -500,6 +600,29 @@ fn build_socket(
 }
 
 #[cfg(test)]
+fn build_bound_socket_excluding(
+    local: SocketAddr,
+    interface: Option<&str>,
+    avoid_port: u16,
+) -> io::Result<Socket> {
+    for _ in 0..8 {
+        let socket = build_bound_socket(local, interface)?;
+        let port = socket
+            .local_addr()?
+            .as_socket()
+            .map(|addr| addr.port())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::AddrNotAvailable, "missing local port"))?;
+        if port != 5060 && port != 5061 && port != avoid_port {
+            return Ok(socket);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "kernel repeatedly selected a reserved SIP port",
+    ))
+}
+
+#[cfg(test)]
 fn build_bound_socket(local: SocketAddr, interface: Option<&str>) -> io::Result<Socket> {
     let socket = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
@@ -611,12 +734,21 @@ mod tests {
             transport: SipTransport::Udp,
         };
         let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
-        let local_send = channel.local_addr().unwrap();
+        let plain_send = channel.local_addr().unwrap();
         let local_receive = SocketAddr::new(
-            local_send.ip(),
+            plain_send.ip(),
             channel.reserve_security_receive_port().unwrap(),
         );
+        let local_send = SocketAddr::new(
+            plain_send.ip(),
+            channel
+                .reserve_security_send_port(local_receive.port())
+                .unwrap(),
+        );
+        assert_ne!(plain_send.port(), local_send.port());
         assert_ne!(local_send.port(), local_receive.port());
+        assert_ne!(local_send.port(), 5060);
+        assert_ne!(local_send.port(), 5061);
 
         channel
             .activate_security(
