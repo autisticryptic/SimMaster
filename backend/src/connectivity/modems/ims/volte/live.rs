@@ -127,15 +127,22 @@ const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// A missing refresh response does not invalidate an existing REGISTER
 /// binding. Retry over the same protected association while its lease remains
 /// valid instead of tearing down the native IMS bearer and modem session.
-const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(15);
+/// Keep the retry well outside the normal SIP transaction timeout so a lost
+/// response cannot turn into a tight REGISTER loop on the baseband.
+const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+/// A failed same-bearer security renegotiation is still a refresh recovery
+/// attempt, not a reason to reconnect the access bearer. Use an exponential
+/// cooldown because each attempt allocates sockets and may install XFRM state.
+const REGISTER_REFRESH_RENEGOTIATION_RETRY_BASE: Duration = Duration::from_secs(60);
+const REGISTER_REFRESH_RENEGOTIATION_RETRY_MAX: Duration = Duration::from_secs(300);
 /// After several unanswered protected REGISTERs, TS 33.203 permits the UE to
 /// assume the old P-CSCF SA is no longer active. Re-negotiate on the same
 /// bearer instead of hiding the signaling failure behind an access rebuild.
 const REGISTER_REFRESH_PROTECTED_TIMEOUTS_BEFORE_RENEGOTIATION: u8 = 2;
-/// Temporary device-validation override. Remove (or set to `None`) after the
-/// protected refresh fix is verified on the 410; production scheduling must
-/// use the network-provided RegistrationLease value.
-const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = Some(120);
+/// The short cycle was only for the first device validation and caused the
+/// production session to issue refreshes far more often than the network lease.
+/// Production scheduling must use the network-provided RegistrationLease value.
+const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
 
 fn scheduled_volte_refresh_delay(lease: &RegistrationLease) -> Duration {
     let normal = lease.refresh_after.max(Duration::from_secs(1));
@@ -438,6 +445,10 @@ struct VolteLiveSession {
     /// that negotiates a replacement SA on the existing bearer.
     security_renegotiation_pending: bool,
     consecutive_protected_refresh_timeouts: u8,
+    /// Number of failed same-bearer renegotiation attempts since the last
+    /// successful protected REGISTER. It drives the recovery cooldown and is
+    /// deliberately not an access/bearer reconnect counter.
+    security_renegotiation_attempts: u8,
     sip_instance: String,
     security_binding: SecAgree,
     register_variant: VolteRegisterVariant,
@@ -507,6 +518,28 @@ fn refresh_retry_delay(
     // and needlessly tears down an otherwise usable IMS bearer.
     let remaining = remaining_registration_lifetime(registration);
     (!remaining.is_zero()).then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
+}
+
+fn security_renegotiation_retry_delay(
+    registration: &RegisteredImsContext,
+    attempt: u8,
+) -> Duration {
+    let exponent = u32::from(attempt.saturating_sub(1).min(3));
+    let multiplier = 1_u64 << exponent;
+    let cooldown_seconds = REGISTER_REFRESH_RENEGOTIATION_RETRY_BASE
+        .as_secs()
+        .saturating_mul(multiplier)
+        .min(REGISTER_REFRESH_RENEGOTIATION_RETRY_MAX.as_secs());
+    let cooldown = Duration::from_secs(cooldown_seconds);
+    let remaining = remaining_registration_lifetime(registration);
+    if remaining.is_zero() {
+        // Let the next loop iteration observe the expired lease and take the
+        // normal expiry recovery path; never spin immediately on an expired
+        // binding.
+        Duration::from_secs(1)
+    } else {
+        remaining.min(cooldown)
+    }
 }
 
 fn advance_register_cseq(current: u32, last_sent: u32) -> u32 {
@@ -2854,6 +2887,7 @@ async fn connect_family(
             security_client: authenticator.initial_security_client.clone(),
             security_renegotiation_pending: false,
             consecutive_protected_refresh_timeouts: 0,
+            security_renegotiation_attempts: 0,
             sip_instance: authenticator.sip_instance,
             security_binding: authenticator.offered_security_binding,
             register_variant: variant,
@@ -3468,6 +3502,36 @@ async fn refresh_live_registration(
     line_id: &str,
     database: &Database,
 ) -> VolteRefreshAttempt {
+    // Do not start another SIP/XFRM attempt after the network lease has
+    // actually expired. A retry cooldown can race the lease boundary, and
+    // entering the refresh path in that state would otherwise recreate
+    // sockets/security state before the timeout branch notices expiry.
+    let remaining_lifetime = remaining_registration_lifetime(&session.registration);
+    if remaining_lifetime.is_zero() {
+        let error = VolteError::with_detail(
+            code::REGISTER_REFRESH_RECEIVE_FAILED,
+            "registration_lease_expired",
+        );
+        tracing::warn!(
+            error = %error,
+            "VoLTE IMS registration lease expired before refresh attempt"
+        );
+        runtime
+            .record_attempt(
+                VolteStage::RegisterRefresh,
+                Some(session.ip_family),
+                "failed",
+                Some(&error),
+                Some("registration_lease_expired".to_string()),
+            )
+            .await;
+        return VolteRefreshAttempt {
+            outcome: RegistrationRefreshResult::RebuildAccess(RegistrationLossReason::Expired),
+            error: Some(error),
+            retry_after: None,
+        };
+    }
+
     if let Err(error) = ensure_worker_binding_current(&session.worker_binding) {
         runtime
             .record_attempt(
@@ -3521,6 +3585,19 @@ async fn refresh_live_registration(
     // stays on the current SA. Replacement ports are allocated only after a
     // Security-Server challenge is actually received by the authenticator.
     let security_renegotiating = session.security_renegotiation_pending;
+    let security_renegotiation_attempt = if security_renegotiating {
+        let attempt = session.security_renegotiation_attempts.saturating_add(1);
+        session.security_renegotiation_attempts = attempt;
+        tracing::warn!(
+            attempt,
+            cooldown_seconds =
+                security_renegotiation_retry_delay(&session.registration, attempt,).as_secs(),
+            "VoLTE IMS same-bearer security renegotiation attempt started"
+        );
+        Some(attempt)
+    } else {
+        None
+    };
     let normal_protected_refresh =
         !security_renegotiating && session.channel.security_verify().is_some();
     let renegotiation_server_port = session.security_binding.port_s;
@@ -3544,7 +3621,10 @@ async fn refresh_live_registration(
             return VolteRefreshAttempt {
                 outcome: RegistrationRefreshResult::Retry,
                 error: Some(error),
-                retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                retry_after: Some(security_renegotiation_retry_delay(
+                    &session.registration,
+                    security_renegotiation_attempt.unwrap_or(1),
+                )),
             };
         }
         if let Some(old_plan) = session.xfrm_plan.take() {
@@ -3570,7 +3650,10 @@ async fn refresh_live_registration(
                 return VolteRefreshAttempt {
                     outcome: RegistrationRefreshResult::Retry,
                     error: Some(error),
-                    retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                    retry_after: Some(security_renegotiation_retry_delay(
+                        &session.registration,
+                        security_renegotiation_attempt.unwrap_or(1),
+                    )),
                 };
             }
         };
@@ -3591,7 +3674,10 @@ async fn refresh_live_registration(
                 return VolteRefreshAttempt {
                     outcome: RegistrationRefreshResult::Retry,
                     error: Some(error),
-                    retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                    retry_after: Some(security_renegotiation_retry_delay(
+                        &session.registration,
+                        security_renegotiation_attempt.unwrap_or(1),
+                    )),
                 };
             }
         };
@@ -3789,7 +3875,10 @@ async fn refresh_live_registration(
                         return VolteRefreshAttempt {
                             outcome: RegistrationRefreshResult::Retry,
                             error: Some(error),
-                            retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                            retry_after: Some(security_renegotiation_retry_delay(
+                                &session.registration,
+                                security_renegotiation_attempt.unwrap_or(1),
+                            )),
                         };
                     }
                     let receive_port = match session
@@ -3811,7 +3900,10 @@ async fn refresh_live_registration(
                             return VolteRefreshAttempt {
                                 outcome: RegistrationRefreshResult::Retry,
                                 error: Some(error),
-                                retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                                retry_after: Some(security_renegotiation_retry_delay(
+                                    &session.registration,
+                                    security_renegotiation_attempt.unwrap_or(1),
+                                )),
                             };
                         }
                     };
@@ -3946,12 +4038,16 @@ async fn refresh_live_registration(
                 return VolteRefreshAttempt {
                     outcome: RegistrationRefreshResult::Retry,
                     error: Some(error),
-                    retry_after: Some(REGISTER_REFRESH_RETRY_INTERVAL),
+                    retry_after: Some(security_renegotiation_retry_delay(
+                        &session.registration,
+                        security_renegotiation_attempt.unwrap_or(1),
+                    )),
                 };
             }
             session.channel.discard_reserved_security_ports();
             session.consecutive_protected_refresh_timeouts = 0;
         }
+        session.security_renegotiation_attempts = 0;
         // Remember the shape that refreshed so later refreshes do not repeat a
         // rejected form; the session still carries the successfully bound one.
         if session.register_variant != variant {
@@ -7619,6 +7715,49 @@ mod tests {
     }
 
     #[test]
+    fn security_renegotiation_retry_uses_bounded_exponential_cooldown() {
+        let registration = RegisteredImsContext::from_response(
+            ImsRegistrationAccess::Volte,
+            b"SIP/2.0 200 OK\r\nExpires: 3600\r\n\r\n",
+            3600,
+        );
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 1),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 2),
+            Duration::from_secs(120)
+        );
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 3),
+            Duration::from_secs(240)
+        );
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 4),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 8),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn expired_registration_does_not_spin_renegotiation_immediately() {
+        let mut registration = RegisteredImsContext::from_response(
+            ImsRegistrationAccess::Volte,
+            b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
+            60,
+        );
+        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(61);
+        assert_eq!(
+            security_renegotiation_retry_delay(&registration, 1),
+            Duration::from_secs(1)
+        );
+    }
+
+    #[test]
     fn refresh_cseq_advances_even_after_an_unanswered_request() {
         assert_eq!(advance_register_cseq(42, 42), 43);
         assert_eq!(advance_register_cseq(43, 42), 43);
@@ -7894,6 +8033,7 @@ mod tests {
             security_client: Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c=1;spi-s=2;port-c=5064;port-s=5063".into()),
             security_renegotiation_pending: false,
             consecutive_protected_refresh_timeouts: 0,
+            security_renegotiation_attempts: 0,
             sip_instance: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
             security_binding: SecAgree {
                 spi_c: 1,
