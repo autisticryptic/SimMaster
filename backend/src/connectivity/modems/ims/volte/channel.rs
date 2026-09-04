@@ -6,12 +6,12 @@
 //! protected SIP. A 401/407 sec-agree challenge may replace the socket with a
 //! channel bound to the negotiated client port.
 
-use std::{net::SocketAddr, time::Duration};
+use std::{io, net::SocketAddr, time::Duration};
 
 #[cfg(test)]
 use socket2::{Domain, Protocol, Socket, Type};
 #[cfg(test)]
-use std::{io, net::UdpSocket as StdUdpSocket};
+use std::net::UdpSocket as StdUdpSocket;
 use tokio::net::UdpSocket;
 
 use crate::connectivity::core::{
@@ -502,9 +502,41 @@ async fn recv_one(socket: &UdpSocket, timeout: Duration) -> Result<Vec<u8>, ImsE
     let read = tokio::time::timeout(timeout, socket.recv(&mut frame))
         .await
         .map_err(|_| ImsError::new("volte_channel_read_timeout"))?
-        .map_err(|_| ImsError::new("volte_channel_read_failed"))?;
+        .map_err(|error| map_socket_read_error("single", error))?;
     frame.truncate(read);
     Ok(frame)
+}
+
+/// A connected UDP socket can report an ICMP error from the previous send as
+/// an immediate `recv` error.  That is not a SIP transaction failure: the next
+/// identical REGISTER retransmission may still receive the response (and this
+/// is exactly the situation covered by RFC 3261's UDP Timer E retransmission).
+/// Keep this distinction in the channel error code so the shared REGISTER
+/// driver can wait for the next retransmission instead of aborting after a few
+/// milliseconds.
+fn map_socket_read_error(path: &'static str, error: io::Error) -> ImsError {
+    let transient = matches!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::HostUnreachable
+            | io::ErrorKind::NetworkUnreachable
+            | io::ErrorKind::NetworkDown
+            | io::ErrorKind::NotConnected
+    );
+    tracing::debug!(
+        receive_path = path,
+        error_kind = ?error.kind(),
+        error = %error,
+        transient,
+        "VoLTE SIP socket read returned an error"
+    );
+    if transient {
+        ImsError::new("volte_channel_read_retryable")
+    } else {
+        ImsError::new("volte_channel_read_failed")
+    }
 }
 
 /// A protected IMS association has two receive-capable tuples. Responses to
@@ -529,7 +561,16 @@ async fn recv_protected(
     })
     .await
     .map_err(|_| ImsError::new("volte_channel_read_timeout"))?;
-    let read = read.map_err(|_| ImsError::new("volte_channel_read_failed"))?;
+    let read = read.map_err(|error| {
+        map_socket_read_error(
+            if from_server {
+                "protected_server"
+            } else {
+                "protected_client"
+            },
+            error,
+        )
+    })?;
     let (mut frame, receive_path) = if from_server {
         (receive_frame, "protected_server")
     } else {

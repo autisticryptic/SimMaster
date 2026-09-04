@@ -568,7 +568,24 @@ where
         }
         let response = match channel.recv_sip_fresh(remaining).await {
             Ok(response) => response,
-            Err(error) if udp_retransmit && is_register_read_timeout(&error) => continue,
+            Err(error) if udp_retransmit && is_register_read_retryable(&error) => {
+                // Connected UDP sockets may surface an ICMP error immediately
+                // from the previous datagram.  Treat that as a lost receive
+                // attempt, not as a completed transaction failure.  Do not
+                // spin on the same socket error: wait until RFC 3261 Timer E
+                // schedules the identical REGISTER retransmission.
+                let wait_until = deadline.min(next_retransmit);
+                let wait = wait_until.saturating_duration_since(tokio::time::Instant::now());
+                tracing::debug!(
+                    error = error.code(),
+                    wait_ms = wait.as_millis(),
+                    "IMS REGISTER receive error; waiting for UDP retransmission"
+                );
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
+                continue;
+            }
             Err(_) => return Err(ImsError::new(receive_error)),
         };
         // The IMS signaling path is shared with in-dialog requests (NOTIFY,
@@ -609,10 +626,14 @@ where
     Err(ImsError::new(provisional_exhausted_error))
 }
 
-fn is_register_read_timeout(error: &ImsError) -> bool {
+fn is_register_read_retryable(error: &ImsError) -> bool {
     matches!(
         error.code(),
-        "ims_channel_read_timeout" | "volte_channel_read_timeout" | "ims_register_read_timeout"
+        "ims_channel_read_timeout"
+            | "volte_channel_read_timeout"
+            | "ims_register_read_timeout"
+            | "ims_channel_read_failed"
+            | "volte_channel_read_retryable"
     )
 }
 
@@ -767,7 +788,65 @@ mod tests {
         }
     }
 
+    struct ImmediateReadErrorChannel {
+        sends: Vec<Vec<u8>>,
+        read_attempts: u8,
+    }
+
+    impl ImsChannel for ImmediateReadErrorChannel {
+        async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+            self.sends.push(frame.to_vec());
+            Ok(())
+        }
+
+        async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            self.recv_sip_fresh(timeout).await
+        }
+
+        async fn recv_sip_fresh(&mut self, _timeout: Duration) -> Result<Vec<u8>, ImsError> {
+            if self.read_attempts == 0 {
+                self.read_attempts = 1;
+                return Err(ImsError::new("volte_channel_read_retryable"));
+            }
+            Ok(response_with_header(
+                200,
+                "OK",
+                "Call-ID: refresh@dev\r\nCSeq: 7 REGISTER\r\n",
+            ))
+        }
+
+        fn route(&self) -> ImsRoute {
+            ImsRoute {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                pcscf_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 5060)),
+                transport: SipTransport::Udp,
+            }
+        }
+
+        fn security_verify(&self) -> Option<&str> {
+            None
+        }
+    }
+
     struct FakeAuthenticator;
+
+    #[tokio::test(start_paused = true)]
+    async fn immediate_udp_read_error_waits_for_same_transaction_retransmission() {
+        let request = b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: refresh@dev\r\nCSeq: 7 REGISTER\r\nContent-Length: 0\r\n\r\n";
+        let mut channel = ImmediateReadErrorChannel {
+            sends: Vec::new(),
+            read_attempts: 0,
+        };
+
+        let result = run_register(&mut channel, request, &mut FakeAuthenticator)
+            .await
+            .expect("transient UDP read error should not abort REGISTER");
+
+        assert_eq!(result.auth_rounds, 0);
+        assert_eq!(channel.sends.len(), 2);
+        assert_eq!(channel.sends[0], request);
+        assert_eq!(channel.sends[1], request);
+    }
 
     impl RegisterAuthenticator<RetransmittingChannel> for FakeAuthenticator {
         async fn authenticated_request(
