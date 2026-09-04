@@ -139,10 +139,10 @@ const REGISTER_REFRESH_RENEGOTIATION_RETRY_MAX: Duration = Duration::from_secs(3
 /// assume the old P-CSCF SA is no longer active. Re-negotiate on the same
 /// bearer instead of hiding the signaling failure behind an access rebuild.
 const REGISTER_REFRESH_PROTECTED_TIMEOUTS_BEFORE_RENEGOTIATION: u8 = 2;
-/// The short cycle was only for the first device validation and caused the
-/// production session to issue refreshes far more often than the network lease.
-/// Production scheduling must use the network-provided RegistrationLease value.
-const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
+/// Temporary device-validation override. Keep this at 120 seconds only while
+/// observing refresh behavior on the test device; restore None afterwards so
+/// production scheduling uses the network-provided RegistrationLease value.
+const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = Some(120);
 
 fn scheduled_volte_refresh_delay(lease: &RegistrationLease) -> Duration {
     let normal = lease.refresh_after.max(Duration::from_secs(1));
