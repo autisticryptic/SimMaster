@@ -109,17 +109,17 @@ jobs:
             build-essential cmake git ca-certificates zip jq \
             pkg-config python3 python3-pip ninja-build \
             libcurl4-openssl-dev libglib2.0-dev \
-            libpcsclite-dev libudev-dev
+            libpcsclite-dev libgudev-1.0-dev libudev-dev
           pip3 install meson
-          # Use the official source archive instead of a GitLab git clone.
-          # The archive endpoint is materially more reliable on hosted ARM
-          # runners and does not require repository metadata/history.
-          LIBQMI_ARCHIVE=/tmp/libqmi-1.36.0.tar.gz
+          # Use the official 1.36.0 source archive instead of a Git clone.
+          # The Ubuntu archive carries the upstream tarball and is reliable
+          # from both hosted runner architectures.
+          LIBQMI_ARCHIVE=/tmp/libqmi_1.36.0.orig.tar.xz
           curl -fL --retry 5 --retry-delay 3 \
-            https://gitlab.freedesktop.org/mobile-broadband/libqmi/-/archive/1.36.0/libqmi-1.36.0.tar.gz \
+            https://archive.ubuntu.com/ubuntu/pool/main/libq/libqmi/libqmi_1.36.0.orig.tar.xz \
             -o "$LIBQMI_ARCHIVE"
           mkdir /libqmi-src
-          tar -xzf "$LIBQMI_ARCHIVE" --strip-components=1 -C /libqmi-src
+          tar -xJf "$LIBQMI_ARCHIVE" --strip-components=1 -C /libqmi-src
           cd /libqmi-src
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
             -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
