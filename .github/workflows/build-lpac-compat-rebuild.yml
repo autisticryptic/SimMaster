@@ -109,7 +109,7 @@ jobs:
             build-essential cmake git ca-certificates zip jq \
             pkg-config python3 python3-pip ninja-build \
             libcurl4-openssl-dev libglib2.0-dev \
-            libpcsclite-dev libgudev-1.0-dev libglib2.0-doc \
+            libpcsclite-dev libgudev-1.0-dev \
             libudev-dev udev
           pip3 install meson
           git clone --depth 1 --branch 1.36.0 \
