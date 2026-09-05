@@ -77,69 +77,72 @@ jobs:
           mkdir -p release
           docker run --rm \
             -v "$GITHUB_WORKSPACE/release:/output" \
-            debian:11 bash -c '
-              set -eux
-              # Debian 11 moved to the archive after Bullseye EOL; keep the
-              # glibc 2.31 build target while using the archived package index.
-              sed -i -e "s|deb.debian.org/debian|archive.debian.org/debian|g" \
-                -e "s|security.debian.org/debian-security|archive.debian.org/debian-security|g" \
-                /etc/apt/sources.list
-              sed -i "/bullseye-updates/d" /etc/apt/sources.list
-              printf "Acquire::Check-Valid-Until \"false\";\n" > /etc/apt/apt.conf.d/99archive
-              apt-get -o Acquire::Check-Valid-Until=false update
-              apt-get install -y --no-install-recommends \
-                build-essential cmake git ca-certificates zip \
-                pkg-config python3 python3-pip ninja-build \
-                libcurl4-openssl-dev libglib2.0-dev \
-                libpcsclite-dev libgudev-1.0-dev libglib2.0-doc \
-                libudev-dev udev
-              pip3 install meson
-              git clone --depth 1 --branch 1.36.0 \
-                https://gitlab.freedesktop.org/mobile-broadband/libqmi.git /libqmi-src
-              cd /libqmi-src
-              meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
-                -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
-                -Dintrospection=false -Dman=false -Dbash_completion=false -Dqmi_username=root
-              ninja -C build
-              ninja -C build install
-              ldconfig
-              git clone --depth 1 --branch "$0" https://github.com/estkme-group/lpac /lpac
-              cd /lpac
-              RESOLVED_VER=$(git describe --tags --always || git rev-parse --short HEAD || echo "$0")
-              echo "$RESOLVED_VER" > /output/resolved_version.txt
-              mkdir build && cd build
-              cmake .. -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
-                -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_APDU_AT=ON -DLPAC_WITH_APDU_QMI=ON
-              make -j$(nproc)
-              DESTDIR=/tmp/lpac-install cmake --install .
-              BUNDLE_ROOT=/tmp/lpac-bundle
-              mkdir -p "$BUNDLE_ROOT/lib"
-              LPAC_BIN=$(find /tmp/lpac-install -name lpac -type f | head -1)
-              test -n "$LPAC_BIN" && test -f "$LPAC_BIN"
-              cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
-              chmod 755 "$BUNDLE_ROOT/lpac"
+            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT'
+          set -eux
+          # Debian 11 moved to the archive after Bullseye EOL; keep the
+          # glibc 2.31 build target while using the archived package index.
+          # The archive does not contain a bullseye-security suite, so keep
+          # only the archived Bullseye main repository.
+          printf "%s\n" "deb [trusted=yes] http://archive.debian.org/debian bullseye main" > /etc/apt/sources.list
+          rm -f /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources
+          printf "Acquire::Check-Valid-Until \"false\";\n" > /etc/apt/apt.conf.d/99archive
+          apt-get \
+            -o Acquire::Check-Valid-Until=false \
+            -o Acquire::AllowInsecureRepositories=true \
+            update
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates zip \
+            pkg-config python3 python3-pip ninja-build \
+            libcurl4-openssl-dev libglib2.0-dev \
+            libpcsclite-dev libgudev-1.0-dev libglib2.0-doc \
+            libudev-dev udev
+          pip3 install meson
+          git clone --depth 1 --branch 1.36.0 \
+            https://gitlab.freedesktop.org/mobile-broadband/libqmi.git /libqmi-src
+          cd /libqmi-src
+          meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
+            -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
+            -Dintrospection=false -Dman=false -Dbash_completion=false -Dqmi_username=root
+          ninja -C build
+          ninja -C build install
+          ldconfig
+          git clone --depth 1 --branch "$0" https://github.com/estkme-group/lpac /lpac
+          cd /lpac
+          RESOLVED_VER=$(git describe --tags --always || git rev-parse --short HEAD || echo "$0")
+          echo "$RESOLVED_VER" > /output/resolved_version.txt
+          mkdir build && cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+            -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_APDU_AT=ON -DLPAC_WITH_APDU_QMI=ON
+          make -j$(nproc)
+          DESTDIR=/tmp/lpac-install cmake --install .
+          BUNDLE_ROOT=/tmp/lpac-bundle
+          mkdir -p "$BUNDLE_ROOT/lib"
+          LPAC_BIN=$(find /tmp/lpac-install -name lpac -type f | head -1)
+          test -n "$LPAC_BIN" && test -f "$LPAC_BIN"
+          cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
+          chmod 755 "$BUNDLE_ROOT/lpac"
 
-              # Standalone lpac loads APDU backends from ./driver at runtime.
-              # Shipping only the executable makes the binary start correctly
-              # but fail every real operation with "No APDU driver found".
-              DRIVER_DIR=$(find /tmp/lpac-install -type d -path '*/driver' | head -1 || true)
-              test -n "$DRIVER_DIR" && test -d "$DRIVER_DIR"
-              mkdir -p "$BUNDLE_ROOT/driver"
-              cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
-              APDU_DRIVER_COUNT=$(find "$BUNDLE_ROOT/driver" -maxdepth 1 -type f -name 'driver_apdu_*.so' | wc -l)
-              test "$APDU_DRIVER_COUNT" -gt 0
+          # Standalone lpac loads APDU backends from ./driver at runtime.
+          # Shipping only the executable makes the binary start correctly
+          # but fail every real operation with "No APDU driver found".
+          DRIVER_DIR=$(find /tmp/lpac-install -type d -path '*/driver' | head -1 || true)
+          test -n "$DRIVER_DIR" && test -d "$DRIVER_DIR"
+          mkdir -p "$BUNDLE_ROOT/driver"
+          cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+          APDU_DRIVER_COUNT=$(find "$BUNDLE_ROOT/driver" -maxdepth 1 -type f -name 'driver_apdu_*.so' | wc -l)
+          test "$APDU_DRIVER_COUNT" -gt 0
 
-              QMI_SO=$(find /usr/local/lib -name "libqmi-glib.so.*.*.*" -type f | head -1 || true)
-              if [ -n "$QMI_SO" ]; then
-                cp -L "$QMI_SO" "$BUNDLE_ROOT/lib/"
-                QMI_BASENAME=$(basename "$QMI_SO")
-                ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so.5"
-                ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so"
-              fi
-              ldd "$BUNDLE_ROOT/lpac" || true
-              (cd "$BUNDLE_ROOT" && zip -r "/output/$1" .)
-              chmod -R 777 /output
-            ' "$LPAC_REF" "$PACKAGE_NAME"
+          QMI_SO=$(find /usr/local/lib -name "libqmi-glib.so.*.*.*" -type f | head -1 || true)
+          if [ -n "$QMI_SO" ]; then
+            cp -L "$QMI_SO" "$BUNDLE_ROOT/lib/"
+            QMI_BASENAME=$(basename "$QMI_SO")
+            ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so.5"
+            ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so"
+          fi
+          ldd "$BUNDLE_ROOT/lpac" || true
+          (cd "$BUNDLE_ROOT" && zip -r "/output/$1" .)
+          chmod -R 777 /output
+          CONTAINER_SCRIPT
 
       - name: Verify output
         run: |
