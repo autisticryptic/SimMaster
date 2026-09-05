@@ -95,8 +95,9 @@ impl AtSession {
             if trimmed.is_empty() || trimmed == command {
                 continue;
             }
+            let is_final = is_final_line(trimmed);
             lines.push(line);
-            if is_final_line(trimmed) {
+            if is_final {
                 break;
             }
         }
