@@ -68,7 +68,10 @@ jobs:
       matrix:
         include:
           - arch: aarch64
-            runner: ubuntu-24.04-arm
+            # ubuntu-24.04-arm currently has hosted-image variants where the
+            # Docker daemon is absent, while this compatibility build needs a
+            # Debian 11 container to keep the glibc 2.31 target.
+            runner: ubuntu-22.04-arm
             package: lpac-linux-aarch64-glibc2.31.zip
           - arch: x86_64
             runner: ubuntu-24.04
