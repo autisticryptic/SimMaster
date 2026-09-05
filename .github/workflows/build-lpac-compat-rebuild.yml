@@ -106,8 +106,8 @@ jobs:
             -o Acquire::AllowInsecureRepositories=true \
             update
           apt-get install -y --no-install-recommends \
-            build-essential cmake git ca-certificates zip jq \
-            pkg-config python3 python3-pip ninja-build \
+            build-essential cmake git curl ca-certificates zip jq \
+            xz-utils pkg-config python3 python3-pip ninja-build \
             libcurl4-openssl-dev libglib2.0-dev \
             libpcsclite-dev libgudev-1.0-dev libudev-dev
           pip3 install meson
