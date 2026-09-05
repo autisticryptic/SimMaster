@@ -121,46 +121,21 @@ jobs:
             -o "$LIBQMI_ARCHIVE"
           # Use Python's built-in lzma/tar reader instead of relying on the
           # tar frontend's optional xz autodetection in the minimal image.
-          # Extract into a sibling staging directory first, then move every
-          # entry (including dotfiles) out of the archive's single top-level
-          # directory.  This avoids cp recursively copying a directory into
-          # its own parent on the hosted ARM runner's overlay filesystem.
+          # Keep the archive's top-level directory intact; Meson can build
+          # directly from that source directory and this avoids fragile
+          # copy/move operations on the hosted ARM runner overlay filesystem.
+          mkdir -p /libqmi-src
           python3 - "$LIBQMI_ARCHIVE" /libqmi-src <<'PY'
-          import os
-          import shutil
           import sys
           import tarfile
 
           archive, destination = sys.argv[1:]
-          destination = os.path.abspath(destination)
-          staging = destination + ".staging"
-          shutil.rmtree(staging, ignore_errors=True)
-          os.makedirs(staging, exist_ok=True)
-          os.makedirs(destination, exist_ok=True)
-
           with tarfile.open(archive, mode="r:xz") as source:
-              source.extractall(staging)
-
-          roots = [
-              os.path.join(staging, name)
-              for name in os.listdir(staging)
-              if os.path.isdir(os.path.join(staging, name))
-          ]
-          if len(roots) != 1 or not os.path.isfile(os.path.join(roots[0], "meson.build")):
-              raise RuntimeError(f"unexpected libqmi archive layout: {roots!r}")
-
-          root = roots[0]
-          for name in os.listdir(root):
-              source_path = os.path.join(root, name)
-              destination_path = os.path.join(destination, name)
-              if os.path.lexists(destination_path):
-                  raise RuntimeError(f"destination already contains {name!r}")
-              shutil.move(source_path, destination_path)
-          os.rmdir(root)
-          os.rmdir(staging)
+              source.extractall(destination)
           PY
-          test -f /libqmi-src/meson.build
-          cd /libqmi-src
+          LIBQMI_ROOT=$(find /libqmi-src -mindepth 1 -maxdepth 1 -type d -name 'libqmi-*' -print -quit)
+          test -n "$LIBQMI_ROOT" && test -f "$LIBQMI_ROOT/meson.build"
+          cd "$LIBQMI_ROOT"
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
             -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
             -Dintrospection=false -Dman=false -Dbash_completion=false -Dqmi_username=root
