@@ -112,10 +112,9 @@ jobs:
             update
           apt-get install -y --no-install-recommends \
             build-essential cmake git curl ca-certificates zip jq \
-            xz-utils pkg-config python3 python3-pip ninja-build \
+            pkg-config \
             libcurl4-openssl-dev libglib2.0-dev \
             libpcsclite-dev libgudev-1.0-dev libudev-dev
-          pip3 install meson
           # Install the same QMI 1.36.0 packages used by upstream LPAC's
           # Debian CI.  Building libqmi from source here is unnecessary and
           # made this compatibility workflow depend on fragile archive
