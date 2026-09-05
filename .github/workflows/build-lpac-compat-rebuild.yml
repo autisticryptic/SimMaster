@@ -120,7 +120,12 @@ jobs:
           RESOLVED_VER=$(git describe --tags --always || git rev-parse --short HEAD || echo "$0")
           echo "$RESOLVED_VER" > /output/resolved_version.txt
           mkdir build && cd build
+          # Keep the compatibility bundle self-contained: lpac 2.3.x links
+          # euicc-drivers statically by default.  QMI therefore appears in
+          # `driver list` inside the lpac executable; it is not a
+          # driver/driver_apdu_qmi.so plugin.
           cmake .. -DCMAKE_BUILD_TYPE=Release -DSTANDALONE_MODE=ON \
+            -DLPAC_DYNAMIC_LIBEUICC=OFF -DLPAC_DYNAMIC_DRIVERS=OFF \
             -DLPAC_WITH_APDU_PCSC=ON -DLPAC_WITH_APDU_AT=ON -DLPAC_WITH_APDU_QMI=ON
           make -j$(nproc)
           DESTDIR=/tmp/lpac-install cmake --install .
@@ -131,46 +136,25 @@ jobs:
           cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
           chmod 755 "$BUNDLE_ROOT/lpac"
 
-          # Standalone lpac loads APDU/HTTP backends from shared objects in
-          # ./driver. Do not assume that the install prefix is fixed: the
-          # Debian container uses DESTDIR and CMake may place the files below
-          # executables/driver (or another configured bindir).
-          DRIVER_FILE=$(find /tmp/lpac-install -type f \
-            -name 'driver_apdu_qmi.so' -print -quit)
-          test -n "$DRIVER_FILE" && test -f "$DRIVER_FILE"
-          DRIVER_DIR=$(dirname "$DRIVER_FILE")
-          mkdir -p "$BUNDLE_ROOT/driver"
-          cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+          # The static lpac executable still has a runtime dependency on
+          # libqmi-glib.  Bundle the SONAME target under lib/ so the device
+          # does not need a separately installed libqmi package.
+          QMI_SO=$(find /usr/local/lib /usr/lib /lib -type f \
+            \( -name 'libqmi-glib.so.5.*' -o -name 'libqmi-glib.so.*.*.*' \) \
+            -print -quit || true)
+          test -n "$QMI_SO" && test -f "$QMI_SO"
+          cp -L "$QMI_SO" "$BUNDLE_ROOT/lib/"
+          QMI_BASENAME=$(basename "$QMI_SO")
+          ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so.5"
+          ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so"
 
-          # LPAC_DYNAMIC_LIBEUICC is enabled by default. Bundle all runtime
-          # libraries installed by lpac, not only libqmi, so dlopen() of the
-          # QMI driver works on the target device as well as in CI.
-          INSTALL_LIB_DIR=$(find /tmp/lpac-install -type d \
-            -path '*/executables/lib' -print -quit || true)
-          if [ -n "$INSTALL_LIB_DIR" ] && [ -d "$INSTALL_LIB_DIR" ]; then
-            cp -a "$INSTALL_LIB_DIR"/. "$BUNDLE_ROOT/lib/"
-          fi
-
-          # Verify the drivers that lpac will actually use.  This works for
-          # both static and dynamic builds and avoids checking an artifact
-          # name that lpac itself does not produce.
-          # `driver list` still initializes the selected backends in lpac.
-          # Use stdio so this capability check does not require a modem or
-          # network in the build container.
+          # Confirm the bundled binary can resolve libqmi before packaging.
           DRIVER_LIST=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
             LD_LIBRARY_PATH="$BUNDLE_ROOT/lib" \
             "$BUNDLE_ROOT/lpac" driver list)
           echo "$DRIVER_LIST"
           echo "$DRIVER_LIST" | jq -e '.payload.LPAC_APDU | index("qmi") != null' >/dev/null
           echo "$DRIVER_LIST" | jq -e '.payload.LPAC_HTTP | index("curl") != null' >/dev/null
-
-          QMI_SO=$(find /usr/local/lib -name "libqmi-glib.so.*.*.*" -type f | head -1 || true)
-          if [ -n "$QMI_SO" ]; then
-            cp -L "$QMI_SO" "$BUNDLE_ROOT/lib/"
-            QMI_BASENAME=$(basename "$QMI_SO")
-            ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so.5"
-            ln -sf "$QMI_BASENAME" "$BUNDLE_ROOT/lib/libqmi-glib.so"
-          fi
           ldd "$BUNDLE_ROOT/lpac" || true
           (cd "$BUNDLE_ROOT" && zip -r "/output/$1" .)
           test -f "/output/$1"
@@ -183,7 +167,8 @@ jobs:
           test -f "release/${{ matrix.package }}"
           ls -lah "release/${{ matrix.package }}"
           unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lpac'
-          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'driver/driver_apdu_qmi.so'
+          # QMI is statically compiled into lpac; there is intentionally
+          # no driver/driver_apdu_qmi.so entry in this upstream build.
           unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lib/libqmi-glib.so.5'
 
       - name: Upload architecture artifact
