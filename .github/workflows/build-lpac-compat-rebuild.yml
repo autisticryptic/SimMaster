@@ -5,7 +5,7 @@ name: Build-Lpac-Compat
 on:
   push:
     paths:
-      - '.github/workflows/build-lpac-compat.yml'
+      - '.github/workflows/build-lpac-compat-rebuild.yml'
       - '.github/workflows/.lpac-build-trigger'
   schedule:
     - cron: '0 0 5,20 * *'
