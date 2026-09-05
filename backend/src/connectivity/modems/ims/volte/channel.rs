@@ -45,6 +45,19 @@ pub struct VolteSipChannel {
     advertised_local_port: Option<u16>,
     interface: Option<String>,
     security_verify: Option<String>,
+    /// The old channel remains alive until a challenged REGISTER completes.
+    staged_security: Option<ChannelSecurity>,
+    /// P-CSCF may still send on the old SA after 200 OK (TS 33.203 7.4.2a).
+    /// Retain one previous association until the next registration procedure.
+    retired_security: Option<ChannelSecurity>,
+}
+
+struct ChannelSecurity {
+    send_socket: Option<UdpSocket>,
+    receive_socket: Option<UdpSocket>,
+    route: ImsRoute,
+    advertised_local_port: Option<u16>,
+    security_verify: Option<String>,
 }
 
 enum ReservedSendSocket {
@@ -82,6 +95,8 @@ impl VolteSipChannel {
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
             security_verify,
+            staged_security: None,
+            retired_security: None,
         })
     }
 
@@ -89,6 +104,11 @@ impl VolteSipChannel {
     /// Reserve a second local UDP port for protected packets sent by the
     /// P-CSCF.  The initial REGISTER socket remains the protected send socket.
     pub fn reserve_security_receive_port(&mut self) -> Result<u16, ImsError> {
+        self.reserve_security_receive_port_at(0)
+    }
+
+    #[cfg(test)]
+    fn reserve_security_receive_port_at(&mut self, port: u16) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_receive_socket.as_ref() {
             return match socket {
                 ReservedReceiveSocket::Host(socket) => socket_port(socket),
@@ -98,12 +118,36 @@ impl VolteSipChannel {
                     .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
             };
         }
-        let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+        let local = SocketAddr::new(self.route.local_addr.ip(), port);
         let socket = build_bound_socket_excluding(local, self.interface.as_deref(), 0)
             .map_err(|_| ImsError::new("volte_channel_receive_reserve_failed"))?;
         let port = socket_port(&socket)?;
         self.reserved_receive_socket = Some(ReservedReceiveSocket::Host(socket));
         Ok(port)
+    }
+
+    /// Use host sockets only in tests, but wrap the resulting descriptors just
+    /// like worker-created sockets so production reservation/activation runs.
+    #[cfg(test)]
+    pub(crate) fn reserve_security_ports_for_test(&mut self, server_port: u16) -> (u16, u16) {
+        let receive = self.reserve_security_receive_port_at(server_port).unwrap();
+        let send = self.reserve_security_send_port(receive).unwrap();
+        let Some(ReservedSendSocket::Host(send_socket)) = self.reserved_send_socket.take() else {
+            panic!("expected host reservation");
+        };
+        let Some(ReservedReceiveSocket::Host(receive_socket)) = self.reserved_receive_socket.take()
+        else {
+            panic!("expected host reservation");
+        };
+        send_socket.set_nonblocking(true).unwrap();
+        receive_socket.set_nonblocking(true).unwrap();
+        self.reserved_send_socket = Some(ReservedSendSocket::Worker(
+            UdpSocket::from_std(send_socket.into()).unwrap(),
+        ));
+        self.reserved_receive_socket = Some(ReservedReceiveSocket::Worker(
+            UdpSocket::from_std(receive_socket.into()).unwrap(),
+        ));
+        (send, receive)
     }
 
     /// Create the initial SIP channel inside the mandatory per-line UE worker.
@@ -137,6 +181,8 @@ impl VolteSipChannel {
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
             security_verify,
+            staged_security: None,
+            retired_security: None,
         })
     }
 
@@ -171,6 +217,19 @@ impl VolteSipChannel {
         worker: &UeWorkerHandle,
         avoid_port: u16,
     ) -> Result<u16, ImsError> {
+        self.reserve_security_send_port_in_worker_at(worker, 0, avoid_port)
+            .await
+    }
+
+    /// Reuse exactly the port already advertised by this REGISTER procedure,
+    /// including after an additional AKA challenge; never invent a new offer
+    /// in response to Security-Server.
+    pub async fn reserve_security_send_port_in_worker_at(
+        &mut self,
+        worker: &UeWorkerHandle,
+        requested_port: u16,
+        avoid_port: u16,
+    ) -> Result<u16, ImsError> {
         if let Some(socket) = self.reserved_send_socket.as_ref() {
             return match socket {
                 #[cfg(test)]
@@ -181,8 +240,9 @@ impl VolteSipChannel {
                     .map_err(|_| ImsError::new("volte_channel_local_addr_failed")),
             };
         }
-        for _ in 0..8 {
-            let local = SocketAddr::new(self.route.local_addr.ip(), 0);
+        let attempts = if requested_port == 0 { 8 } else { 1 };
+        for _ in 0..attempts {
+            let local = SocketAddr::new(self.route.local_addr.ip(), requested_port);
             let spec = UeSocketSpec::udp_bound(local, self.interface.clone());
             let socket = match worker.create_socket(spec).await {
                 Ok(UeSocket::Udp(socket)) => socket,
@@ -193,7 +253,11 @@ impl VolteSipChannel {
                 .local_addr()
                 .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?
                 .port();
-            if port != 5060 && port != 5061 && port != avoid_port {
+            if port != 5060
+                && port != 5061
+                && port != avoid_port
+                && port != self.route.local_addr.port()
+            {
                 self.reserved_send_socket = Some(ReservedSendSocket::Worker(socket));
                 return Ok(port);
             }
@@ -255,7 +319,7 @@ impl VolteSipChannel {
 
     #[cfg(test)]
     /// Activate the two protected UDP directions negotiated by sec-agree:
-    /// UE send -> P-CSCF client port, and P-CSCF send -> UE receive port.
+    /// UE client -> P-CSCF server, and P-CSCF client -> UE server.
     pub fn activate_security(
         &mut self,
         send_route: ImsRoute,
@@ -296,17 +360,13 @@ impl VolteSipChannel {
             }
         };
 
-        self.send_socket.take();
-        let mut send_route = send_route;
-        send_route.local_addr = send_socket
-            .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
-        self.send_socket = Some(send_socket);
-        self.receive_socket = Some(receive_socket);
-        self.route = send_route;
-        self.advertised_local_port = Some(receive_local.port());
-        self.security_verify = security_verify;
-        Ok(())
+        self.stage_security(
+            send_socket,
+            receive_socket,
+            send_route,
+            receive_local.port(),
+            security_verify,
+        )
     }
 
     /// Worker equivalent of [`Self::activate_security`]. Both protected sockets
@@ -367,64 +427,69 @@ impl VolteSipChannel {
             }
         };
 
-        self.send_socket.take();
-        let mut send_route = send_route;
-        send_route.local_addr = send_socket
+        self.stage_security(
+            send_socket,
+            receive_socket,
+            send_route,
+            receive_local.port(),
+            security_verify,
+        )
+    }
+
+    fn stage_security(
+        &mut self,
+        send_socket: UdpSocket,
+        receive_socket: UdpSocket,
+        mut route: ImsRoute,
+        advertised_port: u16,
+        security_verify: Option<String>,
+    ) -> Result<(), ImsError> {
+        if self.staged_security.is_some() {
+            return Err(ImsError::new("volte_channel_security_update_pending"));
+        }
+        route.local_addr = send_socket
             .local_addr()
             .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+        self.staged_security = Some(ChannelSecurity {
+            send_socket: self.send_socket.take(),
+            receive_socket: self.receive_socket.take(),
+            route: self.route,
+            advertised_local_port: self.advertised_local_port,
+            security_verify: self.security_verify.take(),
+        });
         self.send_socket = Some(send_socket);
         self.receive_socket = Some(receive_socket);
-        self.route = send_route;
-        self.advertised_local_port = Some(receive_local.port());
+        self.route = route;
+        self.advertised_local_port = Some(advertised_port);
         self.security_verify = security_verify;
         Ok(())
     }
 
-    /// Drop the protected sockets and return to a plain UDP channel without
-    /// touching the bearer. This is the TS 33.203 recovery path after the
-    /// network has stopped answering packets protected by an old SA: the next
-    /// REGISTER can be sent unprotected and negotiate a replacement SA.
-    ///
-    /// The replacement socket is created before the current sockets are
-    /// swapped out. A socket creation failure therefore leaves the working
-    /// protected channel intact and the caller can retry without rebuilding
-    /// access.
-    pub async fn deactivate_security_in_worker(
-        &mut self,
-        worker: &UeWorkerHandle,
-        route: ImsRoute,
-    ) -> Result<(), ImsError> {
-        // A security re-negotiation must use a fresh protected client port
-        // (`port_uc`) after the old SA is considered inactive.  The caller
-        // supplies the current address only to preserve the bearer/interface;
-        // bind port zero here so the worker allocates a new UDP source port.
-        let mut plain_route = route;
-        plain_route.local_addr.set_port(0);
-        let spec = UeSocketSpec::udp_connected(
-            plain_route.local_addr,
-            plain_route.pcscf_addr,
-            self.interface.clone(),
-        );
-        let send_socket = match worker.create_socket(spec).await {
-            Ok(UeSocket::Udp(socket)) => socket,
-            Ok(_) => return Err(ImsError::new("volte_channel_worker_socket_type")),
-            Err(_) => return Err(ImsError::new("volte_channel_worker_socket_failed")),
-        };
-        let mut route = route;
-        route.local_addr = send_socket
-            .local_addr()
-            .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+    /// Commit only after the matching final 2xx. Keep the preceding protected
+    /// channel readable: the P-CSCF may still use it until it sees further
+    /// traffic on the new SA. Its XFRM plan has the same retirement lifetime.
+    pub fn commit_security(&mut self) {
+        if let Some(previous) = self.staged_security.take() {
+            self.retired_security = previous.security_verify.is_some().then_some(previous);
+        }
+        self.discard_reserved_security_ports();
+    }
 
-        // The old protected sockets and reservation are owned by this channel;
-        // dropping them closes the old protected path but leaves the UE worker,
-        // IP bearer and caller-owned XFRM cleanup untouched.
-        self.send_socket = Some(send_socket);
-        self.receive_socket = None;
-        self.reserved_receive_socket = None;
-        self.route = route;
-        self.advertised_local_port = None;
-        self.security_verify = None;
-        Ok(())
+    /// Restore sockets AND headers together after a failed tentative exchange.
+    /// The caller removes only the tentative XFRM plan, never the active plan.
+    pub fn rollback_security(&mut self) {
+        if let Some(previous) = self.staged_security.take() {
+            self.send_socket = previous.send_socket;
+            self.receive_socket = previous.receive_socket;
+            self.route = previous.route;
+            self.advertised_local_port = previous.advertised_local_port;
+            self.security_verify = previous.security_verify;
+        }
+        self.discard_reserved_security_ports();
+    }
+
+    pub fn discard_retired_security(&mut self) {
+        self.retired_security = None;
     }
 
     /// Route to put in Via/Contact. Identical to [`Self::send_route`] until a
@@ -489,10 +554,41 @@ impl VolteSipChannel {
     }
 
     async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
-        match (self.receive_socket.as_ref(), self.send_socket.as_ref()) {
-            (Some(receive), Some(send)) => recv_protected(receive, send, timeout).await,
-            (Some(socket), None) | (None, Some(socket)) => recv_one(socket, timeout).await,
-            (None, None) => Err(ImsError::new("volte_channel_receive_socket_missing")),
+        let current = recv_socket_pair(
+            self.receive_socket.as_ref(),
+            self.send_socket.as_ref(),
+            timeout,
+        );
+        let Some(previous) = self
+            .staged_security
+            .as_ref()
+            .or(self.retired_security.as_ref())
+        else {
+            return current.await;
+        };
+        let old = recv_socket_pair(
+            previous.receive_socket.as_ref(),
+            previous.send_socket.as_ref(),
+            timeout,
+        );
+        // Failure responses during AKA use the old SA. Old non-REGISTER frames
+        // must also remain readable so the transaction driver can requeue them.
+        // A transient ICMP error on either association must not cancel the other.
+        tokio::pin!(current, old);
+        let deadline = tokio::time::Instant::now() + timeout;
+        tokio::select! {
+            result = &mut current => match result {
+                Ok(frame) => Ok(frame),
+                Err(error) => match tokio::time::timeout_at(deadline, &mut old).await {
+                    Ok(Ok(frame)) => Ok(frame),
+                    _ => Err(error),
+                },
+            },
+            result = &mut old => match result {
+                Ok(frame) => Ok(frame),
+                Err(_) => tokio::time::timeout_at(deadline, &mut current).await
+                    .map_err(|_| ImsError::new("volte_channel_read_timeout"))?,
+            },
         }
     }
 }
@@ -542,6 +638,18 @@ fn map_socket_read_error(path: &'static str, error: io::Error) -> ImsError {
 /// A protected IMS association has two receive-capable tuples. Responses to
 /// UE-originated transactions can return to the client/send port, while
 /// terminating requests arrive on the server/receive port.
+async fn recv_socket_pair(
+    receive: Option<&UdpSocket>,
+    send: Option<&UdpSocket>,
+    timeout: Duration,
+) -> Result<Vec<u8>, ImsError> {
+    match (receive, send) {
+        (Some(receive), Some(send)) => recv_protected(receive, send, timeout).await,
+        (Some(socket), None) | (None, Some(socket)) => recv_one(socket, timeout).await,
+        (None, None) => Err(ImsError::new("volte_channel_receive_socket_missing")),
+    }
+}
+
 async fn recv_protected(
     receive_socket: &UdpSocket,
     send_socket: &UdpSocket,

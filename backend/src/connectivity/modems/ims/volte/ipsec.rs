@@ -22,8 +22,8 @@ use super::errors::{code, VolteError};
 use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 
 /// The four-way port/SPI binding negotiated via SIP `Security-Client` /
-/// `Security-Server` (sec-agree). `port_c`/`spi_c` are the UE (client) side,
-/// `port_s`/`spi_s` are the P-CSCF (server) side.
+/// `Security-Server` (sec-agree). Each endpoint advertises its own protected
+/// client/server ports and the SPIs it expects on its inbound SAs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SecAgree {
     pub spi_c: u32,
@@ -84,12 +84,43 @@ pub fn parse_security_server(value: &str) -> Result<SecAgree, VolteError> {
     if mechanism.as_deref() != Some("ipsec-3gpp") {
         return Err(VolteError::new(code::SECURITY_SERVER_MISSING));
     }
-    Ok(SecAgree {
+    let selected = SecAgree {
         spi_c: spi_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
         spi_s: spi_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
         port_c: port_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
         port_s: port_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
-    })
+    };
+    validate_binding(&selected)?;
+    Ok(selected)
+}
+
+fn validate_binding(binding: &SecAgree) -> Result<(), VolteError> {
+    // ESP SPI zero is reserved (RFC 4303 2.1); UDP port zero is not a peer
+    // endpoint. Never install such an offer, even if the kernel accepts it.
+    if binding.spi_c == 0 || binding.spi_s == 0 || binding.port_c == 0 || binding.port_s == 0 {
+        return Err(VolteError::new(code::SECURITY_SERVER_INVALID));
+    }
+    Ok(())
+}
+
+/// TS 33.203 7.4: a challenged re-registration keeps protected server ports
+/// and changes client ports/SPIs. Reject overlapping selectors before any
+/// XFRM commands: removing a failed replacement must not remove the active SA.
+pub fn validate_server_rollover(
+    current: &SecAgree,
+    replacement: &SecAgree,
+) -> Result<(), VolteError> {
+    validate_binding(replacement)?;
+    if replacement.port_s != current.port_s
+        || replacement.port_c == current.port_c
+        || replacement.spi_c == current.spi_c
+        || replacement.spi_c == current.spi_s
+        || replacement.spi_s == current.spi_c
+        || replacement.spi_s == current.spi_s
+    {
+        return Err(VolteError::new(code::SECURITY_SERVER_INVALID));
+    }
+    Ok(())
 }
 
 fn parse_u32(value: &str) -> Option<u32> {
@@ -289,7 +320,7 @@ pub struct XfrmInstallPlan {
 
 /// Assemble the standard IMS signaling protection plan per TS 33.203:
 /// UE(port_c) ⇄ P-CSCF(port_s), protected client->server and server->client.
-/// We install the two SAs the UE needs (outbound to spi_s, inbound on spi_c)
+/// We install the two observed SIP directions (outbound to peer spi_s, inbound on UE spi_s)
 /// plus matching policies.
 pub fn build_install_plan(
     ue: IpAddr,
@@ -319,6 +350,8 @@ pub fn build_install_plan_with_algs(
     encryption_key: &[u8],
     algs: XfrmAlgs,
 ) -> Result<XfrmInstallPlan, VolteError> {
+    validate_binding(ue_sec)?;
+    validate_binding(pcscf_sec)?;
     // IMS IPsec requires IPv6 in most deployments (observed
     // `volte_ipsec_requires_ipv6`); we allow v4 for lab use but both ends must
     // match family.
@@ -783,6 +816,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hex, offered);
+    }
+
+    #[test]
+    fn zero_spi_or_port_is_not_a_usable_security_offer_or_install_plan() {
+        let valid = SecAgree {
+            spi_c: 0x1001,
+            spi_s: 0x1002,
+            port_c: 40000,
+            port_s: 6000,
+        };
+        for invalid in [
+            SecAgree { spi_c: 0, ..valid },
+            SecAgree { spi_s: 0, ..valid },
+            SecAgree { port_c: 0, ..valid },
+            SecAgree { port_s: 0, ..valid },
+        ] {
+            assert_eq!(
+                parse_security_server(&invalid.security_client_value())
+                    .unwrap_err()
+                    .code(),
+                code::SECURITY_SERVER_INVALID
+            );
+            assert_eq!(
+                build_install_plan(v6(2), v6(1), &valid, &invalid, &[1; 16])
+                    .unwrap_err()
+                    .code(),
+                code::SECURITY_SERVER_INVALID
+            );
+            assert!(build_install_plan(v6(2), v6(1), &invalid, &valid, &[1; 16]).is_err());
+        }
+    }
+
+    #[test]
+    fn refresh_rollover_preserves_server_port_and_keeps_plans_disjoint() {
+        let ue_old = SecAgree {
+            spi_c: 0x1001,
+            spi_s: 0x1002,
+            port_c: 40000,
+            port_s: 41000,
+        };
+        let ue_new = SecAgree {
+            spi_c: 0x1101,
+            spi_s: 0x1102,
+            port_c: 40001,
+            ..ue_old
+        };
+        let pc_old = SecAgree {
+            spi_c: 0x2001,
+            spi_s: 0x2002,
+            port_c: 33001,
+            port_s: 6000,
+        };
+        let pc_new = SecAgree {
+            spi_c: 0x2101,
+            spi_s: 0x2102,
+            port_c: 33002,
+            ..pc_old
+        };
+        validate_server_rollover(&pc_old, &pc_new).unwrap();
+        for invalid in [
+            SecAgree {
+                port_s: 6001,
+                ..pc_new
+            },
+            SecAgree {
+                port_c: pc_old.port_c,
+                ..pc_new
+            },
+            SecAgree {
+                spi_s: pc_old.spi_s,
+                ..pc_new
+            },
+            SecAgree {
+                spi_c: pc_old.spi_c,
+                ..pc_new
+            },
+        ] {
+            assert!(validate_server_rollover(&pc_old, &invalid).is_err());
+        }
+        let old = build_install_plan(v6(2), v6(1), &ue_old, &pc_old, &[1; 16]).unwrap();
+        let new = build_install_plan(v6(2), v6(1), &ue_new, &pc_new, &[2; 16]).unwrap();
+        for state in &new.states {
+            assert!(!old
+                .states
+                .iter()
+                .any(|old| (old.dst, old.spi) == (state.dst, state.spi)));
+        }
+        for policy in &new.policies {
+            assert!(!old.policies.contains(policy));
+        }
     }
 
     #[test]

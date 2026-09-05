@@ -143,20 +143,13 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-  # ==================== 1.5 测试代码类型检查（不阻塞发布） ====================
-  #
-  # 发布流水线只跑 `cargo build --release`，而 release 构建根本不编译
-  # `#[cfg(test)]` 代码。后果是真实存在过的：VoWiFi 的 Contact 兜底分支被
-  # `#[cfg(test)]` 包着，release 里那个 else 是空的 —— 发出的 REGISTER 一个
-  # feature tag 都没有，而覆盖它的测试照样"通过"，因为测试里那段代码存在。
-  #
-  # `cargo test --no-run` 只编译不执行：既能抓住这类只存在于测试构建中的
-  # 代码，也不会碰到 WSL/CI 里跑真实网络测试的那些坑。
-  # continue-on-error 保证它永远不挡发布 —— 这是信号，不是闸门。
+  # ==================== 1.5 IMS refresh regression gate ====================
+  # Execute the hardware-free SIP/channel/refresh regressions on Actions.
+  # A release must not ship if a challenged refresh loses its active SA.
   check-tests:
-    name: Type-check test code (non-blocking)
+    name: IMS refresh regression tests
     runs-on: ubuntu-24.04
-    continue-on-error: true
+    timeout-minutes: 25
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -181,7 +174,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          cargo test --no-run 2>&1 | tee test-compile.log
+          cargo test --locked --no-run 2>&1 | tee test-compile.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
             # Public check annotations remain readable even when GitHub hides
@@ -193,6 +186,37 @@ jobs:
             echo "::error title=Rust test compile failed::$details"
           fi
           exit "$status"
+
+      - name: Run hardware-free IMS refresh regressions
+        working-directory: backend
+        shell: bash
+        run: |
+          set -o pipefail
+          for filter in \
+            connectivity::core::register::tests \
+            connectivity::core::registration::tests \
+            connectivity::modems::ims::volte::channel::tests \
+            connectivity::modems::ims::volte::ipsec::tests \
+            connectivity::modems::ims::volte::live::tests::refresh \
+            connectivity::modems::ims::volte::live::refresh_tests; do
+            if ! cargo test --locked "$filter" -- --test-threads=1 2>&1 | tee -a ims-refresh-tests.log; then
+              details=$(tail -n 80 ims-refresh-tests.log)
+              details=${details//'%'/'%25'}
+              details=${details//$'\r'/'%0D'}
+              details=${details//$'\n'/'%0A'}
+              echo "::error title=IMS refresh regression failed::$details"
+              exit 1
+            fi
+          done
+          grep -E 'running [0-9]+ test|test result:' ims-refresh-tests.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IMS regression results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ims-refresh-tests
+          path: backend/ims-refresh-tests.log
+          retention-days: 7
 
   # ==================== 2. 后端构建 + 分架构打包 ====================
   build:
@@ -408,7 +432,7 @@ jobs:
   # ==================== 3. 汇总所有架构并发布 Release ====================
   release:
     name: Publish Release
-    needs: [prepare, build]
+    needs: [prepare, build, check-tests]
     runs-on: ubuntu-24.04
     steps:
       - name: Download all packages

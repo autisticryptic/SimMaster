@@ -46,6 +46,7 @@ pub mod code {
     pub const IPSEC_IK_INVALID: &str = "volte_ipsec_ik_invalid";
     pub const IPSEC_REQUIRES_IPV6: &str = "volte_ipsec_requires_ipv6";
     pub const IPSEC_UDP_BIND_FAILED: &str = "volte_ipsec_udp_bind_failed";
+    pub const SECURITY_SERVER_INVALID: &str = "volte_security_server_invalid";
     pub const SECURITY_SERVER_MISSING: &str = "volte_security_server_missing";
 
     // SIP framing / encoding.

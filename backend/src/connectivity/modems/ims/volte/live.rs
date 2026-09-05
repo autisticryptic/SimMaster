@@ -130,15 +130,6 @@ const OPTIONS_MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// Keep the retry well outside the normal SIP transaction timeout so a lost
 /// response cannot turn into a tight REGISTER loop on the baseband.
 const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-/// A failed same-bearer security renegotiation is still a refresh recovery
-/// attempt, not a reason to reconnect the access bearer. Use an exponential
-/// cooldown because each attempt allocates sockets and may install XFRM state.
-const REGISTER_REFRESH_RENEGOTIATION_RETRY_BASE: Duration = Duration::from_secs(60);
-const REGISTER_REFRESH_RENEGOTIATION_RETRY_MAX: Duration = Duration::from_secs(300);
-/// After several unanswered protected REGISTERs, TS 33.203 permits the UE to
-/// assume the old P-CSCF SA is no longer active. Re-negotiate on the same
-/// bearer instead of hiding the signaling failure behind an access rebuild.
-const REGISTER_REFRESH_PROTECTED_TIMEOUTS_BEFORE_RENEGOTIATION: u8 = 2;
 /// Temporary device-validation override. Keep this at 120 seconds only while
 /// observing refresh behavior on the test device; restore None afterwards so
 /// production scheduling uses the network-provided RegistrationLease value.
@@ -421,6 +412,9 @@ struct VolteLiveSession {
     pcscf: SocketAddr,
     ip_family: &'static str,
     xfrm_plan: Option<XfrmInstallPlan>,
+    /// Previous successful SA retained for delayed protected traffic until the
+    /// next registration procedure (TS 33.203 7.4.1a/7.4.2a).
+    retired_xfrm_plan: Option<XfrmInstallPlan>,
     /// Namespace owner of `xfrm_plan`.
     xfrm_worker: UeWorkerHandle,
     /// Worker namespace that owns the native bearer interface and routes.
@@ -440,15 +434,6 @@ struct VolteLiveSession {
     /// SA protects the request; a challenged refresh replaces this value with
     /// the newly negotiated association.
     security_client: Option<String>,
-    /// A protected SA can disappear at the P-CSCF without the access bearer
-    /// disappearing. This flag makes the next refresh an unprotected REGISTER
-    /// that negotiates a replacement SA on the existing bearer.
-    security_renegotiation_pending: bool,
-    consecutive_protected_refresh_timeouts: u8,
-    /// Number of failed same-bearer renegotiation attempts since the last
-    /// successful protected REGISTER. It drives the recovery cooldown and is
-    /// deliberately not an access/bearer reconnect counter.
-    security_renegotiation_attempts: u8,
     sip_instance: String,
     security_binding: SecAgree,
     register_variant: VolteRegisterVariant,
@@ -518,28 +503,6 @@ fn refresh_retry_delay(
     // and needlessly tears down an otherwise usable IMS bearer.
     let remaining = remaining_registration_lifetime(registration);
     (!remaining.is_zero()).then_some(remaining.min(REGISTER_REFRESH_RETRY_INTERVAL))
-}
-
-fn security_renegotiation_retry_delay(
-    registration: &RegisteredImsContext,
-    attempt: u8,
-) -> Duration {
-    let exponent = u32::from(attempt.saturating_sub(1).min(3));
-    let multiplier = 1_u64 << exponent;
-    let cooldown_seconds = REGISTER_REFRESH_RENEGOTIATION_RETRY_BASE
-        .as_secs()
-        .saturating_mul(multiplier)
-        .min(REGISTER_REFRESH_RENEGOTIATION_RETRY_MAX.as_secs());
-    let cooldown = Duration::from_secs(cooldown_seconds);
-    let remaining = remaining_registration_lifetime(registration);
-    if remaining.is_zero() {
-        // Let the next loop iteration observe the expired lease and take the
-        // normal expiry recovery path; never spin immediately on an expired
-        // binding.
-        Duration::from_secs(1)
-    } else {
-        remaining.min(cooldown)
-    }
 }
 
 fn advance_register_cseq(current: u32, last_sent: u32) -> u32 {
@@ -1232,9 +1195,7 @@ struct VolteRegisterAuthenticator {
     ids: RequestIds,
     sip_instance: String,
     offered_security: String,
-    /// Formatting variant used to rebuild Security-Client after a challenged
-    /// refresh allocates a replacement local port binding.
-    security_client_offer: VolteSecurityClientOffer,
+    // Frozen for this entire procedure: SM7 must repeat the offer sent in SM1.
     offered_security_binding: SecAgree,
     route: ImsRoute,
     pending: Option<PreparedAuth>,
@@ -1280,7 +1241,6 @@ impl VolteRegisterAuthenticator {
         sip_instance: String,
         offered_security_binding: SecAgree,
         offered_security: String,
-        security_client_offer: VolteSecurityClientOffer,
         route: ImsRoute,
         device: VolteDeviceBinding,
         runtime: VolteRuntime,
@@ -1303,7 +1263,6 @@ impl VolteRegisterAuthenticator {
             ids,
             sip_instance,
             offered_security,
-            security_client_offer,
             offered_security_binding,
             route,
             pending: None,
@@ -1334,10 +1293,6 @@ impl VolteRegisterAuthenticator {
         self
     }
 
-    /// Keep refresh/unregister tied to the exact worker process that owns the
-    /// live bearer. `UeWorkerHandle` survives respawns, so a fresh `bind()` at
-    /// refresh time would accidentally bless sockets/XFRM state belonging to
-    /// an already-dead generation.
     /// Return the last challenge-bound Authorization generated by this
     /// authenticator. It is intentionally copied only after a successful
     /// REGISTER; a failed challenge must never poison the live session's
@@ -1352,8 +1307,8 @@ impl VolteRegisterAuthenticator {
     /// Return the authenticator state emitted by the successful REGISTER and
     /// commit a server-provided nextnonce to that state. This keeps the
     /// challenge state transactional: a failed response cannot replace the
-    /// session's last known-good nonce, while a timeout still preserves the
-    /// already-emitted nonce-count through `refresh_authorization()`.
+    /// session's last known-good nonce. Failure preserves only the original
+    /// association's consumed nonce-count via `refresh_authorization_after_failure`.
     fn refresh_authorization_after_success(
         &self,
         response: &[u8],
@@ -1363,73 +1318,51 @@ impl VolteRegisterAuthenticator {
         Some(authorization)
     }
 
-    fn with_worker_binding(mut self, worker_binding: UeWorkerBinding) -> Self {
-        self.worker_binding = worker_binding;
-        self
+    fn refresh_authorization_after_failure(&self) -> Option<VolteRefreshAuthorization> {
+        self.refresh_authorization.clone()
     }
-}
 
-fn ensure_worker_binding_current(binding: &UeWorkerBinding) -> Result<(), VolteError> {
-    if binding.is_current() {
-        Ok(())
-    } else {
-        Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED))
+    async fn rollback_security(&mut self, channel: &mut VolteSipChannel) {
+        channel.rollback_security();
+        if let Some(plan) = self.xfrm_plan.take() {
+            if self.worker_binding.is_current() {
+                ipsec::uninstall_plan_in_worker(&plan, &self.worker).await;
+            } else {
+                tracing::warn!(
+                    "Skipping tentative VoLTE XFRM cleanup on a stale UE worker generation"
+                );
+            }
+        }
     }
-}
 
-fn ensure_worker_binding_current_ims(binding: &UeWorkerBinding) -> Result<(), ImsError> {
-    ensure_worker_binding_current(binding).map_err(to_ims_error)
-}
-
-impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
-    async fn prepare_authenticated_channel(
+    async fn prepare_aka_result(
         &mut self,
-        challenge_response: &[u8],
+        challenge: digest_aka::DigestChallenge,
+        aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
+        security_server: Option<(SecAgree, String)>,
         channel: &mut VolteSipChannel,
     ) -> Result<(), ImsError> {
-        ensure_worker_binding_current_ims(&self.worker_binding)?;
-        self.runtime
-            .update(|state| state.stage = VolteStage::IdentityAka)
-            .await;
-        let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
-        let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
-        let aid = self.aka_aid.clone();
-        let rand = aka_challenge.rand;
-        let autn = aka_challenge.autn;
-        let qmi_device = self.device.qmi_device.clone();
-        let uim_slot = self.device.uim_slot;
-        let aka = tokio::task::spawn_blocking(move || {
-            identity::run_usim_aka(
-                QMI_PROXY_SOCKET,
-                qmi_device.as_str(),
-                uim_slot,
-                &aid,
-                &rand,
-                &autn,
-                2,
-                Duration::from_secs(5),
-                Duration::from_millis(300),
-            )
-        })
-        .await
-        .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
-        .map_err(to_ims_error)?;
-
         if let Some(auts) = aka.auts.as_deref() {
-            // `self.route` is only ever used to build headers, so it holds the
-            // advertised route. No SA is active on this resync path yet, so it
-            // still equals the send route.
+            // AUTS is an authentication message, not permission to downgrade a
+            // protected refresh. Keep SM1's offer and the active Security-Verify.
             self.route = channel.advertised_route();
             let request_uri = sip::register_request_uri_with_target(
                 self.profile,
                 effective_register_target(&self.effective_ims),
                 &self.route,
             );
-            let (security_client, security_verify, register_policy) =
+            let (security_client, security_verify, mut register_policy) =
                 unnegotiated_authenticated_security(
                     self.initial_security_client.as_deref(),
                     self.register_policy,
                 );
+            let security_verify = channel
+                .security_verify()
+                .map(str::to_string)
+                .or(security_verify);
+            if security_verify.is_some() {
+                register_policy.require_sec_agree = true;
+            }
             self.pending = Some(PreparedAuth {
                 authorization: digest_aka::build_resync_authorization_header(
                     &challenge,
@@ -1445,26 +1378,6 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             return Ok(());
         }
 
-        let security_server_values = sip::header_values(challenge_response, "Security-Server");
-        let security_server = security_server_values.iter().find_map(|value| {
-            if self.profile.ims.register.strict_security_server_offer
-                && !security_server_matches_profile(self.profile, value)
-            {
-                return None;
-            }
-            ipsec::parse_security_server(&value)
-                .ok()
-                .map(|sec| (sec, value.clone()))
-        });
-        tracing::info!(
-            security_server_count = security_server_values.len(),
-            usable_security_server_present = security_server.is_some(),
-            initial_security_client_present = self.initial_security_client.is_some(),
-            declared_require_sec_agree = self.register_policy.require_sec_agree,
-            declared_proxy_require_sec_agree = self.register_policy.proxy_require_sec_agree,
-            sensitive_values = "redacted",
-            "VoLTE IMS REGISTER authentication challenge metadata received"
-        );
         let (security_client, security_verify, register_policy) = if self.reuse_security {
             let security_verify = channel.security_verify().map(str::to_string);
             self.mode = if security_verify.is_some() {
@@ -1507,36 +1420,32 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             // point at which a new SA is actually negotiated, so reserve the
             // replacement local tuple now and rebuild Security-Client from the
             // same formatting variant used by the successful registration.
-            if channel.security_verify().is_some() {
-                let receive_port = channel
-                    .reserve_security_receive_port_in_worker(&self.worker)
-                    .await?;
-                let send_port = match channel
-                    .reserve_security_send_port_in_worker(&self.worker, receive_port)
-                    .await
+            if let Some(previous) = channel.security_verify() {
+                let previous = ipsec::parse_security_server(previous).map_err(to_ims_error)?;
+                ipsec::validate_server_rollover(&previous, &selected).map_err(to_ims_error)?;
+                if self.offered_security_binding.port_c == channel.send_route().local_addr.port()
+                    || self.offered_security_binding.port_s != channel.route().local_addr.port()
                 {
-                    Ok(port) => port,
-                    Err(error) => {
-                        channel.discard_reserved_security_ports();
-                        return Err(error);
-                    }
-                };
-                let old_port_uc = self.offered_security_binding.port_c;
-                self.offered_security_binding = offered_security(send_port, receive_port);
-                self.offered_security = self
-                    .security_client_offer
-                    .build(self.offered_security_binding, self.profile);
-                // The replacement SA is now the binding that authenticated
-                // this refresh. Persist the exact rebuilt Security-Client so
-                // the next refresh does not advertise the retired port tuple.
-                self.initial_security_client = Some(self.offered_security.clone());
-                tracing::info!(
-                    old_port_uc,
-                    new_port_uc = send_port,
-                    new_port_us = receive_port,
-                    "VoLTE challenged protected refresh allocated replacement security ports"
-                );
+                    return Err(ImsError::new(code::SECURITY_SERVER_INVALID));
+                }
             }
+            // Both ports/SPIs were offered before the challenge. Never generate
+            // a different Security-Client in SM7: the P-CSCF already installed
+            // its registration SAs using SM1. Re-reserve exact ports only if a
+            // previous authentication round in this procedure was rolled back.
+            channel
+                .reserve_security_receive_port_in_worker_at(
+                    &self.worker,
+                    self.offered_security_binding.port_s,
+                )
+                .await?;
+            channel
+                .reserve_security_send_port_in_worker_at(
+                    &self.worker,
+                    self.offered_security_binding.port_c,
+                    self.offered_security_binding.port_s,
+                )
+                .await?;
             self.runtime
                 .update(|state| state.stage = VolteStage::Ipsec)
                 .await;
@@ -1594,10 +1503,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
                 Some(verify),
                 register_policy,
             )
-        } else if self.profile.ims.register.sec_agree_mode == "required"
-            || (self.profile.ims.register.strict_security_server_offer
-                && !security_server_values.is_empty())
-        {
+        } else if self.profile.ims.register.sec_agree_mode == "required" {
             return Err(ImsError::new(code::SECURITY_SERVER_MISSING));
         } else {
             self.mode = RegistrationMode::Udp;
@@ -1658,6 +1564,131 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
             register_policy,
         });
         Ok(())
+    }
+
+    fn with_worker_binding(mut self, worker_binding: UeWorkerBinding) -> Self {
+        self.worker_binding = worker_binding;
+        self
+    }
+}
+
+fn select_security_server(
+    profile: &CarrierProfile,
+    values: &[String],
+) -> Result<Option<(SecAgree, String)>, ImsError> {
+    let selected = values.iter().find_map(|value| {
+        if profile.ims.register.strict_security_server_offer
+            && !security_server_matches_profile(profile, value)
+        {
+            return None;
+        }
+        ipsec::parse_security_server(value)
+            .ok()
+            .map(|sec| (sec, value.clone()))
+    });
+    if !values.is_empty() && selected.is_none() {
+        // Do not log the raw challenge (nonce/AKA secrets). In particular SPI=0
+        // is not a usable SA and must never reach Linux XFRM.
+        tracing::warn!(
+            offer_count = values.len(),
+            "VoLTE REGISTER challenge has no usable Security-Server offer"
+        );
+        return Err(ImsError::new(code::SECURITY_SERVER_INVALID));
+    }
+    Ok(selected)
+}
+
+async fn reserve_refresh_security_offer(
+    channel: &mut VolteSipChannel,
+    worker: &UeWorkerHandle,
+    current: SecAgree,
+) -> Result<SecAgree, ImsError> {
+    let server_port = channel
+        .reserve_security_receive_port_in_worker_at(worker, current.port_s)
+        .await?;
+    let client_port = channel
+        .reserve_security_send_port_in_worker(worker, server_port)
+        .await?;
+    Ok(offered_refresh_security(current, client_port))
+}
+
+fn offered_refresh_security(current: SecAgree, client_port: u16) -> SecAgree {
+    loop {
+        let offered = offered_security(client_port, current.port_s);
+        if offered.spi_c != current.spi_c
+            && offered.spi_c != current.spi_s
+            && offered.spi_s != current.spi_c
+            && offered.spi_s != current.spi_s
+        {
+            return offered;
+        }
+    }
+}
+
+fn ensure_worker_binding_current(binding: &UeWorkerBinding) -> Result<(), VolteError> {
+    if binding.is_current() {
+        Ok(())
+    } else {
+        Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED))
+    }
+}
+
+fn ensure_worker_binding_current_ims(binding: &UeWorkerBinding) -> Result<(), ImsError> {
+    ensure_worker_binding_current(binding).map_err(to_ims_error)
+}
+
+impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
+    async fn prepare_authenticated_channel(
+        &mut self,
+        challenge_response: &[u8],
+        channel: &mut VolteSipChannel,
+    ) -> Result<(), ImsError> {
+        ensure_worker_binding_current_ims(&self.worker_binding)?;
+        self.runtime
+            .update(|state| state.stage = VolteStage::IdentityAka)
+            .await;
+        // A second challenge replaces only this procedure's tentative SA. Keep
+        // the original live channel and the offer already seen by the P-CSCF.
+        if self.xfrm_plan.is_some() {
+            self.rollback_security(channel).await;
+        }
+        self.pending = None;
+        let security_server_values = sip::header_values(challenge_response, "Security-Server");
+        let security_server = select_security_server(self.profile, &security_server_values)?;
+        tracing::info!(
+            security_server_count = security_server_values.len(),
+            usable_security_server_present = security_server.is_some(),
+            initial_security_client_present = self.initial_security_client.is_some(),
+            declared_require_sec_agree = self.register_policy.require_sec_agree,
+            sensitive_values = "redacted",
+            "VoLTE IMS REGISTER authentication challenge metadata received"
+        );
+        let challenge = parse_digest_challenge(challenge_response).map_err(to_ims_error)?;
+        let aka_challenge = digest_aka::decode_aka_nonce(&challenge.nonce).map_err(to_ims_error)?;
+        let aid = self.aka_aid.clone();
+        let rand = aka_challenge.rand;
+        let autn = aka_challenge.autn;
+        let qmi_device = self.device.qmi_device.clone();
+        let uim_slot = self.device.uim_slot;
+        let aka = tokio::task::spawn_blocking(move || {
+            identity::run_usim_aka(
+                QMI_PROXY_SOCKET,
+                qmi_device.as_str(),
+                uim_slot,
+                &aid,
+                &rand,
+                &autn,
+                2,
+                Duration::from_secs(5),
+                Duration::from_millis(300),
+            )
+        })
+        .await
+        .map_err(|_| ImsError::new(code::USIM_AKA_FAILED))?
+        .map_err(to_ims_error)?;
+
+        self.prepare_aka_result(challenge, aka, security_server, channel)
+            .await
     }
 
     async fn authenticated_request(
@@ -2692,7 +2723,6 @@ async fn connect_family(
             sip_instance.clone(),
             offered_binding,
             negotiated_security,
-            variant.security_client_offer,
             channel.route(),
             device.clone(),
             runtime.clone(),
@@ -2796,6 +2826,7 @@ async fn connect_family(
                 Some(format!("register_variant={}", variant.label)),
             )
             .await;
+        channel.commit_security();
         let artifacts = RegisterArtifacts::parse(&registration.response);
         let refresh_authorization =
             authenticator.refresh_authorization_after_success(&registration.response);
@@ -2872,6 +2903,7 @@ async fn connect_family(
             pcscf: pcscf_socket(pcscf),
             ip_family: ip_family_name(local_addr),
             xfrm_plan: authenticator.xfrm_plan,
+            retired_xfrm_plan: None,
             xfrm_worker: authenticator.worker.clone(),
             network_worker,
             worker_binding: authenticator.worker_binding.clone(),
@@ -2885,9 +2917,6 @@ async fn connect_family(
             next_register_cseq: authenticator.last_cseq.saturating_add(1),
             refresh_authorization,
             security_client: authenticator.initial_security_client.clone(),
-            security_renegotiation_pending: false,
-            consecutive_protected_refresh_timeouts: 0,
-            security_renegotiation_attempts: 0,
             sip_instance: authenticator.sip_instance,
             security_binding: authenticator.offered_security_binding,
             register_variant: variant,
@@ -2992,7 +3021,6 @@ async fn unregister_live_session(
         session.sip_instance.clone(),
         session.security_binding,
         session.security_client.clone().unwrap_or_default(),
-        session.register_variant.security_client_offer,
         session.channel.route(),
         session.device.clone(),
         runtime.clone(),
@@ -3581,126 +3609,13 @@ async fn refresh_live_registration(
         .expires_seconds
         .max(session.profile.ims.register.expires_seconds);
 
-    // A normal protected refresh repeats the last accepted security offer and
-    // stays on the current SA. Replacement ports are allocated only after a
-    // Security-Server challenge is actually received by the authenticator.
-    let security_renegotiating = session.security_renegotiation_pending;
-    let security_renegotiation_attempt = if security_renegotiating {
-        let attempt = session.security_renegotiation_attempts.saturating_add(1);
-        session.security_renegotiation_attempts = attempt;
-        tracing::warn!(
-            attempt,
-            cooldown_seconds =
-                security_renegotiation_retry_delay(&session.registration, attempt,).as_secs(),
-            "VoLTE IMS same-bearer security renegotiation attempt started"
-        );
-        Some(attempt)
-    } else {
-        None
-    };
-    let normal_protected_refresh =
-        !security_renegotiating && session.channel.security_verify().is_some();
-    let renegotiation_server_port = session.security_binding.port_s;
-    let mut pending_security_binding = if security_renegotiating {
-        let previous_server_port = renegotiation_server_port;
-        let mut send_route = session.channel.send_route();
-        // `send_route().pcscf_addr` is the protected P-CSCF server port once
-        // sec-agree is active. Plain recovery must target the original SIP
-        // P-CSCF address, not the ESP transport port.
-        send_route.pcscf_addr = session.pcscf;
-        if let Err(error) = session
-            .channel
-            .deactivate_security_in_worker(&session.xfrm_worker, send_route)
-            .await
-        {
-            let error = map_channel_error(error);
-            tracing::warn!(
-                error = %error,
-                "VoLTE IMS security renegotiation could not create an unprotected SIP channel"
-            );
-            return VolteRefreshAttempt {
-                outcome: RegistrationRefreshResult::Retry,
-                error: Some(error),
-                retry_after: Some(security_renegotiation_retry_delay(
-                    &session.registration,
-                    security_renegotiation_attempt.unwrap_or(1),
-                )),
-            };
-        }
-        if let Some(old_plan) = session.xfrm_plan.take() {
-            if session.worker_binding.is_current() {
-                ipsec::uninstall_plan_in_worker(&old_plan, &session.xfrm_worker).await;
-            } else {
-                tracing::warn!("Skipping stale VoLTE XFRM cleanup during security renegotiation");
-            }
-        }
-        let receive_port = match session
-            .channel
-            .reserve_security_receive_port_in_worker_at(&session.xfrm_worker, previous_server_port)
-            .await
-        {
-            Ok(port) => port,
-            Err(error) => {
-                let error = map_channel_error(error);
-                tracing::warn!(
-                    error = %error,
-                    requested_port = previous_server_port,
-                    "VoLTE IMS security renegotiation could not reserve the existing port_us"
-                );
-                return VolteRefreshAttempt {
-                    outcome: RegistrationRefreshResult::Retry,
-                    error: Some(error),
-                    retry_after: Some(security_renegotiation_retry_delay(
-                        &session.registration,
-                        security_renegotiation_attempt.unwrap_or(1),
-                    )),
-                };
-            }
-        };
-        let send_port = match session
-            .channel
-            .reserve_security_send_port_in_worker(&session.xfrm_worker, receive_port)
-            .await
-        {
-            Ok(port) => port,
-            Err(error) => {
-                session.channel.discard_reserved_security_ports();
-                let error = map_channel_error(error);
-                tracing::warn!(
-                    error = %error,
-                    requested_port = receive_port,
-                    "VoLTE IMS security renegotiation could not reserve a fresh port_uc"
-                );
-                return VolteRefreshAttempt {
-                    outcome: RegistrationRefreshResult::Retry,
-                    error: Some(error),
-                    retry_after: Some(security_renegotiation_retry_delay(
-                        &session.registration,
-                        security_renegotiation_attempt.unwrap_or(1),
-                    )),
-                };
-            }
-        };
-        Some(offered_security(send_port, receive_port))
-    } else {
-        // A normal protected refresh must be sent using the exact
-        // Security-Client/Verify tuple from the last successful registration.
-        // Do not reserve or advertise a speculative port pair here: no
-        // Security-Server challenge means no new SA has been negotiated, and
-        // changing the offer while protecting the request with the old SA can
-        // make strict P-CSCFs silently discard the REGISTER.
-        None
-    };
-    if security_renegotiating {
-        tracing::info!(
-            port_us = pending_security_binding
-                .as_ref()
-                .map(|binding| binding.port_s),
-            port_uc = pending_security_binding
-                .as_ref()
-                .map(|binding| binding.port_c),
-            "VoLTE IMS refresh entering same-bearer security renegotiation"
-        );
+    // SM1 stays on the current SA. It offers fresh client parameters in case
+    // the network challenges it, while port_us remains stable (TS 33.203 7.4).
+    // No response is ever interpreted as permission to send plaintext here.
+    let normal_protected_refresh = session.channel.security_verify().is_some();
+    session.channel.discard_retired_security();
+    if let Some(retired) = session.retired_xfrm_plan.take() {
+        ipsec::uninstall_plan_in_worker(&retired, &session.xfrm_worker).await;
     }
 
     // Refresh first retries the exact shape that registered, then drops PANI
@@ -3716,63 +3631,60 @@ async fn refresh_live_registration(
     for variant in candidates {
         let mut ids = session.register_ids.clone();
         ids.cseq = session.next_register_cseq;
-        let security_verify = if security_renegotiating {
-            None
-        } else {
-            session.channel.security_verify().map(str::to_string)
-        };
-        let security_client = if let Some(binding) = pending_security_binding.as_ref() {
-            Some(
-                variant
-                    .security_client_offer
-                    .build(*binding, session.profile),
+        let security_verify = session.channel.security_verify().map(str::to_string);
+        let pending_security_binding = if normal_protected_refresh {
+            match reserve_refresh_security_offer(
+                &mut session.channel,
+                &session.xfrm_worker,
+                session.security_binding,
             )
+            .await
+            {
+                Ok(binding) => binding,
+                Err(error) => {
+                    session.channel.discard_reserved_security_ports();
+                    let error = map_channel_error(error);
+                    tracing::warn!(error = %error, "VoLTE refresh could not reserve its security offer; retaining protected channel");
+                    return VolteRefreshAttempt {
+                        outcome: RegistrationRefreshResult::Retry,
+                        error: Some(error),
+                        retry_after: refresh_retry_delay(
+                            &session.registration,
+                            RegistrationLossReason::SignalingTransportLost,
+                        ),
+                    };
+                }
+            }
         } else {
-            security_verify
-                .as_ref()
-                .and_then(|_| session.security_client.clone())
+            session.security_binding
         };
+        let security_client = security_verify.as_ref().map(|_| {
+            variant
+                .security_client_offer
+                .build(pending_security_binding, session.profile)
+        });
         let require_sec_agree = security_verify.is_some();
-        // A refresh reuses the last AKA proof and, while protected, repeats
-        // the exact Security-Client/Verify tuple that was accepted. A recovery
-        // request is unprotected and can therefore receive a new AKA/
-        // Security-Server challenge.
-        let mut refresh_authorization = if security_renegotiating {
-            None
-        } else {
-            session.refresh_authorization.clone()
-        };
+        let mut refresh_authorization = session.refresh_authorization.clone();
         let request_uri = sip::register_request_uri_with_target(
             session.profile,
             effective_register_target(&session.effective_ims),
             &session.channel.route(),
         );
-        let initial_authorization = if security_renegotiating {
-            variant.authorization.build(
-                &session.effective_ims.realm.value,
-                &session.identity,
-                &request_uri,
-            )
-        } else {
-            match refresh_authorization
-                .as_mut()
-                .map(|state| state.authorization_for(&session.identity, &request_uri))
-                .transpose()
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    tracing::warn!(
-                        error = %error,
-                        "VoLTE refresh digest state could not build Authorization"
-                    );
-                    return VolteRefreshAttempt {
-                        outcome: RegistrationRefreshResult::RebuildAccess(
-                            RegistrationLossReason::AuthenticationRejected,
-                        ),
-                        error: Some(error),
-                        retry_after: None,
-                    };
-                }
+        let initial_authorization = match refresh_authorization
+            .as_mut()
+            .map(|state| state.authorization_for(&session.identity, &request_uri))
+            .transpose()
+        {
+            Ok(value) => value,
+            Err(error) => {
+                session.channel.discard_reserved_security_ports();
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(
+                        RegistrationLossReason::AuthenticationRejected,
+                    ),
+                    error: Some(error),
+                    retry_after: None,
+                };
             }
         };
         // `authorization_for` consumes nonce-count state. Move that updated
@@ -3780,23 +3692,14 @@ async fn refresh_live_registration(
         // a successful refresh would store the pre-request clone and the next
         // refresh would repeat the old `nc` (and potentially the old response).
         let emitted_refresh_authorization = refresh_authorization;
-        let register_policy = if security_renegotiating {
-            variant.policy
-        } else {
-            sip::RegisterRequestPolicy {
-                require_sec_agree,
-                ..variant.policy
-            }
-        };
-        let phase = if security_renegotiating {
-            sip::RegisterPhase::Initial
-        } else {
-            sip::RegisterPhase::Refresh
+        let register_policy = sip::RegisterRequestPolicy {
+            require_sec_agree,
+            ..variant.policy
         };
         let initial = sip::build_register_from_profile_with_target_visited_and_access(
             session.profile,
             effective_register_target(&session.effective_ims),
-            phase,
+            sip::RegisterPhase::Refresh,
             &session.identity,
             &session.channel.route(),
             &ids,
@@ -3814,16 +3717,15 @@ async fn refresh_live_registration(
             session.identity.clone(),
             ids.clone(),
             session.sip_instance.clone(),
-            pending_security_binding.unwrap_or(session.security_binding),
+            pending_security_binding,
             security_client
                 .clone()
                 .or_else(|| session.security_client.clone())
                 .unwrap_or_default(),
-            variant.security_client_offer,
             session.channel.route(),
             session.device.clone(),
             runtime.clone(),
-            !normal_protected_refresh && !security_renegotiating,
+            !normal_protected_refresh,
             session.aka_aid.clone(),
             register_policy,
             session.profile,
@@ -3848,75 +3750,16 @@ async fn refresh_live_registration(
             Ok(registration) => registration,
             Err(failure) => {
                 log_volte_register_failure_metadata(variant, &failure, Some(&initial));
-                if security_renegotiating {
-                    // A candidate may have reached the authenticated step and
-                    // installed a replacement SA before receiving a terminal
-                    // error.  Remove that candidate and return to a plain
-                    // channel before trying the next bounded header variant;
-                    // never send the next candidate through a half-installed
-                    // old/new protection mix.
-                    if let Some(plan) = authenticator.xfrm_plan.take() {
-                        if session.worker_binding.is_current() {
-                            ipsec::uninstall_plan_in_worker(&plan, &session.xfrm_worker).await;
-                        }
-                    }
-                    let mut send_route = session.channel.send_route();
-                    send_route.pcscf_addr = session.pcscf;
-                    if let Err(error) = session
-                        .channel
-                        .deactivate_security_in_worker(&session.xfrm_worker, send_route)
-                        .await
-                    {
-                        let error = map_channel_error(error);
-                        tracing::warn!(
-                            error = %error,
-                            "VoLTE IMS security renegotiation could not reset candidate channel"
-                        );
-                        return VolteRefreshAttempt {
-                            outcome: RegistrationRefreshResult::Retry,
-                            error: Some(error),
-                            retry_after: Some(security_renegotiation_retry_delay(
-                                &session.registration,
-                                security_renegotiation_attempt.unwrap_or(1),
-                            )),
-                        };
-                    }
-                    let receive_port = match session
-                        .channel
-                        .reserve_security_receive_port_in_worker_at(
-                            &session.xfrm_worker,
-                            renegotiation_server_port,
-                        )
-                        .await
-                    {
-                        Ok(port) => port,
-                        Err(error) => {
-                            let error = map_channel_error(error);
-                            tracing::warn!(
-                                error = %error,
-                                requested_port = renegotiation_server_port,
-                                "VoLTE IMS security renegotiation could not restore port_us"
-                            );
-                            return VolteRefreshAttempt {
-                                outcome: RegistrationRefreshResult::Retry,
-                                error: Some(error),
-                                retry_after: Some(security_renegotiation_retry_delay(
-                                    &session.registration,
-                                    security_renegotiation_attempt.unwrap_or(1),
-                                )),
-                            };
-                        }
-                    };
-                    pending_security_binding = Some(offered_security(
-                        session.channel.send_route().local_addr.port(),
-                        receive_port,
-                    ));
-                }
-                if let Some(authorization) = authenticator.refresh_authorization() {
+                // Roll back both sockets and selectors before any retry. A
+                // challenged timeout must not leave new sockets paired with
+                // old Security-Client headers or replace the old AKA state.
+                authenticator.rollback_security(&mut session.channel).await;
+                if let Some(authorization) = authenticator.refresh_authorization_after_failure() {
                     session.refresh_authorization = Some(authorization);
                 }
                 let error = map_refresh_register_failure(&failure);
-                if is_refresh_transport_failure(&failure) {
+                let invalid_security_offer = failure.error.code() == code::SECURITY_SERVER_INVALID;
+                if is_refresh_transport_failure(&failure) || invalid_security_offer {
                     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
                     let retry_after = refresh_retry_delay(
                         &session.registration,
@@ -3935,34 +3778,13 @@ async fn refresh_live_registration(
                         )
                         .await;
                     if let Some(retry_after) = retry_after {
-                        if session.channel.security_verify().is_some() {
-                            session.consecutive_protected_refresh_timeouts = session
-                                .consecutive_protected_refresh_timeouts
-                                .saturating_add(1);
-                            if session.consecutive_protected_refresh_timeouts
-                                >= REGISTER_REFRESH_PROTECTED_TIMEOUTS_BEFORE_RENEGOTIATION
-                            {
-                                session.security_renegotiation_pending = true;
-                                tracing::warn!(
-                                    consecutive_timeouts = session
-                                        .consecutive_protected_refresh_timeouts,
-                                    "VoLTE protected REGISTER timed out repeatedly; scheduling same-bearer security renegotiation"
-                                );
-                            }
-                        }
-                        // The fresh Security-Client offer was speculative. A
-                        // transport timeout means no new SA was negotiated, so
-                        // release its sockets before the next retry and keep
-                        // the active association untouched.
-                        if normal_protected_refresh && authenticator.xfrm_plan.is_none() {
-                            session.channel.discard_reserved_security_ports();
-                        }
                         tracing::warn!(
                             error = %error,
                             retry_after_seconds = retry_after.as_secs(),
                             register_variant = variant.label,
                             remaining_lifetime_seconds = remaining_lifetime.as_secs(),
-                            "VoLTE REGISTER refresh transport failure; retaining bearer and session"
+                            invalid_security_offer,
+                            "VoLTE REGISTER refresh failed; retaining protected bearer and session"
                         );
                         return VolteRefreshAttempt {
                             outcome: RegistrationRefreshResult::Retry,
@@ -4002,52 +3824,21 @@ async fn refresh_live_registration(
                 break;
             }
         };
-        // A protected re-registration may either complete directly on the
-        // current SA (no replacement plan) or be challenged and complete on a
-        // newly negotiated SA. Commit a replacement only after the final 2xx;
-        // otherwise discard the speculative fresh ports and keep the current
-        // association untouched.
+        // Only the final 2xx commits a tentative association and its AKA
+        // state. Direct 200 refreshes discard the unneeded offer and keep the
+        // exact active sockets/SAs. Retain one old protected path for delayed
+        // traffic; it is released before the next registration procedure.
         if let Some(plan) = authenticator.xfrm_plan.take() {
-            let old_plan = session.xfrm_plan.replace(plan);
+            session.retired_xfrm_plan = session.xfrm_plan.replace(plan);
             session.security_binding = authenticator.offered_security_binding;
             session.security_client = authenticator.initial_security_client.clone();
-            session.security_renegotiation_pending = false;
-            session.consecutive_protected_refresh_timeouts = 0;
-            if let Some(old_plan) = old_plan {
-                if session.worker_binding.is_current() {
-                    ipsec::uninstall_plan_in_worker(&old_plan, &session.xfrm_worker).await;
-                } else {
-                    tracing::warn!(
-                        "Skipping stale VoLTE XFRM cleanup after protected refresh rollover"
-                    );
-                }
-            }
             tracing::info!(
                 port_uc = session.security_binding.port_c,
                 port_us = session.security_binding.port_s,
-                security_renegotiating,
-                "VoLTE IMS protected refresh security association committed"
+                "VoLTE IMS challenged refresh security association committed"
             );
-        } else {
-            if security_renegotiating {
-                let error = VolteError::new(code::SECURITY_SERVER_MISSING);
-                tracing::warn!(
-                    error = %error,
-                    "VoLTE security renegotiation returned success without a replacement SA"
-                );
-                return VolteRefreshAttempt {
-                    outcome: RegistrationRefreshResult::Retry,
-                    error: Some(error),
-                    retry_after: Some(security_renegotiation_retry_delay(
-                        &session.registration,
-                        security_renegotiation_attempt.unwrap_or(1),
-                    )),
-                };
-            }
-            session.channel.discard_reserved_security_ports();
-            session.consecutive_protected_refresh_timeouts = 0;
         }
-        session.security_renegotiation_attempts = 0;
+        session.channel.commit_security();
         // Remember the shape that refreshed so later refreshes do not repeat a
         // rejected form; the session still carries the successfully bound one.
         if session.register_variant != variant {
@@ -4147,7 +3938,11 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
-        if let Some(plan) = session.xfrm_plan.as_ref() {
+        for plan in session
+            .xfrm_plan
+            .iter()
+            .chain(session.retired_xfrm_plan.iter())
+        {
             if session.worker_binding.is_current() {
                 ipsec::uninstall_plan_in_worker(plan, &session.xfrm_worker).await;
             } else {
@@ -7030,17 +6825,21 @@ fn offered_security(send_port: u16, receive_port: u16) -> SecAgree {
         u32::from_str_radix(&sip::hex_token(4), 16)
             .ok()
             .filter(|value| *value != 0)
-            // Keep the wire value inside RFC 3329 `1*8HEXDIG`. An 8-digit
-            // decimal value parses identically as decimal or hex, so a strict
-            // P-CSCF cannot reject it and a decimal-parsing peer cannot
-            // misread the SPI (which would break the installed xfrm SA).
-            .map(|value| value % 100_000_000)
-            .filter(|value| *value != 0)
-            .unwrap_or(1)
+            // Keep decimal offers within eight digits for existing peers,
+            // and never choose RFC 4303's reserved SPI range 0..=255.
+            .map(|value| 256 + value % (100_000_000 - 256))
+            .unwrap_or(256)
+    };
+    let spi_c = spi();
+    let spi_s = loop {
+        let candidate = spi();
+        if candidate != spi_c {
+            break candidate;
+        }
     };
     SecAgree {
-        spi_c: spi(),
-        spi_s: spi(),
+        spi_c,
+        spi_s,
         port_c: send_port,
         port_s: receive_port,
     }
@@ -7715,49 +7514,6 @@ mod tests {
     }
 
     #[test]
-    fn security_renegotiation_retry_uses_bounded_exponential_cooldown() {
-        let registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
-            b"SIP/2.0 200 OK\r\nExpires: 3600\r\n\r\n",
-            3600,
-        );
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 1),
-            Duration::from_secs(60)
-        );
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 2),
-            Duration::from_secs(120)
-        );
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 3),
-            Duration::from_secs(240)
-        );
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 4),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 8),
-            Duration::from_secs(300)
-        );
-    }
-
-    #[test]
-    fn expired_registration_does_not_spin_renegotiation_immediately() {
-        let mut registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
-            b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
-            60,
-        );
-        registration.registered_at = std::time::SystemTime::now() - Duration::from_secs(61);
-        assert_eq!(
-            security_renegotiation_retry_delay(&registration, 1),
-            Duration::from_secs(1)
-        );
-    }
-
-    #[test]
     fn refresh_cseq_advances_even_after_an_unanswered_request() {
         assert_eq!(advance_register_cseq(42, 42), 43);
         assert_eq!(advance_register_cseq(43, 42), 43);
@@ -7967,7 +7723,8 @@ mod tests {
         frame
     }
 
-    async fn test_voice_session() -> (VolteLiveHandle, Arc<VolteRuntime>, tokio::net::UdpSocket) {
+    pub(super) async fn test_voice_session(
+    ) -> (VolteLiveHandle, Arc<VolteRuntime>, tokio::net::UdpSocket) {
         let pcscf = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let pcscf_addr = pcscf.local_addr().unwrap();
         let channel = VolteSipChannel::bind(
@@ -8024,6 +7781,7 @@ mod tests {
             pcscf: pcscf_addr,
             ip_family: "ipv4",
             xfrm_plan: None,
+            retired_xfrm_plan: None,
             xfrm_worker: test_worker.clone(),
             network_worker: test_worker.clone(),
             worker_binding: test_binding,
@@ -8031,9 +7789,6 @@ mod tests {
             next_register_cseq: 2,
             refresh_authorization: None,
             security_client: Some("ipsec-3gpp;alg=hmac-md5-96;ealg=null;prot=esp;mod=trans;spi-c=1;spi-s=2;port-c=5064;port-s=5063".into()),
-            security_renegotiation_pending: false,
-            consecutive_protected_refresh_timeouts: 0,
-            security_renegotiation_attempts: 0,
             sip_instance: "urn:uuid:00000000-0000-4000-8000-000000000000".into(),
             security_binding: SecAgree {
                 spi_c: 1,
@@ -8509,7 +8264,7 @@ mod tests {
     }
 
     #[test]
-    fn security_renegotiation_keeps_port_us_and_changes_port_uc() {
+    fn refresh_offer_keeps_port_us_and_changes_port_uc() {
         let profile = &GB_EE_23433;
         let old = SecAgree {
             spi_c: 0x1001,
@@ -8517,7 +8272,7 @@ mod tests {
             port_c: 5064,
             port_s: 5063,
         };
-        let replacement = offered_security(51731, old.port_s);
+        let replacement = offered_refresh_security(old, 51731);
         let header = VolteSecurityClientOffer::Full.build(replacement, profile);
 
         assert_eq!(replacement.port_s, old.port_s);
@@ -10454,3 +10209,7 @@ Content-Length: 0\r\n\r\n";
         .await;
     }
 }
+
+#[cfg(test)]
+#[path = "refresh_tests.rs"]
+mod refresh_tests;
