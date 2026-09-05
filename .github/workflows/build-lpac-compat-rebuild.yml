@@ -118,7 +118,7 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 \
             https://archive.ubuntu.com/ubuntu/pool/main/libq/libqmi/libqmi_1.36.0.orig.tar.xz \
             -o "$LIBQMI_ARCHIVE"
-          mkdir /libqmi-src
+          mkdir -p /libqmi-src
           tar -xJf "$LIBQMI_ARCHIVE" --strip-components=1 -C /libqmi-src
           cd /libqmi-src
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
