@@ -119,23 +119,33 @@ jobs:
           curl -fL --retry 5 --retry-delay 3 \
             https://archive.ubuntu.com/ubuntu/pool/main/libq/libqmi/libqmi_1.36.0.orig.tar.xz \
             -o "$LIBQMI_ARCHIVE"
-          mkdir -p /libqmi-src
           # Use Python's built-in lzma/tar reader instead of relying on the
           # tar frontend's optional xz autodetection in the minimal image.
+          # Strip the archive's single top-level directory while extracting;
+          # copying that directory back into its parent with cp can fail on
+          # some overlay filesystems used by the hosted ARM runner.
           python3 - "$LIBQMI_ARCHIVE" /libqmi-src <<'PY'
+          import os
           import sys
           import tarfile
 
           archive, destination = sys.argv[1:]
+          destination = os.path.abspath(destination)
+          os.makedirs(destination, exist_ok=True)
+
           with tarfile.open(archive, mode="r:xz") as source:
-              source.extractall(destination)
+              for member in source:
+                  parts = member.name.split("/", 1)
+                  if len(parts) != 2 or not parts[1]:
+                      continue
+                  relative = parts[1]
+                  target = os.path.abspath(os.path.join(destination, relative))
+                  if os.path.commonpath([destination, target]) != destination:
+                      raise RuntimeError(f"unsafe archive path: {member.name}")
+                  member.name = relative
+                  source.extract(member, destination)
           PY
-          # The archive has one top-level libqmi-1.36.0 directory.  Flatten it
-          # so Meson sees the project files directly at /libqmi-src.
-          LIBQMI_ROOT=$(find /libqmi-src -mindepth 1 -maxdepth 1 -type d -name 'libqmi-*' -print -quit)
-          test -n "$LIBQMI_ROOT" && test -f "$LIBQMI_ROOT/meson.build"
-          cp -a "$LIBQMI_ROOT"/. /libqmi-src/
-          rm -rf "$LIBQMI_ROOT"
+          test -f /libqmi-src/meson.build
           cd /libqmi-src
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
             -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
