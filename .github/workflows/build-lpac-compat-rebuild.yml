@@ -165,12 +165,12 @@ jobs:
         run: |
           set -euo pipefail
           archive="release/${{ matrix.package }}"
+          # The container build performs the capability checks before writing
+          # the archive and asserts that the output file exists.  Keep this
+          # runner-side check deliberately tool-independent; some hosted
+          # images do not provide the same unzip/zipinfo implementation.
           test -s "$archive"
           ls -lah "$archive"
-          # The build step already verified that the executable reports both
-          # qmi and curl.  Here only validate the archive itself; zip tools
-          # differ in whether they print a leading ./ for entries.
-          unzip -t "$archive" >/dev/null
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
