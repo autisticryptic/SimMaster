@@ -121,29 +121,43 @@ jobs:
             -o "$LIBQMI_ARCHIVE"
           # Use Python's built-in lzma/tar reader instead of relying on the
           # tar frontend's optional xz autodetection in the minimal image.
-          # Strip the archive's single top-level directory while extracting;
-          # copying that directory back into its parent with cp can fail on
-          # some overlay filesystems used by the hosted ARM runner.
+          # Extract into a sibling staging directory first, then move every
+          # entry (including dotfiles) out of the archive's single top-level
+          # directory.  This avoids cp recursively copying a directory into
+          # its own parent on the hosted ARM runner's overlay filesystem.
           python3 - "$LIBQMI_ARCHIVE" /libqmi-src <<'PY'
           import os
+          import shutil
           import sys
           import tarfile
 
           archive, destination = sys.argv[1:]
           destination = os.path.abspath(destination)
+          staging = destination + ".staging"
+          shutil.rmtree(staging, ignore_errors=True)
+          os.makedirs(staging, exist_ok=True)
           os.makedirs(destination, exist_ok=True)
 
           with tarfile.open(archive, mode="r:xz") as source:
-              for member in source:
-                  parts = member.name.split("/", 1)
-                  if len(parts) != 2 or not parts[1]:
-                      continue
-                  relative = parts[1]
-                  target = os.path.abspath(os.path.join(destination, relative))
-                  if os.path.commonpath([destination, target]) != destination:
-                      raise RuntimeError(f"unsafe archive path: {member.name}")
-                  member.name = relative
-                  source.extract(member, destination)
+              source.extractall(staging)
+
+          roots = [
+              os.path.join(staging, name)
+              for name in os.listdir(staging)
+              if os.path.isdir(os.path.join(staging, name))
+          ]
+          if len(roots) != 1 or not os.path.isfile(os.path.join(roots[0], "meson.build")):
+              raise RuntimeError(f"unexpected libqmi archive layout: {roots!r}")
+
+          root = roots[0]
+          for name in os.listdir(root):
+              source_path = os.path.join(root, name)
+              destination_path = os.path.join(destination, name)
+              if os.path.lexists(destination_path):
+                  raise RuntimeError(f"destination already contains {name!r}")
+              shutil.move(source_path, destination_path)
+          os.rmdir(root)
+          os.rmdir(staging)
           PY
           test -f /libqmi-src/meson.build
           cd /libqmi-src
