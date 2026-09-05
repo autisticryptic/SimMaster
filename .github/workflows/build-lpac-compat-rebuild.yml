@@ -84,10 +84,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p release
-          docker run --rm \
-            -v "$GITHUB_WORKSPACE/release:/output" \
+          CONTAINER_NAME="lpac-build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.arch }}"
+          # Keep the build output in the container and copy it out explicitly.
+          # This avoids an intermittent Docker bind-mount visibility problem
+          # on hosted runners, which previously made upload-artifact see no
+          # archive even though the container had created and verified it.
+          set +e
+          docker run --name "$CONTAINER_NAME" \
             debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT'
           set -eux
+          mkdir -p /output
           # Debian 11 moved to the archive after Bullseye EOL; keep the
           # glibc 2.31 build target while using the archived package index.
           # The archive does not contain a bullseye-security suite, so keep
@@ -160,6 +166,18 @@ jobs:
           test -f "/output/$1"
           chmod -R 777 /output
           CONTAINER_SCRIPT
+          build_status=$?
+          set -e
+          if [ "$build_status" -ne 0 ]; then
+            docker logs "$CONTAINER_NAME" || true
+            docker rm "$CONTAINER_NAME" || true
+            exit "$build_status"
+          fi
+          docker cp "$CONTAINER_NAME:/output/$PACKAGE_NAME" "release/$PACKAGE_NAME"
+          docker cp "$CONTAINER_NAME:/output/resolved_version.txt" release/resolved_version.txt
+          docker rm "$CONTAINER_NAME"
+          test -s "release/$PACKAGE_NAME"
+          test -s release/resolved_version.txt
 
       # The container build performs the capability checks and asserts that
       # the archive exists before it exits.  Do not repeat a host-side file
