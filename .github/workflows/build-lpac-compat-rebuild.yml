@@ -111,8 +111,15 @@ jobs:
             libcurl4-openssl-dev libglib2.0-dev \
             libpcsclite-dev libudev-dev
           pip3 install meson
-          git clone --depth 1 --branch 1.36.0 \
-            https://gitlab.freedesktop.org/mobile-broadband/libqmi.git /libqmi-src
+          # Use the official source archive instead of a GitLab git clone.
+          # The archive endpoint is materially more reliable on hosted ARM
+          # runners and does not require repository metadata/history.
+          LIBQMI_ARCHIVE=/tmp/libqmi-1.36.0.tar.gz
+          curl -fL --retry 5 --retry-delay 3 \
+            https://gitlab.freedesktop.org/mobile-broadband/libqmi/-/archive/1.36.0/libqmi-1.36.0.tar.gz \
+            -o "$LIBQMI_ARCHIVE"
+          mkdir /libqmi-src
+          tar -xzf "$LIBQMI_ARCHIVE" --strip-components=1 -C /libqmi-src
           cd /libqmi-src
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
             -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
