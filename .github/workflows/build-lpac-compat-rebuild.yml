@@ -170,7 +170,7 @@ jobs:
           set -euo pipefail
           ls -lh "release/${{ matrix.package }}"
           file "release/${{ matrix.package }}"
-          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lpac'
+unzip -Z1 "release/${{ matrix.package }}" | grep -Eq '(^|/)lpac$'
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
