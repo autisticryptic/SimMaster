@@ -168,7 +168,10 @@ jobs:
           build_status=$?
           set -e
           if [ "$build_status" -ne 0 ]; then
-            docker logs "$CONTAINER_NAME" || true
+            docker logs "$CONTAINER_NAME" > release/lpac-build.log 2>&1 || true
+            diagnostic=$(tail -n 20 release/lpac-build.log | tr '\n' ' ' | cut -c1-3000 || true)
+            echo "::error file=.github/workflows/build-lpac-compat-rebuild.yml,line=111::$diagnostic"
+            cat release/lpac-build.log || true
             docker rm "$CONTAINER_NAME" || true
             exit "$build_status"
           fi
