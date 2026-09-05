@@ -79,7 +79,14 @@ jobs:
             -v "$GITHUB_WORKSPACE/release:/output" \
             debian:11 bash -c '
               set -eux
-              apt-get update
+              # Debian 11 moved to the archive after Bullseye EOL; keep the
+              # glibc 2.31 build target while using the archived package index.
+              sed -i -e "s|deb.debian.org/debian|archive.debian.org/debian|g" \
+                -e "s|security.debian.org/debian-security|archive.debian.org/debian-security|g" \
+                /etc/apt/sources.list
+              sed -i "/bullseye-updates/d" /etc/apt/sources.list
+              printf "Acquire::Check-Valid-Until \"false\";\n" > /etc/apt/apt.conf.d/99archive
+              apt-get -o Acquire::Check-Valid-Until=false update
               apt-get install -y --no-install-recommends \
                 build-essential cmake git ca-certificates zip \
                 pkg-config python3 python3-pip ninja-build \
