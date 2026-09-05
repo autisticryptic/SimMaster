@@ -112,35 +112,24 @@ jobs:
             libcurl4-openssl-dev libglib2.0-dev \
             libpcsclite-dev libgudev-1.0-dev libudev-dev
           pip3 install meson
-          # Use the official 1.36.0 source archive instead of a Git clone.
-          # The Ubuntu archive carries the upstream tarball and is reliable
-          # from both hosted runner architectures.
-          LIBQMI_ARCHIVE=/tmp/libqmi_1.36.0.orig.tar.xz
-          curl -fL --retry 5 --retry-delay 3 \
-            https://archive.ubuntu.com/ubuntu/pool/main/libq/libqmi/libqmi_1.36.0.orig.tar.xz \
-            -o "$LIBQMI_ARCHIVE"
-          # Use Python's built-in lzma/tar reader instead of relying on the
-          # tar frontend's optional xz autodetection in the minimal image.
-          # Keep the archive's top-level directory intact; Meson can build
-          # directly from that source directory and this avoids fragile
-          # copy/move operations on the hosted ARM runner overlay filesystem.
-          mkdir -p /libqmi-src
-          python3 - "$LIBQMI_ARCHIVE" /libqmi-src <<'PY'
-          import sys
-          import tarfile
-
-          archive, destination = sys.argv[1:]
-          with tarfile.open(archive, mode="r:xz") as source:
-              source.extractall(destination)
-          PY
-          LIBQMI_ROOT=$(find /libqmi-src -mindepth 1 -maxdepth 1 -type d -name 'libqmi-*' -print -quit)
-          test -n "$LIBQMI_ROOT" && test -f "$LIBQMI_ROOT/meson.build"
-          cd "$LIBQMI_ROOT"
-          meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
-            -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
-            -Dintrospection=false -Dman=false -Dbash_completion=false -Dqmi_username=root
-          ninja -C build
-          ninja -C build install
+          # Install the same QMI 1.36.0 packages used by upstream LPAC's
+          # Debian CI.  Building libqmi from source here is unnecessary and
+          # made this compatibility workflow depend on fragile archive
+          # extraction behavior on the hosted ARM runner.
+          QMI_VERSION="1.36.0-1_$(dpkg --print-architecture)"
+          QMI_TMP=$(mktemp -d)
+          trap 'rm -rf "$QMI_TMP"' EXIT
+          for QMI_PACKAGE in \
+            libqmi-glib5 \
+            libqmi-glib-dev \
+            libqmi-utils \
+            libqmi-proxy \
+            gir1.2-qmi-1.0; do
+            curl -fL --retry 5 --retry-delay 3 \
+              "https://launchpad.net/ubuntu/+archive/primary/+files/${QMI_PACKAGE}_${QMI_VERSION}.deb" \
+              -o "$QMI_TMP/${QMI_PACKAGE}.deb"
+          done
+          dpkg -i "$QMI_TMP"/*.deb
           ldconfig
           git clone --depth 1 --branch "$0" https://github.com/estkme-group/lpac /lpac
           cd /lpac
