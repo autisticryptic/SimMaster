@@ -93,6 +93,7 @@ jobs:
           docker run --name "$CONTAINER_NAME" \
             debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT'
           set -eux
+          trap 'rc=$?; msg=$(printf "LPAC container failed at line %s: %s (exit %s)" "$LINENO" "$BASH_COMMAND" "$rc" | tr "\n" " "); echo "::error title=LPAC container failure::$msg"; exit "$rc"' ERR
           mkdir -p /output
           # Debian 11 moved to the archive after Bullseye EOL; keep the
           # glibc 2.31 build target while using the archived package index.
