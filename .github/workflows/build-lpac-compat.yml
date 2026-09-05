@@ -3,6 +3,9 @@ name: Build-Lpac-Compat
 # Build compatibility lpac binaries from source for ARM64 and AMD64.
 
 on:
+  push:
+    paths:
+      - '.github/workflows/build-lpac-compat.yml'
   schedule:
     - cron: '0 0 5,20 * *'
   workflow_dispatch:
@@ -38,7 +41,8 @@ jobs:
           fi
           OUR_MANIFEST=$(curl -sL -f https://github.com/autisticryptic/SimMaster/releases/download/lpac/lpac.json || echo '{}')
           OUR_TAG=$(echo "$OUR_MANIFEST" | jq -r '.version // empty' || true)
-          if [ "$OFFICIAL_TAG" = "$OUR_TAG" ] && [ -n "$OUR_TAG" ]; then
+          OUR_HAS_APDU_DRIVERS=$(echo "$OUR_MANIFEST" | jq -r '.apdu_drivers // false' || true)
+          if [ "$OFFICIAL_TAG" = "$OUR_TAG" ] && [ "$OUR_HAS_APDU_DRIVERS" = "true" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
             echo "should_build=true" >> "$GITHUB_OUTPUT"
@@ -173,6 +177,7 @@ jobs:
           cat > release/lpac.json << EOF
           {
             "version": "$VERSION",
+            "apdu_drivers": true,
             "assets": [
               {"name": "lpac-linux-aarch64-glibc2.31.zip", "arch": "aarch64", "glibc": "2.31"},
               {"name": "lpac-linux-x86_64-glibc2.31.zip", "arch": "x86_64", "glibc": "2.31"}
