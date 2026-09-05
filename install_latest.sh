@@ -530,9 +530,13 @@ lpac_binary_path_usable() {
     return 1
   fi
 
-  output=$(LD_LIBRARY_PATH="$(lpac_env_prefix "$lpac_path")" "$lpac_path" 2>&1 || true)
+  # lpac initializes the selected backends before handling even a harmless
+  # command.  Use stdio here so an OTA preflight never depends on a modem,
+  # physical reader, or network connection.
+  output=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
+    LD_LIBRARY_PATH="$(lpac_env_prefix "$lpac_path")" "$lpac_path" 2>&1 || true)
   case "$output" in
-    *GLIBC_*|*No\ such\ file\ or\ directory*)
+    *GLIBC_*|*No\ such\ file\ or\ directory*|*Permission\ denied*)
       return 1
       ;;
   esac
@@ -540,19 +544,42 @@ lpac_binary_path_usable() {
   return 0
 }
 
-lpac_apdu_driver_present() {
+lpac_driver_list_usable() {
   lpac_path="$1"
-  lpac_home="$(dirname "$lpac_path")"
-  driver_dir="${lpac_home}/driver"
+  if [ ! -x "$lpac_path" ]; then
+    return 1
+  fi
 
-  [ -d "$driver_dir" ] || return 1
-  find "$driver_dir" -maxdepth 1 -type f -name 'driver_apdu_*.so' -print -quit \
-    | grep -q .
+  # lpac 2.3.x statically links APDU backends into the executable, so the
+  # presence of driver/driver_apdu_*.so is not a valid capability check.
+  # Ask lpac for the compiled capabilities instead.  stdio is always part of
+  # the upstream standalone build and avoids touching real hardware.
+  if ! output=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
+    LD_LIBRARY_PATH="$(lpac_env_prefix "$lpac_path")" \
+    "$lpac_path" driver list 2>&1); then
+    return 1
+  fi
+
+  case "$output" in
+    *GLIBC_*|*No\ such\ file\ or\ directory*|*Permission\ denied*)
+      return 1
+      ;;
+  esac
+
+  # Keep this POSIX-shell-only: the installer must also work on minimal
+  # devices that do not ship jq.  A non-empty JSON array is enough here; the
+  # Rust runtime performs the stricter capability parsing at service startup.
+  printf '%s\n' "$output" \
+    | grep -Eq '"LPAC_APDU"[[:space:]]*:[[:space:]]*\[[[:space:]]*[^]]' || return 1
+  printf '%s\n' "$output" \
+    | grep -Eq '"LPAC_HTTP"[[:space:]]*:[[:space:]]*\[[[:space:]]*[^]]' || return 1
 }
 
 lpac_binary_usable() {
   lpac_home="$1"
-  lpac_binary_path_usable "${lpac_home}/lpac"
+  lpac_path="${lpac_home}/lpac"
+  lpac_binary_path_usable "$lpac_path" \
+    && lpac_driver_list_usable "$lpac_path"
 }
 
 lpac_command_version() {
@@ -767,13 +794,12 @@ lpac_install_needed() {
     return 0
   fi
 
-  # A standalone lpac executable without its dynamically loaded APDU backend
-  # starts successfully but every real eSIM operation fails with
-  # "No APDU driver found".  Treat that state as incomplete even when the
-  # executable version matches the requested release, so an OTA deployment can
-  # repair installations created by older packages.
-  if ! lpac_apdu_driver_present "$lpac_path"; then
-    LPAC_INSTALL_REASON="installed lpac is missing APDU driver"
+  # Do not infer capabilities from a driver/*.so filename.  Modern standalone
+  # lpac builds statically include the APDU backends; query the executable so
+  # an older incomplete installation is still repaired without rejecting a
+  # valid static bundle.
+  if ! lpac_driver_list_usable "$lpac_path"; then
+    LPAC_INSTALL_REASON="installed lpac has no usable APDU/HTTP drivers"
     return 0
   fi
 

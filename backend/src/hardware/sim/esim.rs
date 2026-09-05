@@ -565,23 +565,13 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     // directory (./driver). Probe and real operations must use the same cwd.
     set_lpac_working_directory(&mut command, command_path);
     // The probe only checks that the binary runs and must not select a reader.
-    configure_lpac_environment(
-        &mut command,
-        command_path,
-        &EsimTarget {
-            qmi_device: String::new(),
-            uim_slot: 0,
-            apdu_backend: "qmi".to_string(),
-            http_backend: "curl".to_string(),
-            at_device: String::new(),
-            pcsc_reader_name: String::new(),
-            pcsc_reader_index: None,
-            mbim_device: String::new(),
-            mbim_uim_slot: 0,
-            mbim_use_proxy: false,
-            mbim_skip_slot_mapping: false,
-        },
-    );
+    // Use the stdio backends for a capability probe.  `lpac` initializes the
+    // selected backends before dispatching `driver list`; selecting qmi/curl
+    // here would make a device-wide status check depend on a real modem,
+    // reader, or network connection even though listing drivers needs none of
+    // them.
+    let probe_target = lpac_probe_target();
+    configure_lpac_environment(&mut command, command_path, &probe_target);
 
     let output = match tokio::time::timeout(
         Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
@@ -627,23 +617,31 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
         };
     }
 
-    // Standalone lpac loads APDU implementations dynamically from a sibling
-    // `driver/` directory.  A binary can still print its help/version output
-    // when that directory is absent, so checking only the process exit status
-    // incorrectly reports a broken installation as usable.  Fail the probe
-    // early and make the repair path install the complete bundle instead of
-    // allowing the later operation to surface "No APDU driver found".
-    if !lpac_apdu_driver_present(command_path) {
+    // lpac 2.3.x normally links its APDU/HTTP backends into the executable.
+    // Older or custom builds may provide them through a dynamic library or a
+    // sibling directory instead.  The filesystem layout is therefore not a
+    // reliable capability check; ask lpac for the drivers it actually built
+    // and will select at runtime.  This also catches a genuinely incomplete
+    // install before an eSIM operation reports "No APDU driver found".
+    let (apdu_drivers, http_drivers) = match probe_lpac_driver_list(command_path).await {
+        Ok(drivers) => drivers,
+        Err(message) => {
+            return LpacProbe {
+                installed: true,
+                usable: false,
+                message,
+            };
+        }
+    };
+
+    if apdu_drivers.is_empty() || http_drivers.is_empty() {
         return LpacProbe {
             installed: true,
             usable: false,
             message: format!(
-                "lpac APDU driver directory is missing or empty: {}",
-                command_path
-                    .parent()
-                    .map(|parent| parent.join("driver"))
-                    .unwrap_or_else(|| PathBuf::from("driver"))
-                    .display()
+                "lpac has no usable drivers (APDU: {}; HTTP: {})",
+                format_driver_names(&apdu_drivers),
+                format_driver_names(&http_drivers)
             ),
         };
     }
@@ -651,28 +649,97 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     LpacProbe {
         installed: true,
         usable: true,
-        message: "lpac is available".to_string(),
+        message: format!(
+            "lpac is available (APDU: {}; HTTP: {})",
+            format_driver_names(&apdu_drivers),
+            format_driver_names(&http_drivers)
+        ),
     }
 }
 
-fn lpac_apdu_driver_present(command_path: &Path) -> bool {
-    let Some(parent) = command_path.parent() else {
-        return false;
+async fn probe_lpac_driver_list(command_path: &Path) -> Result<(Vec<String>, Vec<String>), String> {
+    let mut command = tokio::process::Command::new(command_path);
+    command.args(["driver", "list"]);
+    set_lpac_working_directory(&mut command, command_path);
+    // Use the stdio backends for a capability probe.  `lpac` initializes the
+    // selected backends before dispatching `driver list`; selecting qmi/curl
+    // here would make a device-wide status check depend on a real modem,
+    // reader, or network connection even though listing drivers needs none of
+    // them.
+    let probe_target = lpac_probe_target();
+    configure_lpac_environment(&mut command, command_path, &probe_target);
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(LPAC_PROBE_TIMEOUT_SECS),
+        command.output(),
+    )
+    .await
+    .map_err(|_| "lpac driver list probe timed out".to_string())?
+    .map_err(|err| format!("failed to run lpac driver list: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !output.status.success() {
+        return Err(if stderr.is_empty() {
+            format!("lpac driver list exited with status {}", output.status)
+        } else {
+            format!("lpac driver list failed: {stderr}")
+        });
+    }
+
+    let value = parse_json_value_from_output(&stdout)
+        .ok_or_else(|| "lpac driver list returned invalid JSON".to_string())?;
+    let payload = value.get("payload").unwrap_or(&value);
+    let apdu_drivers = lpac_driver_names(payload, "LPAC_APDU");
+    let http_drivers = lpac_driver_names(payload, "LPAC_HTTP");
+    if apdu_drivers.is_empty() && http_drivers.is_empty() {
+        return Err("lpac driver list returned no driver capabilities".to_string());
+    }
+
+    Ok((apdu_drivers, http_drivers))
+}
+
+fn parse_json_value_from_output(output: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str::<Value>(output.trim()) {
+        return Some(value);
+    }
+
+    let mut search_end = output.len();
+    while let Some(position) = output[..search_end].rfind('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(&output[position..]) {
+            return Some(value);
+        }
+        if position == 0 {
+            break;
+        }
+        search_end = position;
+    }
+    None
+}
+
+fn lpac_driver_names(payload: &Value, key: &str) -> Vec<String> {
+    let Some(object) = payload.as_object() else {
+        return Vec::new();
     };
-    let driver_dir = parent.join("driver");
-    let Ok(entries) = fs::read_dir(driver_dir) else {
-        return false;
-    };
-    entries.flatten().any(|entry| {
-        entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false)
-            && entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with("driver_apdu_")
-    })
+    object
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(key))
+        .and_then(|(_, value)| value.as_array())
+        .map(|drivers| {
+            drivers
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn format_driver_names(drivers: &[String]) -> String {
+    if drivers.is_empty() {
+        return "none".to_string();
+    }
+    drivers.join(", ")
 }
 
 fn read_lpac_source() -> Option<String> {
@@ -1231,6 +1298,22 @@ fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
     }
 
     PathBuf::from(configured)
+}
+
+fn lpac_probe_target() -> EsimTarget {
+    EsimTarget {
+        qmi_device: String::new(),
+        uim_slot: 0,
+        apdu_backend: "stdio".to_string(),
+        http_backend: "stdio".to_string(),
+        at_device: String::new(),
+        pcsc_reader_name: String::new(),
+        pcsc_reader_index: None,
+        mbim_device: String::new(),
+        mbim_uim_slot: 0,
+        mbim_use_proxy: false,
+        mbim_skip_slot_mapping: false,
+    }
 }
 
 fn set_lpac_working_directory(command: &mut tokio::process::Command, command_path: &Path) {
@@ -1868,6 +1951,49 @@ mod tests {
         assert_eq!(target.qmi_device, "/dev/wwan-test-qmi");
         assert_eq!(target.uim_slot, 2);
         crate::connectivity::modems::ims::vowifi::live::forget_line_sim_device(line_id);
+    }
+
+    #[test]
+    fn lpac_probe_uses_stdio_backends_without_reader_side_effects() {
+        let target = lpac_probe_target();
+        assert_eq!(target.apdu_backend, "stdio");
+        assert_eq!(target.http_backend, "stdio");
+        assert!(target.qmi_device.is_empty());
+        assert!(target.at_device.is_empty());
+        assert!(target.pcsc_reader_name.is_empty());
+        assert!(target.mbim_device.is_empty());
+    }
+
+    #[test]
+    fn parses_lpac_driver_list_with_envelope_and_prefix() {
+        let output = r#"notice from wrapper
+{"type":"driver","payload":{"LPAC_APDU":["qmi","pcsc","at","stdio"],"LPAC_HTTP":["curl","stdio"]}}
+"#;
+        let value = parse_json_value_from_output(output).expect("driver list JSON");
+        let payload = value.get("payload").expect("driver payload");
+        assert_eq!(
+            lpac_driver_names(payload, "lpac_apdu"),
+            vec!["qmi", "pcsc", "at", "stdio"]
+        );
+        assert_eq!(
+            lpac_driver_names(payload, "lpac_http"),
+            vec!["curl", "stdio"]
+        );
+    }
+
+    #[test]
+    fn parses_lpac_driver_list_without_envelope() {
+        let value = json!({
+            "LPAC_APDU": ["stdio"],
+            "LPAC_HTTP": ["stdio"]
+        });
+        assert_eq!(lpac_driver_names(&value, "LPAC_APDU"), vec!["stdio"]);
+        assert_eq!(lpac_driver_names(&value, "LPAC_HTTP"), vec!["stdio"]);
+    }
+
+    #[test]
+    fn rejects_invalid_lpac_driver_list_json() {
+        assert!(parse_json_value_from_output("wrapper output without json").is_none());
     }
 
     #[test]

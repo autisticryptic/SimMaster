@@ -42,7 +42,14 @@ jobs:
           fi
           OUR_MANIFEST=$(curl -sL -f https://github.com/autisticryptic/SimMaster/releases/download/lpac/lpac.json || echo '{}')
           OUR_TAG=$(echo "$OUR_MANIFEST" | jq -r '.version // empty' || true)
-          OUR_HAS_APDU_DRIVERS=$(echo "$OUR_MANIFEST" | jq -r '.apdu_drivers // false' || true)
+          OUR_HAS_APDU_DRIVERS=$(echo "$OUR_MANIFEST" | jq -r '
+            (.apdu_drivers // false) as $drivers |
+            if ($drivers | type) == "array" then
+              (($drivers | index("qmi")) != null)
+            else
+              ($drivers == true)
+            end
+          ' || true)
           if [ "$OFFICIAL_TAG" = "$OUR_TAG" ] && [ "$OUR_HAS_APDU_DRIVERS" = "true" ]; then
             echo "should_build=false" >> "$GITHUB_OUTPUT"
           else
@@ -92,7 +99,7 @@ jobs:
             -o Acquire::AllowInsecureRepositories=true \
             update
           apt-get install -y --no-install-recommends \
-            build-essential cmake git ca-certificates zip \
+            build-essential cmake git ca-certificates zip jq \
             pkg-config python3 python3-pip ninja-build \
             libcurl4-openssl-dev libglib2.0-dev \
             libpcsclite-dev libgudev-1.0-dev libglib2.0-doc \
@@ -123,15 +130,28 @@ jobs:
           cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
           chmod 755 "$BUNDLE_ROOT/lpac"
 
-          # Standalone lpac loads APDU backends from ./driver at runtime.
-          # Shipping only the executable makes the binary start correctly
-          # but fail every real operation with "No APDU driver found".
+          # lpac 2.3.x statically links euicc-drivers by default.  In that
+          # configuration the APDU backends are inside the lpac executable;
+          # there are no driver_apdu_*.so files to install.  Keep copying an
+          # optional driver directory for dynamically-built packages, but do
+          # not require it for this static compatibility build.
           DRIVER_DIR=$(find /tmp/lpac-install -type d -path '*/driver' | head -1 || true)
-          test -n "$DRIVER_DIR" && test -d "$DRIVER_DIR"
-          mkdir -p "$BUNDLE_ROOT/driver"
-          cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
-          APDU_DRIVER_COUNT=$(find "$BUNDLE_ROOT/driver" -maxdepth 1 -type f -name 'driver_apdu_*.so' | wc -l)
-          test "$APDU_DRIVER_COUNT" -gt 0
+          if [ -n "$DRIVER_DIR" ] && [ -d "$DRIVER_DIR" ]; then
+            mkdir -p "$BUNDLE_ROOT/driver"
+            cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+          fi
+
+          # Verify the drivers that lpac will actually use.  This works for
+          # both static and dynamic builds and avoids checking an artifact
+          # name that lpac itself does not produce.
+          # `driver list` still initializes the selected backends in lpac.
+          # Use stdio so this capability check does not require a modem or
+          # network in the build container.
+          DRIVER_LIST=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
+            "$BUNDLE_ROOT/lpac" driver list)
+          echo "$DRIVER_LIST"
+          echo "$DRIVER_LIST" | jq -e '.payload.LPAC_APDU | index("qmi") != null' >/dev/null
+          echo "$DRIVER_LIST" | jq -e '.payload.LPAC_HTTP | index("curl") != null' >/dev/null
 
           QMI_SO=$(find /usr/local/lib -name "libqmi-glib.so.*.*.*" -type f | head -1 || true)
           if [ -n "$QMI_SO" ]; then
@@ -150,7 +170,7 @@ jobs:
           set -euo pipefail
           ls -lh "release/${{ matrix.package }}"
           file "release/${{ matrix.package }}"
-          unzip -Z1 "release/${{ matrix.package }}" | grep -E '^driver/driver_apdu_[^/]+\.so$'
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lpac'
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
