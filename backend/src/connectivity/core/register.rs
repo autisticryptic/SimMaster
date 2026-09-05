@@ -830,7 +830,7 @@ mod tests {
 
     struct FakeAuthenticator;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn immediate_udp_read_error_waits_for_same_transaction_retransmission() {
         let request = b"REGISTER sip:ims.example SIP/2.0\r\nCall-ID: refresh@dev\r\nCSeq: 7 REGISTER\r\nContent-Length: 0\r\n\r\n";
         let mut channel = ImmediateReadErrorChannel {
@@ -846,6 +846,19 @@ mod tests {
         assert_eq!(channel.sends.len(), 2);
         assert_eq!(channel.sends[0], request);
         assert_eq!(channel.sends[1], request);
+    }
+
+    impl RegisterAuthenticator<ImmediateReadErrorChannel> for FakeAuthenticator {
+        async fn authenticated_request(
+            &mut self,
+            _challenge_response: &[u8],
+            cseq: u32,
+        ) -> Result<Vec<u8>, ImsError> {
+            Ok(format!(
+                "REGISTER sip:ims.example SIP/2.0\r\nCSeq: {cseq} REGISTER\r\nContent-Length: 0\r\n\r\n"
+            )
+            .into_bytes())
+        }
     }
 
     impl RegisterAuthenticator<RetransmittingChannel> for FakeAuthenticator {

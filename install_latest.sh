@@ -492,6 +492,20 @@ copy_lpac_tree() {
     cp -R "${extract_dir}/libraries/." "${lpac_dst}/lib/"
   fi
 
+  # Standalone lpac resolves APDU backends from ./driver relative to lpac.
+  # Some release archives put the executable under executables/ while keeping
+  # driver/ at the archive root, so copying only bundle_root is insufficient.
+  driver_root=""
+  if [ -d "${bundle_root}/driver" ]; then
+    driver_root="${bundle_root}/driver"
+  else
+    driver_root="$(find "$extract_dir" -type d -name driver -print | head -n 1 || true)"
+  fi
+  if [ -n "$driver_root" ] && [ -d "$driver_root" ]; then
+    mkdir -p "${lpac_dst}/driver"
+    cp -R "${driver_root}/." "${lpac_dst}/driver/"
+  fi
+
   chmod -R a+rX "${lpac_dst}"
   chmod 0755 "${lpac_dst}/lpac"
 
@@ -524,6 +538,16 @@ lpac_binary_path_usable() {
   esac
 
   return 0
+}
+
+lpac_apdu_driver_present() {
+  lpac_path="$1"
+  lpac_home="$(dirname "$lpac_path")"
+  driver_dir="${lpac_home}/driver"
+
+  [ -d "$driver_dir" ] || return 1
+  find "$driver_dir" -maxdepth 1 -type f -name 'driver_apdu_*.so' -print -quit \
+    | grep -q .
 }
 
 lpac_binary_usable() {
@@ -740,6 +764,16 @@ lpac_install_needed() {
 
   if ! lpac_binary_path_usable "$lpac_path"; then
     LPAC_INSTALL_REASON="installed lpac is not usable"
+    return 0
+  fi
+
+  # A standalone lpac executable without its dynamically loaded APDU backend
+  # starts successfully but every real eSIM operation fails with
+  # "No APDU driver found".  Treat that state as incomplete even when the
+  # executable version matches the requested release, so an OTA deployment can
+  # repair installations created by older packages.
+  if ! lpac_apdu_driver_present "$lpac_path"; then
+    LPAC_INSTALL_REASON="installed lpac is missing APDU driver"
     return 0
   fi
 

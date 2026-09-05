@@ -948,6 +948,31 @@ pub struct SendSmsRequest {
     pub content: String,
 }
 
+/// A USSD/USSI service-code request for one explicitly selected line.
+#[derive(Debug, Deserialize)]
+pub struct UssdRequest {
+    pub code: String,
+}
+
+/// Follow-up input for an interactive USSD/USSI session.
+#[derive(Debug, Deserialize)]
+pub struct UssdContinueRequest {
+    pub input: String,
+}
+
+/// Result of one modem +CUSD transaction. The session id is intentionally
+/// opaque and is only valid for the line that created it.
+#[derive(Debug, Default, Serialize, Clone)]
+pub struct UssdResponse {
+    pub line_id: String,
+    pub text: String,
+    pub raw: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub continueable: bool,
+}
+
 /// Request body for placing a VoWiFi voice call.
 #[derive(Debug, Deserialize)]
 pub struct PlaceCallRequest {

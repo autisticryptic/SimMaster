@@ -36,7 +36,6 @@ use crate::{
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
-    hardware::cellular::modem_manager,
     hardware::cellular::modem_manager::{
         answer_call_on_modem, get_band_lock_status_for_modem,
         get_baseband_restart_progress_for_line, get_call_by_path_for_modem,
@@ -52,6 +51,7 @@ use crate::{
         set_radio_mode_for_modem, sim_identity_for_modem, start_cell_monitoring_for_modem,
         stop_cell_monitoring_for_modem,
     },
+    hardware::cellular::{modem_manager, ussd},
     hardware::sim::esim::EsimApiError,
     platform::config::{
         AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
@@ -1982,6 +1982,39 @@ async fn resolve_sms_line_id(app: &AppState, requested: &str) -> Result<String, 
         return Err("line_disabled".to_string());
     }
     Ok(line.binding().line_id)
+}
+
+/// Resolve a real modem-backed line for USSD/USSI. Standalone PC/SC reader
+/// lines deliberately fail here: a reader has no cellular AT endpoint and
+/// must never borrow another line's modem.
+async fn resolve_ussd_line(app: &AppState, requested: &str) -> Result<(String, String), String> {
+    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let line_id = requested.trim();
+    if line_id.is_empty() {
+        return Err("ussd_line_id_required".to_string());
+    }
+    let line = app
+        .line_registry
+        .get(line_id)
+        .await
+        .ok_or_else(|| "line_not_found".to_string())?;
+    let binding = line.binding();
+    if !binding.present {
+        return Err("line_not_present".to_string());
+    }
+    if !app
+        .config_manager
+        .get_line_profile(&binding.line_id)
+        .enabled
+    {
+        return Err("line_disabled".to_string());
+    }
+    if binding.line_kind == "reader"
+        || (!binding_has_baseband(&binding) || binding.modem_path.trim().is_empty())
+    {
+        return Err("该线路没有可用的蜂窝 modem，无法使用 USSD/USSI".to_string());
+    }
+    Ok((binding.line_id, binding.modem_path))
 }
 
 /// GET /api/modem/lines/{line_id}/cells
@@ -4257,7 +4290,115 @@ fn persist_vowifi_restore_phase(
     }
 }
 
-/// POST /api/modem/lines/{line_id}/sms/send
+/// POST /api/modem/lines/{line_id}/ussd
+pub async fn start_ussd_handler(
+    State(app): State<AppState>,
+    Path(line_id): Path<String>,
+    Json(payload): Json<UssdRequest>,
+) -> impl IntoResponse {
+    let (line_id, modem_path) = match resolve_ussd_line(&app, &line_id).await {
+        Ok(value) => value,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<UssdResponse>::error(format!(
+                    "Failed to start USSD/USSI: {reason}"
+                ))),
+            )
+        }
+    };
+    match ussd::start(app.dbus_conn.as_ref(), &line_id, &modem_path, &payload.code).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "USSD/USSI completed",
+                data,
+            )),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<UssdResponse>::error(format!(
+                "Failed to start USSD/USSI: {reason}"
+            ))),
+        ),
+    }
+}
+
+/// POST /api/modem/lines/{line_id}/ussd/{session_id}/continue
+pub async fn continue_ussd_handler(
+    State(app): State<AppState>,
+    Path((line_id, session_id)): Path<(String, String)>,
+    Json(payload): Json<UssdContinueRequest>,
+) -> impl IntoResponse {
+    let (line_id, modem_path) = match resolve_ussd_line(&app, &line_id).await {
+        Ok(value) => value,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<UssdResponse>::error(format!(
+                    "Failed to continue USSD/USSI: {reason}"
+                ))),
+            )
+        }
+    };
+    match ussd::continue_session(
+        app.dbus_conn.as_ref(),
+        &line_id,
+        &modem_path,
+        &session_id,
+        &payload.input,
+    )
+    .await
+    {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "USSD/USSI continued",
+                data,
+            )),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<UssdResponse>::error(format!(
+                "Failed to continue USSD/USSI: {reason}"
+            ))),
+        ),
+    }
+}
+
+/// POST /api/modem/lines/{line_id}/ussd/{session_id}/cancel
+pub async fn cancel_ussd_handler(
+    State(app): State<AppState>,
+    Path((line_id, session_id)): Path<(String, String)>,
+) -> impl IntoResponse {
+    let (line_id, modem_path) = match resolve_ussd_line(&app, &line_id).await {
+        Ok(value) => value,
+        Err(reason) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::<UssdResponse>::error(format!(
+                    "Failed to cancel USSD/USSI: {reason}"
+                ))),
+            )
+        }
+    };
+    match ussd::cancel_session(app.dbus_conn.as_ref(), &line_id, &modem_path, &session_id).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message(
+                "USSD/USSI cancelled",
+                data,
+            )),
+        ),
+        Err(reason) => (
+            StatusCode::OK,
+            Json(ApiResponse::<UssdResponse>::error(format!(
+                "Failed to cancel USSD/USSI: {reason}"
+            ))),
+        ),
+    }
+}
+
 pub async fn send_sms_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,

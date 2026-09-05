@@ -561,6 +561,9 @@ fn parse_version_parts(value: &str) -> Vec<u32> {
 
 async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
     let mut command = tokio::process::Command::new(command_path);
+    // Standalone lpac resolves APDU backends relative to its working
+    // directory (./driver). Probe and real operations must use the same cwd.
+    set_lpac_working_directory(&mut command, command_path);
     // The probe only checks that the binary runs and must not select a reader.
     configure_lpac_environment(
         &mut command,
@@ -624,11 +627,52 @@ async fn probe_lpac_binary(command_path: &Path) -> LpacProbe {
         };
     }
 
+    // Standalone lpac loads APDU implementations dynamically from a sibling
+    // `driver/` directory.  A binary can still print its help/version output
+    // when that directory is absent, so checking only the process exit status
+    // incorrectly reports a broken installation as usable.  Fail the probe
+    // early and make the repair path install the complete bundle instead of
+    // allowing the later operation to surface "No APDU driver found".
+    if !lpac_apdu_driver_present(command_path) {
+        return LpacProbe {
+            installed: true,
+            usable: false,
+            message: format!(
+                "lpac APDU driver directory is missing or empty: {}",
+                command_path
+                    .parent()
+                    .map(|parent| parent.join("driver"))
+                    .unwrap_or_else(|| PathBuf::from("driver"))
+                    .display()
+            ),
+        };
+    }
+
     LpacProbe {
         installed: true,
         usable: true,
         message: "lpac is available".to_string(),
     }
+}
+
+fn lpac_apdu_driver_present(command_path: &Path) -> bool {
+    let Some(parent) = command_path.parent() else {
+        return false;
+    };
+    let driver_dir = parent.join("driver");
+    let Ok(entries) = fs::read_dir(driver_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_type()
+            .map(|kind| kind.is_file())
+            .unwrap_or(false)
+            && entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("driver_apdu_")
+    })
 }
 
 fn read_lpac_source() -> Option<String> {
@@ -716,6 +760,7 @@ async fn install_lpac_asset(bytes: &[u8], asset_url: &str) -> Result<(), EsimApi
             .map_err(|err| EsimApiError::Command(format!("Failed to create lpac dir: {err}")))?;
         copy_dir_recursive(&bundle_root, &new_dir)?;
         copy_optional_lpac_libs(&extract_dir, &new_dir)?;
+        copy_optional_lpac_drivers(&extract_dir, &bundle_root, &new_dir)?;
         fs::write(
             new_dir.join("SOURCE.txt"),
             format!(
@@ -825,6 +870,46 @@ fn copy_optional_lpac_libs(extract_dir: &Path, target_dir: &Path) -> Result<(), 
         }
     }
     Ok(())
+}
+
+fn copy_optional_lpac_drivers(
+    extract_dir: &Path,
+    bundle_root: &Path,
+    target_dir: &Path,
+) -> Result<(), EsimApiError> {
+    let source = find_apdu_driver_dir(bundle_root).or_else(|| find_apdu_driver_dir(extract_dir));
+    let Some(source) = source else {
+        return Ok(());
+    };
+    copy_dir_recursive(&source, &target_dir.join("driver"))
+}
+
+fn find_apdu_driver_dir(root: &Path) -> Option<PathBuf> {
+    let direct = root.join("driver");
+    if direct.is_dir()
+        && fs::read_dir(&direct).ok()?.flatten().any(|entry| {
+            entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+                && entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("driver_apdu_")
+        })
+    {
+        return Some(direct);
+    }
+    let entries = fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_apdu_driver_dir(&path) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 fn copy_dir_recursive(source: &Path, target: &Path) -> Result<(), EsimApiError> {
@@ -944,36 +1029,82 @@ fn esim_target_for_line(
     if line_id.is_empty() {
         return Err(EsimApiError::Unavailable("line_id_required".to_string()));
     }
+
     let device = crate::connectivity::modems::ims::vowifi::live::sim_device_for_line(line_id);
-    let qmi_device = if config.qmi_device.trim().is_empty() {
-        device.qmi_device
+    let configured_qmi = config.qmi_device.trim();
+    let qmi_device = if configured_qmi.is_empty() {
+        device.qmi_device.trim().to_string()
     } else {
-        config.qmi_device.trim().to_string()
+        configured_qmi.to_string()
     };
     let uim_slot = if config.qmi_uim_slot == 0 {
         device.uim_slot
     } else {
         config.qmi_uim_slot
     };
+    let configured_pcsc = config.pcsc_reader_name.trim();
     let pcsc_reader = crate::hardware::devices::pcsc::selector_from_path(&device.pcsc_reader);
-    let configured_backend = config.apdu_backend.trim();
-    let apdu_backend = if pcsc_reader.is_some()
-        && (configured_backend.is_empty() || configured_backend.eq_ignore_ascii_case("qmi"))
-        && qmi_device.is_empty()
-    {
-        "pcsc"
-    } else if configured_backend.is_empty() {
-        "qmi"
+    let pcsc_reader_name = if configured_pcsc.is_empty() {
+        pcsc_reader.clone().unwrap_or_default()
     } else {
-        configured_backend
+        configured_pcsc.to_string()
     };
-    if (apdu_backend.eq_ignore_ascii_case("qmi") || apdu_backend.eq_ignore_ascii_case("qmi_qrtr"))
-        && (qmi_device.trim().is_empty() || uim_slot == 0)
-    {
-        return Err(EsimApiError::Unavailable(
-            "esim_line_reader_not_found".to_string(),
-        ));
-    }
+    let configured_at = config.at_device.trim();
+    let configured_mbim = config.mbim_device.trim();
+    let qmi_available = !qmi_device.is_empty() && uim_slot != 0;
+    let pcsc_available = !pcsc_reader_name.is_empty();
+    let at_available = !configured_at.is_empty();
+    let mbim_available = !configured_mbim.is_empty() && config.mbim_uim_slot != 0;
+    let configured_backend = config.apdu_backend.trim().to_ascii_lowercase();
+
+    // `qmi` is the legacy default in existing databases. Treat it as an
+    // automatic preference rather than an unconditional device-wide backend:
+    // standalone PC/SC lines have no QMI device and must never inherit one.
+    let apdu_backend = match configured_backend.as_str() {
+        "" | "qmi" | "qmi_qrtr" => {
+            if qmi_available {
+                if configured_backend == "qmi_qrtr" {
+                    "qmi_qrtr"
+                } else {
+                    "qmi"
+                }
+            } else if pcsc_available {
+                "pcsc"
+            } else if mbim_available {
+                "mbim"
+            } else if at_available {
+                "at"
+            } else {
+                return Err(EsimApiError::Unavailable(
+                    "esim_line_reader_not_found".to_string(),
+                ));
+            }
+        }
+        "pcsc" if pcsc_available => "pcsc",
+        "at" | "at_csim" if at_available => configured_backend.as_str(),
+        "mbim" if mbim_available => "mbim",
+        "pcsc" => {
+            return Err(EsimApiError::Unavailable(
+                "esim_pcsc_reader_not_found".to_string(),
+            ));
+        }
+        "at" | "at_csim" => {
+            return Err(EsimApiError::Unavailable(
+                "esim_at_reader_not_found".to_string(),
+            ));
+        }
+        "mbim" => {
+            return Err(EsimApiError::Unavailable(
+                "esim_mbim_reader_not_found".to_string(),
+            ));
+        }
+        _ => {
+            return Err(EsimApiError::Unavailable(format!(
+                "esim_apdu_backend_unsupported:{configured_backend}"
+            )));
+        }
+    };
+
     Ok(EsimTarget {
         qmi_device,
         uim_slot,
@@ -983,14 +1114,10 @@ fn esim_target_for_line(
         } else {
             config.http_backend.trim().to_string()
         },
-        at_device: config.at_device.trim().to_string(),
-        pcsc_reader_name: if config.pcsc_reader_name.trim().is_empty() {
-            pcsc_reader.unwrap_or_default()
-        } else {
-            config.pcsc_reader_name.trim().to_string()
-        },
+        at_device: configured_at.to_string(),
+        pcsc_reader_name,
         pcsc_reader_index: config.pcsc_reader_index,
-        mbim_device: config.mbim_device.trim().to_string(),
+        mbim_device: configured_mbim.to_string(),
         mbim_uim_slot: config.mbim_uim_slot,
         mbim_use_proxy: config.mbim_use_proxy,
         mbim_skip_slot_mapping: config.mbim_skip_slot_mapping,
@@ -1007,6 +1134,7 @@ async fn run_lpac_command(
     let command_path = resolve_lpac_path(lpac_path);
     let mut command = tokio::process::Command::new(&command_path);
     command.args(args);
+    set_lpac_working_directory(&mut command, &command_path);
     configure_lpac_environment(&mut command, &command_path, target);
 
     let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
@@ -1103,6 +1231,15 @@ fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
     }
 
     PathBuf::from(configured)
+}
+
+fn set_lpac_working_directory(command: &mut tokio::process::Command, command_path: &Path) {
+    let Some(parent) = command_path.parent() else {
+        return;
+    };
+    if !parent.as_os_str().is_empty() {
+        command.current_dir(parent);
+    }
 }
 
 fn configure_lpac_environment(

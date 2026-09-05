@@ -45,6 +45,7 @@ pub const ISO_GET_RESPONSE_INS: u8 = 0xc0;
 pub const EF_EPDG_ID: u16 = 0x6ff3;
 pub const EF_EPDG_SELECTION: u16 = 0x6ff4;
 const MAX_OPTIONAL_EF_BYTES: usize = 4096;
+const MAX_APDU_FOLLOW_UPS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QmiMessage {
@@ -819,20 +820,10 @@ fn read_optional_transparent_ef(
     if !matches!(selected.sw1, 0x90 | 0x61 | 0x9f) {
         return Err(QmiUimError::InvalidApduResponse);
     }
-    let fcp = if matches!(selected.sw1, 0x61 | 0x9f) {
-        conn.send_apdu(
-            client_id,
-            slot,
-            channel_id,
-            &build_get_response_apdu(selected.sw2),
-        )
-        .ok()
-        .filter(|response| (response.sw1, response.sw2) == (0x90, 0x00))
-        .map(|response| response.data)
-        .unwrap_or_default()
-    } else {
-        selected.data
-    };
+    if (selected.sw1, selected.sw2) != (0x90, 0x00) {
+        return Err(QmiUimError::InvalidApduResponse);
+    }
+    let fcp = selected.data;
     let file_size = parse_fcp_file_size(&fcp);
     if file_size.is_some_and(|size| size > MAX_OPTIONAL_EF_BYTES) {
         return Err(QmiUimError::MessageTooLarge);
@@ -862,12 +853,7 @@ fn read_optional_transparent_ef(
             (offset & 0xff) as u8,
             requested as u8,
         ];
-        let mut response = conn.send_apdu(client_id, slot, channel_id, &apdu)?;
-        if response.sw1 == 0x6c {
-            let mut adjusted = apdu;
-            adjusted[4] = response.sw2;
-            response = conn.send_apdu(client_id, slot, channel_id, &adjusted)?;
-        }
+        let response = conn.send_apdu(client_id, slot, channel_id, &apdu)?;
         let eof = (response.sw1, response.sw2) == (0x62, 0x82);
         if (response.sw1, response.sw2) != (0x90, 0x00) && !eof {
             // When FCP was absent, a read immediately beyond an exact chunked
@@ -1112,24 +1098,9 @@ pub fn execute_usim_authenticate_via_proxy_reason(
         let result = (|| {
             let apdu = build_usim_authenticate_apdu(rand, autn)
                 .map_err(|_| "sim_auth_apdu_build_failed")?;
-            let mut response = conn.send_apdu(client_id, slot, channel.channel_id, &apdu);
-            if matches!(response.as_ref().map(|r| r.sw1), Ok(0x61)) {
-                let len = response.as_ref().map(|r| r.sw2).unwrap_or(0);
-                response = conn.send_apdu(
-                    client_id,
-                    slot,
-                    channel.channel_id,
-                    &build_get_response_apdu(len),
-                );
-            } else if matches!(response.as_ref().map(|r| r.sw1), Ok(0x6c)) {
-                let le = response.as_ref().map(|r| r.sw2).unwrap_or(0);
-                let mut adjusted = apdu.clone();
-                if let Some(last) = adjusted.last_mut() {
-                    *last = le;
-                }
-                response = conn.send_apdu(client_id, slot, channel.channel_id, &adjusted);
-            }
-            let response = response.map_err(|_| "sim_auth_apdu_exchange_failed")?;
+            let response = conn
+                .send_apdu(client_id, slot, channel.channel_id, &apdu)
+                .map_err(|_| "sim_auth_apdu_exchange_failed")?;
             parse_usim_authenticate_response_reason(&response)
         })();
         let close_result = conn.close_logical_channel(client_id, slot, channel.channel_id);
@@ -1277,6 +1248,19 @@ struct QmiProxyConnection {
     next_service_transaction: u16,
 }
 
+fn adjust_short_apdu_le(apdu: &[u8], le: u8) -> Option<Vec<u8>> {
+    // All APDUs currently emitted by this module are short APDUs and include
+    // a trailing Le byte (case 2S or case 4S). Do not guess at extended APDU
+    // layouts: returning None turns an unsupported shape into a safe error.
+    if apdu.len() < 5 {
+        return None;
+    }
+    let mut adjusted = apdu.to_vec();
+    let last = adjusted.len() - 1;
+    adjusted[last] = le;
+    Some(adjusted)
+}
+
 #[cfg(unix)]
 impl QmiProxyConnection {
     fn connect(proxy_socket: &str, timeout: Duration) -> Result<Self, QmiUimError> {
@@ -1385,7 +1369,52 @@ impl QmiProxyConnection {
         Ok(())
     }
 
+    /// Exchange one APDU and resolve the ISO 7816 status-word follow-ups that
+    /// are common on modem UIM implementations. In particular, a SELECT or
+    /// AUTHENTICATE may return 61xx/9Fxx and require one or more GET RESPONSE
+    /// commands; some EC20/410 firmware also returns 6Cxx before accepting the
+    /// correct Le. Keeping the whole chain inside this method prevents a later
+    /// APDU from being inserted between the response and its required follow-up.
     fn send_apdu(
+        &mut self,
+        client_id: u8,
+        slot: u8,
+        channel_id: u8,
+        apdu: &[u8],
+    ) -> Result<UimApduResponse, QmiUimError> {
+        let mut request = apdu.to_vec();
+        let mut response = self.send_apdu_raw(client_id, slot, channel_id, &request)?;
+        let mut accumulated = Vec::new();
+
+        for _ in 0..MAX_APDU_FOLLOW_UPS {
+            match response.sw1 {
+                // The card rejected Le. Retry the same command with the exact
+                // length requested by SW2 (0 means 256 for short APDUs).
+                0x6c => {
+                    request = adjust_short_apdu_le(&request, response.sw2)
+                        .ok_or(QmiUimError::InvalidApduResponse)?;
+                    response = self.send_apdu_raw(client_id, slot, channel_id, &request)?;
+                }
+                // The response body is available through GET RESPONSE. Both
+                // 61xx and 9Fxx are seen in UICC/modem paths. Append each chunk
+                // and continue until the card emits a terminal status word.
+                0x61 | 0x9f => {
+                    accumulated.extend_from_slice(&response.data);
+                    request = build_get_response_apdu(response.sw2);
+                    response = self.send_apdu_raw(client_id, slot, channel_id, &request)?;
+                }
+                _ => {
+                    accumulated.extend_from_slice(&response.data);
+                    response.data = accumulated;
+                    return Ok(response);
+                }
+            }
+        }
+
+        Err(QmiUimError::InvalidApduResponse)
+    }
+
+    fn send_apdu_raw(
         &mut self,
         client_id: u8,
         slot: u8,
@@ -1846,6 +1875,22 @@ mod tests {
             find_tlv(&message, TLV_UIM_PROCEDURE_BYTES),
             Some([0].as_slice())
         );
+    }
+
+    #[test]
+    fn adjusts_short_apdu_le_without_changing_command_body() {
+        let apdu = [0x00, 0xb0, 0x00, 0x00, 0xff];
+        assert_eq!(
+            adjust_short_apdu_le(&apdu, 0x10).unwrap(),
+            [0x00, 0xb0, 0x00, 0x00, 0x10]
+        );
+
+        let case_four = [0x00, 0xda, 0x00, 0x00, 0x01, 0xaa, 0xff];
+        assert_eq!(
+            adjust_short_apdu_le(&case_four, 0x20).unwrap(),
+            [0x00, 0xda, 0x00, 0x00, 0x01, 0xaa, 0x20]
+        );
+        assert!(adjust_short_apdu_le(&[0x00, 0xc0, 0x00, 0x00], 0x10).is_none());
     }
 
     #[test]

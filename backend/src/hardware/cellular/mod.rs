@@ -11,9 +11,11 @@
 //! Device-specific endpoint discovery, binding and retained-session behavior
 //! lives under [`crate::hardware::devices`], keyed by device name.
 
+pub mod at_session;
 pub mod cell_lock_store;
 pub mod cgcontrdp;
 pub mod data_proxy;
 pub mod modem_manager;
 pub mod qmi_wds;
 pub mod serial;
+pub mod ussd;

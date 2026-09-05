@@ -1809,6 +1809,18 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
         )
         // ========== 短信功能接口 ==========
         .route(
+            "/api/modem/lines/{line_id}/ussd",
+            post(start_ussd_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/ussd/{session_id}/continue",
+            post(continue_ussd_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/lines/{line_id}/ussd/{session_id}/cancel",
+            post(cancel_ussd_handler).options(options_handler),
+        )
+        .route(
             "/api/modem/lines/{line_id}/sms/send",
             post(send_sms_handler).options(options_handler),
         )

@@ -107,6 +107,17 @@ jobs:
               test -n "$LPAC_BIN" && test -f "$LPAC_BIN"
               cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
               chmod 755 "$BUNDLE_ROOT/lpac"
+
+              # Standalone lpac loads APDU backends from ./driver at runtime.
+              # Shipping only the executable makes the binary start correctly
+              # but fail every real operation with "No APDU driver found".
+              DRIVER_DIR=$(find /tmp/lpac-install -type d -path '*/driver' | head -1 || true)
+              test -n "$DRIVER_DIR" && test -d "$DRIVER_DIR"
+              mkdir -p "$BUNDLE_ROOT/driver"
+              cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+              APDU_DRIVER_COUNT=$(find "$BUNDLE_ROOT/driver" -maxdepth 1 -type f -name 'driver_apdu_*.so' | wc -l)
+              test "$APDU_DRIVER_COUNT" -gt 0
+
               QMI_SO=$(find /usr/local/lib -name "libqmi-glib.so.*.*.*" -type f | head -1 || true)
               if [ -n "$QMI_SO" ]; then
                 cp -L "$QMI_SO" "$BUNDLE_ROOT/lib/"
@@ -121,8 +132,10 @@ jobs:
 
       - name: Verify output
         run: |
+          set -euo pipefail
           ls -lh "release/${{ matrix.package }}"
           file "release/${{ matrix.package }}"
+          unzip -Z1 "release/${{ matrix.package }}" | grep -E '^driver/driver_apdu_[^/]+\.so$'
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4

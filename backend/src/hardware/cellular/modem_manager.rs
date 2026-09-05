@@ -2873,6 +2873,13 @@ fn looks_like_at_port(port: &str) -> bool {
     port.to_ascii_lowercase().contains("at")
 }
 
+fn looks_like_non_command_port(port: &str) -> bool {
+    let port = port.to_ascii_lowercase();
+    ["diag", "diagnostic", "gps", "gnss", "nmea", "qcdm"]
+        .iter()
+        .any(|needle| port.contains(needle))
+}
+
 fn modem_device_path(port: &str) -> String {
     if port.starts_with("/dev/") {
         port.to_string()
@@ -2881,7 +2888,7 @@ fn modem_device_path(port: &str) -> String {
     }
 }
 
-async fn at_command_device_for_modem(
+pub(crate) async fn at_command_device_for_modem(
     conn: &Connection,
     modem_path: &str,
 ) -> Result<String, String> {
@@ -2889,12 +2896,40 @@ async fn at_command_device_for_modem(
         .await
         .map_err(|err| err.to_string())?;
     let ports = Vec::<(String, u32)>::try_from(value).unwrap_or_default();
-    ports
+
+    // Prefer ModemManager's explicit AT type. Quectel firmware sometimes
+    // reports ttyUSB2/ttyACM* with type 0 during a short hotplug window, so
+    // retain deterministic fallbacks instead of selecting QMI/MBIM/GNSS.
+    if let Some((port, _)) = ports
         .iter()
         .find(|(_, port_type)| *port_type == MM_MODEM_PORT_TYPE_AT)
-        .or_else(|| ports.iter().find(|(port, _)| looks_like_at_port(port)))
+    {
+        return Ok(modem_device_path(port));
+    }
+    if let Some((port, _)) = ports.iter().find(|(port, _)| looks_like_at_port(port)) {
+        return Ok(modem_device_path(port));
+    }
+
+    if let Ok(value) = get_property(conn, modem_path, MM_MODEM, "PrimaryPort").await {
+        let primary = extract_string(&value);
+        if !primary.trim().is_empty()
+            && !looks_like_qmi_control_port(&primary)
+            && !looks_like_mbim_control_port(&primary)
+            && !looks_like_non_command_port(&primary)
+        {
+            return Ok(modem_device_path(&primary));
+        }
+    }
+
+    ports
+        .iter()
+        .find(|(port, _)| {
+            !looks_like_qmi_control_port(port)
+                && !looks_like_mbim_control_port(port)
+                && !looks_like_non_command_port(port)
+        })
         .map(|(port, _)| modem_device_path(port))
-        .ok_or_else(|| "未找到 AT 端口（例如 /dev/wwan0at0）".to_string())
+        .ok_or_else(|| "no suitable AT port found (for example /dev/wwan0at0)".to_string())
 }
 
 async fn modem_ports(conn: &Connection, modem_path: &str) -> Vec<(String, u32)> {
@@ -5788,6 +5823,43 @@ fn sanitize_dtmf_digit(value: &str) -> Result<char, String> {
     Ok(digit.to_ascii_uppercase())
 }
 
+/// Execute a USSD/USSI command on the AT port owned by one ModemManager
+/// object. Unlike the generic AT helper, this waits for the asynchronous
+/// `+CUSD:` result as well as the command's final response. Modems in the
+/// EC20/EC25/EG25 family are seen in both orders (`+CUSD` before `OK` and
+/// `OK` before `+CUSD`), so stopping at the first `OK` loses the network
+/// response and makes the next command vulnerable to a stale URC.
+/// Cancel a USSD dialogue. `AT+CUSD=2` normally returns only the final `OK`
+/// and is therefore intentionally handled separately from the URC-driven
+/// request path, which waits for `+CUSD:`.
+pub(crate) async fn cancel_ussd_at_command_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+) -> Result<String, String> {
+    crate::hardware::cellular::serial::with_serial_for(modem_path, async {
+        let device = at_command_device_for_modem(conn, modem_path).await?;
+        tokio::task::spawn_blocking(move || run_ussd_cancel_blocking(&device))
+            .await
+            .map_err(|err| format!("USSD cancel AT task failed: {err}"))?
+    })
+    .await
+}
+
+pub(crate) async fn run_ussd_at_command_for_modem(
+    conn: &Connection,
+    modem_path: &str,
+    command: &str,
+) -> Result<String, String> {
+    crate::hardware::cellular::serial::with_serial_for(modem_path, async {
+        let device = at_command_device_for_modem(conn, modem_path).await?;
+        let command = command.to_string();
+        tokio::task::spawn_blocking(move || run_ussd_at_command_blocking(&device, &command))
+            .await
+            .map_err(|err| format!("USSD AT task failed: {err}"))?
+    })
+    .await
+}
+
 async fn run_direct_at_command_for_modem(
     conn: &Connection,
     modem_path: &str,
@@ -5804,67 +5876,16 @@ async fn run_direct_at_command_on_device(device: String, command: &str) -> Resul
         .map_err(|err| format!("AT 命令任务失败：{err}"))?
 }
 
-#[cfg(unix)]
 fn run_direct_at_command_blocking(device: &str, command: &str) -> Result<String, String> {
-    use std::io::{Read, Write};
-    use std::os::fd::AsRawFd;
-
-    let mut port = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(device)
-        .map_err(|err| format!("打开 AT 端口 {device} 失败：{err}"))?;
-
-    let fd = port.as_raw_fd();
-    unsafe {
-        let flags = libc::fcntl(fd, libc::F_GETFL);
-        if flags >= 0 {
-            let _ = libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-        }
-    }
-
-    port.write_all(format!("{command}\r").as_bytes())
-        .map_err(|err| format!("写入 AT 命令失败：{err}"))?;
-    port.flush()
-        .map_err(|err| format!("刷新 AT 端口失败：{err}"))?;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    let mut output = Vec::new();
-    let mut buffer = [0u8; 512];
-    while std::time::Instant::now() < deadline {
-        match port.read(&mut buffer) {
-            Ok(0) => std::thread::sleep(Duration::from_millis(80)),
-            Ok(n) => {
-                output.extend_from_slice(&buffer[..n]);
-                let text = String::from_utf8_lossy(&output);
-                if text.contains("\r\nOK\r\n")
-                    || text.contains("\nOK\r")
-                    || text.contains("ERROR")
-                    || text.contains("NO CARRIER")
-                {
-                    break;
-                }
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(80));
-            }
-            Err(err) => return Err(format!("读取 AT 响应失败：{err}")),
-        }
-    }
-
-    let text = String::from_utf8_lossy(&output).trim().to_string();
-    if text.contains("ERROR") {
-        Err(text)
-    } else if text.is_empty() {
-        Ok("ok".to_string())
-    } else {
-        Ok(text)
-    }
+    crate::hardware::cellular::at_session::execute_command(device, command)
 }
 
-#[cfg(not(unix))]
-fn run_direct_at_command_blocking(_device: &str, _command: &str) -> Result<String, String> {
-    Err("Direct AT port access is only supported on Linux devices".to_string())
+fn run_ussd_cancel_blocking(device: &str) -> Result<String, String> {
+    crate::hardware::cellular::at_session::execute_command(device, "AT+CUSD=2")
+}
+
+fn run_ussd_at_command_blocking(device: &str, command: &str) -> Result<String, String> {
+    crate::hardware::cellular::at_session::execute_ussd(device, command)
 }
 
 fn at_call_path(modem_path: &str, index: &str) -> String {

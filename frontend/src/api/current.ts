@@ -79,6 +79,7 @@ import type {
   SignalStrengthResponse,
   SimInfo,
   UpdateSimCacheRequest,
+  UssdResponse,
   SmsMessage,
   SmsConversationRequest,
   SmsChannelResponse,
@@ -796,6 +797,36 @@ class SimAdminCurrentAPI {
       method: 'POST',
       body: JSON.stringify({ phone_number: phoneNumber, content }),
     })
+  }
+
+  async startUssd(lineId: string, code: string) {
+    return request<ApiResponse<UssdResponse>>(modemLinePath(lineId, '/ussd'), {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+      timeoutMs: 30000,
+    })
+  }
+
+  async continueUssd(lineId: string, sessionId: string, input: string) {
+    return request<ApiResponse<UssdResponse>>(
+      modemLinePath(lineId, `/ussd/${encodeURIComponent(sessionId)}/continue`),
+      {
+        method: 'POST',
+        body: JSON.stringify({ input }),
+        timeoutMs: 30000,
+      },
+    )
+  }
+
+  async cancelUssd(lineId: string, sessionId: string) {
+    return request<ApiResponse<UssdResponse>>(
+      modemLinePath(lineId, `/ussd/${encodeURIComponent(sessionId)}/cancel`),
+      {
+        method: 'POST',
+        body: JSON.stringify({}),
+        timeoutMs: 10000,
+      },
+    )
   }
 
   async getSmsList(params?: SmsListRequest) {

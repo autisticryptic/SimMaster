@@ -57,6 +57,7 @@ import { maskedIccid, modemSlotLabel, shortLineId } from '../components/modemLin
 import AutomationCenter from './AutomationCenter'
 import NotificationCenterPage from './NotificationCenter'
 import SMSPage from './SMS'
+import SupplementaryServicesPanel from './sim/SupplementaryServicesPanel'
 
 function lineNotificationScope(line: VolteLineControlResponse | null) {
   if (!line) return undefined
@@ -1124,7 +1125,7 @@ export default function SimCardPage() {
       </Box>
 
       <Box sx={{ mt: 2 }}>
-        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
+        {activeTab === 'lines' && <ModemLinesPanel workbench onSelectionChange={setSelectedLine} workbenchHeader={selectedLine ? <WorkbenchOverview key={selectedLine.modem.line_id} line={selectedLine} /> : undefined} workbenchEsim={<EsimWorkbenchPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} onControlChanged={handleEsimControlChanged} />} workbenchSms={selectedLine ? <SMSPage embeddedLineId={selectedLine.modem.line_id} /> : undefined} workbenchUssd={<SupplementaryServicesPanel key={selectedLine?.modem.line_id ?? 'no-line'} line={selectedLine} />} workbenchAutomation={selectedLine ? <AutomationCenter key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} fixedTarget={lineAutomationTarget(selectedLine)} targetIsReader={selectedLine.modem.line_kind === 'reader'} embedded /> : undefined} workbenchNotifications={selectedLine ? <NotificationCenterPage key={selectedLine.modem.line_id} lineId={lineNotificationScope(selectedLine)} embedded /> : undefined} basicInfoForLine={(line, controls) => <SimBasicInfo line={line} controls={controls} />} />}
         {activeTab === 'carrier-profiles' && <CarrierProfilesPanel />}
       </Box>
     </Box>

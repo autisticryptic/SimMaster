@@ -18,7 +18,7 @@ import {
   Typography,
 } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import { CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
+import { CellTower, CheckCircle, ErrorOutline, FlightTakeoff, Lan, Refresh, Replay, RadioButtonUnchecked, History, SettingsEthernet, TravelExplore, Tune, Usb, Wifi } from '@mui/icons-material'
 import {
   api,
   type LineNetworkControlsResponse,
@@ -243,12 +243,13 @@ type ModemLinesPanelProps = {
   workbenchHeader?: ReactNode
   workbenchEsim?: ReactNode
   workbenchSms?: ReactNode
+  workbenchUssd?: ReactNode
   workbenchAutomation?: ReactNode
   workbenchNotifications?: ReactNode
   onSelectionChange?: (line: VolteLineControlResponse | null) => void
 }
 
-type WorkbenchTab = 'overview' | 'esim' | 'ims' | 'sms' | 'automation' | 'notifications'
+type WorkbenchTab = 'overview' | 'esim' | 'ims' | 'sms' | 'ussd' | 'automation' | 'notifications'
 type SupplementalSection = 'trunk' | 'vowifi' | 'network'
 type LoadStatus = 'pending' | 'ready' | 'error'
 
@@ -258,7 +259,7 @@ const INITIAL_SUPPLEMENTAL_STATUS: Record<SupplementalSection, LoadStatus> = {
   network: 'pending',
 }
 
-export default function ModemLinesPanel({ basicInfoForLine, workbench = false, workbenchHeader, workbenchEsim, workbenchSms, workbenchAutomation, workbenchNotifications, onSelectionChange }: ModemLinesPanelProps) {
+export default function ModemLinesPanel({ basicInfoForLine, workbench = false, workbenchHeader, workbenchEsim, workbenchSms, workbenchUssd, workbenchAutomation, workbenchNotifications, onSelectionChange }: ModemLinesPanelProps) {
   const [lines, setLines] = useState<VolteLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
@@ -1007,6 +1008,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       <Tab value="esim" label="eSIM" />
                       <Tab value="ims" label="IMS 与 Trunk" />
                       <Tab value="sms" label="短信" />
+                      <Tab value="ussd" label="补充业务" />
                       <Tab value="automation" label="自动化" />
                       <Tab value="notifications" label="通知" />
                     </Tabs>
@@ -1014,6 +1016,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                   <CardContent sx={{ pt: 0 }}>
                     {workbench && workbenchTab === 'esim' && <Box mt={2}>{workbenchEsim}</Box>}
                     {workbench && workbenchTab === 'sms' && <Box mt={2}>{workbenchSms}</Box>}
+                    {workbench && workbenchTab === 'ussd' && <Box mt={2}>{workbenchUssd}</Box>}
                     {workbench && workbenchTab === 'automation' && <Box mt={2}>{workbenchAutomation}</Box>}
                     {workbench && workbenchTab === 'notifications' && <Box mt={2}>{workbenchNotifications}</Box>}
 
@@ -1155,10 +1158,34 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                     </Box>
                     )}
-                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>4G/5G IMS 详情</Typography><LineVolteDetails line={line} /></Box>}
-                    {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>VoWiFi 详情</Typography><LineVowifiDetails vowifi={vowifiLine} /></Box>}
-                    {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><Typography variant="subtitle2" fontWeight={700} mb={1.5}>Trunk 详情</Typography><LineTrunkDetails trunk={trunkLine} /></Box>}
-                    {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider"><LineActivityLog line={line} appEvents={appEvents} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} /></Box>}
+                    {!isReader && workbench && workbenchTab === 'ims' && line.profile.volte_connection_enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                      <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
+                        <CellTower color="action" fontSize="small" />
+                        <Typography variant="subtitle2" fontWeight={700}>4G/5G 详情</Typography>
+                      </Box>
+                      <LineVolteDetails line={line} />
+                    </Box>}
+                    {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                      <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
+                        <Wifi color="action" fontSize="small" />
+                        <Typography variant="subtitle2" fontWeight={700}>VoWiFi 详情</Typography>
+                      </Box>
+                      <LineVowifiDetails vowifi={vowifiLine} />
+                    </Box>}
+                    {workbench && workbenchTab === 'ims' && trunkLine?.trunk.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                      <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
+                        <SettingsEthernet color="action" fontSize="small" />
+                        <Typography variant="subtitle2" fontWeight={700}>Trunk 详情</Typography>
+                      </Box>
+                      <LineTrunkDetails trunk={trunkLine} />
+                    </Box>}
+                    {workbench && workbenchTab === 'ims' && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
+                      <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
+                        <History color="action" fontSize="small" />
+                        <Typography variant="subtitle2" fontWeight={700}>线路活动日志</Typography>
+                      </Box>
+                      <LineActivityLog line={line} appEvents={appEvents} vowifiEvents={vowifiEvents} trunk={trunkLine} smsMessages={activityMessages} callRecords={activityCalls} />
+                    </Box>}
                     </Box>
                   </CardContent>
                 </Card>

@@ -1156,6 +1156,15 @@ export interface VolteLineControlResponse {
   runtime: VolteRuntimeStatus
 }
 
+export interface UssdResponse {
+  line_id: string
+  text: string
+  raw: string
+  status: string
+  session_id?: string | null
+  continueable: boolean
+}
+
 export interface SmsListRequest {
   limit?: number
   offset?: number

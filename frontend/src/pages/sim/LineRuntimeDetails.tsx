@@ -64,7 +64,7 @@ const ACTIVITY_LOG_VISIBLE_LIMIT = 20
 
 type ActivityLogEntry = {
   at: string
-  source: '4G/5G IMS' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
+  source: '4G/5G' | 'VoWiFi' | 'Trunk' | '短信' | '通话' | '系统'
   stage: string
   outcome: string
   detail?: string
@@ -111,6 +111,18 @@ function compactMessageContent(content: string) {
   return normalized.length > 96 ? `${normalized.slice(0, 96)}...` : normalized
 }
 
+function smsTransportLabel(transport?: string) {
+  switch (transport) {
+    case 'volte_ims':
+    case 'ims':
+      return '4G/5G'
+    case 'vowifi_ims':
+      return 'VoWiFi'
+    default:
+      return transport || 'modem'
+  }
+}
+
 function activityOutcomeLabel(outcome: string) {
   if (outcome === 'succeeded' || outcome === 'success') return '成功'
   if (outcome === 'failed' || outcome === 'error') return '失败'
@@ -154,7 +166,7 @@ export function LineActivityLog({
     const source = event.transport === 'vowifi_ims' || event.event_type.startsWith('vowifi.')
       ? 'VoWiFi'
       : event.transport === 'volte_ims' || event.event_type.startsWith('volte.')
-        ? '4G/5G IMS'
+        ? '4G/5G'
         : event.transport === 'trunk' || event.event_type.startsWith('trunk.')
           ? 'Trunk'
           : event.event_type.startsWith('sms.') ? '短信' : event.event_type.startsWith('call.') ? '通话' : '系统'
@@ -171,7 +183,7 @@ export function LineActivityLog({
     ...(appEvents.length > 0 ? [] : [
     ...(line.runtime.connection_attempts ?? []).map((attempt) => ({
       at: attempt.at,
-      source: '4G/5G IMS' as const,
+      source: '4G/5G' as const,
       stage: `${volteActivityStageLabels[attempt.stage] || attempt.stage}${attempt.ip_family ? ` · ${attempt.ip_family.toUpperCase()}` : ''}`,
       outcome: attempt.outcome,
       detail: [
@@ -194,7 +206,7 @@ export function LineActivityLog({
     ...smsMessages.map((message) => ({
       at: message.timestamp,
       source: '短信' as const,
-      stage: `${message.direction === 'incoming' ? '收到短信' : '发送短信'} · ${message.transport || 'modem'}`,
+      stage: `${message.direction === 'incoming' ? '收到短信' : '发送短信'} · ${smsTransportLabel(message.transport)}`,
       outcome: message.status === 'failed' ? 'failed' : message.status === 'pending' ? 'pending' : 'success',
       detail: [message.phone_number, compactMessageContent(message.content)].filter(Boolean).join(' · '),
     })),
@@ -237,7 +249,6 @@ export function LineActivityLog({
 
   return (
     <Box>
-      <Typography variant="subtitle2" fontWeight={700} mb={0.25}>线路活动日志</Typography>
       <Typography variant="caption" color="text.secondary" display="block" mb={1.5}>
         最新在上，显示最近 {ACTIVITY_LOG_VISIBLE_LIMIT} 条 IMS、短信、通话与 Trunk 关键事件；单栈/双栈及回退过程会记录在这里。
         完整历史与未截断的错误串见后端诊断日志。

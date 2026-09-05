@@ -142,7 +142,7 @@ const REGISTER_REFRESH_PROTECTED_TIMEOUTS_BEFORE_RENEGOTIATION: u8 = 2;
 /// Temporary device-validation override. Keep this at 120 seconds only while
 /// observing refresh behavior on the test device; restore None afterwards so
 /// production scheduling uses the network-provided RegistrationLease value.
-const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = Some(120);
+const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
 
 fn scheduled_volte_refresh_delay(lease: &RegistrationLease) -> Duration {
     let normal = lease.refresh_after.max(Duration::from_secs(1));
