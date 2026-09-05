@@ -90,8 +90,12 @@ jobs:
           # on hosted runners, which previously made upload-artifact see no
           # archive even though the container had created and verified it.
           set +e
+          {
+            echo "docker path: $(command -v docker || echo missing)"
+            docker version 2>&1 || true
+          } > release/docker-host.log
           docker run --name "$CONTAINER_NAME" \
-            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT' 2>&1 | tee release/docker-run.log
+            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" > release/docker-run.log 2>&1
           set -eux
           trap 'rc=$?; msg=$(printf "LPAC container failed at line %s: %s (exit %s)" "$LINENO" "$BASH_COMMAND" "$rc" | tr "\n" " "); echo "::error title=LPAC container failure::$msg"; exit "$rc"' ERR
           mkdir -p /output
@@ -176,10 +180,11 @@ jobs:
           test -f "/output/$1"
           chmod -R 777 /output
           CONTAINER_SCRIPT
-          build_status=${PIPESTATUS[0]}
+          build_status=$?
           set -e
           if [ "$build_status" -ne 0 ]; then
             docker logs "$CONTAINER_NAME" > release/lpac-build.log 2>&1 || true
+            cat release/docker-host.log >> release/lpac-build.log || true
             cat release/docker-run.log >> release/lpac-build.log || true
             diagnostic=$(tail -n 40 release/lpac-build.log | tr '\n' ' ' | cut -c1-3000 || true)
             if [ -z "$diagnostic" ]; then
