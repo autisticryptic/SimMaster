@@ -29,6 +29,12 @@ LPAC_LATEST_RELEASE_API_URL="${LPAC_LATEST_RELEASE_API_URL:-https://api.github.c
 LPAC_ASSET_FLAVOR="${LPAC_ASSET_FLAVOR:-compat}"
 LPAC_ASSET_NAME="${LPAC_ASSET_NAME:-}"
 LPAC_ASSET_URL="${LPAC_ASSET_URL:-}"
+# SimAdmin's Qualcomm/eSIM path uses lpac's QMI APDU backend. Keep this
+# enabled by default so a generic official lpac archive cannot silently
+# replace the compatibility bundle and later fail with "No APDU driver
+# found". Set LPAC_REQUIRE_QMI=0 only for a deployment that deliberately
+# uses another reader backend (PC/SC or AT).
+LPAC_REQUIRE_QMI="${LPAC_REQUIRE_QMI:-1}"
 
 require_root() {
   if [ "$(id -u)" -ne 0 ]; then
@@ -575,11 +581,26 @@ lpac_driver_list_usable() {
     | grep -Eq '"LPAC_HTTP"[[:space:]]*:[[:space:]]*\[[[:space:]]*[^]]' || return 1
 }
 
+lpac_driver_list_has_qmi() {
+  lpac_path="$1"
+  if [ ! -x "$lpac_path" ]; then
+    return 1
+  fi
+
+  output=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
+    LD_LIBRARY_PATH="$(lpac_env_prefix "$lpac_path")" \
+    "$lpac_path" driver list 2>&1) || return 1
+
+  printf '%s\n' "$output" \
+    | grep -Eq '"LPAC_APDU"[[:space:]]*:[[:space:]]*\[[^]]*"qmi"'
+}
+
 lpac_binary_usable() {
   lpac_home="$1"
   lpac_path="${lpac_home}/lpac"
   lpac_binary_path_usable "$lpac_path" \
-    && lpac_driver_list_usable "$lpac_path"
+    && lpac_driver_list_usable "$lpac_path" \
+    && { ! truthy "$LPAC_REQUIRE_QMI" || lpac_driver_list_has_qmi "$lpac_path"; }
 }
 
 lpac_command_version() {
@@ -803,6 +824,11 @@ lpac_install_needed() {
     return 0
   fi
 
+  if truthy "$LPAC_REQUIRE_QMI" && ! lpac_driver_list_has_qmi "$lpac_path"; then
+    LPAC_INSTALL_REASON="installed lpac has no QMI APDU driver"
+    return 0
+  fi
+
   current_version="$(lpac_installed_version "$lpac_path" || true)"
   if [ -z "$current_version" ]; then
     LPAC_INSTALL_REASON="installed version is unknown"
@@ -828,6 +854,7 @@ install_lpac() {
   lpac_dst="${INSTALL_DIR}/lpac"
   lpac_archive="${tmp_dir}/lpac.zip"
   lpac_extract="${tmp_dir}/lpac-extract"
+  lpac_stage="${tmp_dir}/lpac-stage"
 
   if ! truthy "$SIMADMIN_INSTALL_LPAC"; then
     echo "==> skipping lpac install (SIMADMIN_INSTALL_LPAC=${SIMADMIN_INSTALL_LPAC})"
@@ -878,23 +905,29 @@ install_lpac() {
       echo "warning: failed to extract ${candidate_url}, trying next lpac source" >&2
       continue
     fi
-    if ! copy_lpac_tree "$lpac_extract" "$lpac_dst" "$candidate_url"; then
+    # Install into a staging directory. A failed capability check must never
+    # destroy the last known-good lpac installation.
+    rm -rf "$lpac_stage"
+    if ! copy_lpac_tree "$lpac_extract" "$lpac_stage" "$candidate_url"; then
       echo "warning: failed to install ${candidate_url}, trying next lpac source" >&2
       continue
     fi
-    detected_version="$(lpac_command_version "${lpac_dst}/lpac" || true)"
+    detected_version="$(lpac_command_version "${lpac_stage}/lpac" || true)"
     if [ -z "$detected_version" ]; then
       detected_version="$LPAC_TARGET_RELEASE_VERSION"
     fi
-    write_lpac_version_file "$lpac_dst" "$detected_version"
-    if lpac_binary_usable "$lpac_dst"; then
-      if [ -n "$detected_version" ]; then
-        echo "==> lpac ${detected_version} installed to ${lpac_dst}"
-      else
-        echo "==> lpac installed to ${lpac_dst}"
-      fi
+    write_lpac_version_file "$lpac_stage" "$detected_version"
+    if ! lpac_binary_usable "$lpac_stage"; then
+      echo "warning: ${candidate_url} does not provide a usable lpac bundle (required QMI=${LPAC_REQUIRE_QMI}), trying next source" >&2
+      continue
+    fi
+
+    rm -rf "$lpac_dst"
+    mv "$lpac_stage" "$lpac_dst"
+    if [ -n "$detected_version" ]; then
+      echo "==> lpac ${detected_version} installed to ${lpac_dst}"
     else
-      echo "warning: lpac was installed but may not be executable on this device; check glibc/architecture compatibility" >&2
+      echo "==> lpac installed to ${lpac_dst}"
     fi
     return 0
   done

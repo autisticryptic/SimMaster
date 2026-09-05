@@ -491,6 +491,16 @@ async fn fetch_compatible_lpac_candidates(
     let bytes = download_lpac_asset(&manifest_url, proxy_prefix).await?;
     let manifest = serde_json::from_slice::<Value>(&bytes)
         .map_err(|err| EsimApiError::Command(format!("Invalid lpac asset manifest: {err}")))?;
+    // The compatibility release is used for the Qualcomm/eUICC path.  If a
+    // manifest explicitly advertises APDU backends, do not select a bundle
+    // that cannot serve the QMI reader.  Older manifests did not have this
+    // field, so their absence remains backward compatible and the installed
+    // binary probe is still the final check.
+    if manifest.get("apdu_drivers").is_some() && !manifest_advertises_qmi(&manifest) {
+        return Err(EsimApiError::Command(
+            "Compatible lpac manifest has no QMI APDU driver".to_string(),
+        ));
+    }
     let Some(assets) = manifest.get("assets").and_then(Value::as_array) else {
         return Ok(Vec::new());
     };
@@ -523,6 +533,25 @@ async fn fetch_compatible_lpac_candidates(
             name,
         })
         .collect())
+}
+
+fn manifest_advertises_qmi(manifest: &Value) -> bool {
+    let Some(drivers) = manifest.get("apdu_drivers") else {
+        // The field was added after the first compatibility manifest.  Keep
+        // those manifests usable; the actual lpac driver-list probe remains
+        // authoritative after installation.
+        return true;
+    };
+
+    match drivers {
+        Value::Array(items) => items.iter().any(|item| {
+            item.as_str()
+                .map(|name| name.eq_ignore_ascii_case("qmi"))
+                .unwrap_or(false)
+        }),
+        Value::Bool(value) => *value,
+        _ => false,
+    }
 }
 
 fn dedupe_lpac_candidates(candidates: Vec<LpacAssetCandidate>) -> Vec<LpacAssetCandidate> {
@@ -1979,6 +2008,19 @@ mod tests {
             lpac_driver_names(payload, "lpac_http"),
             vec!["curl", "stdio"]
         );
+    }
+
+    #[test]
+    fn compatibility_manifest_requires_qmi_when_drivers_are_declared() {
+        assert!(manifest_advertises_qmi(&json!({
+            "apdu_drivers": ["pcsc", "QMI", "stdio"]
+        })));
+        assert!(!manifest_advertises_qmi(&json!({
+            "apdu_drivers": ["pcsc", "at", "stdio"]
+        })));
+        assert!(manifest_advertises_qmi(&json!({"apdu_drivers": true})));
+        assert!(!manifest_advertises_qmi(&json!({"apdu_drivers": false})));
+        assert!(manifest_advertises_qmi(&json!({"assets": []})));
     }
 
     #[test]

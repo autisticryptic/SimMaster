@@ -131,15 +131,24 @@ jobs:
           cp "$LPAC_BIN" "$BUNDLE_ROOT/lpac"
           chmod 755 "$BUNDLE_ROOT/lpac"
 
-          # lpac 2.3.x statically links euicc-drivers by default.  In that
-          # configuration the APDU backends are inside the lpac executable;
-          # there are no driver_apdu_*.so files to install.  Keep copying an
-          # optional driver directory for dynamically-built packages, but do
-          # not require it for this static compatibility build.
-          DRIVER_DIR=$(find /tmp/lpac-install -type d -path '*/driver' | head -1 || true)
-          if [ -n "$DRIVER_DIR" ] && [ -d "$DRIVER_DIR" ]; then
-            mkdir -p "$BUNDLE_ROOT/driver"
-            cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+          # Standalone lpac loads APDU/HTTP backends from shared objects in
+          # ./driver. Do not assume that the install prefix is fixed: the
+          # Debian container uses DESTDIR and CMake may place the files below
+          # executables/driver (or another configured bindir).
+          DRIVER_FILE=$(find /tmp/lpac-install -type f \
+            -name 'driver_apdu_qmi.so' -print -quit)
+          test -n "$DRIVER_FILE" && test -f "$DRIVER_FILE"
+          DRIVER_DIR=$(dirname "$DRIVER_FILE")
+          mkdir -p "$BUNDLE_ROOT/driver"
+          cp -a "$DRIVER_DIR"/. "$BUNDLE_ROOT/driver/"
+
+          # LPAC_DYNAMIC_LIBEUICC is enabled by default. Bundle all runtime
+          # libraries installed by lpac, not only libqmi, so dlopen() of the
+          # QMI driver works on the target device as well as in CI.
+          INSTALL_LIB_DIR=$(find /tmp/lpac-install -type d \
+            -path '*/executables/lib' -print -quit || true)
+          if [ -n "$INSTALL_LIB_DIR" ] && [ -d "$INSTALL_LIB_DIR" ]; then
+            cp -a "$INSTALL_LIB_DIR"/. "$BUNDLE_ROOT/lib/"
           fi
 
           # Verify the drivers that lpac will actually use.  This works for
@@ -149,6 +158,7 @@ jobs:
           # Use stdio so this capability check does not require a modem or
           # network in the build container.
           DRIVER_LIST=$(LPAC_APDU=stdio LPAC_HTTP=stdio \
+            LD_LIBRARY_PATH="$BUNDLE_ROOT/lib" \
             "$BUNDLE_ROOT/lpac" driver list)
           echo "$DRIVER_LIST"
           echo "$DRIVER_LIST" | jq -e '.payload.LPAC_APDU | index("qmi") != null' >/dev/null
@@ -163,13 +173,18 @@ jobs:
           fi
           ldd "$BUNDLE_ROOT/lpac" || true
           (cd "$BUNDLE_ROOT" && zip -r "/output/$1" .)
+          test -f "/output/$1"
           chmod -R 777 /output
           CONTAINER_SCRIPT
 
       - name: Verify output
         run: |
           set -euo pipefail
-          ls -lah release
+          test -f "release/${{ matrix.package }}"
+          ls -lah "release/${{ matrix.package }}"
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lpac'
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'driver/driver_apdu_qmi.so'
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lib/libqmi-glib.so.5'
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
@@ -207,7 +222,8 @@ jobs:
           cat > release/lpac.json << EOF
           {
             "version": "$VERSION",
-            "apdu_drivers": true,
+            "apdu_drivers": ["qmi", "pcsc", "at", "stdio"],
+            "http_drivers": ["curl", "stdio"],
             "assets": [
               {"name": "lpac-linux-aarch64-glibc2.31.zip", "arch": "aarch64", "glibc": "2.31"},
               {"name": "lpac-linux-x86_64-glibc2.31.zip", "arch": "x86_64", "glibc": "2.31"}
