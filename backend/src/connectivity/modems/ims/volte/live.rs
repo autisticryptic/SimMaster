@@ -396,6 +396,12 @@ async fn build_volte_xcap_authorization(
 
 struct VolteLiveSession {
     channel: VolteSipChannel,
+    /// Immutable identity that created this REGISTER binding. In particular,
+    /// the USIM-derived temporary IMPU remains the REGISTER From/To identity
+    /// for refresh and deregistration (TS 24.229 5.1.1.1A / 5.1.1.4.1).
+    registration_identity: ImsIdentity,
+    /// Default originating identity learned from P-Associated-URI. It is for
+    /// calls/SMS/subscriptions, not a replacement for the registered AoR.
     identity: ImsIdentity,
     registration: RegisteredImsContext,
     bearer: BearerConnection,
@@ -1415,11 +1421,9 @@ impl VolteRegisterAuthenticator {
                 register_policy,
             )
         } else if let Some((selected, verify)) = security_server {
-            // Do not allocate replacement ports speculatively before the
-            // refresh is challenged. A Security-Server response is the first
-            // point at which a new SA is actually negotiated, so reserve the
-            // replacement local tuple now and rebuild Security-Client from the
-            // same formatting variant used by the successful registration.
+            // SM1 already reserved and advertised the replacement tuple.
+            // Only the challenge authorizes installing new SAs; SM7 must use
+            // exactly that frozen offer, not allocate different parameters.
             if let Some(previous) = channel.security_verify() {
                 let previous = ipsec::parse_security_server(previous).map_err(to_ims_error)?;
                 ipsec::validate_server_rollover(&previous, &selected).map_err(to_ims_error)?;
@@ -2839,10 +2843,9 @@ async fn connect_family(
         let associated_uri = registered.default_associated_uri();
         let mut registered_identity = device_identity.ims.clone();
         if let Some(uri) = associated_uri {
-            // The network-provided default public user identity is authoritative
-            // after REGISTER. In particular, operators commonly authenticate
-            // with the IMSI-derived IMPU but require later requests to use the
-            // MSISDN-associated IMPU.
+            // P-Associated-URI supplies the default identity for originating
+            // services. Do not replace the identity used to REGISTER: a USIM's
+            // temporary IMPU is intentionally different from this default.
             registered_identity.public_uri = uri.to_string();
         }
         // Profile policy and local media capability decide what the UE advertises.
@@ -2897,6 +2900,7 @@ async fn connect_family(
         }
         return Ok(VolteLiveSession {
             channel,
+            registration_identity: device_identity.ims.clone(),
             identity: registered_identity,
             registration: registered,
             bearer: bearer.clone(),
@@ -2992,7 +2996,7 @@ async fn unregister_live_session(
     );
     let initial_authorization = session.register_variant.authorization.build(
         &session.effective_ims.realm.value,
-        &session.identity,
+        &session.registration_identity,
         &request_uri,
     );
     let register_policy = sip::RegisterRequestPolicy {
@@ -3003,7 +3007,7 @@ async fn unregister_live_session(
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
-        &session.identity,
+        &session.registration_identity,
         &session.channel.route(),
         &ids,
         0,
@@ -3016,7 +3020,7 @@ async fn unregister_live_session(
         session.access_network.as_ref(),
     );
     let mut authenticator = VolteRegisterAuthenticator::new(
-        session.identity.clone(),
+        session.registration_identity.clone(),
         ids,
         session.sip_instance.clone(),
         session.security_binding,
@@ -3672,7 +3676,7 @@ async fn refresh_live_registration(
         );
         let initial_authorization = match refresh_authorization
             .as_mut()
-            .map(|state| state.authorization_for(&session.identity, &request_uri))
+            .map(|state| state.authorization_for(&session.registration_identity, &request_uri))
             .transpose()
         {
             Ok(value) => value,
@@ -3700,7 +3704,7 @@ async fn refresh_live_registration(
             session.profile,
             effective_register_target(&session.effective_ims),
             sip::RegisterPhase::Refresh,
-            &session.identity,
+            &session.registration_identity,
             &session.channel.route(),
             &ids,
             refresh_expires,
@@ -3714,7 +3718,7 @@ async fn refresh_live_registration(
         );
         log_volte_register_request_metadata(variant, &session.channel, &initial);
         let mut authenticator = VolteRegisterAuthenticator::new(
-            session.identity.clone(),
+            session.registration_identity.clone(),
             ids.clone(),
             session.sip_instance.clone(),
             pending_security_binding,
@@ -7748,15 +7752,17 @@ mod tests {
         );
         test_worker.enable_test_net_config().await;
         let test_binding = test_worker.bind();
+        let identity = ImsIdentity {
+            private_user: "234330000000001@ims.example".into(),
+            public_uri: "sip:+441234567890@ims.example".into(),
+            contact_user: "234330000000001".into(),
+            home_domain: "ims.example".into(),
+            contact_user_phone: false,
+        };
         *live.session.lock().await = Some(VolteLiveSession {
             channel,
-            identity: ImsIdentity {
-                private_user: "234330000000001@ims.example".into(),
-                public_uri: "sip:+441234567890@ims.example".into(),
-                contact_user: "234330000000001".into(),
-                home_domain: "ims.example".into(),
-                contact_user_phone: false,
-            },
+            registration_identity: identity.clone(),
+            identity,
             registration: RegisteredImsContext::from_response(
                 ImsRegistrationAccess::Volte,
                 b"SIP/2.0 200 OK\r\nExpires: 3600\r\nContent-Length: 0\r\n\r\n",

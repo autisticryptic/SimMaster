@@ -26,6 +26,13 @@ fn challenge(nonce: &str) -> digest_aka::DigestChallenge {
 async fn protected_session() -> (VolteLiveSession, VolteRuntime, UdpSocket, UdpSocket) {
     let (live, runtime, server) = super::tests::test_voice_session().await;
     let mut session = live.session.lock().await.take().unwrap();
+    // Model the real USIM trace: REGISTER uses a temporary IMPU, whereas
+    // P-Associated-URI selects an MSISDN identity for originating services.
+    session.registration_identity.public_uri = "sip:234330000000001@ims.example".into();
+    assert_ne!(
+        session.registration_identity.public_uri,
+        session.identity.public_uri
+    );
     let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (port_c, port_s) = session.channel.reserve_security_ports_for_test(0);
     let ue = SecAgree {
@@ -87,10 +94,10 @@ fn authenticator(
         &session.channel.route(),
     );
     let header = authorization
-        .authorization_for(&session.identity, &uri)
+        .authorization_for(&session.registration_identity, &uri)
         .unwrap();
     VolteRegisterAuthenticator::new(
-        session.identity.clone(),
+        session.registration_identity.clone(),
         RequestIds::fresh(10),
         session.sip_instance.clone(),
         offered,
@@ -150,7 +157,7 @@ async fn challenged_refresh_freezes_offer_and_rolls_back_sockets_and_nonce_on_ti
         session.profile,
         effective_register_target(&session.effective_ims),
         sip::RegisterPhase::Refresh,
-        &session.identity,
+        &session.registration_identity,
         &session.channel.route(),
         &auth.ids,
         3600,
@@ -181,6 +188,19 @@ async fn challenged_refresh_freezes_offer_and_rolls_back_sockets_and_nonce_on_ti
     .await
     .unwrap();
     let authenticated = auth.authenticated_request(b"", 2).await.unwrap();
+    for request in [&initial, &authenticated] {
+        assert_eq!(
+            sip::header_value(request, "To"),
+            Some(format!("<{}>", session.registration_identity.public_uri))
+        );
+        assert_eq!(
+            sip::header_value(request, "From"),
+            Some(format!(
+                "<{}>;tag={}",
+                session.registration_identity.public_uri, auth.ids.from_tag
+            ))
+        );
+    }
     assert_eq!(
         sip::header_value(&initial, "Security-Client"),
         sip::header_value(&authenticated, "Security-Client")
@@ -394,6 +414,128 @@ async fn direct_200_refresh_discards_offer_without_replacing_active_association(
 }
 
 #[tokio::test]
+async fn refresh_keeps_registered_aor_when_associated_default_identity_changes() {
+    let (mut session, runtime, mut server, _old_client) = protected_session().await;
+    let registered_identity = session.registration_identity.clone();
+    let old_route = session.channel.send_route();
+    let old_binding = session.security_binding;
+    let old_verify = session.channel.security_verify().unwrap().to_string();
+    let db = Database::new(std::path::PathBuf::from(":memory:")).unwrap();
+
+    // A second 200 can change the default again. Neither update is permission
+    // to re-register a different AoR on the original Call-ID/contact/SA.
+    for default_uri in [
+        "sip:+441234567891@ims.example",
+        "sip:+441234567892@ims.example",
+    ] {
+        session
+            .channel
+            .reserve_security_ports_for_test(old_binding.port_s);
+        let expected_identity = registered_identity.clone();
+        let expected_from_tag = session.register_ids.from_tag.clone();
+        let expected_call_id = session.register_ids.call_id.clone();
+        let expected_cseq = session.next_register_cseq;
+        let expected_verify = old_verify.clone();
+        let peer = tokio::spawn(async move {
+            let (request, source) = receive(&server).await;
+            assert_eq!(source, old_route.local_addr);
+            assert_eq!(
+                sip::header_value(&request, "To"),
+                Some(format!("<{}>", expected_identity.public_uri))
+            );
+            assert_eq!(
+                sip::header_value(&request, "From"),
+                Some(format!("<{}>;tag={expected_from_tag}", expected_identity.public_uri))
+            );
+            assert_eq!(
+                sip::header_value(&request, "Call-ID"),
+                Some(expected_call_id)
+            );
+            assert_eq!(
+                sip::header_value(&request, "CSeq"),
+                Some(format!("{expected_cseq} REGISTER"))
+            );
+            assert_eq!(
+                sip::header_value(&request, "Security-Verify"),
+                Some(expected_verify)
+            );
+            assert!(sip::header_value(&request, "Contact")
+                .unwrap()
+                .starts_with(&format!("<sip:{}@", expected_identity.contact_user)));
+            let extra = format!("Expires: 3600\r\nP-Associated-URI: <{default_uri}>\r\n");
+            server
+                .send_to(&response(&request, "200 OK", &extra), source)
+                .await
+                .unwrap();
+            server
+        });
+        let result =
+            refresh_live_registration(&mut session, &runtime, "identity-refresh-test", &db).await;
+        server = peer.await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            RegistrationRefreshResult::Refreshed(_)
+        ));
+        assert_eq!(session.registration_identity, registered_identity);
+        assert_eq!(session.identity.public_uri, default_uri);
+        assert_eq!(runtime.status().await.public_uri.as_deref(), Some(default_uri));
+        assert_eq!(session.channel.send_route(), old_route);
+        assert_eq!(session.security_binding, old_binding);
+        assert!(session.retired_xfrm_plan.is_none());
+        // Originating service requests must still use the network's default,
+        // rather than accidentally exposing the temporary registration IMPU.
+        let options = sip::build_options(
+            &session.identity,
+            &session.channel.route(),
+            None,
+            1,
+            session.channel.security_verify(),
+        );
+        assert_eq!(
+            sip::header_value(&options, "To"),
+            Some(format!("<{default_uri}>"))
+        );
+    }
+    assert_eq!(runtime.status().await.register_refresh_count, 2);
+}
+
+#[tokio::test]
+async fn unregister_targets_original_binding_not_originating_default() {
+    let (session, runtime, server, _old_client) = protected_session().await;
+    let expected_identity = session.registration_identity.clone();
+    let expected_from_tag = session.register_ids.from_tag.clone();
+    let old_route = session.channel.send_route();
+    let live = VolteLiveHandle::new();
+    *live.session.lock().await = Some(session);
+    let peer = tokio::spawn(async move {
+        let (request, source) = receive(&server).await;
+        assert_eq!(source, old_route.local_addr);
+        assert_eq!(
+            sip::header_value(&request, "To"),
+            Some(format!("<{}>", expected_identity.public_uri))
+        );
+        assert_eq!(
+            sip::header_value(&request, "From"),
+            Some(format!("<{}>;tag={expected_from_tag}", expected_identity.public_uri))
+        );
+        assert_eq!(
+            sip::header_value(&request, "Expires"),
+            Some("0".to_string())
+        );
+        assert!(sip::header_value(&request, "Security-Verify").is_some());
+        server
+            .send_to(&response(&request, "200 OK", "Expires: 0\r\n"), source)
+            .await
+            .unwrap();
+    });
+    assert_eq!(
+        unregister_live_session(&live, &runtime).await,
+        UnregisterResult::Confirmed
+    );
+    peer.await.unwrap();
+}
+
+#[tokio::test]
 async fn repeated_timeouts_never_downgrade_refresh_to_plaintext() {
     let (mut session, runtime, server, _client) = protected_session().await;
     let old_route = session.channel.send_route();
@@ -426,6 +568,10 @@ async fn repeated_timeouts_never_downgrade_refresh_to_plaintext() {
         let mut count = 0;
         while let Ok((frame, source)) = rx.try_recv() {
             assert_eq!(source, old_route.local_addr);
+            assert_eq!(
+                sip::header_value(&frame, "To"),
+                Some(format!("<{}>", session.registration_identity.public_uri))
+            );
             assert_eq!(
                 sip::header_value(&frame, "Security-Verify"),
                 Some(old_verify.clone())

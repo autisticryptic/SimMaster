@@ -19,6 +19,34 @@ refresh, timed out:
 A separate sample had no response at all. A timeout alone is not proof that
 headers should change or that the existing association should be discarded.
 
+## Follow-up: registration identity versus originating identity
+
+The first fix (89bd812 / v1.1.5) passed the hardware-free regressions, but the
+2026-09-06 natural refresh still received no response to SM1. It must not be
+reported as a successful device refresh just because initial registration works.
+
+A complete initial exchange then exposed a separate request-construction bug:
+REGISTER CSeq 1/2 used the USIM-derived temporary IMPU. The 200 returned an
+MSISDN-based default in P-Associated-URI. The session overwrote its sole identity
+with that default, so refresh CSeq 3 (and deregistration) changed the registered
+From/To AoR while retaining the original Contact, Call-ID and security context.
+
+TS 24.229 5.1.1.1A and 5.1.1.4.1 distinguish the derived registration identity
+from the default public identity selected for originating services. The session
+now stores them separately:
+
+- `registration_identity` is fixed when initial registration succeeds. All
+  refresh requests, challenged authentication rounds and deregistration use it.
+- `identity` follows P-Associated-URI for calls, SMS, subscriptions and OPTIONS.
+  A later 200 can update this default without changing the registered AoR.
+- Contact user, Call-ID/CSeq and the protected transport retain their existing
+  lifecycle. This change does not trigger or add IPsec renegotiation.
+
+Regression coverage checks two consecutive refreshes with changing network
+aliases, challenged REGISTER identity, original-AoR deregistration, and timeout
+retries. Real-carrier validation must still observe a complete natural refresh;
+a local mock 200 is not sufficient evidence that carrier timeouts are resolved.
+
 ## Correct transaction boundary
 
 TS 33.203 sections 7.4, 7.4.1a and 7.4.2a distinguish a protected refresh from a
@@ -51,7 +79,8 @@ still scoped to the UE worker; cleanup never globally flushes XFRM.
 ## Verification
 
 Build-Release executes hardware-free regressions on GitHub Actions and gates
-publication on their success. Coverage includes frozen offers, rollback of
+publication on their success. Only the final release job publishes assets; the
+earlier ARM64-only publish shortcut was removed because it bypassed this gate. Coverage includes frozen offers, rollback of
 sockets and authentication state, zero SPI rejection, disjoint XFRM plans,
 direct-200 refresh, reception on old/new associations during rollover, and
 three consecutive real Timer E/F timeouts without plaintext fallback.
