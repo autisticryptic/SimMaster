@@ -91,7 +91,7 @@ jobs:
           # archive even though the container had created and verified it.
           set +e
           docker run --name "$CONTAINER_NAME" \
-            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT'
+            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT' 2>&1 | tee release/docker-run.log
           set -eux
           trap 'rc=$?; msg=$(printf "LPAC container failed at line %s: %s (exit %s)" "$LINENO" "$BASH_COMMAND" "$rc" | tr "\n" " "); echo "::error title=LPAC container failure::$msg"; exit "$rc"' ERR
           mkdir -p /output
@@ -176,11 +176,15 @@ jobs:
           test -f "/output/$1"
           chmod -R 777 /output
           CONTAINER_SCRIPT
-          build_status=$?
+          build_status=${PIPESTATUS[0]}
           set -e
           if [ "$build_status" -ne 0 ]; then
             docker logs "$CONTAINER_NAME" > release/lpac-build.log 2>&1 || true
-            diagnostic=$(tail -n 20 release/lpac-build.log | tr '\n' ' ' | cut -c1-3000 || true)
+            cat release/docker-run.log >> release/lpac-build.log || true
+            diagnostic=$(tail -n 40 release/lpac-build.log | tr '\n' ' ' | cut -c1-3000 || true)
+            if [ -z "$diagnostic" ]; then
+              diagnostic="docker run produced no diagnostic output (exit $build_status)"
+            fi
             echo "::error file=.github/workflows/build-lpac-compat-rebuild.yml,line=111::$diagnostic"
             cat release/lpac-build.log || true
             docker rm "$CONTAINER_NAME" || true
