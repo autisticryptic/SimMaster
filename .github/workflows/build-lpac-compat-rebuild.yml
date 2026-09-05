@@ -120,7 +120,22 @@ jobs:
             https://archive.ubuntu.com/ubuntu/pool/main/libq/libqmi/libqmi_1.36.0.orig.tar.xz \
             -o "$LIBQMI_ARCHIVE"
           mkdir -p /libqmi-src
-          tar -xJf "$LIBQMI_ARCHIVE" --strip-components=1 -C /libqmi-src
+          # Use Python's built-in lzma/tar reader instead of relying on the
+          # tar frontend's optional xz autodetection in the minimal image.
+          python3 - "$LIBQMI_ARCHIVE" /libqmi-src <<'PY'
+          import sys
+          import tarfile
+
+          archive, destination = sys.argv[1:]
+          with tarfile.open(archive, mode="r:xz") as source:
+              source.extractall(destination)
+          PY
+          # The archive has one top-level libqmi-1.36.0 directory.  Flatten it
+          # so Meson sees the project files directly at /libqmi-src.
+          LIBQMI_ROOT=$(find /libqmi-src -mindepth 1 -maxdepth 1 -type d -name 'libqmi-*' -print -quit)
+          test -n "$LIBQMI_ROOT" && test -f "$LIBQMI_ROOT/meson.build"
+          cp -a "$LIBQMI_ROOT"/. /libqmi-src/
+          rm -rf "$LIBQMI_ROOT"
           cd /libqmi-src
           meson setup build --prefix=/usr/local --libdir=lib --buildtype=release \
             -Dcollection=full -Dmbim_qmux=false -Dqrtr=false \
