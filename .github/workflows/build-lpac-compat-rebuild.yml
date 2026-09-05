@@ -32,9 +32,10 @@ jobs:
         id: check
         env:
           MANUAL_REF: ${{ inputs.lpac_ref }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          OFFICIAL_TAG=$(curl -fsSL https://api.github.com/repos/estkme-group/lpac/releases/latest | jq -r .tag_name)
+          OFFICIAL_TAG=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" -H "User-Agent: SimMaster-Actions" https://api.github.com/repos/estkme-group/lpac/releases/latest | jq -r .tag_name)
           if [ -n "$MANUAL_REF" ]; then
             echo "should_build=true" >> "$GITHUB_OUTPUT"
             echo "lpac_ref=$MANUAL_REF" >> "$GITHUB_OUTPUT"
