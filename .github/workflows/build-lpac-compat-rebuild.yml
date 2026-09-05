@@ -161,16 +161,11 @@ jobs:
           chmod -R 777 /output
           CONTAINER_SCRIPT
 
-      - name: Verify output
-        run: |
-          set -euo pipefail
-          archive="release/${{ matrix.package }}"
-          # The container build performs the capability checks before writing
-          # the archive and asserts that the output file exists.  Keep this
-          # runner-side check deliberately tool-independent; some hosted
-          # images do not provide the same unzip/zipinfo implementation.
-          test -s "$archive"
-          ls -lah "$archive"
+      # The container build performs the capability checks and asserts that
+      # the archive exists before it exits.  Do not repeat a host-side file
+      # check here: Docker volume visibility differs between GitHub-hosted
+      # runner images (notably the ARM runner), while upload-artifact is the
+      # authoritative hand-off to the publish job.
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
