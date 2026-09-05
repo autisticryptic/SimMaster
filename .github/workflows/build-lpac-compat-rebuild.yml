@@ -95,7 +95,7 @@ jobs:
             docker version 2>&1 || true
           } > release/docker-host.log
           docker run --name "$CONTAINER_NAME" \
-            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" > release/docker-run.log 2>&1
+            debian:11 bash -s "$LPAC_REF" "$PACKAGE_NAME" <<'CONTAINER_SCRIPT' > release/docker-run.log 2>&1
           set -eux
           trap 'rc=$?; msg=$(printf "LPAC container failed at line %s: %s (exit %s)" "$LINENO" "$BASH_COMMAND" "$rc" | tr "\n" " "); echo "::error title=LPAC container failure::$msg"; exit "$rc"' ERR
           mkdir -p /output
