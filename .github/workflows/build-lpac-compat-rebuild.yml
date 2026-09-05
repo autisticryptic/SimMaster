@@ -166,10 +166,12 @@ jobs:
           set -euo pipefail
           test -f "release/${{ matrix.package }}"
           ls -lah "release/${{ matrix.package }}"
-          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lpac'
+          # zip may record entries with a leading ./ when the archive is
+          # created from the bundle root; accept either canonical form.
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Eq '(^|/)lpac$'
           # QMI is statically compiled into lpac; there is intentionally
           # no driver/driver_apdu_qmi.so entry in this upstream build.
-          unzip -Z1 "release/${{ matrix.package }}" | grep -Fx 'lib/libqmi-glib.so.5'
+          unzip -Z1 "release/${{ matrix.package }}" | grep -Eq '(^|/)lib/libqmi-glib[.]so[.]5$'
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
