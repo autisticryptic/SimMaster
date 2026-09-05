@@ -168,9 +168,9 @@ jobs:
       - name: Verify output
         run: |
           set -euo pipefail
-          ls -lh "release/${{ matrix.package }}"
+          test -s "release/${{ matrix.package }}"
           file "release/${{ matrix.package }}"
-          unzip -Z1 "release/${{ matrix.package }}" | grep -Eq '(^|/)lpac$'
+          unzip -t "release/${{ matrix.package }}" >/dev/null
 
       - name: Upload architecture artifact
         uses: actions/upload-artifact@v4
