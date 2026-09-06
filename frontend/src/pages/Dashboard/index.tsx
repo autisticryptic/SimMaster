@@ -15,6 +15,7 @@ import {
 import Grid from '@mui/material/Grid'
 import { useRefreshInterval } from '@/contexts/RefreshContext'
 import ErrorSnackbar from '@/components/ErrorSnackbar'
+import ImsRegistrationPolicyHint from '@/components/ImsRegistrationPolicyHint'
 import {
   SystemResources,
   NetworkSpeed,
@@ -84,7 +85,10 @@ function LineStatusTable({ lines }: { lines: DashboardLineInfo[] }) {
                 <TableCell sx={{ fontFamily: 'monospace' }}>{maskedIccid(simInfo?.iccid || modem.sim_iccid)}</TableCell>
                 <TableCell>{networkInfo?.operator_name || (isReader ? 'VoWiFi' : '-')}</TableCell>
                 <TableCell>{networkInfo ? `${networkInfo.signal_strength}%` : '-'}</TableCell>
-                <TableCell><Chip size="small" label={ims.label} color={ims.color} variant="outlined" /></TableCell>
+                <TableCell>
+                  <Chip size="small" label={ims.label} color={ims.color} variant="outlined" />
+                  <ImsRegistrationPolicyHint ims={line.ims} />
+                </TableCell>
                 <TableCell><Chip size="small" label={trunk.label} color={trunk.color} variant="outlined" /></TableCell>
                 <TableCell align="right"><Chip size="small" label={online ? '在线' : '离线'} color={online ? 'success' : 'default'} variant="outlined" /></TableCell>
               </TableRow>

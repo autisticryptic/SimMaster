@@ -1313,9 +1313,29 @@ export interface VoiceAccessSelection {
   gateway_mode: boolean
 }
 
+export type ImsAccessPreference = 'concurrent' | 'wlan_preferred' | 'cellular_preferred'
+
+export interface ImsAccessDecision {
+  cellular_registers: boolean
+  wlan_registers: boolean
+  code: string
+}
+
+export interface ImsRegistrationPolicyStatus {
+  requested: ImsAccessPreference
+  effective: 'none' | 'single_registration' | 'concurrent'
+  concurrent_support: 'client_incomplete' | 'not_negotiated' | 'negotiated'
+  desired: ImsAccessDecision
+  applied: ImsAccessDecision
+  switch_deferred_for_call: boolean
+  cellular_last_response?: { require_outbound: boolean; flow_timer_seconds?: number | null } | null
+  wlan_last_response?: { require_outbound: boolean; flow_timer_seconds?: number | null } | null
+}
+
 export interface ImsSubsystemState {
   line_id: string
   registration: ImsRegistrationState
+  registration_policy?: ImsRegistrationPolicyStatus | null
   three_gpp: ThreeGppAccess
   non_three_gpp: NonThreeGppAccess
   voice: VoiceAccessSelection

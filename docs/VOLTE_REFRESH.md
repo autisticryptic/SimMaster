@@ -47,6 +47,55 @@ aliases, challenged REGISTER identity, original-AoR deregistration, and timeout
 retries. Real-carrier validation must still observe a complete natural refresh;
 a local mock 200 is not sufficient evidence that carrier timeouts are resolved.
 
+## Device validation and the dual-access comparison
+
+A bounded comparison on 2026-09-06 temporarily disabled VoWiFi, without changing
+VoLTE's refresh schedule or the configured `concurrent` preference. With
+89bd812 / v1.1.5 still deployed, the natural refresh at 06:31:36 received a
+protected direct 200 at 06:31:37 (0.573 seconds). The original outbound and
+inbound SAs were retained; the refresh counter advanced to one. VoWiFi was
+then re-enabled and the restoration watchdog was cancelled.
+
+That successful request still contained the old identity-mixing defect.
+Consequently identity preservation is a protocol correctness fix, **not yet
+proof of the root cause of the earlier dual-access timeouts**. OPTIONS silence
+is also insufficient evidence of a dead SA: OPTIONS remained unanswered in
+the same isolated session whose natural REGISTER refresh succeeded.
+
+The tested 98f9459 / v1.1.6 ARM64 Release was deployed with the original
+concurrent LTE/WLAN settings restored. LTE initial registration succeeded at
+06:42:33, but its natural refresh at 07:24:54 received no response on the wire;
+protected retries CSeq 4 through 12 also went unanswered. The registered AoR,
+Contact and old SA were preserved. Only after the lease expired did a new
+initial registration succeed at 07:36:11. This is expiration recovery, **not a
+successful refresh**. The next natural refresh at 08:22:56 was also unanswered.
+Passive metadata is scoped to the cellular interface because the decrypted
+inner VoWiFi SIP traffic is not cellular ESP.
+
+A bounded WLAN profile probe at 08:14 added `Supported: outbound`, retaining
+the same instance ID and the distinct WLAN `reg-id`. Its 200 response contained
+neither `Require: outbound` nor `Flow-Timer`. This did not establish outbound
+negotiation or repair coexistence. The temporary profile was removed at 08:19;
+normal profile selection, both enabled intents and the original `concurrent`
+preference were restored, and the rollback timer was cancelled.
+
+TS 24.229 5.1.1.2.1(f) requires a UE advertising multiple registration with
+`reg-id`, `+sip.instance` and `Supported: outbound` to inspect the successful
+response for `Require: outbound`. If absent, the UE must treat RFC 5626 multiple
+registration as unsupported and refrain from registering additional IMS flows
+for that private identity. The same clause describes replacement of the old
+contact and network-initiated deregistration in the non-outbound case. RFC 5626
+section 6 additionally requires first-hop/Path support. Distinct `reg-id` values
+and two initial 200 responses alone are therefore insufficient evidence that
+two independent registrations remain valid concurrently.
+
+The current coexistence implementation lacks this negotiated-capability gate.
+Binding replacement/old-SA removal is a plausible explanation of the device
+comparison, but carrier-side binding/SA removal has not been observed directly;
+a data-plane access interaction has not been excluded. Do not report this
+hypothesis as the proven timeout cause, blindly add an outbound token, silently
+change instance IDs, or permanently disable an access to claim refresh success.
+
 ## Correct transaction boundary
 
 TS 33.203 sections 7.4, 7.4.1a and 7.4.2a distinguish a protected refresh from a
@@ -91,3 +140,14 @@ refresh interval, not shortening it to 120 seconds. Inspect the entire
 SM1 -> 401 (if any) -> SM7 -> 200 exchange, actual UDP ports/ESP SPIs, CSeq,
 refresh counters and absence of timeout-triggered initial registration.
 Do not persist or log AKA material, raw authorization secrets or XFRM keys.
+
+
+## Coexistence admission correction (v1.1.7)
+
+The implementation and its limits are documented in
+[IMS_ACCESS_COEXISTENCE.md](IMS_ACCESS_COEXISTENCE.md). Both enable intents and
+`concurrent` preference are retained, but the effective mode is one coordinated
+registration until complete client/network outbound support exists. This avoids
+starting an unconfirmed competing registration; it does not reinterpret a
+protected refresh timeout as successful IPsec renegotiation. Device validation
+of this release must still observe the natural refresh on the selected LTE leg.

@@ -1871,6 +1871,14 @@ pub async fn connect_live_for_line(
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
 ) -> Result<VolteRuntimeStatus, VolteError> {
+    // Fail closed even if a future caller bypasses the API restore workflow.
+    // Existing protected refreshes deliberately do not pass this bring-up gate.
+    let registration_coordinator =
+        crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id);
+    let _registration_permit = registration_coordinator
+        .admit(crate::connectivity::core::ims_access::ImsAccess::Cellular)
+        .await
+        .map_err(|reason| VolteError::with_detail(reason, "cellular registration is parked"))?;
     // Connection, media and address-family intent are all supplied for this
     // physical line.
     let _advance = runtime.advance_guard().await;
@@ -2835,6 +2843,11 @@ async fn connect_family(
         let refresh_authorization =
             authenticator.refresh_authorization_after_success(&registration.response);
         log_volte_register_success_metadata("initial", variant, &artifacts);
+        crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id)
+            .observe_response(
+                crate::connectivity::core::ims_access::ImsAccess::Cellular,
+                &artifacts,
+            );
         let registered = RegisteredImsContext::from_artifacts(
             ImsRegistrationAccess::Volte,
             artifacts,
@@ -3859,6 +3872,11 @@ async fn refresh_live_registration(
             session.refresh_authorization = Some(authorization);
         }
         log_volte_register_success_metadata("refresh", variant, &artifacts);
+        crate::connectivity::core::ims_registration_coordinator::for_line(line_id)
+            .observe_response(
+                crate::connectivity::core::ims_access::ImsAccess::Cellular,
+                &artifacts,
+            );
         let registered = RegisteredImsContext::from_artifacts(
             ImsRegistrationAccess::Volte,
             artifacts,

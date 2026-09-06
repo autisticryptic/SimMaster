@@ -122,6 +122,9 @@ pub struct LineRuntime {
     /// Serving-cell identity owned by this physical line and shared by its
     /// VoLTE and VoWiFi REGISTER builders. No process-global lookup is used.
     pub ims_access_network: ImsAccessNetworkRuntime,
+    /// Cross-access registration admission; acquired before bearer/access locks.
+    pub ims_registration:
+        Arc<crate::connectivity::core::ims_registration_coordinator::ImsRegistrationCoordinator>,
     /// Serializes every PDP/bearer transition on this physical SIM line.
     /// Native data and IMS may use different device endpoints, while the
     /// baseband policy engine can still reject concurrent session transitions.
@@ -223,6 +226,9 @@ impl LineRuntime {
             volte,
             volte_live,
             ims_access_network,
+            ims_registration: crate::connectivity::core::ims_registration_coordinator::for_line(
+                &line_id,
+            ),
             bearer_operation_lock: Mutex::new(()),
             volte_connect_lock: Mutex::new(()),
             volte_retry_running: AtomicBool::new(false),

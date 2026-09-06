@@ -5,6 +5,10 @@ use super::sip_frame;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RegisterArtifacts {
     pub expires_seconds: Option<u32>,
+    /// Exact Require option-tag from the response, not Supported and not proof
+    /// that this client advertised/implemented the full outbound procedure.
+    pub outbound_required: bool,
+    pub flow_timer_seconds: Option<u32>,
     /// Ordered RFC 3608 service-route set, formatted so it can be copied into
     /// one `Route` header field without losing repeated header lines.
     pub service_route: Option<String>,
@@ -55,8 +59,23 @@ impl RegisterArtifacts {
             collect_associated_uris(&value, &mut associated_uris);
         }
 
+        let outbound_required = sip_frame::header_values(response, "Require")
+            .iter()
+            .flat_map(|value| value.split(','))
+            .any(|tag| tag.trim().eq_ignore_ascii_case("outbound"));
+        let timers = sip_frame::header_values(response, "Flow-Timer");
+        let flow_timer_seconds = match timers.as_slice() {
+            [value] => value
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|seconds| *seconds > 0),
+            _ => None,
+        };
         Self {
             expires_seconds,
+            outbound_required,
+            flow_timer_seconds,
             service_route,
             service_route_count,
             associated_uris,
@@ -185,6 +204,39 @@ fn split_sip_list(value: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn outbound_requires_exact_require_option_tag_including_repeated_headers() {
+        let response = b"SIP/2.0 200 OK\r\nRequire: path, sec-agree\r\nRequire: Outbound, gruu\r\nFlow-Timer: 25\r\n\r\n";
+        let artifacts = RegisterArtifacts::parse(response);
+        assert!(artifacts.outbound_required);
+        assert_eq!(artifacts.flow_timer_seconds, Some(25));
+        for response in [
+            "SIP/2.0 200 OK\r\nSupported: outbound\r\n\r\n",
+            "SIP/2.0 200 OK\r\nRequire: x-outbound, outbound-extra\r\n\r\n",
+            "SIP/2.0 200 OK\r\nContact: <sip:user@example>;reg-id=2\r\n\r\n",
+        ] {
+            assert!(!RegisterArtifacts::parse(response.as_bytes()).outbound_required);
+        }
+    }
+
+    #[test]
+    fn invalid_or_repeated_flow_timers_are_not_interpreted_as_keepalive_support() {
+        for headers in [
+            "",
+            "Flow-Timer: 0\r\n",
+            "Flow-Timer: -1\r\n",
+            "Flow-Timer: 20, 30\r\n",
+            "Flow-Timer: 4294967296\r\n",
+            "Flow-Timer: 20\r\nFlow-Timer: 30\r\n",
+        ] {
+            let response = format!("SIP/2.0 200 OK\r\n{headers}\r\n");
+            assert_eq!(
+                RegisterArtifacts::parse(response.as_bytes()).flow_timer_seconds,
+                None
+            );
+        }
+    }
 
     #[test]
     fn parses_registration_routing_identity_and_contact_expiry() {

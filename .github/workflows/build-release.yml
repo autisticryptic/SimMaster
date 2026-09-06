@@ -195,6 +195,11 @@ jobs:
           for filter in \
             connectivity::core::register::tests \
             connectivity::core::registration::tests \
+            connectivity::core::register_response::tests \
+            connectivity::core::ims_access::tests \
+            connectivity::core::ims_registration_coordinator::tests \
+            api::handlers::tests::coexistence \
+            connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
             connectivity::modems::ims::volte::channel::tests \
             connectivity::modems::ims::volte::ipsec::tests \
             connectivity::modems::ims::volte::live::tests::refresh \

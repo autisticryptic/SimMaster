@@ -4532,36 +4532,18 @@ async fn send_sms_over_vowifi_path(
     }
     let mut ready = scope.runtime().snapshot().await.readiness().sms_ready;
     if !ready {
-        let airplane_enabled = scope.airplane_mode_enabled(app).await;
-        if airplane_enabled {
-            scope
-                .runtime()
-                .refresh_identity_with_timeout(
-                    &app.dbus_conn,
-                    std::time::Duration::from_secs(VOWIFI_SIM_IDENTITY_TIMEOUT_SECS),
-                )
-                .await;
-            ready = scope
-                .runtime()
-                .connect_live_with_stage_timeout(
-                    Some(&app.database),
-                    std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
-                )
-                .await
-                .readiness()
-                .sms_ready;
-        } else {
-            ready = connect_vowifi_on_line(
-                app,
-                scope,
-                VOWIFI_MANUAL_CONNECT_ATTEMPTS,
-                std::time::Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
-                false,
-            )
-            .await
-            .readiness
-            .sms_ready;
-        }
+        // Airplane-mode SMS must use the same cross-access gate too; the
+        // universal connect path already preserves the radio-off preference.
+        ready = connect_vowifi_on_line(
+            app,
+            scope,
+            VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+            Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+            false,
+        )
+        .await
+        .readiness
+        .sms_ready;
     }
     if !ready {
         return Err("sms_ready_not_reached".to_string());
@@ -4760,15 +4742,16 @@ async fn ensure_vowifi_voice_ready(app: &AppState, line_id: &str) -> Result<(), 
     }
     let mut voice_ready = scope.runtime().snapshot().await.readiness().voice_ready;
     if !voice_ready {
-        voice_ready = scope
-            .runtime()
-            .connect_live_with_stage_timeout(
-                Some(&app.database),
-                std::time::Duration::from_secs(VOWIFI_LIVE_STAGE_TIMEOUT_SECS),
-            )
-            .await
-            .readiness()
-            .voice_ready;
+        voice_ready = connect_vowifi_on_line(
+            app,
+            &scope,
+            VOWIFI_MANUAL_CONNECT_ATTEMPTS,
+            Duration::from_secs(VOWIFI_MANUAL_CONNECT_RETRY_DELAY_SECS),
+            false,
+        )
+        .await
+        .readiness
+        .voice_ready;
     }
     if !voice_ready {
         return Err("vowifi_voice_ready_not_reached".to_string());
@@ -6357,8 +6340,9 @@ use crate::services::orchestrator::ims_access::{
 ///
 /// Reports IMS registration, the 3GPP access path, the non-3GPP (Wi-Fi/ePDG)
 /// access path and the current voice access selection as four separate things.
-/// Both access paths can be registered at the same time; which one carries voice
-/// is a policy decision over them, not a property of either.
+/// Registration observations and permission are distinct: a dual snapshot does
+/// not prove outbound support. The response includes desired/applied admission
+/// and whether a real access switch is deferred to protect a call.
 pub async fn get_line_ims_status_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
@@ -6424,19 +6408,24 @@ pub async fn get_line_ims_status_handler(
             .as_ref()
             .and_then(|ims| ims.pcscf)
             .map(str::to_string),
-        registered: vowifi.readiness.ims_registered,
+        registered: crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id).is_available()
+            && crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(&line_id).await,
         degraded_reason: vowifi.degraded_reason.clone(),
         media_gateway_ready: line
             .voice_access
             .media_gateway_ready(AccessPathKind::Vowifi),
     };
 
+    let desired = line_ims_access_decision(&app, &line).await;
+    let mut state = ImsSubsystemState::build(line_id.as_str(), &policy, &three_gpp, &non_three_gpp);
+    state.registration_policy = Some(
+        line.ims_registration
+            .status(profile.ims_access_preference, desired),
+    );
+
     (
         StatusCode::OK,
-        Json(ApiResponse::success_with_message(
-            "ok",
-            ImsSubsystemState::build(line_id.as_str(), &policy, &three_gpp, &non_three_gpp),
-        )),
+        Json(ApiResponse::success_with_message("ok", state)),
     )
 }
 
@@ -6450,7 +6439,10 @@ fn vowifi_restore_reason_is_soft_retry(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| {
         matches!(
             reason,
-            "vowifi_connect_already_running" | "live_connect_already_running"
+            "vowifi_connect_already_running"
+                | "live_connect_already_running"
+                | "ims_access_transition_in_progress"
+                | "ims_access_registration_parked"
         ) || reason.starts_with("vowifi_registration_refresh_retry_pending")
             || reason.starts_with("vowifi_registration_refresh_rebuild_pending")
     })
@@ -6492,12 +6484,31 @@ fn spawn_pending_vowifi_rebuild(app: &AppState, line_id: &str) {
             return;
         }
         let scope = VowifiScope::for_line(line);
-        let _ = reset_vowifi_runtime_for_scope(
-            &app,
-            &scope,
-            "vowifi_registration_refresh_rebuild_after_call",
-        )
-        .await;
+        {
+            let _transition = scope.line.ims_registration.transition_lock.lock().await;
+            if line_has_call_blocking_ims_switch(&app, &line_id).await
+                || !apply_line_ims_access_policy_locked(
+                    &app,
+                    scope.line(),
+                    Some(crate::connectivity::core::ims_access::ImsAccess::Wlan),
+                )
+                .await
+            {
+                return;
+            }
+            scope
+                .line
+                .ims_registration
+                .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+                .await;
+            let _connect = scope.line.vowifi_connect_lock.lock().await;
+            let _ = reset_vowifi_runtime_for_scope(
+                &app,
+                &scope,
+                "vowifi_registration_refresh_rebuild_after_call",
+            )
+            .await;
+        }
         let _ = connect_vowifi_on_line(
             &app,
             &scope,
@@ -6692,7 +6703,14 @@ async fn stop_vowifi_and_restore_cellular(
     scope: &VowifiScope,
     reason: &str,
 ) -> VowifiStatusResponse {
+    let _transition = scope.line.ims_registration.transition_lock.lock().await;
     let _ = disable_vowifi_connection_for_scope(app, scope);
+    scope
+        .line
+        .ims_registration
+        .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+        .await;
+    let _connect = scope.line.vowifi_connect_lock.lock().await;
     restore_cellular_and_reset_vowifi(app, scope, reason).await
 }
 
@@ -6801,19 +6819,6 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
     let Some(_claim) = VowifiRestoreClaim::acquire(&scope) else {
         return;
     };
-    if workflow.is_profile_switch() {
-        persist_optional_vowifi_restore_phase(
-            &app,
-            &workflow,
-            RestorePhase::TeardownVowifi,
-            Instant::now(),
-            false,
-            false,
-            None,
-            0,
-        );
-        let _ = reset_vowifi_runtime_for_scope(&app, &scope, workflow.start_reason).await;
-    }
 
     if !vowifi_restore_intent_enabled(&app, &workflow) {
         persist_optional_vowifi_restore_phase(
@@ -6841,13 +6846,52 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
         crate::connectivity::core::ims_access::ImsAccess::Wlan,
     )
     .await;
-    if !wlan_decision.permits(crate::connectivity::core::ims_access::ImsAccess::Wlan) {
+    if !wlan_decision.permits(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+        && !crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(
+            scope.line_id(),
+        )
+        .await
+    {
         tracing::debug!(
             line_id = %workflow.line_id,
             reason = wlan_decision.code,
             "Skipping WiFi Calling restore: IMS access policy does not permit the WLAN leg"
         );
         return;
+    }
+
+    if workflow.is_profile_switch() {
+        let _transition = scope.line.ims_registration.transition_lock.lock().await;
+        if line_has_call_blocking_ims_switch(&app, scope.line_id()).await {
+            scope.line.ims_registration.defer_switch_for_call();
+            return;
+        }
+        if !apply_line_ims_access_policy_locked(
+            &app,
+            scope.line(),
+            Some(crate::connectivity::core::ims_access::ImsAccess::Wlan),
+        )
+        .await
+        {
+            return;
+        }
+        scope
+            .line
+            .ims_registration
+            .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+            .await;
+        let _connect = scope.line.vowifi_connect_lock.lock().await;
+        persist_optional_vowifi_restore_phase(
+            &app,
+            &workflow,
+            RestorePhase::TeardownVowifi,
+            Instant::now(),
+            false,
+            false,
+            None,
+            0,
+        );
+        let _ = reset_vowifi_runtime_for_scope(&app, &scope, workflow.start_reason).await;
     }
 
     persist_optional_vowifi_restore_phase(
@@ -6954,6 +6998,21 @@ async fn run_vowifi_restore_workflow(app: AppState, workflow: VowifiRestoreWorkf
     // exhausted. The outer 10-second scheduler must not create a fresh budget
     // forever. A config edit, explicit off/on, profile switch, or process
     // restart clears the marker and permits a new bounded batch.
+    let _transition = scope.line.ims_registration.transition_lock.lock().await;
+    if crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(
+        scope.line_id(),
+    )
+    .await
+        || line_has_call_blocking_ims_switch(&app, scope.line_id()).await
+    {
+        return;
+    }
+    scope
+        .line
+        .ims_registration
+        .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+        .await;
+    let _connect = scope.line.vowifi_connect_lock.lock().await;
     let _ =
         restore_cellular_and_reset_vowifi(&app, &scope, VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON).await;
 }
@@ -7241,6 +7300,23 @@ async fn connect_vowifi_on_line(
 ) -> VowifiStatusResponse {
     if !scope.is_present() {
         return disabled_vowifi_status("vowifi_line_not_present");
+    }
+    let Ok(_transition_guard) = scope.line.ims_registration.transition_lock.try_lock() else {
+        let mut status = scope.status().await;
+        status.degraded_reason = Some("ims_access_transition_in_progress".to_string());
+        return status;
+    };
+    if !apply_line_ims_access_policy_locked(
+        app,
+        scope.line(),
+        Some(crate::connectivity::core::ims_access::ImsAccess::Wlan),
+    )
+    .await
+    {
+        let mut status = scope.status().await;
+        status.degraded_reason = Some("ims_access_registration_parked".to_string());
+        persist_vowifi_runtime_snapshot(app, scope.line_id(), &status);
+        return status;
     }
     let operator_ready =
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(scope.line_id())
@@ -7719,8 +7795,17 @@ pub async fn set_vowifi_line_config_handler(
         }
     };
     let scope = VowifiScope::for_line(Arc::clone(&line));
-    crate::connectivity::modems::ims::vowifi::live::forget_live_network_overrides(&line_id);
-    let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_config_updated").await;
+    {
+        let _transition = scope.line.ims_registration.transition_lock.lock().await;
+        scope
+            .line
+            .ims_registration
+            .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+            .await;
+        let _connect = scope.line.vowifi_connect_lock.lock().await;
+        crate::connectivity::modems::ims::vowifi::live::forget_live_network_overrides(&line_id);
+        let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_config_updated").await;
+    }
     if saved.enabled && saved.vowifi.enabled && line.binding().present {
         let connect_app = app.clone();
         tokio::spawn(async move {
@@ -7823,6 +7908,13 @@ pub async fn set_vowifi_line_connection_handler(
             .await;
         });
     } else {
+        let _transition = scope.line.ims_registration.transition_lock.lock().await;
+        scope
+            .line
+            .ims_registration
+            .park(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+            .await;
+        let _connect = scope.line.vowifi_connect_lock.lock().await;
         let _ = reset_vowifi_runtime_for_scope(&app, &scope, "vowifi_line_disabled").await;
     }
     (
@@ -8392,6 +8484,10 @@ pub async fn set_volte_line_connection_handler(
         start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
         Ok(line.volte.status().await)
     } else {
+        let _transition = line.ims_registration.transition_lock.lock().await;
+        line.ims_registration
+            .park(crate::connectivity::core::ims_access::ImsAccess::Cellular)
+            .await;
         let _bearer_guard = line.bearer_operation_lock.lock().await;
         let _guard = line.volte_connect_lock.lock().await;
         Ok(
@@ -8730,17 +8826,9 @@ async fn line_device_identity_spoofed(app: &AppState, line_id: &str) -> bool {
         == OverrideSource::SimOverride
 }
 
-/// Which IMS access legs may hold a registration for this line right now.
-///
-/// See `connectivity::core::ims_access` for the standards reasoning. Two input
-/// choices are worth stating explicitly:
-///
-/// * `wlan_available` means the WLAN leg is *actually* up or coming up, not
-///   merely configured. Treating "enabled" as "available" would let a preferred
-///   but unreachable Wi-Fi leg hold the cellular leg down and leave the line
-///   with no registration at all.
-/// * `cellular_available` requires a present modem binding and no airplane
-///   mode, matching the existing VoLTE gates.
+/// Registration eligibility includes bounded recovery and full live leases.
+/// A present modem alone is not a usable IMS access, and a refresh deadline
+/// does not make the currently registered access disappear.
 async fn line_ims_access_decision(
     app: &AppState,
     line: &crate::services::line_registry::LineRuntime,
@@ -8748,50 +8836,210 @@ async fn line_ims_access_decision(
     line_ims_access_decision_assuming(app, line, None).await
 }
 
-/// [`line_ims_access_decision`], optionally treating one leg as available.
-///
-/// `assume_available` exists because a bring-up gate cannot ask "is this leg
-/// already up?" -- that is what it is about to establish. Evaluating the policy
-/// with the target leg pinned available answers the question that gate actually
-/// has: *if* this leg came up, would the policy let it hold a registration?
-/// Without this, `WlanPreferred` would refuse to start WLAN (it is not up yet),
-/// fall back to cellular, and the preferred leg could never be reached.
+/// An explicit bring-up may retry an exhausted target, but cannot bypass its
+/// enabled intent, identity rule, or an already selected valid registration.
 async fn line_ims_access_decision_assuming(
     app: &AppState,
     line: &crate::services::line_registry::LineRuntime,
     assume_available: Option<crate::connectivity::core::ims_access::ImsAccess>,
 ) -> crate::connectivity::core::ims_access::ImsAccessDecision {
-    use crate::connectivity::core::ims_access::{decide, ImsAccess, ImsAccessInputs};
+    use crate::connectivity::core::ims_access::{
+        decide, ImsAccess, ImsAccessInputs, CURRENT_CONCURRENT_SUPPORT,
+    };
+    use crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState;
 
     let binding = line.binding();
-    let line_id = binding.line_id.clone();
-    let profile = app.config_manager.get_line_profile(&line_id);
-    let wlan_up =
-        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
-            .is_available()
-            || line.vowifi_restore_in_progress();
-
+    let line_id = &binding.line_id;
+    let profile = app.config_manager.get_line_profile(line_id);
+    let cellular = line.volte.snapshot().await;
+    let wlan = line.vowifi.snapshot().await;
+    let wlan_registered =
+        crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(line_id).is_available()
+        && crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(line_id).await;
+    let cellular_retryable = !cellular.manual_retry_available
+        && cellular.recovery_state != VolteRecoveryState::Exhausted
+        && !line.baseband_wedge_permanent()
+        && line.baseband_wedge_remaining().is_none();
+    let radio_ready = matches!(
+        binding.state.as_str(),
+        "registered" | "connected" | "connecting"
+    );
     decide(ImsAccessInputs {
-        cellular_enabled: profile.enabled && profile.volte_connection_enabled,
+        cellular_enabled: profile.enabled
+            && profile.volte_connection_enabled
+            && !profile.airplane_mode_enabled,
         wlan_enabled: profile.enabled && profile.vowifi.enabled,
-        cellular_available: (binding.present && !profile.airplane_mode_enabled)
-            || assume_available == Some(ImsAccess::Cellular),
-        wlan_available: wlan_up || assume_available == Some(ImsAccess::Wlan),
-        device_identity_spoofed: line_device_identity_spoofed(app, &line_id).await,
+        cellular_available: binding.present
+            && binding_has_baseband(&binding)
+            && !profile.airplane_mode_enabled
+            && !line.baseband_wedge_permanent()
+            && ((radio_ready && cellular_retryable)
+                || assume_available == Some(ImsAccess::Cellular)),
+        // Give a preferred/cold WLAN access one bounded attempt even before its
+        // ePDG exists. Exhaustion then releases eligibility to the fallback.
+        wlan_available: binding.present
+            && (!vowifi_auto_restore_is_exhausted(wlan.degraded_reason.as_deref())
+                || assume_available == Some(ImsAccess::Wlan)),
+        cellular_registered: cellular.registered(),
+        wlan_registered,
+        device_identity_spoofed: line_device_identity_spoofed(app, line_id).await,
         preference: profile.ims_access_preference,
+        concurrent_support: CURRENT_CONCURRENT_SUPPORT,
     })
 }
 
-/// Whether the access policy would let `access` hold a registration if its
-/// bring-up succeeded. This is the form the restore gates want; see
-/// [`line_ims_access_decision_assuming`] for why they cannot use the plain
-/// observed-state decision.
 async fn line_ims_access_permits_bringup(
     app: &AppState,
     line: &crate::services::line_registry::LineRuntime,
     access: crate::connectivity::core::ims_access::ImsAccess,
 ) -> crate::connectivity::core::ims_access::ImsAccessDecision {
     line_ims_access_decision_assuming(app, line, Some(access)).await
+}
+
+async fn line_has_call_blocking_ims_switch(app: &AppState, line_id: &str) -> bool {
+    let calls = app.active_calls.lock().await;
+    calls.values().any(|call| {
+        call.line_id == line_id
+            && crate::connectivity::core::ims_access::call_blocks_access_switch(&call.state)
+    })
+}
+
+/// Policy parking releases resources, not an exhausted recovery budget. A
+/// generic disconnect resets that budget; doing so here would immediately make
+/// the failed primary eligible again and steal admission from its fallback.
+fn preserve_exhausted_volte_recovery_after_policy_park(
+    previous: &crate::connectivity::modems::ims::volte::runtime::VolteSnapshot,
+    parked: &mut crate::connectivity::modems::ims::volte::runtime::VolteSnapshot,
+) {
+    use crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState;
+    if !previous.registered()
+        && (previous.manual_retry_available
+            || previous.recovery_state == VolteRecoveryState::Exhausted)
+    {
+        parked.recovery_state = previous.recovery_state;
+        parked.manual_retry_available = previous.manual_retry_available;
+        parked.retry_attempt = previous.retry_attempt;
+        parked.retry_max = previous.retry_max;
+        parked.next_retry_at = previous.next_retry_at.clone();
+        parked.last_error = previous.last_error.clone();
+        parked.last_failure_at = previous.last_failure_at.clone();
+    }
+}
+
+/// Caller owns the per-line transition lock BEFORE taking any bearer/access
+/// lock. Close REGISTER admission, drain in-flight exchanges, then release the
+/// opposite path before authorizing a replacement. Never change enabled flags.
+async fn apply_line_ims_access_policy_locked(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    target: Option<crate::connectivity::core::ims_access::ImsAccess>,
+) -> bool {
+    use crate::connectivity::core::ims_access::{ImsAccess, ImsAccessDecision};
+    let line_id = line.binding().line_id;
+    let desired = line_ims_access_decision_assuming(app, line, target).await;
+    let requested = app
+        .config_manager
+        .get_line_profile(&line_id)
+        .ims_access_preference;
+    let previous = line.ims_registration.status(requested, desired).applied;
+    let cellular = line.volte.snapshot().await;
+    let wlan = line.vowifi.snapshot().await;
+    let cellular_up = cellular.registered() || cellular.bearer_up();
+    let wlan_up = wlan.readiness().ike_ready
+        || wlan.readiness().esp_ready
+        || crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(&line_id)
+            .is_available();
+    let release = desired.legs_to_release(cellular_up, wlan_up);
+    if !release.is_empty() && line_has_call_blocking_ims_switch(app, &line_id).await {
+        line.ims_registration.defer_switch_for_call();
+        // Preserve refresh on the old, still-admitted leg while a preference
+        // change waits for the last call to finish. Do not admit the new leg.
+        return target.is_none_or(|access| previous.permits(access));
+    }
+    if !release.is_empty() {
+        line.ims_registration
+            .publish(ImsAccessDecision::none("ims_access_transition_in_progress"))
+            .await;
+        // Calls may have arrived while an in-flight REGISTER was draining.
+        if line_has_call_blocking_ims_switch(app, &line_id).await {
+            line.ims_registration.publish(previous).await;
+            line.ims_registration.defer_switch_for_call();
+            return target.is_none_or(|access| previous.permits(access));
+        }
+        for access in &release {
+            match access {
+                ImsAccess::Cellular => {
+                    let _bearer = line.bearer_operation_lock.lock().await;
+                    let _connect = line.volte_connect_lock.lock().await;
+                    if line_has_call_blocking_ims_switch(app, &line_id).await {
+                        line.ims_registration.publish(previous).await;
+                        line.ims_registration.defer_switch_for_call();
+                        return target.is_none_or(|access| previous.permits(access));
+                    }
+                    crate::connectivity::modems::ims::volte::live::disconnect_live_for_line(
+                        &line.volte_live,
+                        &line.volte,
+                        "ims_access_registration_parked",
+                    )
+                    .await;
+                    line.volte
+                        .update(|parked| {
+                            preserve_exhausted_volte_recovery_after_policy_park(&cellular, parked);
+                        })
+                        .await;
+                }
+                ImsAccess::Wlan => {
+                    let _connect = line.vowifi_connect_lock.lock().await;
+                    if line_has_call_blocking_ims_switch(app, &line_id).await {
+                        line.ims_registration.publish(previous).await;
+                        line.ims_registration.defer_switch_for_call();
+                        return target.is_none_or(|access| previous.permits(access));
+                    }
+                    // Only this IMS/ePDG path is parked. Do not flip radio or
+                    // data configuration, and do not touch the other SIM.
+                    let reason =
+                        if vowifi_auto_restore_is_exhausted(wlan.degraded_reason.as_deref()) {
+                            VOWIFI_AUTO_RESTORE_EXHAUSTED_REASON
+                        } else {
+                            "ims_access_registration_parked"
+                        };
+                    reset_vowifi_runtime_for_scope(
+                        app,
+                        &VowifiScope::for_line(Arc::clone(line)),
+                        reason,
+                    )
+                    .await;
+                }
+            }
+        }
+    }
+    line.ims_registration.publish(desired).await;
+    if previous != desired || !release.is_empty() {
+        info!(line_id, requested = requested.as_str(), effective = desired.effective_mode(),
+            reason = desired.code, released = ?release,
+            "IMS registration access policy reconciled (enabled intents unchanged)");
+    }
+    target.is_none_or(|access| desired.permits(access))
+}
+
+async fn reconcile_line_ims_access_policy(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+) {
+    let Ok(_transition) = line.ims_registration.transition_lock.try_lock() else {
+        return;
+    };
+    apply_line_ims_access_policy_locked(app, line, None).await;
+}
+
+fn spawn_line_ims_access_reconcile(
+    app: &AppState,
+    line: Arc<crate::services::line_registry::LineRuntime>,
+) {
+    let app = app.clone();
+    tokio::spawn(async move {
+        reconcile_line_ims_access_policy(&app, &line).await;
+    });
 }
 
 async fn sync_line_video_capabilities(app: &AppState) {
@@ -9673,6 +9921,9 @@ pub fn spawn_vowifi_auto_restore(app: AppState) {
                             .enabled
                 })
                 .collect::<Vec<_>>();
+            for line in &present_lines {
+                spawn_line_ims_access_reconcile(&app, Arc::clone(line));
+            }
             for line in present_lines.into_iter().filter(|line| {
                 line_vowifi_restore_enabled(
                     &app.config_manager.get_line_profile(&line.binding().line_id),
@@ -9716,6 +9967,15 @@ async fn schedule_vowifi_auto_restore(
     {
         return;
     }
+    let decision = line_ims_access_decision(app, &line).await;
+    if !decision.permits(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+        && !crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(
+            &line_id,
+        )
+        .await
+    {
+        return;
+    }
     let workflow = VowifiRestoreWorkflow::boot_auto_restore(config, line_id);
     let attempts = app
         .config_manager
@@ -9756,7 +10016,16 @@ async fn start_line_volte_restore(
     // outright, and a single-registration preference parks it behind WLAN. Both
     // are configuration the user chose, so refusing here is not a failure --
     // hence debug rather than warn.
-    let decision = line_ims_access_decision(&app, &line).await;
+    let decision = if source == "automatic" {
+        line_ims_access_decision(&app, &line).await
+    } else {
+        line_ims_access_permits_bringup(
+            &app,
+            &line,
+            crate::connectivity::core::ims_access::ImsAccess::Cellular,
+        )
+        .await
+    };
     if !decision.permits(crate::connectivity::core::ims_access::ImsAccess::Cellular) {
         tracing::debug!(
             line_id = %line.binding().line_id,
@@ -10066,6 +10335,18 @@ async fn run_line_volte_restore_batch(
         LineModemWait::Deferred => return,
     }
 
+    let _transition_guard = line.ims_registration.transition_lock.lock().await;
+    if line.volte.generation() != batch_generation
+        || !apply_line_ims_access_policy_locked(
+            app,
+            line,
+            Some(crate::connectivity::core::ims_access::ImsAccess::Cellular),
+        )
+        .await
+    {
+        return;
+    }
+
     let line_id = line.binding().line_id;
     let line_profile = app.config_manager.get_line_profile(&line_id);
     let restore_policy = line_profile.volte_auto_restore;
@@ -10080,7 +10361,15 @@ async fn run_line_volte_restore_batch(
         .await;
 
     for (candidate_offset, candidate) in candidates.iter().enumerate() {
-        if line.volte.generation() != batch_generation {
+        if line.volte.generation() != batch_generation
+            || !line_ims_access_permits_bringup(
+                app,
+                line,
+                crate::connectivity::core::ims_access::ImsAccess::Cellular,
+            )
+            .await
+            .permits(crate::connectivity::core::ims_access::ImsAccess::Cellular)
+        {
             return;
         }
         if candidate_offset > 0 {
@@ -10742,27 +11031,28 @@ pub async fn set_ims_access_preference_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<ImsAccessPreferencePayload>,
 ) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
-    if resolve_control_line(&app, &line_id).await.is_none() {
+    let Some(line) = resolve_control_line(&app, &line_id).await else {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("line_not_found")),
         );
-    }
+    };
     match app
         .config_manager
         .set_line_ims_access_preference(&line_id, payload.preference)
     {
-        // Only the stored preference changes here. Legs are not torn down or
-        // brought up inline: the restore workflows consult the policy on their
-        // next pass, and the per-line enable intent is left exactly as the user
-        // set it.
-        Ok(preference) => (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Saved",
-                ImsAccessPreferencePayload { preference },
-            )),
-        ),
+        Ok(preference) => {
+            // The transition is asynchronous and call-aware. Both enabled
+            // intents remain unchanged; status reports desired vs applied.
+            spawn_line_ims_access_reconcile(&app, line);
+            (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Saved; IMS access reconciliation queued",
+                    ImsAccessPreferencePayload { preference },
+                )),
+            )
+        }
         Err(err) => (
             StatusCode::OK,
             Json(ApiResponse::error(format!("Failed: {err}"))),
@@ -13584,6 +13874,66 @@ pub async fn delete_e911_address_handler(
 mod tests {
     use super::*;
     use crate::hardware::cellular::modem_manager::SimIdentity;
+
+    #[test]
+    fn coexistence_parking_preserves_exhausted_cellular_budget_for_wlan_fallback() {
+        use crate::connectivity::core::ims_access::{decide, ImsAccessInputs, ImsAccessPreference};
+        use crate::connectivity::modems::ims::volte::runtime::{VolteRecoveryState, VolteSnapshot};
+        let mut failed = VolteSnapshot::default();
+        failed.recovery_state = VolteRecoveryState::Exhausted;
+        failed.manual_retry_available = true;
+        failed.retry_attempt = 3;
+        failed.retry_max = 3;
+        failed.last_error = Some("volte_profile_attempts_exhausted".to_string());
+        let mut parked = VolteSnapshot::default();
+        preserve_exhausted_volte_recovery_after_policy_park(&failed, &mut parked);
+        assert_eq!(parked.recovery_state, VolteRecoveryState::Exhausted);
+        assert!(parked.manual_retry_available);
+        assert_eq!(parked.retry_attempt, 3);
+        assert_eq!(parked.last_error, failed.last_error);
+        for preference in [
+            ImsAccessPreference::Concurrent,
+            ImsAccessPreference::CellularPreferred,
+        ] {
+            let decision = decide(ImsAccessInputs {
+                cellular_enabled: true,
+                wlan_enabled: true,
+                cellular_available: !parked.manual_retry_available
+                    && parked.recovery_state != VolteRecoveryState::Exhausted,
+                wlan_available: true,
+                preference,
+                ..Default::default()
+            });
+            assert!(!decision.cellular_registers);
+            assert!(decision.wlan_registers);
+        }
+    }
+
+    #[test]
+    fn coexistence_parking_a_healthy_cellular_leg_does_not_exhaust_it() {
+        use crate::connectivity::modems::ims::volte::runtime::{
+            VoltePhase, VolteRecoveryState, VolteSnapshot,
+        };
+        let mut healthy = VolteSnapshot::default();
+        healthy.phase = VoltePhase::Registered;
+        healthy.recovery_state = VolteRecoveryState::Registered;
+        let mut parked = VolteSnapshot::default();
+        preserve_exhausted_volte_recovery_after_policy_park(&healthy, &mut parked);
+        assert_eq!(parked.recovery_state, VolteRecoveryState::Idle);
+        assert!(!parked.manual_retry_available);
+        assert!(!parked.registered());
+    }
+
+    #[test]
+    fn coexistence_policy_waits_do_not_exhaust_vowifi_recovery() {
+        for reason in [
+            "ims_access_transition_in_progress",
+            "ims_access_registration_parked",
+        ] {
+            assert!(vowifi_restore_reason_is_soft_retry(Some(reason)));
+            assert!(!vowifi_auto_restore_is_exhausted(Some(reason)));
+        }
+    }
 
     #[test]
     fn vowifi_refresh_rebuild_protects_only_active_or_held_calls() {

@@ -3,14 +3,12 @@
 //! # Why this module exists
 //!
 //! IMS, the access paths that reach it, and the access chosen to carry voice are
-//! four different things. Collapsing them into one `ims_registered` flag (or into
-//! "VoLTE mode" vs "VoWiFi mode") produces two concrete bugs:
-//!
-//!   * bringing up Wi-Fi calling tears down a perfectly good LTE registration, so
-//!     a Wi-Fi drop leaves the line with no voice path at all until a full
-//!     re-registration completes;
-//!   * the voice router has nothing to fall back to, because only one leg is ever
-//!     registered at a time.
+//! four different things. A single `ims_registered` flag cannot explain which
+//! access owns a valid registration or is eligible for voice. This observational
+//! model can represent two registrations, but it does not authorize creating
+//! them: admission requires a complete, negotiated multi-flow implementation.
+//! With an unconfirmed/incomplete client, the coordinator keeps one registration
+//! and switching to the standby access requires a new registration.
 //!
 //! 3GPP models these separately (TS 23.402 access selection, TS 24.229 IMS
 //! registration), and so does this module:
@@ -37,8 +35,10 @@
 //!
 //! # Invariants this encodes
 //!
-//!   * A path may be `Registered` while the other path is also `Registered`.
-//!     Both legs coexisting is the normal case, not a conflict.
+//!   * Observations can describe both paths as `Registered`, but that is not
+//!     permission to establish two independent registrations. The admission
+//!     policy requires complete local/network outbound support; otherwise it
+//!     coordinates one registration and parks the other enabled access.
 //!   * Changing the voice access does **not** change [`ImsRegistrationState`].
 //!     A VoLTE -> VoWiFi switch in idle is a re-selection, not a re-registration.
 //!   * A path going down only clears *its own* entry in `registered_over`.
@@ -270,10 +270,9 @@ pub struct NonThreeGppAccess {
 /// IMS registration state, expressed as the set of accesses currently holding a
 /// live registration.
 ///
-/// This is deliberately a set and not a boolean. A UE registered over both the
-/// 3GPP and the non-3GPP access is a normal, supported state; a single flag
-/// cannot represent it, and code that uses one inevitably starts tearing one
-/// registration down to keep the flag meaningful.
+/// This is deliberately a set and not a boolean. Observing both accesses does
+/// not establish that their bindings coexist at the registrar. Consult the
+/// separate registration admission policy before starting another flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct ImsRegistrationState {
     pub registered_over: Vec<AccessPathKind>,
@@ -311,6 +310,11 @@ pub struct VoiceAccessSelection {
 pub struct ImsSubsystemState {
     pub line_id: String,
     pub registration: ImsRegistrationState,
+    /// Desired versus applied access admission; absent for pure observations.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_policy: Option<
+        crate::connectivity::core::ims_registration_coordinator::ImsRegistrationPolicyStatus,
+    >,
     pub three_gpp: ThreeGppAccess,
     pub non_three_gpp: NonThreeGppAccess,
     pub voice: VoiceAccessSelection,
@@ -375,6 +379,7 @@ impl ImsSubsystemState {
         Self {
             line_id: line_id.into(),
             registration: ImsRegistrationState { registered_over },
+            registration_policy: None,
             three_gpp: ThreeGppAccess {
                 path: three_gpp_path,
                 radio_available: three_gpp.radio_available,

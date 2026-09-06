@@ -3727,6 +3727,15 @@ async fn run_live_ims_register_until(
     profile: &'static CarrierProfile,
     access_network: &ImsAccessNetworkRuntime,
 ) -> Result<(), LiveStageError> {
+    // Every REGISTER path (restore, SMS, voice and stage diagnostics) shares
+    // admission with LTE. Hold it through the exchange to serialize a policy
+    // switch against an already-running registration.
+    let registration_coordinator =
+        crate::connectivity::core::ims_registration_coordinator::for_line(line_id);
+    let _registration_permit = registration_coordinator
+        .admit(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+        .await
+        .map_err(live_stage_error)?;
     // A refresh is identified by an existing lease for the same profile. The
     // lease may already be past its local refresh deadline, so this check must
     // not use `cached_live_ims_register_ready` (which intentionally rejects an
@@ -3905,6 +3914,11 @@ async fn attempt_live_ims_registration(
     let contact_expiry_ambiguous = artifacts.contact_expiry_ambiguous;
     let wildcard_contact_present = artifacts.wildcard_contact_present;
     if parsed.status_code == 200 {
+        crate::connectivity::core::ims_registration_coordinator::for_line(line_id)
+            .observe_response(
+                crate::connectivity::core::ims_access::ImsAccess::Wlan,
+                &artifacts,
+            );
         log_vowifi_register_binding_diagnostics(&artifacts);
     }
     let registered = RegisteredImsContext::from_artifacts(
@@ -4435,8 +4449,8 @@ async fn cached_live_ims_register_ready(line_id: &str, profile: &'static Carrier
         .is_some_and(|ready| ready.expires_at > Instant::now())
 }
 
-/// The REGISTER cache expires at the lease's refresh deadline (11/12 of the
-/// network lifetime), before the installed operator channel reaches its hard
+/// The REGISTER cache expires at the lease's proactive refresh deadline,
+/// before the installed operator channel reaches its hard
 /// expiry. The restore scheduler uses this signal to replace the registration
 /// without creating an avoidable signaling gap every lease interval.
 pub(crate) async fn live_ims_registration_refresh_due_for_line(line_id: &str) -> bool {
@@ -4445,6 +4459,56 @@ pub(crate) async fn live_ims_registration_refresh_due_for_line(line_id: &str) ->
         .await
         .get(line_id)
         .is_none_or(|ready| ready.expires_at <= Instant::now())
+}
+
+/// A refresh becoming due does not release the registered access. Use the
+/// full lease on the monotonic clock, not cached_live_ims_register_ready.
+pub(crate) async fn live_ims_registration_valid_for_line(line_id: &str) -> bool {
+    ims_register_ready_cache()
+        .lock()
+        .await
+        .get(line_id)
+        .is_some_and(|ready| {
+            registration_lease_still_valid(
+                ready.expires_at,
+                ready.registration.lease,
+                Instant::now(),
+            )
+        })
+}
+
+fn registration_lease_still_valid(
+    refresh_at: Instant,
+    lease: crate::connectivity::core::registration::RegistrationLease,
+    now: Instant,
+) -> bool {
+    refresh_at
+        .checked_add(lease.expires_after.saturating_sub(lease.refresh_after))
+        .is_some_and(|expires_at| now < expires_at)
+}
+
+#[cfg(test)]
+mod coexistence_lease_tests {
+    use super::*;
+
+    #[test]
+    fn refresh_deadline_is_not_registration_expiry() {
+        let lease = crate::connectivity::core::registration::RegistrationLease::from_expires(3600);
+        let refresh_at = Instant::now();
+        assert!(registration_lease_still_valid(
+            refresh_at, lease, refresh_at
+        ));
+        assert!(registration_lease_still_valid(
+            refresh_at,
+            lease,
+            refresh_at + Duration::from_secs(599)
+        ));
+        assert!(!registration_lease_still_valid(
+            refresh_at,
+            lease,
+            refresh_at + Duration::from_secs(600)
+        ));
+    }
 }
 
 async fn cached_live_ims_registration(

@@ -25,6 +25,7 @@ pub mod digest_aka;
 pub mod entitlement;
 pub mod ims_access;
 pub mod ims_failure;
+pub mod ims_registration_coordinator;
 pub mod ims_video;
 pub mod media;
 pub mod own_numbers;
