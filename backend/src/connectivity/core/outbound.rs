@@ -159,6 +159,20 @@ impl OutboundFlow {
         } else {
             legacy_register(frame)?
         };
+        // Log the FINAL frame, not the adapter's pre-rewrite template. In
+        // particular the authenticated request can take a different channel.
+        // No Contact/IMSI, Call-ID, digest or security material is logged.
+        tracing::info!(
+            access = offer.access.as_str(),
+            supported_outbound = has_option(&frame, "Supported", "outbound"),
+            supported_path = has_option(&frame, "Supported", "path"),
+            require_outbound = has_option(&frame, "Require", "outbound"),
+            cseq = ?sip_frame::header_value(&frame, "CSeq"),
+            authorization_present = !sip_frame::header_values(&frame, "Authorization").is_empty(),
+            security_verify_present = !sip_frame::header_values(&frame, "Security-Verify").is_empty(),
+            reg_id = offer.access.reg_id(),
+            "IMS REGISTER outbound offer prepared"
+        );
         self.last_source = Some(source);
         self.last_request = Some(frame.clone());
         Ok(frame)
@@ -237,11 +251,22 @@ impl OutboundFlow {
         // accepted/required, never borrow the other access's lifetime.
         let outbound_required = has_option(request, "Require", "outbound")
             || has_option(response, "Require", "outbound");
-        let artifacts = if offered && outbound_required {
-            RegisterArtifacts::parse_for_binding(response, &offer.instance, offer.access.reg_id())
-        } else {
-            RegisterArtifacts::parse(response)
-        };
+        let mut artifacts = RegisterArtifacts::parse(response);
+        if offered {
+            let binding = RegisterArtifacts::parse_for_binding(
+                response,
+                &offer.instance,
+                offer.access.reg_id(),
+            );
+            if outbound_required {
+                artifacts = binding;
+            } else {
+                // Some peers echo instance/reg-id without negotiating outbound.
+                // Report that distinction without borrowing another Contact's
+                // expiry or treating an echo as permission for the second flow.
+                artifacts.own_binding_found = binding.own_binding_found;
+            }
+        }
         offer.coordinator.observe_response(offer.access, &artifacts);
         let negotiated = offered
             && artifacts.outbound_required
@@ -308,6 +333,10 @@ impl OutboundFlow {
         }
         tracing::info!(
             access = offer.access.as_str(),
+            offered,
+            require_outbound = artifacts.outbound_required,
+            first_hop_outbound = artifacts.first_hop_outbound,
+            own_binding_found = artifacts.own_binding_found,
             negotiated,
             no_nat = self.no_nat,
             keepalive_required = self.next_probe.is_some() || self.pending.is_some(),
@@ -525,9 +554,20 @@ fn legacy_register(frame: &[u8]) -> Result<Vec<u8>, ImsError> {
     rewrite_register(frame, None)
 }
 
-/// Change only Contact header parameters, never URI parameters, quoted feature
-/// values, digest fields, or transaction identifiers. Folded/compact headers
-/// are accepted; multiple Contacts fail closed instead of editing another flow.
+fn append_option(tokens: &mut Vec<String>, value: &str) {
+    let value = value.trim();
+    if !value.is_empty() && !tokens.iter().any(|token| token.eq_ignore_ascii_case(value)) {
+        tokens.push(value.to_string());
+    }
+}
+
+/// Complete Contact header parameters and capability options, never URI
+/// parameters, quoted feature values, digest fields, or transaction identifiers.
+/// Folded/compact headers are accepted; multiple Contacts fail closed instead
+/// of editing another flow.
+/// Emit one canonical Supported/Require field (RFC 3261 7.3.1): separate list
+/// fields are legal, but a peer reading only the first field would miss an
+/// appended outbound offer, including on the authenticated REGISTER.
 fn rewrite_register(frame: &[u8], offer: Option<(&str, u32, bool)>) -> Result<Vec<u8>, ImsError> {
     let text =
         std::str::from_utf8(frame).map_err(|_| ImsError::new("ims_outbound_request_invalid"))?;
@@ -548,6 +588,8 @@ fn rewrite_register(frame: &[u8], offer: Option<(&str, u32, bool)>) -> Result<Ve
     }
     let mut lines = Vec::new();
     let mut contacts = 0;
+    let mut supported = Vec::new();
+    let mut require = Vec::new();
     for line in unfolded {
         let Some((name, value)) = line.split_once(':') else {
             lines.push(line);
@@ -584,18 +626,19 @@ fn rewrite_register(frame: &[u8], offer: Option<(&str, u32, bool)>) -> Result<Ve
                 contact.push_str(&format!(";+sip.instance=\"<{instance}>\";reg-id={reg_id}"));
             }
             lines.push(format!("{name}:{contact}"));
-        } else if offer.is_none()
-            && (name.eq_ignore_ascii_case("Supported")
-                || name.eq_ignore_ascii_case("k")
-                || name.eq_ignore_ascii_case("Require"))
+        } else if name.eq_ignore_ascii_case("Supported")
+            || name.eq_ignore_ascii_case("k")
+            || name.eq_ignore_ascii_case("Require")
         {
-            let tokens = value
-                .split(',')
-                .map(str::trim)
-                .filter(|v| !v.is_empty() && !v.eq_ignore_ascii_case("outbound"))
-                .collect::<Vec<_>>();
-            if !tokens.is_empty() {
-                lines.push(format!("{name}: {}", tokens.join(", ")));
+            let tokens = if name.eq_ignore_ascii_case("Require") {
+                &mut require
+            } else {
+                &mut supported
+            };
+            for token in value.split(',').map(str::trim) {
+                if offer.is_some() || !token.eq_ignore_ascii_case("outbound") {
+                    append_option(tokens, token);
+                }
             }
         } else {
             lines.push(line);
@@ -606,15 +649,17 @@ fn rewrite_register(frame: &[u8], offer: Option<(&str, u32, bool)>) -> Result<Ve
     }
     if let Some((_, _, required)) = offer {
         // RFC 5626 4.2.1 requires Path support as well as outbound.
-        if !has_option(frame, "Supported", "path") {
-            lines.push("Supported: path".to_string());
+        append_option(&mut supported, "path");
+        append_option(&mut supported, "outbound");
+        if required {
+            append_option(&mut require, "outbound");
         }
-        if !has_option(frame, "Supported", "outbound") {
-            lines.push("Supported: outbound".to_string());
-        }
-        if required && !has_option(frame, "Require", "outbound") {
-            lines.push("Require: outbound".to_string());
-        }
+    }
+    if !supported.is_empty() {
+        lines.push(format!("Supported: {}", supported.join(", ")));
+    }
+    if !require.is_empty() {
+        lines.push(format!("Require: {}", require.join(", ")));
     }
     Ok(format!("{}\r\n\r\n{body}", lines.join("\r\n")).into_bytes())
 }
@@ -1133,6 +1178,105 @@ pub(crate) mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn outbound_capabilities_are_in_one_field_on_initial_auth_refresh_and_remove() {
+        let mut flow = OutboundFlow::default();
+        flow.configure("outbound-canonical-register", ImsAccess::Wlan, INSTANCE, true);
+        for (cseq, expires) in [(1, 3600), (2, 3600), (3, 3600), (4, 0)] {
+            let source = String::from_utf8(register_request("same-binding", cseq))
+                .unwrap()
+                .replace("Expires: 3600", &format!("Expires: {expires}"))
+                .replace(
+                    "Content-Length: 0",
+                    "Supported: path,sec-agree,gruu\r\nRequire: sec-agree\r\nAuthorization: Digest username=\"test\", response=\"unchanged\"\r\nContent-Length: 0",
+                );
+            let prepared = flow.prepare(source.as_bytes()).unwrap();
+            assert_eq!(
+                sip_frame::header_values(&prepared, "Supported"),
+                vec!["path, sec-agree, gruu, outbound"]
+            );
+            assert!(sip_frame::header_values(&prepared, "k").is_empty());
+            assert_eq!(
+                sip_frame::header_value(&prepared, "Authorization"),
+                sip_frame::header_value(source.as_bytes(), "Authorization")
+            );
+            assert_eq!(
+                RegisterTransactionKey::from_register_request(&prepared),
+                RegisterTransactionKey::from_register_request(source.as_bytes())
+            );
+            // Retransmissions do not rebuild or modify the capability offer.
+            assert_eq!(flow.prepare(source.as_bytes()).unwrap(), prepared);
+            assert_eq!(
+                sip_frame::header_value(&prepared, "Expires"),
+                Some(expires.to_string())
+            );
+        }
+    }
+
+    #[test]
+    fn folded_compact_and_repeated_options_coalesce_without_losing_security() {
+        let source = b"REGISTER sip:ims.test SIP/2.0\r\nCall-ID: options\r\nCSeq: 2 REGISTER\r\nContact: <sip:ue@127.0.0.1>;expires=3600\r\nSupported: path,\r\n sec-agree\r\nk: GRUU, PATH\r\nSupported: outbound, x-outbound\r\nRequire: sec-agree\r\nRequire: outbound\r\nSecurity-Verify: ipsec-3gpp;spi-c=100;spi-s=200\r\nContent-Length: 0\r\n\r\n";
+        let prepared = offer_register(source, INSTANCE, 2, true).unwrap();
+        assert_eq!(
+            sip_frame::header_values(&prepared, "Supported"),
+            vec!["path, sec-agree, GRUU, outbound, x-outbound"]
+        );
+        assert_eq!(
+            sip_frame::header_values(&prepared, "Require"),
+            vec!["sec-agree, outbound"]
+        );
+        assert!(sip_frame::header_values(&prepared, "k").is_empty());
+        assert_eq!(
+            sip_frame::header_value(&prepared, "Security-Verify"),
+            sip_frame::header_value(source, "Security-Verify")
+        );
+        // Formatting and Contact completion are idempotent.
+        assert_eq!(offer_register(&prepared, INSTANCE, 2, true).unwrap(), prepared);
+    }
+
+    #[test]
+    fn legacy_offer_removes_only_exact_outbound_and_preserves_instance_and_body() {
+        let source = b"REGISTER sip:ims.test SIP/2.0\r\nCall-ID: legacy-options\r\nCSeq: 1 REGISTER\r\nContact: <sip:ue@127.0.0.1>;+sip.instance=\"<urn:uuid:stable>\";reg-id=2\r\nSupported: path, OutBound\r\nk: x-outbound, sec-agree\r\nRequire: OUTBOUND, sec-agree\r\nContent-Length: 4\r\n\r\ntest";
+        let prepared = legacy_register(source).unwrap();
+        assert_eq!(
+            sip_frame::header_values(&prepared, "Supported"),
+            vec!["path, x-outbound, sec-agree"]
+        );
+        assert_eq!(
+            sip_frame::header_values(&prepared, "Require"),
+            vec!["sec-agree"]
+        );
+        let contact = sip_frame::header_value(&prepared, "Contact").unwrap();
+        assert!(contact.contains("+sip.instance=\"<urn:uuid:stable>\""));
+        assert!(!contact.contains("reg-id="));
+        assert!(prepared.ends_with(b"\r\n\r\ntest"));
+        assert_eq!(legacy_register(&prepared).unwrap(), prepared);
+    }
+
+    #[test]
+    fn echoed_binding_without_require_is_evidence_not_dual_flow_permission() {
+        let coordinator = ims_registration_coordinator::for_line("outbound-echo-only");
+        let mut flow = OutboundFlow::default();
+        flow.configure("outbound-echo-only", ImsAccess::Wlan, INSTANCE, true);
+        let prepared = flow.prepare(&register_request("echo", 1)).unwrap();
+        let response = String::from_utf8(register_success(&prepared, 3195))
+            .unwrap()
+            .replace("Require: outbound\r\n", "")
+            .replace(";lr;ob>", ";lr>")
+            .replace("Flow-Timer: 25\r\n", "");
+        let artifacts = flow.registered(response.as_bytes(), false, 3600).unwrap();
+        assert!(artifacts.own_binding_found);
+        assert!(!artifacts.outbound_required);
+        assert!(!artifacts.first_hop_outbound);
+        assert_eq!(artifacts.expires_seconds, Some(3195));
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::NotNegotiated
+        );
+        assert!(flow.poll(Instant::now()).unwrap().is_none());
+    }
+
     #[test]
     fn no_negotiation_means_no_blind_stun() {
         let mut flow = OutboundFlow::default();

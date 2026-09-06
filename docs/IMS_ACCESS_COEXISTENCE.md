@@ -1,19 +1,19 @@
 # IMS access coexistence and registration admission
 
-## Scope of v1.1.7
+## Implementation and validation status
 
-This release corrects **unconfirmed parallel registrations**, not all causes of
-REGISTER timeout, and does not implement full RFC 5626 outbound. VoLTE and
-VoWiFi may both remain enabled, but an enabled intent is not a valid IMS binding.
-The effective policy is observable instead of treating two cached `registered`
-flags as proof of standards-compliant concurrency.
+The client implements negotiated LTE/WLAN IMS flows: a shared `+sip.instance`,
+distinct stable `reg-id` values, binding-specific leases, UDP STUN / TCP CRLF
+keepalives, and per-flow recovery. VoLTE and VoWiFi may both remain enabled, but
+enabled intent is not a valid IMS binding. Two cached `registered` flags are
+not proof of concurrency or inbound reachability.
 
-`concurrent` remains the stored/default user preference. The current client
-reports `client_incomplete` because it lacks complete UDP outbound flow
-maintenance (STUN, negotiated flow timers and flow recovery). It therefore
-coordinates **one** IMS registration. No token-only `Supported: outbound` change
-is made. This does not establish that the operator cannot support outbound with
-a capable client.
+`concurrent` remains the stored/default user preference. The bootstrap state is
+`not_negotiated`, not `client_incomplete`. An owned, unexpired flow must prove
+outbound negotiation and transport health before admission opens for the second
+access. Without negotiation, the client retains **one** IMS registration. A
+legacy registration on the tested network does not establish that every access,
+P-CSCF or carrier configuration lacks outbound support.
 
 ## Standards basis
 
@@ -32,18 +32,28 @@ a capable client.
 - [RFC 5626 section 6](https://www.rfc-editor.org/rfc/rfc5626#section-6):
   outbound registrar behavior depends on first-hop Path/ob support and successful
   negotiation, not simply receiving a Contact reg-id parameter.
+- [RFC 3261 section 7.3.1](https://www.rfc-editor.org/rfc/rfc3261#section-7.3.1):
+  comma-list header fields may be combined without changing their meaning.
+  Emit one `Supported` and one `Require`, preserving existing security/GRUU
+  options, so a peer that reads only the first row cannot miss an appended
+  outbound option. Do not combine digest authentication header fields.
+- TS 24.229 K.2.1.5: positively observed no-NAT UDP paths may omit keepalives;
+  an explicit `Flow-Timer` is still honored. An `ob` URI parameter by itself
+  is not proof that an IMS P-CSCF implements STUN.
 
-This implementation is **break-before-make registration selection/fallback**.
-It is not seamless IR.51 handover, does not transfer an active call between
-accesses, and cannot promise instantaneous fallback or terminating-call delivery.
+The non-negotiated fallback uses **break-before-make registration selection**.
+Negotiated concurrency keeps both bindings and refresh owners; a failed refresh
+does not itself authorize destroying the other access. Neither mode implements
+seamless IR.51 handover or transfers an active call between accesses.
 
 ## Selection and lifecycle
 
 1. Preserve both enable flags and the requested preference.
-2. With unconfirmed concurrency, retain an existing valid single registration.
-   At a cold start where both can be attempted, prefer cellular. A working WLAN
-   fallback stays selected when LTE merely reappears, avoiding registration
-   ping-pong. Explicit `cellular_preferred` / `wlan_preferred` can request a switch.
+2. With unconfirmed concurrency, prefer WLAN whenever eligible, deferring a
+   switch during a call. Exhausted WLAN recovery permits the cellular fallback.
+   Explicit `cellular_preferred` / `wlan_preferred` can request a selection.
+   Registration admission is distinct from the business path priority:
+   VoWiFi, then 4G/5G IMS, then CS where configured/available.
 3. A modem merely being present is not enough: normal cellular eligibility
    requires network registration and a non-exhausted, safe recovery budget.
    WLAN gets a bounded attempt; exhausted recovery makes the fallback eligible.
@@ -54,7 +64,8 @@ accesses, and cannot promise instantaneous fallback or terminating-call delivery
    transaction/security behavior described in [VOLTE_REFRESH.md](VOLTE_REFRESH.md).
 5. Serialize per-line LTE/WLAN registration transitions before bearer/access
    locks. Re-evaluate the policy after taking the lock, drain admitted REGISTER
-   transactions, tear down the opposite path, then authorize the selected one.
+   transactions, release only a path no longer admitted, then publish the
+   selection. A negotiated second flow does not tear down the first.
    The low-level LTE/WLAN REGISTER entry points fail closed even if a diagnostic,
    SMS or voice caller bypasses the normal restore workflow. Different SIM lines
    have independent locks and admission decisions.
@@ -84,7 +95,13 @@ accesses, and cannot promise instantaneous fallback or terminating-call delivery
 
 Response metadata is passive evidence only. `Supported: outbound`, a substring
 like `x-outbound`, or reg-id alone never enables concurrency. The dashboard
-shows the effective single-registration selection and explains the limitation.
+shows the applied selection and explains any negotiation limitation.
+
+`IMS REGISTER outbound offer prepared` describes the final request after
+capability completion, including authenticated retries, refresh and removal.
+`IMS outbound registration flow accepted` distinguishes the offer, response
+Require, first-hop Path, matching binding, NAT observation and flow timer. It
+does not log identities, digest authorization, or IPsec key material.
 
 ## Evidence and acceptance
 
@@ -97,13 +114,29 @@ has not been excluded.
 Build/test only through GitHub Actions. Added regressions cover the capability
 gate, all boolean single-registration combinations, full lease versus refresh
 deadline, protected-refresh eligibility, fallback stickiness, deferred calls,
-per-line serialization and fail-closed admission, exact Require parsing, and
-not exhausting a parked access's recovery budget.
+per-line serialization and fail-closed admission, exact Require parsing,
+independent live flows/keepalives, and not exhausting a parked access's recovery
+budget. Capability-field regressions cover initial/authenticated/refresh/remove
+requests, retransmission byte stability, folded/compact/repeated header fields,
+security-option preservation, and Contact echoes without outbound negotiation.
 
 Deploy only a successful Release artifact after checking there are no calls.
 Retain `concurrent` and both enabled intents during validation, but report the
-**effective single-registration mode honestly**. Acceptance requires a natural
-LTE REGISTER refresh and a protected 200 response on the existing session; a new
-initial registration after expiry or access teardown is not refresh success.
-Real dual-registration support remains future work; do not label this test as
-parallel VoLTE/VoWiFi registration success.
+**effective registration mode honestly**. Dual-flow acceptance requires both
+negotiated bindings and a natural refresh on each existing flow, without
+invalidating the other. A new initial registration after expiry or access
+teardown is not refresh success. The fixed 120-second LTE test delay is disabled.
+
+### September 6, 2026 device evidence (Asia/Shanghai)
+
+On commit `0930fd9`, the 23:29:36 initial WLAN REGISTER offered `outbound` in
+a second `Supported` row. The 23:29:38 successful response echoed the same
+instance and `reg-id=2`, with a 3195-second Contact expiry, but lacked
+`Require: outbound`; its Path also lacked `ob`. Therefore the current access
+was registered but did not establish outbound concurrency.
+
+Header coalescing is an interoperability change to test, **not a proven timeout
+root cause**. The baseline metadata collector did not reassemble fragmented
+authenticated requests, so absence of a field in those request snippets is
+not evidence that the actual authenticated request omitted it. Subsequent
+wire checks must reassemble IP fragments and accept only complete SIP headers.
