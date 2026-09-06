@@ -107,7 +107,6 @@ export default function SupplementaryServicesPanel({ line }: SupplementaryServic
               <Typography variant="subtitle1" fontWeight={700}>补充业务</Typography>
               <Typography variant="caption" color="text.secondary">通过 USSD / USSI 查询和操作运营商补充业务</Typography>
             </Box>
-            {line && <Chip size="small" variant="outlined" label={line.modem.line_id} sx={{ ml: 'auto', maxWidth: 180 }} />}
           </Box>
 
           {!line && <Alert severity="info">请先在左侧选择一条线路</Alert>}

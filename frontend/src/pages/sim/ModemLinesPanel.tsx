@@ -119,7 +119,8 @@ function volteStageTimelineState(line: VolteLineControlResponse) {
 }
 
 function VolteStageTimeline({ line }: { line: VolteLineControlResponse }) {
-  if (!line.profile.volte_connection_enabled && !line.runtime.last_error && !line.runtime.connection_attempts?.length) return null
+  const displayError = volteErrorMessage(line.runtime.last_error)
+  if (!line.profile.volte_connection_enabled && !displayError && !line.runtime.connection_attempts?.length) return null
   const items = volteStageTimelineState(line)
   const currentLabel = items.find((item) => item.active || item.failed)?.label
     || (line.runtime.registered ? 'IMS 已注册' : '等待启动')
@@ -131,15 +132,15 @@ function VolteStageTimeline({ line }: { line: VolteLineControlResponse }) {
       </Box>
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', sm: 'repeat(4, minmax(0, 1fr))', md: 'repeat(8, minmax(0, 1fr))' }, gap: 0.75 }}>
         {items.map((item) => (
-          <Box key={item.stage} minWidth={0} display="flex" alignItems="center" gap={0.5} title={item.attempt?.detail || item.attempt?.error_code || item.label}>
+          <Box key={item.stage} minWidth={0} display="flex" alignItems="center" gap={0.5} title={item.attempt?.detail || volteErrorMessage(item.attempt?.error_code) || item.label}>
             {item.failed ? <ErrorOutline color="error" sx={{ fontSize: 16, flexShrink: 0 }} /> : item.complete ? <CheckCircle color="success" sx={{ fontSize: 16, flexShrink: 0 }} /> : <RadioButtonUnchecked color={item.active ? 'primary' : 'disabled'} sx={{ fontSize: 16, flexShrink: 0 }} />}
             <Typography variant="caption" color={item.failed ? 'error' : item.active ? 'primary' : item.complete ? 'text.primary' : 'text.secondary'} sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</Typography>
           </Box>
         ))}
       </Box>
-      {(line.runtime.last_error || line.runtime.current_ip_family || line.runtime.bearer_interface || line.runtime.pcscf) && (
+      {(displayError || line.runtime.current_ip_family || line.runtime.bearer_interface || line.runtime.pcscf) && (
         <Typography variant="caption" color="text.secondary" display="block" mt={1} sx={{ wordBreak: 'break-word' }}>
-          {[line.runtime.last_error, line.runtime.current_ip_family && `地址族 ${line.runtime.current_ip_family}`, line.runtime.bearer_interface && `网卡 ${line.runtime.bearer_interface}`, line.runtime.pcscf && `P-CSCF ${line.runtime.pcscf}`].filter(Boolean).join(' · ')}
+          {[displayError, line.runtime.current_ip_family && `地址族 ${line.runtime.current_ip_family}`, line.runtime.bearer_interface && `网卡 ${line.runtime.bearer_interface}`, line.runtime.pcscf && `P-CSCF ${line.runtime.pcscf}`].filter(Boolean).join(' · ')}
         </Typography>
       )}
     </Box>
@@ -203,15 +204,21 @@ function vowifiRuntimeLabel(line?: VowifiLineConfigResponse) {
 function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
   if (!line) return '等待匹配运营商 profile'
   if (!line.config.enabled) return 'VoWiFi 当前未启用'
+  if (line.runtime_registered) return 'VoWiFi IMS 已注册'
   if (line.runtime_restore_in_progress) return '后台正在执行自动重连'
   const restoreExhausted = line.runtime_error === 'vowifi_auto_restore_exhausted'
-  if (line.matched_profile_source === 'derived') {
-    return line.runtime_error && !restoreExhausted
-      ? '数据库无可用配置，标准自动推断本轮连接失败'
+  const attemptingOrFailed = line.runtime_stage === 'reconnecting' || Boolean(line.runtime_error)
+  if (line.matched_profile_source === 'derived' && attemptingOrFailed) {
+    return line.runtime_error
+      ? restoreExhausted
+        ? '数据库无可用配置，本轮自动连接已耗尽'
+        : '数据库无可用配置，标准自动推断本轮连接失败'
       : '数据库无可用配置，正在使用标准自动推断'
   }
-  if (line.runtime_error && !restoreExhausted) return '本轮重连未成功，后台会继续尝试'
-  return line.matched_profile_id ? `运营商 profile ${line.matched_profile_id}` : '等待匹配运营商 profile'
+  if (line.runtime_error) {
+    return restoreExhausted ? 'VoWiFi 自动恢复已停止' : '本轮重连未成功，后台会继续尝试'
+  }
+  return line.matched_profile_id ? `运营商 profile ${line.matched_profile_id}` : '等待启动'
 }
 
 function recoveryMessage(line: VolteLineControlResponse) {
@@ -835,6 +842,10 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
               : supplementalStatus.trunk === 'error' ? 'Trunk 状态读取失败' : null
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
             const recovery = recoveryMessage(line)
+            const displayError = volteErrorMessage(line.runtime.last_error)
+            const fallbackMessage = !line.runtime.registered
+              ? standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason)
+              : null
             const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
             // A reader line shares VoWiFi, trunk, SMS, calls, and automation
             // with normal lines. Only controls that require a cellular radio or
@@ -1024,14 +1035,14 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       {basicInfoForLine && <Grid size={12}>{basicInfoForLine(line, overviewControls)}</Grid>}
                     </Grid>}
 
-                    {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && (recovery || line.runtime.last_error) && (
+                    {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && !line.runtime.registered && (recovery || displayError) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
-                        {standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason) && (
+                        {fallbackMessage && (
                           <Typography variant="body2" fontWeight={600}>
-                            {standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason)}
+                            {fallbackMessage}
                           </Typography>
                         )}
-                        {recovery ?? volteErrorMessage(line.runtime.last_error)}
+                        {recovery ?? displayError}
                         {line.runtime.next_retry_at && (
                           <Typography variant="caption" display="block">
                             下次尝试：{new Date(line.runtime.next_retry_at).toLocaleString()}
@@ -1055,7 +1066,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         </Box>
                       </Box>
                       <Box display="flex" alignItems="center" gap={1} flexWrap="wrap" justifyContent={{ xs: 'flex-start', sm: 'flex-end' }}>
-                        <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.volte_connection_enabled ? 'default' : line.runtime.registered ? 'success' : line.runtime.last_error ? 'error' : 'warning'} variant="outlined" />
+                        <Chip size="small" label={imsConnectionSummary(line)} color={!line.profile.volte_connection_enabled ? 'default' : line.runtime.registered ? 'success' : displayError ? 'error' : 'warning'} variant="outlined" />
                         <Button
                           size="small"
                           variant="text"

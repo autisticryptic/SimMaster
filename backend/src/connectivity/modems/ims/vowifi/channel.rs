@@ -19,6 +19,9 @@ use tokio::{
 use crate::connectivity::core::{
     access::{ImsChannel, ImsRequeue},
     context::ImsRoute,
+    ims_access::ImsAccess,
+    outbound::OutboundFlow,
+    register_response::RegisterArtifacts,
     sip_frame, ImsError,
 };
 
@@ -29,6 +32,7 @@ pub struct EpdgSipChannel {
     pending: Vec<u8>,
     /// Complete frames set aside by a REGISTER transaction (other dialogs).
     requeued: ImsRequeue,
+    outbound: OutboundFlow,
     route: ImsRoute,
     security_verify: Option<String>,
 }
@@ -44,6 +48,7 @@ impl EpdgSipChannel {
             stream,
             pending,
             requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(),
             route,
             security_verify,
         }
@@ -54,6 +59,9 @@ impl EpdgSipChannel {
     }
 
     pub async fn send_keepalive(&mut self) -> Result<(), ImsError> {
+        if self.outbound.active() {
+            return Ok(());
+        }
         self.stream
             .write_all(b"\r\n\r\n")
             .await
@@ -64,39 +72,55 @@ impl EpdgSipChannel {
             .map_err(|_| ImsError::new("ims_channel_keepalive_flush_failed"))
     }
 
-    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
-        self.discard_keepalive_frames();
-        if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
-            return Ok(self.pending.drain(..frame_len).collect());
-        }
-
-        tokio::time::timeout(timeout, async {
-            loop {
-                let mut chunk = [0u8; 2048];
-                let read = self
-                    .stream
-                    .read(&mut chunk)
-                    .await
-                    .map_err(|_| ImsError::new("ims_channel_read_failed"))?;
-                if read == 0 {
-                    return Err(ImsError::new("ims_channel_closed"));
-                }
-                self.pending.extend_from_slice(&chunk[..read]);
-                self.discard_keepalive_frames();
-                if self.pending.len() > MAX_PENDING_BYTES {
-                    return Err(ImsError::new("ims_channel_frame_too_large"));
-                }
-                if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
-                    return Ok(self.pending.drain(..frame_len).collect());
-                }
+    async fn maintain_outbound(&mut self) -> Result<(), ImsError> {
+        if let Some(packet) = self.outbound.poll(std::time::Instant::now())? {
+            if self.stream.write_all(&packet).await.is_err() {
+                return Err(self.outbound.fail("ims_outbound_keepalive_send_failed"));
             }
-        })
-        .await
-        .map_err(|_| ImsError::new("ims_channel_read_timeout"))?
+        }
+        Ok(())
+    }
+
+    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.maintain_outbound().await?;
+            self.discard_keepalive_frames();
+            if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
+                let frame = self.pending.drain(..frame_len).collect::<Vec<_>>();
+                self.outbound.received_sip(&frame)?;
+                return Ok(frame);
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(ImsError::new("ims_channel_read_timeout"));
+            }
+            let wake = self
+                .outbound
+                .deadline()
+                .map_or(deadline, |due| due.min(deadline));
+            let mut chunk = [0u8; 2048];
+            match tokio::time::timeout(
+                wake.saturating_duration_since(now),
+                self.stream.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) => return Err(ImsError::new("ims_channel_closed")),
+                Ok(Ok(n)) => self.pending.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => return Err(ImsError::new("ims_channel_read_failed")),
+                Err(_) if wake < deadline => continue,
+                Err(_) => return Err(ImsError::new("ims_channel_read_timeout")),
+            }
+            if self.pending.len() > MAX_PENDING_BYTES {
+                return Err(ImsError::new("ims_channel_frame_too_large"));
+            }
+        }
     }
 
     fn discard_keepalive_frames(&mut self) {
         while self.pending.starts_with(b"\r\n") {
+            self.outbound.pong();
             self.pending.drain(..2);
         }
         while self.pending.starts_with(b"\n") {
@@ -107,6 +131,8 @@ impl EpdgSipChannel {
 
 impl ImsChannel for EpdgSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        let prepared = self.outbound.prepare(frame)?;
+        let frame = prepared.as_slice();
         self.stream
             .write_all(frame)
             .await
@@ -118,6 +144,7 @@ impl ImsChannel for EpdgSipChannel {
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.maintain_outbound().await?;
         if let Some(frame) = self.requeued.pop_front() {
             return Ok(frame);
         }
@@ -150,6 +177,7 @@ pub struct UdpSipChannel {
     pending: Vec<u8>,
     /// Complete frames set aside by a REGISTER transaction (other dialogs).
     requeued: ImsRequeue,
+    outbound: OutboundFlow,
     route: ImsRoute,
     security_verify: Option<String>,
 }
@@ -166,6 +194,7 @@ impl UdpSipChannel {
             receive_socket: None,
             pending,
             requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(),
             route,
             security_verify,
         }
@@ -190,6 +219,7 @@ impl UdpSipChannel {
             receive_socket: Some(receive_socket),
             pending,
             requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(),
             route,
             security_verify,
         }
@@ -204,9 +234,9 @@ impl UdpSipChannel {
     }
 
     pub async fn send_keepalive(&mut self) -> Result<(), ImsError> {
-        // UDP has no CRLF keepalive. NAT binding is kept fresh by the SIP
-        // OPTIONS ping timer, so a no-op is the safe behaviour here.
-        Ok(())
+        // Negotiated UDP outbound uses STUN on this socket. SIP OPTIONS is
+        // not a substitute for flow maintenance.
+        self.maintain_outbound().await
     }
 
     fn discard_keepalive_frames(&mut self) {
@@ -218,55 +248,77 @@ impl UdpSipChannel {
         }
     }
 
-    /// Chunked read for the live flows. A UDP datagram may exceed the caller's
-    /// chunk size; the remainder is buffered internally and drained on the next
-    /// call so no bytes are lost.
-    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, ImsError> {
-        if !self.pending.is_empty() {
-            let take = buf.len().min(self.pending.len());
-            buf[..take].copy_from_slice(&self.pending[..take]);
-            self.pending.drain(..take);
-            return Ok(take);
+    async fn maintain_outbound(&mut self) -> Result<(), ImsError> {
+        if let Some(packet) = self.outbound.poll(std::time::Instant::now())? {
+            if !matches!(self.socket.send(&packet).await, Ok(n) if n == packet.len()) {
+                return Err(self.outbound.fail("ims_outbound_keepalive_send_failed"));
+            }
         }
-        let mut scratch = vec![0u8; MAX_PENDING_BYTES];
-        let socket = self.receive_socket.as_ref().unwrap_or(&self.socket);
-        let read = socket
-            .recv(&mut scratch)
-            .await
-            .map_err(|_| ImsError::new("ims_channel_read_failed"))?;
-        if read <= buf.len() {
-            buf[..read].copy_from_slice(&scratch[..read]);
-            Ok(read)
-        } else {
-            buf.copy_from_slice(&scratch[..buf.len()]);
-            self.pending.extend_from_slice(&scratch[buf.len()..read]);
-            Ok(buf.len())
+        Ok(())
+    }
+
+    /// Read BOTH protected tuples. Responses to client-flow STUN (and some
+    /// REGISTER responses) return on port_uc, not the advertised port_us.
+    async fn recv_datagram(&mut self) -> Result<Vec<u8>, ImsError> {
+        loop {
+            self.maintain_outbound().await?;
+            let mut client = vec![0u8; MAX_PENDING_BYTES];
+            let mut server = vec![0u8; MAX_PENDING_BYTES];
+            let due = self.outbound.deadline();
+            let wait = async {
+                match due {
+                    Some(due) => tokio::time::sleep_until(due.into()).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let read = async {
+                if let Some(receive) = &self.receive_socket {
+                    tokio::select! {
+                        result = self.socket.recv(&mut client) => result.map(|n| { client.truncate(n); client }),
+                        result = receive.recv(&mut server) => result.map(|n| { server.truncate(n); server }),
+                    }
+                } else {
+                    self.socket.recv(&mut client).await.map(|n| {
+                        client.truncate(n);
+                        client
+                    })
+                }
+            };
+            let packet = tokio::select! {
+                result = read => result.map_err(|_| ImsError::new("ims_channel_read_failed"))?,
+                _ = wait => continue,
+            };
+            if !self.outbound.receive_stun(&packet)? {
+                return Ok(packet);
+            }
         }
     }
 
-    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
-        self.discard_keepalive_frames();
-        if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
-            return Ok(self.pending.drain(..frame_len).collect());
+    /// Chunk reads are also used during REGISTER; never mix binary STUN into
+    /// the SIP pending buffer. Datagram remainder remains owned by the channel.
+    async fn recv_chunk(&mut self, buf: &mut [u8]) -> Result<usize, ImsError> {
+        if self.pending.is_empty() {
+            self.pending = self.recv_datagram().await?;
         }
+        let take = buf.len().min(self.pending.len());
+        buf[..take].copy_from_slice(&self.pending[..take]);
+        self.pending.drain(..take);
+        Ok(take)
+    }
 
+    async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         tokio::time::timeout(timeout, async {
             loop {
-                let mut scratch = vec![0u8; MAX_PENDING_BYTES];
-                // REGISTER responses, subsequent network requests and their
-                // responses all arrive on port_us for a protected UDP pair.
-                let socket = self.receive_socket.as_ref().unwrap_or(&self.socket);
-                let read = socket
-                    .recv(&mut scratch)
-                    .await
-                    .map_err(|_| ImsError::new("ims_channel_read_failed"))?;
-                self.pending.extend_from_slice(&scratch[..read]);
                 self.discard_keepalive_frames();
+                if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
+                    let frame = self.pending.drain(..frame_len).collect::<Vec<_>>();
+                    self.outbound.received_sip(&frame)?;
+                    return Ok(frame);
+                }
+                let packet = self.recv_datagram().await?;
+                self.pending.extend_from_slice(&packet);
                 if self.pending.len() > MAX_PENDING_BYTES {
                     return Err(ImsError::new("ims_channel_frame_too_large"));
-                }
-                if let Some(frame_len) = sip_frame::complete_frame_len(&self.pending) {
-                    return Ok(self.pending.drain(..frame_len).collect());
                 }
             }
         })
@@ -281,6 +333,8 @@ impl ImsChannel for UdpSipChannel {
     }
 
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        let prepared = self.outbound.prepare(frame)?;
+        let frame = prepared.as_slice();
         // TS 33.203 protected UDP uses two flows. UE-originated requests use
         // port_uc -> port_ps, while responses to network-originated requests
         // must use port_us -> port_pc. The latter is the dedicated receive
@@ -298,6 +352,7 @@ impl ImsChannel for UdpSipChannel {
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.maintain_outbound().await?;
         if let Some(frame) = self.requeued.pop_front() {
             return Ok(frame);
         }
@@ -415,27 +470,81 @@ impl SipChannel {
         }
     }
 
-    pub async fn send_all(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+    pub fn configure_outbound(&mut self, line_id: &str, instance: &str, enabled: bool) {
+        let flow = match self {
+            Self::Tcp(c) => &mut c.outbound,
+            Self::Udp(c) => &mut c.outbound,
+        };
+        flow.configure(line_id, ImsAccess::Wlan, instance, enabled);
+    }
+
+    pub fn inherit_outbound_path_observation(&mut self, previous: &Self) {
+        let previous = match previous {
+            Self::Tcp(c) => &c.outbound,
+            Self::Udp(c) => &c.outbound,
+        };
         match self {
-            Self::Tcp(channel) => {
-                channel
-                    .stream
-                    .write_all(frame)
-                    .await
-                    .map_err(|_| ImsError::new("ims_channel_write_failed"))?;
-                channel
-                    .stream
-                    .flush()
-                    .await
-                    .map_err(|_| ImsError::new("ims_channel_flush_failed"))
-            }
-            Self::Udp(channel) => channel
-                .socket
-                .send(frame)
-                .await
-                .map(|_| ())
-                .map_err(|_| ImsError::new("ims_channel_write_failed")),
+            Self::Tcp(c) => c.outbound.inherit_path_observation(previous),
+            Self::Udp(c) => c.outbound.inherit_path_observation(previous),
         }
+    }
+
+    /// All frame readers, including the adapter-owned protected exchange,
+    /// report explicit outbound refusal using the same transaction key.
+    pub fn observe_outbound_response(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        match self {
+            Self::Tcp(c) => c.outbound.received_sip(frame),
+            Self::Udp(c) => c.outbound.received_sip(frame),
+        }
+    }
+
+    /// Keep the flow/keepalive owner when lending a registered channel to the
+    /// legacy SMS path; reconstructing it from sockets discards its live lease.
+    pub fn update_context(&mut self, route: ImsRoute, security_verify: Option<String>) {
+        match self {
+            Self::Tcp(c) => {
+                c.route = route;
+                c.security_verify = security_verify;
+            }
+            Self::Udp(c) => {
+                c.route = route;
+                c.security_verify = security_verify;
+            }
+        }
+    }
+
+    pub fn prepend_pending(&mut self, bytes: Vec<u8>) -> Result<(), ImsError> {
+        let pending = match self {
+            Self::Tcp(c) => &mut c.pending,
+            Self::Udp(c) => &mut c.pending,
+        };
+        if bytes.len().saturating_add(pending.len()) > MAX_PENDING_BYTES {
+            return Err(ImsError::new("ims_channel_frame_too_large"));
+        }
+        pending.splice(..0, bytes);
+        Ok(())
+    }
+
+    pub fn outbound_registered(
+        &mut self,
+        response: &[u8],
+        expires: u32,
+    ) -> Result<RegisterArtifacts, ImsError> {
+        match self {
+            Self::Tcp(c) => c.outbound.registered(response, true, expires),
+            Self::Udp(c) => c.outbound.registered(response, false, expires),
+        }
+    }
+
+    pub fn outbound_active(&self) -> bool {
+        match self {
+            Self::Tcp(c) => c.outbound.active(),
+            Self::Udp(c) => c.outbound.active(),
+        }
+    }
+
+    pub async fn send_all(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        self.send_sip(frame).await
     }
 
     /// Chunked read used by the live buffered-framing helpers. For UDP the
@@ -618,6 +727,131 @@ mod tests {
 
     fn expected_merged_pending() -> Vec<u8> {
         [REQUEUED_FIRST, REQUEUED_SECOND, PARTIAL_PREFIX].concat()
+    }
+
+    #[tokio::test]
+    async fn outbound_udp_server_tuple_pong_is_consumed_without_corrupting_sip() {
+        use crate::connectivity::core::{
+            ims_access::ConcurrentRegistrationSupport,
+            ims_registration_coordinator,
+            outbound::tests::{register_request, register_success, success, INSTANCE},
+        };
+        let (send_peer, send, send_peer_addr) = udp_pair().await;
+        let (receive_peer, receive, _) = udp_pair().await;
+        let receive_addr = receive.local_addr().unwrap();
+        let local = send.local_addr().unwrap();
+        let mut channel = UdpSipChannel::new_with_receive_socket(
+            send,
+            receive,
+            Vec::new(),
+            udp_route(local, send_peer_addr),
+            Some("ipsec-3gpp".into()),
+        );
+        let coordinator = ims_registration_coordinator::for_line("outbound-vowifi-udp");
+        channel
+            .outbound
+            .configure("outbound-vowifi-udp", ImsAccess::Wlan, INSTANCE, true);
+        channel
+            .send_sip(&register_request("wlan", 1))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = send_peer.recv_from(&mut buf).await.unwrap();
+        receive_peer
+            .send_to(&register_success(&buf[..n], 1800), receive_addr)
+            .await
+            .unwrap();
+        let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+        channel.outbound.registered(&response, false, 3600).unwrap();
+        let responder = tokio::spawn(async move {
+            let mut packet = [0u8; 64];
+            let (n, peer) = send_peer.recv_from(&mut packet).await.unwrap();
+            assert_eq!(n, 28);
+            let id: [u8; 12] = packet[8..20].try_into().unwrap();
+            let mut wrong_id = id;
+            wrong_id[0] ^= 1;
+            receive_peer
+                .send_to(&success(wrong_id, peer), receive_addr)
+                .await
+                .unwrap();
+            receive_peer
+                .send_to(&success(id, peer), receive_addr)
+                .await
+                .unwrap();
+            receive_peer
+                .send_to(REQUEUED_FIRST, receive_addr)
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(2)).await.unwrap(),
+            REQUEUED_FIRST
+        );
+        responder.await.unwrap();
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::Negotiated
+        );
+    }
+
+    #[tokio::test]
+    async fn outbound_tcp_split_pong_preserves_coalesced_sip_frames() {
+        use crate::connectivity::core::{
+            ims_access::ConcurrentRegistrationSupport,
+            ims_registration_coordinator,
+            outbound::tests::{register_request, register_success, INSTANCE},
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (stream, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let stream = stream.unwrap();
+        let (mut peer, _) = accepted.unwrap();
+        let route = ImsRoute {
+            local_addr: stream.local_addr().unwrap(),
+            pcscf_addr: addr,
+            transport: SipTransport::Tcp,
+        };
+        let mut channel = EpdgSipChannel::new(stream, Vec::new(), route, None);
+        let coordinator = ims_registration_coordinator::for_line("outbound-vowifi-tcp");
+        channel
+            .outbound
+            .configure("outbound-vowifi-tcp", ImsAccess::Wlan, INSTANCE, true);
+        channel.send_sip(&register_request("tcp", 1)).await.unwrap();
+        let mut request = Vec::new();
+        while sip_frame::complete_frame_len(&request).is_none() {
+            let mut chunk = [0u8; 512];
+            let n = peer.read(&mut chunk).await.unwrap();
+            assert!(n > 0);
+            request.extend_from_slice(&chunk[..n]);
+        }
+        peer.write_all(&register_success(&request, 1800))
+            .await
+            .unwrap();
+        let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+        channel.outbound.registered(&response, true, 3600).unwrap();
+        let responder = tokio::spawn(async move {
+            let mut ping = [0u8; 4];
+            peer.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"\r\n\r\n");
+            peer.write_all(b"\r").await.unwrap();
+            tokio::task::yield_now().await;
+            peer.write_all(&[b"\n".as_slice(), REQUEUED_FIRST, REQUEUED_SECOND].concat())
+                .await
+                .unwrap();
+        });
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(2)).await.unwrap(),
+            REQUEUED_FIRST
+        );
+        assert_eq!(
+            channel.recv_sip(Duration::from_secs(1)).await.unwrap(),
+            REQUEUED_SECOND
+        );
+        responder.await.unwrap();
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::Negotiated
+        );
     }
 
     #[tokio::test]

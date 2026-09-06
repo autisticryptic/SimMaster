@@ -2598,6 +2598,9 @@ async fn connect_family(
         &device_identity.ims,
         device_identity.effective_device_identity.imei.as_deref(),
     );
+    let sip_instance =
+        crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id)
+            .registration_instance(&sip_instance);
     let access_network = (profile.ims.register.include_pani_initial
         || profile.ims.register.include_pani_authenticated
         || profile.ims.register.enable_cellular_network_info)
@@ -2675,6 +2678,15 @@ async fn connect_family(
             .await
             .map_err(map_channel_error)?;
         ensure_worker_binding_current(worker_binding)?;
+        channel.configure_outbound(
+            &device.line_id,
+            &sip_instance,
+            !profile
+                .ims
+                .register
+                .contact_mode
+                .eq_ignore_ascii_case("custom"),
+        );
         let ids = RequestIds::fresh(1);
         // port_c is reserved before SM1 and is retained through activation. The
         // plain 5060 socket remains only the unprotected SM1 transport; using it
@@ -2839,7 +2851,19 @@ async fn connect_family(
             )
             .await;
         channel.commit_security();
-        let artifacts = RegisterArtifacts::parse(&registration.response);
+        let artifacts = match channel
+            .outbound_registered(&registration.response, authenticator.expires_seconds)
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                if let Some(plan) = authenticator.xfrm_plan.as_ref() {
+                    if authenticator.worker_binding.is_current() {
+                        ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
+                    }
+                }
+                return Err(map_channel_error(error));
+            }
+        };
         let refresh_authorization =
             authenticator.refresh_authorization_after_success(&registration.response);
         log_volte_register_success_metadata("initial", variant, &artifacts);
@@ -3776,6 +3800,20 @@ async fn refresh_live_registration(
                 }
                 let error = map_refresh_register_failure(&failure);
                 let invalid_security_offer = failure.error.code() == code::SECURITY_SERVER_INVALID;
+                // A SIP REGISTER with no response is retryable on this flow;
+                // an RFC 5626 keepalive failure is different: the flow has
+                // been proven dead and must enter flow recovery now. Retrying
+                // REGISTER on a failed OutboundFlow can never repair it.
+                if is_outbound_flow_failure(&failure) {
+                    tracing::warn!(error = %error, "VoLTE outbound flow failed; recovering the access transport");
+                    return VolteRefreshAttempt {
+                        outcome: RegistrationRefreshResult::RebuildAccess(
+                            RegistrationLossReason::AccessTransportLost,
+                        ),
+                        error: Some(error),
+                        retry_after: None,
+                    };
+                }
                 if is_refresh_transport_failure(&failure) || invalid_security_offer {
                     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
                     let retry_after = refresh_retry_delay(
@@ -3865,7 +3903,21 @@ async fn refresh_live_registration(
             );
         }
         session.register_variant = variant;
-        let artifacts = RegisterArtifacts::parse(&registration.response);
+        let artifacts = match session
+            .channel
+            .outbound_registered(&registration.response, authenticator.expires_seconds)
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(
+                        RegistrationLossReason::SignalingTransportLost,
+                    ),
+                    error: Some(map_channel_error(error)),
+                    retry_after: None,
+                }
+            }
+        };
         if let Some(authorization) =
             authenticator.refresh_authorization_after_success(&registration.response)
         {
@@ -6903,10 +6955,16 @@ fn to_ims_error(error: VolteError) -> ImsError {
 }
 
 fn map_channel_error(error: ImsError) -> VolteError {
+    if error.code().starts_with("ims_outbound_") {
+        return VolteError::new(error.code());
+    }
     VolteError::with_detail(code::IPSEC_UDP_BIND_FAILED, error.code())
 }
 
 fn map_register_error(error: ImsError) -> VolteError {
+    if error.code().starts_with("ims_outbound_") {
+        return VolteError::new(error.code());
+    }
     let stage = match error.code() {
         "ims_register_initial_send_failed"
         | "ims_register_initial_receive_failed"
@@ -6921,6 +6979,17 @@ fn map_register_error(error: ImsError) -> VolteError {
     VolteError::with_detail(stage, error.code())
 }
 
+fn is_outbound_flow_failure(failure: &RegisterFailure) -> bool {
+    matches!(
+        failure.error.code(),
+        "ims_outbound_flow_failed"
+            | "ims_outbound_keepalive_timeout"
+            | "ims_outbound_keepalive_send_failed"
+            | "ims_outbound_stun_error"
+            | "ims_outbound_mapping_changed"
+    )
+}
+
 fn is_refresh_transport_failure(failure: &RegisterFailure) -> bool {
     matches!(
         failure.error.code(),
@@ -6932,6 +7001,9 @@ fn is_refresh_transport_failure(failure: &RegisterFailure) -> bool {
 }
 
 fn map_refresh_register_error(error: ImsError) -> VolteError {
+    if error.code().starts_with("ims_outbound_") {
+        return VolteError::new(error.code());
+    }
     let stage = match error.code() {
         "ims_register_initial_send_failed" | "ims_register_authenticated_send_failed" => {
             code::REGISTER_REFRESH_SEND_FAILED

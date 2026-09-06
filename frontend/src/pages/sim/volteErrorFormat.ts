@@ -2,6 +2,11 @@ const PROFILE_NOT_READY = /carrier_catalog_profile_not_ready:([^:]+):lte_epc:([^
 const PROFILE_PLMN = /(?:home_plmn|imsi_prefix):([0-9]{5,6}|unknown):access:lte_epc:no_ready_profile/
 const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|service-option-not-subscribed|option-unsubscribed|Requested service option not subscribed/i
 const SIP_STATUS = /sip_status=(\d{3})/i
+const TRANSIENT_REFRESH_DIAGNOSTIC = /(?:volte_register_refresh_retry|volte_register_refresh_receive_failed|ims_register_initial_receive_failed)/i
+
+export function isTransientVolteRefreshDiagnostic(error?: string | null) {
+  return Boolean(error && TRANSIENT_REFRESH_DIAGNOSTIC.test(error))
+}
 
 function networkFailureStatusLabel(error: string) {
   if (IMS_SERVICE_NOT_SUBSCRIBED.test(error)) return '未订阅 IMS 服务'
@@ -70,7 +75,7 @@ export function standardDerivedProfileMessage(
 }
 
 export function volteErrorMessage(error?: string | null) {
-  if (!error) return null
+  if (!error || isTransientVolteRefreshDiagnostic(error)) return null
 
   const profileNotReady = error.match(PROFILE_NOT_READY)
   if (profileNotReady) {
@@ -119,7 +124,7 @@ export function volteErrorMessage(error?: string | null) {
 }
 
 export function volteErrorStatusLabel(error?: string | null) {
-  if (!error) return null
+  if (!error || isTransientVolteRefreshDiagnostic(error)) return null
   if (error.includes('volte_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   const networkFailure = networkFailureStatusLabel(error)
   if (networkFailure) return networkFailure

@@ -466,6 +466,7 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
       })
       if (response.data) setLpacConfig(response.data)
       setLpacSuccess('当前线路的 lpac 接口配置已保存')
+      setLpacSettingsOpen(false)
       setReloadKey((value) => value + 1)
     } catch (err) {
       setLpacConfigError(err instanceof Error ? err.message : String(err))
@@ -570,11 +571,12 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
         <DialogContent dividers>
           <Stack spacing={2.5}>
             {lpac ? (
-              <Alert severity={lpac.usable ? 'success' : 'warning'}>
-                {lpac.usable
-                  ? `lpac 已就绪：${lpac.path}${lpac.source ? ` · ${lpac.source}` : ''}`
-                  : `未检测到可用 lpac。架构：${lpac.arch || '不支持'}；glibc：${lpac.glibc_version || '未知'}；安装包：${lpac.asset_name || '无匹配资源'}。${lpac.message}`}
-              </Alert>
+              !lpac.usable && (
+                <Alert severity="warning">
+                  {`未检测到可用 lpac。架构：${lpac.arch || '不支持'}；glibc：${lpac.glibc_version || '未知'}；安装包：${lpac.asset_name || '无匹配资源'}。${lpac.message}`}
+
+                </Alert>
+              )
             ) : <Box display="flex" justifyContent="center" py={3}><CircularProgress size={24} /></Box>}
             {lpacConfigError && <Alert severity="error" onClose={() => setLpacConfigError(null)}>{lpacConfigError}</Alert>}
             {lpacSuccess && <Alert severity="success" onClose={() => setLpacSuccess(null)}>{lpacSuccess}</Alert>}

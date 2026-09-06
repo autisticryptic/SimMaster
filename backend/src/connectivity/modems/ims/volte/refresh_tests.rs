@@ -445,7 +445,10 @@ async fn refresh_keeps_registered_aor_when_associated_default_identity_changes()
             );
             assert_eq!(
                 sip::header_value(&request, "From"),
-                Some(format!("<{}>;tag={expected_from_tag}", expected_identity.public_uri))
+                Some(format!(
+                    "<{}>;tag={expected_from_tag}",
+                    expected_identity.public_uri
+                ))
             );
             assert_eq!(
                 sip::header_value(&request, "Call-ID"),
@@ -478,7 +481,10 @@ async fn refresh_keeps_registered_aor_when_associated_default_identity_changes()
         ));
         assert_eq!(session.registration_identity, registered_identity);
         assert_eq!(session.identity.public_uri, default_uri);
-        assert_eq!(runtime.status().await.public_uri.as_deref(), Some(default_uri));
+        assert_eq!(
+            runtime.status().await.public_uri.as_deref(),
+            Some(default_uri)
+        );
         assert_eq!(session.channel.send_route(), old_route);
         assert_eq!(session.security_binding, old_binding);
         assert!(session.retired_xfrm_plan.is_none());
@@ -516,7 +522,10 @@ async fn unregister_targets_original_binding_not_originating_default() {
         );
         assert_eq!(
             sip::header_value(&request, "From"),
-            Some(format!("<{}>;tag={expected_from_tag}", expected_identity.public_uri))
+            Some(format!(
+                "<{}>;tag={expected_from_tag}",
+                expected_identity.public_uri
+            ))
         );
         assert_eq!(
             sip::header_value(&request, "Expires"),

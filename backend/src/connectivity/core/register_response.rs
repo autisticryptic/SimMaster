@@ -8,6 +8,10 @@ pub struct RegisterArtifacts {
     /// Exact Require option-tag from the response, not Supported and not proof
     /// that this client advertised/implemented the full outbound procedure.
     pub outbound_required: bool,
+    /// RFC 5626: last Path URI has `ob`, or no Path (registrar is first hop).
+    pub first_hop_outbound: bool,
+    /// Exact instance/reg-id binding found; never borrow the other flow's TTL.
+    pub own_binding_found: bool,
     pub flow_timer_seconds: Option<u32>,
     /// Ordered RFC 3608 service-route set, formatted so it can be copied into
     /// one `Route` header field without losing repeated header lines.
@@ -75,6 +79,8 @@ impl RegisterArtifacts {
         Self {
             expires_seconds,
             outbound_required,
+            first_hop_outbound: first_hop_outbound(response),
+            own_binding_found: false,
             flow_timer_seconds,
             service_route,
             service_route_count,
@@ -85,14 +91,117 @@ impl RegisterArtifacts {
         }
     }
 
+    pub fn parse_for_binding(response: &[u8], instance: &str, reg_id: u32) -> Self {
+        let mut artifacts = Self::parse(response);
+        let matches = contact_bindings(response)
+            .into_iter()
+            .filter(|contact| {
+                contact_parameter(contact, "+sip.instance").as_deref() == Some(instance)
+                    && contact_parameter(contact, "reg-id").and_then(|v| v.parse::<u32>().ok())
+                        == Some(reg_id)
+            })
+            .collect::<Vec<_>>();
+        if let [contact] = matches.as_slice() {
+            artifacts.own_binding_found = true;
+            artifacts.contact_expiry_ambiguous = false;
+            // Missing per-binding expires can use only the response's Expires,
+            // not another Contact's common/default expiry.
+            artifacts.expires_seconds = contact_expires(contact).or_else(|| {
+                sip_frame::header_value(response, "Expires").and_then(|v| v.trim().parse().ok())
+            });
+        } else {
+            // Never inherit an unrelated binding's expires when our identifiers
+            // are missing/ambiguous. Negotiation validation fails closed later.
+            artifacts.contact_expiry_ambiguous = artifacts.contact_binding_count > 1;
+            artifacts.expires_seconds = sip_frame::header_value(response, "Expires")
+                .and_then(|value| value.trim().parse().ok());
+        }
+        artifacts
+    }
+
     pub fn default_associated_uri(&self) -> Option<&str> {
         self.associated_uris.first().map(String::as_str)
     }
 }
 
+/// Contact parameters are outside the URI and may contain quoted semicolons.
+pub(super) fn contact_parameter(contact: &str, wanted: &str) -> Option<String> {
+    let parameters = name_addr_range(contact).map_or(contact, |(_, end)| &contact[end + 1..]);
+    let values = split_sip_parameters(parameters)
+        .into_iter()
+        .skip(1)
+        .filter_map(|parameter| {
+            let (name, value) = parameter.split_once('=')?;
+            name.trim().eq_ignore_ascii_case(wanted).then(|| {
+                value
+                    .trim()
+                    .trim_matches('"')
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_string()
+            })
+        })
+        .collect::<Vec<_>>();
+    // Duplicate identifiers are ambiguous, not evidence for this binding.
+    match values.as_slice() {
+        [value] => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn first_hop_outbound(response: &[u8]) -> bool {
+    let paths = sip_frame::header_values(response, "Path");
+    if paths.is_empty() {
+        return true;
+    }
+    let routes = paths
+        .iter()
+        .flat_map(|path| split_sip_list(path))
+        .collect::<Vec<_>>();
+    let Some(last) = routes.last() else {
+        return false;
+    };
+    let uri = name_addr_range(last).map_or(last.trim(), |(start, end)| &last[start + 1..end]);
+    // A query/header value or a Contact-style parameter outside <> is not ob.
+    let uri = uri.split('?').next().unwrap_or("");
+    uri.split(';')
+        .skip(1)
+        .any(|p| p.trim().eq_ignore_ascii_case("ob"))
+}
+
+/// Locate only the name-addr URI, not brackets in a quoted display name or
+/// +sip.instance. SIP name-addr URIs themselves cannot contain literal <>.
+pub(super) fn name_addr_range(value: &str) -> Option<(usize, usize)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = None;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            '<' if !quoted => {
+                if start.is_some() {
+                    return None;
+                }
+                start = Some(index);
+            }
+            '>' if !quoted => return start.map(|start| (start, index)),
+            _ => {}
+        }
+    }
+    None
+}
+
 fn contact_bindings(response: &[u8]) -> Vec<String> {
     let mut contacts = Vec::new();
-    for value in sip_frame::header_values(response, "Contact") {
+    for value in sip_frame::header_values(response, "Contact")
+        .into_iter()
+        .chain(sip_frame::header_values(response, "m"))
+    {
         contacts.extend(
             split_sip_list(&value)
                 .into_iter()
@@ -105,29 +214,7 @@ fn contact_bindings(response: &[u8]) -> Vec<String> {
 }
 
 fn contact_expires(contact: &str) -> Option<u32> {
-    // For name-addr form, only parameters after the closing `>` belong to the
-    // Contact binding. URI parameters inside `<sip:...>` (including an
-    // operator-specific parameter named `expires`) must not become the binding
-    // lifetime. RFC 3261 requires angle brackets when an addr-spec contains URI
-    // parameters, so the first semicolon is a safe boundary for the bare form.
-    let parameters = contact
-        .rfind('>')
-        .map(|end| &contact[end + 1..])
-        .unwrap_or(contact);
-    for parameter in parameters.split(';').skip(1) {
-        let Some((name, value)) = parameter.split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("expires") {
-            let value = value
-                .trim()
-                .trim_matches(|ch: char| ch == '"' || ch.is_ascii_whitespace());
-            if let Ok(expires) = value.parse::<u32>() {
-                return Some(expires);
-            }
-        }
-    }
-    None
+    contact_parameter(contact, "expires").and_then(|value| value.parse().ok())
 }
 
 fn common_contact_expires(expiries: &[Option<u32>]) -> (Option<u32>, bool) {
@@ -173,7 +260,15 @@ fn push_supported_uri(uri: &str, uris: &mut Vec<String>) {
 
 /// Split a comma-separated SIP header list without treating commas inside a
 /// quoted display name or a name-addr URI as element separators.
-fn split_sip_list(value: &str) -> Vec<&str> {
+pub(super) fn split_sip_list(value: &str) -> Vec<&str> {
+    split_sip_delimited(value, ',')
+}
+
+pub(super) fn split_sip_parameters(value: &str) -> Vec<&str> {
+    split_sip_delimited(value, ';')
+}
+
+fn split_sip_delimited(value: &str, delimiter: char) -> Vec<&str> {
     let mut values = Vec::new();
     let mut start = 0usize;
     let mut in_quote = false;
@@ -190,7 +285,7 @@ fn split_sip_list(value: &str) -> Vec<&str> {
             '"' => in_quote = !in_quote,
             '<' if !in_quote => angle_depth = angle_depth.saturating_add(1),
             '>' if !in_quote => angle_depth = angle_depth.saturating_sub(1),
-            ',' if !in_quote && angle_depth == 0 => {
+            ch if ch == delimiter && !in_quote && angle_depth == 0 => {
                 values.push(&value[start..index]);
                 start = index + ch.len_utf8();
             }
@@ -346,5 +441,23 @@ mod tests {
         assert!(artifacts.wildcard_contact_present);
         assert_eq!(artifacts.contact_binding_count, 0);
         assert_eq!(artifacts.expires_seconds, Some(0));
+    }
+}
+
+#[cfg(test)]
+mod outbound_binding_tests {
+    use super::*;
+    #[test]
+    fn selects_own_lease_and_checks_last_path_not_first() {
+        let response = b"SIP/2.0 200 OK\r\nRequire: outbound\r\nPath: <sip:registrar.test;lr;ob>, <sip:edge.test;lr>\r\nContact: <sip:a@192.0.2.1>;+sip.instance=\"<urn:uuid:i>\";reg-id=1;expires=90\r\nContact: <sip:a@192.0.2.2>;+sip.instance=\"<urn:uuid:i>\";reg-id=2;expires=600\r\n\r\n";
+        let artifacts = RegisterArtifacts::parse_for_binding(response, "urn:uuid:i", 2);
+        assert!(artifacts.own_binding_found);
+        assert_eq!(artifacts.expires_seconds, Some(600));
+        assert!(!artifacts.first_hop_outbound);
+        assert!(
+            !RegisterArtifacts::parse_for_binding(response, "urn:uuid:other", 2).own_binding_found
+        );
+        let response = b"SIP/2.0 200 OK\r\nPath: <sip:registrar.test;lr>\r\nPath: <sip:edge.test;lr;ob>\r\n\r\n";
+        assert!(RegisterArtifacts::parse(response).first_hop_outbound);
     }
 }

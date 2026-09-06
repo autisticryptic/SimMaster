@@ -575,20 +575,20 @@ pub struct VersionUpdateNotificationConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct GithubDownloadProxyConfig {
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enabled: bool,
     #[serde(default = "default_github_download_proxy_prefix")]
     pub proxy_prefix: String,
 }
 
 fn default_github_download_proxy_prefix() -> String {
-    "https://gh-proxy.com/".to_string()
+    String::new()
 }
 
 impl Default for GithubDownloadProxyConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             proxy_prefix: default_github_download_proxy_prefix(),
         }
     }
@@ -3397,6 +3397,41 @@ line_profiles:
         (manager, path)
     }
 
+    #[test]
+    fn github_download_proxy_defaults_to_direct() {
+        let config = GithubDownloadProxyConfig::default();
+        assert!(!config.enabled);
+        assert!(config.proxy_prefix.is_empty());
+
+        let partial: GithubDownloadProxyConfig = serde_json::from_str("{}").unwrap();
+        assert!(!partial.enabled);
+        assert!(partial.proxy_prefix.is_empty());
+    }
+
+    #[test]
+    fn legacy_gh_proxy_default_is_migrated_to_direct() {
+        let dir = text_config_test_dir("github-download-proxy-migration");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "config_version: 5\ngithub_download_proxy:\n  enabled: true\n  proxy_prefix: https://gh-proxy.com/\n",
+        )
+        .unwrap();
+
+        let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        let config = manager.get_github_download_proxy();
+        assert!(!config.enabled);
+        assert!(config.proxy_prefix.is_empty());
+
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("enabled: false"));
+        assert!(saved.contains("proxy_prefix: ''") || saved.contains("proxy_prefix: \"\""));
+
+        drop(manager);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// A first run must leave a file a person can actually read and edit.
     #[test]
     fn first_run_writes_a_documented_yaml_file() {
@@ -5359,7 +5394,7 @@ const CONFIG_FILE_ANNOTATIONS: &[(&str, &[&str])] = &[
     ),
     (
         "github_download_proxy",
-        &["Prefix applied to GitHub downloads for update checks."],
+        &["Optional prefix for GitHub downloads; empty means direct GitHub (the default)."],
     ),
     (
         "version_update_notifications",
@@ -5435,6 +5470,23 @@ fn migrate_template_string(template: &mut String) -> bool {
     }
 
     changed
+}
+
+/// The original default routed every GitHub request through gh-proxy.com.
+///
+/// Keep explicitly selected mirrors working, but migrate the old generated
+/// value to the new direct-by-default behavior. This matters on upgrades: a
+/// persisted config is not deserialized through `Default`, so changing the
+/// serde default alone would leave existing installations on the broken mirror.
+fn migrate_legacy_github_download_proxy(config: &mut AppConfig) -> bool {
+    let proxy = &mut config.github_download_proxy;
+    let normalized = proxy.proxy_prefix.trim().trim_end_matches('/');
+    if proxy.enabled && normalized.eq_ignore_ascii_case("https://gh-proxy.com") {
+        proxy.enabled = false;
+        proxy.proxy_prefix.clear();
+        return true;
+    }
+    false
 }
 
 fn migrate_templates_to_remove_md5(config: &mut AppConfig) -> bool {
@@ -5553,6 +5605,7 @@ impl ConfigManager {
         let mut config = AppConfig::merge(main, stored);
 
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
+        let github_download_proxy_changed = migrate_legacy_github_download_proxy(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
         let volte_ip_family_defaults_changed = migrate_legacy_volte_ip_family_defaults(&mut config);
 
@@ -5565,6 +5618,7 @@ impl ConfigManager {
 
         if !file_existed
             || templates_changed
+            || github_download_proxy_changed
             || video_gates_changed
             || volte_ip_family_defaults_changed
         {

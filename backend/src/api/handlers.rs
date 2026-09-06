@@ -8843,9 +8843,7 @@ async fn line_ims_access_decision_assuming(
     line: &crate::services::line_registry::LineRuntime,
     assume_available: Option<crate::connectivity::core::ims_access::ImsAccess>,
 ) -> crate::connectivity::core::ims_access::ImsAccessDecision {
-    use crate::connectivity::core::ims_access::{
-        decide, ImsAccess, ImsAccessInputs, CURRENT_CONCURRENT_SUPPORT,
-    };
+    use crate::connectivity::core::ims_access::{decide, ImsAccess, ImsAccessInputs};
     use crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState;
 
     let binding = line.binding();
@@ -8870,6 +8868,9 @@ async fn line_ims_access_decision_assuming(
             && !profile.airplane_mode_enabled,
         wlan_enabled: profile.enabled && profile.vowifi.enabled,
         cellular_available: binding.present
+            && line
+                .ims_registration
+                .flow_creation_ready(ImsAccess::Cellular)
             && binding_has_baseband(&binding)
             && !profile.airplane_mode_enabled
             && !line.baseband_wedge_permanent()
@@ -8878,13 +8879,14 @@ async fn line_ims_access_decision_assuming(
         // Give a preferred/cold WLAN access one bounded attempt even before its
         // ePDG exists. Exhaustion then releases eligibility to the fallback.
         wlan_available: binding.present
+            && line.ims_registration.flow_creation_ready(ImsAccess::Wlan)
             && (!vowifi_auto_restore_is_exhausted(wlan.degraded_reason.as_deref())
                 || assume_available == Some(ImsAccess::Wlan)),
         cellular_registered: cellular.registered(),
         wlan_registered,
         device_identity_spoofed: line_device_identity_spoofed(app, line_id).await,
         preference: profile.ims_access_preference,
-        concurrent_support: CURRENT_CONCURRENT_SUPPORT,
+        concurrent_support: line.ims_registration.concurrent_support(),
     })
 }
 

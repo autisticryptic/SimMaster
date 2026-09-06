@@ -3763,9 +3763,27 @@ async fn run_live_ims_register_until(
         );
     }
 
-    let attempt =
-        attempt_live_ims_registration(line_id, profile, access_network, refresh_context.is_some())
-            .await;
+    let attempt = if refresh_context.is_some() {
+        match super::operator::refresh_registered_for_line(line_id, profile.meta.profile_id).await {
+            Some(result) => result.map_err(|error| {
+                let loss = if error.code().starts_with("ims_outbound_")
+                    || error.code() == "vowifi_refresh_security_update_required"
+                {
+                    RegistrationLossReason::AccessTransportLost
+                } else {
+                    classify_vowifi_register_error(error.code())
+                };
+                live_stage_error(error.code()).with_registration_loss(loss)
+            }),
+            // A closed owner is flow recovery, not a refresh on a new socket.
+            None => Err(live_registration_error(
+                "ims_outbound_flow_failed",
+                RegistrationLossReason::AccessTransportLost,
+            )),
+        }
+    } else {
+        attempt_live_ims_registration(line_id, profile, access_network, false).await
+    };
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
         Err(error)
@@ -3908,7 +3926,20 @@ async fn attempt_live_ims_registration(
                 RegistrationLossReason::NetworkRejected,
             )
         })?;
-    let artifacts = RegisterArtifacts::parse(response.as_bytes());
+    let artifacts = match crate::connectivity::core::ims_registration_coordinator::for_line(line_id)
+        .binding_instance(crate::connectivity::core::ims_access::ImsAccess::Wlan)
+    {
+        Some(instance)
+            if crate::connectivity::core::outbound::has_option(
+                response.as_bytes(),
+                "Require",
+                "outbound",
+            ) =>
+        {
+            RegisterArtifacts::parse_for_binding(response.as_bytes(), &instance, WLAN_REG_ID)
+        }
+        _ => RegisterArtifacts::parse(response.as_bytes()),
+    };
     let service_route_count = artifacts.service_route_count;
     let contact_binding_count = artifacts.contact_binding_count;
     let contact_expiry_ambiguous = artifacts.contact_expiry_ambiguous;
@@ -4577,6 +4608,7 @@ async fn record_live_ims_channel(
 ) -> Result<(), LiveStageError> {
     let route = channel.route();
     let expires_at = Instant::now() + registration.lease.expires_after;
+    let expires_seconds = registration.lease.expires_seconds;
     let media_route_installer: Option<Arc<dyn super::operator::MediaRouteInstaller>> =
         cached_tun_gateway(line_id, profile)
             .await
@@ -4612,9 +4644,13 @@ async fn record_live_ims_channel(
             unregister: Some(Arc::new(VowifiUnregisterFactory {
                 line_id: line_id.to_string(),
                 profile,
-                context: register_context,
+                context: register_context.clone(),
                 variant: register_variant,
-                next_cseq: next_register_cseq,
+                next_cseq: std::sync::atomic::AtomicU32::new(next_register_cseq),
+                expires_seconds: std::sync::atomic::AtomicU32::new(expires_seconds),
+                refresh_authorization: std::sync::Mutex::new(
+                    register_context.refresh_authorization.clone(),
+                ),
                 security_verify: security_verify.clone(),
             })),
             media_route_installer,
@@ -5348,7 +5384,34 @@ async fn run_register_exchange_with_pcscf_variant(
     )
     .await
     {
-        Ok(response) => Ok(response),
+        Ok((response, mut context, next_cseq)) => {
+            if !context.channel_transferred {
+                let artifacts = channel
+                    .outbound_registered(response.as_bytes(), profile.ims.register.expires_seconds)
+                    .map_err(|error| live_stage_error(error.code()))?;
+                if artifacts.expires_seconds == Some(0) {
+                    return Err(live_stage_error("ims_register_binding_removed"));
+                }
+                if let Some(auth) = context.refresh_authorization.as_mut() {
+                    auth.apply_success(response.as_bytes());
+                }
+                let registered = RegisteredImsContext::from_artifacts(
+                    ImsRegistrationAccess::Vowifi,
+                    artifacts,
+                    profile.ims.register.expires_seconds,
+                );
+                let mut identity = context.identity.shared.clone();
+                if let Some(uri) = registered.default_associated_uri() {
+                    identity.public_uri = uri.to_string();
+                }
+                record_live_ims_channel(
+                    line_id, profile, identity, channel, None, registered, context, variant,
+                    next_cseq,
+                )
+                .await?;
+            }
+            Ok(response)
+        }
         Err(err) => {
             channel.abort();
             Err(err)
@@ -5366,7 +5429,7 @@ async fn run_register_exchange_on_connected_stream(
     pcscf_addr: IpAddr,
     variant: LiveRegisterHeaderVariant,
     access_network_runtime: &ImsAccessNetworkRuntime,
-) -> Result<String, LiveStageError> {
+) -> Result<(String, LiveRegisterRequestContext, u32), LiveStageError> {
     let identity = live_ims_register_identity(line_id, profile, variant.identity_format).await?;
     let identity_shape = identity.shape;
     let access_network = (profile.ims.register.enable_cellular_network_info
@@ -5393,6 +5456,16 @@ async fn run_register_exchange_on_connected_stream(
         line_id, profile, identity, local_addr, pcscf_addr,
     )?;
     context.access_network = access_network;
+    channel.configure_outbound(
+        line_id,
+        &context.instance_id,
+        !profile
+            .ims
+            .register
+            .contact_mode
+            .eq_ignore_ascii_case("custom")
+            && !variant.header_profile.compact_register,
+    );
     let request = context.build_initial_request(profile, variant);
     info!(
         pcscf_family = ip_family_name(pcscf_addr),
@@ -5447,6 +5520,7 @@ async fn run_register_exchange_on_connected_stream(
                     .unwrap_or_else(|| map_shared_register_failure(&failure)))
             }
         };
+    drop(authenticator);
     let response = String::from_utf8(registration.response)
         .map_err(|_| live_stage_error("ims_register_response_not_utf8"))?;
     let summary = ims::parse_sip_response(&response, &live_ims_target(line_id, profile).realm)
@@ -5470,7 +5544,11 @@ async fn run_register_exchange_on_connected_stream(
         proxy_require = ?summary.proxy_require,
         "IMS REGISTER final response metadata received from shared engine"
     );
-    Ok(response)
+    let next_cseq = sip_frame::header_value(response.as_bytes(), "CSeq")
+        .and_then(|value| value.split_whitespace().next()?.parse::<u32>().ok())
+        .and_then(|cseq| cseq.checked_add(1))
+        .ok_or_else(|| live_stage_error("ims_register_cseq_invalid"))?;
+    Ok((response, context, next_cseq))
 }
 
 struct VowifiRegisterAuthenticator<'a> {
@@ -5644,6 +5722,9 @@ fn live_register_error_status(error: &LiveStageError) -> Option<u16> {
 /// this project does not follow. No other header shape or P-CSCF can change
 /// the answer, so abort the candidate ladder instead of burning attempts.
 fn live_register_error_is_terminal(error: &LiveStageError) -> bool {
+    if error.reason.starts_with("ims_outbound_") {
+        return true;
+    }
     if error.reason.starts_with("ims_register_auth_rejected") {
         // The bounded challenge rounds were exhausted: credentials were
         // rejected, not shaped wrong.
@@ -5687,6 +5768,9 @@ fn parse_register_min_expires(response: &str) -> Option<u32> {
 }
 
 fn classify_vowifi_register_error(reason: &str) -> RegistrationLossReason {
+    if reason.starts_with("ims_outbound_") || reason == "vowifi_refresh_security_update_required" {
+        return RegistrationLossReason::AccessTransportLost;
+    }
     if reason.starts_with("ims_aka_")
         || reason.starts_with("ims_digest_")
         || reason.starts_with("eap_aka_")
@@ -5748,6 +5832,7 @@ async fn run_authenticated_register_exchange(
         }
         return Ok(response);
     }
+    context.refresh_authorization = auth_material.refresh_authorization.clone();
     let selected_offer = select_live_security_server_offer(profile, challenge)?;
     let security_verify = selected_offer.as_ref().map(|offer| offer.raw.clone());
     if let Some(offer) =
@@ -5760,6 +5845,7 @@ async fn run_authenticated_register_exchange(
         run_protected_authenticated_register_candidates(
             line_id,
             profile,
+            initial_channel,
             gateway,
             context,
             &offer,
@@ -5814,6 +5900,7 @@ async fn run_authenticated_register_exchange(
 async fn run_protected_authenticated_register_candidates(
     line_id: &str,
     profile: &'static CarrierProfile,
+    initial_channel: &SipChannel,
     gateway: &TunGatewayRuntime,
     context: &mut LiveRegisterRequestContext,
     offer: &LiveSecurityServerOffer,
@@ -6103,6 +6190,17 @@ async fn run_protected_authenticated_register_candidates(
                         security_verify.map(str::to_string),
                     )
                 };
+                protected_channel.configure_outbound(
+                    line_id,
+                    &context.instance_id,
+                    !profile
+                        .ims
+                        .register
+                        .contact_mode
+                        .eq_ignore_ascii_case("custom")
+                        && !variant.header_profile.compact_register,
+                );
+                protected_channel.inherit_outbound_path_observation(initial_channel);
                 // TS 24.229 §5.1.1.2.2 b/c: a UDP REGISTER protected by a
                 // security association advertises the protected server port
                 // (port_us) in Via and Contact, even though the packet itself
@@ -6158,8 +6256,11 @@ async fn run_protected_authenticated_register_candidates(
                             policy_candidate = candidate.label,
                             candidate_index,
                             reason = err.reason.as_str(),
-                            "IMS protected SIP candidate timed out; trying next policy"
+                            "IMS protected SIP candidate failed"
                         );
+                        if err.reason.starts_with("ims_outbound_") {
+                            return Err(err);
+                        }
                         last_error = Some(err);
                         continue;
                     }
@@ -6171,7 +6272,12 @@ async fn run_protected_authenticated_register_candidates(
                 let mut min_expires_rounds = 0u8;
                 loop {
                     if summary.status_code == 200 {
-                        let artifacts = RegisterArtifacts::parse(response.as_bytes());
+                        if let Some(auth) = context.refresh_authorization.as_mut() {
+                            auth.apply_success(response.as_bytes());
+                        }
+                        let artifacts = protected_channel
+                            .outbound_registered(response.as_bytes(), expires)
+                            .map_err(|error| live_stage_error(error.code()))?;
                         let registered = RegisteredImsContext::from_artifacts(
                             ImsRegistrationAccess::Vowifi,
                             artifacts,
@@ -6205,6 +6311,7 @@ async fn run_protected_authenticated_register_candidates(
                             retry_cseq.saturating_add(1),
                         )
                         .await?;
+                        context.channel_transferred = true;
                         return Ok(response);
                     }
                     if summary.status_code != 423 || min_expires_rounds >= MAX_MIN_EXPIRES_ROUNDS {
@@ -6247,6 +6354,9 @@ async fn run_protected_authenticated_register_candidates(
                         Ok(response) => response,
                         Err(err) => {
                             protected_channel.abort();
+                            if err.reason.starts_with("ims_outbound_") {
+                                return Err(err);
+                            }
                             warn!(
                                 policy_candidate = candidate.label,
                                 candidate_index,
@@ -6479,10 +6589,9 @@ async fn send_live_sms_message_on_cached_channel(
         return Ok(None);
     }
     let local_addr = channel.channel.route().local_addr;
-    let (socket, mut pending) = channel.channel.into_parts();
-    let mut channel = SipChannel::new(
-        socket,
-        Vec::new(),
+    let mut channel = channel.channel;
+    let mut pending = Vec::new();
+    channel.update_context(
         shared_vowifi_route(profile, route, local_addr),
         security_verify.map(str::to_string),
     );
@@ -6623,21 +6732,24 @@ fn start_live_sms_followup_task(
                     outcome: followup_outcome,
                 });
                 let expires_at = cached_live_ims_expires_at(&line_id, profile).await;
-                let (socket, channel_pending) = channel.into_parts();
-                let mut merged_pending = channel_pending;
-                merged_pending.extend_from_slice(&pending);
+                if channel
+                    .prepend_pending(std::mem::take(&mut pending))
+                    .is_err()
+                {
+                    channel.abort();
+                    return;
+                }
+                channel.update_context(
+                    shared_vowifi_route(profile, &route, local_addr),
+                    security_verify,
+                );
                 let mut guard = ims_channel_cache().lock().await;
                 guard.insert(
                     line_id.clone(),
                     LiveImsChannel {
                         profile_id: profile.meta.profile_id,
                         expires_at,
-                        channel: SipChannel::new(
-                            socket,
-                            merged_pending,
-                            shared_vowifi_route(profile, &route, local_addr),
-                            security_verify,
-                        ),
+                        channel,
                     },
                 );
             }
@@ -7371,29 +7483,20 @@ async fn read_sip_frame(
     timeout: Duration,
     timeout_reason: &'static str,
 ) -> Result<Vec<u8>, LiveStageError> {
-    let mut buffer = Vec::with_capacity(4096);
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        let mut chunk = [0u8; 1024];
-        tokio::select! {
-            _ = &mut deadline => return Err(live_stage_error(timeout_reason)),
-            read = channel.recv_chunk(&mut chunk) => {
-                let read = read.map_err(|_| live_stage_error("ims_register_read_failed"))?;
-                if read == 0 && channel.is_tcp() {
-                    break;
-                }
-                buffer.extend_from_slice(&chunk[..read]);
-                if sip_message_complete(&buffer) {
-                    break;
-                }
-                if buffer.len() > 16 * 1024 {
-                    return Err(live_stage_error("ims_register_response_too_large"));
-                }
-            }
-        }
-    }
-    Ok(buffer)
+    // Channel-owned framing is cancellation safe, retains coalesced TCP
+    // frames, and services CRLF/STUN while waiting. Raw recv_chunk used to
+    // bypass flow refusal handling and could discard trailing SIP messages.
+    let frame = channel.recv_sip_fresh(timeout).await.map_err(|error| {
+        live_stage_error(if error.code() == "ims_channel_read_timeout" {
+            timeout_reason
+        } else {
+            error.code()
+        })
+    })?;
+    channel
+        .observe_outbound_response(&frame)
+        .map_err(|error| live_stage_error(error.code()))?;
+    Ok(frame)
 }
 
 async fn read_sip_frame_buffered(
@@ -7402,37 +7505,12 @@ async fn read_sip_frame_buffered(
     timeout: Duration,
     timeout_reason: &'static str,
 ) -> Result<Vec<u8>, LiveStageError> {
-    if let Some(frame_len) = sip_complete_frame_len(pending) {
-        return Ok(pending.drain(..frame_len).collect());
+    if !pending.is_empty() {
+        channel
+            .prepend_pending(std::mem::take(pending))
+            .map_err(|error| live_stage_error(error.code()))?;
     }
-
-    let deadline = tokio::time::sleep(timeout);
-    tokio::pin!(deadline);
-    loop {
-        let mut chunk = [0u8; 1024];
-        tokio::select! {
-            _ = &mut deadline => return Err(live_stage_error(timeout_reason)),
-            read = channel.recv_chunk(&mut chunk) => {
-                let read = read.map_err(|_| live_stage_error("ims_register_read_failed"))?;
-                if read == 0 && channel.is_tcp() {
-                    break;
-                }
-                pending.extend_from_slice(&chunk[..read]);
-                if pending.len() > 64 * 1024 {
-                    return Err(live_stage_error("sip_frame_buffer_too_large"));
-                }
-                if let Some(frame_len) = sip_complete_frame_len(pending) {
-                    return Ok(pending.drain(..frame_len).collect());
-                }
-            }
-        }
-    }
-
-    if pending.is_empty() {
-        Err(live_stage_error("sip_frame_empty"))
-    } else {
-        Ok(std::mem::take(pending))
-    }
+    read_sip_frame(channel, timeout, timeout_reason).await
 }
 
 fn parse_sip_status(frame: &[u8]) -> Result<u16, LiveStageError> {
@@ -7518,6 +7596,8 @@ struct LiveRegisterRequestContext {
     from_tag: String,
     call_id: String,
     instance_id: String,
+    refresh_authorization: Option<LiveRefreshAuthorization>,
+    channel_transferred: bool,
     security_client_state: LiveSecurityClientState,
     security_client_full_spaced: String,
     security_client_full_compact: String,
@@ -7557,7 +7637,7 @@ impl LiveRegisterRequestContext {
         route_addr: IpAddr,
     ) -> Result<Self, LiveStageError> {
         let device_imei = line_overrides(line_id).effective_device_imei;
-        Self::new_with_target_and_device(
+        let mut context = Self::new_with_target_and_device(
             profile,
             live_ims_target(line_id, profile),
             identity,
@@ -7565,7 +7645,11 @@ impl LiveRegisterRequestContext {
             route_addr,
             device_imei.as_deref(),
             super::operator::operator_link_for_line(line_id).video_enabled(),
-        )
+        )?;
+        context.instance_id =
+            crate::connectivity::core::ims_registration_coordinator::for_line(line_id)
+                .registration_instance(&context.instance_id);
+        Ok(context)
     }
 
     fn new_with_target(
@@ -7600,6 +7684,8 @@ impl LiveRegisterRequestContext {
             from_tag: hex_token(8),
             call_id: format!("{}@simadmin", hex_token(16)),
             instance_id,
+            refresh_authorization: None,
+            channel_transferred: false,
             security_client_state,
             security_client_full_spaced: build_security_client_header(
                 profile,
@@ -8031,73 +8117,314 @@ impl LiveRegisterRequestContext {
     }
 }
 
+/// Secret digest credentials stay with the socket owner; never serialize or
+/// log them. Each new REGISTER gets a new proof/nc, retransmissions reuse bytes.
+#[derive(Clone)]
+struct LiveRefreshAuthorization {
+    challenge: crate::connectivity::core::digest_aka::DigestChallenge,
+    password: Vec<u8>,
+    cnonce: String,
+    nonce_count: u32,
+}
+
+impl std::fmt::Debug for LiveRefreshAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LiveRefreshAuthorization(<redacted>)")
+    }
+}
+
+impl LiveRefreshAuthorization {
+    fn authorization(&mut self, username: &str, uri: &str) -> Result<String, ImsError> {
+        let next = self
+            .nonce_count
+            .checked_add(1)
+            .ok_or_else(|| ImsError::new("vowifi_refresh_nonce_count_exhausted"))?;
+        let nc = format!("{next:08x}");
+        let proof = crate::connectivity::core::digest_aka::compute_digest_response(
+            username,
+            &self.challenge.realm,
+            &self.password,
+            &self.challenge.algorithm,
+            "REGISTER",
+            uri,
+            &self.challenge.nonce,
+            self.challenge.qop.as_deref(),
+            &self.cnonce,
+            &nc,
+        )?;
+        let header = crate::connectivity::core::digest_aka::build_authorization_header(
+            &self.challenge,
+            username,
+            uri,
+            &proof,
+            &self.cnonce,
+            &nc,
+        );
+        self.nonce_count = next;
+        Ok(header)
+    }
+
+    fn apply_success(&mut self, response: &[u8]) {
+        let name = if self.challenge.proxy {
+            "Proxy-Authentication-Info"
+        } else {
+            "Authentication-Info"
+        };
+        if let Some(nonce) = sip_frame::header_values(response, name)
+            .iter()
+            .find_map(|value| {
+                crate::connectivity::core::digest_aka::parse_authentication_info_nextnonce(value)
+            })
+            .filter(|nonce| !nonce.is_empty() && nonce != &self.challenge.nonce)
+        {
+            self.challenge.nonce = nonce;
+            self.nonce_count = 0;
+        }
+    }
+}
+
 struct VowifiUnregisterFactory {
     line_id: String,
     profile: &'static CarrierProfile,
     context: LiveRegisterRequestContext,
     variant: LiveRegisterHeaderVariant,
-    next_cseq: u32,
+    next_cseq: std::sync::atomic::AtomicU32,
+    expires_seconds: std::sync::atomic::AtomicU32,
+    refresh_authorization: std::sync::Mutex<Option<LiveRefreshAuthorization>>,
     security_verify: Option<String>,
 }
 
-impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
-    fn initial_request(&self) -> Result<Vec<u8>, ImsError> {
+impl VowifiUnregisterFactory {
+    fn request(&self, expires: u32, authorization: Option<&str>) -> Result<Vec<u8>, ImsError> {
+        let cseq = self
+            .next_cseq
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |next| next.checked_add(1).filter(|next| *next < (1 << 31)),
+            )
+            .map_err(|_| ImsError::new("vowifi_refresh_cseq_exhausted"))?;
         Ok(self
             .context
-            .build_unregister_request(
+            .build_register_request_with_expires(
                 self.profile,
                 self.variant,
-                self.next_cseq,
-                None,
+                cseq,
+                authorization,
                 self.security_verify.as_deref(),
+                expires,
             )
             .into_bytes())
     }
 
+    fn authorized_request(
+        &self,
+        expires: u32,
+        auth: &mut Option<LiveRefreshAuthorization>,
+    ) -> Result<Vec<u8>, ImsError> {
+        let authorization = auth
+            .as_mut()
+            .map(|state| {
+                state.authorization(
+                    &self.context.identity.private_user,
+                    &self.context.request_uri(self.profile, self.variant),
+                )
+            })
+            .transpose()?;
+        self.request(expires, authorization.as_deref())
+    }
+
+    fn remember_emitted(&self, emitted: &Option<LiveRefreshAuthorization>) {
+        let mut original = self
+            .refresh_authorization
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let (Some(original), Some(emitted)) = (original.as_mut(), emitted.as_ref()) {
+            if original.challenge == emitted.challenge && original.cnonce == emitted.cnonce {
+                original.nonce_count = original.nonce_count.max(emitted.nonce_count);
+            }
+        }
+    }
+
+    async fn challenged_authorization(
+        &self,
+        response: &[u8],
+    ) -> Result<(Option<LiveRefreshAuthorization>, Option<String>), ImsError> {
+        let text = std::str::from_utf8(response)
+            .map_err(|_| ImsError::new("vowifi_refresh_response_not_utf8"))?;
+        let challenge = parse_live_digest_challenge(text, &self.context.target.realm)
+            .map_err(|_| ImsError::new("vowifi_refresh_challenge_invalid"))?;
+        reject_plain_digest_when_disabled(self.profile, &challenge)
+            .map_err(|_| ImsError::new("vowifi_refresh_digest_rejected"))?;
+        // This is an explicit new SA offer, not an unanswered refresh. The
+        // access owner must perform security recovery; never install keys here
+        // while the registered socket still owns the previous selectors.
+        if !challenge.security_server_offers.is_empty() {
+            return Err(ImsError::new("vowifi_refresh_security_update_required"));
+        }
+        let password = match challenge.nonce_kind {
+            LiveDigestNonceKind::AkaChallenge => {
+                let aka =
+                    authenticate_live_sim_for_line(&self.line_id, &challenge.rand, &challenge.autn)
+                        .await
+                        .map_err(|_| ImsError::new("vowifi_refresh_aka_failed"))?;
+                if let Some(auts) = aka.auts.as_ref() {
+                    let header = build_digest_resync_authorization_header(
+                        &self.context,
+                        &challenge,
+                        &self.context.request_uri(self.profile, self.variant),
+                        auts,
+                    )
+                    .map_err(|_| ImsError::new("vowifi_refresh_resync_failed"))?;
+                    return Ok((None, Some(header)));
+                }
+                crate::connectivity::core::digest_aka::aka_digest_password(
+                    &challenge.algorithm,
+                    &crate::connectivity::core::digest_aka::AkaMaterial {
+                        res: &aka.res,
+                        ck: &aka.ck,
+                        ik: &aka.ik,
+                    },
+                )?
+            }
+            LiveDigestNonceKind::PlainDigest => Vec::new(),
+        };
+        Ok((
+            Some(LiveRefreshAuthorization {
+                challenge: challenge.shared(),
+                password,
+                cnonce: live_digest_cnonce()
+                    .map_err(|_| ImsError::new("vowifi_refresh_random_failed"))?,
+                nonce_count: 0,
+            }),
+            None,
+        ))
+    }
+}
+
+struct VowifiRefreshAuthenticator<'a> {
+    factory: &'a VowifiUnregisterFactory,
+    authorization: Option<LiveRefreshAuthorization>,
+    expires: u32,
+}
+
+impl VowifiRefreshAuthenticator<'_> {
+    fn request(&mut self) -> Result<Vec<u8>, ImsError> {
+        let request = self
+            .factory
+            .authorized_request(self.expires, &mut self.authorization)?;
+        self.factory.remember_emitted(&self.authorization);
+        Ok(request)
+    }
+}
+
+impl RegisterAuthenticator<SipChannel> for VowifiRefreshAuthenticator<'_> {
+    async fn authenticated_request(
+        &mut self,
+        response: &[u8],
+        _cseq: u32,
+    ) -> Result<Vec<u8>, ImsError> {
+        let (auth, resync) = self.factory.challenged_authorization(response).await?;
+        self.authorization = auth;
+        if let Some(resync) = resync {
+            self.factory.request(self.expires, Some(&resync))
+        } else {
+            self.request()
+        }
+    }
+
+    async fn rebuild_register_with_min_expires(
+        &mut self,
+        _response: &[u8],
+        _cseq: u32,
+        min_expires: u32,
+        _authenticated: bool,
+    ) -> Result<Vec<u8>, ImsError> {
+        self.expires = self.expires.max(min_expires);
+        self.request()
+    }
+}
+
+impl super::operator::RegisteredUnregister for VowifiUnregisterFactory {
+    fn refresh<'a>(
+        &'a self,
+        channel: &'a mut SipChannel,
+    ) -> futures_util::future::BoxFuture<'a, Result<RegisteredImsContext, ImsError>> {
+        Box::pin(async move {
+            let mut auth = VowifiRefreshAuthenticator {
+                factory: self,
+                authorization: self
+                    .refresh_authorization
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+                expires: self
+                    .expires_seconds
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            };
+            let initial = auth.request()?;
+            let result = run_register_observed(channel, &initial, &mut auth).await;
+            let result = result.map_err(|failure| {
+                if failure.error.code().starts_with("ims_outbound_")
+                    || failure.error.code() == "vowifi_refresh_security_update_required"
+                {
+                    return failure.error;
+                }
+                match failure
+                    .response
+                    .as_deref()
+                    .and_then(|frame| sip_frame::parse_status(frame).ok())
+                {
+                    Some(403 | 404 | 410 | 481 | 401 | 407) => {
+                        ImsError::new("vowifi_refresh_rejected")
+                    }
+                    _ => failure.error,
+                }
+            })?;
+            let artifacts = channel.outbound_registered(&result.response, auth.expires)?;
+            if artifacts.expires_seconds == Some(0) {
+                return Err(ImsError::new("vowifi_refresh_rejected"));
+            }
+            if let Some(state) = auth.authorization.as_mut() {
+                state.apply_success(&result.response);
+            }
+            *self
+                .refresh_authorization
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = auth.authorization;
+            let registration = RegisteredImsContext::from_artifacts(
+                ImsRegistrationAccess::Vowifi,
+                artifacts,
+                auth.expires,
+            );
+            self.expires_seconds.store(
+                registration.lease.expires_seconds,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            Ok(registration)
+        })
+    }
+
+    fn initial_request(&self) -> Result<Vec<u8>, ImsError> {
+        let mut auth = self
+            .refresh_authorization
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.authorized_request(0, &mut auth)
+    }
+
     fn authenticated_request<'a>(
         &'a self,
-        challenge_response: &'a [u8],
-        challenge_cseq: u32,
+        response: &'a [u8],
+        _cseq: u32,
     ) -> futures_util::future::BoxFuture<'a, Result<Vec<u8>, ImsError>> {
         Box::pin(async move {
-            let response = std::str::from_utf8(challenge_response)
-                .map_err(|_| ImsError::new("vowifi_unregister_response_not_utf8"))?;
-            let challenge = parse_live_digest_challenge(response, &self.context.target.realm)
-                .map_err(|_| ImsError::new("vowifi_unregister_challenge_invalid"))?;
-            reject_plain_digest_when_disabled(self.profile, &challenge)
-                .map_err(|_| ImsError::new("vowifi_unregister_digest_rejected"))?;
-            let mut material = build_live_register_auth_material(
-                &self.line_id,
-                self.profile,
-                &self.context,
-                &challenge,
-                self.variant,
-            )
-            .await
-            .map_err(|_| ImsError::new("vowifi_unregister_aka_failed"))?;
-            let authorization = match material.auts.take() {
-                Some(auts) => build_digest_resync_authorization_header(
-                    &self.context,
-                    &challenge,
-                    &self.context.request_uri(self.profile, self.variant),
-                    &auts,
-                )
-                .map_err(|_| ImsError::new("vowifi_unregister_resync_failed"))?,
-                None => material.authorization,
-            };
-            let cseq = self
-                .next_cseq
-                .saturating_add(challenge_cseq.saturating_sub(1));
-            Ok(self
-                .context
-                .build_unregister_request(
-                    self.profile,
-                    self.variant,
-                    cseq,
-                    Some(&authorization),
-                    self.security_verify.as_deref(),
-                )
-                .into_bytes())
+            let (mut auth, resync) = self.challenged_authorization(response).await?;
+            if let Some(resync) = resync {
+                self.request(0, Some(&resync))
+            } else {
+                self.authorized_request(0, &mut auth)
+            }
         })
     }
 }
@@ -8271,6 +8598,7 @@ impl LiveDigestNonceKind {
 
 struct LiveRegisterAuthMaterial {
     authorization: String,
+    refresh_authorization: Option<LiveRefreshAuthorization>,
     ims_esp_secrets: ChildSaSecretPair,
     ims_esp_alt_secrets: Vec<ChildSaSecretPair>,
     /// Integrity-only ESP secrets (ealg=null). Some P-CSCFs (e.g. the
@@ -8290,61 +8618,77 @@ async fn build_live_register_auth_material(
 ) -> Result<LiveRegisterAuthMaterial, LiveStageError> {
     let digest_uri = context.request_uri(profile, variant);
     let cnonce = live_digest_cnonce()?;
-    let (response, ims_esp_secrets, ims_esp_alt_secrets, ims_esp_null_secrets) = match challenge
-        .nonce_kind
-    {
-        LiveDigestNonceKind::AkaChallenge => {
-            let aka_result =
-                authenticate_live_sim_for_line(line_id, &challenge.rand, &challenge.autn)
-                    .await
-                    .map_err(live_stage_error)?;
-            if let Some(auts) = aka_result.auts {
-                return Ok(LiveRegisterAuthMaterial {
-                    authorization: String::new(),
-                    ims_esp_secrets: placeholder_ims_esp_secrets(),
-                    ims_esp_alt_secrets: Vec::new(),
-                    ims_esp_null_secrets: None,
-                    auts: Some(auts),
-                });
+    let (response, password, ims_esp_secrets, ims_esp_alt_secrets, ims_esp_null_secrets) =
+        match challenge.nonce_kind {
+            LiveDigestNonceKind::AkaChallenge => {
+                let aka_result =
+                    authenticate_live_sim_for_line(line_id, &challenge.rand, &challenge.autn)
+                        .await
+                        .map_err(live_stage_error)?;
+                if let Some(auts) = aka_result.auts {
+                    return Ok(LiveRegisterAuthMaterial {
+                        authorization: String::new(),
+                        refresh_authorization: None,
+                        ims_esp_secrets: placeholder_ims_esp_secrets(),
+                        ims_esp_alt_secrets: Vec::new(),
+                        ims_esp_null_secrets: None,
+                        auts: Some(auts),
+                    });
+                }
+                if aka_result.res.is_empty() {
+                    return Err(live_stage_error("ims_aka_empty_response"));
+                }
+                let response = compute_aka_digest_response(
+                    &context.identity.private_user,
+                    &challenge.realm,
+                    &aka_result,
+                    &challenge.algorithm,
+                    "REGISTER",
+                    &digest_uri,
+                    &challenge.nonce,
+                    challenge.qop,
+                    &cnonce,
+                )?;
+                let selected_offer = select_live_security_server_offer(profile, challenge)?
+                    .ok_or_else(|| live_stage_error("ims_security_server_offer_missing"))?;
+                let secrets = derive_ims_esp_secrets(&selected_offer, &aka_result)?;
+                let alt_secrets = derive_ims_esp_secrets_raw_ik(&selected_offer, &aka_result)
+                    .map(|secrets| vec![secrets])
+                    .unwrap_or_default();
+                let null_secrets =
+                    derive_ims_esp_secrets_null_encryption(&selected_offer, &aka_result)
+                        .map(Some)
+                        .unwrap_or(None);
+                let password = crate::connectivity::core::digest_aka::aka_digest_password(
+                    &challenge.algorithm,
+                    &crate::connectivity::core::digest_aka::AkaMaterial {
+                        res: &aka_result.res,
+                        ck: &aka_result.ck,
+                        ik: &aka_result.ik,
+                    },
+                )
+                .map_err(map_shared_digest_error)?;
+                (response, password, secrets, alt_secrets, null_secrets)
             }
-            if aka_result.res.is_empty() {
-                return Err(live_stage_error("ims_aka_empty_response"));
+            LiveDigestNonceKind::PlainDigest => {
+                let response = compute_plain_md5_response(
+                    &context.identity.private_user,
+                    &challenge.realm,
+                    "REGISTER",
+                    &digest_uri,
+                    &challenge.nonce,
+                    challenge.qop,
+                    &cnonce,
+                )?;
+                (
+                    response,
+                    Vec::new(),
+                    placeholder_ims_esp_secrets(),
+                    Vec::new(),
+                    None,
+                )
             }
-            let response = compute_aka_digest_response(
-                &context.identity.private_user,
-                &challenge.realm,
-                &aka_result,
-                &challenge.algorithm,
-                "REGISTER",
-                &digest_uri,
-                &challenge.nonce,
-                challenge.qop,
-                &cnonce,
-            )?;
-            let selected_offer = select_live_security_server_offer(profile, challenge)?
-                .ok_or_else(|| live_stage_error("ims_security_server_offer_missing"))?;
-            let secrets = derive_ims_esp_secrets(&selected_offer, &aka_result)?;
-            let alt_secrets = derive_ims_esp_secrets_raw_ik(&selected_offer, &aka_result)
-                .map(|secrets| vec![secrets])
-                .unwrap_or_default();
-            let null_secrets = derive_ims_esp_secrets_null_encryption(&selected_offer, &aka_result)
-                .map(Some)
-                .unwrap_or(None);
-            (response, secrets, alt_secrets, null_secrets)
-        }
-        LiveDigestNonceKind::PlainDigest => {
-            let response = compute_plain_md5_response(
-                &context.identity.private_user,
-                &challenge.realm,
-                "REGISTER",
-                &digest_uri,
-                &challenge.nonce,
-                challenge.qop,
-                &cnonce,
-            )?;
-            (response, placeholder_ims_esp_secrets(), Vec::new(), None)
-        }
-    };
+        };
     let authorization =
         build_digest_authorization_header(context, challenge, &digest_uri, &response, &cnonce)?;
     info!(
@@ -8355,6 +8699,12 @@ async fn build_live_register_auth_material(
     );
     Ok(LiveRegisterAuthMaterial {
         authorization,
+        refresh_authorization: Some(LiveRefreshAuthorization {
+            challenge: challenge.shared(),
+            password,
+            cnonce,
+            nonce_count: 1,
+        }),
         ims_esp_secrets,
         ims_esp_alt_secrets,
         ims_esp_null_secrets,
@@ -11790,7 +12140,9 @@ mod tests {
             profile: &GB_EE_23433,
             context,
             variant: register_variant("profile_default_spaced_sec_client"),
-            next_cseq: 4,
+            next_cseq: std::sync::atomic::AtomicU32::new(4),
+            expires_seconds: std::sync::atomic::AtomicU32::new(3600),
+            refresh_authorization: std::sync::Mutex::new(None),
             security_verify: Some(
                 "ipsec-3gpp;alg=hmac-sha-1-96;ealg=aes-cbc;prot=esp;mod=trans".into(),
             ),

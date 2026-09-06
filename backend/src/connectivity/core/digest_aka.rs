@@ -145,12 +145,33 @@ pub fn compute_aka_response(
     nc: &str,
 ) -> Result<String, ImsError> {
     let password = aka_digest_password(algorithm, aka)?;
+    compute_digest_response(
+        username, realm, &password, algorithm, method, digest_uri, nonce, qop, cnonce, nc,
+    )
+}
+
+/// Recompute a proof using retained, challenge-bound digest credentials. The
+/// password is not an Authorization header: every new request consumes a fresh
+/// nonce count; retransmission alone reuses the already serialized request.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_digest_response(
+    username: &str,
+    realm: &str,
+    password: &[u8],
+    algorithm: &str,
+    method: &str,
+    digest_uri: &str,
+    nonce: &str,
+    qop: Option<&str>,
+    cnonce: &str,
+    nc: &str,
+) -> Result<String, ImsError> {
     let mut a1 = Vec::with_capacity(username.len() + realm.len() + password.len() + 2);
     a1.extend_from_slice(username.as_bytes());
     a1.push(b':');
     a1.extend_from_slice(realm.as_bytes());
     a1.push(b':');
-    a1.extend_from_slice(&password);
+    a1.extend_from_slice(password);
     let hash = digest_hash_for_algorithm(algorithm)?;
     let ha1 = hash.hex(&a1);
     let ha2 = hash.hex(format!("{method}:{digest_uri}").as_bytes());

@@ -20,14 +20,14 @@ const PROXY_UPDATED_EVENT = 'simadmin-github-download-proxy-updated'
 const DIRECT_PRESET = 'direct'
 const CUSTOM_PRESET = 'custom'
 const PROXY_PRESETS = [
-  { label: 'gh-proxy.com（默认）', value: 'https://gh-proxy.com/' },
+  { label: 'gh-proxy.com', value: 'https://gh-proxy.com/' },
   { label: 'ghproxy.net', value: 'https://ghproxy.net/' },
   { label: 'githubproxy.cc', value: 'https://githubproxy.cc/' },
 ] as const
 
 const DEFAULT_CONFIG: GithubDownloadProxyConfig = {
-  enabled: true,
-  proxy_prefix: PROXY_PRESETS[0].value,
+  enabled: false,
+  proxy_prefix: '',
 }
 
 function normalizePrefix(value: string) {
@@ -126,7 +126,7 @@ export default function GithubDownloadProxyControl({ compact = false }: { compac
               void save({ enabled: true, proxy_prefix: value })
             }}
           >
-            <MenuItem value={DIRECT_PRESET}>GitHub 直连</MenuItem>
+            <MenuItem value={DIRECT_PRESET}>GitHub 直连（默认）</MenuItem>
             {PROXY_PRESETS.map((option) => <MenuItem key={option.value} value={option.value}>{option.label}</MenuItem>)}
             <MenuItem value={CUSTOM_PRESET}>自定义加速节点</MenuItem>
           </Select>

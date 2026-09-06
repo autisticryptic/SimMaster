@@ -7,8 +7,10 @@ REPO_BRANCH="${REPO_BRANCH:-master}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/simadmin}"
 SERVICE_NAME="${SERVICE_NAME:-simadmin}"
 VERSION="${VERSION:-latest}"
-GH_PROXY="${GH_PROXY:-https://gh-proxy.com/}"
-GH_PROXY_FALLBACKS="${GH_PROXY_FALLBACKS:-https://ghproxy.net/ https://githubproxy.cc/}"
+# GitHub direct is the default. Mirrors remain fallback options so a bad proxy
+# response cannot replace the official release asset when the network is healthy.
+GH_PROXY="${GH_PROXY:-}"
+GH_PROXY_FALLBACKS="${GH_PROXY_FALLBACKS:-https://gh-proxy.com/ https://ghproxy.net/ https://githubproxy.cc/}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}}"
 SERVICE_URL="${SERVICE_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin.service}"
 MODEM_RECOVERY_SCRIPT_URL="${MODEM_RECOVERY_SCRIPT_URL:-${RAW_BASE}/${REPO_BRANCH}/scripts/simadmin-modem-recovery.sh}"
@@ -63,7 +65,19 @@ download_with_proxies() {
 
   case "$src_url" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://api.github.com/*)
-      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS ""; do
+      # GitHub direct is the default. If an operator explicitly supplies
+      # GH_PROXY, keep that explicit choice first and retain direct GitHub as
+      # the final fallback.
+      if [ -z "$GH_PROXY" ]; then
+        url="$src_url"
+        echo "    ${url}"
+        if curl -fsSL "$url" -o "$dst_path"; then
+          return 0
+        fi
+        echo "    download failed, trying next mirror" >&2
+      fi
+      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS; do
+        [ -n "$proxy" ] || continue
         url="${proxy}${src_url}"
         echo "    ${url}"
         if curl -fsSL "$url" -o "$dst_path"; then
@@ -71,6 +85,14 @@ download_with_proxies() {
         fi
         echo "    download failed, trying next mirror" >&2
       done
+      if [ -n "$GH_PROXY" ]; then
+        url="$src_url"
+        echo "    ${url}"
+        if curl -fsSL "$url" -o "$dst_path"; then
+          return 0
+        fi
+        echo "    download failed, trying next mirror" >&2
+      fi
       ;;
     *)
       echo "    ${src_url}"
@@ -87,7 +109,16 @@ read_with_proxies() {
 
   case "$src_url" in
     https://github.com/*|https://raw.githubusercontent.com/*|https://objects.githubusercontent.com/*|https://api.github.com/*)
-      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS ""; do
+      if [ -z "$GH_PROXY" ]; then
+        url="$src_url"
+        echo "    ${url}" >&2
+        if curl -fsSL "$url"; then
+          return 0
+        fi
+        echo "    download failed, trying next mirror" >&2
+      fi
+      for proxy in $GH_PROXY $GH_PROXY_FALLBACKS; do
+        [ -n "$proxy" ] || continue
         url="${proxy}${src_url}"
         echo "    ${url}" >&2
         if curl -fsSL "$url"; then
@@ -95,6 +126,14 @@ read_with_proxies() {
         fi
         echo "    download failed, trying next mirror" >&2
       done
+      if [ -n "$GH_PROXY" ]; then
+        url="$src_url"
+        echo "    ${url}" >&2
+        if curl -fsSL "$url"; then
+          return 0
+        fi
+        echo "    download failed, trying next mirror" >&2
+      fi
       ;;
     *)
       echo "    ${src_url}" >&2

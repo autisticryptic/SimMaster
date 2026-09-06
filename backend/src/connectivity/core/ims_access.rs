@@ -42,8 +42,8 @@ impl ImsAccess {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ImsAccessPreference {
-    /// Request concurrency when supported. Otherwise retain the valid existing
-    /// registration; prefer cellular on cold start, with WLAN as fallback.
+    /// Request concurrency when supported. Otherwise prefer WLAN, with
+    /// cellular as the bounded-recovery fallback (including existing profiles).
     #[default]
     Concurrent,
     WlanPreferred,
@@ -65,20 +65,20 @@ impl ImsAccessPreference {
 pub enum ConcurrentRegistrationSupport {
     /// The current client lacks complete RFC 5626 flow maintenance. This says
     /// nothing about whether an operator supports it with a capable client.
-    #[default]
     ClientIncomplete,
     /// A fully capable client has not established network support on the
     /// active registration (including the first-hop outbound procedure).
+    #[default]
     NotNegotiated,
     /// Complete local implementation AND successful outbound negotiation.
     Negotiated,
 }
 
-/// Do not change this by adding a Supported token or by observing an unrelated
-/// Require header. UDP STUN/flow timers and flow recovery must be implemented
-/// and negotiated before enabling the concurrent branch.
+/// Bootstrap state only. Runtime authorization comes from an owned live flow
+/// with matching Contact, Require/Path negotiation and maintained transport
+/// (acknowledged keepalive, or the TS 24.229 no-NAT logical-flow exemption).
 pub const CURRENT_CONCURRENT_SUPPORT: ConcurrentRegistrationSupport =
-    ConcurrentRegistrationSupport::ClientIncomplete;
+    ConcurrentRegistrationSupport::NotNegotiated;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ImsAccessInputs {
@@ -182,14 +182,11 @@ pub fn decide(inputs: ImsAccessInputs) -> ImsAccessDecision {
             (true, true) => {
                 if inputs.concurrent_support == ConcurrentRegistrationSupport::Negotiated {
                     ImsAccessDecision::both("ims_access_concurrent_negotiated")
-                } else if inputs.wlan_registered && !inputs.cellular_registered {
-                    // Do not flap back from a working fallback just because
-                    // the primary modem has reappeared.
-                    ImsAccessDecision::wlan_only("ims_access_single_preserve_wlan")
                 } else {
-                    // Also resolves a legacy, unconfirmed dual registration
-                    // deterministically. Reconciliation defers teardown in calls.
-                    ImsAccessDecision::cellular_only("ims_access_single_cellular")
+                    // Concurrency is a capability request, NOT cellular-first
+                    // preference. The coordinator defers this switch in calls;
+                    // exhausted WLAN recovery removes WLAN eligibility above.
+                    ImsAccessDecision::wlan_only("ims_access_single_wlan_preferred")
                 }
             }
             (true, false) => ImsAccessDecision::cellular_only("ims_access_cellular_only_available"),
@@ -252,7 +249,8 @@ mod tests {
     fn reg_ids_are_distinct_stable_and_positive_not_a_capability_gate() {
         assert_eq!(ImsAccess::Cellular.reg_id(), 1);
         assert_eq!(ImsAccess::Wlan.reg_id(), 2);
-        assert!(!decide(both(ImsAccessPreference::Concurrent)).wlan_registers);
+        let decision = decide(both(ImsAccessPreference::Concurrent));
+        assert!(decision.wlan_registers && !decision.cellular_registers);
     }
 
     #[test]
@@ -263,10 +261,10 @@ mod tests {
         );
         assert_eq!(
             CURRENT_CONCURRENT_SUPPORT,
-            ConcurrentRegistrationSupport::ClientIncomplete
+            ConcurrentRegistrationSupport::NotNegotiated
         );
         let d = decide(both(ImsAccessPreference::default()));
-        assert!(d.cellular_registers && !d.wlan_registers);
+        assert!(d.wlan_registers && !d.cellular_registers);
         assert_eq!(d.effective_mode(), "single_registration");
     }
 
@@ -280,9 +278,9 @@ mod tests {
             let mut i = both(ImsAccessPreference::Concurrent);
             i.concurrent_support = support;
             let d = decide(i);
-            assert!(d.cellular_registers);
+            assert!(d.wlan_registers);
             assert_eq!(
-                d.wlan_registers,
+                d.cellular_registers,
                 support == ConcurrentRegistrationSupport::Negotiated
             );
         }
@@ -293,10 +291,35 @@ mod tests {
         let mut i = both(ImsAccessPreference::Concurrent);
         i.cellular_registered = true;
         i.cellular_available = false;
+        i.wlan_available = false; // WLAN retry/backoff must not block the fallback refresh.
         let d = decide(i);
         assert!(d.permits(ImsAccess::Cellular));
         assert!(!d.permits(ImsAccess::Wlan));
         assert!(d.legs_to_release(true, false).is_empty());
+    }
+
+    #[test]
+    fn negotiated_backup_refresh_stays_admitted_while_wlan_recovers() {
+        let mut i = both(ImsAccessPreference::Concurrent);
+        i.concurrent_support = ConcurrentRegistrationSupport::Negotiated;
+        i.cellular_registered = true;
+        i.cellular_available = false;
+        let d = decide(i);
+        assert!(d.permits(ImsAccess::Cellular) && d.permits(ImsAccess::Wlan));
+        assert!(d.legs_to_release(true, false).is_empty());
+        i.cellular_enabled = false;
+        assert!(!decide(i).cellular_registers);
+        i.wlan_enabled = false;
+        assert_eq!(decide(i).effective_mode(), "none");
+    }
+
+    #[test]
+    fn returning_wlan_requests_switch_from_legacy_cellular_not_competing_register() {
+        let mut i = both(ImsAccessPreference::Concurrent);
+        i.cellular_registered = true;
+        let d = decide(i);
+        assert!(d.wlan_registers && !d.cellular_registers);
+        assert_eq!(d.legs_to_release(true, false), vec![ImsAccess::Cellular]);
     }
 
     #[test]
@@ -312,12 +335,13 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_cellular_allows_wlan_but_pending_attempt_is_not_registration() {
+    fn cellular_return_does_not_preempt_wlan_priority() {
         let mut i = both(ImsAccessPreference::Concurrent);
         i.cellular_available = false;
         assert!(decide(i).wlan_registers);
         i.cellular_available = true;
-        assert!(!decide(i).wlan_registers);
+        assert!(decide(i).wlan_registers);
+        assert!(!decide(i).cellular_registers);
     }
 
     #[test]
@@ -345,7 +369,10 @@ mod tests {
         let mut i = both(ImsAccessPreference::Concurrent);
         i.cellular_registered = true;
         i.wlan_registered = true;
-        assert_eq!(decide(i).legs_to_release(true, true), vec![ImsAccess::Wlan]);
+        assert_eq!(
+            decide(i).legs_to_release(true, true),
+            vec![ImsAccess::Cellular]
+        );
         assert!(i.cellular_enabled && i.wlan_enabled);
     }
 

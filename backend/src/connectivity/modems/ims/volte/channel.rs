@@ -17,6 +17,9 @@ use tokio::net::UdpSocket;
 use crate::connectivity::core::{
     access::{ImsChannel, ImsRequeue},
     context::ImsRoute,
+    ims_access::ImsAccess,
+    outbound::OutboundFlow,
+    register_response::RegisterArtifacts,
     ImsError,
 };
 use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
@@ -35,6 +38,7 @@ pub struct VolteSipChannel {
     /// to a different dialog (NOTIFY/MESSAGE/MWI). They are handed back to the
     /// session loop after the transaction completes.
     requeued: ImsRequeue,
+    outbound: OutboundFlow,
     route: ImsRoute,
     /// Port to advertise in Via/Contact once a security association is active.
     /// TS 24.229 §5.1.1.2.2 b)/c): a UDP request protected by an SA is sourced
@@ -53,6 +57,7 @@ pub struct VolteSipChannel {
 }
 
 struct ChannelSecurity {
+    outbound: OutboundFlow,
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
     route: ImsRoute,
@@ -91,6 +96,7 @@ impl VolteSipChannel {
             reserved_send_socket: None,
             reserved_receive_socket: None,
             requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(),
             route,
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
@@ -177,6 +183,7 @@ impl VolteSipChannel {
             reserved_send_socket: None,
             reserved_receive_socket: None,
             requeued: ImsRequeue::default(),
+            outbound: OutboundFlow::default(),
             route,
             advertised_local_port: None,
             interface: interface.map(ToOwned::to_owned),
@@ -450,7 +457,9 @@ impl VolteSipChannel {
         route.local_addr = send_socket
             .local_addr()
             .map_err(|_| ImsError::new("volte_channel_local_addr_failed"))?;
+        let replacement = self.outbound.replacement();
         self.staged_security = Some(ChannelSecurity {
+            outbound: std::mem::replace(&mut self.outbound, replacement),
             send_socket: self.send_socket.take(),
             receive_socket: self.receive_socket.take(),
             route: self.route,
@@ -469,7 +478,8 @@ impl VolteSipChannel {
     /// channel readable: the P-CSCF may still use it until it sees further
     /// traffic on the new SA. Its XFRM plan has the same retirement lifetime.
     pub fn commit_security(&mut self) {
-        if let Some(previous) = self.staged_security.take() {
+        if let Some(mut previous) = self.staged_security.take() {
+            previous.outbound.disable();
             self.retired_security = previous.security_verify.is_some().then_some(previous);
         }
         self.discard_reserved_security_ports();
@@ -479,6 +489,8 @@ impl VolteSipChannel {
     /// The caller removes only the tentative XFRM plan, never the active plan.
     pub fn rollback_security(&mut self) {
         if let Some(previous) = self.staged_security.take() {
+            self.outbound.disable();
+            self.outbound = previous.outbound;
             self.send_socket = previous.send_socket;
             self.receive_socket = previous.receive_socket;
             self.route = previous.route;
@@ -553,7 +565,63 @@ impl VolteSipChannel {
         self.interface.as_deref()
     }
 
+    pub fn configure_outbound(&mut self, line_id: &str, instance: &str, enabled: bool) {
+        self.outbound
+            .configure(line_id, ImsAccess::Cellular, instance, enabled);
+    }
+
+    pub fn outbound_registered(
+        &mut self,
+        response: &[u8],
+        expires: u32,
+    ) -> Result<RegisterArtifacts, ImsError> {
+        self.outbound.registered(response, false, expires)
+    }
+
+    async fn maintain_outbound(&mut self) -> Result<(), ImsError> {
+        if let Some(packet) = self.outbound.poll(std::time::Instant::now())? {
+            let result = self
+                .send_socket
+                .as_ref()
+                .ok_or_else(|| ImsError::new("volte_channel_send_socket_missing"))?
+                .send(&packet)
+                .await;
+            if !matches!(result, Ok(n) if n == packet.len()) {
+                return Err(self.outbound.fail("ims_outbound_keepalive_send_failed"));
+            }
+        }
+        Ok(())
+    }
+
     async fn recv_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            self.maintain_outbound().await?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(ImsError::new("volte_channel_read_timeout"));
+            }
+            let wake = self
+                .outbound
+                .deadline()
+                .map_or(deadline, |due| due.min(deadline));
+            match self
+                .recv_transport(wake.saturating_duration_since(now))
+                .await
+            {
+                Ok(frame) => {
+                    if !self.outbound.receive_stun(&frame)? {
+                        self.outbound.received_sip(&frame)?;
+                        return Ok(frame);
+                    }
+                }
+                Err(error) if error.code() == "volte_channel_read_timeout" && wake < deadline => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    async fn recv_transport(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         let current = recv_socket_pair(
             self.receive_socket.as_ref(),
             self.send_socket.as_ref(),
@@ -657,40 +725,94 @@ async fn recv_protected(
 ) -> Result<Vec<u8>, ImsError> {
     let mut receive_frame = vec![0u8; MAX_SIP_DATAGRAM];
     let mut send_frame = vec![0u8; MAX_SIP_DATAGRAM];
-    let (read, from_server) = tokio::time::timeout(timeout, async {
-        tokio::select! {
-            read = receive_socket.recv(&mut receive_frame) => {
-                (read, true)
-            }
-            read = send_socket.recv(&mut send_frame) => {
-                (read, false)
-            }
+    let deadline = tokio::time::Instant::now() + timeout;
+    // A connected UDP socket may report an ICMP error from an earlier packet.
+    // Do not let that error mask a response arriving on the other protected
+    // tuple.  Disable only the socket that produced the transient error for
+    // this read window; the next RFC 3261 retransmission starts a fresh window
+    // and gives both sockets another chance.
+    let mut server_path_available = true;
+    let mut client_path_available = true;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(ImsError::new("volte_channel_read_timeout"));
         }
-    })
-    .await
-    .map_err(|_| ImsError::new("volte_channel_read_timeout"))?;
-    let read = read.map_err(|error| {
-        map_socket_read_error(
-            if from_server {
-                "protected_server"
-            } else {
-                "protected_client"
+
+        let read = match (server_path_available, client_path_available) {
+            (true, true) => match tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    read = receive_socket.recv(&mut receive_frame) => (read, true),
+                    read = send_socket.recv(&mut send_frame) => (read, false),
+                }
+            })
+            .await
+            {
+                Ok(read) => read,
+                Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
             },
-            error,
-        )
-    })?;
-    let (mut frame, receive_path) = if from_server {
-        (receive_frame, "protected_server")
-    } else {
-        (send_frame, "protected_client")
-    };
-    frame.truncate(read);
-    tracing::debug!(
-        receive_path,
-        frame_bytes = read,
-        "VoLTE protected SIP frame received"
-    );
-    Ok(frame)
+            (true, false) => {
+                match tokio::time::timeout(remaining, receive_socket.recv(&mut receive_frame)).await
+                {
+                    Ok(read) => (read, true),
+                    Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
+                }
+            }
+            (false, true) => {
+                match tokio::time::timeout(remaining, send_socket.recv(&mut send_frame)).await {
+                    Ok(read) => (read, false),
+                    Err(_) => return Err(ImsError::new("volte_channel_read_timeout")),
+                }
+            }
+            (false, false) => return Err(ImsError::new("volte_channel_read_retryable")),
+        };
+
+        let (read, from_server) = match read {
+            (Ok(read), from_server) => (read, from_server),
+            (Err(error), from_server) => {
+                let path = if from_server {
+                    "protected_server"
+                } else {
+                    "protected_client"
+                };
+                let mapped = map_socket_read_error(path, error);
+                if mapped.code() == "volte_channel_read_retryable" {
+                    if from_server {
+                        server_path_available = false;
+                    } else {
+                        client_path_available = false;
+                    }
+                    tracing::debug!(
+                        receive_path = path,
+                        server_path_available,
+                        client_path_available,
+                        "VoLTE protected SIP socket read is temporarily unavailable; continuing on the other protected tuple"
+                    );
+                    continue;
+                }
+                return Err(mapped);
+            }
+        };
+
+        let receive_path = if from_server {
+            receive_frame.truncate(read);
+            "protected_server"
+        } else {
+            send_frame.truncate(read);
+            "protected_client"
+        };
+        tracing::debug!(
+            receive_path,
+            frame_bytes = read,
+            "VoLTE protected SIP frame received"
+        );
+        return Ok(if from_server {
+            receive_frame
+        } else {
+            send_frame
+        });
+    }
 }
 
 fn header_parameter_port(frame: &[u8], header_name: &str, parameter_name: &str) -> Option<u16> {
@@ -711,6 +833,8 @@ fn header_parameter_port(frame: &[u8], header_name: &str, parameter_name: &str) 
 
 impl ImsChannel for VolteSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
+        let prepared = self.outbound.prepare(frame)?;
+        let frame = prepared.as_slice();
         // Log the actual REGISTER transmit tuple, not only the route used to
         // construct Via/Contact.  In a protected VoLTE session these are
         // intentionally different: headers advertise port_us while the UDP
@@ -754,6 +878,7 @@ impl ImsChannel for VolteSipChannel {
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
+        self.maintain_outbound().await?;
         if let Some(frame) = self.requeued.pop_front() {
             return Ok(frame);
         }
@@ -896,6 +1021,97 @@ mod tests {
     use super::*;
     use crate::connectivity::core::context::SipTransport;
     use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test]
+    async fn outbound_protected_flow_accepts_keepalive_response_on_either_udp_tuple() {
+        use crate::connectivity::core::{
+            ims_access::ConcurrentRegistrationSupport,
+            ims_registration_coordinator,
+            outbound::tests::{register_request, register_success, success, INSTANCE},
+        };
+
+        for on_server_port in [true, false] {
+            let pcscf_server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let pcscf_client = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let route = ImsRoute {
+                local_addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+                pcscf_addr: pcscf_server.local_addr().unwrap(),
+                transport: SipTransport::Udp,
+            };
+            let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+            let server_port = channel.reserve_security_receive_port().unwrap();
+            let client_port = channel.reserve_security_send_port(server_port).unwrap();
+            let local_server = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
+            let local_client = SocketAddr::from((Ipv4Addr::LOCALHOST, client_port));
+            channel
+                .activate_security(
+                    ImsRoute {
+                        local_addr: local_client,
+                        ..route
+                    },
+                    local_server,
+                    pcscf_client.local_addr().unwrap(),
+                    Some("ipsec-3gpp".into()),
+                )
+                .unwrap();
+            let line = format!("outbound-volte-pair-{on_server_port}");
+            let coordinator = ims_registration_coordinator::for_line(&line);
+            channel.configure_outbound(&line, INSTANCE, true);
+            channel
+                .send_sip(&register_request("cellular", 1))
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let (n, peer) = pcscf_server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(peer, local_client);
+            pcscf_client
+                .send_to(&register_success(&buf[..n], 1800), local_server)
+                .await
+                .unwrap();
+            let response = channel.recv_sip(Duration::from_secs(1)).await.unwrap();
+            channel.outbound_registered(&response, 3600).unwrap();
+            assert_eq!(
+                coordinator.concurrent_support(),
+                ConcurrentRegistrationSupport::NotNegotiated
+            );
+
+            let reply = tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                let (n, peer) = pcscf_server.recv_from(&mut buf).await.unwrap();
+                assert_eq!(n, 28);
+                assert_eq!(peer, local_client);
+                let id = buf[8..20].try_into().unwrap();
+                let (socket, destination) = if on_server_port {
+                    (&pcscf_client, local_server)
+                } else {
+                    (&pcscf_server, local_client)
+                };
+                socket
+                    .send_to(&success(id, peer), destination)
+                    .await
+                    .unwrap();
+                socket
+                    .send_to(
+                        b"NOTIFY sip:ue@ims.test SIP/2.0\r\nContent-Length: 0\r\n\r\n",
+                        destination,
+                    )
+                    .await
+                    .unwrap();
+            });
+            let notify = channel.recv_sip(Duration::from_secs(2)).await.unwrap();
+            assert!(notify.starts_with(b"NOTIFY "));
+            reply.await.unwrap();
+            assert_eq!(
+                coordinator.concurrent_support(),
+                ConcurrentRegistrationSupport::Negotiated
+            );
+            assert_eq!(
+                channel.local_addr().unwrap(),
+                local_client,
+                "flow maintenance must not replace sockets"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn udp_channel_round_trips_sip_datagrams() {

@@ -566,6 +566,10 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
   const [euicc, setEuicc] = useState<EsimEuiccInfo | null>(initialSnapshot?.euicc ?? null)
   const [profiles, setProfiles] = useState<EsimProfile[]>(initialSnapshot?.profiles ?? [])
   const [selectedIccid, setSelectedIccid] = useState<string>(initialSnapshot?.selectedIccid ?? '')
+  // A warm per-line snapshot is sufficient to render the management page. Do
+  // not re-open the physical eUICC channel merely because this view mounted
+  // again; an explicit refresh or a write/repair operation still bypasses it.
+  const hasWarmEsimSnapshot = Boolean(initialSnapshot?.lpacStatus?.usable && initialSnapshot.euicc)
   const [statusLoading, setStatusLoading] = useState(!initialSnapshot?.lpacStatus)
   const [profilesLoading, setProfilesLoading] = useState(false)
   const [euiccLoading, setEuiccLoading] = useState(false)
@@ -803,7 +807,16 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
   const selectedMatchingId = selectedProfile?.matching_id
   const selectedCountryCode = profileCountryCode(selectedProfile)
 
-  const loadData = async (silent = false) => {
+  const loadData = async (silent = false, forceRefresh = silent) => {
+    if (!silent && !forceRefresh && hasWarmEsimSnapshot) {
+      // The snapshot is keyed by line. It already contains the last known
+      // eUICC identity and profile list, so opening the page must not trigger a
+      // second lpac info/profile probe and block the UI for several seconds.
+      setStatusLoading(false)
+      setProfilesLoading(false)
+      setEuiccLoading(false)
+      return
+    }
     if (silent) setRefreshing(true)
     setStatusLoading(true)
     setError(null)
@@ -889,7 +902,7 @@ export default function EsimManagerPage({ lineId }: { lineId: string }) {
       }
 
       setEuiccLoading(true)
-      const euiccRes = await requestOrNull(api.getEsimEuicc(scope, true), 'euicc')
+      const euiccRes = await requestOrNull(api.getEsimEuicc(scope, forceRefresh), 'euicc')
       setEuiccLoading(false)
       if (euiccRes?.data) {
         setEuicc(euiccRes.data)

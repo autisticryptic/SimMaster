@@ -76,6 +76,7 @@ struct InstalledTask {
     profile_id: &'static str,
     replacement_tx: mpsc::UnboundedSender<RegisteredChannel>,
     unregister_tx: mpsc::UnboundedSender<oneshot::Sender<UnregisterResult>>,
+    refresh_tx: mpsc::UnboundedSender<RefreshReply>,
     task: JoinHandle<()>,
 }
 
@@ -189,7 +190,51 @@ async fn bind_operator_relay(
     .map_err(|error| format!("{failure_label}:{error}"))
 }
 
+type RefreshReply =
+    oneshot::Sender<Result<RegisteredImsContext, crate::connectivity::core::ImsError>>;
+
+/// Ask the existing socket owner to refresh, not a second task to register on
+/// a fresh source port. Do not time out and retry while the owner still holds
+/// an in-flight REGISTER: the shared driver supplies transaction deadlines.
+pub(crate) async fn refresh_registered_for_line(
+    line_id: &str,
+    profile_id: &str,
+) -> Option<Result<RegisteredImsContext, crate::connectivity::core::ImsError>> {
+    let handle = handle_for_line(line_id);
+    let sender = {
+        let installed = handle.installed.lock().await;
+        let current = installed.as_ref()?;
+        if current.profile_id != profile_id || current.task.is_finished() {
+            return None;
+        }
+        current.refresh_tx.clone()
+    };
+    let (tx, rx) = oneshot::channel();
+    if sender.send(tx).is_err() {
+        return None;
+    }
+    Some(rx.await.unwrap_or_else(|_| {
+        Err(crate::connectivity::core::ImsError::new(
+            "ims_outbound_flow_failed",
+        ))
+    }))
+}
+
 pub(crate) trait RegisteredUnregister: Send + Sync {
+    fn refresh<'a>(
+        &'a self,
+        _channel: &'a mut SipChannel,
+    ) -> futures_util::future::BoxFuture<
+        'a,
+        Result<RegisteredImsContext, crate::connectivity::core::ImsError>,
+    > {
+        Box::pin(async {
+            Err(crate::connectivity::core::ImsError::new(
+                "vowifi_refresh_not_supported",
+            ))
+        })
+    }
+
     fn initial_request(&self) -> Result<Vec<u8>, crate::connectivity::core::ImsError>;
 
     fn authenticated_request<'a>(
@@ -284,6 +329,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
     let mut commands = link.subscribe_commands();
     let (replacement_tx, replacement_rx) = mpsc::unbounded_channel();
     let (unregister_tx, unregister_rx) = mpsc::unbounded_channel();
+    let (refresh_tx, refresh_rx) = mpsc::unbounded_channel();
     let task = tokio::spawn(async move {
         let line_id = registration.context.line_id.clone();
         let cleanup_supplementary = supplementary.clone();
@@ -294,6 +340,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
             &mut commands,
             replacement_rx,
             unregister_rx,
+            refresh_rx,
             supplementary,
             mt_sms,
         )
@@ -319,6 +366,7 @@ pub async fn install_registered_channel(context: RegisteredVoiceContext, channel
         profile_id,
         replacement_tx,
         unregister_tx,
+        refresh_tx,
         task,
     });
     handle.link.set_ready(true);
@@ -508,6 +556,7 @@ async fn run_session(
     commands: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
     replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
     unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
+    refresh_requests: mpsc::UnboundedReceiver<RefreshReply>,
     supplementary: Option<Arc<SupplementaryRuntime>>,
     mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
 ) -> Result<(), String> {
@@ -518,6 +567,7 @@ async fn run_session(
         commands,
         replacements,
         unregister_requests,
+        refresh_requests,
         supplementary,
         mt_sms,
         None,
@@ -532,6 +582,7 @@ async fn run_session_with_initial_mwi_subscription(
     commands: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
     mut replacements: mpsc::UnboundedReceiver<RegisteredChannel>,
     mut unregister_requests: mpsc::UnboundedReceiver<oneshot::Sender<UnregisterResult>>,
+    mut refresh_requests: mpsc::UnboundedReceiver<RefreshReply>,
     supplementary: Option<Arc<SupplementaryRuntime>>,
     mt_sms: broadcast::Sender<crate::connectivity::core::sms_codec::MtSmsDeliver>,
     initial_mwi_subscription: Option<MwiSubscription>,
@@ -567,6 +618,28 @@ async fn run_session_with_initial_mwi_subscription(
             link.set_ready(false);
         }
         tokio::select! {
+            Some(reply) = refresh_requests.recv() => {
+                let result = match session.context.unregister.clone() {
+                    Some(factory) => factory.refresh(&mut session.channel).await,
+                    None => Err(crate::connectivity::core::ImsError::new("vowifi_refresh_not_supported")),
+                };
+                if let Ok(registration) = &result {
+                    session.context.expires_at = Instant::now() + registration.lease.expires_after;
+                    session.context.registration = registration.clone();
+                    if let Some(uri) = registration.default_associated_uri() {
+                        session.context.identity.public_uri = uri.to_string();
+                    }
+                    link.set_ready(true);
+                }
+                let fatal = result.as_ref().err().filter(|error| {
+                    error.code().starts_with("ims_outbound_") || matches!(error.code(), "vowifi_refresh_rejected" | "vowifi_refresh_security_update_required")
+                }).map(|e| e.code());
+                let _ = reply.send(result);
+                if let Some(reason) = fatal {
+                    end_active_calls(&mut session, &link);
+                    return Err(reason.to_string());
+                }
+            },
             Some(reply) = unregister_requests.recv() => {
                 link.set_ready(false);
                 end_active_calls(&mut session, &link);
@@ -4116,6 +4189,7 @@ mod tests {
         let (command_tx, mut command_rx) = broadcast::channel(8);
         let (_replacement_tx, replacement_rx) = mpsc::unbounded_channel();
         let (_unregister_tx, unregister_rx) = mpsc::unbounded_channel();
+        let (_refresh_tx, refresh_rx) = mpsc::unbounded_channel();
         let mt_sms_sender = handle_for_line(line_id).mt_sms.clone();
         let supplementary_for_task = Arc::clone(&supplementary);
         let task = tokio::spawn(async move {
@@ -4126,6 +4200,7 @@ mod tests {
                 &mut command_rx,
                 replacement_rx,
                 unregister_rx,
+                refresh_rx,
                 Some(supplementary_for_task),
                 mt_sms_sender,
                 Some(initial_mwi_subscription),

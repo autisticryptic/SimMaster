@@ -143,7 +143,18 @@ pub fn ota_request_urls(
     include_builtin_proxies: bool,
 ) -> Vec<String> {
     let mut urls = Vec::new();
-    push_proxy_url(&mut urls, proxy_prefix, url);
+    let configured_proxy = normalize_proxy_prefix(Some(proxy_prefix.to_string()));
+
+    // An empty configured prefix means the operator selected GitHub direct.
+    // Keep that path first, and only use mirrors as fallbacks when the caller
+    // explicitly asked for the built-in fallback set. A non-empty configured
+    // prefix remains authoritative so an intentional proxy choice is not
+    // silently reordered.
+    if configured_proxy.is_empty() {
+        urls.push(url.to_string());
+    } else {
+        push_proxy_url(&mut urls, &configured_proxy, url);
+    }
 
     if include_builtin_proxies {
         for builtin_proxy in BUILTIN_PROXY_PREFIXES {
@@ -151,7 +162,9 @@ pub fn ota_request_urls(
         }
     }
 
-    urls.push(url.to_string());
+    if !urls.iter().any(|existing| existing == url) {
+        urls.push(url.to_string());
+    }
     urls
 }
 
@@ -890,6 +903,19 @@ mod tests {
         assert_eq!(
             duration_until_next_update_check_from(after_eighteen),
             Duration::from_secs(14 * 60 * 60 + 59 * 60)
+        );
+    }
+
+    #[test]
+    fn ota_request_urls_prefer_direct_when_no_proxy_is_configured() {
+        assert_eq!(
+            ota_request_urls("https://example.com/release", "", true),
+            vec![
+                "https://example.com/release".to_string(),
+                "https://gh-proxy.com/https://example.com/release".to_string(),
+                "https://ghproxy.net/https://example.com/release".to_string(),
+                "https://githubproxy.cc/https://example.com/release".to_string(),
+            ]
         );
     }
 

@@ -420,6 +420,14 @@ where
     }
 }
 
+fn preserve_flow_error(error: ImsError, fallback: &'static str) -> ImsError {
+    if error.code().starts_with("ims_outbound_") {
+        error
+    } else {
+        ImsError::new(fallback)
+    }
+}
+
 async fn send_register_and_receive<C>(
     channel: &mut C,
     request: &[u8],
@@ -434,7 +442,7 @@ where
     channel
         .send_sip(request)
         .await
-        .map_err(|_| ImsError::new(send_error))?;
+        .map_err(|error| preserve_flow_error(error, send_error))?;
     recv_final_register_response_with_retransmit(
         channel,
         request,
@@ -547,7 +555,7 @@ where
             channel
                 .send_sip(request)
                 .await
-                .map_err(|_| ImsError::new(send_error.unwrap_or(receive_error)))?;
+                .map_err(|error| preserve_flow_error(error, send_error.unwrap_or(receive_error)))?;
             tracing::debug!(
                 register_cseq = sip_frame::header_value(request, "CSeq"),
                 interval_ms = retransmit_interval.as_millis(),
@@ -586,7 +594,7 @@ where
                 }
                 continue;
             }
-            Err(_) => return Err(ImsError::new(receive_error)),
+            Err(error) => return Err(preserve_flow_error(error, receive_error)),
         };
         // The IMS signaling path is shared with in-dialog requests (NOTIFY,
         // MESSAGE, ...). Only a response for this REGISTER transaction may be

@@ -26,10 +26,21 @@ export function LineCsDetails({ line }: { line: VolteLineControlResponse }) {
 }
 
 export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
-  const fallbackMessage = standardDerivedProfileMessage(
-    line.runtime.profile_source,
-    line.runtime.profile_fallback_reason,
-  )
+  const displayError = volteErrorMessage(line.runtime.last_error)
+  const imsAttemptInProgress = line.profile.volte_connection_enabled
+    && !line.runtime.registered
+    && (
+      line.runtime.recovery_state !== 'idle'
+      || Boolean(line.runtime.next_retry_at)
+      || (!['disabled', 'stopping'].includes(line.runtime.stage) && line.runtime.connection_attempts.length > 0)
+      || Boolean(displayError)
+    )
+  const fallbackMessage = imsAttemptInProgress
+    ? standardDerivedProfileMessage(
+      line.runtime.profile_source,
+      line.runtime.profile_fallback_reason,
+    )
+    : null
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="IMS 阶段" value={`${line.runtime.phase} / ${line.runtime.stage}`} /></Grid>
@@ -54,7 +65,7 @@ export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
       <Grid size={{ xs: 12, sm: 6 }}><Field label="运营商 profile" value={line.runtime.profile_id || '尚未匹配'} /></Grid>
       <Grid size={{ xs: 12, sm: 6 }}><Field label="ISIM" value={line.runtime.isim_aid ? `已发现 · ${line.runtime.isim_aid}` : '未发现，使用 IMSI 回退'} /></Grid>
       {fallbackMessage && <Grid size={12}><Alert severity="warning">{fallbackMessage}</Alert></Grid>}
-      {line.runtime.last_error && <Grid size={12}><Alert severity="warning">{volteErrorMessage(line.runtime.last_error)}</Alert></Grid>}
+      {displayError && <Grid size={12}><Alert severity="warning">{displayError}</Alert></Grid>}
     </Grid>
   )
 }
@@ -274,10 +285,13 @@ export function LineActivityLog({
 
 export function LineVowifiDetails({ vowifi }: { vowifi?: VowifiLineConfigResponse }) {
   if (!vowifi) return <Alert severity="info">尚未加载该线路的 VoWiFi 状态。</Alert>
-  const fallbackMessage = standardDerivedProfileMessage(
-    vowifi.matched_profile_source,
-    vowifi.matched_profile_fallback_reason,
-  )
+  const fallbackMessage = !vowifi.runtime_registered && vowifi.config.enabled
+    && (vowifi.runtime_restore_in_progress || Boolean(vowifi.runtime_error))
+    ? standardDerivedProfileMessage(
+      vowifi.matched_profile_source,
+      vowifi.matched_profile_fallback_reason,
+    )
+    : null
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="运行阶段" value={`${vowifi.runtime_phase} / ${vowifi.runtime_stage}`} /></Grid>
