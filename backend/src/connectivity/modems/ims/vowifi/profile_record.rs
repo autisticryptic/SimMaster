@@ -1303,7 +1303,7 @@ pub fn parse_dns_server(value: &str) -> Option<std::net::SocketAddr> {
         return None;
     }
     if let Ok(addr) = value.parse::<std::net::SocketAddr>() {
-        return Some(addr);
+        return (addr.port() != 0).then_some(addr);
     }
     value
         .parse::<std::net::IpAddr>()
@@ -1400,6 +1400,8 @@ mod tests {
         assert_eq!(parse_dns_server("1.1.1.1").unwrap().port(), 53);
         assert_eq!(parse_dns_server("1.1.1.1:5353").unwrap().port(), 5353);
         assert!(parse_dns_server("not-an-ip").is_none());
+        assert!(parse_dns_server("1.1.1.1:0").is_none());
+        assert!(parse_dns_server("[2001:db8::1]:0").is_none());
 
         let mut record = CarrierProfileRecord::from_profile(&GB_EE_23433);
         record.epdg.dns_servers = vec!["8.8.8.8".to_string(), "1.1.1.1:53".to_string()];

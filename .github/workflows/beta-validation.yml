@@ -55,6 +55,7 @@ jobs:
             connectivity::modems::ims::effective_profile::tests \
             connectivity::core::device_identity::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
+            connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
             services::e911::ssrf::tests \

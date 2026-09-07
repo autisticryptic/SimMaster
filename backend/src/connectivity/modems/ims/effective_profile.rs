@@ -442,6 +442,14 @@ fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<St
             problems.push(format!("{name}.pcscf_must_not_contain_empty_entry"));
         }
     }
+    if let Some(servers) = access.dns.as_ref() {
+        if servers
+            .iter()
+            .any(|server| super::vowifi::profile_record::parse_dns_server(server).is_none())
+        {
+            problems.push(format!("{name}.dns_server_invalid"));
+        }
+    }
     for (field, value) in [
         ("domain", access.domain.as_deref()),
         ("realm", access.realm.as_deref()),
