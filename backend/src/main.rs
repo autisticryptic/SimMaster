@@ -2219,7 +2219,7 @@ mod http_router_tests {
         method: reqwest::Method,
         path: &str,
     ) -> (StatusCode, reqwest::header::HeaderMap, String) {
-        let client = reqwest::Client::builder()
+        let client = crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             // A redirect would hide which status the router actually chose.
             .redirect(reqwest::redirect::Policy::none())
@@ -2246,7 +2246,7 @@ mod http_router_tests {
         body: serde_json::Value,
         cookie: Option<&str>,
     ) -> (StatusCode, reqwest::header::HeaderMap, String) {
-        let client = reqwest::Client::builder()
+        let client = crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -2269,7 +2269,7 @@ mod http_router_tests {
         body: serde_json::Value,
         cookie: &str,
     ) -> (StatusCode, String) {
-        let client = reqwest::Client::builder()
+        let client = crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -2288,7 +2288,7 @@ mod http_router_tests {
 
     /// GET with a session cookie.
     async fn get_with_cookie(served: &Served, path: &str, cookie: &str) -> (StatusCode, String) {
-        let client = reqwest::Client::builder()
+        let client = crate::platform::dns::http_client_builder()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()

@@ -344,7 +344,7 @@ impl NotificationSender {
         database: Arc<Database>,
     ) -> Self {
         Self {
-            client: Client::builder()
+            client: crate::platform::dns::http_client_builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("Failed to create HTTP client"),

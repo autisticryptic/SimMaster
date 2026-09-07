@@ -58,10 +58,9 @@ impl TrunkUdpTransport {
 }
 
 pub async fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
-    let mut addresses = tokio::net::lookup_host((host.trim().trim_matches(['[', ']']), port))
+    let mut addresses = crate::platform::dns::resolve_socket_addrs(host, port)
         .await
-        .map_err(|error| format!("trunk_dns_failed:{error}"))?
-        .collect::<Vec<_>>();
+        .map_err(|error| format!("trunk_dns_failed:{error}"))?;
     addresses.sort_unstable();
     addresses.dedup();
     if addresses.is_empty() {

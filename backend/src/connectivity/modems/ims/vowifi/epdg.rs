@@ -6,7 +6,10 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::net::{lookup_host, UdpSocket};
+use tokio::net::UdpSocket;
+
+#[cfg(test)]
+use crate::platform::dns::addresses_from_hosts_file;
 
 use super::{
     profiles::CarrierProfile,
@@ -70,36 +73,31 @@ impl DnsResolver for SystemDnsResolver {
         host: &str,
         port: u16,
     ) -> Result<ResolvedEpdgEndpoint, TransportError> {
-        // Tokio's resolver normally follows NSS, but static musl builds have
-        // been observed to return an uncategorized error without consulting
-        // /etc/hosts inside the UE worker. An operator ePDG pinned there is an
-        // intentional local override, so honor it explicitly before DNS.
-        let hosts_addresses = match tokio::fs::read_to_string("/etc/hosts").await {
-            Ok(contents) => addresses_from_hosts_file(&contents, host, port),
-            Err(_) => Vec::new(),
-        };
-        let addresses = if !hosts_addresses.is_empty() {
-            hosts_addresses
-        } else {
-            match tokio::time::timeout(SYSTEM_DNS_TIMEOUT, lookup_host((host, port))).await {
-                Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
-                Ok(Err(primary_error)) => resolve_epdg_via_dns_fallback(profile, host, port)
-                    .await
-                    .map_err(|fallback_error| {
-                        TransportError::DnsFailed(format!(
-                            "system_resolver={}; fallback={}",
-                            primary_error.kind(),
-                            fallback_error
-                        ))
-                    })?,
-                Err(_) => resolve_epdg_via_dns_fallback(profile, host, port)
-                    .await
-                    .map_err(|fallback_error| {
-                        TransportError::DnsFailed(format!(
-                            "system_resolver=timeout; fallback={fallback_error}"
-                        ))
-                    })?,
-            }
+        // The shared pure-Rust resolver honors hosts before system DNS. Keep
+        // the existing explicit ePDG fallback policy here, not in generic DNS.
+        let addresses = match tokio::time::timeout(
+            SYSTEM_DNS_TIMEOUT,
+            crate::platform::dns::resolve_socket_addrs(host, port),
+        )
+        .await
+        {
+            Ok(Ok(addresses)) => addresses,
+            Ok(Err(primary_error)) => resolve_epdg_via_dns_fallback(profile, host, port)
+                .await
+                .map_err(|fallback_error| {
+                    TransportError::DnsFailed(format!(
+                        "system_resolver={}; fallback={}",
+                        primary_error.kind(),
+                        fallback_error
+                    ))
+                })?,
+            Err(_) => resolve_epdg_via_dns_fallback(profile, host, port)
+                .await
+                .map_err(|fallback_error| {
+                    TransportError::DnsFailed(format!(
+                        "system_resolver=timeout; fallback={fallback_error}"
+                    ))
+                })?,
         };
 
         if addresses.is_empty() {
@@ -113,35 +111,6 @@ impl DnsResolver for SystemDnsResolver {
             route_policy: choose_route_policy(profile, host, None),
         })
     }
-}
-
-fn normalized_hosts_name(value: &str) -> String {
-    value.trim().trim_end_matches('.').to_ascii_lowercase()
-}
-
-fn addresses_from_hosts_file(contents: &str, host: &str, port: u16) -> Vec<SocketAddr> {
-    let requested = normalized_hosts_name(host);
-    if requested.is_empty() {
-        return Vec::new();
-    }
-
-    let mut addresses = Vec::new();
-    for line in contents.lines() {
-        let entry = line.split_once('#').map_or(line, |(entry, _)| entry);
-        let mut fields = entry.split_whitespace();
-        let Some(address) = fields.next() else {
-            continue;
-        };
-        if !fields.any(|alias| normalized_hosts_name(alias) == requested) {
-            continue;
-        }
-        if let Ok(address) = address.parse::<IpAddr>() {
-            addresses.push(SocketAddr::new(address, port));
-        }
-    }
-    addresses.sort();
-    addresses.dedup();
-    addresses
 }
 
 /// Resolve an ePDG through one explicitly selected DNS server. This bypasses

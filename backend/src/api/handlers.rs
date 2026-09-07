@@ -9516,7 +9516,7 @@ async fn download_carrier_catalog(asset_url: &str, proxy_prefix: &str) -> Result
         return Err("carrier_catalog_asset_not_allowed".to_string());
     }
 
-    let client = reqwest::Client::builder()
+    let client = crate::platform::dns::http_client_builder()
         .user_agent("SimAdmin carrier catalog installer")
         .timeout(Duration::from_secs(180))
         .build()

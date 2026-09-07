@@ -15,7 +15,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf},
-    net::{lookup_host, TcpListener, TcpSocket, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{oneshot, Mutex},
     task::{JoinHandle, JoinSet},
 };
@@ -803,9 +803,7 @@ async fn connect_bound(
     interface_name: &str,
     worker: Option<&UeWorkerHandle>,
 ) -> io::Result<TcpStream> {
-    let addresses = lookup_host((host, port))
-        .await?
-        .collect::<Vec<SocketAddr>>();
+    let addresses = crate::platform::dns::resolve_socket_addrs(host, port).await?;
     let mut last_error = None;
     for address in addresses {
         if let Some(worker) = worker {

@@ -1,0 +1,101 @@
+name: Validate Beta Refactor
+
+# Development checks deliberately do not publish/retag beta1 or beta2.
+on:
+  push:
+    branches:
+      - refactor/1.1.4-beta2
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: DNS and IMS compatibility regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            backend/target/
+          key: ${{ runner.os }}-checktests-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-checktests-cargo-
+      - name: Compile tests on Actions only
+        working-directory: backend
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --no-run 2>&1 | tee beta-test-compile.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            details=$(tail -n 80 beta-test-compile.log)
+            details=${details//'%'/'%25'}
+            details=${details//$'\r'/'%0D'}
+            details=${details//$'\n'/'%0A'}
+            echo "::error title=Beta test compilation failed::$details"
+          fi
+          exit "$status"
+      - name: Run hardware-free DNS and IMS regressions
+        working-directory: backend
+        shell: bash
+        run: |
+          set -o pipefail
+          for filter in \
+            platform::dns::tests \
+            connectivity::modems::ims::vowifi::epdg::tests \
+            connectivity::modems::ims::vowifi::socks5::tests \
+            services::trunk::transport::tests \
+            services::e911::ssrf::tests \
+            services::e911::ts43::tests \
+            connectivity::core::outbound::tests \
+            connectivity::core::ims_access::tests \
+            connectivity::core::ims_registration_coordinator::tests \
+            connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
+            connectivity::modems::ims::volte::live::refresh_tests; do
+            cargo test --locked "$filter" -- --list > beta-test-list.txt
+            if ! grep -q ': test$' beta-test-list.txt; then
+              echo "::error title=Empty regression filter::$filter selected no tests"
+              exit 1
+            fi
+            if ! cargo test --locked "$filter" -- --test-threads=1 2>&1 | tee -a beta-tests.log; then
+              details=$(tail -n 80 beta-tests.log)
+              details=${details//'%'/'%25'}
+              details=${details//$'\r'/'%0D'}
+              details=${details//$'\n'/'%0A'}
+              echo "::error title=Beta regression failed::$details"
+              exit 1
+            fi
+          done
+          grep -E 'running [0-9]+ test|test result:' beta-tests.log >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: beta-refactor-tests
+          path: backend/beta-*.log
+          retention-days: 7
+
+  frontend:
+    name: Frontend and release-policy checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - working-directory: frontend
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm run build
+          pnpm run type-check

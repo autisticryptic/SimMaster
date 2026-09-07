@@ -17,6 +17,7 @@ pub mod config_file;
 pub mod config_maintenance;
 pub mod config_store;
 pub mod db;
+pub mod dns;
 pub mod netns;
 pub mod network_routing;
 pub mod shutdown;

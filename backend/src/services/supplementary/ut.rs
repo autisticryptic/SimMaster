@@ -60,7 +60,7 @@ pub struct HttpXcapTransport {
 impl HttpXcapTransport {
     pub fn new(local_address: Option<IpAddr>, policy: &XcapPolicy) -> Result<Self, UtError> {
         policy.validate()?;
-        let mut builder = reqwest::Client::builder()
+        let mut builder = crate::platform::dns::http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .https_only(true)

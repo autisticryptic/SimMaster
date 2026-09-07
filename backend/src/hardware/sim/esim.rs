@@ -779,7 +779,7 @@ fn read_lpac_source() -> Option<String> {
 }
 
 async fn download_lpac_asset(asset_url: &str, proxy_prefix: &str) -> Result<Vec<u8>, EsimApiError> {
-    let client = reqwest::Client::builder()
+    let client = crate::platform::dns::http_client_builder()
         .user_agent("SimAdmin lpac repair")
         .timeout(Duration::from_secs(LPAC_REPAIR_TIMEOUT_SECS))
         .build()

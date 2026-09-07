@@ -119,7 +119,7 @@ pub fn normalize_proxy_prefix(prefix: Option<String>) -> String {
 }
 
 pub fn build_ota_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+    crate::platform::dns::http_client_builder()
         .user_agent("SimAdmin OTA updater")
         .timeout(Duration::from_secs(OTA_HTTP_TIMEOUT_SECS))
         .build()

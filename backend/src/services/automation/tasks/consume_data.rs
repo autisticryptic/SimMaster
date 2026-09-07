@@ -125,7 +125,7 @@ fn proxy_client(
     if !config.username.is_empty() {
         proxy = proxy.basic_auth(&config.username, &config.password);
     }
-    reqwest::Client::builder()
+    crate::platform::dns::http_client_builder()
         .proxy(proxy)
         .resolve_to_addrs(DATA_CONSUMPTION_HOST, &data_consumption_addresses())
         .connect_timeout(std::time::Duration::from_secs(30))

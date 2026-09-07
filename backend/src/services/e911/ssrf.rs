@@ -140,7 +140,7 @@ pub fn validate_redirect(location: &str, allow_list: &[String]) -> Result<Url, S
 }
 
 /// Resolve a host to public IPs. In the real client this wraps
-/// `tokio::net::lookup_host`; the pure function lets tests inject a resolver.
+/// the shared pure-Rust DNS layer; the pure function lets tests inject a resolver.
 #[cfg(test)]
 pub fn first_public_ip<F>(host: &str, resolve: F) -> Result<IpAddr, SsrfError>
 where

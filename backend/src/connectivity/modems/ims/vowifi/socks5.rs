@@ -344,7 +344,14 @@ impl Socks5UdpClient {
         connect_timeout: Duration,
     ) -> Result<Self, Socks5Error> {
         let authority = endpoint.authority();
-        let mut control = tokio::time::timeout(connect_timeout, TcpStream::connect(&authority))
+        let connect = async {
+            let addresses =
+                crate::platform::dns::resolve_socket_addrs(&endpoint.host, endpoint.port).await?;
+            // Passing resolved socket addresses avoids Tokio's implicit libc
+            // lookup for a hostname authority, including the proxy itself.
+            TcpStream::connect(addresses.as_slice()).await
+        };
+        let mut control = tokio::time::timeout(connect_timeout, connect)
             .await
             .map_err(|_| Socks5Error::Timeout(format!("connect {authority}")))?
             .map_err(|err| Socks5Error::Io(format!("connect {authority}: {}", err.kind())))?;

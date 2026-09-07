@@ -47,9 +47,9 @@ impl Ts43Transport {
     }
 
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<IpAddr>, String> {
-        tokio::net::lookup_host((host, port))
+        crate::platform::dns::resolve_socket_addrs(host, port)
             .await
-            .map(|addresses| addresses.map(|address| address.ip()).collect())
+            .map(|addresses| addresses.into_iter().map(|address| address.ip()).collect())
             .map_err(|_| "entitlement_dns_failed".to_string())
     }
 
@@ -64,7 +64,7 @@ impl Ts43Transport {
             .find(|ip| check_resolved_ip(*ip).is_ok())
             .ok_or_else(|| "entitlement_ip_forbidden".to_string())?;
         check_resolved_ip(selected).map_err(|error| error.to_string())?;
-        reqwest::Client::builder()
+        crate::platform::dns::http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             // Pin the address that passed the private/link-local check. TLS
             // still verifies the original hostname.

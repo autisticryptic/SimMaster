@@ -48,7 +48,7 @@ pub struct DdnsManager {
 impl DdnsManager {
     pub fn new() -> Self {
         Self {
-            client: Client::builder()
+            client: crate::platform::dns::http_client_builder()
                 .timeout(Duration::from_secs(20))
                 .user_agent("SimAdmin DDNS")
                 .build()
