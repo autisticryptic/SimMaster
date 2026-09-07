@@ -1,6 +1,6 @@
 ﻿# SimAdmin 开发计划与验收进度
 
-> 最后更新：2026-09-08 02:20（Asia/Shanghai）
+> 最后更新：2026-09-08 02:40（Asia/Shanghai）
 > 用途：持续更新的开发进度报告、发布门禁和后续核对依据。
 > 状态：beta1 / e55780a 已发布、部署并通过原通道自然续期；当前网络两路均未接受 outbound，实机双注册不标为完成。现进入阶段 B，在独立分支 refactor/1.1.4-beta2 开发纯 Rust DNS 与命名迁移；不改动设备或 beta1 发布。朋友的手机卡问题仍暂缓。
 
@@ -126,6 +126,7 @@
 | 2026-09-08 01:06 | 最终设备状态复核 | e55780a / 1.1.4-beta1，服务 active、0 通话、两个配置开关仍开；单注册选择 VoWiFi，当前有效流 not_supported | 不进行额外重连，保留自然续期观察窗口 |
 | 2026-09-08 01:46 | e55780a 原通道自然续期实测通过 | CSeq=3，security_verify=true、reused_access=true；发送时剩余 535 秒，约 0.38 秒后 200 OK，续得 3041 秒；没有重建安全协议来伪装 refresh | 按已验证单注册保护及当前网络限制收尾阶段 A，进入 B |
 | 2026-09-08 02:20 | 独立分支完成普通系统 DNS 迁移第一批代码 | hickory-resolver 0.25.2 + system-config；显式及 SOCKS5 隐式 lookup_host 已移除；HTTP 接入同一入口；cargo metadata 仅解析/下载依赖和更新锁文件 | 在新分支运行不发布版本的 GitHub Actions；命名迁移尚未动手 |
+| 2026-09-08 02:40 | DNS 分支 0257374 / run 34151549316 首轮验证 | 后端全部测试编译、前端与 15 项 Python 检查通过；3 项 DNS 网络测试错误地使用 .invalid，Hickory 按 RFC 6761 本地拒绝，未到测试服务器 | 改为 .test 并验证服务器收到真实 A/AAAA 查询；补充命名迁移映射，重新运行 CI |
 
 ## 6. 当前优先事项（阶段 B）
 
@@ -146,4 +147,5 @@
 - 本地 `.codex-beta1-final-wire-read.sh` 读取有界脱敏抓包；抓包仅含 REGISTER 元数据，自动停止，不保存 Authorization/密钥/SIP 原文。
 - 最新 e55780a 的 01:46 原通道自然 refresh 已通过；蜂窝先注册顺序和优先级回退已验证，但本网络双注册没有通过。
 - 下一步先通过 DNS 分支 CI，再做 `cellular_ims` 语义/兼容迁移；不能机械改掉真正 VoLTE 语音功能或历史数据库列。只在第二阶段全部验收后修改 VERSION 为 1.1.4-beta2 并走发布。
+- 命名迁移映射、旧 JSON/数据库/API 兼容要求见 `docs/IMS_NAMING_MIGRATION.md`；目前是待实现清单，不是已完成声明。
 - 不清理已有临时文件或覆盖无关改动。不要把开发分支 DNS 代码直接安装到设备；仍只部署校验过的 Release。

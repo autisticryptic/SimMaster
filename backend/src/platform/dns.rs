@@ -143,6 +143,7 @@ mod tests {
         },
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::net::UdpSocket;
 
     fn resolver(server: SocketAddr) -> TokioResolver {
@@ -161,13 +162,16 @@ mod tests {
     async fn dns_server(
         v4: Ipv4Addr,
         response_code: ResponseCode,
-    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
         let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let addr = socket.local_addr().unwrap();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let received = Arc::clone(&queries);
         let task = tokio::spawn(async move {
             let mut buffer = [0u8; 4096];
             loop {
                 let (size, peer) = socket.recv_from(&mut buffer).await.unwrap();
+                received.fetch_add(1, Ordering::SeqCst);
                 let request = Message::from_vec(&buffer[..size]).unwrap();
                 let mut response = Message::new();
                 response
@@ -198,7 +202,7 @@ mod tests {
                     .unwrap();
             }
         });
-        (addr, task)
+        (addr, task, queries)
     }
 
     #[tokio::test]
@@ -241,16 +245,22 @@ mod tests {
 
     #[tokio::test]
     async fn local_dns_returns_both_address_families_and_requested_port() {
-        let (server, task) = dns_server(Ipv4Addr::new(192, 0, 2, 5), ResponseCode::NoError).await;
+        let (server, task, queries) =
+            dns_server(Ipv4Addr::new(192, 0, 2, 5), ResponseCode::NoError).await;
         let result = lookup(
             &resolver(server),
-            "fixture.invalid.",
+            // .invalid is answered locally by RFC 6761, not by this server.
+            "fixture.simadmin.test.",
             4500,
             Duration::from_secs(2),
         )
         .await
         .unwrap();
         task.abort();
+        assert!(
+            queries.load(Ordering::SeqCst) >= 2,
+            "A and AAAA must reach the fixture"
+        );
         assert_eq!(
             result,
             vec![
@@ -262,41 +272,64 @@ mod tests {
 
     #[tokio::test]
     async fn resolver_configurations_do_not_share_cached_answers() {
-        let (one, task_one) = dns_server(Ipv4Addr::new(192, 0, 2, 1), ResponseCode::NoError).await;
-        let (two, task_two) = dns_server(Ipv4Addr::new(192, 0, 2, 2), ResponseCode::NoError).await;
-        let first = lookup(&resolver(one), "same.invalid.", 80, Duration::from_secs(2))
-            .await
-            .unwrap();
-        let second = lookup(&resolver(two), "same.invalid.", 80, Duration::from_secs(2))
-            .await
-            .unwrap();
+        let (one, task_one, queries_one) =
+            dns_server(Ipv4Addr::new(192, 0, 2, 1), ResponseCode::NoError).await;
+        let (two, task_two, queries_two) =
+            dns_server(Ipv4Addr::new(192, 0, 2, 2), ResponseCode::NoError).await;
+        let first = lookup(
+            &resolver(one),
+            "same.simadmin.test.",
+            80,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let second = lookup(
+            &resolver(two),
+            "same.simadmin.test.",
+            80,
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
         task_one.abort();
         task_two.abort();
+        assert!(queries_one.load(Ordering::SeqCst) >= 2);
+        assert!(queries_two.load(Ordering::SeqCst) >= 2);
         assert_ne!(first, second);
     }
 
     #[tokio::test]
     async fn nxdomain_and_timeout_are_errors_not_empty_success_or_public_fallback() {
-        let (server, task) = dns_server(Ipv4Addr::LOCALHOST, ResponseCode::NXDomain).await;
+        let (server, task, queries) = dns_server(Ipv4Addr::LOCALHOST, ResponseCode::NXDomain).await;
         assert!(lookup(
             &resolver(server),
-            "missing.invalid.",
+            "missing.simadmin.test.",
             80,
             Duration::from_secs(2)
         )
         .await
         .is_err());
+        assert!(
+            queries.load(Ordering::SeqCst) > 0,
+            "NXDOMAIN must come from the fixture"
+        );
         task.abort();
         let silent = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let error = lookup(
             &resolver(silent.local_addr().unwrap()),
-            "silent.invalid.",
+            "silent.simadmin.test.",
             80,
-            Duration::from_millis(80),
+            Duration::from_millis(200),
         )
         .await
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let mut packet = [0u8; 4096];
+        assert!(
+            silent.try_recv_from(&mut packet).is_ok(),
+            "timeout must follow an actual DNS query"
+        );
     }
 
     #[cfg(unix)]
