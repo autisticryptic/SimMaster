@@ -9,7 +9,7 @@
 //!
 //! The AKA run reuses `vowifi::qmi_uim` (transport-agnostic SIM hardware access).
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 use super::sip::ImsIdentity;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::{UsimAkaApduResult, USIM_AID_PREFIX};
 
@@ -76,7 +76,7 @@ pub fn resolve_home_plmn(
     imsi: &str,
     sim_operator: Option<&str>,
     ef_ad_mnc_length: Option<usize>,
-) -> Result<HomePlmn, VolteError> {
+) -> Result<HomePlmn, CellularImsError> {
     let matching_operator_length = sim_operator
         .filter(|operator| {
             matches!(operator.len(), 5 | 6)
@@ -90,7 +90,7 @@ pub fn resolve_home_plmn(
     } else if let Some(length @ (2 | 3)) = ef_ad_mnc_length {
         (length, "sim_ef_ad")
     } else {
-        return Err(VolteError::with_detail(
+        return Err(CellularImsError::with_detail(
             code::CARRIER_PROFILE_MISSING,
             "home_plmn_mnc_length_ambiguous",
         ));
@@ -169,9 +169,9 @@ fn pad_mnc(mnc: &str) -> String {
 /// MNC length from the IMSI alone; callers that know the true MNC length should
 /// pass it. This helper assumes a 2-digit MNC by default (the common case in
 /// CN/most networks), which the caller can override.
-pub fn split_imsi(imsi: &str, mnc_len: usize) -> Result<(String, String), VolteError> {
+pub fn split_imsi(imsi: &str, mnc_len: usize) -> Result<(String, String), CellularImsError> {
     if imsi.len() < 5 || !imsi.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(VolteError::new(code::IMSI_MISSING));
+        return Err(CellularImsError::new(code::IMSI_MISSING));
     }
     let mcc = imsi[..3].to_string();
     let mnc = imsi[3..3 + mnc_len.clamp(2, 3)].to_string();
@@ -213,7 +213,7 @@ pub fn resolve_usim_aid(discovered: Option<&[u8]>) -> Vec<u8> {
 
 /// Run USIM AKA on the SIM hardware via qmi-proxy (blocking; call from a
 /// blocking context). Thin wrapper over the reused vowifi routine that maps its
-/// `&'static str` reason into a `VolteError`.
+/// `&'static str` reason into a `CellularImsError`.
 #[allow(clippy::too_many_arguments)]
 pub fn run_usim_aka(
     proxy_socket: &str,
@@ -225,7 +225,7 @@ pub fn run_usim_aka(
     attempts: usize,
     timeout: std::time::Duration,
     retry_delay: std::time::Duration,
-) -> Result<UsimAkaApduResult, VolteError> {
+) -> Result<UsimAkaApduResult, CellularImsError> {
     crate::connectivity::modems::ims::vowifi::qmi_uim::execute_usim_authenticate_via_proxy_reason_with_retry(
         proxy_socket,
         device_path,
@@ -237,7 +237,7 @@ pub fn run_usim_aka(
         timeout,
         retry_delay,
     )
-    .map_err(|reason| VolteError::with_detail(code::USIM_AKA_FAILED, reason))
+    .map_err(|reason| CellularImsError::with_detail(code::USIM_AKA_FAILED, reason))
 }
 
 #[cfg(test)]

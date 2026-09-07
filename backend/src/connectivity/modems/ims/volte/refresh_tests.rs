@@ -23,7 +23,12 @@ fn challenge(nonce: &str) -> digest_aka::DigestChallenge {
     }
 }
 
-async fn protected_session() -> (VolteLiveSession, VolteRuntime, UdpSocket, UdpSocket) {
+async fn protected_session() -> (
+    CellularImsLiveSession,
+    CellularImsRuntime,
+    UdpSocket,
+    UdpSocket,
+) {
     let (live, runtime, server) = super::tests::test_voice_session().await;
     let mut session = live.session.lock().await.take().unwrap();
     // Model the real USIM trace: REGISTER uses a temporary IMPU, whereas
@@ -72,17 +77,17 @@ async fn protected_session() -> (VolteLiveSession, VolteRuntime, UdpSocket, UdpS
             .build(ue, session.profile),
     );
     session.xfrm_plan = Some(ipsec::build_install_plan(ip, ip, &ue, &pcscf, &[3; 16]).unwrap());
-    let mut authorization = VolteRefreshAuthorization::new(challenge("old-nonce"), aka());
+    let mut authorization = CellularImsRefreshAuthorization::new(challenge("old-nonce"), aka());
     authorization.nonce_count = 2;
     session.refresh_authorization = Some(authorization);
     (session, (*runtime).clone(), server, client)
 }
 
 fn authenticator(
-    session: &VolteLiveSession,
-    runtime: &VolteRuntime,
+    session: &CellularImsLiveSession,
+    runtime: &CellularImsRuntime,
     offered: SecAgree,
-) -> VolteRegisterAuthenticator {
+) -> CellularImsRegisterAuthenticator {
     let security = session
         .register_variant
         .security_client_offer
@@ -96,7 +101,7 @@ fn authenticator(
     let header = authorization
         .authorization_for(&session.registration_identity, &uri)
         .unwrap();
-    VolteRegisterAuthenticator::new(
+    CellularImsRegisterAuthenticator::new(
         session.registration_identity.clone(),
         RequestIds::fresh(10),
         session.sip_instance.clone(),
@@ -511,7 +516,7 @@ async fn unregister_targets_original_binding_not_originating_default() {
     let expected_identity = session.registration_identity.clone();
     let expected_from_tag = session.register_ids.from_tag.clone();
     let old_route = session.channel.send_route();
-    let live = VolteLiveHandle::new();
+    let live = CellularImsLiveHandle::new();
     *live.session.lock().await = Some(session);
     let peer = tokio::spawn(async move {
         let (request, source) = receive(&server).await;

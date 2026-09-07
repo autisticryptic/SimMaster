@@ -9,8 +9,8 @@ import {
   api,
   type CarrierProfileSummary,
   type LineVowifiConfig,
-  type VolteProfileCandidate,
-  type VolteProfileSource,
+  type ImsProfileCandidate,
+  type ImsProfileSource,
   type VowifiLineConfigResponse,
   type VowifiProxyMode,
   type SimImsOverride,
@@ -31,17 +31,17 @@ const proxyHints: Record<VowifiProxyMode, string> = {
   udp_relay: '暂未实现。要自建转发请在远端跑标准 SOCKS5（sing-box / mihomo / gost），再用上面的 SOCKS5 模式',
 }
 
-const sourceLabels: Record<VolteProfileSource, string> = {
+const sourceLabels: Record<ImsProfileSource, string> = {
   database: '用户数据库',
   carrier_catalog: '下载的只读数据库',
   derived: '自动派生配置',
 }
 
-function cloneAttempts(attempts: VolteProfileCandidate[]) {
+function cloneAttempts(attempts: ImsProfileCandidate[]) {
   return attempts.map((attempt) => ({ ...attempt, profile_id: attempt.profile_id || null }))
 }
 
-function profilesForSource(profiles: CarrierProfileSummary[], source: VolteProfileSource) {
+function profilesForSource(profiles: CarrierProfileSummary[], source: ImsProfileSource) {
   const origin = source === 'database' ? 'database' : source === 'carrier_catalog' ? 'carrier_catalog' : null
   return origin ? profiles.filter((profile) => profile.origin === origin && profile.vowifi_ready) : []
 }
@@ -131,7 +131,7 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
     } : current)
   }
 
-  const patchAttempt = (index: number, patch: Partial<VolteProfileCandidate>) => {
+  const patchAttempt = (index: number, patch: Partial<ImsProfileCandidate>) => {
     update('profile_selection', {
       attempts: draft.profile_selection.attempts.map((attempt, offset) => offset === index
         ? { ...attempt, ...patch }
@@ -243,11 +243,11 @@ export default function VowifiLineDialog({ open, line, onClose, onSaved }: Props
                           value={attempt.source}
                           label="Profile 来源"
                           onChange={(event) => patchAttempt(index, {
-                            source: event.target.value as VolteProfileSource,
+                            source: event.target.value as ImsProfileSource,
                             profile_id: null,
                           })}
                         >
-                          {(Object.keys(sourceLabels) as VolteProfileSource[]).map((source) => (
+                          {(Object.keys(sourceLabels) as ImsProfileSource[]).map((source) => (
                             <MenuItem key={source} value={source}>{sourceLabels[source]}</MenuItem>
                           ))}
                         </Select>

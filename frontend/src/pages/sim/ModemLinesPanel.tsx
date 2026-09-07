@@ -26,8 +26,8 @@ import {
   type CallRecord,
   type SmsMessage,
   type TrunkProfileResponse,
-  type VolteLineControlResponse,
-  type VolteProfileSelectionResponse,
+  type CellularImsLineControlResponse,
+  type CellularImsProfileSelectionResponse,
   type VowifiLineConfigResponse,
   type VowifiRuntimeEventEntry,
 } from '../../api/current'
@@ -66,7 +66,7 @@ const volteStageStatusLabels: Record<string, string> = {
   stopping: '正在断开 IMS',
 }
 
-function imsConnectionSummary(line: VolteLineControlResponse) {
+function imsConnectionSummary(line: CellularImsLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
   if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
   const errorStatus = volteErrorStatusLabel(line.runtime.last_error)
@@ -100,11 +100,11 @@ const volteStageAliases: Record<string, string> = {
   register_udp: 'registered',
 }
 
-function volteStageTimelineState(line: VolteLineControlResponse) {
+function volteStageTimelineState(line: CellularImsLineControlResponse) {
   const runtime = line.runtime
   const current = volteStageAliases[runtime.stage] || runtime.stage
   const currentIndex = volteStageTimeline.findIndex(([stage]) => stage === current)
-  const latestByStage = new Map<string, VolteLineControlResponse['runtime']['connection_attempts'][number]>()
+  const latestByStage = new Map<string, CellularImsLineControlResponse['runtime']['connection_attempts'][number]>()
   for (const attempt of runtime.connection_attempts ?? []) {
     latestByStage.set(volteStageAliases[attempt.stage] || attempt.stage, attempt)
   }
@@ -118,7 +118,7 @@ function volteStageTimelineState(line: VolteLineControlResponse) {
   })
 }
 
-function VolteStageTimeline({ line }: { line: VolteLineControlResponse }) {
+function VolteStageTimeline({ line }: { line: CellularImsLineControlResponse }) {
   const displayError = volteErrorMessage(line.runtime.last_error)
   if (!line.profile.volte_connection_enabled && !displayError && !line.runtime.connection_attempts?.length) return null
   const items = volteStageTimelineState(line)
@@ -147,7 +147,7 @@ function VolteStageTimeline({ line }: { line: VolteLineControlResponse }) {
   )
 }
 
-function voiceAccessLabel(line: VolteLineControlResponse, vowifi?: VowifiLineConfigResponse) {
+function voiceAccessLabel(line: CellularImsLineControlResponse, vowifi?: VowifiLineConfigResponse) {
   if (vowifi?.runtime_registered) return 'VoWiFi'
   if (line.runtime.registered) return 'VoLTE'
   return 'CS 语音'
@@ -221,7 +221,7 @@ function vowifiRuntimeCaption(line?: VowifiLineConfigResponse) {
   return line.matched_profile_id ? `运营商 profile ${line.matched_profile_id}` : '等待启动'
 }
 
-function recoveryMessage(line: VolteLineControlResponse) {
+function recoveryMessage(line: CellularImsLineControlResponse) {
   const runtime = line.runtime
   switch (runtime.recovery_state) {
     case 'waiting_modem':
@@ -245,7 +245,7 @@ function recoveryMessage(line: VolteLineControlResponse) {
 }
 
 type ModemLinesPanelProps = {
-  basicInfoForLine?: (line: VolteLineControlResponse, controls?: ReactNode) => ReactNode
+  basicInfoForLine?: (line: CellularImsLineControlResponse, controls?: ReactNode) => ReactNode
   workbench?: boolean
   workbenchHeader?: ReactNode
   workbenchEsim?: ReactNode
@@ -253,7 +253,7 @@ type ModemLinesPanelProps = {
   workbenchUssd?: ReactNode
   workbenchAutomation?: ReactNode
   workbenchNotifications?: ReactNode
-  onSelectionChange?: (line: VolteLineControlResponse | null) => void
+  onSelectionChange?: (line: CellularImsLineControlResponse | null) => void
 }
 
 type WorkbenchTab = 'overview' | 'esim' | 'ims' | 'sms' | 'ussd' | 'automation' | 'notifications'
@@ -267,7 +267,7 @@ const INITIAL_SUPPLEMENTAL_STATUS: Record<SupplementalSection, LoadStatus> = {
 }
 
 export default function ModemLinesPanel({ basicInfoForLine, workbench = false, workbenchHeader, workbenchEsim, workbenchSms, workbenchUssd, workbenchAutomation, workbenchNotifications, onSelectionChange }: ModemLinesPanelProps) {
-  const [lines, setLines] = useState<VolteLineControlResponse[]>([])
+  const [lines, setLines] = useState<CellularImsLineControlResponse[]>([])
   const [trunkLines, setTrunkLines] = useState<TrunkProfileResponse[]>([])
   const [vowifiLines, setVowifiLines] = useState<VowifiLineConfigResponse[]>([])
   const [vowifiEvents, setVowifiEvents] = useState<VowifiRuntimeEventEntry[]>([])
@@ -340,7 +340,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
 
     let lineFailed = false
     try {
-      const lineResponse = await api.getVolteLines()
+      const lineResponse = await api.getCellularImsLines()
       if (isCurrent()) setLines(stableModemSort(lineResponse.data ?? []))
     } catch (err) {
       lineFailed = true
@@ -588,7 +588,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     setError(null)
     setSuccess(null)
     try {
-      const response = await api.setVolteLineConnection(lineId, enabled)
+      const response = await api.setCellularImsLineConnection(lineId, enabled)
       loadVersion.current += 1
       if (response.data) {
         const updatedLine = response.data
@@ -630,7 +630,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     }
   }
 
-  const handleVolteProfileSaved = (updated: VolteProfileSelectionResponse) => {
+  const handleVolteProfileSaved = (updated: CellularImsProfileSelectionResponse) => {
     setLines((current) => current.map((line) => line.modem.line_id === updated.line_id
       ? {
           ...line,
@@ -656,7 +656,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     setError(null)
     setSuccess(null)
     try {
-      const response = await api.retryVolteLine(lineId)
+      const response = await api.retryCellularImsLine(lineId)
       const updatedLine = response.data
       if (updatedLine) {
         setLines((current) => current.map((line) => (

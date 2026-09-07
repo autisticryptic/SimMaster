@@ -45,7 +45,7 @@ import {
   Build,
 } from '@mui/icons-material'
 import { useSearchParams } from 'react-router-dom'
-import { api, type VolteLineControlResponse } from '../api/current'
+import { api, type CellularImsLineControlResponse } from '../api/current'
 import type { AutomationTarget, DeviceInfo, EsimEuiccInfo, EsimLpacStatusResponse, EsimProfile, EsimReaderConfig, SimInfo } from '../api/types'
 import ErrorSnackbar from '../components/ErrorSnackbar'
 import GithubDownloadProxyControl from '../components/GithubDownloadProxyControl'
@@ -59,12 +59,12 @@ import NotificationCenterPage from './NotificationCenter'
 import SMSPage from './SMS'
 import SupplementaryServicesPanel from './sim/SupplementaryServicesPanel'
 
-function lineNotificationScope(line: VolteLineControlResponse | null) {
+function lineNotificationScope(line: CellularImsLineControlResponse | null) {
   if (!line) return undefined
   return line.modem.line_id
 }
 
-function lineAutomationTarget(line: VolteLineControlResponse | null): AutomationTarget | undefined {
+function lineAutomationTarget(line: CellularImsLineControlResponse | null): AutomationTarget | undefined {
   if (!line) return undefined
   return { kind: 'modem_line', line_id: line.modem.line_id }
 }
@@ -226,7 +226,7 @@ function SmsCapacityProgress({ used, total }: { used?: number | null, total?: nu
   )
 }
 
-function WorkbenchOverview({ line }: { line: VolteLineControlResponse }) {
+function WorkbenchOverview({ line }: { line: CellularImsLineControlResponse }) {
   const [simInfo, setSimInfo] = useState<SimInfo | null>(null)
   const [networkInfo, setNetworkInfo] = useState<{ operator_name: string, registration_status: string, signal_strength: number } | null>(null)
   const [vowifi, setVowifi] = useState<Awaited<ReturnType<typeof api.getVowifiLine>>['data'] | null>(null)
@@ -345,7 +345,7 @@ const DEFAULT_ESIM_READER_CONFIG: EsimReaderConfig = {
   mbim_skip_slot_mapping: false,
 }
 
-function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControlResponse | null, onControlChanged: (control: boolean | null) => void }) {
+function EsimWorkbenchPanel({ line, onControlChanged }: { line: CellularImsLineControlResponse | null, onControlChanged: (control: boolean | null) => void }) {
   const esimReported = Boolean(line && (line.modem.sim_type === 'esim' || line.modem.esim_status === 'no-profiles' || line.modem.esim_status === 'with-profiles'))
   const initialMode: EsimControlMode = line?.profile.esim_control === true ? 'enabled' : line?.profile.esim_control === false ? 'disabled' : 'auto'
   const [controlMode, setControlMode] = useState<EsimControlMode>(initialMode)
@@ -635,7 +635,7 @@ function EsimWorkbenchPanel({ line, onControlChanged }: { line: VolteLineControl
   )
 }
 
-function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, controls?: ReactNode }) {
+function SimBasicInfo({ line, controls }: { line: CellularImsLineControlResponse, controls?: ReactNode }) {
   const lineId = line.modem.line_id
   const [simLoading, setSimLoading] = useState(true)
   const [deviceLoading, setDeviceLoading] = useState(true)
@@ -1094,7 +1094,7 @@ function SimBasicInfo({ line, controls }: { line: VolteLineControlResponse, cont
 
 export default function SimCardPage() {
   const [searchParams, setSearchParams] = useSearchParams()
-  const [selectedLine, setSelectedLine] = useState<VolteLineControlResponse | null>(null)
+  const [selectedLine, setSelectedLine] = useState<CellularImsLineControlResponse | null>(null)
 
   const requestedTab = searchParams.get('tab')
   const activeTab = requestedTab === 'carrier-profiles' ? requestedTab : 'lines'

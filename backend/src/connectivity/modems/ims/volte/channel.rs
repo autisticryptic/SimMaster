@@ -26,7 +26,7 @@ use crate::services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle};
 
 const MAX_SIP_DATAGRAM: usize = 65_535;
 
-pub struct VolteSipChannel {
+pub struct CellularImsSipChannel {
     send_socket: Option<UdpSocket>,
     receive_socket: Option<UdpSocket>,
     /// Protected UE-originated traffic uses a separately reserved port_c.
@@ -77,7 +77,7 @@ enum ReservedReceiveSocket {
     Worker(UdpSocket),
 }
 
-impl VolteSipChannel {
+impl CellularImsSipChannel {
     #[cfg(test)]
     pub fn bind(
         route: ImsRoute,
@@ -831,7 +831,7 @@ fn header_parameter_port(frame: &[u8], header_name: &str, parameter_name: &str) 
     None
 }
 
-impl ImsChannel for VolteSipChannel {
+impl ImsChannel for CellularImsSipChannel {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
         let prepared = self.outbound.prepare(frame)?;
         let frame = prepared.as_slice();
@@ -1038,7 +1038,7 @@ mod tests {
                 pcscf_addr: pcscf_server.local_addr().unwrap(),
                 transport: SipTransport::Udp,
             };
-            let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+            let mut channel = CellularImsSipChannel::bind(route, None, None).unwrap();
             let server_port = channel.reserve_security_receive_port().unwrap();
             let client_port = channel.reserve_security_send_port(server_port).unwrap();
             let local_server = SocketAddr::from((Ipv4Addr::LOCALHOST, server_port));
@@ -1124,7 +1124,7 @@ mod tests {
             pcscf_addr: server_addr,
             transport: SipTransport::Udp,
         };
-        let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+        let mut channel = CellularImsSipChannel::bind(route, None, None).unwrap();
         let client_addr = channel.local_addr().unwrap();
 
         channel
@@ -1153,7 +1153,7 @@ mod tests {
             pcscf_addr: pcscf_client.local_addr().unwrap(),
             transport: SipTransport::Udp,
         };
-        let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+        let mut channel = CellularImsSipChannel::bind(route, None, None).unwrap();
         let plain_send = channel.local_addr().unwrap();
         let local_receive = SocketAddr::new(
             plain_send.ip(),
@@ -1224,7 +1224,7 @@ mod tests {
             pcscf_addr: server.local_addr().unwrap(),
             transport: SipTransport::Udp,
         };
-        let mut channel = VolteSipChannel::bind(route, None, None).unwrap();
+        let mut channel = CellularImsSipChannel::bind(route, None, None).unwrap();
         let client_addr = channel.local_addr().unwrap();
 
         channel.requeue(b"first".to_vec());
@@ -1252,7 +1252,9 @@ mod tests {
             pcscf_addr: "[::1]:5060".parse().unwrap(),
             transport: SipTransport::Udp,
         };
-        let error = VolteSipChannel::bind(route, None, None).err().unwrap();
+        let error = CellularImsSipChannel::bind(route, None, None)
+            .err()
+            .unwrap();
         assert_eq!(error.code(), "volte_channel_bind_failed");
     }
 }

@@ -135,12 +135,12 @@ pub mod code {
 /// what gets stored in `last_error`, so the frontend substring matcher keys off
 /// the leading code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VolteError {
+pub struct CellularImsError {
     code: &'static str,
     detail: Option<String>,
 }
 
-impl VolteError {
+impl CellularImsError {
     pub fn new(code: &'static str) -> Self {
         Self { code, detail: None }
     }
@@ -161,7 +161,7 @@ impl VolteError {
     }
 }
 
-impl fmt::Display for VolteError {
+impl fmt::Display for CellularImsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.detail {
             Some(detail) => write!(f, "{}:{}", self.code, detail),
@@ -170,20 +170,22 @@ impl fmt::Display for VolteError {
     }
 }
 
-impl std::error::Error for VolteError {}
+impl std::error::Error for CellularImsError {}
 
 /// Convenience constructor: `verr!(IMSI_MISSING)` or `verr!(COMMAND_FAILED, "mmcli")`.
 #[macro_export]
 macro_rules! verr {
     ($code:expr) => {
-        $crate::connectivity::modems::ims::volte::errors::VolteError::new($code)
+        $crate::connectivity::modems::ims::volte::errors::CellularImsError::new($code)
     };
     ($code:expr, $detail:expr) => {
-        $crate::connectivity::modems::ims::volte::errors::VolteError::with_detail($code, $detail)
+        $crate::connectivity::modems::ims::volte::errors::CellularImsError::with_detail(
+            $code, $detail,
+        )
     };
 }
 
-pub type VolteResult<T> = Result<T, VolteError>;
+pub type CellularImsResult<T> = Result<T, CellularImsError>;
 
 #[cfg(test)]
 mod tests {
@@ -192,7 +194,7 @@ mod tests {
     #[test]
     fn display_without_detail_is_bare_code() {
         assert_eq!(
-            VolteError::new(code::IMSI_MISSING).to_string(),
+            CellularImsError::new(code::IMSI_MISSING).to_string(),
             "volte_imsi_missing"
         );
     }
@@ -200,7 +202,7 @@ mod tests {
     #[test]
     fn display_with_detail_uses_colon_suffix() {
         assert_eq!(
-            VolteError::with_detail(code::COMMAND_FAILED, "mmcli").to_string(),
+            CellularImsError::with_detail(code::COMMAND_FAILED, "mmcli").to_string(),
             "volte_command_failed:mmcli"
         );
     }

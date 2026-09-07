@@ -1800,17 +1800,17 @@ mod tests {
         let manager = ConfigManager::new(path.clone());
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
-        let selection = VolteProfileSelectionConfig {
+        let selection = ImsProfileSelectionConfig {
             attempts: vec![
-                VolteProfileCandidate {
-                    source: VolteProfileSource::CarrierCatalog,
+                ImsProfileCandidate {
+                    source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("  catalog-a  ".to_string()),
                 },
-                VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("custom-a".to_string()),
                 },
-                VolteProfileCandidate::automatic(VolteProfileSource::Derived),
+                ImsProfileCandidate::automatic(ImsProfileSource::Derived),
             ],
         };
         let saved = manager
@@ -1824,7 +1824,7 @@ mod tests {
         );
         assert_eq!(
             manager.get_line_volte_profile_selection(line_b),
-            VolteProfileSelectionConfig::default()
+            ImsProfileSelectionConfig::default()
         );
 
         let reloaded = ConfigManager::new(path.clone());
@@ -1836,7 +1836,7 @@ mod tests {
         );
         assert_eq!(
             reloaded.get_line_volte_profile_selection(line_b),
-            VolteProfileSelectionConfig::default()
+            ImsProfileSelectionConfig::default()
         );
         let _ = std::fs::remove_file(path);
     }
@@ -2640,11 +2640,14 @@ mod tests {
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         assert_eq!(profile.volte_ip_families, default_line_volte_ip_families());
         assert!(profile.volte_ip_families_auto);
-        profile.volte_ip_families = vec![VolteIpFamily::Ipv6];
+        profile.volte_ip_families = vec![CellularImsIpFamily::Ipv6];
         profile.volte_ip_families_auto = false;
         let round_trip: LineProfileConfig =
             serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
-        assert_eq!(round_trip.volte_ip_families, vec![VolteIpFamily::Ipv6]);
+        assert_eq!(
+            round_trip.volte_ip_families,
+            vec![CellularImsIpFamily::Ipv6]
+        );
         assert!(!round_trip.volte_ip_families_auto);
     }
 
@@ -2663,9 +2666,9 @@ mod tests {
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         profile.volte_ip_families = vec![
-            VolteIpFamily::Ipv4v6,
-            VolteIpFamily::Ipv4,
-            VolteIpFamily::Ipv6,
+            CellularImsIpFamily::Ipv4v6,
+            CellularImsIpFamily::Ipv4,
+            CellularImsIpFamily::Ipv6,
         ];
         profile.volte_ip_families_auto = true;
         config.line_profiles.push(profile);
@@ -2674,9 +2677,9 @@ mod tests {
         assert_eq!(
             config.line_profiles[0].volte_ip_families,
             vec![
-                VolteIpFamily::Ipv4v6,
-                VolteIpFamily::Ipv6,
-                VolteIpFamily::Ipv4,
+                CellularImsIpFamily::Ipv4v6,
+                CellularImsIpFamily::Ipv6,
+                CellularImsIpFamily::Ipv4,
             ]
         );
     }
@@ -2686,9 +2689,9 @@ mod tests {
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
         profile.volte_ip_families = vec![
-            VolteIpFamily::Ipv4v6,
-            VolteIpFamily::Ipv4,
-            VolteIpFamily::Ipv6,
+            CellularImsIpFamily::Ipv4v6,
+            CellularImsIpFamily::Ipv4,
+            CellularImsIpFamily::Ipv6,
         ];
         profile.volte_ip_families_auto = false;
         config.line_profiles.push(profile);
@@ -2697,9 +2700,9 @@ mod tests {
         assert_eq!(
             config.line_profiles[0].volte_ip_families,
             vec![
-                VolteIpFamily::Ipv4v6,
-                VolteIpFamily::Ipv4,
-                VolteIpFamily::Ipv6,
+                CellularImsIpFamily::Ipv4v6,
+                CellularImsIpFamily::Ipv4,
+                CellularImsIpFamily::Ipv6,
             ]
         );
     }
@@ -2712,7 +2715,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             profile.volte_profile_selection,
-            VolteProfileSelectionConfig::default()
+            ImsProfileSelectionConfig::default()
         );
         assert_eq!(
             profile
@@ -2722,9 +2725,9 @@ mod tests {
                 .map(|candidate| candidate.source)
                 .collect::<Vec<_>>(),
             vec![
-                VolteProfileSource::Database,
-                VolteProfileSource::CarrierCatalog,
-                VolteProfileSource::Derived,
+                ImsProfileSource::Database,
+                ImsProfileSource::CarrierCatalog,
+                ImsProfileSource::Derived,
             ]
         );
     }
@@ -2734,7 +2737,7 @@ mod tests {
         let config: LineVowifiConfig = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(
             config.profile_selection,
-            VolteProfileSelectionConfig::default()
+            ImsProfileSelectionConfig::default()
         );
         assert_eq!(
             config
@@ -2744,26 +2747,26 @@ mod tests {
                 .map(|candidate| candidate.source)
                 .collect::<Vec<_>>(),
             vec![
-                VolteProfileSource::Database,
-                VolteProfileSource::CarrierCatalog,
-                VolteProfileSource::Derived,
+                ImsProfileSource::Database,
+                ImsProfileSource::CarrierCatalog,
+                ImsProfileSource::Derived,
             ]
         );
     }
 
     #[test]
     fn volte_profile_selection_preserves_order_and_duplicate_sources_and_validates_slots() {
-        let mut repeated_sources = VolteProfileSelectionConfig {
+        let mut repeated_sources = ImsProfileSelectionConfig {
             attempts: vec![
-                VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("  database-first  ".to_string()),
                 },
-                VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("database-second".to_string()),
                 },
-                VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                ImsProfileCandidate::automatic(ImsProfileSource::Database),
             ],
         };
         assert_eq!(
@@ -2772,32 +2775,30 @@ mod tests {
         );
         assert_eq!(
             repeated_sources,
-            VolteProfileSelectionConfig {
+            ImsProfileSelectionConfig {
                 attempts: vec![
-                    VolteProfileCandidate {
-                        source: VolteProfileSource::Database,
+                    ImsProfileCandidate {
+                        source: ImsProfileSource::Database,
                         profile_id: Some("database-first".to_string()),
                     },
-                    VolteProfileCandidate {
-                        source: VolteProfileSource::Database,
+                    ImsProfileCandidate {
+                        source: ImsProfileSource::Database,
                         profile_id: Some("database-second".to_string()),
                     },
-                    VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                    ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 ],
             }
         );
 
-        let mut too_short = VolteProfileSelectionConfig {
-            attempts: vec![VolteProfileCandidate::automatic(
-                VolteProfileSource::Derived,
-            )],
+        let mut too_short = ImsProfileSelectionConfig {
+            attempts: vec![ImsProfileCandidate::automatic(ImsProfileSource::Derived)],
         };
         assert_eq!(
             validate_volte_profile_selection(&mut too_short),
             Err("volte_profile_attempt_count_invalid".to_string())
         );
 
-        let mut invalid = VolteProfileSelectionConfig::default();
+        let mut invalid = ImsProfileSelectionConfig::default();
         invalid.attempts[2].profile_id = Some("not-allowed".to_string());
         assert_eq!(
             validate_volte_profile_selection(&mut invalid),
@@ -4079,13 +4080,13 @@ impl Default for AutoRestoreConfig {
 /// concrete row inside the requested source.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum VolteProfileSource {
+pub enum ImsProfileSource {
     Database,
     CarrierCatalog,
     Derived,
 }
 
-impl VolteProfileSource {
+impl ImsProfileSource {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Database => "database",
@@ -4101,14 +4102,14 @@ impl VolteProfileSource {
 /// never crosses source boundaries, which keeps a user profile and a downloaded
 /// catalog profile with the same id independently selectable.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VolteProfileCandidate {
-    pub source: VolteProfileSource,
+pub struct ImsProfileCandidate {
+    pub source: ImsProfileSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
 }
 
-impl VolteProfileCandidate {
-    pub fn automatic(source: VolteProfileSource) -> Self {
+impl ImsProfileCandidate {
+    pub fn automatic(source: ImsProfileSource) -> Self {
         Self {
             source,
             profile_id: None,
@@ -4116,11 +4117,11 @@ impl VolteProfileCandidate {
     }
 }
 
-fn default_volte_profile_attempts() -> Vec<VolteProfileCandidate> {
+fn default_volte_profile_attempts() -> Vec<ImsProfileCandidate> {
     vec![
-        VolteProfileCandidate::automatic(VolteProfileSource::Database),
-        VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
-        VolteProfileCandidate::automatic(VolteProfileSource::Derived),
+        ImsProfileCandidate::automatic(ImsProfileSource::Database),
+        ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
+        ImsProfileCandidate::automatic(ImsProfileSource::Derived),
     ]
 }
 
@@ -4131,12 +4132,12 @@ fn default_volte_profile_attempts() -> Vec<VolteProfileCandidate> {
 /// the operator-requested three-attempt behaviour instead of silently deduping
 /// the fallback to a single attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct VolteProfileSelectionConfig {
+pub struct ImsProfileSelectionConfig {
     #[serde(default = "default_volte_profile_attempts")]
-    pub attempts: Vec<VolteProfileCandidate>,
+    pub attempts: Vec<ImsProfileCandidate>,
 }
 
-impl Default for VolteProfileSelectionConfig {
+impl Default for ImsProfileSelectionConfig {
     fn default() -> Self {
         Self {
             attempts: default_volte_profile_attempts(),
@@ -4144,7 +4145,7 @@ impl Default for VolteProfileSelectionConfig {
     }
 }
 
-impl VolteProfileSelectionConfig {
+impl ImsProfileSelectionConfig {
     /// Normalize and validate the public API/storage shape before any
     /// source-bound profile lookup is attempted. Keeping this on the value
     /// itself lets HTTP handlers reject malformed requests before persistence
@@ -4164,7 +4165,7 @@ impl VolteProfileSelectionConfig {
 /// on an unclear failure, IPv6 is tried before IPv4.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
-pub enum VolteIpFamilyPreference {
+pub enum CellularImsIpFamilyPreference {
     #[default]
     Ipv6First,
     Ipv4First,
@@ -4172,44 +4173,44 @@ pub enum VolteIpFamilyPreference {
     Ipv4Only,
 }
 
-impl VolteIpFamilyPreference {
+impl CellularImsIpFamilyPreference {
     /// The equivalent ordered attempt list used by per-line profiles and IMS
     /// planning helpers.
     /// The `*First` presets lead with dual-stack, matching the historical
     /// "always try dual-stack first, then fall back to single families" behaviour.
-    pub fn to_families(self) -> Vec<VolteIpFamily> {
+    pub fn to_families(self) -> Vec<CellularImsIpFamily> {
         match self {
             Self::Ipv6First => vec![
-                VolteIpFamily::Ipv4v6,
-                VolteIpFamily::Ipv6,
-                VolteIpFamily::Ipv4,
+                CellularImsIpFamily::Ipv4v6,
+                CellularImsIpFamily::Ipv6,
+                CellularImsIpFamily::Ipv4,
             ],
             Self::Ipv4First => vec![
-                VolteIpFamily::Ipv4v6,
-                VolteIpFamily::Ipv4,
-                VolteIpFamily::Ipv6,
+                CellularImsIpFamily::Ipv4v6,
+                CellularImsIpFamily::Ipv4,
+                CellularImsIpFamily::Ipv6,
             ],
-            Self::Ipv6Only => vec![VolteIpFamily::Ipv6],
-            Self::Ipv4Only => vec![VolteIpFamily::Ipv4],
+            Self::Ipv6Only => vec![CellularImsIpFamily::Ipv6],
+            Self::Ipv4Only => vec![CellularImsIpFamily::Ipv4],
         }
     }
 }
 
 /// One IMS bearer attempt a line may enable: dual-stack or a single family. The
-/// order of a `Vec<VolteIpFamily>` is the attempt/fallback order, so a line can
+/// order of a `Vec<CellularImsIpFamily>` is the attempt/fallback order, so a line can
 /// place `Ipv4v6` (dual-stack) anywhere in the sequence rather than it always
 /// being tried first. A one-element list means "only this attempt, no fallback".
 /// This is the per-line, web-editable form of the legacy
-/// [`VolteIpFamilyPreference`] and is a strict superset of it.
+/// [`CellularImsIpFamilyPreference`] and is a strict superset of it.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum VolteIpFamily {
+pub enum CellularImsIpFamily {
     Ipv4v6,
     Ipv4,
     Ipv6,
 }
 
-impl VolteIpFamily {
+impl CellularImsIpFamily {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ipv4v6 => "ipv4v6",
@@ -4219,8 +4220,8 @@ impl VolteIpFamily {
     }
 }
 
-fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
-    VolteIpFamilyPreference::default().to_families()
+fn default_line_volte_ip_families() -> Vec<CellularImsIpFamily> {
+    CellularImsIpFamilyPreference::default().to_families()
 }
 
 /// Older releases used `[ipv4v6, ipv4, ipv6]` for automatic lines. Keep
@@ -4228,9 +4229,9 @@ fn default_line_volte_ip_families() -> Vec<VolteIpFamily> {
 /// current dual-stack -> IPv6 -> IPv4 order when loading persisted settings.
 fn migrate_legacy_volte_ip_family_defaults(config: &mut AppConfig) -> bool {
     let legacy = vec![
-        VolteIpFamily::Ipv4v6,
-        VolteIpFamily::Ipv4,
-        VolteIpFamily::Ipv6,
+        CellularImsIpFamily::Ipv4v6,
+        CellularImsIpFamily::Ipv4,
+        CellularImsIpFamily::Ipv6,
     ];
     let current = default_line_volte_ip_families();
     if legacy == current {
@@ -4464,7 +4465,7 @@ pub struct LineVowifiConfig {
     pub proxy_endpoint: String,
     /// Ordered carrier-profile attempts for this physical line's WLAN IMS leg.
     #[serde(default)]
-    pub profile_selection: VolteProfileSelectionConfig,
+    pub profile_selection: ImsProfileSelectionConfig,
     #[serde(default)]
     pub auto_restore: AutoRestoreConfig,
 }
@@ -4475,7 +4476,7 @@ impl Default for LineVowifiConfig {
             enabled: false,
             proxy_mode: VowifiProxyMode::Direct,
             proxy_endpoint: String::new(),
-            profile_selection: VolteProfileSelectionConfig::default(),
+            profile_selection: ImsProfileSelectionConfig::default(),
             auto_restore: AutoRestoreConfig::default(),
         }
     }
@@ -4507,7 +4508,7 @@ pub struct LineProfileConfig {
     pub volte_auto_restore: AutoRestoreConfig,
     /// Ordered outer carrier-profile attempts for this physical line.
     #[serde(default)]
-    pub volte_profile_selection: VolteProfileSelectionConfig,
+    pub volte_profile_selection: ImsProfileSelectionConfig,
     #[serde(default, alias = "vilte")]
     pub ims_video: ImsVideoConfig,
     #[serde(default)]
@@ -4549,7 +4550,7 @@ pub struct LineProfileConfig {
     /// enable, in fallback order. The default `[Ipv4v6, Ipv6, Ipv4]` tries dual-stack,
     /// then IPv6, then IPv4; `[Ipv6]` is IPv6-only. An empty list is invalid.
     #[serde(default = "default_line_volte_ip_families")]
-    pub volte_ip_families: Vec<VolteIpFamily>,
+    pub volte_ip_families: Vec<CellularImsIpFamily>,
     /// Whether the family order is still automatic. Automatic lines may use
     /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
     /// the UI turns this off so the user's choice always wins.
@@ -4673,7 +4674,7 @@ impl LineProfileConfig {
             enabled: true,
             volte_connection_enabled: false,
             volte_auto_restore: AutoRestoreConfig::default(),
-            volte_profile_selection: VolteProfileSelectionConfig::default(),
+            volte_profile_selection: ImsProfileSelectionConfig::default(),
             ims_video: ImsVideoConfig::default(),
             volte_ip_families: default_line_volte_ip_families(),
             volte_ip_families_auto: default_line_volte_ip_families_auto(),
@@ -4732,7 +4733,7 @@ fn valid_line_id(line_id: &str) -> bool {
 }
 
 fn validate_volte_profile_selection(
-    selection: &mut VolteProfileSelectionConfig,
+    selection: &mut ImsProfileSelectionConfig,
 ) -> Result<(), String> {
     if selection.attempts.len() != 3 {
         return Err("volte_profile_attempt_count_invalid".to_string());
@@ -4743,7 +4744,7 @@ fn validate_volte_profile_selection(
             .take()
             .map(|profile_id| profile_id.trim().to_string())
             .filter(|profile_id| !profile_id.is_empty());
-        if candidate.source == VolteProfileSource::Derived && candidate.profile_id.is_some() {
+        if candidate.source == ImsProfileSource::Derived && candidate.profile_id.is_some() {
             return Err("volte_derived_profile_id_not_allowed".to_string());
         }
         if candidate
@@ -6223,7 +6224,7 @@ impl ConfigManager {
     pub fn set_line_volte_ip_families(
         &self,
         line_id: &str,
-        families: Vec<VolteIpFamily>,
+        families: Vec<CellularImsIpFamily>,
     ) -> Result<LineProfileConfig, String> {
         if !valid_line_id(line_id) {
             return Err("invalid_line_id".to_string());
@@ -6264,7 +6265,7 @@ impl ConfigManager {
         Ok(next)
     }
 
-    pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<VolteIpFamily> {
+    pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<CellularImsIpFamily> {
         self.get_line_profile(line_id).volte_ip_families
     }
 
@@ -6272,14 +6273,14 @@ impl ConfigManager {
         self.get_line_profile(line_id).volte_ip_families_auto
     }
 
-    pub fn get_line_volte_profile_selection(&self, line_id: &str) -> VolteProfileSelectionConfig {
+    pub fn get_line_volte_profile_selection(&self, line_id: &str) -> ImsProfileSelectionConfig {
         self.get_line_profile(line_id).volte_profile_selection
     }
 
     pub fn set_line_volte_profile_selection(
         &self,
         line_id: &str,
-        mut selection: VolteProfileSelectionConfig,
+        mut selection: ImsProfileSelectionConfig,
     ) -> Result<LineProfileConfig, String> {
         selection.validate()?;
         self.update_line_profile(line_id, |profile| {

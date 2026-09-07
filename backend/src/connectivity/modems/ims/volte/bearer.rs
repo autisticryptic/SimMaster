@@ -22,7 +22,7 @@ use crate::platform::network_routing::{
 use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 
 use super::{
-    errors::{code, VolteError},
+    errors::{code, CellularImsError},
     pcscf::ImsIpSettings,
     plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
 };
@@ -70,14 +70,14 @@ pub struct BearerAttempt {
     pub ip_type: String,
     pub source: String,
     pub outcome: String,
-    pub error: Option<VolteError>,
+    pub error: Option<CellularImsError>,
 }
 
 impl BearerConnection {
-    pub fn local_addr(&self) -> Result<IpAddr, VolteError> {
+    pub fn local_addr(&self) -> Result<IpAddr, CellularImsError> {
         self.settings
             .local_addr()
-            .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))
+            .ok_or_else(|| CellularImsError::new(code::IP_SETTINGS_MISSING))
     }
 }
 
@@ -143,9 +143,11 @@ pub fn bearer_path_override() -> Option<String> {
 /// Roaming gate: if the network is roaming and roaming is not allowed, the IMS
 /// bearer must not be brought up (mirrors `bearer_roaming_forbidden`).
 #[cfg(test)]
-pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), VolteError> {
+pub fn check_roaming(is_roaming: bool, allow_roaming: bool) -> Result<(), CellularImsError> {
     if is_roaming && !allow_roaming {
-        return Err(VolteError::new(code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN));
+        return Err(CellularImsError::new(
+            code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN,
+        ));
     }
     Ok(())
 }
@@ -162,7 +164,7 @@ pub async fn ensure_ims_bearer(
     modem: &str,
     request: &BearerRequest,
     plan: &ImsConnectionPlan,
-) -> Result<BearerConnection, VolteError> {
+) -> Result<BearerConnection, CellularImsError> {
     ensure_ims_bearer_observed(modem, request, plan, |_| async {}).await
 }
 
@@ -172,7 +174,7 @@ pub async fn ensure_ims_bearer_observed<F, Fut>(
     request: &BearerRequest,
     plan: &ImsConnectionPlan,
     mut observe: F,
-) -> Result<BearerConnection, VolteError>
+) -> Result<BearerConnection, CellularImsError>
 where
     F: FnMut(BearerAttempt) -> Fut,
     Fut: Future<Output = ()>,
@@ -375,7 +377,7 @@ where
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
+    Err(last_error.unwrap_or_else(|| CellularImsError::new(code::RUNTIME_MM_BEARER_CONNECT_FAILED)))
 }
 
 #[cfg(test)]
@@ -433,7 +435,7 @@ fn create_bearer_properties(request: &BearerRequest, ip_type: &str) -> String {
 
 #[cfg(test)]
 struct BearerAttemptFailure {
-    error: VolteError,
+    error: CellularImsError,
     details: String,
 }
 
@@ -469,7 +471,7 @@ async fn create_and_connect_attempt(
         error,
     })?;
     let path = parse_created_bearer_path(&created).ok_or_else(|| BearerAttemptFailure {
-        error: VolteError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
+        error: CellularImsError::new(code::RUNTIME_MM_BEARER_PATH_MISSING),
         details: String::new(),
     })?;
     match connect_and_read(&path).await {
@@ -490,20 +492,23 @@ async fn create_and_connect_attempt(
 }
 
 #[cfg(test)]
-async fn delete_bearer(modem: &str, path: &str) -> Result<(), VolteError> {
+async fn delete_bearer(modem: &str, path: &str) -> Result<(), CellularImsError> {
     run_command("mmcli", &["-m", modem, &format!("--delete-bearer={path}")])
         .await
         .map(|_| ())
 }
 
 #[cfg(test)]
-async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
+async fn connect_and_read(path: &str) -> Result<BearerConnection, CellularImsError> {
     let before = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
     if value(&before, "bearer.status.connected").as_deref() != Some("yes") {
         run_command("mmcli", &["-b", path, "--connect"])
             .await
             .map_err(|error| {
-                VolteError::with_detail(code::RUNTIME_MM_BEARER_CONNECT_FAILED, error.to_string())
+                CellularImsError::with_detail(
+                    code::RUNTIME_MM_BEARER_CONNECT_FAILED,
+                    error.to_string(),
+                )
             })?;
     }
     let connected = run_command("mmcli", &["-b", path, "--output-keyvalue"]).await?;
@@ -511,13 +516,16 @@ async fn connect_and_read(path: &str) -> Result<BearerConnection, VolteError> {
 }
 
 #[cfg(test)]
-pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnection, VolteError> {
+pub fn parse_bearer_connection(
+    path: &str,
+    output: &str,
+) -> Result<BearerConnection, CellularImsError> {
     if value(output, "bearer.status.connected").as_deref() != Some("yes") {
-        return Err(VolteError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
+        return Err(CellularImsError::new(code::RUNTIME_MM_BEARER_NOT_CONNECTED));
     }
     let interface = value(output, "bearer.status.interface")
         .filter(|item| item != "--")
-        .ok_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING))?;
+        .ok_or_else(|| CellularImsError::new(code::IP_SETTINGS_MISSING))?;
     let settings = ImsIpSettings {
         ipv4_address: ip_value(output, "bearer.ipv4-config.address"),
         ipv4_gateway: ip_value(output, "bearer.ipv4-config.gateway"),
@@ -532,7 +540,7 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
     let mtu = number_value(output, "bearer.ipv6-config.mtu")
         .or_else(|| number_value(output, "bearer.ipv4-config.mtu"));
     if settings.local_addr().is_none() {
-        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+        return Err(CellularImsError::new(code::IP_SETTINGS_MISSING));
     }
     Ok(BearerConnection {
         path: path.to_string(),
@@ -549,7 +557,7 @@ pub fn parse_bearer_connection(path: &str, output: &str) -> Result<BearerConnect
 /// Configure the address and DNS host routes for the dedicated bearer. No
 /// default route is added, preserving the management/Wi-Fi path.
 #[cfg(test)]
-pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), VolteError> {
+pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), CellularImsError> {
     ensure_bearer_interface_ready(&bearer.interface).await?;
     if let Some(mtu) = bearer.mtu {
         let mtu = mtu.to_string();
@@ -591,7 +599,7 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
     if configured {
         return Ok(());
     }
-    Err(last_error.unwrap_or_else(|| VolteError::new(code::IP_SETTINGS_MISSING)))
+    Err(last_error.unwrap_or_else(|| CellularImsError::new(code::IP_SETTINGS_MISSING)))
 }
 
 /// Configure a dedicated native IMS netdev after it has been moved into its
@@ -601,11 +609,11 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), V
 pub async fn configure_bearer_network_in_worker(
     bearer: &BearerConnection,
     worker: &UeWorkerHandle,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     apply_worker_ops(worker, bearer_network_ops(bearer)?).await
 }
 
-fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, VolteError> {
+fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, CellularImsError> {
     let mut ops = Vec::new();
     if let Some(mtu) = bearer.mtu {
         ops.push(NetConfigOp::LinkSetMtu {
@@ -645,7 +653,7 @@ fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, Vol
         .iter()
         .any(|op| matches!(op, NetConfigOp::AddrReplace { .. }))
     {
-        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+        return Err(CellularImsError::new(code::IP_SETTINGS_MISSING));
     }
     Ok(ops)
 }
@@ -654,7 +662,7 @@ pub async fn route_pcscf_in_worker(
     bearer: &BearerConnection,
     pcscf: IpAddr,
     worker: &UeWorkerHandle,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     apply_worker_ops(worker, vec![worker_host_route_op(bearer, pcscf)?]).await
 }
 
@@ -662,18 +670,18 @@ pub async fn route_media_host_in_worker(
     bearer: &BearerConnection,
     host: IpAddr,
     worker: &UeWorkerHandle,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     apply_worker_ops(worker, vec![worker_host_route_op(bearer, host)?]).await
 }
 
 fn worker_host_route_op(
     bearer: &BearerConnection,
     host: IpAddr,
-) -> Result<NetConfigOp, VolteError> {
+) -> Result<NetConfigOp, CellularImsError> {
     let source = bearer
         .settings
         .local_addr_for_family(host)
-        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+        .ok_or_else(|| CellularImsError::new("volte_route_family_mismatch"))?;
     let via = bearer
         .settings
         .gateway_for_family(host)
@@ -691,14 +699,14 @@ fn worker_host_route_op(
 async fn apply_worker_ops(
     worker: &UeWorkerHandle,
     ops: Vec<NetConfigOp>,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let outcome = worker.apply_net_config(ops).await.map_err(|error| {
-        VolteError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
+        CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
     })?;
     if outcome.ok {
         Ok(())
     } else {
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             outcome
                 .error
@@ -719,7 +727,7 @@ async fn apply_worker_ops(
 /// must stay in their driver policy instead of making the generic IMS path
 /// assert something true of only one platform. See
 /// `hardware/devices/baseband_faults.rs`.
-pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), VolteError> {
+pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(), CellularImsError> {
     if interface_is_up(interface).await {
         return Ok(());
     }
@@ -730,7 +738,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
             Some(note) => format!("interface={interface}: {when} ({note})"),
             None => format!("interface={interface}: {when}"),
         };
-        VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, detail)
+        CellularImsError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, detail)
     };
     if !faults.inspect_data_interface(interface).permits_bring_up() {
         return Err(latched_error(interface, "runtime_status=error before OPEN"));
@@ -747,7 +755,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
             if !faults.inspect_data_interface(interface).permits_bring_up() {
                 latched_error(interface, &error.to_string())
             } else {
-                VolteError::with_detail(
+                CellularImsError::with_detail(
                     code::BEARER_NETDEV_NOT_UP,
                     format!("interface={interface}: {error}"),
                 )
@@ -766,7 +774,7 @@ pub(crate) async fn ensure_bearer_interface_ready(interface: &str) -> Result<(),
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
     }
-    Err(VolteError::with_detail(
+    Err(CellularImsError::with_detail(
         code::BEARER_NETDEV_NOT_READY,
         format!("interface={interface} remained down after one OPEN request"),
     ))
@@ -840,9 +848,9 @@ fn addr_output_contains(output: &str, address: IpAddr) -> bool {
 }
 
 #[cfg(test)]
-async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
+async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), CellularImsError> {
     let Some(address @ IpAddr::V6(_)) = bearer.settings.ipv6_address else {
-        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+        return Err(CellularImsError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv6_prefix.unwrap_or(64);
     let address_with_prefix = format!("{address}/{prefix}");
@@ -863,9 +871,9 @@ async fn configure_ipv6(bearer: &BearerConnection) -> Result<(), VolteError> {
 }
 
 #[cfg(test)]
-async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
+async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), CellularImsError> {
     let Some(address @ IpAddr::V4(_)) = bearer.settings.ipv4_address else {
-        return Err(VolteError::new(code::IP_SETTINGS_MISSING));
+        return Err(CellularImsError::new(code::IP_SETTINGS_MISSING));
     };
     let prefix = bearer.ipv4_prefix.unwrap_or(32);
     let address_with_prefix = format!("{address}/{prefix}");
@@ -885,7 +893,7 @@ async fn configure_ipv4(bearer: &BearerConnection) -> Result<(), VolteError> {
 }
 
 #[cfg(test)]
-pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), VolteError> {
+pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(), CellularImsError> {
     route_host_on_bearer(bearer, pcscf).await
 }
 
@@ -894,7 +902,10 @@ pub async fn route_pcscf(bearer: &BearerConnection, pcscf: IpAddr) -> Result<(),
 /// are not necessarily the P-CSCF address; without this route Linux may send
 /// media through the management/Wi-Fi default route.
 #[cfg(test)]
-pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+pub async fn route_media_host(
+    bearer: &BearerConnection,
+    host: IpAddr,
+) -> Result<(), CellularImsError> {
     route_host_on_bearer(bearer, host).await
 }
 
@@ -902,7 +913,10 @@ pub async fn route_media_host(bearer: &BearerConnection, host: IpAddr) -> Result
 /// process-wide main route table. Multiple modems can receive the same remote
 /// RTP address, and a main-table `/32` would let the last line win.
 #[cfg(test)]
-async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result<(), VolteError> {
+async fn route_host_on_bearer(
+    bearer: &BearerConnection,
+    host: IpAddr,
+) -> Result<(), CellularImsError> {
     // A dual-stack ModemManager bearer has two independent local addresses.
     // `BearerConnection::local_addr()` intentionally returns the preferred
     // address (currently IPv6-first), which is not necessarily the family
@@ -913,11 +927,11 @@ async fn route_host_on_bearer(bearer: &BearerConnection, host: IpAddr) -> Result
     let local = bearer
         .settings
         .local_addr_for_family(host)
-        .ok_or_else(|| VolteError::new("volte_route_family_mismatch"))?;
+        .ok_or_else(|| CellularImsError::new("volte_route_family_mismatch"))?;
     if local.is_ipv4() != host.is_ipv4() {
-        return Err(VolteError::new("volte_route_family_mismatch"));
+        return Err(CellularImsError::new("volte_route_family_mismatch"));
     }
-    let table = route_table(RouteDomain::VolteIms, &bearer.interface, host);
+    let table = route_table(RouteDomain::CellularIms, &bearer.interface, host);
     let destination = host_selector(host);
     let family = if host.is_ipv6() { Some("-6") } else { None };
     let table = table.to_string();
@@ -942,10 +956,10 @@ async fn configure_source_policy(
     interface: &str,
     address: IpAddr,
     prefix: u8,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let family = if address.is_ipv6() { Some("-6") } else { None };
-    let table = route_table(RouteDomain::VolteIms, interface, address).to_string();
-    let priority = rule_priority(RouteDomain::VolteIms, interface, address).to_string();
+    let table = route_table(RouteDomain::CellularIms, interface, address).to_string();
+    let priority = rule_priority(RouteDomain::CellularIms, interface, address).to_string();
     let source = source_selector(address);
     let connected = format!("{}/{prefix}", network_address(address, prefix));
     let mut flush = Vec::new();
@@ -991,9 +1005,10 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
         (bearer.settings.ipv6_address, bearer.ipv6_prefix),
     ] {
         if let Some(address) = address {
-            let table = route_table(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+            let table =
+                route_table(RouteDomain::CellularIms, &bearer.interface, address).to_string();
             let priority =
-                rule_priority(RouteDomain::VolteIms, &bearer.interface, address).to_string();
+                rule_priority(RouteDomain::CellularIms, &bearer.interface, address).to_string();
             let family = if address.is_ipv6() { Some("-6") } else { None };
             let mut flush = Vec::new();
             if let Some(family) = family {
@@ -1071,29 +1086,33 @@ pub async fn disconnect_bearer(path: &str) {
     let _ = run_command("mmcli", &["-b", path, "--disconnect"]).await;
 }
 
-async fn run_ip(args: &[&str]) -> Result<String, VolteError> {
+async fn run_ip(args: &[&str]) -> Result<String, CellularImsError> {
     run_command("ip", args).await
 }
 
-async fn run_command(program: &str, args: &[&str]) -> Result<String, VolteError> {
+async fn run_command(program: &str, args: &[&str]) -> Result<String, CellularImsError> {
     let output = Command::new(program)
         .args(args)
         .output()
         .await
         .map_err(|error| {
-            VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
+            CellularImsError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
         })?;
     command_output(program, args, output)
 }
 
-fn command_output(program: &str, args: &[&str], output: Output) -> Result<String, VolteError> {
+fn command_output(
+    program: &str,
+    args: &[&str],
+    output: Output,
+) -> Result<String, CellularImsError> {
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr)
             .trim()
             .replace('\n', " ");
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             format!(
                 "{program}:{}:{}:{}",
@@ -1374,9 +1393,9 @@ mod tests {
     #[test]
     fn network_family_rejection_selects_required_bearer_type() {
         use crate::connectivity::modems::ims::volte::plan::{FailureClass, ImsConnectionPlan};
-        use crate::platform::config::VolteIpFamilyPreference;
-        let plan_v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
-        let plan_v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        use crate::platform::config::CellularImsIpFamilyPreference;
+        let plan_v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
+        let plan_v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
         let ipv6 = "bearer.status.connection-error.name : org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed\n";
         assert_eq!(
             FailureClass::from_details(ipv6),
@@ -1411,17 +1430,17 @@ mod tests {
 
     #[test]
     fn create_command_family_rejection_is_not_replaced_by_default_fallback() {
-        use crate::platform::config::VolteIpFamilyPreference;
+        use crate::platform::config::CellularImsIpFamilyPreference;
 
         let ipv6 = BearerAttemptFailure {
-            error: VolteError::with_detail(
+            error: CellularImsError::with_detail(
                 code::RUNTIME_MM_BEARER_CONNECT_FAILED,
                 "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv6OnlyAllowed",
             ),
             details: String::new(),
         };
         let ipv4 = BearerAttemptFailure {
-            error: VolteError::with_detail(
+            error: CellularImsError::with_detail(
                 code::RUNTIME_MM_BEARER_CONNECT_FAILED,
                 "org.freedesktop.ModemManager1.Error.MobileEquipment.Ipv4OnlyAllowed",
             ),
@@ -1429,12 +1448,12 @@ mod tests {
         };
 
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
                 .bearer_fallbacks_after(classify_attempt_failure(&ipv6)),
             vec![IpType::Ipv6]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First)
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
                 .bearer_fallbacks_after(classify_attempt_failure(&ipv4)),
             vec![IpType::Ipv4]
         );

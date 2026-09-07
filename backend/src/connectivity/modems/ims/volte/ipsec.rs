@@ -18,7 +18,7 @@
 
 use std::net::IpAddr;
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
 
 /// The four-way port/SPI binding negotiated via SIP `Security-Client` /
@@ -57,7 +57,7 @@ impl SecAgree {
 
 /// Parse the selected `Security-Server: ipsec-3gpp;...` value. Unknown
 /// extensions are ignored; all four port/SPI bindings are mandatory.
-pub fn parse_security_server(value: &str) -> Result<SecAgree, VolteError> {
+pub fn parse_security_server(value: &str) -> Result<SecAgree, CellularImsError> {
     let mut mechanism = None;
     let mut spi_c = None;
     let mut spi_s = None;
@@ -82,23 +82,23 @@ pub fn parse_security_server(value: &str) -> Result<SecAgree, VolteError> {
         }
     }
     if mechanism.as_deref() != Some("ipsec-3gpp") {
-        return Err(VolteError::new(code::SECURITY_SERVER_MISSING));
+        return Err(CellularImsError::new(code::SECURITY_SERVER_MISSING));
     }
     let selected = SecAgree {
-        spi_c: spi_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
-        spi_s: spi_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
-        port_c: port_c.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
-        port_s: port_s.ok_or_else(|| VolteError::new(code::SECURITY_SERVER_MISSING))?,
+        spi_c: spi_c.ok_or_else(|| CellularImsError::new(code::SECURITY_SERVER_MISSING))?,
+        spi_s: spi_s.ok_or_else(|| CellularImsError::new(code::SECURITY_SERVER_MISSING))?,
+        port_c: port_c.ok_or_else(|| CellularImsError::new(code::SECURITY_SERVER_MISSING))?,
+        port_s: port_s.ok_or_else(|| CellularImsError::new(code::SECURITY_SERVER_MISSING))?,
     };
     validate_binding(&selected)?;
     Ok(selected)
 }
 
-fn validate_binding(binding: &SecAgree) -> Result<(), VolteError> {
+fn validate_binding(binding: &SecAgree) -> Result<(), CellularImsError> {
     // ESP SPI zero is reserved (RFC 4303 2.1); UDP port zero is not a peer
     // endpoint. Never install such an offer, even if the kernel accepts it.
     if binding.spi_c == 0 || binding.spi_s == 0 || binding.port_c == 0 || binding.port_s == 0 {
-        return Err(VolteError::new(code::SECURITY_SERVER_INVALID));
+        return Err(CellularImsError::new(code::SECURITY_SERVER_INVALID));
     }
     Ok(())
 }
@@ -109,7 +109,7 @@ fn validate_binding(binding: &SecAgree) -> Result<(), VolteError> {
 pub fn validate_server_rollover(
     current: &SecAgree,
     replacement: &SecAgree,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     validate_binding(replacement)?;
     if replacement.port_s != current.port_s
         || replacement.port_c == current.port_c
@@ -118,7 +118,7 @@ pub fn validate_server_rollover(
         || replacement.spi_s == current.spi_c
         || replacement.spi_s == current.spi_s
     {
-        return Err(VolteError::new(code::SECURITY_SERVER_INVALID));
+        return Err(CellularImsError::new(code::SECURITY_SERVER_INVALID));
     }
     Ok(())
 }
@@ -328,7 +328,7 @@ pub fn build_install_plan(
     ue_sec: &SecAgree,
     pcscf_sec: &SecAgree,
     auth_key: &[u8],
-) -> Result<XfrmInstallPlan, VolteError> {
+) -> Result<XfrmInstallPlan, CellularImsError> {
     build_install_plan_with_algs(
         ue,
         pcscf,
@@ -349,20 +349,20 @@ pub fn build_install_plan_with_algs(
     auth_key: &[u8],
     encryption_key: &[u8],
     algs: XfrmAlgs,
-) -> Result<XfrmInstallPlan, VolteError> {
+) -> Result<XfrmInstallPlan, CellularImsError> {
     validate_binding(ue_sec)?;
     validate_binding(pcscf_sec)?;
     // IMS IPsec requires IPv6 in most deployments (observed
     // `volte_ipsec_requires_ipv6`); we allow v4 for lab use but both ends must
     // match family.
     if std::mem::discriminant(&ue) != std::mem::discriminant(&pcscf) {
-        return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
+        return Err(CellularImsError::new(code::PCSCF_FAMILY_MISMATCH));
     }
     if auth_key.is_empty() {
-        return Err(VolteError::new(code::IPSEC_IK_INVALID));
+        return Err(CellularImsError::new(code::IPSEC_IK_INVALID));
     }
     if algs.enc != "cipher_null" && encryption_key.is_empty() {
-        return Err(VolteError::new(code::IPSEC_IK_INVALID));
+        return Err(CellularImsError::new(code::IPSEC_IK_INVALID));
     }
     // There are two SIP UDP tuples in the UE, not four independent local
     // flows. TS 33.203 defines the protected client tuple as
@@ -414,7 +414,7 @@ pub fn build_install_plan_with_algs(
 }
 
 /// Translate the negotiated Security-Server algorithms into Linux xfrm names.
-pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, VolteError> {
+pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, CellularImsError> {
     let mut integrity = None;
     let mut encryption = None;
     for part in value.split(';').skip(1) {
@@ -431,12 +431,12 @@ pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, VolteErro
     let (auth, auth_trunc_bits) = match integrity.as_deref() {
         Some("hmac-md5-96") => ("hmac(md5)", 96),
         Some("hmac-sha-1-96" | "hmac-sha1-96") => ("hmac(sha1)", 96),
-        _ => return Err(VolteError::new(code::SECURITY_SERVER_MISSING)),
+        _ => return Err(CellularImsError::new(code::SECURITY_SERVER_MISSING)),
     };
     let enc = match encryption.as_deref() {
         Some("null") => "cipher_null",
         Some("aes-cbc") => "cbc(aes)",
-        _ => return Err(VolteError::new(code::SECURITY_SERVER_MISSING)),
+        _ => return Err(CellularImsError::new(code::SECURITY_SERVER_MISSING)),
     };
     Ok(XfrmAlgs {
         auth,
@@ -449,7 +449,7 @@ pub fn xfrm_algs_from_security_server(value: &str) -> Result<XfrmAlgs, VolteErro
 
 /// Locate the `ip` binary, or return the dependency-missing error the frontend
 /// recognizes (`volte_dependency_missing:ip`).
-pub fn locate_ip_binary() -> Result<&'static str, VolteError> {
+pub fn locate_ip_binary() -> Result<&'static str, CellularImsError> {
     #[cfg(unix)]
     {
         for candidate in IP_BINARY_CANDIDATES {
@@ -457,11 +457,11 @@ pub fn locate_ip_binary() -> Result<&'static str, VolteError> {
                 return Ok(candidate);
             }
         }
-        Err(VolteError::new(code::DEPENDENCY_MISSING_IP))
+        Err(CellularImsError::new(code::DEPENDENCY_MISSING_IP))
     }
     #[cfg(not(unix))]
     {
-        Err(VolteError::new(code::DEPENDENCY_MISSING_IP))
+        Err(CellularImsError::new(code::DEPENDENCY_MISSING_IP))
     }
 }
 
@@ -469,12 +469,14 @@ pub fn locate_ip_binary() -> Result<&'static str, VolteError> {
 /// stub returning the dependency error (the logic layer is fully tested via the
 /// `build_*` functions above).
 #[cfg(unix)]
-pub fn run_ip(argv: &[String]) -> Result<(), VolteError> {
+pub fn run_ip(argv: &[String]) -> Result<(), CellularImsError> {
     let ip = locate_ip_binary()?;
     let output = std::process::Command::new(ip)
         .args(argv)
         .output()
-        .map_err(|e| VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("ip:{e}")))?;
+        .map_err(|e| {
+            CellularImsError::with_detail(code::COMMAND_SPAWN_FAILED, format!("ip:{e}"))
+        })?;
     if output.status.success() {
         Ok(())
     } else {
@@ -482,7 +484,7 @@ pub fn run_ip(argv: &[String]) -> Result<(), VolteError> {
         let stderr = stderr.trim();
         let command = redacted_xfrm_argv(argv);
         let exit_code = output.status.code().unwrap_or(-1);
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             if stderr.is_empty() {
                 format!("ip {command}: exit {exit_code}")
@@ -494,12 +496,12 @@ pub fn run_ip(argv: &[String]) -> Result<(), VolteError> {
 }
 
 #[cfg(not(unix))]
-pub fn run_ip(_argv: &[String]) -> Result<(), VolteError> {
-    Err(VolteError::new(code::DEPENDENCY_MISSING_IP))
+pub fn run_ip(_argv: &[String]) -> Result<(), CellularImsError> {
+    Err(CellularImsError::new(code::DEPENDENCY_MISSING_IP))
 }
 
 /// Install the full plan (flush stale, then add states + policies). Unix-only IO.
-pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), VolteError> {
+pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), CellularImsError> {
     for cmd in build_xfrm_flush() {
         // Flush is best-effort; ignore failures (nothing to flush is fine).
         let _ = run_ip(&cmd);
@@ -522,7 +524,7 @@ pub fn install_plan(plan: &XfrmInstallPlan) -> Result<(), VolteError> {
 pub async fn install_plan_in_worker(
     plan: &XfrmInstallPlan,
     worker: &UeWorkerHandle,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let ops = plan
         .states
         .iter()
@@ -536,7 +538,7 @@ pub async fn install_plan_in_worker(
         }))
         .collect();
     let outcome = worker.apply_net_config(ops).await.map_err(|error| {
-        VolteError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
+        CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker xfrm: {error}"))
     })?;
     if outcome.ok {
         let port_summary = plan.states.first().map(|state| (state.sport, state.dport));
@@ -550,7 +552,7 @@ pub async fn install_plan_in_worker(
         Ok(())
     } else {
         uninstall_plan_in_worker(plan, worker).await;
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             outcome
                 .error

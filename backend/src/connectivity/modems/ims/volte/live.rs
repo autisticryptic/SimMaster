@@ -51,7 +51,7 @@ use crate::{
     },
     hardware::{cellular::modem_manager::ModemBinding, devices::transport::ImsBearerTransport},
     platform::config::{
-        TrunkIncomingMode, TrunkIpConnectMode, VolteIpFamily, VolteProfileCandidate,
+        CellularImsIpFamily, ImsProfileCandidate, TrunkIncomingMode, TrunkIpConnectMode,
     },
     platform::db::{Database, SmsMessage},
     services::trunk::{
@@ -84,10 +84,10 @@ use super::{
         configure_bearer_network_in_worker, ensure_bearer_interface_ready,
         route_media_host_in_worker, route_pcscf_in_worker, BearerConnection, BearerRequest,
     },
-    channel::VolteSipChannel,
+    channel::CellularImsSipChannel,
     data_slot::DataSlotMode,
     digest_aka,
-    errors::{code, VolteError},
+    errors::{code, CellularImsError},
     identity,
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
@@ -97,7 +97,10 @@ use super::{
     },
     plan::{FailureClass, ImsConnectionPlan},
     readiness,
-    runtime::{RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteStage},
+    runtime::{
+        CellularImsPhase, CellularImsRuntime, CellularImsRuntimeStatus, CellularImsStage,
+        RegistrationMode,
+    },
     sip::{self, ImsIdentity, RequestIds},
     sms::{MtIngest, MtReassembler, TRANSPORT_TAG},
 };
@@ -146,11 +149,11 @@ fn scheduled_volte_refresh_delay(lease: &RegistrationLease) -> Duration {
 /// rejected with a stable busy error before allocating RTP relays.
 const MAX_CONCURRENT_CALLS: usize = 2;
 
-struct VolteWorkerOperatorSocketCreator {
+struct CellularImsWorkerOperatorSocketCreator {
     worker: UeWorkerHandle,
 }
 
-impl OperatorSocketCreator for VolteWorkerOperatorSocketCreator {
+impl OperatorSocketCreator for CellularImsWorkerOperatorSocketCreator {
     fn create_udp<'a>(
         &'a self,
         local: SocketAddr,
@@ -207,7 +210,7 @@ async fn trunk_worker_for_bearer(line_id: &str, interface: &str) -> Option<UeWor
 /// Device-specific inputs formerly hard-coded to modem 0, `/dev/wwan0qmi0`
 /// and UIM slot 1. A distinct value is injected for every discovered line.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VolteDeviceBinding {
+pub struct CellularImsDeviceBinding {
     pub line_id: String,
     pub modem_id: String,
     pub qmi_device: String,
@@ -215,12 +218,12 @@ pub struct VolteDeviceBinding {
     pub equipment_identifier: String,
 }
 
-impl VolteDeviceBinding {
-    pub fn from_modem(binding: &ModemBinding) -> Result<Self, VolteError> {
+impl CellularImsDeviceBinding {
+    pub fn from_modem(binding: &ModemBinding) -> Result<Self, CellularImsError> {
         let qmi_device = binding
             .qmi_device
             .clone()
-            .ok_or_else(|| VolteError::new("volte_qmi_device_missing"))?;
+            .ok_or_else(|| CellularImsError::new("volte_qmi_device_missing"))?;
         Ok(Self {
             line_id: binding.line_id.clone(),
             modem_id: binding.modem_id.clone(),
@@ -235,8 +238,8 @@ impl VolteDeviceBinding {
 /// cloneable so its receive task and API callers coordinate only within the
 /// same physical modem/SIM line.
 #[derive(Clone)]
-pub struct VolteLiveHandle {
-    session: Arc<Mutex<Option<VolteLiveSession>>>,
+pub struct CellularImsLiveHandle {
+    session: Arc<Mutex<Option<CellularImsLiveSession>>>,
     failed_bearer: Arc<Mutex<Option<RetainedFailedBearer>>>,
     listener: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     operator: OperatorLink,
@@ -244,13 +247,13 @@ pub struct VolteLiveHandle {
     mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
 }
 
-impl Default for VolteLiveHandle {
+impl Default for CellularImsLiveHandle {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VolteLiveHandle {
+impl CellularImsLiveHandle {
     pub fn new() -> Self {
         let (mt_sms, _) = tokio::sync::broadcast::channel(256);
         Self {
@@ -292,7 +295,7 @@ impl VolteLiveHandle {
             access: ImsRegistrationAccess::Volte,
             profile: session.profile,
             local_address: session.channel.route().local_addr.ip(),
-            digest: Arc::new(VolteXcapDigestProvider {
+            digest: Arc::new(CellularImsXcapDigestProvider {
                 device: session.device.clone(),
                 aid: session.aka_aid.clone(),
                 username: session.identity.private_user.clone(),
@@ -301,13 +304,13 @@ impl VolteLiveHandle {
     }
 }
 
-struct VolteXcapDigestProvider {
-    device: VolteDeviceBinding,
+struct CellularImsXcapDigestProvider {
+    device: CellularImsDeviceBinding,
     aid: Vec<u8>,
     username: String,
 }
 
-impl XcapDigestProvider for VolteXcapDigestProvider {
+impl XcapDigestProvider for CellularImsXcapDigestProvider {
     fn authorize<'a>(
         &'a self,
         challenge: &'a str,
@@ -333,7 +336,7 @@ impl XcapDigestProvider for VolteXcapDigestProvider {
 
 #[allow(clippy::too_many_arguments)]
 async fn build_volte_xcap_authorization(
-    device: VolteDeviceBinding,
+    device: CellularImsDeviceBinding,
     aid: Vec<u8>,
     username: &str,
     challenge_value: &str,
@@ -394,8 +397,8 @@ async fn build_volte_xcap_authorization(
     ))
 }
 
-struct VolteLiveSession {
-    channel: VolteSipChannel,
+struct CellularImsLiveSession {
+    channel: CellularImsSipChannel,
     /// Immutable identity that created this REGISTER binding. In particular,
     /// the USIM-derived temporary IMPU remains the REGISTER From/To identity
     /// for refresh and deregistration (TS 24.229 5.1.1.1A / 5.1.1.4.1).
@@ -434,7 +437,7 @@ struct VolteLiveSession {
     /// Authorization proof from the last successful IMS AKA exchange.
     /// 3GPP TS 24.229 §5.1.1.4.2 requires reregistration to send the
     /// previously calculated response instead of starting a fresh 401 round.
-    refresh_authorization: Option<VolteRefreshAuthorization>,
+    refresh_authorization: Option<CellularImsRefreshAuthorization>,
     /// Exact Security-Client value used by the successful registration.
     /// A protected re-registration offers fresh parameters while the current
     /// SA protects the request; a challenged refresh replaces this value with
@@ -442,8 +445,8 @@ struct VolteLiveSession {
     security_client: Option<String>,
     sip_instance: String,
     security_binding: SecAgree,
-    register_variant: VolteRegisterVariant,
-    device: VolteDeviceBinding,
+    register_variant: CellularImsRegisterVariant,
+    device: CellularImsDeviceBinding,
     aka_aid: Vec<u8>,
     profile: &'static CarrierProfile,
     /// Owned access-specific values fixed when this session started. Refresh,
@@ -642,7 +645,7 @@ fn effective_register_target(profile: &EffectiveImsProfile) -> sip::RegisterTarg
 }
 
 #[derive(Debug, Clone)]
-pub struct VolteSmsSendResult {
+pub struct CellularImsSmsSendResult {
     pub message_id: String,
     pub trace_id: String,
     pub part_count: usize,
@@ -650,14 +653,14 @@ pub struct VolteSmsSendResult {
 }
 
 #[derive(Clone)]
-struct VolteRefreshAuthorization {
+struct CellularImsRefreshAuthorization {
     challenge: digest_aka::DigestChallenge,
     aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
     cnonce: String,
     nonce_count: u32,
 }
 
-impl VolteRefreshAuthorization {
+impl CellularImsRefreshAuthorization {
     fn new(
         challenge: digest_aka::DigestChallenge,
         aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
@@ -679,14 +682,14 @@ impl VolteRefreshAuthorization {
         &mut self,
         identity: &ImsIdentity,
         request_uri: &str,
-    ) -> Result<String, VolteError> {
+    ) -> Result<String, CellularImsError> {
         // Do not consume a nonce-count until the complete Authorization value
         // has been built. A local digest/AKA error must not make the next
         // retry appear to have sent an unseen request.
         let nonce_count = self
             .nonce_count
             .checked_add(1)
-            .ok_or_else(|| VolteError::new("volte_register_nonce_count_exhausted"))?;
+            .ok_or_else(|| CellularImsError::new("volte_register_nonce_count_exhausted"))?;
         let nc = format!("{nonce_count:08x}");
         let response = digest_aka::compute_aka_response(
             &identity.private_user,
@@ -740,7 +743,7 @@ impl VolteRefreshAuthorization {
 #[derive(Clone)]
 struct PreparedAuth {
     authorization: String,
-    refresh_authorization: Option<VolteRefreshAuthorization>,
+    refresh_authorization: Option<CellularImsRefreshAuthorization>,
     security_client: Option<String>,
     security_verify: Option<String>,
     register_policy: sip::RegisterRequestPolicy,
@@ -763,19 +766,19 @@ fn unnegotiated_authenticated_security(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolteInitialAuthorization {
+enum CellularImsInitialAuthorization {
     UriFirstEmptyAka,
     None,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolteSecurityClientOffer {
+enum CellularImsSecurityClientOffer {
     Full,
     FullSpaced,
     Compact,
 }
 
-impl VolteSecurityClientOffer {
+impl CellularImsSecurityClientOffer {
     fn build(self, binding: SecAgree, profile: &CarrierProfile) -> String {
         let mechanism = profile
             .ims
@@ -812,7 +815,7 @@ impl VolteSecurityClientOffer {
     }
 }
 
-impl VolteInitialAuthorization {
+impl CellularImsInitialAuthorization {
     fn label(self) -> &'static str {
         match self {
             Self::UriFirstEmptyAka => "aka_empty_uri_first",
@@ -835,21 +838,21 @@ impl VolteInitialAuthorization {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct VolteRegisterVariant {
+struct CellularImsRegisterVariant {
     label: &'static str,
-    authorization: VolteInitialAuthorization,
+    authorization: CellularImsInitialAuthorization,
     policy: sip::RegisterRequestPolicy,
     server_required_sec_agree: bool,
-    security_client_offer: VolteSecurityClientOffer,
+    security_client_offer: CellularImsSecurityClientOffer,
 }
 
-impl VolteRegisterVariant {
+impl CellularImsRegisterVariant {
     fn with_visited_network(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_roaming_visited_network"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_roaming_visited_network"
             }
         };
@@ -865,10 +868,10 @@ impl VolteRegisterVariant {
 
     fn without_visited_network(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_no_visited_network"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_no_visited_network"
             }
         };
@@ -917,10 +920,10 @@ impl VolteRegisterVariant {
 
     fn requiring_sec_agree(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_sec_agree_required"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_sec_agree_required"
             }
         };
@@ -946,7 +949,7 @@ impl VolteRegisterVariant {
     /// challenges the stacked request.
     fn with_empty_aka_authorization(self) -> Self {
         Self {
-            authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+            authorization: CellularImsInitialAuthorization::UriFirstEmptyAka,
             ..self
         }
         .requiring_sec_agree()
@@ -954,10 +957,10 @@ impl VolteRegisterVariant {
 
     fn requiring_sec_agree_without_proxy(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_sec_agree_require_only"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_sec_agree_require_only"
             }
         };
@@ -974,52 +977,52 @@ impl VolteRegisterVariant {
 
     fn with_compact_security_client(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_sec_agree_compact_security"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_sec_agree_compact_security"
             }
         };
         Self {
             label,
-            security_client_offer: VolteSecurityClientOffer::Compact,
+            security_client_offer: CellularImsSecurityClientOffer::Compact,
             ..self
         }
     }
 
     fn with_spaced_security_client(self) -> Self {
         let label = match self.authorization {
-            VolteInitialAuthorization::UriFirstEmptyAka => {
+            CellularImsInitialAuthorization::UriFirstEmptyAka => {
                 "ims_features_aka_uri_first_sec_agree_spaced_security"
             }
-            VolteInitialAuthorization::None => {
+            CellularImsInitialAuthorization::None => {
                 "ims_features_no_initial_authorization_sec_agree_spaced_security"
             }
         };
         Self {
             label,
-            security_client_offer: VolteSecurityClientOffer::FullSpaced,
+            security_client_offer: CellularImsSecurityClientOffer::FullSpaced,
             ..self
         }
     }
 }
 
 #[cfg(test)]
-const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
+const VOLTE_REGISTER_VARIANTS: &[CellularImsRegisterVariant] = &[
     // This request shape completed AKA/IPsec registration on the target
     // Qualcomm/Maxis deployment. Keep it first so exploratory carrier variants
     // cannot alter P-CSCF transaction state before the proven form.
-    VolteRegisterVariant {
+    CellularImsRegisterVariant {
         label: "reference_sms_sec_agree",
-        authorization: VolteInitialAuthorization::None,
+        authorization: CellularImsInitialAuthorization::None,
         policy: sip::RegisterRequestPolicy::LEGACY,
         server_required_sec_agree: false,
-        security_client_offer: VolteSecurityClientOffer::Full,
+        security_client_offer: CellularImsSecurityClientOffer::Full,
     },
-    VolteRegisterVariant {
+    CellularImsRegisterVariant {
         label: "ims_features_aka_uri_first",
-        authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+        authorization: CellularImsInitialAuthorization::UriFirstEmptyAka,
         policy: sip::RegisterRequestPolicy {
             advertise_sec_agree: true,
             require_sec_agree: false,
@@ -1032,11 +1035,11 @@ const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
             include_sip_instance: true,
         },
         server_required_sec_agree: false,
-        security_client_offer: VolteSecurityClientOffer::Full,
+        security_client_offer: CellularImsSecurityClientOffer::Full,
     },
-    VolteRegisterVariant {
+    CellularImsRegisterVariant {
         label: "ims_features_no_initial_authorization",
-        authorization: VolteInitialAuthorization::None,
+        authorization: CellularImsInitialAuthorization::None,
         policy: sip::RegisterRequestPolicy {
             advertise_sec_agree: true,
             require_sec_agree: false,
@@ -1049,16 +1052,16 @@ const VOLTE_REGISTER_VARIANTS: &[VolteRegisterVariant] = &[
             include_sip_instance: true,
         },
         server_required_sec_agree: false,
-        security_client_offer: VolteSecurityClientOffer::Full,
+        security_client_offer: CellularImsSecurityClientOffer::Full,
     },
 ];
 
-fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
+fn register_variants(profile: &CarrierProfile) -> Vec<CellularImsRegisterVariant> {
     let authorization = match profile.ims.register.initial_authorization {
         "aka_empty" | "digest_empty" | "implementation_variant" => {
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         }
-        _ => VolteInitialAuthorization::None,
+        _ => CellularImsInitialAuthorization::None,
     };
     let disabled = profile.ims.register.sec_agree_mode == "disabled";
     let required = !disabled
@@ -1075,7 +1078,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     // booleans false) suppresses the header even when MMTEL is advertised.
     let profile_includes_pani = profile.ims.register.include_pani_initial
         || profile.ims.register.include_pani_authenticated;
-    let primary = VolteRegisterVariant {
+    let primary = CellularImsRegisterVariant {
         label: profile.ims.register.live_header_variant_set,
         authorization,
         policy: sip::RegisterRequestPolicy {
@@ -1091,16 +1094,16 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
         server_required_sec_agree: required,
-        security_client_offer: VolteSecurityClientOffer::Full,
+        security_client_offer: CellularImsSecurityClientOffer::Full,
     };
     // A database row can be syntactically valid yet disagree with a visited
     // P-CSCF's initial REGISTER expectations. Keep the profile-specific form
     // first, then allow one conservative generic form to proceed to AKA. The
     // transaction loop still refuses this fallback after an authentication
     // round, so it cannot mask bad credentials or USIM authentication errors.
-    let fallback = VolteRegisterVariant {
+    let fallback = CellularImsRegisterVariant {
         label: "generic_ims_register_fallback",
-        authorization: VolteInitialAuthorization::None,
+        authorization: CellularImsInitialAuthorization::None,
         policy: sip::RegisterRequestPolicy {
             advertise_sec_agree: false,
             require_sec_agree: false,
@@ -1113,7 +1116,7 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
             include_sip_instance: profile.ims.register.always_add_sip_instance,
         },
         server_required_sec_agree: false,
-        security_client_offer: VolteSecurityClientOffer::Full,
+        security_client_offer: CellularImsSecurityClientOffer::Full,
     };
     let mut variants = vec![primary, fallback];
     // RFC 3455 §4.3.2.1 says a UA SHOULD NOT originate P-Visited-Network-ID.
@@ -1152,16 +1155,16 @@ fn register_variants(profile: &CarrierProfile) -> Vec<VolteRegisterVariant> {
     // first attempt, and this only runs after every other shape was rejected.
     // Skipped when the profile already starts from an empty AKA, since then the
     // shapes above already carry one.
-    if authorization == VolteInitialAuthorization::None && !disabled {
+    if authorization == CellularImsInitialAuthorization::None && !disabled {
         // The empty AKA alone is not enough. The observed Maxis sequence is
         // cumulative -- Security-Client, then Require, then Proxy-Require, then
         // the empty AKA -- and a candidate carrying only the last step is
         // answered 421 (Require: sec-agree missing), exactly as measured on the
         // device. So this candidate stacks the sec-agree headers *and* the empty
         // AKA, which together are step four of that sequence.
-        variants.push(VolteRegisterVariant {
+        variants.push(CellularImsRegisterVariant {
             label: "ims_features_empty_aka_last_resort",
-            authorization: VolteInitialAuthorization::UriFirstEmptyAka,
+            authorization: CellularImsInitialAuthorization::UriFirstEmptyAka,
             ..primary.requiring_sec_agree()
         });
     }
@@ -1196,7 +1199,7 @@ fn security_server_matches_profile(profile: &CarrierProfile, value: &str) -> boo
         })
 }
 
-struct VolteRegisterAuthenticator {
+struct CellularImsRegisterAuthenticator {
     identity: ImsIdentity,
     ids: RequestIds,
     sip_instance: String,
@@ -1207,8 +1210,8 @@ struct VolteRegisterAuthenticator {
     pending: Option<PreparedAuth>,
     mode: RegistrationMode,
     xfrm_plan: Option<XfrmInstallPlan>,
-    device: VolteDeviceBinding,
-    runtime: VolteRuntime,
+    device: CellularImsDeviceBinding,
+    runtime: CellularImsRuntime,
     reuse_security: bool,
     aka_aid: Vec<u8>,
     register_policy: sip::RegisterRequestPolicy,
@@ -1228,7 +1231,7 @@ struct VolteRegisterAuthenticator {
     /// of reconstructing it from the 401 challenge.
     initial_authorization: Option<String>,
     /// Digest AKA state used to construct each authenticated refresh request.
-    refresh_authorization: Option<VolteRefreshAuthorization>,
+    refresh_authorization: Option<CellularImsRefreshAuthorization>,
     /// Security-Client offered on the initial REGISTER, if any.
     initial_security_client: Option<String>,
     /// Security-Verify carried by an already protected refresh. A 423 retry is
@@ -1240,7 +1243,7 @@ struct VolteRegisterAuthenticator {
     worker_binding: UeWorkerBinding,
 }
 
-impl VolteRegisterAuthenticator {
+impl CellularImsRegisterAuthenticator {
     fn new(
         identity: ImsIdentity,
         ids: RequestIds,
@@ -1248,8 +1251,8 @@ impl VolteRegisterAuthenticator {
         offered_security_binding: SecAgree,
         offered_security: String,
         route: ImsRoute,
-        device: VolteDeviceBinding,
-        runtime: VolteRuntime,
+        device: CellularImsDeviceBinding,
+        runtime: CellularImsRuntime,
         reuse_security: bool,
         aka_aid: Vec<u8>,
         register_policy: sip::RegisterRequestPolicy,
@@ -1258,7 +1261,7 @@ impl VolteRegisterAuthenticator {
         visited_network_header: Option<String>,
         access_network: Option<ImsAccessNetworkContext>,
         initial_authorization: Option<String>,
-        refresh_authorization: Option<VolteRefreshAuthorization>,
+        refresh_authorization: Option<CellularImsRefreshAuthorization>,
         initial_security_client: Option<String>,
         refresh_security_verify: Option<String>,
         worker: UeWorkerHandle,
@@ -1303,7 +1306,7 @@ impl VolteRegisterAuthenticator {
     /// authenticator. It is intentionally copied only after a successful
     /// REGISTER; a failed challenge must never poison the live session's
     /// reregistration credentials.
-    fn refresh_authorization(&self) -> Option<VolteRefreshAuthorization> {
+    fn refresh_authorization(&self) -> Option<CellularImsRefreshAuthorization> {
         self.pending
             .as_ref()
             .and_then(|prepared| prepared.refresh_authorization.clone())
@@ -1318,17 +1321,17 @@ impl VolteRegisterAuthenticator {
     fn refresh_authorization_after_success(
         &self,
         response: &[u8],
-    ) -> Option<VolteRefreshAuthorization> {
+    ) -> Option<CellularImsRefreshAuthorization> {
         let mut authorization = self.refresh_authorization()?;
         authorization.apply_success_authentication_info(response);
         Some(authorization)
     }
 
-    fn refresh_authorization_after_failure(&self) -> Option<VolteRefreshAuthorization> {
+    fn refresh_authorization_after_failure(&self) -> Option<CellularImsRefreshAuthorization> {
         self.refresh_authorization.clone()
     }
 
-    async fn rollback_security(&mut self, channel: &mut VolteSipChannel) {
+    async fn rollback_security(&mut self, channel: &mut CellularImsSipChannel) {
         channel.rollback_security();
         if let Some(plan) = self.xfrm_plan.take() {
             if self.worker_binding.is_current() {
@@ -1346,7 +1349,7 @@ impl VolteRegisterAuthenticator {
         challenge: digest_aka::DigestChallenge,
         aka: crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult,
         security_server: Option<(SecAgree, String)>,
-        channel: &mut VolteSipChannel,
+        channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
         if let Some(auts) = aka.auts.as_deref() {
             // AUTS is an authentication message, not permission to downgrade a
@@ -1451,7 +1454,7 @@ impl VolteRegisterAuthenticator {
                 )
                 .await?;
             self.runtime
-                .update(|state| state.stage = VolteStage::Ipsec)
+                .update(|state| state.stage = CellularImsStage::Ipsec)
                 .await;
             let route = channel.route();
             let algs = ipsec::xfrm_algs_from_security_server(&verify).map_err(to_ims_error)?;
@@ -1543,7 +1546,7 @@ impl VolteRegisterAuthenticator {
             nc,
         )
         .map_err(to_ims_error)?;
-        let refresh_authorization = VolteRefreshAuthorization {
+        let refresh_authorization = CellularImsRefreshAuthorization {
             challenge: challenge.clone(),
             aka: aka.clone(),
             cnonce,
@@ -1603,7 +1606,7 @@ fn select_security_server(
 }
 
 async fn reserve_refresh_security_offer(
-    channel: &mut VolteSipChannel,
+    channel: &mut CellularImsSipChannel,
     worker: &UeWorkerHandle,
     current: SecAgree,
 ) -> Result<SecAgree, ImsError> {
@@ -1629,11 +1632,13 @@ fn offered_refresh_security(current: SecAgree, client_port: u16) -> SecAgree {
     }
 }
 
-fn ensure_worker_binding_current(binding: &UeWorkerBinding) -> Result<(), VolteError> {
+fn ensure_worker_binding_current(binding: &UeWorkerBinding) -> Result<(), CellularImsError> {
     if binding.is_current() {
         Ok(())
     } else {
-        Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED))
+        Err(CellularImsError::new(
+            code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+        ))
     }
 }
 
@@ -1641,15 +1646,15 @@ fn ensure_worker_binding_current_ims(binding: &UeWorkerBinding) -> Result<(), Im
     ensure_worker_binding_current(binding).map_err(to_ims_error)
 }
 
-impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
+impl RegisterAuthenticator<CellularImsSipChannel> for CellularImsRegisterAuthenticator {
     async fn prepare_authenticated_channel(
         &mut self,
         challenge_response: &[u8],
-        channel: &mut VolteSipChannel,
+        channel: &mut CellularImsSipChannel,
     ) -> Result<(), ImsError> {
         ensure_worker_binding_current_ims(&self.worker_binding)?;
         self.runtime
-            .update(|state| state.stage = VolteStage::IdentityAka)
+            .update(|state| state.stage = CellularImsStage::IdentityAka)
             .await;
         // A second challenge replaces only this procedure's tentative SA. Keep
         // the original live channel and the offer already seen by the P-CSCF.
@@ -1702,7 +1707,7 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
     ) -> Result<Vec<u8>, ImsError> {
         ensure_worker_binding_current_ims(&self.worker_binding)?;
         self.runtime
-            .update(|state| state.stage = VolteStage::RegisterAuthenticated)
+            .update(|state| state.stage = CellularImsStage::RegisterAuthenticated)
             .await;
         let mut prepared = self
             .pending
@@ -1855,13 +1860,13 @@ impl RegisterAuthenticator<VolteSipChannel> for VolteRegisterAuthenticator {
 }
 
 pub async fn connect_live_for_line(
-    live: &VolteLiveHandle,
-    device: &VolteDeviceBinding,
+    live: &CellularImsLiveHandle,
+    device: &CellularImsDeviceBinding,
     ims_bearer_transport: Option<&dyn ImsBearerTransport>,
-    runtime: &Arc<VolteRuntime>,
+    runtime: &Arc<CellularImsRuntime>,
     access_network_runtime: &ImsAccessNetworkRuntime,
-    profile_candidate: &VolteProfileCandidate,
-    line_ip_families: &[VolteIpFamily],
+    profile_candidate: &ImsProfileCandidate,
+    line_ip_families: &[CellularImsIpFamily],
     line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
@@ -1870,7 +1875,7 @@ pub async fn connect_live_for_line(
     sim_override: SimOverride,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
-) -> Result<VolteRuntimeStatus, VolteError> {
+) -> Result<CellularImsRuntimeStatus, CellularImsError> {
     // Fail closed even if a future caller bypasses the API restore workflow.
     // Existing protected refreshes deliberately do not pass this bring-up gate.
     let registration_coordinator =
@@ -1878,7 +1883,9 @@ pub async fn connect_live_for_line(
     let _registration_permit = registration_coordinator
         .admit(crate::connectivity::core::ims_access::ImsAccess::Cellular)
         .await
-        .map_err(|reason| VolteError::with_detail(reason, "cellular registration is parked"))?;
+        .map_err(|reason| {
+            CellularImsError::with_detail(reason, "cellular registration is parked")
+        })?;
     // Connection, media and address-family intent are all supplied for this
     // physical line.
     let _advance = runtime.advance_guard().await;
@@ -1889,8 +1896,8 @@ pub async fn connect_live_for_line(
     let generation = runtime.generation();
     runtime
         .update(|state| {
-            state.phase = VoltePhase::Starting;
-            state.stage = VolteStage::Starting;
+            state.phase = CellularImsPhase::Starting;
+            state.stage = CellularImsStage::Starting;
             state.session_started_at = Some(now());
             state.registered_at = None;
             state.last_register_refresh_at = None;
@@ -1942,8 +1949,8 @@ pub async fn connect_live_for_line(
             live.operator.set_ready(true);
             runtime
                 .update(|state| {
-                    state.phase = VoltePhase::Registered;
-                    state.stage = VolteStage::Registered;
+                    state.phase = CellularImsPhase::Registered;
+                    state.stage = CellularImsStage::Registered;
                     state.registration_mode = mode;
                     state.pcscf = Some(pcscf);
                     state.registered_at = Some(now());
@@ -1954,7 +1961,7 @@ pub async fn connect_live_for_line(
                     state.last_tx_at = Some(now());
                     state.last_rx_at = Some(now());
                     state.data_path_mode = Some(data_path_mode);
-                    state.recovery_state = super::runtime::VolteRecoveryState::Registered;
+                    state.recovery_state = super::runtime::CellularImsRecoveryState::Registered;
                     state.manual_retry_available = false;
                     state.next_retry_at = None;
                 })
@@ -1975,7 +1982,7 @@ pub async fn connect_live_for_line(
             let message = error.to_string();
             runtime
                 .update(|state| {
-                    state.phase = VoltePhase::Degraded;
+                    state.phase = CellularImsPhase::Degraded;
                     if let Some(stage) = failure_stage(&error) {
                         state.stage = stage;
                     }
@@ -1988,17 +1995,19 @@ pub async fn connect_live_for_line(
     }
 }
 
-fn failure_stage(error: &VolteError) -> Option<VolteStage> {
+fn failure_stage(error: &CellularImsError) -> Option<CellularImsStage> {
     Some(match error.code() {
-        code::MM_IMSI_MISSING | code::IMSI_MISSING => VolteStage::Identity,
-        code::CARRIER_PROFILE_MISSING | code::CARRIER_IMS_APN_MISSING => VolteStage::CarrierProfile,
+        code::MM_IMSI_MISSING | code::IMSI_MISSING => CellularImsStage::Identity,
+        code::CARRIER_PROFILE_MISSING | code::CARRIER_IMS_APN_MISSING => {
+            CellularImsStage::CarrierProfile
+        }
         code::USIM_AID_MISSING
         | code::USIM_AID_NOT_USIM
         | code::USIM_AKA_FAILED
         | code::AKA_MATERIAL_INVALID
-        | code::AKA_RES_EMPTY => VolteStage::IdentityAka,
-        code::RUNTIME_MM_MODEM_WAIT_TIMEOUT => VolteStage::Modem,
-        code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED => VolteStage::Radio,
+        | code::AKA_RES_EMPTY => CellularImsStage::IdentityAka,
+        code::RUNTIME_MM_MODEM_WAIT_TIMEOUT => CellularImsStage::Modem,
+        code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED => CellularImsStage::Radio,
         code::RUNTIME_MM_BEARER_ROAMING_FORBIDDEN
         | code::RUNTIME_MM_BEARER_NOT_CONNECTED
         | code::RUNTIME_MM_BEARER_CONNECT_FAILED
@@ -2006,55 +2015,55 @@ fn failure_stage(error: &VolteError) -> Option<VolteStage> {
         | code::RUNTIME_IMS_BEARER_START_FAILED
         | code::RUNTIME_MM_BEARER_PATH_MISSING
         | code::RUNTIME_IMS_FAMILY_UNSUPPORTED
-        | code::DATA_SLOT_MODE_MISSING => VolteStage::Bearer,
+        | code::DATA_SLOT_MODE_MISSING => CellularImsStage::Bearer,
         code::RUNTIME_ALL_PCSCF_FAILED
         | code::RUNTIME_PROFILE_PCSCF_MISSING
-        | code::PCSCF_FAMILY_MISMATCH => VolteStage::Pcscf,
+        | code::PCSCF_FAMILY_MISMATCH => CellularImsStage::Pcscf,
         code::IP_SETTINGS_MISSING
         | code::IPV6_GATEWAY_MISSING
         | code::BEARER_NETDEV_NOT_UP
         | code::BEARER_NETDEV_RUNTIME_ERROR
-        | code::BEARER_NETDEV_NOT_READY => VolteStage::IpConfig,
+        | code::BEARER_NETDEV_NOT_READY => CellularImsStage::IpConfig,
         code::REGISTER_SEND_FAILED
         | code::REGISTER_INITIAL_UNEXPECTED_STATUS
         | code::REGISTER_NONCE_NOT_AKA
         | code::DIGEST_CHALLENGE_MISSING
         | code::DIGEST_REALM_MISSING
         | code::DIGEST_NONCE_MISSING
-        | code::DIGEST_NONCE_DECODE_FAILED => VolteStage::RegisterInitial,
+        | code::DIGEST_NONCE_DECODE_FAILED => CellularImsStage::RegisterInitial,
         code::REGISTER_AUTH_SEND_FAILED | code::REGISTER_AUTH_UNEXPECTED_STATUS => {
-            VolteStage::RegisterAuthenticated
+            CellularImsStage::RegisterAuthenticated
         }
         code::REGISTER_REFRESH_SEND_FAILED
         | code::REGISTER_REFRESH_RECEIVE_FAILED
         | code::REGISTER_REFRESH_UNEXPECTED_STATUS
         | code::REGISTER_REFRESH_AUTH_FAILED
-        | code::RUNTIME_UE_WORKER_GENERATION_CHANGED => VolteStage::RegisterRefresh,
+        | code::RUNTIME_UE_WORKER_GENERATION_CHANGED => CellularImsStage::RegisterRefresh,
         _ => return None,
     })
 }
 
 async fn connect_inner(
-    live: &VolteLiveHandle,
-    runtime: &VolteRuntime,
+    live: &CellularImsLiveHandle,
+    runtime: &CellularImsRuntime,
     access_network_runtime: &ImsAccessNetworkRuntime,
     generation: u64,
-    device: &VolteDeviceBinding,
+    device: &CellularImsDeviceBinding,
     ims_bearer_transport: Option<&dyn ImsBearerTransport>,
     plan: ImsConnectionPlan,
     _line_ip_families_auto: bool,
     allow_roaming: bool,
     data_slot_mode: DataSlotMode,
     profile_store: &ProfileStore,
-    profile_candidate: &VolteProfileCandidate,
+    profile_candidate: &ImsProfileCandidate,
     sim_override: &SimOverride,
-) -> Result<VolteLiveSession, VolteError> {
+) -> Result<CellularImsLiveSession, CellularImsError> {
     // The canonical connection plan is built by the caller from this line's
     // explicit ordered families. All family-selection consumers (AT probe
     // order, bearer fallback, IPv6 preflight hint, SIP local-address order)
     // derive from this one object.
     runtime
-        .update(|state| state.stage = VolteStage::Radio)
+        .update(|state| state.stage = CellularImsStage::Radio)
         .await;
     let mut device = resolve_device_binding(device, runtime, generation).await?;
 
@@ -2071,7 +2080,7 @@ async fn connect_inner(
     }
 
     runtime
-        .update(|state| state.stage = VolteStage::Identity)
+        .update(|state| state.stage = CellularImsStage::Identity)
         .await;
     let device_identity = load_device_identity(
         &device,
@@ -2090,11 +2099,11 @@ async fn connect_inner(
         .as_ref()
         .map(|field| field.value.trim())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| VolteError::new(code::CARRIER_IMS_APN_MISSING))?;
+        .ok_or_else(|| CellularImsError::new(code::CARRIER_IMS_APN_MISSING))?;
     ensure_generation(runtime, generation)?;
 
     runtime
-        .update(|state| state.stage = VolteStage::ImsContext)
+        .update(|state| state.stage = CellularImsStage::ImsContext)
         .await;
 
     // UE-only mode always establishes IMS through a SimAdmin-owned bearer that
@@ -2104,7 +2113,7 @@ async fn connect_inner(
     device = resolve_device_binding(&device, runtime, generation).await?;
 
     runtime
-        .update(|state| state.stage = VolteStage::Bearer)
+        .update(|state| state.stage = CellularImsStage::Bearer)
         .await;
     let mut ims_profile_lease: Option<ImsProfileLease> = None;
     let ims_profile = match prepare_ims_profile_context(&device.modem_id, &plan, ims_apn).await {
@@ -2150,7 +2159,7 @@ async fn connect_inner(
 
     runtime
         .record_attempt(
-            VolteStage::Bearer,
+            CellularImsStage::Bearer,
             None,
             "started",
             None,
@@ -2158,7 +2167,7 @@ async fn connect_inner(
         )
         .await;
     let ims_bearer_transport = ims_bearer_transport.ok_or_else(|| {
-        VolteError::with_detail(
+        CellularImsError::with_detail(
             code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
             "native_ims_transport_unsupported_for_device",
         )
@@ -2175,7 +2184,7 @@ async fn connect_inner(
         Ok(established) => {
             runtime
                 .record_attempt(
-                    VolteStage::Bearer,
+                    CellularImsStage::Bearer,
                     Some(established.connection.ip_type.as_str()),
                     "succeeded",
                     None,
@@ -2190,7 +2199,7 @@ async fn connect_inner(
         Err(error) => {
             runtime
                 .record_attempt(
-                    VolteStage::Bearer,
+                    CellularImsStage::Bearer,
                     None,
                     "failed",
                     Some(&error),
@@ -2220,7 +2229,7 @@ async fn connect_inner(
     let worker = match ready_worker(&device.line_id).await {
         Some(worker) => worker,
         None => {
-            let error = VolteError::with_detail(
+            let error = CellularImsError::with_detail(
                 code::RUNTIME_UE_WORKER_UNAVAILABLE,
                 format!("line={}", device.line_id),
             );
@@ -2275,7 +2284,7 @@ async fn connect_inner(
     {
         Some(binding) => binding,
         None => {
-            let error = VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
+            let error = CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
             cleanup_pending_native_bearer(
                 &mut native_bearer,
                 &device.modem_id,
@@ -2287,7 +2296,7 @@ async fn connect_inner(
         }
     };
     if !network_worker_binding.is_current() {
-        let error = VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
+        let error = CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED);
         cleanup_pending_native_bearer(
             &mut native_bearer,
             &device.modem_id,
@@ -2310,7 +2319,7 @@ async fn connect_inner(
         tracing::info!("VoLTE bearer delivered no P-CSCF via PCO; reading the active IMS context");
         runtime
             .record_attempt(
-                VolteStage::Pcscf,
+                CellularImsStage::Pcscf,
                 None,
                 "started",
                 None,
@@ -2321,7 +2330,7 @@ async fn connect_inner(
             Ok(discovery) => {
                 runtime
                     .record_attempt(
-                        VolteStage::Pcscf,
+                        CellularImsStage::Pcscf,
                         None,
                         "succeeded",
                         None,
@@ -2340,7 +2349,7 @@ async fn connect_inner(
             Err(error) => {
                 runtime
                     .record_attempt(
-                        VolteStage::Pcscf,
+                        CellularImsStage::Pcscf,
                         None,
                         "failed",
                         Some(&error),
@@ -2357,7 +2366,7 @@ async fn connect_inner(
     let result = async {
         runtime
             .update(|state| {
-                state.stage = VolteStage::IpConfig;
+                state.stage = CellularImsStage::IpConfig;
                 state.native_bearer_endpoint = Some(native_bearer_endpoint.clone());
                 state.native_bearer_session = Some(native_bearer_session.clone());
                 state.bearer_interface = Some(bearer.interface.clone());
@@ -2369,7 +2378,7 @@ async fn connect_inner(
         if let Err(error) = configured {
             runtime
                 .record_attempt(
-                    VolteStage::IpConfig,
+                    CellularImsStage::IpConfig,
                     None,
                     "failed",
                     Some(&error),
@@ -2380,7 +2389,7 @@ async fn connect_inner(
         }
         runtime
             .record_attempt(
-                VolteStage::IpConfig,
+                CellularImsStage::IpConfig,
                 None,
                 "succeeded",
                 None,
@@ -2401,7 +2410,7 @@ async fn connect_inner(
             } else {
                 code::IP_SETTINGS_MISSING
             };
-            return Err(VolteError::new(code));
+            return Err(CellularImsError::new(code));
         }
         let mut last_error = None;
         for (index, local_addr) in local_addrs.iter().copied().enumerate() {
@@ -2411,7 +2420,7 @@ async fn connect_inner(
                 .update(|state| state.current_ip_family = Some(family.to_string()))
                 .await;
             runtime
-                .record_attempt(VolteStage::Pcscf, Some(family), "started", None, None)
+                .record_attempt(CellularImsStage::Pcscf, Some(family), "started", None, None)
                 .await;
             match connect_family(
                 runtime,
@@ -2428,7 +2437,7 @@ async fn connect_inner(
                 Ok(session) => {
                     runtime
                         .record_attempt(
-                            VolteStage::Registered,
+                            CellularImsStage::Registered,
                             Some(family),
                             "succeeded",
                             None,
@@ -2443,7 +2452,7 @@ async fn connect_inner(
                 {
                     runtime
                         .record_attempt(
-                            VolteStage::Pcscf,
+                            CellularImsStage::Pcscf,
                             Some(family),
                             "failed",
                             Some(&error),
@@ -2455,7 +2464,7 @@ async fn connect_inner(
                 Err(error) => {
                     runtime
                         .record_attempt(
-                            VolteStage::Pcscf,
+                            CellularImsStage::Pcscf,
                             Some(family),
                             "failed",
                             Some(&error),
@@ -2466,7 +2475,7 @@ async fn connect_inner(
                 }
             }
         }
-        Err(last_error.unwrap_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
+        Err(last_error.unwrap_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)))
     }
     .await;
     if let Err(error) = &result {
@@ -2518,17 +2527,17 @@ async fn connect_inner(
 }
 
 async fn connect_family(
-    runtime: &VolteRuntime,
+    runtime: &CellularImsRuntime,
     bearer: &BearerConnection,
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
-    device: &VolteDeviceBinding,
+    device: &CellularImsDeviceBinding,
     video_capability_enabled: bool,
     access_network_runtime: &ImsAccessNetworkRuntime,
     worker_binding: &UeWorkerBinding,
-) -> Result<VolteLiveSession, VolteError> {
+) -> Result<CellularImsLiveSession, CellularImsError> {
     runtime
-        .update(|state| state.stage = VolteStage::Pcscf)
+        .update(|state| state.stage = CellularImsStage::Pcscf)
         .await;
     ensure_worker_binding_current(worker_binding)?;
     let worker = worker_binding.worker().clone();
@@ -2557,7 +2566,7 @@ async fn connect_family(
     // reported as "all P-CSCF failed". Fail here instead, so the retry picks up
     // the current address.
     let worker_status = worker.refresh_net_status().await.map_err(|error| {
-        VolteError::with_detail(code::RUNTIME_UE_WORKER_UNAVAILABLE, error.to_string())
+        CellularImsError::with_detail(code::RUNTIME_UE_WORKER_UNAVAILABLE, error.to_string())
     })?;
     ensure_worker_binding_current(worker_binding)?;
     if !worker_status
@@ -2565,7 +2574,7 @@ async fn connect_family(
         .iter()
         .any(|address| address == &local_addr.to_string())
     {
-        return Err(VolteError::with_detail(
+        return Err(CellularImsError::with_detail(
             code::BEARER_ADDRESS_CHANGED,
             format!(
                 "interface={} policy_source={local_addr} pcscf={pcscf}",
@@ -2575,7 +2584,7 @@ async fn connect_family(
     }
     runtime
         .update(|state| {
-            state.stage = VolteStage::RegisterInitial;
+            state.stage = CellularImsStage::RegisterInitial;
             state.pcscf = Some(pcscf.to_string());
         })
         .await;
@@ -2589,8 +2598,8 @@ async fn connect_family(
     let network_worker = worker.clone();
     let media_worker = trunk_worker_for_bearer(&device.line_id, &bearer.interface)
         .await
-        .ok_or_else(|| VolteError::new(code::RUNTIME_UE_WORKER_UNAVAILABLE))?;
-    let media_operator_creator = Arc::new(VolteWorkerOperatorSocketCreator {
+        .ok_or_else(|| CellularImsError::new(code::RUNTIME_UE_WORKER_UNAVAILABLE))?;
+    let media_operator_creator = Arc::new(CellularImsWorkerOperatorSocketCreator {
         worker: media_worker,
     }) as Arc<dyn OperatorSocketCreator>;
     let sip_instance = sip_instance_for_profile(
@@ -2613,7 +2622,7 @@ async fn connect_family(
     let requires_dynamic_cni = profile.ims.register.enable_cellular_network_info
         && profile.ims.register.cni_identity_policy == AccessIdentityPolicy::RequiredDynamic;
     if access_network.is_none() && (requires_dynamic_pani || requires_dynamic_cni) {
-        return Err(VolteError::new(if requires_dynamic_pani {
+        return Err(CellularImsError::new(if requires_dynamic_pani {
             "volte_pani_required_dynamic_unavailable"
         } else {
             "volte_cni_required_dynamic_unavailable"
@@ -2664,7 +2673,7 @@ async fn connect_family(
         );
         variant.policy.include_video_feature = video_capability_enabled;
         let mut channel =
-            VolteSipChannel::bind_in_worker(route, &worker, Some(&bearer.interface), None)
+            CellularImsSipChannel::bind_in_worker(route, &worker, Some(&bearer.interface), None)
                 .await
                 .map_err(map_channel_error)?;
         ensure_worker_binding_current(worker_binding)?;
@@ -2734,14 +2743,14 @@ async fn connect_family(
         log_volte_register_request_metadata(variant, &channel, &initial);
         runtime
             .record_attempt(
-                VolteStage::RegisterInitial,
+                CellularImsStage::RegisterInitial,
                 Some(ip_family_name(local_addr)),
                 "started",
                 None,
                 Some(format!("register_variant={}", variant.label)),
             )
             .await;
-        let mut authenticator = VolteRegisterAuthenticator::new(
+        let mut authenticator = CellularImsRegisterAuthenticator::new(
             device_identity.ims.clone(),
             ids,
             sip_instance.clone(),
@@ -2783,7 +2792,7 @@ async fn connect_family(
                 let error = map_register_failure(&failure);
                 runtime
                     .record_attempt(
-                        VolteStage::RegisterInitial,
+                        CellularImsStage::RegisterInitial,
                         Some(ip_family_name(local_addr)),
                         "failed",
                         Some(&error),
@@ -2860,7 +2869,7 @@ async fn connect_family(
         channel.commit_security();
         runtime
             .record_attempt(
-                VolteStage::Registered,
+                CellularImsStage::Registered,
                 Some(ip_family_name(local_addr)),
                 "succeeded",
                 None,
@@ -2930,7 +2939,7 @@ async fn connect_family(
         );
         if authenticator.mode == RegistrationMode::Udp {
             runtime
-                .update(|state| state.stage = VolteStage::RegisterUdp)
+                .update(|state| state.stage = CellularImsStage::RegisterUdp)
                 .await;
         }
         if authenticator.xfrm_plan.is_some() {
@@ -2938,7 +2947,7 @@ async fn connect_family(
             // activation path returned a stale/unprotected header port.
             channel.sync_protected_advertised_port(authenticator.offered_security_binding.port_s);
         }
-        return Ok(VolteLiveSession {
+        return Ok(CellularImsLiveSession {
             channel,
             registration_identity: device_identity.ims.clone(),
             identity: registered_identity,
@@ -2975,7 +2984,8 @@ async fn connect_family(
             mwi_subscription: None,
         });
     }
-    Err(last_error.unwrap_or_else(|| VolteError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)))
+    Err(last_error
+        .unwrap_or_else(|| CellularImsError::new(code::REGISTER_INITIAL_UNEXPECTED_STATUS)))
 }
 
 /// Release all resources owned by a failed profile slot before the recovery
@@ -2983,7 +2993,10 @@ async fn connect_family(
 /// keeps the runtime generation stable, because the outer three-slot batch is
 /// still current; only bearer/P-CSCF/profile-lease/security/dialog ownership is
 /// discarded.
-pub async fn cleanup_live_for_profile_switch(live: &VolteLiveHandle, runtime: &Arc<VolteRuntime>) {
+pub async fn cleanup_live_for_profile_switch(
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
+) {
     if let Some(listener) = live.listener.lock().await.take() {
         listener.abort();
     }
@@ -2992,10 +3005,10 @@ pub async fn cleanup_live_for_profile_switch(live: &VolteLiveHandle, runtime: &A
 }
 
 pub async fn disconnect_live_for_line(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     reason: &str,
-) -> VolteRuntimeStatus {
+) -> CellularImsRuntimeStatus {
     if let Some(listener) = live.listener.lock().await.take() {
         listener.abort();
     }
@@ -3007,8 +3020,8 @@ pub async fn disconnect_live_for_line(
 }
 
 async fn unregister_live_session(
-    live: &VolteLiveHandle,
-    runtime: &VolteRuntime,
+    live: &CellularImsLiveHandle,
+    runtime: &CellularImsRuntime,
 ) -> UnregisterResult {
     let mut sessions = live.session.lock().await;
     let Some(session) = sessions.as_mut() else {
@@ -3059,7 +3072,7 @@ async fn unregister_live_session(
         session.visited_network_header.as_deref(),
         session.access_network.as_ref(),
     );
-    let mut authenticator = VolteRegisterAuthenticator::new(
+    let mut authenticator = CellularImsRegisterAuthenticator::new(
         session.registration_identity.clone(),
         ids,
         session.sip_instance.clone(),
@@ -3087,9 +3100,9 @@ async fn unregister_live_session(
 }
 
 async fn start_live_listener(
-    live: VolteLiveHandle,
+    live: CellularImsLiveHandle,
     line_id: String,
-    runtime: Arc<VolteRuntime>,
+    runtime: Arc<CellularImsRuntime>,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     generation: u64,
@@ -3114,7 +3127,7 @@ async fn start_live_listener(
     }));
 }
 
-async fn start_volte_mwi_subscription(live: &VolteLiveHandle) {
+async fn start_volte_mwi_subscription(live: &CellularImsLiveHandle) {
     let Some(runtime) = live.supplementary_runtime() else {
         return;
     };
@@ -3201,9 +3214,9 @@ async fn start_volte_mwi_subscription(live: &VolteLiveHandle) {
 }
 
 async fn live_receive_loop(
-    live: VolteLiveHandle,
+    live: CellularImsLiveHandle,
     line_id: String,
-    runtime: Arc<VolteRuntime>,
+    runtime: Arc<CellularImsRuntime>,
     database: Arc<Database>,
     notification_sender: Arc<NotificationSender>,
     generation: u64,
@@ -3291,7 +3304,7 @@ async fn live_receive_loop(
                 live.operator.set_ready(false);
                 runtime
                     .update(|state| {
-                        state.phase = VoltePhase::Degraded;
+                        state.phase = CellularImsPhase::Degraded;
                         state.last_error = Some(error.to_string());
                         state.last_failure_at = Some(now());
                     })
@@ -3357,9 +3370,9 @@ async fn live_receive_loop(
                     let retry_after = refresh_result
                         .retry_after
                         .unwrap_or(REGISTER_REFRESH_RETRY_INTERVAL);
-                    let error = refresh_result
-                        .error
-                        .unwrap_or_else(|| VolteError::new(code::REGISTER_REFRESH_RECEIVE_FAILED));
+                    let error = refresh_result.error.unwrap_or_else(|| {
+                        CellularImsError::new(code::REGISTER_REFRESH_RECEIVE_FAILED)
+                    });
                     tracing::warn!(
                         error = %error,
                         retry_after_seconds = retry_after.as_secs(),
@@ -3367,8 +3380,8 @@ async fn live_receive_loop(
                     );
                     runtime
                         .update(|state| {
-                            state.phase = VoltePhase::Registered;
-                            state.stage = VolteStage::Registered;
+                            state.phase = CellularImsPhase::Registered;
+                            state.stage = CellularImsStage::Registered;
                             state.last_error =
                                 Some(format!("volte_register_refresh_retry:{}", error));
                             state.last_failure_at = Some(now());
@@ -3379,7 +3392,7 @@ async fn live_receive_loop(
                 }
                 RegistrationRefreshResult::RebuildAccess(loss_reason) => {
                     let error = refresh_result.error.unwrap_or_else(|| {
-                        VolteError::with_detail(
+                        CellularImsError::with_detail(
                             code::REGISTER_AUTH_UNEXPECTED_STATUS,
                             loss_reason.as_str(),
                         )
@@ -3391,7 +3404,7 @@ async fn live_receive_loop(
                     );
                     runtime
                         .update(|state| {
-                            state.phase = VoltePhase::Degraded;
+                            state.phase = CellularImsPhase::Degraded;
                             state.last_error = Some(format!(
                                 "volte_register_refresh_failed:{}:{error}",
                                 loss_reason.as_str()
@@ -3436,7 +3449,7 @@ async fn live_receive_loop(
                 tracing::warn!(error = %error, "VoLTE protected SIP receive failed");
                 runtime
                     .update(|state| {
-                        state.phase = VoltePhase::Degraded;
+                        state.phase = CellularImsPhase::Degraded;
                         state.last_error = Some(error.to_string());
                         state.last_failure_at = Some(now());
                     })
@@ -3462,8 +3475,8 @@ async fn live_receive_loop(
                         tracing::debug!(?status, "VoLTE SIP liveness response received");
                         runtime
                             .update(|state| {
-                                state.phase = VoltePhase::Registered;
-                                state.stage = VolteStage::Registered;
+                                state.phase = CellularImsPhase::Registered;
+                                state.stage = CellularImsStage::Registered;
                                 state.last_error = None;
                                 state.last_rx_at = Some(now());
                             })
@@ -3502,7 +3515,7 @@ async fn live_receive_loop(
 /// Roll back an unanswered re-INVITE without touching the confirmed dialog or
 /// active audio relay. Network-initiated re-INVITEs receive a timeout response;
 /// trunk-initiated re-INVITEs receive a local 408 event.
-async fn expire_volte_renegotiations(live: &VolteLiveHandle) -> Result<(), VolteError> {
+async fn expire_volte_renegotiations(live: &CellularImsLiveHandle) -> Result<(), CellularImsError> {
     let now = Instant::now();
     let mut trunk_timeouts = Vec::new();
     let mut transfer_timeouts = Vec::new();
@@ -3569,18 +3582,18 @@ async fn expire_volte_renegotiations(live: &VolteLiveHandle) -> Result<(), Volte
 }
 
 async fn refresh_live_registration(
-    session: &mut VolteLiveSession,
-    runtime: &VolteRuntime,
+    session: &mut CellularImsLiveSession,
+    runtime: &CellularImsRuntime,
     line_id: &str,
     database: &Database,
-) -> VolteRefreshAttempt {
+) -> CellularImsRefreshAttempt {
     // Do not start another SIP/XFRM attempt after the network lease has
     // actually expired. A retry cooldown can race the lease boundary, and
     // entering the refresh path in that state would otherwise recreate
     // sockets/security state before the timeout branch notices expiry.
     let remaining_lifetime = remaining_registration_lifetime(&session.registration);
     if remaining_lifetime.is_zero() {
-        let error = VolteError::with_detail(
+        let error = CellularImsError::with_detail(
             code::REGISTER_REFRESH_RECEIVE_FAILED,
             "registration_lease_expired",
         );
@@ -3590,14 +3603,14 @@ async fn refresh_live_registration(
         );
         runtime
             .record_attempt(
-                VolteStage::RegisterRefresh,
+                CellularImsStage::RegisterRefresh,
                 Some(session.ip_family),
                 "failed",
                 Some(&error),
                 Some("registration_lease_expired".to_string()),
             )
             .await;
-        return VolteRefreshAttempt {
+        return CellularImsRefreshAttempt {
             outcome: RegistrationRefreshResult::RebuildAccess(RegistrationLossReason::Expired),
             error: Some(error),
             retry_after: None,
@@ -3607,14 +3620,14 @@ async fn refresh_live_registration(
     if let Err(error) = ensure_worker_binding_current(&session.worker_binding) {
         runtime
             .record_attempt(
-                VolteStage::RegisterRefresh,
+                CellularImsStage::RegisterRefresh,
                 Some(session.ip_family),
                 "failed",
                 Some(&error),
                 Some("worker_generation_changed".to_string()),
             )
             .await;
-        return VolteRefreshAttempt {
+        return CellularImsRefreshAttempt {
             outcome: RegistrationRefreshResult::RebuildAccess(
                 RegistrationLossReason::AccessTransportLost,
             ),
@@ -3632,11 +3645,11 @@ async fn refresh_live_registration(
             .sync_protected_advertised_port(session.security_binding.port_s);
     }
     runtime
-        .update(|state| state.stage = VolteStage::RegisterRefresh)
+        .update(|state| state.stage = CellularImsStage::RegisterRefresh)
         .await;
     runtime
         .record_attempt(
-            VolteStage::RegisterRefresh,
+            CellularImsStage::RegisterRefresh,
             Some(session.ip_family),
             "started",
             None,
@@ -3671,7 +3684,7 @@ async fn refresh_live_registration(
         session.register_variant.without_access_network_info(),
         session.register_variant.without_route_header(),
     ];
-    let mut last_failure: Option<(VolteRegisterVariant, RegisterFailure)> = None;
+    let mut last_failure: Option<(CellularImsRegisterVariant, RegisterFailure)> = None;
     for variant in candidates {
         let mut ids = session.register_ids.clone();
         ids.cseq = session.next_register_cseq;
@@ -3689,7 +3702,7 @@ async fn refresh_live_registration(
                     session.channel.discard_reserved_security_ports();
                     let error = map_channel_error(error);
                     tracing::warn!(error = %error, "VoLTE refresh could not reserve its security offer; retaining protected channel");
-                    return VolteRefreshAttempt {
+                    return CellularImsRefreshAttempt {
                         outcome: RegistrationRefreshResult::Retry,
                         error: Some(error),
                         retry_after: refresh_retry_delay(
@@ -3722,7 +3735,7 @@ async fn refresh_live_registration(
             Ok(value) => value,
             Err(error) => {
                 session.channel.discard_reserved_security_ports();
-                return VolteRefreshAttempt {
+                return CellularImsRefreshAttempt {
                     outcome: RegistrationRefreshResult::RebuildAccess(
                         RegistrationLossReason::AuthenticationRejected,
                     ),
@@ -3757,7 +3770,7 @@ async fn refresh_live_registration(
             session.access_network.as_ref(),
         );
         log_volte_register_request_metadata(variant, &session.channel, &initial);
-        let mut authenticator = VolteRegisterAuthenticator::new(
+        let mut authenticator = CellularImsRegisterAuthenticator::new(
             session.registration_identity.clone(),
             ids.clone(),
             session.sip_instance.clone(),
@@ -3809,7 +3822,7 @@ async fn refresh_live_registration(
                 // REGISTER on a failed OutboundFlow can never repair it.
                 if is_outbound_flow_failure(&failure) {
                     tracing::warn!(error = %error, "VoLTE outbound flow failed; recovering the access transport");
-                    return VolteRefreshAttempt {
+                    return CellularImsRefreshAttempt {
                         outcome: RegistrationRefreshResult::RebuildAccess(
                             RegistrationLossReason::AccessTransportLost,
                         ),
@@ -3825,7 +3838,7 @@ async fn refresh_live_registration(
                     );
                     runtime
                         .record_attempt(
-                            VolteStage::RegisterRefresh,
+                            CellularImsStage::RegisterRefresh,
                             Some(session.ip_family),
                             "failed",
                             Some(&error),
@@ -3844,7 +3857,7 @@ async fn refresh_live_registration(
                             invalid_security_offer,
                             "VoLTE REGISTER refresh failed; retaining protected bearer and session"
                         );
-                        return VolteRefreshAttempt {
+                        return CellularImsRefreshAttempt {
                             outcome: RegistrationRefreshResult::Retry,
                             error: Some(error),
                             retry_after: Some(retry_after),
@@ -3862,7 +3875,7 @@ async fn refresh_live_registration(
                         remaining_lifetime_seconds = remaining_lifetime.as_secs(),
                         "VoLTE IMS registration lease expired while refresh was unanswered"
                     );
-                    return VolteRefreshAttempt {
+                    return CellularImsRefreshAttempt {
                         outcome: RegistrationRefreshResult::RebuildAccess(
                             RegistrationLossReason::Expired,
                         ),
@@ -3895,7 +3908,7 @@ async fn refresh_live_registration(
                 if let Some(authorization) = authenticator.refresh_authorization_after_failure() {
                     session.refresh_authorization = Some(authorization);
                 }
-                return VolteRefreshAttempt {
+                return CellularImsRefreshAttempt {
                     outcome: RegistrationRefreshResult::RebuildAccess(
                         RegistrationLossReason::SignalingTransportLost,
                     ),
@@ -3954,7 +3967,7 @@ async fn refresh_live_registration(
         let refreshed_associated_uris = registered.associated_uris.clone();
         runtime
             .record_attempt(
-                VolteStage::RegisterRefresh,
+                CellularImsStage::RegisterRefresh,
                 Some(session.ip_family),
                 "succeeded",
                 None,
@@ -3972,8 +3985,8 @@ async fn refresh_live_registration(
         runtime
             .update(move |state| {
                 let next_count = state.register_refresh_count.saturating_add(1);
-                state.phase = VoltePhase::Registered;
-                state.stage = VolteStage::Registered;
+                state.phase = CellularImsPhase::Registered;
+                state.stage = CellularImsStage::Registered;
                 state.last_error = None;
                 state.last_register_refresh_at = Some(refreshed_at);
                 state.last_tx_at = Some(now());
@@ -3983,7 +3996,7 @@ async fn refresh_live_registration(
                 state.associated_uris = refreshed_associated_uris;
             })
             .await;
-        return VolteRefreshAttempt {
+        return CellularImsRefreshAttempt {
             outcome: RegistrationRefreshResult::Refreshed(registered),
             error: None,
             retry_after: None,
@@ -3998,27 +4011,27 @@ async fn refresh_live_registration(
     let error = map_refresh_register_failure(&failure);
     runtime
         .record_attempt(
-            VolteStage::RegisterRefresh,
+            CellularImsStage::RegisterRefresh,
             Some(session.ip_family),
             "failed",
             Some(&error),
             Some(format!("label={}", variant.label)),
         )
         .await;
-    VolteRefreshAttempt {
+    CellularImsRefreshAttempt {
         outcome: RegistrationRefreshResult::RebuildAccess(loss_reason),
         error: Some(error),
         retry_after: refresh_retry_delay(&session.registration, loss_reason),
     }
 }
 
-struct VolteRefreshAttempt {
+struct CellularImsRefreshAttempt {
     outcome: RegistrationRefreshResult,
-    error: Option<VolteError>,
+    error: Option<CellularImsError>,
     retry_after: Option<Duration>,
 }
 
-async fn cleanup_live_session(live: &VolteLiveHandle) {
+async fn cleanup_live_session(live: &CellularImsLiveHandle) {
     live.operator.set_ready(false);
     let session = live.session.lock().await.take();
     if let Some(session) = session {
@@ -4063,7 +4076,7 @@ async fn cleanup_live_session(live: &VolteLiveHandle) {
     cleanup_retained_failed_bearer(live).await;
 }
 
-async fn cleanup_retained_failed_bearer(live: &VolteLiveHandle) {
+async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
     let Some(retained) = live.failed_bearer.lock().await.take() else {
         return;
     };
@@ -4133,9 +4146,9 @@ async fn disable_pcscf_reporting(modem: &str, cid: Option<u8>) {
 }
 
 struct LiveFrameContext<'a> {
-    live: &'a VolteLiveHandle,
+    live: &'a CellularImsLiveHandle,
     line_id: &'a str,
-    runtime: &'a Arc<VolteRuntime>,
+    runtime: &'a Arc<CellularImsRuntime>,
     database: &'a Arc<Database>,
     notification_sender: &'a Arc<NotificationSender>,
     dedupe_enabled: bool,
@@ -4147,10 +4160,10 @@ enum LiveLoopInput {
 }
 
 async fn handle_operator_command(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     command: OperatorCommand,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let call_id = operator_command_call_id(&command).to_string();
     let initial_call = matches!(&command, OperatorCommand::StartCall { .. });
     let renegotiate = matches!(&command, OperatorCommand::Renegotiate { .. });
@@ -4188,7 +4201,7 @@ async fn handle_operator_command(
         let status = result
             .as_ref()
             .err()
-            .map(VolteError::code)
+            .map(CellularImsError::code)
             .map(|code| {
                 if code.ends_with("_pending") {
                     491
@@ -4212,14 +4225,14 @@ async fn handle_operator_command(
 }
 
 async fn handle_operator_command_inner(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     command: OperatorCommand,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
-        .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+        .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
     let frame = match command {
         OperatorCommand::StartCall {
             call_id,
@@ -4229,13 +4242,13 @@ async fn handle_operator_command_inner(
             ..
         } => {
             if session.voice_calls.contains_key(&call_id) {
-                return Err(VolteError::new("volte_voice_call_duplicate"));
+                return Err(CellularImsError::new("volte_voice_call_duplicate"));
             }
             if session.voice_calls.len() >= MAX_CONCURRENT_CALLS {
-                return Err(VolteError::new("volte_concurrent_call_limit"));
+                return Err(CellularImsError::new("volte_concurrent_call_limit"));
             }
             if offer.video.is_some() && !live.operator.video_enabled() {
-                return Err(VolteError::new("vilte_feature_disabled"));
+                return Err(CellularImsError::new("vilte_feature_disabled"));
             }
             let callee_uri = normalize_operator_callee(&callee, &session.identity.home_domain)?;
             let relay = bind_volte_operator_relay(
@@ -4245,12 +4258,14 @@ async fn handle_operator_command_inner(
                 session.media_operator_creator.clone(),
             )
             .await
-            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
+            .map_err(|error| {
+                CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
+            })?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
-                VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
             let internal_local = relay.internal_local_addr().map_err(|error| {
-                VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
@@ -4262,13 +4277,13 @@ async fn handle_operator_command_inner(
                 )
                 .await
                 .map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_bind_failed", error.to_string())
                 })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
                 let internal_local = relay.internal_local_addr().map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
                 (Some(relay), Some(operator_local), Some(internal_local))
             } else {
@@ -4286,7 +4301,7 @@ async fn handle_operator_command_inner(
                 session.channel.security_verify(),
             );
             let invite_branch = top_via_branch(&frame)
-                .ok_or_else(|| VolteError::new("volte_voice_invite_branch_missing"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_invite_branch_missing"))?;
             session.voice_calls.insert(
                 call_id,
                 LiveVoiceCall {
@@ -4323,7 +4338,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             sip::build_cancel(
                 &session.identity,
                 &session.channel.route(),
@@ -4337,7 +4352,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             if call.dialog.remote_tag.is_some() {
                 sip::build_bye(
                     &session.identity,
@@ -4362,7 +4377,7 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             let cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
             sip::build_dtmf_info(
@@ -4382,16 +4397,16 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| VolteError::new("volte_transfer_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_transfer_call_unknown"))?;
             if !call.operator_answered || call.dialog.remote_tag.is_none() {
-                return Err(VolteError::new("volte_transfer_call_not_confirmed"));
+                return Err(CellularImsError::new("volte_transfer_call_not_confirmed"));
             }
             if call
                 .transfer
                 .as_ref()
                 .is_some_and(|transfer| !transfer.state().is_terminal())
             {
-                return Err(VolteError::new("volte_transfer_pending"));
+                return Err(CellularImsError::new("volte_transfer_pending"));
             }
             let cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
@@ -4426,7 +4441,7 @@ async fn handle_operator_command_inner(
                 &access_headers,
             )
             .map_err(|error| {
-                VolteError::with_detail("volte_transfer_request_invalid", error.to_string())
+                CellularImsError::with_detail("volte_transfer_request_invalid", error.to_string())
             })?;
             call.transfer = Some(DialogTransfer::for_refer_cseq(cseq));
             call.transfer_deadline = Some(Instant::now() + REFER_RESPONSE_TIMEOUT);
@@ -4438,7 +4453,7 @@ async fn handle_operator_command_inner(
             offer,
         } => {
             if offer.video.is_some() && !live.operator.video_enabled() {
-                return Err(VolteError::new("vilte_feature_disabled"));
+                return Err(CellularImsError::new("vilte_feature_disabled"));
             }
             let operator_ip = session.channel.route().local_addr.ip();
             let pending = bind_volte_operator_relay(
@@ -4448,12 +4463,14 @@ async fn handle_operator_command_inner(
                 session.media_operator_creator.clone(),
             )
             .await
-            .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
+            .map_err(|error| {
+                CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
+            })?;
             let operator_local = pending.operator_local_addr().map_err(|error| {
-                VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
             let internal_local = pending.internal_local_addr().map_err(|error| {
-                VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
@@ -4465,13 +4482,13 @@ async fn handle_operator_command_inner(
                 )
                 .await
                 .map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_bind_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_bind_failed", error.to_string())
                 })?;
                 let operator_local = relay.operator_local_addr().map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
                 let internal_local = relay.internal_local_addr().map_err(|error| {
-                    VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                    CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
                 })?;
                 (Some(relay), Some(operator_local), Some(internal_local))
             } else {
@@ -4480,9 +4497,9 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             if call.pending_operator_reinvite.is_some() || call.pending_asterisk_reinvite {
-                return Err(VolteError::new("volte_voice_reinvite_pending"));
+                return Err(CellularImsError::new("volte_voice_reinvite_pending"));
             }
             call.dialog.cseq = call.next_cseq;
             call.next_cseq = call.next_cseq.saturating_add(1);
@@ -4512,12 +4529,12 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             let answer = prepare_incoming_media(call, &body)?;
             let request = call
                 .pending_operator_reinvite
                 .take()
-                .ok_or_else(|| VolteError::new("volte_voice_reinvite_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_reinvite_not_pending"))?;
             call.commit_media_update();
             call.renegotiation_deadline = None;
             let contact = ims_contact(&session.identity, &session.channel.route());
@@ -4534,11 +4551,11 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .get_mut(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             let request = call
                 .pending_operator_reinvite
                 .take()
-                .ok_or_else(|| VolteError::new("volte_voice_reinvite_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_reinvite_not_pending"))?;
             call.rollback_media_update();
             call.renegotiation_deadline = None;
             sip::build_response(
@@ -4559,9 +4576,9 @@ async fn handle_operator_command_inner(
                 let call = session
                     .voice_calls
                     .get_mut(&call_id)
-                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
                 if call.direction != LiveVoiceDirection::MobileTerminated {
-                    return Err(VolteError::new("volte_voice_direction_mismatch"));
+                    return Err(CellularImsError::new("volte_voice_direction_mismatch"));
                 }
                 if call.operator_answered {
                     return Ok(());
@@ -4569,7 +4586,7 @@ async fn handle_operator_command_inner(
                 let request = call
                     .initial_invite
                     .clone()
-                    .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
                 let local_tag = call.dialog.local_tag.clone();
                 let answer = body
                     .as_deref()
@@ -4609,14 +4626,14 @@ async fn handle_operator_command_inner(
                 let call = session
                     .voice_calls
                     .get_mut(&call_id)
-                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
                 if call.direction != LiveVoiceDirection::MobileTerminated {
-                    return Err(VolteError::new("volte_voice_direction_mismatch"));
+                    return Err(CellularImsError::new("volte_voice_direction_mismatch"));
                 }
                 let request = call
                     .initial_invite
                     .clone()
-                    .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
                 let local_tag = call.dialog.local_tag.clone();
                 let operator_answered = call.operator_answered;
                 let answer = prepare_incoming_media(call, &body);
@@ -4640,7 +4657,7 @@ async fn handle_operator_command_inner(
                     tracing::warn!(error = %error, "Rejected unusable Asterisk answer");
                     if operator_answered {
                         let call =
-                            call.ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                            call.ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
                         sip::build_bye(
                             &session.identity,
                             &session.channel.route(),
@@ -4666,9 +4683,9 @@ async fn handle_operator_command_inner(
             let call = session
                 .voice_calls
                 .remove(&call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             if call.direction != LiveVoiceDirection::MobileTerminated {
-                return Err(VolteError::new("volte_voice_direction_mismatch"));
+                return Err(CellularImsError::new("volte_voice_direction_mismatch"));
             }
             if call.operator_answered {
                 sip::build_bye(
@@ -4683,7 +4700,7 @@ async fn handle_operator_command_inner(
                 let request = call
                     .initial_invite
                     .as_deref()
-                    .ok_or_else(|| VolteError::new("volte_voice_initial_invite_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_initial_invite_missing"))?;
                 sip::build_response(
                     request,
                     status,
@@ -4720,9 +4737,9 @@ fn operator_command_call_id(command: &OperatorCommand) -> &str {
     }
 }
 
-fn normalize_operator_callee(callee: &str, home_domain: &str) -> Result<String, VolteError> {
+fn normalize_operator_callee(callee: &str, home_domain: &str) -> Result<String, CellularImsError> {
     let user = crate::connectivity::core::voice::normalize_ims_dial_user(callee)
-        .map_err(|_| VolteError::new("volte_voice_callee_invalid"))?;
+        .map_err(|_| CellularImsError::new("volte_voice_callee_invalid"))?;
     Ok(format!("sip:{user}@{home_domain};user=phone"))
 }
 
@@ -4801,10 +4818,10 @@ fn relay_media_sdp(
 }
 
 async fn handle_operator_sip_frame(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
-) -> Result<bool, VolteError> {
+) -> Result<bool, CellularImsError> {
     // An inbound INVITE left no trace until it had already been accepted, so a
     // terminating call that we dropped on a missing Call-ID, an absent session
     // or a local gate was indistinguishable from one the network never
@@ -4905,7 +4922,7 @@ async fn handle_operator_sip_frame(
             return Ok(true);
         }
         let operator_audio = parse_audio_sdp(sip::sip_body(frame)).map_err(|error| {
-            VolteError::with_detail("volte_voice_sdp_invalid", error.to_string())
+            CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
         })?;
         let operator_remote = media_socket_addr(&operator_audio)?;
         ensure_operator_sdp_routes(
@@ -4935,12 +4952,14 @@ async fn handle_operator_sip_frame(
             session.media_operator_creator.clone(),
         )
         .await
-        .map_err(|error| VolteError::with_detail("volte_rtp_bind_failed", error.to_string()))?;
+        .map_err(|error| {
+            CellularImsError::with_detail("volte_rtp_bind_failed", error.to_string())
+        })?;
         let operator_local = pending.operator_local_addr().map_err(|error| {
-            VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
         })?;
         let internal_local = pending.internal_local_addr().map_err(|error| {
-            VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
         })?;
         let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some()
         {
@@ -4951,12 +4970,14 @@ async fn handle_operator_sip_frame(
                 session.media_operator_creator.clone(),
             )
             .await
-            .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
+            .map_err(|error| {
+                CellularImsError::with_detail("vilte_rtp_bind_failed", error.to_string())
+            })?;
             let operator_local = relay.operator_local_addr().map_err(|error| {
-                VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
             })?;
             let internal_local = relay.internal_local_addr().map_err(|error| {
-                VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+                CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
             })?;
             (Some(relay), Some(operator_local), Some(internal_local))
         } else {
@@ -4981,7 +5002,7 @@ async fn handle_operator_sip_frame(
         let call = session
             .voice_calls
             .get_mut(&trunk_call_id)
-            .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+            .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
         call.pending_operator_reinvite = Some(frame.to_vec());
         call.stage_media_update(
             offer,
@@ -5039,7 +5060,7 @@ async fn handle_operator_sip_frame(
         let call = session
             .voice_calls
             .remove(&trunk_call_id)
-            .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+            .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
         if call.direction != LiveVoiceDirection::MobileTerminated {
             return Ok(false);
         }
@@ -5120,13 +5141,13 @@ async fn handle_operator_sip_frame(
             let call = session
                 .voice_calls
                 .get_mut(&trunk_call_id)
-                .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
             let transfer = call
                 .transfer
                 .as_mut()
-                .ok_or_else(|| VolteError::new("volte_transfer_not_pending"))?;
+                .ok_or_else(|| CellularImsError::new("volte_transfer_not_pending"))?;
             transfer.on_refer_response(status).map_err(|error| {
-                VolteError::with_detail("volte_transfer_response_invalid", error.to_string())
+                CellularImsError::with_detail("volte_transfer_response_invalid", error.to_string())
             })?;
             if status >= 200 {
                 call.transfer_deadline = None;
@@ -5169,7 +5190,7 @@ async fn handle_operator_sip_frame(
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
-                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
                 if let Some(tag) = response_to_tag(frame) {
                     call.dialog.set_remote_tag(tag);
                 }
@@ -5190,7 +5211,7 @@ async fn handle_operator_sip_frame(
                 let prack = if reliable {
                     let rseq = sip::header_value(frame, "RSeq")
                         .and_then(|value| value.trim().parse::<u32>().ok())
-                        .ok_or_else(|| VolteError::new("volte_voice_rseq_missing"))?;
+                        .ok_or_else(|| CellularImsError::new("volte_voice_rseq_missing"))?;
                     let cseq = call.next_cseq;
                     call.next_cseq = call.next_cseq.saturating_add(1);
                     Some(sip::build_prack(
@@ -5248,9 +5269,9 @@ async fn handle_operator_sip_frame(
                 let call = session
                     .voice_calls
                     .get_mut(&trunk_call_id)
-                    .ok_or_else(|| VolteError::new("volte_voice_call_unknown"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_call_unknown"))?;
                 let tag = response_to_tag(frame)
-                    .ok_or_else(|| VolteError::new("volte_voice_remote_tag_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("volte_voice_remote_tag_missing"))?;
                 call.dialog.set_remote_tag(tag);
                 let answer = prepare_final_operator_media(call, sip::sip_body(frame));
                 let first_operator_rtp =
@@ -5350,12 +5371,12 @@ async fn handle_operator_sip_frame(
 }
 
 async fn begin_incoming_operator_call(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
-    session: &mut VolteLiveSession,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
+    session: &mut CellularImsLiveSession,
     frame: &[u8],
     ims_call_id: String,
-) -> Result<bool, VolteError> {
+) -> Result<bool, CellularImsError> {
     let Some(trunk_local_ip) = live.operator.trunk_local_ip() else {
         send_incoming_rejection(session, runtime, frame, 480).await?;
         return Ok(true);
@@ -5441,10 +5462,10 @@ async fn begin_incoming_operator_call(
         }
     };
     let operator_local = relay.operator_local_addr().map_err(|error| {
-        VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+        CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
     })?;
     let internal_local = relay.internal_local_addr().map_err(|error| {
-        VolteError::with_detail("volte_rtp_local_addr_failed", error.to_string())
+        CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
     })?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
         let relay = bind_volte_operator_relay(
@@ -5454,12 +5475,14 @@ async fn begin_incoming_operator_call(
             session.media_operator_creator.clone(),
         )
         .await
-        .map_err(|error| VolteError::with_detail("vilte_rtp_bind_failed", error.to_string()))?;
+        .map_err(|error| {
+            CellularImsError::with_detail("vilte_rtp_bind_failed", error.to_string())
+        })?;
         let operator_local = relay.operator_local_addr().map_err(|error| {
-            VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
         })?;
         let internal_local = relay.internal_local_addr().map_err(|error| {
-            VolteError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
+            CellularImsError::with_detail("vilte_rtp_local_addr_failed", error.to_string())
         })?;
         (Some(relay), Some(operator_local), Some(internal_local))
     } else {
@@ -5551,11 +5574,11 @@ async fn begin_incoming_operator_call(
 }
 
 async fn send_incoming_rejection(
-    session: &mut VolteLiveSession,
-    runtime: &Arc<VolteRuntime>,
+    session: &mut CellularImsLiveSession,
+    runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
     status: u16,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     // Every MT-call rejection used to be silent, which made "the call never
     // arrived" and "we rejected the call" indistinguishable from the journal:
     // an INVITE could be answered 480/486/488 without leaving a single line.
@@ -5595,9 +5618,13 @@ fn normalize_incoming_caller(caller: &str) -> String {
     }
 }
 
-fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<String, VolteError> {
-    let operator_audio = parse_audio_sdp(body)
-        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+fn prepare_operator_media(
+    call: &mut LiveVoiceCall,
+    body: &[u8],
+) -> Result<String, CellularImsError> {
+    let operator_audio = parse_audio_sdp(body).map_err(|error| {
+        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+    })?;
     let operator_remote = media_socket_addr(&operator_audio)?;
     let mut internal_answer = operator_audio.clone();
     internal_answer.direction = operator_audio.direction.for_peer();
@@ -5612,7 +5639,7 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         })
         .collect();
     if internal_answer.codecs.is_empty() {
-        return Err(VolteError::new("volte_voice_no_common_codec"));
+        return Err(CellularImsError::new("volte_voice_no_common_codec"));
     }
     let operator_dtmf = parse_rtp_telephone_event(body);
     let internal_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
@@ -5642,7 +5669,7 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         let pending = call
             .pending_relay
             .take()
-            .ok_or_else(|| VolteError::new("volte_rtp_relay_missing"))?;
+            .ok_or_else(|| CellularImsError::new("volte_rtp_relay_missing"))?;
         let policy = MediaRelayPolicy::from_directions(
             operator_audio.direction,
             call.internal_offer.audio.direction,
@@ -5668,14 +5695,14 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
             answer.push_str(&internal_video.description.rejected_answer().media_lines());
         } else {
             negotiate_video(&internal_video.description, &operator_video).map_err(|error| {
-                VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
+                CellularImsError::with_detail("vilte_video_negotiation_failed", error.to_string())
             })?;
             let operator_remote = media_endpoint_for_video(&operator_audio, &operator_video)?;
             if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
                 let pending = call
                     .pending_video_relay
                     .take()
-                    .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("vilte_rtp_relay_missing"))?;
                 let mappings = (operator_video.payload_type
                     != internal_video.description.payload_type)
                     .then_some(PayloadTypeMapping {
@@ -5713,10 +5740,10 @@ fn prepare_operator_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
 fn prepare_final_operator_media(
     call: &mut LiveVoiceCall,
     body: &[u8],
-) -> Result<String, VolteError> {
+) -> Result<String, CellularImsError> {
     if body.is_empty() {
         return call.early_answer.clone().ok_or_else(|| {
-            VolteError::with_detail("volte_voice_sdp_invalid", "voice_sdp_empty".to_string())
+            CellularImsError::with_detail("volte_voice_sdp_invalid", "voice_sdp_empty".to_string())
         });
     }
     prepare_operator_media(call, body)
@@ -5726,9 +5753,10 @@ async fn ensure_operator_sdp_routes(
     bearer: &BearerConnection,
     worker: &UeWorkerHandle,
     body: &[u8],
-) -> Result<(), VolteError> {
-    let audio = parse_audio_sdp(body)
-        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+) -> Result<(), CellularImsError> {
+    let audio = parse_audio_sdp(body).map_err(|error| {
+        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+    })?;
     let audio_remote = media_socket_addr(&audio)?;
     let video = parse_video_sdp(body).ok().and_then(|description| {
         let endpoint = media_endpoint_for_video(&audio, &description).ok()?;
@@ -5745,7 +5773,7 @@ async fn ensure_operator_media_routes(
     worker: &UeWorkerHandle,
     audio: SocketAddr,
     video: Option<&VideoOffer>,
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     route_media_host_in_worker(bearer, audio.ip(), worker).await?;
     if let Some(video) = video {
         route_media_host_in_worker(bearer, video.endpoint.ip(), worker).await?;
@@ -5780,9 +5808,13 @@ fn spawn_first_rtp_ip_answer(
 
 /// Translate Asterisk's answer for an MT call back into the payload numbers
 /// and relay address advertised on the operator IMS dialog.
-fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<String, VolteError> {
-    let internal_audio = parse_audio_sdp(body)
-        .map_err(|error| VolteError::with_detail("volte_voice_sdp_invalid", error.to_string()))?;
+fn prepare_incoming_media(
+    call: &mut LiveVoiceCall,
+    body: &[u8],
+) -> Result<String, CellularImsError> {
+    let internal_audio = parse_audio_sdp(body).map_err(|error| {
+        CellularImsError::with_detail("volte_voice_sdp_invalid", error.to_string())
+    })?;
     let internal_remote = media_socket_addr(&internal_audio)?;
     let mut operator_answer = call.internal_offer.audio.clone();
     operator_answer.direction = internal_audio.direction.for_peer();
@@ -5795,7 +5827,7 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         .cloned()
         .collect();
     if operator_answer.codecs.is_empty() {
-        return Err(VolteError::new("volte_voice_no_common_codec"));
+        return Err(CellularImsError::new("volte_voice_no_common_codec"));
     }
     let operator_dtmf = call.internal_offer.dtmf.rtp_event.as_ref();
     let internal_dtmf = parse_rtp_telephone_event(body);
@@ -5822,7 +5854,7 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
         let pending = call
             .pending_relay
             .take()
-            .ok_or_else(|| VolteError::new("volte_rtp_relay_missing"))?;
+            .ok_or_else(|| CellularImsError::new("volte_rtp_relay_missing"))?;
         let policy = MediaRelayPolicy::from_directions(
             call.internal_offer.audio.direction,
             internal_audio.direction,
@@ -5847,14 +5879,14 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
             answer.push_str(&operator_video.description.rejected_answer().media_lines());
         } else {
             negotiate_video(&operator_video.description, &internal_video).map_err(|error| {
-                VolteError::with_detail("vilte_video_negotiation_failed", error.to_string())
+                CellularImsError::with_detail("vilte_video_negotiation_failed", error.to_string())
             })?;
             let internal_remote = media_endpoint_for_video(&internal_audio, &internal_video)?;
             if call.active_video_relay.is_none() || call.pending_video_relay.is_some() {
                 let pending = call
                     .pending_video_relay
                     .take()
-                    .ok_or_else(|| VolteError::new("vilte_rtp_relay_missing"))?;
+                    .ok_or_else(|| CellularImsError::new("vilte_rtp_relay_missing"))?;
                 let mappings = (operator_video.description.payload_type
                     != internal_video.payload_type)
                     .then_some(PayloadTypeMapping {
@@ -5892,15 +5924,15 @@ fn prepare_incoming_media(call: &mut LiveVoiceCall, body: &[u8]) -> Result<Strin
 fn media_endpoint_for_video(
     audio: &SdpAudioDescription,
     video: &VideoMediaDescription,
-) -> Result<SocketAddr, VolteError> {
+) -> Result<SocketAddr, CellularImsError> {
     let ip = video
         .connection_addr
         .as_deref()
         .unwrap_or(&audio.connection_addr)
         .parse::<IpAddr>()
-        .map_err(|_| VolteError::new("vilte_video_address_invalid"))?;
+        .map_err(|_| CellularImsError::new("vilte_video_address_invalid"))?;
     if video.media_port == 0 {
-        return Err(VolteError::new("vilte_video_port_invalid"));
+        return Err(CellularImsError::new("vilte_video_port_invalid"));
     }
     Ok(SocketAddr::new(ip, video.media_port))
 }
@@ -5937,13 +5969,13 @@ fn ims_reason(status: u16) -> &'static str {
     }
 }
 
-fn media_socket_addr(audio: &SdpAudioDescription) -> Result<SocketAddr, VolteError> {
+fn media_socket_addr(audio: &SdpAudioDescription) -> Result<SocketAddr, CellularImsError> {
     let ip = audio
         .connection_addr
         .parse::<IpAddr>()
-        .map_err(|_| VolteError::new("volte_voice_media_address_invalid"))?;
+        .map_err(|_| CellularImsError::new("volte_voice_media_address_invalid"))?;
     if audio.media_port == 0 {
-        return Err(VolteError::new("volte_voice_media_port_invalid"));
+        return Err(CellularImsError::new("volte_voice_media_port_invalid"));
     }
     Ok(SocketAddr::new(ip, audio.media_port))
 }
@@ -5958,7 +5990,7 @@ async fn handle_live_frame(
     context: LiveFrameContext<'_>,
     reassembler: &mut MtReassembler,
     frame: &[u8],
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let LiveFrameContext {
         live,
         line_id,
@@ -5993,14 +6025,14 @@ async fn handle_live_frame(
     send_live_frame(live, runtime, &response).await?;
 
     let deliver = crate::connectivity::core::sms_codec::parse_mt_rp_data(sip::sip_body(frame))
-        .map_err(|_| VolteError::new("volte_mt_rp_data_invalid"))?;
+        .map_err(|_| CellularImsError::new("volte_mt_rp_data_invalid"))?;
     let rp_ack_body =
         crate::connectivity::core::sms_codec::build_network_rp_ack(deliver.rp_message_reference);
     let rp_ack = {
         let sessions = live.session.lock().await;
         let session = sessions
             .as_ref()
-            .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+            .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
         sip::build_rp_ack(
             &session.identity,
             &session.channel.route(),
@@ -6034,7 +6066,7 @@ async fn handle_live_frame(
                 let claimed = database
                     .claim_sms_dedup(line_id, &fingerprint, TRANSPORT_TAG)
                     .map_err(|error| {
-                        VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                        CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
                     })?;
                 if !claimed {
                     runtime.update(|state| state.duplicate_count += 1).await;
@@ -6044,7 +6076,7 @@ async fn handle_live_frame(
             if database
                 .sms_exists_by_pdu_for_line(line_id, &message.dedup_marker)
                 .map_err(|error| {
-                    VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                    CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
                 })?
             {
                 runtime.update(|state| state.duplicate_count += 1).await;
@@ -6067,7 +6099,7 @@ async fn handle_live_frame(
                     Some(line_id),
                 )
                 .map_err(|error| {
-                    VolteError::with_detail("volte_sms_db_failed", error.to_string())
+                    CellularImsError::with_detail("volte_sms_db_failed", error.to_string())
                 })?;
             runtime.update(|state| state.received_count += 1).await;
             let sms = SmsMessage {
@@ -6100,16 +6132,16 @@ async fn handle_live_frame(
                 "Buffered VoLTE MT multipart segment"
             );
         }
-        MtIngest::ParseError => return Err(VolteError::new("volte_mt_rp_data_invalid")),
+        MtIngest::ParseError => return Err(CellularImsError::new("volte_mt_rp_data_invalid")),
     }
     Ok(())
 }
 
 async fn handle_volte_mwi_frame(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
-) -> Result<bool, VolteError> {
+) -> Result<bool, CellularImsError> {
     let active_call_id = {
         let sessions = live.session.lock().await;
         sessions.as_ref().and_then(|session| {
@@ -6189,20 +6221,22 @@ async fn handle_volte_mwi_frame(
 }
 
 async fn retry_volte_mwi_subscription_with_aka(
-    live: &VolteLiveHandle,
+    live: &CellularImsLiveHandle,
     challenge_frame: &[u8],
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let (device, aid, identity, route, registration, profile, security_verify) = {
         let sessions = live.session.lock().await;
         let session = sessions
             .as_ref()
-            .ok_or_else(|| VolteError::new("mwi_subscription_missing"))?;
+            .ok_or_else(|| CellularImsError::new("mwi_subscription_missing"))?;
         let subscription = session
             .mwi_subscription
             .as_ref()
-            .ok_or_else(|| VolteError::new("mwi_subscription_missing"))?;
+            .ok_or_else(|| CellularImsError::new("mwi_subscription_missing"))?;
         if subscription.authenticated {
-            return Err(VolteError::new("mwi_subscribe_authentication_rejected"));
+            return Err(CellularImsError::new(
+                "mwi_subscribe_authentication_rejected",
+            ));
         }
         (
             session.device.clone(),
@@ -6230,7 +6264,7 @@ async fn retry_volte_mwi_subscription_with_aka(
         )
     })
     .await
-    .map_err(|_| VolteError::new(code::USIM_AKA_FAILED))??;
+    .map_err(|_| CellularImsError::new(code::USIM_AKA_FAILED))??;
     let cnonce = sip::hex_token(8);
     let digest_uri = identity.public_uri.as_str();
     let authorization = if let Some(auts) = aka.auts.as_deref() {
@@ -6266,18 +6300,20 @@ async fn retry_volte_mwi_subscription_with_aka(
     };
     let (header_name, header_value) = authorization
         .split_once(':')
-        .ok_or_else(|| VolteError::new("mwi_authorization_header_invalid"))?;
+        .ok_or_else(|| CellularImsError::new("mwi_authorization_header_invalid"))?;
 
     let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
-        .ok_or_else(|| VolteError::new("mwi_subscription_missing"))?;
+        .ok_or_else(|| CellularImsError::new("mwi_subscription_missing"))?;
     let subscription = session
         .mwi_subscription
         .as_mut()
-        .ok_or_else(|| VolteError::new("mwi_subscription_missing"))?;
+        .ok_or_else(|| CellularImsError::new("mwi_subscription_missing"))?;
     if subscription.authenticated {
-        return Err(VolteError::new("mwi_subscribe_authentication_rejected"));
+        return Err(CellularImsError::new(
+            "mwi_subscribe_authentication_rejected",
+        ));
     }
     subscription.ids.branch = sip::new_branch();
     subscription.ids.cseq = subscription.ids.cseq.saturating_add(1);
@@ -6307,14 +6343,14 @@ async fn retry_volte_mwi_subscription_with_aka(
 }
 
 async fn send_live_frame(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
-) -> Result<(), VolteError> {
+) -> Result<(), CellularImsError> {
     let mut sessions = live.session.lock().await;
     let session = sessions
         .as_mut()
-        .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+        .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
     session
         .channel
         .send_sip(frame)
@@ -6325,27 +6361,27 @@ async fn send_live_frame(
 }
 
 pub async fn send_live_sms_for_line(
-    live: &VolteLiveHandle,
-    runtime: &Arc<VolteRuntime>,
+    live: &CellularImsLiveHandle,
+    runtime: &Arc<CellularImsRuntime>,
     recipient: &str,
     text: &str,
     service_center: &str,
-) -> Result<VolteSmsSendResult, VolteError> {
+) -> Result<CellularImsSmsSendResult, CellularImsError> {
     if !runtime.status().await.registered {
-        return Err(VolteError::new("volte_runtime_not_registered"));
+        return Err(CellularImsError::new("volte_runtime_not_registered"));
     }
     if service_center.trim().is_empty() {
-        return Err(VolteError::new("volte_smsc_missing"));
+        return Err(CellularImsError::new("volte_smsc_missing"));
     }
     let submissions = crate::connectivity::modems::ims::volte::sms::build_mo_submissions(
         recipient,
         text,
         service_center,
     )
-    .map_err(|error| VolteError::with_detail("volte_sms_encode_failed", error.to_string()))?;
+    .map_err(|error| CellularImsError::with_detail("volte_sms_encode_failed", error.to_string()))?;
     let first = submissions
         .first()
-        .ok_or_else(|| VolteError::new("volte_sms_encode_failed"))?;
+        .ok_or_else(|| CellularImsError::new("volte_sms_encode_failed"))?;
     let message_id = first.message_id.clone();
     let trace_id = first.trace_id.clone();
     let part_count = submissions.len();
@@ -6355,7 +6391,7 @@ pub async fn send_live_sms_for_line(
         let mut sessions = live.session.lock().await;
         let session = sessions
             .as_mut()
-            .ok_or_else(|| VolteError::new("volte_runtime_not_registered"))?;
+            .ok_or_else(|| CellularImsError::new("volte_runtime_not_registered"))?;
         let (service_center_uri, recipient_uri) =
             mo_sms_uris(recipient, service_center, &session.identity.home_domain)?;
         let frame = sip::build_sms_message(
@@ -6388,7 +6424,7 @@ pub async fn send_live_sms_for_line(
                 service_route_present = session.registration.service_route.is_some(),
                 "VoLTE MO SMS SIP MESSAGE rejected"
             );
-            return Err(VolteError::with_detail(
+            return Err(CellularImsError::with_detail(
                 "volte_sms_message_rejected",
                 sip_status.to_string(),
             ));
@@ -6396,7 +6432,7 @@ pub async fn send_live_sms_for_line(
         sip_statuses.push(sip_status);
     }
     runtime.update(|state| state.sent_count += 1).await;
-    Ok(VolteSmsSendResult {
+    Ok(CellularImsSmsSendResult {
         message_id,
         trace_id,
         part_count,
@@ -6421,26 +6457,26 @@ fn mo_sms_uris(
     recipient: &str,
     service_center: &str,
     domain: &str,
-) -> Result<(String, String), VolteError> {
+) -> Result<(String, String), CellularImsError> {
     Ok((
         phone_uri(service_center, domain)?,
         phone_uri(recipient, domain)?,
     ))
 }
 
-fn phone_uri(number: &str, domain: &str) -> Result<String, VolteError> {
+fn phone_uri(number: &str, domain: &str) -> Result<String, CellularImsError> {
     let number = number.trim();
     if number.is_empty()
         || !number.chars().enumerate().all(|(index, character)| {
             character.is_ascii_digit() || (index == 0 && character == '+')
         })
     {
-        return Err(VolteError::new("volte_phone_uri_invalid"));
+        return Err(CellularImsError::new("volte_phone_uri_invalid"));
     }
     Ok(format!("sip:{number}@{domain};user=phone"))
 }
 
-fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, VolteError> {
+fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, CellularImsError> {
     let www_values = sip::header_values(frame, "WWW-Authenticate");
     let proxy_values = sip::header_values(frame, "Proxy-Authenticate");
     // The VoLTE path currently has no plain-Digest credential implementation:
@@ -6450,12 +6486,12 @@ fn parse_digest_challenge(frame: &[u8]) -> Result<digest_aka::DigestChallenge, V
 }
 
 async fn load_device_identity(
-    device: &VolteDeviceBinding,
-    runtime: &VolteRuntime,
+    device: &CellularImsDeviceBinding,
+    runtime: &CellularImsRuntime,
     profile_store: &ProfileStore,
-    profile_candidate: &VolteProfileCandidate,
+    profile_candidate: &ImsProfileCandidate,
     sim_override: &SimOverride,
-) -> Result<DeviceIdentity, VolteError> {
+) -> Result<DeviceIdentity, CellularImsError> {
     let modem = command_output(
         "mmcli",
         &["-m", device.modem_id.as_str(), "--output-keyvalue"],
@@ -6498,7 +6534,7 @@ async fn load_device_identity(
                 resolve_fallback_imsi(device, sim_imsi.as_deref())
                     .await
                     .ok_or_else(|| {
-                        VolteError::with_detail(
+                        CellularImsError::with_detail(
                             code::MM_IMSI_MISSING,
                             "at_cimi_modemmanager_and_uim_imsi_invalid",
                         )
@@ -6511,7 +6547,7 @@ async fn load_device_identity(
             resolve_fallback_imsi(device, sim_imsi.as_deref())
                 .await
                 .ok_or_else(|| {
-                    VolteError::with_detail(
+                    CellularImsError::with_detail(
                         code::MM_IMSI_MISSING,
                         "modemmanager_sim_at_and_uim_identity_unavailable",
                     )
@@ -6589,7 +6625,7 @@ async fn load_device_identity(
     };
     runtime
         .update(|state| {
-            state.stage = VolteStage::CarrierProfile;
+            state.stage = CellularImsStage::CarrierProfile;
             state.identity_source = Some(identity_source.to_string());
             state.profile_id = None;
             state.profile_source = None;
@@ -6605,7 +6641,7 @@ async fn load_device_identity(
             &imsi,
             home_plmn.as_deref(),
         )
-        .map_err(|detail| VolteError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
+        .map_err(|detail| CellularImsError::with_detail(code::CARRIER_PROFILE_MISSING, detail))?
         .ok_or_else(|| {
             let identity_hint = home_plmn
                 .as_deref()
@@ -6614,7 +6650,7 @@ async fn load_device_identity(
                     let prefix = imsi.get(..imsi.len().min(6)).unwrap_or("unknown");
                     format!("imsi_prefix:{prefix}")
                 });
-            VolteError::with_detail(
+            CellularImsError::with_detail(
                 code::CARRIER_PROFILE_MISSING,
                 format!("{identity_hint}:access:lte_epc:no_ready_profile"),
             )
@@ -6680,7 +6716,7 @@ async fn load_device_identity(
 }
 
 async fn resolve_fallback_imsi(
-    device: &VolteDeviceBinding,
+    device: &CellularImsDeviceBinding,
     modemmanager_imsi: Option<&str>,
 ) -> Option<FallbackImsi> {
     if let Some(imsi) = modemmanager_imsi {
@@ -6700,7 +6736,7 @@ async fn resolve_fallback_imsi(
 }
 
 async fn read_uim_identity(
-    device: &VolteDeviceBinding,
+    device: &CellularImsDeviceBinding,
 ) -> Option<crate::connectivity::modems::ims::vowifi::qmi_uim::UsimIdentity> {
     let qmi_device = device.qmi_device.clone();
     let uim_slot = device.uim_slot;
@@ -6726,10 +6762,10 @@ struct FallbackImsi {
 }
 
 async fn resolve_device_binding(
-    requested: &VolteDeviceBinding,
-    runtime: &VolteRuntime,
+    requested: &CellularImsDeviceBinding,
+    runtime: &CellularImsRuntime,
     generation: u64,
-) -> Result<VolteDeviceBinding, VolteError> {
+) -> Result<CellularImsDeviceBinding, CellularImsError> {
     let mut current = requested.clone();
     let mut modem_seen = false;
     for attempt in 0..MM_MODEM_WAIT_ATTEMPTS {
@@ -6774,7 +6810,7 @@ async fn resolve_device_binding(
             tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
         }
     }
-    Err(VolteError::new(if modem_seen {
+    Err(CellularImsError::new(if modem_seen {
         code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED
     } else {
         code::RUNTIME_MM_MODEM_WAIT_TIMEOUT
@@ -6789,8 +6825,8 @@ async fn resolve_device_binding(
 /// index is the point: the index is ModemManager's own enumeration order and
 /// is not stable across a re-probe.
 async fn relocate_modem_by_equipment_id(
-    requested: &VolteDeviceBinding,
-) -> Option<(VolteDeviceBinding, bool)> {
+    requested: &CellularImsDeviceBinding,
+) -> Option<(CellularImsDeviceBinding, bool)> {
     let wanted = requested.equipment_identifier.trim();
     if wanted.is_empty() {
         return None;
@@ -6819,7 +6855,7 @@ async fn relocate_modem_by_equipment_id(
             == Some(wanted);
         if matches_equipment {
             return Some((
-                VolteDeviceBinding {
+                CellularImsDeviceBinding {
                     modem_id: candidate.to_string(),
                     ..requested.clone()
                 },
@@ -6837,13 +6873,13 @@ fn modem_is_ready(output: &str) -> bool {
     )
 }
 
-async fn command_output(program: &str, args: &[&str]) -> Result<String, VolteError> {
+async fn command_output(program: &str, args: &[&str]) -> Result<String, CellularImsError> {
     let output = Command::new(program)
         .args(args)
         .output()
         .await
         .map_err(|error| {
-            VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
+            CellularImsError::with_detail(code::COMMAND_SPAWN_FAILED, format!("{program}:{error}"))
         })?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -6851,7 +6887,7 @@ async fn command_output(program: &str, args: &[&str]) -> Result<String, VolteErr
         let stderr = String::from_utf8_lossy(&output.stderr)
             .trim()
             .replace('\n', " ");
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             format!(
                 "{program}:{}:{}:{}",
@@ -6948,11 +6984,11 @@ fn sip_instance_for_profile(
     )
 }
 
-fn ensure_generation(runtime: &VolteRuntime, expected: u64) -> Result<(), VolteError> {
+fn ensure_generation(runtime: &CellularImsRuntime, expected: u64) -> Result<(), CellularImsError> {
     if runtime.generation() == expected {
         Ok(())
     } else {
-        Err(VolteError::new(code::RUNTIME_NOT_RUNNING))
+        Err(CellularImsError::new(code::RUNTIME_NOT_RUNNING))
     }
 }
 
@@ -6960,20 +6996,20 @@ fn now() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn to_ims_error(error: VolteError) -> ImsError {
+fn to_ims_error(error: CellularImsError) -> ImsError {
     ImsError::new(error.code())
 }
 
-fn map_channel_error(error: ImsError) -> VolteError {
+fn map_channel_error(error: ImsError) -> CellularImsError {
     if error.code().starts_with("ims_outbound_") {
-        return VolteError::new(error.code());
+        return CellularImsError::new(error.code());
     }
-    VolteError::with_detail(code::IPSEC_UDP_BIND_FAILED, error.code())
+    CellularImsError::with_detail(code::IPSEC_UDP_BIND_FAILED, error.code())
 }
 
-fn map_register_error(error: ImsError) -> VolteError {
+fn map_register_error(error: ImsError) -> CellularImsError {
     if error.code().starts_with("ims_outbound_") {
-        return VolteError::new(error.code());
+        return CellularImsError::new(error.code());
     }
     let stage = match error.code() {
         "ims_register_initial_send_failed"
@@ -6986,7 +7022,7 @@ fn map_register_error(error: ImsError) -> VolteError {
         }
         _ => code::REGISTER_AUTH_UNEXPECTED_STATUS,
     };
-    VolteError::with_detail(stage, error.code())
+    CellularImsError::with_detail(stage, error.code())
 }
 
 fn is_outbound_flow_failure(failure: &RegisterFailure) -> bool {
@@ -7010,9 +7046,9 @@ fn is_refresh_transport_failure(failure: &RegisterFailure) -> bool {
     )
 }
 
-fn map_refresh_register_error(error: ImsError) -> VolteError {
+fn map_refresh_register_error(error: ImsError) -> CellularImsError {
     if error.code().starts_with("ims_outbound_") {
-        return VolteError::new(error.code());
+        return CellularImsError::new(error.code());
     }
     let stage = match error.code() {
         "ims_register_initial_send_failed" | "ims_register_authenticated_send_failed" => {
@@ -7034,13 +7070,13 @@ fn map_refresh_register_error(error: ImsError) -> VolteError {
         }
         _ => code::REGISTER_REFRESH_AUTH_FAILED,
     };
-    VolteError::with_detail(stage, error.code())
+    CellularImsError::with_detail(stage, error.code())
 }
 
-fn map_refresh_register_failure(failure: &RegisterFailure) -> VolteError {
+fn map_refresh_register_failure(failure: &RegisterFailure) -> CellularImsError {
     let mapped = map_refresh_register_error(failure.error);
     match register_failure_status(failure) {
-        Some(status) => VolteError::with_detail(
+        Some(status) => CellularImsError::with_detail(
             mapped.code(),
             format!("{}:sip_status={status}", failure.error.code()),
         ),
@@ -7080,9 +7116,9 @@ fn pre_authentication_variant_failure(failure: &RegisterFailure) -> bool {
 
 fn sec_agree_retry_variant(
     profile: &CarrierProfile,
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     if profile.ims.register.sec_agree_mode == "disabled"
         || variant.policy.require_sec_agree
         || failure.auth_rounds != 0
@@ -7113,9 +7149,9 @@ fn sec_agree_retry_variant(
 /// retry before moving on.
 fn sec_agree_timeout_retry_variant(
     profile: &CarrierProfile,
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     if profile.ims.register.sec_agree_mode == "disabled"
         || variant.policy.require_sec_agree
         || failure.auth_rounds != 0
@@ -7136,10 +7172,10 @@ fn sec_agree_timeout_retry_variant(
 /// 421 -> 400 -> 401 path does not burn most of the bounded candidate budget.
 fn next_dynamic_register_variant_with_roaming(
     profile: &CarrierProfile,
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
     dynamic_visited_network_fallback: bool,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     sec_agree_retry_variant(profile, variant, failure)
         .or_else(|| sec_agree_timeout_retry_variant(profile, variant, failure))
         .or_else(|| sec_agree_proxy_require_retry_variant(variant, failure))
@@ -7170,9 +7206,9 @@ fn next_dynamic_register_variant_with_roaming(
 #[cfg(test)]
 fn next_dynamic_register_variant(
     profile: &CarrierProfile,
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     next_dynamic_register_variant_with_roaming(profile, variant, failure, false)
 }
 
@@ -7184,13 +7220,13 @@ fn next_dynamic_register_variant(
 /// require-only fallback intentionally removes Proxy-Require; adding it back
 /// there would create a two-state retry loop until the candidate budget expires.
 fn sec_agree_proxy_require_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && !variant.policy.proxy_require_sec_agree
-        && variant.security_client_offer == VolteSecurityClientOffer::Full
+        && variant.security_client_offer == CellularImsSecurityClientOffer::Full
         && failure.auth_rounds == 0
         && register_failure_status(failure) == Some(400))
     .then(|| variant.requiring_sec_agree())
@@ -7207,29 +7243,29 @@ fn sec_agree_proxy_require_retry_variant(
 /// the next transition then proceeds to the formatting fallbacks without
 /// dropping Authorization.
 fn sec_agree_empty_aka_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && variant.policy.proxy_require_sec_agree
-        && variant.authorization == VolteInitialAuthorization::None
+        && variant.authorization == CellularImsInitialAuthorization::None
         && failure.auth_rounds == 0
         && matches!(register_failure_status(failure), Some(400 | 403)))
     .then(|| variant.with_empty_aka_authorization())
 }
 
 fn roaming_visited_network_empty_aka_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
     dynamic_visited_network_fallback: bool,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (dynamic_visited_network_fallback
         && variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && variant.policy.proxy_require_sec_agree
         && variant.policy.include_visited_network
-        && variant.authorization == VolteInitialAuthorization::None
+        && variant.authorization == CellularImsInitialAuthorization::None
         && failure.auth_rounds == 0
         && failure.response.is_none()
         && failure.error.code() == "ims_register_initial_receive_failed")
@@ -7242,10 +7278,10 @@ fn roaming_visited_network_empty_aka_retry_variant(
 /// profile only enables it after the core has explicitly required sec-agree
 /// and then rejects or drops that compliant pre-authentication request.
 fn roaming_visited_network_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
     dynamic_visited_network_fallback: bool,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     let rejected_before_aka = register_failure_status(failure) == Some(403)
         || (failure.response.is_none()
             && failure.error.code() == "ims_register_initial_receive_failed");
@@ -7260,20 +7296,20 @@ fn roaming_visited_network_retry_variant(
 }
 
 fn sec_agree_require_only_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && variant.policy.proxy_require_sec_agree
-        && variant.security_client_offer == VolteSecurityClientOffer::Compact
+        && variant.security_client_offer == CellularImsSecurityClientOffer::Compact
         && failure.auth_rounds == 0
         && register_failure_status(failure) == Some(400))
     .then(|| variant.requiring_sec_agree_without_proxy())
 }
 
 fn sec_agree_require_only_was_rejected(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
 ) -> bool {
     variant.server_required_sec_agree
@@ -7288,26 +7324,26 @@ fn sec_agree_require_only_was_rejected(
 }
 
 fn sec_agree_compact_security_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && variant.policy.proxy_require_sec_agree
-        && variant.security_client_offer == VolteSecurityClientOffer::FullSpaced
+        && variant.security_client_offer == CellularImsSecurityClientOffer::FullSpaced
         && failure.auth_rounds == 0
         && register_failure_status(failure) == Some(400))
     .then(|| variant.with_compact_security_client())
 }
 
 fn sec_agree_spaced_security_retry_variant(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
-) -> Option<VolteRegisterVariant> {
+) -> Option<CellularImsRegisterVariant> {
     (variant.server_required_sec_agree
         && variant.policy.require_sec_agree
         && variant.policy.proxy_require_sec_agree
-        && variant.security_client_offer == VolteSecurityClientOffer::Full
+        && variant.security_client_offer == CellularImsSecurityClientOffer::Full
         && failure.auth_rounds == 0
         && register_failure_status(failure) == Some(400))
     .then(|| variant.with_spaced_security_client())
@@ -7347,10 +7383,10 @@ fn terminal_register_failure_status(failure: &RegisterFailure) -> Option<u16> {
     .flatten()
 }
 
-fn map_register_failure(failure: &RegisterFailure) -> VolteError {
+fn map_register_failure(failure: &RegisterFailure) -> CellularImsError {
     let mapped = map_register_error(failure.error);
     match terminal_register_failure_status(failure) {
-        Some(status) => VolteError::with_detail(
+        Some(status) => CellularImsError::with_detail(
             mapped.code(),
             format!("{}:sip_status={status}", failure.error.code()),
         ),
@@ -7358,7 +7394,7 @@ fn map_register_failure(failure: &RegisterFailure) -> VolteError {
     }
 }
 
-fn should_retain_failed_bearer(error: &VolteError) -> bool {
+fn should_retain_failed_bearer(error: &CellularImsError) -> bool {
     match error.code() {
         // Qualcomm 410 firmware has a short-lived WDS teardown race when
         // every P-CSCF candidate is rejected/unreachable. Keep the connected
@@ -7373,8 +7409,8 @@ fn should_retain_failed_bearer(error: &VolteError) -> bool {
 }
 
 fn log_volte_register_request_metadata(
-    variant: VolteRegisterVariant,
-    channel: &VolteSipChannel,
+    variant: CellularImsRegisterVariant,
+    channel: &CellularImsSipChannel,
     request: &[u8],
 ) {
     let route = channel.route();
@@ -7433,7 +7469,7 @@ fn log_volte_register_request_metadata(
 
 fn log_volte_register_success_metadata(
     register_phase: &'static str,
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     artifacts: &RegisterArtifacts,
 ) {
     tracing::info!(
@@ -7475,7 +7511,7 @@ fn log_volte_register_success_metadata(
 }
 
 fn log_volte_register_failure_metadata(
-    variant: VolteRegisterVariant,
+    variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
     request: Option<&[u8]>,
 ) {
@@ -7647,7 +7683,7 @@ mod tests {
             home_domain: "ims.example".to_string(),
             contact_user_phone: false,
         };
-        let mut authorization = VolteRefreshAuthorization::new(challenge, aka);
+        let mut authorization = CellularImsRefreshAuthorization::new(challenge, aka);
 
         let first = authorization
             .authorization_for(&identity, "sip:ims.example")
@@ -7685,7 +7721,7 @@ mod tests {
             ik: Vec::new(),
             auts: None,
         };
-        let mut authorization = VolteRefreshAuthorization::new(challenge, aka);
+        let mut authorization = CellularImsRefreshAuthorization::new(challenge, aka);
         assert!(authorization.apply_success_authentication_info(
             b"SIP/2.0 200 OK\r\nProxy-Authentication-Info: nextnonce=\"nonce-proxy\"\r\n\r\n"
         ));
@@ -7695,24 +7731,24 @@ mod tests {
 
     #[tokio::test]
     async fn profile_switch_aborts_listener_and_releases_line_scoped_registration() {
-        let live = VolteLiveHandle::new();
-        let runtime = Arc::new(VolteRuntime::new());
+        let live = CellularImsLiveHandle::new();
+        let runtime = Arc::new(CellularImsRuntime::new());
         let supplementary = Arc::new(SupplementaryRuntime::for_line("line-profile-switch"));
         supplementary
             .begin_mwi_subscription(ImsRegistrationAccess::Volte)
             .await;
         live.bind_supplementary(Arc::clone(&supplementary));
 
-        let candidate = VolteProfileCandidate {
-            source: crate::platform::config::VolteProfileSource::Database,
+        let candidate = ImsProfileCandidate {
+            source: crate::platform::config::ImsProfileSource::Database,
             profile_id: Some("profile-a".to_string()),
         };
         runtime.begin_profile_attempt_batch().await;
         runtime.begin_profile_attempt(1, &candidate).await;
         runtime
             .update(|state| {
-                state.phase = VoltePhase::Registered;
-                state.stage = VolteStage::Registered;
+                state.phase = CellularImsPhase::Registered;
+                state.stage = CellularImsStage::Registered;
                 state.registration_mode = RegistrationMode::Ipsec;
                 state.pcscf = Some("192.0.2.10:5060".to_string());
                 state.profile_id = Some("effective-profile-a".to_string());
@@ -7758,15 +7794,15 @@ mod tests {
     #[test]
     fn carrier_profile_failures_are_not_reported_as_sim_identity_failures() {
         assert_eq!(
-            failure_stage(&VolteError::with_detail(
+            failure_stage(&CellularImsError::with_detail(
                 code::CARRIER_PROFILE_MISSING,
                 "home_plmn:46000:access:lte_epc:no_ready_profile",
             )),
-            Some(VolteStage::CarrierProfile)
+            Some(CellularImsStage::CarrierProfile)
         );
         assert_eq!(
-            failure_stage(&VolteError::new(code::MM_IMSI_MISSING)),
-            Some(VolteStage::Identity)
+            failure_stage(&CellularImsError::new(code::MM_IMSI_MISSING)),
+            Some(CellularImsStage::Identity)
         );
         for error_code in [
             code::BEARER_NETDEV_RUNTIME_ERROR,
@@ -7774,13 +7810,13 @@ mod tests {
             code::BEARER_NETDEV_NOT_READY,
         ] {
             assert_eq!(
-                failure_stage(&VolteError::new(error_code)),
-                Some(VolteStage::IpConfig)
+                failure_stage(&CellularImsError::new(error_code)),
+                Some(CellularImsStage::IpConfig)
             );
         }
     }
 
-    fn register_variant(label: &str) -> VolteRegisterVariant {
+    fn register_variant(label: &str) -> CellularImsRegisterVariant {
         *VOLTE_REGISTER_VARIANTS
             .iter()
             .find(|variant| variant.label == label)
@@ -7827,11 +7863,14 @@ mod tests {
         frame
     }
 
-    pub(super) async fn test_voice_session(
-    ) -> (VolteLiveHandle, Arc<VolteRuntime>, tokio::net::UdpSocket) {
+    pub(super) async fn test_voice_session() -> (
+        CellularImsLiveHandle,
+        Arc<CellularImsRuntime>,
+        tokio::net::UdpSocket,
+    ) {
         let pcscf = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let pcscf_addr = pcscf.local_addr().unwrap();
-        let channel = VolteSipChannel::bind(
+        let channel = CellularImsSipChannel::bind(
             ImsRoute {
                 local_addr: "127.0.0.1:0".parse().unwrap(),
                 pcscf_addr,
@@ -7842,7 +7881,7 @@ mod tests {
         )
         .unwrap();
         let profile = &crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
-        let live = VolteLiveHandle::new();
+        let live = CellularImsLiveHandle::new();
         let test_worker = UeWorkerHandle::for_line(
             "volte-dialog-matrix",
             crate::platform::netns::NetnsName::for_line(
@@ -7859,7 +7898,7 @@ mod tests {
             home_domain: "ims.example".into(),
             contact_user_phone: false,
         };
-        *live.session.lock().await = Some(VolteLiveSession {
+        *live.session.lock().await = Some(CellularImsLiveSession {
             channel,
             registration_identity: identity.clone(),
             identity,
@@ -7903,7 +7942,7 @@ mod tests {
                 port_s: 5062,
             },
             register_variant: register_variant("reference_sms_sec_agree"),
-            device: VolteDeviceBinding {
+            device: CellularImsDeviceBinding {
                 line_id: "volte-dialog-matrix".into(),
                 modem_id: "test".into(),
                 qmi_device: "/dev/null".into(),
@@ -7920,7 +7959,7 @@ mod tests {
             voice_calls: HashMap::new(),
             mwi_subscription: None,
         });
-        (live, Arc::new(VolteRuntime::new()), pcscf)
+        (live, Arc::new(CellularImsRuntime::new()), pcscf)
     }
 
     #[test]
@@ -7928,9 +7967,12 @@ mod tests {
         let first = VOLTE_REGISTER_VARIANTS[0];
 
         assert_eq!(first.label, "reference_sms_sec_agree");
-        assert_eq!(first.authorization, VolteInitialAuthorization::None);
+        assert_eq!(first.authorization, CellularImsInitialAuthorization::None);
         assert_eq!(first.policy, sip::RegisterRequestPolicy::LEGACY);
-        assert_eq!(first.security_client_offer, VolteSecurityClientOffer::Full);
+        assert_eq!(
+            first.security_client_offer,
+            CellularImsSecurityClientOffer::Full
+        );
     }
 
     #[test]
@@ -7943,7 +7985,10 @@ mod tests {
             profile.ims.register.live_header_variant_set
         );
         assert_eq!(variants[1].label, "generic_ims_register_fallback");
-        assert_eq!(variants[1].authorization, VolteInitialAuthorization::None);
+        assert_eq!(
+            variants[1].authorization,
+            CellularImsInitialAuthorization::None
+        );
         assert!(!variants[1].policy.require_sec_agree);
         assert_eq!(
             variants[2].label,
@@ -7981,7 +8026,7 @@ mod tests {
         assert!(
             variants[..variants.len() - 1]
                 .iter()
-                .all(|variant| variant.authorization == VolteInitialAuthorization::None),
+                .all(|variant| variant.authorization == CellularImsInitialAuthorization::None),
             "only the final candidate may pre-fill Authorization: {:?}",
             variants.iter().map(|v| v.label).collect::<Vec<_>>()
         );
@@ -7989,7 +8034,7 @@ mod tests {
         assert_eq!(last.label, "ims_features_empty_aka_last_resort");
         assert_eq!(
             last.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         // The empty AKA must arrive *with* the sec-agree headers. Measured on the
         // device: a candidate carrying only the empty AKA is answered 421
@@ -8022,7 +8067,7 @@ mod tests {
         // excluded here rather than asserted over.
         assert_eq!(
             variants[0].authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
     }
 
@@ -8379,7 +8424,7 @@ mod tests {
             port_s: 5063,
         };
         let replacement = offered_refresh_security(old, 51731);
-        let header = VolteSecurityClientOffer::Full.build(replacement, profile);
+        let header = CellularImsSecurityClientOffer::Full.build(replacement, profile);
 
         assert_eq!(replacement.port_s, old.port_s);
         assert_ne!(replacement.port_c, old.port_c);
@@ -8470,7 +8515,7 @@ mod tests {
             equipment_identifier: "490154203237518".to_string(),
             ..ModemBinding::default()
         };
-        let device = VolteDeviceBinding::from_modem(&modem).unwrap();
+        let device = CellularImsDeviceBinding::from_modem(&modem).unwrap();
         assert_eq!(device.modem_id, "7");
         assert_eq!(device.qmi_device, "/dev/cdc-wdm3");
         assert_eq!(device.uim_slot, 2);
@@ -8528,7 +8573,7 @@ mod tests {
 
     #[test]
     fn device_binding_rejects_modem_without_qmi_control_port() {
-        assert!(VolteDeviceBinding::from_modem(&ModemBinding::default()).is_err());
+        assert!(CellularImsDeviceBinding::from_modem(&ModemBinding::default()).is_err());
     }
 
     #[test]
@@ -8576,8 +8621,8 @@ mod tests {
 
     #[test]
     fn cellular_registration_timeout_is_reported_at_the_radio_stage() {
-        let error = VolteError::new(code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED);
-        assert_eq!(failure_stage(&error), Some(VolteStage::Radio));
+        let error = CellularImsError::new(code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED);
+        assert_eq!(failure_stage(&error), Some(CellularImsStage::Radio));
     }
 
     #[test]
@@ -8586,7 +8631,7 @@ mod tests {
         // family-fallback logic can react to it. (The old AT-context cleanup-and-
         // retry workaround that keyed off this was removed with the beta2 P-CSCF
         // reordering, since AT no longer runs before the bearer.)
-        let prefix = VolteError::with_detail(
+        let prefix = CellularImsError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:prefix-unavailable",
         );
@@ -8594,7 +8639,7 @@ mod tests {
             FailureClass::from_details(prefix.detail().unwrap_or("")),
             FailureClass::PrefixUnavailable
         );
-        let generic = VolteError::with_detail(
+        let generic = CellularImsError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "volte_command_failed:mmcli:operation-failed",
         );
@@ -8604,7 +8649,7 @@ mod tests {
         );
         assert_ne!(
             FailureClass::from_details(
-                VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)
+                CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)
                     .detail()
                     .unwrap_or("")
             ),
@@ -8925,7 +8970,7 @@ Content-Length: 0\r\n\r\n";
             )
             .expect("derived Maxis LTE profile");
         let base = register_variants(profile)[0];
-        assert_eq!(base.authorization, VolteInitialAuthorization::None);
+        assert_eq!(base.authorization, CellularImsInitialAuthorization::None);
         assert!(!base.policy.require_sec_agree);
         assert!(!base.policy.proxy_require_sec_agree);
 
@@ -8939,7 +8984,10 @@ Content-Length: 0\r\n\r\n";
         };
         let declared = next_dynamic_register_variant(profile, base, &requires_sec_agree)
             .expect("421 must preserve the variant and declare sec-agree");
-        assert_eq!(declared.authorization, VolteInitialAuthorization::None);
+        assert_eq!(
+            declared.authorization,
+            CellularImsInitialAuthorization::None
+        );
         assert!(declared.policy.advertise_sec_agree);
         assert!(declared.policy.require_sec_agree);
         assert!(declared.policy.proxy_require_sec_agree);
@@ -8953,11 +9001,11 @@ Content-Length: 0\r\n\r\n";
             .expect("400 after declared sec-agree must add empty AKA before format probes");
         assert_eq!(
             cumulative.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert_eq!(
             cumulative.security_client_offer,
-            VolteSecurityClientOffer::Full,
+            CellularImsSecurityClientOffer::Full,
             "the empty-AKA transition must precede Security-Client format probes"
         );
         assert!(cumulative.policy.require_sec_agree);
@@ -8970,21 +9018,21 @@ Content-Length: 0\r\n\r\n";
             .expect("a second 400 moves to the spaced Security-Client offer");
         assert_eq!(
             spaced.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert_eq!(
             spaced.security_client_offer,
-            VolteSecurityClientOffer::FullSpaced
+            CellularImsSecurityClientOffer::FullSpaced
         );
         let compact = next_dynamic_register_variant(profile, spaced, &needs_empty_aka)
             .expect("a third 400 moves to the compact Security-Client offer");
         assert_eq!(
             compact.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert_eq!(
             compact.security_client_offer,
-            VolteSecurityClientOffer::Compact
+            CellularImsSecurityClientOffer::Compact
         );
         let require_only = next_dynamic_register_variant(profile, compact, &needs_empty_aka)
             .expect("a fourth 400 removes Proxy-Require as the final format fallback");
@@ -8992,7 +9040,7 @@ Content-Length: 0\r\n\r\n";
         assert!(!require_only.policy.proxy_require_sec_agree);
         assert_eq!(
             require_only.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert!(
             next_dynamic_register_variant(profile, require_only, &needs_empty_aka).is_none(),
@@ -9136,7 +9184,7 @@ Content-Length: 0\r\n\r\n";
             .expect("server-required sec-agree 403 before AKA gets one identity-hint retry");
         assert_eq!(
             retry.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert!(retry.policy.require_sec_agree);
         assert!(retry.policy.proxy_require_sec_agree);
@@ -9174,7 +9222,10 @@ Content-Length: 0\r\n\r\n";
             next_dynamic_register_variant_with_roaming(profile, declared, &timeout, true)
                 .expect("a derived roaming timeout gets one visited-network candidate");
         assert!(with_visited.policy.include_visited_network);
-        assert_eq!(with_visited.authorization, VolteInitialAuthorization::None);
+        assert_eq!(
+            with_visited.authorization,
+            CellularImsInitialAuthorization::None
+        );
         assert!(with_visited.server_required_sec_agree);
 
         let with_empty_aka =
@@ -9183,7 +9234,7 @@ Content-Length: 0\r\n\r\n";
         assert!(with_empty_aka.policy.include_visited_network);
         assert_eq!(
             with_empty_aka.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert!(next_dynamic_register_variant_with_roaming(
             profile,
@@ -9219,7 +9270,10 @@ Content-Length: 0\r\n\r\n";
             next_dynamic_register_variant_with_roaming(profile, declared, &forbidden, true)
                 .expect("403 first identifies the visited network");
         assert!(with_visited.policy.include_visited_network);
-        assert_eq!(with_visited.authorization, VolteInitialAuthorization::None);
+        assert_eq!(
+            with_visited.authorization,
+            CellularImsInitialAuthorization::None
+        );
 
         let with_empty_aka =
             next_dynamic_register_variant_with_roaming(profile, with_visited, &forbidden, true)
@@ -9227,7 +9281,7 @@ Content-Length: 0\r\n\r\n";
         assert!(with_empty_aka.policy.include_visited_network);
         assert_eq!(
             with_empty_aka.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
 
         assert!(next_dynamic_register_variant_with_roaming(
@@ -9252,27 +9306,30 @@ Content-Length: 0\r\n\r\n";
             .requiring_sec_agree_without_proxy();
         assert_eq!(
             partial.security_client_offer,
-            VolteSecurityClientOffer::Full
+            CellularImsSecurityClientOffer::Full
         );
-        assert_eq!(partial.authorization, VolteInitialAuthorization::None);
+        assert_eq!(partial.authorization, CellularImsInitialAuthorization::None);
         assert!(partial.policy.require_sec_agree);
         assert!(!partial.policy.proxy_require_sec_agree);
 
         let complete = next_dynamic_register_variant(&profile, partial, &failure)
             .expect("400 on a profile-level Require must add Proxy-Require first");
-        assert_eq!(complete.authorization, VolteInitialAuthorization::None);
+        assert_eq!(
+            complete.authorization,
+            CellularImsInitialAuthorization::None
+        );
         assert!(complete.policy.require_sec_agree);
         assert!(complete.policy.proxy_require_sec_agree);
         assert_eq!(
             complete.security_client_offer,
-            VolteSecurityClientOffer::Full
+            CellularImsSecurityClientOffer::Full
         );
 
         let with_empty_aka = next_dynamic_register_variant(&profile, complete, &failure)
             .expect("the next 400 must add empty AKA after Proxy-Require");
         assert_eq!(
             with_empty_aka.authorization,
-            VolteInitialAuthorization::UriFirstEmptyAka
+            CellularImsInitialAuthorization::UriFirstEmptyAka
         );
         assert!(with_empty_aka.policy.require_sec_agree);
         assert!(with_empty_aka.policy.proxy_require_sec_agree);
@@ -9301,7 +9358,7 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(
             spaced_security.security_client_offer,
-            VolteSecurityClientOffer::FullSpaced
+            CellularImsSecurityClientOffer::FullSpaced
         );
         let compact_security =
             sec_agree_compact_security_retry_variant(spaced_security, &failure).unwrap();
@@ -9311,7 +9368,7 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(
             compact_security.security_client_offer,
-            VolteSecurityClientOffer::Compact
+            CellularImsSecurityClientOffer::Compact
         );
         let require_only =
             sec_agree_require_only_retry_variant(compact_security, &failure).unwrap();
@@ -9451,7 +9508,7 @@ Content-Length: 0\r\n\r\n";
             .detail()
             .is_some_and(|detail| detail.contains("sip_status=")));
 
-        assert!(should_retain_failed_bearer(&VolteError::new(
+        assert!(should_retain_failed_bearer(&CellularImsError::new(
             code::RUNTIME_ALL_PCSCF_FAILED,
         )));
     }
@@ -9459,19 +9516,19 @@ Content-Length: 0\r\n\r\n";
     #[test]
     fn family_fallback_is_limited_to_discovery_and_initial_transport_failures() {
         assert!(
-            FailureClass::from_error(&VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+            FailureClass::from_error(&CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
                 .is_retryable_family()
         );
-        assert!(FailureClass::from_error(&VolteError::new(
+        assert!(FailureClass::from_error(&CellularImsError::new(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
         ))
         .is_retryable_family());
+        assert!(!FailureClass::from_error(&CellularImsError::new(
+            code::REGISTER_AUTH_UNEXPECTED_STATUS
+        ))
+        .is_retryable_family());
         assert!(
-            !FailureClass::from_error(&VolteError::new(code::REGISTER_AUTH_UNEXPECTED_STATUS))
-                .is_retryable_family()
-        );
-        assert!(
-            !FailureClass::from_error(&VolteError::new(code::USIM_AKA_FAILED))
+            !FailureClass::from_error(&CellularImsError::new(code::USIM_AKA_FAILED))
                 .is_retryable_family()
         );
         assert_eq!(ip_family_name("2001:db8::1".parse().unwrap()), "ipv6");

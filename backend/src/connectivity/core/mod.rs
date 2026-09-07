@@ -44,7 +44,7 @@ pub mod voice;
 use std::fmt;
 
 /// A neutral IMS-core error carrying a stable, greppable code (no leg-specific
-/// type). Callers map this into their own error (`VolteError`, `LiveStageError`).
+/// type). Callers map this into their own error (`CellularImsError`, `LiveStageError`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImsError {
     code: &'static str,

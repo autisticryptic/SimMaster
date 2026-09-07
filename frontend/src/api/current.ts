@@ -58,9 +58,9 @@ import type {
   ImsSubsystemState,
   SimImsOverride,
   TrunkProfileResponse,
-  VolteLineControlResponse,
-  VolteProfileSelectionConfig,
-  VolteProfileSelectionResponse,
+  CellularImsLineControlResponse,
+  ImsProfileSelectionConfig,
+  CellularImsProfileSelectionResponse,
   NetworkInfo,
   NetworkInterfacesResponse,
   NotificationConfig,
@@ -95,7 +95,7 @@ import type {
   WebCallCapabilitiesResponse,
   VilteConfig,
   VilteStatusResponse,
-  VolteVoiceStatusResponse,
+  CellularImsVoiceStatusResponse,
   WlanConnectRequest,
   WlanForgetRequest,
   WlanProfileRequest,
@@ -683,30 +683,30 @@ class SimAdminCurrentAPI {
     )
   }
 
-  async getVolteLines() {
-    return request<ApiResponse<VolteLineControlResponse[]>>('/volte/lines')
+  async getCellularImsLines() {
+    return request<ApiResponse<CellularImsLineControlResponse[]>>('/cellular-ims/lines')
   }
 
-  async getVolteLine(lineId: string) {
-    return request<ApiResponse<VolteLineControlResponse>>(`/volte/lines/${encodeURIComponent(lineId)}`)
+  async getCellularImsLine(lineId: string) {
+    return request<ApiResponse<CellularImsLineControlResponse>>(`/cellular-ims/lines/${encodeURIComponent(lineId)}`)
   }
 
-  async getVolteProfileSelection(lineId: string) {
-    return request<ApiResponse<VolteProfileSelectionResponse>>(
-      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+  async getCellularImsProfileSelection(lineId: string) {
+    return request<ApiResponse<CellularImsProfileSelectionResponse>>(
+      `/cellular-ims/lines/${encodeURIComponent(lineId)}/profile-selection`,
     )
   }
 
-  async setVolteProfileSelection(lineId: string, selection: VolteProfileSelectionConfig) {
-    return request<ApiResponse<VolteProfileSelectionResponse>>(
-      `/volte/lines/${encodeURIComponent(lineId)}/profile-selection`,
+  async setCellularImsProfileSelection(lineId: string, selection: ImsProfileSelectionConfig) {
+    return request<ApiResponse<CellularImsProfileSelectionResponse>>(
+      `/cellular-ims/lines/${encodeURIComponent(lineId)}/profile-selection`,
       { method: 'PUT', body: JSON.stringify(selection) },
     )
   }
 
-  async setVolteLineConnection(lineId: string, enabled: boolean) {
-    return request<ApiResponse<VolteLineControlResponse>>(
-      `/volte/lines/${encodeURIComponent(lineId)}/connection`,
+  async setCellularImsLineConnection(lineId: string, enabled: boolean) {
+    return request<ApiResponse<CellularImsLineControlResponse>>(
+      `/cellular-ims/lines/${encodeURIComponent(lineId)}/connection`,
       {
         method: 'POST',
         body: JSON.stringify({ enabled }),
@@ -714,9 +714,9 @@ class SimAdminCurrentAPI {
     )
   }
 
-  async retryVolteLine(lineId: string) {
-    return request<ApiResponse<VolteLineControlResponse>>(
-      `/volte/lines/${encodeURIComponent(lineId)}/retry`,
+  async retryCellularImsLine(lineId: string) {
+    return request<ApiResponse<CellularImsLineControlResponse>>(
+      `/cellular-ims/lines/${encodeURIComponent(lineId)}/retry`,
       { method: 'POST', body: JSON.stringify({}) },
     )
   }
@@ -972,8 +972,8 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<WebCallCapabilitiesResponse>>('/web-call/capabilities')
   }
 
-  async getVolteVoiceStatus(lineId: string) {
-    return request<ApiResponse<VolteVoiceStatusResponse>>(modemLinePath(lineId, '/volte/call/status'))
+  async getCellularImsVoiceStatus(lineId: string) {
+    return request<ApiResponse<CellularImsVoiceStatusResponse>>(modemLinePath(lineId, '/cellular-ims/call/status'))
   }
 
   async getVilteStatus(lineId: string) {

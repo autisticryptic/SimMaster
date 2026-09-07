@@ -13,10 +13,10 @@ import {
   Typography,
 } from '@mui/material'
 import { Dialpad, SimCard as SimCardIcon } from '@mui/icons-material'
-import { api, type UssdResponse, type VolteLineControlResponse } from '../../api/current'
+import { api, type UssdResponse, type CellularImsLineControlResponse } from '../../api/current'
 
 type SupplementaryServicesPanelProps = {
-  line: VolteLineControlResponse | null
+  line: CellularImsLineControlResponse | null
 }
 
 const statusLabels: Record<string, string> = {

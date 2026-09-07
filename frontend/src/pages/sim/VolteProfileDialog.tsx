@@ -20,9 +20,9 @@ import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
 import {
   api,
   type StoredCarrierProfile,
-  type VolteProfileCandidate,
-  type VolteProfileSelectionResponse,
-  type VolteProfileSource,
+  type ImsProfileCandidate,
+  type CellularImsProfileSelectionResponse,
+  type ImsProfileSource,
 } from '../../api/current'
 import { shortLineId } from '../../components/modemLineFormat'
 
@@ -30,27 +30,27 @@ interface Props {
   open: boolean
   lineId: string | null
   onClose: () => void
-  onSaved: (response: VolteProfileSelectionResponse) => void
+  onSaved: (response: CellularImsProfileSelectionResponse) => void
 }
 
-const sourceLabels: Record<VolteProfileSource, string> = {
+const sourceLabels: Record<ImsProfileSource, string> = {
   database: '用户数据库',
   carrier_catalog: '下载的只读数据库',
   derived: '自动派生配置',
 }
 
-function cloneAttempts(attempts: VolteProfileCandidate[]) {
+function cloneAttempts(attempts: ImsProfileCandidate[]) {
   return attempts.map((attempt) => ({ ...attempt, profile_id: attempt.profile_id || null }))
 }
 
-function profilesForSource(profiles: StoredCarrierProfile[], source: VolteProfileSource) {
+function profilesForSource(profiles: StoredCarrierProfile[], source: ImsProfileSource) {
   const origin = source === 'database' ? 'database' : source === 'carrier_catalog' ? 'carrier_catalog' : null
   return origin ? profiles.filter((profile) => profile.origin === origin) : []
 }
 
 export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: Props) {
-  const [data, setData] = useState<VolteProfileSelectionResponse | null>(null)
-  const [attempts, setAttempts] = useState<VolteProfileCandidate[]>([])
+  const [data, setData] = useState<CellularImsProfileSelectionResponse | null>(null)
+  const [attempts, setAttempts] = useState<ImsProfileCandidate[]>([])
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -62,7 +62,7 @@ export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: P
     setError(null)
     setData(null)
     setAttempts([])
-    void api.getVolteProfileSelection(lineId)
+    void api.getCellularImsProfileSelection(lineId)
       .then((response) => {
         if (!active) return
         if (!response.data) {
@@ -85,7 +85,7 @@ export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: P
     return null
   }, [attempts])
 
-  const patchAttempt = (index: number, patch: Partial<VolteProfileCandidate>) => {
+  const patchAttempt = (index: number, patch: Partial<ImsProfileCandidate>) => {
     setAttempts((current) => current.map((attempt, offset) => offset === index
       ? { ...attempt, ...patch }
       : attempt))
@@ -106,7 +106,7 @@ export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: P
     setSaving(true)
     setError(null)
     try {
-      const response = await api.setVolteProfileSelection(lineId, { attempts })
+      const response = await api.setCellularImsProfileSelection(lineId, { attempts })
       if (!response.data) throw new Error('后端未返回保存后的 VoLTE Profile 配置')
       setData(response.data)
       setAttempts(cloneAttempts(response.data.selection.attempts))
@@ -164,11 +164,11 @@ export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: P
                       value={attempt.source}
                       label="Profile 来源"
                       onChange={(event) => patchAttempt(index, {
-                        source: event.target.value as VolteProfileSource,
+                        source: event.target.value as ImsProfileSource,
                         profile_id: null,
                       })}
                     >
-                      {(Object.keys(sourceLabels) as VolteProfileSource[]).map((source) => (
+                      {(Object.keys(sourceLabels) as ImsProfileSource[]).map((source) => (
                         <MenuItem key={source} value={source}>{sourceLabels[source]}</MenuItem>
                       ))}
                     </Select>

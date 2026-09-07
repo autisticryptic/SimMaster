@@ -4,7 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RouteDomain {
     ModemData,
-    VolteIms,
+    CellularIms,
     VowifiIms,
 }
 
@@ -12,7 +12,7 @@ impl RouteDomain {
     const fn table_base(self) -> u32 {
         match self {
             Self::ModemData => 12_000,
-            Self::VolteIms => 14_000,
+            Self::CellularIms => 14_000,
             Self::VowifiIms => 16_000,
         }
     }
@@ -20,7 +20,7 @@ impl RouteDomain {
     const fn priority_base(self) -> u32 {
         match self {
             Self::ModemData => 10_000,
-            Self::VolteIms => 14_000,
+            Self::CellularIms => 14_000,
             Self::VowifiIms => 18_000,
         }
     }
@@ -92,16 +92,16 @@ mod tests {
         let v4 = "10.0.0.2".parse().unwrap();
         let v6 = "2001:db8::2".parse().unwrap();
         assert_eq!(route_table(RouteDomain::ModemData, "wwan0", v4), 12_000);
-        assert_eq!(route_table(RouteDomain::VolteIms, "wwan0", v4), 14_000);
-        assert_eq!(route_table(RouteDomain::VolteIms, "wwan0", v6), 14_001);
-        assert_eq!(route_table(RouteDomain::VolteIms, "wwan7", v4), 14_014);
+        assert_eq!(route_table(RouteDomain::CellularIms, "wwan0", v4), 14_000);
+        assert_eq!(route_table(RouteDomain::CellularIms, "wwan0", v6), 14_001);
+        assert_eq!(route_table(RouteDomain::CellularIms, "wwan7", v4), 14_014);
     }
 
     #[test]
     fn route_domains_and_line_interfaces_do_not_share_tables() {
         let address = "10.0.0.2".parse().unwrap();
         let data = route_table(RouteDomain::ModemData, "wwan2", address);
-        let volte = route_table(RouteDomain::VolteIms, "wwan2", address);
+        let volte = route_table(RouteDomain::CellularIms, "wwan2", address);
         let vowifi_a = route_table(RouteDomain::VowifiIms, "sa_vwf0c93197", address);
         let vowifi_b = route_table(RouteDomain::VowifiIms, "sa_vwf8a14d20", address);
         assert_ne!(data, volte);

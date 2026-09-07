@@ -18,7 +18,7 @@ use super::carrier_catalog::{CarrierCatalog, CatalogAccessKind};
 use super::profile_record::{CarrierProfileRecord, CURRENT_SCHEMA_VERSION};
 use super::profiles::{self, CarrierProfile};
 use crate::platform::{
-    config::{VolteProfileCandidate, VolteProfileSource},
+    config::{ImsProfileCandidate, ImsProfileSource},
     db::{CustomCarrierProfileEntry, Database},
 };
 
@@ -47,7 +47,7 @@ impl ProfileOrigin {
 /// Automatic candidates do not use this: they are allowed to resolve to the
 /// derived fallback when their source is absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolteProfileReferenceState {
+pub enum ImsProfileReferenceState {
     Ready,
     NotLteReady,
     Missing,
@@ -198,54 +198,54 @@ impl ProfileStore {
     /// is later removed; this stricter check is only for accepting a new PUT.
     pub fn volte_reference_state(
         &self,
-        source: VolteProfileSource,
+        source: ImsProfileSource,
         profile_id: &str,
-    ) -> Result<VolteProfileReferenceState, String> {
+    ) -> Result<ImsProfileReferenceState, String> {
         let profile_id = profile_id.trim();
         if profile_id.is_empty() {
-            return Ok(VolteProfileReferenceState::Missing);
+            return Ok(ImsProfileReferenceState::Missing);
         }
         match source {
-            VolteProfileSource::Database => {
+            ImsProfileSource::Database => {
                 let records = self.custom_records()?;
                 if records
                     .valid
                     .iter()
                     .any(|(_, record)| record.meta.profile_id == profile_id)
                 {
-                    return Ok(VolteProfileReferenceState::Ready);
+                    return Ok(ImsProfileReferenceState::Ready);
                 }
                 if records
                     .invalid
                     .iter()
                     .any(|invalid| invalid.entry.profile_id == profile_id)
                 {
-                    return Ok(VolteProfileReferenceState::NotLteReady);
+                    return Ok(ImsProfileReferenceState::NotLteReady);
                 }
-                Ok(VolteProfileReferenceState::Missing)
+                Ok(ImsProfileReferenceState::Missing)
             }
-            VolteProfileSource::CarrierCatalog => {
+            ImsProfileSource::CarrierCatalog => {
                 let capabilities = self.catalog.service_capabilities()?;
                 let Some(capability) = capabilities.get(profile_id) else {
-                    return Ok(VolteProfileReferenceState::Missing);
+                    return Ok(ImsProfileReferenceState::Missing);
                 };
                 if !capability.volte_ready {
-                    return Ok(VolteProfileReferenceState::NotLteReady);
+                    return Ok(ImsProfileReferenceState::NotLteReady);
                 }
                 match self.catalog.get(profile_id, CatalogAccessKind::LteEpc) {
-                    Ok(Some(_)) => Ok(VolteProfileReferenceState::Ready),
-                    Ok(None) => Ok(VolteProfileReferenceState::Missing),
+                    Ok(Some(_)) => Ok(ImsProfileReferenceState::Ready),
+                    Ok(None) => Ok(ImsProfileReferenceState::Missing),
                     Err(error) => {
                         tracing::warn!(
                             profile_id,
                             error = %error,
                             "Catalog marks a profile LTE-ready but its LTE projection is unusable"
                         );
-                        Ok(VolteProfileReferenceState::NotLteReady)
+                        Ok(ImsProfileReferenceState::NotLteReady)
                     }
                 }
             }
-            VolteProfileSource::Derived => Ok(VolteProfileReferenceState::Missing),
+            ImsProfileSource::Derived => Ok(ImsProfileReferenceState::Missing),
         }
     }
 
@@ -254,15 +254,15 @@ impl ProfileStore {
     /// projection.
     pub fn vowifi_reference_state(
         &self,
-        source: VolteProfileSource,
+        source: ImsProfileSource,
         profile_id: &str,
-    ) -> Result<VolteProfileReferenceState, String> {
+    ) -> Result<ImsProfileReferenceState, String> {
         let profile_id = profile_id.trim();
         if profile_id.is_empty() {
-            return Ok(VolteProfileReferenceState::Missing);
+            return Ok(ImsProfileReferenceState::Missing);
         }
         match source {
-            VolteProfileSource::Database => {
+            ImsProfileSource::Database => {
                 let records = self.custom_records()?;
                 if let Some((_, record)) = records
                     .valid
@@ -270,9 +270,9 @@ impl ProfileStore {
                     .find(|(_, record)| record.meta.profile_id == profile_id)
                 {
                     return Ok(if record.voice.vowifi_enabled {
-                        VolteProfileReferenceState::Ready
+                        ImsProfileReferenceState::Ready
                     } else {
-                        VolteProfileReferenceState::NotLteReady
+                        ImsProfileReferenceState::NotLteReady
                     });
                 }
                 if records
@@ -280,32 +280,32 @@ impl ProfileStore {
                     .iter()
                     .any(|invalid| invalid.entry.profile_id == profile_id)
                 {
-                    return Ok(VolteProfileReferenceState::NotLteReady);
+                    return Ok(ImsProfileReferenceState::NotLteReady);
                 }
-                Ok(VolteProfileReferenceState::Missing)
+                Ok(ImsProfileReferenceState::Missing)
             }
-            VolteProfileSource::CarrierCatalog => {
+            ImsProfileSource::CarrierCatalog => {
                 let capabilities = self.catalog.service_capabilities()?;
                 let Some(capability) = capabilities.get(profile_id) else {
-                    return Ok(VolteProfileReferenceState::Missing);
+                    return Ok(ImsProfileReferenceState::Missing);
                 };
                 if !capability.vowifi_ready {
-                    return Ok(VolteProfileReferenceState::NotLteReady);
+                    return Ok(ImsProfileReferenceState::NotLteReady);
                 }
                 match self.catalog.get(profile_id, CatalogAccessKind::WifiEpdg) {
-                    Ok(Some(_)) => Ok(VolteProfileReferenceState::Ready),
-                    Ok(None) => Ok(VolteProfileReferenceState::Missing),
+                    Ok(Some(_)) => Ok(ImsProfileReferenceState::Ready),
+                    Ok(None) => Ok(ImsProfileReferenceState::Missing),
                     Err(error) => {
                         tracing::warn!(
                             profile_id,
                             error = %error,
                             "Catalog marks a profile VoWiFi-ready but its Wi-Fi projection is unusable"
                         );
-                        Ok(VolteProfileReferenceState::NotLteReady)
+                        Ok(ImsProfileReferenceState::NotLteReady)
                     }
                 }
             }
-            VolteProfileSource::Derived => Ok(VolteProfileReferenceState::Missing),
+            ImsProfileSource::Derived => Ok(ImsProfileReferenceState::Missing),
         }
     }
 
@@ -720,7 +720,7 @@ impl ProfileStore {
     /// strict and always wins over it.
     pub fn resolve_volte_candidate(
         &self,
-        candidate: &VolteProfileCandidate,
+        candidate: &ImsProfileCandidate,
         legacy_pinned_profile_id: Option<&str>,
         imsi: &str,
         home_plmn: Option<&str>,
@@ -742,7 +742,7 @@ impl ProfileStore {
     /// custom record whose `vowifi_enabled` gate is off.
     fn resolve_profile_candidate(
         &self,
-        candidate: &VolteProfileCandidate,
+        candidate: &ImsProfileCandidate,
         legacy_pinned_profile_id: Option<&str>,
         imsi: &str,
         home_plmn: Option<&str>,
@@ -768,7 +768,7 @@ impl ProfileStore {
             .filter(|profile_id| !profile_id.is_empty());
 
         let requested = match source {
-            VolteProfileSource::Database => {
+            ImsProfileSource::Database => {
                 let records = match self.custom_records() {
                     Ok(records) => records,
                     Err(error) => {
@@ -852,7 +852,7 @@ impl ProfileStore {
                         fallback_reason: None,
                     })
             }
-            VolteProfileSource::CarrierCatalog => {
+            ImsProfileSource::CarrierCatalog => {
                 if let Some(profile_id) = explicit_profile_id {
                     match self.catalog.get(profile_id, access) {
                         Ok(Some(profile)) => {
@@ -924,7 +924,7 @@ impl ProfileStore {
                     }
                 }
             }
-            VolteProfileSource::Derived => {
+            ImsProfileSource::Derived => {
                 return Ok(derive_standard_fallback(
                     digits,
                     inferred_home_plmn.as_deref(),
@@ -956,7 +956,7 @@ impl ProfileStore {
     /// per-SIM profile pin is likewise considered only in its matching source.
     pub fn resolve_vowifi_candidate(
         &self,
-        candidate: &VolteProfileCandidate,
+        candidate: &ImsProfileCandidate,
         legacy_pinned_profile_id: Option<&str>,
         imsi: &str,
         home_plmn: Option<&str>,
@@ -1224,7 +1224,7 @@ pub struct StoredProfileSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::config::VolteProfileSelectionConfig;
+    use crate::platform::config::ImsProfileSelectionConfig;
     use std::path::PathBuf;
 
     fn store_with_catalog() -> (ProfileStore, PathBuf) {
@@ -1487,7 +1487,7 @@ mod tests {
             .expect("private automatic lookup")
             .is_none());
 
-        for candidate in VolteProfileSelectionConfig::default().attempts {
+        for candidate in ImsProfileSelectionConfig::default().attempts {
             assert!(store
                 .resolve_volte_candidate(&candidate, None, "999990123456789", Some("99999"),)
                 .expect("private VoLTE candidate lookup")
@@ -1517,8 +1517,8 @@ mod tests {
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("private-db-99999".to_string()),
                 },
                 None,
@@ -1545,21 +1545,21 @@ mod tests {
 
         assert_eq!(
             store
-                .vowifi_reference_state(VolteProfileSource::Database, "private-wifi-99999")
+                .vowifi_reference_state(ImsProfileSource::Database, "private-wifi-99999")
                 .expect("database reference state"),
-            VolteProfileReferenceState::Ready
+            ImsProfileReferenceState::Ready
         );
         assert_eq!(
             store
-                .vowifi_reference_state(VolteProfileSource::CarrierCatalog, "private-wifi-99999")
+                .vowifi_reference_state(ImsProfileSource::CarrierCatalog, "private-wifi-99999")
                 .expect("catalog reference state"),
-            VolteProfileReferenceState::Missing
+            ImsProfileReferenceState::Missing
         );
 
         let resolved = store
             .resolve_vowifi_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("private-wifi-99999".to_string()),
                 },
                 None,
@@ -1584,7 +1584,7 @@ mod tests {
 
         let legacy_pin = store
             .resolve_vowifi_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 Some("private-wifi-99999"),
                 "999990123456789",
                 Some("99999"),
@@ -1596,7 +1596,7 @@ mod tests {
 
         assert!(store
             .resolve_vowifi_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 Some("private-wifi-99999"),
                 "999990123456789",
                 Some("99999"),
@@ -1627,7 +1627,7 @@ mod tests {
 
         let volte = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 None,
                 "502121234567890",
                 Some("50212"),
@@ -1639,7 +1639,7 @@ mod tests {
 
         let vowifi = store
             .resolve_vowifi_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 None,
                 "502121234567890",
                 Some("50212"),
@@ -1699,8 +1699,8 @@ mod tests {
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::CarrierCatalog,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),
                 },
                 None,
@@ -1749,8 +1749,8 @@ mod tests {
 
         let database = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::Database,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::Database,
                     profile_id: Some("test-v7-23433".to_string()),
                 },
                 None,
@@ -1761,8 +1761,8 @@ mod tests {
             .expect("database profile");
         let catalog = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::CarrierCatalog,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),
                 },
                 None,
@@ -1797,7 +1797,7 @@ mod tests {
             Database::new(PathBuf::from(":memory:")).expect("create profile store database"),
         );
         let store = ProfileStore::new(Arc::new(catalog), database);
-        let candidates = VolteProfileSelectionConfig::default().attempts;
+        let candidates = ImsProfileSelectionConfig::default().attempts;
         let resolved = candidates
             .iter()
             .map(|candidate| {
@@ -1839,7 +1839,7 @@ mod tests {
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 None,
                 "502121234567890",
                 Some("50212"),
@@ -1859,7 +1859,7 @@ mod tests {
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 None,
                 "234330123456789",
                 Some("23433"),
@@ -1883,13 +1883,10 @@ mod tests {
         );
         let store = ProfileStore::new(Arc::new(catalog), database);
 
-        for source in [
-            VolteProfileSource::Database,
-            VolteProfileSource::CarrierCatalog,
-        ] {
+        for source in [ImsProfileSource::Database, ImsProfileSource::CarrierCatalog] {
             let resolved = store
                 .resolve_volte_candidate(
-                    &VolteProfileCandidate {
+                    &ImsProfileCandidate {
                         source,
                         profile_id: Some("deleted-profile".to_string()),
                     },
@@ -1915,7 +1912,7 @@ mod tests {
 
         let database = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Database),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 legacy_pin,
                 "234330123456789",
                 Some("23433"),
@@ -1924,7 +1921,7 @@ mod tests {
             .expect("derived database fallback");
         let catalog = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 legacy_pin,
                 "234330123456789",
                 Some("23433"),
@@ -1957,7 +1954,7 @@ mod tests {
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::Derived),
+                &ImsProfileCandidate::automatic(ImsProfileSource::Derived),
                 Some("custom-50212"),
                 "502121234567890",
                 Some("50212"),
@@ -1998,7 +1995,7 @@ mod tests {
 
         let vowifi = store
             .resolve_vowifi_candidate(
-                &VolteProfileCandidate::automatic(VolteProfileSource::CarrierCatalog),
+                &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 None,
                 "502121234567890",
                 Some("50212"),
@@ -2276,21 +2273,21 @@ mod tests {
         assert!(catalog.vowifi_ready);
         assert_eq!(
             store
-                .volte_reference_state(VolteProfileSource::CarrierCatalog, "test-v7-23433",)
+                .volte_reference_state(ImsProfileSource::CarrierCatalog, "test-v7-23433",)
                 .expect("explicit reference state"),
-            VolteProfileReferenceState::NotLteReady
+            ImsProfileReferenceState::NotLteReady
         );
         assert_eq!(
             store
-                .volte_reference_state(VolteProfileSource::CarrierCatalog, "missing-profile",)
+                .volte_reference_state(ImsProfileSource::CarrierCatalog, "missing-profile",)
                 .expect("missing explicit reference state"),
-            VolteProfileReferenceState::Missing
+            ImsProfileReferenceState::Missing
         );
 
         let resolved = store
             .resolve_volte_candidate(
-                &VolteProfileCandidate {
-                    source: VolteProfileSource::CarrierCatalog,
+                &ImsProfileCandidate {
+                    source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),
                 },
                 None,

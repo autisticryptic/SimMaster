@@ -5,7 +5,7 @@
 //! moved into that line's UE namespace. Ordinary cellular data, when enabled,
 //! follows the same rule and uses its own native session/interface.
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSlotMode {
@@ -42,9 +42,9 @@ pub struct DataSlotInputs {
     pub native_endpoint_available: bool,
 }
 
-pub fn select_data_slot_mode(inputs: DataSlotInputs) -> Result<DataSlotMode, VolteError> {
+pub fn select_data_slot_mode(inputs: DataSlotInputs) -> Result<DataSlotMode, CellularImsError> {
     if !inputs.native_endpoint_available {
-        return Err(VolteError::new(code::DATA_SLOT_MODE_MISSING));
+        return Err(CellularImsError::new(code::DATA_SLOT_MODE_MISSING));
     }
 
     Ok(if inputs.data_requested {

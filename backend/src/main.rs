@@ -1721,30 +1721,58 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             get(get_vowifi_esim_restore_handler).options(options_handler),
         )
         .route(
+            "/api/cellular-ims/lines",
+            get(get_cellular_ims_lines_handler).options(options_handler),
+        )
+        .route(
+            "/api/cellular-ims/lines/{line_id}",
+            get(get_cellular_ims_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/cellular-ims/lines/{line_id}/profile-selection",
+            get(get_cellular_ims_profile_selection_handler)
+                .put(set_cellular_ims_profile_selection_handler)
+                .options(options_handler),
+        )
+        .route(
+            "/api/cellular-ims/lines/{line_id}/connection",
+            post(set_cellular_ims_line_connection_handler).options(options_handler),
+        )
+        .route(
+            "/api/cellular-ims/lines/{line_id}/retry",
+            post(retry_cellular_ims_line_handler).options(options_handler),
+        )
+        .route(
+            "/api/cellular-ims/lines/{line_id}/ip-families",
+            post(set_cellular_ims_line_ip_families_handler).options(options_handler),
+        )
+        // Legacy routes remain exact aliases, including their response schema.
+        // Persisted/serialized keys are migrated separately from type names.
+        .route(
             "/api/volte/lines",
-            get(get_volte_lines_handler).options(options_handler),
+            get(get_cellular_ims_lines_handler).options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}",
-            get(get_volte_line_handler).options(options_handler),
+            get(get_cellular_ims_line_handler).options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/profile-selection",
-            get(get_volte_profile_selection_handler)
-                .put(set_volte_profile_selection_handler)
+            get(get_cellular_ims_profile_selection_handler)
+                .put(set_cellular_ims_profile_selection_handler)
                 .options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/connection",
-            post(set_volte_line_connection_handler).options(options_handler),
+            post(set_cellular_ims_line_connection_handler).options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/retry",
-            post(retry_volte_line_handler).options(options_handler),
+            post(retry_cellular_ims_line_handler).options(options_handler),
         )
         .route(
             "/api/volte/lines/{line_id}/ip-families",
-            post(set_volte_line_ip_families_handler).options(options_handler),
+            post(set_cellular_ims_line_ip_families_handler).options(options_handler),
         )
         .route(
             "/api/sim/slots",
@@ -1771,8 +1799,12 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
             post(set_line_trunk_enabled_handler).options(options_handler),
         )
         .route(
+            "/api/modem/lines/{line_id}/cellular-ims/call/status",
+            get(get_cellular_ims_call_status_handler).options(options_handler),
+        )
+        .route(
             "/api/modem/lines/{line_id}/volte/call/status",
-            get(get_volte_call_status_handler).options(options_handler),
+            get(get_cellular_ims_call_status_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/voice/path-policy",
@@ -2220,6 +2252,7 @@ mod http_router_tests {
         path: &str,
     ) -> (StatusCode, reqwest::header::HeaderMap, String) {
         let client = crate::platform::dns::http_client_builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             // A redirect would hide which status the router actually chose.
             .redirect(reqwest::redirect::Policy::none())
@@ -2247,6 +2280,7 @@ mod http_router_tests {
         cookie: Option<&str>,
     ) -> (StatusCode, reqwest::header::HeaderMap, String) {
         let client = crate::platform::dns::http_client_builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -2270,6 +2304,7 @@ mod http_router_tests {
         cookie: &str,
     ) -> (StatusCode, String) {
         let client = crate::platform::dns::http_client_builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -2289,6 +2324,7 @@ mod http_router_tests {
     /// GET with a session cookie.
     async fn get_with_cookie(served: &Served, path: &str, cookie: &str) -> (StatusCode, String) {
         let client = crate::platform::dns::http_client_builder()
+            .no_proxy()
             .timeout(std::time::Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -2386,6 +2422,92 @@ mod http_router_tests {
             StatusCode::UNAUTHORIZED,
             "a forged session must be refused, got {status}: {body}"
         );
+    }
+
+    /// Real HTTP alias and authentication checks on a private D-Bus. CI sets
+    /// DBUS_SYSTEM_BUS_ADDRESS to that private bus; it must not silently skip.
+    #[tokio::test]
+    async fn cellular_ims_route_aliases_keep_auth_and_response_contract() {
+        let state = build_test_router()
+            .await
+            .expect("run with a private DBUS_SYSTEM_BUS_ADDRESS; no hardware is required");
+        let served = serve(state.router.clone()).await;
+        let unknown = format!("line-{:032x}", 0xdeadbeefu64);
+        let root = format!("/api/volte/lines/{unknown}");
+        let selection = serde_json::json!({
+            "attempts": [
+                {"source": "database"},
+                {"source": "carrier_catalog"},
+                {"source": "derived"}
+            ]
+        });
+        let cases = [
+            (
+                reqwest::Method::GET,
+                "/api/volte/lines".to_string(),
+                serde_json::json!({}),
+            ),
+            (reqwest::Method::GET, root.clone(), serde_json::json!({})),
+            (
+                reqwest::Method::GET,
+                format!("{root}/profile-selection"),
+                serde_json::json!({}),
+            ),
+            (
+                reqwest::Method::PUT,
+                format!("{root}/profile-selection"),
+                selection,
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{root}/connection"),
+                serde_json::json!({"enabled": false}),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{root}/retry"),
+                serde_json::json!({}),
+            ),
+            (
+                reqwest::Method::POST,
+                format!("{root}/ip-families"),
+                serde_json::json!({"families": ["ipv4v6"]}),
+            ),
+            (
+                reqwest::Method::GET,
+                format!("/api/modem/lines/{unknown}/volte/call/status"),
+                serde_json::json!({}),
+            ),
+        ];
+        // Verify every new endpoint is protected, not merely reachable.
+        for (method, legacy, _) in &cases {
+            let canonical = legacy.replace("/volte/", "/cellular-ims/");
+            let (status, _, body) = send(&served, method.clone(), &canonical).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{canonical}: {body}");
+        }
+        let cookie = authenticate(&served).await;
+        for (method, legacy, payload) in cases {
+            let canonical = legacy.replace("/volte/", "/cellular-ims/");
+            let mut responses = Vec::new();
+            for path in [&legacy, &canonical] {
+                let (status, body) = if method == reqwest::Method::GET {
+                    get_with_cookie(&served, path, &cookie).await
+                } else if method == reqwest::Method::PUT {
+                    put_json(&served, path, payload.clone(), &cookie).await
+                } else {
+                    let (status, _, body) =
+                        post_json(&served, path, payload.clone(), Some(&cookie)).await;
+                    (status, body)
+                };
+                let json: serde_json::Value = serde_json::from_str(&body)
+                    .unwrap_or_else(|_| panic!("missing JSON route {path}: {status} {body}"));
+                responses.push((status, json));
+            }
+            assert_eq!(
+                responses[0], responses[1],
+                "{method} {canonical} differs from {legacy}"
+            );
+        }
     }
 
     /// A partial PUT body is refused at the boundary.

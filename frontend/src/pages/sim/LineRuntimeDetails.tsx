@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
-import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, VolteLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
+import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, CellularImsLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
 import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
@@ -13,7 +13,7 @@ function Field({ label, value }: { label: string, value: ReactNode }) {
   )
 }
 
-export function LineCsDetails({ line }: { line: VolteLineControlResponse }) {
+export function LineCsDetails({ line }: { line: CellularImsLineControlResponse }) {
   return (
     <Grid container spacing={2}>
       <Grid size={{ xs: 12, sm: 4 }}><Field label="基带状态" value={line.modem.state || '未知'} /></Grid>
@@ -25,7 +25,7 @@ export function LineCsDetails({ line }: { line: VolteLineControlResponse }) {
   )
 }
 
-export function LineVolteDetails({ line }: { line: VolteLineControlResponse }) {
+export function LineVolteDetails({ line }: { line: CellularImsLineControlResponse }) {
   const displayError = volteErrorMessage(line.runtime.last_error)
   const imsAttemptInProgress = line.profile.volte_connection_enabled
     && !line.runtime.registered
@@ -157,7 +157,7 @@ export function LineActivityLog({
   smsMessages = [],
   callRecords = [],
 }: {
-  line: VolteLineControlResponse
+  line: CellularImsLineControlResponse
   appEvents?: AppEventEntry[]
   vowifiEvents?: VowifiRuntimeEventEntry[]
   trunk?: TrunkProfileResponse

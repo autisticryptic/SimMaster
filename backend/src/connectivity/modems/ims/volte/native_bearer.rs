@@ -36,7 +36,7 @@ use crate::{
 
 use super::{
     bearer::{teardown_bearer_network_in_worker, BearerConnection, BearerRequest},
-    errors::{code, VolteError},
+    errors::{code, CellularImsError},
     pcscf::{self, ImsIpSettings},
     plan::{FailureClass, ImsConnectionPlan, IpFamily, IpType},
 };
@@ -99,20 +99,27 @@ impl NativeImsBearer {
     /// primary ModemManager interface is intentionally rejected; only a
     /// provider-declared application-owned bearer may cross the
     /// namespace boundary.
-    pub async fn move_into_worker(&mut self, worker: UeWorkerHandle) -> Result<(), VolteError> {
+    pub async fn move_into_worker(
+        &mut self,
+        worker: UeWorkerHandle,
+    ) -> Result<(), CellularImsError> {
         let worker_binding = worker.bind();
         if !worker_binding.is_current() {
-            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
         }
         if self.moved_to_worker {
             if self.worker_binding_is_current() {
                 return Ok(());
             }
-            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
         }
         match self.interface_ownership {
             BearerInterfaceOwnership::HostManagedPrimary => {
-                return Err(VolteError::with_detail(
+                return Err(CellularImsError::with_detail(
                     code::COMMAND_FAILED,
                     format!(
                         "native bearer refuses to move host-managed interface {}",
@@ -121,7 +128,7 @@ impl NativeImsBearer {
                 ));
             }
             BearerInterfaceOwnership::Unknown => {
-                return Err(VolteError::with_detail(
+                return Err(CellularImsError::with_detail(
                     code::COMMAND_FAILED,
                     format!(
                         "native bearer ownership is unknown; refusing to move {}",
@@ -142,7 +149,7 @@ impl NativeImsBearer {
         netns::move_iface_in(worker_binding.namespace(), &self.interface)
             .await
             .map_err(|error| {
-                VolteError::with_detail(
+                CellularImsError::with_detail(
                     code::COMMAND_FAILED,
                     format!(
                         "move native bearer {} into {}: {error}",
@@ -159,7 +166,7 @@ impl NativeImsBearer {
                 .any(|name| name == &self.interface)
         }) {
             let _ = netns::move_iface_out(worker_binding.namespace(), &self.interface).await;
-            return Err(VolteError::with_detail(
+            return Err(CellularImsError::with_detail(
                 code::COMMAND_FAILED,
                 format!(
                     "worker cannot observe moved native interface {}",
@@ -176,7 +183,9 @@ impl NativeImsBearer {
             self.worker = Some(worker);
             self.worker_binding = Some(worker_binding);
             self.moved_to_worker = true;
-            return Err(VolteError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED));
+            return Err(CellularImsError::new(
+                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+            ));
         }
         self.worker = Some(worker);
         self.worker_binding = Some(worker_binding);
@@ -262,7 +271,7 @@ pub async fn establish_native_ims_bearer(
     modem_id: &str,
     request: &BearerRequest,
     plan: &ImsConnectionPlan,
-) -> Result<NativeImsBearer, VolteError> {
+) -> Result<NativeImsBearer, CellularImsError> {
     let cid = ims_context_cid(request);
     let families = requested_families_for(plan);
     // Walk the plan's attempts in order. Dual-stack is an ordinary entry, so a
@@ -339,7 +348,7 @@ pub async fn establish_native_ims_bearer(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        VolteError::with_detail(
+        CellularImsError::with_detail(
             code::RUNTIME_MM_BEARER_CONNECT_FAILED,
             "native_ims_no_family_attempted".to_string(),
         )
@@ -368,7 +377,7 @@ pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
 async fn adopt_bearer(
     info: ImsBearerInfo,
     handle: Box<dyn ImsBearerHandle + Send>,
-) -> Result<NativeImsBearer, VolteError> {
+) -> Result<NativeImsBearer, CellularImsError> {
     match to_bearer_connection(&info) {
         Ok(connection) => Ok(NativeImsBearer {
             connection,
@@ -397,9 +406,9 @@ fn forced_native_family(hint: ImsBearerFailureHint) -> Option<u8> {
     }
 }
 
-/// Fold a device-agnostic [`ImsBearerError`] into the stack's [`VolteError`],
+/// Fold a device-agnostic [`ImsBearerError`] into the stack's [`CellularImsError`],
 /// preserving the exact codes and detail strings used by runtime diagnostics.
-fn volte_error_from_ims_bearer(error: ImsBearerError) -> VolteError {
+fn volte_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
     let error_code = match error.kind {
         ImsBearerErrorKind::BasebandUnresolved => code::IP_SETTINGS_MISSING,
         ImsBearerErrorKind::EndpointUnavailable => code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
@@ -412,14 +421,14 @@ fn volte_error_from_ims_bearer(error: ImsBearerError) -> VolteError {
         }
         ImsBearerErrorKind::SettingsMissing => code::IP_SETTINGS_MISSING,
     };
-    VolteError::with_detail(error_code, error.detail)
+    CellularImsError::with_detail(error_code, error.detail)
 }
 
 /// Project the device-agnostic bearer result onto the `BearerConnection`
 /// contract the rest of the VoLTE stack consumes.
 ///
 /// Kept separate from the IO above so the mapping is testable without a modem.
-pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, VolteError> {
+pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, CellularImsError> {
     let ims = ImsIpSettings {
         ipv4_address: info.ipv4_address,
         ipv4_gateway: info.ipv4_gateway,
@@ -430,7 +439,7 @@ pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, Vo
         pcscf: info.pcscf.clone(),
     };
     if ims.local_addr().is_none() {
-        return Err(VolteError::with_detail(
+        return Err(CellularImsError::with_detail(
             code::IP_SETTINGS_MISSING,
             "native_ims_session_has_no_address".to_string(),
         ));
@@ -449,7 +458,7 @@ pub fn to_bearer_connection(info: &ImsBearerInfo) -> Result<BearerConnection, Vo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::platform::config::VolteIpFamilyPreference;
+    use crate::platform::config::CellularImsIpFamilyPreference;
 
     /// The reference IMS context as `+CGCONTRDP` reports it: address+mask,
     /// gateway, DNS and a P-CSCF, all on the same line, projected onto the
@@ -512,13 +521,13 @@ mod tests {
 
     #[test]
     fn families_follow_the_plan_order() {
-        let v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        let v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
         assert_eq!(requested_families_for(&v4), vec![4, 6]);
-        let v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
+        let v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
         assert_eq!(requested_families_for(&v6), vec![6, 4]);
-        let only4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4Only);
+        let only4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4Only);
         assert_eq!(requested_families_for(&only4), vec![4]);
-        let only6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6Only);
+        let only6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6Only);
         assert_eq!(requested_families_for(&only6), vec![6]);
         assert_eq!(
             forced_native_family(ImsBearerFailureHint::NetworkForcedIpv4),

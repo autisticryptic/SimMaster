@@ -21,11 +21,11 @@ use std::{
 use tokio::{process::Command, time::sleep};
 
 use crate::{
-    platform::config::VolteIpFamilyPreference,
+    platform::config::CellularImsIpFamilyPreference,
     services::ue_worker::{UeSocket, UeSocketSpec, UeWorkerHandle},
 };
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 use super::plan::{ImsConnectionPlan, IpFamily};
 
 const DNS_TIMEOUT: Duration = Duration::from_secs(4);
@@ -145,7 +145,7 @@ impl ImsIpSettings {
     /// DNS server addresses must never be returned here. Some Qualcomm
     /// devices expose public carrier resolvers in the IMS bearer DNS slots;
     /// sending SIP REGISTER to those addresses produces a misleading timeout.
-    pub fn resolve_pcscf_for(&self, local: IpAddr) -> Result<IpAddr, VolteError> {
+    pub fn resolve_pcscf_for(&self, local: IpAddr) -> Result<IpAddr, CellularImsError> {
         if let Some(p) = self
             .pcscf
             .iter()
@@ -154,13 +154,17 @@ impl ImsIpSettings {
         {
             return Ok(p);
         }
-        Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+        Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
     }
 
     /// Validate the family invariant: local addr and P-CSCF must share family.
-    pub fn ensure_family_match(&self, local: IpAddr, pcscf: IpAddr) -> Result<IpAddr, VolteError> {
+    pub fn ensure_family_match(
+        &self,
+        local: IpAddr,
+        pcscf: IpAddr,
+    ) -> Result<IpAddr, CellularImsError> {
         if !same_family(local, pcscf) {
-            return Err(VolteError::new(code::PCSCF_FAMILY_MISMATCH));
+            return Err(CellularImsError::new(code::PCSCF_FAMILY_MISMATCH));
         }
         Ok(pcscf)
     }
@@ -214,7 +218,7 @@ pub async fn prepare_ims_profile_context(
     modem: &str,
     plan: &ImsConnectionPlan,
     apn: &str,
-) -> Result<ImsProfileContext, VolteError> {
+) -> Result<ImsProfileContext, CellularImsError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
     let profile = select_ims_profile_context(&contexts, configured_ims_cid(), apn);
@@ -255,7 +259,11 @@ fn select_ims_profile_context(
 /// Deliberately does not issue `AT+CGACT`: that activation sequence caused a
 /// baseband restart on the reference MSM8916 firmware. The following native or
 /// ModemManager bearer activation consumes this setting safely.
-pub async fn set_pcscf_reporting(modem: &str, cid: u8, enabled: bool) -> Result<(), VolteError> {
+pub async fn set_pcscf_reporting(
+    modem: &str,
+    cid: u8,
+    enabled: bool,
+) -> Result<(), CellularImsError> {
     let value = if enabled { "1,1,1" } else { "0,0,0" };
     run_at(modem, &format!("AT$QCPDPIMSCFGE={cid},{value}"))
         .await
@@ -275,7 +283,7 @@ pub async fn prefetch_pcscf_from_ims_profile(
     modem: &str,
     plan: &ImsConnectionPlan,
     apn: &str,
-) -> Result<ImsProfilePrefetch, VolteError> {
+) -> Result<ImsProfilePrefetch, CellularImsError> {
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let contexts = parse_pdp_contexts(&contexts_output);
     let mut profile_ids = Vec::with_capacity(3);
@@ -355,7 +363,7 @@ pub async fn prefetch_pcscf_from_ims_profile(
     }
 
     Err(last_error.unwrap_or_else(|| {
-        VolteError::with_detail(
+        CellularImsError::with_detail(
             code::RUNTIME_PROFILE_PCSCF_MISSING,
             "beta2_profile_candidates_exhausted".to_string(),
         )
@@ -398,7 +406,7 @@ pub async fn discover_pcscf_via_active_at_context(
     modem: &str,
     _plan: &ImsConnectionPlan,
     apn: &str,
-) -> Result<AtPcscfDiscovery, VolteError> {
+) -> Result<AtPcscfDiscovery, CellularImsError> {
     let active_output = run_at(modem, "AT+CGACT?").await?;
     let contexts_output = run_at(modem, "AT+CGDCONT?").await?;
     let mut active_cids = parse_active_context_cids(&active_output);
@@ -416,7 +424,7 @@ pub async fn discover_pcscf_via_active_at_context(
     });
 
     if active_cids.is_empty() {
-        return Err(VolteError::with_detail(
+        return Err(CellularImsError::with_detail(
             code::RUNTIME_ALL_PCSCF_FAILED,
             format!("at_active_context_missing:ims={configured_ims_cids:?}"),
         ));
@@ -437,7 +445,7 @@ pub async fn discover_pcscf_via_active_at_context(
             }
         }
     }
-    Err(VolteError::with_detail(
+    Err(CellularImsError::with_detail(
         code::RUNTIME_ALL_PCSCF_FAILED,
         format!("at_active_ims_context_no_pcscf:cids={attempted:?}:ims={configured_ims_cids:?}"),
     ))
@@ -458,14 +466,14 @@ pub use crate::hardware::cellular::cgcontrdp::{
     parse_cgcontrdp_addresses, parse_cgcontrdp_settings, read_cgcontrdp_settings, CgcontrdpSettings,
 };
 
-async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
+async fn run_at(modem: &str, command: &str) -> Result<String, CellularImsError> {
     let argument = format!("--command={command}");
     let output = Command::new("mmcli")
         .args(["-m", modem, &argument])
         .output()
         .await
         .map_err(|error| {
-            VolteError::with_detail(code::COMMAND_SPAWN_FAILED, format!("mmcli:{error}"))
+            CellularImsError::with_detail(code::COMMAND_SPAWN_FAILED, format!("mmcli:{error}"))
         })?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -473,7 +481,7 @@ async fn run_at(modem: &str, command: &str) -> Result<String, VolteError> {
         let stderr = String::from_utf8_lossy(&output.stderr)
             .trim()
             .replace('\n', " ");
-        Err(VolteError::with_detail(
+        Err(CellularImsError::with_detail(
             code::COMMAND_FAILED,
             format!(
                 "mmcli:{}:-m {modem} {argument}:{stderr}",
@@ -580,7 +588,7 @@ pub async fn discover_pcscf_in_worker(
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<IpAddr, VolteError> {
+) -> Result<IpAddr, CellularImsError> {
     discover_pcscf_on_path(
         settings,
         home_domain,
@@ -599,7 +607,7 @@ async fn discover_pcscf_on_path(
     local: IpAddr,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<IpAddr, VolteError> {
+) -> Result<IpAddr, CellularImsError> {
     if let Ok(explicit) = std::env::var(ENV_PCSCF) {
         if let Some(address) = parse_pcscf_override(&explicit)
             .into_iter()
@@ -707,7 +715,7 @@ async fn discover_pcscf_on_path(
             }
         }
     }
-    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+    Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
 fn pcscf_srv_names(home_domain: &str) -> Vec<String> {
@@ -736,7 +744,7 @@ async fn query_dns(
     record_type: u16,
     interface: &str,
     worker: &UeWorkerHandle,
-) -> Result<DnsRecords, VolteError> {
+) -> Result<DnsRecords, CellularImsError> {
     let query_id = dns_query_id(name, record_type);
     let query = build_dns_query(query_id, name, record_type)?;
     let remote = SocketAddr::new(server, DNS_PORT);
@@ -747,17 +755,17 @@ async fn query_dns(
     );
     let socket = match worker.create_socket(spec).await {
         Ok(UeSocket::Udp(socket)) => socket,
-        _ => return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
+        _ => return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED)),
     };
     socket
         .send(&query)
         .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
     let mut response = [0u8; 4096];
     let read = tokio::time::timeout(DNS_TIMEOUT, socket.recv(&mut response))
         .await
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?
+        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
     parse_dns_response(query_id, &response[..read])
 }
 
@@ -769,7 +777,7 @@ fn dns_query_id(name: &str, record_type: u16) -> u16 {
     hash
 }
 
-fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, VolteError> {
+fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, CellularImsError> {
     let mut query = Vec::with_capacity(64 + name.len());
     query.extend_from_slice(&id.to_be_bytes());
     query.extend_from_slice(&0x0100u16.to_be_bytes());
@@ -779,7 +787,7 @@ fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, Vol
     query.extend_from_slice(&0u16.to_be_bytes());
     for label in name.trim_end_matches('.').split('.') {
         if label.is_empty() || label.len() > 63 {
-            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
         }
         query.push(label.len() as u8);
         query.extend_from_slice(label.as_bytes());
@@ -790,13 +798,13 @@ fn build_dns_query(id: u16, name: &str, record_type: u16) -> Result<Vec<u8>, Vol
     Ok(query)
 }
 
-fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> {
+fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, CellularImsError> {
     if packet.len() < 12 || u16::from_be_bytes([packet[0], packet[1]]) != id {
-        return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
     }
     let flags = u16::from_be_bytes([packet[2], packet[3]]);
     if flags & 0x000f != 0 {
-        return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+        return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
     }
     let questions = usize::from(u16::from_be_bytes([packet[4], packet[5]]));
     let answers = usize::from(u16::from_be_bytes([packet[6], packet[7]]));
@@ -808,14 +816,14 @@ fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> 
         offset = offset
             .checked_add(4)
             .filter(|end| *end <= packet.len())
-            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
     }
 
     let mut records = DnsRecords::default();
     for _ in 0..answers + authorities + additional {
         offset = read_dns_name(packet, offset)?.1;
         if offset + 10 > packet.len() {
-            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
         }
         let record_type = u16::from_be_bytes([packet[offset], packet[offset + 1]]);
         let length = usize::from(u16::from_be_bytes([packet[offset + 8], packet[offset + 9]]));
@@ -823,7 +831,7 @@ fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> 
         let data_end = data_offset
             .checked_add(length)
             .filter(|end| *end <= packet.len())
-            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
         match (record_type, length) {
             (1, 4) => records.addresses.push(IpAddr::V4(Ipv4Addr::new(
                 packet[data_offset],
@@ -834,7 +842,7 @@ fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> 
             (28, 16) => {
                 let octets: [u8; 16] = packet[data_offset..data_end]
                     .try_into()
-                    .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+                    .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
                 records.addresses.push(IpAddr::V6(Ipv6Addr::from(octets)));
             }
             (33, 6..) => {
@@ -850,40 +858,40 @@ fn parse_dns_response(id: u16, packet: &[u8]) -> Result<DnsRecords, VolteError> 
     Ok(records)
 }
 
-fn read_dns_name(packet: &[u8], start: usize) -> Result<(String, usize), VolteError> {
+fn read_dns_name(packet: &[u8], start: usize) -> Result<(String, usize), CellularImsError> {
     let mut labels = Vec::new();
     let mut offset = start;
     let mut end = None;
     for _ in 0..128 {
         let length = *packet
             .get(offset)
-            .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+            .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
         if length == 0 {
             return Ok((labels.join("."), end.unwrap_or(offset + 1)));
         }
         if length & 0xc0 == 0xc0 {
             let low = *packet
                 .get(offset + 1)
-                .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+                .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
             end.get_or_insert(offset + 2);
             offset = (usize::from(length & 0x3f) << 8) | usize::from(low);
             continue;
         }
         if length & 0xc0 != 0 {
-            return Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED));
+            return Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED));
         }
         let label_start = offset + 1;
         let label_end = label_start + usize::from(length);
         let label = std::str::from_utf8(
             packet
                 .get(label_start..label_end)
-                .ok_or_else(|| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?,
+                .ok_or_else(|| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?,
         )
-        .map_err(|_| VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
+        .map_err(|_| CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))?;
         labels.push(label.to_string());
         offset = label_end;
     }
-    Err(VolteError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+    Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
 }
 
 /// Strip a possible prefix length / netmask suffix and parse an IP.
@@ -965,7 +973,7 @@ IPv4 primary DNS: 10.0.0.53";
         let s = parse_ip_settings(SAMPLE);
         assert_eq!(
             s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                VolteIpFamilyPreference::Ipv6First
+                CellularImsIpFamilyPreference::Ipv6First
             )),
             vec![
                 IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
@@ -974,7 +982,7 @@ IPv4 primary DNS: 10.0.0.53";
         );
         assert_eq!(
             s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                VolteIpFamilyPreference::Ipv4First
+                CellularImsIpFamilyPreference::Ipv4First
             )),
             vec![
                 IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
@@ -983,13 +991,13 @@ IPv4 primary DNS: 10.0.0.53";
         );
         assert_eq!(
             s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                VolteIpFamilyPreference::Ipv6Only
+                CellularImsIpFamilyPreference::Ipv6Only
             )),
             vec![IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap())]
         );
         assert_eq!(
             s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
-                VolteIpFamilyPreference::Ipv4Only
+                CellularImsIpFamilyPreference::Ipv4Only
             )),
             vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2))]
         );
@@ -1103,19 +1111,21 @@ IPv4 primary DNS: 10.0.0.53";
     fn at_probe_family_order_matches_runtime_preference() {
         use crate::connectivity::modems::ims::volte::plan::ImsConnectionPlan;
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
+                .pdp_types(),
             vec!["IPV4V6", "IPV6", "IP"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First)
+                .pdp_types(),
             vec!["IPV4V6", "IP", "IPV6"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6Only).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6Only).pdp_types(),
             vec!["IPV6"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4Only).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4Only).pdp_types(),
             vec!["IP"]
         );
     }

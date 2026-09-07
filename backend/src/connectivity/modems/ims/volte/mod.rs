@@ -47,7 +47,8 @@ pub mod sms;
 pub mod vilte;
 pub mod voice;
 
-pub use errors::VolteError;
+pub use errors::CellularImsError;
 pub use runtime::{
-    RegistrationMode, VoltePhase, VolteRuntime, VolteRuntimeStatus, VolteSnapshot, VolteStage,
+    CellularImsPhase, CellularImsRuntime, CellularImsRuntimeStatus, CellularImsSnapshot,
+    CellularImsStage, RegistrationMode,
 };

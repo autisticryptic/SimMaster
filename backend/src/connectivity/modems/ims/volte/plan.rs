@@ -9,14 +9,14 @@
 //!   - the per-family SIP loop (`live.rs`, ordering local addresses).
 //!
 //! This module is the single source of truth. `ImsConnectionPlan` turns the
-//! configured [`VolteIpFamilyPreference`] into one ordered plan; each consumer
+//! configured [`CellularImsIpFamilyPreference`] into one ordered plan; each consumer
 //! projects it into its own vocabulary through the `IpFamily`/`IpType`
 //! converters. Failure signals that used to be recognised by ad-hoc substring
 //! matching are consolidated into [`FailureClass`].
 
-use crate::platform::config::VolteIpFamilyPreference;
+use crate::platform::config::CellularImsIpFamilyPreference;
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 
 /// A single IP address family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,9 +186,9 @@ impl FailureClass {
         }
     }
 
-    /// Classify a structured [`VolteError`] surfaced during the per-family SIP
+    /// Classify a structured [`CellularImsError`] surfaced during the per-family SIP
     /// loop (was `live::should_try_next_family`).
-    pub fn from_error(error: &VolteError) -> Self {
+    pub fn from_error(error: &CellularImsError) -> Self {
         match error.code() {
             code::BEARER_NETDEV_RUNTIME_ERROR => FailureClass::BasebandWedged,
             code::REGISTER_INITIAL_UNEXPECTED_STATUS
@@ -234,20 +234,20 @@ impl FailureClass {
 /// only a reporting/diagnostic value — the runtime drives off `bearer_attempts`
 /// and `pcscf_order`. A custom list that has no exact legacy equivalent (e.g.
 /// single families before dual-stack) maps to the closest `*First`/`*Only` label.
-fn preference_for_pcscf_order(pcscf_order: &[IpFamily]) -> VolteIpFamilyPreference {
+fn preference_for_pcscf_order(pcscf_order: &[IpFamily]) -> CellularImsIpFamilyPreference {
     match pcscf_order {
-        [IpFamily::Ipv6, IpFamily::Ipv4, ..] => VolteIpFamilyPreference::Ipv6First,
-        [IpFamily::Ipv4, IpFamily::Ipv6, ..] => VolteIpFamilyPreference::Ipv4First,
-        [IpFamily::Ipv6] => VolteIpFamilyPreference::Ipv6Only,
-        [IpFamily::Ipv4] => VolteIpFamilyPreference::Ipv4Only,
-        _ => VolteIpFamilyPreference::default(),
+        [IpFamily::Ipv6, IpFamily::Ipv4, ..] => CellularImsIpFamilyPreference::Ipv6First,
+        [IpFamily::Ipv4, IpFamily::Ipv6, ..] => CellularImsIpFamilyPreference::Ipv4First,
+        [IpFamily::Ipv6] => CellularImsIpFamilyPreference::Ipv6Only,
+        [IpFamily::Ipv4] => CellularImsIpFamilyPreference::Ipv4Only,
+        _ => CellularImsIpFamilyPreference::default(),
     }
 }
 
 /// A resolved, ordered plan for one IMS connection attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImsConnectionPlan {
-    preference: VolteIpFamilyPreference,
+    preference: CellularImsIpFamilyPreference,
     /// Ordered bearer/PDP attempts. Dual-stack leads for the `*First` presets,
     /// but a per-line list may place it anywhere or omit it.
     bearer_attempts: Vec<IpType>,
@@ -257,18 +257,18 @@ pub struct ImsConnectionPlan {
 
 impl ImsConnectionPlan {
     /// Build the plan from the configured preference.
-    pub fn from_preference(preference: VolteIpFamilyPreference) -> Self {
+    pub fn from_preference(preference: CellularImsIpFamilyPreference) -> Self {
         let (bearer_attempts, pcscf_order) = match preference {
-            VolteIpFamilyPreference::Ipv6First => (
+            CellularImsIpFamilyPreference::Ipv6First => (
                 vec![IpType::Ipv4v6, IpType::Ipv6, IpType::Ipv4],
                 vec![IpFamily::Ipv6, IpFamily::Ipv4],
             ),
-            VolteIpFamilyPreference::Ipv4First => (
+            CellularImsIpFamilyPreference::Ipv4First => (
                 vec![IpType::Ipv4v6, IpType::Ipv4, IpType::Ipv6],
                 vec![IpFamily::Ipv4, IpFamily::Ipv6],
             ),
-            VolteIpFamilyPreference::Ipv6Only => (vec![IpType::Ipv6], vec![IpFamily::Ipv6]),
-            VolteIpFamilyPreference::Ipv4Only => (vec![IpType::Ipv4], vec![IpFamily::Ipv4]),
+            CellularImsIpFamilyPreference::Ipv6Only => (vec![IpType::Ipv6], vec![IpFamily::Ipv6]),
+            CellularImsIpFamilyPreference::Ipv4Only => (vec![IpType::Ipv4], vec![IpFamily::Ipv4]),
         };
         Self {
             preference,
@@ -287,20 +287,20 @@ impl ImsConnectionPlan {
     ///
     /// `[v4v6, v4, v6]` == `Ipv4First`, `[v4v6, v6, v4]` == `Ipv6First`,
     /// `[v4]` == `Ipv4Only`, `[v6]` == `Ipv6Only` — a strict superset of
-    /// [`VolteIpFamilyPreference`].
-    pub fn from_families(families: &[crate::platform::config::VolteIpFamily]) -> Self {
-        use crate::platform::config::VolteIpFamily;
+    /// [`CellularImsIpFamilyPreference`].
+    pub fn from_families(families: &[crate::platform::config::CellularImsIpFamily]) -> Self {
+        use crate::platform::config::CellularImsIpFamily;
         if families.is_empty() {
-            return Self::from_preference(VolteIpFamilyPreference::default());
+            return Self::from_preference(CellularImsIpFamilyPreference::default());
         }
         // Bearer attempts follow the list literally — dual-stack sits wherever the
         // operator put it.
         let mut bearer_attempts: Vec<IpType> = Vec::with_capacity(families.len());
         for family in families {
             let ip_type = match family {
-                VolteIpFamily::Ipv4v6 => IpType::Ipv4v6,
-                VolteIpFamily::Ipv4 => IpType::Ipv4,
-                VolteIpFamily::Ipv6 => IpType::Ipv6,
+                CellularImsIpFamily::Ipv4v6 => IpType::Ipv4v6,
+                CellularImsIpFamily::Ipv4 => IpType::Ipv4,
+                CellularImsIpFamily::Ipv6 => IpType::Ipv6,
             };
             if !bearer_attempts.contains(&ip_type) {
                 bearer_attempts.push(ip_type);
@@ -314,9 +314,9 @@ impl ImsConnectionPlan {
         let mut pcscf_order: Vec<IpFamily> = Vec::with_capacity(2);
         for family in families {
             let single = match family {
-                VolteIpFamily::Ipv4 => IpFamily::Ipv4,
-                VolteIpFamily::Ipv6 => IpFamily::Ipv6,
-                VolteIpFamily::Ipv4v6 => continue,
+                CellularImsIpFamily::Ipv4 => IpFamily::Ipv4,
+                CellularImsIpFamily::Ipv6 => IpFamily::Ipv6,
+                CellularImsIpFamily::Ipv4v6 => continue,
             };
             if !pcscf_order.contains(&single) {
                 pcscf_order.push(single);
@@ -325,7 +325,7 @@ impl ImsConnectionPlan {
         // Dual-stack can still deliver a family the list never named on its own
         // (including the dual-stack-only case, where it names none). Append those
         // after the explicit ones so stated priority always wins.
-        if families.contains(&VolteIpFamily::Ipv4v6) {
+        if families.contains(&CellularImsIpFamily::Ipv4v6) {
             for single in [IpFamily::Ipv4, IpFamily::Ipv6] {
                 if !pcscf_order.contains(&single) {
                     pcscf_order.push(single);
@@ -347,13 +347,13 @@ impl ImsConnectionPlan {
     /// an explicit family order.
     pub fn with_catalog_ip_stack_hint(self, ip_stack: &str) -> Self {
         match ip_stack.trim().to_ascii_lowercase().as_str() {
-            "ipv4" => Self::from_preference(VolteIpFamilyPreference::Ipv4First),
-            "ipv6" => Self::from_preference(VolteIpFamilyPreference::Ipv6First),
+            "ipv4" => Self::from_preference(CellularImsIpFamilyPreference::Ipv4First),
+            "ipv6" => Self::from_preference(CellularImsIpFamilyPreference::Ipv6First),
             _ => self,
         }
     }
 
-    pub fn preference(&self) -> VolteIpFamilyPreference {
+    pub fn preference(&self) -> CellularImsIpFamilyPreference {
         self.preference
     }
 
@@ -451,14 +451,14 @@ mod tests {
 
     #[test]
     fn dual_stack_default_leads_with_ipv4v6() {
-        let plan = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
+        let plan = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
         assert_eq!(plan.initial_bearer_attempt(), IpType::Ipv4v6);
         // Fallback honors preference (ipv6 before ipv4), unlike the old always-v4-first.
         assert_eq!(
             plan.single_family_fallbacks(),
             vec![IpType::Ipv6, IpType::Ipv4]
         );
-        let plan4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        let plan4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
         assert_eq!(
             plan4.single_family_fallbacks(),
             vec![IpType::Ipv4, IpType::Ipv6]
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn network_forced_family_collapses_fallback() {
-        let plan = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First);
+        let plan = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
         assert_eq!(
             plan.bearer_fallbacks_after(FailureClass::NetworkForcedIpv4),
             vec![IpType::Ipv4]
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn unclear_failure_uses_preference_order() {
-        let plan = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        let plan = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
         assert_eq!(
             plan.bearer_fallbacks_after(FailureClass::PrefixUnavailable),
             vec![IpType::Ipv4, IpType::Ipv6]
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn catalog_ip_stack_hint_reorders_only_single_family_fallbacks() {
-        let base = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First);
+        let base = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);
         assert_eq!(
             base.clone().with_catalog_ip_stack_hint("ipv6").pdp_types(),
             vec!["IPV4V6", "IPV6", "IP"]
@@ -510,18 +510,18 @@ mod tests {
     /// switching a line to a custom list cannot silently change its behaviour.
     #[test]
     fn from_families_reproduces_the_legacy_presets() {
-        use crate::platform::config::VolteIpFamily as F;
+        use crate::platform::config::CellularImsIpFamily as F;
         for (families, preference) in [
             (
                 vec![F::Ipv4v6, F::Ipv4, F::Ipv6],
-                VolteIpFamilyPreference::Ipv4First,
+                CellularImsIpFamilyPreference::Ipv4First,
             ),
             (
                 vec![F::Ipv4v6, F::Ipv6, F::Ipv4],
-                VolteIpFamilyPreference::Ipv6First,
+                CellularImsIpFamilyPreference::Ipv6First,
             ),
-            (vec![F::Ipv4], VolteIpFamilyPreference::Ipv4Only),
-            (vec![F::Ipv6], VolteIpFamilyPreference::Ipv6Only),
+            (vec![F::Ipv4], CellularImsIpFamilyPreference::Ipv4Only),
+            (vec![F::Ipv6], CellularImsIpFamilyPreference::Ipv6Only),
         ] {
             let from_list = ImsConnectionPlan::from_families(&families);
             let from_preset = ImsConnectionPlan::from_preference(preference);
@@ -543,7 +543,7 @@ mod tests {
     /// express.
     #[test]
     fn from_families_honors_dual_stack_position_and_omission() {
-        use crate::platform::config::VolteIpFamily as F;
+        use crate::platform::config::CellularImsIpFamily as F;
 
         // Single family first, dual-stack as the fallback.
         let v4_then_dual = ImsConnectionPlan::from_families(&[F::Ipv4, F::Ipv4v6]);
@@ -565,17 +565,18 @@ mod tests {
         let empty = ImsConnectionPlan::from_families(&[]);
         assert_eq!(
             empty.pdp_types(),
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::default()).pdp_types()
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::default())
+                .pdp_types()
         );
     }
 
     #[test]
     fn single_only_modes_never_try_the_other_family() {
-        let v6 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6Only);
+        let v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6Only);
         assert_eq!(v6.initial_bearer_attempt(), IpType::Ipv6);
         assert!(v6.single_family_fallbacks().is_empty());
         assert_eq!(v6.pcscf_order(), &[IpFamily::Ipv6]);
-        let v4 = ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4Only);
+        let v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4Only);
         assert_eq!(v4.pdp_types(), vec!["IP"]);
         assert_eq!(v4.pcscf_order(), &[IpFamily::Ipv4]);
     }
@@ -583,11 +584,13 @@ mod tests {
     #[test]
     fn pdp_types_match_legacy_ordered_pdp_types() {
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv6First).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
+                .pdp_types(),
             vec!["IPV4V6", "IPV6", "IP"]
         );
         assert_eq!(
-            ImsConnectionPlan::from_preference(VolteIpFamilyPreference::Ipv4First).pdp_types(),
+            ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First)
+                .pdp_types(),
             vec!["IPV4V6", "IP", "IPV6"]
         );
     }
@@ -747,14 +750,14 @@ mod tests {
     #[test]
     fn bearer_netdev_errors_have_explicit_retry_safety() {
         let runtime_error =
-            VolteError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, "interface=wwan0");
+            CellularImsError::with_detail(code::BEARER_NETDEV_RUNTIME_ERROR, "interface=wwan0");
         let runtime_class = FailureClass::from_error(&runtime_error);
         assert_eq!(runtime_class, FailureClass::BasebandWedged);
         assert!(!runtime_class.is_retryable_family());
         assert!(runtime_class.is_unsafe_to_retry());
 
         for code in [code::BEARER_NETDEV_NOT_UP, code::BEARER_NETDEV_NOT_READY] {
-            let error = VolteError::with_detail(code, "interface=wwan0");
+            let error = CellularImsError::with_detail(code, "interface=wwan0");
             let class = FailureClass::from_error(&error);
             assert_eq!(class, FailureClass::Other);
             assert!(!class.is_retryable_family());
@@ -764,13 +767,13 @@ mod tests {
 
     #[test]
     fn terminal_sip_status_is_not_retried_as_an_ip_family_failure() {
-        let rejection = VolteError::with_detail(
+        let rejection = CellularImsError::with_detail(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS,
             "ims_register_initial_unexpected_status:sip_status=400",
         );
         assert_eq!(FailureClass::from_error(&rejection), FailureClass::Other);
 
-        let timeout = VolteError::with_detail(
+        let timeout = CellularImsError::with_detail(
             code::REGISTER_INITIAL_UNEXPECTED_STATUS,
             "ims_register_initial_receive_failed",
         );

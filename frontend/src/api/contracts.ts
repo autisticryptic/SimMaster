@@ -514,24 +514,24 @@ export interface ModemBinding {
   line_kind?: string
 }
 
-export type VolteProfileSource = 'database' | 'carrier_catalog' | 'derived'
+export type ImsProfileSource = 'database' | 'carrier_catalog' | 'derived'
 
-export interface VolteProfileCandidate {
-  source: VolteProfileSource
+export interface ImsProfileCandidate {
+  source: ImsProfileSource
   /** Missing/null means automatic IMSI/Home-PLMN matching inside the selected source. */
   profile_id?: string | null
 }
 
-export interface VolteProfileSelectionConfig {
+export interface ImsProfileSelectionConfig {
   /** Exactly three ordered logical attempts, stored independently on each physical line. */
-  attempts: VolteProfileCandidate[]
+  attempts: ImsProfileCandidate[]
 }
 
-export interface VolteProfileAttemptResult {
+export interface CellularImsProfileAttemptResult {
   index: number
-  requested_source: VolteProfileSource
+  requested_source: ImsProfileSource
   requested_profile_id?: string
-  effective_source?: VolteProfileSource
+  effective_source?: ImsProfileSource
   effective_profile_id?: string
   fallback_reason?: string
   outcome: string
@@ -539,7 +539,7 @@ export interface VolteProfileAttemptResult {
   at: string
 }
 
-export interface VolteConnectionAttempt {
+export interface CellularImsConnectionAttempt {
   sequence: number
   stage: string
   ip_family?: string
@@ -554,7 +554,7 @@ export interface VolteConnectionAttempt {
   at: string
 }
 
-export interface VolteRuntimeStatus {
+export interface CellularImsRuntimeStatus {
   phase: string
   stage: string
   registration_mode: string
@@ -588,12 +588,12 @@ export interface VolteRuntimeStatus {
   profile_source?: 'carrier_catalog' | 'database' | 'derived'
   profile_fallback_reason?: string
   profile_candidate_index?: number
-  profile_candidate_source?: VolteProfileSource
+  profile_candidate_source?: ImsProfileSource
   profile_candidate_profile_id?: string
-  profile_attempt_results: VolteProfileAttemptResult[]
+  profile_attempt_results: CellularImsProfileAttemptResult[]
   usim_aid?: string
   isim_aid?: string
-  connection_attempts: VolteConnectionAttempt[]
+  connection_attempts: CellularImsConnectionAttempt[]
   recovery_state: 'idle' | 'waiting_modem' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
   recovery_source?: string
   retry_attempt: number
@@ -676,7 +676,7 @@ export interface TrunkProfileResponse {
  * One IMS bearer attempt: dual-stack (`ipv4v6`) or a single family. Dual-stack is
  * an ordinary orderable entry, so a line may try single families before it.
  */
-export type VolteIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
+export type CellularImsIpFamily = 'ipv4v6' | 'ipv4' | 'ipv6'
 
 export interface AutoRestoreConfig {
   initial_delay_secs: number
@@ -689,7 +689,7 @@ export interface LineProfileConfig {
   enabled: boolean
   volte_connection_enabled: boolean
   volte_auto_restore: AutoRestoreConfig
-  volte_profile_selection: VolteProfileSelectionConfig
+  volte_profile_selection: ImsProfileSelectionConfig
   vilte: VilteConfig
   vowifi: LineVowifiConfig
   trunk: TrunkProfileConfig
@@ -701,7 +701,7 @@ export interface LineProfileConfig {
    * Ordered IMS address-family attempt list. Order is the attempt/fallback order; a one-element list means
    * "only that family".
    */
-  volte_ip_families: VolteIpFamily[]
+  volte_ip_families: CellularImsIpFamily[]
   /** Whether the carrier catalog may choose the preferred fallback order. */
   volte_ip_families_auto: boolean
   /**
@@ -967,11 +967,11 @@ export interface CarrierProfileSummary {
   ut_xcap_enabled: boolean
 }
 
-export interface VolteProfileSelectionResponse {
+export interface CellularImsProfileSelectionResponse {
   line_id: string
-  selection: VolteProfileSelectionConfig
+  selection: ImsProfileSelectionConfig
   profiles: StoredCarrierProfile[]
-  runtime: VolteRuntimeStatus
+  runtime: CellularImsRuntimeStatus
   legacy_pinned_profile_id?: string
 }
 
@@ -1046,7 +1046,7 @@ export interface LineVowifiConfig {
   enabled: boolean
   proxy_mode: VowifiProxyMode
   proxy_endpoint: string
-  profile_selection: VolteProfileSelectionConfig
+  profile_selection: ImsProfileSelectionConfig
   auto_restore: AutoRestoreConfig
 }
 
@@ -1099,7 +1099,7 @@ export interface VowifiLineConfigResponse {
   runtime_restore_in_progress: boolean
   runtime_error?: string | null
   matched_profile_id?: string | null
-  matched_profile_source?: VolteProfileSource | null
+  matched_profile_source?: ImsProfileSource | null
   matched_profile_fallback_reason?: string | null
 }
 
@@ -1114,7 +1114,7 @@ export interface AccessNetworkRuntimeStatus {
 
 export interface LineRuntimeStatus {
   modem: ModemBinding
-  volte: VolteRuntimeStatus
+  volte: CellularImsRuntimeStatus
   ims_access_network: AccessNetworkRuntimeStatus
   trunk: TrunkRuntimeStatus
   supplementary: SupplementarySnapshot
@@ -1150,10 +1150,10 @@ export interface MessageCount {
   urgent_old: number
 }
 
-export interface VolteLineControlResponse {
+export interface CellularImsLineControlResponse {
   modem: ModemBinding
   profile: LineProfileConfig
-  runtime: VolteRuntimeStatus
+  runtime: CellularImsRuntimeStatus
 }
 
 export interface UssdResponse {
@@ -1413,7 +1413,7 @@ export interface VilteStatusResponse {
   config: VilteConfig
 }
 
-export interface VolteVoiceStatusResponse {
+export interface CellularImsVoiceStatusResponse {
   line_id: string
   enabled: boolean
   ims_connection_enabled: boolean

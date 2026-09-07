@@ -55,9 +55,9 @@ use crate::{
     hardware::sim::esim::EsimApiError,
     platform::config::{
         AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
-        GithubDownloadProxyConfig, ImsVideoConfig, LineDataProxyConfig, LineProfileConfig,
-        LineVowifiConfig, SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig,
-        VoicePathPolicy, VolteProfileCandidate, VolteProfileSelectionConfig, VolteProfileSource,
+        GithubDownloadProxyConfig, ImsProfileCandidate, ImsProfileSelectionConfig,
+        ImsProfileSource, ImsVideoConfig, LineDataProxyConfig, LineProfileConfig, LineVowifiConfig,
+        SmsPathPolicy, StandaloneSimSlotConfig, TrunkProfileConfig, VoicePathPolicy,
     },
     platform::db::{
         NewVowifiSmsDelivery, NewVowifiSmsPart, SmsMessage, VowifiEsimRestoreEntry,
@@ -3546,7 +3546,7 @@ async fn prepare_line_data_slot_for_volte(
     profile: &LineProfileConfig,
 ) -> Result<
     crate::connectivity::modems::ims::volte::data_slot::DataSlotMode,
-    crate::connectivity::modems::ims::volte::VolteError,
+    crate::connectivity::modems::ims::volte::CellularImsError,
 > {
     use crate::connectivity::modems::ims::volte::data_slot::{
         select_data_slot_mode, DataSlotInputs,
@@ -4632,7 +4632,7 @@ async fn send_sms_over_volte_path(
         line.volte
             .update(|state| {
                 state.recovery_state =
-                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
+                    crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Connecting;
                 state.recovery_source = Some("sms".to_string());
                 state.retry_attempt = 0;
                 state.retry_max = retry_max;
@@ -6380,7 +6380,7 @@ pub async fn get_line_ims_status_handler(
         // Only a genuinely degraded phase is a degradation. A stale `last_error`
         // from an earlier attempt must not mark a healthy registration down.
         degraded_reason: (volte.phase
-            == crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded)
+            == crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded)
             .then(|| {
                 volte
                     .last_error
@@ -7259,7 +7259,7 @@ async fn configure_vowifi_live_overrides(
 async fn select_vowifi_profile_candidate(
     app: &AppState,
     scope: &VowifiScope,
-    candidate: &VolteProfileCandidate,
+    candidate: &ImsProfileCandidate,
 ) -> Result<(), String> {
     let modem_path = scope
         .modem_path()
@@ -7627,15 +7627,15 @@ pub struct VowifiControlToggleRequest {
 // ===================== VoLTE handlers (stage 1 skeleton) =====================
 
 #[derive(Deserialize)]
-pub struct VolteControlToggleRequest {
+pub struct CellularImsControlToggleRequest {
     pub enabled: bool,
 }
 
 #[derive(Debug, serde::Serialize, Default)]
-pub struct VolteLineControlResponse {
+pub struct CellularImsLineControlResponse {
     pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
     pub profile: LineProfileConfig,
-    pub runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+    pub runtime: crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus,
 }
 
 #[derive(Debug, Default, serde::Serialize)]
@@ -8072,8 +8072,8 @@ pub async fn set_line_esim_control_handler(
 fn build_volte_line_response(
     app: &AppState,
     status: crate::services::line_registry::LineRuntimeStatus,
-) -> VolteLineControlResponse {
-    VolteLineControlResponse {
+) -> CellularImsLineControlResponse {
+    CellularImsLineControlResponse {
         // Redacted: the embedded trunk settings carry a Digest secret that must
         // never cross the API boundary.
         profile: app
@@ -8085,9 +8085,12 @@ fn build_volte_line_response(
     }
 }
 
-pub async fn get_volte_lines_handler(
+pub async fn get_cellular_ims_lines_handler(
     State(app): State<AppState>,
-) -> (StatusCode, Json<ApiResponse<Vec<VolteLineControlResponse>>>) {
+) -> (
+    StatusCode,
+    Json<ApiResponse<Vec<CellularImsLineControlResponse>>>,
+) {
     if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -8109,10 +8112,13 @@ pub async fn get_volte_lines_handler(
     )
 }
 
-pub async fn get_volte_line_handler(
+pub async fn get_cellular_ims_line_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsLineControlResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
@@ -8130,32 +8136,32 @@ pub async fn get_volte_line_handler(
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VolteProfileSelectionRequest {
-    pub attempts: Vec<VolteProfileCandidateRequest>,
+pub struct CellularImsProfileSelectionRequest {
+    pub attempts: Vec<CellularImsProfileCandidateRequest>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct VolteProfileCandidateRequest {
+pub struct CellularImsProfileCandidateRequest {
     pub source: String,
     #[serde(default)]
     pub profile_id: Option<String>,
 }
 
-impl TryFrom<VolteProfileSelectionRequest> for VolteProfileSelectionConfig {
+impl TryFrom<CellularImsProfileSelectionRequest> for ImsProfileSelectionConfig {
     type Error = String;
 
-    fn try_from(request: VolteProfileSelectionRequest) -> Result<Self, Self::Error> {
+    fn try_from(request: CellularImsProfileSelectionRequest) -> Result<Self, Self::Error> {
         let attempts = request
             .attempts
             .into_iter()
             .map(|candidate| {
                 let source = match candidate.source.trim() {
-                    "database" => VolteProfileSource::Database,
-                    "carrier_catalog" => VolteProfileSource::CarrierCatalog,
-                    "derived" => VolteProfileSource::Derived,
+                    "database" => ImsProfileSource::Database,
+                    "carrier_catalog" => ImsProfileSource::CarrierCatalog,
+                    "derived" => ImsProfileSource::Derived,
                     _ => return Err("volte_profile_source_unsupported".to_string()),
                 };
-                Ok(VolteProfileCandidate {
+                Ok(ImsProfileCandidate {
                     source,
                     profile_id: candidate.profile_id,
                 })
@@ -8166,23 +8172,23 @@ impl TryFrom<VolteProfileSelectionRequest> for VolteProfileSelectionConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct VolteProfileSelectionResponse {
+pub struct CellularImsProfileSelectionResponse {
     pub line_id: String,
-    pub selection: VolteProfileSelectionConfig,
+    pub selection: ImsProfileSelectionConfig,
     pub profiles: Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>,
-    pub runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+    pub runtime: crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub legacy_pinned_profile_id: Option<String>,
 }
 
 fn assemble_volte_profile_selection_response(
     line_id: &str,
-    selection: VolteProfileSelectionConfig,
+    selection: ImsProfileSelectionConfig,
     profiles: Vec<crate::connectivity::modems::ims::vowifi::profile_store::StoredProfile>,
-    runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
+    runtime: crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus,
     legacy_pinned_profile_id: Option<String>,
-) -> VolteProfileSelectionResponse {
-    VolteProfileSelectionResponse {
+) -> CellularImsProfileSelectionResponse {
+    CellularImsProfileSelectionResponse {
         line_id: line_id.to_string(),
         selection,
         profiles,
@@ -8194,8 +8200,8 @@ fn assemble_volte_profile_selection_response(
 async fn build_volte_profile_selection_response(
     app: &AppState,
     line_id: &str,
-    runtime: crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
-) -> Result<VolteProfileSelectionResponse, String> {
+    runtime: crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus,
+) -> Result<CellularImsProfileSelectionResponse, String> {
     let profiles = profile_store(app).list_for_access(
         crate::connectivity::modems::ims::vowifi::carrier_catalog::CatalogAccessKind::LteEpc,
     )?;
@@ -8216,9 +8222,9 @@ fn validate_and_save_volte_profile_selection(
     config_manager: &ConfigManager,
     store: &crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore,
     line_id: &str,
-    request: VolteProfileSelectionRequest,
+    request: CellularImsProfileSelectionRequest,
 ) -> Result<LineProfileConfig, (StatusCode, String)> {
-    let mut selection = VolteProfileSelectionConfig::try_from(request)
+    let mut selection = ImsProfileSelectionConfig::try_from(request)
         .map_err(|error| (StatusCode::BAD_REQUEST, error))?;
     selection
         .validate()
@@ -8230,10 +8236,10 @@ fn validate_and_save_volte_profile_selection(
         };
         match store.volte_reference_state(candidate.source, profile_id) {
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Ready,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::Ready,
             ) => {}
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::NotLteReady,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::NotLteReady,
             ) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -8244,7 +8250,7 @@ fn validate_and_save_volte_profile_selection(
                 ));
             }
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Missing,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::Missing,
             ) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -8265,7 +8271,7 @@ fn validate_and_save_volte_profile_selection(
 
 fn validate_vowifi_profile_selection_references(
     store: &crate::connectivity::modems::ims::vowifi::profile_store::ProfileStore,
-    selection: &VolteProfileSelectionConfig,
+    selection: &ImsProfileSelectionConfig,
 ) -> Result<(), (StatusCode, String)> {
     let mut normalized = selection.clone();
     normalized
@@ -8277,10 +8283,10 @@ fn validate_vowifi_profile_selection_references(
         };
         match store.vowifi_reference_state(candidate.source, profile_id) {
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Ready,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::Ready,
             ) => {}
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::NotLteReady,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::NotLteReady,
             ) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -8291,7 +8297,7 @@ fn validate_vowifi_profile_selection_references(
                 ));
             }
             Ok(
-                crate::connectivity::modems::ims::vowifi::profile_store::VolteProfileReferenceState::Missing,
+                crate::connectivity::modems::ims::vowifi::profile_store::ImsProfileReferenceState::Missing,
             ) => {
                 return Err((
                     StatusCode::BAD_REQUEST,
@@ -8314,10 +8320,13 @@ fn should_restart_after_volte_profile_selection_put(
     line_present && saved.enabled && saved.volte_connection_enabled
 }
 
-pub async fn get_volte_profile_selection_handler(
+pub async fn get_cellular_ims_profile_selection_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<VolteProfileSelectionResponse>>) {
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsProfileSelectionResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let line = app.line_registry.get(&line_id).await;
     let configured = app
@@ -8333,7 +8342,7 @@ pub async fn get_volte_profile_selection_handler(
     }
     let runtime = match line {
         Some(line) => line.volte.status().await,
-        None => crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default(),
+        None => crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus::default(),
     };
     match build_volte_profile_selection_response(&app, &line_id, runtime).await {
         Ok(response) => (
@@ -8347,11 +8356,14 @@ pub async fn get_volte_profile_selection_handler(
     }
 }
 
-pub async fn set_volte_profile_selection_handler(
+pub async fn set_cellular_ims_profile_selection_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(request): Json<VolteProfileSelectionRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteProfileSelectionResponse>>) {
+    Json(request): Json<CellularImsProfileSelectionRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsProfileSelectionResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let line = app.line_registry.get(&line_id).await;
     if line.is_none()
@@ -8402,7 +8414,7 @@ pub async fn set_volte_profile_selection_handler(
 
     let runtime = match line {
         Some(line) => line.volte.status().await,
-        None => crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default(),
+        None => crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus::default(),
     };
     match build_volte_profile_selection_response(&app, &line_id, runtime).await {
         Ok(response) => (
@@ -8416,11 +8428,14 @@ pub async fn set_volte_profile_selection_handler(
     }
 }
 
-pub async fn set_volte_line_connection_handler(
+pub async fn set_cellular_ims_line_connection_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    Json(payload): Json<CellularImsControlToggleRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsLineControlResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
@@ -8469,7 +8484,7 @@ pub async fn set_volte_line_connection_handler(
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
                 "Saved; device offline",
-                VolteLineControlResponse {
+                CellularImsLineControlResponse {
                     modem: line.binding(),
                     profile: profile.redacted(),
                     runtime: line.volte.status().await,
@@ -8478,8 +8493,8 @@ pub async fn set_volte_line_connection_handler(
         );
     }
     let result: Result<
-        crate::connectivity::modems::ims::volte::VolteRuntimeStatus,
-        crate::connectivity::modems::ims::volte::VolteError,
+        crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus,
+        crate::connectivity::modems::ims::volte::CellularImsError,
     > = if payload.enabled {
         start_line_volte_restore(app.clone(), Arc::clone(&line), "connection_enabled").await;
         Ok(line.volte.status().await)
@@ -8500,7 +8515,7 @@ pub async fn set_volte_line_connection_handler(
         )
     };
     sync_line_video_capabilities(&app).await;
-    let response = VolteLineControlResponse {
+    let response = CellularImsLineControlResponse {
         modem: line.binding(),
         profile: profile.redacted(),
         runtime: line.volte.status().await,
@@ -8522,19 +8537,22 @@ pub async fn set_volte_line_connection_handler(
 /// `families` is this line's non-empty ordered attempt list
 /// (`["ipv4","ipv6"]`, `["ipv6"]`, …).
 #[derive(Debug, serde::Deserialize)]
-pub struct SetVolteIpFamiliesRequest {
-    pub families: Vec<crate::platform::config::VolteIpFamily>,
+pub struct SetCellularImsIpFamiliesRequest {
+    pub families: Vec<crate::platform::config::CellularImsIpFamily>,
 }
 
 /// PUT /api/volte/lines/{line_id}/ip-families
 ///
 /// Persist this line's ordered IMS address-family list. If the line is currently
 /// connected, restart it so the new order takes effect immediately.
-pub async fn set_volte_line_ip_families_handler(
+pub async fn set_cellular_ims_line_ip_families_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<SetVolteIpFamiliesRequest>,
-) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+    Json(payload): Json<SetCellularImsIpFamiliesRequest>,
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsLineControlResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
@@ -8569,7 +8587,7 @@ pub async fn set_volte_line_ip_families_handler(
         }
         start_line_volte_restore(app.clone(), Arc::clone(&line), "ip_families_changed").await;
     }
-    let response = VolteLineControlResponse {
+    let response = CellularImsLineControlResponse {
         modem: line.binding(),
         profile: profile.redacted(),
         runtime: line.volte.status().await,
@@ -8583,10 +8601,13 @@ pub async fn set_volte_line_ip_families_handler(
 /// Start a fresh three-attempt recovery batch without changing the persisted
 /// VoLTE switch.  The response is immediate; progress is returned by the normal
 /// line status endpoint and automatic polling.
-pub async fn retry_volte_line_handler(
+pub async fn retry_cellular_ims_line_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<VolteLineControlResponse>>) {
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsLineControlResponse>>,
+) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
@@ -8752,7 +8773,7 @@ pub async fn set_line_trunk_handler(
 pub async fn set_line_trunk_enabled_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-    Json(payload): Json<VolteControlToggleRequest>,
+    Json(payload): Json<CellularImsControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let Some(line) = app.line_registry.get(&line_id).await else {
@@ -8844,7 +8865,7 @@ async fn line_ims_access_decision_assuming(
     assume_available: Option<crate::connectivity::core::ims_access::ImsAccess>,
 ) -> crate::connectivity::core::ims_access::ImsAccessDecision {
     use crate::connectivity::core::ims_access::{decide, ImsAccess, ImsAccessInputs};
-    use crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState;
+    use crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState;
 
     let binding = line.binding();
     let line_id = &binding.line_id;
@@ -8855,7 +8876,7 @@ async fn line_ims_access_decision_assuming(
         crate::connectivity::modems::ims::vowifi::operator::operator_link_for_line(line_id).is_available()
         && crate::connectivity::modems::ims::vowifi::live::live_ims_registration_valid_for_line(line_id).await;
     let cellular_retryable = !cellular.manual_retry_available
-        && cellular.recovery_state != VolteRecoveryState::Exhausted
+        && cellular.recovery_state != CellularImsRecoveryState::Exhausted
         && !line.baseband_wedge_permanent()
         && line.baseband_wedge_remaining().is_none();
     let radio_ready = matches!(
@@ -8912,13 +8933,13 @@ async fn line_has_call_blocking_ims_switch(app: &AppState, line_id: &str) -> boo
 /// generic disconnect resets that budget; doing so here would immediately make
 /// the failed primary eligible again and steal admission from its fallback.
 fn preserve_exhausted_volte_recovery_after_policy_park(
-    previous: &crate::connectivity::modems::ims::volte::runtime::VolteSnapshot,
-    parked: &mut crate::connectivity::modems::ims::volte::runtime::VolteSnapshot,
+    previous: &crate::connectivity::modems::ims::volte::runtime::CellularImsSnapshot,
+    parked: &mut crate::connectivity::modems::ims::volte::runtime::CellularImsSnapshot,
 ) {
-    use crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState;
+    use crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState;
     if !previous.registered()
         && (previous.manual_retry_available
-            || previous.recovery_state == VolteRecoveryState::Exhausted)
+            || previous.recovery_state == CellularImsRecoveryState::Exhausted)
     {
         parked.recovery_state = previous.recovery_state;
         parked.manual_retry_available = previous.manual_retry_available;
@@ -9082,7 +9103,7 @@ async fn sync_line_video_capabilities(app: &AppState) {
 /// surfaces instead of pre-emptively refusing locally. Media capabilities come
 /// from the detected device driver.
 #[derive(Debug, serde::Serialize, Default)]
-pub struct VolteVoiceStatusResponse {
+pub struct CellularImsVoiceStatusResponse {
     pub line_id: String,
     pub enabled: bool,
     pub ims_connection_enabled: bool,
@@ -9092,7 +9113,7 @@ pub struct VolteVoiceStatusResponse {
     pub local_audio_capable: bool,
 }
 
-impl VolteVoiceStatusResponse {
+impl CellularImsVoiceStatusResponse {
     fn build(
         line_id: String,
         line_enabled: bool,
@@ -9114,10 +9135,10 @@ impl VolteVoiceStatusResponse {
 async fn current_volte_voice_status(
     app: &AppState,
     line: &crate::services::line_registry::LineRuntime,
-) -> VolteVoiceStatusResponse {
+) -> CellularImsVoiceStatusResponse {
     let line_id = line.binding().line_id;
     let registered = line.volte.status().await.registered;
-    VolteVoiceStatusResponse::build(
+    CellularImsVoiceStatusResponse::build(
         line_id,
         line_volte_enabled(app, line),
         registered,
@@ -9125,10 +9146,13 @@ async fn current_volte_voice_status(
     )
 }
 
-pub async fn get_volte_call_status_handler(
+pub async fn get_cellular_ims_call_status_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
-) -> (StatusCode, Json<ApiResponse<VolteVoiceStatusResponse>>) {
+) -> (
+    StatusCode,
+    Json<ApiResponse<CellularImsVoiceStatusResponse>>,
+) {
     let Some(line) = resolve_control_line(&app, &line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -10046,9 +10070,9 @@ async fn start_line_volte_restore(
         );
         line.volte
             .update(|state| {
-                state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
                 state.recovery_state =
-                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
+                    crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Exhausted;
                 state.manual_retry_available = false;
                 state.next_retry_at = None;
                 state.last_error = Some(
@@ -10087,7 +10111,7 @@ async fn start_line_volte_restore(
     line.volte
         .update(|state| {
             state.recovery_state =
-                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
+                crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Connecting;
             state.recovery_source = Some(source.to_string());
             state.retry_attempt = 0;
             state.retry_max = retry_max;
@@ -10130,8 +10154,8 @@ fn line_volte_restore_enabled(
 fn volte_profile_restart_is_current(
     expected_generation: u64,
     current_generation: u64,
-    expected_selection: &VolteProfileSelectionConfig,
-    current_selection: &VolteProfileSelectionConfig,
+    expected_selection: &ImsProfileSelectionConfig,
+    current_selection: &ImsProfileSelectionConfig,
     restore_enabled: bool,
     line_present: bool,
 ) -> bool {
@@ -10149,7 +10173,7 @@ fn volte_profile_restart_is_current(
 fn schedule_line_volte_profile_selection_restart(
     app: AppState,
     line: Arc<crate::services::line_registry::LineRuntime>,
-    expected_selection: VolteProfileSelectionConfig,
+    expected_selection: ImsProfileSelectionConfig,
     expected_generation: u64,
 ) {
     tokio::spawn(async move {
@@ -10201,7 +10225,7 @@ fn schedule_line_volte_profile_selection_restart(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VolteProfileBatchAction {
+enum CellularImsProfileBatchAction {
     Succeeded,
     Continue,
     WaitForNetwork,
@@ -10214,26 +10238,26 @@ fn volte_profile_batch_action(
     generation_current: bool,
     attempt: u32,
     max_attempts: u32,
-    error: Option<&crate::connectivity::modems::ims::volte::VolteError>,
-) -> VolteProfileBatchAction {
+    error: Option<&crate::connectivity::modems::ims::volte::CellularImsError>,
+) -> CellularImsProfileBatchAction {
     if !generation_current {
-        return VolteProfileBatchAction::Cancelled;
+        return CellularImsProfileBatchAction::Cancelled;
     }
     let Some(error) = error else {
-        return VolteProfileBatchAction::Succeeded;
+        return CellularImsProfileBatchAction::Succeeded;
     };
     if error.code()
         == crate::connectivity::modems::ims::volte::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED
     {
-        VolteProfileBatchAction::WaitForNetwork
+        CellularImsProfileBatchAction::WaitForNetwork
     } else if crate::connectivity::modems::ims::volte::plan::FailureClass::from_error(error)
         == crate::connectivity::modems::ims::volte::plan::FailureClass::BasebandWedged
     {
-        VolteProfileBatchAction::AbortUnsafe
+        CellularImsProfileBatchAction::AbortUnsafe
     } else if attempt < max_attempts {
-        VolteProfileBatchAction::Continue
+        CellularImsProfileBatchAction::Continue
     } else {
-        VolteProfileBatchAction::Exhausted
+        CellularImsProfileBatchAction::Exhausted
     }
 }
 
@@ -10274,10 +10298,10 @@ async fn wait_for_line_modem(
         }
         line.volte
             .update(|state| {
-                state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
-                state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
+                state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
+                state.stage = crate::connectivity::modems::ims::volte::runtime::CellularImsStage::Modem;
                 state.recovery_state =
-                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+                    crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::WaitingModem;
                 state.last_error = Some(format!(
                     "volte_modem_missing_wait:{}/{}",
                     poll + 1,
@@ -10305,9 +10329,9 @@ async fn wait_for_line_modem(
     // let the inventory reconciler start a fresh batch after hotplug.
     line.volte
         .update(|state| {
-            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+            state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
             state.recovery_state =
-                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+                crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::WaitingModem;
             state.manual_retry_available = false;
             state.next_retry_at = None;
             state.last_error = Some("volte_line_not_present".to_string());
@@ -10328,7 +10352,7 @@ async fn run_line_volte_restore_batch(
             line.volte
                 .update(|state| {
                     state.recovery_state =
-                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
+                        crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -10399,7 +10423,7 @@ async fn run_line_volte_restore_batch(
             line.volte
                 .update(|state| {
                     state.recovery_state =
-                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
+                        crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Idle;
                     state.recovery_source = None;
                     state.next_retry_at = None;
                     state.manual_retry_available = false;
@@ -10411,16 +10435,17 @@ async fn run_line_volte_restore_batch(
         line.volte.begin_profile_attempt(attempt, candidate).await;
         let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
         if let Err(error) = refreshed {
-            let attempt_error = crate::connectivity::modems::ims::volte::VolteError::with_detail(
-                "volte_modem_refresh_failed",
-                error.to_string(),
-            );
+            let attempt_error =
+                crate::connectivity::modems::ims::volte::CellularImsError::with_detail(
+                    "volte_modem_refresh_failed",
+                    error.to_string(),
+                );
             line.volte
                 .update(|state| {
-                    state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
-                    state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Modem;
+                    state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
+                    state.stage = crate::connectivity::modems::ims::volte::runtime::CellularImsStage::Modem;
                     state.recovery_state =
-                        crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::WaitingModem;
+                        crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::WaitingModem;
                     state.last_error = Some(attempt_error.to_string());
                     state.next_retry_at =
                         Some(volte_next_retry_at(VOLTE_MODEM_MISSING_POLL_DELAY_SECS));
@@ -10451,7 +10476,7 @@ async fn run_line_volte_restore_batch(
         }
         let binding = line.binding();
         let device =
-            match crate::connectivity::modems::ims::volte::live::VolteDeviceBinding::from_modem(
+            match crate::connectivity::modems::ims::volte::live::CellularImsDeviceBinding::from_modem(
                 &binding,
             ) {
                 Ok(device) => device,
@@ -10468,7 +10493,7 @@ async fn run_line_volte_restore_batch(
         line.volte
             .update(|state| {
                 state.recovery_state =
-                    crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Connecting;
+                    crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Connecting;
                 state.recovery_source = Some(source.to_string());
                 state.retry_attempt = attempt;
                 state.next_retry_at = None;
@@ -10482,7 +10507,7 @@ async fn run_line_volte_restore_batch(
             match prepare_line_data_slot_for_volte(app, line, &profile).await {
                 Ok(data_slot_mode) => match ims_override_for_line(app, &binding.line_id).await {
                     Err(error) => Err(
-                        crate::connectivity::modems::ims::volte::VolteError::with_detail(
+                        crate::connectivity::modems::ims::volte::CellularImsError::with_detail(
                             "volte_sim_override_not_ready",
                             error,
                         ),
@@ -10528,7 +10553,7 @@ async fn run_line_volte_restore_batch(
             max_attempts,
             result.as_ref().err(),
         );
-        if batch_action == VolteProfileBatchAction::Cancelled {
+        if batch_action == CellularImsProfileBatchAction::Cancelled {
             return;
         }
         match result {
@@ -10543,7 +10568,7 @@ async fn run_line_volte_restore_batch(
                 line.volte
                     .update(|state| {
                         state.recovery_state =
-                            crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Registered;
+                            crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Registered;
                         state.manual_retry_available = false;
                         state.next_retry_at = None;
                     })
@@ -10577,14 +10602,14 @@ async fn run_line_volte_restore_batch(
                 // database/catalog/derived attempts. Leave automatic recovery
                 // enabled; the periodic restore loop will resume after the
                 // modem reaches registered/connected.
-                if batch_action == VolteProfileBatchAction::WaitForNetwork {
+                if batch_action == CellularImsProfileBatchAction::WaitForNetwork {
                     let delay = 30;
                     line.volte
                         .update(|state| {
-                            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
-                            state.stage = crate::connectivity::modems::ims::volte::runtime::VolteStage::Radio;
+                            state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
+                            state.stage = crate::connectivity::modems::ims::volte::runtime::CellularImsStage::Radio;
                             state.recovery_state =
-                                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Idle;
+                                crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Idle;
                             state.manual_retry_available = false;
                             state.next_retry_at = Some(volte_next_retry_at(delay));
                             state.last_error = Some(error.to_string());
@@ -10597,7 +10622,7 @@ async fn run_line_volte_restore_batch(
                 // activation against it can escalate to a modem subsystem
                 // restart and take the whole device down, so stop the batch and
                 // wait for an explicit operator retry instead.
-                if batch_action == VolteProfileBatchAction::AbortUnsafe {
+                if batch_action == CellularImsProfileBatchAction::AbortUnsafe {
                     // The crash this abort guards against re-enumerates the
                     // modem, and that hotplug resets the VoLTE snapshot. Record
                     // the cooldown on the line instead, where it survives.
@@ -10618,9 +10643,9 @@ async fn run_line_volte_restore_batch(
                     );
                     line.volte
                         .update(|state| {
-                            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+                            state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
                             state.recovery_state =
-                                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
+                                crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Exhausted;
                             state.manual_retry_available = !permanent;
                             state.next_retry_at = None;
                             state.last_error = Some(format!("volte_baseband_wedged:{error}"));
@@ -10629,7 +10654,7 @@ async fn run_line_volte_restore_batch(
                         .await;
                     return;
                 }
-                if batch_action == VolteProfileBatchAction::Continue {
+                if batch_action == CellularImsProfileBatchAction::Continue {
                     let delay = restore_policy.retry_delay_secs.clamp(5, 180);
                     line.volte
                         .update(|state| state.next_retry_at = Some(volte_next_retry_at(delay)))
@@ -10650,9 +10675,9 @@ async fn run_line_volte_restore_batch(
 
     line.volte
         .update(|state| {
-            state.phase = crate::connectivity::modems::ims::volte::runtime::VoltePhase::Degraded;
+            state.phase = crate::connectivity::modems::ims::volte::runtime::CellularImsPhase::Degraded;
             state.recovery_state =
-                crate::connectivity::modems::ims::volte::runtime::VolteRecoveryState::Exhausted;
+                crate::connectivity::modems::ims::volte::runtime::CellularImsRecoveryState::Exhausted;
             state.manual_retry_available = true;
             state.next_retry_at = None;
             if state.last_error.is_none() {
@@ -13882,16 +13907,18 @@ mod tests {
     #[test]
     fn coexistence_parking_preserves_exhausted_cellular_budget_for_wlan_fallback() {
         use crate::connectivity::core::ims_access::{decide, ImsAccessInputs, ImsAccessPreference};
-        use crate::connectivity::modems::ims::volte::runtime::{VolteRecoveryState, VolteSnapshot};
-        let mut failed = VolteSnapshot::default();
-        failed.recovery_state = VolteRecoveryState::Exhausted;
+        use crate::connectivity::modems::ims::volte::runtime::{
+            CellularImsRecoveryState, CellularImsSnapshot,
+        };
+        let mut failed = CellularImsSnapshot::default();
+        failed.recovery_state = CellularImsRecoveryState::Exhausted;
         failed.manual_retry_available = true;
         failed.retry_attempt = 3;
         failed.retry_max = 3;
         failed.last_error = Some("volte_profile_attempts_exhausted".to_string());
-        let mut parked = VolteSnapshot::default();
+        let mut parked = CellularImsSnapshot::default();
         preserve_exhausted_volte_recovery_after_policy_park(&failed, &mut parked);
-        assert_eq!(parked.recovery_state, VolteRecoveryState::Exhausted);
+        assert_eq!(parked.recovery_state, CellularImsRecoveryState::Exhausted);
         assert!(parked.manual_retry_available);
         assert_eq!(parked.retry_attempt, 3);
         assert_eq!(parked.last_error, failed.last_error);
@@ -13903,7 +13930,7 @@ mod tests {
                 cellular_enabled: true,
                 wlan_enabled: true,
                 cellular_available: !parked.manual_retry_available
-                    && parked.recovery_state != VolteRecoveryState::Exhausted,
+                    && parked.recovery_state != CellularImsRecoveryState::Exhausted,
                 wlan_available: true,
                 preference,
                 ..Default::default()
@@ -13916,14 +13943,14 @@ mod tests {
     #[test]
     fn coexistence_parking_a_healthy_cellular_leg_does_not_exhaust_it() {
         use crate::connectivity::modems::ims::volte::runtime::{
-            VoltePhase, VolteRecoveryState, VolteSnapshot,
+            CellularImsPhase, CellularImsRecoveryState, CellularImsSnapshot,
         };
-        let mut healthy = VolteSnapshot::default();
-        healthy.phase = VoltePhase::Registered;
-        healthy.recovery_state = VolteRecoveryState::Registered;
-        let mut parked = VolteSnapshot::default();
+        let mut healthy = CellularImsSnapshot::default();
+        healthy.phase = CellularImsPhase::Registered;
+        healthy.recovery_state = CellularImsRecoveryState::Registered;
+        let mut parked = CellularImsSnapshot::default();
         preserve_exhausted_volte_recovery_after_policy_park(&healthy, &mut parked);
-        assert_eq!(parked.recovery_state, VolteRecoveryState::Idle);
+        assert_eq!(parked.recovery_state, CellularImsRecoveryState::Idle);
         assert!(!parked.manual_retry_available);
         assert!(!parked.registered());
     }
@@ -13996,8 +14023,11 @@ mod tests {
         let _ = std::fs::remove_file(catalog_path);
     }
 
-    fn candidate_request(source: &str, profile_id: Option<&str>) -> VolteProfileCandidateRequest {
-        VolteProfileCandidateRequest {
+    fn candidate_request(
+        source: &str,
+        profile_id: Option<&str>,
+    ) -> CellularImsProfileCandidateRequest {
+        CellularImsProfileCandidateRequest {
             source: source.to_string(),
             profile_id: profile_id.map(str::to_string),
         }
@@ -14005,7 +14035,7 @@ mod tests {
 
     #[test]
     fn volte_profile_selection_request_rejects_unknown_source() {
-        let request = VolteProfileSelectionRequest {
+        let request = CellularImsProfileSelectionRequest {
             attempts: vec![
                 candidate_request("database", None),
                 candidate_request("downloaded", None),
@@ -14014,7 +14044,7 @@ mod tests {
         };
 
         assert_eq!(
-            VolteProfileSelectionConfig::try_from(request),
+            ImsProfileSelectionConfig::try_from(request),
             Err("volte_profile_source_unsupported".to_string())
         );
     }
@@ -14022,7 +14052,7 @@ mod tests {
     #[test]
     fn volte_profile_selection_request_validates_shape_before_profile_lookup() {
         let mut derived_with_id =
-            VolteProfileSelectionConfig::try_from(VolteProfileSelectionRequest {
+            ImsProfileSelectionConfig::try_from(CellularImsProfileSelectionRequest {
                 attempts: vec![
                     candidate_request("database", None),
                     candidate_request("carrier_catalog", None),
@@ -14035,13 +14065,14 @@ mod tests {
             Err("volte_derived_profile_id_not_allowed".to_string())
         );
 
-        let mut wrong_count = VolteProfileSelectionConfig::try_from(VolteProfileSelectionRequest {
-            attempts: vec![
-                candidate_request("database", None),
-                candidate_request("derived", None),
-            ],
-        })
-        .expect("supported source names");
+        let mut wrong_count =
+            ImsProfileSelectionConfig::try_from(CellularImsProfileSelectionRequest {
+                attempts: vec![
+                    candidate_request("database", None),
+                    candidate_request("derived", None),
+                ],
+            })
+            .expect("supported source names");
         assert_eq!(
             wrong_count.validate(),
             Err("volte_profile_attempt_count_invalid".to_string())
@@ -14050,10 +14081,11 @@ mod tests {
 
     #[test]
     fn volte_profile_selection_response_preserves_get_payload_fields() {
-        let mut runtime = crate::connectivity::modems::ims::volte::VolteRuntimeStatus::default();
+        let mut runtime =
+            crate::connectivity::modems::ims::volte::CellularImsRuntimeStatus::default();
         runtime.profile_id = Some("effective-profile".to_string());
         runtime.profile_source = Some("database".to_string());
-        let selection = VolteProfileSelectionConfig::default();
+        let selection = ImsProfileSelectionConfig::default();
         let response = assemble_volte_profile_selection_response(
             "line-0123456789abcdef0123456789abcdef",
             selection.clone(),
@@ -14102,7 +14134,7 @@ mod tests {
             &config_manager,
             &store,
             line_a,
-            VolteProfileSelectionRequest {
+            CellularImsProfileSelectionRequest {
                 attempts: vec![
                     candidate_request("database", Some("test-v7-23433")),
                     candidate_request("carrier_catalog", Some("test-v7-23433")),
@@ -14114,11 +14146,11 @@ mod tests {
 
         assert_eq!(
             saved.volte_profile_selection.attempts[0].source,
-            VolteProfileSource::Database
+            ImsProfileSource::Database
         );
         assert_eq!(
             saved.volte_profile_selection.attempts[1].source,
-            VolteProfileSource::CarrierCatalog
+            ImsProfileSource::CarrierCatalog
         );
         assert_eq!(
             saved.volte_profile_selection.attempts[0]
@@ -14132,7 +14164,7 @@ mod tests {
         );
         assert_eq!(
             config_manager.get_line_volte_profile_selection(line_b),
-            VolteProfileSelectionConfig::default(),
+            ImsProfileSelectionConfig::default(),
             "a PUT for one physical line must not alter another line"
         );
 
@@ -14148,7 +14180,7 @@ mod tests {
             &config_manager,
             &store,
             line_id,
-            VolteProfileSelectionRequest {
+            CellularImsProfileSelectionRequest {
                 attempts: vec![
                     candidate_request("database", Some("missing-user-profile")),
                     candidate_request("carrier_catalog", None),
@@ -14177,7 +14209,7 @@ mod tests {
             &config_manager,
             &store,
             line_id,
-            VolteProfileSelectionRequest {
+            CellularImsProfileSelectionRequest {
                 attempts: vec![
                     candidate_request("database", None),
                     candidate_request("carrier_catalog", Some("test-v7-23433")),
@@ -14223,7 +14255,7 @@ mod tests {
 
     #[test]
     fn volte_profile_restart_waiter_is_bound_to_generation_selection_and_line_state() {
-        let expected = VolteProfileSelectionConfig::default();
+        let expected = ImsProfileSelectionConfig::default();
         let mut changed = expected.clone();
         changed.attempts.swap(0, 1);
 
@@ -14245,7 +14277,7 @@ mod tests {
     }
 
     #[derive(Clone, Copy)]
-    enum MockVolteProfileOutcome {
+    enum MockCellularImsProfileOutcome {
         Success,
         Failure,
         NetworkNotRegistered,
@@ -14253,33 +14285,33 @@ mod tests {
     }
 
     fn simulate_volte_profile_batch(
-        outcomes: &[MockVolteProfileOutcome],
-    ) -> (Vec<usize>, VolteProfileBatchAction) {
+        outcomes: &[MockCellularImsProfileOutcome],
+    ) -> (Vec<usize>, CellularImsProfileBatchAction) {
         let max_attempts = outcomes.len() as u32;
         let mut attempted = Vec::new();
         for (offset, outcome) in outcomes.iter().enumerate() {
             let attempt = offset as u32 + 1;
             attempted.push(attempt as usize);
             let error = match outcome {
-                MockVolteProfileOutcome::Success => None,
-                MockVolteProfileOutcome::Failure => Some(
-                    crate::connectivity::modems::ims::volte::VolteError::new(
+                MockCellularImsProfileOutcome::Success => None,
+                MockCellularImsProfileOutcome::Failure => Some(
+                    crate::connectivity::modems::ims::volte::CellularImsError::new(
                         crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
                     ),
                 ),
-                MockVolteProfileOutcome::NetworkNotRegistered => Some(
-                    crate::connectivity::modems::ims::volte::VolteError::new(
+                MockCellularImsProfileOutcome::NetworkNotRegistered => Some(
+                    crate::connectivity::modems::ims::volte::CellularImsError::new(
                         crate::connectivity::modems::ims::volte::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED,
                     ),
                 ),
-                MockVolteProfileOutcome::BasebandWedged => Some(
-                    crate::connectivity::modems::ims::volte::VolteError::new(
+                MockCellularImsProfileOutcome::BasebandWedged => Some(
+                    crate::connectivity::modems::ims::volte::CellularImsError::new(
                         crate::connectivity::modems::ims::volte::errors::code::BEARER_NETDEV_RUNTIME_ERROR,
                     ),
                 ),
             };
             let action = volte_profile_batch_action(true, attempt, max_attempts, error.as_ref());
-            if action != VolteProfileBatchAction::Continue {
+            if action != CellularImsProfileBatchAction::Continue {
                 return (attempted, action);
             }
         }
@@ -14290,27 +14322,27 @@ mod tests {
     fn volte_profile_batch_advances_in_order_until_success_or_exhaustion() {
         assert_eq!(
             simulate_volte_profile_batch(&[
-                MockVolteProfileOutcome::Failure,
-                MockVolteProfileOutcome::Success,
-                MockVolteProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Success,
+                MockCellularImsProfileOutcome::Failure,
             ]),
-            (vec![1, 2], VolteProfileBatchAction::Succeeded)
+            (vec![1, 2], CellularImsProfileBatchAction::Succeeded)
         );
         assert_eq!(
             simulate_volte_profile_batch(&[
-                MockVolteProfileOutcome::Failure,
-                MockVolteProfileOutcome::Failure,
-                MockVolteProfileOutcome::Success,
+                MockCellularImsProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Success,
             ]),
-            (vec![1, 2, 3], VolteProfileBatchAction::Succeeded)
+            (vec![1, 2, 3], CellularImsProfileBatchAction::Succeeded)
         );
         assert_eq!(
             simulate_volte_profile_batch(&[
-                MockVolteProfileOutcome::Failure,
-                MockVolteProfileOutcome::Failure,
-                MockVolteProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Failure,
+                MockCellularImsProfileOutcome::Failure,
             ]),
-            (vec![1, 2, 3], VolteProfileBatchAction::Exhausted)
+            (vec![1, 2, 3], CellularImsProfileBatchAction::Exhausted)
         );
     }
 
@@ -14318,18 +14350,18 @@ mod tests {
     fn volte_profile_batch_aborts_on_baseband_wedge_or_generation_change() {
         assert_eq!(
             simulate_volte_profile_batch(&[
-                MockVolteProfileOutcome::BasebandWedged,
-                MockVolteProfileOutcome::Success,
-                MockVolteProfileOutcome::Success,
+                MockCellularImsProfileOutcome::BasebandWedged,
+                MockCellularImsProfileOutcome::Success,
+                MockCellularImsProfileOutcome::Success,
             ]),
-            (vec![1], VolteProfileBatchAction::AbortUnsafe)
+            (vec![1], CellularImsProfileBatchAction::AbortUnsafe)
         );
-        let error = crate::connectivity::modems::ims::volte::VolteError::new(
+        let error = crate::connectivity::modems::ims::volte::CellularImsError::new(
             crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
         );
         assert_eq!(
             volte_profile_batch_action(false, 1, 3, Some(&error)),
-            VolteProfileBatchAction::Cancelled
+            CellularImsProfileBatchAction::Cancelled
         );
     }
 
@@ -14337,11 +14369,11 @@ mod tests {
     fn volte_profile_batch_waits_for_cellular_registration_without_fallback() {
         assert_eq!(
             simulate_volte_profile_batch(&[
-                MockVolteProfileOutcome::NetworkNotRegistered,
-                MockVolteProfileOutcome::Success,
-                MockVolteProfileOutcome::Success,
+                MockCellularImsProfileOutcome::NetworkNotRegistered,
+                MockCellularImsProfileOutcome::Success,
+                MockCellularImsProfileOutcome::Success,
             ]),
-            (vec![1], VolteProfileBatchAction::WaitForNetwork)
+            (vec![1], CellularImsProfileBatchAction::WaitForNetwork)
         );
     }
 
@@ -14455,13 +14487,13 @@ mod tests {
             local_audio_capable: false,
             local_video_capable: false,
         };
-        let enabled = VolteVoiceStatusResponse::build(
+        let enabled = CellularImsVoiceStatusResponse::build(
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             true,
             capabilities,
         );
-        let disabled = VolteVoiceStatusResponse::build(
+        let disabled = CellularImsVoiceStatusResponse::build(
             "line-fedcba9876543210fedcba9876543210".to_string(),
             false,
             false,
@@ -14483,7 +14515,7 @@ mod tests {
         // locally. MMTEL voice is the reason this project registers IMS, so the
         // only local precondition is the connection itself; a carrier that
         // withholds voice says so with a SIP error.
-        let connected = VolteVoiceStatusResponse::build(
+        let connected = CellularImsVoiceStatusResponse::build(
             "line-0123456789abcdef0123456789abcdef".to_string(),
             true,
             false,

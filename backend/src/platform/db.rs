@@ -257,7 +257,7 @@ pub struct OwnNumberCacheEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-pub struct VolteRefreshStatsEntry {
+pub struct CellularImsRefreshStatsEntry {
     pub refresh_count: u64,
     pub last_refresh_at: Option<String>,
     pub updated_at: String,
@@ -5753,7 +5753,10 @@ impl Database {
 
     // ==================== VoLTE REGISTER refresh stats ====================
 
-    pub fn get_volte_refresh_stats(&self, line_id: &str) -> Result<Option<VolteRefreshStatsEntry>> {
+    pub fn get_volte_refresh_stats(
+        &self,
+        line_id: &str,
+    ) -> Result<Option<CellularImsRefreshStatsEntry>> {
         let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         conn.query_row(
@@ -5763,7 +5766,7 @@ impl Database {
             params![line_id],
             |row| {
                 let refresh_count = row.get::<_, i64>(0)?.max(0) as u64;
-                Ok(VolteRefreshStatsEntry {
+                Ok(CellularImsRefreshStatsEntry {
                     refresh_count,
                     last_refresh_at: row.get(1)?,
                     updated_at: row.get(2)?,
@@ -5780,7 +5783,7 @@ impl Database {
         &self,
         line_id: &str,
         last_refresh_at: &str,
-    ) -> Result<VolteRefreshStatsEntry> {
+    ) -> Result<CellularImsRefreshStatsEntry> {
         let line_id = required_line_id(line_id)?;
         let last_refresh_at = last_refresh_at.trim();
         if last_refresh_at.is_empty() {
@@ -5817,7 +5820,7 @@ impl Database {
             params![line_id],
             |row| {
                 let refresh_count = row.get::<_, i64>(0)?.max(0) as u64;
-                Ok(VolteRefreshStatsEntry {
+                Ok(CellularImsRefreshStatsEntry {
                     refresh_count,
                     last_refresh_at: row.get(1)?,
                     updated_at: row.get(2)?,

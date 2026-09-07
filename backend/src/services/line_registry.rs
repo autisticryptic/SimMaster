@@ -20,7 +20,9 @@ use crate::{
     connectivity::core::access_network::{
         AccessNetworkRuntimeStatus, ImsAccessNetworkRuntime, DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE,
     },
-    connectivity::modems::ims::volte::{live::VolteLiveHandle, VolteRuntime, VolteRuntimeStatus},
+    connectivity::modems::ims::volte::{
+        live::CellularImsLiveHandle, CellularImsRuntime, CellularImsRuntimeStatus,
+    },
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
     hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
     hardware::cellular::modem_manager::{discover_modem_bindings, ModemBinding},
@@ -117,8 +119,8 @@ pub struct LineRuntime {
     /// namespace (`setns`) and hosts the UE's IMS/data
     /// sockets, so identical IPs/P-CSCF/xfrm state can never cross lines.
     pub ue_worker: UeWorkerHandle,
-    pub volte: Arc<VolteRuntime>,
-    pub volte_live: VolteLiveHandle,
+    pub volte: Arc<CellularImsRuntime>,
+    pub volte_live: CellularImsLiveHandle,
     /// Serving-cell identity owned by this physical line and shared by its
     /// VoLTE and VoWiFi REGISTER builders. No process-global lookup is used.
     pub ims_access_network: ImsAccessNetworkRuntime,
@@ -173,8 +175,8 @@ pub struct LineRuntime {
 impl LineRuntime {
     fn new(
         binding: ModemBinding,
-        volte: Arc<VolteRuntime>,
-        volte_live: VolteLiveHandle,
+        volte: Arc<CellularImsRuntime>,
+        volte_live: CellularImsLiveHandle,
         voice_policy: VoicePathPolicy,
     ) -> Self {
         Self::new_for_device(
@@ -188,8 +190,8 @@ impl LineRuntime {
 
     fn new_for_device(
         binding: ModemBinding,
-        volte: Arc<VolteRuntime>,
-        volte_live: VolteLiveHandle,
+        volte: Arc<CellularImsRuntime>,
+        volte_live: CellularImsLiveHandle,
         voice_policy: VoicePathPolicy,
         device_kind: DeviceKind,
     ) -> Self {
@@ -445,7 +447,7 @@ pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
     pub ue: UeContext,
     pub ue_worker: UeWorkerStatus,
-    pub volte: VolteRuntimeStatus,
+    pub volte: CellularImsRuntimeStatus,
     pub ims_access_network: AccessNetworkRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,
     pub supplementary: SupplementarySnapshot,
@@ -796,8 +798,8 @@ impl LineRuntimeRegistry {
                     continue;
                 }
 
-                let runtime = Arc::new(VolteRuntime::new());
-                let live = VolteLiveHandle::new();
+                let runtime = Arc::new(CellularImsRuntime::new());
+                let live = CellularImsLiveHandle::new();
                 let line_id = binding.line_id.clone();
                 let voice_policy = self
                     .config_manager
@@ -1413,11 +1415,11 @@ mod tests {
 
     #[tokio::test]
     async fn line_status_keeps_runtime_and_binding_together() {
-        let runtime = Arc::new(VolteRuntime::new());
+        let runtime = Arc::new(CellularImsRuntime::new());
         let line = LineRuntime::new(
             binding("line-a", true),
             runtime,
-            VolteLiveHandle::new(),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let status = line.status().await;
@@ -1429,11 +1431,11 @@ mod tests {
 
     #[tokio::test]
     async fn absent_transition_does_not_change_stable_identity() {
-        let runtime = Arc::new(VolteRuntime::new());
+        let runtime = Arc::new(CellularImsRuntime::new());
         let line = LineRuntime::new(
             binding("line-a", true),
             runtime,
-            VolteLiveHandle::new(),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         line.mark_absent();
@@ -1445,8 +1447,8 @@ mod tests {
     async fn controlled_bearer_move_defers_absent_line_cleanup() {
         let line = LineRuntime::new(
             binding("line-a", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         assert!(!line.bearer_operation_in_progress());
@@ -1458,8 +1460,8 @@ mod tests {
     fn wedge_line(line_id: &str) -> LineRuntime {
         LineRuntime::new(
             binding(line_id, true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         )
     }
@@ -1542,11 +1544,11 @@ mod tests {
 
     #[test]
     fn absent_line_forces_only_the_runtime_trunk_profile_off() {
-        let runtime = Arc::new(VolteRuntime::new());
+        let runtime = Arc::new(CellularImsRuntime::new());
         let line = LineRuntime::new(
             binding("line-a", false),
             runtime,
-            VolteLiveHandle::new(),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let requested = TrunkProfileConfig {
@@ -1576,11 +1578,11 @@ mod tests {
 
     #[test]
     fn vowifi_restore_claim_is_exclusive_and_reusable() {
-        let runtime = Arc::new(VolteRuntime::new());
+        let runtime = Arc::new(CellularImsRuntime::new());
         let line = LineRuntime::new(
             binding("line-a", true),
             runtime,
-            VolteLiveHandle::new(),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
 
@@ -1595,14 +1597,14 @@ mod tests {
     async fn data_watchdog_state_is_independent_per_line() {
         let line_a = LineRuntime::new(
             binding("line-a", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let line_b = LineRuntime::new(
             binding("line-b", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
 
@@ -1623,14 +1625,14 @@ mod tests {
     fn volte_runtime_and_operator_channels_are_independent_per_line() {
         let line_a = LineRuntime::new(
             binding("line-a", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let line_b = LineRuntime::new(
             binding("line-b", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         assert!(!Arc::ptr_eq(&line_a.volte, &line_b.volte));
@@ -1648,14 +1650,14 @@ mod tests {
     async fn trunk_and_supplementary_teardown_are_independent_per_line() {
         let line_a = LineRuntime::new(
             binding("line-a", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let line_b = LineRuntime::new(
             binding("line-b", true),
-            Arc::new(VolteRuntime::new()),
-            VolteLiveHandle::new(),
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
         let profile = TrunkProfileConfig {

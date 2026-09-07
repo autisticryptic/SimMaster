@@ -1,7 +1,26 @@
 # Cellular IMS naming migration (beta2 work list)
 
-This is the implementation checklist, **not a claim that the renames below
-have already shipped**. DNS migration is being validated separately first.
+This is the implementation checklist, **not a claim that all renames below
+have shipped**. Work remains isolated on `refactor/1.1.4-beta2`.
+
+## Current incremental implementation
+
+- DNS migration passed Actions run `34153925916` at `87eead1`.
+- The access stack's `Volte*` type symbols now use `CellularIms*`. Shared
+  profile source/candidate/selection/reference types used by **both** cellular
+  and WLAN instead use `ImsProfile*`, not a misleading cellular-only name.
+- Eight backend handler names and seven frontend client method names now use
+  cellular IMS terminology. The frontend calls the new canonical endpoints.
+- All seven canonical route groups have been added; the old routes still
+  invoke exactly the same handlers. **JSON field names, enum wire values and
+  persistent storage keys are deliberately unchanged in this first increment.**
+- A private-D-Bus HTTP test checks canonical/legacy response parity and ensures
+  the new endpoints remain authenticated. It fails rather than silently
+  skipping if its test bus is missing. This increment still needs Actions.
+
+Remaining: module/runtime member naming, persistent-field aliases and canonical
+writes, access enum wire aliases, history compatibility, and full beta2 device
+validation. A new route name alone is not completion of that remaining work.
 
 ## Meaning
 

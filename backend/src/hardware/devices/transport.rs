@@ -163,7 +163,7 @@ pub enum ImsBearerFailureHint {
 }
 
 /// A device IMS bearer failure with a stable `detail` string for
-/// classification, mirroring the pre-existing `VolteError` detail vocabulary.
+/// classification, mirroring the pre-existing `CellularImsError` detail vocabulary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImsBearerError {
     pub kind: ImsBearerErrorKind,

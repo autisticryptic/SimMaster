@@ -4,18 +4,18 @@
 //! (shared by every IMS access leg). This module is a thin VoLTE-facing adapter
 //! that:
 //!   - re-exports the shared challenge/header builders, and
-//!   - bridges VoLTE's concrete types (`UsimAkaApduResult`, `VolteError`) to the
+//!   - bridges VoLTE's concrete types (`UsimAkaApduResult`, `CellularImsError`) to the
 //!     shared functions' neutral `AkaMaterial` / `ImsError`.
 //!
 //! Keeping this adapter means the rest of the VoLTE code (and its tests) still
-//! call `volte::digest_aka::*` with `VolteError` semantics, while the crypto is
+//! call `volte::digest_aka::*` with `CellularImsError` semantics, while the crypto is
 //! implemented and vector-tested exactly once in the shared core.
 
 use crate::connectivity::core::digest_aka as core;
 use crate::connectivity::core::ImsError;
 use crate::connectivity::modems::ims::vowifi::qmi_uim::UsimAkaApduResult;
 
-use super::errors::{code, VolteError};
+use super::errors::{code, CellularImsError};
 
 // Re-export the shared, transport-agnostic types/builders verbatim. These carry
 // no error type, so they need no adaptation.
@@ -33,7 +33,7 @@ pub use core::AkaChallenge;
 /// The shared core emits stable neutral codes (`aka_res_empty`, `hex_invalid`,
 /// and so on; VoLTE surfaces the `volte_`-prefixed variants its frontend contract and
 /// error taxonomy expect. This is the single mapping seam.
-fn map_err(err: ImsError) -> VolteError {
+fn map_err(err: ImsError) -> CellularImsError {
     let mapped = match err.code() {
         "register_nonce_not_aka" => code::REGISTER_NONCE_NOT_AKA,
         "digest_nonce_decode_failed" => code::DIGEST_NONCE_DECODE_FAILED,
@@ -46,9 +46,9 @@ fn map_err(err: ImsError) -> VolteError {
         "digest_realm_missing" => code::DIGEST_REALM_MISSING,
         "digest_nonce_missing" => code::DIGEST_NONCE_MISSING,
         // Any unmapped neutral code is surfaced verbatim (still greppable).
-        other => return VolteError::with_detail(code::DIGEST_CHALLENGE_MISSING, other),
+        other => return CellularImsError::with_detail(code::DIGEST_CHALLENGE_MISSING, other),
     };
-    VolteError::new(mapped)
+    CellularImsError::new(mapped)
 }
 
 /// Borrow a `UsimAkaApduResult` as the shared `AkaMaterial` view.
@@ -61,7 +61,7 @@ fn material(aka: &UsimAkaApduResult) -> core::AkaMaterial<'_> {
 }
 
 /// Decode an AKA nonce into RAND(16) || AUTN(16).
-pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, VolteError> {
+pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, CellularImsError> {
     core::decode_aka_nonce(nonce).map_err(map_err)
 }
 
@@ -69,7 +69,7 @@ pub fn decode_aka_nonce(nonce: &str) -> Result<AkaChallenge, VolteError> {
 pub fn aka_digest_password(
     algorithm: &str,
     aka: &UsimAkaApduResult,
-) -> Result<Vec<u8>, VolteError> {
+) -> Result<Vec<u8>, CellularImsError> {
     core::aka_digest_password(algorithm, &material(aka)).map_err(map_err)
 }
 
@@ -86,7 +86,7 @@ pub fn compute_aka_response(
     qop: Option<&str>,
     cnonce: &str,
     nc: &str,
-) -> Result<String, VolteError> {
+) -> Result<String, CellularImsError> {
     core::compute_aka_response(
         username,
         realm,
@@ -103,7 +103,10 @@ pub fn compute_aka_response(
 }
 
 /// Parse a digest challenge from a header value.
-pub fn parse_digest_challenge(value: &str, proxy: bool) -> Result<DigestChallenge, VolteError> {
+pub fn parse_digest_challenge(
+    value: &str,
+    proxy: bool,
+) -> Result<DigestChallenge, CellularImsError> {
     core::parse_digest_challenge(value, proxy).map_err(map_err)
 }
 
@@ -113,7 +116,7 @@ pub fn select_digest_challenge(
     www_values: &[String],
     proxy_values: &[String],
     allow_plain_md5: bool,
-) -> Result<DigestChallenge, VolteError> {
+) -> Result<DigestChallenge, CellularImsError> {
     core::select_digest_challenge(www_values, proxy_values, allow_plain_md5).map_err(map_err)
 }
 

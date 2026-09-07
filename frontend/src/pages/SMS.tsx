@@ -43,7 +43,7 @@ import {
   Search,
   Settings,
 } from '@mui/icons-material'
-import { api, type SmsChannelResponse, type SmsMessage, type SmsStats, type VolteLineControlResponse } from '../api/current'
+import { api, type SmsChannelResponse, type SmsMessage, type SmsStats, type CellularImsLineControlResponse } from '../api/current'
 import ModemLineSelector from '../components/ModemLineSelector'
 import SmsPathPolicyDialog from './sms/SmsPathPolicyDialog'
 
@@ -197,7 +197,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
   const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
   const [newChatNumber, setNewChatNumber] = useState('')
   const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
-  const [volteLines, setVolteLines] = useState<VolteLineControlResponse[]>([])
+  const [volteLines, setVolteLines] = useState<CellularImsLineControlResponse[]>([])
   const [smsChannels, setSmsChannels] = useState<SmsChannelResponse[]>([])
   const [selectedChannelId, setSelectedChannelId] = useState(embeddedLineId ?? '')
   const [selectedLineId, setSelectedLineId] = useState(embeddedLineId ?? '')
@@ -325,7 +325,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
 
   const fetchLines = useCallback(async () => {
     try {
-      const response = await api.getVolteLines()
+      const response = await api.getCellularImsLines()
       const nextLines = response.data ?? []
       setVolteLines(nextLines)
       setSelectedLineId((current) => {

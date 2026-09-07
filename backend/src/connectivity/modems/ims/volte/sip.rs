@@ -13,7 +13,7 @@
 
 use std::net::IpAddr;
 
-use super::errors::VolteError;
+use super::errors::CellularImsError;
 use crate::connectivity::core::{
     access_network::{
         access_type_token, resolve_access_identity, sanitize_header_value, AccessIdentityPolicy,
@@ -88,12 +88,12 @@ pub fn hex_token(bytes: usize) -> String {
     }
 }
 
-fn random_bytes(len: usize) -> Result<Vec<u8>, VolteError> {
+fn random_bytes(len: usize) -> Result<Vec<u8>, CellularImsError> {
     use ring::rand::{SecureRandom, SystemRandom};
     let mut buf = vec![0u8; len];
     SystemRandom::new()
         .fill(&mut buf)
-        .map_err(|_| VolteError::new("volte_random_failed"))?;
+        .map_err(|_| CellularImsError::new("volte_random_failed"))?;
     Ok(buf)
 }
 
@@ -1264,7 +1264,7 @@ pub fn build_dtmf_info(
     cseq: u32,
     digit: char,
     duration_ms: u16,
-) -> Result<Vec<u8>, VolteError> {
+) -> Result<Vec<u8>, CellularImsError> {
     build_dtmf_info_for_access(
         identity,
         route,
@@ -1291,13 +1291,13 @@ pub fn build_dtmf_info_for_access(
     duration_ms: u16,
     pani: &str,
     user_agent: &str,
-) -> Result<Vec<u8>, VolteError> {
+) -> Result<Vec<u8>, CellularImsError> {
     let digit = digit.to_ascii_uppercase();
     if !matches!(digit, '0'..='9' | '*' | '#' | 'A'..='D') {
-        return Err(VolteError::new("volte_dtmf_digit_invalid"));
+        return Err(CellularImsError::new("volte_dtmf_digit_invalid"));
     }
     if !(40..=5000).contains(&duration_ms) {
-        return Err(VolteError::new("volte_dtmf_duration_invalid"));
+        return Err(CellularImsError::new("volte_dtmf_duration_invalid"));
     }
     let branch = new_branch();
     let local_host = sip_host(route.local_addr.ip());
@@ -1470,13 +1470,13 @@ pub fn build_response_for_access(
 
 // SIP framing/parsing primitives are shared with every IMS leg — they live in
 // `crate::connectivity::core::sip_frame` (single implementation). The wrappers below keep the
-// volte-facing names/signatures (e.g. `parse_status` returning `VolteError`) so
+// volte-facing names/signatures (e.g. `parse_status` returning `CellularImsError`) so
 // existing volte call sites are unchanged.
 
 /// Parse the SIP status code (delegates to shared framing; remaps the error).
-pub fn parse_status(frame: &[u8]) -> Result<u16, VolteError> {
+pub fn parse_status(frame: &[u8]) -> Result<u16, CellularImsError> {
     crate::connectivity::core::sip_frame::parse_status(frame)
-        .map_err(|_| VolteError::new("volte_sip_status_invalid"))
+        .map_err(|_| CellularImsError::new("volte_sip_status_invalid"))
 }
 
 /// Everything after the header terminator (may be empty).

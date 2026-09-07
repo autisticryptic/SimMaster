@@ -50,6 +50,10 @@ jobs:
           set -o pipefail
           for filter in \
             platform::dns::tests \
+            platform::config::tests \
+            platform::config_file::tests \
+            platform::config_store::tests \
+            platform::network_routing::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
@@ -75,6 +79,22 @@ jobs:
             fi
           done
           grep -E 'running [0-9]+ test|test result:' beta-tests.log >> "$GITHUB_STEP_SUMMARY"
+      - name: Check canonical and legacy API routes on a private bus
+        working-directory: backend
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! dbus-run-session -- sh -c '
+            export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
+            cargo test --locked cellular_ims_route_aliases_keep_auth_and_response_contract -- --test-threads=1
+          ' 2>&1 | tee beta-api-tests.log; then
+            details=$(tail -n 80 beta-api-tests.log)
+            details=${details//'%'/'%25'}
+            details=${details//$'\r'/'%0D'}
+            details=${details//$'\n'/'%0A'}
+            echo "::error title=Cellular IMS API compatibility failed::$details"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:

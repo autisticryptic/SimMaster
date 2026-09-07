@@ -8,7 +8,7 @@ import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
 import {
   api,
   type VilteStatusResponse,
-  type VolteVoiceStatusResponse,
+  type CellularImsVoiceStatusResponse,
   type VoiceAccessPathKind,
   type VoicePathPolicy,
   type WebCallCapabilitiesResponse,
@@ -28,7 +28,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
   const [voicePath, setVoicePath] = useState<VoicePathPolicy | null>(null)
   const [webCall, setWebCall] = useState<WebCallCapabilitiesResponse | null>(null)
   const [vilte, setVilte] = useState<VilteStatusResponse | null>(null)
-  const [volteVoice, setVolteVoice] = useState<VolteVoiceStatusResponse | null>(null)
+  const [volteVoice, setVolteVoice] = useState<CellularImsVoiceStatusResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -56,7 +56,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
         api.getVoicePathPolicy(lineId),
         api.getWebCallCapabilities(),
         api.getVilteStatus(lineId),
-        api.getVolteVoiceStatus(lineId),
+        api.getCellularImsVoiceStatus(lineId),
       ])
       if (generation !== loadGeneration.current || activeLineId.current !== lineId) return
       if (vilteResponse.data?.line_id !== lineId || volteVoiceResponse.data?.line_id !== lineId) {

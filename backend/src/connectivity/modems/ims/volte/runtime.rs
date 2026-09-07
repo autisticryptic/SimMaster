@@ -20,12 +20,12 @@ use serde::Serialize;
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    connectivity::core::ims_failure::ImsServiceState, platform::config::VolteProfileCandidate,
+    connectivity::core::ims_failure::ImsServiceState, platform::config::ImsProfileCandidate,
 };
 
 /// Connection sub-stage. String values MUST match `volteStatus.js` `b()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolteStage {
+pub enum CellularImsStage {
     Disabled,
     Starting,
     Identity,
@@ -51,32 +51,32 @@ pub enum VolteStage {
     Stopping,
 }
 
-impl VolteStage {
+impl CellularImsStage {
     pub fn as_str(self) -> &'static str {
         match self {
-            VolteStage::Disabled => "disabled",
-            VolteStage::Starting => "starting",
-            VolteStage::Identity => "identity",
-            VolteStage::CarrierProfile => "carrier_profile",
-            VolteStage::IdentityAka => "identity_aka",
-            VolteStage::Radio => "radio",
-            VolteStage::ImsContext => "ims_context",
-            VolteStage::Pcscf => "pcscf",
-            VolteStage::Ipv6Preflight => "ipv6_preflight",
-            VolteStage::Modem => "modem",
-            VolteStage::Bearer => "bearer",
-            VolteStage::BearerDual => "bearer_dual",
-            VolteStage::BearerIpv4 => "bearer_ipv4",
-            VolteStage::BearerIpv6 => "bearer_ipv6",
-            VolteStage::IpConfig => "ip_config",
-            VolteStage::RegisterInitial => "register_initial",
-            VolteStage::Ipsec => "ipsec",
-            VolteStage::RegisterAuthenticated => "register_authenticated",
-            VolteStage::RegisterRefresh => "register_refresh",
-            VolteStage::RegisterIpsec => "register_ipsec",
-            VolteStage::RegisterUdp => "register_udp",
-            VolteStage::Registered => "registered",
-            VolteStage::Stopping => "stopping",
+            CellularImsStage::Disabled => "disabled",
+            CellularImsStage::Starting => "starting",
+            CellularImsStage::Identity => "identity",
+            CellularImsStage::CarrierProfile => "carrier_profile",
+            CellularImsStage::IdentityAka => "identity_aka",
+            CellularImsStage::Radio => "radio",
+            CellularImsStage::ImsContext => "ims_context",
+            CellularImsStage::Pcscf => "pcscf",
+            CellularImsStage::Ipv6Preflight => "ipv6_preflight",
+            CellularImsStage::Modem => "modem",
+            CellularImsStage::Bearer => "bearer",
+            CellularImsStage::BearerDual => "bearer_dual",
+            CellularImsStage::BearerIpv4 => "bearer_ipv4",
+            CellularImsStage::BearerIpv6 => "bearer_ipv6",
+            CellularImsStage::IpConfig => "ip_config",
+            CellularImsStage::RegisterInitial => "register_initial",
+            CellularImsStage::Ipsec => "ipsec",
+            CellularImsStage::RegisterAuthenticated => "register_authenticated",
+            CellularImsStage::RegisterRefresh => "register_refresh",
+            CellularImsStage::RegisterIpsec => "register_ipsec",
+            CellularImsStage::RegisterUdp => "register_udp",
+            CellularImsStage::Registered => "registered",
+            CellularImsStage::Stopping => "stopping",
         }
     }
 }
@@ -88,7 +88,7 @@ const MAX_CONNECTION_ATTEMPTS: usize = 100;
 const MAX_PROFILE_ATTEMPT_RESULTS: usize = 12;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct VolteConnectionAttempt {
+pub struct CellularImsConnectionAttempt {
     pub sequence: u32,
     pub stage: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,7 +120,7 @@ pub struct VolteConnectionAttempt {
 /// database/catalog slot intentionally resolves to the standards-derived
 /// fallback without changing the configured order.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct VolteProfileAttemptResult {
+pub struct CellularImsProfileAttemptResult {
     pub index: u32,
     pub requested_source: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +139,7 @@ pub struct VolteProfileAttemptResult {
 
 /// High-level phase. String values MUST match `volteStatus.js` `g()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VoltePhase {
+pub enum CellularImsPhase {
     Disabled,
     Starting,
     Registered,
@@ -151,7 +151,7 @@ pub enum VoltePhase {
 /// focused on IMS itself; this state explains why a requested connection is
 /// waiting, retrying, or deliberately stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VolteRecoveryState {
+pub enum CellularImsRecoveryState {
     Idle,
     WaitingModem,
     RestartingBaseband,
@@ -160,7 +160,7 @@ pub enum VolteRecoveryState {
     Exhausted,
 }
 
-impl VolteRecoveryState {
+impl CellularImsRecoveryState {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -173,14 +173,14 @@ impl VolteRecoveryState {
     }
 }
 
-impl VoltePhase {
+impl CellularImsPhase {
     pub fn as_str(self) -> &'static str {
         match self {
-            VoltePhase::Disabled => "disabled",
-            VoltePhase::Starting => "starting",
-            VoltePhase::Registered => "registered",
-            VoltePhase::Degraded => "degraded",
-            VoltePhase::Stopping => "stopping",
+            CellularImsPhase::Disabled => "disabled",
+            CellularImsPhase::Starting => "starting",
+            CellularImsPhase::Registered => "registered",
+            CellularImsPhase::Degraded => "degraded",
+            CellularImsPhase::Stopping => "stopping",
         }
     }
 }
@@ -204,11 +204,11 @@ impl RegistrationMode {
 }
 
 /// Canonical runtime snapshot. Field names + wire format match the frontend
-/// `control` response contract (see `VolteControlResponse` in models).
+/// `control` response contract (see `CellularImsControlResponse` in models).
 #[derive(Debug, Clone)]
-pub struct VolteSnapshot {
-    pub phase: VoltePhase,
-    pub stage: VolteStage,
+pub struct CellularImsSnapshot {
+    pub phase: CellularImsPhase,
+    pub stage: CellularImsStage,
     pub registration_mode: RegistrationMode,
     pub pcscf: Option<String>,
     pub session_started_at: Option<String>,
@@ -271,11 +271,11 @@ pub struct VolteSnapshot {
     pub profile_candidate_index: Option<u32>,
     pub profile_candidate_source: Option<String>,
     pub profile_candidate_profile_id: Option<String>,
-    pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
+    pub profile_attempt_results: Vec<CellularImsProfileAttemptResult>,
     pub usim_aid: Option<String>,
     pub isim_aid: Option<String>,
-    pub connection_attempts: Vec<VolteConnectionAttempt>,
-    pub recovery_state: VolteRecoveryState,
+    pub connection_attempts: Vec<CellularImsConnectionAttempt>,
+    pub recovery_state: CellularImsRecoveryState,
     pub recovery_source: Option<String>,
     pub retry_attempt: u32,
     pub retry_max: u32,
@@ -284,11 +284,11 @@ pub struct VolteSnapshot {
     pub manual_retry_available: bool,
 }
 
-impl Default for VolteSnapshot {
+impl Default for CellularImsSnapshot {
     fn default() -> Self {
         Self {
-            phase: VoltePhase::Disabled,
-            stage: VolteStage::Disabled,
+            phase: CellularImsPhase::Disabled,
+            stage: CellularImsStage::Disabled,
             registration_mode: RegistrationMode::None,
             pcscf: None,
             session_started_at: None,
@@ -330,7 +330,7 @@ impl Default for VolteSnapshot {
             usim_aid: None,
             isim_aid: None,
             connection_attempts: Vec::new(),
-            recovery_state: VolteRecoveryState::Idle,
+            recovery_state: CellularImsRecoveryState::Idle,
             recovery_source: None,
             retry_attempt: 0,
             retry_max: 3,
@@ -341,9 +341,9 @@ impl Default for VolteSnapshot {
     }
 }
 
-impl VolteSnapshot {
+impl CellularImsSnapshot {
     pub fn registered(&self) -> bool {
-        self.phase == VoltePhase::Registered
+        self.phase == CellularImsPhase::Registered
     }
 
     /// Whether the IMS APN bearer carrying this access is established.
@@ -353,18 +353,18 @@ impl VolteSnapshot {
     pub fn bearer_up(&self) -> bool {
         matches!(
             self.stage,
-            VolteStage::Bearer
-                | VolteStage::BearerDual
-                | VolteStage::BearerIpv4
-                | VolteStage::BearerIpv6
-                | VolteStage::IpConfig
-                | VolteStage::RegisterInitial
-                | VolteStage::Ipsec
-                | VolteStage::RegisterAuthenticated
-                | VolteStage::RegisterRefresh
-                | VolteStage::RegisterIpsec
-                | VolteStage::RegisterUdp
-                | VolteStage::Registered
+            CellularImsStage::Bearer
+                | CellularImsStage::BearerDual
+                | CellularImsStage::BearerIpv4
+                | CellularImsStage::BearerIpv6
+                | CellularImsStage::IpConfig
+                | CellularImsStage::RegisterInitial
+                | CellularImsStage::Ipsec
+                | CellularImsStage::RegisterAuthenticated
+                | CellularImsStage::RegisterRefresh
+                | CellularImsStage::RegisterIpsec
+                | CellularImsStage::RegisterUdp
+                | CellularImsStage::Registered
         )
     }
 
@@ -377,7 +377,7 @@ impl VolteSnapshot {
 
 /// Serializable per-line runtime projection returned by the VoLTE line APIs.
 #[derive(Debug, Clone, Serialize, Default)]
-pub struct VolteRuntimeStatus {
+pub struct CellularImsRuntimeStatus {
     pub phase: String,
     pub stage: String,
     pub registration_mode: String,
@@ -450,12 +450,12 @@ pub struct VolteRuntimeStatus {
     pub profile_candidate_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_candidate_profile_id: Option<String>,
-    pub profile_attempt_results: Vec<VolteProfileAttemptResult>,
+    pub profile_attempt_results: Vec<CellularImsProfileAttemptResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usim_aid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isim_aid: Option<String>,
-    pub connection_attempts: Vec<VolteConnectionAttempt>,
+    pub connection_attempts: Vec<CellularImsConnectionAttempt>,
     pub recovery_state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery_source: Option<String>,
@@ -466,8 +466,8 @@ pub struct VolteRuntimeStatus {
     pub manual_retry_available: bool,
 }
 
-impl From<&VolteSnapshot> for VolteRuntimeStatus {
-    fn from(s: &VolteSnapshot) -> Self {
+impl From<&CellularImsSnapshot> for CellularImsRuntimeStatus {
+    fn from(s: &CellularImsSnapshot) -> Self {
         Self {
             phase: s.phase.as_str().to_string(),
             stage: s.stage.as_str().to_string(),
@@ -526,35 +526,35 @@ impl From<&VolteSnapshot> for VolteRuntimeStatus {
 /// single source of truth + a serialization mutex + a generation counter that
 /// acts as a cancellation token for in-flight advances.
 #[derive(Clone)]
-pub struct VolteRuntime {
-    snapshot: Arc<RwLock<VolteSnapshot>>,
+pub struct CellularImsRuntime {
+    snapshot: Arc<RwLock<CellularImsSnapshot>>,
     advance_lock: Arc<Mutex<()>>,
     generation: Arc<AtomicU64>,
 }
 
-impl Default for VolteRuntime {
+impl Default for CellularImsRuntime {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl VolteRuntime {
+impl CellularImsRuntime {
     pub fn new() -> Self {
         Self {
-            snapshot: Arc::new(RwLock::new(VolteSnapshot::default())),
+            snapshot: Arc::new(RwLock::new(CellularImsSnapshot::default())),
             advance_lock: Arc::new(Mutex::new(())),
             generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Read-lock clone of the current snapshot.
-    pub async fn snapshot(&self) -> VolteSnapshot {
+    pub async fn snapshot(&self) -> CellularImsSnapshot {
         self.snapshot.read().await.clone()
     }
 
     /// Serializable projection for the API.
-    pub async fn status(&self) -> VolteRuntimeStatus {
-        VolteRuntimeStatus::from(&*self.snapshot.read().await)
+    pub async fn status(&self) -> CellularImsRuntimeStatus {
+        CellularImsRuntimeStatus::from(&*self.snapshot.read().await)
     }
 
     /// Current generation token; a driver captures this before a long advance
@@ -564,7 +564,7 @@ impl VolteRuntime {
     }
 
     /// Apply a mutation to the snapshot under the write lock.
-    pub async fn update(&self, f: impl FnOnce(&mut VolteSnapshot)) -> VolteSnapshot {
+    pub async fn update(&self, f: impl FnOnce(&mut CellularImsSnapshot)) -> CellularImsSnapshot {
         let mut guard = self.snapshot.write().await;
         f(&mut guard);
         guard.clone()
@@ -572,10 +572,10 @@ impl VolteRuntime {
 
     pub async fn record_attempt(
         &self,
-        stage: VolteStage,
+        stage: CellularImsStage,
         ip_family: Option<&str>,
         outcome: &str,
-        error: Option<&crate::connectivity::modems::ims::volte::errors::VolteError>,
+        error: Option<&crate::connectivity::modems::ims::volte::errors::CellularImsError>,
         detail: Option<String>,
     ) {
         self.update(|snapshot| {
@@ -592,21 +592,23 @@ impl VolteRuntime {
             let bearer_path = snapshot.bearer_path.clone();
             let bearer_interface = snapshot.bearer_interface.clone();
             let pcscf = snapshot.pcscf.clone();
-            snapshot.connection_attempts.push(VolteConnectionAttempt {
-                sequence,
-                stage: stage.as_str().to_string(),
-                ip_family: ip_family.map(str::to_string),
-                outcome: outcome.to_string(),
-                error_code: error.map(|error| error.code().to_string()),
-                detail: detail
-                    .or_else(|| error.and_then(|error| error.detail().map(str::to_string))),
-                at_cid,
-                qmi_device,
-                bearer_path,
-                interface: bearer_interface,
-                pcscf,
-                at: chrono::Utc::now().to_rfc3339(),
-            });
+            snapshot
+                .connection_attempts
+                .push(CellularImsConnectionAttempt {
+                    sequence,
+                    stage: stage.as_str().to_string(),
+                    ip_family: ip_family.map(str::to_string),
+                    outcome: outcome.to_string(),
+                    error_code: error.map(|error| error.code().to_string()),
+                    detail: detail
+                        .or_else(|| error.and_then(|error| error.detail().map(str::to_string))),
+                    at_cid,
+                    qmi_device,
+                    bearer_path,
+                    interface: bearer_interface,
+                    pcscf,
+                    at: chrono::Utc::now().to_rfc3339(),
+                });
             if snapshot.connection_attempts.len() > MAX_CONNECTION_ATTEMPTS {
                 let excess = snapshot.connection_attempts.len() - MAX_CONNECTION_ATTEMPTS;
                 snapshot.connection_attempts.drain(..excess);
@@ -638,8 +640,8 @@ impl VolteRuntime {
     /// counters and completed slot results deliberately survive.
     pub async fn prepare_profile_switch(&self) {
         self.update(|snapshot| {
-            snapshot.phase = VoltePhase::Starting;
-            snapshot.stage = VolteStage::Starting;
+            snapshot.phase = CellularImsPhase::Starting;
+            snapshot.stage = CellularImsStage::Starting;
             snapshot.registration_mode = RegistrationMode::None;
             snapshot.pcscf = None;
             snapshot.session_started_at = None;
@@ -675,7 +677,7 @@ impl VolteRuntime {
     /// Start one configured profile slot. The current effective profile is
     /// cleared so an identity-stage failure cannot accidentally report values
     /// inherited from the previous slot.
-    pub async fn begin_profile_attempt(&self, index: u32, candidate: &VolteProfileCandidate) {
+    pub async fn begin_profile_attempt(&self, index: u32, candidate: &ImsProfileCandidate) {
         self.update(|snapshot| {
             snapshot.profile_candidate_index = Some(index);
             snapshot.profile_candidate_source = Some(candidate.source.as_str().to_string());
@@ -693,14 +695,14 @@ impl VolteRuntime {
     pub async fn finish_profile_attempt(
         &self,
         index: u32,
-        candidate: &VolteProfileCandidate,
+        candidate: &ImsProfileCandidate,
         outcome: &str,
-        error: Option<&crate::connectivity::modems::ims::volte::errors::VolteError>,
+        error: Option<&crate::connectivity::modems::ims::volte::errors::CellularImsError>,
     ) {
         self.update(|snapshot| {
             snapshot
                 .profile_attempt_results
-                .push(VolteProfileAttemptResult {
+                .push(CellularImsProfileAttemptResult {
                     index,
                     requested_source: candidate.source.as_str().to_string(),
                     requested_profile_id: candidate.profile_id.clone(),
@@ -727,21 +729,21 @@ impl VolteRuntime {
 
     /// Teardown / cancel: bump generation (invalidating in-flight advances) and
     /// reset the snapshot to a disabled/degraded baseline.
-    pub async fn reset_runtime(&self, reason: impl Into<String>) -> VolteSnapshot {
+    pub async fn reset_runtime(&self, reason: impl Into<String>) -> CellularImsSnapshot {
         self.generation.fetch_add(1, Ordering::SeqCst);
         let reason = reason.into();
         self.update(|s| {
             let prev_reconnect = s.reconnect_count;
-            *s = VolteSnapshot {
-                phase: VoltePhase::Disabled,
-                stage: VolteStage::Disabled,
+            *s = CellularImsSnapshot {
+                phase: CellularImsPhase::Disabled,
+                stage: CellularImsStage::Disabled,
                 reconnect_count: prev_reconnect,
                 last_error: if reason.is_empty() {
                     None
                 } else {
                     Some(reason)
                 },
-                ..VolteSnapshot::default()
+                ..CellularImsSnapshot::default()
             };
         })
         .await
@@ -755,28 +757,28 @@ mod tests {
     #[test]
     fn stage_strings_match_frontend_contract() {
         // Exact set from volteStatus.js b().
-        assert_eq!(VolteStage::Disabled.as_str(), "disabled");
-        assert_eq!(VolteStage::Starting.as_str(), "starting");
-        assert_eq!(VolteStage::Identity.as_str(), "identity");
-        assert_eq!(VolteStage::CarrierProfile.as_str(), "carrier_profile");
-        assert_eq!(VolteStage::IdentityAka.as_str(), "identity_aka");
-        assert_eq!(VolteStage::Radio.as_str(), "radio");
-        assert_eq!(VolteStage::Pcscf.as_str(), "pcscf");
-        assert_eq!(VolteStage::Modem.as_str(), "modem");
-        assert_eq!(VolteStage::Bearer.as_str(), "bearer");
-        assert_eq!(VolteStage::RegisterIpsec.as_str(), "register_ipsec");
-        assert_eq!(VolteStage::RegisterUdp.as_str(), "register_udp");
-        assert_eq!(VolteStage::Registered.as_str(), "registered");
-        assert_eq!(VolteStage::Stopping.as_str(), "stopping");
+        assert_eq!(CellularImsStage::Disabled.as_str(), "disabled");
+        assert_eq!(CellularImsStage::Starting.as_str(), "starting");
+        assert_eq!(CellularImsStage::Identity.as_str(), "identity");
+        assert_eq!(CellularImsStage::CarrierProfile.as_str(), "carrier_profile");
+        assert_eq!(CellularImsStage::IdentityAka.as_str(), "identity_aka");
+        assert_eq!(CellularImsStage::Radio.as_str(), "radio");
+        assert_eq!(CellularImsStage::Pcscf.as_str(), "pcscf");
+        assert_eq!(CellularImsStage::Modem.as_str(), "modem");
+        assert_eq!(CellularImsStage::Bearer.as_str(), "bearer");
+        assert_eq!(CellularImsStage::RegisterIpsec.as_str(), "register_ipsec");
+        assert_eq!(CellularImsStage::RegisterUdp.as_str(), "register_udp");
+        assert_eq!(CellularImsStage::Registered.as_str(), "registered");
+        assert_eq!(CellularImsStage::Stopping.as_str(), "stopping");
     }
 
     #[test]
     fn phase_strings_match_frontend_contract() {
-        assert_eq!(VoltePhase::Disabled.as_str(), "disabled");
-        assert_eq!(VoltePhase::Starting.as_str(), "starting");
-        assert_eq!(VoltePhase::Registered.as_str(), "registered");
-        assert_eq!(VoltePhase::Degraded.as_str(), "degraded");
-        assert_eq!(VoltePhase::Stopping.as_str(), "stopping");
+        assert_eq!(CellularImsPhase::Disabled.as_str(), "disabled");
+        assert_eq!(CellularImsPhase::Starting.as_str(), "starting");
+        assert_eq!(CellularImsPhase::Registered.as_str(), "registered");
+        assert_eq!(CellularImsPhase::Degraded.as_str(), "degraded");
+        assert_eq!(CellularImsPhase::Stopping.as_str(), "stopping");
     }
 
     #[test]
@@ -788,24 +790,27 @@ mod tests {
 
     #[test]
     fn recovery_state_strings_are_stable() {
-        assert_eq!(VolteRecoveryState::Idle.as_str(), "idle");
-        assert_eq!(VolteRecoveryState::WaitingModem.as_str(), "waiting_modem");
+        assert_eq!(CellularImsRecoveryState::Idle.as_str(), "idle");
         assert_eq!(
-            VolteRecoveryState::RestartingBaseband.as_str(),
+            CellularImsRecoveryState::WaitingModem.as_str(),
+            "waiting_modem"
+        );
+        assert_eq!(
+            CellularImsRecoveryState::RestartingBaseband.as_str(),
             "restarting_baseband"
         );
-        assert_eq!(VolteRecoveryState::Connecting.as_str(), "connecting");
-        assert_eq!(VolteRecoveryState::Registered.as_str(), "registered");
-        assert_eq!(VolteRecoveryState::Exhausted.as_str(), "exhausted");
+        assert_eq!(CellularImsRecoveryState::Connecting.as_str(), "connecting");
+        assert_eq!(CellularImsRecoveryState::Registered.as_str(), "registered");
+        assert_eq!(CellularImsRecoveryState::Exhausted.as_str(), "exhausted");
     }
 
     #[test]
     fn default_snapshot_is_disabled_and_unregistered() {
-        let s = VolteSnapshot::default();
-        assert_eq!(s.phase, VoltePhase::Disabled);
-        assert_eq!(s.stage, VolteStage::Disabled);
+        let s = CellularImsSnapshot::default();
+        assert_eq!(s.phase, CellularImsPhase::Disabled);
+        assert_eq!(s.stage, CellularImsStage::Disabled);
         assert!(!s.registered());
-        let status = VolteRuntimeStatus::from(&s);
+        let status = CellularImsRuntimeStatus::from(&s);
         assert_eq!(status.phase, "disabled");
         assert_eq!(status.stage, "disabled");
         assert_eq!(status.registration_mode, "");
@@ -817,9 +822,9 @@ mod tests {
 
     #[tokio::test]
     async fn profile_attempt_records_requested_and_effective_identity() {
-        let rt = VolteRuntime::new();
-        let candidate = VolteProfileCandidate {
-            source: crate::platform::config::VolteProfileSource::Database,
+        let rt = CellularImsRuntime::new();
+        let candidate = ImsProfileCandidate {
+            source: crate::platform::config::ImsProfileSource::Database,
             profile_id: Some("user-profile-a".to_string()),
         };
 
@@ -843,7 +848,7 @@ mod tests {
             snapshot.profile_fallback_reason = Some("database_profile_not_found".to_string());
         })
         .await;
-        let error = crate::connectivity::modems::ims::volte::errors::VolteError::with_detail(
+        let error = crate::connectivity::modems::ims::volte::errors::CellularImsError::with_detail(
             crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
             "fixture",
         );
@@ -881,9 +886,9 @@ mod tests {
 
     #[tokio::test]
     async fn profile_attempt_batch_clears_history_and_history_is_bounded() {
-        let rt = VolteRuntime::new();
+        let rt = CellularImsRuntime::new();
         let candidate =
-            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Derived);
+            ImsProfileCandidate::automatic(crate::platform::config::ImsProfileSource::Derived);
 
         for index in 1..=(MAX_PROFILE_ATTEMPT_RESULTS as u32 + 3) {
             rt.begin_profile_attempt(index, &candidate).await;
@@ -912,13 +917,13 @@ mod tests {
 
     #[tokio::test]
     async fn profile_switch_clears_session_ownership_without_cancelling_the_batch() {
-        let rt = VolteRuntime::new();
+        let rt = CellularImsRuntime::new();
         let candidate =
-            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Database);
+            ImsProfileCandidate::automatic(crate::platform::config::ImsProfileSource::Database);
         rt.begin_profile_attempt(1, &candidate).await;
         rt.update(|snapshot| {
-            snapshot.phase = VoltePhase::Registered;
-            snapshot.stage = VolteStage::Registered;
+            snapshot.phase = CellularImsPhase::Registered;
+            snapshot.stage = CellularImsStage::Registered;
             snapshot.registration_mode = RegistrationMode::Ipsec;
             snapshot.pcscf = Some("192.0.2.10:5060".to_string());
             snapshot.session_started_at = Some("started".to_string());
@@ -1001,9 +1006,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_manual_retry_batch_restarts_at_slot_one() {
-        let rt = VolteRuntime::new();
+        let rt = CellularImsRuntime::new();
         let candidate =
-            VolteProfileCandidate::automatic(crate::platform::config::VolteProfileSource::Derived);
+            ImsProfileCandidate::automatic(crate::platform::config::ImsProfileSource::Derived);
         rt.begin_profile_attempt(3, &candidate).await;
         rt.finish_profile_attempt(3, &candidate, "failed", None)
             .await;
@@ -1022,18 +1027,18 @@ mod tests {
 
     #[tokio::test]
     async fn reset_runtime_bumps_generation_and_disables() {
-        let rt = VolteRuntime::new();
+        let rt = CellularImsRuntime::new();
         let g0 = rt.generation();
         rt.update(|s| {
-            s.phase = VoltePhase::Registered;
-            s.stage = VolteStage::Registered;
+            s.phase = CellularImsPhase::Registered;
+            s.stage = CellularImsStage::Registered;
             s.reconnect_count = 5;
             s.register_refresh_count = 4;
         })
         .await;
         let snap = rt.reset_runtime("volte_disabled").await;
-        assert_eq!(snap.phase, VoltePhase::Disabled);
-        assert_eq!(snap.stage, VolteStage::Disabled);
+        assert_eq!(snap.phase, CellularImsPhase::Disabled);
+        assert_eq!(snap.stage, CellularImsStage::Disabled);
         assert_eq!(
             snap.reconnect_count, 5,
             "reconnect count is preserved across reset"

@@ -152,7 +152,7 @@ pub struct MediaReoffer {
 /// [`MediaReoffer`] the caller sends as an in-dialog re-INVITE
 /// (`sip::build_reinvite`). The new mode becomes effective when the far end
 /// answers 2xx ([`confirm_media_switch`](Self::confirm_media_switch)).
-pub struct VolteVoiceCall {
+pub struct CellularImsVoiceCall {
     machine: VoiceCallStateMachine,
     params: VoiceParams,
     local_media: MediaEndpoint,
@@ -169,7 +169,7 @@ pub struct VolteVoiceCall {
     pending_switch: Option<CallMediaMode>,
 }
 
-impl VolteVoiceCall {
+impl CellularImsVoiceCall {
     /// Create a new orchestrator bound to the local media relay endpoint.
     /// Audio-only (VoLTE); video is disabled unless [`with_vilte`](Self::with_vilte)
     /// supplies a ViLTE config + a local video media endpoint.
@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn mo_offer_advertises_preferred_codecs_at_local_media() {
-        let mut call = VolteVoiceCall::new(true, local_media());
+        let mut call = CellularImsVoiceCall::new(true, local_media());
         let offer = call.build_mo_offer();
         assert_eq!(offer.connection_addr, "10.0.0.2");
         assert_eq!(offer.media_port, 40000);
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn negotiate_answer_intersects_codecs() {
-        let call = VolteVoiceCall::new(true, local_media());
+        let call = CellularImsVoiceCall::new(true, local_media());
         // Remote offers PCMU (PT 0) + AMR (PT 96). We support both; answer keeps
         // the offerer's PT numbering.
         let remote = concat!(
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn full_mo_call_reaches_active_then_ends() {
-        let mut call = VolteVoiceCall::new(true, local_media());
+        let mut call = CellularImsVoiceCall::new(true, local_media());
         call.mark_registration_ready();
         let offer = call.build_mo_offer();
         call.on_invite_sent(offer.codecs.len());
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn rejected_call_is_error() {
-        let mut call = VolteVoiceCall::new(true, local_media());
+        let mut call = CellularImsVoiceCall::new(true, local_media());
         call.mark_registration_ready();
         let _ = call.build_mo_offer();
         call.on_invite_sent(2);
@@ -502,8 +502,8 @@ mod tests {
     }
 
     /// Bring a call to the Active state so media re-negotiation is allowed.
-    fn active_call(vilte: bool) -> VolteVoiceCall {
-        let mut call = VolteVoiceCall::new(true, local_media());
+    fn active_call(vilte: bool) -> CellularImsVoiceCall {
+        let mut call = CellularImsVoiceCall::new(true, local_media());
         if vilte {
             call = call.with_vilte(&vilte_on(), video_media());
         }
@@ -564,7 +564,7 @@ mod tests {
     #[test]
     fn cannot_upgrade_before_call_is_active() {
         let mut call =
-            VolteVoiceCall::new(true, local_media()).with_vilte(&vilte_on(), video_media());
+            CellularImsVoiceCall::new(true, local_media()).with_vilte(&vilte_on(), video_media());
         call.mark_registration_ready();
         let _ = call.build_mo_offer();
         call.on_invite_sent(2);
