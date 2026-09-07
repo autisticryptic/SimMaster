@@ -160,7 +160,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
                 ready(AccessPathKind::Cs, true),
             ],
         );
@@ -168,7 +168,7 @@ mod tests {
             plan.iter().map(|c| c.kind).collect::<Vec<_>>(),
             vec![
                 AccessPathKind::Vowifi,
-                AccessPathKind::Volte,
+                AccessPathKind::CellularIms,
                 AccessPathKind::Cs
             ]
         );
@@ -181,7 +181,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, false),
-                ready(AccessPathKind::Volte, false),
+                ready(AccessPathKind::CellularIms, false),
                 ready(AccessPathKind::Cs, true),
             ],
         );
@@ -201,7 +201,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
                 ready(AccessPathKind::Cs, true),
             ],
         );
@@ -220,7 +220,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
                 ready(AccessPathKind::Cs, true),
             ],
         );
@@ -240,21 +240,21 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
                 ready(AccessPathKind::Cs, true),
             ],
         );
         assert_eq!(
             r.record(AttemptOutcome::Failed),
             RouteDecision::TryNext {
-                next: AccessPathKind::Volte
+                next: AccessPathKind::CellularIms
             }
         );
-        assert_eq!(r.current(), Some(AccessPathKind::Volte));
+        assert_eq!(r.current(), Some(AccessPathKind::CellularIms));
         assert_eq!(
             r.record(AttemptOutcome::Sent),
             RouteDecision::Delivered {
-                kind: AccessPathKind::Volte
+                kind: AccessPathKind::CellularIms
             }
         );
     }
@@ -266,14 +266,14 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
                 ready(AccessPathKind::Cs, true),
             ],
         );
         assert_eq!(
             r.record(AttemptOutcome::Failed),
             RouteDecision::TryNext {
-                next: AccessPathKind::Volte
+                next: AccessPathKind::CellularIms
             }
         );
         assert_eq!(
@@ -287,7 +287,7 @@ mod tests {
             RouteDecision::Exhausted {
                 attempted: vec![
                     AccessPathKind::Vowifi,
-                    AccessPathKind::Volte,
+                    AccessPathKind::CellularIms,
                     AccessPathKind::Cs
                 ]
             }
@@ -302,13 +302,13 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
             ],
         );
         assert_eq!(
             r.record(AttemptOutcome::DisabledMidFlight),
             RouteDecision::TryNext {
-                next: AccessPathKind::Volte
+                next: AccessPathKind::CellularIms
             }
         );
     }
@@ -323,7 +323,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, true),
-                ready(AccessPathKind::Volte, true),
+                ready(AccessPathKind::CellularIms, true),
             ],
         );
         assert_eq!(
@@ -341,7 +341,7 @@ mod tests {
             &p,
             &[
                 ready(AccessPathKind::Vowifi, false),
-                ready(AccessPathKind::Volte, false),
+                ready(AccessPathKind::CellularIms, false),
                 ready(AccessPathKind::Cs, false),
             ],
         );

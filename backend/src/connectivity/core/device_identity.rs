@@ -216,10 +216,10 @@ mod tests {
         // independently, and must arrive at the same instance id or the S-CSCF
         // holds two RFC 5626 bindings for one IMPU.
         let impi = "502120000000001@ims.mnc012.mcc502.3gppnetwork.org";
-        let volte = stable_sip_instance(impi, None, false);
+        let cellular_ims = stable_sip_instance(impi, None, false);
         let vowifi = stable_sip_instance(impi, None, false);
-        assert_eq!(volte, vowifi);
-        assert!(volte.starts_with("urn:uuid:"));
+        assert_eq!(cellular_ims, vowifi);
+        assert!(cellular_ims.starts_with("urn:uuid:"));
     }
 
     #[test]

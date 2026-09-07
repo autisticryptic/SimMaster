@@ -238,7 +238,8 @@ pub struct SimOverride {
     #[serde(default)]
     pub ims_common: ImsCommonOverride,
     #[serde(default)]
-    pub ims_volte: ImsAccessOverride,
+    #[serde(rename = "ims_volte", alias = "ims_cellular")]
+    pub ims_cellular: ImsAccessOverride,
     #[serde(default)]
     pub ims_vowifi: ImsAccessOverride,
     #[serde(default)]
@@ -252,7 +253,7 @@ impl SimOverride {
     /// override is deleted from disk rather than persisted.
     pub fn is_empty(&self) -> bool {
         self.ims_common.is_empty()
-            && self.ims_volte.is_empty()
+            && self.ims_cellular.is_empty()
             && self.ims_vowifi.is_empty()
             && self.services.is_empty()
             && self.emergency.is_empty()
@@ -340,7 +341,8 @@ impl StoredBinding {
 #[serde(default)]
 struct StoredImsOverrides {
     common: ImsCommonOverride,
-    volte: ImsAccessOverride,
+    #[serde(rename = "volte", alias = "cellular_ims")]
+    cellular_ims: ImsAccessOverride,
     vowifi: ImsAccessOverride,
 }
 
@@ -363,7 +365,7 @@ impl OverrideFile {
             binding: StoredBinding::from(key),
             ims: StoredImsOverrides {
                 common: override_.ims_common.clone(),
-                volte: override_.ims_volte.clone(),
+                cellular_ims: override_.ims_cellular.clone(),
                 vowifi: override_.ims_vowifi.clone(),
             },
             services: override_.services.clone(),
@@ -374,7 +376,7 @@ impl OverrideFile {
     fn into_override(self) -> SimOverride {
         SimOverride {
             ims_common: self.ims.common,
-            ims_volte: self.ims.volte,
+            ims_cellular: self.ims.cellular_ims,
             ims_vowifi: self.ims.vowifi,
             services: self.services,
             emergency: self.emergency,
@@ -859,6 +861,34 @@ fn sha256_hex(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cellular_ims_override_aliases_preserve_existing_flat_and_bound_documents() {
+        let mut value = SimOverride::default();
+        value.ims_cellular.apn = Some("ims.fixture".into());
+        value.ims_cellular.pcscf = Some(vec!["192.0.2.1".into()]);
+        let flat = serde_json::to_value(&value).unwrap();
+        assert!(flat.get("ims_volte").is_some());
+        let mut alias = flat.clone();
+        let cell = alias.as_object_mut().unwrap().remove("ims_volte").unwrap();
+        alias["ims_cellular"] = cell;
+        assert_eq!(serde_json::from_value::<SimOverride>(alias).unwrap(), value);
+        let key = SimBindingKey::Plain {
+            iccid: "test-sim".into(),
+        };
+        let stored = serde_json::to_value(OverrideFile::from_override(&key, &value)).unwrap();
+        assert!(stored["ims"].get("volte").is_some());
+        let mut alias = stored.clone();
+        let cell = alias["ims"]
+            .as_object_mut()
+            .unwrap()
+            .remove("volte")
+            .unwrap();
+        alias["ims"]["cellular_ims"] = cell;
+        let decoded: OverrideFile = serde_json::from_value(alias).unwrap();
+        assert_eq!(decoded.clone().into_override(), value);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), stored);
+    }
+
     fn temp_store() -> SimOverrideStore {
         use std::sync::atomic::{AtomicU64, Ordering};
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -986,7 +1016,7 @@ mod tests {
             loaded.ims_vowifi.epdg_host.as_deref(),
             Some("epdg.example.com")
         );
-        assert!(loaded.ims_volte.is_empty());
+        assert!(loaded.ims_cellular.is_empty());
         assert!(loaded.services.is_empty());
     }
 
@@ -1310,7 +1340,7 @@ mod tests {
                 custom_imei: Some(imei.to_string()),
                 voicemail_number: Some(format!("*8{suffix}")),
             },
-            ims_volte: ImsAccessOverride {
+            ims_cellular: ImsAccessOverride {
                 domain: Some(format!("volte-{suffix}.ims.example")),
                 ..Default::default()
             },

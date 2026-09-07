@@ -4,7 +4,7 @@ const IMS_SERVICE_NOT_SUBSCRIBED = /ServiceOptionNotSubscribed|service-option-no
 const SIP_STATUS = /sip_status=(\d{3})/i
 const TRANSIENT_REFRESH_DIAGNOSTIC = /(?:volte_register_refresh_retry|volte_register_refresh_receive_failed|ims_register_initial_receive_failed)/i
 
-export function isTransientVolteRefreshDiagnostic(error?: string | null) {
+export function isTransientCellularImsRefreshDiagnostic(error?: string | null) {
   return Boolean(error && TRANSIENT_REFRESH_DIAGNOSTIC.test(error))
 }
 
@@ -74,8 +74,8 @@ export function standardDerivedProfileMessage(
   return '运营商数据库没有可用配置，当前使用未经运营商验证的 3GPP 标准自动推断。'
 }
 
-export function volteErrorMessage(error?: string | null) {
-  if (!error || isTransientVolteRefreshDiagnostic(error)) return null
+export function cellularImsErrorMessage(error?: string | null) {
+  if (!error || isTransientCellularImsRefreshDiagnostic(error)) return null
 
   const profileNotReady = error.match(PROFILE_NOT_READY)
   if (profileNotReady) {
@@ -123,8 +123,8 @@ export function volteErrorMessage(error?: string | null) {
   return error
 }
 
-export function volteErrorStatusLabel(error?: string | null) {
-  if (!error || isTransientVolteRefreshDiagnostic(error)) return null
+export function cellularImsErrorStatusLabel(error?: string | null) {
+  if (!error || isTransientCellularImsRefreshDiagnostic(error)) return null
   if (error.includes('volte_runtime_cellular_network_not_registered')) return '蜂窝网络未注册'
   const networkFailure = networkFailureStatusLabel(error)
   if (networkFailure) return networkFailure

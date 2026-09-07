@@ -2,7 +2,7 @@ import type { ReactNode } from 'react'
 import { Alert, Box, Chip, Typography } from '@mui/material'
 import Grid from '@mui/material/Grid'
 import type { AppEventEntry, CallRecord, SmsMessage, TrunkProfileResponse, CellularImsLineControlResponse, VowifiLineConfigResponse, VowifiRuntimeEventEntry } from '../../api/current'
-import { standardDerivedProfileMessage, volteErrorMessage } from './volteErrorFormat'
+import { standardDerivedProfileMessage, cellularImsErrorMessage } from './cellularImsErrorFormat'
 
 function Field({ label, value }: { label: string, value: ReactNode }) {
   return (
@@ -25,8 +25,8 @@ export function LineCsDetails({ line }: { line: CellularImsLineControlResponse }
   )
 }
 
-export function LineVolteDetails({ line }: { line: CellularImsLineControlResponse }) {
-  const displayError = volteErrorMessage(line.runtime.last_error)
+export function LineCellularImsDetails({ line }: { line: CellularImsLineControlResponse }) {
+  const displayError = cellularImsErrorMessage(line.runtime.last_error)
   const imsAttemptInProgress = line.profile.volte_connection_enabled
     && !line.runtime.registered
     && (
@@ -82,7 +82,7 @@ type ActivityLogEntry = {
   error?: string
 }
 
-const volteActivityStageLabels: Record<string, string> = {
+const cellularImsActivityStageLabels: Record<string, string> = {
   bearer: '建立 IMS Bearer',
   bearer_dual: '建立双栈 IMS Bearer',
   bearer_ipv4: '回退 IPv4 IMS Bearer',
@@ -195,7 +195,7 @@ export function LineActivityLog({
     ...(line.runtime.connection_attempts ?? []).map((attempt) => ({
       at: attempt.at,
       source: '4G/5G' as const,
-      stage: `${volteActivityStageLabels[attempt.stage] || attempt.stage}${attempt.ip_family ? ` · ${attempt.ip_family.toUpperCase()}` : ''}`,
+      stage: `${cellularImsActivityStageLabels[attempt.stage] || attempt.stage}${attempt.ip_family ? ` · ${attempt.ip_family.toUpperCase()}` : ''}`,
       outcome: attempt.outcome,
       detail: [
         attempt.detail,

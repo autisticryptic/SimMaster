@@ -329,7 +329,7 @@ impl ImsSubsystemState {
     ) -> Self {
         let three_gpp_stage = three_gpp.stage();
         let three_gpp_path = ImsAccessPath {
-            kind: AccessPathKind::Volte,
+            kind: AccessPathKind::CellularIms,
             family: AccessFamily::ThreeGpp,
             configured: three_gpp.configured,
             stage: three_gpp_stage,
@@ -355,7 +355,7 @@ impl ImsSubsystemState {
             registered_over.push(AccessPathKind::Vowifi);
         }
         if three_gpp_path.registered {
-            registered_over.push(AccessPathKind::Volte);
+            registered_over.push(AccessPathKind::CellularIms);
         }
 
         let plan = plan_voice_route(
@@ -368,7 +368,7 @@ impl ImsSubsystemState {
                     media_gateway_ready: non_three_gpp.media_gateway_ready,
                 },
                 VoiceLegReadiness {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     feature_enabled: three_gpp_path.configured,
                     registered: three_gpp_path.registered,
                     media_gateway_ready: three_gpp.media_gateway_ready,
@@ -494,14 +494,14 @@ mod tests {
     // --- the four operator scenarios ------------------------------------
 
     #[test]
-    fn lte_only_carries_voice_on_volte() {
+    fn lte_only_carries_voice_on_cellular_ims() {
         let state = build_state(&lte_up(), &wifi_down());
 
         assert_eq!(
             state.registration.registered_over,
-            vec![AccessPathKind::Volte]
+            vec![AccessPathKind::CellularIms]
         );
-        assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
+        assert_eq!(state.voice.active, Some(AccessPathKind::CellularIms));
         assert_eq!(state.three_gpp.path.stage, AccessPathStage::Registered);
         assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
     }
@@ -514,9 +514,11 @@ mod tests {
         // "tear down VoLTE when VoWiFi connects" logic violated.
         assert_eq!(
             state.registration.registered_over,
-            vec![AccessPathKind::Vowifi, AccessPathKind::Volte]
+            vec![AccessPathKind::Vowifi, AccessPathKind::CellularIms]
         );
-        assert!(state.registration.is_registered_over(AccessPathKind::Volte));
+        assert!(state
+            .registration
+            .is_registered_over(AccessPathKind::CellularIms));
         assert!(state
             .registration
             .is_registered_over(AccessPathKind::Vowifi));
@@ -525,7 +527,7 @@ mod tests {
         assert_eq!(state.voice.active, Some(AccessPathKind::Vowifi));
         assert_eq!(
             state.voice.candidates,
-            vec![AccessPathKind::Vowifi, AccessPathKind::Volte]
+            vec![AccessPathKind::Vowifi, AccessPathKind::CellularIms]
         );
     }
 
@@ -542,7 +544,7 @@ mod tests {
     }
 
     #[test]
-    fn losing_wifi_falls_back_to_volte_without_touching_its_registration() {
+    fn losing_wifi_falls_back_to_cellular_ims_without_touching_its_registration() {
         let both = build_state(&lte_up(), &wifi_up());
         assert_eq!(both.voice.active, Some(AccessPathKind::Vowifi));
 
@@ -552,9 +554,9 @@ mod tests {
 
         assert_eq!(
             after.registration.registered_over,
-            vec![AccessPathKind::Volte]
+            vec![AccessPathKind::CellularIms]
         );
-        assert_eq!(after.voice.active, Some(AccessPathKind::Volte));
+        assert_eq!(after.voice.active, Some(AccessPathKind::CellularIms));
         assert_eq!(after.three_gpp.path.stage, AccessPathStage::Registered);
         assert_eq!(
             both.three_gpp.path, after.three_gpp.path,
@@ -566,10 +568,10 @@ mod tests {
 
     #[test]
     fn voice_selection_change_does_not_change_registration() {
-        let volte_first = VoicePathPolicy {
+        let cellular_ims_first = VoicePathPolicy {
             priority: vec![
                 crate::platform::config::PathLayerConfig {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     enabled: true,
                 },
                 crate::platform::config::PathLayerConfig {
@@ -581,10 +583,11 @@ mod tests {
         };
 
         let default_policy = build_state(&lte_up(), &wifi_up());
-        let swapped = ImsSubsystemState::build("line-1", &volte_first, &lte_up(), &wifi_up());
+        let swapped =
+            ImsSubsystemState::build("line-1", &cellular_ims_first, &lte_up(), &wifi_up());
 
         assert_eq!(default_policy.voice.active, Some(AccessPathKind::Vowifi));
-        assert_eq!(swapped.voice.active, Some(AccessPathKind::Volte));
+        assert_eq!(swapped.voice.active, Some(AccessPathKind::CellularIms));
         assert_eq!(
             default_policy.registration, swapped.registration,
             "changing which access carries voice is not a re-registration"
@@ -601,7 +604,9 @@ mod tests {
 
         assert_eq!(state.three_gpp.path.stage, AccessPathStage::Disabled);
         assert!(!state.three_gpp.path.registered);
-        assert!(!state.registration.is_registered_over(AccessPathKind::Volte));
+        assert!(!state
+            .registration
+            .is_registered_over(AccessPathKind::CellularIms));
 
         let failing = ThreeGppObservation {
             registered: false,
@@ -627,7 +632,7 @@ mod tests {
 
         let state = build_state(&lte_up(), &half_up);
         assert_eq!(state.non_three_gpp.path.stage, AccessPathStage::Down);
-        assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
+        assert_eq!(state.voice.active, Some(AccessPathKind::CellularIms));
     }
 
     #[test]
@@ -641,7 +646,9 @@ mod tests {
 
         assert_eq!(state.three_gpp.path.stage, AccessPathStage::Down);
         assert!(!state.three_gpp.path.registered);
-        assert!(!state.registration.is_registered_over(AccessPathKind::Volte));
+        assert!(!state
+            .registration
+            .is_registered_over(AccessPathKind::CellularIms));
         assert_eq!(state.voice.active, Some(AccessPathKind::Vowifi));
     }
 
@@ -659,7 +666,7 @@ mod tests {
         assert!(!state
             .registration
             .is_registered_over(AccessPathKind::Vowifi));
-        assert_eq!(state.voice.active, Some(AccessPathKind::Volte));
+        assert_eq!(state.voice.active, Some(AccessPathKind::CellularIms));
     }
 
     #[test]
@@ -698,7 +705,9 @@ mod tests {
         let state = build_state(&no_media, &wifi_down());
 
         // Still registered for SMS/signaling...
-        assert!(state.registration.is_registered_over(AccessPathKind::Volte));
+        assert!(state
+            .registration
+            .is_registered_over(AccessPathKind::CellularIms));
         // ...but cannot carry voice in gateway mode.
         assert_eq!(state.voice.active, None);
     }

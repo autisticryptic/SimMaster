@@ -42,7 +42,7 @@ pub const DEFAULT_PTIME_MS: u16 = 20;
 /// leg enabled" from the leg's own perspective (the shared state machine only
 /// needs to know an IMS leg is available); the carrier/USB-audio fallback leg is
 /// off (the target device has no audio hardware).
-pub fn volte_voice_params(voice_enabled: bool) -> VoiceParams {
+pub fn cellular_ims_voice_params(voice_enabled: bool) -> VoiceParams {
     VoiceParams {
         preferred_codecs: DEFAULT_VOICE_CODECS.iter().map(|s| s.to_string()).collect(),
         codec_policies: Vec::new(),
@@ -174,7 +174,7 @@ impl CellularImsVoiceCall {
     /// Audio-only (VoLTE); video is disabled unless [`with_vilte`](Self::with_vilte)
     /// supplies a ViLTE config + a local video media endpoint.
     pub fn new(voice_enabled: bool, local_media: MediaEndpoint) -> Self {
-        let params = volte_voice_params(voice_enabled);
+        let params = cellular_ims_voice_params(voice_enabled);
         Self {
             machine: VoiceCallStateMachine::with_params(params.clone()),
             params,
@@ -195,7 +195,7 @@ impl CellularImsVoiceCall {
         ims_video: &ImsVideoConfig,
         local_video_media: MediaEndpoint,
     ) -> Self {
-        self.video_enabled = ims_video.volte_enabled;
+        self.video_enabled = ims_video.cellular_ims_enabled;
         self.ims_video = ims_video.clone();
         self.local_video_media = Some(local_video_media);
         self
@@ -412,13 +412,13 @@ mod tests {
 
     #[test]
     fn params_reflect_voice_enabled() {
-        let on = volte_voice_params(true);
+        let on = cellular_ims_voice_params(true);
         assert!(on.vowifi_enabled);
         assert!(
             !on.carrier_fallback_enabled,
             "no audio hardware -> no carrier leg"
         );
-        let off = volte_voice_params(false);
+        let off = cellular_ims_voice_params(false);
         assert!(!off.vowifi_enabled);
     }
 
@@ -488,7 +488,7 @@ mod tests {
 
     fn vilte_on() -> ImsVideoConfig {
         ImsVideoConfig {
-            volte_enabled: true,
+            cellular_ims_enabled: true,
             ..ImsVideoConfig::default()
         }
     }

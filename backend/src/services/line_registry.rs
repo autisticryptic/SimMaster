@@ -20,7 +20,7 @@ use crate::{
     connectivity::core::access_network::{
         AccessNetworkRuntimeStatus, ImsAccessNetworkRuntime, DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE,
     },
-    connectivity::modems::ims::volte::{
+    connectivity::modems::ims::cellular_ims::{
         live::CellularImsLiveHandle, CellularImsRuntime, CellularImsRuntimeStatus,
     },
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
@@ -119,8 +119,8 @@ pub struct LineRuntime {
     /// namespace (`setns`) and hosts the UE's IMS/data
     /// sockets, so identical IPs/P-CSCF/xfrm state can never cross lines.
     pub ue_worker: UeWorkerHandle,
-    pub volte: Arc<CellularImsRuntime>,
-    pub volte_live: CellularImsLiveHandle,
+    pub cellular_ims: Arc<CellularImsRuntime>,
+    pub cellular_ims_live: CellularImsLiveHandle,
     /// Serving-cell identity owned by this physical line and shared by its
     /// VoLTE and VoWiFi REGISTER builders. No process-global lookup is used.
     pub ims_access_network: ImsAccessNetworkRuntime,
@@ -131,8 +131,8 @@ pub struct LineRuntime {
     /// Native data and IMS may use different device endpoints, while the
     /// baseband policy engine can still reject concurrent session transitions.
     pub bearer_operation_lock: Mutex<()>,
-    pub volte_connect_lock: Mutex<()>,
-    pub volte_retry_running: AtomicBool,
+    pub cellular_ims_connect_lock: Mutex<()>,
+    pub cellular_ims_retry_running: AtomicBool,
     /// Suppression window for IMS activations that crash the baseband. Held
     /// here, not in the VoLTE snapshot, because the crash re-enumerates the
     /// modem and that hotplug resets the snapshot. See [`BasebandWedgeState`].
@@ -175,14 +175,14 @@ pub struct LineRuntime {
 impl LineRuntime {
     fn new(
         binding: ModemBinding,
-        volte: Arc<CellularImsRuntime>,
-        volte_live: CellularImsLiveHandle,
+        cellular_ims: Arc<CellularImsRuntime>,
+        cellular_ims_live: CellularImsLiveHandle,
         voice_policy: VoicePathPolicy,
     ) -> Self {
         Self::new_for_device(
             binding,
-            volte,
-            volte_live,
+            cellular_ims,
+            cellular_ims_live,
             voice_policy,
             devices::detect_device_kind(),
         )
@@ -190,8 +190,8 @@ impl LineRuntime {
 
     fn new_for_device(
         binding: ModemBinding,
-        volte: Arc<CellularImsRuntime>,
-        volte_live: CellularImsLiveHandle,
+        cellular_ims: Arc<CellularImsRuntime>,
+        cellular_ims_live: CellularImsLiveHandle,
         voice_policy: VoicePathPolicy,
         device_kind: DeviceKind,
     ) -> Self {
@@ -203,7 +203,10 @@ impl LineRuntime {
             voice_policy,
             vec![
                 (AccessPathKind::Vowifi, vowifi_operator),
-                (AccessPathKind::Volte, volte_live.operator_link()),
+                (
+                    AccessPathKind::CellularIms,
+                    cellular_ims_live.operator_link(),
+                ),
             ],
         );
         let operator = voice_access.operator_link();
@@ -213,7 +216,7 @@ impl LineRuntime {
             ims_access_network.clone(),
         ));
         let supplementary = Arc::new(SupplementaryRuntime::for_line(&binding.line_id));
-        volte_live.bind_supplementary(Arc::clone(&supplementary));
+        cellular_ims_live.bind_supplementary(Arc::clone(&supplementary));
         crate::connectivity::modems::ims::vowifi::operator::bind_supplementary_for_line(
             &binding.line_id,
             Arc::clone(&supplementary),
@@ -225,15 +228,15 @@ impl LineRuntime {
             binding: RwLock::new(binding),
             ue: RwLock::new(ue_context),
             ue_worker: UeWorkerHandle::for_line(&line_id, namespace),
-            volte,
-            volte_live,
+            cellular_ims,
+            cellular_ims_live,
             ims_access_network,
             ims_registration: crate::connectivity::core::ims_registration_coordinator::for_line(
                 &line_id,
             ),
             bearer_operation_lock: Mutex::new(()),
-            volte_connect_lock: Mutex::new(()),
-            volte_retry_running: AtomicBool::new(false),
+            cellular_ims_connect_lock: Mutex::new(()),
+            cellular_ims_retry_running: AtomicBool::new(false),
             baseband_wedge: RwLock::new(BasebandWedgeState::default()),
             vowifi,
             vowifi_connect_lock: Mutex::new(()),
@@ -291,7 +294,7 @@ impl LineRuntime {
             modem: self.binding(),
             ue: self.ue(),
             ue_worker: self.ue_worker.status().await,
-            volte: self.volte.status().await,
+            cellular_ims: self.cellular_ims.status().await,
             ims_access_network: self
                 .ims_access_network
                 .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE),
@@ -302,18 +305,19 @@ impl LineRuntime {
 
     /// Claim the complete VoLTE recovery workflow, not just one connect call.
     /// This keeps automatic restore and the Web retry action from overlapping.
-    pub fn begin_volte_retry(&self) -> bool {
-        self.volte_retry_running
+    pub fn begin_cellular_ims_retry(&self) -> bool {
+        self.cellular_ims_retry_running
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
-    pub fn finish_volte_retry(&self) {
-        self.volte_retry_running.store(false, Ordering::SeqCst);
+    pub fn finish_cellular_ims_retry(&self) {
+        self.cellular_ims_retry_running
+            .store(false, Ordering::SeqCst);
     }
 
-    pub fn volte_retry_in_progress(&self) -> bool {
-        self.volte_retry_running.load(Ordering::SeqCst)
+    pub fn cellular_ims_retry_in_progress(&self) -> bool {
+        self.cellular_ims_retry_running.load(Ordering::SeqCst)
     }
 
     /// A native bearer move temporarily removes a modem netdev from the host
@@ -447,7 +451,8 @@ pub struct LineRuntimeStatus {
     pub modem: ModemBinding,
     pub ue: UeContext,
     pub ue_worker: UeWorkerStatus,
-    pub volte: CellularImsRuntimeStatus,
+    #[serde(rename = "volte")]
+    pub cellular_ims: CellularImsRuntimeStatus,
     pub ims_access_network: AccessNetworkRuntimeStatus,
     pub trunk: TrunkRuntimeStatus,
     pub supplementary: SupplementarySnapshot,
@@ -1425,7 +1430,7 @@ mod tests {
         let status = line.status().await;
         assert_eq!(status.modem.line_id, "line-a");
         assert_eq!(line.vowifi.line_id(), "line-a");
-        assert_eq!(status.volte.phase, "disabled");
+        assert_eq!(status.cellular_ims.phase, "disabled");
         assert_eq!(status.trunk.phase, "disabled");
     }
 
@@ -1622,7 +1627,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_runtime_and_operator_channels_are_independent_per_line() {
+    fn cellular_ims_runtime_and_operator_channels_are_independent_per_line() {
         let line_a = LineRuntime::new(
             binding("line-a", true),
             Arc::new(CellularImsRuntime::new()),
@@ -1635,10 +1640,10 @@ mod tests {
             CellularImsLiveHandle::new(),
             VoicePathPolicy::default(),
         );
-        assert!(!Arc::ptr_eq(&line_a.volte, &line_b.volte));
+        assert!(!Arc::ptr_eq(&line_a.cellular_ims, &line_b.cellular_ims));
 
-        let operator_a = line_a.volte_live.operator_link();
-        let operator_b = line_b.volte_live.operator_link();
+        let operator_a = line_a.cellular_ims_live.operator_link();
+        let operator_b = line_b.cellular_ims_live.operator_link();
         let _commands_a = operator_a.subscribe_commands();
         operator_a.set_ready(true);
 
@@ -1677,7 +1682,7 @@ mod tests {
         line_a
             .supplementary
             .begin_mwi_subscription(
-                crate::connectivity::core::registration::ImsRegistrationAccess::Volte,
+                crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms,
             )
             .await;
         line_b
@@ -1694,7 +1699,7 @@ mod tests {
         line_a
             .supplementary
             .clear_registration(
-                crate::connectivity::core::registration::ImsRegistrationAccess::Volte,
+                crate::connectivity::core::registration::ImsRegistrationAccess::CellularIms,
             )
             .await;
 

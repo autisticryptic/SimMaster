@@ -101,11 +101,11 @@ mod tests {
     fn route_domains_and_line_interfaces_do_not_share_tables() {
         let address = "10.0.0.2".parse().unwrap();
         let data = route_table(RouteDomain::ModemData, "wwan2", address);
-        let volte = route_table(RouteDomain::CellularIms, "wwan2", address);
+        let cellular_ims = route_table(RouteDomain::CellularIms, "wwan2", address);
         let vowifi_a = route_table(RouteDomain::VowifiIms, "sa_vwf0c93197", address);
         let vowifi_b = route_table(RouteDomain::VowifiIms, "sa_vwf8a14d20", address);
-        assert_ne!(data, volte);
-        assert_ne!(volte, vowifi_a);
+        assert_ne!(data, cellular_ims);
+        assert_ne!(cellular_ims, vowifi_a);
         assert_ne!(vowifi_a, vowifi_b);
     }
 

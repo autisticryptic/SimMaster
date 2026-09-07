@@ -170,14 +170,14 @@ pub fn resolve_effective_vowifi_profile(
 /// IMS access whose independent override fields are being resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectiveImsAccess {
-    Volte,
+    CellularIms,
     Vowifi,
 }
 
 impl EffectiveImsAccess {
     fn override_from(self, override_: &SimOverride) -> &ImsAccessOverride {
         match self {
-            Self::Volte => &override_.ims_volte,
+            Self::CellularIms => &override_.ims_cellular,
             Self::Vowifi => &override_.ims_vowifi,
         }
     }
@@ -235,7 +235,7 @@ pub fn resolve_effective_ims_profile(
     catalog: &CarrierProfile,
     override_: Option<&SimOverride>,
 ) -> EffectiveImsProfile {
-    resolve_effective_ims_profile_for_access(catalog, override_, EffectiveImsAccess::Volte)
+    resolve_effective_ims_profile_for_access(catalog, override_, EffectiveImsAccess::CellularIms)
 }
 
 pub fn resolve_effective_vowifi_ims_profile(
@@ -408,7 +408,7 @@ pub fn validate_override(override_: &SimOverride) -> Vec<String> {
     }
     for (access, name) in [
         (&override_.ims_vowifi, "ims_vowifi"),
-        (&override_.ims_volte, "ims_volte"),
+        (&override_.ims_cellular, "ims_volte"),
     ] {
         validate_access(access, name, &mut problems);
     }
@@ -458,7 +458,7 @@ fn validate_access(access: &ImsAccessOverride, name: &str, problems: &mut Vec<St
 #[allow(clippy::too_many_arguments)]
 pub fn source_map_of(
     vowifi: &EffectiveVowifiProfile,
-    volte_ims: &EffectiveImsProfile,
+    cellular_ims: &EffectiveImsProfile,
     vowifi_ims: &EffectiveImsProfile,
     identity: &EffectiveDeviceIdentity,
     common: &EffectiveCommon,
@@ -476,7 +476,7 @@ pub fn source_map_of(
     for (index, server) in vowifi.dns_servers.iter().enumerate() {
         push_field(&mut map, &format!("vowifi.dns[{index}]"), server);
     }
-    for (prefix, ims) in [("volte_ims", volte_ims), ("vowifi_ims", vowifi_ims)] {
+    for (prefix, ims) in [("volte_ims", cellular_ims), ("vowifi_ims", vowifi_ims)] {
         push_field(&mut map, &format!("{prefix}.domain"), &ims.domain);
         push_field(&mut map, &format!("{prefix}.realm"), &ims.realm);
         if let Some(pcscf) = &ims.pcscf {
@@ -747,7 +747,7 @@ mod tests {
             ..Default::default()
         };
         let vowifi = resolve_effective_vowifi_profile(&GB_EE_23433, Some(&override_));
-        let volte_ims = resolve_effective_ims_profile(&GB_EE_23433, Some(&override_));
+        let cellular_ims = resolve_effective_ims_profile(&GB_EE_23433, Some(&override_));
         let vowifi_ims = resolve_effective_vowifi_ims_profile(&GB_EE_23433, Some(&override_));
         let identity = resolve_effective_device_identity(Some(&override_), None);
         let common = resolve_effective_common(Some(&override_));
@@ -755,7 +755,7 @@ mod tests {
         let emergency = resolve_effective_emergency(Some(&override_));
         let map = source_map_of(
             &vowifi,
-            &volte_ims,
+            &cellular_ims,
             &vowifi_ims,
             &identity,
             &common,
@@ -770,9 +770,9 @@ mod tests {
     }
 
     #[test]
-    fn volte_and_vowifi_ims_overrides_remain_independent() {
+    fn cellular_ims_and_vowifi_ims_overrides_remain_independent() {
         let override_ = SimOverride {
-            ims_volte: ImsAccessOverride {
+            ims_cellular: ImsAccessOverride {
                 domain: Some("volte.example".to_string()),
                 realm: Some("volte-realm.example".to_string()),
                 registrar: Some("sip:volte-reg.example".to_string()),
@@ -786,20 +786,23 @@ mod tests {
             },
             ..Default::default()
         };
-        let volte = resolve_effective_ims_profile(&GB_EE_23433, Some(&override_));
+        let cellular_ims = resolve_effective_ims_profile(&GB_EE_23433, Some(&override_));
         let vowifi = resolve_effective_vowifi_ims_profile(&GB_EE_23433, Some(&override_));
-        assert_eq!(volte.domain.value, "volte.example");
-        assert_eq!(volte.realm.value, "volte-realm.example");
-        assert_eq!(volte.registrar.unwrap().value, "sip:volte-reg.example");
+        assert_eq!(cellular_ims.domain.value, "volte.example");
+        assert_eq!(cellular_ims.realm.value, "volte-realm.example");
+        assert_eq!(
+            cellular_ims.registrar.unwrap().value,
+            "sip:volte-reg.example"
+        );
         assert_eq!(vowifi.domain.value, "vowifi.example");
         assert_eq!(vowifi.realm.value, "vowifi-realm.example");
         assert_eq!(vowifi.registrar.unwrap().value, "sip:vowifi-reg.example");
     }
 
     #[test]
-    fn volte_connection_snapshot_uses_only_volte_access_fields() {
+    fn cellular_ims_connection_snapshot_uses_only_cellular_ims_access_fields() {
         let override_ = SimOverride {
-            ims_volte: ImsAccessOverride {
+            ims_cellular: ImsAccessOverride {
                 profile_id: Some("volte-profile".to_string()),
                 apn: Some("volte-ims".to_string()),
                 pcscf: Some(vec!["192.0.2.10".to_string(), "192.0.2.11".to_string()]),
@@ -821,9 +824,9 @@ mod tests {
     }
 
     #[test]
-    fn volte_ip_stack_override_wins_over_lte_catalog_hint() {
+    fn cellular_ims_ip_stack_override_wins_over_lte_catalog_hint() {
         let override_ = SimOverride {
-            ims_volte: ImsAccessOverride {
+            ims_cellular: ImsAccessOverride {
                 ip_stack: Some("ipv4".to_string()),
                 ..Default::default()
             },

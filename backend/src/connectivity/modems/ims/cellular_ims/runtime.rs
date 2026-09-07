@@ -575,7 +575,7 @@ impl CellularImsRuntime {
         stage: CellularImsStage,
         ip_family: Option<&str>,
         outcome: &str,
-        error: Option<&crate::connectivity::modems::ims::volte::errors::CellularImsError>,
+        error: Option<&crate::connectivity::modems::ims::cellular_ims::errors::CellularImsError>,
         detail: Option<String>,
     ) {
         self.update(|snapshot| {
@@ -697,7 +697,7 @@ impl CellularImsRuntime {
         index: u32,
         candidate: &ImsProfileCandidate,
         outcome: &str,
-        error: Option<&crate::connectivity::modems::ims::volte::errors::CellularImsError>,
+        error: Option<&crate::connectivity::modems::ims::cellular_ims::errors::CellularImsError>,
     ) {
         self.update(|snapshot| {
             snapshot
@@ -848,8 +848,8 @@ mod tests {
             snapshot.profile_fallback_reason = Some("database_profile_not_found".to_string());
         })
         .await;
-        let error = crate::connectivity::modems::ims::volte::errors::CellularImsError::with_detail(
-            crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING,
+        let error = crate::connectivity::modems::ims::cellular_ims::errors::CellularImsError::with_detail(
+            crate::connectivity::modems::ims::cellular_ims::errors::code::CARRIER_PROFILE_MISSING,
             "fixture",
         );
         rt.finish_profile_attempt(2, &candidate, "failed", Some(&error))
@@ -880,7 +880,7 @@ mod tests {
         assert_eq!(result.outcome, "failed");
         assert_eq!(
             result.error_code.as_deref(),
-            Some(crate::connectivity::modems::ims::volte::errors::code::CARRIER_PROFILE_MISSING)
+            Some(crate::connectivity::modems::ims::cellular_ims::errors::code::CARRIER_PROFILE_MISSING)
         );
     }
 

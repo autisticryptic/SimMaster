@@ -86,7 +86,7 @@ fn spawn_runtime_event_bridge(app: AppState) {
     tokio::spawn(async move {
         use std::collections::{HashMap, VecDeque};
 
-        let mut seen_volte_attempts: HashMap<String, VecDeque<String>> = HashMap::new();
+        let mut seen_cellular_ims_attempts: HashMap<String, VecDeque<String>> = HashMap::new();
         let mut trunk_fingerprints: HashMap<String, String> = HashMap::new();
         let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(1));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -101,10 +101,10 @@ fn spawn_runtime_event_bridge(app: AppState) {
                 // what keeps the diagnostic log readable when several cards are
                 // retrying at the same time.
                 services::system::diagnostic_log::with_ue_worker_context(async {
-                    let volte = line.volte.snapshot().await;
-                    let seen = seen_volte_attempts.entry(line_id.clone()).or_default();
+                    let cellular_ims = line.cellular_ims.snapshot().await;
+                    let seen = seen_cellular_ims_attempts.entry(line_id.clone()).or_default();
 
-                    for attempt in &volte.connection_attempts {
+                    for attempt in &cellular_ims.connection_attempts {
                         let key = format!("{}:{}", attempt.sequence, attempt.at);
                         if seen.contains(&key) {
                             continue;
@@ -987,7 +987,7 @@ async fn main() -> Result<()> {
 
     // Build protected routes - 使用统一的 AppState
     spawn_vowifi_auto_restore(app_state.clone());
-    spawn_volte_auto_restore(app_state.clone());
+    spawn_cellular_ims_auto_restore(app_state.clone());
 
     let app = build_router(app_state, cors);
 
@@ -1045,7 +1045,7 @@ fn spawn_trunk_sms_bridge(app: AppState) {
                     continue;
                 }
                 let mut requests = line.trunk.operator_link().subscribe_sms_requests();
-                let mut volte_mt = line.volte_live.subscribe_mt_sms();
+                let mut cellular_ims_mt = line.cellular_ims_live.subscribe_mt_sms();
                 let app_task = app.clone();
                 let attach_id = line_id.clone();
                 let handle = tokio::spawn(async move {
@@ -1078,7 +1078,7 @@ fn spawn_trunk_sms_bridge(app: AppState) {
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 }
                             }
-                            maybe = volte_mt.recv() => {
+                            maybe = cellular_ims_mt.recv() => {
                                 match maybe {
                                     Ok(sms) => {
                                         crate::api::handlers::publish_sms_to_trunk(&app_task, &sms).await;

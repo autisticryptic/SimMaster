@@ -1656,7 +1656,7 @@ mod tests {
         {
             let mut config = manager.config.write().unwrap();
             let mut profile = LineProfileConfig::for_line(legacy_line_id);
-            profile.volte_connection_enabled = true;
+            profile.cellular_ims_connection_enabled = true;
             profile.trunk.context = "from-migrated-slot".to_string();
             config.line_profiles.push(profile);
             config.automation.tasks.push(AutomationTask {
@@ -1687,7 +1687,7 @@ mod tests {
             .migrate_line_profile_aliases(current_line_id, &[legacy_line_id.to_string()])
             .unwrap());
         let migrated = manager.get_line_profile(current_line_id);
-        assert!(migrated.volte_connection_enabled);
+        assert!(migrated.cellular_ims_connection_enabled);
         assert_eq!(migrated.trunk.context, "from-migrated-slot");
         let config = manager.config.read().unwrap();
         assert!(matches!(
@@ -1769,7 +1769,7 @@ mod tests {
     }
 
     #[test]
-    fn per_line_volte_connection_is_independent_and_persists() {
+    fn per_line_cellular_ims_connection_is_independent_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-config-{}-{}.json",
             std::process::id(),
@@ -1779,19 +1779,31 @@ mod tests {
         let line_a = "line-0123456789abcdef0123456789abcdef";
         let line_b = "line-fedcba9876543210fedcba9876543210";
         let profile = manager
-            .set_line_volte_connection_enabled(line_a, true)
+            .set_line_cellular_ims_connection_enabled(line_a, true)
             .unwrap();
-        assert!(profile.volte_connection_enabled);
-        assert!(!manager.get_line_profile(line_b).volte_connection_enabled);
+        assert!(profile.cellular_ims_connection_enabled);
+        assert!(
+            !manager
+                .get_line_profile(line_b)
+                .cellular_ims_connection_enabled
+        );
 
         let reloaded = ConfigManager::new(path.clone());
-        assert!(reloaded.get_line_profile(line_a).volte_connection_enabled);
-        assert!(!reloaded.get_line_profile(line_b).volte_connection_enabled);
+        assert!(
+            reloaded
+                .get_line_profile(line_a)
+                .cellular_ims_connection_enabled
+        );
+        assert!(
+            !reloaded
+                .get_line_profile(line_b)
+                .cellular_ims_connection_enabled
+        );
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn per_line_volte_profile_selection_is_independent_and_persists() {
+    fn per_line_cellular_ims_profile_selection_is_independent_and_persists() {
         let path = std::env::temp_dir().join(format!(
             "simadmin-line-profile-selection-{}-{}.json",
             std::process::id(),
@@ -1814,28 +1826,30 @@ mod tests {
             ],
         };
         let saved = manager
-            .set_line_volte_profile_selection(line_a, selection)
+            .set_line_cellular_ims_profile_selection(line_a, selection)
             .unwrap();
         assert_eq!(
-            saved.volte_profile_selection.attempts[0]
+            saved.cellular_ims_profile_selection.attempts[0]
                 .profile_id
                 .as_deref(),
             Some("catalog-a")
         );
         assert_eq!(
-            manager.get_line_volte_profile_selection(line_b),
+            manager.get_line_cellular_ims_profile_selection(line_b),
             ImsProfileSelectionConfig::default()
         );
 
         let reloaded = ConfigManager::new(path.clone());
         assert_eq!(
-            reloaded.get_line_volte_profile_selection(line_a).attempts[1]
+            reloaded
+                .get_line_cellular_ims_profile_selection(line_a)
+                .attempts[1]
                 .profile_id
                 .as_deref(),
             Some("custom-a")
         );
         assert_eq!(
-            reloaded.get_line_volte_profile_selection(line_b),
+            reloaded.get_line_cellular_ims_profile_selection(line_b),
             ImsProfileSelectionConfig::default()
         );
         let _ = std::fs::remove_file(path);
@@ -1905,14 +1919,14 @@ mod tests {
         assert!(manager.get_line_sms_path_policy(line_a).force_vowifi_send);
         assert!(!manager.get_line_sms_path_policy(line_b).force_vowifi_send);
 
-        let mut only_volte_voice = VoicePathPolicy::default();
-        for layer in &mut only_volte_voice.priority {
+        let mut only_cellular_ims_voice = VoicePathPolicy::default();
+        for layer in &mut only_cellular_ims_voice.priority {
             if layer.kind == AccessPathKind::Vowifi {
                 layer.enabled = false;
             }
         }
         manager
-            .set_line_voice_path_policy(line_a, only_volte_voice)
+            .set_line_voice_path_policy(line_a, only_cellular_ims_voice)
             .unwrap();
         let voice_vowifi_enabled = |policy: VoicePathPolicy| {
             policy
@@ -1972,7 +1986,7 @@ mod tests {
         let line = "line-0123456789abcdef0123456789abcdef";
 
         manager
-            .set_line_volte_connection_enabled(line, true)
+            .set_line_cellular_ims_connection_enabled(line, true)
             .unwrap();
         manager
             .set_line_vowifi_connection_enabled(line, true)
@@ -1980,21 +1994,21 @@ mod tests {
 
         let profile = manager.get_line_profile(line);
         assert!(
-            profile.volte_connection_enabled,
+            profile.cellular_ims_connection_enabled,
             "enabling the non-3GPP access must not disable the 3GPP access"
         );
         assert!(profile.vowifi.enabled);
 
         // Re-asserting VoLTE must likewise leave VoWiFi alone.
         manager
-            .set_line_volte_connection_enabled(line, true)
+            .set_line_cellular_ims_connection_enabled(line, true)
             .unwrap();
         let profile = manager.get_line_profile(line);
         assert!(
             profile.vowifi.enabled,
             "enabling the 3GPP access must not disable the non-3GPP access"
         );
-        assert!(profile.volte_connection_enabled);
+        assert!(profile.cellular_ims_connection_enabled);
 
         // Turning one leg off is a change to that leg only.
         manager
@@ -2003,7 +2017,7 @@ mod tests {
         let profile = manager.get_line_profile(line);
         assert!(!profile.vowifi.enabled);
         assert!(
-            profile.volte_connection_enabled,
+            profile.cellular_ims_connection_enabled,
             "disabling one access must not cascade into the other"
         );
 
@@ -2035,7 +2049,7 @@ mod tests {
         );
 
         manager
-            .set_line_volte_connection_enabled(line, true)
+            .set_line_cellular_ims_connection_enabled(line, true)
             .unwrap();
         manager
             .set_line_vowifi_connection_enabled(line, true)
@@ -2052,7 +2066,7 @@ mod tests {
             let profile = manager.get_line_profile(line);
             assert_eq!(profile.ims_access_preference, preference);
             assert!(
-                profile.volte_connection_enabled,
+                profile.cellular_ims_connection_enabled,
                 "{preference:?} must not clear the VoLTE enable intent"
             );
             assert!(
@@ -2243,7 +2257,7 @@ mod tests {
         let manager = ConfigManager::new(path.clone());
         let line_id = "line-0123456789abcdef0123456789abcdef";
         manager
-            .set_line_volte_connection_enabled(line_id, true)
+            .set_line_cellular_ims_connection_enabled(line_id, true)
             .unwrap();
         manager
             .set_line_vowifi_connection_enabled(line_id, true)
@@ -2266,7 +2280,7 @@ mod tests {
         let profile = manager.set_line_airplane_mode(line_id, true).unwrap();
         assert!(profile.airplane_mode_enabled);
         assert!(!profile.data_connection_enabled);
-        assert!(!profile.volte_connection_enabled);
+        assert!(!profile.cellular_ims_connection_enabled);
         assert!(profile.vowifi.enabled);
         assert!(profile.trunk.enabled);
         assert_eq!(
@@ -2372,14 +2386,14 @@ mod tests {
     }
 
     #[test]
-    fn sms_path_policy_default_order_is_vowifi_volte_cs() {
+    fn sms_path_policy_default_order_is_vowifi_cellular_ims_cs() {
         let policy = SmsPathPolicy::default();
         let order: Vec<AccessPathKind> = policy.enabled_layers().collect();
         assert_eq!(
             order,
             vec![
                 AccessPathKind::Vowifi,
-                AccessPathKind::Volte,
+                AccessPathKind::CellularIms,
                 AccessPathKind::Cs
             ]
         );
@@ -2403,7 +2417,7 @@ mod tests {
                     enabled: true,
                 },
                 PathLayerConfig {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     enabled: false,
                 },
                 PathLayerConfig {
@@ -2414,7 +2428,10 @@ mod tests {
             ..SmsPathPolicy::default()
         };
         let ims: Vec<AccessPathKind> = policy.enabled_ims_layers().collect();
-        assert_eq!(ims, vec![AccessPathKind::Vowifi, AccessPathKind::Volte]);
+        assert_eq!(
+            ims,
+            vec![AccessPathKind::Vowifi, AccessPathKind::CellularIms]
+        );
         assert!(policy.is_enabled(AccessPathKind::Cs));
     }
 
@@ -2423,12 +2440,12 @@ mod tests {
         let policy = SmsPathPolicy {
             priority: vec![
                 PathLayerConfig {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     enabled: false,
                 },
                 // duplicate should be dropped
                 PathLayerConfig {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     enabled: true,
                 },
             ],
@@ -2440,12 +2457,12 @@ mod tests {
             kinds,
             vec![
                 AccessPathKind::Vowifi,
-                AccessPathKind::Volte,
+                AccessPathKind::CellularIms,
                 AccessPathKind::Cs
             ]
         );
         assert!(policy.priority.iter().all(|layer| layer.enabled));
-        assert!(policy.is_enabled(AccessPathKind::Volte));
+        assert!(policy.is_enabled(AccessPathKind::CellularIms));
         assert!(policy.is_enabled(AccessPathKind::Vowifi));
     }
 
@@ -2507,7 +2524,7 @@ mod tests {
         );
         let voice = config.line_profiles[0].voice_path.clone().normalized();
         assert_eq!(voice.priority.len(), 2);
-        assert_eq!(voice.priority[0].kind, AccessPathKind::Volte);
+        assert_eq!(voice.priority[0].kind, AccessPathKind::CellularIms);
         assert!(!voice.priority[0].enabled);
         assert!(voice
             .priority
@@ -2560,10 +2577,10 @@ mod tests {
     #[test]
     fn access_path_kind_transport_tags_match_db_contract() {
         assert_eq!(AccessPathKind::Vowifi.transport_tag(), "vowifi_ims");
-        assert_eq!(AccessPathKind::Volte.transport_tag(), "volte_ims");
+        assert_eq!(AccessPathKind::CellularIms.transport_tag(), "volte_ims");
         assert_eq!(AccessPathKind::Cs.transport_tag(), "modem");
         assert!(AccessPathKind::Vowifi.is_ims());
-        assert!(AccessPathKind::Volte.is_ims());
+        assert!(AccessPathKind::CellularIms.is_ims());
         assert!(!AccessPathKind::Cs.is_ims());
     }
 
@@ -2631,24 +2648,30 @@ mod tests {
     #[test]
     fn line_auto_restore_defaults_are_explicit() {
         let profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        assert_eq!(profile.volte_auto_restore, AutoRestoreConfig::default());
+        assert_eq!(
+            profile.cellular_ims_auto_restore,
+            AutoRestoreConfig::default()
+        );
         assert_eq!(profile.vowifi.auto_restore, AutoRestoreConfig::default());
     }
 
     #[test]
-    fn line_volte_ip_families_round_trip() {
+    fn line_cellular_ims_ip_families_round_trip() {
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        assert_eq!(profile.volte_ip_families, default_line_volte_ip_families());
-        assert!(profile.volte_ip_families_auto);
-        profile.volte_ip_families = vec![CellularImsIpFamily::Ipv6];
-        profile.volte_ip_families_auto = false;
+        assert_eq!(
+            profile.cellular_ims_ip_families,
+            default_line_cellular_ims_ip_families()
+        );
+        assert!(profile.cellular_ims_ip_families_auto);
+        profile.cellular_ims_ip_families = vec![CellularImsIpFamily::Ipv6];
+        profile.cellular_ims_ip_families_auto = false;
         let round_trip: LineProfileConfig =
             serde_json::from_value(serde_json::to_value(profile).unwrap()).unwrap();
         assert_eq!(
-            round_trip.volte_ip_families,
+            round_trip.cellular_ims_ip_families,
             vec![CellularImsIpFamily::Ipv6]
         );
-        assert!(!round_trip.volte_ip_families_auto);
+        assert!(!round_trip.cellular_ims_ip_families_auto);
     }
 
     #[test]
@@ -2658,24 +2681,24 @@ mod tests {
             "volte_ip_families": ["ipv4v6", "ipv4", "ipv6"]
         }))
         .unwrap();
-        assert!(profile.volte_ip_families_auto);
+        assert!(profile.cellular_ims_ip_families_auto);
     }
 
     #[test]
     fn legacy_automatic_ip_family_order_migrates_to_ipv6_first() {
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        profile.volte_ip_families = vec![
+        profile.cellular_ims_ip_families = vec![
             CellularImsIpFamily::Ipv4v6,
             CellularImsIpFamily::Ipv4,
             CellularImsIpFamily::Ipv6,
         ];
-        profile.volte_ip_families_auto = true;
+        profile.cellular_ims_ip_families_auto = true;
         config.line_profiles.push(profile);
 
-        assert!(migrate_legacy_volte_ip_family_defaults(&mut config));
+        assert!(migrate_legacy_cellular_ims_ip_family_defaults(&mut config));
         assert_eq!(
-            config.line_profiles[0].volte_ip_families,
+            config.line_profiles[0].cellular_ims_ip_families,
             vec![
                 CellularImsIpFamily::Ipv4v6,
                 CellularImsIpFamily::Ipv6,
@@ -2688,17 +2711,17 @@ mod tests {
     fn explicit_legacy_ip_family_order_is_not_migrated() {
         let mut config = AppConfig::default();
         let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
-        profile.volte_ip_families = vec![
+        profile.cellular_ims_ip_families = vec![
             CellularImsIpFamily::Ipv4v6,
             CellularImsIpFamily::Ipv4,
             CellularImsIpFamily::Ipv6,
         ];
-        profile.volte_ip_families_auto = false;
+        profile.cellular_ims_ip_families_auto = false;
         config.line_profiles.push(profile);
 
-        assert!(!migrate_legacy_volte_ip_family_defaults(&mut config));
+        assert!(!migrate_legacy_cellular_ims_ip_family_defaults(&mut config));
         assert_eq!(
-            config.line_profiles[0].volte_ip_families,
+            config.line_profiles[0].cellular_ims_ip_families,
             vec![
                 CellularImsIpFamily::Ipv4v6,
                 CellularImsIpFamily::Ipv4,
@@ -2708,18 +2731,18 @@ mod tests {
     }
 
     #[test]
-    fn legacy_line_profile_gets_default_volte_profile_attempt_order() {
+    fn legacy_line_profile_gets_default_cellular_ims_profile_attempt_order() {
         let profile: LineProfileConfig = serde_json::from_value(serde_json::json!({
             "line_id": "line-0123456789abcdef0123456789abcdef"
         }))
         .unwrap();
         assert_eq!(
-            profile.volte_profile_selection,
+            profile.cellular_ims_profile_selection,
             ImsProfileSelectionConfig::default()
         );
         assert_eq!(
             profile
-                .volte_profile_selection
+                .cellular_ims_profile_selection
                 .attempts
                 .iter()
                 .map(|candidate| candidate.source)
@@ -2755,7 +2778,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_profile_selection_preserves_order_and_duplicate_sources_and_validates_slots() {
+    fn cellular_ims_profile_selection_preserves_order_and_duplicate_sources_and_validates_slots() {
         let mut repeated_sources = ImsProfileSelectionConfig {
             attempts: vec![
                 ImsProfileCandidate {
@@ -2770,7 +2793,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            validate_volte_profile_selection(&mut repeated_sources),
+            validate_cellular_ims_profile_selection(&mut repeated_sources),
             Ok(())
         );
         assert_eq!(
@@ -2794,14 +2817,14 @@ mod tests {
             attempts: vec![ImsProfileCandidate::automatic(ImsProfileSource::Derived)],
         };
         assert_eq!(
-            validate_volte_profile_selection(&mut too_short),
+            validate_cellular_ims_profile_selection(&mut too_short),
             Err("volte_profile_attempt_count_invalid".to_string())
         );
 
         let mut invalid = ImsProfileSelectionConfig::default();
         invalid.attempts[2].profile_id = Some("not-allowed".to_string());
         assert_eq!(
-            validate_volte_profile_selection(&mut invalid),
+            validate_cellular_ims_profile_selection(&mut invalid),
             Err("volte_derived_profile_id_not_allowed".to_string())
         );
     }
@@ -2858,10 +2881,18 @@ mod tests {
         // voice or video switch to set. Connecting VoLTE on line_b is therefore
         // the whole action, and line_a stays off because it is not connected.
         manager
-            .set_line_volte_connection_enabled(line_b, true)
+            .set_line_cellular_ims_connection_enabled(line_b, true)
             .unwrap();
-        assert!(!manager.get_line_ims_video_config(line_a).volte_enabled);
-        assert!(manager.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(
+            !manager
+                .get_line_ims_video_config(line_a)
+                .cellular_ims_enabled
+        );
+        assert!(
+            manager
+                .get_line_ims_video_config(line_b)
+                .cellular_ims_enabled
+        );
 
         // VoWiFi video follows the VoWiFi connection independently.
         manager
@@ -2869,7 +2900,7 @@ mod tests {
             .unwrap();
         let vowifi_video = manager.get_line_ims_video_config(line_b);
         assert!(vowifi_video.vowifi_enabled);
-        assert!(vowifi_video.volte_enabled);
+        assert!(vowifi_video.cellular_ims_enabled);
 
         assert_eq!(
             manager
@@ -2902,34 +2933,46 @@ mod tests {
             .set_line_ims_video_config(
                 line_b,
                 ImsVideoConfig {
-                    volte_enabled: false,
+                    cellular_ims_enabled: false,
                     vowifi_enabled: false,
                     video_payload_type: 112,
                     ..ImsVideoConfig::default()
                 },
             )
             .unwrap();
-        assert!(derived.volte_enabled);
+        assert!(derived.cellular_ims_enabled);
         assert!(derived.vowifi_enabled);
         assert_eq!(derived.video_payload_type, 112);
 
         let reloaded = ConfigManager::new(path.clone());
-        assert!(!reloaded.get_line_volte_voice_enabled(line_a));
-        assert!(reloaded.get_line_volte_voice_enabled(line_b));
+        assert!(!reloaded.get_line_cellular_ims_voice_enabled(line_a));
+        assert!(reloaded.get_line_cellular_ims_voice_enabled(line_b));
         assert_eq!(
             reloaded
                 .get_line_ims_video_config(line_b)
                 .video_payload_type,
             112
         );
-        assert!(reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(
+            reloaded
+                .get_line_ims_video_config(line_b)
+                .cellular_ims_enabled
+        );
         assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
-        assert!(!reloaded.get_line_ims_video_config(line_a).volte_enabled);
+        assert!(
+            !reloaded
+                .get_line_ims_video_config(line_a)
+                .cellular_ims_enabled
+        );
 
         reloaded
-            .set_line_volte_connection_enabled(line_b, false)
+            .set_line_cellular_ims_connection_enabled(line_b, false)
             .unwrap();
-        assert!(!reloaded.get_line_ims_video_config(line_b).volte_enabled);
+        assert!(
+            !reloaded
+                .get_line_ims_video_config(line_b)
+                .cellular_ims_enabled
+        );
         assert!(reloaded.get_line_ims_video_config(line_b).vowifi_enabled);
 
         let _ = std::fs::remove_file(path.with_extension("bak"));
@@ -2955,10 +2998,10 @@ mod tests {
                 crate::platform::db::Database::new(database_path.clone()).expect("test database"),
             );
             let mut profile = LineProfileConfig::for_line(line_id);
-            profile.volte_connection_enabled = true;
+            profile.cellular_ims_connection_enabled = true;
             profile.vowifi.enabled = true;
             // The stale part: both legs are on, both gates are off.
-            assert!(!profile.ims_video.volte_enabled);
+            assert!(!profile.ims_video.cellular_ims_enabled);
             assert!(!profile.ims_video.vowifi_enabled);
             let stored = crate::platform::config_store::StoredConfig {
                 line_profiles: vec![profile],
@@ -2970,14 +3013,14 @@ mod tests {
         // `try_new_for_test` derives exactly this database path.
         let manager = ConfigManager::try_new_for_test(path.clone()).unwrap();
         let normalized = manager.get_line_ims_video_config(line_id);
-        assert!(normalized.volte_enabled);
+        assert!(normalized.cellular_ims_enabled);
         assert!(normalized.vowifi_enabled);
 
         // The correction is persisted, not just applied in memory.
         drop(manager);
         let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
         let persisted = reloaded.get_line_ims_video_config(line_id);
-        assert!(persisted.volte_enabled);
+        assert!(persisted.cellular_ims_enabled);
         assert!(persisted.vowifi_enabled);
 
         drop(reloaded);
@@ -3410,6 +3453,67 @@ line_profiles:
     }
 
     #[test]
+    fn cellular_ims_field_aliases_preserve_legacy_storage_and_nondefault_values() {
+        let mut profile = LineProfileConfig::default();
+        profile.line_id = "line-alias-fixture".into();
+        profile.cellular_ims_connection_enabled = true;
+        profile.cellular_ims_auto_restore = AutoRestoreConfig {
+            initial_delay_secs: 19,
+            attempts: 7,
+            retry_delay_secs: 23,
+        };
+        profile.cellular_ims_profile_selection.attempts.swap(0, 2);
+        profile.cellular_ims_ip_families = vec![CellularImsIpFamily::Ipv6];
+        profile.cellular_ims_ip_families_auto = false;
+        profile.ims_video.cellular_ims_enabled = true;
+        let legacy = serde_json::to_value(&profile).unwrap();
+        let mut aliases = legacy.clone();
+        for (old, new) in [
+            (
+                "volte_connection_enabled",
+                "cellular_ims_connection_enabled",
+            ),
+            ("volte_auto_restore", "cellular_ims_auto_restore"),
+            ("volte_profile_selection", "cellular_ims_profile_selection"),
+            ("volte_ip_families", "cellular_ims_ip_families"),
+            ("volte_ip_families_auto", "cellular_ims_ip_families_auto"),
+        ] {
+            let object = aliases.as_object_mut().unwrap();
+            let value = object.remove(old).expect("legacy wire key remains present");
+            assert!(!object.contains_key(new));
+            object.insert(new.into(), value);
+        }
+        let video = aliases["ims_video"].as_object_mut().unwrap();
+        let enabled = video.remove("volte_enabled").unwrap();
+        video.insert("cellular_ims_enabled".into(), enabled);
+        let from_legacy: LineProfileConfig = serde_json::from_value(legacy.clone()).unwrap();
+        let from_aliases: LineProfileConfig = serde_json::from_value(aliases).unwrap();
+        assert_eq!(from_legacy, profile);
+        assert_eq!(from_aliases, profile);
+        assert_eq!(serde_json::to_value(from_aliases).unwrap(), legacy);
+        // Ambiguous mixed spellings fail closed instead of disabling a line.
+        for value in [true, false] {
+            let mut mixed = legacy.clone();
+            mixed["cellular_ims_connection_enabled"] = serde_json::json!(value);
+            assert!(serde_json::from_value::<LineProfileConfig>(mixed).is_err());
+        }
+    }
+
+    #[test]
+    fn cellular_ims_access_alias_retains_history_and_automation_transport_ids() {
+        for value in ["volte", "cellular_ims"] {
+            let kind: AccessPathKind = serde_json::from_value(serde_json::json!(value)).unwrap();
+            assert_eq!(kind, AccessPathKind::CellularIms);
+            assert_eq!(kind.as_str(), "volte");
+            assert_eq!(kind.transport_tag(), "volte_ims");
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::json!("volte")
+            );
+        }
+    }
+
+    #[test]
     fn legacy_gh_proxy_default_is_migrated_to_direct() {
         let dir = text_config_test_dir("github-download-proxy-migration");
         std::fs::create_dir_all(&dir).unwrap();
@@ -3610,7 +3714,7 @@ device_network:
         let line = "line-0123456789abcdef0123456789abcdef";
 
         manager
-            .set_line_volte_connection_enabled(line, true)
+            .set_line_cellular_ims_connection_enabled(line, true)
             .unwrap();
         manager
             .set_line_vowifi_connection_enabled(line, true)
@@ -3631,7 +3735,7 @@ device_network:
         // Reload through the same paths, as a restart would.
         let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
         let profile = reloaded.get_line_profile(line);
-        assert!(profile.volte_connection_enabled);
+        assert!(profile.cellular_ims_connection_enabled);
         assert!(profile.vowifi.enabled);
         assert_eq!(
             profile.ims_access_preference,
@@ -3715,7 +3819,7 @@ device_network:
         let (manager, path) = text_manager(&dir);
         let line = "line-0123456789abcdef0123456789abcdef";
         manager
-            .set_line_volte_connection_enabled(line, true)
+            .set_line_cellular_ims_connection_enabled(line, true)
             .unwrap();
         let mut security = manager.get_security();
         security.session_ttl_seconds = 999;
@@ -3731,7 +3835,9 @@ device_network:
             "file-owned settings reset"
         );
         assert!(
-            reloaded.get_line_profile(line).volte_connection_enabled,
+            reloaded
+                .get_line_profile(line)
+                .cellular_ims_connection_enabled,
             "line settings must not be lost with the file"
         );
         drop(reloaded);
@@ -4052,34 +4158,34 @@ impl Default for EsimReaderConfig {
     }
 }
 
-fn default_volte_auto_restore_initial_delay_secs() -> u64 {
+fn default_ims_auto_restore_initial_delay_secs() -> u64 {
     60
 }
 
-fn default_volte_auto_restore_attempts() -> u8 {
+fn default_ims_auto_restore_attempts() -> u8 {
     3
 }
 
-fn default_volte_auto_restore_retry_delay_secs() -> u64 {
+fn default_ims_auto_restore_retry_delay_secs() -> u64 {
     30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AutoRestoreConfig {
-    #[serde(default = "default_volte_auto_restore_initial_delay_secs")]
+    #[serde(default = "default_ims_auto_restore_initial_delay_secs")]
     pub initial_delay_secs: u64,
-    #[serde(default = "default_volte_auto_restore_attempts")]
+    #[serde(default = "default_ims_auto_restore_attempts")]
     pub attempts: u8,
-    #[serde(default = "default_volte_auto_restore_retry_delay_secs")]
+    #[serde(default = "default_ims_auto_restore_retry_delay_secs")]
     pub retry_delay_secs: u64,
 }
 
 impl Default for AutoRestoreConfig {
     fn default() -> Self {
         Self {
-            initial_delay_secs: default_volte_auto_restore_initial_delay_secs(),
-            attempts: default_volte_auto_restore_attempts(),
-            retry_delay_secs: default_volte_auto_restore_retry_delay_secs(),
+            initial_delay_secs: default_ims_auto_restore_initial_delay_secs(),
+            attempts: default_ims_auto_restore_attempts(),
+            retry_delay_secs: default_ims_auto_restore_retry_delay_secs(),
         }
     }
 }
@@ -4129,7 +4235,7 @@ impl ImsProfileCandidate {
     }
 }
 
-fn default_volte_profile_attempts() -> Vec<ImsProfileCandidate> {
+fn default_cellular_ims_profile_attempts() -> Vec<ImsProfileCandidate> {
     vec![
         ImsProfileCandidate::automatic(ImsProfileSource::Database),
         ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
@@ -4145,14 +4251,14 @@ fn default_volte_profile_attempts() -> Vec<ImsProfileCandidate> {
 /// the fallback to a single attempt.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ImsProfileSelectionConfig {
-    #[serde(default = "default_volte_profile_attempts")]
+    #[serde(default = "default_cellular_ims_profile_attempts")]
     pub attempts: Vec<ImsProfileCandidate>,
 }
 
 impl Default for ImsProfileSelectionConfig {
     fn default() -> Self {
         Self {
-            attempts: default_volte_profile_attempts(),
+            attempts: default_cellular_ims_profile_attempts(),
         }
     }
 }
@@ -4164,7 +4270,7 @@ impl ImsProfileSelectionConfig {
     /// while `ConfigManager` still enforces the same invariant for every other
     /// caller.
     pub fn validate(&mut self) -> Result<(), String> {
-        validate_volte_profile_selection(self)
+        validate_cellular_ims_profile_selection(self)
     }
 }
 
@@ -4232,34 +4338,34 @@ impl CellularImsIpFamily {
     }
 }
 
-fn default_line_volte_ip_families() -> Vec<CellularImsIpFamily> {
+fn default_line_cellular_ims_ip_families() -> Vec<CellularImsIpFamily> {
     CellularImsIpFamilyPreference::default().to_families()
 }
 
 /// Older releases used `[ipv4v6, ipv4, ipv6]` for automatic lines. Keep
 /// explicit operator choices intact, but migrate that generated default to the
 /// current dual-stack -> IPv6 -> IPv4 order when loading persisted settings.
-fn migrate_legacy_volte_ip_family_defaults(config: &mut AppConfig) -> bool {
+fn migrate_legacy_cellular_ims_ip_family_defaults(config: &mut AppConfig) -> bool {
     let legacy = vec![
         CellularImsIpFamily::Ipv4v6,
         CellularImsIpFamily::Ipv4,
         CellularImsIpFamily::Ipv6,
     ];
-    let current = default_line_volte_ip_families();
+    let current = default_line_cellular_ims_ip_families();
     if legacy == current {
         return false;
     }
     let mut changed = false;
     for profile in &mut config.line_profiles {
-        if profile.volte_ip_families_auto && profile.volte_ip_families == legacy {
-            profile.volte_ip_families = current.clone();
+        if profile.cellular_ims_ip_families_auto && profile.cellular_ims_ip_families == legacy {
+            profile.cellular_ims_ip_families = current.clone();
             changed = true;
         }
     }
     changed
 }
 
-fn default_line_volte_ip_families_auto() -> bool {
+fn default_line_cellular_ims_ip_families_auto() -> bool {
     true
 }
 
@@ -4515,12 +4621,21 @@ pub struct LineProfileConfig {
     #[serde(default = "default_line_enabled")]
     pub enabled: bool,
     #[serde(default)]
-    pub volte_connection_enabled: bool,
+    #[serde(
+        rename = "volte_connection_enabled",
+        alias = "cellular_ims_connection_enabled"
+    )]
+    pub cellular_ims_connection_enabled: bool,
     #[serde(default)]
-    pub volte_auto_restore: AutoRestoreConfig,
+    #[serde(rename = "volte_auto_restore", alias = "cellular_ims_auto_restore")]
+    pub cellular_ims_auto_restore: AutoRestoreConfig,
     /// Ordered outer carrier-profile attempts for this physical line.
     #[serde(default)]
-    pub volte_profile_selection: ImsProfileSelectionConfig,
+    #[serde(
+        rename = "volte_profile_selection",
+        alias = "cellular_ims_profile_selection"
+    )]
+    pub cellular_ims_profile_selection: ImsProfileSelectionConfig,
     #[serde(default, alias = "vilte")]
     pub ims_video: ImsVideoConfig,
     #[serde(default)]
@@ -4561,13 +4676,18 @@ pub struct LineProfileConfig {
     /// Per-line ordered IMS IP-family attempt order. The list elements are the families to
     /// enable, in fallback order. The default `[Ipv4v6, Ipv6, Ipv4]` tries dual-stack,
     /// then IPv6, then IPv4; `[Ipv6]` is IPv6-only. An empty list is invalid.
-    #[serde(default = "default_line_volte_ip_families")]
-    pub volte_ip_families: Vec<CellularImsIpFamily>,
+    #[serde(default = "default_line_cellular_ims_ip_families")]
+    #[serde(rename = "volte_ip_families", alias = "cellular_ims_ip_families")]
+    pub cellular_ims_ip_families: Vec<CellularImsIpFamily>,
     /// Whether the family order is still automatic. Automatic lines may use
     /// the carrier catalog's LTE `ip_family` as a hint; saving the order from
     /// the UI turns this off so the user's choice always wins.
-    #[serde(default = "default_line_volte_ip_families_auto")]
-    pub volte_ip_families_auto: bool,
+    #[serde(default = "default_line_cellular_ims_ip_families_auto")]
+    #[serde(
+        rename = "volte_ip_families_auto",
+        alias = "cellular_ims_ip_families_auto"
+    )]
+    pub cellular_ims_ip_families_auto: bool,
     /// Per-line APN.
     #[serde(default)]
     pub apn: ApnConfig,
@@ -4676,7 +4796,7 @@ impl LineProfileConfig {
     /// does not permit them answers with a SIP error (488 on the media, 403/420
     /// or 380 on the registration) which the runtime surfaces as-is.
     fn sync_ims_video_access_gates(&mut self) {
-        self.ims_video.volte_enabled = self.volte_connection_enabled;
+        self.ims_video.cellular_ims_enabled = self.cellular_ims_connection_enabled;
         self.ims_video.vowifi_enabled = self.vowifi.enabled;
     }
 
@@ -4684,12 +4804,12 @@ impl LineProfileConfig {
         Self {
             line_id: line_id.into(),
             enabled: true,
-            volte_connection_enabled: false,
-            volte_auto_restore: AutoRestoreConfig::default(),
-            volte_profile_selection: ImsProfileSelectionConfig::default(),
+            cellular_ims_connection_enabled: false,
+            cellular_ims_auto_restore: AutoRestoreConfig::default(),
+            cellular_ims_profile_selection: ImsProfileSelectionConfig::default(),
             ims_video: ImsVideoConfig::default(),
-            volte_ip_families: default_line_volte_ip_families(),
-            volte_ip_families_auto: default_line_volte_ip_families_auto(),
+            cellular_ims_ip_families: default_line_cellular_ims_ip_families(),
+            cellular_ims_ip_families_auto: default_line_cellular_ims_ip_families_auto(),
             vowifi: LineVowifiConfig::default(),
             trunk: TrunkProfileConfig::default(),
             data_connection_enabled: false,
@@ -4725,13 +4845,13 @@ fn sync_line_ims_video_access_gates(config: &mut AppConfig) -> bool {
     let mut changed = false;
     for profile in &mut config.line_profiles {
         let before = (
-            profile.ims_video.volte_enabled,
+            profile.ims_video.cellular_ims_enabled,
             profile.ims_video.vowifi_enabled,
         );
         profile.sync_ims_video_access_gates();
         changed |= before
             != (
-                profile.ims_video.volte_enabled,
+                profile.ims_video.cellular_ims_enabled,
                 profile.ims_video.vowifi_enabled,
             );
     }
@@ -4744,7 +4864,7 @@ fn valid_line_id(line_id: &str) -> bool {
     })
 }
 
-fn validate_volte_profile_selection(
+fn validate_cellular_ims_profile_selection(
     selection: &mut ImsProfileSelectionConfig,
 ) -> Result<(), String> {
     if selection.attempts.len() != 3 {
@@ -4894,7 +5014,8 @@ fn default_vilte_h264_fmtp() -> String {
 pub struct ImsVideoConfig {
     /// Effective configured state for the VoLTE (LTE) access leg.
     #[serde(default, alias = "feature_enabled")]
-    pub volte_enabled: bool,
+    #[serde(rename = "volte_enabled", alias = "cellular_ims_enabled")]
+    pub cellular_ims_enabled: bool,
     /// Effective configured state for the VoWiFi (WiFi/ePDG) access leg.
     #[serde(default)]
     pub vowifi_enabled: bool,
@@ -4913,7 +5034,7 @@ pub struct ImsVideoConfig {
 impl Default for ImsVideoConfig {
     fn default() -> Self {
         Self {
-            volte_enabled: false,
+            cellular_ims_enabled: false,
             vowifi_enabled: false,
             codec: default_vilte_codec(),
             video_payload_type: default_vilte_video_payload_type(),
@@ -4933,8 +5054,9 @@ impl Default for ImsVideoConfig {
 pub enum AccessPathKind {
     /// VoWiFi (IMS over WiFi / ePDG).
     Vowifi,
-    /// VoLTE (IMS over LTE / kernel xfrm).
-    Volte,
+    /// Cellular IMS; the old transport ID remains a compatibility wire value.
+    #[serde(rename = "volte", alias = "cellular_ims")]
+    CellularIms,
     /// Circuit-switched (ModemManager baseband).
     Cs,
 }
@@ -4943,7 +5065,7 @@ impl AccessPathKind {
     pub fn as_str(self) -> &'static str {
         match self {
             AccessPathKind::Vowifi => "vowifi",
-            AccessPathKind::Volte => "volte",
+            AccessPathKind::CellularIms => "volte",
             AccessPathKind::Cs => "cs",
         }
     }
@@ -4952,14 +5074,14 @@ impl AccessPathKind {
     pub fn transport_tag(self) -> &'static str {
         match self {
             AccessPathKind::Vowifi => "vowifi_ims",
-            AccessPathKind::Volte => "volte_ims",
+            AccessPathKind::CellularIms => "volte_ims",
             AccessPathKind::Cs => "modem",
         }
     }
 
     /// Whether this path is an IMS leg (needs registration / listener election).
     pub fn is_ims(self) -> bool {
-        matches!(self, AccessPathKind::Vowifi | AccessPathKind::Volte)
+        matches!(self, AccessPathKind::Vowifi | AccessPathKind::CellularIms)
     }
 }
 
@@ -5000,7 +5122,7 @@ fn default_sms_path_order() -> Vec<PathLayerConfig> {
             enabled: true,
         },
         PathLayerConfig {
-            kind: AccessPathKind::Volte,
+            kind: AccessPathKind::CellularIms,
             enabled: true,
         },
         PathLayerConfig {
@@ -5068,7 +5190,7 @@ impl SmsPathPolicy {
     pub fn enabled_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
         const AUTO: [AccessPathKind; 3] = [
             AccessPathKind::Vowifi,
-            AccessPathKind::Volte,
+            AccessPathKind::CellularIms,
             AccessPathKind::Cs,
         ];
         let count = if self.force_vowifi_send {
@@ -5081,7 +5203,7 @@ impl SmsPathPolicy {
 
     /// Receive-side IMS order is fixed and independent from the send-only switch.
     pub fn enabled_ims_layers(&self) -> impl Iterator<Item = AccessPathKind> + '_ {
-        [AccessPathKind::Vowifi, AccessPathKind::Volte].into_iter()
+        [AccessPathKind::Vowifi, AccessPathKind::CellularIms].into_iter()
     }
 
     /// All receive paths stay enabled; the user switch only constrains sending.
@@ -5110,7 +5232,7 @@ fn default_voice_path_order() -> Vec<PathLayerConfig> {
             enabled: true,
         },
         PathLayerConfig {
-            kind: AccessPathKind::Volte,
+            kind: AccessPathKind::CellularIms,
             enabled: true,
         },
     ]
@@ -5156,7 +5278,7 @@ impl VoicePathPolicy {
                 deduped.push(layer);
             }
         }
-        for kind in [AccessPathKind::Vowifi, AccessPathKind::Volte] {
+        for kind in [AccessPathKind::Vowifi, AccessPathKind::CellularIms] {
             if !seen.contains(&kind) {
                 deduped.push(PathLayerConfig {
                     kind,
@@ -5620,7 +5742,8 @@ impl ConfigManager {
         let templates_changed = migrate_templates_to_remove_md5(&mut config);
         let github_download_proxy_changed = migrate_legacy_github_download_proxy(&mut config);
         let video_gates_changed = sync_line_ims_video_access_gates(&mut config);
-        let volte_ip_family_defaults_changed = migrate_legacy_volte_ip_family_defaults(&mut config);
+        let cellular_ims_ip_family_defaults_changed =
+            migrate_legacy_cellular_ims_ip_family_defaults(&mut config);
 
         let manager = Self {
             config: Arc::new(RwLock::new(config)),
@@ -5633,7 +5756,7 @@ impl ConfigManager {
             || templates_changed
             || github_download_proxy_changed
             || video_gates_changed
-            || volte_ip_family_defaults_changed
+            || cellular_ims_ip_family_defaults_changed
         {
             manager.save()?;
         }
@@ -6141,7 +6264,7 @@ impl ConfigManager {
         profile
     }
 
-    pub fn set_line_volte_connection_enabled(
+    pub fn set_line_cellular_ims_connection_enabled(
         &self,
         line_id: &str,
         enabled: bool,
@@ -6166,7 +6289,7 @@ impl ConfigManager {
             if enabled && !profile.enabled {
                 return Err("line_disabled".to_string());
             }
-            profile.volte_connection_enabled = enabled;
+            profile.cellular_ims_connection_enabled = enabled;
             profile.sync_ims_video_access_gates();
             let next = profile.clone();
             config
@@ -6233,7 +6356,7 @@ impl ConfigManager {
     }
 
     /// Set this line's explicit ordered VoLTE IMS address-family list.
-    pub fn set_line_volte_ip_families(
+    pub fn set_line_cellular_ims_ip_families(
         &self,
         line_id: &str,
         families: Vec<CellularImsIpFamily>,
@@ -6265,8 +6388,8 @@ impl ConfigManager {
                     .push(LineProfileConfig::for_line(line_id));
                 config.line_profiles.last_mut().expect("profile inserted")
             };
-            profile.volte_ip_families = families;
-            profile.volte_ip_families_auto = false;
+            profile.cellular_ims_ip_families = families;
+            profile.cellular_ims_ip_families_auto = false;
             let next = profile.clone();
             config
                 .line_profiles
@@ -6277,26 +6400,30 @@ impl ConfigManager {
         Ok(next)
     }
 
-    pub fn get_line_volte_ip_families(&self, line_id: &str) -> Vec<CellularImsIpFamily> {
-        self.get_line_profile(line_id).volte_ip_families
+    pub fn get_line_cellular_ims_ip_families(&self, line_id: &str) -> Vec<CellularImsIpFamily> {
+        self.get_line_profile(line_id).cellular_ims_ip_families
     }
 
-    pub fn get_line_volte_ip_families_auto(&self, line_id: &str) -> bool {
-        self.get_line_profile(line_id).volte_ip_families_auto
+    pub fn get_line_cellular_ims_ip_families_auto(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id).cellular_ims_ip_families_auto
     }
 
-    pub fn get_line_volte_profile_selection(&self, line_id: &str) -> ImsProfileSelectionConfig {
-        self.get_line_profile(line_id).volte_profile_selection
+    pub fn get_line_cellular_ims_profile_selection(
+        &self,
+        line_id: &str,
+    ) -> ImsProfileSelectionConfig {
+        self.get_line_profile(line_id)
+            .cellular_ims_profile_selection
     }
 
-    pub fn set_line_volte_profile_selection(
+    pub fn set_line_cellular_ims_profile_selection(
         &self,
         line_id: &str,
         mut selection: ImsProfileSelectionConfig,
     ) -> Result<LineProfileConfig, String> {
         selection.validate()?;
         self.update_line_profile(line_id, |profile| {
-            profile.volte_profile_selection = selection;
+            profile.cellular_ims_profile_selection = selection;
         })
     }
 
@@ -6513,7 +6640,7 @@ impl ConfigManager {
             profile.airplane_mode_enabled = enabled;
             if enabled {
                 profile.data_connection_enabled = false;
-                profile.volte_connection_enabled = false;
+                profile.cellular_ims_connection_enabled = false;
             }
             profile.sync_ims_video_access_gates();
             let next = profile.clone();
@@ -6698,8 +6825,9 @@ impl ConfigManager {
     /// line's VoLTE connection rather than a separate switch. A carrier that
     /// does not permit voice answers the REGISTER or the INVITE with a SIP
     /// error, which the runtime reports instead of pre-emptively refusing.
-    pub fn get_line_volte_voice_enabled(&self, line_id: &str) -> bool {
-        self.get_line_profile(line_id).volte_connection_enabled
+    pub fn get_line_cellular_ims_voice_enabled(&self, line_id: &str) -> bool {
+        self.get_line_profile(line_id)
+            .cellular_ims_connection_enabled
     }
 
     /// SMS path policy for one line.

@@ -1996,7 +1996,7 @@ async fn execute_net_config(ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Option
 
 fn net_config_diagnostic_argv(op: &NetConfigOp, argv: &[String]) -> String {
     if matches!(op, NetConfigOp::Xfrm { .. }) {
-        crate::connectivity::modems::ims::volte::ipsec::redacted_xfrm_argv(argv)
+        crate::connectivity::modems::ims::cellular_ims::ipsec::redacted_xfrm_argv(argv)
     } else {
         argv.join(" ")
     }

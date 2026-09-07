@@ -250,7 +250,7 @@ pub(super) fn list_summaries(conn: &Connection) -> Result<Vec<CatalogProfileSumm
             plmn,
             brand,
             aliases_json,
-            volte_ready,
+            cellular_ims_ready,
             vowifi_ready,
             vilte_enabled,
             smsoip_enabled,
@@ -278,7 +278,7 @@ pub(super) fn list_summaries(conn: &Connection) -> Result<Vec<CatalogProfileSumm
             brand,
             aliases,
             release: release.clone(),
-            volte_ready,
+            cellular_ims_ready,
             vowifi_ready,
             vilte_enabled,
             smsoip_enabled,
@@ -307,7 +307,7 @@ pub(super) fn service_capabilities(
             Ok((
                 row.get::<_, String>(0)?,
                 CatalogServiceCapabilities {
-                    volte_ready: row.get::<_, i64>(1)? != 0,
+                    cellular_ims_ready: row.get::<_, i64>(1)? != 0,
                     vowifi_ready: row.get::<_, i64>(2)? != 0,
                     vilte_enabled: row.get::<_, i64>(3)? != 0,
                     smsoip_enabled: row.get::<_, i64>(4)? != 0,

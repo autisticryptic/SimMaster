@@ -13,7 +13,7 @@ use super::{
 /// Access on which the IMS registration was established.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImsRegistrationAccess {
-    Volte,
+    CellularIms,
     Vowifi,
 }
 
@@ -205,7 +205,7 @@ mod tests {
     #[test]
     fn profile_expiry_is_only_the_missing_header_fallback() {
         let context = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             b"SIP/2.0 200 OK\r\n\r\n",
             600,
         );

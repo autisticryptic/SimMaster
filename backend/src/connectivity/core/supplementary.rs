@@ -811,7 +811,7 @@ mod tests {
             transport: SipTransport::Udp,
         };
         let registration = RegisteredImsContext {
-            access: ImsRegistrationAccess::Volte,
+            access: ImsRegistrationAccess::CellularIms,
             registered_at: SystemTime::now(),
             lease: RegistrationLease::from_expires(3600),
             service_route: Some("<sip:route.ims.example;lr>".to_string()),

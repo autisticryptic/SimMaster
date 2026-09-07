@@ -176,10 +176,10 @@ impl std::error::Error for CellularImsError {}
 #[macro_export]
 macro_rules! verr {
     ($code:expr) => {
-        $crate::connectivity::modems::ims::volte::errors::CellularImsError::new($code)
+        $crate::connectivity::modems::ims::cellular_ims::errors::CellularImsError::new($code)
     };
     ($code:expr, $detail:expr) => {
-        $crate::connectivity::modems::ims::volte::errors::CellularImsError::with_detail(
+        $crate::connectivity::modems::ims::cellular_ims::errors::CellularImsError::with_detail(
             $code, $detail,
         )
     };

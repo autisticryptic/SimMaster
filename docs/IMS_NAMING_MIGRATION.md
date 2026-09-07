@@ -18,9 +18,32 @@ have shipped**. Work remains isolated on `refactor/1.1.4-beta2`.
   the new endpoints remain authenticated. It fails rather than silently
   skipping if its test bus is missing. This increment still needs Actions.
 
-Remaining: module/runtime member naming, persistent-field aliases and canonical
-writes, access enum wire aliases, history compatibility, and full beta2 device
-validation. A new route name alone is not completion of that remaining work.
+The next increment moves the implementation directory/module to `cellular_ims`,
+renames runtime fields/functions and frontend code identifiers, and accepts new
+configuration aliases. The externally stored/written keys remain compatible as
+described below. Full beta2 device validation is still required.
+
+## Wire/storage compatibility decision
+
+This refactor does **not** require rewriting existing installations or breaking
+old API clients. Rust fields/members use the canonical names, but serde retains
+the old serialized key and accepts the new spelling as an input alias.
+Examples:
+
+- Rust `cellular_ims_connection_enabled`: reads either that key or
+  `volte_connection_enabled`; serializes the established legacy key.
+- Rust `ims_cellular`: accepts `ims_cellular` and `ims_volte`; stored SIM-bound
+  envelopes likewise accept `ims.cellular_ims` and `ims.volte`.
+- `AccessPathKind::CellularIms` accepts `"cellular_ims"` or `"volte"`; it retains
+  `"volte"` / `"volte_ims"` as wire/history identifiers so existing SMS,
+  notification and automation conditions continue to work.
+
+Do not send both spellings of one setting: ambiguous duplicate keys are
+rejected, not silently resolved. JSON DTO properties in the frontend and
+historical error codes intentionally retain their compatibility spellings;
+code variables, helpers, components and new route names use cellular IMS.
+Actual VoLTE standard/vendor terms and protocol strings are not globally
+rewritten. These intentional compatibility encodings are not missed renames.
 
 ## Meaning
 
@@ -36,7 +59,7 @@ the user's short **4G/5G**, not a longer internal identifier.
 | IMS `volte` module | `cellular_ims` | Update internal imports and CI filters together; never rename vendor AT commands or protocol tokens |
 | Registration/runtime `Volte*` types | `CellularIms*` | Restrict to this access stack; leave actual voice-specific standard/vendor terms alone |
 | `LineRuntime.volte`, `volte_live`, locks | `cellular_ims`, `cellular_ims_live`, corresponding locks | Inventory/API compatibility must be deliberate, not silently broken |
-| `volte_connection_enabled` | `cellular_ims_connection_enabled` | Read old saved key; write canonical key without disabling an existing line |
+| `volte_connection_enabled` | `cellular_ims_connection_enabled` | Read both spellings; keep established wire/storage key without disabling a line |
 | `volte_auto_restore`, `volte_profile_selection` | corresponding `cellular_ims_*` | Preserve retries, ordered profile attempts and their sources |
 | `volte_ip_families`, `volte_ip_families_auto` | corresponding `cellular_ims_*` | Preserve automatic/manual semantics and ordering |
 | `AccessPathKind::Volte` | `AccessPathKind::CellularIms` | Accept old serialized `"volte"`; update voice/SMS/UI together |
@@ -57,7 +80,7 @@ Merely adding route aliases does not make a changed JSON schema compatible.
 ## Storage and safety
 
 - Existing line profiles are JSON documents in `config_line_profiles`.
-  Add and test deserialization aliases before writing new canonical keys.
+  Test aliases and unchanged re-serialization; do not gratuitously rewrite keys.
 - Keep historical SQLite column names and counters unless an explicit,
   backward-tested migration is necessary. Rust field/method names can change
   independently from SQL column literals.
@@ -71,7 +94,7 @@ Merely adding route aliases does not make a changed JSON schema compatible.
 
 ## Required validation
 
-- Old config/DB fixture load, canonical write, reload, no duplicate alias keys.
+- Old/new alias fixture load, compatible write/reload, duplicate-key rejection.
 - New and legacy HTTP routes, request keys and response schemas.
 - SMS/voice/supplementary routing and old/new activity history display.
 - Frontend lint/build/type-check and nonempty Rust regression filters on Actions.

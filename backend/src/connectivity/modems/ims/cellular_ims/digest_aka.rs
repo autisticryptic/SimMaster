@@ -146,7 +146,7 @@ mod tests {
     }
 
     #[test]
-    fn akav1_empty_res_maps_to_volte_code() {
+    fn akav1_empty_res_maps_to_cellular_ims_code() {
         let a = aka(vec![], vec![0; 16], vec![0; 16]);
         assert_eq!(
             aka_digest_password("AKAv1-MD5", &a).unwrap_err().code(),
@@ -155,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn akav2_bad_material_maps_to_volte_code() {
+    fn akav2_bad_material_maps_to_cellular_ims_code() {
         let a = aka(vec![0x11; 8], vec![0x22; 8], vec![0x33; 16]);
         assert_eq!(
             aka_digest_password("AKAv2-MD5", &a).unwrap_err().code(),
@@ -188,7 +188,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_algorithm_maps_to_volte_code() {
+    fn unsupported_algorithm_maps_to_cellular_ims_code() {
         let a = aka(vec![1], vec![], vec![]);
         assert_eq!(
             aka_digest_password("SHA-256", &a).unwrap_err().code(),

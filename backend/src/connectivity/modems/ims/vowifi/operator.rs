@@ -36,7 +36,7 @@ use crate::{
             },
             voice::{parse_audio_sdp, SdpAddrType, SdpAudioDescription},
         },
-        modems::ims::volte::sip,
+        modems::ims::cellular_ims::sip,
     },
     platform::config::{TrunkIncomingMode, TrunkIpConnectMode},
     services::{

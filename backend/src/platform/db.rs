@@ -19,7 +19,7 @@ use crate::connectivity::core::ims_failure::ImsFailureDiagnostic;
 const BEIJING_UTC_OFFSET_SECONDS: i32 = 8 * 60 * 60;
 const SMS_TIMESTAMP_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const ESIM_DETECTION_CACHE_MAX_ROWS: i64 = 64;
-const VOLTE_REFRESH_STATS_MAX_ROWS: i64 = 256;
+const CELLULAR_IMS_REFRESH_STATS_MAX_ROWS: i64 = 256;
 
 fn required_line_id(line_id: &str) -> Result<&str> {
     let line_id = line_id.trim();
@@ -757,10 +757,10 @@ mod tests {
     }
 
     #[test]
-    fn volte_refresh_stats_increment_restore_clear_and_stay_bounded() {
+    fn cellular_ims_refresh_stats_increment_restore_clear_and_stay_bounded() {
         let db = test_database();
         let first = db
-            .increment_volte_refresh_stats("line-a", "2026-09-02T00:01:00Z")
+            .increment_cellular_ims_refresh_stats("line-a", "2026-09-02T00:01:00Z")
             .expect("increment first refresh");
         assert_eq!(first.refresh_count, 1);
         assert_eq!(
@@ -769,26 +769,26 @@ mod tests {
         );
 
         let second = db
-            .increment_volte_refresh_stats("line-a", "2026-09-02T00:02:00Z")
+            .increment_cellular_ims_refresh_stats("line-a", "2026-09-02T00:02:00Z")
             .expect("increment second refresh");
         assert_eq!(second.refresh_count, 2);
         assert_eq!(
-            db.get_volte_refresh_stats("line-a")
+            db.get_cellular_ims_refresh_stats("line-a")
                 .expect("restore refresh stats")
                 .expect("stored refresh stats"),
             second
         );
 
         assert!(db
-            .clear_volte_refresh_stats("line-a")
+            .clear_cellular_ims_refresh_stats("line-a")
             .expect("clear refresh stats"));
         assert!(db
-            .get_volte_refresh_stats("line-a")
+            .get_cellular_ims_refresh_stats("line-a")
             .expect("read cleared refresh stats")
             .is_none());
 
-        for index in 0..(VOLTE_REFRESH_STATS_MAX_ROWS + 8) {
-            db.increment_volte_refresh_stats(
+        for index in 0..(CELLULAR_IMS_REFRESH_STATS_MAX_ROWS + 8) {
+            db.increment_cellular_ims_refresh_stats(
                 &format!("bounded-line-{index}"),
                 "2026-09-02T00:03:00Z",
             )
@@ -802,7 +802,7 @@ mod tests {
                 row.get(0)
             })
             .expect("count refresh stats rows");
-        assert_eq!(count, VOLTE_REFRESH_STATS_MAX_ROWS);
+        assert_eq!(count, CELLULAR_IMS_REFRESH_STATS_MAX_ROWS);
     }
 
     #[test]
@@ -5753,7 +5753,7 @@ impl Database {
 
     // ==================== VoLTE REGISTER refresh stats ====================
 
-    pub fn get_volte_refresh_stats(
+    pub fn get_cellular_ims_refresh_stats(
         &self,
         line_id: &str,
     ) -> Result<Option<CellularImsRefreshStatsEntry>> {
@@ -5779,7 +5779,7 @@ impl Database {
     /// Atomically record a successful REGISTER refresh and return the durable
     /// counter. The database value is authoritative so process restarts and
     /// concurrent status updates cannot make the displayed count go backwards.
-    pub fn increment_volte_refresh_stats(
+    pub fn increment_cellular_ims_refresh_stats(
         &self,
         line_id: &str,
         last_refresh_at: &str,
@@ -5811,7 +5811,7 @@ impl Database {
                 ORDER BY updated_at DESC, line_id ASC
                 LIMIT ?1
              )",
-            params![VOLTE_REFRESH_STATS_MAX_ROWS],
+            params![CELLULAR_IMS_REFRESH_STATS_MAX_ROWS],
         )?;
         let entry = tx.query_row(
             "SELECT refresh_count, last_refresh_at, updated_at
@@ -5831,7 +5831,7 @@ impl Database {
         Ok(entry)
     }
 
-    pub fn clear_volte_refresh_stats(&self, line_id: &str) -> Result<bool> {
+    pub fn clear_cellular_ims_refresh_stats(&self, line_id: &str) -> Result<bool> {
         let line_id = required_line_id(line_id)?;
         let conn = self.conn.lock().unwrap();
         Ok(conn.execute(

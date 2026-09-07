@@ -1,6 +1,6 @@
-//! Native VoLTE (IMS over LTE) SMS module.
+//! User-space cellular IMS (4G/5G) access stack.
 //!
-//! Clean-room implementation of SMS-over-IMS on the LTE cellular path, written
+//! Clean-room implementation of IMS signaling, SMS and voice on cellular access, written
 //! from public 3GPP/IETF specifications:
 //!   - 3GPP TS 24.229 (IMS SIP), TS 24.341 (SMS over IP), TS 24.011 (RP/CP),
 //!     TS 23.040 (TPDU), TS 24.301 (EPS bearer), TS 33.203 (IMS access security)

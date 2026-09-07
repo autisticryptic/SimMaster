@@ -420,11 +420,11 @@ async fn scan_sms_paths(
 fn ims_sms_owns_reception(
     profile: &LineProfileConfig,
     vowifi_sms_ready: bool,
-    volte_registered: bool,
+    cellular_ims_registered: bool,
 ) -> bool {
     profile.enabled
         && ((profile.vowifi.enabled && vowifi_sms_ready)
-            || (profile.volte_connection_enabled && volte_registered))
+            || (profile.cellular_ims_connection_enabled && cellular_ims_registered))
 }
 
 /// Whether the ModemManager SMS scan should be suppressed because an IMS SMS
@@ -443,8 +443,8 @@ async fn modem_sms_paused_for_ims(
     let line_id = line.binding().line_id;
     let profile = config_manager.get_line_profile(&line_id);
     let vowifi_sms_ready = line.vowifi.snapshot().await.readiness().sms_ready;
-    let volte_registered = line.volte.status().await.registered;
-    ims_sms_owns_reception(&profile, vowifi_sms_ready, volte_registered)
+    let cellular_ims_registered = line.cellular_ims.status().await.registered;
+    ims_sms_owns_reception(&profile, vowifi_sms_ready, cellular_ims_registered)
 }
 
 async fn maybe_scan_sms_paths(
@@ -736,7 +736,7 @@ mod tests {
         );
 
         line_a.vowifi.enabled = false;
-        line_a.volte_connection_enabled = true;
+        line_a.cellular_ims_connection_enabled = true;
         assert!(!ims_sms_owns_reception(&line_a, false, false));
         assert!(ims_sms_owns_reception(&line_a, false, true));
         line_a.enabled = false;

@@ -67,7 +67,7 @@ pub struct CatalogProfileSummary {
     pub operator_legal_name: String,
     pub aliases: Vec<String>,
     pub release: CatalogRelease,
-    pub volte_ready: bool,
+    pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,
     pub smsoip_enabled: bool,
@@ -82,7 +82,7 @@ pub struct CatalogIdentityMatch {
 
 #[derive(Debug, Clone, Default)]
 pub struct CatalogServiceCapabilities {
-    pub volte_ready: bool,
+    pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,
     pub smsoip_enabled: bool,

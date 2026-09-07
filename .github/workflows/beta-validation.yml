@@ -51,6 +51,9 @@ jobs:
             platform::config::tests \
             platform::config_file::tests \
             platform::network_routing::tests \
+            connectivity::modems::ims::profile_override::tests \
+            connectivity::modems::ims::effective_profile::tests \
+            connectivity::core::device_identity::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
@@ -60,7 +63,7 @@ jobs:
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
-            connectivity::modems::ims::volte::live::refresh_tests; do
+            connectivity::modems::ims::cellular_ims::live::refresh_tests; do
             cargo test --locked "$filter" -- --list > beta-test-list.txt
             if ! grep -q ': test$' beta-test-list.txt; then
               echo "::error title=Empty regression filter::$filter selected no tests"

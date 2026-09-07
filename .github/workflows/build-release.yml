@@ -152,13 +152,7 @@ jobs:
           cargo test --locked --no-run 2>&1 | tee test-compile.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            # Public check annotations remain readable even when GitHub hides
-            # the full job log behind repository-admin authentication.
-            details=$(tail -n 80 test-compile.log)
-            details=${details//'%'/'%25'}
-            details=${details//$'\r'/'%0D'}
-            details=${details//$'\n'/'%0A'}
-            echo "::error title=Rust test compile failed::$details"
+            python3 ../.github/scripts/ci_failure_excerpt.py test-compile.log "Rust test compile failed"
           fi
           exit "$status"
 
@@ -168,6 +162,18 @@ jobs:
         run: |
           set -o pipefail
           for filter in \
+            platform::dns::tests \
+            platform::config::tests \
+            platform::config_file::tests \
+            platform::network_routing::tests \
+            connectivity::modems::ims::profile_override::tests \
+            connectivity::modems::ims::effective_profile::tests \
+            connectivity::modems::ims::vowifi::epdg::tests \
+            connectivity::modems::ims::vowifi::socks5::tests \
+            services::trunk::transport::tests \
+            services::e911::ssrf::tests \
+            services::e911::ts43::tests \
+            connectivity::core::device_identity::tests \
             connectivity::core::register::tests \
             connectivity::core::registration::tests \
             connectivity::core::register_response::tests \
@@ -176,24 +182,38 @@ jobs:
             connectivity::core::ims_access::tests \
             connectivity::core::ims_registration_coordinator::tests \
             services::trunk::access_router::tests \
-            platform::config::tests::sms_path_policy_default_order_is_vowifi_volte_cs \
+            platform::config::tests::sms_path_policy_default_order_is_vowifi_cellular_ims_cs \
             api::handlers::tests::coexistence \
             connectivity::modems::ims::vowifi::live::coexistence_lease_tests \
             connectivity::modems::ims::vowifi::channel::tests \
-            connectivity::modems::ims::volte::channel::tests \
-            connectivity::modems::ims::volte::ipsec::tests \
-            connectivity::modems::ims::volte::live::tests::refresh \
-            connectivity::modems::ims::volte::live::refresh_tests; do
+            connectivity::modems::ims::cellular_ims::channel::tests \
+            connectivity::modems::ims::cellular_ims::ipsec::tests \
+            connectivity::modems::ims::cellular_ims::live::tests::refresh \
+            connectivity::modems::ims::cellular_ims::live::refresh_tests; do
+            cargo test --locked "$filter" -- --list > release-test-list.txt
+            if ! grep -q ': test$' release-test-list.txt; then
+              echo "::error title=Empty regression filter::$filter selected no tests"
+              exit 1
+            fi
             if ! cargo test --locked "$filter" -- --test-threads=1 2>&1 | tee -a ims-refresh-tests.log; then
-              details=$(tail -n 80 ims-refresh-tests.log)
-              details=${details//'%'/'%25'}
-              details=${details//$'\r'/'%0D'}
-              details=${details//$'\n'/'%0A'}
-              echo "::error title=IMS refresh regression failed::$details"
+              python3 ../.github/scripts/ci_failure_excerpt.py ims-refresh-tests.log "IMS refresh regression failed"
               exit 1
             fi
           done
           grep -E 'running [0-9]+ test|test result:' ims-refresh-tests.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check canonical and legacy API routes on a private bus
+        working-directory: backend
+        shell: bash
+        run: |
+          set -o pipefail
+          if ! dbus-run-session -- sh -c '
+            export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
+            cargo test --locked cellular_ims_route_aliases_keep_auth_and_response_contract -- --test-threads=1
+          ' 2>&1 | tee -a ims-refresh-tests.log; then
+            python3 ../.github/scripts/ci_failure_excerpt.py ims-refresh-tests.log "Cellular IMS API compatibility failed"
+            exit 1
+          fi
 
       - name: Upload IMS regression results
         if: always()

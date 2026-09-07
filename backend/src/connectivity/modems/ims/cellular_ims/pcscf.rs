@@ -969,7 +969,7 @@ IPv4 primary DNS: 10.0.0.53";
 
     #[test]
     fn address_order_honors_preference_and_strict_modes() {
-        use crate::connectivity::modems::ims::volte::plan::ImsConnectionPlan;
+        use crate::connectivity::modems::ims::cellular_ims::plan::ImsConnectionPlan;
         let s = parse_ip_settings(SAMPLE);
         assert_eq!(
             s.ordered_local_addrs(&ImsConnectionPlan::from_preference(
@@ -1109,7 +1109,7 @@ IPv4 primary DNS: 10.0.0.53";
 
     #[test]
     fn at_probe_family_order_matches_runtime_preference() {
-        use crate::connectivity::modems::ims::volte::plan::ImsConnectionPlan;
+        use crate::connectivity::modems::ims::cellular_ims::plan::ImsConnectionPlan;
         assert_eq!(
             ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First)
                 .pdp_types(),

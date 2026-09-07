@@ -205,11 +205,11 @@ mod tests {
         let first = SupplementaryRuntime::for_line("line-a");
         let second = SupplementaryRuntime::for_line("line-b");
         first
-            .begin_mwi_subscription(ImsRegistrationAccess::Volte)
+            .begin_mwi_subscription(ImsRegistrationAccess::CellularIms)
             .await;
         first
             .update_message_waiting(
-                ImsRegistrationAccess::Volte,
+                ImsRegistrationAccess::CellularIms,
                 MessageWaitingSummary {
                     source: crate::connectivity::core::supplementary::VoicemailSource::OperatorIms,
                     messages_waiting: true,
@@ -235,7 +235,7 @@ mod tests {
         );
         assert!(second.snapshot().await.message_waiting.is_none());
         second
-            .clear_registration(ImsRegistrationAccess::Volte)
+            .clear_registration(ImsRegistrationAccess::CellularIms)
             .await;
         assert!(first.snapshot().await.message_waiting.is_some());
     }
@@ -244,7 +244,7 @@ mod tests {
     async fn stale_access_teardown_does_not_clear_handover_state() {
         let runtime = SupplementaryRuntime::for_line("line-a");
         runtime
-            .begin_mwi_subscription(ImsRegistrationAccess::Volte)
+            .begin_mwi_subscription(ImsRegistrationAccess::CellularIms)
             .await;
         runtime
             .begin_mwi_subscription(ImsRegistrationAccess::Vowifi)
@@ -260,7 +260,7 @@ mod tests {
             .await;
 
         runtime
-            .clear_registration(ImsRegistrationAccess::Volte)
+            .clear_registration(ImsRegistrationAccess::CellularIms)
             .await;
         assert!(runtime.snapshot().await.message_waiting.is_some());
     }
@@ -270,7 +270,7 @@ mod tests {
         let runtime = SupplementaryRuntime::for_line("line-a");
         runtime
             .begin_ut_request(
-                ImsRegistrationAccess::Volte,
+                ImsRegistrationAccess::CellularIms,
                 UtDocumentKind::CommunicationWaiting,
             )
             .await;
@@ -287,7 +287,7 @@ mod tests {
             .await;
 
         runtime
-            .clear_registration(ImsRegistrationAccess::Volte)
+            .clear_registration(ImsRegistrationAccess::CellularIms)
             .await;
         let snapshot = runtime.snapshot().await;
         assert_eq!(snapshot.call_waiting, NetworkToggleState::Enabled);

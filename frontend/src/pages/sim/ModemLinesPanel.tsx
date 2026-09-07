@@ -35,12 +35,12 @@ import { maskedIccid, modemSlotLabel, modemSlotSourceLabel, shortLineId, stableM
 import TrunkProfileDialog from './TrunkProfileDialog'
 import VowifiLineDialog from './VowifiLineDialog'
 import DataProxyDialog from './DataProxyDialog'
-import VolteProfileDialog from './VolteProfileDialog'
-import { LineActivityLog, LineTrunkDetails, LineVolteDetails, LineVowifiDetails } from './LineRuntimeDetails'
-import { standardDerivedProfileMessage, volteErrorMessage, volteErrorStatusLabel } from './volteErrorFormat'
+import CellularImsProfileDialog from './CellularImsProfileDialog'
+import { LineActivityLog, LineTrunkDetails, LineCellularImsDetails, LineVowifiDetails } from './LineRuntimeDetails'
+import { standardDerivedProfileMessage, cellularImsErrorMessage, cellularImsErrorStatusLabel } from './cellularImsErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
 
-const volteStageStatusLabels: Record<string, string> = {
+const cellularImsStageStatusLabels: Record<string, string> = {
   disabled: 'IMS 未连接',
   starting: '正在准备 IMS 连接',
   identity: '正在读取 SIM 身份',
@@ -69,14 +69,14 @@ const volteStageStatusLabels: Record<string, string> = {
 function imsConnectionSummary(line: CellularImsLineControlResponse) {
   if (line.runtime.registered) return 'IMS 已注册'
   if (!line.profile.volte_connection_enabled) return 'IMS 未连接'
-  const errorStatus = volteErrorStatusLabel(line.runtime.last_error)
+  const errorStatus = cellularImsErrorStatusLabel(line.runtime.last_error)
   if (errorStatus) return errorStatus
-  const label = volteStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
+  const label = cellularImsStageStatusLabels[line.runtime.stage] || '正在连接 IMS'
   if (line.runtime.last_error) return `${label.replace(/^正在/, '').replace(/ IMS$/, '')}失败`
   return label
 }
 
-const volteStageTimeline = [
+const cellularImsStageTimeline = [
   ['identity', 'SIM 身份'],
   ['carrier_profile', '运营商 Profile'],
   ['bearer', 'IMS Bearer'],
@@ -87,7 +87,7 @@ const volteStageTimeline = [
   ['registered', 'IMS 已注册'],
 ] as const
 
-const volteStageAliases: Record<string, string> = {
+const cellularImsStageAliases: Record<string, string> = {
   starting: 'identity',
   ims_context: 'bearer',
   bearer_dual: 'bearer',
@@ -100,15 +100,15 @@ const volteStageAliases: Record<string, string> = {
   register_udp: 'registered',
 }
 
-function volteStageTimelineState(line: CellularImsLineControlResponse) {
+function cellularImsStageTimelineState(line: CellularImsLineControlResponse) {
   const runtime = line.runtime
-  const current = volteStageAliases[runtime.stage] || runtime.stage
-  const currentIndex = volteStageTimeline.findIndex(([stage]) => stage === current)
+  const current = cellularImsStageAliases[runtime.stage] || runtime.stage
+  const currentIndex = cellularImsStageTimeline.findIndex(([stage]) => stage === current)
   const latestByStage = new Map<string, CellularImsLineControlResponse['runtime']['connection_attempts'][number]>()
   for (const attempt of runtime.connection_attempts ?? []) {
-    latestByStage.set(volteStageAliases[attempt.stage] || attempt.stage, attempt)
+    latestByStage.set(cellularImsStageAliases[attempt.stage] || attempt.stage, attempt)
   }
-  return volteStageTimeline.map(([stage, label], index) => {
+  return cellularImsStageTimeline.map(([stage, label], index) => {
     const attempt = latestByStage.get(stage)
     const failed = Boolean(runtime.last_error && current === stage && runtime.phase !== 'registered')
     const complete = runtime.registered || (!failed && currentIndex > index)
@@ -118,10 +118,10 @@ function volteStageTimelineState(line: CellularImsLineControlResponse) {
   })
 }
 
-function VolteStageTimeline({ line }: { line: CellularImsLineControlResponse }) {
-  const displayError = volteErrorMessage(line.runtime.last_error)
+function CellularImsStageTimeline({ line }: { line: CellularImsLineControlResponse }) {
+  const displayError = cellularImsErrorMessage(line.runtime.last_error)
   if (!line.profile.volte_connection_enabled && !displayError && !line.runtime.connection_attempts?.length) return null
-  const items = volteStageTimelineState(line)
+  const items = cellularImsStageTimelineState(line)
   const currentLabel = items.find((item) => item.active || item.failed)?.label
     || (line.runtime.registered ? 'IMS 已注册' : '等待启动')
   return (
@@ -132,7 +132,7 @@ function VolteStageTimeline({ line }: { line: CellularImsLineControlResponse }) 
       </Box>
       <Box sx={{ display: 'grid', gridTemplateColumns: { xs: '1fr 1fr', sm: 'repeat(4, minmax(0, 1fr))', md: 'repeat(8, minmax(0, 1fr))' }, gap: 0.75 }}>
         {items.map((item) => (
-          <Box key={item.stage} minWidth={0} display="flex" alignItems="center" gap={0.5} title={item.attempt?.detail || volteErrorMessage(item.attempt?.error_code) || item.label}>
+          <Box key={item.stage} minWidth={0} display="flex" alignItems="center" gap={0.5} title={item.attempt?.detail || cellularImsErrorMessage(item.attempt?.error_code) || item.label}>
             {item.failed ? <ErrorOutline color="error" sx={{ fontSize: 16, flexShrink: 0 }} /> : item.complete ? <CheckCircle color="success" sx={{ fontSize: 16, flexShrink: 0 }} /> : <RadioButtonUnchecked color={item.active ? 'primary' : 'disabled'} sx={{ fontSize: 16, flexShrink: 0 }} />}
             <Typography variant="caption" color={item.failed ? 'error' : item.active ? 'primary' : item.complete ? 'text.primary' : 'text.secondary'} sx={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.label}</Typography>
           </Box>
@@ -279,7 +279,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
   const [enableTrunkOnOpen, setEnableTrunkOnOpen] = useState(false)
   const [editingVowifiLine, setEditingVowifiLine] = useState<VowifiLineConfigResponse | null>(null)
   const [editingDataLineId, setEditingDataLineId] = useState<string | null>(null)
-  const [editingVolteProfileLineId, setEditingVolteProfileLineId] = useState<string | null>(null)
+  const [editingCellularImsProfileLineId, setEditingCellularImsProfileLineId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [supplementalStatus, setSupplementalStatus] = useState(INITIAL_SUPPLEMENTAL_STATUS)
   const [savingKey, setSavingKey] = useState<string | null>(null)
@@ -630,7 +630,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
     }
   }
 
-  const handleVolteProfileSaved = (updated: CellularImsProfileSelectionResponse) => {
+  const handleCellularImsProfileSaved = (updated: CellularImsProfileSelectionResponse) => {
     setLines((current) => current.map((line) => line.modem.line_id === updated.line_id
       ? {
           ...line,
@@ -641,7 +641,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
           runtime: updated.runtime,
         }
       : line))
-    setEditingVolteProfileLineId(null)
+    setEditingCellularImsProfileLineId(null)
     setSuccess(`${shortLineId(updated.line_id)} 的 VoLTE Profile 顺序已保存`)
   }
 
@@ -820,7 +820,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
       ) : (
         <Grid container spacing={2.5}>
           {(workbench ? lines.filter((line) => line.modem.line_id === selectedLineId) : lines).map((line, index) => {
-            const volteBusy = savingKey === `volte:${line.modem.line_id}`
+            const cellularImsBusy = savingKey === `volte:${line.modem.line_id}`
             const retryBusy = savingKey === `retry:${line.modem.line_id}`
             const vowifiBusy = savingKey === `vowifi:${line.modem.line_id}`
             const trunkBusy = savingKey === `trunk:${line.modem.line_id}`
@@ -842,7 +842,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
               : supplementalStatus.trunk === 'error' ? 'Trunk 状态读取失败' : null
             const airplaneEnabled = network?.airplane_mode_requested ?? line.profile.airplane_mode_enabled
             const recovery = recoveryMessage(line)
-            const displayError = volteErrorMessage(line.runtime.last_error)
+            const displayError = cellularImsErrorMessage(line.runtime.last_error)
             const fallbackMessage = !line.runtime.registered
               ? standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason)
               : null
@@ -1075,12 +1075,12 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                           // names this one so a browser test cannot pick the
                           // wrong one and act on it.
                           data-testid="volte-profile-config"
-                          onClick={() => setEditingVolteProfileLineId(line.modem.line_id)}
+                          onClick={() => setEditingCellularImsProfileLineId(line.modem.line_id)}
                           disabled={savingKey !== null}
                         >
                           配置
                         </Button>
-                        {(volteBusy || retryBusy) && <CircularProgress size={18} />}
+                        {(cellularImsBusy || retryBusy) && <CircularProgress size={18} />}
                         {line.profile.volte_connection_enabled && line.runtime.manual_retry_available && (
                           <Tooltip title={recoveryRunning ? '自动恢复正在进行' : `立即开始新的 ${line.runtime.retry_max || 3} 次恢复批次`}>
                             <span>
@@ -1105,7 +1105,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                     </Box>}
                     {/* 工作台的 IMS 标签页不再重复渲染阶段进度：线路卡片顶部已有同源的
                         阶段条，两处并列只是同一份 connection_attempts 的两种画法。 */}
-                    {!isReader && !workbench && <VolteStageTimeline line={line} />}
+                    {!isReader && !workbench && <CellularImsStageTimeline line={line} />}
                     {(!workbench || workbenchTab === 'ims') && <Box display="flex" justifyContent="space-between" alignItems="center" mt={1.5} pt={1.5} borderTop={1} borderColor="divider" gap={1.5}>
                       <Box minWidth={0}>
                         <Box display="flex" alignItems="center" gap={0.75} flexWrap="wrap">
@@ -1174,7 +1174,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                         <CellTower color="action" fontSize="small" />
                         <Typography variant="subtitle2" fontWeight={700}>4G/5G 详情</Typography>
                       </Box>
-                      <LineVolteDetails line={line} />
+                      <LineCellularImsDetails line={line} />
                     </Box>}
                     {workbench && workbenchTab === 'ims' && vowifiLine?.config.enabled && <Box mt={2} pt={2} borderTop={1} borderColor="divider">
                       <Box display="flex" alignItems="center" gap={0.75} mb={1.5}>
@@ -1244,11 +1244,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
         onClose={() => setEditingVowifiLine(null)}
         onSaved={handleVowifiSaved}
       />
-      <VolteProfileDialog
-        open={editingVolteProfileLineId !== null}
-        lineId={editingVolteProfileLineId}
-        onClose={() => setEditingVolteProfileLineId(null)}
-        onSaved={handleVolteProfileSaved}
+      <CellularImsProfileDialog
+        open={editingCellularImsProfileLineId !== null}
+        lineId={editingCellularImsProfileLineId}
+        onClose={() => setEditingCellularImsProfileLineId(null)}
+        onSaved={handleCellularImsProfileSaved}
       />
       <DataProxyDialog
         open={editingDataLineId !== null}

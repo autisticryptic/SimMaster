@@ -111,10 +111,10 @@ mod tests {
             &policy,
             &[
                 state(AccessPathKind::Vowifi, true, true, false),
-                state(AccessPathKind::Volte, true, true, true),
+                state(AccessPathKind::CellularIms, true, true, true),
             ],
         );
-        assert_eq!(plan.candidates, vec![AccessPathKind::Volte]);
+        assert_eq!(plan.candidates, vec![AccessPathKind::CellularIms]);
         assert_eq!(
             plan.rejected[0].reason,
             VoiceRouteRejection::MediaGatewayUnavailable
@@ -130,7 +130,7 @@ mod tests {
                     enabled: false,
                 },
                 PathLayerConfig {
-                    kind: AccessPathKind::Volte,
+                    kind: AccessPathKind::CellularIms,
                     enabled: true,
                 },
             ],
@@ -138,7 +138,7 @@ mod tests {
         };
         let plan = plan_voice_route(
             &policy,
-            &[state(AccessPathKind::Volte, false, false, false)],
+            &[state(AccessPathKind::CellularIms, false, false, false)],
         );
         assert!(plan.candidates.is_empty());
         assert_eq!(plan.rejected[0].reason, VoiceRouteRejection::PolicyDisabled);

@@ -286,10 +286,10 @@ where
                                 .forced_family()
                                 .map(|f| {
                                     match f {
-                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv6 => {
+                            crate::connectivity::modems::ims::cellular_ims::plan::IpFamily::Ipv6 => {
                                 IpType::Ipv6
                             }
-                            crate::connectivity::modems::ims::volte::plan::IpFamily::Ipv4 => {
+                            crate::connectivity::modems::ims::cellular_ims::plan::IpFamily::Ipv4 => {
                                 IpType::Ipv4
                             }
                         }
@@ -1392,7 +1392,9 @@ mod tests {
 
     #[test]
     fn network_family_rejection_selects_required_bearer_type() {
-        use crate::connectivity::modems::ims::volte::plan::{FailureClass, ImsConnectionPlan};
+        use crate::connectivity::modems::ims::cellular_ims::plan::{
+            FailureClass, ImsConnectionPlan,
+        };
         use crate::platform::config::CellularImsIpFamilyPreference;
         let plan_v6 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv6First);
         let plan_v4 = ImsConnectionPlan::from_preference(CellularImsIpFamilyPreference::Ipv4First);

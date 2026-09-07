@@ -154,7 +154,7 @@ impl ProfileStore {
                 origin: ProfileOrigin::Catalog,
                 source: format!("carrier_catalog:{}", entry.release.release_id),
                 updated_at: entry.release.generated_at,
-                volte_ready: capability.volte_ready
+                cellular_ims_ready: capability.cellular_ims_ready
                     || loaded_projection == CatalogAccessKind::LteEpc,
                 vowifi_ready: capability.vowifi_ready
                     || loaded_projection == CatalogAccessKind::WifiEpdg,
@@ -169,14 +169,14 @@ impl ProfileStore {
             // separate LTE/Wi-Fi projections. `from_database_json` already
             // validates the shared IMS portion, so every valid database row has
             // an LTE projection by construction.
-            let volte_ready = record.validate_ims_only().is_ok();
+            let cellular_ims_ready = record.validate_ims_only().is_ok();
             profiles.push(StoredProfile {
                 profile_id: entry.profile_id,
                 plmn: entry.plmn,
                 origin: ProfileOrigin::Database,
                 source: "manual".to_string(),
                 updated_at: entry.updated_at,
-                volte_ready,
+                cellular_ims_ready,
                 vowifi_ready: record.voice.vowifi_enabled,
                 vilte_enabled: false,
                 smsoip_enabled: true,
@@ -196,7 +196,7 @@ impl ProfileStore {
     /// Check an explicit profile reference without allowing source crossover or
     /// derived fallback. Runtime resolution remains tolerant after a saved row
     /// is later removed; this stricter check is only for accepting a new PUT.
-    pub fn volte_reference_state(
+    pub fn cellular_ims_reference_state(
         &self,
         source: ImsProfileSource,
         profile_id: &str,
@@ -229,7 +229,7 @@ impl ProfileStore {
                 let Some(capability) = capabilities.get(profile_id) else {
                     return Ok(ImsProfileReferenceState::Missing);
                 };
-                if !capability.volte_ready {
+                if !capability.cellular_ims_ready {
                     return Ok(ImsProfileReferenceState::NotLteReady);
                 }
                 match self.catalog.get(profile_id, CatalogAccessKind::LteEpc) {
@@ -331,7 +331,7 @@ impl ProfileStore {
                                 source: format!("carrier_catalog:{}", profile.release.release_id),
                                 updated_at: profile.release.generated_at,
                                 record: profile.record,
-                                volte_ready: capability.volte_ready,
+                                cellular_ims_ready: capability.cellular_ims_ready,
                                 vowifi_ready: capability.vowifi_ready,
                                 vilte_enabled: capability.vilte_enabled,
                                 smsoip_enabled: capability.smsoip_enabled,
@@ -353,7 +353,7 @@ impl ProfileStore {
                     origin: ProfileOrigin::Database,
                     source: "manual".to_string(),
                     updated_at: entry.updated_at,
-                    volte_ready: true,
+                    cellular_ims_ready: true,
                     vowifi_ready: record.voice.vowifi_enabled,
                     vilte_enabled: false,
                     smsoip_enabled: true,
@@ -385,7 +385,7 @@ impl ProfileStore {
                     origin: ProfileOrigin::Catalog,
                     source: format!("carrier_catalog:{}", profile.release.release_id),
                     updated_at: profile.release.generated_at,
-                    volte_ready: profile.volte_ready,
+                    cellular_ims_ready: profile.cellular_ims_ready,
                     vowifi_ready: profile.vowifi_ready,
                     vilte_enabled: profile.vilte_enabled,
                     smsoip_enabled: profile.smsoip_enabled,
@@ -408,7 +408,7 @@ impl ProfileStore {
                 origin: ProfileOrigin::Database,
                 source: "manual".to_string(),
                 updated_at: entry.updated_at,
-                volte_ready: record.validate_ims_only().is_ok(),
+                cellular_ims_ready: record.validate_ims_only().is_ok(),
                 vowifi_ready: record.voice.vowifi_enabled,
                 vilte_enabled: false,
                 smsoip_enabled: true,
@@ -446,7 +446,7 @@ impl ProfileStore {
                     origin: ProfileOrigin::Database,
                     source: "manual".to_string(),
                     updated_at: entry.updated_at,
-                    volte_ready: record.validate_ims_only().is_ok(),
+                    cellular_ims_ready: record.validate_ims_only().is_ok(),
                     vowifi_ready: record.voice.vowifi_enabled,
                     vilte_enabled: false,
                     smsoip_enabled: true,
@@ -477,7 +477,7 @@ impl ProfileStore {
                     source: format!("carrier_catalog:{}", summary.release.release_id),
                     updated_at: summary.release.generated_at,
                     record: profile.record,
-                    volte_ready: summary.volte_ready,
+                    cellular_ims_ready: summary.cellular_ims_ready,
                     vowifi_ready: summary.vowifi_ready,
                     vilte_enabled: summary.vilte_enabled,
                     smsoip_enabled: summary.smsoip_enabled,
@@ -565,7 +565,7 @@ impl ProfileStore {
             origin: ProfileOrigin::Database,
             source: "manual".to_string(),
             updated_at: entry.updated_at,
-            volte_ready: true,
+            cellular_ims_ready: true,
             vowifi_ready: record.voice.vowifi_enabled,
             vilte_enabled: false,
             smsoip_enabled: true,
@@ -718,7 +718,7 @@ impl ProfileStore {
     /// profile for the same logical slot. A legacy SIM pin is consulted only
     /// inside the source where that id actually exists; an explicit line id is
     /// strict and always wins over it.
-    pub fn resolve_volte_candidate(
+    pub fn resolve_cellular_ims_candidate(
         &self,
         candidate: &ImsProfileCandidate,
         legacy_pinned_profile_id: Option<&str>,
@@ -1196,7 +1196,8 @@ pub struct StoredProfile {
     pub source: String,
     pub updated_at: String,
     pub record: CarrierProfileRecord,
-    pub volte_ready: bool,
+    #[serde(rename = "volte_ready")]
+    pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,
     pub smsoip_enabled: bool,
@@ -1214,7 +1215,8 @@ pub struct StoredProfileSummary {
     pub origin: ProfileOrigin,
     pub source: String,
     pub updated_at: String,
-    pub volte_ready: bool,
+    #[serde(rename = "volte_ready")]
+    pub cellular_ims_ready: bool,
     pub vowifi_ready: bool,
     pub vilte_enabled: bool,
     pub smsoip_enabled: bool,
@@ -1489,7 +1491,7 @@ mod tests {
 
         for candidate in ImsProfileSelectionConfig::default().attempts {
             assert!(store
-                .resolve_volte_candidate(&candidate, None, "999990123456789", Some("99999"),)
+                .resolve_cellular_ims_candidate(&candidate, None, "999990123456789", Some("99999"),)
                 .expect("private VoLTE candidate lookup")
                 .is_none());
         }
@@ -1516,7 +1518,7 @@ mod tests {
         assert_eq!(by_plmn.profile.epdg.host, "epdg.private.example");
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate {
                     source: ImsProfileSource::Database,
                     profile_id: Some("private-db-99999".to_string()),
@@ -1625,8 +1627,8 @@ mod tests {
             .upsert(record)
             .expect("save IMS-only database profile");
 
-        let volte = store
-            .resolve_volte_candidate(
+        let cellular_ims = store
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 None,
                 "502121234567890",
@@ -1634,8 +1636,8 @@ mod tests {
             )
             .expect("resolve VoLTE database candidate")
             .expect("VoLTE may use the shared IMS profile");
-        assert_eq!(volte.origin, ProfileOrigin::Database);
-        assert_eq!(volte.profile.meta.profile_id, "ims-only-db-50212");
+        assert_eq!(cellular_ims.origin, ProfileOrigin::Database);
+        assert_eq!(cellular_ims.profile.meta.profile_id, "ims-only-db-50212");
 
         let vowifi = store
             .resolve_vowifi_candidate(
@@ -1698,7 +1700,7 @@ mod tests {
         assert_eq!(by_plmn.profile.epdg.host, "epdg.private.example");
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate {
                     source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),
@@ -1748,7 +1750,7 @@ mod tests {
         store.upsert(custom).expect("save same-id custom row");
 
         let database = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate {
                     source: ImsProfileSource::Database,
                     profile_id: Some("test-v7-23433".to_string()),
@@ -1760,7 +1762,7 @@ mod tests {
             .expect("database resolution")
             .expect("database profile");
         let catalog = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate {
                     source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),
@@ -1802,7 +1804,12 @@ mod tests {
             .iter()
             .map(|candidate| {
                 store
-                    .resolve_volte_candidate(candidate, None, "502121234567890", Some("50212"))
+                    .resolve_cellular_ims_candidate(
+                        candidate,
+                        None,
+                        "502121234567890",
+                        Some("50212"),
+                    )
                     .expect("candidate resolution")
                     .expect("derived fallback")
             })
@@ -1821,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_database_candidate_auto_matches_home_plmn() {
+    fn cellular_ims_database_candidate_auto_matches_home_plmn() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let catalog =
             CarrierCatalog::at_path(PathBuf::from("/definitely-missing/carrier-bundles.sqlite3"));
@@ -1838,7 +1845,7 @@ mod tests {
         store.upsert(record).expect("save database profile");
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 None,
                 "502121234567890",
@@ -1853,12 +1860,12 @@ mod tests {
     }
 
     #[test]
-    fn volte_catalog_candidate_auto_matches_lte_catalog() {
+    fn cellular_ims_catalog_candidate_auto_matches_lte_catalog() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let (store, path) = store_with_catalog();
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 None,
                 "234330123456789",
@@ -1885,7 +1892,7 @@ mod tests {
 
         for source in [ImsProfileSource::Database, ImsProfileSource::CarrierCatalog] {
             let resolved = store
-                .resolve_volte_candidate(
+                .resolve_cellular_ims_candidate(
                     &ImsProfileCandidate {
                         source,
                         profile_id: Some("deleted-profile".to_string()),
@@ -1911,7 +1918,7 @@ mod tests {
         let legacy_pin = Some("test-v7-23433");
 
         let database = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::Database),
                 legacy_pin,
                 "234330123456789",
@@ -1920,7 +1927,7 @@ mod tests {
             .expect("database resolution")
             .expect("derived database fallback");
         let catalog = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::CarrierCatalog),
                 legacy_pin,
                 "234330123456789",
@@ -1953,7 +1960,7 @@ mod tests {
         store.upsert(record).expect("save database profile");
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate::automatic(ImsProfileSource::Derived),
                 Some("custom-50212"),
                 "502121234567890",
@@ -2247,7 +2254,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_catalog_reference_reports_missing_lte_projection_and_runtime_falls_back() {
+    fn cellular_ims_catalog_reference_reports_missing_lte_projection_and_runtime_falls_back() {
         let _resolver_guard = profiles::profile_resolver_test_guard();
         let (store, path) = store_with_catalog();
         {
@@ -2269,23 +2276,23 @@ mod tests {
                 profile.origin == ProfileOrigin::Catalog && profile.profile_id == "test-v7-23433"
             })
             .expect("Wi-Fi-only catalog row remains visible as a disabled VoLTE choice");
-        assert!(!catalog.volte_ready);
+        assert!(!catalog.cellular_ims_ready);
         assert!(catalog.vowifi_ready);
         assert_eq!(
             store
-                .volte_reference_state(ImsProfileSource::CarrierCatalog, "test-v7-23433",)
+                .cellular_ims_reference_state(ImsProfileSource::CarrierCatalog, "test-v7-23433",)
                 .expect("explicit reference state"),
             ImsProfileReferenceState::NotLteReady
         );
         assert_eq!(
             store
-                .volte_reference_state(ImsProfileSource::CarrierCatalog, "missing-profile",)
+                .cellular_ims_reference_state(ImsProfileSource::CarrierCatalog, "missing-profile",)
                 .expect("missing explicit reference state"),
             ImsProfileReferenceState::Missing
         );
 
         let resolved = store
-            .resolve_volte_candidate(
+            .resolve_cellular_ims_candidate(
                 &ImsProfileCandidate {
                     source: ImsProfileSource::CarrierCatalog,
                     profile_id: Some("test-v7-23433".to_string()),

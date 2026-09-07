@@ -1,8 +1,14 @@
 # SimAdmin DNS 解析层 Hickory 重构任务
 
 创建日期：2026-09-02
-状态：待后续开发
-本轮范围：仅记录方案 A，不在当前 VoWiFi 修复中实施
+状态：普通系统 DNS 已在 beta2 分支迁移到 Hickory 并通过回归；实机验收待发布候选
+本轮范围：替换 libc 系统解析、HTTP 和代理端点隐式解析，启用 system-config；专用 DNS 传输维持原行为
+
+> 2026-09-08 更新：详见 `docs/DNS_HICKORY.md` 和 `plan.md`。
+> 用户本轮要求的普通系统解析已使用 hickory-resolver 0.25.2。
+> 下列原始“统一所有专用 DNS 报文/传输”项目保留为后续设计清单；
+> 原有运营商 DNS、P-CSCF、NAPTR 和 SOCKS5 UDP DNS 已是 Rust 实现，
+> 本次不借替换 lookup_host 改变它们的出口/回退策略，也不谎称这些传输已经重写。
 
 ## 目标
 
@@ -14,7 +20,7 @@ NAPTR 查询统一到可测试的纯 Rust 解析层，避免静态 musl 环境�
 ## 当前临时实现
 
 - [x] 未指定 DNS 时显式读取 `/etc/hosts`。
-- [x] hosts 未命中时继续调用系统 `lookup_host`。
+- [x] hosts 未命中时由 Hickory 读取系统配置并查询，不再调用系统 `lookup_host`。
 - [x] 系统解析失败时保留现有 UDP DNS fallback。
 - [x] 指定 Profile DNS 时仍严格使用指定 DNS，不读取 hosts 覆盖运营商配置。
 - [ ] Hickory 重构完成后删除不再需要的临时重复实现。

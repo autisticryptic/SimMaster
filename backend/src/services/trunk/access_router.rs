@@ -825,7 +825,7 @@ mod tests {
         };
         VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
             .with_offer(AccessPathKind::Vowifi, offer.clone())
-            .with_offer(AccessPathKind::Volte, offer)
+            .with_offer(AccessPathKind::CellularIms, offer)
     }
 
     async fn wait_available(link: &OperatorLink) {
@@ -859,16 +859,16 @@ mod tests {
     #[tokio::test]
     async fn pins_all_commands_to_the_selected_access_leg() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let trunk = router.operator_link();
@@ -886,11 +886,14 @@ mod tests {
             OperatorCommand::StartCall { .. }
         ));
         assert!(matches!(
-            volte_commands.try_recv(),
+            cellular_ims_commands.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
-        router.set_policy(policy(&[AccessPathKind::Volte, AccessPathKind::Vowifi]));
+        router.set_policy(policy(&[
+            AccessPathKind::CellularIms,
+            AccessPathKind::Vowifi,
+        ]));
         trunk
             .send_command(OperatorCommand::HangupCall {
                 call_id: "call-a".into(),
@@ -901,7 +904,7 @@ mod tests {
             OperatorCommand::HangupCall { .. }
         ));
         assert!(matches!(
-            volte_commands.try_recv(),
+            cellular_ims_commands.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
     }
@@ -909,16 +912,16 @@ mod tests {
     #[tokio::test]
     async fn local_call_plan_uses_router_selection_and_returns_queued_access() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Volte, AccessPathKind::Vowifi]),
+            policy(&[AccessPathKind::CellularIms, AccessPathKind::Vowifi]),
             vec![
                 (AccessPathKind::Vowifi, vowifi),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let mut lifecycle_events = router.operator_link().subscribe_events();
@@ -928,7 +931,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued.call_id, "local-voicemail-a");
-        assert_eq!(queued.access, AccessPathKind::Volte);
+        assert_eq!(queued.access, AccessPathKind::CellularIms);
         assert!(matches!(
             recv_event(&mut lifecycle_events).await,
             OperatorEvent::Started { call_id, caller, callee }
@@ -937,7 +940,7 @@ mod tests {
                     && callee == "+601112023012"
         ));
         assert!(matches!(
-            recv_command(&mut volte_commands).await,
+            recv_command(&mut cellular_ims_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-a"
         ));
         assert!(matches!(
@@ -949,16 +952,16 @@ mod tests {
     #[tokio::test]
     async fn local_call_plan_skips_accesses_without_matching_media_offer() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let OperatorCommand::StartCall {
@@ -972,12 +975,12 @@ mod tests {
             unreachable!();
         };
         let plan = VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
-            .with_offer(AccessPathKind::Volte, offer);
+            .with_offer(AccessPathKind::CellularIms, offer);
 
         let queued = router.start_call(plan).await.unwrap();
-        assert_eq!(queued.access, AccessPathKind::Volte);
+        assert_eq!(queued.access, AccessPathKind::CellularIms);
         assert!(matches!(
-            recv_command(&mut volte_commands).await,
+            recv_command(&mut cellular_ims_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "local-voicemail-b"
         ));
         assert!(matches!(
@@ -989,16 +992,16 @@ mod tests {
     #[tokio::test]
     async fn local_call_plan_failover_uses_the_next_access_media_offer() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi.clone()),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let OperatorCommand::StartCall {
@@ -1011,12 +1014,12 @@ mod tests {
         else {
             unreachable!();
         };
-        let mut volte_offer = offer.clone();
-        volte_offer.audio.media_port = 40002;
-        volte_offer.audio_endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 40002));
+        let mut cellular_ims_offer = offer.clone();
+        cellular_ims_offer.audio.media_port = 40002;
+        cellular_ims_offer.audio_endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 40002));
         let plan = VoiceCallPlan::new(call_id, caller, callee, trunk_local_ip)
             .with_offer(AccessPathKind::Vowifi, offer)
-            .with_offer(AccessPathKind::Volte, volte_offer);
+            .with_offer(AccessPathKind::CellularIms, cellular_ims_offer);
 
         let queued = router.start_call(plan).await.unwrap();
         assert_eq!(queued.access, AccessPathKind::Vowifi);
@@ -1029,7 +1032,7 @@ mod tests {
             call_id: "local-voicemail-failover".into(),
         });
         assert!(matches!(
-            recv_command(&mut volte_commands).await,
+            recv_command(&mut cellular_ims_commands).await,
             OperatorCommand::StartCall { offer, .. } if offer.audio.media_port == 40002
         ));
     }
@@ -1037,16 +1040,16 @@ mod tests {
     #[tokio::test]
     async fn unavailable_outgoing_leg_fails_over_without_exposing_failure() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi.clone()),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let trunk = router.operator_link();
@@ -1059,7 +1062,7 @@ mod tests {
             call_id: "call-b".into(),
         });
         assert!(matches!(
-            recv_command(&mut volte_commands).await,
+            recv_command(&mut cellular_ims_commands).await,
             OperatorCommand::StartCall { call_id, .. } if call_id == "call-b"
         ));
         // Dispatching the StartCall publishes `Started` upstream before any
@@ -1079,21 +1082,21 @@ mod tests {
     #[tokio::test]
     async fn video_calls_skip_backends_without_video_capability() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi.clone()),
-                (AccessPathKind::Volte, volte.clone()),
+                (AccessPathKind::CellularIms, cellular_ims.clone()),
             ],
         );
-        router.set_backend_video_enabled(AccessPathKind::Volte, true);
+        router.set_backend_video_enabled(AccessPathKind::CellularIms, true);
         assert!(!vowifi.video_enabled());
-        assert!(volte.video_enabled());
+        assert!(cellular_ims.video_enabled());
         let trunk = router.operator_link();
         wait_available(&trunk).await;
 
@@ -1109,7 +1112,7 @@ mod tests {
 
         trunk.send_command(command).unwrap();
         assert!(matches!(
-            recv_command(&mut volte_commands).await,
+            recv_command(&mut cellular_ims_commands).await,
             OperatorCommand::StartCall { call_id, offer, .. }
                 if call_id == "video-call" && offer.video.is_some()
         ));
@@ -1122,16 +1125,16 @@ mod tests {
     #[tokio::test]
     async fn routes_dtmf_bidirectionally_on_the_selected_leg() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let mut volte_commands = volte.subscribe_commands();
+        let mut cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi.clone()),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let trunk = router.operator_link();
@@ -1173,7 +1176,7 @@ mod tests {
                 if call_id == "dtmf-call" && signal == outbound
         ));
         assert!(matches!(
-            volte_commands.try_recv(),
+            cellular_ims_commands.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
 
@@ -1260,19 +1263,19 @@ mod tests {
     #[tokio::test]
     async fn rejects_incoming_calls_from_a_policy_disabled_leg() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let mut vowifi_commands = vowifi.subscribe_commands();
-        let _volte_commands = volte.subscribe_commands();
+        let _cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
             policy_layers(&[
-                (AccessPathKind::Volte, true),
+                (AccessPathKind::CellularIms, true),
                 (AccessPathKind::Vowifi, false),
             ]),
             vec![
                 (AccessPathKind::Vowifi, vowifi.clone()),
-                (AccessPathKind::Volte, volte),
+                (AccessPathKind::CellularIms, cellular_ims),
             ],
         );
         let mut trunk_events = router.operator_link().subscribe_events();
@@ -1295,22 +1298,22 @@ mod tests {
     #[tokio::test]
     async fn reports_the_exact_access_that_owns_an_incoming_call() {
         let vowifi = OperatorLink::default();
-        let volte = OperatorLink::default();
+        let cellular_ims = OperatorLink::default();
         let _vowifi_commands = vowifi.subscribe_commands();
-        let _volte_commands = volte.subscribe_commands();
+        let _cellular_ims_commands = cellular_ims.subscribe_commands();
         vowifi.set_ready(true);
-        volte.set_ready(true);
+        cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::Vowifi, AccessPathKind::Volte]),
+            policy(&[AccessPathKind::Vowifi, AccessPathKind::CellularIms]),
             vec![
                 (AccessPathKind::Vowifi, vowifi),
-                (AccessPathKind::Volte, volte.clone()),
+                (AccessPathKind::CellularIms, cellular_ims.clone()),
             ],
         );
         let trunk = router.operator_link();
         wait_available(&trunk).await;
         let mut events = trunk.subscribe_events();
-        volte.send_event(OperatorEvent::Incoming {
+        cellular_ims.send_event(OperatorEvent::Incoming {
             call_id: "ims-incoming-access".into(),
             caller: "+601112023012".into(),
             body: Vec::new(),
@@ -1324,10 +1327,10 @@ mod tests {
         ));
         assert_eq!(
             router.call_access("ims-incoming-access").await,
-            Some(AccessPathKind::Volte)
+            Some(AccessPathKind::CellularIms)
         );
 
-        volte.send_event(OperatorEvent::Ended {
+        cellular_ims.send_event(OperatorEvent::Ended {
             call_id: "ims-incoming-access".into(),
         });
         assert!(matches!(

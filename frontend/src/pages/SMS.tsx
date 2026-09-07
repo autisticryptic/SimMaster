@@ -197,7 +197,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
   const [newChatDialogOpen, setNewChatDialogOpen] = useState(false)
   const [newChatNumber, setNewChatNumber] = useState('')
   const [pathPolicyOpen, setPathPolicyOpen] = useState(false)
-  const [volteLines, setVolteLines] = useState<CellularImsLineControlResponse[]>([])
+  const [cellularImsLines, setCellularImsLines] = useState<CellularImsLineControlResponse[]>([])
   const [smsChannels, setSmsChannels] = useState<SmsChannelResponse[]>([])
   const [selectedChannelId, setSelectedChannelId] = useState(embeddedLineId ?? '')
   const [selectedLineId, setSelectedLineId] = useState(embeddedLineId ?? '')
@@ -327,7 +327,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
     try {
       const response = await api.getCellularImsLines()
       const nextLines = response.data ?? []
-      setVolteLines(nextLines)
+      setCellularImsLines(nextLines)
       setSelectedLineId((current) => {
         if (embeddedLineId) return embeddedLineId
         const available = nextLines.filter((line) => line.modem.present)
@@ -1286,7 +1286,7 @@ export default function SMSPage({ embeddedLineId }: SmsPageProps = {}) {
       >
         <Box display="grid" gridTemplateColumns={embeddedLineId ? 'minmax(0, 1fr)' : { xs: '1fr', md: '230px minmax(0, 1fr)' }} gap={1} alignItems="start">
           {!embeddedLineId && <ModemLineSelector
-              lines={volteLines}
+              lines={cellularImsLines}
               value={selectedLineId}
               onChange={setSelectedLineId}
               disabled={sendLoading || channelCannotSend}

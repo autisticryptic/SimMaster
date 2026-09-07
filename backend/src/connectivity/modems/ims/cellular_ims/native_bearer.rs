@@ -305,7 +305,7 @@ pub async fn establish_native_ims_bearer(
             Ok((info, handle)) => return adopt_bearer(info, handle).await,
             Err(error) => {
                 let hint = error.hint;
-                let error = volte_error_from_ims_bearer(error);
+                let error = cellular_ims_error_from_ims_bearer(error);
                 if hint == ImsBearerFailureHint::BasebandWedged {
                     return Err(error);
                 }
@@ -340,7 +340,7 @@ pub async fn establish_native_ims_bearer(
         {
             Ok((info, handle)) => return adopt_bearer(info, handle).await,
             Err(error) => {
-                let error = volte_error_from_ims_bearer(error);
+                let error = cellular_ims_error_from_ims_bearer(error);
                 tracing::warn!(family = forced, error = %error, "Native VoLTE network-forced family WDS attempt failed");
                 last_error = Some(error);
             }
@@ -408,7 +408,7 @@ fn forced_native_family(hint: ImsBearerFailureHint) -> Option<u8> {
 
 /// Fold a device-agnostic [`ImsBearerError`] into the stack's [`CellularImsError`],
 /// preserving the exact codes and detail strings used by runtime diagnostics.
-fn volte_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
+fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError {
     let error_code = match error.kind {
         ImsBearerErrorKind::BasebandUnresolved => code::IP_SETTINGS_MISSING,
         ImsBearerErrorKind::EndpointUnavailable => code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
@@ -573,13 +573,13 @@ mod tests {
         // The wedge signature on a start failure must surface as
         // RUNTIME_MM_BEARER_CONNECT_FAILED, not as a generic start failure, so the
         // runtime does not hand a dead baseband to ModemManager.
-        let error = volte_error_from_ims_bearer(ImsBearerError {
+        let error = cellular_ims_error_from_ims_bearer(ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
             hint: ImsBearerFailureHint::BasebandWedged,
             detail: "secondary_qmi_start_failed:endpoint hangup".to_string(),
         });
         assert_eq!(error.code(), code::RUNTIME_MM_BEARER_CONNECT_FAILED);
-        let ordinary = volte_error_from_ims_bearer(ImsBearerError {
+        let ordinary = cellular_ims_error_from_ims_bearer(ImsBearerError {
             kind: ImsBearerErrorKind::SessionStartFailed,
             hint: ImsBearerFailureHint::None,
             detail: "secondary_qmi_start_failed:verbose call end reason (2,201): [internal] error"

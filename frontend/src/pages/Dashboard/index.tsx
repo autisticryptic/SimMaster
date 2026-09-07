@@ -29,10 +29,10 @@ function imsStatusLabel(line: DashboardLineInfo) {
 
   const registered = line.ims.registration.registered_over
   const hasVowifi = registered.includes('vowifi')
-  const hasVolte = registered.includes('volte')
-  if (hasVowifi && hasVolte) return { label: 'VoWiFi + VoLTE', color: 'success' as const }
+  const hasCellularIms = registered.includes('volte')
+  if (hasVowifi && hasCellularIms) return { label: 'VoWiFi + VoLTE', color: 'success' as const }
   if (hasVowifi) return { label: 'VoWiFi', color: 'success' as const }
-  if (hasVolte) return { label: 'VoLTE', color: 'success' as const }
+  if (hasCellularIms) return { label: 'VoLTE', color: 'success' as const }
 
   const stages = [line.ims.three_gpp.stage, line.ims.non_three_gpp.stage]
   if (stages.includes('degraded')) return { label: '异常', color: 'error' as const }

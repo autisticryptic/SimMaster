@@ -1810,7 +1810,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_never_emits_non_cellular_access_cellular_network_info() {
+    fn cellular_ims_never_emits_non_cellular_access_cellular_network_info() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.enable_cellular_network_info = true;
         profile.ims.register.pani_identity_policy = AccessIdentityPolicy::DynamicIfKnown;
@@ -1849,7 +1849,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_static_identity_policy_rejects_wlan_values() {
+    fn cellular_ims_static_identity_policy_rejects_wlan_values() {
         let mut profile = crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         profile.ims.register.enable_cellular_network_info = true;
         profile.ims.register.pani_identity_policy = AccessIdentityPolicy::Static;

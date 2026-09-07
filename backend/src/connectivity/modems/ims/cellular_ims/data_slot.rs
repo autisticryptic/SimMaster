@@ -59,7 +59,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_endpoint_is_required_for_every_volte_line() {
+    fn native_endpoint_is_required_for_every_cellular_ims_line() {
         for data_requested in [false, true] {
             let error = select_data_slot_mode(DataSlotInputs {
                 data_requested,
@@ -71,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_only_uses_native_ims_in_the_ue_namespace() {
+    fn cellular_ims_only_uses_native_ims_in_the_ue_namespace() {
         let mode = select_data_slot_mode(DataSlotInputs {
             data_requested: false,
             native_endpoint_available: true,

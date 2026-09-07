@@ -115,11 +115,11 @@ const FAILED_BEARER_MIN_RETENTION: Duration = Duration::from_secs(3);
 /// SIP interoperability candidates are separate from the outer bearer
 /// recovery budget. Keep the ladder bounded so a malformed profile cannot
 /// create an unbounded REGISTER storm on a baseband.
-const VOLTE_REGISTER_CANDIDATE_LIMIT: usize = 24;
+const CELLULAR_IMS_REGISTER_CANDIDATE_LIMIT: usize = 24;
 /// 3GPP IMS uses the well-known SIP/UDP port for the unprotected initial
 /// REGISTER.  The negotiated ipsec-3gpp client/server ports replace this
 /// endpoint after the P-CSCF sends its Security-Server challenge.
-const VOLTE_SIP_PORT: u16 = 5060;
+const CELLULAR_IMS_SIP_PORT: u16 = 5060;
 const MWI_SUBSCRIBE_EXPIRES_SECONDS: u32 = 3600;
 const REINVITE_TIMEOUT: Duration = Duration::from_secs(32);
 const REFER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(32);
@@ -136,11 +136,11 @@ const REGISTER_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// Temporary device-validation override. Keep this at 120 seconds only while
 /// observing refresh behavior on the test device; restore None afterwards so
 /// production scheduling uses the network-provided RegistrationLease value.
-const VOLTE_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
+const CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS: Option<u64> = None;
 
-fn scheduled_volte_refresh_delay(lease: &RegistrationLease) -> Duration {
+fn scheduled_cellular_ims_refresh_delay(lease: &RegistrationLease) -> Duration {
     let normal = lease.refresh_after.max(Duration::from_secs(1));
-    VOLTE_REFRESH_TEST_DELAY_SECONDS
+    CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS
         .map(Duration::from_secs)
         .map(|test| test.min(normal))
         .unwrap_or(normal)
@@ -292,7 +292,7 @@ impl CellularImsLiveHandle {
         let session = self.session.lock().await;
         let session = session.as_ref()?;
         Some(XcapAccessContext {
-            access: ImsRegistrationAccess::Volte,
+            access: ImsRegistrationAccess::CellularIms,
             profile: session.profile,
             local_address: session.channel.route().local_addr.ip(),
             digest: Arc::new(CellularImsXcapDigestProvider {
@@ -320,7 +320,7 @@ impl XcapDigestProvider for CellularImsXcapDigestProvider {
     ) -> futures_util::future::BoxFuture<'a, Result<String, crate::connectivity::core::ut::UtError>>
     {
         Box::pin(async move {
-            build_volte_xcap_authorization(
+            build_cellular_ims_xcap_authorization(
                 self.device.clone(),
                 self.aid.clone(),
                 &self.username,
@@ -335,7 +335,7 @@ impl XcapDigestProvider for CellularImsXcapDigestProvider {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn build_volte_xcap_authorization(
+async fn build_cellular_ims_xcap_authorization(
     device: CellularImsDeviceBinding,
     aid: Vec<u8>,
     username: &str,
@@ -467,7 +467,7 @@ struct CellularImsLiveSession {
     mwi_subscription: Option<MwiSubscription>,
 }
 
-async fn bind_volte_operator_relay(
+async fn bind_cellular_ims_operator_relay(
     operator_ip: IpAddr,
     trunk_local_ip: IpAddr,
     operator_interface: Option<String>,
@@ -1009,7 +1009,7 @@ impl CellularImsRegisterVariant {
 }
 
 #[cfg(test)]
-const VOLTE_REGISTER_VARIANTS: &[CellularImsRegisterVariant] = &[
+const CELLULAR_IMS_REGISTER_VARIANTS: &[CellularImsRegisterVariant] = &[
     // This request shape completed AKA/IPsec registration on the target
     // Qualcomm/Maxis deployment. Keep it first so exploratory carrier variants
     // cannot alter P-CSCF transaction state before the proven form.
@@ -2590,7 +2590,7 @@ async fn connect_family(
         .await;
 
     let route = ImsRoute {
-        local_addr: SocketAddr::new(local_addr, VOLTE_SIP_PORT),
+        local_addr: SocketAddr::new(local_addr, CELLULAR_IMS_SIP_PORT),
         pcscf_addr: pcscf_socket(pcscf),
         transport: SipTransport::Udp,
     };
@@ -2650,7 +2650,7 @@ async fn connect_family(
     let mut pending_variant = None;
     let mut candidate_attempts = 0usize;
     while pending_variant.is_some() || register_variants.peek().is_some() {
-        if candidate_attempts >= VOLTE_REGISTER_CANDIDATE_LIMIT {
+        if candidate_attempts >= CELLULAR_IMS_REGISTER_CANDIDATE_LIMIT {
             tracing::warn!(
                 line_id = %device.line_id,
                 candidate_attempts,
@@ -2740,7 +2740,7 @@ async fn connect_family(
             device_identity.visited_network_header.as_deref(),
             access_network.as_ref(),
         );
-        log_volte_register_request_metadata(variant, &channel, &initial);
+        log_cellular_ims_register_request_metadata(variant, &channel, &initial);
         runtime
             .record_attempt(
                 CellularImsStage::RegisterInitial,
@@ -2779,7 +2779,7 @@ async fn connect_family(
         {
             Ok(registration) => registration,
             Err(failure) => {
-                log_volte_register_failure_metadata(variant, &failure, None);
+                log_cellular_ims_register_failure_metadata(variant, &failure, None);
                 if let Some(plan) = authenticator.xfrm_plan.as_ref() {
                     if authenticator.worker_binding.is_current() {
                         ipsec::uninstall_plan_in_worker(plan, &authenticator.worker).await;
@@ -2878,14 +2878,14 @@ async fn connect_family(
             .await;
         let refresh_authorization =
             authenticator.refresh_authorization_after_success(&registration.response);
-        log_volte_register_success_metadata("initial", variant, &artifacts);
+        log_cellular_ims_register_success_metadata("initial", variant, &artifacts);
         crate::connectivity::core::ims_registration_coordinator::for_line(&device.line_id)
             .observe_response(
                 crate::connectivity::core::ims_access::ImsAccess::Cellular,
                 &artifacts,
             );
         let registered = RegisteredImsContext::from_artifacts(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             artifacts,
             authenticator.expires_seconds,
         );
@@ -3127,7 +3127,7 @@ async fn start_live_listener(
     }));
 }
 
-async fn start_volte_mwi_subscription(live: &CellularImsLiveHandle) {
+async fn start_cellular_ims_mwi_subscription(live: &CellularImsLiveHandle) {
     let Some(runtime) = live.supplementary_runtime() else {
         return;
     };
@@ -3139,7 +3139,7 @@ async fn start_volte_mwi_subscription(live: &CellularImsLiveHandle) {
     };
     if is_refresh {
         if !runtime
-            .owns_mwi_subscription(ImsRegistrationAccess::Volte)
+            .owns_mwi_subscription(ImsRegistrationAccess::CellularIms)
             .await
         {
             if let Some(session) = live.session.lock().await.as_mut() {
@@ -3149,7 +3149,7 @@ async fn start_volte_mwi_subscription(live: &CellularImsLiveHandle) {
         }
     } else {
         runtime
-            .begin_mwi_subscription(ImsRegistrationAccess::Volte)
+            .begin_mwi_subscription(ImsRegistrationAccess::CellularIms)
             .await;
     }
     let send_result = {
@@ -3208,7 +3208,7 @@ async fn start_volte_mwi_subscription(live: &CellularImsLiveHandle) {
     };
     if let Err(error) = send_result {
         runtime
-            .fail_mwi_subscription(ImsRegistrationAccess::Volte, error.code())
+            .fail_mwi_subscription(ImsRegistrationAccess::CellularIms, error.code())
             .await;
     }
 }
@@ -3224,7 +3224,7 @@ async fn live_receive_loop(
 ) {
     let mut reassembler = MtReassembler::new();
     let mut operator_commands = live.operator.subscribe_commands();
-    start_volte_mwi_subscription(&live).await;
+    start_cellular_ims_mwi_subscription(&live).await;
     let mut options_cseq = 1u32;
     let mut options_due = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut pending_options: Option<PendingOptionsPing> = None;
@@ -3235,13 +3235,13 @@ async fn live_receive_loop(
             .as_ref()
             .map(|session| {
                 let protected = session.channel.security_verify().is_some();
-                let delay = scheduled_volte_refresh_delay(&session.registration.lease);
+                let delay = scheduled_cellular_ims_refresh_delay(&session.registration.lease);
                 tracing::info!(
                     refresh_after_seconds = delay.as_secs(),
                     network_refresh_after_seconds =
                         session.registration.lease.refresh_after.as_secs(),
                     lease_seconds = session.registration.lease.expires_seconds,
-                    test_override_seconds = VOLTE_REFRESH_TEST_DELAY_SECONDS,
+                    test_override_seconds = CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS,
                     protected,
                     "VoLTE IMS refresh scheduled"
                 );
@@ -3320,7 +3320,7 @@ async fn live_receive_loop(
             });
             continue;
         }
-        if let Err(error) = expire_volte_renegotiations(&live).await {
+        if let Err(error) = expire_cellular_ims_renegotiations(&live).await {
             tracing::warn!(error = %error, "VoLTE re-INVITE timeout handling failed");
             cleanup_live_session(&live).await;
             break;
@@ -3333,7 +3333,7 @@ async fn live_receive_loop(
                 .is_some_and(|subscription| tokio::time::Instant::now() >= subscription.refresh_at)
         };
         if mwi_refresh_due {
-            start_volte_mwi_subscription(&live).await;
+            start_cellular_ims_mwi_subscription(&live).await;
             continue;
         }
         if tokio::time::Instant::now() >= refresh_at {
@@ -3354,12 +3354,12 @@ async fn live_receive_loop(
                             .as_ref()
                             .is_some_and(|session| session.channel.security_verify().is_some())
                     };
-                    let delay = scheduled_volte_refresh_delay(&registration.lease);
+                    let delay = scheduled_cellular_ims_refresh_delay(&registration.lease);
                     tracing::info!(
                         refresh_after_seconds = delay.as_secs(),
                         network_refresh_after_seconds = registration.lease.refresh_after.as_secs(),
                         lease_seconds = registration.lease.expires_seconds,
-                        test_override_seconds = VOLTE_REFRESH_TEST_DELAY_SECONDS,
+                        test_override_seconds = CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS,
                         protected,
                         "VoLTE IMS refresh rescheduled after successful REGISTER"
                     );
@@ -3515,7 +3515,9 @@ async fn live_receive_loop(
 /// Roll back an unanswered re-INVITE without touching the confirmed dialog or
 /// active audio relay. Network-initiated re-INVITEs receive a timeout response;
 /// trunk-initiated re-INVITEs receive a local 408 event.
-async fn expire_volte_renegotiations(live: &CellularImsLiveHandle) -> Result<(), CellularImsError> {
+async fn expire_cellular_ims_renegotiations(
+    live: &CellularImsLiveHandle,
+) -> Result<(), CellularImsError> {
     let now = Instant::now();
     let mut trunk_timeouts = Vec::new();
     let mut transfer_timeouts = Vec::new();
@@ -3769,7 +3771,7 @@ async fn refresh_live_registration(
             session.visited_network_header.as_deref(),
             session.access_network.as_ref(),
         );
-        log_volte_register_request_metadata(variant, &session.channel, &initial);
+        log_cellular_ims_register_request_metadata(variant, &session.channel, &initial);
         let mut authenticator = CellularImsRegisterAuthenticator::new(
             session.registration_identity.clone(),
             ids.clone(),
@@ -3806,7 +3808,7 @@ async fn refresh_live_registration(
         let registration = match registration_result {
             Ok(registration) => registration,
             Err(failure) => {
-                log_volte_register_failure_metadata(variant, &failure, Some(&initial));
+                log_cellular_ims_register_failure_metadata(variant, &failure, Some(&initial));
                 // Roll back both sockets and selectors before any retry. A
                 // challenged timeout must not leave new sockets paired with
                 // old Security-Client headers or replace the old AKA state.
@@ -3946,14 +3948,14 @@ async fn refresh_live_registration(
         {
             session.refresh_authorization = Some(authorization);
         }
-        log_volte_register_success_metadata("refresh", variant, &artifacts);
+        log_cellular_ims_register_success_metadata("refresh", variant, &artifacts);
         crate::connectivity::core::ims_registration_coordinator::for_line(line_id)
             .observe_response(
                 crate::connectivity::core::ims_access::ImsAccess::Cellular,
                 &artifacts,
             );
         let registered = RegisteredImsContext::from_artifacts(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             artifacts,
             authenticator.expires_seconds,
         );
@@ -3975,7 +3977,7 @@ async fn refresh_live_registration(
             )
             .await;
         let refreshed_at = now();
-        if let Err(error) = database.increment_volte_refresh_stats(line_id, &refreshed_at) {
+        if let Err(error) = database.increment_cellular_ims_refresh_stats(line_id, &refreshed_at) {
             tracing::warn!(
                 line_id = %line_id,
                 %error,
@@ -4070,7 +4072,7 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
     }
     if let Some(runtime) = live.supplementary_runtime() {
         runtime
-            .clear_registration(ImsRegistrationAccess::Volte)
+            .clear_registration(ImsRegistrationAccess::CellularIms)
             .await;
     }
     cleanup_retained_failed_bearer(live).await;
@@ -4251,7 +4253,7 @@ async fn handle_operator_command_inner(
                 return Err(CellularImsError::new("vilte_feature_disabled"));
             }
             let callee_uri = normalize_operator_callee(&callee, &session.identity.home_domain)?;
-            let relay = bind_volte_operator_relay(
+            let relay = bind_cellular_ims_operator_relay(
                 session.channel.route().local_addr.ip(),
                 trunk_local_ip,
                 session.channel.interface().map(str::to_string),
@@ -4269,7 +4271,7 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = bind_volte_operator_relay(
+                let relay = bind_cellular_ims_operator_relay(
                     session.channel.route().local_addr.ip(),
                     trunk_local_ip,
                     session.channel.interface().map(str::to_string),
@@ -4456,7 +4458,7 @@ async fn handle_operator_command_inner(
                 return Err(CellularImsError::new("vilte_feature_disabled"));
             }
             let operator_ip = session.channel.route().local_addr.ip();
-            let pending = bind_volte_operator_relay(
+            let pending = bind_cellular_ims_operator_relay(
                 operator_ip,
                 trunk_local_ip,
                 session.channel.interface().map(str::to_string),
@@ -4474,7 +4476,7 @@ async fn handle_operator_command_inner(
             })?;
             let (video_relay, operator_video_local, internal_video_local) = if offer.video.is_some()
             {
-                let relay = bind_volte_operator_relay(
+                let relay = bind_cellular_ims_operator_relay(
                     operator_ip,
                     trunk_local_ip,
                     session.channel.interface().map(str::to_string),
@@ -4945,7 +4947,7 @@ async fn handle_operator_sip_frame(
             send_incoming_rejection(session, runtime, frame, 488).await?;
             return Ok(true);
         }
-        let pending = bind_volte_operator_relay(
+        let pending = bind_cellular_ims_operator_relay(
             session.channel.route().local_addr.ip(),
             trunk_local_ip,
             session.channel.interface().map(str::to_string),
@@ -4963,7 +4965,7 @@ async fn handle_operator_sip_frame(
         })?;
         let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some()
         {
-            let relay = bind_volte_operator_relay(
+            let relay = bind_cellular_ims_operator_relay(
                 session.channel.route().local_addr.ip(),
                 trunk_local_ip,
                 session.channel.interface().map(str::to_string),
@@ -5446,7 +5448,7 @@ async fn begin_incoming_operator_call(
         send_incoming_rejection(session, runtime, frame, 400).await?;
         return Ok(true);
     };
-    let relay = match bind_volte_operator_relay(
+    let relay = match bind_cellular_ims_operator_relay(
         session.channel.route().local_addr.ip(),
         trunk_local_ip,
         session.channel.interface().map(str::to_string),
@@ -5468,7 +5470,7 @@ async fn begin_incoming_operator_call(
         CellularImsError::with_detail("volte_rtp_local_addr_failed", error.to_string())
     })?;
     let (video_relay, operator_video_local, internal_video_local) = if operator_video.is_some() {
-        let relay = bind_volte_operator_relay(
+        let relay = bind_cellular_ims_operator_relay(
             session.channel.route().local_addr.ip(),
             trunk_local_ip,
             session.channel.interface().map(str::to_string),
@@ -5999,7 +6001,7 @@ async fn handle_live_frame(
         notification_sender,
         dedupe_enabled,
     } = context;
-    if handle_volte_mwi_frame(live, runtime, frame).await? {
+    if handle_cellular_ims_mwi_frame(live, runtime, frame).await? {
         return Ok(());
     }
     if handle_operator_sip_frame(live, runtime, frame).await? {
@@ -6137,7 +6139,7 @@ async fn handle_live_frame(
     Ok(())
 }
 
-async fn handle_volte_mwi_frame(
+async fn handle_cellular_ims_mwi_frame(
     live: &CellularImsLiveHandle,
     runtime: &Arc<CellularImsRuntime>,
     frame: &[u8],
@@ -6167,12 +6169,12 @@ async fn handle_volte_mwi_frame(
                 match summary {
                     Ok(summary) => {
                         supplementary
-                            .update_message_waiting(ImsRegistrationAccess::Volte, summary)
+                            .update_message_waiting(ImsRegistrationAccess::CellularIms, summary)
                             .await;
                     }
                     Err(error) => {
                         supplementary
-                            .fail_mwi_subscription(ImsRegistrationAccess::Volte, error.code())
+                            .fail_mwi_subscription(ImsRegistrationAccess::CellularIms, error.code())
                             .await;
                     }
                 }
@@ -6195,20 +6197,22 @@ async fn handle_volte_mwi_frame(
                         }
                     }
                     supplementary
-                        .mark_mwi_subscribed(ImsRegistrationAccess::Volte)
+                        .mark_mwi_subscribed(ImsRegistrationAccess::CellularIms)
                         .await;
                 }
                 Ok(401 | 407) => {
-                    if let Err(error) = retry_volte_mwi_subscription_with_aka(live, frame).await {
+                    if let Err(error) =
+                        retry_cellular_ims_mwi_subscription_with_aka(live, frame).await
+                    {
                         supplementary
-                            .fail_mwi_subscription(ImsRegistrationAccess::Volte, error.code())
+                            .fail_mwi_subscription(ImsRegistrationAccess::CellularIms, error.code())
                             .await;
                     }
                 }
                 Ok(_) | Err(_) => {
                     supplementary
                         .fail_mwi_subscription(
-                            ImsRegistrationAccess::Volte,
+                            ImsRegistrationAccess::CellularIms,
                             "mwi_subscribe_rejected",
                         )
                         .await;
@@ -6220,7 +6224,7 @@ async fn handle_volte_mwi_frame(
     }
 }
 
-async fn retry_volte_mwi_subscription_with_aka(
+async fn retry_cellular_ims_mwi_subscription_with_aka(
     live: &CellularImsLiveHandle,
     challenge_frame: &[u8],
 ) -> Result<(), CellularImsError> {
@@ -6373,7 +6377,7 @@ pub async fn send_live_sms_for_line(
     if service_center.trim().is_empty() {
         return Err(CellularImsError::new("volte_smsc_missing"));
     }
-    let submissions = crate::connectivity::modems::ims::volte::sms::build_mo_submissions(
+    let submissions = crate::connectivity::modems::ims::cellular_ims::sms::build_mo_submissions(
         recipient,
         text,
         service_center,
@@ -6635,9 +6639,9 @@ async fn load_device_identity(
         })
         .await;
     let resolved = profile_store
-        .resolve_volte_candidate(
+        .resolve_cellular_ims_candidate(
             profile_candidate,
-            sim_override.ims_volte.profile_id.as_deref(),
+            sim_override.ims_cellular.profile_id.as_deref(),
             &imsi,
             home_plmn.as_deref(),
         )
@@ -7408,7 +7412,7 @@ fn should_retain_failed_bearer(error: &CellularImsError) -> bool {
     }
 }
 
-fn log_volte_register_request_metadata(
+fn log_cellular_ims_register_request_metadata(
     variant: CellularImsRegisterVariant,
     channel: &CellularImsSipChannel,
     request: &[u8],
@@ -7467,7 +7471,7 @@ fn log_volte_register_request_metadata(
     );
 }
 
-fn log_volte_register_success_metadata(
+fn log_cellular_ims_register_success_metadata(
     register_phase: &'static str,
     variant: CellularImsRegisterVariant,
     artifacts: &RegisterArtifacts,
@@ -7510,7 +7514,7 @@ fn log_volte_register_success_metadata(
     }
 }
 
-fn log_volte_register_failure_metadata(
+fn log_cellular_ims_register_failure_metadata(
     variant: CellularImsRegisterVariant,
     failure: &RegisterFailure,
     request: Option<&[u8]>,
@@ -7581,7 +7585,7 @@ mod tests {
     #[test]
     fn protected_refresh_uses_the_standard_lease_schedule() {
         let registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             b"SIP/2.0 200 OK\r\nExpires: 2767\r\n\r\n",
             2767,
         );
@@ -7591,7 +7595,7 @@ mod tests {
     #[test]
     fn short_protected_lease_keeps_the_existing_refresh_point() {
         let registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             b"SIP/2.0 200 OK\r\nExpires: 600\r\n\r\n",
             600,
         );
@@ -7601,7 +7605,7 @@ mod tests {
     #[test]
     fn refresh_transport_timeout_retains_unexpired_registration() {
         let mut registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
             60,
         );
@@ -7639,7 +7643,7 @@ mod tests {
     #[test]
     fn refresh_transport_retry_is_allowed_until_lease_expiry() {
         let mut registration = RegisteredImsContext::from_response(
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
             b"SIP/2.0 200 OK\r\nExpires: 60\r\n\r\n",
             60,
         );
@@ -7735,7 +7739,7 @@ mod tests {
         let runtime = Arc::new(CellularImsRuntime::new());
         let supplementary = Arc::new(SupplementaryRuntime::for_line("line-profile-switch"));
         supplementary
-            .begin_mwi_subscription(ImsRegistrationAccess::Volte)
+            .begin_mwi_subscription(ImsRegistrationAccess::CellularIms)
             .await;
         live.bind_supplementary(Arc::clone(&supplementary));
 
@@ -7774,7 +7778,7 @@ mod tests {
         assert!(listener_abort.is_finished(), "old listener must be aborted");
         assert!(
             !supplementary
-                .owns_mwi_subscription(ImsRegistrationAccess::Volte)
+                .owns_mwi_subscription(ImsRegistrationAccess::CellularIms)
                 .await,
             "the old profile must not retain supplementary registration ownership"
         );
@@ -7817,7 +7821,7 @@ mod tests {
     }
 
     fn register_variant(label: &str) -> CellularImsRegisterVariant {
-        *VOLTE_REGISTER_VARIANTS
+        *CELLULAR_IMS_REGISTER_VARIANTS
             .iter()
             .find(|variant| variant.label == label)
             .unwrap_or_else(|| panic!("missing REGISTER variant: {label}"))
@@ -7903,7 +7907,7 @@ mod tests {
             registration_identity: identity.clone(),
             identity,
             registration: RegisteredImsContext::from_response(
-                ImsRegistrationAccess::Volte,
+                ImsRegistrationAccess::CellularIms,
                 b"SIP/2.0 200 OK\r\nExpires: 3600\r\nContent-Length: 0\r\n\r\n",
                 3600,
             ),
@@ -7911,7 +7915,7 @@ mod tests {
                 path: "/org/freedesktop/ModemManager1/Bearer/1".into(),
                 interface: "lo".into(),
                 ip_type: "ipv4".into(),
-                settings: crate::connectivity::modems::ims::volte::pcscf::ImsIpSettings {
+                settings: crate::connectivity::modems::ims::cellular_ims::pcscf::ImsIpSettings {
                     ipv4_address: Some("127.0.0.1".parse().unwrap()),
                     ..Default::default()
                 },
@@ -7964,7 +7968,7 @@ mod tests {
 
     #[test]
     fn reference_sms_sec_agree_variant_is_attempted_first() {
-        let first = VOLTE_REGISTER_VARIANTS[0];
+        let first = CELLULAR_IMS_REGISTER_VARIANTS[0];
 
         assert_eq!(first.label, "reference_sms_sec_agree");
         assert_eq!(first.authorization, CellularImsInitialAuthorization::None);
@@ -8237,7 +8241,7 @@ mod tests {
         let profile = record.intern();
 
         let override_ = SimOverride {
-            ims_volte: ImsAccessOverride {
+            ims_cellular: ImsAccessOverride {
                 domain: Some("override.ims.example".to_string()),
                 realm: Some("override.realm.example".to_string()),
                 registrar: Some("sip:registrar.override.example".to_string()),
@@ -8249,7 +8253,7 @@ mod tests {
         let effective = resolve_effective_ims_profile_for_access(
             profile,
             Some(&override_),
-            EffectiveImsAccess::Volte,
+            EffectiveImsAccess::CellularIms,
         );
 
         // Prove the override really is in force before asserting what it cannot
@@ -8353,7 +8357,7 @@ mod tests {
     }
 
     #[test]
-    fn volte_refresh_starts_without_initial_empty_aka_authorization() {
+    fn cellular_ims_refresh_starts_without_initial_empty_aka_authorization() {
         let profile = &crate::connectivity::modems::ims::vowifi::profiles::GB_EE_23433;
         let variant = register_variant("ims_features_aka_uri_first");
         let identity = ImsIdentity {
@@ -10364,10 +10368,10 @@ Content-Length: 0\r\n\r\n";
     }
 
     #[tokio::test]
-    async fn shared_register_contract_covers_volte_exchange_shape() {
+    async fn shared_register_contract_covers_cellular_ims_exchange_shape() {
         crate::connectivity::core::register::contract::assert_register_contract(
             crate::connectivity::core::register::contract::AuthenticatedExchangeStyle::SharedDriver,
-            ImsRegistrationAccess::Volte,
+            ImsRegistrationAccess::CellularIms,
         )
         .await;
     }

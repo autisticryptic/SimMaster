@@ -58,7 +58,7 @@ impl ImsRequeue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessLegKind {
     Vowifi,
-    Volte,
+    CellularIms,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,97 +116,97 @@ pub trait ImsAccessLegBehavior {
 }
 
 /// Closed-set runtime access-leg dispatcher.
-pub enum AccessLeg<Vowifi, Volte> {
+pub enum AccessLeg<Vowifi, CellularIms> {
     Vowifi(Vowifi),
-    Volte(Volte),
+    CellularIms(CellularIms),
 }
 
 /// Closed-set protected-channel dispatcher.
-pub enum AccessLegChannel<Vowifi, Volte> {
+pub enum AccessLegChannel<Vowifi, CellularIms> {
     Vowifi(Vowifi),
-    Volte(Volte),
+    CellularIms(CellularIms),
 }
 
-impl<Vowifi, Volte> AccessLeg<Vowifi, Volte>
+impl<Vowifi, CellularIms> AccessLeg<Vowifi, CellularIms>
 where
     Vowifi: ImsAccessLegBehavior,
-    Volte: ImsAccessLegBehavior,
+    CellularIms: ImsAccessLegBehavior,
 {
     pub fn kind(&self) -> AccessLegKind {
         match self {
             Self::Vowifi(leg) => leg.kind(),
-            Self::Volte(leg) => leg.kind(),
+            Self::CellularIms(leg) => leg.kind(),
         }
     }
 
     pub fn readiness(&self) -> LegReadiness {
         match self {
             Self::Vowifi(leg) => leg.readiness(),
-            Self::Volte(leg) => leg.readiness(),
+            Self::CellularIms(leg) => leg.readiness(),
         }
     }
 
     pub async fn establish(
         &mut self,
-    ) -> Result<AccessLegChannel<Vowifi::Channel, Volte::Channel>, ImsError> {
+    ) -> Result<AccessLegChannel<Vowifi::Channel, CellularIms::Channel>, ImsError> {
         match self {
             Self::Vowifi(leg) => leg.establish().await.map(AccessLegChannel::Vowifi),
-            Self::Volte(leg) => leg.establish().await.map(AccessLegChannel::Volte),
+            Self::CellularIms(leg) => leg.establish().await.map(AccessLegChannel::CellularIms),
         }
     }
 
     pub async fn teardown(&mut self) {
         match self {
             Self::Vowifi(leg) => leg.teardown().await,
-            Self::Volte(leg) => leg.teardown().await,
+            Self::CellularIms(leg) => leg.teardown().await,
         }
     }
 }
 
-impl<Vowifi, Volte> ImsChannel for AccessLegChannel<Vowifi, Volte>
+impl<Vowifi, CellularIms> ImsChannel for AccessLegChannel<Vowifi, CellularIms>
 where
     Vowifi: ImsChannel,
-    Volte: ImsChannel,
+    CellularIms: ImsChannel,
 {
     async fn send_sip(&mut self, frame: &[u8]) -> Result<(), ImsError> {
         match self {
             Self::Vowifi(channel) => channel.send_sip(frame).await,
-            Self::Volte(channel) => channel.send_sip(frame).await,
+            Self::CellularIms(channel) => channel.send_sip(frame).await,
         }
     }
 
     async fn recv_sip(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         match self {
             Self::Vowifi(channel) => channel.recv_sip(timeout).await,
-            Self::Volte(channel) => channel.recv_sip(timeout).await,
+            Self::CellularIms(channel) => channel.recv_sip(timeout).await,
         }
     }
 
     async fn recv_sip_fresh(&mut self, timeout: Duration) -> Result<Vec<u8>, ImsError> {
         match self {
             Self::Vowifi(channel) => channel.recv_sip_fresh(timeout).await,
-            Self::Volte(channel) => channel.recv_sip_fresh(timeout).await,
+            Self::CellularIms(channel) => channel.recv_sip_fresh(timeout).await,
         }
     }
 
     fn requeue(&mut self, frame: Vec<u8>) {
         match self {
             Self::Vowifi(channel) => channel.requeue(frame),
-            Self::Volte(channel) => channel.requeue(frame),
+            Self::CellularIms(channel) => channel.requeue(frame),
         }
     }
 
     fn route(&self) -> ImsRoute {
         match self {
             Self::Vowifi(channel) => channel.route(),
-            Self::Volte(channel) => channel.route(),
+            Self::CellularIms(channel) => channel.route(),
         }
     }
 
     fn security_verify(&self) -> Option<&str> {
         match self {
             Self::Vowifi(channel) => channel.security_verify(),
-            Self::Volte(channel) => channel.security_verify(),
+            Self::CellularIms(channel) => channel.security_verify(),
         }
     }
 }

@@ -48,7 +48,7 @@ function profilesForSource(profiles: StoredCarrierProfile[], source: ImsProfileS
   return origin ? profiles.filter((profile) => profile.origin === origin) : []
 }
 
-export default function VolteProfileDialog({ open, lineId, onClose, onSaved }: Props) {
+export default function CellularImsProfileDialog({ open, lineId, onClose, onSaved }: Props) {
   const [data, setData] = useState<CellularImsProfileSelectionResponse | null>(null)
   const [attempts, setAttempts] = useState<ImsProfileCandidate[]>([])
   const [loading, setLoading] = useState(false)

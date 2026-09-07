@@ -16,7 +16,7 @@ import {
 
 const pathLabels: Record<VoiceAccessPathKind, string> = {
   vowifi: 'VoWiFi',
-  volte: 'VoLTE',
+  volte: '4G/5G',
 }
 
 type Props = { lineId: string }
@@ -28,7 +28,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
   const [voicePath, setVoicePath] = useState<VoicePathPolicy | null>(null)
   const [webCall, setWebCall] = useState<WebCallCapabilitiesResponse | null>(null)
   const [vilte, setVilte] = useState<VilteStatusResponse | null>(null)
-  const [volteVoice, setVolteVoice] = useState<CellularImsVoiceStatusResponse | null>(null)
+  const [cellularImsVoice, setCellularImsVoice] = useState<CellularImsVoiceStatusResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -40,7 +40,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
       setVoicePath(null)
       setWebCall(null)
       setVilte(null)
-      setVolteVoice(null)
+      setCellularImsVoice(null)
       setLoading(false)
       return
     }
@@ -50,22 +50,22 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     setVoicePath(null)
     setWebCall(null)
     setVilte(null)
-    setVolteVoice(null)
+    setCellularImsVoice(null)
     try {
-      const [pathResponse, webResponse, vilteResponse, volteVoiceResponse] = await Promise.all([
+      const [pathResponse, webResponse, vilteResponse, cellularImsVoiceResponse] = await Promise.all([
         api.getVoicePathPolicy(lineId),
         api.getWebCallCapabilities(),
         api.getVilteStatus(lineId),
         api.getCellularImsVoiceStatus(lineId),
       ])
       if (generation !== loadGeneration.current || activeLineId.current !== lineId) return
-      if (vilteResponse.data?.line_id !== lineId || volteVoiceResponse.data?.line_id !== lineId) {
+      if (vilteResponse.data?.line_id !== lineId || cellularImsVoiceResponse.data?.line_id !== lineId) {
         throw new Error('线路媒体状态响应与当前线路不匹配')
       }
       setVoicePath(pathResponse.data ?? null)
       setWebCall(webResponse.data ?? null)
       setVilte(vilteResponse.data ?? null)
-      setVolteVoice(volteVoiceResponse.data ?? null)
+      setCellularImsVoice(cellularImsVoiceResponse.data ?? null)
     } catch (err) {
       if (generation === loadGeneration.current && activeLineId.current === lineId) {
         setError(err instanceof Error ? err.message : String(err))
@@ -136,7 +136,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     <Stack spacing={2}>
       {error && <Alert severity="error" onClose={() => setError(null)}>{error}</Alert>}
       {success && <Alert severity="success" onClose={() => setSuccess(null)}>{success}</Alert>}
-      {volteVoice && !volteVoice.registered && (
+      {cellularImsVoice && !cellularImsVoice.registered && (
         <Alert severity="warning">当前线路 IMS 尚未注册，VoLTE/ViLTE 媒体中继不可用。</Alert>
       )}
       <Alert severity="info">
@@ -167,7 +167,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
         <Alert severity="info" sx={{ my: 2 }}>视频中继自动跟随当前线路的 VoLTE 语音和 VoWiFi 连接，不需要单独开关。这里仅配置 H.264 中继参数，不会启动摄像头或主动发起视频呼叫。</Alert>
         {vilte && <Stack spacing={2}>
           <Typography variant="body2" color="text.secondary">
-            VoLTE 语音：{volteVoice?.ims_connection_enabled ? '随 IMS 连接自动可用' : '请先启用当前线路的 VoLTE IMS 连接'}
+            VoLTE 语音：{cellularImsVoice?.ims_connection_enabled ? '随 IMS 连接自动可用' : '请先启用当前线路的 VoLTE IMS 连接'}
           </Typography>
           <Typography variant="body2" color="text.secondary">
             VoLTE 视频：{vilte.config.volte_enabled ? '已随连接启用' : '等待 VoLTE 连接启用'}；VoWiFi 视频：{vilte.config.vowifi_enabled ? '已随连接启用' : '等待 VoWiFi 连接启用'}
