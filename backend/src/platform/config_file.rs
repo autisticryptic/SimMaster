@@ -38,7 +38,7 @@ use std::str::FromStr;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use yaml_edit::{Document, MappingBuilder, SequenceBuilder, YamlFile};
+use yaml_edit::{Document, YamlFile};
 
 /// Text formats the configuration file may use.
 ///
@@ -179,7 +179,7 @@ where
         .document()
         .ok_or_else(|| format!("{} contains no YAML document", source.display()))?;
 
-    merge_into_document(&document, &previous_json, &desired_json);
+    merge_into_document(&document, &previous_json, &desired_json)?;
     let rendered = ensure_trailing_newline(file.to_string());
 
     // Verify with the parser, not the writer.
@@ -212,7 +212,7 @@ fn merge_into_document(
     document: &Document,
     previous: &Map<String, Value>,
     desired: &Map<String, Value>,
-) {
+) -> Result<(), String> {
     for (key, desired_child) in desired {
         let previous_child = previous.get(key);
         if previous_child == Some(desired_child) && document.contains_key(key.as_str()) {
@@ -224,9 +224,9 @@ fn merge_into_document(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
-                merge_into_mapping(&child, &previous_object, desired_object);
+                merge_into_mapping(&child, &previous_object, desired_object)?;
             }
-            _ => set_value(&SetTarget::Document(document), key, desired_child),
+            _ => set_value(&SetTarget::Document(document), key, desired_child)?,
         }
     }
     for key in previous.keys() {
@@ -234,6 +234,7 @@ fn merge_into_document(
             document.remove(key.as_str());
         }
     }
+    Ok(())
 }
 
 /// Reconcile one nested mapping level.
@@ -245,7 +246,7 @@ fn merge_into_mapping(
     mapping: &yaml_edit::Mapping,
     previous: &Map<String, Value>,
     desired: &Map<String, Value>,
-) {
+) -> Result<(), String> {
     for (key, desired_child) in desired {
         let previous_child = previous.get(key);
         if previous_child == Some(desired_child) && mapping.contains_key(key.as_str()) {
@@ -257,9 +258,9 @@ fn merge_into_mapping(
                     .and_then(Value::as_object)
                     .cloned()
                     .unwrap_or_default();
-                merge_into_mapping(&child, &previous_object, desired_object);
+                merge_into_mapping(&child, &previous_object, desired_object)?;
             }
-            _ => set_value(&SetTarget::Mapping(mapping), key, desired_child),
+            _ => set_value(&SetTarget::Mapping(mapping), key, desired_child)?,
         }
     }
     for key in previous.keys() {
@@ -267,6 +268,7 @@ fn merge_into_mapping(
             mapping.remove(key.as_str());
         }
     }
+    Ok(())
 }
 
 /// `Document` and `Mapping` both offer `set`, but through separate inherent
@@ -284,14 +286,6 @@ impl SetTarget<'_> {
             Self::Mapping(mapping) => mapping.set(key, value),
         }
     }
-
-    /// Fetch `key` as a mapping, for recursing into a subtree.
-    fn get_mapping(&self, key: &str) -> Option<yaml_edit::Mapping> {
-        match self {
-            Self::Document(document) => document.get_mapping(key),
-            Self::Mapping(mapping) => mapping.get_mapping(key),
-        }
-    }
 }
 
 /// Write one JSON value at `key`.
@@ -301,13 +295,12 @@ impl SetTarget<'_> {
 /// `"true"` or a numeric DDNS access ID comes back as a string instead of a
 /// sexagesimal, a boolean or an integer.
 ///
-/// Nested mappings are deliberately *not* built with `MappingBuilder` and
-/// inserted as one value. Doing that indents only the first child correctly and
-/// leaves the rest at the parent's level, producing a document that no longer
-/// parses. Instead the key is created empty and then filled by recursion, so
-/// every leaf goes through the single-key `set` path that keeps indentation
-/// correct.
-fn set_value(target: &SetTarget<'_>, key: &str, value: &Value) {
+/// New compound subtrees use parsed flow YAML (JSON is a YAML subset), not a
+/// detached builder tree whose nested indentation/key indexes may be invalid.
+/// Existing mappings still merge in place above, preserving their comments.
+/// Only NEW/replaced compound values use flow style; unrelated operator text
+/// is never re-rendered. The complete result is still parsed and verified.
+fn set_value(target: &SetTarget<'_>, key: &str, value: &Value) -> Result<(), String> {
     match value {
         Value::Null => target.set(key, Option::<&str>::None),
         Value::Bool(flag) => target.set(key, *flag),
@@ -323,100 +316,31 @@ fn set_value(target: &SetTarget<'_>, key: &str, value: &Value) {
             }
         }
         Value::String(text) => target.set(key, text.as_str()),
-        Value::Array(items) => {
-            // A sequence is a single node with no nested keys to indent, so the
-            // builder is safe here.
-            let mut builder = SequenceBuilder::new();
-            for item in items {
-                builder = push_sequence_item(builder, item);
-            }
-            target.set(key, builder.build_document());
-        }
-        Value::Object(entries) if entries.is_empty() => {
-            target.set(key, MappingBuilder::new().build_document());
-        }
-        Value::Object(entries) => {
-            // The FIRST value may itself be a nested mapping (for example
-            // device_network.ddns). Never pass that nested tree through the
-            // builder: it loses indentation when inserted below another key.
-            // Seed a scalar placeholder, then set EVERY real value recursively
-            // through its attached mapping so the depth is known.
-            let Some(first_key) = entries.keys().next() else {
-                return;
-            };
-            let seed = MappingBuilder::new().pair(first_key.as_str(), Option::<&str>::None);
-            target.set(key, seed.build_document());
-
-            let Some(child) = target.get_mapping(key) else {
-                // The write did not produce a mapping we can descend into.
-                // Leaving the remaining keys out would silently drop settings,
-                // so fall back to the flat builder: `apply_update` verifies the
-                // result and refuses to write a document that reads back wrong.
-                let mut builder = MappingBuilder::new();
-                for (child_key, child_value) in entries {
-                    builder = push_mapping_pair(builder, child_key, child_value);
-                }
-                target.set(key, builder.build_document());
-                return;
-            };
-            let child_target = SetTarget::Mapping(&child);
-            for (child_key, child_value) in entries {
-                set_value(&child_target, child_key, child_value);
+        Value::Array(_) | Value::Object(_) => {
+            let literal = serde_json::to_string(value)
+                .map_err(|error| format!("Failed to serialize setting {key}: {error}"))?;
+            let file = YamlFile::from_str(&literal)
+                .map_err(|error| format!("Failed to parse new setting {key}: {error}"))?;
+            let document = file
+                .document()
+                .ok_or_else(|| format!("New setting {key} has no YAML document"))?;
+            // Document::AsYaml is a document wrapper, not an inline value, and
+            // ignores the destination indentation. Insert the actual parsed
+            // Mapping/Sequence node instead.
+            if matches!(value, Value::Object(_)) {
+                let mapping = document
+                    .as_mapping()
+                    .ok_or_else(|| format!("New setting {key} is not a mapping"))?;
+                target.set(key, mapping);
+            } else {
+                let sequence = document
+                    .as_sequence()
+                    .ok_or_else(|| format!("New setting {key} is not a sequence"))?;
+                target.set(key, sequence);
             }
         }
     }
-}
-
-fn push_sequence_item(builder: SequenceBuilder, value: &Value) -> SequenceBuilder {
-    match value {
-        Value::Null => builder.item(Option::<&str>::None),
-        Value::Bool(flag) => builder.item(*flag),
-        Value::Number(number) => match number.as_i64() {
-            Some(int) => builder.item(int),
-            None => builder.item(number.to_string().as_str()),
-        },
-        Value::String(text) => builder.item(text.as_str()),
-        Value::Array(items) => {
-            let mut nested = SequenceBuilder::new();
-            for item in items {
-                nested = push_sequence_item(nested, item);
-            }
-            builder.insert_sequence(nested)
-        }
-        Value::Object(entries) => {
-            let mut nested = MappingBuilder::new();
-            for (key, child) in entries {
-                nested = push_mapping_pair(nested, key, child);
-            }
-            builder.insert_mapping(nested)
-        }
-    }
-}
-
-fn push_mapping_pair(builder: MappingBuilder, key: &str, value: &Value) -> MappingBuilder {
-    match value {
-        Value::Null => builder.pair(key, Option::<&str>::None),
-        Value::Bool(flag) => builder.pair(key, *flag),
-        Value::Number(number) => match number.as_i64() {
-            Some(int) => builder.pair(key, int),
-            None => builder.pair(key, number.to_string().as_str()),
-        },
-        Value::String(text) => builder.pair(key, text.as_str()),
-        Value::Array(items) => {
-            let mut nested = SequenceBuilder::new();
-            for item in items {
-                nested = push_sequence_item(nested, item);
-            }
-            builder.insert_sequence(key, nested)
-        }
-        Value::Object(entries) => {
-            let mut nested = MappingBuilder::new();
-            for (child_key, child) in entries {
-                nested = push_mapping_pair(nested, child_key, child);
-            }
-            builder.insert_mapping(key, nested)
-        }
-    }
+    Ok(())
 }
 
 // --- first-time emitter -----------------------------------------------------
@@ -619,6 +543,22 @@ mod tests {
         assert_eq!(parsed, desired);
         assert!(rendered.contains("# owned by operator"));
         assert!(rendered.contains("# keep enabled comment"));
+        // The inserted flow subtree remains editable on the next save.
+        let mut changed = desired.clone();
+        changed["device_network"]["ddns"]["ipv4"]["access"]["id"] = json!("00456");
+        let updated = apply_update(
+            &rendered,
+            &desired,
+            &changed,
+            TextFormat::Yaml,
+            Path::new("fixture.yaml"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let parsed: Value = parse(&updated, TextFormat::Yaml, Path::new("fixture.yaml")).unwrap();
+        assert_eq!(parsed, changed);
+        assert!(updated.contains("# keep enabled comment"));
     }
 }
 
