@@ -3426,10 +3426,22 @@ line_profiles:
         assert!(config.proxy_prefix.is_empty());
 
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("enabled: false"));
-        assert!(saved.contains("proxy_prefix: ''") || saved.contains("proxy_prefix: \"\""));
+        // Assert persisted semantics, not yaml-edit's choice of quotes for an
+        // empty string. Also catch a migration that only changed memory.
+        let persisted: MainConfig = crate::platform::config_file::parse(
+            &saved,
+            crate::platform::config_file::TextFormat::Yaml,
+            &path,
+        )
+        .unwrap();
+        assert!(!persisted.github_download_proxy.enabled);
+        assert!(persisted.github_download_proxy.proxy_prefix.is_empty());
 
         drop(manager);
+        let reloaded = ConfigManager::try_new_for_test(path.clone()).unwrap();
+        assert_eq!(reloaded.get_github_download_proxy(), config);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        drop(reloaded);
         let _ = std::fs::remove_dir_all(dir);
     }
 

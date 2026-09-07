@@ -36,11 +36,7 @@ jobs:
           cargo test --locked --no-run 2>&1 | tee beta-test-compile.log
           status=${PIPESTATUS[0]}
           if [ "$status" -ne 0 ]; then
-            details=$(tail -n 80 beta-test-compile.log)
-            details=${details//'%'/'%25'}
-            details=${details//$'\r'/'%0D'}
-            details=${details//$'\n'/'%0A'}
-            echo "::error title=Beta test compilation failed::$details"
+            python3 ../.github/scripts/ci_failure_excerpt.py beta-test-compile.log "Beta test compilation failed"
           fi
           exit "$status"
       - name: Run hardware-free DNS and IMS regressions
@@ -70,11 +66,7 @@ jobs:
               exit 1
             fi
             if ! cargo test --locked "$filter" -- --test-threads=1 2>&1 | tee -a beta-tests.log; then
-              details=$(tail -n 80 beta-tests.log)
-              details=${details//'%'/'%25'}
-              details=${details//$'\r'/'%0D'}
-              details=${details//$'\n'/'%0A'}
-              echo "::error title=Beta regression failed::$details"
+              python3 ../.github/scripts/ci_failure_excerpt.py beta-tests.log "Beta regression failed"
               exit 1
             fi
           done
@@ -88,11 +80,7 @@ jobs:
             export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
             cargo test --locked cellular_ims_route_aliases_keep_auth_and_response_contract -- --test-threads=1
           ' 2>&1 | tee beta-api-tests.log; then
-            details=$(tail -n 80 beta-api-tests.log)
-            details=${details//'%'/'%25'}
-            details=${details//$'\r'/'%0D'}
-            details=${details//$'\n'/'%0A'}
-            echo "::error title=Cellular IMS API compatibility failed::$details"
+            python3 ../.github/scripts/ci_failure_excerpt.py beta-api-tests.log "Cellular IMS API compatibility failed"
             exit 1
           fi
       - uses: actions/upload-artifact@v4
