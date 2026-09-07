@@ -3784,10 +3784,15 @@ async fn run_live_ims_register_until(
     } else {
         attempt_live_ims_registration(line_id, profile, access_network, false).await
     };
+    // An exchange can consume part/all of the remaining lease. Decide retry
+    // eligibility AFTER it finishes, using the hard lease deadline rather
+    // than the cache's proactive refresh deadline captured before sending.
+    let lease_still_valid =
+        refresh_context.is_some() && live_ims_registration_valid_for_line(line_id).await;
     let (outcome, error) = match attempt {
         Ok(registered) => (RegistrationRefreshResult::Refreshed(registered), None),
         Err(error)
-            if refresh_context.is_some_and(|(_, remaining_seconds)| remaining_seconds > 0)
+            if lease_still_valid
                 && error.registration_loss
                     == Some(RegistrationLossReason::SignalingTransportLost) =>
         {
@@ -3871,7 +3876,8 @@ async fn live_ims_refresh_context(
         .map(|ready| {
             (
                 ready.registration.lease.expires_seconds,
-                ready.expires_at.saturating_duration_since(now).as_secs(),
+                registration_lease_remaining(ready.expires_at, ready.registration.lease, now)
+                    .as_secs(),
             )
         })
 }
@@ -4513,9 +4519,19 @@ fn registration_lease_still_valid(
     lease: crate::connectivity::core::registration::RegistrationLease,
     now: Instant,
 ) -> bool {
+    !registration_lease_remaining(refresh_at, lease, now).is_zero()
+}
+
+fn registration_lease_remaining(
+    refresh_at: Instant,
+    lease: crate::connectivity::core::registration::RegistrationLease,
+    now: Instant,
+) -> Duration {
     refresh_at
         .checked_add(lease.expires_after.saturating_sub(lease.refresh_after))
-        .is_some_and(|expires_at| now < expires_at)
+        .map_or(Duration::ZERO, |expires_at| {
+            expires_at.saturating_duration_since(now)
+        })
 }
 
 #[cfg(test)]
@@ -4538,6 +4554,38 @@ mod coexistence_lease_tests {
             refresh_at,
             lease,
             refresh_at + Duration::from_secs(600)
+        ));
+    }
+
+    #[test]
+    fn refresh_timeout_retains_real_retry_margin_but_not_an_expired_lease() {
+        let lease = crate::connectivity::core::registration::RegistrationLease::from_expires(3600);
+        let refresh_at = Instant::now();
+        assert_eq!(
+            registration_lease_remaining(refresh_at, lease, refresh_at),
+            Duration::from_secs(600)
+        );
+        // The old cache-based calculation returned zero at every scheduled
+        // refresh, turning a normal Timer F timeout into an access rebuild.
+        assert_eq!(
+            registration_lease_remaining(refresh_at, lease, refresh_at + Duration::from_secs(32)),
+            Duration::from_secs(568)
+        );
+        assert!(registration_lease_still_valid(
+            refresh_at,
+            lease,
+            refresh_at + Duration::from_secs(599)
+        ));
+        // Check again after the exchange: a late timeout cannot borrow a
+        // positive remaining lifetime sampled before the REGISTER was sent.
+        assert_eq!(
+            registration_lease_remaining(refresh_at, lease, refresh_at + Duration::from_secs(601)),
+            Duration::ZERO
+        );
+        assert!(!registration_lease_still_valid(
+            refresh_at,
+            lease,
+            refresh_at + Duration::from_secs(601)
         ));
     }
 }
