@@ -1075,7 +1075,7 @@ mod tests {
                 ConcurrentRegistrationSupport::Negotiated
             );
             assert!(!coordinator
-                .flow_creation_ready(crate::connectivity::core::ims_access::ImsAccess::Wlan));
+                .additional_flow_ready(crate::connectivity::core::ims_access::ImsAccess::Wlan));
 
             let reply = tokio::spawn(async move {
                 let mut buf = [0u8; 64];

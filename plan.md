@@ -1,6 +1,6 @@
 ﻿# SimAdmin 开发计划与验收进度
 
-> 最后更新：2026-09-07 21:49（Asia/Shanghai）
+> 最后更新：2026-09-07 23:26（Asia/Shanghai）
 > 用途：持续更新的开发进度报告、发布门禁和后续核对依据。
 > 状态：已恢复阶段 A，优先实现并验证真正的 VoWiFi / 蜂窝 IMS 双注册及各自 refresh；朋友的中国手机卡问题暂缓。阶段 B 尚未开始。代码完成、CI 通过、实机通过分别记录。
 
@@ -113,6 +113,10 @@
 | 2026-09-07 19:46 | 修正诊断脚本的 `status=ok`、`modem.line_id` 解析后读取 410 | 旧版 active、0 通话，仅 VoWiFi；未部署/重启 | 构建新候选包后验证实际协商 |
 | 2026-09-07 20:42 | 修正多流能力/即时保活混淆、安全通道提交次序，增加蜂窝先注册等回归 | 本地 Rust 格式及 12 项发布规则测试通过；Rust 未本地编译，新回归尚待 Actions | 独立提交 beta1 候选，CI 全通过后部署 |
 | 2026-09-07 21:49 | 提交前本地检查完成 | ESLint、Vite production build、TypeScript type-check、Rust 格式检查、12 项版本策略测试均通过；未本地编译后端 | 提交 beta1 候选，由 Actions 验证后端 |
+| 2026-09-07 21:56 | e5bde5f 的 Actions run 34129622356 全通过 | IMS 测试、前端、ARM64、AMD64、Release 成功；v1.1.4-beta1 为 pre-release 且非 latest | 核验并部署候选 |
+| 2026-09-07 22:48 | 部署 e5bde5f 到 410 | 包 SHA256 `64bb31a1edcf552f32e8833fd8aaedeb1c7b18a44ed31960ceb7ac6be6e6c5be`；二进制 SHA256 `1a067011360412aac889f7bdad331a0c2cbf96d75f53a0cb0b5b5501f27b05c2`；备份 `/opt/simadmin/manual-backup/20260907-224802-beta1-e5bde5f`；健康检查通过 | 验证实际协商和自然续期 |
+| 2026-09-07 22:49 | 新版 VoWiFi 初始及认证请求均提供 outbound | 200 OK 回显自身 reg-id=2，但 Require 无 outbound、第一跳无 ob，租期 3387 秒；当前流为 not_supported，不是双注册成功 | 继续观察自然续期并对照蜂窝先注册 |
+| 2026-09-07 23:26 | 核对时发现新增第二流的验证误挡单路切换，补充修正 | 候选选择与实际并行 REGISTER 准入分开；新增蜂窝→WLAN 优先回退及显式接入切换测试；新修改待独立 CI | 同一 beta1 候选修订，核验标签/commit/包一致后再激活 |
 
 ## 6. 当前优先事项（恢复阶段 A）
 
@@ -129,5 +133,6 @@
 - 修改的 `.github/workflows/build-release.yml` 尚未提交；HEAD 仍为 `3b5078e`。
 - `docs/releases/1.1.4-beta1.md` 明确候选版和未验收双注册，不标注双注册修复完成。
 - 部署前通话检查的 API schema 误用已修正，本轮验证 0 通话；实际部署前仍需重新检查，不能沿用过时检查。
-- 本轮尚未推进日志游标或得到新一轮 refresh/双注册抓包，不得宣称已验证。
+- 新日志游标为 `/tmp/.simadmin-beta1-e5bde5f.cursor`，仅增量采集。journal 的 MESSAGE 实为字节数组，已修正解码；只对首次漏选的 22:48–22:51 三分钟启动窗口补提取一次，不反复读取完整 journal。
+- 22:49 新版协商证据已记录；自然 refresh 和蜂窝先注册对照尚未验收。重注册不得计入续期通过。
 - 大规模 IMS 命名迁移和 hickory-resolver 替换尚未开始。

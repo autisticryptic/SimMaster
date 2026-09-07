@@ -8870,7 +8870,7 @@ async fn line_ims_access_decision_assuming(
         cellular_available: binding.present
             && line
                 .ims_registration
-                .flow_creation_ready(ImsAccess::Cellular)
+                .registration_candidate_ready(ImsAccess::Cellular, profile.ims_access_preference)
             && binding_has_baseband(&binding)
             && !profile.airplane_mode_enabled
             && !line.baseband_wedge_permanent()
@@ -8879,7 +8879,9 @@ async fn line_ims_access_decision_assuming(
         // Give a preferred/cold WLAN access one bounded attempt even before its
         // ePDG exists. Exhaustion then releases eligibility to the fallback.
         wlan_available: binding.present
-            && line.ims_registration.flow_creation_ready(ImsAccess::Wlan)
+            && line
+                .ims_registration
+                .registration_candidate_ready(ImsAccess::Wlan, profile.ims_access_preference)
             && (!vowifi_auto_restore_is_exhausted(wlan.degraded_reason.as_deref())
                 || assume_available == Some(ImsAccess::Wlan)),
         cellular_registered: cellular.registered(),

@@ -141,7 +141,7 @@ impl ImsRegistrationCoordinator {
         if !existing && !self.recovery_ready(access) {
             return Err("ims_outbound_recovery_backoff");
         }
-        if !existing && !self.flow_creation_ready(access) {
+        if !existing && !self.additional_flow_ready(access) {
             return Err("ims_outbound_additional_flow_not_supported");
         }
         if !existing
@@ -279,6 +279,15 @@ impl ImsRegistrationCoordinator {
     /// With no surviving flow, a cooled-down outbound offer may still fall
     /// back to a legacy SINGLE registration; never do that for a second flow.
     pub fn flow_creation_ready(&self, access: ImsAccess) -> bool {
+        self.recovery_ready(access)
+            && (!self.additional_flow_requires_outbound(access) || self.may_offer_outbound(access))
+    }
+
+    /// Readiness for creating a flow while another binding is still live.
+    /// Keep this separate from candidate selection: a single-access policy
+    /// switch releases the old binding FIRST and must not be blocked merely
+    /// because that binding does not support concurrent registration.
+    pub fn additional_flow_ready(&self, access: ImsAccess) -> bool {
         if !self.recovery_ready(access) {
             return false;
         }
@@ -297,6 +306,20 @@ impl ImsRegistrationCoordinator {
                         .is_none_or(|until| Instant::now() >= until)
             }
             None => true,
+        }
+    }
+
+    pub fn registration_candidate_ready(
+        &self,
+        access: ImsAccess,
+        preference: ImsAccessPreference,
+    ) -> bool {
+        if preference == ImsAccessPreference::Concurrent
+            && self.concurrent_support() == ConcurrentRegistrationSupport::Negotiated
+        {
+            self.additional_flow_ready(access)
+        } else {
+            self.flow_creation_ready(access)
         }
     }
 

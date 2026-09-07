@@ -897,9 +897,9 @@ pub(crate) mod tests {
             coordinator.concurrent_support(),
             ConcurrentRegistrationSupport::Negotiated
         );
-        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
+        assert!(!coordinator.additional_flow_ready(ImsAccess::Cellular));
         acknowledge_probe(&mut wlan, "192.0.2.2:5060");
-        assert!(coordinator.flow_creation_ready(ImsAccess::Cellular));
+        assert!(coordinator.additional_flow_ready(ImsAccess::Cellular));
 
         let decision = decide(ImsAccessInputs {
             wlan_registered: true,
@@ -995,8 +995,8 @@ pub(crate) mod tests {
             cellular_enabled: true,
             wlan_enabled: true,
             cellular_registered: true,
-            cellular_available: coordinator.flow_creation_ready(ImsAccess::Cellular),
-            wlan_available: coordinator.flow_creation_ready(ImsAccess::Wlan),
+            cellular_available: coordinator.additional_flow_ready(ImsAccess::Cellular),
+            wlan_available: coordinator.additional_flow_ready(ImsAccess::Wlan),
             concurrent_support: coordinator.concurrent_support(),
             ..Default::default()
         });
@@ -1008,7 +1008,7 @@ pub(crate) mod tests {
                 cellular_enabled: true,
                 wlan_enabled: true,
                 cellular_registered: true,
-                wlan_available: coordinator.flow_creation_ready(ImsAccess::Wlan),
+                wlan_available: coordinator.additional_flow_ready(ImsAccess::Wlan),
                 concurrent_support: coordinator.concurrent_support(),
                 ..Default::default()
             }))
@@ -1063,8 +1063,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .healthy_until = Instant::now() - Duration::from_secs(1);
         }
-        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
-        assert!(!coordinator.flow_creation_ready(ImsAccess::Wlan));
+        assert!(!coordinator.additional_flow_ready(ImsAccess::Cellular));
+        assert!(!coordinator.additional_flow_ready(ImsAccess::Wlan));
         assert_eq!(
             coordinator.concurrent_support(),
             ConcurrentRegistrationSupport::Negotiated
@@ -1124,6 +1124,76 @@ pub(crate) mod tests {
         assert!(active.lease.as_ref().unwrap().live());
     }
 
+    #[tokio::test]
+    async fn single_access_fallback_selection_is_not_blocked_by_dual_flow_validation() {
+        use super::super::ims_access::ImsAccessDecision;
+        for (first, preference, target) in [
+            (
+                ImsAccess::Cellular,
+                ImsAccessPreference::Concurrent,
+                ImsAccess::Wlan,
+            ),
+            (
+                ImsAccess::Wlan,
+                ImsAccessPreference::CellularPreferred,
+                ImsAccess::Cellular,
+            ),
+            (
+                ImsAccess::Cellular,
+                ImsAccessPreference::WlanPreferred,
+                ImsAccess::Wlan,
+            ),
+        ] {
+            let line = format!("outbound-single-switch-{}", preference.as_str());
+            let coordinator = ims_registration_coordinator::for_line(&line);
+            let mut old = OutboundFlow::default();
+            old.configure(&line, first, INSTANCE, true);
+            let request = old.prepare(&register_request("old-binding", 1)).unwrap();
+            let response = String::from_utf8(register_success(&request, 3600))
+                .unwrap()
+                .replace("Require: outbound\r\n", "")
+                .replace(";lr;ob>", ";lr>")
+                .replace("Flow-Timer: 25\r\n", "");
+            old.registered(response.as_bytes(), false, 3600).unwrap();
+            assert_eq!(
+                coordinator.concurrent_support(),
+                ConcurrentRegistrationSupport::NotSupported
+            );
+            assert!(coordinator.registration_candidate_ready(target, preference));
+            assert!(!coordinator.additional_flow_ready(target));
+            let decision = decide(ImsAccessInputs {
+                cellular_enabled: true,
+                wlan_enabled: true,
+                cellular_registered: first == ImsAccess::Cellular,
+                wlan_registered: first == ImsAccess::Wlan,
+                cellular_available: coordinator
+                    .registration_candidate_ready(ImsAccess::Cellular, preference),
+                wlan_available: coordinator
+                    .registration_candidate_ready(ImsAccess::Wlan, preference),
+                concurrent_support: coordinator.concurrent_support(),
+                preference,
+                ..Default::default()
+            });
+            assert!(decision.permits(target));
+            assert!(!decision.permits(first));
+            assert_eq!(
+                decision.legs_to_release(first == ImsAccess::Cellular, first == ImsAccess::Wlan),
+                vec![first]
+            );
+            // Publishing a new intent alone must not accidentally allow a
+            // competing REGISTER while the legacy binding is still owned.
+            coordinator.publish(decision).await;
+            assert!(coordinator.admit(target).await.is_err());
+            // The normal transition drains and removes that old flow first.
+            coordinator
+                .publish(ImsAccessDecision::none("switching"))
+                .await;
+            old.disable();
+            coordinator.publish(decision).await;
+            assert!(coordinator.admit(target).await.is_ok());
+        }
+    }
+
     fn contact_parameter_for_test(request: &[u8], name: &str) -> Option<String> {
         super::super::register_response::contact_parameter(
             &sip_frame::header_value(request, "Contact").unwrap(),
@@ -1152,8 +1222,8 @@ pub(crate) mod tests {
         );
         cellular.prepare(&register_request("secondary", 1)).unwrap();
         cellular.received_sip(b"SIP/2.0 439 First Hop Lacks Outbound Support\r\nCall-ID: secondary\r\nCSeq: 1 REGISTER\r\n\r\n").unwrap_err();
-        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
-        assert!(coordinator.flow_creation_ready(ImsAccess::Wlan));
+        assert!(!coordinator.additional_flow_ready(ImsAccess::Cellular));
+        assert!(coordinator.additional_flow_ready(ImsAccess::Wlan));
         assert_eq!(
             coordinator.concurrent_support(),
             ConcurrentRegistrationSupport::Negotiated
@@ -1473,7 +1543,7 @@ pub(crate) mod tests {
         let lease = flow.lease.as_ref().unwrap();
         assert!(lease.status().binding_live);
         assert!(!lease.status().outbound_negotiated);
-        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
+        assert!(!coordinator.additional_flow_ready(ImsAccess::Cellular));
         // Stale evidence from a previous access must not permanently blacklist
         // the carrier after this flow is removed or the network changes.
         flow.disable();
