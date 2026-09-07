@@ -44,11 +44,12 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          # Text-file and DB-store round trips are covered by config::tests;
-          # those implementation modules do not have standalone test modules.
+          # DB-store round trips are covered by config::tests; the text-file
+          # module additionally checks insertion of nested default subtrees.
           for filter in \
             platform::dns::tests \
             platform::config::tests \
+            platform::config_file::tests \
             platform::network_routing::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::socks5::tests \

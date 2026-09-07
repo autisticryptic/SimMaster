@@ -336,14 +336,15 @@ fn set_value(target: &SetTarget<'_>, key: &str, value: &Value) {
             target.set(key, MappingBuilder::new().build_document());
         }
         Value::Object(entries) => {
-            // Seed the block with its first entry so the parser sees a mapping,
-            // then recurse for the rest at the correct depth.
-            let mut iterator = entries.iter();
-            let Some((first_key, first_value)) = iterator.next() else {
+            // The FIRST value may itself be a nested mapping (for example
+            // device_network.ddns). Never pass that nested tree through the
+            // builder: it loses indentation when inserted below another key.
+            // Seed a scalar placeholder, then set EVERY real value recursively
+            // through its attached mapping so the depth is known.
+            let Some(first_key) = entries.keys().next() else {
                 return;
             };
-            let mut seed = MappingBuilder::new();
-            seed = push_mapping_pair(seed, first_key, first_value);
+            let seed = MappingBuilder::new().pair(first_key.as_str(), Option::<&str>::None);
             target.set(key, seed.build_document());
 
             let Some(child) = target.get_mapping(key) else {
@@ -359,7 +360,7 @@ fn set_value(target: &SetTarget<'_>, key: &str, value: &Value) {
                 return;
             };
             let child_target = SetTarget::Mapping(&child);
-            for (child_key, child_value) in iterator {
+            for (child_key, child_value) in entries {
                 set_value(&child_target, child_key, child_value);
             }
         }
@@ -558,6 +559,67 @@ fn ensure_trailing_newline(mut text: String) -> String {
         text.push('\n');
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn adding_a_missing_root_with_a_nested_first_child_keeps_indentation() {
+        let source = "# operator comment\nconfig_version: 5\nproxy:\n  enabled: true\n";
+        // Typed configuration has already filled absent defaults in memory.
+        let previous = json!({
+            "config_version": 5,
+            "proxy": {"enabled": true},
+            "device_network": {"ddns": {
+                "access_id": "", "enabled": false,
+                "ipv4": {"fallbacks": ["first", "second"], "source": "interface"}
+            }}
+        });
+        let mut desired = previous.clone();
+        desired["proxy"]["enabled"] = json!(false);
+        let rendered = apply_update(
+            source,
+            &previous,
+            &desired,
+            TextFormat::Yaml,
+            Path::new("fixture.yaml"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let parsed: Value = parse(&rendered, TextFormat::Yaml, Path::new("fixture.yaml")).unwrap();
+        assert_eq!(parsed, desired);
+        assert!(rendered.contains("# operator comment"));
+        assert!(!rendered.lines().any(|line| line.starts_with("access_id:")));
+    }
+
+    #[test]
+    fn adding_nested_subtrees_preserves_existing_mapping_comments() {
+        let source =
+            "# owned by operator\ndevice_network:\n  # keep enabled comment\n  enabled: true\n";
+        let previous = json!({"device_network": {"enabled": true}});
+        let desired = json!({"device_network": {
+            "enabled": true,
+            "ddns": {"ipv4": {"access": {"id": "00123", "secret": ""}}, "provider": "test"}
+        }});
+        let rendered = apply_update(
+            source,
+            &previous,
+            &desired,
+            TextFormat::Yaml,
+            Path::new("fixture.yaml"),
+            &[],
+            &[],
+        )
+        .unwrap();
+        let parsed: Value = parse(&rendered, TextFormat::Yaml, Path::new("fixture.yaml")).unwrap();
+        assert_eq!(parsed, desired);
+        assert!(rendered.contains("# owned by operator"));
+        assert!(rendered.contains("# keep enabled comment"));
+    }
 }
 
 // --- durability -------------------------------------------------------------

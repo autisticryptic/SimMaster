@@ -129,6 +129,7 @@
 | 2026-09-08 02:40 | DNS 分支 0257374 / run 34151549316 首轮验证 | 后端全部测试编译、前端与 15 项 Python 检查通过；3 项 DNS 网络测试错误地使用 .invalid，Hickory 按 RFC 6761 本地拒绝，未到测试服务器 | 改为 .test 并验证服务器收到真实 A/AAAA 查询；补充命名迁移映射，重新运行 CI |
 | 2026-09-08 03:00 | DNS 修订 87eead1 / run 34153925916 全通过 | 本地 DNS 真实 A/AAAA 查询、配置隔离、NXDOMAIN、超时和现有 ePDG/SOCKS5/Trunk/IMS 回归，以及前端、15 项 Python 检查均通过；不发布、不部署 | 开始命名迁移 |
 | 2026-09-08 03:21 | 实施第一批类型和 HTTP 名称迁移 | 蜂窝接入类型用 CellularIms*，蜂窝/WLAN 共用 profile 类型用 ImsProfile*；新增 7 组 canonical API、8 个后端 handler 和 7 个前端 client 方法新名称；旧端点和 JSON 字段保持原状 | 新增私有 D-Bus HTTP 鉴权/响应一致性测试；随后单独做持久化字段与模块迁移 |
+| 2026-09-08 本轮扩大回归 | 类型/API 改动编译和前端检查通过，全量配置测试暴露既有 YAML 写入边界 | 旧精简配置补写 device_network.ddns 时，首个子值本身是 mapping，旧 MappingBuilder seed 把字段放错层级，重新解析校验阻止了保存；不是跳过测试 | 改为标量占位后逐层写入；新增缺失根块/深层子树与注释保持回归；CI 错误摘录已改为保留真正失败原因 |
 
 ## 6. 当前优先事项（阶段 B）
 
