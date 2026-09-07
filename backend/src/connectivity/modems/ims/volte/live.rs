@@ -2841,16 +2841,6 @@ async fn connect_family(
                 return Err(error);
             }
         };
-        runtime
-            .record_attempt(
-                VolteStage::Registered,
-                Some(ip_family_name(local_addr)),
-                "succeeded",
-                None,
-                Some(format!("register_variant={}", variant.label)),
-            )
-            .await;
-        channel.commit_security();
         let artifacts = match channel
             .outbound_registered(&registration.response, authenticator.expires_seconds)
         {
@@ -2864,6 +2854,19 @@ async fn connect_family(
                 return Err(map_channel_error(error));
             }
         };
+        // Publish the validated binding before retiring the preceding flow.
+        // Otherwise a concurrent policy read can briefly see no negotiated
+        // binding and incorrectly park the other access.
+        channel.commit_security();
+        runtime
+            .record_attempt(
+                VolteStage::Registered,
+                Some(ip_family_name(local_addr)),
+                "succeeded",
+                None,
+                Some(format!("register_variant={}", variant.label)),
+            )
+            .await;
         let refresh_authorization =
             authenticator.refresh_authorization_after_success(&registration.response);
         log_volte_register_success_metadata("initial", variant, &artifacts);
@@ -3879,7 +3882,29 @@ async fn refresh_live_registration(
                 break;
             }
         };
-        // Only the final 2xx commits a tentative association and its AKA
+        // Validate and publish the new flow BEFORE retiring its predecessor.
+        // A 200 alone is not successful refresh if its own binding/negotiation
+        // is missing. Never commit tentative security on that error path.
+        let artifacts = match session
+            .channel
+            .outbound_registered(&registration.response, authenticator.expires_seconds)
+        {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                authenticator.rollback_security(&mut session.channel).await;
+                if let Some(authorization) = authenticator.refresh_authorization_after_failure() {
+                    session.refresh_authorization = Some(authorization);
+                }
+                return VolteRefreshAttempt {
+                    outcome: RegistrationRefreshResult::RebuildAccess(
+                        RegistrationLossReason::SignalingTransportLost,
+                    ),
+                    error: Some(map_channel_error(error)),
+                    retry_after: None,
+                };
+            }
+        };
+        // Only the validated final 2xx commits a tentative association and its AKA
         // state. Direct 200 refreshes discard the unneeded offer and keep the
         // exact active sockets/SAs. Retain one old protected path for delayed
         // traffic; it is released before the next registration procedure.
@@ -3903,21 +3928,6 @@ async fn refresh_live_registration(
             );
         }
         session.register_variant = variant;
-        let artifacts = match session
-            .channel
-            .outbound_registered(&registration.response, authenticator.expires_seconds)
-        {
-            Ok(artifacts) => artifacts,
-            Err(error) => {
-                return VolteRefreshAttempt {
-                    outcome: RegistrationRefreshResult::RebuildAccess(
-                        RegistrationLossReason::SignalingTransportLost,
-                    ),
-                    error: Some(map_channel_error(error)),
-                    retry_after: None,
-                }
-            }
-        };
         if let Some(authorization) =
             authenticator.refresh_authorization_after_success(&registration.response)
         {

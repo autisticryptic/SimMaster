@@ -1324,12 +1324,22 @@ export interface ImsAccessDecision {
 export interface ImsRegistrationPolicyStatus {
   requested: ImsAccessPreference
   effective: 'none' | 'single_registration' | 'concurrent'
-  concurrent_support: 'client_incomplete' | 'not_negotiated' | 'negotiated'
+  concurrent_support: 'client_incomplete' | 'not_negotiated' | 'not_supported' | 'negotiated'
   desired: ImsAccessDecision
   applied: ImsAccessDecision
   switch_deferred_for_call: boolean
   cellular_last_response?: { require_outbound: boolean; flow_timer_seconds?: number | null } | null
   wlan_last_response?: { require_outbound: boolean; flow_timer_seconds?: number | null } | null
+  cellular_flow?: ImsRegistrationFlowStatus | null
+  wlan_flow?: ImsRegistrationFlowStatus | null
+}
+
+export interface ImsRegistrationFlowStatus {
+  binding_live: boolean
+  outbound_offered: boolean
+  outbound_negotiated: boolean
+  transport_validated: boolean
+  expires_in_seconds: number
 }
 
 export interface ImsSubsystemState {

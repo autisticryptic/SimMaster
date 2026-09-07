@@ -66,11 +66,16 @@ pub enum ConcurrentRegistrationSupport {
     /// The current client lacks complete RFC 5626 flow maintenance. This says
     /// nothing about whether an operator supports it with a capable client.
     ClientIncomplete,
-    /// A fully capable client has not established network support on the
-    /// active registration (including the first-hop outbound procedure).
+    /// No live binding has established or declined network support yet.
     #[default]
     NotNegotiated,
-    /// Complete local implementation AND successful outbound negotiation.
+    /// An owned successful registration offered outbound, but its response
+    /// did not accept it. Scoped to the CURRENT flow, not a permanent carrier
+    /// blacklist or an inference from a timeout.
+    NotSupported,
+    /// An owned live binding negotiated outbound. Transport validation is
+    /// checked separately before creating an additional flow; a delayed pong
+    /// must not erase negotiated capability and tear down existing bindings.
     Negotiated,
 }
 
@@ -273,6 +278,7 @@ mod tests {
         for support in [
             ConcurrentRegistrationSupport::ClientIncomplete,
             ConcurrentRegistrationSupport::NotNegotiated,
+            ConcurrentRegistrationSupport::NotSupported,
             ConcurrentRegistrationSupport::Negotiated,
         ] {
             let mut i = both(ImsAccessPreference::Concurrent);

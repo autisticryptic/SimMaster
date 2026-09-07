@@ -1072,8 +1072,10 @@ mod tests {
             channel.outbound_registered(&response, 3600).unwrap();
             assert_eq!(
                 coordinator.concurrent_support(),
-                ConcurrentRegistrationSupport::NotNegotiated
+                ConcurrentRegistrationSupport::Negotiated
             );
+            assert!(!coordinator
+                .flow_creation_ready(crate::connectivity::core::ims_access::ImsAccess::Wlan));
 
             let reply = tokio::spawn(async move {
                 let mut buf = [0u8; 64];

@@ -21,7 +21,7 @@ use super::{
         ConcurrentRegistrationSupport, ImsAccess, ImsAccessDecision, ImsAccessPreference,
         CURRENT_CONCURRENT_SUPPORT,
     },
-    outbound::FlowLease,
+    outbound::{FlowLease, FlowLeaseStatus},
     register_response::RegisterArtifacts,
 };
 
@@ -43,6 +43,8 @@ pub struct ImsRegistrationPolicyStatus {
     pub switch_deferred_for_call: bool,
     pub cellular_last_response: Option<OutboundResponseEvidence>,
     pub wlan_last_response: Option<OutboundResponseEvidence>,
+    pub cellular_flow: Option<FlowLeaseStatus>,
+    pub wlan_flow: Option<FlowLeaseStatus>,
 }
 
 struct Observation {
@@ -277,8 +279,25 @@ impl ImsRegistrationCoordinator {
     /// With no surviving flow, a cooled-down outbound offer may still fall
     /// back to a legacy SINGLE registration; never do that for a second flow.
     pub fn flow_creation_ready(&self, access: ImsAccess) -> bool {
-        self.recovery_ready(access)
-            && (!self.additional_flow_requires_outbound(access) || self.may_offer_outbound(access))
+        if !self.recovery_ready(access) {
+            return false;
+        }
+        let o = self.observation.read().unwrap_or_else(|e| e.into_inner());
+        let opposite = match access {
+            ImsAccess::Cellular => &o.wlan_flow,
+            ImsAccess::Wlan => &o.cellular_flow,
+        };
+        match opposite.upgrade().filter(|flow| flow.live()) {
+            // Both negotiation and CURRENT transport health are mandatory for
+            // a NEW second flow. Existing bindings bypass this creation gate
+            // in admit() and remain eligible for protected refresh.
+            Some(flow) => {
+                flow.proven()
+                    && o.outbound_rejected_until[flow_index(access)]
+                        .is_none_or(|until| Instant::now() >= until)
+            }
+            None => true,
+        }
     }
 
     pub fn defer_switch_for_call(&self) {
@@ -317,6 +336,11 @@ impl ImsRegistrationCoordinator {
             switch_deferred_for_call: observation.switch_deferred_for_call,
             cellular_last_response: observation.cellular,
             wlan_last_response: observation.wlan,
+            cellular_flow: observation
+                .cellular_flow
+                .upgrade()
+                .map(|flow| flow.status()),
+            wlan_flow: observation.wlan_flow.upgrade().map(|flow| flow.status()),
         }
     }
 }
@@ -332,12 +356,22 @@ fn support_from_observation(o: &Observation) -> ConcurrentRegistrationSupport {
     // A secondary P-CSCF refusing outbound says nothing about the established
     // primary's negotiation. Demoting both here made reconciliation tear down
     // the working registration after a failed secondary attempt.
-    if [&o.cellular_flow, &o.wlan_flow]
+    let flows = [&o.cellular_flow, &o.wlan_flow]
         .iter()
         .filter_map(|l| l.upgrade())
-        .any(|l| l.proven())
-    {
+        .map(|flow| flow.status())
+        .collect::<Vec<_>>();
+    // Negotiation and a keepalive's proof window are different facts. If the
+    // latter lapses before its owner handles the probe, do NOT downgrade the
+    // policy and destroy an otherwise live cellular registration. Only flow
+    // expiry/owner loss/explicit failure revokes the negotiated capability.
+    if flows.iter().any(|flow| flow.outbound_negotiated) {
         ConcurrentRegistrationSupport::Negotiated
+    } else if flows
+        .iter()
+        .any(|flow| flow.binding_live && flow.outbound_offered)
+    {
+        ConcurrentRegistrationSupport::NotSupported
     } else {
         CURRENT_CONCURRENT_SUPPORT
     }

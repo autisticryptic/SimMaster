@@ -17,6 +17,7 @@ use super::{
     sip_frame, ImsError,
 };
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::Serialize;
 use std::{
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{Arc, Mutex},
@@ -34,6 +35,7 @@ const STUN_TIMEOUT: Duration = Duration::from_secs(8);
 #[derive(Debug)]
 struct LeaseState {
     expires: Instant,
+    offered: bool,
     negotiated: bool,
     healthy: bool,
     healthy_until: Instant,
@@ -47,7 +49,30 @@ pub struct FlowLease {
     state: Mutex<LeaseState>,
 }
 
+/// Safe API evidence, never a dump of Contact identities or security material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FlowLeaseStatus {
+    pub binding_live: bool,
+    pub outbound_offered: bool,
+    pub outbound_negotiated: bool,
+    pub transport_validated: bool,
+    pub expires_in_seconds: u64,
+}
+
 impl FlowLease {
+    pub fn status(&self) -> FlowLeaseStatus {
+        let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let binding_live = !s.failed && now < s.expires;
+        FlowLeaseStatus {
+            binding_live,
+            outbound_offered: s.offered,
+            outbound_negotiated: binding_live && s.negotiated,
+            transport_validated: binding_live && s.negotiated && s.healthy && now < s.healthy_until,
+            expires_in_seconds: s.expires.saturating_duration_since(now).as_secs(),
+        }
+    }
+
     pub fn proven(&self) -> bool {
         let s = self.state.lock().unwrap_or_else(|e| e.into_inner());
         s.negotiated
@@ -110,6 +135,9 @@ pub struct OutboundFlow {
     mapped: Option<SocketAddr>,
     failure_reported: bool,
     no_nat: bool,
+    /// A challenged refresh may stage new sockets, but must not downgrade the
+    /// already-negotiated binding while its old lease is retained for rollback.
+    bound_outbound_required: bool,
 }
 
 impl OutboundFlow {
@@ -140,7 +168,8 @@ impl OutboundFlow {
                 return Ok(prepared.clone());
             }
         }
-        let bound_outbound = self.lease.as_ref().is_some_and(|lease| lease.negotiated());
+        let bound_outbound = self.bound_outbound_required
+            || self.lease.as_ref().is_some_and(|lease| lease.negotiated());
         // Once bound, refresh/remove this binding using its original outbound
         // identity even if a capability probe on the other access was refused.
         let required = bound_outbound
@@ -213,6 +242,8 @@ impl OutboundFlow {
         Self {
             offer: self.offer.clone(),
             no_nat: self.no_nat,
+            bound_outbound_required: self.bound_outbound_required
+                || self.lease.as_ref().is_some_and(|lease| lease.negotiated()),
             ..Self::default()
         }
     }
@@ -291,6 +322,7 @@ impl OutboundFlow {
                 instance: offer.instance.clone(),
                 state: Mutex::new(LeaseState {
                     expires: Instant::now(),
+                    offered,
                     negotiated: false,
                     healthy: false,
                     healthy_until: Instant::now(),
@@ -305,6 +337,7 @@ impl OutboundFlow {
                 return Err(ImsError::new("ims_outbound_flow_failed"));
             }
             state.expires = Instant::now() + Duration::from_secs(u64::from(expires));
+            state.offered = offered;
             state.negotiated = negotiated;
         }
         offer
@@ -862,9 +895,11 @@ pub(crate) mod tests {
         assert!(!has_option(&initial_wlan, "Require", "outbound"));
         assert_eq!(
             coordinator.concurrent_support(),
-            ConcurrentRegistrationSupport::NotNegotiated
+            ConcurrentRegistrationSupport::Negotiated
         );
+        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
         acknowledge_probe(&mut wlan, "192.0.2.2:5060");
+        assert!(coordinator.flow_creation_ready(ImsAccess::Cellular));
 
         let decision = decide(ImsAccessInputs {
             wlan_registered: true,
@@ -935,6 +970,158 @@ pub(crate) mod tests {
             coordinator.concurrent_support(),
             ConcurrentRegistrationSupport::Negotiated
         );
+    }
+
+    #[tokio::test]
+    async fn cellular_first_then_wlan_keeps_both_original_bindings_across_refreshes() {
+        let line = "outbound-cellular-first";
+        let coordinator = ims_registration_coordinator::for_line(line);
+        let mut cellular = OutboundFlow::default();
+        cellular.configure(line, ImsAccess::Cellular, INSTANCE, true);
+        let mut wlan = OutboundFlow::default();
+        wlan.configure(line, ImsAccess::Wlan, INSTANCE, true);
+        coordinator
+            .publish(super::super::ims_access::ImsAccessDecision::cellular_only(
+                "first",
+            ))
+            .await;
+        {
+            let _permit = coordinator.admit(ImsAccess::Cellular).await.unwrap();
+            register_flow(&mut cellular, "cellular-first", 1, 3600);
+        }
+        // An accepted REGISTER without the first pong must not enable a NEW
+        // second flow, but also must not cause the current flow to be parked.
+        let decision = decide(ImsAccessInputs {
+            cellular_enabled: true,
+            wlan_enabled: true,
+            cellular_registered: true,
+            cellular_available: coordinator.flow_creation_ready(ImsAccess::Cellular),
+            wlan_available: coordinator.flow_creation_ready(ImsAccess::Wlan),
+            concurrent_support: coordinator.concurrent_support(),
+            ..Default::default()
+        });
+        assert!(decision.cellular_registers && !decision.wlan_registers);
+        assert!(decision.legs_to_release(true, false).is_empty());
+        acknowledge_probe(&mut cellular, "192.0.2.1:5060");
+        coordinator
+            .publish(decide(ImsAccessInputs {
+                cellular_enabled: true,
+                wlan_enabled: true,
+                cellular_registered: true,
+                wlan_available: coordinator.flow_creation_ready(ImsAccess::Wlan),
+                concurrent_support: coordinator.concurrent_support(),
+                ..Default::default()
+            }))
+            .await;
+        let cell_lease = cellular.lease.as_ref().unwrap().clone();
+        {
+            let _permit = coordinator.admit(ImsAccess::Wlan).await.unwrap();
+            let request = register_flow(&mut wlan, "wlan-second", 1, 3600);
+            assert!(has_option(&request, "Require", "outbound"));
+        }
+        acknowledge_probe(&mut wlan, "192.0.2.2:5060");
+        let wlan_lease = wlan.lease.as_ref().unwrap().clone();
+        for cseq in 2..=4 {
+            let wlan_expiry = wlan_lease.state.lock().unwrap().expires;
+            {
+                let _permit = coordinator.admit(ImsAccess::Cellular).await.unwrap();
+                register_flow(&mut cellular, "cellular-first", cseq, 3600);
+            }
+            assert!(Arc::ptr_eq(&cell_lease, cellular.lease.as_ref().unwrap()));
+            assert_eq!(wlan_lease.state.lock().unwrap().expires, wlan_expiry);
+            let cell_expiry = cell_lease.state.lock().unwrap().expires;
+            {
+                let _permit = coordinator.admit(ImsAccess::Wlan).await.unwrap();
+                register_flow(&mut wlan, "wlan-second", cseq, 3600);
+            }
+            assert!(Arc::ptr_eq(&wlan_lease, wlan.lease.as_ref().unwrap()));
+            assert_eq!(cell_lease.state.lock().unwrap().expires, cell_expiry);
+        }
+        assert!(cell_lease.proven() && wlan_lease.proven());
+    }
+
+    #[tokio::test]
+    async fn pending_keepalive_never_demotes_existing_dual_bindings_or_blocks_refresh() {
+        let line = "outbound-pending-health";
+        let coordinator = ims_registration_coordinator::for_line(line);
+        let mut cellular = OutboundFlow::default();
+        cellular.configure(line, ImsAccess::Cellular, INSTANCE, true);
+        register_flow(&mut cellular, "cellular", 1, 3600);
+        acknowledge_probe(&mut cellular, "192.0.2.1:5060");
+        let mut wlan = OutboundFlow::default();
+        wlan.configure(line, ImsAccess::Wlan, INSTANCE, true);
+        register_flow(&mut wlan, "wlan", 1, 3600);
+        acknowledge_probe(&mut wlan, "192.0.2.2:5060");
+        // Simulate a scheduler tick after the proof window, but before the
+        // owner has classified the pending probe as a real transport failure.
+        for flow in [&cellular, &wlan] {
+            flow.lease
+                .as_ref()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .healthy_until = Instant::now() - Duration::from_secs(1);
+        }
+        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
+        assert!(!coordinator.flow_creation_ready(ImsAccess::Wlan));
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::Negotiated
+        );
+        let decision = decide(ImsAccessInputs {
+            cellular_enabled: true,
+            wlan_enabled: true,
+            cellular_registered: true,
+            wlan_registered: true,
+            concurrent_support: coordinator.concurrent_support(),
+            ..Default::default()
+        });
+        assert_eq!(decision.effective_mode(), "concurrent");
+        assert!(decision.legs_to_release(true, true).is_empty());
+        coordinator.publish(decision).await;
+        assert!(coordinator.admit(ImsAccess::Cellular).await.is_ok());
+        assert!(coordinator.admit(ImsAccess::Wlan).await.is_ok());
+        let status = coordinator.status(ImsAccessPreference::Concurrent, decision);
+        assert!(status.cellular_flow.unwrap().outbound_negotiated);
+        assert!(!status.cellular_flow.unwrap().transport_validated);
+        assert!(status.wlan_flow.unwrap().binding_live);
+        // A real failure revokes only its owner's lease, not the other SA.
+        cellular.fail("ims_outbound_keepalive_timeout");
+        assert!(!cellular.lease.as_ref().unwrap().live());
+        assert!(wlan.lease.as_ref().unwrap().live());
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::Negotiated
+        );
+    }
+
+    #[test]
+    fn staged_security_refresh_retains_outbound_requirement_without_a_second_access() {
+        let mut active = OutboundFlow::default();
+        active.configure(
+            "outbound-security-replacement",
+            ImsAccess::Cellular,
+            INSTANCE,
+            true,
+        );
+        register_flow(&mut active, "same-binding", 1, 3600);
+        let mut staged = active.replacement();
+        let request = staged
+            .prepare(&register_request("same-binding", 2))
+            .unwrap();
+        assert!(has_option(&request, "Require", "outbound"));
+        assert_eq!(
+            contact_parameter_for_test(&request, "reg-id"),
+            Some("1".into())
+        );
+        assert_eq!(
+            contact_parameter_for_test(&request, "+sip.instance"),
+            Some(INSTANCE.into())
+        );
+        // Discarding an uncommitted candidate does not destroy the active flow.
+        staged.disable();
+        assert!(active.lease.as_ref().unwrap().live());
     }
 
     fn contact_parameter_for_test(request: &[u8], name: &str) -> Option<String> {
@@ -1024,7 +1211,7 @@ pub(crate) mod tests {
         assert!(!flow.active());
         assert_eq!(
             ims_registration_coordinator::for_line("outbound-legacy-expiry").concurrent_support(),
-            ConcurrentRegistrationSupport::NotNegotiated
+            ConcurrentRegistrationSupport::NotSupported
         );
     }
 
@@ -1182,7 +1369,12 @@ pub(crate) mod tests {
     #[test]
     fn outbound_capabilities_are_in_one_field_on_initial_auth_refresh_and_remove() {
         let mut flow = OutboundFlow::default();
-        flow.configure("outbound-canonical-register", ImsAccess::Wlan, INSTANCE, true);
+        flow.configure(
+            "outbound-canonical-register",
+            ImsAccess::Wlan,
+            INSTANCE,
+            true,
+        );
         for (cseq, expires) in [(1, 3600), (2, 3600), (3, 3600), (4, 0)] {
             let source = String::from_utf8(register_request("same-binding", cseq))
                 .unwrap()
@@ -1232,7 +1424,10 @@ pub(crate) mod tests {
             sip_frame::header_value(source, "Security-Verify")
         );
         // Formatting and Contact completion are idempotent.
-        assert_eq!(offer_register(&prepared, INSTANCE, 2, true).unwrap(), prepared);
+        assert_eq!(
+            offer_register(&prepared, INSTANCE, 2, true).unwrap(),
+            prepared
+        );
     }
 
     #[test]
@@ -1272,9 +1467,20 @@ pub(crate) mod tests {
         assert_eq!(artifacts.expires_seconds, Some(3195));
         assert_eq!(
             coordinator.concurrent_support(),
-            ConcurrentRegistrationSupport::NotNegotiated
+            ConcurrentRegistrationSupport::NotSupported
         );
         assert!(flow.poll(Instant::now()).unwrap().is_none());
+        let lease = flow.lease.as_ref().unwrap();
+        assert!(lease.status().binding_live);
+        assert!(!lease.status().outbound_negotiated);
+        assert!(!coordinator.flow_creation_ready(ImsAccess::Cellular));
+        // Stale evidence from a previous access must not permanently blacklist
+        // the carrier after this flow is removed or the network changes.
+        flow.disable();
+        assert_eq!(
+            coordinator.concurrent_support(),
+            ConcurrentRegistrationSupport::NotNegotiated
+        );
     }
 
     #[test]

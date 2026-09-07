@@ -10,8 +10,10 @@ not proof of concurrency or inbound reachability.
 
 `concurrent` remains the stored/default user preference. The bootstrap state is
 `not_negotiated`, not `client_incomplete`. An owned, unexpired flow must prove
-outbound negotiation and transport health before admission opens for the second
-access. Without negotiation, the client retains **one** IMS registration. A
+outbound negotiation and transport health before admission opens for a **new**
+second access. Those are separate facts: a temporarily expired keepalive proof
+does not erase an existing binding's negotiated capability or authorize policy
+teardown. Without negotiation, the client retains **one** IMS registration. A
 legacy registration on the tested network does not establish that every access,
 P-CSCF or carrier configuration lacks outbound support.
 
@@ -69,6 +71,10 @@ seamless IR.51 handover or transfers an active call between accesses.
    The low-level LTE/WLAN REGISTER entry points fail closed even if a diagnostic,
    SMS or voice caller bypasses the normal restore workflow. Different SIM lines
    have independent locks and admission decisions.
+   A protected security rollover validates and publishes the new owned flow
+   before retiring its predecessor, avoiding a transient capability gap.
+   A staged refresh retains the original outbound requirement even when there
+   is no second access; a challenged 200 cannot silently downgrade the binding.
 6. Reconcile already connected paths every scheduler pass and on preference
    updates. Calls in dialing, ringing, incoming, active, held or unknown
    nonterminal states defer policy teardown; check again after draining a
@@ -89,9 +95,16 @@ seamless IR.51 handover or transfers an active call between accesses.
 - `requested`: original user preference;
 - `effective`: applied `single_registration`, `concurrent`, or `none`;
 - `desired` / `applied`: per-access admission and stable reason codes;
-- `concurrent_support`: `client_incomplete`, `not_negotiated`, or `negotiated`;
+- `concurrent_support`: `client_incomplete`, `not_negotiated`, `not_supported`,
+  or `negotiated`. `not_supported` means a **current owned successful flow**
+  offered outbound but its response did not accept it; it is not inferred from
+  a timeout, and disappears when that flow is removed. `negotiated` alone is
+  not proof of current transport health or that both accesses are registered;
 - `switch_deferred_for_call`;
 - each access's last successful response `require_outbound` and `flow_timer_seconds`.
+- `cellular_flow` / `wlan_flow`: current owned binding lifetime, whether outbound
+  was offered/negotiated, and separate `transport_validated` evidence. These
+  fields contain no Contact, subscriber identity, authorization or SA keys.
 
 Response metadata is passive evidence only. `Supported: outbound`, a substring
 like `x-outbound`, or reg-id alone never enables concurrency. The dashboard
@@ -116,7 +129,10 @@ gate, all boolean single-registration combinations, full lease versus refresh
 deadline, protected-refresh eligibility, fallback stickiness, deferred calls,
 per-line serialization and fail-closed admission, exact Require parsing,
 independent live flows/keepalives, and not exhausting a parked access's recovery
-budget. Capability-field regressions cover initial/authenticated/refresh/remove
+budget. Cellular-first regressions then register WLAN and alternate protected
+flow ownership through multiple refreshes, without borrowing the other lease.
+Pending keepalive proof windows preserve existing dual admission but cannot
+authorize a new second flow. Capability-field regressions cover initial/authenticated/refresh/remove
 requests, retransmission byte stability, folded/compact/repeated header fields,
 security-option preservation, and Contact echoes without outbound negotiation.
 
@@ -140,3 +156,16 @@ root cause**. The baseline metadata collector did not reassemble fragmented
 authenticated requests, so absence of a field in those request snippets is
 not evidence that the actual authenticated request omitted it. Subsequent
 wire checks must reassemble IP fragments and accept only complete SIP headers.
+
+### September 7 continuation
+
+The requested acceptance remains **both registrations plus each flow's natural
+refresh**, or an evidence-backed priority fallback where the current network
+does not accept the required multi-registration procedure. Disabling cellular
+IMS is not a dual-registration fix. Re-establishing security after failed
+refresh is recovery, never counted as successful refresh.
+
+The keepalive/admission and staged-flow publication fixes are client-side
+correctness fixes. They are not yet a proven explanation for the older carrier
+trace with no outbound negotiation. That trace must be tested with the corrected
+final REGISTER before drawing a conclusion about this access.
