@@ -1,8 +1,8 @@
 ﻿# SimAdmin 开发计划与验收进度
 
-> 最后更新：2026-09-08 13:48（Asia/Shanghai；新增设置/资费保护开发，设备仍为 0b97b4f）
+> 最后更新：2026-09-08 17:18（Asia/Shanghai；48e37fc 已部署并完成本轮无资费验收）
 > 用途：持续更新的开发进度报告、发布门禁和后续核对依据。
-> 状态：beta2 修正版 0b97b4f 已通过最终 CI、发布并部署；命名、旧配置/API 兼容、应用 HTTP DNS 及本候选 VoWiFi 原通道自然续期实测通过。临时观察已停止，主服务和配置未变。当前网络双注册仍未通过，不能将单注册回退当作双注册修复完成；未启用/未实测的业务仍单列。朋友的手机卡问题仍暂缓。
+> 状态：beta2 最新候选 48e37fc 已通过最终 CI、发布并部署，包含命名/DNS 重构、自动/单注册设置和资费门禁。实机配置/API、模式保存恢复、HTTP DNS 和自身原通道自然续期通过；临时观察已结束。当前网络未接受多流，自动模式按规范单注册回退，不宣称实机双注册成功。短信/Trunk 的“仅 VoWiFi”均保持关闭，Trunk 未启用；真实通话/短信/Trunk/浏览器交互未实测。朋友手机卡问题仍暂缓。
 
 ## 1. 目标与不可变约束
 
@@ -95,12 +95,12 @@
 
 ### B3. beta2 验证与发布门禁
 
-- [x] 2bb6099 和修正 0b97b4f 分别通过本地格式/静态、17 项 Python、前端及最终 Actions；后端测试和双架构编译只用 Actions，最新最终 run 为 34173433980。
+- [x] 2bb6099、0b97b4f 和后续 48e37fc 分别通过对应静态/前端/最终 Actions；最新 run 34197531701 包含 4 项前端单元及新的资费/模式门禁。后端测试和双架构编译只用 Actions。
 - [x] 410 设备发现、旧配置/API 兼容、VoWiFi ePDG/IKE/CHILD_SA/ESP/IMS 初始注册通过；两个启用开关未修改，当前仅 VoWiFi 有有效注册。
 - [x] 普通系统 DNS/HTTP：0b97b4f 应用在 08:54 查询系统首台 DNS，A/AAAA 响应成功（AAAA 为有效 NODATA），HTTPS 元数据读取耗时 0.496 秒。使用应用 HTTP client，不是拿独立 UDP 诊断替代。
 - [ ] Trunk 未启用，未强行开启；仅状态 API 和代码回归通过，不宣称实际 Trunk DNS/注册通过。
 - [ ] 前端入口 HTML/JS 与部署文件一致；没有浏览器交互工具，UI 操作/历史页面仅有代码和构建检查，未做实机交互验收。
-- [x] 修正版 0b97b4f 自身在 09:31 完成原通道自然 refresh；完整事务元数据、真实租期、原服务/TUN 均核实。没有拿初始注册或首个候选的 08:25 结果替代。
+- [x] 0b97b4f 的 09:31 与最新 48e37fc 的 16:47:58 自身自然 refresh 分别核实；均有完整事务元数据、真实租期和原服务/TUN 证据。没有用初始注册或旧候选结果替代。
 - [x] 2bb6099 和修正 0b97b4f 分别构建、发布、校验并部署 **1.1.4-beta2**（pre-release、非 latest）。修正发布前使用已知旧值做原子 master/tag 前移，tag/包/设备 commit 重新核验一致；保留旧产物证据。
 - [x] 变更说明、兼容映射、验证结果和回滚路径已更新；只标记已验证范围，双注册及 UI/真实业务等未验证项保持未通过。
 
@@ -154,6 +154,15 @@
 | 2026-09-08 09:31:28 | 0b97b4f 自身原通道自然续期通过 | CSeq=3、Security-Verify，发送时真实剩余 531 秒；完整请求/响应同 Call-ID 摘要、同 instance/reg-id，0.292738 秒后 200、续得 3100 秒；reused_access=true。核实已到实际续期时间且服务/TUN index 未变，没有重建安全关联 | 保留本候选独立证据，不算作双注册验收 |
 | 2026-09-08 09:37 | 最终版本/配置/注册复核 | 0b97b4f / 1.1.4-beta2、active、0 通话；原设置未变，两个配置开关仍启用，当前 VoWiFi 有有效租期，outbound 仍未协商 | 关闭临时抓包，整理记录，不重启、不再部署 |
 | 2026-09-08 09:43 | 关闭本次临时观察 | 仅停止 simadmin-beta2-wire-0b97b4f.service；主服务 PID/InvocationID/状态未变，事件、元数据、产物及回滚备份均保留 | 仅文档收尾，显式跳过 CI，避免同版本再次覆盖 Release |
+| 2026-09-08 本轮追加规范核查 | ETSI TS 124 229 V18.11.0（2026-08）/ RFC 5626 | §5.1.1.2.1 的 200 OK 处理 f 项允许协商成功后追加流；未确认则不得追加。保留多注册，默认请求、条件回退 | 新增中文设置，资费限制独立于注册模式 |
+| 2026-09-08 13:55–14:49 | 实现模式/资费过滤，独立分支验证 | d795972 首轮编译暴露短信转发目标配置读取误删，2de7d85 修复后 run 34193792866 全通过；前端有效优先级收尾 48e37fc / run 34196362725 全通过 | 保留失败记录，不本机编译或跳过测试 |
+| 2026-09-08 14:59 | 新候选升级前基线 | 0b97b4f、active、0 通话；两个 IMS 启用意图为 true；短信/Trunk 仅 VoWiFi 均 false、Trunk enabled=false，已告知用户，不擅自更改 | 保存完整配置指纹及资费字段 |
+| 2026-09-08 15:11 构建、15:54 核验 | 48e37fc / Build-Release 34197531701 全通过 | 版本仍 beta2/pre-release/非 latest；tag、包 commit 一致；CI 状态查询曾遇一次 504，重试后确认成功，非测试失败 | 校验包并在无通话时部署 |
+| 2026-09-08 15:57 | 部署 48e37fc | 包 SHA256 `e25d3d49e7eb82bf49fd403226454f72bc73f72880ee937d7bcf8ef7ccaf45a2`；二进制 SHA256 `e5e6828d292d988ae8e2db87089cd05bd58762a1b1350c0b1ab4132dde235fe7`；备份 `/opt/simadmin/manual-backup/20260908-155656-beta2-48e37fc` 含 0b97b4f | 保留配置，观察新候选 |
+| 2026-09-08 15:58:09 | 新候选默认 outbound 请求与初始注册 | 初始/认证请求均提供 outbound；200 自身绑定匹配、租期 3524 秒、refresh_after=2924 秒，但网络未确认多流，因此自动选择 VoWiFi 单注册 | 等待自然续期，不强行追加蜂窝绑定 |
+| 2026-09-08 16:23 | 无资费实机验收 | 新旧 API/401/前端入口/完整配置与备份匹配；HTTP DNS 0.49 秒；模式 API 自动→单注册→自动后恢复原值，released=[]，服务/TUN/其他整份配置与资费字段未变，没有电话或短信发送 | 保持原通道，继续自然观察 |
+| 2026-09-08 16:47:58 | 48e37fc 自身自然 refresh 通过 | CSeq=3、Security-Verify、真实剩余 535 秒；同事务 0.328795 秒后 200，续得 3115 秒，reused_access=true，原服务/TUN 不变，非重新初始注册 | 完整证明留存，不计为实机双注册 |
+| 2026-09-08 17:18 | 最终状态和观察收尾 | 48e37fc、active、0 通话、升级前配置指纹一致，两个仅 VoWiFi 资费开关仍关闭。临时抓包已结束，主服务与证据/备份保留 | 仅文档 [skip ci] 收尾，不重新打包 |
 
 ## 6. 当前优先事项（阶段 B）
 
@@ -167,10 +176,11 @@
 - [x] 已新增配置 API、拒绝回退、VoWiFi-only、设置变化、两种 IMS 实际 SIP 480 拒接的硬件无关回归；本地只跑 Rust 格式解析、17 项 Python、3 项前端单元、TypeScript/ESLint/Vite，均通过。
 - [x] `2de7d85` / 独立分支 Actions `34193792866`：后端编译、DNS/IMS/模式 API 与资费门禁测试通过；首轮 `d795972` 的短信转发目标配置变量编译错误已修正，没有跳过失败或本机编译。
 - [x] 前端收尾固定显示 VoWiFi 优先、移除失效的排序按钮，但保留存储值和启用状态；4 项 Node 单元、TypeScript/ESLint/Vite 通过。
-- [ ] 最新收尾候选仍需最终 CI、版本/产物校验和适用的无资费实机验收。不会发真实短信/拨号测试资费；当前设备未改动。
-- 当前在独立分支继续开发，设备/Release 仍是已验收的 0b97b4f。未进行新的拨号、短信发送或强制双注册测试。
+- [x] 最新 48e37fc 通过最终 CI 34197531701、版本/产物校验，部署后通过模式 API 往返、原配置保持、DNS 和自身自然续期验收。没有真实短信/拨号、未强行测试不受支持的双注册。
+- [x] 已明确当前两个“仅 VoWiFi”开关关闭、Trunk 未启用，未擅自开启；默认优先 VoWiFi 不等于已经禁止蜂窝回退，需要用户开启对应限制。
+- 功能实现与当前网络下的无资费验收已完成。真实业务/账单、浏览器交互和运营商实际双注册不作为已通过项；后续验证需相应环境和授权，不冒充全部历史项目已实测。
 
-**当前设备是 beta2 / 0b97b4f，命名、旧配置/API、系统 DNS 修正和自身原通道自然续期均已实测。当前网络仍未接受 outbound 多流；不能把已验证的单注册保护当作双注册修复完成。**
+**当前设备是 beta2 / 48e37fc，自动模式在本网络的单注册回退及原通道续期符合新增要求。标准允许的双注册实现保留；不能把当前单注册回退写成运营商实际双注册成功。**
 
 - [x] beta1 发布规则、代码、CI、部署与自然续期证据见上表，不能再沿用旧暂停时的版本/未提交状态。
 - [x] 朋友的手机卡任务暂缓，无设备/失败材料，不推测其原因。
@@ -178,16 +188,16 @@
 
 ### 暂停点与续接注意
 
-- Release tag/设备/发布源码当前为 0b97b4f，最终 run 34173433980；开发分支 CI 为 34172883931。不要重新激活旧 2bb6099 暂存脚本。
-- `.codex-beta2-release-verified.json` 和 `.codex-beta2-ci-run.json` 当前对应 0b97b4f。首个候选证据保存在 `.codex-beta2-artifacts/2bb6099/evidence/`，自然续期另有 `.codex-beta2-finalize-2bb6099.sh.result.txt`；设备备份/事件文件均保留。
+- Release tag/设备/发布源码当前为 48e37fc，最终 run 34197531701；开发分支 CI 为 34196362725。不要重新激活 2bb6099/0b97b4f 的旧暂存脚本。
+- `.codex-beta2-release-verified.json` / `.codex-beta2-ci-run.json` 当前对应 48e37fc。旧候选证据在 `.codex-beta2-artifacts/2bb6099/evidence/` 和 `.codex-beta2-artifacts/0b97b4f/evidence/`；设备旧备份/事件均保留。
 - **同一 VERSION 正常推送 master 会覆盖 Release 同名资产，而旧标签不会自动前移。** 纯文档收尾不能无意触发发布；修正版需明确协调 tag/包一致性，仍使用 beta2、pre-release、非 latest。
-- 本次收尾仅提交文档，并用 `[skip ci]` 明确跳过 push CI，不重新打包。master 后续文档提交可以晚于 Release tag；发布/设备继续对应 0b97b4f，不把文档 HEAD 当成待部署二进制 commit。
-- 当前增量游标 `/tmp/.simadmin-beta2-0b97b4f.cursor`；事件 `/tmp/simadmin-beta2-0b97b4f.events.jsonl`。自然续期 observer 已结束；如需新日志，用 `.codex-beta2-order-collect.sh`，不重复读取完整 journal。
-- `.codex-beta2-order-wire-read.sh` 可读已保存的新候选 REGISTER 脱敏元数据；临时抓包已于 09:43 停止，旧 2bb6099 抓包也已结束并保留。均不保存原始 SIP/认证/密钥，不把蜂窝 ESP 当作已解密抓包。
-- `.codex-beta2-inspect-after.sh` 比较部署前基线；**不要运行 inspect-before 覆盖基线**。扩展检查、DNS 诊断均保存了独立脱敏结果。
-- 2bb6099 的 08:25:52 与 0b97b4f 的 09:31:28 自然 refresh 分别验证；本候选独立证明见 `.codex-beta2-finalize-0b97b4f.sh.result.txt` 和设备 `/tmp/simadmin-beta2-refresh-0b97b4f.json`。不能将任一单路结果算作双注册通过。
+- 本次收尾仅文档 `[skip ci]`，不重新打包。master 文档提交可以晚于 Release tag；发布/设备继续对应 48e37fc，不把文档 HEAD 当作二进制 commit。
+- 当前游标 `/tmp/.simadmin-beta2-48e37fc.cursor`；事件 `/tmp/simadmin-beta2-48e37fc.events.jsonl`。observer 已结束；如需新日志，用 `.codex-ims-policy-collect.sh`，不重复读取完整 journal。
+- `.codex-ims-policy-wire-read.sh` 读取已保存的 48e37fc REGISTER 元数据；临时抓包已结束。旧候选观察亦结束并保留，均不保存原始 SIP/认证/密钥，不把蜂窝 ESP 当作已解密抓包。
+- `.codex-ims-policy-inspect-after.sh` 比较本次升级前基线，含完整 profile 指纹和 SMS/Trunk 资费字段；**不要运行 before 覆盖基线**。模式往返结果在 `.codex-ims-policy-mode-test.sh.result.txt`。
+- 48e37fc 独立续期证明在 `.codex-ims-policy-finalize.sh.result.txt` 和设备 `/tmp/simadmin-beta2-refresh-48e37fc.json`；旧候选的 08:25/09:31 证明独立保留，不代替新候选或双注册验收。
 - 固定测试间隔 `CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS` 仍为 `None`。不通过强制重注册、重建 SA、人工缩短租期或拨号来制造验收成功。
 - 旧 JSON/数据库编码与新读取别名并存是明确兼容决定；不得因仍有 `volte` wire/history 标识再次全局替换。
-- 回滚备份 `/opt/simadmin/manual-backup/20260908-084315-beta2-0b97b4f` 内是 2bb6099（有已知 DNS 排序问题）；`/opt/simadmin/manual-backup/20260908-073410-beta2-2bb6099` 内是 beta1/e55780a。回滚前重新检查所有线路通话并备份当前数据；恢复二进制、前端、devices、meta，默认保留兼容的现有配置和数据库，不盲目覆盖升级后的短信/历史记录。
+- 最新回滚备份 `/opt/simadmin/manual-backup/20260908-155656-beta2-48e37fc` 内是 0b97b4f（不含新增资费门禁/模式设置）。更早 084315 备份含 2bb6099、073410 备份含 beta1/e55780a。回滚前检查通话并备份当前数据；默认保留兼容配置/数据库，不盲目覆盖新短信/历史。
 - Trunk 未配置、真实短信/电话、浏览器交互未实测，不能标为完成。朋友手机卡任务仍暂缓。
 - 不清理已有临时文件或设备备份，不覆盖无关改动；设备只安装校验过的 Release，不在本机编译后端。

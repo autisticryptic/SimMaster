@@ -114,3 +114,8 @@ Tests check that contract rather than merely the presence of route aliases.
   inferred from initial registration or another candidate's result.
   Current-network dual registration and unexercised live business paths remain
   unverified.
+- The later registration-mode/cost-guard candidate `48e37fc` retains these
+  compatibility contracts. Final CI `34197531701`, live API/settings checks
+  at 16:23, and its own protected natural refresh at 16:47:58 passed after
+  deployment. The current SMS/Trunk VoWiFi-only switches were not silently
+  enabled or reset; operational details are in `docs/IMS_REGISTRATION_POLICY.md`.

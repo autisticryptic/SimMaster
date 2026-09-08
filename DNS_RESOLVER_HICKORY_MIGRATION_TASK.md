@@ -1,7 +1,7 @@
 # SimAdmin DNS 解析层 Hickory 重构任务
 
 创建日期：2026-09-02
-状态：beta2/0b97b4f 已通过最终 CI、部署、应用 HTTP DNS 及自身 VoWiFi 原通道自然续期实测；新 resolver 随机排序问题已修正。双注册及未启用的专用业务不标为通过
+状态：DNS 排序修正 0b97b4f 和后续 beta2/48e37fc 均通过各自最终 CI、部署、应用 HTTP DNS 及 VoWiFi 原通道自然续期实测；48e37fc 当前在设备运行。双注册及未启用的专用业务不标为通过
 本轮范围：替换 libc 系统解析、HTTP 和代理端点隐式解析，启用 system-config；专用 DNS 传输维持原行为
 
 > 2026-09-08 更新：详见 `docs/DNS_HICKORY.md` 和 `plan.md`。

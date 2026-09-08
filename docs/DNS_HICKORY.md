@@ -86,3 +86,10 @@ The temporary metadata capture was stopped without restarting the service.
 This verifies the deployed HTTP/system DNS path and the current single WLAN
 registration, not live dual registration, an unconfigured Trunk, or every
 carrier/proxy DNS path. Detailed evidence and untested cases remain in `plan.md`.
+
+The later policy/cost-guard candidate `48e37fc` passed final workflow
+`34197531701` and was deployed at 15:57. Its application HTTP DNS check passed
+again at 16:23 (0.49 seconds), and its own protected natural refresh passed at
+16:47:58. This candidate retains the same pure-Rust resolver and server-order
+correction; it does not claim that the separate carrier/proxy transports were
+rewritten or all physically exercised.
