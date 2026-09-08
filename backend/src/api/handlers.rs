@@ -4564,6 +4564,7 @@ pub(crate) async fn publish_sms_to_trunk(app: &AppState, sms: &crate::platform::
     };
     // Cost switches restrict outgoing SMS and voice, not receipt of an
     // already-delivered SMS. Both IMS paths retain the shared dedup pipeline.
+    let profile = app.config_manager.get_line_profile(line_id);
     line.trunk
         .operator_link()
         .send_sms_delivery(crate::services::trunk::operator::SmsDelivery {
