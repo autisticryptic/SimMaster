@@ -9,8 +9,8 @@ from release_version import resolve_version
 
 
 class ReleaseVersionTests(unittest.TestCase):
-    def test_explicit_beta1_and_beta2_on_push(self):
-        for version in ("1.1.4-beta1", "1.1.4-beta2", "1.1.4-beta.1", "1.1.4-rc.1"):
+    def test_explicit_beta_versions_on_push(self):
+        for version in ("1.1.4-beta1", "1.1.4-beta2", "1.1.4-beta3", "1.1.4-beta.1", "1.1.4-rc.1"):
             with self.subTest(version=version):
                 result = resolve_version(version)
                 self.assertEqual(result["version"], version)
@@ -73,6 +73,17 @@ class ReleaseVersionTests(unittest.TestCase):
         self.assertIn("make_latest: ${{ needs.prepare.outputs.make_latest }}", text)
         self.assertIn("target_commitish: ${{ github.sha }}", text)
         self.assertIn("tag_name: v${{ needs.prepare.outputs.version }}", text)
+
+    def test_development_candidates_cannot_publish_or_retag_on_push(self):
+        workflow = Path(__file__).resolve().parents[1] / "workflows/build-release.yml"
+        text = workflow.read_text(encoding="utf8")
+        before_release, release = text.split("\n  release:\n", 1)
+        self.assertNotIn("uses: softprops/action-gh-release@", before_release)
+        self.assertIn(
+            "if: github.event_name != 'push' || github.ref == 'refs/heads/master'",
+            release.split("    steps:", 1)[0],
+        )
+        self.assertIn("needs: [prepare, build, check-tests]", release)
 
     def test_cli_outputs_are_explicit_and_run_number_independent(self):
         script = Path(__file__).with_name("release_version.py").resolve()
