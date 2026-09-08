@@ -1,4 +1,4 @@
-# Pure-Rust system DNS migration (beta2 development)
+# Pure-Rust system DNS migration (beta2)
 
 ## Scope
 
@@ -19,6 +19,9 @@ TS.43's checked address pins and redirect validation are retained.
    Thus a hosts-pinned ePDG still works if resolv.conf is unavailable.
 3. Hickory reads the current system nameservers, search domains and options.
    A/AAAA are both requested; the overall network lookup budget is four seconds.
+   Fresh resolvers preserve the configured server order (`UserProvidedOrder`);
+   randomized initial RTT statistics are not evidence for preferring later
+   servers. System per-query timeouts and retry counts are not overwritten.
 4. Empty answers/errors are failures. Generic DNS does not inject public servers.
    The existing, explicit ePDG public-fallback policy remains at its call site.
 
@@ -42,7 +45,24 @@ and replacement contents, local A/AAAA replies, isolated resolver configurations
 NXDOMAIN, bounded timeout and system search/nameserver options. Existing ePDG,
 SOCKS5, Trunk, TS.43/SSRF and IMS refresh regressions are included in branch CI.
 
-At creation of this document the new DNS code is **not deployed or yet validated
-on 410**. The device remains on beta1/e55780a. DNS build/CI results and later
-beta2 field testing must be recorded in `plan.md`; do not infer live success
-from source changes or unit tests.
+## 410 field validation (2026-09-08)
+
+The beta2 candidate `2bb6099` passed the final release workflow
+`34169025117` and was deployed at 07:34 (Asia/Shanghai). Old line configuration,
+API compatibility and initial VoWiFi registration passed device checks.
+Its own first natural refresh is still pending; beta1's earlier result is not
+substituted for it.
+
+The live HTTP DNS check found a release-gating issue in that candidate:
+Hickory's default `QueryStatistics` initializes each new pool with random RTTs.
+On the device, requests selected later unreachable configured servers, instead
+of the reachable first server, and exhausted the four-second overall budget.
+At 08:03, captured A/AAAA requests went to configured servers 2 and 4; a
+separate numeric-address UDP diagnostic got an answer from server 0 in 21 ms.
+The diagnostic is not misreported as an application resolver test.
+
+The `UserProvidedOrder` correction and a six-server/fresh-resolver regression
+are now implemented on the refactor branch, **not yet built or deployed**.
+It does not change resolv.conf, inject public DNS, or restart IMS.
+Do not mark the live HTTP lookup successful until the corrected release is
+validated. Detailed build, deployment and refresh evidence belongs in `plan.md`.

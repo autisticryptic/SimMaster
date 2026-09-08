@@ -16,7 +16,7 @@ use std::{
 };
 
 use hickory_resolver::{
-    config::{LookupIpStrategy, ResolveHosts},
+    config::{LookupIpStrategy, ResolveHosts, ResolverOpts, ServerOrderingStrategy},
     proto::{
         op::Query,
         rr::{Name, RecordType},
@@ -74,11 +74,21 @@ pub async fn resolve_socket_addrs(host: &str, port: u16) -> io::Result<Vec<Socke
     }
     let mut builder = TokioResolver::builder_tokio()
         .map_err(|error| io::Error::other(format!("dns_system_config_failed:{error}")))?;
-    let options = builder.options_mut();
+    configure_system_options(builder.options_mut());
+    lookup(&builder.build(), host, port, LOOKUP_TIMEOUT).await
+}
+
+fn configure_system_options(options: &mut ResolverOpts) {
     options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
     options.use_hosts_file = ResolveHosts::Never; // already read above
     options.cache_size = 32; // bounded and owned by this lookup only
-    lookup(&builder.build(), host, port, LOOKUP_TIMEOUT).await
+
+    // A fresh Hickory pool seeds QueryStatistics with random RTTs. There is no
+    // learned history to justify that reordering here: unreachable later
+    // servers can then consume our whole budget before the configured first
+    // server is tried. Preserve system order without injecting/replacing DNS
+    // servers or changing the system's per-query timeout/retry options.
+    options.server_ordering_strategy = ServerOrderingStrategy::UserProvidedOrder;
 }
 
 async fn lookup(
@@ -135,11 +145,12 @@ pub(crate) fn addresses_from_hosts_file(contents: &str, host: &str, port: u16) -
 mod tests {
     use super::*;
     use hickory_resolver::{
-        config::{NameServerConfigGroup, ResolverConfig},
+        config::{NameServerConfig, NameServerConfigGroup, ResolverConfig},
         name_server::TokioConnectionProvider,
         proto::{
             op::{Message, MessageType, ResponseCode},
             rr::{RData, Record},
+            xfer::Protocol,
         },
     };
     use std::net::{Ipv4Addr, Ipv6Addr};
@@ -300,6 +311,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fresh_system_resolvers_do_not_randomly_skip_the_first_nameserver() {
+        let (preferred, task, queries) =
+            dns_server(Ipv4Addr::new(192, 0, 2, 9), ResponseCode::NoError).await;
+        // Mirror the field failure: six configured servers, only the first
+        // reachable. Keep the others bound but silent, not connection-refused.
+        let mut silent = Vec::new();
+        let mut servers = vec![NameServerConfig::new(preferred, Protocol::Udp)];
+        for _ in 0..5 {
+            let socket = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            servers.push(NameServerConfig::new(
+                socket.local_addr().unwrap(),
+                Protocol::Udp,
+            ));
+            silent.push(socket);
+        }
+        for _ in 0..4 {
+            let config = ResolverConfig::from_parts(None, vec![], servers.clone());
+            let mut builder =
+                TokioResolver::builder_with_config(config, TokioConnectionProvider::default());
+            let options = builder.options_mut();
+            // A blackholed first batch would outlast the overall lookup
+            // deadline, as it did on the device. No shortened fixture timeout
+            // should accidentally hide the server-ordering bug.
+            options.timeout = Duration::from_secs(5);
+            configure_system_options(options);
+            assert_eq!(
+                options.server_ordering_strategy,
+                ServerOrderingStrategy::UserProvidedOrder
+            );
+            let addresses = lookup(
+                &builder.build(),
+                "preferred.simadmin.test.",
+                443,
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                addresses,
+                vec![
+                    "192.0.2.9:443".parse().unwrap(),
+                    "[::1]:443".parse().unwrap()
+                ]
+            );
+        }
+        task.abort();
+        assert!(queries.load(Ordering::SeqCst) >= 8);
+        // Hickory races the first two by default; later servers must not be
+        // picked in place of that initial, system-ordered batch.
+        for socket in silent.iter().skip(1) {
+            assert_eq!(
+                socket.try_recv_from(&mut [0; 4096]).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn nxdomain_and_timeout_are_errors_not_empty_success_or_public_fallback() {
         let (server, task, queries) = dns_server(Ipv4Addr::LOCALHOST, ResponseCode::NXDomain).await;
         assert!(lookup(
@@ -335,10 +404,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn system_config_keeps_nameservers_search_and_options() {
-        let (config, options) = hickory_resolver::system_conf::parse_resolv_conf(
+        let (config, mut options) = hickory_resolver::system_conf::parse_resolv_conf(
             "nameserver 192.0.2.53\nnameserver 2001:db8::53\nsearch ims.test\noptions ndots:2 timeout:3 attempts:1\n",
         ).unwrap();
+        configure_system_options(&mut options);
         assert_eq!(config.name_servers().len(), 4); // UDP + TCP per server
+        assert_eq!(
+            config.name_servers()[0].socket_addr,
+            "192.0.2.53:53".parse().unwrap()
+        );
+        assert_eq!(
+            config.name_servers()[2].socket_addr,
+            "[2001:db8::53]:53".parse().unwrap()
+        );
         assert_eq!(
             config.search()[0].to_ascii().trim_end_matches('.'),
             "ims.test"
@@ -346,6 +424,10 @@ mod tests {
         assert_eq!(options.ndots, 2);
         assert_eq!(options.timeout, Duration::from_secs(3));
         assert_eq!(options.attempts, 1);
+        assert_eq!(
+            options.server_ordering_strategy,
+            ServerOrderingStrategy::UserProvidedOrder
+        );
         assert!(hickory_resolver::system_conf::parse_resolv_conf("nameserver invalid").is_err());
     }
 }
