@@ -7835,6 +7835,21 @@ mod tests {
             .unwrap_or_else(|| panic!("missing REGISTER variant: {label}"))
     }
 
+    /// Preserve the field-tested compatibility ladder for explicit/older
+    /// profiles that omit initial Authorization. New standards-derived LTE
+    /// profiles identify the AKA user in their first REGISTER instead.
+    fn legacy_derived_without_initial_authorization(mcc: &str, mnc: &str) -> CarrierProfile {
+        let mut profile =
+            *crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                mcc,
+                mnc,
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .expect("legacy LTE profile fixture");
+        profile.ims.register.initial_authorization = "none";
+        profile
+    }
+
     fn test_audio_offer(endpoint: SocketAddr, direction: MediaDirection) -> MediaOffer {
         let sdp = format!(
             "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\ns=call\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio {} RTP/AVP 0 101\r\na=rtpmap:0 PCMU/8000\r\na=rtpmap:101 telephone-event/8000\r\na=fmtp:101 0-16\r\na={}\r\n",
@@ -8383,19 +8398,102 @@ mod tests {
             .expect("derived LTE profile");
         let variants = register_variants(&profile);
 
-        // Four unauthenticated shapes plus the empty-AKA last resort. A derived
-        // profile sets `initial_authorization: "none"`, so it is exactly the case
-        // that needs that final candidate: without it a core which only
-        // challenges once an empty AKA is present rejects every shape and the leg
-        // dies without ever being challenged.
+        // IMS AKA identifies the private user before a challenge. Do not defer
+        // that standards requirement to a last resort behind a terminal 403.
+        assert_eq!(
+            variants[0].authorization,
+            CellularImsInitialAuthorization::UriFirstEmptyAka
+        );
+        assert!(!variants
+            .iter()
+            .any(|variant| variant.label == "ims_features_empty_aka_last_resort"));
+        assert!(variants
+            .iter()
+            .all(|variant| !variant.policy.include_visited_network));
+    }
+
+    #[test]
+    fn standard_derived_cellular_initial_register_identifies_aka_user() {
+        let profile =
+            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
+                "454",
+                "00",
+                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
+            )
+            .unwrap();
+        let variant = register_variants(profile)[0];
+        let identity = ImsIdentity {
+            private_user: format!("test-subscriber@{}", profile.ims.domain),
+            public_uri: format!("sip:test-subscriber@{}", profile.ims.domain),
+            contact_user: "test-subscriber".into(),
+            home_domain: profile.ims.domain.into(),
+            contact_user_phone: false,
+        };
+        let route = ImsRoute {
+            local_addr: "[2001:db8::2]:5060".parse().unwrap(),
+            pcscf_addr: "[2001:db8::1]:5060".parse().unwrap(),
+            transport: SipTransport::Udp,
+        };
+        let request_uri = sip::register_request_uri(profile, &route);
+        let authorization = variant
+            .authorization
+            .build(profile.ims.realm, &identity, &request_uri)
+            .expect("initial IMS AKA identity");
+        let security_client = variant
+            .security_client_offer
+            .build(offered_security(5060, 5062), profile);
+        let request = sip::build_register_from_profile_with_target_visited_and_access(
+            profile,
+            sip::RegisterTarget::from_profile(profile),
+            sip::RegisterPhase::Initial,
+            &identity,
+            &route,
+            &RequestIds::fresh(1),
+            profile.ims.register.expires_seconds,
+            Some(&authorization),
+            Some(&security_client),
+            None,
+            "urn:uuid:00000000-0000-4000-8000-000000000000",
+            variant.policy,
+            None,
+            None,
+        );
+        let authorization = sip::header_value(&request, "Authorization").unwrap();
+        for directive in [
+            format!("username=\"{}\"", identity.private_user),
+            format!("realm=\"{}\"", profile.ims.realm),
+            format!("uri=\"{request_uri}\""),
+            "nonce=\"\"".into(),
+            "response=\"\"".into(),
+        ] {
+            assert!(authorization.contains(&directive), "missing {directive}");
+        }
+        assert!(sip::header_value(&request, "Security-Client").is_some());
+        assert!(sip::header_value(&request, "Security-Verify").is_none());
+        let forbidden = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(
+                b"SIP/2.0 403 Forbidden\r\nWarning: 399 ims \"Authentication Failure\"\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            ),
+            auth_rounds: 0,
+        };
+        assert!(next_dynamic_register_variant(profile, variant, &forbidden).is_none());
+        assert!(!pre_authentication_variant_failure(&forbidden));
+    }
+
+    #[test]
+    fn legacy_omitted_authorization_profiles_keep_the_bounded_last_resort() {
+        let profile = legacy_derived_without_initial_authorization("460", "00");
+        let variants = register_variants(&profile);
         assert_eq!(variants.len(), 5);
+        assert_eq!(
+            variants[0].authorization,
+            CellularImsInitialAuthorization::None
+        );
         assert_eq!(
             variants.last().map(|variant| variant.label),
             Some("ims_features_empty_aka_last_resort")
         );
-        assert!(variants
-            .iter()
-            .all(|variant| !variant.policy.include_visited_network));
     }
 
     #[test]
@@ -9008,13 +9106,7 @@ Content-Length: 0\r\n\r\n";
     /// the 401-authenticated request must retain the complete security headers.
     #[test]
     fn maxis_50212_dynamic_register_upgrade_is_cumulative_end_to_end() {
-        let profile =
-            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
-                "502",
-                "12",
-                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
-            )
-            .expect("derived Maxis LTE profile");
+        let profile = &legacy_derived_without_initial_authorization("502", "12");
         let base = register_variants(profile)[0];
         assert_eq!(base.authorization, CellularImsInitialAuthorization::None);
         assert!(!base.policy.require_sec_agree);
@@ -9211,13 +9303,7 @@ Content-Length: 0\r\n\r\n";
 
     #[test]
     fn sec_agree_403_before_aka_gets_one_identity_hint_retry() {
-        let profile =
-            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
-                "255",
-                "03",
-                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
-            )
-            .expect("derived Kyivstar LTE profile");
+        let profile = &legacy_derived_without_initial_authorization("255", "03");
         let base = register_variants(profile)[0];
         let declared = base.requiring_sec_agree();
         let forbidden = RegisterFailure {
@@ -9245,13 +9331,7 @@ Content-Length: 0\r\n\r\n";
 
     #[test]
     fn derived_roaming_timeout_tries_visited_network_then_empty_aka() {
-        let profile =
-            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
-                "255",
-                "03",
-                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
-            )
-            .expect("derived Kyivstar LTE profile");
+        let profile = &legacy_derived_without_initial_authorization("255", "03");
         let timeout = RegisterFailure {
             error: ImsError::new("ims_register_initial_receive_failed"),
             response: None,
@@ -9293,13 +9373,7 @@ Content-Length: 0\r\n\r\n";
 
     #[test]
     fn derived_roaming_403_identifies_visited_network_before_empty_aka() {
-        let profile =
-            crate::connectivity::modems::ims::vowifi::profiles::derive_standard_3gpp_profile(
-                "255",
-                "03",
-                crate::connectivity::modems::ims::vowifi::profiles::Standard3gppAccess::LteEpc,
-            )
-            .expect("derived Kyivstar LTE profile");
+        let profile = &legacy_derived_without_initial_authorization("255", "03");
         let forbidden = RegisterFailure {
             error: ImsError::new("ims_register_initial_unexpected_status"),
             response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),

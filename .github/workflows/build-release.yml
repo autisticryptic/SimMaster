@@ -180,6 +180,7 @@ jobs:
             connectivity::modems::ims::effective_profile::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
+            connectivity::modems::ims::vowifi::profiles::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
             services::e911::ssrf::tests \
@@ -196,7 +197,7 @@ jobs:
             services::trunk::operator::tests \
             services::orchestrator::voice_router::tests \
             services::orchestrator::sms_router \
-            connectivity::modems::ims::cellular_ims::live::tests::incoming_cost_gate \
+            connectivity::modems::ims::cellular_ims::live::tests \
             connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
             platform::config::tests::sms_path_policy_default_order_is_vowifi_cellular_ims_cs \
             api::handlers::tests::coexistence \

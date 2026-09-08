@@ -62,13 +62,14 @@ jobs:
             connectivity::core::device_identity::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
+            connectivity::modems::ims::vowifi::profiles::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
             services::trunk::access_router::tests \
             services::trunk::operator::tests \
             services::orchestrator::voice_router::tests \
             services::orchestrator::sms_router \
-            connectivity::modems::ims::cellular_ims::live::tests::incoming_cost_gate \
+            connectivity::modems::ims::cellular_ims::live::tests \
             connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \

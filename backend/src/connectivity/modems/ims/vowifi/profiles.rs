@@ -1194,7 +1194,15 @@ pub fn derive_standard_3gpp_profile(
                 request_uri_policy: "home_domain",
                 include_pani_initial: true,
                 include_pani_authenticated: true,
-                initial_authorization: "none",
+                // TS 24.229 5.1.1.2.2: an IMS-AKA initial REGISTER identifies
+                // the private user even before a challenge, with empty nonce
+                // and response. Omitting it selects a different authentication
+                // procedure and can yield a pre-challenge Authentication Failure.
+                // Keep the separately authenticated WLAN/ePDG baseline unchanged.
+                initial_authorization: match access {
+                    Standard3gppAccess::LteEpc => "aka_empty",
+                    Standard3gppAccess::WifiEpdg => "none",
+                },
                 // Voice-capable fallback registrations advertise MMTEL/audio.
                 // A carrier-specific database profile can deliberately select
                 // an SMS-only Contact (as observed with some IPCC profiles).
@@ -1793,6 +1801,7 @@ mod tests {
         assert_ne!(lte.meta.profile_id, matched.profile.meta.profile_id);
         assert_eq!(lte.ims.register.access_network_info, "3GPP-E-UTRAN-FDD");
         assert_eq!(lte.ims.transport, "udp");
+        assert_eq!(lte.ims.register.initial_authorization, "aka_empty");
         assert_eq!(lte.ims.register.sec_agree_mode, "auto");
         assert!(!lte.ims.register.require_sec_agree_headers);
         assert!(!lte.ims.register.proxy_require_sec_agree_headers);
@@ -1817,6 +1826,7 @@ mod tests {
         );
         let wifi = derive_standard_3gpp_profile("502", "12", Standard3gppAccess::WifiEpdg)
             .expect("derive standard Wi-Fi profile");
+        assert_eq!(wifi.ims.register.initial_authorization, "none");
         assert!(wifi.ims.register.enable_cellular_network_info);
         assert_eq!(wifi.ims.register.access_network_info, "IEEE-802.11");
         assert_eq!(
