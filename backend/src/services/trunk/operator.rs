@@ -30,6 +30,7 @@ pub struct OperatorLink {
 struct OperatorLinkInner {
     ready: AtomicBool,
     video_enabled: AtomicBool,
+    incoming_call_allowed: AtomicBool,
     trunk_local_ip: RwLock<Option<IpAddr>>,
     incoming_mode: RwLock<TrunkIncomingMode>,
     ip_connect_mode: RwLock<TrunkIpConnectMode>,
@@ -145,6 +146,7 @@ impl Default for OperatorLink {
             inner: Arc::new(OperatorLinkInner {
                 ready: AtomicBool::new(false),
                 video_enabled: AtomicBool::new(false),
+                incoming_call_allowed: AtomicBool::new(true),
                 trunk_local_ip: RwLock::new(None),
                 incoming_mode: RwLock::new(TrunkIncomingMode::default()),
                 ip_connect_mode: RwLock::new(TrunkIpConnectMode::default()),
@@ -159,6 +161,22 @@ impl Default for OperatorLink {
 }
 
 impl OperatorLink {
+    /// Read by the IMS adapter BEFORE it can auto-answer the network leg.
+    /// Registration/SMS readiness is deliberately unaffected by this gate.
+    pub fn set_incoming_call_allowed(&self, allowed: bool) {
+        self.inner
+            .incoming_call_allowed
+            .store(allowed, Ordering::SeqCst);
+    }
+
+    pub fn incoming_call_allowed(&self) -> bool {
+        self.inner.incoming_call_allowed.load(Ordering::SeqCst)
+    }
+
+    pub fn may_auto_answer_incoming(&self) -> bool {
+        self.incoming_call_allowed() && self.incoming_mode() == TrunkIncomingMode::BoundImmediate
+    }
+
     pub fn set_ready(&self, ready: bool) {
         self.inner.ready.store(ready, Ordering::SeqCst);
     }
@@ -304,6 +322,26 @@ impl OperatorLink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn incoming_cost_gate_prevents_immediate_answer_without_disabling_registration() {
+        let link = OperatorLink::default();
+        let _commands = link.subscribe_commands();
+        link.set_ready(true);
+        link.set_incoming_mode(TrunkIncomingMode::BoundImmediate);
+        assert!(link.may_auto_answer_incoming());
+        link.set_incoming_call_allowed(false);
+        assert!(!link.incoming_call_allowed());
+        assert!(!link.may_auto_answer_incoming());
+        assert!(
+            link.is_available(),
+            "cost policy must not deregister the IMS access"
+        );
+        link.set_incoming_call_allowed(true);
+        assert!(link.may_auto_answer_incoming());
+        link.set_incoming_mode(TrunkIncomingMode::BoundPending);
+        assert!(!link.may_auto_answer_incoming());
+    }
 
     #[test]
     fn readiness_requires_a_live_command_consumer() {

@@ -1041,6 +1041,54 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn rejected_second_flow_selects_single_wifi_without_revoking_the_primary_early() {
+        let line = "outbound-refused-second-fallback";
+        let coordinator = ims_registration_coordinator::for_line(line);
+        let mut cellular = OutboundFlow::default();
+        cellular.configure(line, ImsAccess::Cellular, INSTANCE, true);
+        register_flow(&mut cellular, "first-cellular", 1, 3600);
+        acknowledge_probe(&mut cellular, "192.0.2.1:5060");
+        let primary = cellular.lease.as_ref().unwrap().clone();
+        coordinator
+            .publish(decide(ImsAccessInputs {
+                cellular_enabled: true,
+                wlan_enabled: true,
+                cellular_registered: true,
+                wlan_available: true,
+                concurrent_support: coordinator.concurrent_support(),
+                ..Default::default()
+            }))
+            .await;
+        coordinator.reject_outbound(ImsAccess::Wlan);
+        let decision = decide(ImsAccessInputs {
+            cellular_enabled: true,
+            wlan_enabled: true,
+            cellular_registered: true,
+            wlan_available: coordinator
+                .registration_candidate_ready(ImsAccess::Wlan, ImsAccessPreference::Concurrent),
+            concurrent_support: coordinator.concurrent_support(),
+            multiple_registration_blocked: coordinator.multiple_registration_blocked(),
+            ..Default::default()
+        });
+        assert!(decision.wlan_registers && !decision.cellular_registers);
+        assert!(primary.proven(), "selecting a candidate is not teardown");
+        coordinator.defer_switch_for_call();
+        assert!(coordinator.admit(ImsAccess::Cellular).await.is_ok());
+        assert!(coordinator.admit(ImsAccess::Wlan).await.is_err());
+        // The real transition drains/unregisters before this publish; simulate
+        // its retirement, never send a competing legacy REGISTER.
+        cellular.disable();
+        coordinator.publish(decision).await;
+        assert!(coordinator.admit(ImsAccess::Wlan).await.is_ok());
+        let mut wlan = OutboundFlow::default();
+        wlan.configure(line, ImsAccess::Wlan, INSTANCE, true);
+        let single = wlan.prepare(&register_request("single-wlan", 1)).unwrap();
+        assert!(!has_option(&single, "Supported", "outbound"));
+        assert!(contact_parameter_for_test(&single, "reg-id").is_none());
+        assert!(!primary.live());
+    }
+
+    #[tokio::test]
     async fn pending_keepalive_never_demotes_existing_dual_bindings_or_blocks_refresh() {
         let line = "outbound-pending-health";
         let coordinator = ims_registration_coordinator::for_line(line);

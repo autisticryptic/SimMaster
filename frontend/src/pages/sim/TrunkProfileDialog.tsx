@@ -123,10 +123,10 @@ export default function TrunkProfileDialog({ open, line, enableOnOpen = false, o
           />
           <FormControlLabel
             control={<Switch checked={draft.vowifi_only} onChange={(_, enabled) => update('vowifi_only', enabled)} />}
-            label="仅允许 VoWiFi 处理 trunk 电话和短信"
+            label="Trunk 仅通过 VoWiFi 接打电话、发送短信"
           />
           <Typography variant="caption" color="text.secondary">
-            开启后，Asterisk 发起的电话和短信只使用 VoWiFi；VoWiFi 不可用时不会回退到 VoLTE 或 CS，运营商来电也不会经此 trunk 送出。
+            开启后，电话和短信发送均不会回退到 4G/5G IMS 或 CS；蜂窝 IMS 来电在接通前拒绝，不能自动改道到 VoWiFi。接收短信不限制通道，仍保留去重。已发出的短信无法撤回，已有通话不会自动迁移。
           </Typography>
 
           <Box display="grid" gridTemplateColumns={{ xs: '1fr', sm: '1fr 1fr' }} gap={2}>

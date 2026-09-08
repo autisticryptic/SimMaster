@@ -22,5 +22,5 @@
     "noFallthroughCasesInSwitch": true,
     "noUncheckedSideEffectImports": true
   },
-  "include": ["e2e", "playwright.config.ts"]
+  "include": ["e2e", "tests", "playwright.config.ts"]
 }

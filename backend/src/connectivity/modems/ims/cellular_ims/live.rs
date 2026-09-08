@@ -50,9 +50,7 @@ use crate::{
         profiles::CarrierProfile,
     },
     hardware::{cellular::modem_manager::ModemBinding, devices::transport::ImsBearerTransport},
-    platform::config::{
-        CellularImsIpFamily, ImsProfileCandidate, TrunkIncomingMode, TrunkIpConnectMode,
-    },
+    platform::config::{CellularImsIpFamily, ImsProfileCandidate, TrunkIpConnectMode},
     platform::db::{Database, SmsMessage},
     services::trunk::{
         bridge::{
@@ -5379,6 +5377,10 @@ async fn begin_incoming_operator_call(
     frame: &[u8],
     ims_call_id: String,
 ) -> Result<bool, CellularImsError> {
+    if !live.operator.incoming_call_allowed() {
+        send_incoming_rejection(session, runtime, frame, 480).await?;
+        return Ok(true);
+    }
     let Some(trunk_local_ip) = live.operator.trunk_local_ip() else {
         send_incoming_rejection(session, runtime, frame, 480).await?;
         return Ok(true);
@@ -5518,7 +5520,13 @@ async fn begin_incoming_operator_call(
         .send_sip(&trying)
         .await
         .map_err(map_channel_error)?;
-    let operator_answered = live.operator.incoming_mode() == TrunkIncomingMode::BoundImmediate;
+    // Media preparation and 100 Trying can await; recheck the cost gate before
+    // any 200 OK, not after forwarding an already-answered call to the router.
+    if !live.operator.incoming_call_allowed() {
+        send_incoming_rejection(session, runtime, frame, 480).await?;
+        return Ok(true);
+    }
+    let operator_answered = live.operator.may_auto_answer_incoming();
     if operator_answered {
         let contact = ims_contact(&session.identity, &session.channel.route());
         let answer = relay_media_sdp(&media_offer, operator_local, operator_video_local);
@@ -7964,6 +7972,40 @@ mod tests {
             mwi_subscription: None,
         });
         (live, Arc::new(CellularImsRuntime::new()), pcscf)
+    }
+
+    #[tokio::test]
+    async fn incoming_cost_gate_rejects_before_immediate_answer() {
+        let (live, runtime, pcscf) = test_voice_session().await;
+        let _commands = live.operator.subscribe_commands();
+        live.operator.set_ready(true);
+        live.operator
+            .set_trunk_local_ip(Some("127.0.0.1".parse().unwrap()));
+        live.operator
+            .set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        live.operator.set_incoming_call_allowed(false);
+        let invite = b"INVITE sip:callee@ims.test SIP/2.0\r\nVia: SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKcost\r\nFrom: <sip:caller@ims.test>;tag=remote\r\nTo: <sip:callee@ims.test>\r\nCall-ID: incoming-cost\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        let mut guard = live.session.lock().await;
+        let session = guard.as_mut().unwrap();
+        assert!(begin_incoming_operator_call(
+            &live,
+            &runtime,
+            session,
+            invite,
+            "incoming-cost".into()
+        )
+        .await
+        .unwrap());
+        let mut frame = [0; 4096];
+        let (length, _) = tokio::time::timeout(Duration::from_secs(1), pcscf.recv_from(&mut frame))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(frame[..length].starts_with(b"SIP/2.0 480"));
+        assert!(
+            session.voice_calls.is_empty(),
+            "no answered dialog or media relay"
+        );
     }
 
     #[test]

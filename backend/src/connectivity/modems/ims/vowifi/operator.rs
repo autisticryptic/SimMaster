@@ -38,7 +38,7 @@ use crate::{
         },
         modems::ims::cellular_ims::sip,
     },
-    platform::config::{TrunkIncomingMode, TrunkIpConnectMode},
+    platform::config::TrunkIpConnectMode,
     services::{
         supplementary::SupplementaryRuntime,
         trunk::{
@@ -1878,6 +1878,9 @@ async fn begin_incoming_call(
     frame: &[u8],
     ims_call_id: String,
 ) -> Result<(), String> {
+    if !link.incoming_call_allowed() {
+        return reject_request(session, frame, 480).await;
+    }
     let Some(trunk_local_ip) = link.trunk_local_ip() else {
         return reject_request(session, frame, 480).await;
     };
@@ -1987,7 +1990,10 @@ async fn begin_incoming_call(
         .send_sip(&trying)
         .await
         .map_err(|error| error.code().to_string())?;
-    let operator_answered = link.incoming_mode() == TrunkIncomingMode::BoundImmediate;
+    if !link.incoming_call_allowed() {
+        return reject_request(session, frame, 480).await;
+    }
+    let operator_answered = link.may_auto_answer_incoming();
     if operator_answered {
         let answer = relay_media_sdp(&offer, operator_local, operator_video_local);
         let accepted = sip::build_response_for_access(
@@ -4258,6 +4264,35 @@ mod tests {
 
         drop(command_tx);
         assert_eq!(task.await.unwrap(), Ok(()));
+    }
+
+    #[tokio::test]
+    async fn incoming_cost_gate_rejects_before_immediate_answer() {
+        let (client, mut server) = tcp_pair().await;
+        let line_id = "operator-test-cost-gate";
+        let link = operator_link_for_line(line_id);
+        link.set_trunk_local_ip(Some("127.0.0.1".parse().unwrap()));
+        link.set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        link.set_incoming_call_allowed(false);
+        let route_context = context(line_id, &client, &server);
+        install_registered_channel(
+            route_context.clone(),
+            SipChannel::Tcp(EpdgSipChannel::new(
+                client,
+                Vec::new(),
+                route_context.route,
+                route_context.security_verify.clone(),
+            )),
+        )
+        .await;
+        let invite = b"INVITE sip:callee@ims.test SIP/2.0\r\nVia: SIP/2.0/TCP 127.0.0.1:5060;branch=z9hG4bKcost\r\nFrom: <sip:caller@ims.test>;tag=remote\r\nTo: <sip:callee@ims.test>\r\nCall-ID: incoming-cost\r\nCSeq: 1 INVITE\r\nContent-Length: 0\r\n\r\n";
+        server.write_all(invite).await.unwrap();
+        let response = read_frame(&mut server, &mut Vec::new()).await;
+        assert!(
+            response.starts_with(b"SIP/2.0 480"),
+            "must reject before SDP/media/200 OK"
+        );
+        disconnect_line(line_id).await;
     }
 
     #[tokio::test]

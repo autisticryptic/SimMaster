@@ -58,6 +58,12 @@ jobs:
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
+            services::trunk::access_router::tests \
+            services::trunk::operator::tests \
+            services::orchestrator::voice_router::tests \
+            services::orchestrator::sms_router \
+            connectivity::modems::ims::cellular_ims::live::tests::incoming_cost_gate \
+            connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \
             connectivity::core::outbound::tests \
@@ -82,8 +88,13 @@ jobs:
         run: |
           set -o pipefail
           if ! dbus-run-session -- sh -c '
+            set -eu
             export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
-            cargo test --locked cellular_ims_route_aliases_keep_auth_and_response_contract -- --test-threads=1
+            for filter in cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings; do
+              cargo test --locked "$filter" -- --list > beta-api-test-list.txt
+              grep -q ": test$" beta-api-test-list.txt
+              cargo test --locked "$filter" -- --test-threads=1
+            done
           ' 2>&1 | tee beta-api-tests.log; then
             python3 ../.github/scripts/ci_failure_excerpt.py beta-api-tests.log "Cellular IMS API compatibility failed"
             exit 1
@@ -112,3 +123,4 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm run build
           pnpm run type-check
+          pnpm run test:unit

@@ -39,6 +39,7 @@ import CellularImsProfileDialog from './CellularImsProfileDialog'
 import { LineActivityLog, LineTrunkDetails, LineCellularImsDetails, LineVowifiDetails } from './LineRuntimeDetails'
 import { standardDerivedProfileMessage, cellularImsErrorMessage, cellularImsErrorStatusLabel } from './cellularImsErrorFormat'
 import { formatBytes } from '../Dashboard/utils'
+import ImsRegistrationSettings from './ImsRegistrationSettings'
 
 const cellularImsStageStatusLabels: Record<string, string> = {
   disabled: 'IMS 未连接',
@@ -1035,6 +1036,9 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       {basicInfoForLine && <Grid size={12}>{basicInfoForLine(line, overviewControls)}</Grid>}
                     </Grid>}
 
+                    {(!workbench || workbenchTab === 'ims') && (
+                      <ImsRegistrationSettings key={line.modem.line_id} lineId={line.modem.line_id} disabled={savingKey !== null} />
+                    )}
                     {(!workbench || workbenchTab === 'ims') && line.profile.volte_connection_enabled && !line.runtime.registered && (recovery || displayError) && (
                       <Alert severity={line.runtime.recovery_state === 'exhausted' ? 'error' : 'warning'} sx={{ mt: 2, py: 0.25 }}>
                         {fallbackMessage && (

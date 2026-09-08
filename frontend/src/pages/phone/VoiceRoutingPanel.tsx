@@ -145,7 +145,7 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
 
       <Card><CardContent>
         <Typography variant="h6" gutterBottom>语音线路优先级</Typography>
-        <Typography variant="body2" color="text.secondary" mb={1}>此策略独立于短信路径；启用的线路按顺序作为呼叫候选。</Typography>
+        <Typography variant="body2" color="text.secondary" mb={1}>此策略独立于短信路径。两路同时可用时固定优先 VoWiFi，再考虑已启用的 4G/5G IMS；Trunk 的“仅 VoWiFi”限制优先于任何备用顺序，开启后失败即停止，不走蜂窝回退。</Typography>
         <List disablePadding>
           {voicePath.priority.map((layer, index) => (
             <ListItem key={layer.kind} divider secondaryAction={(

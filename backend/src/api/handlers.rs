@@ -4445,17 +4445,53 @@ pub(crate) async fn send_sms_on_line(
     phone_number: &str,
     content: &str,
 ) -> Result<serde_json::Value, String> {
-    send_sms_on_line_with_vowifi_only(app, line_id, phone_number, content, false).await
+    send_sms_on_line_with_origin(
+        app,
+        line_id,
+        phone_number,
+        content,
+        crate::services::orchestrator::sms_router::SmsSendOrigin::Local,
+    )
+    .await
 }
 
-/// Trunk-facing SMS send path. When `vowifi_only` is set, only the VoWiFi IMS
-/// transport is attempted and no VoLTE/CS fallback is allowed.
-pub(crate) async fn send_sms_on_line_with_vowifi_only(
+/// Keep the request's origin, not just a stale snapshot of its cost switch.
+pub(crate) async fn send_sms_on_line_from_trunk(
     app: &AppState,
     line_id: &str,
     phone_number: &str,
     content: &str,
-    vowifi_only: bool,
+) -> Result<serde_json::Value, String> {
+    send_sms_on_line_with_origin(
+        app,
+        line_id,
+        phone_number,
+        content,
+        crate::services::orchestrator::sms_router::SmsSendOrigin::Trunk,
+    )
+    .await
+}
+
+fn check_sms_send_cost_guard(
+    app: &AppState,
+    line_id: &str,
+    path: AccessPathKind,
+    guard: crate::services::orchestrator::sms_router::SmsSendGuard,
+) -> Result<(), String> {
+    let profile = app.config_manager.get_line_profile(line_id);
+    if guard.allows(path, &profile.sms_path, profile.trunk.vowifi_only) {
+        Ok(())
+    } else {
+        Err("sms_vowifi_only_required".to_string())
+    }
+}
+
+async fn send_sms_on_line_with_origin(
+    app: &AppState,
+    line_id: &str,
+    phone_number: &str,
+    content: &str,
+    origin: crate::services::orchestrator::sms_router::SmsSendOrigin,
 ) -> Result<serde_json::Value, String> {
     let payload = SendSmsRequest {
         phone_number: phone_number.to_string(),
@@ -4467,20 +4503,29 @@ pub(crate) async fn send_sms_on_line_with_vowifi_only(
         Ok(scope) => scope,
         Err(reason) => return Err(reason),
     };
-    let policy = app.config_manager.get_line_sms_path_policy(scope.line_id());
+    let profile = app.config_manager.get_line_profile(scope.line_id());
+    let policy = &profile.sms_path;
+    let guard = crate::services::orchestrator::sms_router::SmsSendGuard::new(
+        policy,
+        profile.trunk.vowifi_only,
+        origin,
+    );
     let mut failures = Vec::new();
-    let paths: Vec<AccessPathKind> = if vowifi_only {
-        vec![AccessPathKind::Vowifi]
-    } else {
-        policy.enabled_layers().collect()
-    };
+    let paths: Vec<AccessPathKind> = policy
+        .enabled_layers()
+        .filter(|path| guard.allows(*path, policy, profile.trunk.vowifi_only))
+        .collect();
     for path in paths {
+        if let Err(reason) = check_sms_send_cost_guard(app, &line_id, path, guard) {
+            failures.push(reason);
+            break;
+        }
         let result = match path {
             AccessPathKind::Vowifi => send_sms_over_vowifi_path(&app, &scope, &payload).await,
             AccessPathKind::CellularIms => {
-                send_sms_over_cellular_ims_path(&app, &line_id, &payload).await
+                send_sms_over_cellular_ims_path(&app, &line_id, &payload, guard).await
             }
-            AccessPathKind::Cs => send_sms_over_cs_path(&app, &line_id, &payload).await,
+            AccessPathKind::Cs => send_sms_over_cs_path(&app, &line_id, &payload, guard).await,
         };
         match result {
             Ok(data) => {
@@ -4490,6 +4535,13 @@ pub(crate) async fn send_sms_on_line_with_vowifi_only(
                 failures.push(format!("{}:{reason}", path.as_str()));
                 warn!(path = path.as_str(), reason = %reason, "SMS send path failed");
             }
+        }
+    }
+    if let Err(reason) =
+        check_sms_send_cost_guard(app, &line_id, AccessPathKind::CellularIms, guard)
+    {
+        if !failures.contains(&reason) {
+            failures.push(reason);
         }
     }
     let detail = if failures.is_empty() {
@@ -4510,13 +4562,8 @@ pub(crate) async fn publish_sms_to_trunk(app: &AppState, sms: &crate::platform::
     let Some(line) = app.line_registry.get(line_id).await else {
         return;
     };
-    let profile = app.config_manager.get_line_profile(line_id);
-    // Trunk 的 "仅允许 VoWiFi" 门控对入向短信同样生效：开关开启时，只有
-    // VoWiFi（vowifi_ims）路径收到的短信才推送给 trunk；VoLTE/CS 短信
-    // 仍留在本地 Web 短信记录中，不进入 Asterisk/Linphone。
-    if profile.trunk.vowifi_only && sms.transport != "vowifi_ims" {
-        return;
-    }
+    // Cost switches restrict outgoing SMS and voice, not receipt of an
+    // already-delivered SMS. Both IMS paths retain the shared dedup pipeline.
     line.trunk
         .operator_link()
         .send_sms_delivery(crate::services::trunk::operator::SmsDelivery {
@@ -4618,7 +4665,9 @@ async fn send_sms_over_cellular_ims_path(
     app: &AppState,
     line_id: &str,
     payload: &SendSmsRequest,
+    guard: crate::services::orchestrator::sms_router::SmsSendGuard,
 ) -> Result<serde_json::Value, String> {
+    check_sms_send_cost_guard(app, line_id, AccessPathKind::CellularIms, guard)?;
     let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
     let line = app
         .line_registry
@@ -4663,6 +4712,9 @@ async fn send_sms_over_cellular_ims_path(
         get_sim_info_for_modem_with_cache(&app.dbus_conn, &binding.modem_path, Some(&app.database))
             .await
             .map_err(|error| error.to_string())?;
+    // Registration/SIM reads can take time. Do not use an earlier permissive
+    // snapshot if the user enabled VoWiFi-only during that preparation.
+    check_sms_send_cost_guard(app, line_id, AccessPathKind::CellularIms, guard)?;
     let result = crate::connectivity::modems::ims::cellular_ims::live::send_live_sms_for_line(
         &line.cellular_ims_live,
         &line.cellular_ims,
@@ -4698,6 +4750,7 @@ async fn send_sms_over_cs_path(
     app: &AppState,
     line_id: &str,
     payload: &SendSmsRequest,
+    guard: crate::services::orchestrator::sms_router::SmsSendGuard,
 ) -> Result<serde_json::Value, String> {
     let line = app
         .line_registry
@@ -4711,6 +4764,7 @@ async fn send_sms_over_cs_path(
     if !binding_has_baseband(&binding) || binding.modem_path.trim().is_empty() {
         return Err("line_has_no_baseband".to_string());
     }
+    check_sms_send_cost_guard(app, line_id, AccessPathKind::Cs, guard)?;
     let path = send_sms_via_modem(
         &app.dbus_conn,
         &binding.modem_path,
@@ -5591,6 +5645,11 @@ pub(crate) async fn start_call_for_automation(
     requested_line_id: &str,
     phone_number: &str,
 ) -> Result<(String, String, &'static str), String> {
+    let initially_vowifi_only = app
+        .config_manager
+        .get_line_profile(requested_line_id.trim())
+        .trunk
+        .vowifi_only;
     match start_routed_ims_voice_call(app, requested_line_id, phone_number, false).await {
         Ok(result) => return Ok(result),
         Err(ims_error) => {
@@ -5598,12 +5657,31 @@ pub(crate) async fn start_call_for_automation(
             if modem_path.trim().is_empty() {
                 return Err(ims_error);
             }
+            if initially_vowifi_only
+                || app
+                    .config_manager
+                    .get_line_profile(&line_id)
+                    .trunk
+                    .vowifi_only
+            {
+                return Err(format!("{ims_error};voice_vowifi_only_required"));
+            }
             let airplane =
                 modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path)
                     .await
                     .map_err(|_| "airplane_mode_state_unavailable".to_string())?;
             if airplane.enabled {
                 return Err(format!("{ims_error};cs_blocked_by_airplane_mode"));
+            }
+            // The same restriction covers automation's native-modem escape
+            // path; an unavailable IMS router must not turn into a paid CS call.
+            if app
+                .config_manager
+                .get_line_profile(&line_id)
+                .trunk
+                .vowifi_only
+            {
+                return Err(format!("{ims_error};voice_vowifi_only_required"));
             }
             let path = make_call_on_modem(&app.dbus_conn, &modem_path, phone_number)
                 .await
@@ -5933,6 +6011,13 @@ async fn answer_call_on_line(
             body,
         })
         .map_err(|_| "ims_operator_channel_unavailable".to_string())
+    } else if app
+        .config_manager
+        .get_line_profile(&line_id)
+        .trunk
+        .vowifi_only
+    {
+        Err("voice_vowifi_only_required".to_string())
     } else {
         answer_call_on_modem(&app.dbus_conn, &modem_path, &path)
             .await
@@ -5984,6 +6069,15 @@ async fn build_ims_answer_body(
         .call_access(call_id)
         .await
         .ok_or_else(|| "ims_call_access_unavailable".to_string())?;
+    if access != AccessPathKind::Vowifi
+        && app
+            .config_manager
+            .get_line_profile(line_id)
+            .trunk
+            .vowifi_only
+    {
+        return Err("voice_vowifi_only_required".to_string());
+    }
     let local_ip = std::net::Ipv4Addr::LOCALHOST;
     let addr_type = crate::connectivity::core::voice::SdpAddrType::Ip4;
     let context = match access {
@@ -8926,6 +9020,7 @@ async fn line_ims_access_decision_assuming(
         device_identity_spoofed: line_device_identity_spoofed(app, line_id).await,
         preference: profile.ims_access_preference,
         concurrent_support: line.ims_registration.concurrent_support(),
+        multiple_registration_blocked: line.ims_registration.multiple_registration_blocked(),
     })
 }
 
@@ -11069,7 +11164,13 @@ pub async fn get_ims_access_preference_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
-    if resolve_control_line(&app, &line_id).await.is_none() {
+    if resolve_control_line(&app, &line_id).await.is_none()
+        && !app
+            .config_manager
+            .get_line_profiles()
+            .iter()
+            .any(|profile| profile.line_id == line_id)
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("line_not_found")),
@@ -11091,12 +11192,19 @@ pub async fn set_ims_access_preference_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<ImsAccessPreferencePayload>,
 ) -> (StatusCode, Json<ApiResponse<ImsAccessPreferencePayload>>) {
-    let Some(line) = resolve_control_line(&app, &line_id).await else {
+    let line = resolve_control_line(&app, &line_id).await;
+    if line.is_none()
+        && !app
+            .config_manager
+            .get_line_profiles()
+            .iter()
+            .any(|profile| profile.line_id == line_id)
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(ApiResponse::error("line_not_found")),
         );
-    };
+    }
     match app
         .config_manager
         .set_line_ims_access_preference(&line_id, payload.preference)
@@ -11104,7 +11212,9 @@ pub async fn set_ims_access_preference_handler(
         Ok(preference) => {
             // The transition is asynchronous and call-aware. Both enabled
             // intents remain unchanged; status reports desired vs applied.
-            spawn_line_ims_access_reconcile(&app, line);
+            if let Some(line) = line {
+                spawn_line_ims_access_reconcile(&app, line);
+            }
             (
                 StatusCode::OK,
                 Json(ApiResponse::success_with_message(

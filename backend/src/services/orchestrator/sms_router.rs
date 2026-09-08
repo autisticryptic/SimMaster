@@ -16,6 +16,86 @@
 
 use crate::platform::config::{AccessPathKind, SmsPathPolicy};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmsSendOrigin {
+    Local,
+    Trunk,
+}
+
+/// A cost restriction is not a preference. Capture a restriction already in
+/// force at dispatch, and also honor one enabled before a later fallback.
+#[derive(Debug, Clone, Copy)]
+pub struct SmsSendGuard {
+    origin: SmsSendOrigin,
+    initially_vowifi_only: bool,
+}
+
+#[cfg(test)]
+mod cost_guard_tests {
+    use super::*;
+
+    #[test]
+    fn local_and_trunk_sms_honor_initial_and_new_cost_restrictions() {
+        for origin in [SmsSendOrigin::Local, SmsSendOrigin::Trunk] {
+            for initial_sms in [false, true] {
+                for initial_trunk in [false, true] {
+                    for current_sms in [false, true] {
+                        for current_trunk in [false, true] {
+                            let initial = SmsPathPolicy {
+                                force_vowifi_send: initial_sms,
+                                ..Default::default()
+                            };
+                            let current = SmsPathPolicy {
+                                force_vowifi_send: current_sms,
+                                ..Default::default()
+                            };
+                            let guard = SmsSendGuard::new(&initial, initial_trunk, origin);
+                            let only_wifi = initial_sms
+                                || current_sms
+                                || (origin == SmsSendOrigin::Trunk
+                                    && (initial_trunk || current_trunk));
+                            assert!(guard.allows(AccessPathKind::Vowifi, &current, current_trunk));
+                            for other in [AccessPathKind::CellularIms, AccessPathKind::Cs] {
+                                assert_eq!(
+                                    guard.allows(other, &current, current_trunk),
+                                    !only_wifi
+                                );
+                            }
+                            assert_eq!(
+                                current.enabled_ims_layers().collect::<Vec<_>>(),
+                                vec![AccessPathKind::Vowifi, AccessPathKind::CellularIms],
+                                "receive paths are independent of send cost restrictions"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl SmsSendGuard {
+    pub fn new(policy: &SmsPathPolicy, trunk_vowifi_only: bool, origin: SmsSendOrigin) -> Self {
+        Self {
+            origin,
+            initially_vowifi_only: policy.force_vowifi_send
+                || (origin == SmsSendOrigin::Trunk && trunk_vowifi_only),
+        }
+    }
+
+    pub fn allows(
+        &self,
+        kind: AccessPathKind,
+        current_policy: &SmsPathPolicy,
+        current_trunk_vowifi_only: bool,
+    ) -> bool {
+        kind == AccessPathKind::Vowifi
+            || !(self.initially_vowifi_only
+                || current_policy.force_vowifi_send
+                || (self.origin == SmsSendOrigin::Trunk && current_trunk_vowifi_only))
+    }
+}
+
 /// Why a leg was skipped or an attempt was not made.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipReason {

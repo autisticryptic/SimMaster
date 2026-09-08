@@ -38,6 +38,7 @@ pub struct ImsRegistrationPolicyStatus {
     pub requested: ImsAccessPreference,
     pub effective: &'static str,
     pub concurrent_support: ConcurrentRegistrationSupport,
+    pub multiple_registration_blocked: bool,
     pub desired: ImsAccessDecision,
     pub applied: ImsAccessDecision,
     pub switch_deferred_for_call: bool,
@@ -147,7 +148,8 @@ impl ImsRegistrationCoordinator {
         if !existing
             && decision.cellular_registers
             && decision.wlan_registers
-            && self.concurrent_support() != ConcurrentRegistrationSupport::Negotiated
+            && (self.concurrent_support() != ConcurrentRegistrationSupport::Negotiated
+                || self.multiple_registration_blocked())
         {
             return Err("ims_access_registration_parked");
         }
@@ -189,6 +191,14 @@ impl ImsRegistrationCoordinator {
     pub fn concurrent_support(&self) -> ConcurrentRegistrationSupport {
         let observation = self.observation.read().unwrap_or_else(|e| e.into_inner());
         support_from_observation(&observation)
+    }
+
+    /// A refusal of the second leg cannot invalidate the primary, but it must
+    /// stop an AUTO policy from treating that primary's capability as proof the
+    /// entire access pair can coexist. Reconsider after the existing cooldown.
+    pub fn multiple_registration_blocked(&self) -> bool {
+        let observation = self.observation.read().unwrap_or_else(|e| e.into_inner());
+        multiple_registration_blocked(&observation)
     }
 
     /// Remember explicit peer refusal without invalidating the healthy primary.
@@ -316,10 +326,15 @@ impl ImsRegistrationCoordinator {
     ) -> bool {
         if preference == ImsAccessPreference::Concurrent
             && self.concurrent_support() == ConcurrentRegistrationSupport::Negotiated
+            && !self.multiple_registration_blocked()
         {
             self.additional_flow_ready(access)
         } else {
-            self.flow_creation_ready(access)
+            // This selects a SINGLE-registration replacement candidate, not
+            // permission to register while its opposite is live. The policy
+            // transition drains/unregisters the old leg before admit(). A
+            // failed outbound offer may still work as a legacy single flow.
+            self.recovery_ready(access)
         }
     }
 
@@ -354,6 +369,7 @@ impl ImsRegistrationCoordinator {
             requested,
             effective: observation.applied.effective_mode(),
             concurrent_support: support_from_observation(&observation),
+            multiple_registration_blocked: multiple_registration_blocked(&observation),
             desired,
             applied: observation.applied,
             switch_deferred_for_call: observation.switch_deferred_for_call,
@@ -373,6 +389,14 @@ fn flow_index(access: ImsAccess) -> usize {
         ImsAccess::Cellular => 0,
         ImsAccess::Wlan => 1,
     }
+}
+
+fn multiple_registration_blocked(observation: &Observation) -> bool {
+    let now = Instant::now();
+    observation
+        .outbound_rejected_until
+        .iter()
+        .any(|until| until.is_some_and(|until| now < until))
 }
 
 fn support_from_observation(o: &Observation) -> ConcurrentRegistrationSupport {
@@ -423,6 +447,29 @@ pub fn for_line(line_id: &str) -> Arc<ImsRegistrationCoordinator> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_additional_flow_is_not_a_permanent_operator_blacklist() {
+        let coordinator = ImsRegistrationCoordinator::default();
+        assert!(!coordinator.multiple_registration_blocked());
+        coordinator.reject_outbound(ImsAccess::Wlan);
+        assert!(coordinator.multiple_registration_blocked());
+        assert!(!coordinator.may_offer_outbound(ImsAccess::Wlan));
+        assert!(coordinator
+            .registration_candidate_ready(ImsAccess::Wlan, ImsAccessPreference::Concurrent));
+        coordinator
+            .observation
+            .write()
+            .unwrap()
+            .outbound_rejected_until[1] = Some(Instant::now() - Duration::from_secs(1));
+        assert!(!coordinator.multiple_registration_blocked());
+        assert!(coordinator.may_offer_outbound(ImsAccess::Wlan));
+        coordinator.flow_failed(ImsAccess::Wlan);
+        assert!(
+            !coordinator.multiple_registration_blocked(),
+            "transport loss is not a refusal"
+        );
+    }
 
     #[tokio::test]
     async fn fails_closed_until_owner_reconciles_and_parks_only_opposite_access() {

@@ -1054,18 +1054,16 @@ fn spawn_trunk_sms_bridge(app: AppState) {
                             maybe = requests.recv() => {
                                 match maybe {
                                     Ok(request) => {
-                                        let profile = app_task.config_manager.get_line_profile(&attach_id);
                                         let target = if request.to.trim().is_empty() {
                                             request.from.clone()
                                         } else {
                                             request.to.clone()
                                         };
-                                        if let Err(error) = crate::api::handlers::send_sms_on_line_with_vowifi_only(
+                                        if let Err(error) = crate::api::handlers::send_sms_on_line_from_trunk(
                                             &app_task,
                                             &attach_id,
                                             &target,
                                             &request.body,
-                                            profile.trunk.vowifi_only,
                                         )
                                         .await
                                         {
@@ -2508,6 +2506,77 @@ mod http_router_tests {
                 "{method} {canonical} differs from {legacy}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn ims_registration_preference_api_preserves_cost_and_enable_settings() {
+        let state = build_test_router()
+            .await
+            .expect("run with a private DBUS_SYSTEM_BUS_ADDRESS; no hardware is required");
+        let served = serve(state.router.clone()).await;
+        let line_id = format!("line-{:032x}", 0x1a5a110du64);
+        let path = format!("/api/modem/lines/{line_id}/ims/access-preference");
+        state
+            .config_manager
+            .reconcile_line_profiles(&[line_id.clone()])
+            .unwrap();
+        let mut sms = state.config_manager.get_line_sms_path_policy(&line_id);
+        sms.force_vowifi_send = true;
+        state
+            .config_manager
+            .set_line_sms_path_policy(&line_id, sms)
+            .unwrap();
+        let before = serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap();
+        let (status, _, _) = send(&served, reqwest::Method::GET, &path).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _, _) = post_json(
+            &served,
+            &path,
+            serde_json::json!({"preference":"concurrent"}),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let cookie = authenticate(&served).await;
+        for preference in ["wlan_preferred", "concurrent"] {
+            let (status, _, body) = post_json(
+                &served,
+                &path,
+                serde_json::json!({"preference":preference}),
+                Some(&cookie),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["data"]["preference"], preference);
+            let (status, body) = get_with_cookie(&served, &path, &cookie).await;
+            assert_eq!(status, StatusCode::OK);
+            let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(response["data"]["preference"], preference);
+            let mut expected = before.clone();
+            expected["ims_access_preference"] = preference.into();
+            assert_eq!(
+                serde_json::to_value(state.config_manager.get_line_profile(&line_id)).unwrap(),
+                expected,
+                "registration mode must not rewrite connection, SMS, Trunk or voice policy"
+            );
+        }
+        let (status, _, _) = post_json(
+            &served,
+            &path,
+            serde_json::json!({"preference":"force_dual"}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        let unknown = format!(
+            "/api/modem/lines/line-{:032x}/ims/access-preference",
+            0xdeadbeefu64
+        );
+        assert_eq!(
+            get_with_cookie(&served, &unknown, &cookie).await.0,
+            StatusCode::NOT_FOUND
+        );
     }
 
     /// A partial PUT body is refused at the boundary.

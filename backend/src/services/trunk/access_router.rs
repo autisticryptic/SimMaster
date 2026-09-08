@@ -169,6 +169,7 @@ impl VoiceAccessRouter {
 
         let (requests, request_rx) = mpsc::channel(16);
         let trunk_vowifi_only = Arc::new(AtomicBool::new(false));
+        sync_incoming_permissions(&current_policy(&policy), &backends, false);
 
         let task = tokio::runtime::Handle::try_current().ok().map(|handle| {
             let command_rx = trunk.subscribe_commands();
@@ -213,10 +214,16 @@ impl VoiceAccessRouter {
             .policy
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = policy.normalized();
+        sync_incoming_permissions(
+            &current_policy(&self.policy),
+            &self.backends,
+            self.trunk_vowifi_only.load(Ordering::SeqCst),
+        );
     }
 
     pub fn set_trunk_vowifi_only(&self, enabled: bool) {
         self.trunk_vowifi_only.store(enabled, Ordering::SeqCst);
+        sync_incoming_permissions(&current_policy(&self.policy), &self.backends, enabled);
     }
 
     pub fn set_backend_video_enabled(&self, kind: AccessPathKind, enabled: bool) {
@@ -488,6 +495,7 @@ fn refresh_router_state(
     vowifi_only: bool,
 ) {
     let policy = current_policy(policy);
+    sync_incoming_permissions(&policy, backends, vowifi_only);
     let candidates = route_plan_for_trunk(&policy, backends, false, vowifi_only);
     let owned_consumer = routes.values().any(|route| {
         backend(backends, route.owner).is_some_and(|backend| backend.link.has_command_consumer())
@@ -530,6 +538,18 @@ fn refresh_router_state(
             .saturating_add(diagnostics.rtp_to_asterisk_bytes);
     }
     trunk.replace_relay_diagnostics(aggregate);
+}
+
+fn sync_incoming_permissions(
+    policy: &VoicePathPolicy,
+    backends: &[AccessBackend],
+    vowifi_only: bool,
+) {
+    for backend in backends {
+        let allowed = (!vowifi_only || backend.kind == AccessPathKind::Vowifi)
+            && policy.enabled_layers().any(|kind| kind == backend.kind);
+        backend.link.set_incoming_call_allowed(allowed);
+    }
 }
 
 fn backend(backends: &[AccessBackend], kind: AccessPathKind) -> Option<&AccessBackend> {
@@ -597,6 +617,25 @@ fn route_command(
         }
         return;
     };
+    // A setting can change after an incoming call started ringing. Never
+    // answer it on cellular merely because its route was created earlier.
+    if vowifi_only && owner != AccessPathKind::Vowifi {
+        if matches!(&command, OperatorCommand::AcceptCall { .. }) {
+            reject_incoming_collision(owner, &call_id, backends);
+            routes.remove(&call_id);
+            trunk.send_event(OperatorEvent::Unavailable { call_id });
+            return;
+        }
+        if matches!(&command, OperatorCommand::TransferCall { .. }) {
+            trunk.send_event(OperatorEvent::TransferResponse {
+                call_id,
+                status: 403,
+            });
+            return;
+        }
+        // Hangup and other control of a call already established before the
+        // setting changed remain pinned to their real owner.
+    }
     let sent = backend(backends, owner)
         .is_some_and(|selected| selected.link.send_command(command.clone()).is_ok());
     if !sent {
@@ -670,6 +709,21 @@ fn route_event(
             let Some(start) = start else {
                 continue;
             };
+            let video_required =
+                matches!(&start, OperatorCommand::StartCall { offer, .. } if offer.video.is_some());
+            // Remaining candidates are only a snapshot. Recheck restrictions
+            // BEFORE dispatching a new leg, including a newly enabled
+            // VoWiFi-only cost guard and changes to the media/voice policy.
+            if !route_plan_for_trunk(
+                &current_policy(policy),
+                backends,
+                video_required,
+                vowifi_only,
+            )
+            .contains(&next)
+            {
+                continue;
+            }
             let Some(selected) = backend(backends, next) else {
                 continue;
             };
@@ -838,6 +892,147 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn enabling_wifi_only_during_dial_blocks_cached_fallback_for_all_entry_points() {
+        for local_api in [false, true] {
+            let wlan = OperatorLink::default();
+            let cellular = OperatorLink::default();
+            let mut wlan_commands = wlan.subscribe_commands();
+            let mut cellular_commands = cellular.subscribe_commands();
+            wlan.set_ready(true);
+            cellular.set_ready(true);
+            let router = VoiceAccessRouter::new(
+                // Even a legacy reversed order may not prefer roaming.
+                policy(&[AccessPathKind::CellularIms, AccessPathKind::Vowifi]),
+                vec![
+                    (AccessPathKind::CellularIms, cellular),
+                    (AccessPathKind::Vowifi, wlan.clone()),
+                ],
+            );
+            let trunk = router.operator_link();
+            let mut events = trunk.subscribe_events();
+            wait_available(&trunk).await;
+            if local_api {
+                assert_eq!(
+                    router
+                        .start_call(call_plan("cost-fallback"))
+                        .await
+                        .unwrap()
+                        .access,
+                    AccessPathKind::Vowifi
+                );
+            } else {
+                trunk.send_command(start("cost-fallback")).unwrap();
+            }
+            assert!(matches!(
+                recv_command(&mut wlan_commands).await,
+                OperatorCommand::StartCall { .. }
+            ));
+            assert!(matches!(
+                recv_event(&mut events).await,
+                OperatorEvent::Started { .. }
+            ));
+            router.set_trunk_vowifi_only(true);
+            wlan.send_event(OperatorEvent::Unavailable {
+                call_id: "cost-fallback".into(),
+            });
+            assert!(matches!(
+                recv_event(&mut events).await,
+                OperatorEvent::Unavailable { .. }
+            ));
+            assert!(matches!(
+                cellular_commands.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn wifi_only_blocks_immediate_cellular_answer_and_new_outgoing_calls() {
+        let wlan = OperatorLink::default();
+        let cellular = OperatorLink::default();
+        let _wlan_commands = wlan.subscribe_commands();
+        let mut cellular_commands = cellular.subscribe_commands();
+        wlan.set_ready(false);
+        cellular.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![
+                (AccessPathKind::Vowifi, wlan),
+                (AccessPathKind::CellularIms, cellular.clone()),
+            ],
+        );
+        router
+            .operator_link()
+            .set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        cellular.set_incoming_mode(crate::platform::config::TrunkIncomingMode::BoundImmediate);
+        router.set_trunk_vowifi_only(true);
+        assert!(!cellular.incoming_call_allowed());
+        assert!(!cellular.may_auto_answer_incoming());
+        assert!(
+            cellular.is_available(),
+            "registration must remain usable for SMS receipt"
+        );
+        assert_eq!(
+            router
+                .start_call(call_plan("cost-no-wifi"))
+                .await
+                .unwrap_err(),
+            VoiceCallStartError::NoEligibleImsAccess
+        );
+        let mut events = router.operator_link().subscribe_events();
+        cellular.send_event(OperatorEvent::Incoming {
+            call_id: "cost-incoming".into(),
+            caller: "test-caller".into(),
+            body: Vec::new(),
+        });
+        assert!(matches!(recv_command(&mut cellular_commands).await,
+            OperatorCommand::RejectCall { call_id, status: 480 } if call_id == "cost-incoming"));
+        assert!(matches!(
+            events.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn enabling_wifi_only_before_answer_rejects_a_previously_ringing_cellular_call() {
+        let cellular = OperatorLink::default();
+        let mut commands = cellular.subscribe_commands();
+        cellular.set_ready(true);
+        let router = VoiceAccessRouter::new(
+            VoicePathPolicy::default(),
+            vec![(AccessPathKind::CellularIms, cellular.clone())],
+        );
+        let trunk = router.operator_link();
+        let mut events = trunk.subscribe_events();
+        cellular.send_event(OperatorEvent::Incoming {
+            call_id: "cost-ringing".into(),
+            caller: "test-caller".into(),
+            body: Vec::new(),
+        });
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Incoming { .. }
+        ));
+        router.set_trunk_vowifi_only(true);
+        trunk
+            .send_command(OperatorCommand::AcceptCall {
+                call_id: "cost-ringing".into(),
+                body: Vec::new(),
+            })
+            .unwrap();
+        assert!(matches!(recv_command(&mut commands).await,
+            OperatorCommand::RejectCall { call_id, status: 480 } if call_id == "cost-ringing"));
+        assert!(matches!(
+            recv_event(&mut events).await,
+            OperatorEvent::Unavailable { .. }
+        ));
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
     async fn recv_command(
         receiver: &mut tokio::sync::broadcast::Receiver<OperatorCommand>,
     ) -> OperatorCommand {
@@ -918,7 +1113,10 @@ mod tests {
         vowifi.set_ready(true);
         cellular_ims.set_ready(true);
         let router = VoiceAccessRouter::new(
-            policy(&[AccessPathKind::CellularIms, AccessPathKind::Vowifi]),
+            policy_layers(&[
+                (AccessPathKind::CellularIms, true),
+                (AccessPathKind::Vowifi, false),
+            ]),
             vec![
                 (AccessPathKind::Vowifi, vowifi),
                 (AccessPathKind::CellularIms, cellular_ims),

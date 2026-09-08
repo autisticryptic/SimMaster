@@ -98,6 +98,9 @@ pub struct ImsAccessInputs {
     pub device_identity_spoofed: bool,
     pub preference: ImsAccessPreference,
     pub concurrent_support: ConcurrentRegistrationSupport,
+    /// An additional flow was rejected or failed negotiation validation.
+    /// This does not revoke an existing primary's negotiated capability/lease.
+    pub multiple_registration_blocked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -185,8 +188,12 @@ pub fn decide(inputs: ImsAccessInputs) -> ImsAccessDecision {
     match inputs.preference {
         ImsAccessPreference::Concurrent => match (cellular, wlan) {
             (true, true) => {
-                if inputs.concurrent_support == ConcurrentRegistrationSupport::Negotiated {
+                if inputs.concurrent_support == ConcurrentRegistrationSupport::Negotiated
+                    && !inputs.multiple_registration_blocked
+                {
                     ImsAccessDecision::both("ims_access_concurrent_negotiated")
+                } else if inputs.multiple_registration_blocked {
+                    ImsAccessDecision::wlan_only("ims_access_single_wlan_multi_flow_blocked")
                 } else {
                     // Concurrency is a capability request, NOT cellular-first
                     // preference. The coordinator defers this switch in calls;
@@ -371,6 +378,30 @@ mod tests {
     }
 
     #[test]
+    fn single_mode_and_multi_flow_refusal_keep_wlan_then_cellular_priority() {
+        let mut inputs = both(ImsAccessPreference::WlanPreferred);
+        inputs.concurrent_support = ConcurrentRegistrationSupport::Negotiated;
+        assert_eq!(decide(inputs).effective_mode(), "single_registration");
+        assert!(decide(inputs).wlan_registers);
+        inputs.preference = ImsAccessPreference::Concurrent;
+        inputs.cellular_registered = true;
+        inputs.multiple_registration_blocked = true;
+        let fallback = decide(inputs);
+        assert!(fallback.wlan_registers && !fallback.cellular_registers);
+        assert_eq!(
+            fallback.legs_to_release(true, false),
+            vec![ImsAccess::Cellular]
+        );
+        inputs.wlan_available = false;
+        let keep_primary = decide(inputs);
+        assert!(keep_primary.cellular_registers && !keep_primary.wlan_registers);
+        assert!(keep_primary.legs_to_release(true, false).is_empty());
+        inputs.cellular_registered = false;
+        inputs.cellular_available = false;
+        assert_eq!(decide(inputs).effective_mode(), "none");
+    }
+
+    #[test]
     fn resolves_legacy_unconfirmed_dual_registration_without_disabling_intents() {
         let mut i = both(ImsAccessPreference::Concurrent);
         i.cellular_registered = true;
@@ -453,6 +484,7 @@ mod tests {
                     ConcurrentRegistrationSupport::NotNegotiated
                 },
                 preference: ImsAccessPreference::Concurrent,
+                multiple_registration_blocked: false,
             });
             assert!(!(d.cellular_registers && d.wlan_registers), "{bits}");
         }

@@ -78,6 +78,14 @@ pub fn plan_voice_route(
         }
     }
 
+    // When both IMS legs can actually carry the call, prefer VoWiFi even if a
+    // legacy saved order put cellular first. Never enable a disabled leg, and
+    // never change the owner of an incoming/already-established dialog.
+    candidates.sort_by_key(|kind| match kind {
+        AccessPathKind::Vowifi => 0,
+        AccessPathKind::CellularIms => 1,
+        AccessPathKind::Cs => 2,
+    });
     VoiceRoutePlan {
         gateway_mode: policy.gateway_mode,
         candidates,
@@ -89,6 +97,32 @@ pub fn plan_voice_route(
 mod tests {
     use super::*;
     use crate::platform::config::PathLayerConfig;
+
+    #[test]
+    fn dual_ready_calls_prefer_wifi_without_rewriting_saved_policy_or_enabling_it() {
+        let mut policy = VoicePathPolicy::default();
+        policy.priority.reverse();
+        let before = policy.clone();
+        let states = [
+            state(AccessPathKind::CellularIms, true, true, true),
+            state(AccessPathKind::Vowifi, true, true, true),
+        ];
+        assert_eq!(
+            plan_voice_route(&policy, &states).candidates,
+            vec![AccessPathKind::Vowifi, AccessPathKind::CellularIms]
+        );
+        assert_eq!(policy, before);
+        policy
+            .priority
+            .iter_mut()
+            .find(|layer| layer.kind == AccessPathKind::Vowifi)
+            .unwrap()
+            .enabled = false;
+        assert_eq!(
+            plan_voice_route(&policy, &states).candidates,
+            vec![AccessPathKind::CellularIms]
+        );
+    }
 
     fn state(
         kind: AccessPathKind,

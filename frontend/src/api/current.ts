@@ -56,6 +56,8 @@ import type {
   LineVowifiConfig,
   ImsOverrideResponse,
   ImsSubsystemState,
+  ImsAccessPreference,
+  ImsAccessPreferencePayload,
   SimImsOverride,
   TrunkProfileResponse,
   CellularImsLineControlResponse,
@@ -106,6 +108,7 @@ import type {
   E911Operation,
   E911Status,
 } from './types'
+import { humanizeCostPolicyError } from '../policies/imsRegistration'
 
 type SmsListResponse = {
   messages: SmsMessage[]
@@ -142,7 +145,7 @@ function throwIfApiEnvelopeError(payload: unknown): void {
   const status = (payload as { status: unknown }).status
   const message = (payload as { message?: unknown }).message
   if (status === 'error' && typeof message === 'string') {
-    throw new Error(message)
+    throw new Error(humanizeCostPolicyError(message))
   }
 }
 
@@ -190,7 +193,7 @@ async function request<T>(
     } catch {
       // Fall back to the HTTP status below.
     }
-    if (apiMessage) throw new Error(apiMessage)
+    if (apiMessage) throw new Error(humanizeCostPolicyError(apiMessage))
     throw new Error(httpStatusMessage(response.status))
   }
 
@@ -675,6 +678,17 @@ class SimAdminCurrentAPI {
     return request<ApiResponse<ImsSubsystemState>>(
       modemLinePath(lineId, '/ims/status'),
     )
+  }
+
+  async getImsAccessPreference(lineId: string) {
+    return request<ApiResponse<ImsAccessPreferencePayload>>(modemLinePath(lineId, '/ims/access-preference'))
+  }
+
+  async setImsAccessPreference(lineId: string, preference: ImsAccessPreference) {
+    return request<ApiResponse<ImsAccessPreferencePayload>>(modemLinePath(lineId, '/ims/access-preference'), {
+      method: 'POST',
+      body: JSON.stringify({ preference }),
+    })
   }
 
   async getImsSupplementary(lineId: string) {

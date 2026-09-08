@@ -1315,6 +1315,10 @@ export interface VoiceAccessSelection {
 
 export type ImsAccessPreference = 'concurrent' | 'wlan_preferred' | 'cellular_preferred'
 
+export interface ImsAccessPreferencePayload {
+  preference: ImsAccessPreference
+}
+
 export interface ImsAccessDecision {
   cellular_registers: boolean
   wlan_registers: boolean
@@ -1325,6 +1329,7 @@ export interface ImsRegistrationPolicyStatus {
   requested: ImsAccessPreference
   effective: 'none' | 'single_registration' | 'concurrent'
   concurrent_support: 'client_incomplete' | 'not_negotiated' | 'not_supported' | 'negotiated'
+  multiple_registration_blocked?: boolean
   desired: ImsAccessDecision
   applied: ImsAccessDecision
   switch_deferred_for_call: boolean
