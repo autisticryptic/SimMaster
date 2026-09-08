@@ -1,4 +1,4 @@
-import type { ImsAccessPreference, ImsRegistrationPolicyStatus } from '../api/contracts'
+import type { ImsAccessPreference, ImsRegistrationPolicyStatus, VoicePathLayerConfig } from '../api/contracts'
 
 export type SelectableRegistrationPreference = 'concurrent' | 'wlan_preferred'
 
@@ -48,4 +48,9 @@ export function humanizeCostPolicyError(message: string) {
     return '仅通过 VoWiFi 通话的限制已生效。当前不能通过 VoWiFi 呼出，已阻止蜂窝或 CS 回退。'
   }
   return message
+}
+
+/** Display the effective fixed preference without rewriting stored enable intent. */
+export function orderedVoicePaths(layers: readonly VoicePathLayerConfig[]) {
+  return [...layers].sort((a, b) => Number(a.kind !== 'vowifi') - Number(b.kind !== 'vowifi'))
 }

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   humanizeCostPolicyError,
   isSelectableRegistrationPreference,
+  orderedVoicePaths,
   registrationModeOptions,
   registrationPreferenceLabel,
   registrationSupportText,
@@ -36,4 +37,12 @@ await test('cost restrictions produce clear Chinese errors without hiding unrela
   assert.match(humanizeCostPolicyError('send failed;sms_vowifi_only_required'), /未回退/)
   assert.match(humanizeCostPolicyError('ims unavailable;voice_vowifi_only_required'), /阻止蜂窝/)
   assert.equal(humanizeCostPolicyError('unrelated_error'), 'unrelated_error')
+})
+
+await test('voice controls display effective WiFi priority without changing enabled flags or storage order', () => {
+  const stored = [{ kind: 'volte', enabled: true }, { kind: 'vowifi', enabled: false }] as const
+  const displayed = orderedVoicePaths(stored)
+  assert.deepEqual(displayed, [{ kind: 'vowifi', enabled: false }, { kind: 'volte', enabled: true }])
+  assert.equal(stored[0].kind, 'volte')
+  assert.equal(stored[1].enabled, false)
 })

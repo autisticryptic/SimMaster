@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert, Box, Button, Card, CardContent, CircularProgress, FormControl,
-  IconButton, InputLabel, List, ListItem, ListItemText,
-  MenuItem, Select, Stack, Switch, TextField, Tooltip, Typography,
+  InputLabel, List, ListItem, ListItemText,
+  MenuItem, Select, Stack, Switch, TextField, Typography,
 } from '@mui/material'
-import { ArrowDownward, ArrowUpward } from '@mui/icons-material'
+import { orderedVoicePaths } from '../../policies/imsRegistration'
 import {
   api,
   type VilteStatusResponse,
@@ -88,15 +88,6 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
     return null
   }, [vilte])
 
-  const movePath = (index: number, delta: -1 | 1) => {
-    if (!voicePath) return
-    const target = index + delta
-    if (target < 0 || target >= voicePath.priority.length) return
-    const priority = [...voicePath.priority]
-    ;[priority[index], priority[target]] = [priority[target], priority[index]]
-    setVoicePath({ ...voicePath, priority })
-  }
-
   const savePath = async () => {
     if (!voicePath) return
     setSaving(true)
@@ -144,15 +135,13 @@ export default function VoiceRoutingPanel({ lineId }: Props) {
       </Alert>
 
       <Card><CardContent>
-        <Typography variant="h6" gutterBottom>语音线路优先级</Typography>
+        <Typography variant="h6" gutterBottom>呼出路径（VoWiFi 优先）</Typography>
         <Typography variant="body2" color="text.secondary" mb={1}>此策略独立于短信路径。两路同时可用时固定优先 VoWiFi，再考虑已启用的 4G/5G IMS；Trunk 的“仅 VoWiFi”限制优先于任何备用顺序，开启后失败即停止，不走蜂窝回退。</Typography>
         <List disablePadding>
-          {voicePath.priority.map((layer, index) => (
+          {orderedVoicePaths(voicePath.priority).map((layer, index) => (
             <ListItem key={layer.kind} divider secondaryAction={(
               <Box>
-                <Tooltip title="上移"><span><IconButton disabled={index === 0} onClick={() => movePath(index, -1)}><ArrowUpward /></IconButton></span></Tooltip>
-                <Tooltip title="下移"><span><IconButton disabled={index === voicePath.priority.length - 1} onClick={() => movePath(index, 1)}><ArrowDownward /></IconButton></span></Tooltip>
-                <Switch checked={layer.enabled} onChange={(_, enabled) => setVoicePath({ ...voicePath, priority: voicePath.priority.map((item, i) => i === index ? { ...item, enabled } : item) })} />
+                <Switch checked={layer.enabled} onChange={(_, enabled) => setVoicePath({ ...voicePath, priority: voicePath.priority.map((item) => item.kind === layer.kind ? { ...item, enabled } : item) })} />
               </Box>
             )}>
               <ListItemText primary={`${index + 1}. ${pathLabels[layer.kind]}`} secondary="网关模式；实际接通由对应 IMS 运行时和 Trunk 驱动" />
