@@ -1,8 +1,8 @@
 ﻿# SimAdmin 开发计划与验收进度
 
-> 最后更新：2026-09-08 07:01（Asia/Shanghai）
+> 最后更新：2026-09-08 09:43（Asia/Shanghai，最新实测记录）
 > 用途：持续更新的开发进度报告、发布门禁和后续核对依据。
-> 状态：beta1 / e55780a 已发布、部署并通过原通道自然续期；当前网络两路均未接受 outbound，实机双注册不标为完成。现进入阶段 B，在独立分支 refactor/1.1.4-beta2 开发纯 Rust DNS 与命名迁移；不改动设备或 beta1 发布。朋友的手机卡问题仍暂缓。
+> 状态：beta2 修正版 0b97b4f 已通过最终 CI、发布并部署；命名、旧配置/API 兼容、应用 HTTP DNS 及本候选 VoWiFi 原通道自然续期实测通过。临时观察已停止，主服务和配置未变。当前网络双注册仍未通过，不能将单注册回退当作双注册修复完成；未启用/未实测的业务仍单列。朋友的手机卡问题仍暂缓。
 
 ## 1. 目标与不可变约束
 
@@ -23,7 +23,7 @@
 - 日志只进行游标增量采集，筛出关键事件后本地留存并分析；不反复查询完整 journal。
 - “两路开关开启”不等于双注册成功；不能用修改状态标志或绕过网络协商伪造并发成功。
 
-## 2. 接手时已核实的基线
+## 2. 接手时已核实的基线（历史快照，不是当前运行版本）
 
 | 项目 | 当前事实 | 验证级别 |
 | --- | --- | --- |
@@ -45,8 +45,8 @@
 - [x] 核对工作区、版本差异、最近提交及已有交接资料。
 - [x] 建立本计划；明确真实验收标准及未完成项。
 - [x] 再读设备版本、服务、无通话状态、两路注册策略：19:46 设备仍为 1.1.7/0930fd9、active、无通话，仅 VoWiFi 注册。日志继续沿用增量游标。
-- [x] 本地 VERSION 已改为 1.1.4-beta1，不递增正式版；尚未提交或发布。
-- [x] 已本地修正 push/dispatch 的 beta pre-release / 非 latest 规则；12 个 Python 回归测试通过，包含 workflow 接线检查。尚未执行本 commit 的 Actions。
+- [x] 已纠正旧 VERSION 并完成 1.1.4-beta1 发布；未递增正式版。后续阶段 B 使用单独的 1.1.4-beta2。
+- [x] push/dispatch 的 beta pre-release / 非 latest 规则已提交并通过最终 Actions；最初 12 项 Python 回归随 DNS/CI 边界检查扩充为 17 项。
 - [x] 已读取远端 release 清单，仍有 v1.1.7 / v1.1.8 正式发布；未删除或改写历史发布。
 
 ### A2. 代码与实机验证
@@ -67,8 +67,8 @@
 ### A3. beta1 收尾门禁
 
 - [x] 本阶段提交、CI run、release/tag、包 SHA256、设备 SHA256、备份路径已记录；最终候选为 e55780a。
-- [ ] 发布说明逐项标明“修复完成”的已验证范围；未完成/网络限制另列，不承诺未经验证的双注册。
-- [ ] beta1 验收记录完整后进入阶段 B；未通过的项目不得悄悄勾选。
+- [x] beta1 发布说明已逐项区分客户端修正、单路自然续期和当前网络的双注册限制，不承诺未经验证的双注册。
+- [x] beta1 已验证范围及未通过的双注册项分别记录后进入阶段 B；未通过项保留，阶段切换不代表双注册目标已完成。
 
 > 为实机取得二进制而生成的 beta 候选包可先标“待实机验收”；只有实测通过才能更新为“修复完成”。这不等于提前宣称修好了问题。
 
@@ -77,28 +77,32 @@
 ### B1. IMS/VoLTE 语义与兼容迁移
 
 - [x] 初步清点：42 个后端文件约 2084 处标识符引用、12 个前端文件约 160 处；7 组旧 HTTP 路由，以及持久化配置、活动日志和历史数据库字段需分别兼容，不能全局字符串替换。
-- [ ] 用 `cellular_ims` 表示蜂窝（4G/5G）IMS 接入/注册；真正的 LTE 语音功能可保留 VoLTE 语义，不能机械全局替换。
+- [x] 用 `cellular_ims` 表示蜂窝（4G/5G）IMS 接入/注册；真正的 LTE 语音功能保留 VoLTE 语义，未机械全局替换。
 - [x] 新增 canonical API、类型、运行时字段/函数并更新项目内调用；模块已移动到 cellular_ims，前端代码标识符同步。旧端点保留，序列化旧键保留作为兼容编码，新拼写作为读取别名；不强制改写既有数据库/JSON。
 - [x] 本批代码回归已验证旧/新别名读取、兼容写回、前端及历史传输标识保持；保留 `"volte"` / `"volte_ims"`，拒绝重复别名。实机依然单独验收，不把回归当作全部业务实测。
-- [ ] 不改变业务能力判断和 VoWiFi → 蜂窝 IMS → CS 优先级，不用单个注册开关等同短信/语音能力。
+- [x] 源码和回归保持业务能力判断及 VoWiFi → 蜂窝 IMS → CS 优先级；实机原开关/策略未变化。未拨打真实电话或发送短信，不将 readiness 状态当作业务实测。
 
 ### B2. Hickory DNS
 
 - [x] 查阅官方 crate 0.25.2 的 resolver/hosts/system_conf 源码；与 reqwest 0.12.28 所需 0.25 系列一致，启用 tokio/system-config；锁文件只新增所需依赖，未编译后端。
 - [x] 清点普通系统解析、HTTP 和 SOCKS5 代理端点的隐式解析；运营商指定 DNS、NAPTR、SOCKS5 UDP DNS 已是 Rust 专用路径，暂不改动其出站选择。
-- [x] 已实现共用纯 Rust 解析接口、HTTP builder；数字 IP 不做 I/O，hosts 先于系统配置，4 秒解析上限，空结果和错误不冒充成功；待 Actions 验证。
-- [ ] 尊重系统 resolv.conf/hosts，以及 UE 网络 namespace/运营商下发 DNS 的上下文；不得用公共 DNS 替代 IMS 私有解析。
+- [x] 已实现共用纯 Rust 解析接口、HTTP builder；数字 IP 不做 I/O，hosts 先于系统配置，4 秒解析上限，空结果和错误不冒充成功；2bb6099 最终 Actions 通过。
+- [x] 普通系统解析尊重当前 resolv.conf/hosts，保留调用方网络上下文；专用运营商 DNS/UE 出口未替换为公共 DNS。配置隔离有 CI 回归；实机普通 HTTP 已确认查询系统首台服务器，未声称多线路/所有专用 DNS 路径均已实测。
 - [x] 每次解析读取当前 hosts/system-config、创建有界 resolver，不共享跨 runtime/namespace 的 DNS socket/cache；保留调用方原来的网络上下文，不借迁移偷偷改变出口。
 - [x] 生产 HTTP builder 统一使用新解析器，同时开启 reqwest hickory-dns 防止遗漏路径退回 libc；TS.43 的地址固定覆盖仍保留。
-- [x] 新增本地 A/AAAA、数字地址、hosts 别名/更新、配置隔离、NXDOMAIN、超时、resolv.conf/search 测试；新分支 CI 不发布任何版本，结果待运行。
+- [x] A/AAAA、数字地址、hosts 别名/更新、配置隔离、NXDOMAIN、超时、resolv.conf/search 测试通过最终 Actions。
+- [x] 修正默认 QueryStatistics 对新 resolver 随机重排服务器的问题；UserProvidedOrder 及六服务器回归 0b97b4f 已通过独立 CI、最终双架构发布和实机应用 HTTP 查询。没有改设备 resolv.conf 或插入公共 DNS。
 
 ### B3. beta2 验证与发布门禁
 
-- [ ] 本地格式/静态检查及前端测试；后端测试和双架构编译只用 Actions。
-- [ ] 在 410 验证设备发现、旧配置兼容、DNS、ePDG/P-CSCF/Trunk、UI 和两路 IMS 状态。
-- [ ] 记录实际观察的 refresh 结果；初始注册成功不能替代续期验收。
-- [ ] 单独提交和构建 **1.1.4-beta2**（pre-release、非 latest）；核验包和部署 commit 一致。
-- [ ] 更新变更说明、兼容性映射、验证结果与回滚步骤，再标记已通过项修复完成。
+- [x] 2bb6099 和修正 0b97b4f 分别通过本地格式/静态、17 项 Python、前端及最终 Actions；后端测试和双架构编译只用 Actions，最新最终 run 为 34173433980。
+- [x] 410 设备发现、旧配置/API 兼容、VoWiFi ePDG/IKE/CHILD_SA/ESP/IMS 初始注册通过；两个启用开关未修改，当前仅 VoWiFi 有有效注册。
+- [x] 普通系统 DNS/HTTP：0b97b4f 应用在 08:54 查询系统首台 DNS，A/AAAA 响应成功（AAAA 为有效 NODATA），HTTPS 元数据读取耗时 0.496 秒。使用应用 HTTP client，不是拿独立 UDP 诊断替代。
+- [ ] Trunk 未启用，未强行开启；仅状态 API 和代码回归通过，不宣称实际 Trunk DNS/注册通过。
+- [ ] 前端入口 HTML/JS 与部署文件一致；没有浏览器交互工具，UI 操作/历史页面仅有代码和构建检查，未做实机交互验收。
+- [x] 修正版 0b97b4f 自身在 09:31 完成原通道自然 refresh；完整事务元数据、真实租期、原服务/TUN 均核实。没有拿初始注册或首个候选的 08:25 结果替代。
+- [x] 2bb6099 和修正 0b97b4f 分别构建、发布、校验并部署 **1.1.4-beta2**（pre-release、非 latest）。修正发布前使用已知旧值做原子 master/tag 前移，tag/包/设备 commit 重新核验一致；保留旧产物证据。
+- [x] 变更说明、兼容映射、验证结果和回滚路径已更新；只标记已验证范围，双注册及 UI/真实业务等未验证项保持未通过。
 
 ## 5. 证据与进度记录
 
@@ -133,10 +137,27 @@
 | 2026-09-08 04:50 | fbc3f69 / run 34160063031 全通过 | 确认 YAML 根因是把 Document 包装节点当子值插入；改为实际 Mapping/Sequence 值节点，新复杂子树用合法 flow YAML，已有注释与手写块不重排；配置、DNS、IMS 及私有 D-Bus 新旧 API 测试通过 | 完成模块/成员和配置别名迁移 |
 | 2026-09-08 06:32 | 本批命名/别名迁移代码完成本地静态检查 | 移动 backend cellular_ims 模块，重命名 129 个 Rust 标识符和前端组件/变量；字符串协议、SQL列、旧路由未全局替换。前端 lint/type-check/build、17 项 Python 检查通过；新 Rust 回归仍待 Actions | 分支 CI 通过后准备 beta2 发布与实机验证 |
 | 2026-09-08 07:01 复核 | e6f7b0d / run 34168332351 全通过 | 模块/运行时/配置别名及相关完整回归、私有 D-Bus API 契约、前端全部通过；新增检查发现并补齐 DNS 覆盖配置非法地址/端口0校验，没有跳过失败测试 | 同步 VERSION/Cargo/package.json 为 1.1.4-beta2，锁文件仅更新本包版本；准备最终发布构建 |
+| 2026-09-08 07:15 | 2bb6099 / Build-Release 34169025117 全通过 | 前端、完整回归、私有 D-Bus API、ARM64、AMD64、发布成功；v1.1.4-beta2 为 pre-release、非 latest | 下载并校验包、检查通话后部署 |
+| 2026-09-08 07:34 | 校验并部署 beta2 / 2bb6099 | 包 SHA256 `67550d6d70d7fb55516d938124947d13a26ef4a92fa186cb2605ffad76a1abbb`；二进制 SHA256 `1fd466ddf65065f6169bb9a846a89048595c151288171771d2b51626e0c4137e`；备份 `/opt/simadmin/manual-backup/20260908-073410-beta2-2bb6099`；服务 active | 不再重启，观察本版本初始注册与自然续期 |
+| 2026-09-08 07:35:32 | beta2 VoWiFi 初始注册成功 | 初始响应驱动 494/403 变体后，认证 REGISTER CSeq=2 得到 200，租期 3553 秒、refresh_after=2953 秒；offered=true、自身 binding 匹配，但 Require 无 outbound、第一跳无 ob；不是双注册成功 | 约 08:25 等待原通道自然续期，不提前缩短租期 |
+| 2026-09-08 07:40 | beta2 API 与升级前基线比较通过 | 1 条线路、0 通话，新旧 API schema/设置一致；两个开关、IMS 偏好、语音/短信优先级、视频/IP families/恢复策略不变；单注册 VoWiFi 优先 | 保持当前通道，脱敏元数据抓包自动限时 |
+| 2026-09-08 07:52 | 扩展只读检查 | 整份持久化线路配置和 config.yaml 与备份相同；8 个新旧 GET 端点未认证均 401；profile-selection/call-status 一致；入口 HTML/JS 与部署文件一致；ARM64 ELF 无 interpreter/DT_NEEDED。Trunk disabled，未开启 | 普通 HTTP DNS 检查失败，单独定位，未触发 OTA 安装 |
+| 2026-09-08 08:03 | 对比应用 DNS 元数据和有界 UDP 诊断 | 应用查询了配置索引 2/4 的 DNS，4 秒无响应；配置首台 DNS 独立查询 21 ms 返回。上游源码确认新 pool 的 QueryStatistics 使用随机初始 RTT；非运营商 IMS/SA 问题 | 在独立分支修正排序，不改设备 DNS、不重连 IMS |
+| 2026-09-08 08:18 | 提交 0b97b4f 并推送 refactor/1.1.4-beta2 | 使用 UserProvidedOrder，保留系统 timeout/attempts；新增六服务器/连续新 resolver 回归，扩充配置顺序断言。本地格式、17 项 Python 检查通过；Rust 未本机编译 | 等独立分支 CI；当前设备仍为 2bb6099，不能宣称 DNS 修正已部署 |
+| 2026-09-08 08:22 核实 | 0b97b4f / Validate Beta Refactor 34172883931 全通过 | 前端、DNS/IMS/配置/API 完整回归成功，包含六服务器排序测试 | 准备同一 beta2 候选修订，不直接安装开发产物 |
+| 2026-09-08 08:25:52 | 2bb6099 原通道自然续期通过 | CSeq=3、Security-Verify，发送时真实剩余 532 秒；同事务元数据 0.360646 秒后 200，续得 2858 秒；reused_access=true，服务/namespace/TUN index 未变，没有重建安全关联冒充 refresh | 保留本候选证据；修正版仍需自己的自然续期验收 |
+| 2026-09-08 08:28 | 有条件原子发布修正候选 | 确认远端 master/tag 均为 2bb6099 后，用 tag 的 force-with-lease 原子推送 master/tag 到 0b97b4f；首个候选产物/校验/部署记录归档，未删除备份 | 等最终 Build-Release |
+| 2026-09-08 08:35 | 0b97b4f / Build-Release 34173433980 全通过 | 完整回归、前端、ARM64、AMD64、发布全部通过；下载后确认 pre-release/非 latest、tag/包 commit 一致 | 再检查所有线路通话并备份，部署修正版 |
+| 2026-09-08 08:43 | 部署修正 beta2 / 0b97b4f | 包 SHA256 `7710e21879bc4d5ceea678e9dd187e93787b886635e26b3a99652428dd9a14fb`；二进制 SHA256 `3d53567fcfad9c3810630475696e0add213a5e9ae80a892c2e5e7a7f1a3a2b5d`；备份 `/opt/simadmin/manual-backup/20260908-084315-beta2-0b97b4f`；确认 0 通话后切换，active | 启动新候选独立游标/限时脱敏抓包 |
+| 2026-09-08 08:44:38 | 修正版 VoWiFi 初始注册成功 | REGISTER 200，租期 3342 秒、refresh_after=2742 秒；自身 binding 匹配，仍未协商 outbound，因此仍为 VoWiFi 优先单注册 | 约 09:31 等待自然续期，不缩短租期 |
+| 2026-09-08 08:54 | 修正版配置/API/DNS 实机检查通过 | 整份线路配置和 YAML 与切换前备份相同；新旧 API、8 个未认证 GET 的 401、前端入口文件通过；应用查询系统 DNS 索引 0，A/AAAA 均响应，HTTPS 元数据读取 0.496 秒成功。只读取旧 latest 元数据，没有升级到它，也未触发 OTA 准备/安装 | 保持服务/原通道等待自然续期；Trunk/真实短信电话/浏览器交互不标为实测 |
+| 2026-09-08 09:31:28 | 0b97b4f 自身原通道自然续期通过 | CSeq=3、Security-Verify，发送时真实剩余 531 秒；完整请求/响应同 Call-ID 摘要、同 instance/reg-id，0.292738 秒后 200、续得 3100 秒；reused_access=true。核实已到实际续期时间且服务/TUN index 未变，没有重建安全关联 | 保留本候选独立证据，不算作双注册验收 |
+| 2026-09-08 09:37 | 最终版本/配置/注册复核 | 0b97b4f / 1.1.4-beta2、active、0 通话；原设置未变，两个配置开关仍启用，当前 VoWiFi 有有效租期，outbound 仍未协商 | 关闭临时抓包，整理记录，不重启、不再部署 |
+| 2026-09-08 09:43 | 关闭本次临时观察 | 仅停止 simadmin-beta2-wire-0b97b4f.service；主服务 PID/InvocationID/状态未变，事件、元数据、产物及回滚备份均保留 | 仅文档收尾，显式跳过 CI，避免同版本再次覆盖 Release |
 
 ## 6. 当前优先事项（阶段 B）
 
-**beta1 保持设备上的 e55780a。阶段 B 在 refactor/1.1.4-beta2 分支独立开发和 CI 验证，完成命名兼容迁移与 DNS 实机验证后才发布 beta2。**
+**当前设备是 beta2 / 0b97b4f，命名、旧配置/API、系统 DNS 修正和自身原通道自然续期均已实测。当前网络仍未接受 outbound 多流；不能把已验证的单注册保护当作双注册修复完成。**
 
 - [x] beta1 发布规则、代码、CI、部署与自然续期证据见上表，不能再沿用旧暂停时的版本/未提交状态。
 - [x] 朋友的手机卡任务暂缓，无设备/失败材料，不推测其原因。
@@ -144,16 +165,16 @@
 
 ### 暂停点与续接注意
 
-- 本地 `.github/scripts/release_version.py` 和对应测试已完成，12 个测试通过。
-- beta1 标签/master 均为 e55780a；当前开发分支不触发 Build-Release，只触发 Validate Beta Refactor。
-- `docs/releases/1.1.4-beta1.md` 明确候选版和未验收双注册，不标注双注册修复完成。
-- 部署前通话检查的 API schema 误用已修正，本轮验证 0 通话；实际部署前仍需重新检查，不能沿用过时检查。
-- 最新日志游标为 `/tmp/.simadmin-beta1-e55780a.cursor`，事件文件 `/tmp/simadmin-beta1-e55780a.events.jsonl`。本地继续使用 `.codex-beta1-final-collect.sh`，不要重读完整 journal。
-- 本地 `.codex-beta1-release-verified.json` 是最终包校验证据；`.codex-beta1-ci-run.json` 对应最新 Actions。e5bde5f、d8e2148 的 CI/候选历史另有本地留档。
-- 本地 `.codex-beta1-final-wire-read.sh` 读取有界脱敏抓包；抓包仅含 REGISTER 元数据，自动停止，不保存 Authorization/密钥/SIP 原文。
-- 最新 e55780a 的 01:46 原通道自然 refresh 已通过；蜂窝先注册顺序和优先级回退已验证，但本网络双注册没有通过。
-- DNS/类型/API 第一批和 YAML 兼容修正均已通过 CI；模块、runtime 成员和新旧配置别名的后一批正在验证。外部 JSON/数据库写入保持旧编码，接受新输入别名；这是一项明确的兼容决定，不强制用户迁移历史数据。
-- 当前代码中的固定测试间隔名为 CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS，仍为 None。最终 Build-Release 已加入 DNS/配置/SIM override/新旧 API 门禁及零测试检查，不能只通过开发分支测试就绕过最终发布验证。
-- 代码回归已通过 e6f7b0d / 34168332351；现在准备 beta2 发布候选，版本统一为 1.1.4-beta2。仍须校验最终 release/tag/包/设备 commit、备份、无通话检查和自然续期实测。
-- 命名迁移映射、旧 JSON/数据库/API 兼容要求见 `docs/IMS_NAMING_MIGRATION.md`；目前是待实现清单，不是已完成声明。
-- 不清理已有临时文件或覆盖无关改动。不要把开发分支 DNS 代码直接安装到设备；仍只部署校验过的 Release。
+- Release tag/设备/发布源码当前为 0b97b4f，最终 run 34173433980；开发分支 CI 为 34172883931。不要重新激活旧 2bb6099 暂存脚本。
+- `.codex-beta2-release-verified.json` 和 `.codex-beta2-ci-run.json` 当前对应 0b97b4f。首个候选证据保存在 `.codex-beta2-artifacts/2bb6099/evidence/`，自然续期另有 `.codex-beta2-finalize-2bb6099.sh.result.txt`；设备备份/事件文件均保留。
+- **同一 VERSION 正常推送 master 会覆盖 Release 同名资产，而旧标签不会自动前移。** 纯文档收尾不能无意触发发布；修正版需明确协调 tag/包一致性，仍使用 beta2、pre-release、非 latest。
+- 本次收尾仅提交文档，并用 `[skip ci]` 明确跳过 push CI，不重新打包。master 后续文档提交可以晚于 Release tag；发布/设备继续对应 0b97b4f，不把文档 HEAD 当成待部署二进制 commit。
+- 当前增量游标 `/tmp/.simadmin-beta2-0b97b4f.cursor`；事件 `/tmp/simadmin-beta2-0b97b4f.events.jsonl`。自然续期 observer 已结束；如需新日志，用 `.codex-beta2-order-collect.sh`，不重复读取完整 journal。
+- `.codex-beta2-order-wire-read.sh` 可读已保存的新候选 REGISTER 脱敏元数据；临时抓包已于 09:43 停止，旧 2bb6099 抓包也已结束并保留。均不保存原始 SIP/认证/密钥，不把蜂窝 ESP 当作已解密抓包。
+- `.codex-beta2-inspect-after.sh` 比较部署前基线；**不要运行 inspect-before 覆盖基线**。扩展检查、DNS 诊断均保存了独立脱敏结果。
+- 2bb6099 的 08:25:52 与 0b97b4f 的 09:31:28 自然 refresh 分别验证；本候选独立证明见 `.codex-beta2-finalize-0b97b4f.sh.result.txt` 和设备 `/tmp/simadmin-beta2-refresh-0b97b4f.json`。不能将任一单路结果算作双注册通过。
+- 固定测试间隔 `CELLULAR_IMS_REFRESH_TEST_DELAY_SECONDS` 仍为 `None`。不通过强制重注册、重建 SA、人工缩短租期或拨号来制造验收成功。
+- 旧 JSON/数据库编码与新读取别名并存是明确兼容决定；不得因仍有 `volte` wire/history 标识再次全局替换。
+- 回滚备份 `/opt/simadmin/manual-backup/20260908-084315-beta2-0b97b4f` 内是 2bb6099（有已知 DNS 排序问题）；`/opt/simadmin/manual-backup/20260908-073410-beta2-2bb6099` 内是 beta1/e55780a。回滚前重新检查所有线路通话并备份当前数据；恢复二进制、前端、devices、meta，默认保留兼容的现有配置和数据库，不盲目覆盖升级后的短信/历史记录。
+- Trunk 未配置、真实短信/电话、浏览器交互未实测，不能标为完成。朋友手机卡任务仍暂缓。
+- 不清理已有临时文件或设备备份，不覆盖无关改动；设备只安装校验过的 Release，不在本机编译后端。

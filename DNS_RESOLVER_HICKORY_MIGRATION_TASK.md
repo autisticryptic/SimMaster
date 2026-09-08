@@ -1,7 +1,7 @@
 # SimAdmin DNS 解析层 Hickory 重构任务
 
 创建日期：2026-09-02
-状态：普通系统 DNS 已在 beta2 分支迁移到 Hickory 并通过回归；实机验收待发布候选
+状态：beta2/0b97b4f 已通过最终 CI、部署、应用 HTTP DNS 及自身 VoWiFi 原通道自然续期实测；新 resolver 随机排序问题已修正。双注册及未启用的专用业务不标为通过
 本轮范围：替换 libc 系统解析、HTTP 和代理端点隐式解析，启用 system-config；专用 DNS 传输维持原行为
 
 > 2026-09-08 更新：详见 `docs/DNS_HICKORY.md` 和 `plan.md`。
@@ -9,6 +9,8 @@
 > 下列原始“统一所有专用 DNS 报文/传输”项目保留为后续设计清单；
 > 原有运营商 DNS、P-CSCF、NAPTR 和 SOCKS5 UDP DNS 已是 Rust 实现，
 > 本次不借替换 lookup_host 改变它们的出口/回退策略，也不谎称这些传输已经重写。
+> 后续统一全部传输的未勾选项不是本次移除 libc 系统解析的完成声明；
+> 当前候选的 DNS 实机失败也不能因已通过单元测试而忽略。
 
 ## 目标
 
@@ -44,9 +46,9 @@ NAPTR 查询统一到可测试的纯 Rust 解析层，避免静态 musl 环境�
 
 ### 1. 依赖与构建
 
-- [ ] 选择并固定兼容当前 Rust 工具链的 `hickory-resolver` 版本。
-- [ ] 明确启用的 feature，至少覆盖系统配置、hosts、Tokio runtime 和所需协议。
-- [ ] 更新 `backend/Cargo.toml` 与 `backend/Cargo.lock`。
+- [x] 固定 `hickory-resolver 0.25.2`，与 reqwest 0.12 的 Hickory 版本一致。
+- [x] 启用 `system-config`、`tokio`，hosts 使用 Hickory parser；HTTP 统一解析入口并启用 hickory-dns。
+- [x] 更新 `backend/Cargo.toml` 与 `backend/Cargo.lock`；不在本机编译后端。
 - [ ] 确认 ARM64、AMD64 的 musl 静态构建均不引入动态运行库依赖。
 - [ ] 检查最终二进制体积和启动内存变化。
 
@@ -92,24 +94,25 @@ NAPTR 查询统一到可测试的纯 Rust 解析层，避免静态 musl 环境�
 - [ ] 未指定 DNS 时 hosts 优先级正确。
 - [ ] DNS fallback 只在允许的错误类型下触发。
 - [ ] UE namespace、双线路隔离、SOCKS5 和 IPv4/IPv6 回退测试。
-- [ ] GitHub Actions 的 test、ARM64、AMD64、Release 全部通过。
+- [x] 2bb6099 / 34169025117 与排序修正 0b97b4f / 34173433980 分别通过 GitHub Actions test、ARM64、AMD64、Release，没有沿用旧构建。
+- [x] 六服务器场景中每次新建 resolver 保持系统顺序；0b97b4f 回归通过。08:54 应用向系统首台 DNS 查询 A/AAAA 并收到响应，HTTPS 元数据读取 0.496 秒成功，未修改 DNS 配置。
 
 ### 7. 410 实机验收
 
 - [ ] 无自定义 Profile，仅派生 Vodafone Germany 配置能够解析 hosts 中的 ePDG。
-- [ ] VoWiFi IKE/500、NAT-T/4500、ESP/TUN 和 IMS REGISTER 成功。
+- [x] 2bb6099 启动证据：IKE/500、CHILD_SA、ESP/TUN 和 IMS REGISTER 成功，07:35:32 获得 3553 秒租期；没有将未直接观察的 NAT-T/4500 单独标为已实测。
 - [ ] 指定德国运营商 DNS 时仍能得到运营商预期结果。
 - [ ] hosts、指定 DNS、系统 DNS 三种路径的日志能够区分来源。
-- [ ] VoWiFi 自然续期复用现有会话，不因 DNS 重构重建 ePDG 链路。
+- [x] 0b97b4f 在 09:31:28 自然续期复用原通道；CSeq=3、Security-Verify、真实剩余 531 秒，0.292738 秒后 200、续得 3100 秒；服务/TUN 未变，没有重建 ePDG/安全关联来代替 refresh。
 - [ ] VoLTE 注册和续期不受 DNS 重构影响。
 
 ## 完成标准
 
-- [ ] Hickory 成为普通系统 DNS 的唯一实现入口。
-- [ ] 项目不再直接依赖 `tokio::net::lookup_host` 处理 ePDG。
+- [x] Hickory 成为普通系统 DNS 的唯一实现入口；专用传输保留，不冒充已统一。
+- [x] 项目不再直接依赖 `tokio::net::lookup_host` 处理 ePDG。
 - [ ] 原有指定 DNS、SOCKS5、NAPTR、UE namespace 能力无回归。
-- [ ] 双架构 CI、410 初始注册及至少一次自然续期全部通过。
-- [ ] 更新架构文档并勾选本文件全部验收项。
+- [x] 双架构 CI、410 VoWiFi 初始注册及至少一次原通道自然续期通过；不冒充当前网络双路注册/续期通过。
+- [x] 更新架构文档并仅勾选有对应证据的本轮验收项；后续专用传输统一项目、未启用/未实测业务和未通过项继续保留。
 
 ## 非目标
 

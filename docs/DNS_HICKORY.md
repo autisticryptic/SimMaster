@@ -47,11 +47,12 @@ SOCKS5, Trunk, TS.43/SSRF and IMS refresh regressions are included in branch CI.
 
 ## 410 field validation (2026-09-08)
 
-The beta2 candidate `2bb6099` passed the final release workflow
-`34169025117` and was deployed at 07:34 (Asia/Shanghai). Old line configuration,
-API compatibility and initial VoWiFi registration passed device checks.
-Its own first natural refresh is still pending; beta1's earlier result is not
-substituted for it.
+The first beta2 candidate `2bb6099` passed release workflow `34169025117`
+and was deployed at 07:34 (Asia/Shanghai). Old line configuration, API
+compatibility and initial VoWiFi registration passed device checks.
+Its natural protected refresh passed at 08:25:52: CSeq=3, 532 seconds left,
+200 OK after 0.36 seconds, renewed lease 2858 seconds, unchanged service/TUN
+and `reused_access=true`.
 
 The live HTTP DNS check found a release-gating issue in that candidate:
 Hickory's default `QueryStatistics` initializes each new pool with random RTTs.
@@ -61,8 +62,27 @@ At 08:03, captured A/AAAA requests went to configured servers 2 and 4; a
 separate numeric-address UDP diagnostic got an answer from server 0 in 21 ms.
 The diagnostic is not misreported as an application resolver test.
 
-The `UserProvidedOrder` correction and a six-server/fresh-resolver regression
-are now implemented on the refactor branch, **not yet built or deployed**.
-It does not change resolv.conf, inject public DNS, or restart IMS.
-Do not mark the live HTTP lookup successful until the corrected release is
-validated. Detailed build, deployment and refresh evidence belongs in `plan.md`.
+The `UserProvidedOrder` correction `0b97b4f` passed branch validation
+`34172883931` and final release workflow `34173433980`, including the
+six-server/fresh-resolver regression and both architecture builds. It was
+deployed at 08:43, retaining beta2/pre-release/non-latest status and matching
+tag/package/device commits. The original candidate and backup were retained.
+
+At 08:54:46 the corrected application's HTTP client queried configured
+nameserver 0 for A/AAAA and received both responses (A answer and valid AAAA
+NODATA). The complete HTTPS metadata fetch succeeded in 0.496 seconds.
+This is the deployed Rust application's path, not curl/Python DNS standing in
+for it. No resolv.conf change, public-DNS insertion, OTA preparation/installation
+or registration command was used by the check.
+
+Old/new APIs, authentication, persistent settings and initial registration
+were checked again on `0b97b4f`. Its own natural protected refresh passed at
+09:31:28: CSeq=3, Security-Verify present, 531 seconds left, matching 200 OK
+after 0.292738 seconds and renewed lease 3100 seconds. Service identity and TUN
+index were unchanged; the log reported `reused_access=true`. The check also
+verified that the request followed the actual proactive refresh deadline.
+The temporary metadata capture was stopped without restarting the service.
+
+This verifies the deployed HTTP/system DNS path and the current single WLAN
+registration, not live dual registration, an unconfigured Trunk, or every
+carrier/proxy DNS path. Detailed evidence and untested cases remain in `plan.md`.

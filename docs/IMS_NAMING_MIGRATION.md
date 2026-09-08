@@ -1,11 +1,12 @@
-# Cellular IMS naming migration (beta2 work list)
+# Cellular IMS naming migration (beta2)
 
-This is the implementation checklist, **not a claim that all renames below
-have shipped**. Work remains isolated on `refactor/1.1.4-beta2`.
+The naming implementation shipped in beta2 candidate `2bb6099` after final
+Actions run `34169025117`. It was deployed to 410 on 2026-09-08 at 07:34
+(Asia/Shanghai). Implementation/contract tests and live business validation
+remain distinct; the latter is not implied by a successful build.
 
-## Current incremental implementation
+## Implemented migration
 
-- DNS migration passed Actions run `34153925916` at `87eead1`.
 - The access stack's `Volte*` type symbols now use `CellularIms*`. Shared
   profile source/candidate/selection/reference types used by **both** cellular
   and WLAN instead use `ImsProfile*`, not a misleading cellular-only name.
@@ -13,15 +14,14 @@ have shipped**. Work remains isolated on `refactor/1.1.4-beta2`.
   cellular IMS terminology. The frontend calls the new canonical endpoints.
 - All seven canonical route groups have been added; the old routes still
   invoke exactly the same handlers. **JSON field names, enum wire values and
-  persistent storage keys are deliberately unchanged in this first increment.**
+  persistent storage keys deliberately retain compatible serialized spellings.**
 - A private-D-Bus HTTP test checks canonical/legacy response parity and ensures
   the new endpoints remain authenticated. It fails rather than silently
-  skipping if its test bus is missing. This increment still needs Actions.
-
-The next increment moves the implementation directory/module to `cellular_ims`,
-renames runtime fields/functions and frontend code identifiers, and accepts new
-configuration aliases. The externally stored/written keys remain compatible as
-described below. Full beta2 device validation is still required.
+  skipping if its test bus is missing. It passed the final release workflow.
+- The implementation directory/module is now `cellular_ims`; runtime
+  fields/functions and frontend code identifiers have been renamed. New
+  configuration aliases are accepted; externally stored/written keys remain
+  compatible as described below.
 
 ## Wire/storage compatibility decision
 
@@ -52,7 +52,7 @@ SMS, supplementary services and voice. VoLTE remains the correct name for
 LTE voice capabilities in standards/vendor data. Visible access labels remain
 the user's short **4G/5G**, not a longer internal identifier.
 
-## Planned canonical names
+## Canonical names
 
 | Current concept | Canonical name | Compatibility requirement |
 | --- | --- | --- |
@@ -66,7 +66,7 @@ the user's short **4G/5G**, not a longer internal identifier.
 | `ImsRegistrationAccess::Volte`, `EffectiveImsAccess::Volte` | corresponding `CellularIms` variants | Internal registration access, not LTE-only voice capability |
 | `volte_ready` and equivalent access readiness | `cellular_ims_ready` | Do not conflate registration with voice/SMS capability |
 
-Seven HTTP route groups need canonical endpoints plus old endpoint aliases:
+Seven HTTP route groups provide canonical endpoints plus old endpoint aliases:
 
 - `/api/volte/lines` → `/api/cellular-ims/lines`
 - `/api/volte/lines/{line_id}` → `/api/cellular-ims/lines/{line_id}`
@@ -74,8 +74,8 @@ Seven HTTP route groups need canonical endpoints plus old endpoint aliases:
 - `/api/modem/lines/{line_id}/volte/call/status` →
   `/api/modem/lines/{line_id}/cellular-ims/call/status`
 
-New and legacy route responses must have an explicit compatibility contract.
-Merely adding route aliases does not make a changed JSON schema compatible.
+New and legacy routes share the same handlers and compatible response schema.
+Tests check that contract rather than merely the presence of route aliases.
 
 ## Storage and safety
 
@@ -92,11 +92,25 @@ Merely adding route aliases does not make a changed JSON schema compatible.
 - Keep VoWiFi → cellular IMS → CS ordering, enabled intents, binding ownership,
   leases and the beta1 protected-refresh behavior unchanged.
 
-## Required validation
+## Validation and remaining limits
 
-- Old/new alias fixture load, compatible write/reload, duplicate-key rejection.
-- New and legacy HTTP routes, request keys and response schemas.
-- SMS/voice/supplementary routing and old/new activity history display.
-- Frontend lint/build/type-check and nonempty Rust regression filters on Actions.
-- Only after implementation and 410 validation: `1.1.4-beta2`, pre-release and
-  not latest. The running beta1 device is not upgraded by development CI.
+- Final CI passed old/new alias load, compatible write/reload, duplicate-key
+  rejection, API contracts, routing regressions, frontend lint/build/type-check
+  and nonempty Rust test filters. No backend build/test ran locally.
+- At 07:40/07:52 the live canonical/legacy APIs, profile selection and call
+  status matched. Eight unauthenticated GET requests were rejected with 401.
+  Complete stored line profiles and config.yaml matched the pre-upgrade backup.
+- SMS/voice policy, enabled intent and IP-family settings were unchanged.
+  Actual SMS, calls, supplementary-service operations and interactive history
+  pages were **not** exercised. Readiness is not evidence of a completed call.
+- The DNS-only correction `0b97b4f` passed final release workflow `34173433980`
+  and was deployed at 08:43. At 08:54 the same live API/authentication/settings
+  checks passed again, along with the actual application's HTTP DNS lookup.
+  Naming/wire contracts were not changed by that correction.
+- beta2 remains a pre-release, not latest. The first candidate's natural
+  refresh passed at 08:25:52; the corrected candidate independently passed at
+  09:31:28 (protected CSeq=3 → 200, 531 seconds left, renewed lease 3100
+  seconds, original service/TUN). Field results belong in `plan.md`, never
+  inferred from initial registration or another candidate's result.
+  Current-network dual registration and unexercised live business paths remain
+  unverified.
