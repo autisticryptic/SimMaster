@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - refactor/1.1.4-beta2
+      - fix/1.1.4-beta3-cellular-ims
   workflow_dispatch:
 
 permissions:
@@ -51,18 +52,24 @@ jobs:
             platform::config::tests \
             platform::config_file::tests \
             platform::network_routing::tests \
+            hardware::cellular::cgcontrdp::tests \
+            hardware::devices::qcm410::ims_bearer::tests \
+            connectivity::modems::ims::cellular_ims::data_slot::tests \
+            connectivity::modems::ims::cellular_ims::runtime::tests \
+            api::handlers::tests::cellular_ims_profile_batch \
             connectivity::modems::ims::profile_override::tests \
             connectivity::modems::ims::effective_profile::tests \
             connectivity::core::device_identity::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
+            connectivity::modems::ims::vowifi::profiles::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
             services::trunk::access_router::tests \
             services::trunk::operator::tests \
             services::orchestrator::voice_router::tests \
             services::orchestrator::sms_router \
-            connectivity::modems::ims::cellular_ims::live::tests::incoming_cost_gate \
+            connectivity::modems::ims::cellular_ims::live::tests \
             connectivity::modems::ims::vowifi::operator::tests::incoming_cost_gate \
             services::e911::ssrf::tests \
             services::e911::ts43::tests \

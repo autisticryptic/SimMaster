@@ -10347,6 +10347,7 @@ enum CellularImsProfileBatchAction {
     Succeeded,
     Continue,
     WaitForNetwork,
+    WaitForNativeEndpoint,
     Exhausted,
     AbortUnsafe,
     Cancelled,
@@ -10368,6 +10369,12 @@ fn cellular_ims_profile_batch_action(
         == crate::connectivity::modems::ims::cellular_ims::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED
     {
         CellularImsProfileBatchAction::WaitForNetwork
+    } else if matches!(
+        error.code(),
+        crate::connectivity::modems::ims::cellular_ims::errors::code::DATA_SLOT_MODE_MISSING
+            | crate::connectivity::modems::ims::cellular_ims::errors::code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE
+    ) {
+        CellularImsProfileBatchAction::WaitForNativeEndpoint
     } else if crate::connectivity::modems::ims::cellular_ims::plan::FailureClass::from_error(error)
         == crate::connectivity::modems::ims::cellular_ims::plan::FailureClass::BasebandWedged
     {
@@ -10377,6 +10384,31 @@ fn cellular_ims_profile_batch_action(
     } else {
         CellularImsProfileBatchAction::Exhausted
     }
+}
+
+fn line_native_ims_endpoint_available(line: &crate::services::line_registry::LineRuntime) -> bool {
+    line.binding()
+        .qmi_device
+        .as_deref()
+        .is_some_and(|device| line.cellular_data.endpoint_available(device))
+}
+
+fn cellular_ims_wait_for_native_endpoint(
+    state: &mut crate::connectivity::modems::ims::cellular_ims::runtime::CellularImsSnapshot,
+    error: &crate::connectivity::modems::ims::cellular_ims::CellularImsError,
+) {
+    use crate::connectivity::modems::ims::cellular_ims::runtime::{
+        CellularImsPhase, CellularImsRecoveryState, CellularImsStage,
+    };
+    state.phase = CellularImsPhase::Degraded;
+    state.stage = CellularImsStage::Bearer;
+    state.recovery_state = CellularImsRecoveryState::WaitingNativeEndpoint;
+    state.last_error = Some(error.to_string());
+    state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+    state.next_retry_at = None;
+    // The periodic restore loop only reads endpoint readiness while waiting.
+    // It does not bind/probe ports or restart any modem/service.
+    state.manual_retry_available = false;
 }
 
 async fn wait_for_cellular_ims_batch_delay(
@@ -10481,6 +10513,20 @@ async fn run_line_cellular_ims_restore_batch(
             return;
         }
         LineModemWait::Deferred => return,
+    }
+
+    // This is a device prerequisite, not a carrier-profile failure. Check it
+    // before acquiring/reconciling the IMS access lease, so a missing DATA6
+    // endpoint neither burns all profile slots nor parks a healthy WLAN leg.
+    if !line_native_ims_endpoint_available(line) {
+        let error = crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(
+            crate::connectivity::modems::ims::cellular_ims::errors::code::DATA_SLOT_MODE_MISSING,
+        );
+        line.cellular_ims.begin_profile_attempt_batch().await;
+        line.cellular_ims
+            .update(|state| cellular_ims_wait_for_native_endpoint(state, &error))
+            .await;
+        return;
     }
 
     let _transition_guard = line.ims_registration.transition_lock.lock().await;
@@ -10709,6 +10755,15 @@ async fn run_line_cellular_ims_restore_batch(
                 line.cellular_ims
                     .finish_profile_attempt(attempt, candidate, "failed", Some(&error))
                     .await;
+                // Pre-live errors do not pass through connect_live_for_line's
+                // diagnostic update. Preserve their actual cause instead of
+                // replacing it with "profile attempts exhausted".
+                line.cellular_ims
+                    .update(|state| {
+                        state.last_error = Some(error.to_string());
+                        state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
+                    })
+                    .await;
                 warn!(
                     line_id = %binding.line_id,
                     attempt,
@@ -10737,6 +10792,12 @@ async fn run_line_cellular_ims_restore_batch(
                             state.last_error = Some(error.to_string());
                             state.last_failure_at = Some(chrono::Utc::now().to_rfc3339());
                         })
+                        .await;
+                    return;
+                }
+                if batch_action == CellularImsProfileBatchAction::WaitForNativeEndpoint {
+                    line.cellular_ims
+                        .update(|state| cellular_ims_wait_for_native_endpoint(state, &error))
                         .await;
                     return;
                 }
@@ -10849,6 +10910,8 @@ pub fn spawn_cellular_ims_auto_restore(app: AppState) {
                 if status.registered
                     || status.manual_retry_available
                     || line.cellular_ims_retry_in_progress()
+                    || (status.recovery_state == "waiting_native_endpoint"
+                        && !line_native_ims_endpoint_available(&line))
                 {
                     continue;
                 }
@@ -14428,6 +14491,7 @@ mod tests {
         Success,
         Failure,
         NetworkNotRegistered,
+        NativeEndpointMissing,
         BasebandWedged,
     }
 
@@ -14449,6 +14513,11 @@ mod tests {
                 MockCellularImsProfileOutcome::NetworkNotRegistered => Some(
                     crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(
                         crate::connectivity::modems::ims::cellular_ims::errors::code::RUNTIME_CELLULAR_NETWORK_NOT_REGISTERED,
+                    ),
+                ),
+                MockCellularImsProfileOutcome::NativeEndpointMissing => Some(
+                    crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(
+                        crate::connectivity::modems::ims::cellular_ims::errors::code::DATA_SLOT_MODE_MISSING,
                     ),
                 ),
                 MockCellularImsProfileOutcome::BasebandWedged => Some(
@@ -14523,6 +14592,46 @@ mod tests {
             ]),
             (vec![1], CellularImsProfileBatchAction::WaitForNetwork)
         );
+    }
+
+    #[test]
+    fn cellular_ims_profile_batch_waits_for_native_endpoint_without_profile_fallback() {
+        use crate::connectivity::modems::ims::cellular_ims::{
+            errors::code,
+            runtime::{CellularImsRecoveryState, CellularImsSnapshot},
+            CellularImsError,
+        };
+        assert_eq!(
+            simulate_cellular_ims_profile_batch(&[
+                MockCellularImsProfileOutcome::NativeEndpointMissing,
+                MockCellularImsProfileOutcome::Success,
+                MockCellularImsProfileOutcome::Success,
+            ]),
+            (
+                vec![1],
+                CellularImsProfileBatchAction::WaitForNativeEndpoint
+            )
+        );
+        for code in [
+            code::DATA_SLOT_MODE_MISSING,
+            code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE,
+        ] {
+            let error = CellularImsError::new(code);
+            assert_eq!(
+                cellular_ims_profile_batch_action(true, 3, 3, Some(&error)),
+                CellularImsProfileBatchAction::WaitForNativeEndpoint
+            );
+            let mut snapshot = CellularImsSnapshot::default();
+            cellular_ims_wait_for_native_endpoint(&mut snapshot, &error);
+            assert_eq!(
+                snapshot.recovery_state,
+                CellularImsRecoveryState::WaitingNativeEndpoint
+            );
+            assert_eq!(snapshot.last_error.as_deref(), Some(code));
+            assert!(!snapshot.manual_retry_available);
+            assert_eq!(snapshot.retry_attempt, 0);
+            assert!(snapshot.profile_attempt_results.is_empty());
+        }
     }
 
     #[test]

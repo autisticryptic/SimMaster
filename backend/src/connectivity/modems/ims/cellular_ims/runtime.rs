@@ -154,6 +154,7 @@ pub enum CellularImsPhase {
 pub enum CellularImsRecoveryState {
     Idle,
     WaitingModem,
+    WaitingNativeEndpoint,
     RestartingBaseband,
     Connecting,
     Registered,
@@ -165,6 +166,7 @@ impl CellularImsRecoveryState {
         match self {
             Self::Idle => "idle",
             Self::WaitingModem => "waiting_modem",
+            Self::WaitingNativeEndpoint => "waiting_native_endpoint",
             Self::RestartingBaseband => "restarting_baseband",
             Self::Connecting => "connecting",
             Self::Registered => "registered",
@@ -794,6 +796,10 @@ mod tests {
         assert_eq!(
             CellularImsRecoveryState::WaitingModem.as_str(),
             "waiting_modem"
+        );
+        assert_eq!(
+            CellularImsRecoveryState::WaitingNativeEndpoint.as_str(),
+            "waiting_native_endpoint"
         );
         assert_eq!(
             CellularImsRecoveryState::RestartingBaseband.as_str(),

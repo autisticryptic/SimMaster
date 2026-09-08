@@ -227,6 +227,8 @@ function recoveryMessage(line: CellularImsLineControlResponse) {
   switch (runtime.recovery_state) {
     case 'waiting_modem':
       return '长时间未检测到基带，正在等待设备重新出现'
+    case 'waiting_native_endpoint':
+      return '原生蜂窝端点未就绪，等待设备初始化；不会消耗运营商配置重试次数'
     case 'restarting_baseband':
       return `正在恢复基带（${runtime.modem_restart_attempt}/${runtime.modem_restart_max}）`
     case 'connecting':
@@ -847,7 +849,7 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
             const fallbackMessage = !line.runtime.registered
               ? standardDerivedProfileMessage(line.runtime.profile_source, line.runtime.profile_fallback_reason)
               : null
-            const recoveryRunning = ['waiting_modem', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
+            const recoveryRunning = ['waiting_modem', 'waiting_native_endpoint', 'restarting_baseband', 'connecting'].includes(line.runtime.recovery_state)
             // A reader line shares VoWiFi, trunk, SMS, calls, and automation
             // with normal lines. Only controls that require a cellular radio or
             // ModemManager object are hidden.
