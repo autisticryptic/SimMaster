@@ -594,7 +594,7 @@ export interface CellularImsRuntimeStatus {
   usim_aid?: string
   isim_aid?: string
   connection_attempts: CellularImsConnectionAttempt[]
-  recovery_state: 'idle' | 'waiting_modem' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
+  recovery_state: 'idle' | 'waiting_modem' | 'waiting_native_endpoint' | 'restarting_baseband' | 'connecting' | 'registered' | 'exhausted'
   recovery_source?: string
   retry_attempt: number
   retry_max: number

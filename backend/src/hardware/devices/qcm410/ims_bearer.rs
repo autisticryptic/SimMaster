@@ -148,7 +148,10 @@ async fn establish_bearer(
     let sessions = vec![session];
 
     // Read the active context once from AT, which is beta8's IMS source of truth.
-    let settings = match read_settings(modem_id, cid, apn).await {
+    let settings = match read_settings(modem_id, cid, apn)
+        .await
+        .and_then(|settings| settings_for_started_family(settings, first_family))
+    {
         Ok(settings) => settings,
         Err(error) => {
             stop_sessions(sessions).await;
@@ -156,12 +159,7 @@ async fn establish_bearer(
         }
     };
 
-    let netdev_family = if settings.ipv6_address.is_some() {
-        6
-    } else {
-        4
-    };
-    let Some(config) = netdev_config_for(&settings, netdev_family) else {
+    let Some(config) = netdev_config_for(&settings, first_family) else {
         stop_sessions(sessions).await;
         return Err(settings_missing(
             "native_ims_session_has_no_address".to_string(),
@@ -217,6 +215,40 @@ fn ip_type_for(first_family: u8) -> &'static str {
     } else {
         "ipv4"
     }
+}
+
+/// An AT context can describe both families even though DATA6 started only one
+/// retained WDS session. Advertising the other address lets SIP silently use an
+/// unstarted path and prevents the outer IP-family fallback from running.
+fn settings_for_started_family(
+    mut settings: CgcontrdpSettings,
+    family: u8,
+) -> Result<CgcontrdpSettings, ImsBearerError> {
+    let address = match family {
+        4 => settings.ipv4_address.filter(|address| address.is_ipv4()),
+        6 => settings.ipv6_address.filter(|address| address.is_ipv6()),
+        _ => None,
+    };
+    if address.is_none() {
+        return Err(settings_missing(format!(
+            "native_ims_started_family_address_missing:ipv{family}"
+        )));
+    }
+    if family == 4 {
+        settings.ipv6_address = None;
+        settings.ipv6_gateway = None;
+        settings.ipv6_dns.clear();
+        settings.ipv6_prefix = None;
+    } else {
+        settings.ipv4_address = None;
+        settings.ipv4_gateway = None;
+        settings.ipv4_dns.clear();
+        settings.ipv4_prefix = None;
+    }
+    settings
+        .pcscf
+        .retain(|address| address.is_ipv4() == (family == 4));
+    Ok(settings)
 }
 
 /// Start one retained IMS WDS session on the secondary endpoint. CID allocation
@@ -365,5 +397,45 @@ mod tests {
     fn ip_type_reflects_the_actual_safe_data6_family() {
         assert_eq!(ip_type_for(4), "ipv4");
         assert_eq!(ip_type_for(6), "ipv6");
+    }
+
+    #[test]
+    fn missing_started_family_is_rejected_before_netdev_or_sip_fallback() {
+        let error = settings_for_started_family(reference_settings(), 6).unwrap_err();
+        assert_eq!(error.kind, ImsBearerErrorKind::SettingsMissing);
+        assert_eq!(error.hint, ImsBearerFailureHint::None);
+        assert_eq!(
+            error.detail,
+            "native_ims_started_family_address_missing:ipv6"
+        );
+        assert!(settings_for_started_family(reference_settings(), 4).is_ok());
+    }
+
+    #[test]
+    fn dual_context_never_advertises_an_unstarted_data6_family() {
+        let mut dual = reference_settings();
+        dual.ipv6_address = Some("2001:db8:1::a".parse().unwrap());
+        dual.ipv6_gateway = Some("fe80::1".parse().unwrap());
+        dual.ipv6_dns = vec!["2001:db8::53".parse().unwrap()];
+        dual.ipv6_prefix = Some(64);
+        dual.pcscf.push("2001:db8::20".parse().unwrap());
+
+        let v4 = settings_for_started_family(dual.clone(), 4).unwrap();
+        assert!(v4.ipv6_address.is_none());
+        assert!(v4.ipv6_gateway.is_none());
+        assert!(v4.ipv6_dns.is_empty());
+        assert!(v4.ipv6_prefix.is_none());
+        assert!(v4.pcscf.iter().all(|address| address.is_ipv4()));
+        assert!(netdev_config_for(&v4, 4).is_some());
+        assert!(netdev_config_for(&v4, 6).is_none());
+
+        let v6 = settings_for_started_family(dual, 6).unwrap();
+        assert!(v6.ipv4_address.is_none());
+        assert!(v6.ipv4_gateway.is_none());
+        assert!(v6.ipv4_dns.is_empty());
+        assert!(v6.ipv4_prefix.is_none());
+        assert!(v6.pcscf.iter().all(|address| address.is_ipv6()));
+        assert!(netdev_config_for(&v6, 6).is_some());
+        assert!(netdev_config_for(&v6, 4).is_none());
     }
 }

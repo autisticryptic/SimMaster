@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - refactor/1.1.4-beta2
+      - fix/1.1.4-beta3-cellular-ims
   workflow_dispatch:
 
 permissions:
@@ -51,6 +52,11 @@ jobs:
             platform::config::tests \
             platform::config_file::tests \
             platform::network_routing::tests \
+            hardware::cellular::cgcontrdp::tests \
+            hardware::devices::qcm410::ims_bearer::tests \
+            connectivity::modems::ims::cellular_ims::data_slot::tests \
+            connectivity::modems::ims::cellular_ims::runtime::tests \
+            api::handlers::tests::cellular_ims_profile_batch \
             connectivity::modems::ims::profile_override::tests \
             connectivity::modems::ims::effective_profile::tests \
             connectivity::core::device_identity::tests \

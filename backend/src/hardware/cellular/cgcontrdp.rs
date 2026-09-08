@@ -55,29 +55,105 @@ pub async fn read_cgcontrdp_settings(
     apn: &str,
 ) -> Result<CgcontrdpSettings, CgcontrdpError> {
     let output = run_at(modem, &format!("AT+CGCONTRDP={cid}")).await?;
-    Ok(parse_cgcontrdp_settings(&output, cid, apn))
+    // Some Qualcomm firmware puts the two local addresses in separate CSV
+    // columns. Do not guess that an opposite-family gateway is a local address:
+    // confirm the alternate layout with CGPADDR for this exact active CID.
+    let local_addresses = if has_possible_paired_local_columns(&output, cid, apn) {
+        run_at(modem, &format!("AT+CGPADDR={cid}"))
+            .await
+            .map(|response| parse_cgpaddr_addresses(&response, cid))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    Ok(parse_cgcontrdp_settings_with_local_addresses(
+        &output,
+        cid,
+        apn,
+        &local_addresses,
+    ))
 }
 
 /// Parse the full IP configuration (address, gateway, DNS, P-CSCF) for one CID
 /// from a `+CGCONTRDP` response.
 pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8, apn: &str) -> CgcontrdpSettings {
-    let mut settings = CgcontrdpSettings::default();
+    parse_cgcontrdp_settings_with_local_addresses(output, expected_cid, apn, &[])
+}
+
+fn context_fields<'a>(line: &'a str, expected_cid: u8, apn: &str) -> Option<Vec<&'a str>> {
+    let (_, values) = line.split_once("+CGCONTRDP:")?;
+    let fields: Vec<&str> = values.split(',').map(str::trim).collect();
+    (fields.len() >= 4
+        && fields[0].parse::<u8>().ok() == Some(expected_cid)
+        && fields[2]
+            .trim_matches(['\'', '"'])
+            .eq_ignore_ascii_case(apn))
+    .then_some(fields)
+}
+
+fn paired_local_columns(fields: &[&str]) -> Option<[IpAddr; 2]> {
+    // Observed compact IPv4v6 layout:
+    // cid,bearer,apn,local4,local6,gw,dns1,dns2,pcscf1v4,pcscf1v6,pcscf2v4,pcscf2v6
+    // Requiring both addresses plus the extended columns avoids interpreting
+    // an ordinary v4 row's v6 gateway as a second local address.
+    if fields.len() < 12 {
+        return None;
+    }
+    let first = parse_cgcontrdp_addr_and_mask(fields[3])?.0;
+    let second = parse_cgcontrdp_addr_and_mask(fields[4])?.0;
+    (first.is_ipv4() != second.is_ipv4() && !first.is_unspecified() && !second.is_unspecified())
+        .then_some([first, second])
+}
+
+fn has_possible_paired_local_columns(output: &str, cid: u8, apn: &str) -> bool {
+    output.lines().any(|line| {
+        context_fields(line, cid, apn)
+            .and_then(|fields| paired_local_columns(&fields))
+            .is_some()
+    })
+}
+
+fn parse_cgpaddr_addresses(output: &str, expected_cid: u8) -> Vec<IpAddr> {
+    let mut addresses = Vec::new();
     for line in output.lines() {
-        let Some((_, values)) = line.split_once("+CGCONTRDP:") else {
+        let Some((_, values)) = line.split_once("+CGPADDR:") else {
             continue;
         };
-        let fields: Vec<&str> = values.split(',').map(|field| field.trim()).collect();
-        if fields.len() < 4
-            || fields[0].parse::<u8>().ok() != Some(expected_cid)
-            || !fields
-                .get(2)
-                .is_some_and(|value| value.trim_matches(['\'', '"']).eq_ignore_ascii_case(apn))
-        {
+        let mut fields = values.split(',').map(str::trim);
+        if fields.next().and_then(|cid| cid.parse::<u8>().ok()) != Some(expected_cid) {
             continue;
         }
+        for address in fields.take(2).flat_map(parse_cgcontrdp_addresses) {
+            if !address.is_unspecified() && !addresses.contains(&address) {
+                addresses.push(address);
+            }
+        }
+    }
+    addresses
+}
 
-        // Field 3: local address and subnet mask, as concatenated octets.
-        if let Some((address, prefix)) = parse_cgcontrdp_addr_and_mask(fields[3]) {
+fn parse_cgcontrdp_settings_with_local_addresses(
+    output: &str,
+    expected_cid: u8,
+    apn: &str,
+    confirmed_local_addresses: &[IpAddr],
+) -> CgcontrdpSettings {
+    let mut settings = CgcontrdpSettings::default();
+    for line in output.lines() {
+        let Some(fields) = context_fields(line, expected_cid, apn) else {
+            continue;
+        };
+        let paired = paired_local_columns(&fields).is_some_and(|addresses| {
+            addresses
+                .iter()
+                .all(|address| confirmed_local_addresses.contains(address))
+        });
+        let gateway_index = if paired { 5 } else { 4 };
+
+        for field in &fields[3..gateway_index] {
+            let Some((address, prefix)) = parse_cgcontrdp_addr_and_mask(field) else {
+                continue;
+            };
             match address {
                 IpAddr::V4(_) => {
                     settings.ipv4_address.get_or_insert(address);
@@ -93,9 +169,8 @@ pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8, apn: &str) -> Cg
                 }
             }
         }
-        // Field 4: gateway.
         if let Some(gateway) = fields
-            .get(4)
+            .get(gateway_index)
             .and_then(|f| parse_cgcontrdp_addresses(f).into_iter().next())
         {
             match gateway {
@@ -103,8 +178,7 @@ pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8, apn: &str) -> Cg
                 IpAddr::V6(_) => settings.ipv6_gateway.get_or_insert(gateway),
             };
         }
-        // Fields 5..=6: DNS servers.
-        for field in fields.iter().skip(5).take(2) {
+        for field in fields.iter().skip(gateway_index + 1).take(2) {
             for dns in parse_cgcontrdp_addresses(field) {
                 let bucket = if dns.is_ipv6() {
                     &mut settings.ipv6_dns
@@ -116,8 +190,11 @@ pub fn parse_cgcontrdp_settings(output: &str, expected_cid: u8, apn: &str) -> Cg
                 }
             }
         }
-        // Fields 7..=8: P-CSCF.
-        for field in fields.iter().skip(7).take(2) {
+        for field in fields
+            .iter()
+            .skip(gateway_index + 3)
+            .take(if paired { 4 } else { 2 })
+        {
             for pcscf in parse_cgcontrdp_addresses(field) {
                 if !settings.pcscf.contains(&pcscf) {
                     settings.pcscf.push(pcscf);
@@ -233,5 +310,86 @@ async fn run_at(modem: &str, command: &str) -> Result<String, CgcontrdpError> {
                 output.status.code().unwrap_or(-1)
             ),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMPACT_DUAL: &str =
+        "+CGCONTRDP: 2,6,ims,192.0.2.10,32.1.13.184.0.1.0.0.0.0.0.0.0.0.0.10,fe80::1,,,192.0.2.20,2001:db8::20,192.0.2.21,2001:db8::21";
+
+    #[test]
+    fn compact_dual_stack_requires_matching_cgpaddr_for_the_same_cid() {
+        let confirmed = parse_cgpaddr_addresses(
+            "response: '+CGPADDR: 1,192.0.2.99\n+CGPADDR: 2,192.0.2.10,32.1.13.184.0.1.0.0.0.0.0.0.0.0.0.10'",
+            2,
+        );
+        let settings =
+            parse_cgcontrdp_settings_with_local_addresses(COMPACT_DUAL, 2, "ims", &confirmed);
+        assert_eq!(settings.ipv4_address, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(
+            settings.ipv6_address,
+            Some("2001:db8:1::a".parse().unwrap())
+        );
+        assert_eq!(settings.ipv6_gateway, Some("fe80::1".parse().unwrap()));
+        assert!(settings.ipv4_dns.is_empty());
+        assert!(settings.ipv6_dns.is_empty());
+        assert_eq!(
+            settings.pcscf,
+            ["192.0.2.20", "2001:db8::20", "192.0.2.21", "2001:db8::21"]
+                .map(|value| value.parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn unconfirmed_or_stale_second_address_is_not_promoted_from_gateway() {
+        for confirmed in [
+            Vec::new(),
+            vec!["192.0.2.10".parse().unwrap()],
+            vec![
+                "192.0.2.10".parse().unwrap(),
+                "2001:db8:1::b".parse().unwrap(),
+            ],
+            parse_cgpaddr_addresses("+CGPADDR: 1,192.0.2.10,2001:db8:1::a", 2),
+        ] {
+            let settings =
+                parse_cgcontrdp_settings_with_local_addresses(COMPACT_DUAL, 2, "ims", &confirmed);
+            assert!(settings.ipv6_address.is_none());
+        }
+        assert!(has_possible_paired_local_columns(COMPACT_DUAL, 2, "IMS"));
+        assert!(!has_possible_paired_local_columns(COMPACT_DUAL, 1, "ims"));
+        assert!(!has_possible_paired_local_columns(
+            COMPACT_DUAL,
+            2,
+            "internet"
+        ));
+    }
+
+    #[test]
+    fn standard_single_family_rows_keep_their_existing_layout() {
+        let settings = parse_cgcontrdp_settings(
+            "+CGCONTRDP: 2,6,\"ims\",192.0.2.10.255.255.255.0,192.0.2.1,192.0.2.53,,192.0.2.20,192.0.2.21\n\
+             +CGCONTRDP: 2,6,\"ims\",2001:db8:1::a/64,fe80::1,2001:db8::53,,2001:db8::20,2001:db8::21",
+            2,
+            "ims",
+        );
+        assert_eq!(settings.ipv4_address, Some("192.0.2.10".parse().unwrap()));
+        assert_eq!(settings.ipv4_prefix, Some(24));
+        assert_eq!(
+            settings.ipv6_address,
+            Some("2001:db8:1::a".parse().unwrap())
+        );
+        assert_eq!(settings.ipv6_prefix, Some(64));
+        assert_eq!(
+            settings.ipv4_dns,
+            vec!["192.0.2.53".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            settings.ipv6_dns,
+            vec!["2001:db8::53".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(settings.pcscf.len(), 4);
     }
 }

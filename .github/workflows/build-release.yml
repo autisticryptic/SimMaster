@@ -15,6 +15,9 @@ on:
   push:
     branches:
       - master
+      # Device candidates are built as Actions artifacts only. The release job
+      # below must never publish/retag an existing beta from this branch.
+      - fix/1.1.4-beta3-cellular-ims
   workflow_dispatch:
     inputs:
       version:
@@ -168,6 +171,11 @@ jobs:
             platform::config::tests \
             platform::config_file::tests \
             platform::network_routing::tests \
+            hardware::cellular::cgcontrdp::tests \
+            hardware::devices::qcm410::ims_bearer::tests \
+            connectivity::modems::ims::cellular_ims::data_slot::tests \
+            connectivity::modems::ims::cellular_ims::runtime::tests \
+            api::handlers::tests::cellular_ims_profile_batch \
             connectivity::modems::ims::profile_override::tests \
             connectivity::modems::ims::effective_profile::tests \
             connectivity::modems::ims::vowifi::epdg::tests \
@@ -438,6 +446,7 @@ jobs:
   # ==================== 3. 汇总所有架构并发布 Release ====================
   release:
     name: Publish Release
+    if: github.event_name != 'push' || github.ref == 'refs/heads/master'
     needs: [prepare, build, check-tests]
     runs-on: ubuntu-24.04
     steps:
