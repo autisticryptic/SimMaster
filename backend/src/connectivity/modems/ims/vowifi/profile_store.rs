@@ -225,7 +225,17 @@ impl ProfileStore {
                 Ok(ImsProfileReferenceState::Missing)
             }
             ImsProfileSource::CarrierCatalog => {
-                let capabilities = self.catalog.service_capabilities()?;
+                let capabilities = match self.catalog.service_capabilities() {
+                    Ok(capabilities) => capabilities,
+                    // A source-bound reference to a profile in an unavailable
+                    // optional catalog is simply not present in that source.
+                    // Do not turn an unrelated database profile validation
+                    // request into a service-unavailable error.
+                    Err(error) if error.starts_with("carrier_catalog_open_failed:") => {
+                        return Ok(ImsProfileReferenceState::Missing);
+                    }
+                    Err(error) => return Err(error),
+                };
                 let Some(capability) = capabilities.get(profile_id) else {
                     return Ok(ImsProfileReferenceState::Missing);
                 };
