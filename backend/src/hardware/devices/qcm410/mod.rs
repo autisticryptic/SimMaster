@@ -1,9 +1,10 @@
 //! Qualcomm 410 (MSM8916-class) device driver.
 //!
-//! Everything specific to the Qualcomm 410 pocket-WiFi: exposing spare
-//! `DATA*_CNTL` rpmsg channels as QMI endpoints, keeping them out of
-//! ModemManager's hands (udev `ID_MM_PORT_IGNORE`), and running a retained WDS
-//! session for user data so the IMS bearer never shares a slot with it.
+//! Everything specific to the Qualcomm 410 pocket-WiFi: exposing the project
+//! selected `DATA6_CNTL` RPMSG channel as a QMI endpoint, keeping it out of
+//! ModemManager's hands with `ID_MM_PORT_IGNORE`, and running ordinary data on
+//! that retained WDS session. IMS has its separate, fixed primary-qmi0 path in
+//! [`ims_bearer`].
 
 use std::sync::Arc;
 

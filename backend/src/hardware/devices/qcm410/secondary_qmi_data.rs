@@ -33,6 +33,7 @@ struct SecondaryDataSession {
     endpoint: SecondaryQmiEndpoint,
     netdev: ResolvedNetdev,
     netdev_config: NetdevConfig,
+    primary_netdev: String,
     worker: Option<UeWorkerBinding>,
 }
 
@@ -90,6 +91,8 @@ impl SecondaryDataRuntime {
         let endpoint = secondary_qmi::runtime_endpoint(primary_qmi)
             .await
             .map_err(|error| format!("cellular_secondary_qmi_unavailable:{error}"))?;
+        let primary_netdev = qmi_netdev::primary_netdev_for_qmi(primary_qmi)
+            .ok_or_else(|| format!("cellular_primary_qmi_netdev_unresolved:{primary_qmi}"))?;
         let apn_name = normalized_data_apn(&apn.apn)?;
         let baseband = baseband_key(&endpoint);
 
@@ -112,7 +115,16 @@ impl SecondaryDataRuntime {
         let mut errors = Vec::new();
 
         for family in families {
-            match start_family(&endpoint, &baseband, apn, &apn_name, family).await {
+            match start_family(
+                &endpoint,
+                &baseband,
+                &primary_netdev,
+                apn,
+                &apn_name,
+                family,
+            )
+            .await
+            {
                 Ok(mut session) => {
                     if let Err(error) =
                         move_data_session_into_worker(&mut session, worker.clone()).await
@@ -180,14 +192,6 @@ impl CellularDataTransport for SecondaryDataRuntime {
     }
 }
 
-/// The netdev DATA6 must never land on.
-///
-/// `wwan0` is the netdev of the primary QMI port held by ModemManager. A native
-/// session must use a secondary interface that can move into the UE namespace;
-/// adopting `wwan0` would both break ModemManager ownership and recreate the
-/// prohibited host-network data path.
-const DATA_RESERVED_NETDEVS: &[&str] = &["wwan0"];
-
 /// The sysfs key every candidate netdev of this endpoint's baseband contains.
 ///
 /// Resolved from the QMI device path, then the port name, falling back to the
@@ -202,6 +206,7 @@ fn baseband_key(endpoint: &SecondaryQmiEndpoint) -> String {
 async fn start_family(
     endpoint: &SecondaryQmiEndpoint,
     baseband: &str,
+    primary_netdev: &str,
     apn: &ApnConfig,
     apn_name: &str,
     family: u8,
@@ -224,7 +229,7 @@ async fn start_family(
             return Err(error);
         }
     };
-    let netdev = match qmi_netdev::resolve(baseband, &settings, DATA_RESERVED_NETDEVS).await {
+    let netdev = match qmi_netdev::resolve(baseband, &settings, &[primary_netdev]).await {
         Ok(netdev) => netdev,
         Err(error) => {
             stop_retained_session(endpoint, &retained).await;
@@ -243,6 +248,7 @@ async fn start_family(
         endpoint: endpoint.clone(),
         netdev,
         netdev_config: settings,
+        primary_netdev: primary_netdev.to_string(),
         worker: None,
     })
 }
@@ -289,11 +295,11 @@ async fn move_data_session_into_worker(
 ) -> Result<(), String> {
     let interface = session.netdev.interface.as_str();
     // Belt to the resolver's braces. Resolution can no longer hand back a
-    // reserved interface, so reaching this is a bug rather than a race -- but a
-    // DATA6 session on the IMS netdev is silent breakage several layers up, so
-    // keep refusing it here too. Both checks read the same list so they cannot
-    // drift apart.
-    if DATA_RESERVED_NETDEVS.contains(&interface) {
+    // reserved interface, so reaching this is a bug rather than a race. A DATA6
+    // session on the primary IMS netdev is silent breakage several layers up, so
+    // keep refusing it here too. The instance-specific primary mapping is passed
+    // through the retained session, so multi-baseband hosts cannot cross lists.
+    if session.primary_netdev == interface {
         return Err(format!(
             "cellular_data_refuses_primary_interface_{interface}"
         ));

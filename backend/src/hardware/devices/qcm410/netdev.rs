@@ -173,6 +173,21 @@ pub struct NetdevConfig {
     pub probe_target: Option<IpAddr>,
 }
 
+/// Return the primary `wwanN` data interface for a QCA410 `qmi0` node.
+///
+/// The mapping is deterministic for the primary access leg. Keeping it here
+/// lets both IMS and ordinary DATA6 resolution use the same parser, including
+/// when more than one QCA410 baseband is present.
+pub fn primary_netdev_for_qmi(device: &str) -> Option<String> {
+    let name = device.strip_prefix("/dev/").unwrap_or(device).trim();
+    let modem = name.strip_suffix("qmi0")?;
+    let index = modem.strip_prefix("wwan")?;
+    if index.is_empty() || !index.chars().all(|character| character.is_ascii_digit()) {
+        return None;
+    }
+    Some(modem.to_string())
+}
+
 impl NetdevConfig {
     /// Build the probe configuration from a session's settings.
     ///
@@ -376,6 +391,39 @@ pub async fn resolve(
         interface: assumed,
         rx_packets: 0,
         method: ResolutionMethod::Assumed,
+    })
+}
+
+/// Resolve the exact netdev associated with a known QMI data leg.
+///
+/// QCA410 has multiple bam-dmux netdevs under one baseband, but its primary
+/// QMI control node has a deterministic `wwanN` data interface. The IMS driver
+/// must use that exact primary interface; probing another candidate would
+/// silently route IMS over DATA6 or a different bearer. This helper is kept in
+/// the device netdev module so callers cannot accidentally reimplement a
+/// candidate-selection fallback for the primary IMS leg.
+pub async fn resolve_exact(
+    baseband: &str,
+    config: &NetdevConfig,
+    interface: &str,
+) -> Result<ResolvedNetdev, NetdevError> {
+    if !candidates_for_baseband(baseband)
+        .iter()
+        .any(|candidate| candidate == interface)
+    {
+        return Err(NetdevError::NoCandidates(format!("{baseband}:{interface}")));
+    }
+    configure(interface, config)
+        .await
+        .map_err(|error| classify(&[(interface.to_string(), error)]))?;
+    info!(
+        interface,
+        baseband, "Data netdev resolved: exact QMI data leg"
+    );
+    Ok(ResolvedNetdev {
+        interface: interface.to_string(),
+        rx_packets: 0,
+        method: ResolutionMethod::SoleCandidate,
     })
 }
 
@@ -855,10 +903,10 @@ mod tests {
     fn a_reserved_netdev_can_never_become_the_assumed_fallback() {
         // The actual failure this guards. No candidate answered the probe, so
         // resolution falls back to the lowest-numbered one -- wwan0, the netdev
-        // ModemManager holds for IMS. DATA6 taking it stops the IMS PDN from
-        // establishing, and the VoLTE REGISTER then leaves over Wi-Fi toward a
-        // carrier-private P-CSCF that cannot answer. Filtering the input means
-        // the fallback has no way to select it.
+        // ModemManager holds for the primary IMS leg. A DATA6 data session
+        // taking it stops the IMS PDN from establishing, and the VoLTE REGISTER
+        // then leaves over Wi-Fi toward a carrier-private P-CSCF that cannot
+        // answer. Filtering the input means the fallback cannot select it.
         let candidates =
             usable_candidates(vec!["wwan0".to_string(), "wwan2".to_string()], &["wwan0"]);
         let assumed = candidates.first().cloned();

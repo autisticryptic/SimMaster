@@ -3557,8 +3557,15 @@ async fn prepare_line_data_slot_for_cellular_ims(
 
     let binding = line.binding();
     let inputs = DataSlotInputs {
+        ims_endpoint_available: binding.qmi_device.as_deref().is_some_and(|device| {
+            line.ims_bearer
+                .as_ref()
+                .is_some_and(|transport| transport.endpoint_available(device))
+        }),
         data_requested: profile.data_connection_enabled,
-        native_endpoint_available: binding
+        // On QCA410 this is the project-created DATA6 leg; the selected device
+        // transport owns the actual readiness check for every device family.
+        data_endpoint_available: binding
             .qmi_device
             .as_deref()
             .is_some_and(|device| line.cellular_data.endpoint_available(device)),
@@ -10387,10 +10394,12 @@ fn cellular_ims_profile_batch_action(
 }
 
 fn line_native_ims_endpoint_available(line: &crate::services::line_registry::LineRuntime) -> bool {
-    line.binding()
-        .qmi_device
-        .as_deref()
-        .is_some_and(|device| line.cellular_data.endpoint_available(device))
+    let Some(device) = line.binding().qmi_device else {
+        return false;
+    };
+    line.ims_bearer
+        .as_ref()
+        .is_some_and(|transport| transport.endpoint_available(&device))
 }
 
 fn cellular_ims_wait_for_native_endpoint(
@@ -10515,9 +10524,9 @@ async fn run_line_cellular_ims_restore_batch(
         LineModemWait::Deferred => return,
     }
 
-    // This is a device prerequisite, not a carrier-profile failure. Check it
-    // before acquiring/reconciling the IMS access lease, so a missing DATA6
-    // endpoint neither burns all profile slots nor parks a healthy WLAN leg.
+    // QCA410 IMS is on the fixed primary qmi0 access leg. DATA6 is only a
+    // prerequisite when ordinary cellular data was requested; IMS alone must
+    // not be blocked because the project-created DATA6 endpoint is absent.
     if !line_native_ims_endpoint_available(line) {
         let error = crate::connectivity::modems::ims::cellular_ims::CellularImsError::new(
             crate::connectivity::modems::ims::cellular_ims::errors::code::DATA_SLOT_MODE_MISSING,

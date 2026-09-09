@@ -191,6 +191,14 @@ impl fmt::Display for ImsBearerError {
 /// that tears the session down again. On failure the implementation is
 /// responsible for releasing anything it bound.
 pub trait ImsBearerTransport: Send + Sync {
+    /// Cheap admission check for the device's IMS control endpoint.
+    ///
+    /// This is intentionally owned by the device transport. A generic handler
+    /// must not infer an endpoint layout from a path such as `wwan0qmi0`,
+    /// because that layout is a QCA410 contract and other device drivers may
+    /// use a different control interface.
+    fn endpoint_available(&self, primary_device: &str) -> bool;
+
     /// Establish one IMS bearer for the given address families.
     ///
     /// `families` carries one IP version (`4` or `6`) for a single-family

@@ -2,15 +2,15 @@
 //!
 //! # Why this exists
 //!
-//! ModemManager owns the primary QMI control port (e.g. `/dev/wwan0qmi0`) to run
-//! the normal mobile-data bearer. Creating a *second* data session (the IMS/VoLTE
-//! bearer) on that same port either fails outright with
-//! `interface-in-use-config-match`, or — on the MSM8916-class firmware this
-//! project targets — wedges the baseband while activating the IMS PDP context.
+//! This module owns the project-created DATA6 control endpoint. The QCA410
+//! initializer binds `DATA6_CNTL` through the stock RPMSG WWAN driver, publishes
+//! its WWAN node, and marks that node `ID_MM_PORT_IGNORE` so ModemManager does
+//! not claim it. DATA6 is reserved for ordinary cellular data; IMS is always
+//! activated separately on primary `/dev/wwan0qmi0` through `qmi-proxy`.
 //!
-//! The fix is physical separation: expose one of the modem's spare control
-//! channels as an additional character device and run the IMS bearer there, while
-//! ModemManager keeps sole ownership of the primary port.
+//! DATA6 is therefore a SimAdmin resource, not an inherent IMS capability of
+//! the modem. Do not redirect the IMS bearer into this module. QCA410 IMS has
+//! one supported access leg: primary qmi0 through qmi-proxy.
 //!
 //! # Portability: discover, don't assume
 //!
@@ -50,18 +50,12 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::{Output, Stdio},
+    process::Output,
     time::Duration,
 };
 
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::mpsc,
-    task::JoinHandle,
-    time::sleep,
-};
-use tracing::{debug, info, warn};
+use tokio::{process::Command, time::sleep};
+use tracing::{debug, info};
 
 /// Beta8 deliberately migrated DATA6 away from the kernel-specific multi-port
 /// module and binds exactly one channel through the in-tree driver. On MSM8916,
@@ -192,42 +186,6 @@ impl QmiOpenMode {
 /// endpoint confirms why — it reports link-layer `raw-ip` with no QoS header, so
 /// the client has to be opened the same way.
 pub const QMI_OPEN_NET_ARG: &str = "--device-open-net=net-raw-ip|net-no-qos-header";
-
-/// Result of bringing up an IMS data session on a secondary endpoint.
-#[derive(Debug)]
-pub struct ImsSession {
-    /// Long-running qmicli process that owns both the WDS client and packet-data
-    /// call. DATA6 cannot safely transfer either across direct-QMI opens.
-    child: Child,
-    output_tasks: Vec<JoinHandle<()>>,
-    /// WDS packet data handle, retained for status and diagnostics.
-    pub packet_data_handle: String,
-    /// Family actually established.
-    pub ip_family: String,
-    pub ipv4_address: Option<String>,
-    pub ipv4_gateway: Option<String>,
-    pub ipv4_dns: Vec<String>,
-    pub ipv6_address: Option<String>,
-    pub ipv6_gateway: Option<String>,
-    pub ipv6_dns: Vec<String>,
-    pub mtu: Option<u32>,
-}
-
-impl ImsSession {
-    pub fn check_liveness(&mut self) -> Result<(), String> {
-        check_session_process(&mut self.child)
-    }
-}
-
-fn check_session_process(child: &mut Child) -> Result<(), String> {
-    match child.try_wait() {
-        Ok(None) => Ok(()),
-        // --wds-follow-network can exit successfully after a disconnect. A
-        // zero exit code does not mean the retained bearer is still usable.
-        Ok(Some(status)) => Err(format!("secondary_qmi_session_exited:{status}")),
-        Err(error) => Err(format!("secondary_qmi_session_status_failed:{error}")),
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecondaryQmiEndpoint {
@@ -363,7 +321,7 @@ pub fn discover_primary_qmi_ports() -> Vec<String> {
 /// Once a port shows up this keeps polling until the count holds steady for
 /// [`PRIMARY_PORT_SETTLE`]. A host with two modems can attach them seconds apart,
 /// and returning on the first one would silently leave the second baseband
-/// without an IMS endpoint.
+/// without a project-created DATA6 data endpoint.
 pub async fn wait_for_primary_qmi_ports(timeout: Duration) -> Vec<String> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut ports = discover_primary_qmi_ports();
@@ -1193,177 +1151,6 @@ pub async fn hold_endpoint(endpoint: &SecondaryQmiEndpoint) -> Result<(), Second
     }
 }
 
-/// Start the IMS data session in one direct QMI process.
-///
-/// DATA6 is exposed as an AT-typed WWAN port even though it speaks QMI. Opening
-/// it in a second qmicli process sends a fresh QMI sync and invalidates a CID
-/// retained by the first process. The start request must therefore allocate the
-/// WDS client and activate the packet-data call in the same invocation.
-///
-/// `family` is `Some(4)` or `Some(6)` for a forced single-stack attempt. `None`
-/// omits the WDS IP-family preference so the prepared 3GPP profile's IPv4v6 PDP
-/// type is used for the dual-stack attempt.
-pub async fn start_ims_session(
-    endpoint: &SecondaryQmiEndpoint,
-    apn: &str,
-    family: Option<u8>,
-    profile_id: Option<u32>,
-) -> Result<ImsSession, String> {
-    let start = ims_start_action(apn, family, profile_id);
-    let mut command = Command::new("qmicli");
-    command
-        .args(ims_session_args(&endpoint.device_path, &start))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("secondary_qmi_start_spawn_failed:{error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "secondary_qmi_start_stdout_missing".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "secondary_qmi_start_stderr_missing".to_string())?;
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let output_tasks = vec![
-        spawn_qmicli_output_reader(stdout, sender.clone()),
-        spawn_qmicli_output_reader(stderr, sender),
-    ];
-    let mut output = String::new();
-    let handle = match tokio::time::timeout(Duration::from_secs(65), async {
-        while let Some(line) = receiver.recv().await {
-            output.push_str(&line);
-            output.push('\n');
-            if let Some(handle) = parse_packet_data_handle(&line) {
-                return Some(handle);
-            }
-        }
-        None
-    })
-    .await
-    {
-        Ok(Some(handle)) => handle,
-        Ok(None) => {
-            let _ = child.wait().await;
-            await_output_tasks(output_tasks).await;
-            let reason =
-                parse_call_end_reason(&output).unwrap_or_else(|| output.trim().to_string());
-            return Err(format!("secondary_qmi_start_failed:{reason}"));
-        }
-        Err(_) => {
-            terminate_qmicli(&mut child).await;
-            await_output_tasks(output_tasks).await;
-            return Err(format!(
-                "secondary_qmi_start_failed:timeout:{}",
-                output.trim()
-            ));
-        }
-    };
-    Ok(ImsSession {
-        child,
-        output_tasks,
-        packet_data_handle: handle,
-        ip_family: family
-            .map(|family| format!("ipv{family}"))
-            .unwrap_or_else(|| "ipv4v6".to_string()),
-        ipv4_address: None,
-        ipv4_gateway: None,
-        ipv4_dns: Vec::new(),
-        ipv6_address: None,
-        ipv6_gateway: None,
-        ipv6_dns: Vec::new(),
-        mtu: None,
-    })
-}
-
-fn ims_session_args<'a>(device: &'a str, start: &'a str) -> [&'a str; 7] {
-    [
-        "--verbose",
-        "-d",
-        device,
-        "--device-open-qmi",
-        QMI_OPEN_NET_ARG,
-        start,
-        "--wds-follow-network",
-    ]
-}
-
-fn spawn_qmicli_output_reader<R>(reader: R, sender: mpsc::UnboundedSender<String>) -> JoinHandle<()>
-where
-    R: tokio::io::AsyncRead + Unpin + Send + 'static,
-{
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(reader).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            debug!(output = %line, "Secondary QMI session output");
-            if let Some(event) = followed_session_event(&line) {
-                warn!(event, "Secondary QMI retained session lifecycle event");
-            }
-            let _ = sender.send(line);
-        }
-    })
-}
-
-fn followed_session_event(line: &str) -> Option<&'static str> {
-    if line.ends_with("Connection status: 'disconnected'") {
-        Some("network_disconnected")
-    } else if line.ends_with("Stopping after detecting disconnection") {
-        Some("stopping_after_disconnection")
-    } else if line.ends_with("Network stopped") {
-        Some("network_stopped")
-    } else {
-        None
-    }
-}
-
-async fn await_output_tasks(tasks: Vec<JoinHandle<()>>) {
-    for task in tasks {
-        let _ = task.await;
-    }
-}
-
-async fn terminate_qmicli(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(pid) = child.id() {
-        // qmicli handles SIGINT by stopping the followed WDS call before exit.
-        // SAFETY: `pid` comes directly from the live child process.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGINT);
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = child.start_kill();
-
-    if tokio::time::timeout(Duration::from_secs(10), child.wait())
-        .await
-        .is_err()
-    {
-        let _ = child.start_kill();
-        let _ = child.wait().await;
-    }
-}
-
-fn ims_start_action(apn: &str, family: Option<u8>, profile_id: Option<u32>) -> String {
-    let mut action = format!("--wds-start-network=apn={apn}");
-    if let Some(profile) = profile_id {
-        action.push_str(&format!(",3gpp-profile={profile}"));
-    }
-    if let Some(family) = family {
-        action.push_str(&format!(",ip-type={family}"));
-    }
-    action
-}
-
-/// Tear down an IMS session in the process that owns its WDS client.
-pub async fn stop_ims_session(mut session: ImsSession) {
-    terminate_qmicli(&mut session.child).await;
-    await_output_tasks(session.output_tasks).await;
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CurrentSettings {
     pub ip_family: Option<String>,
@@ -1468,52 +1255,6 @@ pub fn parse_current_settings(output: &str) -> CurrentSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn followed_session_clean_exit_is_still_bearer_loss() {
-        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
-        assert!(child.wait().await.unwrap().success());
-        assert!(check_session_process(&mut child)
-            .unwrap_err()
-            .starts_with("secondary_qmi_session_exited:"));
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn followed_session_live_process_is_not_a_disconnect() {
-        let mut child = Command::new("sleep")
-            .arg("30")
-            .kill_on_drop(true)
-            .spawn()
-            .unwrap();
-        assert!(check_session_process(&mut child).is_ok());
-        child.kill().await.unwrap();
-        assert!(check_session_process(&mut child)
-            .unwrap_err()
-            .starts_with("secondary_qmi_session_exited:"));
-    }
-
-    #[test]
-    fn followed_session_reports_only_lifecycle_events() {
-        assert_eq!(
-            followed_session_event("[/dev/wwan0at1] Connection status: 'disconnected'"),
-            Some("network_disconnected")
-        );
-        assert_eq!(
-            followed_session_event("[/dev/wwan0at1] Stopping after detecting disconnection"),
-            Some("stopping_after_disconnection")
-        );
-        assert_eq!(
-            followed_session_event("[/dev/wwan0at1] Network stopped"),
-            Some("network_stopped")
-        );
-        assert_eq!(
-            followed_session_event("[/dev/wwan0at1] Connection status: 'connected'"),
-            None
-        );
-        assert_eq!(followed_session_event("Packet data handle: '12345'"), None);
-    }
 
     #[test]
     fn remoteproc_extracted_from_sysfs_path() {
@@ -1631,16 +1372,6 @@ mod tests {
     fn open_mode_args_and_probe_order() {
         assert_eq!(QmiOpenMode::ForceQmi.as_arg(), "--device-open-qmi");
         assert_eq!(QmiOpenMode::probe_order(), [QmiOpenMode::ForceQmi]);
-    }
-
-    #[test]
-    fn ims_session_is_owned_by_one_following_qmicli_process() {
-        let start = ims_start_action("ims", Some(6), Some(2));
-        let args = ims_session_args("/dev/wwan0at2", &start);
-        assert!(args.contains(&"--wds-follow-network"));
-        assert!(args.contains(&QMI_OPEN_NET_ARG));
-        assert!(args.contains(&start.as_str()));
-        assert!(!args.contains(&"--client-no-release-cid"));
     }
 
     #[test]
@@ -1804,25 +1535,6 @@ mod tests {
         assert!(parse_packet_data_handle(output).is_none());
         let reason = parse_call_end_reason(output).unwrap();
         assert!(reason.contains("ipv4-only-allowed"), "got: {reason}");
-    }
-
-    #[test]
-    fn ims_start_action_uses_profile_default_for_dual_stack() {
-        let action = ims_start_action("ims", None, Some(2));
-        assert_eq!(action, "--wds-start-network=apn=ims,3gpp-profile=2");
-        assert!(!action.contains("ip-type="));
-    }
-
-    #[test]
-    fn ims_start_action_forces_only_explicit_single_stack() {
-        assert_eq!(
-            ims_start_action("ims", Some(6), None),
-            "--wds-start-network=apn=ims,ip-type=6"
-        );
-        assert_eq!(
-            ims_start_action("ims", Some(4), Some(2)),
-            "--wds-start-network=apn=ims,3gpp-profile=2,ip-type=4"
-        );
     }
 
     #[test]
