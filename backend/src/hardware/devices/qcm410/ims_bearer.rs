@@ -668,7 +668,7 @@ mod tests {
         let settings = current_settings_for_family(&current, 4).unwrap();
         assert_eq!(settings.ipv4_address, Some("10.0.0.2".parse().unwrap()));
         assert_eq!(settings.ipv4_prefix, Some(30));
-        assert_eq!(settings.pcscf, vec!["10.0.0.3".parse().unwrap()]);
+        assert_eq!(settings.pcscf, vec!["10.0.0.3".parse::<IpAddr>().unwrap()]);
     }
 
     #[test]
