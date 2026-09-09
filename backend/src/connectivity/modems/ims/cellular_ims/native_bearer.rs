@@ -95,6 +95,12 @@ pub struct NativeImsBearer {
 }
 
 impl NativeImsBearer {
+    pub fn check_liveness(&mut self) -> Result<(), CellularImsError> {
+        self.handle
+            .check_liveness()
+            .map_err(cellular_ims_error_from_ims_bearer)
+    }
+
     /// Move the dedicated native netdev into this line's UE namespace. The
     /// primary ModemManager interface is intentionally rejected; only a
     /// provider-declared application-owned bearer may cross the
@@ -419,6 +425,7 @@ fn cellular_ims_error_from_ims_bearer(error: ImsBearerError) -> CellularImsError
                 code::RUNTIME_IMS_BEARER_START_FAILED
             }
         }
+        ImsBearerErrorKind::SessionLost => code::BEARER_SESSION_LOST,
         ImsBearerErrorKind::SettingsMissing => code::IP_SETTINGS_MISSING,
     };
     CellularImsError::with_detail(error_code, error.detail)
@@ -586,5 +593,17 @@ mod tests {
                 .to_string(),
         });
         assert_eq!(ordinary.code(), code::RUNTIME_IMS_BEARER_START_FAILED);
+    }
+
+    #[test]
+    fn lost_session_does_not_retry_another_family_on_the_dead_bearer() {
+        let error = cellular_ims_error_from_ims_bearer(ImsBearerError {
+            kind: ImsBearerErrorKind::SessionLost,
+            hint: ImsBearerFailureHint::None,
+            detail: "secondary_qmi_session_exited:exit status: 0".to_string(),
+        });
+        assert_eq!(error.code(), code::BEARER_SESSION_LOST);
+        assert!(!FailureClass::from_error(&error).is_retryable_family());
+        assert!(!FailureClass::from_error(&error).is_unsafe_to_retry());
     }
 }

@@ -46,6 +46,17 @@ pub struct Qcm410ImsBearerHandle {
 }
 
 impl ImsBearerHandle for Qcm410ImsBearerHandle {
+    fn check_liveness(&mut self) -> Result<(), ImsBearerError> {
+        for session in &mut self.sessions {
+            session.check_liveness().map_err(|detail| ImsBearerError {
+                kind: ImsBearerErrorKind::SessionLost,
+                hint: ImsBearerFailureHint::None,
+                detail,
+            })?;
+        }
+        Ok(())
+    }
+
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         Box::pin(async move {
             let Qcm410ImsBearerHandle {

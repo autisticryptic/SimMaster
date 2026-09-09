@@ -92,6 +92,7 @@ pub mod code {
     /// The bearer re-addressed between reading its settings and using them, so
     /// the source-based policy routing no longer matches the live interface.
     pub const BEARER_ADDRESS_CHANGED: &str = "volte_bearer_address_changed";
+    pub const BEARER_SESSION_LOST: &str = "volte_bearer_session_lost";
     pub const PCSCF_FAMILY_MISMATCH: &str = "volte_pcscf_family_mismatch";
 
     // UE-only native bearer allocation.

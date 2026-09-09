@@ -129,6 +129,10 @@ pub struct ImsBearerInfo {
 /// The teardown is returned as a boxed future so the trait stays object-safe and
 /// can be held as `Box<dyn ImsBearerHandle + Send>` by upper layers.
 pub trait ImsBearerHandle: Send {
+    /// Report confirmed loss of the retained provider session without opening
+    /// another control connection or sending network probes.
+    fn check_liveness(&mut self) -> Result<(), ImsBearerError>;
+
     /// Stop the provider session and release its endpoint and network state.
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
@@ -143,6 +147,8 @@ pub enum ImsBearerErrorKind {
     EndpointUnavailable,
     /// The device-native session failed to start.
     SessionStartFailed,
+    /// The provider session ended after its bearer was established.
+    SessionLost,
     /// The IMS context reported no usable IP configuration / P-CSCF.
     SettingsMissing,
     /// The data interface for the session could not be resolved.

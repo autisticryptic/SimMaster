@@ -61,7 +61,7 @@ use tokio::{
     task::JoinHandle,
     time::sleep,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Beta8 deliberately migrated DATA6 away from the kernel-specific multi-port
 /// module and binds exactly one channel through the in-tree driver. On MSM8916,
@@ -211,6 +211,22 @@ pub struct ImsSession {
     pub ipv6_gateway: Option<String>,
     pub ipv6_dns: Vec<String>,
     pub mtu: Option<u32>,
+}
+
+impl ImsSession {
+    pub fn check_liveness(&mut self) -> Result<(), String> {
+        check_session_process(&mut self.child)
+    }
+}
+
+fn check_session_process(child: &mut Child) -> Result<(), String> {
+    match child.try_wait() {
+        Ok(None) => Ok(()),
+        // --wds-follow-network can exit successfully after a disconnect. A
+        // zero exit code does not mean the retained bearer is still usable.
+        Ok(Some(status)) => Err(format!("secondary_qmi_session_exited:{status}")),
+        Err(error) => Err(format!("secondary_qmi_session_status_failed:{error}")),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,9 +1300,24 @@ where
         let mut lines = BufReader::new(reader).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             debug!(output = %line, "Secondary QMI session output");
+            if let Some(event) = followed_session_event(&line) {
+                warn!(event, "Secondary QMI retained session lifecycle event");
+            }
             let _ = sender.send(line);
         }
     })
+}
+
+fn followed_session_event(line: &str) -> Option<&'static str> {
+    if line.ends_with("Connection status: 'disconnected'") {
+        Some("network_disconnected")
+    } else if line.ends_with("Stopping after detecting disconnection") {
+        Some("stopping_after_disconnection")
+    } else if line.ends_with("Network stopped") {
+        Some("network_stopped")
+    } else {
+        None
+    }
 }
 
 async fn await_output_tasks(tasks: Vec<JoinHandle<()>>) {
@@ -1437,6 +1468,52 @@ pub fn parse_current_settings(output: &str) -> CurrentSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followed_session_clean_exit_is_still_bearer_loss() {
+        let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();
+        assert!(child.wait().await.unwrap().success());
+        assert!(check_session_process(&mut child)
+            .unwrap_err()
+            .starts_with("secondary_qmi_session_exited:"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn followed_session_live_process_is_not_a_disconnect() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        assert!(check_session_process(&mut child).is_ok());
+        child.kill().await.unwrap();
+        assert!(check_session_process(&mut child)
+            .unwrap_err()
+            .starts_with("secondary_qmi_session_exited:"));
+    }
+
+    #[test]
+    fn followed_session_reports_only_lifecycle_events() {
+        assert_eq!(
+            followed_session_event("[/dev/wwan0at1] Connection status: 'disconnected'"),
+            Some("network_disconnected")
+        );
+        assert_eq!(
+            followed_session_event("[/dev/wwan0at1] Stopping after detecting disconnection"),
+            Some("stopping_after_disconnection")
+        );
+        assert_eq!(
+            followed_session_event("[/dev/wwan0at1] Network stopped"),
+            Some("network_stopped")
+        );
+        assert_eq!(
+            followed_session_event("[/dev/wwan0at1] Connection status: 'connected'"),
+            None
+        );
+        assert_eq!(followed_session_event("Packet data handle: '12345'"), None);
+    }
 
     #[test]
     fn remoteproc_extracted_from_sysfs_path() {

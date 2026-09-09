@@ -2011,6 +2011,7 @@ fn failure_stage(error: &CellularImsError) -> Option<CellularImsStage> {
         | code::RUNTIME_MM_BEARER_CONNECT_FAILED
         | code::RUNTIME_IMS_ENDPOINT_UNAVAILABLE
         | code::RUNTIME_IMS_BEARER_START_FAILED
+        | code::BEARER_SESSION_LOST
         | code::RUNTIME_MM_BEARER_PATH_MISSING
         | code::RUNTIME_IMS_FAMILY_UNSUPPORTED
         | code::DATA_SLOT_MODE_MISSING => CellularImsStage::Bearer,
@@ -2429,6 +2430,7 @@ async fn connect_inner(
                 live.operator.video_enabled(),
                 access_network_runtime,
                 &network_worker_binding,
+                native_bearer.as_mut(),
             )
             .await
             {
@@ -2533,7 +2535,11 @@ async fn connect_family(
     video_capability_enabled: bool,
     access_network_runtime: &ImsAccessNetworkRuntime,
     worker_binding: &UeWorkerBinding,
+    mut native_bearer: Option<&mut NativeImsBearer>,
 ) -> Result<CellularImsLiveSession, CellularImsError> {
+    if let Some(native) = native_bearer.as_deref_mut() {
+        native.check_liveness()?;
+    }
     runtime
         .update(|state| state.stage = CellularImsStage::Pcscf)
         .await;
@@ -2648,6 +2654,9 @@ async fn connect_family(
     let mut pending_variant = None;
     let mut candidate_attempts = 0usize;
     while pending_variant.is_some() || register_variants.peek().is_some() {
+        if let Some(native) = native_bearer.as_deref_mut() {
+            native.check_liveness()?;
+        }
         if candidate_attempts >= CELLULAR_IMS_REGISTER_CANDIDATE_LIMIT {
             tracing::warn!(
                 line_id = %device.line_id,
@@ -2772,9 +2781,15 @@ async fn connect_family(
         )
         .with_worker_binding(worker_binding.clone());
         ensure_worker_binding_current(worker_binding)?;
-        let registration = match run_register_observed(&mut channel, &initial, &mut authenticator)
-            .await
-        {
+        let registration_result =
+            run_register_observed(&mut channel, &initial, &mut authenticator).await;
+        if let Some(native) = native_bearer.as_deref_mut() {
+            if let Err(error) = native.check_liveness() {
+                authenticator.rollback_security(&mut channel).await;
+                return Err(error);
+            }
+        }
+        let registration = match registration_result {
             Ok(registration) => registration,
             Err(failure) => {
                 log_cellular_ims_register_failure_metadata(variant, &failure, None);
@@ -3249,11 +3264,31 @@ async fn live_receive_loop(
     };
     // Refresh retries stay on this live channel. Rebuilding is reserved for
     // an expired registration or a proven worker/access-generation loss.
-    // The native IMS provider retains its device session until teardown.
-    // REGISTER refresh remains the end-to-end bearer health signal because it
-    // covers the IMS IP path and SIP service, not only WDS packet status.
+    // A provider-process exit proves access loss. An unanswered advisory probe
+    // does not; REGISTER refresh remains the end-to-end IMS health signal.
     loop {
         if runtime.generation() != generation {
+            break;
+        }
+        let bearer_error = {
+            let mut sessions = live.session.lock().await;
+            sessions
+                .as_mut()
+                .and_then(|session| session.native_bearer.as_mut())
+                .and_then(|native| native.check_liveness().err())
+        };
+        if let Some(error) = bearer_error {
+            live.operator.set_ready(false);
+            runtime
+                .update(|state| {
+                    state.phase = CellularImsPhase::Degraded;
+                    state.stage = CellularImsStage::Bearer;
+                    state.last_error = Some(error.to_string());
+                    state.last_failure_at = Some(now());
+                })
+                .await;
+            tracing::warn!(error = %error, "VoLTE retained IMS bearer ended");
+            cleanup_live_session(&live).await;
             break;
         }
         if let Some(pending) = pending_options.as_ref() {
@@ -9602,6 +9637,16 @@ Content-Length: 0\r\n\r\n";
             authenticated.detail(),
             Some("ims_register_authenticated_receive_failed")
         );
+    }
+
+    #[test]
+    fn lost_provider_session_is_a_bearer_failure_without_retention() {
+        let error = CellularImsError::with_detail(
+            code::BEARER_SESSION_LOST,
+            "secondary_qmi_session_exited:exit status: 0",
+        );
+        assert_eq!(failure_stage(&error), Some(CellularImsStage::Bearer));
+        assert!(!should_retain_failed_bearer(&error));
     }
 
     #[test]
