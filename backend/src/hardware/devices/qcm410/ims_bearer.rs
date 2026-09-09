@@ -371,11 +371,12 @@ async fn start_primary_session(
     })
 }
 
-async fn drain_qmicli_stream<R>(mut reader: BufReader<R>, sender: mpsc::UnboundedSender<String>)
+async fn drain_qmicli_stream<R>(reader: BufReader<R>, sender: mpsc::UnboundedSender<String>)
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    while let Ok(Some(line)) = reader.lines().next_line().await {
+    let mut lines = reader.lines();
+    while let Ok(Some(line)) = lines.next_line().await {
         if sender.send(line).is_err() {
             break;
         }
