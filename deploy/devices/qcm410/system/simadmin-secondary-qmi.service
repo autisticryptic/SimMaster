@@ -6,9 +6,11 @@ Before=ModemManager.service simadmin.service
 [Service]
 Type=notify
 NotifyAccess=all
-# The QCM410 driver is UE-only. It always prepares the validated DATA6 native
-# endpoint; when that hardware endpoint is absent, cellular data and VoLTE stay
-# unavailable rather than falling back to a host-namespace bearer.
+# The QCM410 driver is UE-only. It always asks device-init to create the
+# project-owned DATA6 ordinary-data endpoint from DATA6_CNTL and marks its WWAN
+# node ignored by ModemManager. If that project-created endpoint cannot be
+# prepared, cellular data stays unavailable rather than falling back to a
+# host-namespace bearer; IMS still uses the fixed primary qmi0 access leg.
 # Nothing here may name a channel, a driver, or a port. The initializer
 # discovers the baseband layout at runtime -- it reads /sys/class/wwan/*/type,
 # dedupes by baseband, and accepts an endpoint only after a QMI probe confirms
