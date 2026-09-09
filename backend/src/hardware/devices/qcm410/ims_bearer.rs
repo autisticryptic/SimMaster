@@ -12,11 +12,21 @@
 //! namespace by the native bearer strategy, so SIP and IPsec remain isolated
 //! per line.
 
-use std::{future::Future, net::IpAddr, pin::Pin, process::Command as StdCommand, time::Duration};
+use std::{
+    future::Future,
+    net::IpAddr,
+    pin::Pin,
+    process::Stdio,
+    time::{Duration, Instant},
+};
 
-use tokio::process::Command;
+use tokio::{
+    io::{AsyncBufReadExt, BufReader},
+    process::{Child, Command},
+    sync::mpsc,
+};
 
-use crate::hardware::cellular::{cgcontrdp::CgcontrdpSettings, qmi_wds};
+use crate::hardware::cellular::cgcontrdp::{self, CgcontrdpSettings};
 use crate::hardware::devices::qcm410::{
     netdev::{self as qmi_netdev, NetdevConfig},
     secondary_qmi,
@@ -27,15 +37,15 @@ use crate::hardware::devices::transport::{
 };
 
 const PRIMARY_QMI_DEVICE: &str = "/dev/wwan0qmi0";
-// The primary qmi0 node is already advertised as QMI. Keep it proxy-owned so
-// retained WDS CIDs survive across qmicli processes. On QCA410, forcing
-// `--device-open-qmi` here makes qmi-proxy hang up the endpoint after the first
-// process exits; that flag remains required by the project-created DATA6
-// secondary endpoint and must not be copied into this primary access leg.
+// A single qmicli process owns the primary WDS bearer for its entire lifetime.
+// On QCA410, moving a retained CID between short-lived qmicli processes makes
+// qmi-proxy hang up the endpoint; this proxy-only access leg therefore must not
+// be changed back to an allocate/start/query/stop sequence. `--device-open-qmi`
+// remains required by the project-created DATA6 secondary endpoint and must not
+// be copied into this primary IMS leg.
 const PRIMARY_QMI_OPEN_FLAGS: [&str; 2] = ["--device-open-proxy", secondary_qmi::QMI_OPEN_NET_ARG];
 const CURRENT_SETTINGS_RETRIES: usize = 12;
-const QMI_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
-const WDS_START_TIMEOUT: Duration = Duration::from_secs(65);
+const WDS_FOLLOW_START_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn is_primary_qmi_device(device: &str) -> bool {
     device.trim().starts_with("/dev/") && qmi_netdev::primary_netdev_for_qmi(device).is_some()
@@ -48,40 +58,28 @@ fn primary_netdev_for_qmi(device: &str) -> Option<String> {
     qmi_netdev::primary_netdev_for_qmi(device)
 }
 
-/// Retained primary-QMI WDS session. The WDS CID is kept by qmi-proxy so
-/// subsequent qmicli processes can fetch settings/status and stop the call.
+/// Primary-QMI WDS session owned by one long-lived qmicli process.
+///
+/// Do not replace this with a numeric CID plus short-lived qmicli calls. The
+/// QCA410 qmi-proxy/device combination invalidates that ownership boundary and
+/// takes down ModemManager's primary endpoint.
 struct PrimaryQmiSession {
-    device_path: String,
     client_id: String,
     packet_data_handle: String,
+    process: Child,
 }
 
 impl PrimaryQmiSession {
     fn check_liveness(&mut self) -> Result<(), String> {
-        let cid = format!("--client-cid={}", self.client_id);
-        let args = action_args(
-            &self.device_path,
-            &cid,
-            "--wds-get-packet-service-status",
-            true,
-        );
-        let output = StdCommand::new("qmicli")
-            .args(args)
-            .output()
-            .map_err(|error| format!("qca410_primary_qmi_status_spawn_failed:{error}"))?;
-        let text = output_text(&output);
-        if output.status.success()
-            && text.lines().any(|line| {
-                line.to_ascii_lowercase()
-                    .contains("connection status: 'connected'")
-            })
+        match self
+            .process
+            .try_wait()
+            .map_err(|error| format!("qca410_primary_qmi_follow_status_failed:{error}"))?
         {
-            Ok(())
-        } else {
-            Err(format!(
-                "qca410_primary_qmi_session_disconnected:{}",
-                compact(&text)
-            ))
+            None => Ok(()),
+            Some(status) => Err(format!(
+                "qca410_primary_qmi_session_disconnected:pid_exit={status}"
+            )),
         }
     }
 }
@@ -113,7 +111,6 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
                 qmi_netdev::teardown(&interface, &config).await;
             }
             stop_primary_session(&mut session).await;
-            release_primary_client(&session).await;
         })
     }
 }
@@ -182,10 +179,10 @@ async fn establish_bearer(
     device: &str,
     primary_netdev: &str,
     baseband: &str,
-    _modem_id: &str,
+    modem_id: &str,
     apn: &str,
     profile_id: Option<u32>,
-    _context_cid: u8,
+    context_cid: u8,
     families: &[u8],
 ) -> Result<Established, ImsBearerError> {
     let Some(first_family) = families.first().copied() else {
@@ -202,11 +199,13 @@ async fn establish_bearer(
         }
     };
 
-    let settings = match wait_for_current_settings(&session, first_family).await {
+    // The long-lived qmicli process is the sole WDS owner. Read the active
+    // context through the AT path instead of reopening qmi-proxy with the
+    // retained CID from another process.
+    let settings = match wait_for_current_settings(modem_id, context_cid, apn, first_family).await {
         Ok(settings) => settings,
         Err(error) => {
             stop_primary_session(&mut session).await;
-            release_primary_client(&session).await;
             return Err(error);
         }
     };
@@ -214,13 +213,11 @@ async fn establish_bearer(
         Ok(settings) => settings,
         Err(error) => {
             stop_primary_session(&mut session).await;
-            release_primary_client(&session).await;
             return Err(error);
         }
     };
     let Some(config) = netdev_config_for(&settings, first_family) else {
         stop_primary_session(&mut session).await;
-        release_primary_client(&session).await;
         return Err(settings_missing(
             "qca410_primary_ims_session_has_no_address".to_string(),
         ));
@@ -232,7 +229,6 @@ async fn establish_bearer(
         Ok(resolution) => resolution,
         Err(error) => {
             stop_primary_session(&mut session).await;
-            release_primary_client(&session).await;
             return Err(ImsBearerError {
                 kind: ImsBearerErrorKind::NetdevUnresolved,
                 hint: if matches!(error, qmi_netdev::NetdevError::LinkUnavailable(_)) {
@@ -284,21 +280,21 @@ fn primary_open_args(device: &str) -> Vec<String> {
     args
 }
 
-fn action_args(device: &str, cid: &str, action: &str, no_release: bool) -> Vec<String> {
+fn primary_follow_args(
+    device: &str,
+    apn: &str,
+    family: u8,
+    profile_id: Option<u32>,
+) -> Vec<String> {
     let mut args = primary_open_args(device);
-    args.push(cid.to_string());
-    if no_release {
-        args.push("--client-no-release-cid".to_string());
+    let mut start = format!("--wds-start-network=apn={apn}");
+    if let Some(profile_id) = profile_id {
+        start.push_str(&format!(",3gpp-profile={profile_id}"));
     }
-    args.push(action.to_string());
+    start.push_str(&format!(",ip-type={family}"));
+    args.push(start);
+    args.push("--wds-follow-network".to_string());
     args
-}
-
-async fn run_primary(args: Vec<String>, timeout: Duration) -> Result<std::process::Output, String> {
-    tokio::time::timeout(timeout, Command::new("qmicli").args(args).output())
-        .await
-        .map_err(|_| "qca410_primary_qmi_command_timeout".to_string())?
-        .map_err(|error| format!("qca410_primary_qmi_command_spawn_failed:{error}"))
 }
 
 async fn start_primary_session(
@@ -307,116 +303,97 @@ async fn start_primary_session(
     family: u8,
     profile_id: Option<u32>,
 ) -> Result<PrimaryQmiSession, String> {
-    let allocation = run_primary(
-        {
-            let mut args = primary_open_args(device);
-            args.extend([
-                "--client-no-release-cid".to_string(),
-                "--wds-noop".to_string(),
-            ]);
-            args
-        },
-        QMI_COMMAND_TIMEOUT,
-    )
-    .await?;
-    let allocation_text = output_text(&allocation);
-    if !allocation.status.success() {
-        return Err(format!(
-            "qca410_primary_qmi_cid_allocate_failed:{}",
-            compact(&allocation_text)
-        ));
-    }
-    let client_id = secondary_qmi::parse_wds_client_id(&allocation_text).ok_or_else(|| {
-        format!(
-            "qca410_primary_qmi_cid_missing:{}",
-            compact(&allocation_text)
-        )
-    })?;
-    let cid = format!("--client-cid={client_id}");
-
-    let family_action = format!("--wds-set-ip-family={family}");
-    let family_output = run_primary(
-        action_args(device, &cid, &family_action, true),
-        QMI_COMMAND_TIMEOUT,
-    )
-    .await;
-    if let Err(error) = family_output.and_then(|output| {
-        if output.status.success() {
-            Ok(output)
-        } else {
-            Err(format!(
-                "qca410_primary_qmi_family_failed:{}",
-                compact(&output_text(&output))
-            ))
+    let mut process = Command::new("qmicli")
+        .args(primary_follow_args(device, apn, family, profile_id))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("qca410_primary_qmi_follow_spawn_failed:{error}"))?;
+    let stdout = match process.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            stop_child(&mut process).await;
+            return Err("qca410_primary_qmi_follow_stdout_missing".to_string());
         }
-    }) {
-        release_primary_client_parts(device, &client_id).await;
-        return Err(error);
-    }
+    };
+    let stderr = match process.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            stop_child(&mut process).await;
+            return Err("qca410_primary_qmi_follow_stderr_missing".to_string());
+        }
+    };
+    let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(drain_qmicli_stream(BufReader::new(stdout), sender.clone()));
+    tokio::spawn(drain_qmicli_stream(BufReader::new(stderr), sender));
 
-    let mut start = format!("--wds-start-network=apn={apn}");
-    if let Some(profile_id) = profile_id {
-        start.push_str(&format!(",3gpp-profile={profile_id}"));
-    }
-    start.push_str(&format!(",ip-type={family}"));
-    let output = match run_primary(action_args(device, &cid, &start, true), WDS_START_TIMEOUT).await
-    {
-        Ok(output) if output.status.success() => output,
-        Ok(output) => {
-            release_primary_client_parts(device, &client_id).await;
+    let deadline = Instant::now() + WDS_FOLLOW_START_TIMEOUT;
+    let mut startup = String::new();
+    let mut client_id = None;
+    let mut packet_data_handle = None;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
+            Ok(Some(line)) => {
+                if startup.len() < 16 * 1024 {
+                    startup.push_str(&line);
+                    startup.push('\n');
+                }
+                client_id = client_id.or_else(|| secondary_qmi::parse_wds_client_id(&line));
+                packet_data_handle =
+                    packet_data_handle.or_else(|| secondary_qmi::parse_packet_data_handle(&line));
+                if packet_data_handle.is_some() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => {}
+        }
+        if let Some(status) = process
+            .try_wait()
+            .map_err(|error| format!("qca410_primary_qmi_follow_status_failed:{error}"))?
+        {
             return Err(format!(
-                "qca410_primary_qmi_start_failed:{}",
-                compact(&output_text(&output))
+                "qca410_primary_qmi_start_failed:pid_exit={status}:{}",
+                compact(&startup)
             ));
         }
-        Err(error) => {
-            release_primary_client_parts(device, &client_id).await;
-            return Err(error);
-        }
-    };
-    let packet_data_handle = match secondary_qmi::parse_packet_data_handle(&output_text(&output)) {
-        Some(handle) => handle,
-        None => {
-            release_primary_client_parts(device, &client_id).await;
-            return Err("qca410_primary_qmi_packet_data_handle_missing".to_string());
-        }
+    }
+    let Some(packet_data_handle) = packet_data_handle else {
+        stop_child(&mut process).await;
+        return Err(format!(
+            "qca410_primary_qmi_packet_data_handle_missing:{}",
+            compact(&startup)
+        ));
     };
     Ok(PrimaryQmiSession {
-        device_path: device.to_string(),
-        client_id,
+        client_id: client_id.unwrap_or_else(|| "follow".to_string()),
         packet_data_handle,
+        process,
     })
 }
 
+async fn drain_qmicli_stream<R>(mut reader: BufReader<R>, sender: mpsc::UnboundedSender<String>)
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    while let Ok(Some(line)) = reader.lines().next_line().await {
+        if sender.send(line).is_err() {
+            break;
+        }
+    }
+}
+
 async fn wait_for_current_settings(
-    session: &PrimaryQmiSession,
+    modem_id: &str,
+    cid: u8,
+    apn: &str,
     family: u8,
 ) -> Result<CgcontrdpSettings, ImsBearerError> {
-    let cid = format!("--client-cid={}", session.client_id);
     let mut last = String::new();
     for _ in 0..CURRENT_SETTINGS_RETRIES {
-        match run_primary(
-            action_args(
-                &session.device_path,
-                &cid,
-                "--wds-get-current-settings",
-                true,
-            ),
-            QMI_COMMAND_TIMEOUT,
-        )
-        .await
-        {
-            Ok(output) => {
-                let text = output_text(&output);
-                last = text.clone();
-                if output.status.success() {
-                    let current = qmi_wds::parse_current_settings(&text);
-                    if let Some(settings) = current_settings_for_family(&current, family) {
-                        return Ok(settings);
-                    }
-                }
-            }
-            Err(error) => last = error,
+        match cgcontrdp::read_cgcontrdp_settings(modem_id, cid, apn).await {
+            Ok(settings) if has_started_family(&settings, family) => return Ok(settings),
+            Ok(_) => last = format!("active IMS context has no ipv{family} address"),
+            Err(error) => last = error.to_string(),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -426,67 +403,39 @@ async fn wait_for_current_settings(
     )))
 }
 
-fn current_settings_for_family(
-    current: &qmi_wds::CurrentSettings,
-    family: u8,
-) -> Option<CgcontrdpSettings> {
-    let parse = |value: Option<&String>| value.and_then(|value| value.parse::<IpAddr>().ok());
-    let settings = CgcontrdpSettings {
-        ipv4_address: parse(current.ipv4_address.as_ref()),
-        ipv4_gateway: parse(current.ipv4_gateway.as_ref()),
-        ipv4_dns: current
-            .ipv4_dns
-            .iter()
-            .filter_map(|value| value.parse().ok())
-            .collect(),
-        ipv4_prefix: current.ipv4_prefix,
-        ipv6_address: parse(current.ipv6_address.as_ref()),
-        ipv6_gateway: parse(current.ipv6_gateway.as_ref()),
-        ipv6_dns: current
-            .ipv6_dns
-            .iter()
-            .filter_map(|value| value.parse().ok())
-            .collect(),
-        ipv6_prefix: current.ipv6_prefix,
-        pcscf: current
-            .pcscf
-            .iter()
-            .filter_map(|value| value.parse().ok())
-            .collect(),
-    };
-    let address = if family == 6 {
-        settings.ipv6_address
-    } else {
-        settings.ipv4_address
-    }?;
-    if (family == 4 && address.is_ipv4()) || (family == 6 && address.is_ipv6()) {
-        Some(settings)
-    } else {
-        None
+fn has_started_family(settings: &CgcontrdpSettings, family: u8) -> bool {
+    match family {
+        4 => settings
+            .ipv4_address
+            .is_some_and(|address| address.is_ipv4()),
+        6 => settings
+            .ipv6_address
+            .is_some_and(|address| address.is_ipv6()),
+        _ => false,
     }
 }
 
 async fn stop_primary_session(session: &mut PrimaryQmiSession) {
-    let cid = format!("--client-cid={}", session.client_id);
-    let stop = format!("--wds-stop-network={}", session.packet_data_handle);
-    let _ = run_primary(
-        action_args(&session.device_path, &cid, &stop, true),
-        QMI_COMMAND_TIMEOUT,
-    )
-    .await;
+    stop_child(&mut session.process).await;
 }
 
-async fn release_primary_client(session: &PrimaryQmiSession) {
-    release_primary_client_parts(&session.device_path, &session.client_id).await;
-}
-
-async fn release_primary_client_parts(device: &str, client_id: &str) {
-    let cid = format!("--client-cid={client_id}");
-    let _ = run_primary(
-        action_args(device, &cid, "--wds-noop", false),
-        QMI_COMMAND_TIMEOUT,
-    )
-    .await;
+async fn stop_child(process: &mut Child) {
+    if let Some(pid) = process.id() {
+        // qmicli's follow mode owns the WDS CID and performs the graceful
+        // stop/release path when interrupted. Do not reopen qmi-proxy with a
+        // second process to issue stop-network or release-cid.
+        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < deadline {
+            match process.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(_) => break,
+            }
+        }
+        let _ = process.start_kill();
+    }
+    let _ = process.wait().await;
 }
 
 fn ip_type_for(family: u8) -> &'static str {
@@ -594,14 +543,6 @@ fn compact(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn output_text(output: &std::process::Output) -> String {
-    format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -641,12 +582,7 @@ mod tests {
 
     #[test]
     fn qca410_primary_commands_always_use_proxy_and_never_bind() {
-        let args = action_args(
-            PRIMARY_QMI_DEVICE,
-            "--client-cid=7",
-            "--wds-get-current-settings",
-            true,
-        );
+        let args = primary_follow_args(PRIMARY_QMI_DEVICE, "ims", 4, Some(2));
         assert!(args.iter().any(|arg| arg == "--device-open-proxy"));
         assert!(args
             .iter()
@@ -654,22 +590,27 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "--device-open-qmi"));
         assert!(!args.iter().any(|arg| arg.contains("bind-data-port")));
         assert!(!args.iter().any(|arg| arg.contains("bind-mux-data-port")));
+        assert!(args.iter().any(|arg| arg == "--wds-follow-network"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "--wds-start-network=apn=ims,3gpp-profile=2,ip-type=4"));
     }
 
     #[test]
-    fn current_settings_are_converted_for_the_started_family() {
-        let current = qmi_wds::CurrentSettings {
-            ipv4_address: Some("10.0.0.2".to_string()),
-            ipv4_gateway: Some("10.0.0.1".to_string()),
-            ipv4_dns: vec!["1.1.1.1".to_string()],
-            ipv4_prefix: Some(30),
-            pcscf: vec!["10.0.0.3".to_string()],
-            ..Default::default()
-        };
-        let settings = current_settings_for_family(&current, 4).unwrap();
-        assert_eq!(settings.ipv4_address, Some("10.0.0.2".parse().unwrap()));
-        assert_eq!(settings.ipv4_prefix, Some(30));
-        assert_eq!(settings.pcscf, vec!["10.0.0.3".parse::<IpAddr>().unwrap()]);
+    fn current_settings_are_filtered_for_the_started_family() {
+        let mut settings = reference_settings();
+        settings.ipv6_address = Some("2001:db8::2".parse().unwrap());
+        settings.ipv6_gateway = Some("2001:db8::1".parse().unwrap());
+        settings.ipv6_prefix = Some(64);
+        settings.ipv6_dns = vec!["2001:4860:4860::8888".parse().unwrap()];
+        settings.pcscf.push("2001:db8::3".parse().unwrap());
+        let settings = settings_for_started_family(settings, 4).unwrap();
+        assert_eq!(
+            settings.ipv4_address,
+            Some("10.129.39.207".parse().unwrap())
+        );
+        assert!(settings.ipv6_address.is_none());
+        assert!(settings.pcscf.iter().all(IpAddr::is_ipv4));
     }
 
     #[test]
