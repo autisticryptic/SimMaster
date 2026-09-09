@@ -146,15 +146,29 @@ impl ImsIpSettings {
     /// devices expose public carrier resolvers in the IMS bearer DNS slots;
     /// sending SIP REGISTER to those addresses produces a misleading timeout.
     pub fn resolve_pcscf_for(&self, local: IpAddr) -> Result<IpAddr, CellularImsError> {
-        if let Some(p) = self
-            .pcscf
-            .iter()
-            .copied()
-            .find(|candidate| same_family(local, *candidate))
-        {
+        if let Some(p) = self.pcscf_candidates_for(local).into_iter().next() {
             return Ok(p);
         }
         Err(CellularImsError::new(code::RUNTIME_ALL_PCSCF_FAILED))
+    }
+
+    /// Return every explicit PCO P-CSCF that can carry traffic for `local`, in
+    /// modem-provided order and without duplicates. Registration may rotate
+    /// through this list when a candidate is unreachable while the bearer is
+    /// still alive.
+    pub fn pcscf_candidates_for(&self, local: IpAddr) -> Vec<IpAddr> {
+        let mut candidates = Vec::new();
+        for candidate in self
+            .pcscf
+            .iter()
+            .copied()
+            .filter(|candidate| same_family(local, *candidate))
+        {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+        candidates
     }
 
     /// Validate the family invariant: local addr and P-CSCF must share family.
@@ -600,6 +614,49 @@ pub async fn discover_pcscf_in_worker(
     .await
 }
 
+/// Discover the preferred P-CSCF candidates for bounded failover. Discovery
+/// keeps the existing priority: environment override, modem PCO, configured
+/// profile, then configured or standard IMS DNS. Explicit address lists retain
+/// every same-family candidate; DNS discovery keeps its existing single result.
+pub async fn discover_pcscf_candidates_in_worker(
+    settings: &ImsIpSettings,
+    home_domain: &str,
+    configured_pcscf: Option<&str>,
+    local: IpAddr,
+    interface: &str,
+    worker: &UeWorkerHandle,
+) -> Result<Vec<IpAddr>, CellularImsError> {
+    if let Ok(explicit) = std::env::var(ENV_PCSCF) {
+        let candidates = pcscf_candidates_for_family(&parse_pcscf_override(&explicit), local);
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+    let candidates = settings.pcscf_candidates_for(local);
+    if !candidates.is_empty() {
+        return Ok(candidates);
+    }
+    if let Some(configured) = configured_pcscf
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let candidates = pcscf_candidates_for_family(&parse_pcscf_override(configured), local);
+        if !candidates.is_empty() {
+            return Ok(candidates);
+        }
+    }
+    discover_pcscf_on_path(
+        settings,
+        home_domain,
+        configured_pcscf,
+        local,
+        interface,
+        worker,
+    )
+    .await
+    .map(|candidate| vec![candidate])
+}
+
 async fn discover_pcscf_on_path(
     settings: &ImsIpSettings,
     home_domain: &str,
@@ -926,6 +983,19 @@ fn same_family(left: IpAddr, right: IpAddr) -> bool {
     left.is_ipv4() == right.is_ipv4()
 }
 
+fn pcscf_candidates_for_family(candidates: &[IpAddr], local: IpAddr) -> Vec<IpAddr> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|candidate| same_family(local, *candidate))
+        .fold(Vec::new(), |mut matching, candidate| {
+            if !matching.contains(&candidate) {
+                matching.push(candidate);
+            }
+            matching
+        })
+}
+
 fn parse_pcscf_override(value: &str) -> Vec<IpAddr> {
     value
         .split(|character: char| character == ',' || character == ';' || character.is_whitespace())
@@ -1088,6 +1158,24 @@ IPv4 primary DNS: 10.0.0.53";
         assert_eq!(
             parse_pcscf_override("2001:db8::99, 192.0.2.10;invalid 192.0.2.10"),
             vec![v6, v4]
+        );
+    }
+
+    #[test]
+    fn explicit_pcscf_candidates_keep_modem_order_and_remove_duplicates() {
+        let mut settings = parse_ip_settings(SAMPLE);
+        let v4_first = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
+        let v4_second = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 11));
+        let v6_first = IpAddr::V6("2001:db8::99".parse().unwrap());
+        settings.pcscf = vec![v6_first, v4_first, v4_first, v4_second, v6_first];
+
+        assert_eq!(
+            settings.pcscf_candidates_for(settings.ipv4_address.unwrap()),
+            vec![v4_first, v4_second]
+        );
+        assert_eq!(
+            settings.pcscf_candidates_for(settings.ipv6_address.unwrap()),
+            vec![v6_first]
         );
     }
 

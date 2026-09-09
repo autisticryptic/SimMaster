@@ -90,7 +90,7 @@ use super::{
     ipsec::{self, SecAgree, XfrmInstallPlan},
     native_bearer::{self, NativeImsBearer},
     pcscf::{
-        discover_pcscf_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
+        discover_pcscf_candidates_in_worker, discover_pcscf_via_active_at_context, pcscf_socket,
         prepare_ims_profile_context, set_pcscf_reporting, ImsProfileLease,
     },
     plan::{FailureClass, ImsConnectionPlan},
@@ -2418,34 +2418,23 @@ async fn connect_inner(
             runtime
                 .update(|state| state.current_ip_family = Some(family.to_string()))
                 .await;
-            runtime
-                .record_attempt(CellularImsStage::Pcscf, Some(family), "started", None, None)
-                .await;
-            match connect_family(
-                runtime,
-                &bearer,
-                &device_identity,
+            let worker = network_worker_binding.worker().clone();
+            let configured_pcscf = device_identity
+                .effective_ims
+                .pcscf
+                .as_ref()
+                .map(|field| field.value.as_str());
+            let pcscf_candidates = match discover_pcscf_candidates_in_worker(
+                &bearer.settings,
+                &device_identity.ims.home_domain,
+                configured_pcscf,
                 local_addr,
-                &device,
-                live.operator.video_enabled(),
-                access_network_runtime,
-                &network_worker_binding,
-                native_bearer.as_mut(),
+                &bearer.interface,
+                &worker,
             )
             .await
             {
-                Ok(session) => {
-                    runtime
-                        .record_attempt(
-                            CellularImsStage::Registered,
-                            Some(family),
-                            "succeeded",
-                            None,
-                            None,
-                        )
-                        .await;
-                    return Ok(session);
-                }
+                Ok(candidates) => candidates,
                 Err(error)
                     if index + 1 < local_addrs.len()
                         && FailureClass::from_error(&error).is_retryable_family() =>
@@ -2460,6 +2449,7 @@ async fn connect_inner(
                         )
                         .await;
                     last_error = Some(error);
+                    continue;
                 }
                 Err(error) => {
                     runtime
@@ -2472,6 +2462,99 @@ async fn connect_inner(
                         )
                         .await;
                     return Err(error);
+                }
+            };
+            tracing::info!(
+                family,
+                pcscf_count = pcscf_candidates.len(),
+                "VoLTE will try every discovered P-CSCF candidate"
+            );
+            for (pcscf_index, pcscf) in pcscf_candidates.iter().copied().enumerate() {
+                let has_next_pcscf = pcscf_index + 1 < pcscf_candidates.len();
+                runtime
+                    .record_attempt(
+                        CellularImsStage::Pcscf,
+                        Some(family),
+                        "started",
+                        None,
+                        Some(format!(
+                            "pcscf_candidate={}/{}:{pcscf}",
+                            pcscf_index + 1,
+                            pcscf_candidates.len()
+                        )),
+                    )
+                    .await;
+                match connect_family(
+                    runtime,
+                    &bearer,
+                    &device_identity,
+                    local_addr,
+                    pcscf,
+                    has_next_pcscf,
+                    &device,
+                    live.operator.video_enabled(),
+                    access_network_runtime,
+                    &network_worker_binding,
+                    native_bearer.as_mut(),
+                )
+                .await
+                {
+                    Ok(session) => {
+                        runtime
+                            .record_attempt(
+                                CellularImsStage::Registered,
+                                Some(family),
+                                "succeeded",
+                                None,
+                                Some(format!(
+                                    "pcscf_candidate={}/{}:{pcscf}",
+                                    pcscf_index + 1,
+                                    pcscf_candidates.len()
+                                )),
+                            )
+                            .await;
+                        return Ok(session);
+                    }
+                    Err(error) if FailureClass::from_error(&error).is_retryable_family() => {
+                        let has_next_family = index + 1 < local_addrs.len();
+                        let detail = if has_next_pcscf {
+                            Some("trying_next_pcscf".to_string())
+                        } else if has_next_family {
+                            Some("trying_next_family".to_string())
+                        } else {
+                            None
+                        };
+                        runtime
+                            .record_attempt(
+                                CellularImsStage::Pcscf,
+                                Some(family),
+                                "failed",
+                                Some(&error),
+                                detail,
+                            )
+                            .await;
+                        if has_next_pcscf {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        if has_next_family {
+                            last_error = Some(error);
+                            break;
+                        }
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        runtime
+                            .record_attempt(
+                                CellularImsStage::Pcscf,
+                                Some(family),
+                                "failed",
+                                Some(&error),
+                                None,
+                            )
+                            .await;
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -2531,6 +2614,8 @@ async fn connect_family(
     bearer: &BearerConnection,
     device_identity: &DeviceIdentity,
     local_addr: IpAddr,
+    pcscf: IpAddr,
+    has_alternate_pcscf: bool,
     device: &CellularImsDeviceBinding,
     video_capability_enabled: bool,
     access_network_runtime: &ImsAccessNetworkRuntime,
@@ -2545,20 +2630,7 @@ async fn connect_family(
         .await;
     ensure_worker_binding_current(worker_binding)?;
     let worker = worker_binding.worker().clone();
-    let configured_pcscf = device_identity
-        .effective_ims
-        .pcscf
-        .as_ref()
-        .map(|field| field.value.as_str());
-    let pcscf = discover_pcscf_in_worker(
-        &bearer.settings,
-        &device_identity.ims.home_domain,
-        configured_pcscf,
-        local_addr,
-        &bearer.interface,
-        &worker,
-    )
-    .await?;
+    let pcscf = bearer.settings.ensure_family_match(local_addr, pcscf)?;
     ensure_worker_binding_current(worker_binding)?;
     route_pcscf_in_worker(bearer, pcscf, &worker).await?;
     ensure_worker_binding_current(worker_binding)?;
@@ -2653,6 +2725,7 @@ async fn connect_family(
     let mut last_error = None;
     let mut pending_variant = None;
     let mut candidate_attempts = 0usize;
+    let mut consecutive_silent_failures = 0usize;
     while pending_variant.is_some() || register_variants.peek().is_some() {
         if let Some(native) = native_bearer.as_deref_mut() {
             native.check_liveness()?;
@@ -2803,6 +2876,11 @@ async fn connect_family(
                     }
                 }
                 let error = map_register_failure(&failure);
+                if silent_pcscf_failure(&failure) {
+                    consecutive_silent_failures = consecutive_silent_failures.saturating_add(1);
+                } else {
+                    consecutive_silent_failures = 0;
+                }
                 runtime
                     .record_attempt(
                         CellularImsStage::RegisterInitial,
@@ -2812,6 +2890,16 @@ async fn connect_family(
                         Some(format!("register_variant={}", variant.label)),
                     )
                     .await;
+                if has_alternate_pcscf
+                    && should_handoff_pcscf(&failure, consecutive_silent_failures)
+                {
+                    tracing::info!(
+                        pcscf = %pcscf,
+                        consecutive_silent_failures,
+                        "VoLTE P-CSCF candidate produced no SIP response; handing off to the next candidate"
+                    );
+                    return Err(error);
+                }
                 let next_variant_available = register_variants.peek().is_some();
                 if let Some(upgraded_variant) = next_dynamic_register_variant_with_roaming(
                     profile,
@@ -7138,6 +7226,16 @@ fn register_failure_status(failure: &RegisterFailure) -> Option<u16> {
         .and_then(|response| sip::parse_status(response).ok())
 }
 
+fn silent_pcscf_failure(failure: &RegisterFailure) -> bool {
+    failure.auth_rounds == 0
+        && failure.response.is_none()
+        && failure.error.code() == "ims_register_initial_receive_failed"
+}
+
+fn should_handoff_pcscf(failure: &RegisterFailure, consecutive_silent_failures: usize) -> bool {
+    consecutive_silent_failures >= 2 && silent_pcscf_failure(failure)
+}
+
 /// Only format/interoperability failures may advance to another REGISTER
 /// candidate. Once AKA has started, credentials and security negotiation are
 /// fixed for this session and must not be hidden by header experimentation.
@@ -9647,6 +9745,31 @@ Content-Length: 0\r\n\r\n";
         );
         assert_eq!(failure_stage(&error), Some(CellularImsStage::Bearer));
         assert!(!should_retain_failed_bearer(&error));
+    }
+
+    #[test]
+    fn pcscf_handoff_requires_two_pre_authentication_silent_failures() {
+        let silent = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 0,
+        };
+        assert!(!should_handoff_pcscf(&silent, 1));
+        assert!(should_handoff_pcscf(&silent, 2));
+
+        let forbidden = RegisterFailure {
+            error: ImsError::new("ims_register_initial_unexpected_status"),
+            response: Some(b"SIP/2.0 403 Forbidden\r\nContent-Length: 0\r\n\r\n".to_vec()),
+            auth_rounds: 0,
+        };
+        assert!(!should_handoff_pcscf(&forbidden, 2));
+
+        let after_aka = RegisterFailure {
+            error: ImsError::new("ims_register_initial_receive_failed"),
+            response: None,
+            auth_rounds: 1,
+        };
+        assert!(!should_handoff_pcscf(&after_aka, 2));
     }
 
     #[test]
