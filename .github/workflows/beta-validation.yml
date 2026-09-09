@@ -1,11 +1,12 @@
 name: Validate Beta Refactor
 
-# Development checks deliberately do not publish/retag beta1 or beta2.
+# Development checks deliberately do not publish or retag releases.
 on:
   push:
     branches:
       - refactor/1.1.4-beta2
       - fix/1.1.4-beta3-cellular-ims
+      - fix/sim02-catalog-aka-baseline
   workflow_dispatch:
 
 permissions:
@@ -63,6 +64,8 @@ jobs:
             connectivity::modems::ims::vowifi::epdg::tests \
             connectivity::modems::ims::vowifi::profile_record::tests \
             connectivity::modems::ims::vowifi::profiles::tests \
+            connectivity::modems::ims::vowifi::carrier_catalog::v7::tests \
+            connectivity::modems::ims::vowifi::profile_store::tests \
             connectivity::modems::ims::vowifi::socks5::tests \
             services::trunk::transport::tests \
             services::trunk::access_router::tests \

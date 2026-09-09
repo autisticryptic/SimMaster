@@ -1444,13 +1444,16 @@ fn project_register(
         // TS 24.229 §5.1.1.2.2: an AKA UE's initial REGISTER SHALL carry an
         // empty Authorization (username/realm/uri populated, nonce/response
         // empty) so the network knows which private identity to challenge.
-        // Offering ipsec-3gpp means we are doing IMS AKA, so default to that
-        // shape; a core that demands sec-agree has no way to start the
-        // challenge without it and answers 400. The explicit JSON value still
-        // Empty AKA Authorization is carrier/profile specific. Unknown
-        // bundles use challenge-first Digest/AKA and may opt in explicitly.
+        // The v7 projection has already validated IMS-AKA as its authentication
+        // scheme. An absent field (including a Pixel bundle with `sip: {}`)
+        // must follow that LTE baseline, not become an explicit "none" policy.
+        // Preserve explicit carrier choices and the separately authenticated
+        // WLAN/ePDG baseline, just as standards-derived profiles do.
         initial_authorization: string_at(register, "/initial_authorization")
-            .unwrap_or("none")
+            .unwrap_or(match access {
+                CatalogAccessKind::LteEpc => "aka_empty",
+                CatalogAccessKind::WifiEpdg => "none",
+            })
             .to_string(),
         include_mmtel_features,
         include_route_header: bool_at_or_omit(register, "/include_route_header")?.unwrap_or(false),
@@ -2520,6 +2523,82 @@ mod tests {
             ["hmac-sha-1-96/aes-cbc/esp/trans"]
         );
         std::fs::remove_file(path).expect("remove fixture");
+    }
+
+    #[test]
+    fn missing_catalog_initial_authorization_follows_the_lte_aka_baseline() {
+        for sip in [
+            None,
+            Some(serde_json::json!({})),
+            Some(serde_json::json!({"common": {}})),
+            Some(serde_json::json!({"common": {"register": {}}})),
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture");
+                let raw: String = conn
+                    .query_row(
+                        "SELECT config_json FROM carrier_profiles WHERE profile_id = ?1",
+                        ["test-v7-23433"],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let mut config: Value = serde_json::from_str(&raw).unwrap();
+                match sip {
+                    Some(sip) => {
+                        config["sip"] = sip;
+                    }
+                    None => {
+                        config.as_object_mut().unwrap().remove("sip");
+                    }
+                }
+                conn.execute(
+                    "UPDATE carrier_profiles SET config_json = ?1 WHERE profile_id = ?2",
+                    params![config.to_string(), "test-v7-23433"],
+                )
+                .unwrap();
+            }
+            for (access, expected) in [
+                (CatalogAccessKind::LteEpc, "aka_empty"),
+                (CatalogAccessKind::WifiEpdg, "none"),
+            ] {
+                let profile = catalog.get("test-v7-23433", access).unwrap().unwrap();
+                let register = &profile.record.ims.register;
+                assert_eq!(register.initial_authorization, expected);
+                assert_eq!(register.sec_agree_mode, "auto");
+                assert!(!register.require_sec_agree_headers);
+                assert!(!register.proxy_require_sec_agree_headers);
+            }
+            std::fs::remove_file(path).expect("remove fixture");
+        }
+    }
+
+    #[test]
+    fn explicit_catalog_initial_authorization_is_never_replaced_by_the_baseline() {
+        for value in [
+            "none",
+            "aka_empty",
+            "digest_empty",
+            "implementation_variant",
+        ] {
+            let (catalog, path) = fixture();
+            {
+                let conn = Connection::open(&path).expect("open fixture");
+                conn.execute(
+                    "UPDATE carrier_profiles
+                        SET config_json = json_set(
+                            config_json, '$.sip.common.register.initial_authorization', ?1)
+                      WHERE profile_id = ?2",
+                    params![value, "test-v7-23433"],
+                )
+                .unwrap();
+            }
+            for access in [CatalogAccessKind::LteEpc, CatalogAccessKind::WifiEpdg] {
+                let profile = catalog.get("test-v7-23433", access).unwrap().unwrap();
+                assert_eq!(profile.record.ims.register.initial_authorization, value);
+            }
+            std::fs::remove_file(path).expect("remove fixture");
+        }
     }
 
     /// A tri-state switch only has three legal spellings: `true`, `false` and
