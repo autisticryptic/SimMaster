@@ -231,7 +231,7 @@ impl ProfileStore {
                     // optional catalog is simply not present in that source.
                     // Do not turn an unrelated database profile validation
                     // request into a service-unavailable error.
-                    Err(error) if error.starts_with("carrier_catalog_open_failed:") => {
+                    Err(error) if error.contains("carrier_catalog_open_failed:") => {
                         return Ok(ImsProfileReferenceState::Missing);
                     }
                     Err(error) => return Err(error),
