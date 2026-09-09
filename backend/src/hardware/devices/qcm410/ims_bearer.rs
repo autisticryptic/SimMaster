@@ -27,11 +27,12 @@ use crate::hardware::devices::transport::{
 };
 
 const PRIMARY_QMI_DEVICE: &str = "/dev/wwan0qmi0";
-const PRIMARY_QMI_OPEN_FLAGS: [&str; 3] = [
-    "--device-open-qmi",
-    "--device-open-proxy",
-    secondary_qmi::QMI_OPEN_NET_ARG,
-];
+// The primary qmi0 node is already advertised as QMI. Keep it proxy-owned so
+// retained WDS CIDs survive across qmicli processes. On QCA410, forcing
+// `--device-open-qmi` here makes qmi-proxy hang up the endpoint after the first
+// process exits; that flag remains required by the project-created DATA6
+// secondary endpoint and must not be copied into this primary access leg.
+const PRIMARY_QMI_OPEN_FLAGS: [&str; 2] = ["--device-open-proxy", secondary_qmi::QMI_OPEN_NET_ARG];
 const CURRENT_SETTINGS_RETRIES: usize = 12;
 const QMI_COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const WDS_START_TIMEOUT: Duration = Duration::from_secs(65);
@@ -646,11 +647,11 @@ mod tests {
             "--wds-get-current-settings",
             true,
         );
-        assert!(args.iter().any(|arg| arg == "--device-open-qmi"));
         assert!(args.iter().any(|arg| arg == "--device-open-proxy"));
         assert!(args
             .iter()
             .any(|arg| arg == secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(!args.iter().any(|arg| arg == "--device-open-qmi"));
         assert!(!args.iter().any(|arg| arg.contains("bind-data-port")));
         assert!(!args.iter().any(|arg| arg.contains("bind-mux-data-port")));
     }
