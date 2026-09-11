@@ -377,9 +377,13 @@ where
 {
     let mut lines = reader.lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        if sender.send(line).is_err() {
-            break;
-        }
+        // The receiver belongs only to startup and is dropped as soon as the
+        // packet-data handle is found. Keep both OS pipes open and drain them
+        // until qmicli exits: closing them here makes later follow-mode status
+        // writes fail with EPIPE/SIGPIPE, killing the process that owns IMS WDS.
+        // Do not retain or log raw output after startup (it can contain modem
+        // identifiers); a disconnected startup receiver is not a session stop.
+        let _ = sender.send(line);
     }
 }
 
@@ -558,6 +562,58 @@ mod tests {
             pcscf: vec![IpAddr::V4(Ipv4Addr::new(10, 11, 12, 13))],
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn primary_follow_output_is_drained_after_startup_receiver_drops() {
+        use tokio::io::AsyncWriteExt;
+
+        let (mut output, input) = tokio::io::duplex(64);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let drain = tokio::spawn(drain_qmicli_stream(BufReader::new(input), sender));
+        output
+            .write_all(b"Packet data handle: '123'\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            receiver.recv().await.as_deref(),
+            Some("Packet data handle: '123'")
+        );
+        drop(receiver);
+
+        // Fill more than one pipe buffer after startup. The old implementation
+        // returned after the first late line and closed the reader, so these
+        // writes failed (or hung if a future change stopped draining the pipe).
+        let late_output = "Connection status: 'connected'\n".repeat(128);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            output.write_all(late_output.as_bytes()),
+        )
+        .await
+        .expect("follow output stopped draining")
+        .expect("follow output reader was closed after startup");
+        assert!(!drain.is_finished(), "the reader must outlive startup");
+        drop(output);
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("reader did not finish at EOF")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn primary_follow_output_reports_startup_lines_and_stops_at_eof() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        drain_qmicli_stream(
+            BufReader::new(&b"CID: '2'\nPacket data handle: '123'\n"[..]),
+            sender,
+        )
+        .await;
+        assert_eq!(receiver.recv().await.as_deref(), Some("CID: '2'"));
+        assert_eq!(
+            receiver.recv().await.as_deref(),
+            Some("Packet data handle: '123'")
+        );
+        assert!(receiver.recv().await.is_none());
     }
 
     #[test]
