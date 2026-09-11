@@ -38,12 +38,19 @@ use crate::hardware::devices::transport::{
 
 const PRIMARY_QMI_DEVICE: &str = "/dev/wwan0qmi0";
 // A single qmicli process owns the primary WDS bearer for its entire lifetime.
-// On QCA410, moving a retained CID between short-lived qmicli processes makes
-// qmi-proxy hang up the endpoint; this proxy-only access leg therefore must not
-// be changed back to an allocate/start/query/stop sequence. `--device-open-qmi`
-// remains required by the project-created DATA6 secondary endpoint and must not
-// be copied into this primary IMS leg.
-const PRIMARY_QMI_OPEN_FLAGS: [&str; 2] = ["--device-open-proxy", secondary_qmi::QMI_OPEN_NET_ARG];
+// Keep one owner instead of an allocate/start/query/stop sequence so teardown
+// and liveness track the same process. Earlier endpoint hangups were reproduced
+// with a flag mask that silently disabled proxy mode (see below); they are not
+// evidence that correctly proxied retained CIDs inherently cannot be reused.
+// `--device-open-qmi` remains required by the project-created DATA6 secondary
+// endpoint and must not be copied into this primary IMS leg.
+// qmicli 1.28.6 (shipped on QCA410) parses --device-open-net by replacing the
+// ENTIRE open flag mask, clearing even an earlier --device-open-proxy. Keep
+// `proxy` in that mask too, or the command opens qmi0 directly and breaks
+// ModemManager's endpoint despite appearing to request proxy mode. Do not
+// reuse DATA6's direct-open mask here, and do not make this a user option.
+const PRIMARY_QMI_OPEN_NET_ARG: &str = "--device-open-net=net-raw-ip|net-no-qos-header|proxy";
+const PRIMARY_QMI_OPEN_FLAGS: [&str; 2] = ["--device-open-proxy", PRIMARY_QMI_OPEN_NET_ARG];
 const CURRENT_SETTINGS_RETRIES: usize = 12;
 const WDS_FOLLOW_START_TIMEOUT: Duration = Duration::from_secs(65);
 
@@ -60,9 +67,9 @@ fn primary_netdev_for_qmi(device: &str) -> Option<String> {
 
 /// Primary-QMI WDS session owned by one long-lived qmicli process.
 ///
-/// Do not replace this with a numeric CID plus short-lived qmicli calls. The
-/// QCA410 qmi-proxy/device combination invalidates that ownership boundary and
-/// takes down ModemManager's primary endpoint.
+/// Do not replace this with a numeric CID plus short-lived qmicli calls: the
+/// process is the bearer liveness/teardown boundary. Its command must preserve
+/// effective proxy mode to avoid taking down ModemManager's primary endpoint.
 struct PrimaryQmiSession {
     client_id: String,
     packet_data_handle: String,
@@ -641,9 +648,7 @@ mod tests {
     fn qca410_primary_commands_always_use_proxy_and_never_bind() {
         let args = primary_follow_args(PRIMARY_QMI_DEVICE, "ims", 4, Some(2));
         assert!(args.iter().any(|arg| arg == "--device-open-proxy"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == secondary_qmi::QMI_OPEN_NET_ARG));
+        assert!(args.iter().any(|arg| arg == PRIMARY_QMI_OPEN_NET_ARG));
         assert!(!args.iter().any(|arg| arg == "--device-open-qmi"));
         assert!(!args.iter().any(|arg| arg.contains("bind-data-port")));
         assert!(!args.iter().any(|arg| arg.contains("bind-mux-data-port")));
@@ -651,6 +656,30 @@ mod tests {
         assert!(args
             .iter()
             .any(|arg| arg == "--wds-start-network=apn=ims,3gpp-profile=2,ip-type=4"));
+    }
+
+    #[test]
+    fn qca410_primary_open_net_mask_preserves_proxy_on_legacy_qmicli() {
+        for family in [4, 6] {
+            let args = primary_follow_args(PRIMARY_QMI_DEVICE, "ims", family, Some(2));
+            // Model the legacy parser's overwrite, not just presence of the
+            // separate --device-open-proxy switch (which alone is insufficient).
+            let mut effective_flags = Vec::new();
+            for arg in &args {
+                if arg == "--device-open-proxy" {
+                    effective_flags.push("proxy");
+                } else if let Some(mask) = arg.strip_prefix("--device-open-net=") {
+                    effective_flags = mask.split('|').collect();
+                }
+            }
+            assert!(effective_flags.contains(&"proxy"));
+            assert!(effective_flags.contains(&"net-raw-ip"));
+            assert!(effective_flags.contains(&"net-no-qos-header"));
+        }
+        // DATA6 intentionally remains direct and must not inherit IMS flags.
+        assert!(!secondary_qmi::QMI_OPEN_NET_ARG
+            .split('|')
+            .any(|flag| flag == "proxy"));
     }
 
     #[test]
