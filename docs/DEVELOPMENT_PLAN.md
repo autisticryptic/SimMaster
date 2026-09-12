@@ -1,12 +1,30 @@
 ﻿# SimAdmin 未完成开发计划
 
-> 状态：2026-08-30 整理版。本文是本仓库唯一的后续开发与验收计划，只记录尚未完成、尚未通过外部验收或仍需收口的事项。
+> 状态：2026-09-12 补充 1.1.5 / 1.1.6 版本路线；其余任务沿用 2026-08-30 整理基线并分别复核。本文是后续开发与验收计划总入口，只记录尚未完成、尚未通过外部验收或仍需收口的事项；版本分项维护详细执行门槛，不另建互相冲突的总清单。
 >
 > 2026-08-30 合并了原先分散的四份清单（`IMS_REGISTER_FOLLOWUP_PLAN.md`、`BACKEND_REVIEW_TODO.md`、`IMS_ACCESS_REFACTOR_DEVICE_TESTS.md`、`HARDWARE_EXPANSION_TODO.md`）。已完成项和历史验收记录不再保留在文档里——那些在 git 历史中。架构设计说明移到 `ARCHITECTURE.md`。
 >
 > 本文不把代码中已有的基础能力直接视为产品完成。每项能力只有在对应的自动化测试、真实硬件、运营商网络或发布流程验收通过后，才能从本计划移除。
 
+## 已确认版本路线：1.1.5 / 1.1.6
+
+用户于 2026-09-12 确认以下方向。详细任务、设备范围、迁移与发布门槛统一维护在
+[设备后端版本规划](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)，本节仅维护总入口。
+
+| 版本 | 核心目标 | 状态 |
+| --- | --- | --- |
+| 1.1.4 修复线 | 现有 IMS/生命周期修复及必要多卡回归收口，保留对照和回滚基线 | 与后端大重构分开推进 |
+| 1.1.5 | 统一设备接口；兼容 MM 与原生 QMI/MBIM/AT，MM 从必要条件变成可选后端 | 规划已确认，待实施 |
+| 1.1.6 | 删除 MM 后端、运行调用、必装依赖及专属恢复流程，由原生接管全部声明支持的设备能力 | 规划已确认，待实施；不保留隐藏回退 |
+
+- 保留 UE worker/netns、稳定物理线路和 SIM 覆写语义；同一物理 modem 同时只允许一个 backend owner。
+- QMI/MBIM/AT 均需要真实适配证据；明确设备/固件/能力支持清单，未适配硬件不伪装为已支持。
+- 原生覆盖或关键回归不足会阻止 1.1.6 发布，不能用隐式 MM fallback 或静默缩减范围替代验收。
+- 本次只写规划，不修改当前版本号、不卸载/停止 MM，不把候选代码当作正式功能。
+
 ## 当前结论
+
+下列为 2026-08-30 的业务基线，不自动代表后续主 QMI 修复或 1.1.5/1.1.6 后端迁移已通过相同验收。
 
 SimAdmin 的单线路 VoLTE → SIP Trunk → Asterisk 普通语音路径已经完成实机验证，不属于本计划的待办范围。当前已确认：
 
@@ -82,6 +100,8 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
 
 ## P2：设备抽象与 CS
 
+设备后端统一、MM 解耦与原生接管按上方版本路线推进；本节保留已有能力与设备/业务待验收项，不重复维护版本实施清单。
+
 - [x] 让 `DeviceKind` 真正参与 DATA6 / native bearer 的准入判断。
   - `detect_device_kind()`（`hardware/devices/mod.rs`）按 remoteproc 的 `name` 识别 `4080000.remoteproc`，刻意不把邻居 `a204000.remoteproc`（WCNSS Wi-Fi/BT）当基带；认不出即返回 `Unknown`。
   - 只有 QCM410 driver 会枚举和绑定 DATA6；`Unknown` 的 native IMS 和数据 transport 均明确不可用，不会回退宿主网络命名空间。旧的 `SIMADMIN_ENABLE_SECONDARY_QMI` 运行时开关已删除。
@@ -95,7 +115,7 @@ E911 只能通过运营商非紧急 provisioning/validation 流程验收，不�
   - [ ] USB 读卡器：无卡、实体 SIM、PIN 锁卡、USIM AKA、读卡器热插拔。
   - [ ] USB eUICC 读卡器：经 PC/SC lpac 完成 profile 列出/下载/启用/停用。
   - [ ] 用物理 eUICC 读卡器验证 lpac reader name/index 选择。
-- [ ] QCM410 逐项确认：DATA6 被 ModemManager 忽略且普通数据留在主 QMI 口；定时流量任务在持久化数据开关关闭时成功并恢复为关闭；定时通话能启动、自动挂机并容忍对端提前挂断。
+- [ ] QCM410 按 2026-09-12 修复分支的接入契约逐项确认：主 QMI 用于 IMS，DATA6 仅用于普通数据；MM 后端下保持备用端口隔离，原生迁移后继续保证两种承载归属清晰。定时流量任务在持久化数据开关关闭时成功并恢复为关闭；定时通话能启动、自动挂机并容忍对端提前挂断。不得重新套用旧 DATA6 IMS / 主 QMI 普通数据布局。
 - [ ] 仅当 PC/SC 服务/包是 SimAdmin 自己安装的才卸载（需要 installer 状态追踪）。
 - [ ] 只有找到真实双向音频数据面后，才实现 CS trunk；仅有 ModemManager 呼叫控制不能标记为 CS trunk ready。
 - [ ] 验证 QCM410 数据与 IMS bearer 并发时的 slot allocator、baseband wedge guard、恢复和 modem 重启行为。
@@ -202,6 +222,7 @@ VoLTE profile 三槽位编排：
 
 ## 相关现行说明
 
+- 1.1.5 双后端过渡与 1.1.6 完全原生接管的版本分项：`docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md`
 - 架构总览（线路模型、路由隔离、profile 选择）：`docs/ARCHITECTURE.md`
 - REGISTER 三态字段契约：`docs/IMS_REGISTER_TRISTATE_SCHEMA.md`
 - 410 基带崩溃分析与现场恢复：`docs/QCM410_BAM_DMUX_MODEM_CRASH.md`

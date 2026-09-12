@@ -153,9 +153,14 @@ profile 以 **SIM 的归属 PLMN** 为准，绝不把 `modem.3gpp.operator-code`
 
 ## 6. 相关文档
 
+后续版本演进已确定为：1.1.5 在统一设备接口下兼容 MM/native，1.1.6 移除 MM 后端，
+由原生 QMI/MBIM/AT 接管声明支持的设备能力。**这是待实施规划，不改变本文对当前实现的描述。**
+UE 隔离、稳定线路及 SIM 覆写边界保留，同一物理 modem 仍只有一个 owner。
+
 | 文档 | 内容 |
 |---|---|
-| `DEVELOPMENT_PLAN.md` | 待办与验收计划（唯一的 TODO 来源） |
+| `DEVELOPMENT_PLAN.md` | 待办与验收计划总入口 |
+| `MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md` | 设备后端版本分项、能力范围与 MM 移除门槛（规划） |
 | `IMS_REGISTER_TRISTATE_SCHEMA.md` | REGISTER 三态字段（`true`/`false`/`omit`）契约 |
 | `QCM410_BAM_DMUX_MODEM_CRASH.md` | 410 基带崩溃分析与恢复 |
 | `ue-network-namespaces.md` | 强制 per-UE 网络命名空间架构 |

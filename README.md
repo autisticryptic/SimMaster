@@ -150,7 +150,8 @@ systemctl enable --now simadmin.service
 | [架构说明](./docs/ARCHITECTURE.md) | 线路模型、前端信息架构、路由隔离、profile 选择 | 是，读代码前先看这份 |
 | [开发者指南](./docs/DEVELOPER.md) | 架构、前后端开发、构建、测试、ADB 调试 | 是，前后端子 README 已归并于此 |
 | [Bruno API 集合](./bruno-api/README.md) | API 调试方法、环境变量和线路级请求说明 | 是，可执行请求以 `.bru` 文件为准 |
-| [未完成开发计划](./docs/DEVELOPMENT_PLAN.md) | 未完成功能、真实硬件验收和发布前门槛 | 是，当前唯一后续开发计划 |
+| [未完成开发计划](./docs/DEVELOPMENT_PLAN.md) | 未完成功能、真实硬件验收和发布前门槛 | 是，后续开发总入口 |
+| [1.1.5 / 1.1.6 设备后端规划](./docs/MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md) | 1.1.5 双后端过渡、1.1.6 完全移除 ModemManager | 是，总计划的版本分项，尚未实施 |
 | [版本更新记录](./docs/CHANGELOG.md) | 已发布版本的用户可见变化 | 是，不与开发计划混写 |
 | [运营商 Profile 来源说明](./docs/CARRIER_PROFILES.md) | catalog、AOSP/IPCC 来源、限制与维护边界 | 是，保留为专题背景 |
 

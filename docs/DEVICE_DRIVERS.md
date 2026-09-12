@@ -46,3 +46,14 @@ deploy/devices/qcm410/
 eSIM 和离线基带恢复确实通过 QMI/UIM 完成。它不是未来设备必须实现的通用能力：接入
 MBIM、PC/SC 或厂商 API 的设备时，应分别增加 SIM 鉴权与基带恢复 transport，由 driver
 选择实现；不能让新设备伪造一个 QMI 路径，也不能在通用 IMS 编排中增加设备型号判断。
+
+## 后续版本边界（规划，尚未实施）
+
+- **1.1.5**：通过统一设备能力接口兼容 MM/native；原生 QMI/MBIM/AT 适配器由设备控制器
+  协调。同一物理 modem 的全部槽位和端口只能由一个 backend owner 管理。
+- **1.1.6**：移除 MM provider、运行调用与依赖，原生接管所有声明支持的设备能力，
+  不保留隐藏 MM fallback；未适配硬件继续明确返回 unsupported。
+- 复用现有 driver、transport、UE 和身份边界；不能因迁移后端把临时 MM 对象路径、
+  QMI 端点或网卡编号当成跨设备统一的持久身份。
+
+详细执行与验收统一见 [1.1.5 / 1.1.6 设备后端版本规划](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)。
