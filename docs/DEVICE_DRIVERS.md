@@ -57,3 +57,20 @@ MBIM、PC/SC 或厂商 API 的设备时，应分别增加 SIM 鉴权与基带恢
   QMI 端点或网卡编号当成跨设备统一的持久身份。
 
 详细执行与验收统一见 [1.1.5 / 1.1.6 设备后端版本规划](MODEM_BACKEND_ROADMAP_1.1.5_1.1.6.md)。
+
+## 1.1.5 第一阶段：设备观察接口
+
+`hardware/cellular/observations.rs` 的 `ModemObservationProvider` 提供设备列表与驻网
+snapshot，`LineRuntimeRegistry` 在构造时注入它。注册表及其 API 调用者不再为刷新传入
+D-Bus connection，也不直接解析 MM 的错误字符串。
+
+- `bindings.rs` 承载原有 `ModemBinding`、稳定线路/迁移别名与 reader 绑定算法；
+  原 JSON 字段和 ID 值保留。`modem_path` 等旧字段暂作为兼容 selector，不能要求未来
+  原生 provider 伪造 MM 对象路径。
+- `mm_observations.rs` 复用已有 D-Bus connection 与既有 MM 查询。构造 adapter 不新增
+  连接，也不执行 Enable/Connect、切卡或修改开机策略。
+- 驻网 snapshot 的明确不可用会立即清除，瞬时查询失败按原 TTL 保留；
+  对整个设备列表查询失败的既有策略暂不改变，不能混为同一种缓存策略。
+- 当前唯一生产实现仍是 MM；fake provider 只用于无硬件测试。这不是完整 MM 后端剥离，
+  也不是原生 QMI/MBIM/AT 已实现。设备控制、AT/UIM、短信/呼叫、bearer 及启动副作用
+  还需逐步迁移；飞行模式和冷启动离线保证需要独立策略及实机验证。

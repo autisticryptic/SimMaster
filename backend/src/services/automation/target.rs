@@ -43,7 +43,7 @@ pub async fn resolve_line_target(
                 .into_iter()
                 .find(|slot| slot.id == slot_id)
                 .ok_or_else(|| anyhow!("automation_target_reader_slot_not_found"))?;
-            crate::hardware::cellular::modem_manager::reader_line_id(
+            crate::hardware::cellular::bindings::reader_line_id(
                 slot.reader_path
                     .trim()
                     .strip_prefix("pcsc://")

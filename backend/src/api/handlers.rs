@@ -137,7 +137,7 @@ pub async fn get_modem_lines_handler(
     StatusCode,
     Json<ApiResponse<Vec<crate::services::line_registry::LineRuntimeStatus>>>,
 ) {
-    match app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+    match app.line_registry.refresh().await {
         Ok(_) => (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -235,7 +235,7 @@ async fn resolve_line_esim_gate(
     }
     let mut line = app.line_registry.get(line_id).await;
     if line.is_none() {
-        let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let _ = app.line_registry.refresh().await;
         line = app.line_registry.get(line_id).await;
     }
     let line = line.ok_or_else(|| EsimApiError::Unavailable("line_not_found".to_string()))?;
@@ -734,7 +734,7 @@ pub async fn get_line_esim_reader_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<EsimReaderConfig>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if app.line_registry.get(&line_id).await.is_none() {
         return (
             StatusCode::NOT_FOUND,
@@ -756,7 +756,7 @@ pub async fn set_line_esim_reader_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<EsimReaderConfig>,
 ) -> (StatusCode, Json<ApiResponse<EsimReaderConfig>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if app.line_registry.get(&line_id).await.is_none() {
         return (
             StatusCode::NOT_FOUND,
@@ -1032,11 +1032,7 @@ pub async fn enable_esim_profile_handler(
                                 snapshot.last_register_refresh_at = None;
                             })
                             .await;
-                        if let Err(error) = bg_app
-                            .line_registry
-                            .refresh(bg_app.dbus_conn.as_ref())
-                            .await
-                        {
+                        if let Err(error) = bg_app.line_registry.refresh().await {
                             warn!(
                                 line_id = %bg_line_id,
                                 %error,
@@ -1522,7 +1518,7 @@ pub async fn get_device_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if let Some(line) = app.line_registry.get(line_id.trim()).await {
         let binding = line.binding();
         if binding.line_kind == "reader" {
@@ -1619,7 +1615,7 @@ pub async fn get_sim_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if let Some(line) = app.line_registry.get(line_id.trim()).await {
         let binding = line.binding();
         if binding.line_kind == "reader" {
@@ -1739,7 +1735,7 @@ pub async fn update_sim_cache_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<UpdateSimCacheRequest>,
 ) -> impl IntoResponse {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if let Some(line) = app.line_registry.get(line_id.trim()).await {
         let binding = line.binding();
         if binding.line_kind == "reader" {
@@ -1843,7 +1839,7 @@ pub async fn get_network_info(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> impl IntoResponse {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     if let Some(line) = app.line_registry.get(line_id.trim()).await {
         let binding = line.binding();
         if binding.line_kind == "reader" {
@@ -1903,7 +1899,7 @@ pub async fn get_network_info(
 /// absent, or disabled lines fail instead of falling through to another
 /// baseband.
 async fn resolve_modem_path(app: &AppState, line_id: &str) -> Result<String, String> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_id = line_id.trim();
     if line_id.is_empty() {
         return Err("line_id_required".to_string());
@@ -1934,7 +1930,7 @@ fn binding_has_baseband(binding: &crate::hardware::cellular::modem_manager::Mode
 /// Resolve an explicitly selected voice-capable line. Reader lines return an
 /// empty modem path and are routed through their private VoWiFi operator link.
 async fn resolve_call_line(app: &AppState, line_id: &str) -> Result<(String, String), String> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_id = line_id.trim();
     if line_id.is_empty() {
         return Err("call_line_id_required".to_string());
@@ -1968,7 +1964,7 @@ async fn resolve_baseband_line(app: &AppState, line_id: &str) -> Result<(String,
 }
 
 async fn resolve_sms_line_id(app: &AppState, requested: &str) -> Result<String, String> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_id = requested.trim();
     if line_id.is_empty() {
         return Err("sms_line_id_required".to_string());
@@ -1991,7 +1987,7 @@ async fn resolve_sms_line_id(app: &AppState, requested: &str) -> Result<String, 
 /// lines deliberately fail here: a reader has no cellular AT endpoint and
 /// must never borrow another line's modem.
 async fn resolve_ussd_line(app: &AppState, requested: &str) -> Result<(String, String), String> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_id = requested.trim();
     if line_id.is_empty() {
         return Err("ussd_line_id_required".to_string());
@@ -2945,7 +2941,7 @@ async fn restart_selected_baseband(
     app: &AppState,
     requested_line_id: &str,
 ) -> (StatusCode, Json<ApiResponse<BasebandRestartResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_id = requested_line_id.trim();
     let Some(line) = app.line_registry.get(line_id).await else {
         return (
@@ -3003,7 +2999,7 @@ async fn restart_selected_baseband(
     };
     let result = match result {
         Ok(mut data) if profile.airplane_mode_enabled => {
-            let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+            let _ = app.line_registry.refresh().await;
             let recovered = line.binding();
             if !recovered.present || recovered.modem_path.trim().is_empty() {
                 Err("基带已执行恢复，但重新枚举后仍无法应用飞行模式配置".to_string())
@@ -3163,7 +3159,7 @@ pub async fn get_line_network_controls_handler(
     StatusCode,
     Json<ApiResponse<Vec<LineNetworkControlsResponse>>>,
 ) {
-    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+    if let Err(error) = app.line_registry.refresh().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
@@ -3190,7 +3186,7 @@ pub async fn reset_line_data_traffic_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -3275,7 +3271,7 @@ pub async fn get_line_data_connection_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -3625,7 +3621,7 @@ pub async fn set_line_data_connection_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<LineNetworkToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -3701,7 +3697,7 @@ pub async fn set_line_data_proxy_config_handler(
     Path(line_id): Path<String>,
     Json(mut payload): Json<LineDataProxyConfig>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -3758,7 +3754,7 @@ pub async fn set_line_roaming_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<RoamingRequest>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -3829,7 +3825,7 @@ pub async fn set_line_airplane_mode_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<LineNetworkToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<LineNetworkControlsResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -4676,7 +4672,7 @@ async fn send_sms_over_cellular_ims_path(
     guard: crate::services::orchestrator::sms_router::SmsSendGuard,
 ) -> Result<serde_json::Value, String> {
     check_sms_send_cost_guard(app, line_id, AccessPathKind::CellularIms, guard)?;
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line = app
         .line_registry
         .get(line_id)
@@ -4938,7 +4934,7 @@ pub async fn place_call_handler(
 pub async fn get_sms_channels_handler(
     State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<Vec<SmsChannelResponse>>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let mut channels = Vec::new();
     for line in app.line_registry.all().await {
         let modem = line.binding();
@@ -7841,7 +7837,7 @@ async fn build_vowifi_line_response(
 pub async fn get_vowifi_lines_handler(
     State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<Vec<VowifiLineConfigResponse>>>) {
-    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+    if let Err(error) = app.line_registry.refresh().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
@@ -7864,7 +7860,7 @@ pub async fn get_vowifi_line_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<VowifiLineConfigResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -7885,7 +7881,7 @@ pub async fn set_vowifi_line_config_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<LineVowifiConfig>,
 ) -> (StatusCode, Json<ApiResponse<VowifiLineConfigResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -7947,7 +7943,7 @@ pub async fn set_vowifi_line_connection_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<VowifiControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<VowifiLineConfigResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8131,7 +8127,7 @@ pub async fn get_line_esim_control_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8154,7 +8150,7 @@ pub async fn set_line_esim_control_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<LineEsimControlRequest>,
 ) -> (StatusCode, Json<ApiResponse<LineEsimControlResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8204,7 +8200,7 @@ pub async fn get_cellular_ims_lines_handler(
     StatusCode,
     Json<ApiResponse<Vec<CellularImsLineControlResponse>>>,
 ) {
-    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+    if let Err(error) = app.line_registry.refresh().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
@@ -8232,7 +8228,7 @@ pub async fn get_cellular_ims_line_handler(
     StatusCode,
     Json<ApiResponse<CellularImsLineControlResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8441,7 +8437,7 @@ pub async fn get_cellular_ims_profile_selection_handler(
     StatusCode,
     Json<ApiResponse<CellularImsProfileSelectionResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line = app.line_registry.get(&line_id).await;
     let configured = app
         .config_manager
@@ -8478,7 +8474,7 @@ pub async fn set_cellular_ims_profile_selection_handler(
     StatusCode,
     Json<ApiResponse<CellularImsProfileSelectionResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line = app.line_registry.get(&line_id).await;
     if line.is_none()
         && !app
@@ -8550,7 +8546,7 @@ pub async fn set_cellular_ims_line_connection_handler(
     StatusCode,
     Json<ApiResponse<CellularImsLineControlResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8667,7 +8663,7 @@ pub async fn set_cellular_ims_line_ip_families_handler(
     StatusCode,
     Json<ApiResponse<CellularImsLineControlResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8723,7 +8719,7 @@ pub async fn retry_cellular_ims_line_handler(
     StatusCode,
     Json<ApiResponse<CellularImsLineControlResponse>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8790,7 +8786,7 @@ impl TrunkProfileResponse {
 pub async fn get_trunk_lines_handler(
     State(app): State<AppState>,
 ) -> (StatusCode, Json<ApiResponse<Vec<TrunkProfileResponse>>>) {
-    if let Err(error) = app.line_registry.refresh(app.dbus_conn.as_ref()).await {
+    if let Err(error) = app.line_registry.refresh().await {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ApiResponse::error(format!(
@@ -8817,7 +8813,7 @@ pub async fn get_line_trunk_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8843,7 +8839,7 @@ pub async fn set_line_trunk_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<TrunkProfileConfig>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8890,7 +8886,7 @@ pub async fn set_line_trunk_enabled_handler(
     Path(line_id): Path<String>,
     Json(payload): Json<CellularImsControlToggleRequest>,
 ) -> (StatusCode, Json<ApiResponse<TrunkProfileResponse>>) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -8935,7 +8931,7 @@ async fn resolve_control_line(
     app: &AppState,
     line_id: &str,
 ) -> Option<Arc<crate::services::line_registry::LineRuntime>> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     app.line_registry.get(line_id).await
 }
 
@@ -9985,7 +9981,7 @@ async fn resolve_vowifi_diagnostic_line_id(
     app: &AppState,
     requested: &str,
 ) -> Result<String, String> {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line_ids = app
         .line_registry
         .all()
@@ -10016,7 +10012,7 @@ async fn current_vowifi_status(
     line_id: &str,
     live_probe: bool,
 ) -> VowifiStatusResponse {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let scope = match VowifiScope::resolve(app, line_id).await {
         Ok(scope) => scope,
         Err(reason) => return disabled_vowifi_status(&reason),
@@ -10055,7 +10051,7 @@ async fn current_vowifi_status(
 pub fn spawn_vowifi_auto_restore(app: AppState) {
     tokio::spawn(async move {
         loop {
-            let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+            let _ = app.line_registry.refresh().await;
             let present_lines = app
                 .line_registry
                 .all()
@@ -10449,11 +10445,7 @@ async fn wait_for_line_modem(
         {
             return LineModemWait::Cancelled;
         }
-        let refreshed = app
-            .line_registry
-            .refresh(app.dbus_conn.as_ref())
-            .await
-            .is_ok();
+        let refreshed = app.line_registry.refresh().await.is_ok();
         if refreshed && line.binding().present {
             return LineModemWait::Ready;
         }
@@ -10610,7 +10602,7 @@ async fn run_line_cellular_ims_restore_batch(
         line.cellular_ims
             .begin_profile_attempt(attempt, candidate)
             .await;
-        let refreshed = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+        let refreshed = app.line_registry.refresh().await;
         if let Err(error) = refreshed {
             let attempt_error =
                 crate::connectivity::modems::ims::cellular_ims::CellularImsError::with_detail(
@@ -10888,7 +10880,7 @@ pub fn spawn_cellular_ims_auto_restore(app: AppState) {
     tokio::spawn(async move {
         let started_at = Instant::now();
         loop {
-            let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+            let _ = app.line_registry.refresh().await;
             for profile in app
                 .config_manager
                 .get_line_profiles()
@@ -12509,7 +12501,7 @@ async fn resolve_ims_binding(
     ),
     String,
 > {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let line = app
         .line_registry
         .get(line_id)
@@ -12908,7 +12900,7 @@ pub async fn get_ims_supplementary_handler(
     StatusCode,
     Json<ApiResponse<crate::services::supplementary::SupplementarySnapshot>>,
 ) {
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -13163,7 +13155,7 @@ pub async fn get_ims_ut_document_handler(
             Json(ApiResponse::error("ut_document_kind_invalid")),
         );
     };
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,
@@ -13252,7 +13244,7 @@ pub async fn put_ims_ut_document_handler(
         }
     }
 
-    let _ = app.line_registry.refresh(app.dbus_conn.as_ref()).await;
+    let _ = app.line_registry.refresh().await;
     let Some(line) = app.line_registry.get(&line_id).await else {
         return (
             StatusCode::NOT_FOUND,

@@ -33,6 +33,7 @@ mod state;
 
 use api::handlers::*;
 use hardware::cellular::modem_manager::ensure_nm_modem_profile;
+use hardware::cellular::observations::ModemObservationProvider;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
 use platform::config_maintenance;
@@ -496,9 +497,9 @@ async fn main() -> Result<()> {
         };
     }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {
-        let conn = Connection::system().await?;
-        let mut bindings =
-            hardware::cellular::modem_manager::discover_modem_bindings(&conn).await?;
+        let conn = Arc::new(Connection::system().await?);
+        let observations = hardware::cellular::mm_observations::ModemManagerObservations::new(conn);
+        let mut bindings = observations.discover().await?;
         for binding in &mut bindings {
             binding.sim_iccid = services::system::system_event::mask_identifier(&binding.sim_iccid);
         }
@@ -615,6 +616,11 @@ async fn main() -> Result<()> {
             Arc::clone(&config_manager),
             Arc::clone(&app_db),
             device_kind,
+            Arc::new(
+                hardware::cellular::mm_observations::ModemManagerObservations::new(Arc::clone(
+                    &dbus_conn,
+                )),
+            ),
         ),
     );
     // Must precede the first discovery pass. A previous process that was killed
@@ -627,7 +633,7 @@ async fn main() -> Result<()> {
     hardware::devices::recover_owned_ims_sessions().await;
     platform::netns::reclaim_all_stranded_hardware_links().await;
 
-    match line_registry.refresh(dbus_conn.as_ref()).await {
+    match line_registry.refresh().await {
         Ok(count) => info!(count, "Discovered modem/SIM lines"),
         Err(error) => warn!(error = %error, "Initial modem/SIM line discovery failed"),
     }
@@ -853,11 +859,7 @@ async fn main() -> Result<()> {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
-                if let Err(error) = refresh_app
-                    .line_registry
-                    .refresh(refresh_app.dbus_conn.as_ref())
-                    .await
-                {
+                if let Err(error) = refresh_app.line_registry.refresh().await {
                     tracing::warn!(error = %error, "Modem/SIM line inventory refresh failed");
                 } else {
                     refresh_app
@@ -2161,6 +2163,11 @@ mod http_router_tests {
         let line_registry = Arc::new(services::line_registry::LineRuntimeRegistry::with_config(
             Arc::clone(&config_manager),
             Arc::clone(&app_db),
+            Arc::new(
+                hardware::cellular::mm_observations::ModemManagerObservations::new(Arc::clone(
+                    &dbus_conn,
+                )),
+            ),
         ));
         let esim_supervisor = Arc::new(EsimSupervisor::new(
             Arc::clone(&config_manager),

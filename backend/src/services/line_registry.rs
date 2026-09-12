@@ -1,7 +1,8 @@
 //! Per-modem/SIM runtime registry.
 //!
-//! Each stable hardware+SIM line owns one independent runtime. API handlers must
-//! resolve a line before touching modem, IMS, data, or trunk state.
+//! Each stable physical-slot line owns one independent runtime; its current SIM
+//! binding may change. API handlers must resolve a line before touching modem,
+//! IMS, data, or trunk state.
 
 use std::{
     collections::BTreeMap,
@@ -14,7 +15,6 @@ use std::{
 
 use serde::Serialize;
 use tokio::sync::{Mutex, RwLock as AsyncRwLock};
-use zbus::Connection;
 
 use crate::{
     connectivity::core::access_network::{
@@ -24,8 +24,9 @@ use crate::{
         live::CellularImsLiveHandle, CellularImsRuntime, CellularImsRuntimeStatus,
     },
     connectivity::modems::ims::vowifi::runtime::VowifiRuntime,
+    hardware::cellular::bindings::{self, ModemBinding},
     hardware::cellular::data_proxy::{DataProxyRuntime, DataProxyTraffic},
-    hardware::cellular::modem_manager::{discover_modem_bindings, ModemBinding},
+    hardware::cellular::observations::{ModemObservationProvider, ObservationError},
     hardware::devices::{
         self,
         transport::{CellularDataTransport, ImsBearerTransport},
@@ -530,12 +531,9 @@ pub struct LineRuntimeRegistry {
     /// Platform driver selected once at startup. Every line gets fresh
     /// stateful transports from this provider family.
     device_kind: DeviceKind,
-}
-
-impl Default for LineRuntimeRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Observation backend selected at construction. It owns any protocol/bus
+    /// context; callers do not pass MM connections into each refresh.
+    observations: Arc<dyn ModemObservationProvider>,
 }
 
 impl LineRuntimeRegistry {
@@ -544,48 +542,58 @@ impl LineRuntimeRegistry {
         self.device_kind
     }
 
-    pub fn new() -> Self {
+    pub fn new(device_kind: DeviceKind, observations: Arc<dyn ModemObservationProvider>) -> Self {
         Self {
             lines: AsyncRwLock::new(BTreeMap::new()),
             refresh_lock: Mutex::new(()),
             config_manager: None,
             database: None,
             traffic_persistence_lock: Mutex::new(()),
-            device_kind: devices::detect_device_kind(),
+            device_kind,
+            observations,
         }
     }
 
-    pub fn with_config(config_manager: Arc<ConfigManager>, database: Arc<Database>) -> Self {
-        Self::with_config_for_device(config_manager, database, devices::detect_device_kind())
+    pub fn with_config(
+        config_manager: Arc<ConfigManager>,
+        database: Arc<Database>,
+        observations: Arc<dyn ModemObservationProvider>,
+    ) -> Self {
+        Self::with_config_for_device(
+            config_manager,
+            database,
+            devices::detect_device_kind(),
+            observations,
+        )
     }
 
     pub fn with_config_for_device(
         config_manager: Arc<ConfigManager>,
         database: Arc<Database>,
         device_kind: DeviceKind,
+        observations: Arc<dyn ModemObservationProvider>,
     ) -> Self {
-        Self {
-            lines: AsyncRwLock::new(BTreeMap::new()),
-            refresh_lock: Mutex::new(()),
-            config_manager: Some(config_manager),
-            database: Some(database),
-            traffic_persistence_lock: Mutex::new(()),
-            device_kind,
-        }
+        let mut registry = Self::new(device_kind, observations);
+        registry.config_manager = Some(config_manager);
+        registry.database = Some(database);
+        registry
     }
 
     /// Refresh presence and descriptors without discarding per-line runtime
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.
-    pub async fn refresh(&self, conn: &Connection) -> zbus::Result<usize> {
+    pub async fn refresh(&self) -> Result<usize, ObservationError> {
         // Several handlers and background watchers may refresh concurrently.
         // Keep discovery/reconciliation passes ordered, while the registry write
         // lock remains reserved for the short snapshot publication below.
         let _refresh_guard = self.refresh_lock.lock().await;
-        let mut discovered = match discover_modem_bindings(conn).await {
+        let mut discovered = match self.observations.discover().await {
             Ok(bindings) => bindings,
             Err(error) => {
-                tracing::warn!(error = %error, "ModemManager discovery unavailable; continuing with non-baseband lines");
+                // Preserve the current discovery failure policy in this
+                // extraction. Last-known baseband inventory retention is a
+                // separate policy decision from serving-snapshot TTL.
+                tracing::warn!(backend = self.observations.name(), error = %error, "Modem discovery unavailable; continuing with non-baseband lines");
                 Vec::new()
             }
         };
@@ -635,12 +643,7 @@ impl LineRuntimeRegistry {
                             .filter(|label| !label.is_empty())
                             .unwrap_or(reader.name.as_str());
                         let legacy_line_ids = legacy_slot
-                            .map(|slot| {
-                                vec![crate::hardware::cellular::modem_manager::reader_line_id(
-                                    &slot.id,
-                                    slot.uim_slot,
-                                )]
-                            })
+                            .map(|slot| vec![bindings::reader_line_id(&slot.id, slot.uim_slot)])
                             .unwrap_or_default();
                         let identity = match crate::hardware::devices::pcsc::read_identity_async(
                             reader_path,
@@ -672,7 +675,7 @@ impl LineRuntimeRegistry {
                                     .then(|| identity.imsi[..3 + mnc_length].to_string())
                             })
                             .unwrap_or_default();
-                        let mut binding = crate::hardware::cellular::modem_manager::reader_binding(
+                        let mut binding = bindings::reader_binding(
                             &reader.name,
                             label,
                             reader_path,
@@ -707,7 +710,7 @@ impl LineRuntimeRegistry {
                     && slot.reader_path.trim().starts_with("/dev/")
             }) {
                 let reader_path = slot.reader_path.trim();
-                discovered.push(crate::hardware::cellular::modem_manager::reader_binding(
+                discovered.push(bindings::reader_binding(
                     &slot.id,
                     &slot.label,
                     reader_path,
@@ -866,13 +869,13 @@ impl LineRuntimeRegistry {
         let mut prepared_new = Vec::with_capacity(new_lines.len());
         for (_, line) in &new_lines {
             let binding = line.binding();
-            Self::refresh_ims_access_network(line, &binding, conn).await;
+            self.refresh_ims_access_network(line, &binding).await;
             prepared_new.push(self.reconcile_ue_context(line, &binding).await);
         }
 
         let mut prepared_existing = Vec::with_capacity(existing_lines.len());
         for (line, binding) in &existing_lines {
-            Self::refresh_ims_access_network(line, binding, conn).await;
+            self.refresh_ims_access_network(line, binding).await;
             prepared_existing.push(self.reconcile_ue_context(line, binding).await);
         }
 
@@ -939,24 +942,14 @@ impl LineRuntimeRegistry {
         Ok(present_count)
     }
 
-    async fn refresh_ims_access_network(
-        line: &LineRuntime,
-        binding: &ModemBinding,
-        conn: &Connection,
-    ) {
-        if !binding.present || binding.line_kind == "reader" || binding.modem_path.trim().is_empty()
-        {
+    async fn refresh_ims_access_network(&self, line: &LineRuntime, binding: &ModemBinding) {
+        if !binding.present || binding.line_kind == "reader" {
             line.ims_access_network
                 .clear("access_network_unavailable_for_line_kind");
             return;
         }
 
-        match crate::connectivity::modems::ims::access_network::serving_access_snapshot(
-            conn,
-            &binding.modem_path,
-        )
-        .await
-        {
+        match self.observations.serving_access(binding).await {
             Ok(snapshot) => {
                 let technology = snapshot.technology.clone();
                 line.ims_access_network.publish(snapshot);
@@ -966,13 +959,12 @@ impl LineRuntimeRegistry {
                     "Refreshed per-line IMS serving access context"
                 );
             }
-            Err(reason) => {
+            Err(error) => {
                 // A confirmed no-service/incomplete observation invalidates the
                 // old cell immediately. A transient query failure may retain it
                 // only until the runtime TTL expires.
-                if reason.starts_with("access_network_not_registered:")
-                    || reason.starts_with("access_network_snapshot_incomplete:")
-                {
+                let reason = error.to_string();
+                if error.invalidates_context() {
                     line.ims_access_network.clear(reason.clone());
                 } else {
                     line.ims_access_network.record_refresh_error(reason.clone());
@@ -1385,6 +1377,206 @@ impl LineRuntimeRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        connectivity::core::access_network::{AccessNetworkSource, ServingAccessSnapshot},
+        hardware::devices::transport::TransportFuture,
+    };
+    use std::sync::atomic::AtomicUsize;
+
+    struct TestObservations {
+        discover_calls: AtomicUsize,
+        serving_calls: AtomicUsize,
+        discovery_failure: bool,
+        serving: std::sync::Mutex<Result<ServingAccessSnapshot, ObservationError>>,
+    }
+
+    impl TestObservations {
+        fn new(serving: Result<ServingAccessSnapshot, ObservationError>) -> Self {
+            Self {
+                discover_calls: AtomicUsize::new(0),
+                serving_calls: AtomicUsize::new(0),
+                discovery_failure: false,
+                serving: std::sync::Mutex::new(serving),
+            }
+        }
+    }
+
+    impl ModemObservationProvider for TestObservations {
+        fn name(&self) -> &'static str {
+            "test-observations"
+        }
+
+        fn discover(&self) -> TransportFuture<'_, Result<Vec<ModemBinding>, ObservationError>> {
+            Box::pin(async move {
+                self.discover_calls.fetch_add(1, Ordering::SeqCst);
+                if self.discovery_failure {
+                    Err(ObservationError::Transient("inventory_unavailable".into()))
+                } else {
+                    Ok(Vec::new())
+                }
+            })
+        }
+
+        fn serving_access<'a>(
+            &'a self,
+            _binding: &'a ModemBinding,
+        ) -> TransportFuture<'a, Result<ServingAccessSnapshot, ObservationError>> {
+            Box::pin(async move {
+                self.serving_calls.fetch_add(1, Ordering::SeqCst);
+                self.serving.lock().expect("test snapshot").clone()
+            })
+        }
+    }
+
+    fn serving_snapshot() -> ServingAccessSnapshot {
+        ServingAccessSnapshot::new(
+            "001",
+            "01",
+            "lte",
+            123,
+            4,
+            Some("LTE BAND 3".to_string()),
+            AccessNetworkSource::TestFixture,
+        )
+        .expect("valid test snapshot")
+    }
+
+    fn observation_line(mut binding: ModemBinding) -> LineRuntime {
+        // A non-MM implementation must not fabricate either MM or QMI paths.
+        binding.modem_path.clear();
+        binding.qmi_device = None;
+        LineRuntime::new_for_device(
+            binding,
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
+            VoicePathPolicy::default(),
+            DeviceKind::Unknown,
+        )
+    }
+
+    #[tokio::test]
+    async fn registry_discovery_uses_the_injected_provider_without_dbus() {
+        let observations = Arc::new(TestObservations::new(Ok(serving_snapshot())));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations.clone());
+        assert_eq!(registry.refresh().await.expect("refresh"), 0);
+        assert_eq!(observations.discover_calls.load(Ordering::SeqCst), 1);
+        assert!(registry.all().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_keeps_refresh_available_without_dbus() {
+        let mut provider = TestObservations::new(Ok(serving_snapshot()));
+        provider.discovery_failure = true;
+        let observations = Arc::new(provider);
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations.clone());
+        assert_eq!(registry.refresh().await.expect("refresh remains usable"), 0);
+        assert_eq!(observations.discover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_gate_still_serializes_queries_without_blocking_status_reads() {
+        let observations = Arc::new(TestObservations::new(Ok(serving_snapshot())));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations.clone());
+        let gate = registry.refresh_lock.lock().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), registry.refresh())
+                .await
+                .is_err()
+        );
+        assert_eq!(observations.discover_calls.load(Ordering::SeqCst), 0);
+        assert!(tokio::time::timeout(Duration::from_secs(1), registry.all())
+            .await
+            .expect("status reads must not take the discovery gate")
+            .is_empty());
+        drop(gate);
+        assert_eq!(registry.refresh().await.expect("refresh after gate"), 0);
+        assert_eq!(observations.discover_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn serving_context_does_not_require_a_modemmanager_selector() {
+        let observations = Arc::new(TestObservations::new(Ok(serving_snapshot())));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations.clone());
+        let line = observation_line(binding("line-observation-native", true));
+        let binding = line.binding();
+        assert!(binding.modem_path.is_empty());
+        assert!(binding.qmi_device.is_none());
+
+        registry.refresh_ims_access_network(&line, &binding).await;
+
+        let status = line
+            .ims_access_network
+            .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE);
+        assert!(status.available);
+        assert_eq!(status.serving_plmn.as_deref(), Some("00101"));
+        assert_eq!(observations.serving_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_serving_error_keeps_the_snapshot_only_under_its_ttl() {
+        let observations = Arc::new(TestObservations::new(Err(ObservationError::Transient(
+            "fixture_query_timeout".to_string(),
+        ))));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations);
+        let line = observation_line(binding("line-observation-transient", true));
+        line.ims_access_network.publish(serving_snapshot());
+
+        registry
+            .refresh_ims_access_network(&line, &line.binding())
+            .await;
+
+        let status = line
+            .ims_access_network
+            .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE);
+        assert!(status.available);
+        assert_eq!(status.last_error.as_deref(), Some("fixture_query_timeout"));
+        assert!(!line.ims_access_network.status(Duration::ZERO).available);
+    }
+
+    #[tokio::test]
+    async fn definitive_serving_error_clears_without_parsing_provider_text() {
+        let observations = Arc::new(TestObservations::new(Err(ObservationError::Unavailable(
+            "fixture_no_service".to_string(),
+        ))));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations);
+        let line = observation_line(binding("line-observation-no-service", true));
+        line.ims_access_network.publish(serving_snapshot());
+
+        registry
+            .refresh_ims_access_network(&line, &line.binding())
+            .await;
+
+        let status = line
+            .ims_access_network
+            .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE);
+        assert!(!status.available);
+        assert_eq!(status.last_error.as_deref(), Some("fixture_no_service"));
+    }
+
+    #[tokio::test]
+    async fn readers_and_absent_lines_never_query_cellular_serving_context() {
+        let observations = Arc::new(TestObservations::new(Ok(serving_snapshot())));
+        let registry = LineRuntimeRegistry::new(DeviceKind::Unknown, observations.clone());
+        for (line_id, present, kind) in [
+            ("line-observation-reader", true, "reader"),
+            ("line-observation-absent", false, "baseband"),
+        ] {
+            let mut descriptor = binding(line_id, present);
+            descriptor.line_kind = kind.to_string();
+            let line = observation_line(descriptor);
+            line.ims_access_network.publish(serving_snapshot());
+            registry
+                .refresh_ims_access_network(&line, &line.binding())
+                .await;
+            assert!(
+                !line
+                    .ims_access_network
+                    .status(DEFAULT_IMS_ACCESS_NETWORK_MAX_AGE)
+                    .available
+            );
+        }
+        assert_eq!(observations.serving_calls.load(Ordering::SeqCst), 0);
+    }
 
     fn binding(line_id: &str, present: bool) -> ModemBinding {
         ModemBinding {
