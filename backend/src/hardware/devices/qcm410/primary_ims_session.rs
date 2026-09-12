@@ -30,6 +30,7 @@ use super::{
 };
 
 const BEARER_PREFIX: &str = "/org/freedesktop/ModemManager1/Bearer/";
+const MODEM_PREFIX: &str = "/org/freedesktop/ModemManager1/Modem/";
 pub(super) const OWNER_MISSING: &str = "qca410_primary_mm_owner_missing";
 
 pub(super) struct PrimaryImsRequest<'a> {
@@ -55,7 +56,11 @@ impl PrimaryImsSession {
         if lifecycle::is_shutting_down() {
             return Err("qca410_primary_mm_shutting_down".to_string());
         }
-        let request = OwnedRequest::from(request);
+        let mut request = OwnedRequest::from(request);
+        // The generic IMS layer historically passes mmcli's numeric selector.
+        // D-Bus requires an object path; normalize here inside the MM adapter,
+        // not by changing all devices or user-visible line identifiers.
+        request.modem = canonical_modem_path(&request.modem)?;
         let cancelled = Arc::new(AtomicBool::new(false));
         let mut cancellation = CancelSetup {
             flag: Arc::clone(&cancelled),
@@ -182,6 +187,18 @@ impl PrimaryImsSession {
             .owned(&self.bearer)?
             .namespace_will_change(namespace)
     }
+}
+
+fn canonical_modem_path(selector: &str) -> Result<String, String> {
+    let selector = selector.trim();
+    let id = selector.strip_prefix(MODEM_PREFIX).unwrap_or(selector);
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("qca410_primary_mm_modem_selector_invalid".to_string());
+    }
+    let id = id
+        .parse::<u32>()
+        .map_err(|_| "qca410_primary_mm_modem_selector_invalid".to_string())?;
+    Ok(format!("{MODEM_PREFIX}{id}"))
 }
 
 async fn deliver_setup<T, F, R>(
@@ -636,6 +653,27 @@ mod tests {
             profile_id: Some(2),
             family: 4,
             allow_roaming: true,
+        }
+    }
+
+    #[test]
+    fn numeric_mmcli_selectors_become_dbus_object_paths() {
+        assert_eq!(canonical_modem_path("56").unwrap(), MODEM);
+        assert_eq!(canonical_modem_path(" 056 ").unwrap(), MODEM);
+        assert_eq!(canonical_modem_path(MODEM).unwrap(), MODEM);
+        assert_eq!(
+            canonical_modem_path("0").unwrap(),
+            "/org/freedesktop/ModemManager1/Modem/0"
+        );
+        for invalid in [
+            "",
+            "../56",
+            "wwan0qmi0",
+            "4294967296",
+            "/Modem/56",
+            MODEM_PREFIX,
+        ] {
+            assert!(canonical_modem_path(invalid).is_err());
         }
     }
 
