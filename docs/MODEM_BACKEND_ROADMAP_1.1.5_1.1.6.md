@@ -13,6 +13,10 @@
 - 构建任务的默认 token 权限收紧为 contents:read，只有受门禁保护的 release job 请求 contents:write。
 - 本地27项Python边界/发布规则测试通过，包含开发分支手动构建也不能发布的用例；Rust编译、
   双架构构建和回归交由Actions，状态以对应run为准，不能将本地规则测试当作后端CI已通过。
+- `9edd70c` 的 [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34706343440)
+  与 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34706343475) 均 success，
+  包含自动回归和 arm64/amd64 构建；`Publish Release` 明确 skipped。没有发布/部署新程序，
+  也不能把自动测试名称中的“双流”等同于运营商实机验收。
 - 本阶段仅建立开发/验证边界：应用版本仍沿用共同基线 `1.1.4-beta3`，尚未改运行时 MM 行为、
   实现原生后端或飞行/开机策略，也未部署到 IMS 测试机。首次功能候选再统一设置 1.1.5 版本号。
 - M0 其余设备矩阵/接口设计及 M1 调用迁移仍待完成；下方未完成项不因分支或 CI 接入而自动勾选。
