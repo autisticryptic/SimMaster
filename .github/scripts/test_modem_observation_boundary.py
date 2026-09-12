@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import unittest
 
 
@@ -6,6 +7,14 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ModemObservationBoundaryTests(unittest.TestCase):
+    def test_all_registry_refresh_callers_use_the_injected_backend(self):
+        # Callers also live outside main/API (for example automation targets).
+        # Catch leftover arguments before waiting for the Rust compile job.
+        legacy_call = re.compile(r"\bline_registry\s*\.refresh\s*\(\s*[^\s)]")
+        for source in (ROOT / "backend/src").rglob("*.rs"):
+            with self.subTest(path=str(source.relative_to(ROOT))):
+                self.assertIsNone(legacy_call.search(source.read_text()))
+
     def test_registry_uses_provider_without_dbus_or_mm_calls(self):
         text = (ROOT / "backend/src/services/line_registry.rs").read_text()
         self.assertNotIn("use zbus::", text)

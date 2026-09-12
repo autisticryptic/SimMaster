@@ -58,7 +58,7 @@ pub async fn resolve_line_target(
         None => return Err(anyhow!("automation_target_line_required")),
     };
     app.line_registry
-        .refresh(app.dbus_conn.as_ref())
+        .refresh()
         .await
         .map_err(|error| anyhow!("automation_target_refresh_failed: {error}"))?;
     let line = app
