@@ -16,6 +16,8 @@ use super::{
 pub mod baseband_faults;
 pub mod ims_bearer;
 pub mod netdev;
+mod primary_ims_lifecycle;
+mod primary_ims_session;
 pub mod resources;
 pub mod secondary_qmi;
 pub mod secondary_qmi_data;
@@ -77,5 +79,17 @@ impl DeviceDriver for Driver {
 
     fn install_update_resources(&self, staging_dir: &str, restart_now: bool) -> String {
         resources::install(staging_dir, restart_now)
+    }
+
+    fn begin_ims_shutdown(&self) {
+        primary_ims_lifecycle::begin_shutdown();
+    }
+
+    fn shutdown_owned_ims(&self) -> TransportFuture<'_, ()> {
+        Box::pin(primary_ims_lifecycle::shutdown_owned())
+    }
+
+    fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
+        Box::pin(primary_ims_lifecycle::recover_owned())
     }
 }

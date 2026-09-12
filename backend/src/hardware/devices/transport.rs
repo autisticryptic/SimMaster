@@ -133,6 +133,17 @@ pub trait ImsBearerHandle: Send {
     /// another control connection or sending network probes.
     fn check_liveness(&mut self) -> Result<(), ImsBearerError>;
 
+    /// Record namespace ownership before the move can happen. Controllers
+    /// that survive application exit use it for bounded shutdown/recovery.
+    /// The returned opaque guard must live until the move finishes or is
+    /// cancelled, so shutdown cannot race past an in-flight network mutation.
+    fn prepare_namespace_move(
+        &mut self,
+        _namespace: &str,
+    ) -> Result<Box<dyn Send>, ImsBearerError> {
+        Ok(Box::new(()))
+    }
+
     /// Stop the provider session and release its endpoint and network state.
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 }
@@ -143,7 +154,7 @@ pub trait ImsBearerHandle: Send {
 pub enum ImsBearerErrorKind {
     /// The primary device could not be mapped to a baseband.
     BasebandUnresolved,
-    /// No secondary endpoint could be obtained (bound) for the device.
+    /// The device's required IMS control endpoint is unavailable or invalid.
     EndpointUnavailable,
     /// The device-native session failed to start.
     SessionStartFailed,
@@ -207,6 +218,8 @@ pub trait ImsBearerTransport: Send + Sync {
     ///
     /// `modem_id` identifies the line to the provider; `profile_id` and `cid`
     /// carry the selected 3GPP profile/context when the driver needs them.
+    /// `allow_roaming` preserves the caller's policy when the device controller
+    /// also enforces roaming admission; it is not a device-mode switch.
     fn establish_ims_bearer<'a>(
         &'a self,
         primary_device: &'a str,
@@ -215,6 +228,7 @@ pub trait ImsBearerTransport: Send + Sync {
         profile_id: Option<u32>,
         cid: u8,
         families: &'a [u8],
+        allow_roaming: bool,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>;
 }
 

@@ -9,10 +9,12 @@
 //! On the bam-dmux target this project runs on, it is not. One baseband publishes
 //! eight identical netdevs (`wwan0`…`wwan7`, all `POINTOPOINT,NOARP`, all under
 //! the same `<addr>.remoteproc:bam-dmux` parent), and the firmware decides which
-//! MUX channel a session lands on. Nothing in sysfs says which. The two QMI
-//! commands that would tell us — `--wds-bind-data-port` and
-//! `--wds-bind-mux-data-port` — are unsupported by the 2015 firmware here and
-//! issuing either one restarts the baseband, so asking is not an option either.
+//! MUX channel a session lands on. DATA6 resolution must not guess arbitrary
+//! USB/QMUX bindings: the old firmware has restarted during those experiments.
+//! The primary IMS leg is different: its ModemManager controller uses the
+//! driver's `dev_port` and known A2 SIO mapping, and this module resolves its
+//! exact interface. Do not confuse that verified primary setup with probing
+//! bindings to discover a DATA6 interface.
 //!
 //! What is left is observation: configure a candidate, send a packet that the
 //! network is obliged to answer, and see which interface counts the reply. That
@@ -163,7 +165,7 @@ impl std::fmt::Display for ConfigureError {
 }
 
 /// The address configuration a session needs on its interface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NetdevConfig {
     pub address: IpAddr,
     pub prefix: u8,
@@ -745,6 +747,7 @@ fn probe_observed(socket_replied: bool, before: LinkCounters, after: LinkCounter
 async fn run_ip(args: &[&str]) -> Result<(), String> {
     let output = Command::new("ip")
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|error| format!("spawn ip: {error}"))?;

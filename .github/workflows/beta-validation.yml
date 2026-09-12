@@ -55,6 +55,8 @@ jobs:
             platform::network_routing::tests \
             hardware::cellular::cgcontrdp::tests \
             hardware::devices::qcm410::ims_bearer::tests \
+            hardware::devices::qcm410::primary_ims_session::tests \
+            hardware::devices::qcm410::primary_ims_lifecycle::tests \
             hardware::devices::qcm410::secondary_qmi::tests \
             connectivity::modems::ims::cellular_ims::native_bearer::tests \
             connectivity::modems::ims::cellular_ims::data_slot::tests \

@@ -12,23 +12,12 @@
 //! namespace by the native bearer strategy, so SIP and IPsec remain isolated
 //! per line.
 
-use std::{
-    future::Future,
-    net::IpAddr,
-    pin::Pin,
-    process::Stdio,
-    time::{Duration, Instant},
-};
-
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    process::{Child, Command},
-    sync::mpsc,
-};
+use std::{future::Future, net::IpAddr, pin::Pin, time::Duration};
 
 use crate::hardware::cellular::cgcontrdp::{self, CgcontrdpSettings};
 use crate::hardware::devices::qcm410::{
     netdev::{self as qmi_netdev, NetdevConfig},
+    primary_ims_session::{PrimaryImsRequest, PrimaryImsSession},
     secondary_qmi,
 };
 use crate::hardware::devices::transport::{
@@ -37,22 +26,12 @@ use crate::hardware::devices::transport::{
 };
 
 const PRIMARY_QMI_DEVICE: &str = "/dev/wwan0qmi0";
-// A single qmicli process owns the primary WDS bearer for its entire lifetime.
-// Keep one owner instead of an allocate/start/query/stop sequence so teardown
-// and liveness track the same process. Earlier endpoint hangups were reproduced
-// with a flag mask that silently disabled proxy mode (see below); they are not
-// evidence that correctly proxied retained CIDs inherently cannot be reused.
-// `--device-open-qmi` remains required by the project-created DATA6 secondary
-// endpoint and must not be copied into this primary IMS leg.
-// qmicli 1.28.6 (shipped on QCA410) parses --device-open-net by replacing the
-// ENTIRE open flag mask, clearing even an earlier --device-open-proxy. Keep
-// `proxy` in that mask too, or the command opens qmi0 directly and breaks
-// ModemManager's endpoint despite appearing to request proxy mode. Do not
-// reuse DATA6's direct-open mask here, and do not make this a user option.
-const PRIMARY_QMI_OPEN_NET_ARG: &str = "--device-open-net=net-raw-ip|net-no-qos-header|proxy";
-const PRIMARY_QMI_OPEN_FLAGS: [&str; 2] = ["--device-open-proxy", PRIMARY_QMI_OPEN_NET_ARG];
+// The primary control endpoint and WDS client stay with ModemManager/proxy.
+// Do not replace its complete BAM-DMUX session with an independent qmicli
+// start/follow command: that obtained PCO addresses but no SIP replies on SIM-03.
+// Only our newly created, exclusive IMS bearer supplies the data interface that
+// moves into the UE worker. Existing Internet bearers are never borrowed.
 const CURRENT_SETTINGS_RETRIES: usize = 12;
-const WDS_FOLLOW_START_TIMEOUT: Duration = Duration::from_secs(65);
 
 fn is_primary_qmi_device(device: &str) -> bool {
     device.trim().starts_with("/dev/") && qmi_netdev::primary_netdev_for_qmi(device).is_some()
@@ -65,36 +44,9 @@ fn primary_netdev_for_qmi(device: &str) -> Option<String> {
     qmi_netdev::primary_netdev_for_qmi(device)
 }
 
-/// Primary-QMI WDS session owned by one long-lived qmicli process.
-///
-/// Do not replace this with a numeric CID plus short-lived qmicli calls: the
-/// process is the bearer liveness/teardown boundary. Its command must preserve
-/// effective proxy mode to avoid taking down ModemManager's primary endpoint.
-struct PrimaryQmiSession {
-    client_id: String,
-    packet_data_handle: String,
-    process: Child,
-}
-
-impl PrimaryQmiSession {
-    fn check_liveness(&mut self) -> Result<(), String> {
-        match self
-            .process
-            .try_wait()
-            .map_err(|error| format!("qca410_primary_qmi_follow_status_failed:{error}"))?
-        {
-            None => Ok(()),
-            Some(status) => Err(format!(
-                "qca410_primary_qmi_session_disconnected:pid_exit={status}"
-            )),
-        }
-    }
-}
-
 /// Everything needed to tear down one primary-QMI IMS bearer.
 pub struct Qcm410ImsBearerHandle {
-    session: PrimaryQmiSession,
-    configured_netdev: Option<(String, NetdevConfig)>,
+    session: PrimaryImsSession,
 }
 
 impl ImsBearerHandle for Qcm410ImsBearerHandle {
@@ -110,15 +62,16 @@ impl ImsBearerHandle for Qcm410ImsBearerHandle {
 
     fn release(self: Box<Self>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         Box::pin(async move {
-            let Qcm410ImsBearerHandle {
-                mut session,
-                configured_netdev,
-            } = *self;
-            if let Some((interface, config)) = configured_netdev {
-                qmi_netdev::teardown(&interface, &config).await;
-            }
+            let Qcm410ImsBearerHandle { mut session } = *self;
             stop_primary_session(&mut session).await;
         })
+    }
+
+    fn prepare_namespace_move(&mut self, namespace: &str) -> Result<Box<dyn Send>, ImsBearerError> {
+        self.session
+            .namespace_will_change(namespace)
+            .map(|guard| Box::new(guard) as Box<dyn Send>)
+            .map_err(settings_missing)
     }
 }
 
@@ -139,6 +92,7 @@ impl ImsBearerTransport for Qcm410ImsBearer {
         profile_id: Option<u32>,
         cid: u8,
         families: &'a [u8],
+        allow_roaming: bool,
     ) -> TransportFuture<'a, Result<(ImsBearerInfo, Box<dyn ImsBearerHandle + Send>), ImsBearerError>>
     {
         Box::pin(async move {
@@ -164,7 +118,15 @@ impl ImsBearerTransport for Qcm410ImsBearer {
                 detail: format!("qca410_primary_qmi_netdev_unresolved:{device}"),
             })?;
             establish_bearer(
-                device, &netdev, &baseband, modem_id, apn, profile_id, cid, families,
+                device,
+                &netdev,
+                &baseband,
+                modem_id,
+                apn,
+                profile_id,
+                cid,
+                families,
+                allow_roaming,
             )
             .await
             .map(|established| {
@@ -191,11 +153,22 @@ async fn establish_bearer(
     profile_id: Option<u32>,
     context_cid: u8,
     families: &[u8],
+    allow_roaming: bool,
 ) -> Result<Established, ImsBearerError> {
     let Some(first_family) = families.first().copied() else {
         return Err(session_start_error("native_ims_no_address_family"));
     };
-    let mut session = match start_primary_session(device, apn, first_family, profile_id).await {
+    let mut session = match PrimaryImsSession::start(PrimaryImsRequest {
+        device,
+        modem: modem_id,
+        interface: primary_netdev,
+        apn,
+        profile_id,
+        family: first_family,
+        allow_roaming,
+    })
+    .await
+    {
         Ok(session) => session,
         Err(error) => {
             return Err(ImsBearerError {
@@ -206,9 +179,8 @@ async fn establish_bearer(
         }
     };
 
-    // The long-lived qmicli process is the sole WDS owner. Read the active
-    // context through the AT path instead of reopening qmi-proxy with the
-    // retained CID from another process.
+    // ModemManager holds this exact IMS WDS client for its whole lifetime.
+    // AT reads the corresponding active context without taking over the CID.
     let settings = match wait_for_current_settings(modem_id, context_cid, apn, first_family).await {
         Ok(settings) => settings,
         Err(error) => {
@@ -216,6 +188,14 @@ async fn establish_bearer(
             return Err(error);
         }
     };
+    if let Err(detail) = session.check_liveness() {
+        stop_primary_session(&mut session).await;
+        return Err(ImsBearerError {
+            kind: ImsBearerErrorKind::SessionLost,
+            hint: ImsBearerFailureHint::None,
+            detail,
+        });
+    }
     let settings = match settings_for_started_family(settings, first_family) {
         Ok(settings) => settings,
         Err(error) => {
@@ -229,12 +209,20 @@ async fn establish_bearer(
             "qca410_primary_ims_session_has_no_address".to_string(),
         ));
     };
+    let network_guard = match session.network_will_be_configured(&config) {
+        Ok(guard) => guard,
+        Err(error) => {
+            stop_primary_session(&mut session).await;
+            return Err(settings_missing(error));
+        }
+    };
 
     // The control port is primary qmi0, but the WDS data interface is moved into
     // the line worker. DATA6 remains exclusively owned by secondary_qmi_data.
     let resolution = match qmi_netdev::resolve_exact(baseband, &config, primary_netdev).await {
         Ok(resolution) => resolution,
         Err(error) => {
+            drop(network_guard);
             stop_primary_session(&mut session).await;
             return Err(ImsBearerError {
                 kind: ImsBearerErrorKind::NetdevUnresolved,
@@ -247,13 +235,22 @@ async fn establish_bearer(
             });
         }
     };
+    drop(network_guard);
+    if let Err(detail) = session.check_liveness() {
+        stop_primary_session(&mut session).await;
+        return Err(ImsBearerError {
+            kind: ImsBearerErrorKind::SessionLost,
+            hint: ImsBearerFailureHint::None,
+            detail,
+        });
+    }
 
     let info = ImsBearerInfo {
         interface: resolution.interface.clone(),
         netdev_method: resolution.method.as_str(),
         ip_type: ip_type_for(first_family).to_string(),
         path_device: device.to_string(),
-        path_handle: format!("{}:{}", session.client_id, session.packet_data_handle),
+        path_handle: format!("mm:{}", session.path()),
         ipv4_address: settings.ipv4_address,
         ipv4_gateway: settings.ipv4_gateway,
         ipv4_dns: settings.ipv4_dns,
@@ -270,128 +267,8 @@ async fn establish_bearer(
     };
     Ok(Established {
         info,
-        handle: Qcm410ImsBearerHandle {
-            session,
-            configured_netdev: Some((resolution.interface, config)),
-        },
+        handle: Qcm410ImsBearerHandle { session },
     })
-}
-
-fn primary_open_args(device: &str) -> Vec<String> {
-    let mut args = vec!["-d".to_string(), device.to_string()];
-    args.extend(
-        PRIMARY_QMI_OPEN_FLAGS
-            .iter()
-            .map(|flag| (*flag).to_string()),
-    );
-    args
-}
-
-fn primary_follow_args(
-    device: &str,
-    apn: &str,
-    family: u8,
-    profile_id: Option<u32>,
-) -> Vec<String> {
-    let mut args = primary_open_args(device);
-    let mut start = format!("--wds-start-network=apn={apn}");
-    if let Some(profile_id) = profile_id {
-        start.push_str(&format!(",3gpp-profile={profile_id}"));
-    }
-    start.push_str(&format!(",ip-type={family}"));
-    args.push(start);
-    args.push("--wds-follow-network".to_string());
-    args
-}
-
-async fn start_primary_session(
-    device: &str,
-    apn: &str,
-    family: u8,
-    profile_id: Option<u32>,
-) -> Result<PrimaryQmiSession, String> {
-    let mut process = Command::new("qmicli")
-        .args(primary_follow_args(device, apn, family, profile_id))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("qca410_primary_qmi_follow_spawn_failed:{error}"))?;
-    let stdout = match process.stdout.take() {
-        Some(stdout) => stdout,
-        None => {
-            stop_child(&mut process).await;
-            return Err("qca410_primary_qmi_follow_stdout_missing".to_string());
-        }
-    };
-    let stderr = match process.stderr.take() {
-        Some(stderr) => stderr,
-        None => {
-            stop_child(&mut process).await;
-            return Err("qca410_primary_qmi_follow_stderr_missing".to_string());
-        }
-    };
-    let (sender, mut receiver) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(drain_qmicli_stream(BufReader::new(stdout), sender.clone()));
-    tokio::spawn(drain_qmicli_stream(BufReader::new(stderr), sender));
-
-    let deadline = Instant::now() + WDS_FOLLOW_START_TIMEOUT;
-    let mut startup = String::new();
-    let mut client_id = None;
-    let mut packet_data_handle = None;
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
-            Ok(Some(line)) => {
-                if startup.len() < 16 * 1024 {
-                    startup.push_str(&line);
-                    startup.push('\n');
-                }
-                client_id = client_id.or_else(|| secondary_qmi::parse_wds_client_id(&line));
-                packet_data_handle =
-                    packet_data_handle.or_else(|| secondary_qmi::parse_packet_data_handle(&line));
-                if packet_data_handle.is_some() {
-                    break;
-                }
-            }
-            Ok(None) | Err(_) => {}
-        }
-        if let Some(status) = process
-            .try_wait()
-            .map_err(|error| format!("qca410_primary_qmi_follow_status_failed:{error}"))?
-        {
-            return Err(format!(
-                "qca410_primary_qmi_start_failed:pid_exit={status}:{}",
-                compact(&startup)
-            ));
-        }
-    }
-    let Some(packet_data_handle) = packet_data_handle else {
-        stop_child(&mut process).await;
-        return Err(format!(
-            "qca410_primary_qmi_packet_data_handle_missing:{}",
-            compact(&startup)
-        ));
-    };
-    Ok(PrimaryQmiSession {
-        client_id: client_id.unwrap_or_else(|| "follow".to_string()),
-        packet_data_handle,
-        process,
-    })
-}
-
-async fn drain_qmicli_stream<R>(reader: BufReader<R>, sender: mpsc::UnboundedSender<String>)
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        // The receiver belongs only to startup and is dropped as soon as the
-        // packet-data handle is found. Keep both OS pipes open and drain them
-        // until qmicli exits: closing them here makes later follow-mode status
-        // writes fail with EPIPE/SIGPIPE, killing the process that owns IMS WDS.
-        // Do not retain or log raw output after startup (it can contain modem
-        // identifiers); a disconnected startup receiver is not a session stop.
-        let _ = sender.send(line);
-    }
 }
 
 async fn wait_for_current_settings(
@@ -427,27 +304,8 @@ fn has_started_family(settings: &CgcontrdpSettings, family: u8) -> bool {
     }
 }
 
-async fn stop_primary_session(session: &mut PrimaryQmiSession) {
-    stop_child(&mut session.process).await;
-}
-
-async fn stop_child(process: &mut Child) {
-    if let Some(pid) = process.id() {
-        // qmicli's follow mode owns the WDS CID and performs the graceful
-        // stop/release path when interrupted. Do not reopen qmi-proxy with a
-        // second process to issue stop-network or release-cid.
-        let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) };
-        let deadline = Instant::now() + Duration::from_secs(8);
-        while Instant::now() < deadline {
-            match process.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
-                Err(_) => break,
-            }
-        }
-        let _ = process.start_kill();
-    }
-    let _ = process.wait().await;
+async fn stop_primary_session(session: &mut PrimaryImsSession) {
+    session.stop().await;
 }
 
 fn ip_type_for(family: u8) -> &'static str {
@@ -571,58 +429,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn primary_follow_output_is_drained_after_startup_receiver_drops() {
-        use tokio::io::AsyncWriteExt;
-
-        let (mut output, input) = tokio::io::duplex(64);
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        let drain = tokio::spawn(drain_qmicli_stream(BufReader::new(input), sender));
-        output
-            .write_all(b"Packet data handle: '123'\n")
-            .await
-            .unwrap();
-        assert_eq!(
-            receiver.recv().await.as_deref(),
-            Some("Packet data handle: '123'")
-        );
-        drop(receiver);
-
-        // Fill more than one pipe buffer after startup. The old implementation
-        // returned after the first late line and closed the reader, so these
-        // writes failed (or hung if a future change stopped draining the pipe).
-        let late_output = "Connection status: 'connected'\n".repeat(128);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            output.write_all(late_output.as_bytes()),
-        )
-        .await
-        .expect("follow output stopped draining")
-        .expect("follow output reader was closed after startup");
-        assert!(!drain.is_finished(), "the reader must outlive startup");
-        drop(output);
-        tokio::time::timeout(Duration::from_secs(2), drain)
-            .await
-            .expect("reader did not finish at EOF")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn primary_follow_output_reports_startup_lines_and_stops_at_eof() {
-        let (sender, mut receiver) = mpsc::unbounded_channel();
-        drain_qmicli_stream(
-            BufReader::new(&b"CID: '2'\nPacket data handle: '123'\n"[..]),
-            sender,
-        )
-        .await;
-        assert_eq!(receiver.recv().await.as_deref(), Some("CID: '2'"));
-        assert_eq!(
-            receiver.recv().await.as_deref(),
-            Some("Packet data handle: '123'")
-        );
-        assert!(receiver.recv().await.is_none());
-    }
-
     #[test]
     fn qca410_ims_has_one_primary_qmi_endpoint() {
         assert_eq!(PRIMARY_QMI_DEVICE, "/dev/wwan0qmi0");
@@ -642,44 +448,6 @@ mod tests {
             primary_netdev_for_qmi("/dev/wwan12qmi0").as_deref(),
             Some("wwan12")
         );
-    }
-
-    #[test]
-    fn qca410_primary_commands_always_use_proxy_and_never_bind() {
-        let args = primary_follow_args(PRIMARY_QMI_DEVICE, "ims", 4, Some(2));
-        assert!(args.iter().any(|arg| arg == "--device-open-proxy"));
-        assert!(args.iter().any(|arg| arg == PRIMARY_QMI_OPEN_NET_ARG));
-        assert!(!args.iter().any(|arg| arg == "--device-open-qmi"));
-        assert!(!args.iter().any(|arg| arg.contains("bind-data-port")));
-        assert!(!args.iter().any(|arg| arg.contains("bind-mux-data-port")));
-        assert!(args.iter().any(|arg| arg == "--wds-follow-network"));
-        assert!(args
-            .iter()
-            .any(|arg| arg == "--wds-start-network=apn=ims,3gpp-profile=2,ip-type=4"));
-    }
-
-    #[test]
-    fn qca410_primary_open_net_mask_preserves_proxy_on_legacy_qmicli() {
-        for family in [4, 6] {
-            let args = primary_follow_args(PRIMARY_QMI_DEVICE, "ims", family, Some(2));
-            // Model the legacy parser's overwrite, not just presence of the
-            // separate --device-open-proxy switch (which alone is insufficient).
-            let mut effective_flags = Vec::new();
-            for arg in &args {
-                if arg == "--device-open-proxy" {
-                    effective_flags.push("proxy");
-                } else if let Some(mask) = arg.strip_prefix("--device-open-net=") {
-                    effective_flags = mask.split('|').collect();
-                }
-            }
-            assert!(effective_flags.contains(&"proxy"));
-            assert!(effective_flags.contains(&"net-raw-ip"));
-            assert!(effective_flags.contains(&"net-no-qos-header"));
-        }
-        // DATA6 intentionally remains direct and must not inherit IMS flags.
-        assert!(!secondary_qmi::QMI_OPEN_NET_ARG
-            .split('|')
-            .any(|flag| flag == "proxy"));
     }
 
     #[test]

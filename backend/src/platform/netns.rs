@@ -1207,6 +1207,7 @@ async fn run_command(
 ) -> Result<String, NetnsError> {
     let output = Command::new(program)
         .args(args)
+        .kill_on_drop(true)
         .output()
         .await
         .map_err(|error| NetnsError {

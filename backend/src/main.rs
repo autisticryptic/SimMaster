@@ -624,6 +624,7 @@ async fn main() -> Result<()> {
     // interface would be invisible and the session would come up as `Assumed`
     // (unverified), which makes SIP fail silently. Nothing owns a netdev yet at
     // this point, so anything found inside a namespace is a leftover.
+    hardware::devices::recover_owned_ims_sessions().await;
     platform::netns::reclaim_all_stranded_hardware_links().await;
 
     match line_registry.refresh(dbus_conn.as_ref()).await {
@@ -1011,7 +1012,10 @@ async fn main() -> Result<()> {
     // Only reached once the drain completes, which is what the shutdown signal
     // above makes possible. Releasing the data sessions here is what keeps the
     // DATA netdev from being left inside a UE namespace.
-    release_data_sessions(&shutdown_registry).await;
+    tokio::join!(
+        release_data_sessions(&shutdown_registry),
+        hardware::devices::shutdown_owned_ims_sessions()
+    );
 
     // Exit explicitly rather than returning. Returning drops the tokio runtime,
     // and that drop blocks until every `spawn_blocking` task has finished --
@@ -1247,6 +1251,10 @@ async fn wait_for_shutdown_signal(controller: platform::shutdown::ShutdownContro
     }
 
     warn!("Shutdown signal received; starting graceful shutdown");
+    hardware::devices::begin_ims_shutdown();
+    // An SSE/HTTP drain must not postpone releasing controller-owned IMS.
+    // The final join below is idempotent and waits for the same owned leases.
+    tokio::spawn(hardware::devices::shutdown_owned_ims_sessions());
     // Before the watchdog, so long-lived responses get the whole window to end.
     controller.trigger();
     std::thread::spawn(|| {

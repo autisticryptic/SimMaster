@@ -102,9 +102,10 @@ impl NativeImsBearer {
     }
 
     /// Move the dedicated native netdev into this line's UE namespace. The
-    /// primary ModemManager interface is intentionally rejected; only a
-    /// provider-declared application-owned bearer may cross the
-    /// namespace boundary.
+    /// host-managed Internet interface is intentionally rejected. A device
+    /// provider may use ModemManager as the control-plane owner of its own
+    /// exclusive IMS bearer, but must verify data-interface ownership before
+    /// declaring it application-owned and crossing the namespace boundary.
     pub async fn move_into_worker(
         &mut self,
         worker: UeWorkerHandle,
@@ -152,6 +153,10 @@ impl NativeImsBearer {
             }
             BearerInterfaceOwnership::ApplicationOwnedNative => {}
         }
+        let _move_guard = self
+            .handle
+            .prepare_namespace_move(worker_binding.namespace().as_str())
+            .map_err(cellular_ims_error_from_ims_bearer)?;
         netns::move_iface_in(worker_binding.namespace(), &self.interface)
             .await
             .map_err(|error| {
@@ -305,6 +310,7 @@ pub async fn establish_native_ims_bearer(
                 request.profile_id,
                 cid,
                 attempt_families,
+                request.allow_roaming,
             )
             .await;
         match result {
@@ -341,6 +347,7 @@ pub async fn establish_native_ims_bearer(
                 request.profile_id,
                 cid,
                 &[forced],
+                request.allow_roaming,
             )
             .await
         {

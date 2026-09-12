@@ -71,6 +71,18 @@ pub trait DeviceDriver: Send + Sync {
     ) -> TransportFuture<'_, anyhow::Result<()>>;
 
     fn install_update_resources(&self, staging_dir: &str, restart_now: bool) -> String;
+
+    /// Device controllers may outlive this process. Hooks operate only on
+    /// sessions whose ownership was recorded by this driver.
+    fn begin_ims_shutdown(&self) {}
+
+    fn shutdown_owned_ims(&self) -> TransportFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    fn recover_owned_ims(&self) -> TransportFuture<'_, Result<(), String>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 #[derive(Default)]
@@ -149,6 +161,33 @@ impl DeviceDriver for UnsupportedDeviceDriver {
 
 static QCM410_DRIVER: qcm410::Driver = qcm410::Driver;
 static UNSUPPORTED_DRIVER: UnsupportedDeviceDriver = UnsupportedDeviceDriver;
+
+fn registered_drivers() -> [&'static dyn DeviceDriver; 2] {
+    [&QCM410_DRIVER, &UNSUPPORTED_DRIVER]
+}
+
+/// Block new device sessions as soon as shutdown is announced, not only once
+/// the HTTP drain finishes.
+pub fn begin_ims_shutdown() {
+    for driver in registered_drivers() {
+        driver.begin_ims_shutdown();
+    }
+}
+
+pub async fn shutdown_owned_ims_sessions() {
+    let drivers = registered_drivers();
+    futures_util::future::join_all(drivers.iter().map(|driver| driver.shutdown_owned_ims())).await;
+}
+
+/// Reclaim recorded ownership even if the original device is currently absent.
+/// A missing controller is not permission to touch a new daemon's objects.
+pub async fn recover_owned_ims_sessions() {
+    for driver in registered_drivers() {
+        if let Err(error) = driver.recover_owned_ims().await {
+            tracing::warn!(kind = ?driver.kind(), error, "Owned IMS recovery deferred");
+        }
+    }
+}
 
 /// Return the registered driver for a detected platform.
 pub fn driver(kind: DeviceKind) -> &'static dyn DeviceDriver {

@@ -406,9 +406,9 @@ struct CellularImsLiveSession {
     identity: ImsIdentity,
     registration: RegisteredImsContext,
     bearer: BearerConnection,
-    /// Set when the bearer was established directly over QMI instead of through
-    /// ModemManager. Owns the WDS client/handle, so teardown must release it here;
-    /// `mmcli --disconnect` has no object to act on for such a bearer.
+    /// A device-owned bearer may wrap a WDS client or a private MM bearer.
+    /// Its display path is synthetic; only the retained provider handle knows
+    /// which controller resources to release.
     native_bearer: Option<NativeImsBearer>,
     data_slot_mode: DataSlotMode,
     /// Qualcomm P-CSCF reporting is scoped to this session and restored during
@@ -4169,9 +4169,9 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
                 tracing::warn!("Skipping VoLTE XFRM cleanup bound to a stale UE worker generation");
             }
         }
-        // A native bearer has no ModemManager object: its WDS session must be
-        // stopped through the handle we kept, or the PDP context stays up on
-        // the modem after the line is disconnected.
+        // Release the device-owned session through its opaque handle. It may
+        // own a private MM object, but the synthetic path is not an MM object
+        // that this upper layer may disconnect by itself.
         match session.native_bearer {
             Some(native) => native_bearer::release_native_ims_bearer(native).await,
             None if session.worker_binding.is_current() => {
