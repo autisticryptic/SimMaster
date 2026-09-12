@@ -21,7 +21,7 @@
   实现原生后端或飞行/开机策略，也未部署到 IMS 测试机。首次功能候选再统一设置 1.1.5 版本号。
 - M0 其余设备矩阵/接口设计及 M1 调用迁移仍待完成；下方未完成项不因分支或 CI 接入而自动勾选。
 
-### M1 第一条调用链（2026-09-13，代码完成、等待本提交 CI）
+### M1 第一条调用链（2026-09-13，已通过 CI，未部署实机）
 
 - 引入 `ModemObservationProvider`，在注册表构造时注入；设备列表和驻网 snapshot 改为
   通过接口获取，CLI `inspect-modems` 也使用当前 MM adapter。
@@ -33,8 +33,11 @@
   全仓注册表调用扫描，避免只检查主循环/API。该首轮失败不能写成Rust回归已通过。
 - 新测试覆盖无 D-Bus 的 provider 注入、无需 MM selector 的 snapshot、查询串行化、
   状态读取不被刷新锁阻塞、reader/离线分支、瞬时失败 TTL 与明确无服务清除。
-- 本地30项Python边界/发布规则、局部Rust格式/语法检查及身份代码等价检查通过；
-  Rust编译/回归只在Actions执行，不能据本地检查宣称它们已通过。
+- 补齐后，本地31项Python边界/发布规则、局部Rust格式/语法检查及身份代码等价检查通过。
+- `e013684` 的 [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34712410908)
+  和 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34712410934) 均 success，
+  包含新增/原有Rust回归及arm64/amd64构建；`Publish Release` 已核对为 skipped。
+  首轮 `57bc851` 的失败记录保留，不将代码完成、本地检查、CI通过与实机验收混写。
 - 此步只完成“查询观察”边界，尚未实现完整可选MM、原生后端、开机策略和新的飞行模式
   控制。应用版本暂沿用共同基线，未发布、未部署，不影响1.1.4 IMS测试设备。
 

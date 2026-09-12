@@ -47,7 +47,7 @@ eSIM 和离线基带恢复确实通过 QMI/UIM 完成。它不是未来设备必
 MBIM、PC/SC 或厂商 API 的设备时，应分别增加 SIM 鉴权与基带恢复 transport，由 driver
 选择实现；不能让新设备伪造一个 QMI 路径，也不能在通用 IMS 编排中增加设备型号判断。
 
-## 后续版本边界（规划，尚未实施）
+## 后续版本目标（完整后端能力尚未实现）
 
 - **1.1.5**：通过统一设备能力接口兼容 MM/native；原生 QMI/MBIM/AT 适配器由设备控制器
   协调。同一物理 modem 的全部槽位和端口只能由一个 backend owner 管理。
@@ -63,6 +63,8 @@ MBIM、PC/SC 或厂商 API 的设备时，应分别增加 SIM 鉴权与基带恢
 `hardware/cellular/observations.rs` 的 `ModemObservationProvider` 提供设备列表与驻网
 snapshot，`LineRuntimeRegistry` 在构造时注入它。注册表及其 API 调用者不再为刷新传入
 D-Bus connection，也不直接解析 MM 的错误字符串。
+该查询调用链已通过 `e013684` 的 Actions 编译、回归和双架构构建；未部署实机，
+不代表后面的控制/原生接入阶段已经完成。
 
 - `bindings.rs` 承载原有 `ModemBinding`、稳定线路/迁移别名与 reader 绑定算法；
   原 JSON 字段和 ID 值保留。`modem_path` 等旧字段暂作为兼容 selector，不能要求未来
