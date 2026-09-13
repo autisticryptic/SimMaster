@@ -1301,13 +1301,12 @@ async fn run_lpac_command(
     set_lpac_working_directory(&mut command, &command_path);
     configure_lpac_environment(&mut command, &command_path, target);
 
-    let output = tokio::time::timeout(Duration::from_secs(timeout_seconds), command.output())
+    let output = lpac_output_reaped(&mut command, Duration::from_secs(timeout_seconds))
         .await
-        .map_err(|_| {
-            EsimApiError::Command(format!("lpac {action} timed out after {timeout_seconds}s"))
-        })?
         .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                EsimApiError::Command(format!("lpac {action} timed out after {timeout_seconds}s"))
+            } else if err.kind() == std::io::ErrorKind::NotFound {
                 EsimApiError::Unavailable(
                     "lpac is unavailable; use the eSIM Manager repair action, run \
                      install_latest.sh, or set esim.lpac_path"
@@ -1382,6 +1381,83 @@ async fn run_lpac_command(
         stderr,
         output.status.success(),
     ))
+}
+
+/// Do not release the SIM/device lease until a timed-out child has actually
+/// exited. kill_on_drop alone only requests termination; it is not a join.
+async fn lpac_output_reaped(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+) -> io::Result<std::process::Output> {
+    use tokio::io::AsyncReadExt;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let outcome = tokio::time::timeout(timeout, async {
+        let stdout = async {
+            let mut bytes = Vec::new();
+            stdout.take(LIMIT + 1).read_to_end(&mut bytes).await?;
+            Ok::<_, io::Error>(bytes)
+        };
+        let stderr = async {
+            let mut bytes = Vec::new();
+            stderr.take(LIMIT + 1).read_to_end(&mut bytes).await?;
+            Ok::<_, io::Error>(bytes)
+        };
+        let (stdout, stderr, status) = tokio::join!(stdout, stderr, child.wait());
+        let stdout = stdout?;
+        let stderr = stderr?;
+        if stdout.len() > LIMIT as usize || stderr.len() > LIMIT as usize {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "lpac output limit exceeded",
+            ));
+        }
+        Ok(std::process::Output {
+            status: status?,
+            stdout,
+            stderr,
+        })
+    })
+    .await;
+    match outcome {
+        Ok(output) => output,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "lpac process deadline",
+            ))
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod process_lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn process_output_and_timeout_are_hardware_free_and_bounded() {
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "printf fixture"]);
+        let output = lpac_output_reaped(&mut command, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"fixture");
+        let mut command = tokio::process::Command::new("sh");
+        command.args(["-c", "exec sleep 10"]);
+        let error = lpac_output_reaped(&mut command, Duration::from_millis(30))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
 }
 
 fn resolve_lpac_path(lpac_path: &str) -> PathBuf {
