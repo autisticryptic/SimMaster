@@ -141,12 +141,14 @@ pub enum NativeError {
     Unavailable(String),
     OwnerConflict(String),
     Protocol(String),
+    ProtocolRejected(u16),
     CommandFailed(&'static str),
 }
 
 impl fmt::Display for NativeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::ProtocolRejected(code) => write!(f, "native_protocol_rejected:{code}"),
             Self::Unsupported(reason) | Self::CommandFailed(reason) => f.write_str(reason),
             Self::Unavailable(reason) | Self::OwnerConflict(reason) | Self::Protocol(reason) => {
                 f.write_str(reason)

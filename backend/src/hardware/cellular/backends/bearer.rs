@@ -405,6 +405,25 @@ async fn begin_locked(
     if families.is_empty() || families.len() > 2 || families.iter().any(|f| !matches!(f, 4 | 6)) {
         return Err(NativeError::Protocol("native_ip_families_invalid".into()));
     }
+    if families.len() == 2 && families[0] == families[1] {
+        return Err(NativeError::Protocol("native_duplicate_ip_family".into()));
+    }
+    // Validate CLI grammars before allocating anything.
+    match device.spec.protocol {
+        NativeProtocol::Qmi => {
+            for family in &families {
+                qmi_start(&apn, *family, profile_id)?;
+            }
+        }
+        NativeProtocol::Mbim => {
+            mbim_start(&endpoint, &apn, &families, role)?;
+        }
+        NativeProtocol::At => {
+            return Err(NativeError::Unsupported(
+                "native_at_packet_data_driver_unavailable",
+            ))
+        }
+    }
     let receipt = receipt_path(&device, role);
     let mut session = Session {
         device: device.clone(),
@@ -422,15 +441,18 @@ async fn begin_locked(
         .lock()
         .unwrap()
         .insert(role.label().into(), endpoint.interface.clone());
+    let mut awaiting_resource_identity = false;
     let result = async {
         let mut settings = Vec::new();
         match device.spec.protocol {
             NativeProtocol::Qmi => {
                 for family in &families {
+                    awaiting_resource_identity = true;
                     let output = device.io.execute(&qmi_request(&endpoint,None,"--wds-noop",true)).await?;
                     let cid = labelled(&output,"CID").and_then(|s| s.parse::<u8>().ok())
                         .filter(|n| *n > 0).ok_or_else(|| NativeError::Protocol("native_qmi_client_id_unconfirmed".into()))?;
                     session.clients.push(Client { cid: Some(cid), packet_handle: None, mbim_session: None });
+                    awaiting_resource_identity = false;
                     session.save(false)?;
                     if let Some(port) = &endpoint.qmi_data_port {
                         device.io.execute(&qmi_request(&endpoint,Some(cid),&format!("--wds-bind-data-port={port}"),true)).await?;
@@ -440,10 +462,12 @@ async fn begin_locked(
                             &format!("--wds-bind-mux-data-port=mux-id={},ep-type={},ep-iface-number={}", binding.mux_id,binding.endpoint_type,binding.interface_number),true)).await?;
                     }
                     device.io.execute(&qmi_request(&endpoint,Some(cid),&format!("--wds-set-ip-family=ipv{family}"),true)).await?;
+                    awaiting_resource_identity = true;
                     let start = device.io.execute(&qmi_request(&endpoint,Some(cid),&qmi_start(&apn,*family,profile_id)?,true)).await?;
                     let handle = qmi_wds::parse_packet_data_handle(&start).and_then(|v| v.parse::<u32>().ok())
                         .ok_or_else(|| NativeError::Protocol("native_qmi_packet_handle_unconfirmed".into()))?;
                     session.clients.last_mut().expect("allocated client").packet_handle = Some(handle);
+                    awaiting_resource_identity = false;
                     session.save(false)?;
                     let text = device.io.execute(&qmi_request(&endpoint,Some(cid),"--wds-get-current-settings",true)).await?;
                     let settings_for_family = qmi_wds::parse_current_settings(&text);
@@ -460,7 +484,9 @@ async fn begin_locked(
                 }
                 session.clients.push(Client { cid: None, packet_handle: None, mbim_session: Some(endpoint.session_id) });
                 session.save(false)?;
+                awaiting_resource_identity = true;
                 device.io.execute(&mbim_request(&endpoint,&mbim_start(&endpoint,&apn,&families,role)?)).await?;
+                awaiting_resource_identity = false;
                 let text = device.io.execute(&mbim_request(&endpoint,&format!("--query-ip-configuration={}",endpoint.session_id))).await?;
                 settings.push(parse_mbim_ip_configuration(&text)?);
             }
@@ -514,8 +540,8 @@ async fn begin_locked(
         }
         Err(error) => {
             // Unknown allocation outcomes are not safe to silently forget.
-            let ambiguous = matches!(&error, NativeError::Protocol(reason) if reason.contains("unconfirmed"))
-                || matches!(&error, NativeError::CommandFailed(reason) if reason.contains("timeout"));
+            let ambiguous =
+                awaiting_resource_identity && !matches!(&error, NativeError::ProtocolRejected(_));
             if ambiguous {
                 tracing::warn!(line_id = %device.spec.line_id(), "Native allocation outcome ambiguous; receipt retained for reconciliation");
             } else {
@@ -927,6 +953,9 @@ mod tests {
                         "ownership must be recorded before activation"
                     );
                     if let Some(reason) = self.failure {
+                        if reason == "fixture_rejected" {
+                            return Err(NativeError::ProtocolRejected(14));
+                        }
                         return Err(NativeError::CommandFailed(reason));
                     }
                     return Ok("Packet data handle: '42'".into());
@@ -1017,6 +1046,8 @@ mod tests {
         for (failure, ambiguous) in [
             ("fixture_rejected", false),
             ("native_protocol_command_timeout", true),
+            ("native_helper_output_encoding", true),
+            ("native_command_outcome_unconfirmed", true),
         ] {
             let (device, io) = memory_device(Some(failure));
             assert!(begin(

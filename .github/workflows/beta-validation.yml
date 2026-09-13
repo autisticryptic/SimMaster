@@ -61,6 +61,7 @@ jobs:
             hardware::cellular::radio::tests \
             hardware::cellular::mm_radio::tests \
             hardware::cellular::backends::config::tests \
+            hardware::cellular::backends::io::tests \
             hardware::cellular::backends::protocol::tests \
             hardware::cellular::backends::native::tests \
             hardware::cellular::backends::messages::tests \

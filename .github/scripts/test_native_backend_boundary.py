@@ -59,7 +59,7 @@ class NativeBackendBoundaryTests(unittest.TestCase):
     def test_all_native_regression_groups_are_run_in_ci_without_hardware(self):
         for workflow in ("build-release.yml", "beta-validation.yml"):
             text = (ROOT / ".github/workflows" / workflow).read_text()
-            for group in ("config", "protocol", "native", "messages", "sim", "management", "bearer"):
+            for group in ("config", "io", "protocol", "native", "messages", "sim", "management", "bearer"):
                 self.assertIn(f"hardware::cellular::backends::{group}::tests \\", text)
             self.assertIn("hardware::cellular::modem_manager::roaming_observation_tests \\", text)
             self.assertIn("http_router_tests::backend_selection_", text)

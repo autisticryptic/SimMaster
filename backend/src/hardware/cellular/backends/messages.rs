@@ -9,13 +9,15 @@ use super::{
 use crate::connectivity::core::sms_codec;
 use std::{collections::BTreeMap, sync::Arc};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct NativeSms {
     pub path: String,
     pub number: String,
     pub content: String,
     pub timestamp: String,
     pub smsc: String,
+    sim_imsi: String,
+    cleanup_pending: bool,
     parts: Vec<(u32, String)>,
 }
 
@@ -75,20 +77,22 @@ impl NativeDevice {
         .map(|_| ())
     }
 
-    async fn raw_messages(self: &Arc<Self>) -> Result<Vec<(u32, String)>, NativeError> {
+    async fn raw_messages(self: &Arc<Self>) -> Result<(String, Vec<(u32, String)>), NativeError> {
         self.verify_primary_slot().await?;
         let output = self
             .commands(vec![
+                self.at_request("AT+CIMI")?,
                 self.at_request("AT+CMGF=0")?,
                 self.at_request("AT+CMGL=4")?,
             ])
             .await?;
-        parse_stored_pdus(&output[1])
+        Ok((imsi_response(&output[0])?, parse_stored_pdus(&output[2])?))
     }
 
     pub async fn messages(self: &Arc<Self>) -> Result<Vec<NativeSms>, NativeError> {
-        let pdus = self.raw_messages().await?;
+        let (sim_imsi, pdus) = self.raw_messages().await?;
         let mut singles = Vec::new();
+        let mut conflicts = std::collections::BTreeSet::new();
         let mut groups: BTreeMap<
             (String, u16, u8),
             BTreeMap<u8, (u32, String, sms_codec::MtSmsDeliver)>,
@@ -102,17 +106,19 @@ impl NativeDevice {
                 let Some(reference) = delivery.segment_reference else {
                     continue;
                 };
-                let entry = groups
-                    .entry((
-                        delivery.originator.clone(),
-                        reference,
-                        delivery.segment_total,
-                    ))
-                    .or_default();
+                let key = (
+                    delivery.originator.clone(),
+                    reference,
+                    delivery.segment_total,
+                );
+                if conflicts.contains(&key) {
+                    continue;
+                }
+                let entry = groups.entry(key.clone()).or_default();
                 // Conflicting reused references are not permission to merge
                 // unrelated messages. Leave them stored for explicit recovery.
                 if entry.contains_key(&delivery.segment_sequence) {
-                    entry.clear();
+                    conflicts.insert(key);
                     continue;
                 }
                 entry.insert(delivery.segment_sequence, (index, pdu, delivery));
@@ -120,7 +126,11 @@ impl NativeDevice {
                 singles.push(vec![(index, pdu, delivery)]);
             }
         }
-        for ((_, _, total), entries) in groups {
+        for (key, entries) in groups {
+            if conflicts.contains(&key) {
+                continue;
+            }
+            let total = key.2;
             if entries.len() == usize::from(total) && (1..=total).all(|i| entries.contains_key(&i))
             {
                 singles.push(entries.into_values().collect());
@@ -144,6 +154,8 @@ impl NativeDevice {
                 timestamp: first.service_center_timestamp.clone(),
                 content: parts.iter().map(|(_, _, d)| d.text.as_str()).collect(),
                 smsc: String::new(),
+                sim_imsi: sim_imsi.clone(),
+                cleanup_pending: false,
                 parts: parts
                     .into_iter()
                     .map(|(index, pdu, _)| (index, pdu))
@@ -151,11 +163,11 @@ impl NativeDevice {
             });
         }
         let mut cache = self.sms_cache.lock().await;
-        cache.clear();
+        cache.retain(|_, sms| sms.cleanup_pending && sms.sim_imsi == sim_imsi);
         for sms in &messages {
-            cache.insert(sms.path.clone(), sms.clone());
+            cache.entry(sms.path.clone()).or_insert_with(|| sms.clone());
         }
-        Ok(messages)
+        Ok(cache.values().cloned().collect())
     }
 
     pub async fn message(self: &Arc<Self>, path: &str) -> Result<NativeSms, NativeError> {
@@ -169,24 +181,63 @@ impl NativeDevice {
 
     pub async fn delete_message(self: &Arc<Self>, path: &str) -> Result<(), NativeError> {
         let message = self.message(path).await?;
-        let current = self
-            .raw_messages()
-            .await?
-            .into_iter()
-            .collect::<BTreeMap<_, _>>();
-        let mut requests = Vec::new();
-        for (index, pdu) in &message.parts {
-            if current.get(index) != Some(pdu) {
-                return Err(NativeError::OwnerConflict(
-                    "native_sms_storage_generation_changed".into(),
+        let this = self.clone();
+        tokio::spawn(async move {
+            let _gate = this.operation.lock().await;
+            if super::is_shutting_down() {
+                return Err(NativeError::Unavailable(
+                    "native_backend_shutting_down".into(),
                 ));
             }
-            requests.push(self.at_request(&format!("AT+CMGD={index}"))?);
-        }
-        self.commands(requests).await?;
-        self.sms_cache.lock().await.remove(path);
-        Ok(())
+            // Verify SIM + stored content and delete under ONE physical lease.
+            // eSIM switching/another native scan cannot interleave these steps.
+            let imsi = this.io.execute(&this.at_request("AT+CIMI")?).await?;
+            if imsi_response(&imsi)? != message.sim_imsi {
+                this.sms_cache.lock().await.remove(&message.path);
+                return Err(NativeError::OwnerConflict("native_sms_sim_changed".into()));
+            }
+            this.io.execute(&this.at_request("AT+CMGF=0")?).await?;
+            let output = this.io.execute(&this.at_request("AT+CMGL=4")?).await?;
+            let current = parse_stored_pdus(&output)?
+                .into_iter()
+                .collect::<BTreeMap<_, _>>();
+            for (index, pdu) in &message.parts {
+                if current.get(index).is_some_and(|value| value != pdu) {
+                    this.sms_cache.lock().await.remove(&message.path);
+                    return Err(NativeError::OwnerConflict(
+                        "native_sms_storage_generation_changed".into(),
+                    ));
+                }
+            }
+            if let Some(cached) = this.sms_cache.lock().await.get_mut(&message.path) {
+                cached.cleanup_pending = true;
+            }
+            for (index, _) in &message.parts {
+                if current.contains_key(index) {
+                    this.io
+                        .execute(&this.at_request(&format!("AT+CMGD={index}"))?)
+                        .await?;
+                }
+                // A partial cleanup is retryable without re-deleting old indices.
+                if let Some(cached) = this.sms_cache.lock().await.get_mut(&message.path) {
+                    cached.parts.retain(|(part, _)| part != index);
+                }
+            }
+            this.sms_cache.lock().await.remove(&message.path);
+            Ok(())
+        })
+        .await
+        .map_err(|_| NativeError::CommandFailed("native_sms_cleanup_task_failed"))?
     }
+}
+
+fn imsi_response(output: &str) -> Result<String, NativeError> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|s| (5..=15).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()))
+        .map(str::to_string)
+        .ok_or_else(|| NativeError::Unavailable("native_sms_sim_identity_unavailable".into()))
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -241,5 +292,56 @@ mod tests {
         let result = parse_stored_pdus("+CMGL: 7,0,,4\r\n+CEREG: 1\r\n00112233\r\nOK\r\n").unwrap();
         assert_eq!(result, vec![(7, "00112233".into())]);
         assert!(unhex("00;AT").is_none());
+    }
+
+    struct ChangedSimIo(std::sync::Mutex<Vec<String>>);
+    impl super::super::io::NativeIo for ChangedSimIo {
+        fn execute<'a>(
+            &'a self,
+            request: &'a super::super::protocol::CommandRequest,
+        ) -> crate::hardware::devices::transport::TransportFuture<'a, Result<String, NativeError>>
+        {
+            Box::pin(async move {
+                self.0.lock().unwrap().push(request.arguments[0].clone());
+                Ok("001012222222222\r\nOK".into())
+            })
+        }
+    }
+    #[tokio::test]
+    async fn sms_cleanup_refuses_a_replaced_sim_before_any_delete() {
+        use super::super::config::{NativeDeviceConfig, NativeProtocol};
+        let io = Arc::new(ChangedSimIo(Default::default()));
+        let device = NativeDevice::new(
+            NativeDeviceConfig {
+                hardware_key: "fixture-sms".into(),
+                sysfs_anchor: "/sys/devices/fixture".into(),
+                protocol: NativeProtocol::At,
+                control_device: "/dev/fixture".into(),
+                at_device: None,
+                uim_slot: 1,
+                ims: None,
+                data: None,
+            },
+            io.clone(),
+        );
+        let path = format!("{}:sms:fixture", device.spec.selector());
+        device.sms_cache.lock().await.insert(
+            path.clone(),
+            NativeSms {
+                path: path.clone(),
+                number: "12345".into(),
+                content: "fixture".into(),
+                timestamp: "2026-01-01T00:00:00Z".into(),
+                smsc: String::new(),
+                sim_imsi: "001011111111111".into(),
+                cleanup_pending: false,
+                parts: vec![(1, "001122".into())],
+            },
+        );
+        assert_eq!(
+            device.delete_message(&path).await.unwrap_err(),
+            NativeError::OwnerConflict("native_sms_sim_changed".into())
+        );
+        assert_eq!(*io.0.lock().unwrap(), vec!["AT+CIMI"]);
     }
 }

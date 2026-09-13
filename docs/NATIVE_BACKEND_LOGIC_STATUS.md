@@ -93,7 +93,15 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
 - Rust 编译、离线用例、私有 D-Bus API 回归及双架构构建通过 Actions 执行。
 - 新用例覆盖默认 MM 不碰预存 native 设备、协议解码、参数/slot 校验、AKA/PDU、
   NAS 字段白名单、session 释放/回滚和超时保留 receipt。
-- 当前 Actions 结果待回填；没有部署、发布或 native 硬件测试。
+- 首轮 `9aafa06` 的 Actions 编译发现 DNS 地址解析类型推导错误（E0283），由
+  `32d4c0d` 修正。后者的
+  [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34739474728)
+  和 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34739474668)
+  均 success，包含后端/前端回归与 arm64/amd64 构建；发布任务 skipped。
+- 后续收尾增加：拨号调用者取消后的已确认呼叫清理；协议明确拒绝与结果不确定的
+  区分；SMS 删除在同一物理门内核对 SIM/内容，保留部分清理进度。这些追加变更待 CI 回填。
+- 本地49项 Python检查与 Rust格式/语法、shell语法检查通过；没有本地 Rust 构建，
+  没有部署、发布或 native 硬件测试。
 
 ## 6. 后续 agent 接续
 

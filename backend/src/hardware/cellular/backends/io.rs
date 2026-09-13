@@ -464,7 +464,7 @@ async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
                 .map_err(|_| NativeError::CommandFailed("native_helper_wait_failed"))?
                 .success()
             {
-                return Err(NativeError::CommandFailed("native_protocol_command_failed"));
+                return Err(classify_failed_command(&stderr));
             }
             String::from_utf8(stdout)
                 .map_err(|_| NativeError::Protocol("native_helper_output_encoding".into()))
@@ -479,6 +479,45 @@ async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
             Err(NativeError::CommandFailed(
                 "native_protocol_command_timeout",
             ))
+        }
+    }
+}
+
+/// A nonzero helper exit is not proof that a mutating request was rejected.
+/// Only an explicit protocol response may turn an uncertain allocation into
+/// a known failure. Do not expose stderr (it may contain APN credentials).
+fn classify_failed_command(stderr: &[u8]) -> NativeError {
+    let text = String::from_utf8_lossy(stderr);
+    for prefix in ["QMI protocol error (", "MBIM protocol error ("] {
+        if let Some(code) = text
+            .split_once(prefix)
+            .and_then(|(_, tail)| tail.split_once(')'))
+            .and_then(|(code, _)| code.parse::<u16>().ok())
+        {
+            return NativeError::ProtocolRejected(code);
+        }
+    }
+    NativeError::CommandFailed("native_command_outcome_unconfirmed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn helper_failure_is_not_silently_treated_as_a_protocol_rejection() {
+        assert_eq!(
+            classify_failed_command(b"QMI protocol error (14): 'CallFailed'"),
+            NativeError::ProtocolRejected(14)
+        );
+        for message in [
+            b"operation timed out".as_slice(),
+            b"helper crashed",
+            b"QMI protocol error (unknown)",
+        ] {
+            assert_eq!(
+                classify_failed_command(message),
+                NativeError::CommandFailed("native_command_outcome_unconfirmed")
+            );
         }
     }
 }

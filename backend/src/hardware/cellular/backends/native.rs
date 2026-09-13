@@ -424,11 +424,63 @@ impl NativeDevice {
     }
 
     pub async fn dial(self: &Arc<Self>, number: &str) -> Result<String, NativeError> {
-        let _voice = self.voice_operation.lock().await;
         protocol::phone_number(number)?;
+        let this = self.clone();
+        let number = number.to_string();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _voice = this.voice_operation.lock().await;
+            let mut attempted = false;
+            let result = this.dial_owned(&number, &sender, &mut attempted).await;
+            let failed = result.is_err();
+            let abandoned = sender.send(result).is_err();
+            if attempted && (failed || abandoned) {
+                // Only a fresh observation of this outgoing call authorizes
+                // cleanup. Never ATH an unrelated incoming call on cancellation.
+                match this.calls().await {
+                    Ok(calls) => {
+                        for call in calls
+                            .calls
+                            .into_iter()
+                            .filter(|c| c.direction == "outgoing" && c.phone_number == number)
+                        {
+                            if let Some(index) = call
+                                .path
+                                .rsplit(':')
+                                .next()
+                                .and_then(|s| s.parse::<u32>().ok())
+                            {
+                                let _ = this.at(&format!("AT+CHLD=1{index}")).await;
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(line_id = %this.spec.line_id(), "Native dial outcome unconfirmed; caller must inspect the owned modem before retrying")
+                    }
+                }
+            }
+        });
+        receiver
+            .await
+            .map_err(|_| NativeError::CommandFailed("native_voice_controller_task_failed"))?
+    }
+
+    async fn dial_owned(
+        self: &Arc<Self>,
+        number: &str,
+        caller: &tokio::sync::oneshot::Sender<Result<String, NativeError>>,
+        attempted: &mut bool,
+    ) -> Result<String, NativeError> {
+        if caller.is_closed() {
+            return Err(NativeError::Unavailable("native_dial_cancelled".into()));
+        }
         if !self.calls().await?.calls.is_empty() {
             return Err(NativeError::Unavailable("native_voice_device_busy".into()));
         }
+        if caller.is_closed() {
+            return Err(NativeError::Unavailable("native_dial_cancelled".into()));
+        }
+        *attempted = true;
         self.at(&format!("ATD{number};")).await?;
         for _ in 0..5 {
             if let Some(call) = self
@@ -764,5 +816,56 @@ mod tests {
         assert_eq!(ef_ad_mnc_length("+CRSM: 144,0,\"00000002\""), Some(2));
         assert_eq!(ef_ad_mnc_length("+CRSM: 106,130,\"00000003\""), None);
         assert_eq!(ef_ad_mnc_length("+CRSM: 144,0,\"000000FF\""), None);
+    }
+
+    struct CancelledDialIo {
+        dialled: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        cleaned: tokio::sync::Notify,
+    }
+    impl NativeIo for CancelledDialIo {
+        fn execute<'a>(
+            &'a self,
+            request: &'a CommandRequest,
+        ) -> TransportFuture<'a, Result<String, NativeError>> {
+            Box::pin(async move {
+                use std::sync::atomic::Ordering;
+                let action = &request.arguments[0];
+                if action.starts_with("ATD") {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                    self.dialled.store(true, Ordering::Release);
+                } else if action == "AT+CLCC" && self.dialled.load(Ordering::Acquire) {
+                    return Ok("+CLCC: 1,0,2,0,0,\"12345\",129\r\nOK".into());
+                } else if action == "AT+CHLD=11" {
+                    self.dialled.store(false, Ordering::Release);
+                    self.cleaned.notify_one();
+                }
+                Ok("OK".into())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn caller_cancellation_after_atd_does_not_abandon_a_billable_outgoing_call() {
+        let io = Arc::new(CancelledDialIo {
+            dialled: std::sync::atomic::AtomicBool::new(false),
+            entered: Default::default(),
+            release: Default::default(),
+            cleaned: Default::default(),
+        });
+        let device = at_device(io.clone());
+        let caller = tokio::spawn(async move { device.dial("12345").await });
+        tokio::time::timeout(std::time::Duration::from_secs(2), io.entered.notified())
+            .await
+            .unwrap();
+        caller.abort();
+        let _ = caller.await;
+        io.release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), io.cleaned.notified())
+            .await
+            .unwrap();
+        assert!(!io.dialled.load(std::sync::atomic::Ordering::Acquire));
     }
 }
