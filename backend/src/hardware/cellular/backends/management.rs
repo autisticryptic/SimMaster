@@ -89,25 +89,7 @@ impl NativeDevice {
             ));
         }
         let text = self.command(self.request("--dms-get-capabilities")).await?;
-        let mask = [
-            "cdma-1x",
-            "cdma-1xevdo",
-            "gsm",
-            "umts",
-            "lte",
-            "td-scdma",
-            "5gnr",
-        ]
-        .iter()
-        .enumerate()
-        .filter(|(_, name)| text.contains(&format!("'{name}'")))
-        .fold(0u16, |mask, (bit, _)| mask | (1 << bit));
-        if mask == 0 {
-            return Err(NativeError::Unavailable(
-                "native_rat_capabilities_unknown".into(),
-            ));
-        }
-        Ok(mask)
+        parse_rat_capabilities(&text)
     }
 
     pub async fn radio_mode(self: &Arc<Self>) -> Result<RadioModeResponse, NativeError> {
@@ -402,9 +384,77 @@ fn band_write_fields(
     Ok(fields)
 }
 
+// qmicli prints one quoted, comma-separated Networks field (for example
+// Networks: 'gsm, umts, lte'), not one independently quoted string per RAT.
+// Match complete tokens in that field only: incidental names in other fields
+// must never authorize a RAT preference write.
+fn parse_rat_capabilities(text: &str) -> Result<u16, NativeError> {
+    let unknown = || NativeError::Unavailable("native_rat_capabilities_unknown".into());
+    let mut fields = text
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("Networks:"));
+    let value = fields.next().ok_or_else(unknown)?.trim();
+    if fields.next().is_some() {
+        return Err(unknown());
+    }
+    let value = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .unwrap_or(value);
+    let mut mask = 0u16;
+    for network in value.split(',').map(str::trim) {
+        let bit = match network {
+            "cdma-1x" => 0,
+            "cdma-1xevdo" => 1,
+            "gsm" => 2,
+            "umts" => 3,
+            "lte" => 4,
+            "td-scdma" => 5,
+            "5gnr" => 6,
+            _ => continue,
+        };
+        mask |= 1 << bit;
+    }
+    if mask == 0 {
+        return Err(unknown());
+    }
+    Ok(mask)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rat_capabilities_parse_qmicli_comma_separated_networks() {
+        let response = "[/dev/fixture] Device capabilities retrieved:\n\tMax TX channel rate: '50000000'\n\tData Service: 'non-simultaneous-cs-ps'\n\tSIM: 'supported'\n\tNetworks: 'gsm, umts, lte'\n";
+        assert_eq!(parse_rat_capabilities(response).unwrap(), 0x1c);
+        assert_eq!(parse_rat_capabilities("Networks: 'lte'").unwrap(), 0x10);
+        assert_eq!(
+            parse_rat_capabilities(
+                "Networks: 'cdma-1x, cdma-1xevdo, gsm, umts, lte, td-scdma, 5gnr'"
+            )
+            .unwrap(),
+            0x7f
+        );
+    }
+
+    #[test]
+    fn rat_capabilities_require_unambiguous_network_tokens() {
+        for response in [
+            "Data Service: 'lte'",
+            "Networks: ''",
+            "Networks: 'unknown'",
+            "Networks: 'lte-advanced'",
+            "Networks: 'gsm'\nNetworks: 'lte'",
+        ] {
+            assert!(parse_rat_capabilities(response).is_err(), "{response}");
+        }
+        assert_eq!(
+            parse_rat_capabilities("Other: '5gnr'\nNetworks: 'gsm, unknown'").unwrap(),
+            0x04
+        );
+    }
     #[test]
     fn preference_writes_are_typed_and_do_not_include_radio_enable_or_roaming_policy() {
         assert!(validate_fields(0x33, &[(0x10, vec![1])]).is_err());
