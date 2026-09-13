@@ -79,6 +79,9 @@ D-Bus connection，也不直接解析 MM 的错误字符串。
 
 ## 1.1.5 第二阶段：射频观察与意图门
 
+此链路的 `f95af94` 已通过 Actions 后端/控制/API 回归、前端检查及双架构构建，
+发布任务 skipped；没有部署或新增实机验收记录。对应 run 链接见版本规划。
+
 `hardware/cellular/radio.rs` 的 `ModemRadioControl` 提供 `observe(binding)` 和显式
 `set_airplane_mode(binding, enabled)`。`AppState.modem_radio` 目前注入
 `mm_radio.rs`，复用同一个 D-Bus connection；不在构造/观察中 Enable 或 Connect。

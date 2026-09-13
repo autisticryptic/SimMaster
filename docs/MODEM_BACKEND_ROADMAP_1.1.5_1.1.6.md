@@ -41,7 +41,7 @@
 - 此步只完成“查询观察”边界，尚未实现完整可选MM、原生后端、开机策略和新的飞行模式
   控制。应用版本暂沿用共同基线，未发布、未部署，不影响1.1.4 IMS测试设备。
 
-### M1 第二条调用链（2026-09-13，射频意图与控制，待 CI）
+### M1 第二条调用链（2026-09-13，射频意图与控制，已通过 CI，未部署）
 
 - 新增 backend-neutral `ModemRadioControl` 与 `ModemManagerRadio`，注入 `AppState`；
   飞行模式查询/操作经接口执行，MM adapter 复用原 connection、Enable 和有界等待，
@@ -68,15 +68,31 @@
   `connection.autoconnect=no`；已有外部 profile、固件/NV、其他 daemon 仍需单独审计。
 - 本地40项 Python 边界/发布规则测试、定向 rustfmt 与 diff 检查通过；新 Rust 用例覆盖
   状态映射、恢复优先级、临时任务准入、HTTP 离线保存、双向切换串行、等待后重读意图、
-  操作失败与 reader 拒绝。两套 workflow 已接入，**Rust 编译/执行和双架构构建待 Actions**。
+  操作失败与 reader 拒绝；两套候选 workflow 均已接入这些回归。
+- 代码提交 **`f95af94`** 的
+  [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34727658539)、
+  [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34727658571) 和
+  [Frontend Checks](https://github.com/autisticryptic/SimMaster/actions/runs/34727658528)
+  均 success；Rust 编译/回归、私有 D-Bus 下的控制/API 测试、前端检查及 arm64/amd64
+  构建通过。`Publish Release` 已核对为 skipped。Rust 编译/测试/打包只在 Actions 执行，
+  这些自动测试不是运营商实机注册或飞行模式硬件验收。
 - **边界**：这不是完整启动策略/原生后端；没有新增空接线开关，没有取消现有8秒恢复
   延时，也不保证冷启动以来零射频。门会等待已有操作，不是立即中断命令；没有新增
   持续射频重试器。物理 modem 多槽共享 RF 的 owner/仲裁及剩余 MM 启动副作用仍待完成。
   UE/netns 与卡配置算法未替换；版本仍为共同基线 `1.1.4-beta3`，未发布/部署/操作测试机。
 
-**下一步接续**：先检查本节对应 CI，再收口 MM/NM 启动副作用与设备级 owner/启动策略；
+**下一步接续**：以上代码已过 CI；继续收口 MM/NM 启动副作用与设备级 owner/启动策略。
 不能仅凭上述线路门把 M1、MM 可选或 1.1.5 验收勾为完成。接口字段和操作约束见
 [设备驱动说明](DEVICE_DRIVERS.md#115-第二阶段射频观察与意图门)。
+
+接续时优先审阅以下未完成入口，不要把本节的接口提取当作它们也已完成：
+
+| 入口 | 当前事实 / 下一步边界 |
+| --- | --- |
+| `main.rs::ensure_modemmanager_debug_override` | 已移到配置校验之后；内容变化时仍写 systemd override、reload/restart MM，命令结果与设备归属策略仍需收口 |
+| `modem_manager.rs::ensure_nm_modem_profile` | 新建 profile 的 autoconnect 原本为 no；仍可能移除旧 unmanaged 配置并重启 NM，需审计已有外部 profile 和管理服务副作用 |
+| `main.rs` 启动/热插拔恢复、data watchdog | 8秒启动恢复/10秒发现循环仍在；当前线路门不能覆盖应用启动前的固件/daemon 动作，后续独立设计冷启动/驻网策略 |
+| baseband restart、eSIM power-cycle、OS reboot 射频路径 | 仍有原 MM 命令和系统恢复行为；迁移时保留维护操作语义，不能用线路级锁冒充同一物理 modem 多槽共享 RF 仲裁 |
 
 ## 1. 已确定的版本方向
 
