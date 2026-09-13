@@ -5302,6 +5302,11 @@ impl VoicePathPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AppConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::hardware::cellular::backends::config::BackendConfig::is_default"
+    )]
+    pub cellular_backend: crate::hardware::cellular::backends::config::BackendConfig,
     /// Version of the persisted line-profile schema.
     #[serde(default)]
     pub line_config_version: u32,
@@ -5332,6 +5337,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            cellular_backend: Default::default(),
             line_config_version: CURRENT_LINE_CONFIG_VERSION,
             notifications: NotificationConfig::default(),
             device_network: DeviceNetworkConfig::default(),
@@ -5374,6 +5380,11 @@ pub(crate) const CURRENT_LINE_CONFIG_VERSION: u32 = 5;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct MainConfig {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::hardware::cellular::backends::config::BackendConfig::is_default"
+    )]
+    pub cellular_backend: crate::hardware::cellular::backends::config::BackendConfig,
     /// Schema version of this file. A mismatch stops startup rather than
     /// guessing what an older or newer layout meant.
     #[serde(default = "default_config_version")]
@@ -5397,6 +5408,7 @@ fn default_config_version() -> u32 {
 impl Default for MainConfig {
     fn default() -> Self {
         Self {
+            cellular_backend: Default::default(),
             config_version: CURRENT_LINE_CONFIG_VERSION,
             security: SecurityConfig::default(),
             device_network: DeviceNetworkConfig::default(),
@@ -5438,6 +5450,7 @@ impl AppConfig {
     /// it as one value. Only persistence knows about the split.
     pub(crate) fn split(&self) -> (MainConfig, crate::platform::config_store::StoredConfig) {
         let main = MainConfig {
+            cellular_backend: self.cellular_backend.clone(),
             config_version: self.line_config_version,
             security: self.security.clone(),
             device_network: self.device_network.clone(),
@@ -5469,6 +5482,7 @@ impl AppConfig {
         stored: crate::platform::config_store::StoredConfig,
     ) -> Self {
         Self {
+            cellular_backend: main.cellular_backend,
             line_config_version: main.config_version,
             notifications: stored.notifications,
             device_network: main.device_network,
@@ -5743,6 +5757,7 @@ impl ConfigManager {
             (MainConfig::default(), false)
         };
 
+        main.cellular_backend.validate()?;
         let stored = crate::platform::config_store::load(&database)?;
         let mut config = AppConfig::merge(main, stored);
 
@@ -5792,6 +5807,13 @@ impl ConfigManager {
                 .map_err(|error| format!("test database must open: {error}"))?,
         );
         Self::try_new(config_path, database)
+    }
+
+    /// Backend selection is startup-only. No HTTP retry changes hardware owner.
+    pub fn get_cellular_backend(
+        &self,
+    ) -> crate::hardware::cellular::backends::config::BackendConfig {
+        self.config.read().unwrap().cellular_backend.clone()
     }
 
     /// 获取通知配置

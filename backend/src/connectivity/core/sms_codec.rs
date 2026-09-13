@@ -621,6 +621,46 @@ pub fn parse_mt_rp_data(body: &[u8]) -> Result<MtSmsDeliver, SmsEncodingError> {
     })
 }
 
+/// TS 27.005 modem PDU wrapper around the shared TS 23.040 codec. No modem IO.
+pub fn parse_modem_deliver_pdu(pdu: &[u8]) -> Result<MtSmsDeliver, SmsEncodingError> {
+    let start = 1 + usize::from(*pdu.first().ok_or(SmsEncodingError::BodyTooLong)?);
+    let tpdu = pdu.get(start..).ok_or(SmsEncodingError::BodyTooLong)?;
+    if tpdu.first().is_none_or(|b| b & 0x03 != 0) {
+        return Err(SmsEncodingError::BodyTooLong);
+    }
+    parse_sms_deliver_tpdu(0, tpdu)
+}
+
+pub fn build_modem_submit_pdus(
+    recipient: &str,
+    text: &str,
+    smsc: &str,
+) -> Result<Vec<Vec<u8>>, SmsEncodingError> {
+    build_mo_submissions(recipient, text, smsc)?
+        .into_iter()
+        .map(|submission| {
+            let body = submission.body;
+            let mut offset = 3 + usize::from(*body.get(2).ok_or(SmsEncodingError::BodyTooLong)?);
+            let sc_length = usize::from(*body.get(offset).ok_or(SmsEncodingError::BodyTooLong)?);
+            offset += 1;
+            let sc = body
+                .get(offset..offset + sc_length)
+                .ok_or(SmsEncodingError::BodyTooLong)?;
+            offset += sc_length;
+            let tpdu_length = usize::from(*body.get(offset).ok_or(SmsEncodingError::BodyTooLong)?);
+            offset += 1;
+            let tpdu = body
+                .get(offset..offset + tpdu_length)
+                .ok_or(SmsEncodingError::BodyTooLong)?;
+            let mut pdu = Vec::with_capacity(1 + sc_length + tpdu_length);
+            pdu.push(sc_length as u8);
+            pdu.extend_from_slice(sc);
+            pdu.extend_from_slice(tpdu);
+            Ok(pdu)
+        })
+        .collect()
+}
+
 fn parse_mt_rp_user_data(
     reference: u8,
     body: &[u8],

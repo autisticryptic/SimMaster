@@ -80,6 +80,9 @@ impl DeviceDriver for Driver {
     fn install_update_resources(&self, staging_dir: &str, restart_now: bool) -> String {
         resources::install(staging_dir, restart_now)
     }
+    fn install_native_update_resources(&self, staging_dir: &str, restart_now: bool) -> String {
+        resources::install_for_backend(staging_dir, restart_now, false)
+    }
 
     fn begin_ims_shutdown(&self) {
         primary_ims_lifecycle::begin_shutdown();

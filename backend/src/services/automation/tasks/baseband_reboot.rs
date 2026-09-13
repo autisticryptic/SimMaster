@@ -1,4 +1,4 @@
-use crate::hardware::cellular::modem_manager::restart_baseband_via_modem;
+use crate::hardware::cellular::control::restart_baseband_via_modem;
 use crate::services::automation::target::resolve_modem_target;
 use crate::services::automation::traits::AutomationTaskHandler;
 use crate::state::AppState;

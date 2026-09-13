@@ -71,6 +71,10 @@ pub trait DeviceDriver: Send + Sync {
     ) -> TransportFuture<'_, anyhow::Result<()>>;
 
     fn install_update_resources(&self, staging_dir: &str, restart_now: bool) -> String;
+    fn install_native_update_resources(&self, _staging_dir: &str, _restart_now: bool) -> String {
+        "Native backend uses the configured kernel endpoints; no MM recovery resources installed"
+            .into()
+    }
 
     /// Device controllers may outlive this process. Hooks operate only on
     /// sessions whose ownership was recorded by this driver.
@@ -169,12 +173,20 @@ fn registered_drivers() -> [&'static dyn DeviceDriver; 2] {
 /// Block new device sessions as soon as shutdown is announced, not only once
 /// the HTTP drain finishes.
 pub fn begin_ims_shutdown() {
+    if crate::hardware::cellular::backends::active_native().is_some() {
+        crate::hardware::cellular::backends::begin_shutdown();
+        return;
+    }
     for driver in registered_drivers() {
         driver.begin_ims_shutdown();
     }
 }
 
 pub async fn shutdown_owned_ims_sessions() {
+    if crate::hardware::cellular::backends::active_native().is_some() {
+        crate::hardware::cellular::backends::drain_native_operations().await;
+        return; // Native handles are released by the line/worker shutdown path.
+    }
     let drivers = registered_drivers();
     futures_util::future::join_all(drivers.iter().map(|driver| driver.shutdown_owned_ims())).await;
 }
@@ -238,7 +250,25 @@ pub async fn run_native_bearer_init(
 /// The OTA service knows only the staging directory. Unit names, ordering and
 /// activation details stay with the hardware implementation that requires them.
 pub fn install_update_resources(kind: DeviceKind, staging_dir: &str, restart_now: bool) -> String {
-    driver(kind).install_update_resources(staging_dir, restart_now)
+    install_update_resources_for_backend(
+        kind,
+        staging_dir,
+        restart_now,
+        crate::hardware::cellular::backends::active_native().is_none(),
+    )
+}
+
+pub fn install_update_resources_for_backend(
+    kind: DeviceKind,
+    staging_dir: &str,
+    restart_now: bool,
+    use_mm: bool,
+) -> String {
+    if use_mm {
+        driver(kind).install_update_resources(staging_dir, restart_now)
+    } else {
+        driver(kind).install_native_update_resources(staging_dir, restart_now)
+    }
 }
 
 /// Resolve the device kind from the running platform.

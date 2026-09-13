@@ -21,6 +21,10 @@ fn source_path(staging_dir: &str, name: &str) -> PathBuf {
 /// Unit names, source layout, permissions and ModemManager ordering remain
 /// entirely inside this driver.
 pub fn install(staging_dir: &str, restart_now: bool) -> String {
+    install_for_backend(staging_dir, restart_now, true)
+}
+
+pub fn install_for_backend(staging_dir: &str, restart_now: bool, use_mm: bool) -> String {
     let resources = [
         (
             source_path(staging_dir, SECONDARY_QMI_SERVICE_NAME),
@@ -44,6 +48,10 @@ pub fn install(staging_dir: &str, restart_now: bool) -> String {
         ),
     ];
 
+    let resources = resources
+        .into_iter()
+        .filter(|(_, destination, _)| use_mm || *destination == SECONDARY_QMI_SERVICE_PATH)
+        .collect::<Vec<_>>();
     if resources.iter().any(|(source, _, _)| !source.is_file()) {
         return "QCM410 resources not present, existing setup preserved".to_string();
     }
@@ -68,6 +76,20 @@ pub fn install(staging_dir: &str, restart_now: bool) -> String {
     if !secondary_enabled {
         return "QCM410 resources installed but native-bearer service could not be enabled"
             .to_string();
+    }
+
+    if !use_mm {
+        // Disable only SimAdmin's own MM-specific recovery jobs, never the
+        // user's ModemManager service or unrelated network managers.
+        let _ = Command::new("systemctl")
+            .args([
+                "disable",
+                "--now",
+                MODEM_RECOVERY_TIMER_NAME,
+                MODEM_RECOVERY_SERVICE_NAME,
+            ])
+            .status();
+        return "Native QCM410 initializer installed; MM recovery disabled; hardware activation deferred to explicit maintenance".into();
     }
 
     let mut timer_enable = Command::new("systemctl");

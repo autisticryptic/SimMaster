@@ -189,6 +189,70 @@ impl AtSession {
         }
     }
 
+    fn send_sms_pdu(&mut self, pdu: &str, tpdu_length: usize) -> Result<String, String> {
+        if pdu.is_empty()
+            || pdu.len() > 1024
+            || pdu.len() % 2 != 0
+            || !pdu.bytes().all(|b| b.is_ascii_hexdigit())
+            || tpdu_length == 0
+            || tpdu_length > 255
+        {
+            return Err("invalid modem SMS PDU".into());
+        }
+        self.execute_command("AT+CMGF=0", COMMAND_TIMEOUT)?;
+        self.write_command(&format!("AT+CMGS={tpdu_length}"))?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            self.read_available()?;
+            if let Some(prompt) = self.read_buf.iter().position(|b| *b == b'>') {
+                self.read_buf.drain(..=prompt);
+                break;
+            }
+            if Instant::now() >= deadline || self.read_buf.windows(5).any(|w| w == b"ERROR") {
+                if let Some(port) = self.port.as_mut() {
+                    let _ = port.write_all(&[0x1b]);
+                }
+                self.reset();
+                return Err("modem SMS prompt unavailable".into());
+            }
+            std::thread::sleep(READ_POLL);
+        }
+        let port = self
+            .port
+            .as_mut()
+            .ok_or_else(|| "AT port is not open".to_string())?;
+        port.write_all(pdu.as_bytes())
+            .map_err(|_| "SMS PDU write failed".to_string())?;
+        port.write_all(&[0x1a])
+            .map_err(|_| "SMS submit write failed".to_string())?;
+        port.flush()
+            .map_err(|_| "SMS submit flush failed".to_string())?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut reference = None;
+        loop {
+            let line = match self.next_line(deadline)? {
+                Some(line) => line,
+                None => {
+                    self.reset();
+                    // Never retry automatically: the network may have accepted it.
+                    return Err("SMS submission result unconfirmed".into());
+                }
+            };
+            if let Some(value) = line.trim().strip_prefix("+CMGS:") {
+                reference = value.trim().parse::<u32>().ok();
+            }
+            if is_error_line(line.trim()) {
+                self.reset();
+                return Err("modem rejected SMS submission".into());
+            }
+            if line.trim() == "OK" {
+                return reference
+                    .map(|r| r.to_string())
+                    .ok_or_else(|| "SMS submission result unconfirmed".into());
+            }
+        }
+    }
+
     fn cancel_ussd_best_effort(&mut self) {
         let _ = self.execute_command("AT+CUSD=2", USSD_CANCEL_TIMEOUT);
         self.reset();
@@ -355,6 +419,32 @@ pub fn execute_command(_device: &str, _command: &str) -> Result<String, String> 
 
 /// Execute an AT+CUSD transaction and wait for the asynchronous +CUSD URC.
 #[cfg(unix)]
+pub fn execute_command_with_timeout(
+    device: &str,
+    command: &str,
+    timeout: Duration,
+) -> Result<String, String> {
+    let session = session_for(device);
+    let mut session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    session.execute_command(
+        command,
+        timeout.clamp(Duration::from_secs(1), Duration::from_secs(120)),
+    )
+}
+
+#[cfg(not(unix))]
+pub fn execute_command_with_timeout(
+    _device: &str,
+    _command: &str,
+    _timeout: std::time::Duration,
+) -> Result<String, String> {
+    Err("AT port access is only supported on Unix devices".into())
+}
+
+/// Execute an AT+CUSD transaction and wait for the asynchronous +CUSD URC.
+#[cfg(unix)]
 pub fn execute_ussd(device: &str, command: &str) -> Result<String, String> {
     let session = session_for(device);
     let mut session = session
@@ -366,6 +456,27 @@ pub fn execute_ussd(device: &str, command: &str) -> Result<String, String> {
 #[cfg(not(unix))]
 pub fn execute_ussd(_device: &str, _command: &str) -> Result<String, String> {
     Err("USSD AT port access is only supported on Unix devices".to_string())
+}
+
+#[cfg(unix)]
+pub fn send_sms_pdu(device: &str, pdu: &str, tpdu_length: usize) -> Result<String, String> {
+    let session = session_for(device);
+    let mut session = session
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let result = session.send_sms_pdu(pdu, tpdu_length);
+    if result.is_err() {
+        if let Some(port) = session.port.as_mut() {
+            let _ = port.write_all(&[0x1b]);
+        }
+        session.reset();
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub fn send_sms_pdu(_device: &str, _pdu: &str, _tpdu_length: usize) -> Result<String, String> {
+    Err("SMS AT port access is only supported on Unix devices".into())
 }
 
 #[cfg(all(test, unix))]

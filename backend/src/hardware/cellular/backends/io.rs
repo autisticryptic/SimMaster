@@ -1,0 +1,484 @@
+//! The only process/serial boundary used by native controllers.
+//!
+//! No shell, no mmcli, no service start/stop, and no automatic manager
+//! takeover. Hardware access is possible only after an explicit native claim.
+
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::io::AsyncReadExt;
+use zbus::{fdo::DBusProxy, Connection};
+
+use super::{
+    config::{NativeBearerConfig, NativeDeviceConfig},
+    protocol::{single_line, CommandRequest, Tool},
+    NativeError,
+};
+use crate::hardware::devices::transport::TransportFuture;
+
+pub trait NativeIo: Send + Sync {
+    fn execute<'a>(
+        &'a self,
+        request: &'a CommandRequest,
+    ) -> TransportFuture<'a, Result<String, NativeError>>;
+
+    fn verify_bearer<'a>(
+        &'a self,
+        _endpoint: &'a NativeBearerConfig,
+    ) -> TransportFuture<'a, Result<(), NativeError>> {
+        Box::pin(async {
+            Err(NativeError::Unsupported(
+                "native_interface_ownership_verification_unavailable",
+            ))
+        })
+    }
+    fn verify_owner<'a>(
+        &'a self,
+        _device: &'a str,
+    ) -> TransportFuture<'a, Result<(), NativeError>> {
+        Box::pin(async {
+            Err(NativeError::Unsupported(
+                "native_owner_verification_unavailable",
+            ))
+        })
+    }
+    fn save_receipt(&self, _key: &str, _bytes: &[u8], _create: bool) -> Result<(), NativeError> {
+        Err(NativeError::Unsupported(
+            "native_session_ledger_unavailable",
+        ))
+    }
+    fn clear_receipt(&self, _key: &str) -> Result<(), NativeError> {
+        Err(NativeError::Unsupported(
+            "native_session_ledger_unavailable",
+        ))
+    }
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortIdentity {
+    device: String,
+    canonical: std::path::PathBuf,
+    sysfs: std::path::PathBuf,
+    rdev: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn identity(device: &str, anchor: &std::path::Path) -> Result<PortIdentity, NativeError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let canonical = std::fs::canonicalize(device)
+        .map_err(|_| NativeError::Unavailable("native_control_port_absent".into()))?;
+    let metadata = std::fs::metadata(&canonical)
+        .map_err(|_| NativeError::Unavailable("native_control_port_absent".into()))?;
+    if !metadata.file_type().is_char_device() {
+        return Err(NativeError::OwnerConflict(
+            "native_control_port_is_not_character_device".into(),
+        ));
+    }
+    let sysfs = std::fs::canonicalize(format!(
+        "/sys/dev/char/{}:{}",
+        libc::major(metadata.rdev()),
+        libc::minor(metadata.rdev())
+    ))
+    .map_err(|_| NativeError::OwnerConflict("native_control_sysfs_unresolved".into()))?;
+    if !sysfs.starts_with(anchor) {
+        return Err(NativeError::OwnerConflict(
+            "native_control_port_wrong_physical_device".into(),
+        ));
+    }
+    Ok(PortIdentity {
+        device: device.into(),
+        canonical,
+        sysfs,
+        rdev: metadata.rdev(),
+        inode: metadata.ino(),
+    })
+}
+
+pub struct SystemNativeIo {
+    connection: Arc<Connection>,
+    #[cfg(unix)]
+    anchor: std::path::PathBuf,
+    #[cfg(unix)]
+    identities: Vec<PortIdentity>,
+    #[cfg(unix)]
+    _locks: Vec<std::fs::File>,
+}
+
+impl SystemNativeIo {
+    /// The conservative initial handover policy requires MM to be stopped by
+    /// the operator. It never stops it itself and never calls a method that
+    /// would D-Bus-activate MM. Coexisting device owners need a separate,
+    /// explicit inhibition/port-isolation policy, not a fallback here.
+    async fn verify_manager_absent(connection: &Connection) -> Result<(), NativeError> {
+        let bus = DBusProxy::new(connection)
+            .await
+            .map_err(|_| NativeError::OwnerConflict("native_owner_check_unavailable".into()))?;
+        if bus
+            .name_has_owner(
+                "org.freedesktop.ModemManager1"
+                    .try_into()
+                    .expect("valid service name"),
+            )
+            .await
+            .map_err(|_| NativeError::OwnerConflict("native_owner_check_unavailable".into()))?
+        {
+            return Err(NativeError::OwnerConflict(
+                "native_handover_required_modemmanager_running".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub async fn claim(
+        spec: &NativeDeviceConfig,
+        connection: Arc<Connection>,
+    ) -> Result<Arc<Self>, NativeError> {
+        Self::verify_manager_absent(&connection).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::{
+                fs::{OpenOptionsExt, PermissionsExt},
+                io::AsRawFd,
+            };
+            let anchor = std::fs::canonicalize(&spec.sysfs_anchor)
+                .map_err(|_| NativeError::OwnerConflict("native_sysfs_anchor_absent".into()))?;
+            let ports = std::iter::once(spec.control_device.as_str())
+                .chain(spec.at_device.as_deref())
+                .chain(spec.ims.iter().map(|b| b.control_device.as_str()))
+                .chain(spec.data.iter().map(|b| b.control_device.as_str()))
+                .collect::<HashSet<_>>();
+            let identities = ports
+                .into_iter()
+                .map(|p| identity(p, &anchor))
+                .collect::<Result<Vec<_>, _>>()?;
+            let directory = std::path::Path::new("/run/simadmin/native-control");
+            std::fs::create_dir_all(directory).map_err(|_| {
+                NativeError::OwnerConflict("native_lock_directory_unavailable".into())
+            })?;
+            std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))
+                .map_err(|_| NativeError::OwnerConflict("native_lock_permissions_failed".into()))?;
+            let mut keys = identities
+                .iter()
+                .map(|p| format!("port-{}", p.rdev))
+                .collect::<HashSet<_>>();
+            keys.insert(format!(
+                "physical-{:x}",
+                md5::compute(anchor.as_os_str().as_encoded_bytes())
+            ));
+            let mut locks = Vec::new();
+            // Nonblocking claims cannot deadlock with another partially
+            // acquired set; unwinding drops every already-held flock.
+            for key in keys {
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .mode(0o600)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(directory.join(key))
+                    .map_err(|_| {
+                        NativeError::OwnerConflict("native_device_lock_unavailable".into())
+                    })?;
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                    return Err(NativeError::OwnerConflict(
+                        "native_device_already_owned".into(),
+                    ));
+                }
+                locks.push(file);
+            }
+            Ok(Arc::new(Self {
+                connection,
+                anchor,
+                identities,
+                _locks: locks,
+            }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = spec;
+            Err(NativeError::Unsupported("native_backend_requires_linux"))
+        }
+    }
+
+    async fn verify(&self, device: &str) -> Result<(), NativeError> {
+        Self::verify_manager_absent(&self.connection).await?;
+        #[cfg(unix)]
+        {
+            let previous = self
+                .identities
+                .iter()
+                .find(|i| i.device == device)
+                .ok_or_else(|| NativeError::OwnerConflict("native_port_not_owned".into()))?;
+            if identity(device, &self.anchor)? != *previous {
+                return Err(NativeError::OwnerConflict(
+                    "native_device_generation_changed_restart_required".into(),
+                ));
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        Err(NativeError::Unsupported("native_backend_requires_linux"))
+    }
+}
+
+impl NativeIo for SystemNativeIo {
+    fn verify_owner<'a>(&'a self, device: &'a str) -> TransportFuture<'a, Result<(), NativeError>> {
+        Box::pin(self.verify(device))
+    }
+    fn save_receipt(&self, key: &str, bytes: &[u8], create: bool) -> Result<(), NativeError> {
+        use std::io::Write;
+        let path = ledger_path(key)?;
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        }
+        let mut file = options
+            .open(if create { &path } else { &temporary })
+            .map_err(|_| {
+                NativeError::OwnerConflict("native_session_receipt_pending_reconciliation".into())
+            })?;
+        file.write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| {
+                NativeError::OwnerConflict("native_session_receipt_write_failed".into())
+            })?;
+        if !create {
+            std::fs::rename(&temporary, &path).map_err(|_| {
+                NativeError::OwnerConflict("native_session_receipt_commit_failed".into())
+            })?;
+        }
+        Ok(())
+    }
+    fn clear_receipt(&self, key: &str) -> Result<(), NativeError> {
+        std::fs::remove_file(ledger_path(key)?)
+            .map_err(|_| NativeError::OwnerConflict("native_session_receipt_remove_failed".into()))
+    }
+    fn verify_bearer<'a>(
+        &'a self,
+        endpoint: &'a NativeBearerConfig,
+    ) -> TransportFuture<'a, Result<(), NativeError>> {
+        Box::pin(async move {
+            self.verify(&endpoint.control_device).await?;
+            #[cfg(unix)]
+            {
+                let sysfs =
+                    std::fs::canonicalize(format!("/sys/class/net/{}/device", endpoint.interface))
+                        .map_err(|_| {
+                            NativeError::OwnerConflict("native_bearer_interface_absent".into())
+                        })?;
+                if !sysfs.starts_with(&self.anchor) {
+                    return Err(NativeError::OwnerConflict(
+                        "native_bearer_interface_wrong_device".into(),
+                    ));
+                }
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::process::Command::new("ip")
+                        .args(["-j", "address", "show", "dev", &endpoint.interface])
+                        .kill_on_drop(true)
+                        .output(),
+                )
+                .await
+                .map_err(|_| {
+                    NativeError::OwnerConflict("native_interface_inspection_timeout".into())
+                })?
+                .map_err(|_| {
+                    NativeError::OwnerConflict("native_interface_inspection_failed".into())
+                })?;
+                if !result.status.success() {
+                    return Err(NativeError::OwnerConflict(
+                        "native_interface_inspection_failed".into(),
+                    ));
+                }
+                let value: serde_json::Value =
+                    serde_json::from_slice(&result.stdout).map_err(|_| {
+                        NativeError::OwnerConflict("native_interface_inspection_invalid".into())
+                    })?;
+                let interfaces = value.as_array().filter(|a| a.len() == 1).ok_or_else(|| {
+                    NativeError::OwnerConflict("native_interface_inspection_ambiguous".into())
+                })?;
+                let addresses = interfaces[0]
+                    .get("addr_info")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        NativeError::OwnerConflict("native_interface_addresses_unknown".into())
+                    })?;
+                if addresses
+                    .iter()
+                    .any(|a| a.get("scope").and_then(|s| s.as_str()) != Some("link"))
+                {
+                    return Err(NativeError::OwnerConflict(
+                        "native_interface_already_configured_by_another_owner".into(),
+                    ));
+                }
+                Ok(())
+            }
+            #[cfg(not(unix))]
+            Err(NativeError::Unsupported("native_backend_requires_linux"))
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        request: &'a CommandRequest,
+    ) -> TransportFuture<'a, Result<String, NativeError>> {
+        Box::pin(async move {
+            self.verify(&request.device).await?;
+            if request.arguments.is_empty() || request.arguments.len() > 32 {
+                return Err(NativeError::Protocol("native_command_shape_invalid".into()));
+            }
+            for argument in &request.arguments {
+                single_line(argument)?;
+            }
+            let result = if matches!(request.tool, Tool::At | Tool::AtUssd | Tool::AtSms) {
+                if request.arguments.len() != if request.tool == Tool::AtSms { 2 } else { 1 } {
+                    return Err(NativeError::Protocol(
+                        "native_at_transaction_invalid".into(),
+                    ));
+                }
+                let device = request.device.clone();
+                let command = request.arguments[0].clone();
+                let arguments = request.arguments.clone();
+                let tool = request.tool;
+                let timeout = Duration::from_secs(request.timeout_seconds.clamp(1, 120));
+                // The serial implementation has its own deadline. Do not drop
+                // a blocking transaction and release the owner gate early.
+                tokio::task::spawn_blocking(move || match tool {
+                    Tool::AtUssd => {
+                        crate::hardware::cellular::at_session::execute_ussd(&device, &command)
+                    }
+                    Tool::AtSms => {
+                        let length = arguments[0]
+                            .parse::<usize>()
+                            .map_err(|_| "invalid SMS length".to_string())?;
+                        crate::hardware::cellular::at_session::send_sms_pdu(
+                            &device,
+                            &arguments[1],
+                            length,
+                        )
+                    }
+                    _ => crate::hardware::cellular::at_session::execute_command_with_timeout(
+                        &device, &command, timeout,
+                    ),
+                })
+                .await
+                .map_err(|_| NativeError::CommandFailed("native_at_worker_failed"))?
+                .map_err(|_| NativeError::CommandFailed("native_at_command_failed"))
+            } else if request.tool == Tool::QmiControl {
+                if request.arguments.len() != 2 {
+                    return Err(NativeError::Protocol("native_qmi_control_invalid".into()));
+                }
+                let (service, message_id) = match request.arguments[0].as_str() {
+                    "band-capabilities" => (2, 0x45),
+                    "get-preferences" => (3, 0x34),
+                    "set-preferences" => (3, 0x33),
+                    _ => {
+                        return Err(NativeError::Protocol(
+                            "native_qmi_control_not_allowed".into(),
+                        ))
+                    }
+                };
+                let fields: Vec<(u8, Vec<u8>)> = serde_json::from_str(&request.arguments[1])
+                    .map_err(|_| NativeError::Protocol("native_qmi_control_invalid".into()))?;
+                super::management::validate_fields(message_id, &fields)?;
+                let device = request.device.clone();
+                let response = tokio::task::spawn_blocking(move || {
+                    crate::connectivity::modems::ims::vowifi::qmi_uim::native_management_exchange(
+                        &device, service, message_id, fields,
+                    )
+                })
+                .await
+                .map_err(|_| NativeError::CommandFailed("native_qmi_control_worker_failed"))?
+                .map_err(|_| NativeError::CommandFailed("native_qmi_control_failed"))?;
+                serde_json::to_string(&response).map_err(|_| {
+                    NativeError::Protocol("native_qmi_response_encoding_failed".into())
+                })
+            } else {
+                run_process(request).await
+            }?;
+            self.verify(&request.device).await?;
+            Ok(result)
+        })
+    }
+}
+
+fn ledger_path(key: &str) -> Result<std::path::PathBuf, NativeError> {
+    if key.is_empty()
+        || key.len() > 100
+        || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return Err(NativeError::Protocol(
+            "native_session_ledger_key_invalid".into(),
+        ));
+    }
+    Ok(std::path::Path::new("/run/simadmin/native-control").join(format!("{key}.json")))
+}
+
+async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
+    let program = match request.tool {
+        Tool::Qmi => "qmicli",
+        Tool::Mbim => "mbimcli",
+        Tool::At | Tool::AtSms | Tool::AtUssd | Tool::QmiControl => {
+            return Err(NativeError::Protocol("native_at_not_a_process".into()))
+        }
+    };
+    let mut child = tokio::process::Command::new(program)
+        .args(&request.arguments)
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| NativeError::CommandFailed("native_protocol_helper_unavailable"))?;
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let result = tokio::time::timeout(
+        Duration::from_secs(request.timeout_seconds.clamp(1, 120)),
+        async {
+            // Different pipe types require separate futures, not a generic closure.
+            let stdout = async {
+                let mut b = Vec::new();
+                stdout.take(1_048_577).read_to_end(&mut b).await.map(|_| b)
+            };
+            let stderr = async {
+                let mut b = Vec::new();
+                stderr.take(1_048_577).read_to_end(&mut b).await.map(|_| b)
+            };
+            let (stdout, stderr, status) = tokio::join!(stdout, stderr, child.wait());
+            let stdout =
+                stdout.map_err(|_| NativeError::CommandFailed("native_helper_read_failed"))?;
+            let stderr =
+                stderr.map_err(|_| NativeError::CommandFailed("native_helper_read_failed"))?;
+            if stdout.len() > 1_048_576 || stderr.len() > 1_048_576 {
+                return Err(NativeError::CommandFailed("native_helper_output_limit"));
+            }
+            if !status
+                .map_err(|_| NativeError::CommandFailed("native_helper_wait_failed"))?
+                .success()
+            {
+                return Err(NativeError::CommandFailed("native_protocol_command_failed"));
+            }
+            String::from_utf8(stdout)
+                .map_err(|_| NativeError::Protocol("native_helper_output_encoding".into()))
+        },
+    )
+    .await;
+    match result {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            Err(NativeError::CommandFailed(
+                "native_protocol_command_timeout",
+            ))
+        }
+    }
+}

@@ -481,28 +481,9 @@ pub use crate::hardware::cellular::cgcontrdp::{
 };
 
 async fn run_at(modem: &str, command: &str) -> Result<String, CellularImsError> {
-    let argument = format!("--command={command}");
-    let output = Command::new("mmcli")
-        .args(["-m", modem, &argument])
-        .output()
+    crate::hardware::cellular::control::at_command(modem, command)
         .await
-        .map_err(|error| {
-            CellularImsError::with_detail(code::COMMAND_SPAWN_FAILED, format!("mmcli:{error}"))
-        })?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .replace('\n', " ");
-        Err(CellularImsError::with_detail(
-            code::COMMAND_FAILED,
-            format!(
-                "mmcli:{}:-m {modem} {argument}:{stderr}",
-                output.status.code().unwrap_or(-1)
-            ),
-        ))
-    }
+        .map_err(|error| CellularImsError::with_detail(code::COMMAND_FAILED, error))
 }
 
 fn parse_active_context_cids(output: &str) -> Vec<u8> {

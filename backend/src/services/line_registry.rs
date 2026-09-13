@@ -225,6 +225,33 @@ impl LineRuntime {
         let ue_context = UeContext::for_binding(&binding);
         let line_id = binding.line_id.clone();
         let namespace = ue_context.namespace.clone();
+        let native_device =
+            crate::hardware::cellular::backends::native_device(&binding.modem_path).ok();
+        let ims_bearer: Option<Arc<dyn ImsBearerTransport>> = match native_device.as_ref() {
+            Some(device) if device.spec.ims.is_some() => Some(
+                crate::hardware::cellular::backends::bearer::NativeImsTransport::new(
+                    device.clone(),
+                ),
+            ),
+            Some(_) => None,
+            None if crate::hardware::cellular::backends::active_native().is_some()
+                || crate::hardware::cellular::backends::is_native_selector(&binding.modem_path) =>
+            {
+                None
+            }
+            None => devices::ims_bearer_transport(device_kind),
+        };
+        let cellular_data: Arc<dyn CellularDataTransport> = match native_device {
+            Some(device) => {
+                crate::hardware::cellular::backends::bearer::NativeDataTransport::new(device)
+            }
+            None if crate::hardware::cellular::backends::active_native().is_some()
+                || crate::hardware::cellular::backends::is_native_selector(&binding.modem_path) =>
+            {
+                devices::cellular_data_transport(DeviceKind::Unknown)
+            }
+            None => devices::cellular_data_transport(device_kind),
+        };
         Self {
             binding: RwLock::new(binding),
             ue: RwLock::new(ue_context),
@@ -249,8 +276,8 @@ impl LineRuntime {
             supplementary,
             data_proxy: Arc::new(DataProxyRuntime::default()),
             data_watchdog: Mutex::new(LineDataWatchdogState::default()),
-            ims_bearer: devices::ims_bearer_transport(device_kind),
-            cellular_data: devices::cellular_data_transport(device_kind),
+            ims_bearer,
+            cellular_data,
             egress_fingerprint: Mutex::new(None),
             ue_lifecycle_lock: Mutex::new(()),
         }
@@ -1007,7 +1034,7 @@ impl LineRuntimeRegistry {
         } else {
             crate::connectivity::modems::ims::vowifi::live::register_line_sim_device(
                 &binding.line_id,
-                binding.qmi_device.as_deref().unwrap_or_default(),
+                binding.control_device().unwrap_or_default(),
                 binding.uim_slot,
                 &binding.modem_path,
             );

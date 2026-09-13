@@ -32,7 +32,7 @@ mod services;
 mod state;
 
 use api::handlers::*;
-use hardware::cellular::modem_manager::ensure_nm_modem_profile;
+use hardware::cellular::control::ensure_nm_modem_profile;
 use hardware::cellular::observations::ModemObservationProvider;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
@@ -319,6 +319,27 @@ struct Cli {
     serve: ServeArgs,
 }
 
+fn read_backend_config(
+    path: PathBuf,
+) -> Result<hardware::cellular::backends::config::BackendConfig> {
+    if !path.exists() {
+        return Ok(Default::default());
+    }
+    platform::config_file::ensure_regular_file(&path).map_err(anyhow::Error::msg)?;
+    let format = platform::config_file::TextFormat::from_path(&path)
+        .ok_or_else(|| anyhow::anyhow!("Unsupported backend configuration format"))?;
+    let main: platform::config::MainConfig =
+        platform::config_file::parse(&std::fs::read_to_string(&path)?, format, &path)
+            .map_err(anyhow::Error::msg)?;
+    if main.config_version != platform::config::CURRENT_LINE_CONFIG_VERSION {
+        anyhow::bail!("Unsupported backend configuration version");
+    }
+    main.cellular_backend
+        .validate()
+        .map_err(anyhow::Error::msg)?;
+    Ok(main.cellular_backend)
+}
+
 #[derive(Subcommand, Debug)]
 enum CliCommand {
     /// 启动 Web 管理服务
@@ -342,6 +363,14 @@ enum CliCommand {
     },
     /// Read-only JSON inventory of every ModemManager modem/SIM line.
     InspectModems,
+    /// Read backend selection without opening a bus, probing hardware or changing services.
+    ModemBackendMode {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// systemd ExecCondition: exit 1 when MM is not the selected backend.
+        #[arg(long)]
+        require_mm: bool,
+    },
     /// Run the detected device driver's boot-time native-bearer initializer.
     DeviceInit {
         /// Write any device-owned udev rules and reload udev (default: yes).
@@ -496,9 +525,27 @@ async fn main() -> Result<()> {
             }
         };
     }
+    if let Some(CliCommand::ModemBackendMode { config, require_mm }) = &cli.command {
+        let backend = read_backend_config(config.clone().unwrap_or_else(get_default_config_path))?;
+        let mode = match backend.mode {
+            hardware::cellular::backends::config::BackendMode::Modemmanager => "modemmanager",
+            hardware::cellular::backends::config::BackendMode::Native => "native",
+        };
+        println!("{mode}");
+        if *require_mm && mode == "modemmanager" {
+            hardware::cellular::backends::ensure_mm_handover_clear().map_err(anyhow::Error::msg)?;
+        }
+        if *require_mm && mode != "modemmanager" {
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
     if matches!(&cli.command, Some(CliCommand::InspectModems)) {
         let conn = Arc::new(Connection::system().await?);
-        let observations = hardware::cellular::mm_observations::ModemManagerObservations::new(conn);
+        let backend = read_backend_config(get_default_config_path())?;
+        let (observations, _) = hardware::cellular::backends::initialize(&backend, conn)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let mut bindings = observations.discover().await?;
         for binding in &mut bindings {
             binding.sim_iccid = services::system::system_event::mask_identifier(&binding.sim_iccid);
@@ -523,12 +570,14 @@ async fn main() -> Result<()> {
         activate,
     }) = &cli.command
     {
+        let backend = read_backend_config(get_default_config_path())?;
         println!(
             "{}",
-            hardware::devices::install_update_resources(
+            hardware::devices::install_update_resources_for_backend(
                 hardware::devices::detect_device_kind(),
                 staging_dir,
                 *activate,
+                backend.mode == hardware::cellular::backends::config::BackendMode::Modemmanager,
             )
         );
         return Ok(());
@@ -604,11 +653,27 @@ async fn main() -> Result<()> {
     // Validate configuration before altering/restarting a system modem service.
     // This remains MM-specific startup work, not a native backend or a promise
     // that the firmware/NM could not have enabled RF before SimAdmin started.
-    ensure_modemmanager_debug_override();
+    let backend_config = config_manager.get_cellular_backend();
+    let using_mm =
+        backend_config.mode == hardware::cellular::backends::config::BackendMode::Modemmanager;
+    if using_mm {
+        hardware::cellular::backends::ensure_mm_handover_clear().map_err(anyhow::Error::msg)?;
+        ensure_modemmanager_debug_override();
+        // Replaces the unconditional systemd Wants=MM dependency. Native mode
+        // must never cause systemd/D-Bus to start MM behind its owner gate.
+        match std::process::Command::new("systemctl")
+            .args(["start", "ModemManager.service"])
+            .output()
+        {
+            Ok(output) if output.status.success() => {}
+            _ => warn!("ModemManager startup request failed; MM backend will report unavailable"),
+        }
+    }
     let dbus_conn = Arc::new(Connection::system().await?);
-    let modem_radio = Arc::new(hardware::cellular::mm_radio::ModemManagerRadio::new(
-        Arc::clone(&dbus_conn),
-    ));
+    let (modem_observations, modem_radio) =
+        hardware::cellular::backends::initialize(&backend_config, Arc::clone(&dbus_conn))
+            .await
+            .map_err(anyhow::Error::msg)?;
     let device_kind = hardware::devices::detect_device_kind();
     info!(?device_kind, "Detected hardware device kind");
 
@@ -619,11 +684,7 @@ async fn main() -> Result<()> {
             Arc::clone(&config_manager),
             Arc::clone(&app_db),
             device_kind,
-            Arc::new(
-                hardware::cellular::mm_observations::ModemManagerObservations::new(Arc::clone(
-                    &dbus_conn,
-                )),
-            ),
+            modem_observations,
         ),
     );
     // Must precede the first discovery pass. A previous process that was killed
@@ -633,7 +694,9 @@ async fn main() -> Result<()> {
     // interface would be invisible and the session would come up as `Assumed`
     // (unverified), which makes SIP fail silently. Nothing owns a netdev yet at
     // this point, so anything found inside a namespace is a leftover.
-    hardware::devices::recover_owned_ims_sessions().await;
+    if using_mm {
+        hardware::devices::recover_owned_ims_sessions().await;
+    }
     platform::netns::reclaim_all_stranded_hardware_links().await;
 
     match line_registry.refresh().await {
@@ -658,8 +721,10 @@ async fn main() -> Result<()> {
         Arc::clone(&app_db),
     ));
 
-    let nm_result = ensure_nm_modem_profile().await;
-    tracing::info!(result = %nm_result, "NetworkManager modem profile setup completed");
+    if using_mm {
+        let nm_result = ensure_nm_modem_profile().await;
+        tracing::info!(result = %nm_result, "NetworkManager modem profile setup completed");
+    }
 
     // 初始化通知发送器
     let notification_sender = Arc::new(NotificationSender::new(
@@ -1447,6 +1512,10 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
         .route(
             "/api/modem/line-controls",
             get(get_line_network_controls_handler).options(options_handler),
+        )
+        .route(
+            "/api/modem/backend",
+            get(get_modem_backend_status_handler).options(options_handler),
         )
         .route(
             "/api/modem/lines/{line_id}/data/config",
@@ -2779,6 +2848,58 @@ mod http_router_tests {
             serde_json::to_value(after.ims_access_preference).unwrap(),
             serde_json::to_value(before.ims_access_preference).unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn backend_selection_mm_default_never_claims_parked_native_hardware() {
+        use hardware::cellular::backends::{self, config::*};
+        let state = build_test_router()
+            .await
+            .expect("private D-Bus is required");
+        let config = BackendConfig {
+            devices: vec![NativeDeviceConfig {
+                hardware_key: "test-slot".into(),
+                sysfs_anchor: "/sys/devices/nonexistent-test-slot".into(),
+                protocol: NativeProtocol::Qmi,
+                control_device: "/dev/nonexistent-test-qmi".into(),
+                at_device: None,
+                uim_slot: 1,
+                ims: None,
+                data: None,
+            }],
+            ..Default::default()
+        };
+        let (observations, _) = backends::initialize(&config, state.app.dbus_conn.clone())
+            .await
+            .unwrap();
+        assert_eq!(observations.name(), "modemmanager");
+        assert!(backends::active_native().is_none());
+        let defaults = serde_json::to_value(platform::config::MainConfig::default()).unwrap();
+        assert!(
+            defaults.get("cellular_backend").is_none(),
+            "default MM config should stay rollback-compatible"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_selection_status_is_authenticated_read_only_and_mm_first() {
+        let state = build_test_router()
+            .await
+            .expect("private D-Bus is required");
+        let served = serve(state.router.clone()).await;
+        let path = "/api/modem/backend";
+        assert_eq!(
+            send(&served, reqwest::Method::GET, path).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        let cookie = authenticate(&served).await;
+        let (status, body) = get_with_cookie(&served, path, &cookie).await;
+        assert_eq!(status, StatusCode::OK);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["data"]["active_backend"], "modemmanager");
+        assert_eq!(body["data"]["automatic_fallback"], false);
+        assert_eq!(body["data"]["native_hardware_validation"], "deferred");
+        assert_eq!(body["data"]["native_devices"], serde_json::json!([]));
     }
 
     #[tokio::test]

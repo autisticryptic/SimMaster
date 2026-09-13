@@ -1,5 +1,5 @@
 use crate::api::models::{DdnsEvent, VersionUpdateEvent};
-use crate::hardware::cellular::modem_manager::{
+use crate::hardware::cellular::control::{
     discover_modem_bindings, get_sim_info_for_modem_with_cache, ModemBinding,
 };
 use crate::platform::config::{

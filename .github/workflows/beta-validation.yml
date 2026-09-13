@@ -60,6 +60,14 @@ jobs:
             hardware::cellular::mm_observations::tests \
             hardware::cellular::radio::tests \
             hardware::cellular::mm_radio::tests \
+            hardware::cellular::backends::config::tests \
+            hardware::cellular::backends::protocol::tests \
+            hardware::cellular::backends::native::tests \
+            hardware::cellular::backends::messages::tests \
+            hardware::cellular::backends::sim::tests \
+            hardware::cellular::backends::management::tests \
+            hardware::cellular::backends::bearer::tests \
+            hardware::cellular::modem_manager::roaming_observation_tests \
             services::orchestrator::radio_intent::tests \
             services::automation::tasks::consume_data::tests \
             services::line_registry::tests \
@@ -114,7 +122,7 @@ jobs:
           if ! dbus-run-session -- sh -c '
             set -eu
             export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
-            for filter in cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings http_router_tests::radio_intent_; do
+            for filter in cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings http_router_tests::radio_intent_ http_router_tests::backend_selection_; do
               cargo test --locked "$filter" -- --list > beta-api-test-list.txt
               grep -q ": test$" beta-api-test-list.txt
               cargo test --locked "$filter" -- --test-threads=1

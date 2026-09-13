@@ -690,6 +690,11 @@ pub fn read_usim_epdg_config_via_proxy_reason(
     aid: &[u8],
     timeout: Duration,
 ) -> Result<UsimEpdgConfig, &'static str> {
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|l| l.uses_at()) {
+        return lease.epdg(aid);
+    }
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, timeout);
@@ -914,6 +919,11 @@ pub fn read_usim_identity_via_proxy_reason(
     aid: &[u8],
     timeout: Duration,
 ) -> Result<UsimIdentity, &'static str> {
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|l| l.uses_at()) {
+        return lease.identity(aid);
+    }
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, timeout);
@@ -1031,6 +1041,14 @@ pub fn execute_usim_authenticate_via_proxy(
     autn: &[u8],
     timeout: Duration,
 ) -> Result<UsimAkaApduResult, QmiUimError> {
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)
+            .map_err(|_| QmiUimError::InvalidApduResponse)?;
+    if let Some(lease) = native_lease.as_ref().filter(|l| l.uses_at()) {
+        return lease
+            .authenticate(aid, rand, autn)
+            .map_err(|_| QmiUimError::InvalidAkaResponse);
+    }
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, rand, autn, timeout);
@@ -1073,6 +1091,11 @@ pub fn execute_usim_authenticate_via_proxy_reason(
     autn: &[u8],
     timeout: Duration,
 ) -> Result<UsimAkaApduResult, &'static str> {
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|l| l.uses_at()) {
+        return lease.authenticate(aid, rand, autn);
+    }
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, rand, autn, timeout);
@@ -1165,6 +1188,11 @@ pub fn verify_usim_application_via_proxy_reason(
     aid: &[u8],
     timeout: Duration,
 ) -> Result<(), &'static str> {
+    let native_lease =
+        crate::hardware::cellular::backends::sim::SimLease::for_endpoint(device_path, slot)?;
+    if let Some(lease) = native_lease.as_ref().filter(|l| l.uses_at()) {
+        return lease.verify(aid);
+    }
     #[cfg(not(unix))]
     {
         let _ = (proxy_socket, device_path, slot, aid, timeout);
@@ -1248,6 +1276,87 @@ struct QmiProxyConnection {
     next_service_transaction: u16,
 }
 
+/// Narrow native-management exchange sharing the proven QMUX framing. This is
+/// not a generic raw-QMI API: only DMS capabilities and NAS preference messages
+/// are admitted. Callers hold their physical native-controller lease.
+pub(crate) fn native_management_exchange(
+    device: &str,
+    service: u8,
+    message_id: u16,
+    fields: Vec<(u8, Vec<u8>)>,
+) -> Result<Vec<(u8, Vec<u8>)>, QmiUimError> {
+    if !matches!((service, message_id), (2, 0x45) | (3, 0x33) | (3, 0x34)) {
+        return Err(QmiUimError::InvalidFrame);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (device, fields);
+        Err(QmiUimError::InvalidFrame)
+    }
+    #[cfg(unix)]
+    {
+        let mut connection = QmiProxyConnection::connect("@qmi-proxy", Duration::from_secs(15))?;
+        connection.proxy_open(device)?;
+        let request = QmiMessage {
+            service: 0,
+            client_id: 0,
+            transaction_id: connection.take_ctl_transaction(),
+            message_id: QMI_CTL_ALLOCATE_CID,
+            tlvs: vec![QmiTlv {
+                tlv_type: 1,
+                value: vec![service],
+            }],
+        };
+        let response = connection.native_exchange_correlated(&request)?;
+        ensure_success(&response)?;
+        let allocation = find_tlv(&response, 1).ok_or(QmiUimError::MissingTlv("native_client"))?;
+        if allocation.len() != 2 || allocation[0] != service || allocation[1] == 0 {
+            return Err(QmiUimError::InvalidFrame);
+        }
+        let client = allocation[1];
+        let request = QmiMessage {
+            service,
+            client_id: client,
+            transaction_id: connection.take_service_transaction(),
+            message_id,
+            tlvs: fields
+                .into_iter()
+                .map(|(tlv_type, value)| QmiTlv { tlv_type, value })
+                .collect(),
+        };
+        let result = connection
+            .native_exchange_correlated(&request)
+            .and_then(|response| {
+                ensure_success(&response)?;
+                Ok(response
+                    .tlvs
+                    .into_iter()
+                    .map(|t| (t.tlv_type, t.value))
+                    .collect())
+            });
+        let release = QmiMessage {
+            service: 0,
+            client_id: 0,
+            transaction_id: connection.take_ctl_transaction(),
+            message_id: QMI_CTL_RELEASE_CID,
+            tlvs: vec![QmiTlv {
+                tlv_type: 1,
+                value: vec![service, client],
+            }],
+        };
+        let released = connection
+            .native_exchange_correlated(&release)
+            .and_then(|r| ensure_success(&r).map(|_| ()));
+        match result {
+            Ok(value) => released.map(|_| value),
+            Err(error) => {
+                let _ = released;
+                Err(error)
+            }
+        }
+    }
+}
+
 fn adjust_short_apdu_le(apdu: &[u8], le: u8) -> Option<Vec<u8>> {
     // All APDUs currently emitted by this module are short APDUs and include
     // a trailing Le byte (case 2S or case 4S). Do not guess at extended APDU
@@ -1263,6 +1372,24 @@ fn adjust_short_apdu_le(apdu: &[u8], le: u8) -> Option<Vec<u8>> {
 
 #[cfg(unix)]
 impl QmiProxyConnection {
+    fn native_exchange_correlated(
+        &mut self,
+        request: &QmiMessage,
+    ) -> Result<QmiMessage, QmiUimError> {
+        self.stream.write_all(&encode_qmi_message(request)?)?;
+        self.stream.flush()?;
+        for _ in 0..32 {
+            let response = read_qmi_message(&mut self.stream)?;
+            if response.service == request.service
+                && response.client_id == request.client_id
+                && response.transaction_id == request.transaction_id
+                && response.message_id == request.message_id
+            {
+                return Ok(response);
+            }
+        }
+        Err(QmiUimError::InvalidFrame)
+    }
     fn connect(proxy_socket: &str, timeout: Duration) -> Result<Self, QmiUimError> {
         let stream = if let Some(name) = proxy_socket.strip_prefix('@') {
             connect_abstract_socket(name)?

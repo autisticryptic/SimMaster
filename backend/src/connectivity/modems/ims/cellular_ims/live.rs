@@ -49,7 +49,7 @@ use crate::{
         profile_store::{ProfileOrigin, ProfileStore},
         profiles::CarrierProfile,
     },
-    hardware::{cellular::modem_manager::ModemBinding, devices::transport::ImsBearerTransport},
+    hardware::{cellular::bindings::ModemBinding, devices::transport::ImsBearerTransport},
     platform::config::{CellularImsIpFamily, ImsProfileCandidate, TrunkIpConnectMode},
     platform::db::{Database, SmsMessage},
     services::trunk::{
@@ -219,8 +219,8 @@ pub struct CellularImsDeviceBinding {
 impl CellularImsDeviceBinding {
     pub fn from_modem(binding: &ModemBinding) -> Result<Self, CellularImsError> {
         let qmi_device = binding
-            .qmi_device
-            .clone()
+            .control_device()
+            .map(str::to_string)
             .ok_or_else(|| CellularImsError::new("volte_qmi_device_missing"))?;
         Ok(Self {
             line_id: binding.line_id.clone(),
@@ -2071,11 +2071,13 @@ async fn connect_inner(
     // This is advisory — a timeout falls through to the ordinary modem-readiness
     // checks rather than failing (matching beta2's
     // "continuing with modem readiness checks").
-    tracing::info!("Waiting for initial QMI UIM provisioning to settle");
-    let readiness = readiness::wait_for_qmi_ready().await;
-    match readiness {
-        readiness::ReadinessOutcome::Ready => tracing::info!("{}", readiness.log_message()),
-        readiness::ReadinessOutcome::TimedOut => tracing::warn!("{}", readiness.log_message()),
+    if !crate::hardware::cellular::backends::is_native_selector(&device.modem_id) {
+        tracing::info!("Waiting for initial QMI UIM provisioning to settle");
+        let readiness = readiness::wait_for_qmi_ready().await;
+        match readiness {
+            readiness::ReadinessOutcome::Ready => tracing::info!("{}", readiness.log_message()),
+            readiness::ReadinessOutcome::TimedOut => tracing::warn!("{}", readiness.log_message()),
+        }
     }
 
     runtime
@@ -6901,6 +6903,35 @@ async fn resolve_device_binding(
     runtime: &CellularImsRuntime,
     generation: u64,
 ) -> Result<CellularImsDeviceBinding, CellularImsError> {
+    if crate::hardware::cellular::backends::is_native_selector(&requested.modem_id)
+        || crate::hardware::cellular::backends::active_native().is_some()
+    {
+        let controller = crate::hardware::cellular::backends::native_device(&requested.modem_id)
+            .map_err(|e| {
+                CellularImsError::with_detail("native_ims_owner_unavailable", e.to_string())
+            })?;
+        if controller.spec.control_device != requested.qmi_device
+            || controller.spec.line_id() != requested.line_id
+        {
+            return Err(CellularImsError::new("native_ims_device_binding_mismatch"));
+        }
+        for attempt in 0..MM_MODEM_WAIT_ATTEMPTS {
+            ensure_generation(runtime, generation)?;
+            let network = controller.network().await.map_err(|e| {
+                CellularImsError::with_detail(
+                    "native_ims_network_observation_failed",
+                    e.to_string(),
+                )
+            })?;
+            if network.registration.registered() {
+                return Ok(requested.clone());
+            }
+            if attempt + 1 < MM_MODEM_WAIT_ATTEMPTS {
+                tokio::time::sleep(MM_MODEM_WAIT_DELAY).await;
+            }
+        }
+        return Err(CellularImsError::new("native_ims_network_not_registered"));
+    }
     let mut current = requested.clone();
     let mut modem_seen = false;
     for attempt in 0..MM_MODEM_WAIT_ATTEMPTS {
@@ -7009,6 +7040,63 @@ fn modem_is_ready(output: &str) -> bool {
 }
 
 async fn command_output(program: &str, args: &[&str]) -> Result<String, CellularImsError> {
+    if program == "mmcli" {
+        let native_mode = crate::hardware::cellular::backends::active_native().is_some()
+            || args
+                .get(1)
+                .is_some_and(|s| crate::hardware::cellular::backends::is_native_selector(s));
+        if native_mode {
+            let selector = args
+                .get(1)
+                .ok_or_else(|| CellularImsError::new("native_ims_selector_missing"))?;
+            let result = match (args.first().copied(), args.get(2).copied()) {
+                (Some("-m"), Some("--output-keyvalue")) => {
+                    crate::hardware::cellular::control::native_ims_properties(selector, false).await
+                }
+                (Some("-i"), Some("--output-keyvalue")) => {
+                    crate::hardware::cellular::control::native_ims_properties(selector, true).await
+                }
+                (Some("-m"), Some(command)) if command.starts_with("--command=") => {
+                    crate::hardware::cellular::control::at_command(
+                        selector,
+                        &command["--command=".len()..],
+                    )
+                    .await
+                }
+                _ => Err("native_ims_legacy_query_not_supported".into()),
+            };
+            return result
+                .map_err(|e| CellularImsError::with_detail("native_ims_control_failed", e));
+        }
+    }
+    if program == "qmicli" {
+        if let Some(fleet) = crate::hardware::cellular::backends::active_native() {
+            let port = args
+                .windows(2)
+                .find(|pair| pair[0] == "-d")
+                .map(|pair| pair[1])
+                .ok_or_else(|| CellularImsError::new("native_ims_qmi_port_missing"))?;
+            let device = fleet.by_control_device(port).map_err(|e| {
+                CellularImsError::with_detail("native_ims_owner_unavailable", e.to_string())
+            })?;
+            if device.spec.protocol
+                != crate::hardware::cellular::backends::config::NativeProtocol::Qmi
+            {
+                // Optional UICC AID enumeration has an existing USIM-prefix
+                // fallback; never send QMI frames down an MBIM/AT port.
+                return Err(CellularImsError::new("native_uicc_enumeration_not_qmi"));
+            }
+            let request = crate::hardware::cellular::backends::protocol::CommandRequest {
+                tool: crate::hardware::cellular::backends::protocol::Tool::Qmi,
+                device: port.to_string(),
+                arguments: args.iter().map(|s| s.to_string()).collect(),
+                timeout_seconds: 20,
+            };
+            return device.command(request).await.map_err(|e| {
+                CellularImsError::with_detail("native_ims_uim_query_failed", e.to_string())
+            });
+        }
+    }
     let output = Command::new(program)
         .args(args)
         .output()

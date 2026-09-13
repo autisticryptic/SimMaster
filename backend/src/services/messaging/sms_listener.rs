@@ -2,7 +2,7 @@
 //!
 //! 通过 D-Bus 信号监听 ModemManager 的短信接收事件，并增加轮询兜底，
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
-use crate::hardware::cellular::modem_manager::{
+use crate::hardware::cellular::control::{
     cache_smsc_for_identity, list_modem_paths, sim_identity_for_modem,
 };
 use crate::platform::config::{ConfigManager, LineProfileConfig};
@@ -110,6 +110,26 @@ fn should_forward_after_insert(mode: SmsIngestMode, forward_reconciled_new_sms: 
 
 /// 从 SMS 对象路径读取短信内容
 async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingSms> {
+    if let Some((selector, _)) = sms_path
+        .split_once(":sms:")
+        .filter(|(s, _)| s.starts_with("native:"))
+    {
+        let sms = crate::hardware::cellular::backends::native_device(selector)
+            .ok()?
+            .message(sms_path)
+            .await
+            .ok()?;
+        return Some(IncomingSms {
+            path: sms.path,
+            number: sms.number,
+            content: sms.content,
+            timestamp: sms.timestamp,
+            smsc: sms.smsc,
+        });
+    }
+    if crate::hardware::cellular::backends::active_native().is_some() {
+        return None;
+    }
     let proxy = Proxy::new(conn, MM_SERVICE, sms_path, DBUS_PROPERTIES)
         .await
         .ok()?;
@@ -173,6 +193,17 @@ fn schedule_sms_delete(conn: &Connection, modem_path: &str, sms_path: String) {
     let modem_path = modem_path.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(SMS_DELETE_DELAY_SECS)).await;
+        if crate::hardware::cellular::backends::is_native_selector(&modem_path) {
+            if let Ok(device) = crate::hardware::cellular::backends::native_device(&modem_path) {
+                if let Err(error) = device.delete_message(&sms_path).await {
+                    warn!(%error, "Native SMS deletion deferred; stored message was not blindly removed");
+                }
+            }
+            return;
+        }
+        if crate::hardware::cellular::backends::active_native().is_some() {
+            return;
+        }
         let proxy = Proxy::new(&conn_clone, MM_SERVICE, modem_path.as_str(), MM_MESSAGING).await;
         match proxy {
             Ok(proxy) => {
@@ -358,6 +389,18 @@ async fn process_sms_path(
 }
 
 async fn list_sms_paths(conn: &Connection, modem_path: &str) -> zbus::Result<Vec<String>> {
+    if crate::hardware::cellular::backends::is_native_selector(modem_path) {
+        let device = crate::hardware::cellular::backends::native_device(modem_path)
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()))?;
+        return device
+            .messages()
+            .await
+            .map(|messages| messages.into_iter().map(|m| m.path).collect())
+            .map_err(|e| zbus::fdo::Error::Failed(e.to_string()).into());
+    }
+    if crate::hardware::cellular::backends::active_native().is_some() {
+        return Err(zbus::fdo::Error::Failed("native_sms_owner_mismatch".into()).into());
+    }
     let proxy = Proxy::new(conn, MM_SERVICE, modem_path, MM_MESSAGING).await?;
     let paths: Vec<OwnedObjectPath> = proxy.call("List", &()).await?;
     Ok(paths.into_iter().map(|path| path.to_string()).collect())
@@ -539,6 +582,40 @@ pub async fn start_sms_listener(
     mt_sms: tokio::sync::broadcast::Sender<SmsMessage>,
     mut resync_receiver: SmsResyncReceiver,
 ) -> zbus::Result<()> {
+    if let Some(fleet) = crate::hardware::cellular::backends::active_native() {
+        for device in fleet.all() {
+            if let Err(error) = device.initialize_sms().await {
+                warn!(line_id = %device.spec.line_id(), %error, "Native SMS capability unavailable");
+            }
+        }
+        let mut interval = tokio::time::interval(Duration::from_secs(SMS_POLL_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let reason = tokio::select! {
+                _ = interval.tick() => "native_poll".to_string(),
+                message = resync_receiver.recv() => match message {
+                    Some(message) => message.reason,
+                    None => return Ok(()),
+                },
+            };
+            for path in list_modem_paths(&conn).await? {
+                maybe_scan_sms_paths(
+                    SmsScanContext {
+                        conn: &conn,
+                        db: &db,
+                        notification_sender: &notification_sender,
+                        config_manager: &config_manager,
+                        line_registry: &line_registry,
+                        mt_sms: &mt_sms,
+                    },
+                    &path,
+                    &reason,
+                    true,
+                )
+                .await;
+            }
+        }
+    }
     info!("Starting SMS listener (ModemManager mode)");
     loop {
         let modem_paths = loop {

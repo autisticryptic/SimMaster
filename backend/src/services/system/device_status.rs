@@ -1,11 +1,10 @@
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
-use crate::hardware::cellular::modem_manager::{
+use crate::hardware::cellular::control::{
     discover_modem_bindings, get_cells_data_for_modem, get_data_connection_status_for_modem,
     get_device_info_for_modem, get_is_roaming_for_modem, get_network_info_for_modem,
     get_signal_strength_for_modem, get_sim_info_for_modem_with_cache, ModemBinding,
 };
-use crate::hardware::cellular::{mm_radio::ModemManagerRadio, radio::ModemRadioControl};
 use crate::platform::config::{ConfigManager, NotificationRule};
 use crate::platform::db::{Database, PeriodSmsStats};
 use crate::platform::utils::{
@@ -432,7 +431,7 @@ pub async fn collect_device_status_report(
     if items.contains("airplane_mode") || items.contains("roaming") {
         // Other fields in this legacy report are still MM-specific. Reuse the
         // same connection/normalizer so failed RF queries do not say "off".
-        let radio = ModemManagerRadio::new(Arc::clone(&dbus_conn));
+        let radio = crate::hardware::cellular::control::runtime_radio(Arc::clone(&dbus_conn));
         for binding in &bindings {
             let label = cellular_line_label(binding);
             if items.contains("airplane_mode") {

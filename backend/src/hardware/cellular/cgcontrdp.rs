@@ -290,27 +290,9 @@ fn parse_cgcontrdp_address(value: &str) -> Option<IpAddr> {
 }
 
 async fn run_at(modem: &str, command: &str) -> Result<String, CgcontrdpError> {
-    let argument = format!("--command={command}");
-    let output = Command::new("mmcli")
-        .args(["-m", modem, &argument])
-        .output()
+    crate::hardware::cellular::control::at_command(modem, command)
         .await
-        .map_err(|error| CgcontrdpError {
-            detail: format!("mmcli:{error}"),
-        })?;
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr)
-            .trim()
-            .replace('\n', " ");
-        Err(CgcontrdpError {
-            detail: format!(
-                "mmcli:{}:-m {modem} {argument}:{stderr}",
-                output.status.code().unwrap_or(-1)
-            ),
-        })
-    }
+        .map_err(|detail| CgcontrdpError { detail })
 }
 
 #[cfg(test)]

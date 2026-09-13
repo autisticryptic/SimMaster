@@ -4,6 +4,13 @@
 //! a standalone SIM reader. Serialized field names retain the existing API
 //! contract while callers migrate away from the legacy MM module.
 
+#[derive(Debug, Clone, Default)]
+pub struct SimIdentity {
+    pub iccid: String,
+    pub imsi: String,
+    pub operator_id: String,
+}
+
 /// Stable description of one physical modem and its currently selected SIM.
 ///
 /// `line_id` is anchored to physical hardware plus UIM slot, not a backend
@@ -69,6 +76,18 @@ pub struct ModemBinding {
     /// Previous line IDs that may own the current SIM's saved profile.
     #[serde(skip)]
     pub legacy_line_ids: Vec<String>,
+}
+
+impl ModemBinding {
+    /// Packet/SIM control endpoint for the selected backend. Callers must use
+    /// that backend, not feed an MBIM/AT endpoint to a QMI-only implementation.
+    pub fn control_device(&self) -> Option<&str> {
+        if self.modem_path.starts_with("native:") {
+            (!self.primary_port.trim().is_empty()).then_some(self.primary_port.as_str())
+        } else {
+            self.qmi_device.as_deref()
+        }
+    }
 }
 
 pub(super) fn stable_line_id(hardware_key: &str, sim_key: &str) -> String {

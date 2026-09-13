@@ -836,12 +836,7 @@ async fn read_usim_identity_fallback(
     identity
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct SimIdentity {
-    pub iccid: String,
-    pub imsi: String,
-    pub operator_id: String,
-}
+pub use super::bindings::SimIdentity;
 
 fn physical_device_slot_id(device: &str) -> Option<String> {
     let device = device.trim().trim_end_matches('/');
@@ -4478,11 +4473,39 @@ async fn disconnect_known_bearers(conn: &Connection, modem_path: &str) {
 /// 当前是否处于漫游注册态（与「是否允许漫游」无关，后者来自该线路的配置）。
 pub async fn get_is_roaming_for_modem(conn: &Connection, modem_path: &str) -> zbus::Result<bool> {
     let gpp_props = get_all_properties(conn, modem_path, MM_MODEM_3GPP).await?;
-    let reg_state = gpp_props
-        .get("RegistrationState")
-        .map(extract_u32)
-        .unwrap_or(0);
-    Ok(matches!(reg_state, 5 | 7 | 10))
+    let reg_state = gpp_props.get("RegistrationState").map(extract_u32);
+    roaming_observation_from_registration(reg_state)
+        .ok_or_else(|| zbus::fdo::Error::Failed("cellular_roaming_state_unknown".into()).into())
+}
+
+fn roaming_observation_from_registration(state: Option<u32>) -> Option<bool> {
+    match state {
+        Some(1 | 6 | 9) => Some(false),
+        Some(5 | 7 | 10) => Some(true),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod roaming_observation_tests {
+    #[test]
+    fn only_registered_home_or_roaming_is_authoritative() {
+        for state in [1, 6, 9] {
+            assert_eq!(
+                super::roaming_observation_from_registration(Some(state)),
+                Some(false)
+            );
+        }
+        for state in [5, 7, 10] {
+            assert_eq!(
+                super::roaming_observation_from_registration(Some(state)),
+                Some(true)
+            );
+        }
+        for state in [None, Some(0), Some(2), Some(3), Some(4), Some(8), Some(999)] {
+            assert_eq!(super::roaming_observation_from_registration(state), None);
+        }
+    }
 }
 
 fn is_invalid_transition_error(err: &zbus::Error) -> bool {

@@ -258,22 +258,30 @@ install_hardware_support() {
 
   echo "==> installing Quectel and USB SIM reader host support"
   installed=0
+  # Selection comes from the newly installed binary's read-only config parser.
+  # A native upgrade must not install/start MM as a hidden dependency.
+  mm_debian=""
+  mm_rpm=""
+  if [ "$MODEM_BACKEND" = "modemmanager" ]; then
+    mm_debian="modemmanager"
+    mm_rpm="ModemManager"
+  fi
   if command -v apt-get >/dev/null 2>&1; then
     if apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      modemmanager libqmi-utils usb-modeswitch pcscd libccid opensc pcsc-tools; then
+      $mm_debian libqmi-utils libmbim-utils usb-modeswitch pcscd libccid opensc pcsc-tools; then
       installed=1
     fi
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y ModemManager libqmi-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
+    dnf install -y $mm_rpm libqmi-utils libmbim-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y ModemManager libqmi-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
+    yum install -y $mm_rpm libqmi-utils libmbim-utils usb_modeswitch pcsc-lite pcsc-lite-ccid opensc pcsc-tools && installed=1 || true
   elif command -v pacman >/dev/null 2>&1; then
-    pacman -Sy --noconfirm modemmanager libqmi usb_modeswitch pcsclite ccid opensc && installed=1 || true
+    pacman -Sy --noconfirm $mm_debian libqmi libmbim usb_modeswitch pcsclite ccid opensc && installed=1 || true
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache modemmanager libqmi-utils usb-modeswitch pcsc-lite ccid opensc && installed=1 || true
+    apk add --no-cache $mm_debian libqmi-utils libmbim-tools usb-modeswitch pcsc-lite ccid opensc && installed=1 || true
   elif command -v opkg >/dev/null 2>&1; then
     opkg update >/dev/null 2>&1 || true
-    for package in modemmanager qmi-utils usb-modeswitch pcscd ccid opensc-utils; do
+    for package in $mm_debian qmi-utils umbim usb-modeswitch pcscd ccid opensc-utils; do
       opkg install "$package" >/dev/null 2>&1 || true
     done
     installed=1
@@ -1027,18 +1035,27 @@ main() {
     install -m 0644 "${tmp_dir}/pkg/meta.json" "${INSTALL_DIR}/meta.json"
   fi
 
+  MODEM_BACKEND="$("${INSTALL_DIR}/simadmin" modem-backend-mode)"
+  case "$MODEM_BACKEND" in
+    modemmanager|native) ;;
+    *) echo "error: cannot determine configured modem backend; refusing service/dependency changes" >&2; exit 1 ;;
+  esac
+  if [ "$MODEM_BACKEND" = "modemmanager" ]; then
+    "${INSTALL_DIR}/simadmin" modem-backend-mode --require-mm >/dev/null
+  fi
   install_hardware_support
   install_lpac
 
   echo "==> installing systemd unit"
   install_service_file
-  echo "==> installing modem recovery service"
-  install_modem_recovery_service
-  echo "==> installing secondary QMI service"
-  install_secondary_qmi_service "${tmp_dir}/pkg"
+  echo "==> installing resources for ${MODEM_BACKEND} through the device driver"
+  "${INSTALL_DIR}/simadmin" install-device-resources --staging-dir "${tmp_dir}/pkg" --activate
 
-  configure_networkmanager_modem_unmanaged
-  activate_secondary_qmi_runtime
+  if [ "$MODEM_BACKEND" = "modemmanager" ]; then
+    configure_networkmanager_modem_unmanaged
+  else
+    echo "==> native is explicitly configured; no MM/NM activation or automatic owner takeover"
+  fi
 
   echo "==> starting service"
   systemctl restart "${SERVICE_NAME}.service"

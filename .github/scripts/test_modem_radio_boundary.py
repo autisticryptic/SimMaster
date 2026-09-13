@@ -100,7 +100,7 @@ class ModemRadioBoundaryTests(unittest.TestCase):
             ):
                 with self.subTest(workflow=name, group=group):
                     self.assertIn(group + " \\", text)
-            self.assertIn("http_router_tests::radio_intent_; do", text)
+            self.assertIn("http_router_tests::radio_intent_", text)
 
 
 if __name__ == "__main__":

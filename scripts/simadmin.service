@@ -1,7 +1,8 @@
 [Unit]
 Description=SimAdmin Backend Service
 After=network.target ModemManager.service
-Wants=ModemManager.service
+# Backend-dependent activation is done after configuration validation in the
+# application. A native candidate must not implicitly start ModemManager.
 
 [Service]
 Type=simple

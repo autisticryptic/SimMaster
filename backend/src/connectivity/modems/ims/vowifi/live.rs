@@ -69,7 +69,7 @@ use crate::connectivity::core::{
     sip_frame, ImsError,
 };
 use crate::connectivity::modems::ims::profile_override::SimOverride;
-use crate::hardware::cellular::modem_manager::get_sim_info_for_modem_with_cache;
+use crate::hardware::cellular::control::get_sim_info_for_modem_with_cache;
 use crate::platform::config::{LineVowifiConfig, VowifiProxyMode};
 use crate::services::supplementary::ut::{XcapAccessContext, XcapDigestProvider};
 use crate::services::trunk::bridge::{
@@ -1529,7 +1529,7 @@ pub fn register_line_pcsc_reader(line_id: &str, reader_path: &str) {
 async fn line_sim_identity(
     line_id: &str,
     conn: &zbus::Connection,
-) -> Option<crate::hardware::cellular::modem_manager::SimIdentity> {
+) -> Option<crate::hardware::cellular::control::SimIdentity> {
     let device = sim_device_for_line(line_id);
     if !device.pcsc_reader.is_empty() {
         return tokio::task::spawn_blocking(move || {
@@ -1541,7 +1541,7 @@ async fn line_sim_identity(
                         .filter(|length| identity.imsi.len() >= 3 + *length as usize)
                         .map(|length| identity.imsi[..3 + length as usize].to_string())
                         .unwrap_or_default();
-                    crate::hardware::cellular::modem_manager::SimIdentity {
+                    crate::hardware::cellular::control::SimIdentity {
                         iccid: identity.iccid,
                         imsi: identity.imsi,
                         operator_id,
@@ -1553,11 +1553,9 @@ async fn line_sim_identity(
         .flatten();
     }
     if !device.modem_path.is_empty() {
-        if let Some(identity) = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
-            conn,
-            &device.modem_path,
-        )
-        .await
+        if let Some(identity) =
+            crate::hardware::cellular::control::sim_identity_for_modem(conn, &device.modem_path)
+                .await
         {
             return Some(identity);
         }

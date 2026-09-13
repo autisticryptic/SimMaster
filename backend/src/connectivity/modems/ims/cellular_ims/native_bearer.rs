@@ -387,7 +387,7 @@ pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
 /// Project a successful transport result onto the `NativeImsBearer` the rest of
 /// the stack consumes. If the projection rejects the bearer (e.g. no address),
 /// the device handle is still released so nothing leaks.
-async fn adopt_bearer(
+pub(crate) async fn adopt_bearer(
     info: ImsBearerInfo,
     handle: Box<dyn ImsBearerHandle + Send>,
 ) -> Result<NativeImsBearer, CellularImsError> {

@@ -20,7 +20,7 @@ use super::{
 };
 use crate::{
     connectivity::core::access_network::ImsAccessNetworkRuntime,
-    hardware::cellular::modem_manager::sim_identity_for_modem,
+    hardware::cellular::control::sim_identity_for_modem,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,7 +198,7 @@ impl VowifiRuntime {
     async fn read_bound_sim_identity(
         &self,
         conn: &Connection,
-    ) -> Option<crate::hardware::cellular::modem_manager::SimIdentity> {
+    ) -> Option<crate::hardware::cellular::control::SimIdentity> {
         let modem_path = super::live::sim_device_for_line(&self.line_id).modem_path;
         if modem_path.is_empty() {
             return None;

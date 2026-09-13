@@ -162,6 +162,7 @@ impl ImsAccessType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AccessNetworkSource {
     ModemManager,
+    Native,
     TestFixture,
 }
 

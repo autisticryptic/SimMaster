@@ -6,7 +6,7 @@
 
 use crate::{
     connectivity::core::access_network::{AccessNetworkSource, ServingAccessSnapshot},
-    hardware::cellular::modem_manager::{get_cells_data_for_modem, get_network_info_for_modem},
+    hardware::cellular::control::{get_cells_data_for_modem, get_network_info_for_modem},
 };
 use zbus::Connection;
 

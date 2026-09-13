@@ -12,7 +12,7 @@ use std::time::Instant;
 use serde::Serialize;
 
 use crate::{
-    hardware::cellular::modem_manager::ModemBinding,
+    hardware::cellular::control::ModemBinding,
     platform::netns::{self, NetnsError, NetnsName},
 };
 

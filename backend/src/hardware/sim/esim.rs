@@ -60,7 +60,7 @@ impl EsimApiError {
 pub struct EsimSupervisor {
     config_manager: Arc<ConfigManager>,
     database: Arc<Database>,
-    lpac_lock: Mutex<()>,
+    lpac_lock: Arc<Mutex<()>>,
 }
 
 impl EsimSupervisor {
@@ -68,7 +68,7 @@ impl EsimSupervisor {
         Self {
             config_manager,
             database,
-            lpac_lock: Mutex::new(()),
+            lpac_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -211,8 +211,75 @@ impl EsimSupervisor {
         }
 
         let device_config = self.config_manager.get_esim_config();
-        let reader_config = self.config_manager.get_line_esim_reader_config(line_id);
+        let mut reader_config = self.config_manager.get_line_esim_reader_config(line_id);
+        let native = crate::hardware::cellular::backends::active_native()
+            .and_then(|fleet| fleet.device(&format!("native:{line_id}")).ok());
+        if let Some(device) = &native {
+            if matches!(reader_config.apdu_backend.as_str(), "" | "qmi") {
+                use crate::hardware::cellular::backends::config::NativeProtocol;
+                match device.spec.protocol {
+                    NativeProtocol::Qmi => {
+                        reader_config.apdu_backend = "qmi".into();
+                        reader_config.qmi_device = device.spec.control_device.clone();
+                        reader_config.qmi_uim_slot = device.spec.uim_slot;
+                    }
+                    NativeProtocol::Mbim if device.spec.at_device.is_none() => {
+                        reader_config.apdu_backend = "mbim".into();
+                        reader_config.mbim_device = device.spec.control_device.clone();
+                        reader_config.mbim_uim_slot = device.spec.uim_slot;
+                    }
+                    _ => {
+                        reader_config.apdu_backend = "at".into();
+                        reader_config.at_device = device
+                            .spec
+                            .at_device
+                            .clone()
+                            .unwrap_or_else(|| device.spec.control_device.clone());
+                    }
+                }
+            }
+        }
         let target = esim_target_for_line(line_id, &reader_config)?;
+        if let Some(device) = native {
+            let selected = match target.apdu_backend.as_str() {
+                "qmi" | "qmi_qrtr" => &target.qmi_device,
+                "mbim" => &target.mbim_device,
+                "at" => &target.at_device,
+                _ => {
+                    return Err(EsimApiError::Unavailable(
+                        "native_esim_reader_not_owned_by_line".into(),
+                    ))
+                }
+            };
+            if selected != &device.spec.control_device
+                && device.spec.at_device.as_ref() != Some(selected)
+            {
+                return Err(EsimApiError::Unavailable(
+                    "native_esim_reader_not_owned_by_line".into(),
+                ));
+            }
+            let global_gate = self.lpac_lock.clone();
+            let action = action.to_string();
+            let args = args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            return tokio::spawn(async move {
+                let _global = global_gate.lock_owned().await;
+                let _physical = device
+                    .external_sim_operation()
+                    .await
+                    .map_err(|e| EsimApiError::Unavailable(e.to_string()))?;
+                let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+                run_lpac_command(
+                    &device_config.lpac_path,
+                    &action,
+                    &args,
+                    timeout_seconds,
+                    &target,
+                )
+                .await
+            })
+            .await
+            .map_err(|_| EsimApiError::Command("native_esim_operation_task_failed".into()))?;
+        }
         let _guard = self.lpac_lock.lock().await;
         run_lpac_command(
             &device_config.lpac_path,
@@ -1229,6 +1296,7 @@ async fn run_lpac_command(
 ) -> Result<EsimCommandResponse, EsimApiError> {
     let command_path = resolve_lpac_path(lpac_path);
     let mut command = tokio::process::Command::new(&command_path);
+    command.kill_on_drop(true);
     command.args(args);
     set_lpac_working_directory(&mut command, &command_path);
     configure_lpac_environment(&mut command, &command_path, target);

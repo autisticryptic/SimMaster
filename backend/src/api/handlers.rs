@@ -36,7 +36,7 @@ use crate::{
         },
         sms::{MoSmsSipOutcome, MtSmsDeliver},
     },
-    hardware::cellular::modem_manager::{
+    hardware::cellular::control::{
         answer_call_on_modem, get_band_lock_status_for_modem,
         get_baseband_restart_progress_for_line, get_call_by_path_for_modem,
         get_call_settings_for_modem, get_cell_location_for_modem, get_cells_data_for_modem,
@@ -51,7 +51,7 @@ use crate::{
         set_radio_mode_for_modem, sim_identity_for_modem, start_cell_monitoring_for_modem,
         stop_cell_monitoring_for_modem,
     },
-    hardware::cellular::{modem_manager, ussd},
+    hardware::cellular::{control as modem, ussd},
     hardware::sim::esim::EsimApiError,
     platform::config::{
         AccessPathKind, AutoRestoreConfig, DiagnosticLogConfig, EsimReaderConfig,
@@ -188,7 +188,7 @@ fn esim_error_response<T: Default>(error: EsimApiError) -> (StatusCode, Json<Api
 /// policy: trust ModemManager when it reports a eUICC, otherwise prove the card
 /// is a eUICC with a line-scoped lpac `chip info` probe. Removable eUICCs are
 /// commonly exposed as an ordinary SIM by older ModemManager versions.
-fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemBinding) -> bool {
+fn line_reports_euicc(binding: &crate::hardware::cellular::control::ModemBinding) -> bool {
     binding.sim_type == "esim"
         || matches!(
             binding.esim_status.as_str(),
@@ -199,7 +199,7 @@ fn line_reports_euicc(binding: &crate::hardware::cellular::modem_manager::ModemB
 fn esim_detection_identity_key(
     app: &AppState,
     line_id: &str,
-    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    binding: &crate::hardware::cellular::control::ModemBinding,
 ) -> Option<String> {
     let iccid = crate::platform::utils::normalize_iccid(&binding.sim_iccid);
     if iccid.is_empty() {
@@ -334,7 +334,7 @@ fn split_profile_operator_code(code: &str) -> (String, String) {
 
 fn enrich_profiles_with_current_identity(
     profiles: &mut [EsimProfile],
-    identity: &crate::hardware::cellular::modem_manager::SimIdentity,
+    identity: &crate::hardware::cellular::control::SimIdentity,
 ) {
     let current_index = profiles
         .iter()
@@ -926,12 +926,9 @@ pub async fn enable_esim_profile_handler(
     // Clear both the old and target learned identities before ModemManager can
     // re-enumerate the modem. Manual numbers intentionally survive this cleanup.
     crate::connectivity::core::own_numbers::clear(&line_id);
-    modem_manager::clear_non_manual_own_numbers_for_iccid(&app.database, &bg_binding.sim_iccid);
-    modem_manager::clear_non_manual_own_numbers_for_iccid(&app.database, &iccid);
-    modem_manager::invalidate_sim_identity_cache(
-        bg_binding.qmi_device.as_deref(),
-        bg_binding.uim_slot,
-    );
+    modem::clear_non_manual_own_numbers_for_iccid(&app.database, &bg_binding.sim_iccid);
+    modem::clear_non_manual_own_numbers_for_iccid(&app.database, &iccid);
+    modem::invalidate_sim_identity_cache(bg_binding.qmi_device.as_deref(), bg_binding.uim_slot);
     if let Err(error) = app.database.clear_cellular_ims_refresh_stats(&line_id) {
         warn!(line_id = %line_id, %error, "Failed to clear VoLTE refresh stats for eSIM switch");
     }
@@ -963,8 +960,8 @@ pub async fn enable_esim_profile_handler(
 
     // Progress belongs to this line even though the underlying ModemManager
     // maintenance operation is process-wide.
-    modem_manager::reset_baseband_restart_progress_for_line(&line_id);
-    modem_manager::record_restart_step_for_line(&line_id, "启用 eSIM Profile", "running", None);
+    modem::reset_baseband_restart_progress_for_line(&line_id);
+    modem::record_restart_step_for_line(&line_id, "启用 eSIM Profile", "running", None);
 
     let bg_app = app.clone();
     let bg_iccid = iccid.clone();
@@ -973,10 +970,10 @@ pub async fn enable_esim_profile_handler(
     let bg_cellular_ims_runtime = Arc::clone(&line.cellular_ims);
 
     let progress_line_id = bg_line_id.clone();
-    tokio::spawn(modem_manager::with_baseband_restart_progress(
+    tokio::spawn(modem::with_baseband_restart_progress(
         progress_line_id,
         async move {
-            let _guard = modem_manager::BasebandRestartRunGuard::for_line(&bg_line_id);
+            let _guard = modem::BasebandRestartRunGuard::for_line(&bg_line_id);
 
             match bg_app
                 .esim_supervisor
@@ -985,7 +982,7 @@ pub async fn enable_esim_profile_handler(
             {
                 Ok(data) => {
                     if esim_command_succeeded(&data) {
-                        modem_manager::record_restart_step("启用 eSIM Profile", "ok", None);
+                        modem::record_restart_step("启用 eSIM Profile", "ok", None);
                         let line_profile = bg_app.config_manager.get_line_profile(&bg_line_id);
                         let auto_connect_data = line_profile.data_connection_enabled;
                         let allow_roaming = line_profile.roaming_allowed;
@@ -993,7 +990,7 @@ pub async fn enable_esim_profile_handler(
                         let recovery = if bg_binding.line_kind == "reader"
                             || bg_binding.modem_path.is_empty()
                         {
-                            modem_manager::record_restart_step(
+                            modem::record_restart_step(
                                 "独立读卡器无需重启基带",
                                 "ok",
                                 Some(bg_line_id.clone()),
@@ -1011,7 +1008,7 @@ pub async fn enable_esim_profile_handler(
                             )
                             .await
                         };
-                        modem_manager::invalidate_sim_identity_cache(
+                        modem::invalidate_sim_identity_cache(
                             bg_binding.qmi_device.as_deref(),
                             bg_binding.uim_slot,
                         );
@@ -1092,7 +1089,7 @@ pub async fn enable_esim_profile_handler(
                             }
                         }
                     } else {
-                        modem_manager::record_restart_step(
+                        modem::record_restart_step(
                             "启用 eSIM Profile",
                             "error",
                             Some(data.msg.clone()),
@@ -1111,11 +1108,7 @@ pub async fn enable_esim_profile_handler(
                 }
                 Err(err) => {
                     let message = err.message();
-                    modem_manager::record_restart_step(
-                        "启用 eSIM Profile",
-                        "error",
-                        Some(message.clone()),
-                    );
+                    modem::record_restart_step("启用 eSIM Profile", "error", Some(message.clone()));
                     bg_app
                         .system_event_emitter
                         .emit_code(
@@ -1595,9 +1588,9 @@ async fn apply_ims_observed_own_numbers(
     // Persisting needs the ICCID: it is the cache's identity key, and without it
     // the value would be re-derived from the registrar on every read.
     if !info.iccid.is_empty() {
-        crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+        crate::hardware::cellular::control::cache_own_numbers_for_identity(
             &app.database,
-            &crate::hardware::cellular::modem_manager::SimIdentity {
+            &crate::hardware::cellular::control::SimIdentity {
                 iccid: info.iccid.clone(),
                 imsi: info.imsi.clone(),
                 operator_id: format!("{}{}", info.mcc, info.mnc),
@@ -1663,13 +1656,13 @@ pub async fn get_sim_info(
             } else {
                 (String::new(), String::new())
             };
-            let cache_identity = crate::hardware::cellular::modem_manager::SimIdentity {
+            let cache_identity = crate::hardware::cellular::control::SimIdentity {
                 iccid: iccid.clone(),
                 imsi: imsi.clone(),
                 operator_id: operator_id.clone(),
             };
             let (phone_numbers, sms_center, phone_number_is_manual, sms_center_is_manual) =
-                crate::hardware::cellular::modem_manager::cached_sim_metadata_for_identity(
+                crate::hardware::cellular::control::cached_sim_metadata_for_identity(
                     &app.database,
                     &cache_identity,
                 );
@@ -1753,13 +1746,13 @@ pub async fn update_sim_cache_handler(
                         )
                     }
                 };
-            let identity = crate::hardware::cellular::modem_manager::SimIdentity {
+            let identity = crate::hardware::cellular::control::SimIdentity {
                 iccid: pcsc_identity.iccid,
                 imsi: pcsc_identity.imsi,
                 operator_id: binding.operator_id,
             };
             if let Some(sms_center) = &payload.sms_center {
-                crate::hardware::cellular::modem_manager::cache_smsc_for_identity(
+                crate::hardware::cellular::control::cache_smsc_for_identity(
                     &app.database,
                     &identity,
                     sms_center,
@@ -1767,7 +1760,7 @@ pub async fn update_sim_cache_handler(
                 );
             }
             if let Some(phone_number) = &payload.phone_number {
-                crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+                crate::hardware::cellular::control::cache_own_numbers_for_identity(
                     &app.database,
                     &identity,
                     std::slice::from_ref(phone_number),
@@ -1810,7 +1803,7 @@ pub async fn update_sim_cache_handler(
     };
 
     if let Some(sms_center) = &payload.sms_center {
-        crate::hardware::cellular::modem_manager::cache_smsc_for_identity(
+        crate::hardware::cellular::control::cache_smsc_for_identity(
             &app.database,
             &identity,
             sms_center,
@@ -1819,7 +1812,7 @@ pub async fn update_sim_cache_handler(
     }
 
     if let Some(phone_number) = &payload.phone_number {
-        crate::hardware::cellular::modem_manager::cache_own_numbers_for_identity(
+        crate::hardware::cellular::control::cache_own_numbers_for_identity(
             &app.database,
             &identity,
             std::slice::from_ref(phone_number),
@@ -1927,7 +1920,7 @@ async fn resolve_modem_path(app: &AppState, line_id: &str) -> Result<String, Str
     Ok(binding.modem_path)
 }
 
-fn binding_has_baseband(binding: &crate::hardware::cellular::modem_manager::ModemBinding) -> bool {
+fn binding_has_baseband(binding: &crate::hardware::cellular::control::ModemBinding) -> bool {
     binding.line_kind.is_empty() || binding.line_kind == "baseband"
 }
 
@@ -3021,7 +3014,7 @@ async fn restart_selected_baseband(
                             status: "ok".to_string(),
                             detail: Some("移动射频保持关闭".to_string()),
                         };
-                        modem_manager::record_restart_step_for_line(
+                        modem::record_restart_step_for_line(
                             line_id,
                             &step.step,
                             &step.status,
@@ -3164,6 +3157,45 @@ pub async fn get_line_network_controls_handler(
     )
 }
 
+/// Read-only, redacted startup selection. There is deliberately no live
+/// backend-toggle endpoint: handover requires releasing all physical resources.
+pub async fn get_modem_backend_status_handler(State(app): State<AppState>) -> impl IntoResponse {
+    let configured = app.config_manager.get_cellular_backend();
+    let native = crate::hardware::cellular::backends::active_native();
+    let devices = native.map(|fleet| fleet.all().into_iter().map(|device| {
+        let at = device.spec.at_device.is_some()
+            || device.spec.protocol == crate::hardware::cellular::backends::config::NativeProtocol::At;
+        json!({
+            "line_id": device.spec.line_id(),
+            "protocol": device.spec.protocol,
+            "hardware_validated": false,
+            "radio_logic": true,
+            "sim_auth_logic": at || device.spec.protocol == crate::hardware::cellular::backends::config::NativeProtocol::Qmi,
+            "sms_voice_ussd_logic": at,
+            "ims_endpoint_configured": device.spec.ims.is_some(),
+            "data_endpoint_configured": device.spec.data.is_some(),
+            "band_lock_logic": device.spec.protocol == crate::hardware::cellular::backends::config::NativeProtocol::Qmi,
+            "automatic_owner_handover": false,
+        })
+    }).collect::<Vec<_>>()).unwrap_or_default();
+    (
+        StatusCode::OK,
+        Json(ApiResponse::success_with_message(
+            "Success",
+            json!({
+                "configured_backend": configured.mode,
+                "active_backend": if native.is_some() { "native" } else { "modemmanager" },
+                "default_backend": "modemmanager",
+                "experimental_native": native.is_some(),
+                "native_hardware_validation": "deferred",
+                "native_devices": devices,
+                "switch_requires_restart_and_maintenance": true,
+                "automatic_fallback": false,
+            }),
+        )),
+    )
+}
+
 /// POST /api/modem/lines/{line_id}/data/traffic/reset
 ///
 /// Zero one line's proxied-traffic counters, in memory and on disk. Useful at
@@ -3253,12 +3285,12 @@ async fn start_line_data_runtime_locked(
     )
     .map_err(str::to_string)?;
     let proxy = temporary_proxy.unwrap_or(&profile.data_proxy);
-    if get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-        .await
-        .unwrap_or(false)
-        && !profile.roaming_allowed
-    {
-        return Err("cellular_data_roaming_forbidden".to_string());
+    if !profile.roaming_allowed {
+        match get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path).await {
+            Ok(false) => {}
+            Ok(true) => return Err("cellular_data_roaming_forbidden".into()),
+            Err(_) => return Err("cellular_data_roaming_state_unknown".into()),
+        }
     }
 
     // A native secondary session is the only supported cellular data bearer.
@@ -3271,14 +3303,14 @@ async fn start_line_data_runtime_locked(
     }
 
     let configured_apn = app.config_manager.get_line_apn_config(&binding.line_id);
-    let apn = modem_manager::resolve_data_apn_config(
+    let apn = modem::resolve_data_apn_config(
         app.dbus_conn.as_ref(),
         &binding.modem_path,
         Some(&configured_apn),
     )
     .await;
 
-    if let Some(qmi_device) = binding.qmi_device.as_deref() {
+    if let Some(qmi_device) = binding.control_device() {
         match line
             .cellular_data
             .start(&binding.line_id, qmi_device, &apn)
@@ -3435,9 +3467,7 @@ async fn reconcile_line_data_health(
         return;
     }
 
-    match modem_manager::get_modem_state_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-        .await
-    {
+    match modem::get_modem_state_for_modem(app.dbus_conn.as_ref(), &binding.modem_path).await {
         Ok(MM_MODEM_STATE_SEARCHING) => {
             watchdog.searching_polls = watchdog.searching_polls.saturating_add(1);
             if watchdog.searching_polls >= LINE_DATA_REGISTER_THRESHOLD
@@ -3588,8 +3618,7 @@ async fn stop_line_data_runtime_locked(
     // used by the UE-only runtime.
     if binding.present && binding_has_baseband(&binding) && !binding.modem_path.trim().is_empty() {
         if let Err(error) =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
+            modem::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path).await
         {
             warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed");
         }
@@ -3612,7 +3641,7 @@ async fn prepare_line_data_slot_for_cellular_ims(
 
     let binding = line.binding();
     let inputs = DataSlotInputs {
-        ims_endpoint_available: binding.qmi_device.as_deref().is_some_and(|device| {
+        ims_endpoint_available: binding.control_device().is_some_and(|device| {
             line.ims_bearer
                 .as_ref()
                 .is_some_and(|transport| transport.endpoint_available(device))
@@ -3621,8 +3650,7 @@ async fn prepare_line_data_slot_for_cellular_ims(
         // On QCA410 this is the project-created DATA6 leg; the selected device
         // transport owns the actual readiness check for every device family.
         data_endpoint_available: binding
-            .qmi_device
-            .as_deref()
+            .control_device()
             .is_some_and(|device| line.cellular_data.endpoint_available(device)),
     };
     let mode = match select_data_slot_mode(inputs) {
@@ -3637,15 +3665,14 @@ async fn prepare_line_data_slot_for_cellular_ims(
     // An older build may have left ordinary data on qmi0. It is not a valid
     // allocation in UE-only mode and must not remain active as a hidden host
     // fallback.
-    if modem_manager::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+    if modem::data_interface_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
         .await
         .unwrap_or(None)
         .is_some()
     {
         line.data_proxy.stop().await;
         if let Err(error) =
-            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-                .await
+            modem::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path).await
         {
             warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed before VoLTE");
         }
@@ -7786,7 +7813,7 @@ pub struct CellularImsControlToggleRequest {
 
 #[derive(Debug, serde::Serialize, Default)]
 pub struct CellularImsLineControlResponse {
-    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::control::ModemBinding,
     pub profile: LineProfileConfig,
     pub runtime: crate::connectivity::modems::ims::cellular_ims::CellularImsRuntimeStatus,
 }
@@ -7794,7 +7821,7 @@ pub struct CellularImsLineControlResponse {
 #[derive(Debug, Default, serde::Serialize)]
 pub struct VowifiLineConfigResponse {
     pub line_id: String,
-    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::control::ModemBinding,
     pub config: LineVowifiConfig,
     pub runtime_phase: String,
     pub runtime_stage: String,
@@ -8153,7 +8180,7 @@ pub struct LineEsimControlRequest {
 fn build_line_esim_control_response(
     line_id: &str,
     esim_control: Option<bool>,
-    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    binding: &crate::hardware::cellular::control::ModemBinding,
 ) -> LineEsimControlResponse {
     let euicc_detected = line_reports_euicc(binding);
     LineEsimControlResponse {
@@ -8806,7 +8833,7 @@ pub async fn retry_cellular_ims_line_handler(
 #[derive(Debug, Default, serde::Serialize)]
 pub struct TrunkProfileResponse {
     pub line_id: String,
-    pub modem: crate::hardware::cellular::modem_manager::ModemBinding,
+    pub modem: crate::hardware::cellular::control::ModemBinding,
     pub trunk: TrunkProfileConfig,
     pub secret_set: bool,
     pub runtime: crate::services::trunk::runtime::TrunkRuntimeStatus,
@@ -10434,12 +10461,13 @@ fn cellular_ims_profile_batch_action(
 }
 
 fn line_native_ims_endpoint_available(line: &crate::services::line_registry::LineRuntime) -> bool {
-    let Some(device) = line.binding().qmi_device else {
+    let binding = line.binding();
+    let Some(device) = binding.control_device() else {
         return false;
     };
     line.ims_bearer
         .as_ref()
-        .is_some_and(|transport| transport.endpoint_available(&device))
+        .is_some_and(|transport| transport.endpoint_available(device))
 }
 
 fn cellular_ims_wait_for_native_endpoint(
@@ -11788,24 +11816,26 @@ pub async fn run_safe_os_reboot_sequence(
             )
             .await;
     }
-    if let Some(message) = run_reboot_prep_command(
-        "stop ModemManager IPC service",
-        "systemctl",
-        &["stop", "ModemManager"],
-        false,
-    ) {
-        system_events
-            .emit_code(
-                system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
-                system_event_severity::WARNING,
-                system_event_status::FAILED,
-                "stop ModemManager IPC service",
-                message,
-            )
-            .await;
+    if crate::hardware::cellular::backends::active_native().is_none() {
+        if let Some(message) = run_reboot_prep_command(
+            "stop ModemManager IPC service",
+            "systemctl",
+            &["stop", "ModemManager"],
+            false,
+        ) {
+            system_events
+                .emit_code(
+                    system_event_codes::SYSTEM_SERVICE_REBOOT_PREP_FAILED,
+                    system_event_severity::WARNING,
+                    system_event_status::FAILED,
+                    "stop ModemManager IPC service",
+                    message,
+                )
+                .await;
+        }
+        let _ = run_reboot_prep_command("stop qmi-proxy", "killall", &["qmi-proxy"], true);
+        cleanup_modemmanager_runtime_cache();
     }
-    let _ = run_reboot_prep_command("stop qmi-proxy", "killall", &["qmi-proxy"], true);
-    cleanup_modemmanager_runtime_cache();
     if let Some(message) = run_reboot_prep_command("flush filesystem cache", "sync", &[], false) {
         system_events
             .emit_code(
@@ -11827,7 +11857,7 @@ pub async fn run_safe_os_reboot_sequence(
 }
 
 async fn disable_all_modem_radios_for_reboot(conn: &Connection) -> Option<String> {
-    let modem_paths = match modem_manager::list_modem_paths(conn).await {
+    let modem_paths = match modem::list_modem_paths(conn).await {
         Ok(paths) if !paths.is_empty() => paths,
         Ok(_) => return Some("重启预处理步骤失败: ModemManager 未枚举到任何基带".to_string()),
         Err(error) => {
@@ -11839,7 +11869,7 @@ async fn disable_all_modem_radios_for_reboot(conn: &Connection) -> Option<String
 
     let mut failures = Vec::new();
     for modem_path in modem_paths {
-        match modem_manager::set_modem_enabled(conn, &modem_path, false).await {
+        match modem::set_modem_enabled(conn, &modem_path, false).await {
             Ok(_) => info!(modem_path = %modem_path, "Disabled modem radio for safe OS reboot"),
             Err(error) => failures.push(format!("{modem_path}: {error}")),
         }
@@ -11990,6 +12020,14 @@ pub async fn restart_service_handler(State(app): State<AppState>) -> impl IntoRe
 
 /// Restart the system ModemManager service without restarting SimAdmin or the OS.
 pub async fn restart_modem_manager_handler(State(app): State<AppState>) -> impl IntoResponse {
+    if crate::hardware::cellular::backends::active_native().is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(ApiResponse::<serde_json::Value>::error(
+                "native_backend_owns_devices_release_before_starting_modemmanager",
+            )),
+        );
+    }
     let output = tokio::task::spawn_blocking(|| {
         Command::new("systemctl")
             .args(["restart", "ModemManager.service"])
@@ -12553,7 +12591,7 @@ async fn resolve_ims_binding(
 ) -> Result<
     (
         SimBindingKey,
-        crate::hardware::cellular::modem_manager::ModemBinding,
+        crate::hardware::cellular::control::ModemBinding,
     ),
     String,
 > {
@@ -12689,17 +12727,12 @@ async fn query_sim_voicemail_number(modem_id: &str) -> Option<String> {
     }
     let output = tokio::time::timeout(
         Duration::from_secs(4),
-        tokio::process::Command::new("mmcli")
-            .args(["-m", modem_id, "--command=AT+CSVM?"])
-            .output(),
+        crate::hardware::cellular::control::at_command(modem_id, "AT+CSVM?"),
     )
     .await
     .ok()?
     .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_csvm_voicemail_number(&String::from_utf8_lossy(&output.stdout))
+    parse_csvm_voicemail_number(&output)
 }
 
 fn parse_csvm_voicemail_number(output: &str) -> Option<String> {
@@ -12718,7 +12751,7 @@ fn parse_csvm_voicemail_number(output: &str) -> Option<String> {
 fn build_effective_response(
     app: &AppState,
     key: &SimBindingKey,
-    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    binding: &crate::hardware::cellular::control::ModemBinding,
     imsi: Option<&str>,
     sim_voicemail_number: Option<&str>,
 ) -> Result<EffectiveImsProfileResponse, String> {
@@ -12923,7 +12956,7 @@ pub async fn get_effective_ims_profile_handler(
             );
         }
     };
-    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+    let imsi = crate::hardware::cellular::control::sim_identity_for_modem(
         app.dbus_conn.as_ref(),
         &binding.modem_path,
     )
@@ -13045,7 +13078,7 @@ pub async fn place_voicemail_call_handler(
         }
     };
 
-    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+    let imsi = crate::hardware::cellular::control::sim_identity_for_modem(
         app.dbus_conn.as_ref(),
         &binding.modem_path,
     )
@@ -13507,7 +13540,7 @@ async fn resolve_e911_context(
 ) -> Result<
     (
         SimBindingKey,
-        crate::hardware::cellular::modem_manager::ModemBinding,
+        crate::hardware::cellular::control::ModemBinding,
         &'static CarrierProfile,
         SimOverride,
     ),
@@ -13529,7 +13562,7 @@ async fn resolve_e911_context(
     } else {
         CatalogAccessKind::WifiEpdg
     };
-    let imsi = crate::hardware::cellular::modem_manager::sim_identity_for_modem(
+    let imsi = crate::hardware::cellular::control::sim_identity_for_modem(
         app.dbus_conn.as_ref(),
         &binding.modem_path,
     )
@@ -13586,7 +13619,7 @@ impl crate::services::e911::SimAkaProvider for LineE911AkaProvider {
 }
 
 fn e911_request_context(
-    binding: &crate::hardware::cellular::modem_manager::ModemBinding,
+    binding: &crate::hardware::cellular::control::ModemBinding,
     catalog: &CarrierProfile,
     override_: &SimOverride,
     imsi: String,
@@ -13740,7 +13773,7 @@ pub async fn post_e911_query_handler(
         };
     let context = e911_request_context(&binding, catalog, &override_, sim_identity.imsi);
     let sim_auth = LineE911AkaProvider {
-        qmi_device: binding.qmi_device.clone().unwrap_or_default(),
+        qmi_device: binding.control_device().unwrap_or_default().to_string(),
         uim_slot: binding.uim_slot,
         proxy_socket: std::env::var("SIMADMIN_VOWIFI_QMI_PROXY_SOCKET")
             .ok()
@@ -14167,7 +14200,7 @@ pub async fn delete_e911_address_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hardware::cellular::modem_manager::SimIdentity;
+    use crate::hardware::cellular::control::SimIdentity;
 
     #[test]
     fn coexistence_parking_preserves_exhausted_cellular_budget_for_wlan_fallback() {

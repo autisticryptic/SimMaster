@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 use zbus::Connection;
 
 use crate::api::models::UssdResponse;
-use crate::hardware::cellular::modem_manager;
+use crate::hardware::cellular::control as modem;
 
 const SESSION_TTL: Duration = Duration::from_secs(5 * 60);
 
@@ -147,9 +147,7 @@ async fn reap_expired_sessions(conn: &Connection) {
             })
         };
         if still_reserved {
-            if let Err(error) =
-                modem_manager::cancel_ussd_at_command_for_modem(conn, &modem_path).await
-            {
+            if let Err(error) = modem::cancel_ussd_at_command_for_modem(conn, &modem_path).await {
                 tracing::warn!(
                     modem_path = %modem_path,
                     session_id = %session_id,
@@ -251,7 +249,7 @@ pub(crate) async fn start(
 ) -> Result<UssdResponse, String> {
     let code = validate_code(code)?;
     let operation = reserve_modem(modem_path).await?;
-    let raw = modem_manager::run_ussd_at_command_for_modem(
+    let raw = modem::run_ussd_at_command_for_modem(
         conn,
         modem_path,
         &format!(r#"AT+CUSD=1,"{code}",15"#),
@@ -325,7 +323,7 @@ pub(crate) async fn continue_session(
     if !session_still_active(session_id, &session).await {
         return Err("USSD session does not exist or has expired".to_string());
     }
-    let raw = modem_manager::run_ussd_at_command_for_modem(
+    let raw = modem::run_ussd_at_command_for_modem(
         conn,
         modem_path,
         &format!(r#"AT+CUSD=1,"{input}",15"#),
@@ -379,7 +377,7 @@ pub(crate) async fn cancel_session(
     if !session_still_active(session_id, &session).await {
         return Err("USSD session does not exist or has expired".to_string());
     }
-    let raw = modem_manager::cancel_ussd_at_command_for_modem(conn, modem_path).await;
+    let raw = modem::cancel_ussd_at_command_for_modem(conn, modem_path).await;
     remove_session(session_id, &session).await;
     raw.map(|raw| UssdResponse {
         line_id: line_id.to_string(),
