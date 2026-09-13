@@ -2289,10 +2289,17 @@ mod tests {
                 .unwrap_err(),
             "line_airplane_mode_enabled"
         );
+        assert_eq!(
+            manager
+                .set_line_cellular_ims_connection_enabled(line_id, true)
+                .unwrap_err(),
+            "line_airplane_mode_enabled"
+        );
 
         let profile = manager.set_line_airplane_mode(line_id, false).unwrap();
         assert!(!profile.airplane_mode_enabled);
         assert!(!profile.data_connection_enabled);
+        assert!(!profile.cellular_ims_connection_enabled);
         let _ = std::fs::remove_file(path);
     }
 
@@ -6288,6 +6295,11 @@ impl ConfigManager {
             };
             if enabled && !profile.enabled {
                 return Err("line_disabled".to_string());
+            }
+            // Check under the configuration write lock as well as at the API
+            // boundary: flight mode may have changed since an HTTP precheck.
+            if enabled && profile.airplane_mode_enabled {
+                return Err("line_airplane_mode_enabled".to_string());
             }
             profile.cellular_ims_connection_enabled = enabled;
             profile.sync_ims_video_access_gates();

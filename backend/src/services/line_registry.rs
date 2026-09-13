@@ -579,6 +579,22 @@ impl LineRuntimeRegistry {
         registry
     }
 
+    /// Control/API fixtures need a resolved line, not real namespaces, workers
+    /// or device discovery. Production always uses refresh/reconcile instead.
+    #[cfg(test)]
+    pub(crate) async fn insert_control_test_line(&self, binding: ModemBinding) -> Arc<LineRuntime> {
+        let line_id = binding.line_id.clone();
+        let line = Arc::new(LineRuntime::new_for_device(
+            binding,
+            Arc::new(CellularImsRuntime::new()),
+            CellularImsLiveHandle::new(),
+            VoicePathPolicy::default(),
+            DeviceKind::Unknown,
+        ));
+        self.lines.write().await.insert(line_id, Arc::clone(&line));
+        line
+    }
+
     /// Refresh presence and descriptors without discarding per-line runtime
     /// state. Missing lines remain addressable as offline entries so callers
     /// can tear them down and the same SIM can safely reappear after hotplug.

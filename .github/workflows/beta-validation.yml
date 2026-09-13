@@ -58,6 +58,10 @@ jobs:
             hardware::cellular::bindings::tests \
             hardware::cellular::observations::tests \
             hardware::cellular::mm_observations::tests \
+            hardware::cellular::radio::tests \
+            hardware::cellular::mm_radio::tests \
+            services::orchestrator::radio_intent::tests \
+            services::automation::tasks::consume_data::tests \
             services::line_registry::tests \
             hardware::devices::qcm410::ims_bearer::tests \
             hardware::devices::qcm410::primary_ims_session::tests \
@@ -110,7 +114,7 @@ jobs:
           if ! dbus-run-session -- sh -c '
             set -eu
             export DBUS_SYSTEM_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"
-            for filter in cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings; do
+            for filter in cellular_ims_route_aliases_keep_auth_and_response_contract ims_registration_preference_api_preserves_cost_and_enable_settings http_router_tests::radio_intent_; do
               cargo test --locked "$filter" -- --list > beta-api-test-list.txt
               grep -q ": test$" beta-api-test-list.txt
               cargo test --locked "$filter" -- --test-threads=1

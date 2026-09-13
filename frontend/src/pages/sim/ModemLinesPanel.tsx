@@ -871,9 +871,11 @@ export default function ModemLinesPanel({ basicInfoForLine, workbench = false, w
                       </Box>
                       <Stack minWidth={0} justifyContent="center" spacing={0.25} sx={{ gridColumn: { xs: '1 / -1', sm: 'auto' }, gridRow: { xs: 2, sm: 'auto' }, minHeight: 40 }}>
                         <Typography variant="caption" color="text.secondary" display="block">
-                          {networkLoadLabel || (!line.modem.present ? '配置可修改，设备恢复后自动应用' : network?.airplane_stage || (airplaneEnabled ? '移动射频已关闭' : '移动射频正常'))}
+                          {networkLoadLabel || (!line.modem.present ? '配置可修改，设备恢复后自动应用；当前射频状态未知' : network?.airplane_stage || '射频状态尚未确认')}
                         </Typography>
-                        <Typography variant="caption" color="text.disabled" sx={{ visibility: 'hidden' }}>&nbsp;</Typography>
+                        <Typography variant="caption" color="text.disabled" title={network?.airplane_error ?? undefined}>
+                          开关表示保存的意图，不代表射频已完成切换
+                        </Typography>
                       </Stack>
                       <Box display="flex" alignItems="center" justifyContent="flex-end" gap={0.5} sx={{ gridColumn: { xs: 2, sm: 3 }, gridRow: 1 }}>
                         {airplaneBusy && <CircularProgress size={16} />}

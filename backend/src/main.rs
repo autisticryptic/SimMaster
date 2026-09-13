@@ -577,14 +577,6 @@ async fn main() -> Result<()> {
         Arc::new(services::e911::ts43::Ts43Transport::new()),
     ));
 
-    // 确保 ModemManager 已提权以支持 AT 指令读取短信中心
-    ensure_modemmanager_debug_override();
-
-    // Connect to system D-Bus
-    let dbus_conn = Arc::new(Connection::system().await?);
-    let device_kind = hardware::devices::detect_device_kind();
-    info!(?device_kind, "Detected hardware device kind");
-
     // 创建应用数据库（存储在可执行文件同级目录）
     //
     // This has to come before both the override store and the configuration
@@ -609,6 +601,17 @@ async fn main() -> Result<()> {
     let config_manager = Arc::new(
         ConfigManager::try_new(config_path, Arc::clone(&app_db)).map_err(anyhow::Error::msg)?,
     );
+    // Validate configuration before altering/restarting a system modem service.
+    // This remains MM-specific startup work, not a native backend or a promise
+    // that the firmware/NM could not have enabled RF before SimAdmin started.
+    ensure_modemmanager_debug_override();
+    let dbus_conn = Arc::new(Connection::system().await?);
+    let modem_radio = Arc::new(hardware::cellular::mm_radio::ModemManagerRadio::new(
+        Arc::clone(&dbus_conn),
+    ));
+    let device_kind = hardware::devices::detect_device_kind();
+    info!(?device_kind, "Detected hardware device kind");
+
     let cell_monitoring_active =
         Arc::new(tokio::sync::Mutex::new(std::collections::HashSet::new()));
     let line_registry = Arc::new(
@@ -803,6 +806,7 @@ async fn main() -> Result<()> {
     // 创建统一的应用状态
     let app_state = AppState::new(AppStateDependencies {
         shutdown: shutdown_signal,
+        modem_radio,
         dbus_conn,
         database: app_db,
         config_manager,
@@ -2078,7 +2082,84 @@ fn build_router(app_state: AppState, cors: CorsLayer) -> Router {
 #[cfg(test)]
 mod http_router_tests {
     use super::*;
+    use hardware::cellular::{
+        bindings::ModemBinding,
+        radio::{ModemRadioControl, RadioError, RadioState},
+    };
+    use hardware::devices::transport::TransportFuture;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Radio-only fixture. No modem, worker process, netns, call or packet is
+    /// created by a command; failures/ordering can be exercised deterministically.
+    struct TestRadio {
+        observation: std::sync::Mutex<Result<RadioState, RadioError>>,
+        commands: std::sync::Mutex<Vec<bool>>,
+        block_next: AtomicBool,
+        fail_apply: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl TestRadio {
+        fn new(observation: Result<RadioState, RadioError>) -> Self {
+            Self {
+                observation: std::sync::Mutex::new(observation),
+                commands: std::sync::Mutex::new(Vec::new()),
+                block_next: AtomicBool::new(false),
+                fail_apply: AtomicBool::new(false),
+                entered: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn commands(&self) -> Vec<bool> {
+            self.commands.lock().unwrap().clone()
+        }
+    }
+
+    impl ModemRadioControl for TestRadio {
+        fn observe<'a>(
+            &'a self,
+            _binding: &'a ModemBinding,
+        ) -> TransportFuture<'a, Result<RadioState, RadioError>> {
+            Box::pin(async move { self.observation.lock().unwrap().clone() })
+        }
+
+        fn set_airplane_mode<'a>(
+            &'a self,
+            _binding: &'a ModemBinding,
+            enabled: bool,
+        ) -> TransportFuture<'a, Result<(), RadioError>> {
+            Box::pin(async move {
+                self.commands.lock().unwrap().push(enabled);
+                if self.block_next.swap(false, Ordering::SeqCst) {
+                    self.entered.notify_one();
+                    self.release.notified().await;
+                }
+                if self.fail_apply.load(Ordering::SeqCst) {
+                    return Err(RadioError::Failed("test_radio_apply_failed".into()));
+                }
+                *self.observation.lock().unwrap() = Ok(if enabled {
+                    RadioState::Off
+                } else {
+                    RadioState::On
+                });
+                Ok(())
+            })
+        }
+    }
+
+    fn radio_test_binding(tag: u64, present: bool) -> ModemBinding {
+        ModemBinding {
+            line_id: format!("line-{tag:032x}"),
+            hardware_key: format!("test-radio-control-{tag}"),
+            line_kind: "baseband".into(),
+            present,
+            uim_slot: 1,
+            // Deliberately no MM or QMI selector; never touch a real modem.
+            ..Default::default()
+        }
+    }
 
     /// Distinct temp paths per test; several of these run in one process.
     fn temp_path(tag: &str, extension: &str) -> PathBuf {
@@ -2112,6 +2193,7 @@ mod http_router_tests {
     /// handler accepts a line that exists in config even when no modem is bound.
     struct TempState {
         router: Router,
+        app: AppState,
         config_manager: Arc<ConfigManager>,
         paths: Vec<PathBuf>,
     }
@@ -2126,9 +2208,16 @@ mod http_router_tests {
 
     /// Build the real router over throwaway storage, or `None` with no bus.
     ///
-    /// Every dependency is constructed exactly as `main` does. Nothing is
-    /// stubbed, so what the test exercises is the shipped wiring.
+    /// The default fixture uses the same MM adapters as main, on a private bus.
     async fn build_test_router() -> Option<TempState> {
+        build_test_router_with_radio(None).await
+    }
+
+    /// Explicit radio injection is only for control tests; the router, config,
+    /// authentication and remaining dependencies remain real.
+    async fn build_test_router_with_radio(
+        radio: Option<Arc<dyn hardware::cellular::radio::ModemRadioControl>>,
+    ) -> Option<TempState> {
         let dbus_conn = match zbus::Connection::system().await {
             Ok(connection) => Arc::new(connection),
             Err(error) => {
@@ -2196,9 +2285,15 @@ mod http_router_tests {
             Arc::new(services::e911::ts43::Ts43Transport::new()),
         ));
         let (_shutdown_controller, shutdown_signal) = platform::shutdown::channel();
+        let modem_radio = radio.unwrap_or_else(|| {
+            Arc::new(hardware::cellular::mm_radio::ModemManagerRadio::new(
+                Arc::clone(&dbus_conn),
+            ))
+        });
 
         let app_state = AppState::new(AppStateDependencies {
             shutdown: shutdown_signal,
+            modem_radio,
             dbus_conn,
             database: app_db,
             config_manager,
@@ -2222,7 +2317,8 @@ mod http_router_tests {
             .allow_headers(Any);
 
         Some(TempState {
-            router: build_router(app_state, cors),
+            router: build_router(app_state.clone(), cors),
+            app: app_state,
             config_manager: config_manager_for_test,
             paths,
         })
@@ -2591,6 +2687,285 @@ mod http_router_tests {
         assert_eq!(
             get_with_cookie(&served, &unknown, &cookie).await.0,
             StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_intent_api_preserves_unknown_and_saved_offline_state() {
+        let radio = Arc::new(TestRadio::new(Err(RadioError::Unavailable(
+            "test_radio_query_unavailable".into(),
+        ))));
+        let state = build_test_router_with_radio(Some(radio.clone()))
+            .await
+            .expect("run on a private D-Bus; no modem is required");
+        let binding = radio_test_binding(0xa11501, false);
+        let line_id = binding.line_id.clone();
+        state
+            .app
+            .line_registry
+            .insert_control_test_line(binding)
+            .await;
+        state
+            .config_manager
+            .set_line_data_connection_enabled(&line_id, true)
+            .unwrap();
+        state
+            .config_manager
+            .set_line_cellular_ims_connection_enabled(&line_id, true)
+            .unwrap();
+        state
+            .config_manager
+            .set_line_vowifi_connection_enabled(&line_id, true)
+            .unwrap();
+        let before = state.config_manager.get_line_profile(&line_id);
+        let served = serve(state.router.clone()).await;
+        let path = format!("/api/modem/lines/{line_id}/airplane-mode");
+        let read_path = format!("/api/modem/lines/{line_id}/data");
+
+        let (status, _, _) =
+            post_json(&served, &path, serde_json::json!({"enabled":true}), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let cookie = authenticate(&served).await;
+        let (status, body) = get_with_cookie(&served, &read_path, &cookie).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["data"]["airplane_mode_requested"], false);
+        assert_eq!(response["data"]["airplane_phase"], "unknown");
+        assert!(response["data"]["airplane_mode_observed"].is_null());
+        assert_eq!(response["data"]["radio_state"], "unknown");
+        assert_eq!(
+            response["data"]["airplane_error"],
+            "test_radio_query_unavailable"
+        );
+        assert_ne!(response["data"]["airplane_stage"], "移动射频正常");
+
+        let (status, _, body) = post_json(
+            &served,
+            &path,
+            serde_json::json!({"enabled":true}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["data"]["present"], false);
+        assert_eq!(response["data"]["airplane_mode_requested"], true);
+        assert!(response["data"]["airplane_mode_observed"].is_null());
+        assert!(
+            radio.commands().is_empty(),
+            "offline writes must not reach hardware"
+        );
+        let after = state.config_manager.get_line_profile(&line_id);
+        assert!(after.airplane_mode_enabled);
+        assert!(!after.data_connection_enabled);
+        assert!(!after.cellular_ims_connection_enabled);
+        assert_eq!(
+            serde_json::to_value(after.vowifi).unwrap(),
+            serde_json::to_value(before.vowifi).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(after.trunk).unwrap(),
+            serde_json::to_value(before.trunk).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(after.sms_path).unwrap(),
+            serde_json::to_value(before.sms_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(after.voice_path).unwrap(),
+            serde_json::to_value(before.voice_path).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(after.ims_access_preference).unwrap(),
+            serde_json::to_value(before.ims_access_preference).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_intent_serializes_both_toggle_directions_before_persisting() {
+        use api::handlers::{apply_line_airplane_intent, AirplaneIntentApply};
+        let radio = Arc::new(TestRadio::new(Ok(RadioState::Off)));
+        radio.block_next.store(true, Ordering::SeqCst);
+        let state = build_test_router_with_radio(Some(radio.clone()))
+            .await
+            .unwrap();
+        let line = state
+            .app
+            .line_registry
+            .insert_control_test_line(radio_test_binding(0xa11502, true))
+            .await;
+        let app = state.app.clone();
+        let first_line = line.clone();
+        let first =
+            tokio::spawn(async move { apply_line_airplane_intent(&app, &first_line, false).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), radio.entered.notified())
+            .await
+            .unwrap();
+        let second = apply_line_airplane_intent(&state.app, &line, true);
+        tokio::pin!(second);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), second.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            !state
+                .config_manager
+                .get_line_profile(&line.binding().line_id)
+                .airplane_mode_enabled
+        );
+        assert_eq!(
+            radio.commands(),
+            vec![false],
+            "second request must still be gated"
+        );
+        radio.release.notify_one();
+        assert_eq!(first.await.unwrap(), Ok(AirplaneIntentApply::Applied));
+        assert_eq!(second.await, Ok(AirplaneIntentApply::Applied));
+        assert_eq!(radio.commands(), vec![false, true]);
+        assert!(
+            state
+                .config_manager
+                .get_line_profile(&line.binding().line_id)
+                .airplane_mode_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_intent_restore_rereads_saved_profile_after_waiting() {
+        let radio = Arc::new(TestRadio::new(Ok(RadioState::On)));
+        let state = build_test_router_with_radio(Some(radio.clone()))
+            .await
+            .unwrap();
+        let line = state
+            .app
+            .line_registry
+            .insert_control_test_line(radio_test_binding(0xa11503, true))
+            .await;
+        let line_id = line.binding().line_id;
+        state
+            .config_manager
+            .set_line_data_connection_enabled(&line_id, true)
+            .unwrap();
+        let guard = line.bearer_operation_lock.lock().await;
+        let restore = api::handlers::restore_line_runtime_intents(&state.app, &line);
+        tokio::pin!(restore);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), restore.as_mut())
+                .await
+                .is_err()
+        );
+        // Models a newer intent being saved by the current holder of the gate.
+        state
+            .config_manager
+            .set_line_airplane_mode(&line_id, true)
+            .unwrap();
+        drop(guard);
+        restore.await;
+        assert_eq!(
+            radio.commands(),
+            vec![true],
+            "must not execute stale data=true"
+        );
+        state
+            .config_manager
+            .set_line_airplane_mode(&line_id, false)
+            .unwrap();
+        api::handlers::restore_line_runtime_intents(&state.app, &line).await;
+        assert_eq!(
+            radio.commands(),
+            vec![true],
+            "idle restore is not an RF-enable command"
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_intent_apply_failure_blocks_saved_and_temporary_data() {
+        use api::handlers::{
+            apply_line_airplane_intent, start_line_data_runtime, start_temporary_line_data_runtime,
+        };
+        let radio = Arc::new(TestRadio::new(Ok(RadioState::On)));
+        radio.fail_apply.store(true, Ordering::SeqCst);
+        let state = build_test_router_with_radio(Some(radio.clone()))
+            .await
+            .unwrap();
+        let line = state
+            .app
+            .line_registry
+            .insert_control_test_line(radio_test_binding(0xa11504, true))
+            .await;
+        let line_id = line.binding().line_id;
+        state
+            .config_manager
+            .set_line_data_connection_enabled(&line_id, true)
+            .unwrap();
+        state
+            .config_manager
+            .set_line_cellular_ims_connection_enabled(&line_id, true)
+            .unwrap();
+        assert_eq!(
+            apply_line_airplane_intent(&state.app, &line, true).await,
+            Err("test_radio_apply_failed".into())
+        );
+        let profile = state.config_manager.get_line_profile(&line_id);
+        assert!(profile.airplane_mode_enabled);
+        assert!(!profile.data_connection_enabled);
+        assert!(!profile.cellular_ims_connection_enabled);
+        assert_eq!(
+            start_line_data_runtime(&state.app, &line).await,
+            Err("line_airplane_mode_enabled".into())
+        );
+        assert_eq!(
+            start_temporary_line_data_runtime(&state.app, &line, &profile.data_proxy).await,
+            Err("line_airplane_mode_enabled".into())
+        );
+        let view = services::orchestrator::radio_intent::airplane_intent_view(
+            true,
+            radio.observe(&line.binding()).await,
+        );
+        assert_eq!(view.observed, Some(false));
+        assert_eq!(
+            view.phase, "enabling",
+            "failed command must not confirm RF off"
+        );
+        radio.fail_apply.store(false, Ordering::SeqCst);
+        apply_line_airplane_intent(&state.app, &line, false)
+            .await
+            .unwrap();
+        let profile = state.config_manager.get_line_profile(&line_id);
+        assert!(
+            !profile.data_connection_enabled,
+            "leaving flight mode does not re-enable data"
+        );
+        assert!(
+            !profile.cellular_ims_connection_enabled,
+            "leaving flight mode does not re-enable IMS"
+        );
+    }
+
+    #[tokio::test]
+    async fn radio_intent_reader_rejects_control_without_changing_saved_intent() {
+        let radio = Arc::new(TestRadio::new(Ok(RadioState::On)));
+        let state = build_test_router_with_radio(Some(radio.clone()))
+            .await
+            .unwrap();
+        let mut binding = radio_test_binding(0xa11505, true);
+        binding.line_kind = "reader".into();
+        let line = state
+            .app
+            .line_registry
+            .insert_control_test_line(binding)
+            .await;
+        assert_eq!(
+            api::handlers::apply_line_airplane_intent(&state.app, &line, true).await,
+            Err("line_has_no_baseband".into())
+        );
+        assert!(radio.commands().is_empty());
+        assert!(
+            !state
+                .config_manager
+                .get_line_profile(&line.binding().line_id)
+                .airplane_mode_enabled
         );
     }
 

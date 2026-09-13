@@ -33,6 +33,7 @@
 
 pub mod dedup;
 pub mod ims_access;
+pub mod radio_intent;
 pub mod sms_router;
 pub mod voice_router;
 

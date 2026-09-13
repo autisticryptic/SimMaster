@@ -17,11 +17,10 @@ use zbus::{
 
 use crate::{
     api::models::{
-        AirplaneModeResponse, BandLockRequest, BandLockStatus, BasebandRestartResponse,
-        BasebandRestartStep, CallInfo, CallListResponse, CallSettingsResponse, CellInfo,
-        CellLocationInfo, CellLocationResponse, CellsResponse, DeviceInfoResponse,
-        NetworkInfoResponse, OperatorInfo, OperatorListResponse, RadioMode, RadioModeResponse,
-        ServingCell, SignalStrengthResponse, SimInfoResponse,
+        BandLockRequest, BandLockStatus, BasebandRestartResponse, BasebandRestartStep, CallInfo,
+        CallListResponse, CallSettingsResponse, CellInfo, CellLocationInfo, CellLocationResponse,
+        CellsResponse, DeviceInfoResponse, NetworkInfoResponse, OperatorInfo, OperatorListResponse,
+        RadioMode, RadioModeResponse, ServingCell, SignalStrengthResponse, SimInfoResponse,
     },
     hardware::cellular::serial::with_serial_for,
 };
@@ -4771,7 +4770,7 @@ async fn recover_after_registration_failure(
     }
 }
 
-pub async fn set_airplane_mode_for_modem(
+pub(super) async fn set_airplane_mode_for_modem(
     conn: &Connection,
     modem_path: &str,
     enabled: bool,
@@ -4782,19 +4781,6 @@ pub async fn set_airplane_mode_for_modem(
             .map(|_| ())
     })
     .await
-}
-
-pub async fn get_airplane_mode_for_modem(
-    conn: &Connection,
-    modem_path: &str,
-) -> zbus::Result<AirplaneModeResponse> {
-    let modem_props = get_all_properties(conn, modem_path, MM_MODEM).await?;
-    let state = modem_props.get("State").map(extract_i32).unwrap_or(0);
-    Ok(AirplaneModeResponse {
-        enabled: matches!(state, 3 | 4),
-        powered: state >= 3,
-        online: state >= 6,
-    })
 }
 
 pub async fn get_signal_strength_for_modem(

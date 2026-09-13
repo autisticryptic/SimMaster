@@ -1031,6 +1031,10 @@ export interface LineNetworkControlsResponse {
   roaming: RoamingResponse
   airplane_mode: AirplaneModeResponse
   airplane_mode_requested: boolean
+  /** null means unknown/transitional, not "flight mode disabled". */
+  airplane_mode_observed?: boolean | null
+  radio_state?: 'on' | 'off' | 'turning_on' | 'turning_off' | 'unknown'
+  airplane_error?: string | null
   airplane_phase: string
   airplane_stage: string
 }

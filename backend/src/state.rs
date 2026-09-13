@@ -12,6 +12,7 @@ use zbus::Connection;
 use crate::connectivity::modems::ims::profile_override::SimOverrideStore;
 use crate::connectivity::modems::ims::vowifi::carrier_catalog::CarrierCatalog;
 use crate::hardware::cellular::cell_lock_store::CellLockStore;
+use crate::hardware::cellular::radio::ModemRadioControl;
 use crate::hardware::sim::esim::EsimSupervisor;
 use crate::platform::config::ConfigManager;
 use crate::platform::db::Database;
@@ -45,8 +46,10 @@ pub struct ActiveCallRecord {
 /// 统一管理所有共享资源，避免在路由中多次调用 `.with_state()`
 #[derive(Clone)]
 pub struct AppState {
-    /// D-Bus 连接（用于与 ofono 通信）
+    /// Shared D-Bus connection for capabilities not yet migrated from MM.
     pub dbus_conn: Arc<Connection>,
+    /// Explicit radio observation/control; construction does not enable RF.
+    pub modem_radio: Arc<dyn ModemRadioControl>,
     /// 数据库连接（用于存储 SMS 和通话记录）
     pub database: Arc<Database>,
     /// 配置管理器（用于管理通知等配置）
@@ -89,6 +92,7 @@ pub struct AppState {
 /// Named startup dependencies prevent positional mix-ups as application state grows.
 pub struct AppStateDependencies {
     pub dbus_conn: Arc<Connection>,
+    pub modem_radio: Arc<dyn ModemRadioControl>,
     pub database: Arc<Database>,
     pub config_manager: Arc<ConfigManager>,
     pub notification_sender: Arc<NotificationSender>,
@@ -111,6 +115,7 @@ impl AppState {
     pub fn new(dependencies: AppStateDependencies) -> Self {
         let AppStateDependencies {
             dbus_conn,
+            modem_radio,
             database,
             config_manager,
             notification_sender,
@@ -129,6 +134,7 @@ impl AppState {
         } = dependencies;
         Self {
             dbus_conn,
+            modem_radio,
             database,
             config_manager,
             notification_sender,

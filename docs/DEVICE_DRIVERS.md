@@ -76,3 +76,44 @@ D-Bus connection，也不直接解析 MM 的错误字符串。
 - 当前唯一生产实现仍是 MM；fake provider 只用于无硬件测试。这不是完整 MM 后端剥离，
   也不是原生 QMI/MBIM/AT 已实现。设备控制、AT/UIM、短信/呼叫、bearer 及启动副作用
   还需逐步迁移；飞行模式和冷启动离线保证需要独立策略及实机验证。
+
+## 1.1.5 第二阶段：射频观察与意图门
+
+`hardware/cellular/radio.rs` 的 `ModemRadioControl` 提供 `observe(binding)` 和显式
+`set_airplane_mode(binding, enabled)`。`AppState.modem_radio` 目前注入
+`mm_radio.rs`，复用同一个 D-Bus connection；不在构造/观察中 Enable 或 Connect。
+MM State=3 为关闭，4/5 为关闭中/开启中，6–11 为开启；失败/未知/初始化/锁卡和
+未识别值均为 unknown，不能伪装成“飞行已关闭”。这仍是 MM 的 Enable/State 观测，
+不是硬件射频测量，也不是从上电开始的零射频证明。
+
+线路 network-controls/data API 保持已有 URL/字段，并增加：
+
+| 字段 | 语义 |
+| --- | --- |
+| `airplane_mode_requested` | 保存的用户意图，页面开关使用它 |
+| `airplane_mode_observed` | 稳定观测：true=射频关闭，false=射频开启；过渡、未知和观测失败为 null |
+| `radio_state` | `on/off/turning_on/turning_off/unknown`，不表示驻网、data 或 IMS 已成功 |
+| `airplane_error` | 可空的观测失败原因；控制失败由 POST 错误响应返回 |
+| `airplane_phase/stage` | 保留既有阶段并增加 unknown/offline/unsupported；期望与实际不符时明确说明“期望…当前…” |
+
+旧 `airplane_mode.enabled/powered/online` 为兼容投影，不能用于证明当前 RF 状态，
+尤其 `enabled` 仍可能包含保存的意图。新客户端应读取 requested、observed 与 stage，
+不能将 null 转成 false。系统通知也使用同一状态解释。
+
+`services/orchestrator/radio_intent.rs` 只做纯决策；实际 IO 仍由调用方执行：
+
+- 已迁移的启动/热插拔恢复、飞行切换、数据配置/恢复和 watchdog，在同一线路
+  `bearer_operation_lock` 内读取配置并执行；IMS 接入也在拿门后再次检查意图和 generation。
+  锁顺序为 bearer → cellular IMS；触发 VoWiFi 恢复必须在释放此门之后。
+- RF-off 意图优先于线路 disabled。启用飞行模式保留 VoWiFi/Trunk，清 data/IMS 意图；
+  控制失败不回滚成“允许连接”。离线只保存；退出飞行模式不自动恢复 data/IMS。
+- 自动化临时流量与保存的数据开关分开准入，不能因加强恢复门而取消合法临时任务，
+  也不能用“临时”绕过当前飞行/线路/漫游限制；清理时重读当前意图。
+- VoWiFi 准备和停止都不隐式开启 RF；依赖 RF-on 才能读取 SIM 的硬件必须明确报错，
+  由用户显式操作或后续 driver 适配，不做某张 SIM 的特殊例外。
+
+这不是完整 device owner：一个物理 modem 的多槽共享 RF、命令取消和其他 MM
+内部/eSIM/系统重启调用仍待协调。当前也没有新增持续 RF 重试器；失败不等于稍后
+必然自动成功。MM/NM 启动工作尚未按后端条件化，8秒启动恢复延时未改，
+`airplane=false/data=false` 的恢复计划不会主动 Enable，但不能阻止固件或外部服务驻网。
+实现/CI/实机状态分别记录在版本规划中；本阶段没有部署到 IMS 验证设备。

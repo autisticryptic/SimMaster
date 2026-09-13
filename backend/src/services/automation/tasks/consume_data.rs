@@ -1,4 +1,6 @@
-use crate::api::handlers::{start_line_data_runtime, stop_line_data_runtime};
+use crate::api::handlers::{
+    finish_temporary_line_data_runtime, start_line_data_runtime, start_temporary_line_data_runtime,
+};
 use crate::hardware::cellular::data_proxy::DataProxyStatus;
 use crate::platform::config::{LineDataProxyConfig, LineProfileConfig};
 use crate::services::automation::target::resolve_modem_target;
@@ -243,8 +245,12 @@ impl AutomationTaskHandler for ConsumeDataHandler {
             let task_result = match tokio::time::timeout(
                 std::time::Duration::from_secs(timeout_secs),
                 async {
-                    start_line_data_runtime(app, &line, &runtime_profile)
-                        .await
+                    let start = if temporary_runtime {
+                        start_temporary_line_data_runtime(app, &line, &runtime_profile.data_proxy).await
+                    } else {
+                        start_line_data_runtime(app, &line).await
+                    };
+                    start
                         .map_err(anyhow::Error::msg)
                         .context("目标线路的数据承载或代理启动失败")?;
                     if unit == "bytes" {
@@ -307,18 +313,10 @@ impl AutomationTaskHandler for ConsumeDataHandler {
             };
 
             let cleanup_result = if temporary_runtime {
-                let current_profile = app.config_manager.get_line_profile(&target.line_id);
-                if current_profile.data_connection_enabled
-                    && !current_profile.airplane_mode_enabled
-                {
-                    start_line_data_runtime(app, &line, &current_profile)
-                        .await
-                        .map_err(anyhow::Error::msg)
-                        .context("流量任务结束后恢复已启用的数据代理失败")
-                } else {
-                    stop_line_data_runtime(app, &line).await;
-                    Ok(())
-                }
+                finish_temporary_line_data_runtime(app, &line)
+                    .await
+                    .map_err(anyhow::Error::msg)
+                    .context("流量任务结束后恢复当前数据连接意图失败")
             } else {
                 Ok(())
             };

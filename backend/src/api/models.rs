@@ -291,8 +291,13 @@ pub struct LineNetworkControlsResponse {
     pub present: bool,
     pub data: LineDataConnectionResponse,
     pub roaming: RoamingResponse,
+    /// Legacy compatibility projection; use requested/observed for RF proof.
     pub airplane_mode: AirplaneModeResponse,
     pub airplane_mode_requested: bool,
+    /// Stable observation only; null for transitions, failures and absence.
+    pub airplane_mode_observed: Option<bool>,
+    pub radio_state: crate::hardware::cellular::radio::RadioState,
+    pub airplane_error: Option<String>,
     pub airplane_phase: String,
     pub airplane_stage: String,
 }

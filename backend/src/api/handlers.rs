@@ -68,6 +68,10 @@ use crate::{
         read_cpu_load_sync, read_disk_info, read_interface_stats, read_memory_info,
         read_network_interfaces, read_system_info, read_uptime, sample_cpu_usage,
     },
+    services::orchestrator::radio_intent::{
+        airplane_intent_view, data_start_admission, native_call_radio_admission,
+        runtime_restore_plan, DataStartPurpose, RuntimeRestorePlan,
+    },
     services::system::diagnostic_log,
     services::system::system_event::{
         codes as system_event_codes, mask_identifier, severity as system_event_severity,
@@ -2951,6 +2955,7 @@ async fn restart_selected_baseband(
             )),
         );
     };
+    let _bearer_guard = line.bearer_operation_lock.lock().await;
     let binding = line.binding();
     if !binding_has_baseband(&binding) {
         return (
@@ -2998,19 +3003,18 @@ async fn restart_selected_baseband(
         Err("离线线路没有保留的 QMI 控制口，无法安全定位要恢复的基带".to_string())
     };
     let result = match result {
-        Ok(mut data) if profile.airplane_mode_enabled => {
+        Ok(mut data)
+            if app
+                .config_manager
+                .get_line_profile(line_id)
+                .airplane_mode_enabled =>
+        {
             let _ = app.line_registry.refresh().await;
             let recovered = line.binding();
             if !recovered.present || recovered.modem_path.trim().is_empty() {
                 Err("基带已执行恢复，但重新枚举后仍无法应用飞行模式配置".to_string())
             } else {
-                match modem_manager::set_airplane_mode_for_modem(
-                    app.dbus_conn.as_ref(),
-                    &recovered.modem_path,
-                    true,
-                )
-                .await
-                {
+                match apply_line_airplane_mode_locked(app, &line, true).await {
                     Ok(_) => {
                         let step = BasebandRestartStep {
                             step: "应用已保存的飞行模式".to_string(),
@@ -3079,36 +3083,11 @@ async fn build_line_network_controls(
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&binding.line_id);
     let connected = binding.present && line.cellular_data.interface().await.is_some();
-    let observed_airplane = if binding.present {
-        modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
-            .await
-            .unwrap_or(AirplaneModeResponse {
-                enabled: false,
-                powered: false,
-                online: false,
-            })
-    } else {
-        AirplaneModeResponse {
-            enabled: false,
-            powered: false,
-            online: false,
-        }
-    };
     let airplane_mode_requested = profile.airplane_mode_enabled;
-    let airplane_phase = match (airplane_mode_requested, observed_airplane.enabled) {
-        (true, true) => "enabled",
-        (true, false) => "enabling",
-        (false, true) => "disabling",
-        (false, false) => "disabled",
-    };
-    let airplane_stage = match airplane_phase {
-        "enabled" => "移动射频已关闭",
-        "enabling" => "正在关闭移动射频",
-        "disabling" => "正在恢复移动射频",
-        _ => "移动射频正常",
-    };
-    let mut airplane_mode = observed_airplane;
-    airplane_mode.enabled |= airplane_mode_requested;
+    let airplane = airplane_intent_view(
+        airplane_mode_requested,
+        app.modem_radio.observe(&binding).await,
+    );
     let is_roaming = if binding.present {
         get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
             .await
@@ -3146,10 +3125,17 @@ async fn build_line_network_controls(
             roaming_allowed: profile.roaming_allowed,
             is_roaming,
         },
-        airplane_mode,
+        airplane_mode: AirplaneModeResponse {
+            enabled: airplane.legacy_enabled,
+            powered: airplane.legacy_powered,
+            online: airplane.legacy_online,
+        },
         airplane_mode_requested,
-        airplane_phase: airplane_phase.to_string(),
-        airplane_stage: airplane_stage.to_string(),
+        airplane_mode_observed: airplane.observed,
+        radio_state: airplane.radio_state,
+        airplane_error: airplane.error,
+        airplane_phase: airplane.phase.to_string(),
+        airplane_stage: airplane.stage.to_string(),
     }
 }
 
@@ -3206,18 +3192,67 @@ pub async fn reset_line_data_traffic_handler(
 pub(crate) async fn start_line_data_runtime(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
-    profile: &LineProfileConfig,
 ) -> Result<(), String> {
     let _guard = line.bearer_operation_lock.lock().await;
-    start_line_data_runtime_locked(app, line, profile).await
+    start_line_data_runtime_locked(app, line, None).await
+}
+
+/// Only an explicit automation run may temporarily open a loopback proxy while
+/// the saved data switch is off. It still obeys the latest line/RF/roaming gates.
+pub(crate) async fn start_temporary_line_data_runtime(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    proxy: &LineDataProxyConfig,
+) -> Result<(), String> {
+    let _guard = line.bearer_operation_lock.lock().await;
+    start_line_data_runtime_locked(app, line, Some(proxy)).await
+}
+
+/// Temporary-task cleanup samples the current intent under the same lock as
+/// toggles, so an old task cannot resurrect data after a newer airplane request.
+pub(crate) async fn finish_temporary_line_data_runtime(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+) -> Result<(), String> {
+    let _guard = line.bearer_operation_lock.lock().await;
+    let binding = line.binding();
+    let current = app.config_manager.get_line_profile(&binding.line_id);
+    if data_start_admission(
+        binding.present,
+        binding_has_baseband(&binding),
+        &current,
+        DataStartPurpose::SavedIntent,
+    )
+    .is_ok()
+    {
+        start_line_data_runtime_locked(app, line, None).await
+    } else {
+        stop_line_data_runtime_locked(app, line).await;
+        Ok(())
+    }
 }
 
 async fn start_line_data_runtime_locked(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
-    profile: &LineProfileConfig,
+    temporary_proxy: Option<&LineDataProxyConfig>,
 ) -> Result<(), String> {
     let binding = line.binding();
+    // Never admit from a profile snapshot taken before acquiring the operation
+    // lock. Boot/hotplug/watchdog/VoWiFi restores are saved-intent consumers.
+    let profile = app.config_manager.get_line_profile(&binding.line_id);
+    data_start_admission(
+        binding.present,
+        binding_has_baseband(&binding),
+        &profile,
+        if temporary_proxy.is_some() {
+            DataStartPurpose::TemporaryAutomation
+        } else {
+            DataStartPurpose::SavedIntent
+        },
+    )
+    .map_err(str::to_string)?;
+    let proxy = temporary_proxy.unwrap_or(&profile.data_proxy);
     if get_is_roaming_for_modem(app.dbus_conn.as_ref(), &binding.modem_path)
         .await
         .unwrap_or(false)
@@ -3230,7 +3265,7 @@ async fn start_line_data_runtime_locked(
     // Reuse it when it is already alive and visible inside this line's worker.
     if let Some(interface) = line.cellular_data.interface().await {
         line.data_proxy
-            .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
+            .start_for_line(&binding.line_id, &interface, proxy)
             .await?;
         return Ok(());
     }
@@ -3251,7 +3286,7 @@ async fn start_line_data_runtime_locked(
         {
             Ok(interface) => {
                 line.data_proxy
-                    .start_for_line(&binding.line_id, &interface, &profile.data_proxy)
+                    .start_for_line(&binding.line_id, &interface, proxy)
                     .await?;
                 return Ok(());
             }
@@ -3301,34 +3336,50 @@ pub(crate) async fn restore_line_runtime_intents(
     app: &AppState,
     line: &Arc<crate::services::line_registry::LineRuntime>,
 ) {
+    let _guard = line.bearer_operation_lock.lock().await;
     let binding = line.binding();
-    if !binding.present {
-        return;
-    }
     let profile = app.config_manager.get_line_profile(&binding.line_id);
-    if !profile.enabled {
-        stop_line_data_runtime(app, line).await;
-        return;
+    match runtime_restore_plan(binding.present, binding_has_baseband(&binding), &profile) {
+        RuntimeRestorePlan::ApplyAirplane => {
+            if let Err(error) = apply_line_airplane_mode_locked(app, line, true).await {
+                warn!(line_id = %binding.line_id, error = %error, "Failed to restore line airplane mode");
+            }
+        }
+        RuntimeRestorePlan::StopData => stop_line_data_runtime_locked(app, line).await,
+        RuntimeRestorePlan::StartData => {
+            if let Err(error) = start_line_data_runtime_locked(app, line, None).await {
+                line.data_proxy.record_error(error.clone()).await;
+                warn!(line_id = %binding.line_id, error = %error, "Failed to restore per-line data runtime");
+            }
+        }
+        RuntimeRestorePlan::Offline
+        | RuntimeRestorePlan::NoCellularRadio
+        | RuntimeRestorePlan::LeaveUnchanged => {}
     }
-    if profile.airplane_mode_enabled {
-        stop_line_data_runtime(app, line).await;
-        if let Err(error) = modem_manager::set_airplane_mode_for_modem(
-            app.dbus_conn.as_ref(),
-            &binding.modem_path,
-            true,
+}
+
+/// Caller holds bearer_operation_lock through both teardown and RF control.
+/// Lock order remains bearer -> cellular IMS; do not take a VoWiFi admission
+/// lock here. Airplane mode removes only 3GPP, not the WLAN registration/trunk.
+async fn apply_line_airplane_mode_locked(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        stop_line_data_runtime_locked(app, line).await;
+        let _ims_guard = line.cellular_ims_connect_lock.lock().await;
+        crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
+            &line.cellular_ims_live,
+            &line.cellular_ims,
+            "line_airplane_mode_enabled",
         )
+        .await;
+    }
+    app.modem_radio
+        .set_airplane_mode(&line.binding(), enabled)
         .await
-        {
-            warn!(line_id = %binding.line_id, error = %error, "Failed to restore line airplane mode");
-        }
-        return;
-    }
-    if profile.data_connection_enabled {
-        if let Err(error) = start_line_data_runtime(app, line, &profile).await {
-            line.data_proxy.record_error(error.clone()).await;
-            warn!(line_id = %binding.line_id, error = %error, "Failed to restore per-line data runtime");
-        }
-    }
+        .map_err(|error| error.to_string())
 }
 
 fn cooldown_elapsed(last_attempt: Option<Instant>, cooldown_secs: u64) -> bool {
@@ -3370,6 +3421,11 @@ async fn reconcile_line_data_health(
     line: &Arc<crate::services::line_registry::LineRuntime>,
 ) {
     let Ok(mut watchdog) = line.data_watchdog.try_lock() else {
+        return;
+    };
+    // Do not let a registration recovery (which may cycle RF inside MM) race
+    // a newer flight-mode request. Busy transitions are skipped, not queued.
+    let Ok(_bearer_guard) = line.bearer_operation_lock.try_lock() else {
         return;
     };
     let binding = line.binding();
@@ -3458,7 +3514,7 @@ async fn reconcile_line_data_health(
         return;
     }
     watchdog.last_connect_attempt = Some(Instant::now());
-    match start_line_data_runtime(app, line, &profile).await {
+    match start_line_data_runtime_locked(app, line, None).await {
         Ok(()) => {
             watchdog.missing_data_polls = 0;
             info!(line_id = %binding.line_id, "Per-line watchdog restored data bearer and proxy");
@@ -3530,10 +3586,13 @@ async fn stop_line_data_runtime_locked(
     line.cellular_data.stop().await;
     // Clean up any bearer created by an older build. It is never adopted or
     // used by the UE-only runtime.
-    if let Err(error) =
-        modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path).await
-    {
-        warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed");
+    if binding.present && binding_has_baseband(&binding) && !binding.modem_path.trim().is_empty() {
+        if let Err(error) =
+            modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &binding.modem_path)
+                .await
+        {
+            warn!(line_id = %binding.line_id, error = %error, "Legacy host data bearer cleanup failed");
+        }
     }
 }
 
@@ -3593,9 +3652,7 @@ async fn prepare_line_data_slot_for_cellular_ims(
     }
 
     if profile.data_connection_enabled {
-        let data_start_error = start_line_data_runtime_locked(app, line, profile)
-            .await
-            .err();
+        let data_start_error = start_line_data_runtime_locked(app, line, None).await.err();
         let cellular_data_active = line.cellular_data.interface().await.is_some();
         if let Some(error) = data_start_error {
             line.data_proxy.record_error(error.clone()).await;
@@ -3628,6 +3685,7 @@ pub async fn set_line_data_connection_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    let _bearer_guard = line.bearer_operation_lock.lock().await;
     let binding = line.binding();
     let profile = app.config_manager.get_line_profile(&line_id);
     if payload.enabled && !profile.enabled {
@@ -3649,21 +3707,19 @@ pub async fn set_line_data_connection_handler(
         // before accepting clients on the new listener.
         app.line_registry.reset_data_traffic(&line_id).await;
     }
-    let profile = match app
+    if let Err(error) = app
         .config_manager
         .set_line_data_connection_enabled(&line_id, payload.enabled)
     {
-        Ok(profile) => profile,
-        Err(error) => {
-            return (
-                StatusCode::OK,
-                Json(ApiResponse::error(format!("Failed: {error}"))),
-            )
-        }
-    };
+        return (
+            StatusCode::OK,
+            Json(ApiResponse::error(format!("Failed: {error}"))),
+        );
+    }
     // Offline lines remain configurable. Persist the requested state now and
     // let the inventory reconciler apply it after this exact line reappears.
     if !binding.present {
+        drop(_bearer_guard);
         return (
             StatusCode::OK,
             Json(ApiResponse::success_with_message(
@@ -3673,7 +3729,7 @@ pub async fn set_line_data_connection_handler(
         );
     }
     if payload.enabled {
-        if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+        if let Err(error) = start_line_data_runtime_locked(&app, &line, None).await {
             line.data_proxy.record_error(error.clone()).await;
             return (
                 StatusCode::OK,
@@ -3681,8 +3737,9 @@ pub async fn set_line_data_connection_handler(
             );
         }
     } else {
-        stop_line_data_runtime(&app, &line).await;
+        stop_line_data_runtime_locked(&app, &line).await;
     }
+    drop(_bearer_guard);
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -3704,6 +3761,7 @@ pub async fn set_line_data_proxy_config_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    let _bearer_guard = line.bearer_operation_lock.lock().await;
     let current = app.config_manager.get_line_profile(&line_id).data_proxy;
     payload.username = payload.username.trim().to_string();
     if !payload.username.is_empty()
@@ -3729,7 +3787,7 @@ pub async fn set_line_data_proxy_config_handler(
     if profile.data_connection_enabled {
         let binding = line.binding();
         if binding.present {
-            if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+            if let Err(error) = start_line_data_runtime_locked(&app, &line, None).await {
                 line.data_proxy.record_error(error.clone()).await;
                 return (
                     StatusCode::OK,
@@ -3740,6 +3798,7 @@ pub async fn set_line_data_proxy_config_handler(
             line.data_proxy.stop().await;
         }
     }
+    drop(_bearer_guard);
     (
         StatusCode::OK,
         Json(ApiResponse::success_with_message(
@@ -3761,6 +3820,7 @@ pub async fn set_line_roaming_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
+    let _bearer_guard = line.bearer_operation_lock.lock().await;
     let profile = match app
         .config_manager
         .set_line_roaming_allowed(&line_id, payload.allowed)
@@ -3777,13 +3837,14 @@ pub async fn set_line_roaming_handler(
     if profile.data_connection_enabled {
         let binding = line.binding();
         if binding.present {
-            stop_line_data_runtime(&app, &line).await;
-            if let Err(error) = start_line_data_runtime(&app, &line, &profile).await {
+            stop_line_data_runtime_locked(&app, &line).await;
+            if let Err(error) = start_line_data_runtime_locked(&app, &line, None).await {
                 line.data_proxy.record_error(error.clone()).await;
                 data_error = Some(error);
             }
         }
     }
+    drop(_bearer_guard);
     if line.binding().present && profile.enabled && profile.cellular_ims_connection_enabled {
         let status = line.cellular_ims.status().await;
         if status.registered {
@@ -3820,6 +3881,35 @@ pub async fn set_line_roaming_handler(
     )
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AirplaneIntentApply {
+    SavedOffline,
+    Applied,
+}
+
+/// Resolved-line control entry point, shared by the HTTP handler and isolated
+/// control tests. No discovery, worker startup or VoWiFi admission in this gate.
+pub(crate) async fn apply_line_airplane_intent(
+    app: &AppState,
+    line: &Arc<crate::services::line_registry::LineRuntime>,
+    enabled: bool,
+) -> Result<AirplaneIntentApply, String> {
+    // Persist and apply under one gate for BOTH directions. Old boot/hotplug
+    // snapshots cannot apply an older request after a newer toggle completes.
+    let _bearer_guard = line.bearer_operation_lock.lock().await;
+    let binding = line.binding();
+    if !binding_has_baseband(&binding) {
+        return Err("line_has_no_baseband".into());
+    }
+    app.config_manager
+        .set_line_airplane_mode(&binding.line_id, enabled)?;
+    if !binding.present {
+        return Ok(AirplaneIntentApply::SavedOffline);
+    }
+    apply_line_airplane_mode_locked(app, line, enabled).await?;
+    Ok(AirplaneIntentApply::Applied)
+}
+
 pub async fn set_line_airplane_mode_handler(
     State(app): State<AppState>,
     Path(line_id): Path<String>,
@@ -3832,48 +3922,30 @@ pub async fn set_line_airplane_mode_handler(
             Json(ApiResponse::error("line_not_found")),
         );
     };
-    let binding = line.binding();
-    if let Err(error) = app
-        .config_manager
-        .set_line_airplane_mode(&line_id, payload.enabled)
-    {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::error(format!("Failed: {error}"))),
-        );
+    match apply_line_airplane_intent(&app, &line, payload.enabled).await {
+        Ok(AirplaneIntentApply::Applied) => {}
+        Ok(AirplaneIntentApply::SavedOffline) => {
+            return (
+                StatusCode::OK,
+                Json(ApiResponse::success_with_message(
+                    "Saved; device offline",
+                    build_line_network_controls(&app, &line).await,
+                )),
+            );
+        }
+        Err(error) => {
+            return (
+                if error == "line_has_no_baseband" {
+                    StatusCode::CONFLICT
+                } else {
+                    StatusCode::OK
+                },
+                Json(ApiResponse::error(format!("Failed: {error}"))),
+            );
+        }
     }
-    if !binding.present {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::success_with_message(
-                "Saved; device offline",
-                build_line_network_controls(&app, &line).await,
-            )),
-        );
-    }
-    if payload.enabled {
-        let _bearer_guard = line.bearer_operation_lock.lock().await;
-        stop_line_data_runtime_locked(&app, &line).await;
-        let _cellular_ims_guard = line.cellular_ims_connect_lock.lock().await;
-        crate::connectivity::modems::ims::cellular_ims::live::disconnect_live_for_line(
-            &line.cellular_ims_live,
-            &line.cellular_ims,
-            "line_airplane_mode_enabled",
-        )
-        .await;
-    }
-    if let Err(error) = modem_manager::set_airplane_mode_for_modem(
-        app.dbus_conn.as_ref(),
-        &binding.modem_path,
-        payload.enabled,
-    )
-    .await
-    {
-        return (
-            StatusCode::OK,
-            Json(ApiResponse::error(format!("Failed: {error}"))),
-        );
-    }
+    // The intent gate has been released: VoWiFi admission can itself acquire
+    // bearer/access locks, and must not be called from inside that gate.
     if payload.enabled && app.config_manager.get_line_profile(&line_id).vowifi.enabled {
         // Airplane mode only removes the 3GPP access. The connect path is
         // idempotent: it preserves a healthy non-3GPP registration and repairs
@@ -5670,13 +5742,22 @@ pub(crate) async fn start_call_for_automation(
             {
                 return Err(format!("{ims_error};voice_vowifi_only_required"));
             }
-            let airplane =
-                modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path)
-                    .await
-                    .map_err(|_| "airplane_mode_state_unavailable".to_string())?;
-            if airplane.enabled {
-                return Err(format!("{ims_error};cs_blocked_by_airplane_mode"));
+            let line = app
+                .line_registry
+                .get(&line_id)
+                .await
+                .ok_or_else(|| "line_not_found".to_string())?;
+            let _bearer_guard = line.bearer_operation_lock.lock().await;
+            let current = app.config_manager.get_line_profile(&line_id);
+            if !current.enabled {
+                return Err("line_disabled".to_string());
             }
+            let binding = line.binding();
+            native_call_radio_admission(
+                current.airplane_mode_enabled,
+                app.modem_radio.observe(&binding).await,
+            )
+            .map_err(|reason| format!("{ims_error};{reason}"))?;
             // The same restriction covers automation's native-modem escape
             // path; an unavailable IMS router must not turn into a paid CS call.
             if app
@@ -5687,9 +5768,10 @@ pub(crate) async fn start_call_for_automation(
             {
                 return Err(format!("{ims_error};voice_vowifi_only_required"));
             }
-            let path = make_call_on_modem(&app.dbus_conn, &modem_path, phone_number)
+            let path = make_call_on_modem(&app.dbus_conn, &binding.modem_path, phone_number)
                 .await
                 .map_err(|error| error.to_string())?;
+            drop(_bearer_guard);
             track_call_start(app, &line_id, &path, "outgoing", phone_number, false).await;
             return Ok((line_id, path, "modem"));
         }
@@ -6699,18 +6781,6 @@ impl VowifiScope {
     async fn status(&self) -> VowifiStatusResponse {
         self.runtime.snapshot().await.status_response()
     }
-
-    /// Whether *this line's* radio is off. Airplane mode is per line now, so a
-    /// second SIM being powered down must not change how this line behaves.
-    async fn airplane_mode_enabled(&self, app: &AppState) -> bool {
-        let Some(modem_path) = self.modem_path() else {
-            return false;
-        };
-        modem_manager::get_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path)
-            .await
-            .map(|state| state.enabled)
-            .unwrap_or(false)
-    }
 }
 
 struct VowifiRestoreClaim(Arc<crate::services::line_registry::LineRuntime>);
@@ -6770,13 +6840,11 @@ async fn restore_cellular_and_reset_vowifi(
             detail_json: "{}",
         });
 
-    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
-        warn!(error = %err, "Failed to restore the line radio state while stopping WiFi Calling");
-    }
-
+    // Stopping VoWiFi is not permission to enable RF either. Only restore a
+    // separately saved data intent, subject to the latest flight-mode gate.
     restore_cellular_data_after_vowifi(app, scope).await;
 
-    // 2. SMS Event: 短信路径已释放，成功退回到蜂窝基站数据链路。
+    // 2. SMS Event: 非 3GPP 短信路径已释放；不代表蜂窝已驻网或已承接短信。
     let _ = app
         .database
         .insert_vowifi_runtime_event(crate::platform::db::NewVowifiRuntimeEvent {
@@ -7264,40 +7332,16 @@ fn persist_optional_vowifi_restore_phase(
     }
 }
 
-/// Preserve the line's persisted RF intent while preparing VoWiFi. QMI UIM and
-/// PC/SC SIM access remain available with cellular RF disabled, so connect,
-/// refresh and fallback paths must not clear airplane mode.
-async fn ensure_line_radio_state_for_vowifi(
-    app: &AppState,
-    scope: &VowifiScope,
-) -> Result<(), String> {
-    let Some(modem_path) = scope.modem_path() else {
-        return Ok(());
-    };
-    if app
-        .config_manager
-        .get_line_profile(scope.line_id())
-        .airplane_mode_enabled
-    {
-        return Ok(());
-    }
-    modem_manager::set_airplane_mode_for_modem(app.dbus_conn.as_ref(), &modem_path, false).await
-}
-
 async fn pause_cellular_data_for_vowifi(app: &AppState, scope: &VowifiScope) -> Result<(), String> {
-    if let Err(err) = ensure_line_radio_state_for_vowifi(app, scope).await {
-        warn!(error = %err, "Failed to keep modem enabled for WiFi Calling SIM access");
-    }
-    let Some(modem_path) = scope.modem_path() else {
-        return Ok(());
-    };
-    if let Some(line) = app.line_registry.get(scope.line_id()).await {
-        stop_line_data_runtime(app, &line).await;
+    // SIM access for VoWiFi is not permission to enable cellular RF. If a
+    // device cannot authenticate with RF off, report the SIM access failure;
+    // do not secretly cancel flight mode or enable a previously disabled modem.
+    let binding = scope.line().binding();
+    if !binding.present || !binding_has_baseband(&binding) {
         return Ok(());
     }
-    modem_manager::disconnect_data_via_modem(app.dbus_conn.as_ref(), &modem_path)
-        .await
-        .map_err(|err| err.to_string())
+    stop_line_data_runtime(app, scope.line()).await;
+    Ok(())
 }
 
 async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope) {
@@ -7310,7 +7354,7 @@ async fn restore_cellular_data_after_vowifi(app: &AppState, scope: &VowifiScope)
         return;
     }
     if let Some(line) = app.line_registry.get(scope.line_id()).await {
-        if let Err(err) = start_line_data_runtime(app, &line, &line_profile).await {
+        if let Err(err) = start_line_data_runtime(app, &line).await {
             warn!(error = %err, "Failed to restore cellular data after WiFi Calling");
         }
     }
@@ -10673,6 +10717,18 @@ async fn run_line_cellular_ims_restore_batch(
 
         let result = {
             let _bearer_guard = line.bearer_operation_lock.lock().await;
+            // A flight-mode toggle may have completed while this batch waited
+            // for the bearer gate. Its old profile/device snapshot is not new
+            // permission to allocate an IMS bearer or turn RF back on.
+            let profile = app.config_manager.get_line_profile(&binding.line_id);
+            if line.cellular_ims.generation() != batch_generation
+                || !line.binding().present
+                || !profile.enabled
+                || profile.airplane_mode_enabled
+                || !profile.cellular_ims_connection_enabled
+            {
+                return;
+            }
             match prepare_line_data_slot_for_cellular_ims(app, line, &profile).await {
                 Ok(data_slot_mode) => match ims_override_for_line(app, &binding.line_id).await {
                     Err(error) => Err(

@@ -3,6 +3,7 @@
 //!   - `bindings` / `observations`: stable line descriptors and injectable
 //!     discovery/serving observations, independent of a D-Bus connection
 //!   - `mm_observations`: current ModemManager observation adapter
+//!   - `radio` / `mm_radio`: explicit radio control and truthful observations
 //!   - `modem_manager`: ModemManager (D-Bus) + qmicli/mmcli/AT integration —
 //!     data connection, calls, SMS, band/cell lock, operator registration
 //!   - `qmi_wds`: QMI WDS sessions — a client id held across the several
@@ -20,8 +21,10 @@ pub mod cell_lock_store;
 pub mod cgcontrdp;
 pub mod data_proxy;
 pub mod mm_observations;
+pub mod mm_radio;
 pub mod modem_manager;
 pub mod observations;
 pub mod qmi_wds;
+pub mod radio;
 pub mod serial;
 pub mod ussd;

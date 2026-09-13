@@ -1,11 +1,11 @@
 use crate::api::handlers::{async_ping_host, read_temperature_sensors};
 use crate::api::models::{NetworkInterfaceInfo, OtaLatestReleaseResponse, ThermalZone};
 use crate::hardware::cellular::modem_manager::{
-    discover_modem_bindings, get_airplane_mode_for_modem, get_cells_data_for_modem,
-    get_data_connection_status_for_modem, get_device_info_for_modem, get_is_roaming_for_modem,
-    get_network_info_for_modem, get_signal_strength_for_modem, get_sim_info_for_modem_with_cache,
-    ModemBinding,
+    discover_modem_bindings, get_cells_data_for_modem, get_data_connection_status_for_modem,
+    get_device_info_for_modem, get_is_roaming_for_modem, get_network_info_for_modem,
+    get_signal_strength_for_modem, get_sim_info_for_modem_with_cache, ModemBinding,
 };
+use crate::hardware::cellular::{mm_radio::ModemManagerRadio, radio::ModemRadioControl};
 use crate::platform::config::{ConfigManager, NotificationRule};
 use crate::platform::db::{Database, PeriodSmsStats};
 use crate::platform::utils::{
@@ -14,6 +14,7 @@ use crate::platform::utils::{
 };
 use crate::services::network::device_network::DdnsManager;
 use crate::services::notify::notification::{quiet_hours_active, NotificationSender};
+use crate::services::orchestrator::radio_intent::airplane_intent_view;
 use chrono::{
     Datelike, Duration as ChronoDuration, FixedOffset, NaiveTime, TimeZone, Timelike, Utc,
 };
@@ -429,17 +430,21 @@ pub async fn collect_device_status_report(
         }
     }
     if items.contains("airplane_mode") || items.contains("roaming") {
+        // Other fields in this legacy report are still MM-specific. Reuse the
+        // same connection/normalizer so failed RF queries do not say "off".
+        let radio = ModemManagerRadio::new(Arc::clone(&dbus_conn));
         for binding in &bindings {
             let label = cellular_line_label(binding);
             if items.contains("airplane_mode") {
-                if let Ok(status) =
-                    get_airplane_mode_for_modem(&dbus_conn, &binding.modem_path).await
-                {
-                    lines.push(format!(
-                        "飞行模式（{label}）：{}",
-                        if status.enabled { "开启" } else { "关闭" }
-                    ));
-                }
+                let requested = config_manager
+                    .get_line_profile(&binding.line_id)
+                    .airplane_mode_enabled;
+                let view = airplane_intent_view(requested, radio.observe(binding).await);
+                lines.push(format!(
+                    "飞行模式（{label}）：{}；配置：{}",
+                    view.stage,
+                    if requested { "开启" } else { "关闭" }
+                ));
             }
             if items.contains("roaming") {
                 let allowed = config_manager
