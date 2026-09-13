@@ -481,15 +481,15 @@ async fn begin_locked(
                 info.ipv4_address = Some(parse_ip(&address,4)?);
                 info.ipv4_prefix = Some(settings.ipv4_prefix.ok_or_else(|| NativeError::Protocol("native_ipv4_prefix_unknown".into()))?);
                 info.ipv4_gateway = settings.ipv4_gateway.and_then(|v| v.parse().ok());
-                info.ipv4_dns.extend(settings.ipv4_dns.iter().filter_map(|v| v.parse().ok()));
+                info.ipv4_dns.extend(settings.ipv4_dns.iter().filter_map(|v| v.parse::<IpAddr>().ok()));
             }
             if let Some(address) = settings.ipv6_address {
                 info.ipv6_address = Some(parse_ip(&address,6)?);
                 info.ipv6_prefix = Some(settings.ipv6_prefix.ok_or_else(|| NativeError::Protocol("native_ipv6_prefix_unknown".into()))?);
                 info.ipv6_gateway = settings.ipv6_gateway.and_then(|v| v.parse().ok());
-                info.ipv6_dns.extend(settings.ipv6_dns.iter().filter_map(|v| v.parse().ok()));
+                info.ipv6_dns.extend(settings.ipv6_dns.iter().filter_map(|v| v.parse::<IpAddr>().ok()));
             }
-            info.pcscf.extend(settings.pcscf.iter().filter_map(|v| v.parse().ok()));
+            info.pcscf.extend(settings.pcscf.iter().filter_map(|v| v.parse::<IpAddr>().ok()));
         }
         if families.contains(&4) && info.ipv4_address.is_none() || families.contains(&6) && info.ipv6_address.is_none() {
             return Err(NativeError::Protocol("native_bearer_family_address_missing".into()));

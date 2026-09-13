@@ -33,7 +33,6 @@ mod state;
 
 use api::handlers::*;
 use hardware::cellular::control::ensure_nm_modem_profile;
-use hardware::cellular::observations::ModemObservationProvider;
 use hardware::sim::esim::EsimSupervisor;
 use platform::config::{get_default_config_path, ConfigManager};
 use platform::config_maintenance;

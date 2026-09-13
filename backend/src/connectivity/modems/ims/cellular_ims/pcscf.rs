@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::{process::Command, time::sleep};
+use tokio::time::sleep;
 
 use crate::{
     platform::config::CellularImsIpFamilyPreference,

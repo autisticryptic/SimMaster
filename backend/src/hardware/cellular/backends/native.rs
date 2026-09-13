@@ -7,9 +7,7 @@ use tokio::sync::Mutex;
 use super::{
     config::{NativeDeviceConfig, NativeProtocol},
     io::NativeIo,
-    protocol::{
-        self, at_payload, csv, labelled, CommandRequest, NetworkSnapshot, RegistrationState,
-    },
+    protocol::{self, at_payload, csv, labelled, CommandRequest, NetworkSnapshot},
     NativeError,
 };
 use crate::{

@@ -16,8 +16,6 @@
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use tokio::process::Command;
-
 /// IP configuration and P-CSCF reported for one IMS PDP context.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CgcontrdpSettings {
