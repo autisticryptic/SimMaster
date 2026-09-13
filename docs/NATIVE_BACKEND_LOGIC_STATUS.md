@@ -99,9 +99,19 @@ API 的 `hardware_validated: false`、`native_hardware_validation: deferred` 是
   和 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34739474668)
   均 success，包含后端/前端回归与 arm64/amd64 构建；发布任务 skipped。
 - 后续收尾增加：拨号调用者取消后的已确认呼叫清理；协议明确拒绝与结果不确定的
-  区分；SMS 删除在同一物理门内核对 SIM/内容，保留部分清理进度。这些追加变更待 CI 回填。
+  区分；SMS 删除在同一物理门内核对 SIM/内容，保留部分清理进度；
+  lpac 超时后等待子进程退出再释放操作门。
+- 安全收尾提交为 `b1caafe`、`b94c9c2`。最新 **`b94c9c2`** 的
+  [Validate Beta Refactor](https://github.com/autisticryptic/SimMaster/actions/runs/34740891966)
+  与 [Build-Release](https://github.com/autisticryptic/SimMaster/actions/runs/34740891971)
+  均 success，包含新增/原有离线回归、私有 D-Bus API 测试、前端和 arm64/amd64 构建；
+  `Publish Release` 已核对为 skipped。中间 `b1caafe` 两套 workflow 也均 success。
 - 本地49项 Python检查与 Rust格式/语法、shell语法检查通过；没有本地 Rust 构建，
   没有部署、发布或 native 硬件测试。
+
+**当前检查点**：本轮逻辑候选已提交并通过 CI，但第 3 节的逻辑缺口仍未完成。
+下一名开发 agent 应从混合 owner / 代次恢复等项目继续，不把本轮当作完整替代已完成，
+也不提前在 IMS 验证设备启用 `native`。
 
 ## 6. 后续 agent 接续
 
