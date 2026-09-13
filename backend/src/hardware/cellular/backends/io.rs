@@ -8,7 +8,7 @@ use tokio::io::AsyncReadExt;
 use zbus::{fdo::DBusProxy, Connection};
 
 use super::{
-    config::{NativeBearerConfig, NativeDeviceConfig},
+    config::{NativeBearerConfig, NativeDeviceConfig, NativeProtocol},
     protocol::{single_line, CommandRequest, Tool},
     NativeError,
 };
@@ -100,6 +100,9 @@ pub struct SystemNativeIo {
     anchor: std::path::PathBuf,
     #[cfg(unix)]
     identities: Vec<PortIdentity>,
+    // Drop the proxy-open leases before releasing the physical locks.
+    #[cfg(unix)]
+    qmi_proxy_leases: Vec<super::qmi_proxy::QmiProxyLease>,
     #[cfg(unix)]
     _locks: Vec<std::fs::File>,
 }
@@ -187,10 +190,32 @@ impl SystemNativeIo {
                 }
                 locks.push(file);
             }
+            // Opening a new physical channel can invalidate old firmware CIDs.
+            // Crash receipts must be reconciled before even a helper bootstrap.
+            verify_receipts_clear(directory, &spec.line_id())?;
+            let mut qmi_proxy_leases = Vec::new();
+            if spec.protocol == NativeProtocol::Qmi {
+                let ports = std::iter::once(spec.control_device.clone())
+                    .chain(spec.ims.iter().map(|e| e.control_device.clone()))
+                    .chain(spec.data.iter().map(|e| e.control_device.clone()))
+                    .collect::<std::collections::BTreeSet<_>>();
+                for port in ports {
+                    qmi_proxy_leases.push(open_qmi_proxy_lease(&port).await?);
+                }
+            }
+            Self::verify_manager_absent(&connection).await?;
+            for previous in &identities {
+                if identity(&previous.device, &anchor)? != *previous {
+                    return Err(NativeError::OwnerConflict(
+                        "native_device_changed_during_claim".into(),
+                    ));
+                }
+            }
             Ok(Arc::new(Self {
                 connection,
                 anchor,
                 identities,
+                qmi_proxy_leases,
                 _locks: locks,
             }))
         }
@@ -205,6 +230,9 @@ impl SystemNativeIo {
         Self::verify_manager_absent(&self.connection).await?;
         #[cfg(unix)]
         {
+            for lease in &self.qmi_proxy_leases {
+                lease.verify_alive()?;
+            }
             let previous = self
                 .identities
                 .iter()
@@ -220,6 +248,50 @@ impl SystemNativeIo {
         #[cfg(not(unix))]
         Err(NativeError::Unsupported("native_backend_requires_linux"))
     }
+}
+
+fn verify_receipts_clear(directory: &std::path::Path, line: &str) -> Result<(), NativeError> {
+    for role in ["ims", "data"] {
+        for extension in ["json", "tmp"] {
+            let path = directory.join(format!("session-{line}-{role}.{extension}"));
+            if path.try_exists().map_err(|_| {
+                NativeError::OwnerConflict("native_session_receipt_state_unreadable".into())
+            })? {
+                return Err(NativeError::OwnerConflict(
+                    "native_sessions_require_reconciliation_before_native_start".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn open_qmi_proxy_lease(
+    device: &str,
+) -> Result<super::qmi_proxy::QmiProxyLease, NativeError> {
+    use super::qmi_proxy::QmiProxyLease;
+    use crate::connectivity::modems::ims::vowifi::qmi_uim::QmiUimError;
+    let open = |path: String| tokio::task::spawn_blocking(move || QmiProxyLease::open(&path));
+    let mut result = open(device.to_string())
+        .await
+        .map_err(|_| NativeError::CommandFailed("native_qmi_proxy_lease_worker_failed"))?;
+    if matches!(&result, Err(QmiUimError::Io(error))
+        if matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused))
+    {
+        // libqmi starts qmi-proxy on demand. This CTL query neither allocates a
+        // WDS client nor changes RF, SIM, data-format, APNs or autoconnect.
+        run_process(&CommandRequest::query(
+            NativeProtocol::Qmi,
+            device,
+            "--get-service-version-info",
+        ))
+        .await?;
+        result = open(device.to_string())
+            .await
+            .map_err(|_| NativeError::CommandFailed("native_qmi_proxy_lease_worker_failed"))?;
+    }
+    result.map_err(|_| NativeError::OwnerConflict("native_qmi_proxy_open_lease_failed".into()))
 }
 
 impl NativeIo for SystemNativeIo {
@@ -460,12 +532,10 @@ async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
             if stdout.len() > 1_048_576 || stderr.len() > 1_048_576 {
                 return Err(NativeError::CommandFailed("native_helper_output_limit"));
             }
-            if !status
+            let success = status
                 .map_err(|_| NativeError::CommandFailed("native_helper_wait_failed"))?
-                .success()
-            {
-                return Err(classify_failed_command(&stderr));
-            }
+                .success();
+            verify_command_completion(success, &stderr)?;
             String::from_utf8(stdout)
                 .map_err(|_| NativeError::Protocol("native_helper_output_encoding".into()))
         },
@@ -480,6 +550,21 @@ async fn run_process(request: &CommandRequest) -> Result<String, NativeError> {
                 "native_protocol_command_timeout",
             ))
         }
+    }
+}
+
+fn verify_command_completion(success: bool, stderr: &[u8]) -> Result<(), NativeError> {
+    // qmicli can exit 0 even when its asynchronous CTL Release Client fails.
+    // Such a warning must not authorize deleting an ownership receipt.
+    if String::from_utf8_lossy(stderr).contains("couldn't release client") {
+        return Err(NativeError::CommandFailed(
+            "native_qmi_client_release_unconfirmed",
+        ));
+    }
+    if success {
+        Ok(())
+    } else {
+        Err(classify_failed_command(stderr))
     }
 }
 
@@ -519,5 +604,41 @@ mod tests {
                 NativeError::CommandFailed("native_command_outcome_unconfirmed")
             );
         }
+    }
+
+    #[test]
+    fn successful_process_exit_does_not_hide_an_unconfirmed_client_release() {
+        assert_eq!(
+            verify_command_completion(
+                true,
+                b"error: couldn't release client: QMI protocol error (7): 'InvalidClientId'"
+            ),
+            Err(NativeError::CommandFailed(
+                "native_qmi_client_release_unconfirmed"
+            ))
+        );
+        assert!(verify_command_completion(true, b"").is_ok());
+    }
+
+    #[test]
+    fn native_reopen_requires_reconciling_both_complete_and_partial_receipts() {
+        let directory = std::env::temp_dir().join(format!(
+            "simadmin-native-receipt-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        verify_receipts_clear(&directory, "fixture").unwrap();
+        for extension in ["json", "tmp"] {
+            let path = directory.join(format!("session-fixture-ims.{extension}"));
+            std::fs::write(&path, "{}").unwrap();
+            assert!(verify_receipts_clear(&directory, "fixture").is_err());
+            assert!(verify_receipts_clear(&directory, "another-line").is_ok());
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_dir(directory).unwrap();
     }
 }

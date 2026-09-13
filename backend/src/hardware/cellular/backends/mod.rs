@@ -12,6 +12,7 @@ pub mod management;
 pub mod messages;
 pub mod native;
 pub mod protocol;
+pub mod qmi_proxy;
 pub mod sim;
 
 static ACTIVE_NATIVE: std::sync::OnceLock<std::sync::Arc<native::NativeFleet>> =

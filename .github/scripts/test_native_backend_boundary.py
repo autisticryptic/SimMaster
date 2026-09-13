@@ -69,11 +69,20 @@ class NativeBackendBoundaryTests(unittest.TestCase):
     def test_all_native_regression_groups_are_run_in_ci_without_hardware(self):
         for workflow in ("build-release.yml", "beta-validation.yml"):
             text = (ROOT / ".github/workflows" / workflow).read_text()
-            for group in ("config", "io", "protocol", "native", "messages", "sim", "management", "bearer"):
+            for group in ("config", "io", "qmi_proxy", "protocol", "native", "messages", "sim", "management", "bearer"):
                 self.assertIn(f"hardware::cellular::backends::{group}::tests \\", text)
             self.assertIn("hardware::cellular::modem_manager::roaming_observation_tests \\", text)
             self.assertIn("services::messaging::sms_listener::tests \\", text)
             self.assertIn("http_router_tests::backend_selection_", text)
+
+    def test_native_qmi_leases_precede_commands_and_do_not_reconnect_old_cids(self):
+        text = (SRC / "hardware/cellular/backends/io.rs").read_text()
+        claim = text[text.index("pub async fn claim("):text.index("async fn verify(&self")]
+        self.assertLess(claim.index("verify_receipts_clear("), claim.index("open_qmi_proxy_lease("))
+        verify = text[text.index("async fn verify(&self"):text.index("fn verify_receipts_clear(")]
+        self.assertIn("lease.verify_alive()?", verify)
+        self.assertNotIn("open_qmi_proxy_lease(", verify)
+        self.assertIn("qmi_proxy_leases,", claim)
 
     def test_package_and_services_do_not_unconditionally_start_mm(self):
         for name in ("simadmin.service", "simadmin-loopback.service"):

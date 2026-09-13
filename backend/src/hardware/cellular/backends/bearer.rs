@@ -271,7 +271,8 @@ fn qmi_start(apn: &ApnConfig, family: u8, profile_id: Option<u32>) -> Result<Str
             "native_qmi_bearer_parameters_invalid".into(),
         ));
     }
-    let mut action = format!("--wds-start-network=apn={name},ip-type=ipv{family}");
+    // qmicli's WDS grammar takes 4/6, unlike MM and MBIM's ipv4/ipv6 names.
+    let mut action = format!("--wds-start-network=apn={name},ip-type={family}");
     if let Some(profile) = profile_id {
         action.push_str(&format!(",3gpp-profile={profile}"));
     }
@@ -461,7 +462,7 @@ async fn begin_locked(
                         device.io.execute(&qmi_request(&endpoint,Some(cid),
                             &format!("--wds-bind-mux-data-port=mux-id={},ep-type={},ep-iface-number={}", binding.mux_id,binding.endpoint_type,binding.interface_number),true)).await?;
                     }
-                    device.io.execute(&qmi_request(&endpoint,Some(cid),&format!("--wds-set-ip-family=ipv{family}"),true)).await?;
+                    device.io.execute(&qmi_request(&endpoint,Some(cid),&format!("--wds-set-ip-family={family}"),true)).await?;
                     awaiting_resource_identity = true;
                     let start = device.io.execute(&qmi_request(&endpoint,Some(cid),&qmi_start(&apn,*family,profile_id)?,true)).await?;
                     let handle = qmi_wds::parse_packet_data_handle(&start).and_then(|v| v.parse::<u32>().ok())
@@ -907,7 +908,8 @@ mod tests {
             Some(2),
         )
         .unwrap();
-        assert!(start.contains("ip-type=ipv6"));
+        assert!(start.contains("ip-type=6"));
+        assert!(!start.contains("ip-type=ipv6"));
         assert!(!start.contains("autoconnect"));
         assert!(qmi_start(
             &ApnConfig {
@@ -969,6 +971,10 @@ mod tests {
                     return Ok("Client ID not released:\nService: 'wds'\nCID: '17'".into());
                 }
                 if action.starts_with("--wds-start-network=") {
+                    assert!(
+                        action.contains("ip-type=4") || action.contains("ip-type=6"),
+                        "qmicli does not accept the MM/MBIM ipv4/ipv6 spelling"
+                    );
                     assert!(
                         !self.receipts.lock().unwrap().is_empty(),
                         "ownership must be recorded before activation"
@@ -1058,6 +1064,9 @@ mod tests {
         assert!(requests
             .iter()
             .any(|r| r.arguments.iter().any(|s| s == "--wds-stop-network=42")));
+        assert!(requests
+            .iter()
+            .any(|r| r.arguments.iter().any(|s| s == "--wds-set-ip-family=4")));
         assert!(requests
             .iter()
             .all(|r| r.tool == super::super::protocol::Tool::Qmi));
