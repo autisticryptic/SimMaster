@@ -69,6 +69,7 @@ jobs:
             hardware::cellular::backends::sim::tests \
             hardware::cellular::backends::management::tests \
             hardware::cellular::backends::bearer::tests \
+            services::messaging::sms_listener::tests \
             hardware::cellular::modem_manager::roaming_observation_tests \
             services::orchestrator::radio_intent::tests \
             services::automation::tasks::consume_data::tests \

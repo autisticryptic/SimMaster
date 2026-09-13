@@ -2862,6 +2862,7 @@ mod http_router_tests {
                 protocol: NativeProtocol::Qmi,
                 control_device: "/dev/nonexistent-test-qmi".into(),
                 at_device: None,
+                sms_reception_enabled: false,
                 uim_slot: 1,
                 ims: None,
                 data: None,

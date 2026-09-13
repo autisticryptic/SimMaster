@@ -141,6 +141,38 @@ pub fn at_payload<'a>(text: &'a str, prefix: &str) -> Option<&'a str> {
         .find_map(|line| line.trim().strip_prefix(prefix).map(str::trim))
 }
 
+/// Map actual RSSI observations to the same 0..100 scale as AT+CSQ.
+/// Unknown sentinels/malformed output stay unknown, not a fabricated zero.
+pub fn parse_signal_percent(protocol: NativeProtocol, text: &str) -> Option<u8> {
+    match protocol {
+        NativeProtocol::Qmi => {
+            let value = labelled(text, "RSSI")
+                .filter(|s| s.contains("dBm"))
+                .or_else(|| {
+                    // Older NAS implementations only support Get Signal Strength.
+                    text.split_once("Current:")?.1.lines().find_map(|line| {
+                        let (key, value) = line.trim().split_once(':')?;
+                        (key.starts_with("Network ") && value.contains("dBm"))
+                            .then(|| value.trim().trim_matches('\''))
+                    })
+                })?;
+            let dbm = value.split_whitespace().next()?.parse::<i16>().ok()?;
+            (-150..=-1)
+                .contains(&dbm)
+                .then(|| (((dbm + 113).clamp(0, 62) * 100) / 62) as u8)
+        }
+        NativeProtocol::Mbim | NativeProtocol::At => {
+            let value = if protocol == NativeProtocol::At {
+                at_payload(text, "+CSQ:")?.split(',').next()?.trim()
+            } else {
+                labelled(text, "RSSI")?
+            };
+            let csq = value.parse::<u16>().ok()?;
+            (csq <= 31).then(|| ((csq * 100) / 31) as u8)
+        }
+    }
+}
+
 pub fn parse_radio(protocol: NativeProtocol, text: &str) -> RadioState {
     match protocol {
         NativeProtocol::Qmi => match labelled(text, "Mode") {
@@ -301,6 +333,43 @@ pub fn phone_number(value: &str) -> Result<&str, NativeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signal_queries_decode_qmi_without_at_and_keep_unknown_sentinels_unknown() {
+        assert_eq!(
+            parse_signal_percent(
+                NativeProtocol::Qmi,
+                "LTE:\n RSSI: '-55 dBm'\n RSRQ: '-13 dB'\n RSRP: '-88 dBm'\n SNR: '5.6 dB'"
+            ),
+            Some(93)
+        );
+        assert_eq!(
+            parse_signal_percent(
+                NativeProtocol::Qmi,
+                "Current:\n Network 'lte': '-55 dBm'\nRSSI:\n Network 'lte': '-55 dBm'"
+            ),
+            Some(93)
+        );
+        for text in ["", "RSSI: '127 dBm'", "RSSI: 'unknown'", "RSRP: '-88 dBm'"] {
+            assert_eq!(parse_signal_percent(NativeProtocol::Qmi, text), None);
+        }
+        assert_eq!(
+            parse_signal_percent(NativeProtocol::Mbim, "RSSI: '31'"),
+            Some(100)
+        );
+        assert_eq!(
+            parse_signal_percent(NativeProtocol::Mbim, "RSSI: '99'"),
+            None
+        );
+        assert_eq!(
+            parse_signal_percent(NativeProtocol::At, "+CSQ: 0,99\r\nOK"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_signal_percent(NativeProtocol::At, "+CSQ: 99,99\r\nOK"),
+            None
+        );
+    }
 
     #[test]
     fn unknown_network_and_radio_are_never_treated_as_home_or_online() {

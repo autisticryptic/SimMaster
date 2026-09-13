@@ -43,6 +43,10 @@ pub struct NativeDeviceConfig {
     pub control_device: String,
     #[serde(default)]
     pub at_device: Option<String>,
+    /// Receiving stored SMS also consumes modem storage after durable ingest.
+    /// Merely adding an AT port for SIM/IMS queries must not enable deletion.
+    #[serde(default)]
+    pub sms_reception_enabled: bool,
     #[serde(default = "slot_one")]
     pub uim_slot: u8,
     #[serde(default)]
@@ -179,6 +183,12 @@ impl NativeDeviceConfig {
         if self.protocol != NativeProtocol::Qmi && self.uim_slot != 1 {
             return Err("native_mbim_at_multi_slot_requires_slot_mapping_driver".into());
         }
+        if self.sms_reception_enabled
+            && self.at_device.is_none()
+            && self.protocol != NativeProtocol::At
+        {
+            return Err("native_sms_reception_requires_at_port".into());
+        }
         for bearer in self.ims.iter().chain(self.data.iter()) {
             if !valid_device_path(&bearer.control_device) || !valid_interface(&bearer.interface) {
                 return Err("native_bearer_binding_invalid".into());
@@ -228,6 +238,7 @@ mod tests {
             protocol: NativeProtocol::Qmi,
             control_device: "/dev/wwan0qmi0".into(),
             at_device: Some("/dev/wwan0at0".into()),
+            sms_reception_enabled: false,
             uim_slot: 1,
             ims: None,
             data: None,
@@ -255,6 +266,24 @@ mod tests {
     fn backend_switch_preserves_physical_line_identity() {
         assert_eq!(device().line_id(), "line-fa9b70acd51cf9273a726ab948073c92");
         assert!(device().selector().starts_with("native:line-"));
+    }
+
+    #[test]
+    fn native_at_metadata_does_not_implicitly_consume_stored_sms() {
+        let mut value = serde_json::to_value(device()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("sms_reception_enabled");
+        let mut config: NativeDeviceConfig = serde_json::from_value(value).unwrap();
+        assert!(!config.sms_reception_enabled);
+        config.sms_reception_enabled = true;
+        assert!(config.validate().is_ok());
+        config.at_device = None;
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "native_sms_reception_requires_at_port"
+        );
     }
 
     #[test]

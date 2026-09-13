@@ -198,14 +198,27 @@ impl NativeDevice {
                 result.operator = parsed.operator;
             }
         }
-        if let Ok(signal) = self.at("AT+CSQ").await {
-            result.signal_percent = at_payload(&signal, "+CSQ:")
-                .and_then(|s| s.split(',').next())
-                .and_then(|s| s.parse::<u16>().ok())
-                .filter(|s| *s <= 31)
-                .map(|s| ((s * 100) / 31) as u8);
-        }
+        result.signal_percent = self.signal_percent().await;
         Ok(result)
+    }
+
+    async fn signal_percent(self: &Arc<Self>) -> Option<u8> {
+        let actions: &[&str] = match self.spec.protocol {
+            NativeProtocol::Qmi => &["--nas-get-signal-info", "--nas-get-signal-strength"],
+            NativeProtocol::Mbim => &["--query-signal-state"],
+            NativeProtocol::At => &[],
+        };
+        for action in actions {
+            if let Ok(output) = self.command(self.request(action)).await {
+                if let Some(percent) = protocol::parse_signal_percent(self.spec.protocol, &output) {
+                    return Some(percent);
+                }
+            }
+        }
+        self.at("AT+CSQ")
+            .await
+            .ok()
+            .and_then(|s| protocol::parse_signal_percent(NativeProtocol::At, &s))
     }
 
     pub async fn sim_identity(self: &Arc<Self>) -> Result<SimIdentity, NativeError> {
@@ -777,6 +790,7 @@ mod tests {
                 protocol: NativeProtocol::At,
                 control_device: "/dev/fixture-at".into(),
                 at_device: None,
+                sms_reception_enabled: false,
                 uim_slot: 1,
                 ims: None,
                 data: None,
@@ -808,6 +822,25 @@ mod tests {
         let device = at_device(io.clone());
         assert!(device.radio().await.is_err());
         assert_eq!(io.requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn qmi_signal_does_not_require_an_at_port() {
+        let io = Arc::new(ScriptedIo {
+            requests: Default::default(),
+            replies: std::sync::Mutex::new([Ok("LTE:\n RSSI: '-55 dBm'".into())].into()),
+        });
+        let mut spec = at_device(io.clone()).spec.clone();
+        spec.protocol = NativeProtocol::Qmi;
+        let device = NativeDevice::new(spec, io.clone());
+        assert_eq!(device.signal_percent().await, Some(93));
+        let requests = io.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].tool, protocol::Tool::Qmi);
+        assert!(requests[0]
+            .arguments
+            .iter()
+            .any(|a| a == "--nas-get-signal-info"));
     }
 
     #[test]

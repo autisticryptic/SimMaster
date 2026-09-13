@@ -740,6 +740,17 @@ pub struct NativeDataTransport {
     device: Arc<NativeDevice>,
     state: Mutex<Option<native_bearer::NativeImsBearer>>,
 }
+
+fn data_ip_families(protocol: &str) -> Result<Vec<u8>, String> {
+    match protocol.trim().to_ascii_lowercase().as_str() {
+        "ipv4" => Ok(vec![4]),
+        "ipv6" => Ok(vec![6]),
+        // `dual` is the persisted ApnConfig default and the existing UI value.
+        "dual" | "ipv4v6" => Ok(vec![4, 6]),
+        _ => Err("native_data_ip_protocol_invalid".into()),
+    }
+}
+
 impl NativeDataTransport {
     pub fn new(device: Arc<NativeDevice>) -> Arc<Self> {
         Arc::new(Self {
@@ -787,12 +798,7 @@ impl CellularDataTransport for NativeDataTransport {
             if apn.apn.is_empty() || apn.apn.eq_ignore_ascii_case("ims") {
                 return Err("native_data_apn_required".into());
             }
-            let families = match apn.protocol.as_str() {
-                "ipv4" => vec![4],
-                "ipv6" => vec![6],
-                "ipv4v6" => vec![4, 6],
-                _ => return Err("native_data_ip_protocol_invalid".into()),
-            };
+            let families = data_ip_families(&apn.protocol)?;
             let (info, handle) = begin(
                 self.device.clone(),
                 Role::Data,
@@ -858,6 +864,21 @@ impl CellularDataTransport for NativeDataTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_data_accepts_existing_dual_apn_default_without_guessing_unknown_values() {
+        assert_eq!(
+            data_ip_families(&ApnConfig::default().protocol).unwrap(),
+            vec![4, 6]
+        );
+        assert_eq!(data_ip_families("dual").unwrap(), vec![4, 6]);
+        assert_eq!(data_ip_families("IPV4V6").unwrap(), vec![4, 6]);
+        assert_eq!(data_ip_families("ipv4").unwrap(), vec![4]);
+        assert_eq!(data_ip_families("ipv6").unwrap(), vec![6]);
+        for invalid in ["", "automatic", "dual,autoconnect=yes"] {
+            assert!(data_ip_families(invalid).is_err());
+        }
+    }
 
     fn endpoint() -> NativeBearerConfig {
         NativeBearerConfig {
@@ -998,6 +1019,7 @@ mod tests {
                 protocol: NativeProtocol::Qmi,
                 control_device: "/dev/fixture".into(),
                 at_device: None,
+                sms_reception_enabled: false,
                 uim_slot: 1,
                 ims: Some(endpoint()),
                 data: None,

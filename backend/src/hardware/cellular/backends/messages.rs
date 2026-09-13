@@ -22,6 +22,14 @@ pub struct NativeSms {
 }
 
 impl NativeDevice {
+    fn require_sms_reception(&self) -> Result<(), NativeError> {
+        if self.spec.sms_reception_enabled {
+            Ok(())
+        } else {
+            Err(NativeError::Unsupported("native_sms_reception_disabled"))
+        }
+    }
+
     pub async fn ussd(self: &Arc<Self>, command: &str) -> Result<String, NativeError> {
         if !command.starts_with("AT+CUSD=") {
             return Err(NativeError::Protocol("native_ussd_command_invalid".into()));
@@ -67,6 +75,7 @@ impl NativeDevice {
     }
 
     pub async fn initialize_sms(self: &Arc<Self>) -> Result<(), NativeError> {
+        self.require_sms_reception()?;
         self.verify_primary_slot().await?;
         self.commands(vec![
             self.at_request("AT+CMGF=0")?,
@@ -78,6 +87,7 @@ impl NativeDevice {
     }
 
     async fn raw_messages(self: &Arc<Self>) -> Result<(String, Vec<(u32, String)>), NativeError> {
+        self.require_sms_reception()?;
         self.verify_primary_slot().await?;
         let output = self
             .commands(vec![
@@ -180,6 +190,7 @@ impl NativeDevice {
     }
 
     pub async fn delete_message(self: &Arc<Self>, path: &str) -> Result<(), NativeError> {
+        self.require_sms_reception()?;
         let message = self.message(path).await?;
         let this = self.clone();
         tokio::spawn(async move {
@@ -318,6 +329,7 @@ mod tests {
                 protocol: NativeProtocol::At,
                 control_device: "/dev/fixture".into(),
                 at_device: None,
+                sms_reception_enabled: true,
                 uim_slot: 1,
                 ims: None,
                 data: None,
@@ -343,5 +355,38 @@ mod tests {
             NativeError::OwnerConflict("native_sms_sim_changed".into())
         );
         assert_eq!(*io.0.lock().unwrap(), vec!["AT+CIMI"]);
+    }
+
+    #[tokio::test]
+    async fn disabled_native_sms_reception_never_initializes_scans_or_deletes() {
+        use super::super::config::{NativeDeviceConfig, NativeProtocol};
+        let io = Arc::new(ChangedSimIo(Default::default()));
+        let device = NativeDevice::new(
+            NativeDeviceConfig {
+                hardware_key: "fixture-readonly-at".into(),
+                sysfs_anchor: "/sys/devices/fixture".into(),
+                protocol: NativeProtocol::At,
+                control_device: "/dev/fixture".into(),
+                at_device: None,
+                sms_reception_enabled: false,
+                uim_slot: 1,
+                ims: None,
+                data: None,
+            },
+            io.clone(),
+        );
+        assert!(matches!(
+            device.initialize_sms().await,
+            Err(NativeError::Unsupported("native_sms_reception_disabled"))
+        ));
+        assert!(matches!(
+            device.messages().await,
+            Err(NativeError::Unsupported("native_sms_reception_disabled"))
+        ));
+        assert!(matches!(
+            device.delete_message("unused").await,
+            Err(NativeError::Unsupported("native_sms_reception_disabled"))
+        ));
+        assert!(io.0.lock().unwrap().is_empty());
     }
 }

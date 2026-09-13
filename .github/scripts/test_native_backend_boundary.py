@@ -56,12 +56,23 @@ class NativeBackendBoundaryTests(unittest.TestCase):
             self.assertFalse('Command::new("mmcli")' in text, path)
             self.assertIn("control::at_command(", text)
 
+    def test_native_sms_initialization_is_admitted_before_touching_storage(self):
+        text = (SRC / "services/messaging/sms_listener.rs").read_text()
+        gate = text[text.index("async fn maybe_scan_sms_paths("):text.index("async fn scan_all_modems_or_rebind(")]
+        self.assertLess(gate.index("modem_sms_scan_allowed("), gate.index("initialize_sms().await"))
+        self.assertLess(gate.index("sms_reception_enabled"), gate.index("initialize_sms().await"))
+        cleanup = text[text.index("fn schedule_sms_delete("):text.index("struct SmsIngestContext")]
+        self.assertLess(cleanup.index("get_line_profile(&line_id).enabled"), cleanup.index("delete_message("))
+        config = (SRC / "hardware/cellular/backends/config.rs").read_text()
+        self.assertRegex(config, r"#\[serde\(default\)\]\s*pub sms_reception_enabled: bool")
+
     def test_all_native_regression_groups_are_run_in_ci_without_hardware(self):
         for workflow in ("build-release.yml", "beta-validation.yml"):
             text = (ROOT / ".github/workflows" / workflow).read_text()
             for group in ("config", "io", "protocol", "native", "messages", "sim", "management", "bearer"):
                 self.assertIn(f"hardware::cellular::backends::{group}::tests \\", text)
             self.assertIn("hardware::cellular::modem_manager::roaming_observation_tests \\", text)
+            self.assertIn("services::messaging::sms_listener::tests \\", text)
             self.assertIn("http_router_tests::backend_selection_", text)
 
     def test_package_and_services_do_not_unconditionally_start_mm(self):

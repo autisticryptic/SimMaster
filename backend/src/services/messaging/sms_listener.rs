@@ -1,4 +1,4 @@
-//! SMS Listener Module (ModemManager 版)
+//! SMS reception shared by ModemManager and explicitly enabled native storage.
 //!
 //! 通过 D-Bus 信号监听 ModemManager 的短信接收事件，并增加轮询兜底，
 //! 以便在部分 eSIM/国际运营商场景下尽量减少漏收。
@@ -188,11 +188,23 @@ async fn read_sms_content(conn: &Connection, sms_path: &str) -> Option<IncomingS
     })
 }
 
-fn schedule_sms_delete(conn: &Connection, modem_path: &str, sms_path: String) {
+fn schedule_sms_delete(
+    conn: &Connection,
+    config_manager: &Arc<ConfigManager>,
+    line_id: &str,
+    modem_path: &str,
+    sms_path: String,
+) {
     let conn_clone = conn.clone();
+    let config_manager = Arc::clone(config_manager);
+    let line_id = line_id.to_string();
     let modem_path = modem_path.to_string();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_secs(SMS_DELETE_DELAY_SECS)).await;
+        // Disabling a line during the delay must preserve the stored message.
+        if !config_manager.get_line_profile(&line_id).enabled {
+            return;
+        }
         if crate::hardware::cellular::backends::is_native_selector(&modem_path) {
             if let Ok(device) = crate::hardware::cellular::backends::native_device(&modem_path) {
                 if let Err(error) = device.delete_message(&sms_path).await {
@@ -232,7 +244,7 @@ struct SmsIngestContext<'a> {
     notification_sender: &'a Arc<NotificationSender>,
     modem_path: &'a str,
     line_id: &'a str,
-    config_manager: &'a ConfigManager,
+    config_manager: &'a Arc<ConfigManager>,
     mt_sms: &'a tokio::sync::broadcast::Sender<SmsMessage>,
 }
 
@@ -241,7 +253,7 @@ struct SmsScanContext<'a> {
     conn: &'a Connection,
     db: &'a Database,
     notification_sender: &'a Arc<NotificationSender>,
-    config_manager: &'a ConfigManager,
+    config_manager: &'a Arc<ConfigManager>,
     line_registry: &'a LineRuntimeRegistry,
     mt_sms: &'a tokio::sync::broadcast::Sender<SmsMessage>,
 }
@@ -261,15 +273,21 @@ async fn process_sms_path(
         config_manager,
         mt_sms,
     } = context;
+    if !config_manager.get_line_profile(line_id).enabled {
+        return;
+    }
     let Some(incoming) = read_sms_content(conn, sms_path).await else {
         return;
     };
+    if !config_manager.get_line_profile(line_id).enabled {
+        return;
+    }
 
     let marker = sms_marker(&incoming);
     let timestamp = sms_timestamp(&incoming, mode);
     match db.sms_exists_by_pdu_for_line(line_id, &marker) {
         Ok(true) => {
-            schedule_sms_delete(conn, modem_path, incoming.path);
+            schedule_sms_delete(conn, config_manager, line_id, modem_path, incoming.path);
             return;
         }
         Ok(false) => {}
@@ -287,7 +305,7 @@ async fn process_sms_path(
             &timestamp,
         ) {
             Ok(true) => {
-                schedule_sms_delete(conn, modem_path, incoming.path);
+                schedule_sms_delete(conn, config_manager, line_id, modem_path, incoming.path);
                 return;
             }
             Ok(false) => {}
@@ -303,7 +321,7 @@ async fn process_sms_path(
             &incoming.content,
         ) {
             Ok(true) => {
-                schedule_sms_delete(conn, modem_path, incoming.path);
+                schedule_sms_delete(conn, config_manager, line_id, modem_path, incoming.path);
                 return;
             }
             Ok(false) => {}
@@ -340,7 +358,7 @@ async fn process_sms_path(
         match db.claim_sms_dedup(line_id, &fingerprint, "modem") {
             Ok(true) => {}
             Ok(false) => {
-                schedule_sms_delete(conn, modem_path, incoming.path);
+                schedule_sms_delete(conn, config_manager, line_id, modem_path, incoming.path);
                 return;
             }
             Err(error) => {
@@ -380,7 +398,7 @@ async fn process_sms_path(
                 });
             }
 
-            schedule_sms_delete(conn, modem_path, incoming.path);
+            schedule_sms_delete(conn, config_manager, line_id, modem_path, incoming.path);
         }
         Err(e) => {
             warn!(error = %e, path = %incoming.path, "Failed to store incoming SMS");
@@ -470,6 +488,14 @@ fn ims_sms_owns_reception(
             || (profile.cellular_ims_connection_enabled && cellular_ims_registered))
 }
 
+fn modem_sms_scan_allowed(
+    profile: &LineProfileConfig,
+    present: bool,
+    ims_owns_reception: bool,
+) -> bool {
+    present && profile.enabled && (!ims_owns_reception || profile.sms_path.cs_fallback_receiver)
+}
+
 /// Whether the ModemManager SMS scan should be suppressed because an IMS SMS
 /// path (VoWiFi or VoLTE) has taken over reception. Mirrors the reference
 /// behavior "SMS listener paused while VoLTE IMS SMS path is registered": once
@@ -509,18 +535,32 @@ async fn maybe_scan_sms_paths(
         );
         return;
     };
-    let line_id = line.binding().line_id;
-    let cs_fallback_receiver = config_manager
-        .get_line_sms_path_policy(&line_id)
-        .cs_fallback_receiver;
-    if modem_sms_paused_for_ims(config_manager, line_registry, modem_path).await
-        && !cs_fallback_receiver
-    {
+    let binding = line.binding();
+    let line_id = binding.line_id;
+    let profile = config_manager.get_line_profile(&line_id);
+    if !modem_sms_scan_allowed(
+        &profile,
+        binding.present,
+        modem_sms_paused_for_ims(config_manager, line_registry, modem_path).await,
+    ) {
         debug!(
             reason = %reason,
-            "Skipping ModemManager SMS scan while an IMS (VoWiFi/VoLTE) SMS path is active"
+            "Skipping modem SMS scan: line disabled/absent or IMS owns reception"
         );
         return;
+    }
+    if crate::hardware::cellular::backends::is_native_selector(modem_path) {
+        let Ok(device) = crate::hardware::cellular::backends::native_device(modem_path) else {
+            return;
+        };
+        if !device.spec.sms_reception_enabled {
+            return;
+        }
+        // Initialize only AFTER line/reception admission, also after SIM changes.
+        if let Err(error) = device.initialize_sms().await {
+            warn!(line_id, %error, "Native SMS initialization deferred");
+            return;
+        }
     }
     scan_sms_paths(context, modem_path, reason, forward_new_sms, &line_id).await;
 }
@@ -583,11 +623,6 @@ pub async fn start_sms_listener(
     mut resync_receiver: SmsResyncReceiver,
 ) -> zbus::Result<()> {
     if let Some(fleet) = crate::hardware::cellular::backends::active_native() {
-        for device in fleet.all() {
-            if let Err(error) = device.initialize_sms().await {
-                warn!(line_id = %device.spec.line_id(), %error, "Native SMS capability unavailable");
-            }
-        }
         let mut interval = tokio::time::interval(Duration::from_secs(SMS_POLL_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -598,7 +633,10 @@ pub async fn start_sms_listener(
                     None => return Ok(()),
                 },
             };
-            for path in list_modem_paths(&conn).await? {
+            for device in fleet.all() {
+                if !device.spec.sms_reception_enabled {
+                    continue;
+                }
                 maybe_scan_sms_paths(
                     SmsScanContext {
                         conn: &conn,
@@ -608,7 +646,7 @@ pub async fn start_sms_listener(
                         line_registry: &line_registry,
                         mt_sms: &mt_sms,
                     },
-                    &path,
+                    &device.spec.selector(),
                     &reason,
                     true,
                 )
@@ -668,7 +706,7 @@ pub async fn start_sms_listener(
             conn: &conn,
             db: db.as_ref(),
             notification_sender: &notification_sender,
-            config_manager: config_manager.as_ref(),
+            config_manager: &config_manager,
             line_registry: line_registry.as_ref(),
             mt_sms: &mt_sms,
         };
@@ -797,6 +835,22 @@ pub async fn start_sms_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_or_absent_lines_never_admit_modem_sms_even_with_cs_fallback() {
+        let mut profile = LineProfileConfig::for_line("line-0123456789abcdef0123456789abcdef");
+        profile.sms_path.cs_fallback_receiver = true;
+        assert!(modem_sms_scan_allowed(&profile, true, false));
+        assert!(modem_sms_scan_allowed(&profile, true, true));
+        assert!(!modem_sms_scan_allowed(&profile, false, false));
+        profile.enabled = false;
+        assert!(!modem_sms_scan_allowed(&profile, true, false));
+        assert!(!modem_sms_scan_allowed(&profile, true, true));
+        profile.enabled = true;
+        profile.sms_path.cs_fallback_receiver = false;
+        assert!(modem_sms_scan_allowed(&profile, true, false));
+        assert!(!modem_sms_scan_allowed(&profile, true, true));
+    }
 
     #[test]
     fn only_ready_ims_runtime_on_the_same_line_pauses_cs_sms() {
