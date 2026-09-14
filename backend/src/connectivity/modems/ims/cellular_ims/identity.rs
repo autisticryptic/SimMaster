@@ -58,7 +58,11 @@ pub fn parse_ef_ad_mnc_length(output: &str) -> Option<usize> {
         {
             continue;
         }
-        let length = usize::from_str_radix(octets[3], 16).ok()?;
+        // EF_AD byte four stores the MNC length in its low nibble. The upper
+        // nibble carries unrelated administrative flags and must not make a
+        // valid 0x82/0x83 value look ambiguous.
+        let value = u8::from_str_radix(octets[3], 16).ok()?;
+        let length = usize::from(value & 0x0f);
         return matches!(length, 2 | 3).then_some(length);
     }
     None
@@ -105,12 +109,39 @@ pub fn resolve_home_plmn(
 
 /// Extract USIM/ISIM application identifiers from `qmicli
 /// --uim-get-card-status` output. qmicli formatting differs between releases,
-/// so recognition is based on the registered 3GPP RID/application prefixes
-/// instead of translated labels or line positions.
+/// so values accept colon/space-separated or compact hex. Application type
+/// is determined by the registered 3GPP RID, not by application order.
 pub fn parse_uicc_applications(output: &str) -> UiccApplications {
     let mut applications = UiccApplications::default();
     for line in output.lines() {
-        let compact = line
+        // Filter only the value after the field label. Letters from
+        // "Application ID" itself are valid hex characters and must not be
+        // allowed to contaminate a discovered AID.
+        let Some((label, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !label.trim().eq_ignore_ascii_case("application id") {
+            continue;
+        }
+        let value = value.trim();
+        let value = if let Some(quote) = value.chars().next().filter(|c| matches!(c, '\'' | '"')) {
+            let Some(value) = value
+                .strip_prefix(quote)
+                .and_then(|v| v.strip_suffix(quote))
+            else {
+                continue;
+            };
+            value
+        } else {
+            value
+        };
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b':' || byte.is_ascii_whitespace())
+        {
+            continue;
+        }
+        let compact = value
             .bytes()
             .filter(|byte| byte.is_ascii_hexdigit())
             .map(|byte| (byte as char).to_ascii_lowercase())
@@ -119,12 +150,10 @@ pub fn parse_uicc_applications(output: &str) -> UiccApplications {
             ("a0000000871002", &mut applications.usim_aid),
             ("a0000000871004", &mut applications.isim_aid),
         ] {
-            let Some(start) = compact.find(prefix) else {
+            if !compact.starts_with(prefix) {
                 continue;
-            };
-            let candidate = &compact[start..];
-            let even_len = candidate.len() - candidate.len() % 2;
-            if let Some(decoded) = decode_hex_aid(&candidate[..even_len]) {
+            }
+            if let Some(decoded) = decode_hex_aid(&compact) {
                 if target
                     .as_ref()
                     .is_none_or(|current| decoded.len() > current.len())
@@ -138,7 +167,7 @@ pub fn parse_uicc_applications(output: &str) -> UiccApplications {
 }
 
 fn decode_hex_aid(value: &str) -> Option<Vec<u8>> {
-    if value.len() < 14 || value.len() % 2 != 0 {
+    if !(14..=32).contains(&value.len()) || value.len() % 2 != 0 {
         return None;
     }
     (0..value.len())
@@ -165,16 +194,17 @@ fn pad_mnc(mnc: &str) -> String {
     }
 }
 
-/// Split a 15/16-digit IMSI into (MCC=3, MNC=2 or 3). We can't always know the
-/// MNC length from the IMSI alone; callers that know the true MNC length should
-/// pass it. This helper assumes a 2-digit MNC by default (the common case in
-/// CN/most networks), which the caller can override.
+/// Split the MCC/MNC prefix from an IMSI. The caller must provide a resolved
+/// two- or three-digit MNC length; this function does not guess one.
 pub fn split_imsi(imsi: &str, mnc_len: usize) -> Result<(String, String), CellularImsError> {
-    if imsi.len() < 5 || !imsi.bytes().all(|b| b.is_ascii_digit()) {
+    if !matches!(mnc_len, 2 | 3)
+        || imsi.len() < 3 + mnc_len
+        || !imsi.bytes().all(|b| b.is_ascii_digit())
+    {
         return Err(CellularImsError::new(code::IMSI_MISSING));
     }
     let mcc = imsi[..3].to_string();
-    let mnc = imsi[3..3 + mnc_len.clamp(2, 3)].to_string();
+    let mnc = imsi[3..3 + mnc_len].to_string();
     Ok((mcc, mnc))
 }
 
@@ -289,6 +319,14 @@ mod tests {
     }
 
     #[test]
+    fn split_imsi_rejects_short_input_without_panicking() {
+        assert_eq!(
+            split_imsi("12345", 3).unwrap_err().code(),
+            code::IMSI_MISSING
+        );
+    }
+
+    #[test]
     fn parses_modemmanager_cimi_response() {
         assert_eq!(
             parse_cimi_response("response: '460001234567890'\n").as_deref(),
@@ -306,6 +344,10 @@ mod tests {
         assert_eq!(
             parse_ef_ad_mnc_length("Read result: '00:00:01:03'\n"),
             Some(3)
+        );
+        assert_eq!(
+            parse_ef_ad_mnc_length("Read result: '00:00:01:82'\n"),
+            Some(2)
         );
         assert_eq!(
             parse_ef_ad_mnc_length("Read result:\n\t00:00:01:04\n"),
@@ -371,5 +413,51 @@ Application ID: 'A0:00:00:00:87:10:04:FF:86:FF'
             .isim_aid
             .as_deref()
             .is_some_and(|aid| aid.starts_with(ISIM_AID_PREFIX)));
+    }
+
+    #[test]
+    fn application_id_parser_ignores_hex_letters_in_the_label() {
+        let applications = parse_uicc_applications("Application ID: 'A0:00:00:00:87:10:02:FF'\n");
+        assert_eq!(
+            applications.usim_aid.as_deref(),
+            Some(&[0xa0, 0, 0, 0, 0x87, 0x10, 2, 0xff][..])
+        );
+    }
+
+    #[test]
+    fn aid_parser_rejects_corrupt_or_oversized_values_instead_of_truncating() {
+        for value in [
+            "a0000000871002f",
+            "00a0000000871002",
+            "a0000000871002z",
+            "a0000000871002ffffffffffffffffffff00",
+        ] {
+            assert_eq!(
+                parse_uicc_applications(&format!("Application ID: '{value}'")),
+                UiccApplications::default()
+            );
+        }
+        assert_eq!(
+            parse_uicc_applications("note Application ID: 'a0000000871002'"),
+            UiccApplications::default()
+        );
+        assert!(
+            parse_uicc_applications(" application id : \"A0 00 00 00 87 10 02\" ")
+                .usim_aid
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn ef_ad_low_nibble_and_explicit_mnc_length_are_validated() {
+        assert_eq!(
+            parse_ef_ad_mnc_length("Read result: '00:00:01:83'"),
+            Some(3)
+        );
+        assert_eq!(parse_ef_ad_mnc_length("Read result: '00:00:01:ff'"), None);
+        for length in [0, 1, 4, usize::MAX] {
+            assert!(split_imsi("310260123456789", length).is_err());
+        }
+        assert!(resolve_home_plmn("310260123456789", Some("45507"), None).is_err());
     }
 }

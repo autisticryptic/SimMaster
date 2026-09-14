@@ -135,6 +135,21 @@ pub enum NetConfigOp {
         ifname: String,
         cidr: String,
     },
+    /// IMS-only IPv6 address installation.  `nodad` prevents a tentative
+    /// address from being rejected as a route source, while `noprefixroute`
+    /// avoids an implicit connected route that can escape the bearer policy.
+    /// This is intentionally separate from `AddrReplace`: ordinary UE veth,
+    /// VoWiFi TUN and native data addresses retain normal kernel DAD behavior.
+    ImsIpv6AddrReplace {
+        ifname: String,
+        cidr: String,
+    },
+    /// Bounded readiness barrier before using an assigned address as a route
+    /// source. Runs in this worker's namespace and checks the exact netdev.
+    AddrWaitReady {
+        ifname: String,
+        address: String,
+    },
     /// Best-effort `ip address del`; a missing address is not an error.
     AddrDel {
         ifname: String,
@@ -493,6 +508,44 @@ impl UeWorkerBinding {
     pub fn matches(&self, other: &Self) -> bool {
         self.worker.same_instance(&other.worker) && self.generation == other.generation
     }
+
+    /// Hold across a namespace move, or briefly while submitting a request.
+    /// Never hold while waiting for a worker net-config response: failure
+    /// cleanup needs this same lock. Always use the original bearer binding.
+    pub(crate) async fn lock_current_generation(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, ()>, UeWorkerError> {
+        let guard = self.worker.core.lifecycle.lock().await;
+        if !self.is_current() {
+            return Err(UeWorkerError::Protocol("worker generation changed".into()));
+        }
+        Ok(guard)
+    }
+
+    /// Every operation in the batch executes on the captured process. A
+    /// control-channel failure returns an error; it is never retried on a new
+    /// process. The generation is checked both before and after the request,
+    /// so a response from a replacement worker cannot be accepted as success.
+    pub async fn apply_net_config(
+        &self,
+        ops: Vec<NetConfigOp>,
+    ) -> Result<NetConfigOutcome, UeWorkerError> {
+        if !self.is_current() {
+            return Err(UeWorkerError::Protocol(
+                "worker generation changed".to_string(),
+            ));
+        }
+        let result = self
+            .worker
+            .apply_net_config_current(ops, self.generation)
+            .await?;
+        if !self.is_current() {
+            return Err(UeWorkerError::Protocol(
+                "worker generation changed".to_string(),
+            ));
+        }
+        Ok(result)
+    }
 }
 
 impl UeWorkerHandle {
@@ -582,6 +635,21 @@ impl UeWorkerHandle {
         &self,
         ops: Vec<NetConfigOp>,
     ) -> Result<NetConfigOutcome, UeWorkerError> {
+        self.bind().apply_net_config(ops).await
+    }
+
+    async fn apply_net_config_current(
+        &self,
+        ops: Vec<NetConfigOp>,
+        expected_generation: u64,
+    ) -> Result<NetConfigOutcome, UeWorkerError> {
+        // Prevent respawn between checking the binding and selecting its
+        // writer. Release before awaiting the result so shutdown/failure can
+        // retire the process and fail pending requests without deadlocking.
+        let lifecycle = self.core.lifecycle.lock().await;
+        if self.generation() != expected_generation {
+            return Err(UeWorkerError::Protocol("worker generation changed".into()));
+        }
         if ops.is_empty() {
             return Ok(NetConfigOutcome {
                 request_id: 0,
@@ -604,7 +672,8 @@ impl UeWorkerHandle {
                 "worker control channel is not up".to_string(),
             ));
         }
-        match tokio::time::timeout(NET_CONFIG_TIMEOUT, rx).await {
+        drop(lifecycle);
+        let result = match tokio::time::timeout(NET_CONFIG_TIMEOUT, rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => Err(UeWorkerError::Protocol(
                 "worker dropped the net-config request".to_string(),
@@ -612,7 +681,9 @@ impl UeWorkerHandle {
             Err(_) => Err(UeWorkerError::Protocol(format!(
                 "net-config request {request_id} timed out"
             ))),
-        }
+        };
+        self.core.pending.lock().unwrap().remove(&request_id);
+        result
     }
 
     /// Install an in-process control responder for unit tests that exercise
@@ -620,6 +691,11 @@ impl UeWorkerHandle {
     /// process. Production code has no host-path equivalent.
     #[cfg(test)]
     pub async fn enable_test_net_config(&self) {
+        self.enable_test_net_config_outcome(None).await;
+    }
+
+    #[cfg(test)]
+    pub async fn enable_test_net_config_outcome(&self, error: Option<String>) {
         let (tx, mut rx) = mpsc::unbounded_channel();
         *self.core.tx.lock().unwrap() = Some(tx);
         let core = Arc::clone(&self.core);
@@ -630,15 +706,15 @@ impl UeWorkerHandle {
                 };
                 let outcome = NetConfigOutcome {
                     request_id,
-                    ok: true,
+                    ok: error.is_none(),
                     output: vec![format!("test applied {} net-config operations", ops.len())],
-                    error: None,
+                    error: error.clone(),
                 };
                 let sender = core.pending.lock().unwrap().remove(&request_id);
                 {
                     let mut state = core.state.lock().unwrap();
-                    state.last_net_config_ok = true;
-                    state.last_net_config_error = None;
+                    state.last_net_config_ok = error.is_none();
+                    state.last_net_config_error = error.clone();
                 }
                 if let Some(PendingRequest::NetConfig(sender)) = sender {
                     let _ = sender.send(outcome);
@@ -1944,6 +2020,73 @@ async fn collect_net_status() -> NetStatusSnapshot {
     snapshot
 }
 
+/// Interpret the exact interface/address entry, not a namespace-wide list
+/// that might contain a matching address on another bearer or the UE veth.
+#[cfg(unix)]
+fn address_is_ready(json: &[u8], ifname: &str, address: std::net::IpAddr) -> Result<bool, String> {
+    let interfaces: Vec<serde_json::Value> = serde_json::from_slice(json)
+        .map_err(|_| "bearer address observation invalid".to_string())?;
+    for interface in interfaces {
+        if interface.get("ifname").and_then(|v| v.as_str()) != Some(ifname) {
+            continue;
+        }
+        let Some(infos) = interface.get("addr_info").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for info in infos {
+            let local = info
+                .get("local")
+                .and_then(|v| v.as_str())
+                .and_then(|v| v.parse::<std::net::IpAddr>().ok());
+            if local != Some(address) {
+                continue;
+            }
+            // iproute2 emits boolean keys; accept the flags-array rendering
+            // as well. In both formats DAD failure is terminal, not a retry.
+            let flag = |name: &str| {
+                info.get(name).and_then(|v| v.as_bool()).unwrap_or(false)
+                    || info
+                        .get("flags")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|flags| flags.iter().any(|flag| flag.as_str() == Some(name)))
+            };
+            if flag("dadfailed") {
+                return Err("bearer source address DAD failed".into());
+            }
+            return Ok(!flag("tentative")
+                && info.get("valid_life_time").and_then(|v| v.as_u64()) != Some(0));
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+async fn wait_address_ready(ip: &str, ifname: &str, address: &str) -> Result<(), String> {
+    let address = address
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| "bearer source address invalid".to_string())?;
+    let observation = async {
+        loop {
+            let result = tokio::process::Command::new(ip)
+                .args(["-json", "address", "show", "dev", ifname])
+                .kill_on_drop(true)
+                .output()
+                .await
+                .map_err(|_| "bearer address observation failed".to_string())?;
+            if !result.status.success() {
+                return Err("bearer address observation failed".into());
+            }
+            if address_is_ready(&result.stdout, ifname, address)? {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), observation)
+        .await
+        .map_err(|_| "bearer source address not ready (missing or tentative)".to_string())?
+}
+
 /// Execute a net-config batch. Runs inside the worker's own namespace, so the
 /// commands target the UE stack exclusively. Each op captures its stdout; a
 /// failed op aborts the batch and reports the first error.
@@ -1954,6 +2097,13 @@ async fn execute_net_config(ops: Vec<NetConfigOp>) -> (bool, Vec<String>, Option
     let mut output = Vec::with_capacity(ops.len());
     let ip_path = discover_ip().await.unwrap_or_else(|| "ip".to_string());
     for op in ops {
+        if let NetConfigOp::AddrWaitReady { ifname, address } = &op {
+            match wait_address_ready(&ip_path, ifname, address).await {
+                Ok(()) => output.push("bearer source address ready".into()),
+                Err(error) => return (false, output, Some(error)),
+            }
+            continue;
+        }
         let argv = match net_config_argv(&op) {
             Ok(argv) => argv,
             Err(error) => return (false, output, Some(error)),
@@ -2031,13 +2181,36 @@ fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
             "mtu".into(),
             mtu.to_string(),
         ],
-        NetConfigOp::AddrReplace { ifname, cidr } => vec![
-            "address".into(),
-            "replace".into(),
-            cidr.clone(),
-            "dev".into(),
-            ifname.clone(),
-        ],
+        NetConfigOp::AddrReplace { ifname, cidr } => {
+            vec![
+                "address".into(),
+                "replace".into(),
+                cidr.clone(),
+                "dev".into(),
+                ifname.clone(),
+            ]
+        }
+        NetConfigOp::AddrWaitReady { .. } => {
+            return Err("address readiness is not an ip mutation".into());
+        }
+        NetConfigOp::ImsIpv6AddrReplace { ifname, cidr } => {
+            let valid = cidr.split_once('/').is_some_and(|(address, prefix)| {
+                address.parse::<std::net::Ipv6Addr>().is_ok()
+                    && prefix.parse::<u8>().is_ok_and(|prefix| prefix <= 128)
+            });
+            if !valid {
+                return Err("IMS address operation requires an IPv6 CIDR".into());
+            }
+            vec![
+                "address".into(),
+                "replace".into(),
+                cidr.clone(),
+                "dev".into(),
+                ifname.clone(),
+                "nodad".into(),
+                "noprefixroute".into(),
+            ]
+        }
         NetConfigOp::AddrDel { ifname, cidr } => vec![
             "address".into(),
             "del".into(),
@@ -2076,15 +2249,15 @@ fn net_config_argv(op: &NetConfigOp) -> Result<Vec<String>, String> {
             *table,
             false,
         ),
-        NetConfigOp::DefaultRouteReplace { via, dev } => vec![
-            "route".into(),
-            "replace".into(),
-            "default".into(),
-            "via".into(),
-            via.as_str().into(),
-            "dev".into(),
-            dev.as_str().into(),
-        ],
+        NetConfigOp::DefaultRouteReplace { via, dev } => route_argv(
+            "replace",
+            "default",
+            Some(via),
+            Some(dev),
+            None,
+            None,
+            false,
+        ),
         NetConfigOp::DefaultRouteDeviceReplace { dev, ipv6, metric } => {
             let mut argv = Vec::with_capacity(8);
             if *ipv6 {
@@ -2390,6 +2563,171 @@ mod tests {
                 "onlink",
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ipv6_address_replace_disables_dad_and_prefix_route_for_explicit_ims_routes() {
+        let op = NetConfigOp::ImsIpv6AddrReplace {
+            ifname: "wwan0".into(),
+            cidr: "2400:db8::10/64".into(),
+        };
+        assert_eq!(
+            net_config_argv(&op).unwrap(),
+            vec![
+                "address",
+                "replace",
+                "2400:db8::10/64",
+                "dev",
+                "wwan0",
+                "nodad",
+                "noprefixroute",
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_ipv6_keeps_dad_and_default_routes_select_the_right_family() {
+        let op = NetConfigOp::AddrReplace {
+            ifname: "wwan0".into(),
+            cidr: "2001:db8::1/64".into(),
+        };
+        assert_eq!(
+            net_config_argv(&op).unwrap(),
+            vec!["address", "replace", "2001:db8::1/64", "dev", "wwan0"]
+        );
+        for via in ["192.0.2.1", "8000::500"] {
+            let args = net_config_argv(&NetConfigOp::DefaultRouteReplace {
+                via: via.into(),
+                dev: "wwan0".into(),
+            })
+            .unwrap();
+            assert_eq!(args.first().unwrap() == "-6", via.contains(':'));
+        }
+        assert!(net_config_argv(&NetConfigOp::ImsIpv6AddrReplace {
+            ifname: "wwan0".into(),
+            cidr: "192.0.2.2/32".into(),
+        })
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readiness_requires_the_exact_non_tentative_interface_address() {
+        let address = "2001:db8::1".parse().unwrap();
+        for flags in [serde_json::json!({}), serde_json::json!({"flags": []})] {
+            let mut entry = flags;
+            entry["local"] = "2001:0db8:0:0:0:0:0:1".into();
+            let json = serde_json::to_vec(&serde_json::json!([
+                {"ifname": "wwan0", "addr_info": [entry]}
+            ]))
+            .unwrap();
+            assert!(address_is_ready(&json, "wwan0", address).unwrap());
+            assert!(!address_is_ready(&json, "wwan1", address).unwrap());
+        }
+        for entry in [
+            serde_json::json!({"local": "2001:db8::1", "tentative": true}),
+            serde_json::json!({"local": "2001:db8::1", "flags": ["tentative"]}),
+            serde_json::json!({"local": "2001:db8::1", "valid_life_time": 0}),
+            serde_json::json!({"local": "2001:db8::2"}),
+        ] {
+            let json = serde_json::to_vec(&serde_json::json!([
+                {"ifname": "wwan0", "addr_info": [entry]}
+            ]))
+            .unwrap();
+            assert!(!address_is_ready(&json, "wwan0", address).unwrap());
+        }
+        let failed =
+            br#"[{"ifname":"wwan0","addr_info":[{"local":"2001:db8::1","dadfailed":true}]}]"#;
+        assert!(address_is_ready(failed, "wwan0", address)
+            .unwrap_err()
+            .contains("DAD failed"));
+        assert!(address_is_ready(b"invalid", "wwan0", address).is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_binding_cannot_enqueue_configuration_on_a_replacement() {
+        let worker = UeWorkerHandle::for_line("test", NetnsName::for_line("sa-ue", "test"));
+        worker.enable_test_net_config().await;
+        let binding = worker.bind();
+        let ops = vec![NetConfigOp::LinkSetUp {
+            ifname: "wwan0".into(),
+        }];
+        assert!(binding.apply_net_config(ops.clone()).await.unwrap().ok);
+        worker.core.generation.fetch_add(1, Ordering::SeqCst);
+        let next_request = worker.core.request_seq.load(Ordering::Relaxed);
+        assert!(binding.apply_net_config(ops).await.is_err());
+        assert_eq!(
+            worker.core.request_seq.load(Ordering::Relaxed),
+            next_request
+        );
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn generation_is_rechecked_after_waiting_for_the_lifecycle_lock() {
+        let worker = UeWorkerHandle::for_line("test", NetnsName::for_line("sa-ue", "test"));
+        let binding = worker.bind();
+        let guard = worker.core.lifecycle.lock().await;
+        let request = binding.apply_net_config(vec![NetConfigOp::LinkSetUp {
+            ifname: "wwan0".into(),
+        }]);
+        tokio::pin!(request);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), &mut request)
+                .await
+                .is_err()
+        );
+        worker.core.generation.fetch_add(1, Ordering::SeqCst);
+        drop(guard);
+        assert!(request
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("generation changed"));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn response_from_a_superseded_generation_is_not_success() {
+        let worker = UeWorkerHandle::for_line("test", NetnsName::for_line("sa-ue", "test"));
+        let binding = worker.bind();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        *worker.core.tx.lock().unwrap() = Some(tx);
+        let responder = async {
+            let Some(UeWorkerMessage::NetConfigRequest { request_id, .. }) = rx.recv().await else {
+                panic!("net-config request missing");
+            };
+            // Sending must have released lifecycle: failure/shutdown must be
+            // able to take it while the caller awaits the response.
+            let _lifecycle = worker.core.lifecycle.lock().await;
+            worker.core.generation.fetch_add(1, Ordering::SeqCst);
+            let pending = worker.core.pending.lock().unwrap().remove(&request_id);
+            if let Some(PendingRequest::NetConfig(tx)) = pending {
+                let _ = tx.send(NetConfigOutcome {
+                    request_id,
+                    ok: true,
+                    output: vec![],
+                    error: None,
+                });
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(
+                binding.apply_net_config(vec![NetConfigOp::LinkSetUp {
+                    ifname: "wwan0".into()
+                }]),
+                responder
+            )
+        })
+        .await
+        .expect("lifecycle must not be held while awaiting response");
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("generation changed"));
+        assert!(worker.core.pending.lock().unwrap().is_empty());
     }
 
     #[cfg(unix)]

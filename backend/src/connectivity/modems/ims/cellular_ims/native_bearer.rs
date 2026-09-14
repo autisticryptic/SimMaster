@@ -111,18 +111,20 @@ impl NativeImsBearer {
         worker: UeWorkerHandle,
     ) -> Result<(), CellularImsError> {
         let worker_binding = worker.bind();
-        if !worker_binding.is_current() {
-            return Err(CellularImsError::new(
-                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
-            ));
-        }
-        if self.moved_to_worker {
-            if self.worker_binding_is_current() {
+        let _generation = worker_binding
+            .lock_current_generation()
+            .await
+            .map_err(|_| CellularImsError::new(code::RUNTIME_UE_WORKER_GENERATION_CHANGED))?;
+        if let Some(existing) = self.worker_binding.as_ref() {
+            if existing.is_current() && existing.matches(&worker_binding) {
                 return Ok(());
             }
             return Err(CellularImsError::new(
                 code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
             ));
+        }
+        if !worker.status().await.ready {
+            return Err(CellularImsError::new(code::RUNTIME_UE_WORKER_UNAVAILABLE));
         }
         match self.interface_ownership {
             BearerInterfaceOwnership::HostManagedPrimary => {
@@ -148,7 +150,7 @@ impl NativeImsBearer {
                 // worker. Record the worker for route/socket teardown, but do
                 // not attempt a second namespace move.
                 self.worker = Some(worker);
-                self.worker_binding = Some(worker_binding);
+                self.worker_binding = Some(worker_binding.clone());
                 return Ok(());
             }
             BearerInterfaceOwnership::ApplicationOwnedNative => {}
@@ -169,6 +171,13 @@ impl NativeImsBearer {
                     ),
                 )
             })?;
+        // Record ownership as soon as the move succeeds. Any later failure is
+        // released through the captured binding, never a same-name lookup in
+        // a replacement worker. The lifecycle guard prevents respawn/move-out
+        // races until this method returns.
+        self.worker = Some(worker);
+        self.worker_binding = Some(worker_binding.clone());
+        self.moved_to_worker = true;
         let status = worker_binding.worker().refresh_net_status().await;
         if status.as_ref().ok().is_none_or(|snapshot| {
             !snapshot
@@ -176,7 +185,6 @@ impl NativeImsBearer {
                 .iter()
                 .any(|name| name == &self.interface)
         }) {
-            let _ = netns::move_iface_out(worker_binding.namespace(), &self.interface).await;
             return Err(CellularImsError::with_detail(
                 code::COMMAND_FAILED,
                 format!(
@@ -185,22 +193,6 @@ impl NativeImsBearer {
                 ),
             ));
         }
-        if !worker_binding.is_current() {
-            // The worker respawned while the interface was being moved. Do not
-            // use the long-lived handle to clean the namespace: that would
-            // target the replacement generation. Its teardown owns the stale
-            // namespace state, while the provider handle is still released by
-            // the caller.
-            self.worker = Some(worker);
-            self.worker_binding = Some(worker_binding);
-            self.moved_to_worker = true;
-            return Err(CellularImsError::new(
-                code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
-            ));
-        }
-        self.worker = Some(worker);
-        self.worker_binding = Some(worker_binding);
-        self.moved_to_worker = true;
         Ok(())
     }
 
@@ -217,7 +209,7 @@ impl NativeImsBearer {
             return;
         }
         if let Some(binding) = self.worker_binding.as_ref() {
-            if binding.is_current() {
+            if let Ok(_generation) = binding.lock_current_generation().await {
                 let _ = netns::move_iface_out(binding.namespace(), &self.interface).await;
                 let _ = binding.worker().refresh_net_status().await;
             } else {
@@ -371,7 +363,7 @@ pub async fn establish_native_ims_bearer(
 /// Tear down a native bearer's WDS session(s) and release its endpoint.
 pub async fn release_native_ims_bearer(mut bearer: NativeImsBearer) {
     if bearer.worker_binding_is_current() {
-        if let Some(worker) = bearer.worker.as_ref() {
+        if let Some(worker) = bearer.worker_binding.as_ref() {
             teardown_bearer_network_in_worker(&bearer.connection, worker).await;
         }
     } else {

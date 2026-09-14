@@ -1,5 +1,9 @@
 # 原生后端逻辑候选：默认 MM，硬件验收延期
 
+> **新阶段入口**：用户随后在 2026-09-13 授权自有设备实测。最新过程见
+> [Native 自有设备实测与交接](NATIVE_BACKEND_DEVICE_VALIDATION_2026-09-13.md)。
+> 下文保留先前“仅逻辑、延期验收”阶段的范围和结论，不代表新阶段仍禁止测试。
+
 > 2026-09-13，`dev/1.1.5-modem-backends`。
 > 用户要求先推进非 MM 逻辑；现阶段继续以 MM 为主，等 IMS 多卡基线收敛后再做接管测试。
 > 本轮不部署、不连接测试设备、不切换 owner。代码接线、离线验证和实机支持必须分开记录。
@@ -46,6 +50,14 @@
   旧 SIM-03 的 MM 注册/续期记录不算新 native 路径的验收证据。
 
 ## 3. 仍未完成或未覆盖
+
+### 3.1 本轮离线逻辑强化（2026-09-14）
+
+- `identity.rs` 修正 EF_AD 低半字节读取、IMSI 长度/MNC 校验，以及只从 `Application ID:` 字段解析 USIM/ISIM AID；异常/越界 AID 不再被截断接受。
+- UE worker 增加专用 `ImsIpv6AddrReplace` 和 `AddrWaitReady` 操作：只有 IMS IPv6 使用 `nodad noprefixroute`，普通数据、veth、VoWiFi TUN 保留正常 DAD；P-CSCF/DNS 路由前在同一 namespace 验证精确接口地址非 tentative、非 dadfailed 且仍有效。
+- 网络配置批次现在捕获并复核 worker generation；请求不会在代次变化后重放到替换 worker。Native IMS/普通数据路由使用原始 binding，并检查 worker 返回的 `ok/error`，避免路由失败被报告为成功。
+- MBIM IP 配置解析改为严格校验地址族、前缀、网关/DNS，去重并拒绝未标记或跨族值；普通 native 数据网关先建立 host route，再安装对应族默认路由。
+- 这些改动仅完成离线代码/格式层面的强化，尚未经过 Rust 编译、Actions 或设备验证；SIM-04 仍没有 AKA/SIP 注册证据。
 
 不能因为代码能够构建，就将以下项目标记完成：
 

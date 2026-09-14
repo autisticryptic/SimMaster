@@ -2375,7 +2375,7 @@ async fn connect_inner(
                 state.bearer_path = Some(bearer.path.clone());
             })
             .await;
-        let configured = configure_bearer_network_in_worker(&bearer, &network_worker).await;
+        let configured = configure_bearer_network_in_worker(&bearer, &network_worker_binding).await;
         if let Err(error) = configured {
             runtime
                 .record_attempt(
@@ -2589,7 +2589,8 @@ async fn connect_inner(
             // twice here.
             native_bearer::release_native_ims_bearer(established).await;
         } else if network_worker_binding.is_current() {
-            super::bearer::teardown_bearer_network_in_worker(&bearer, &network_worker).await;
+            super::bearer::teardown_bearer_network_in_worker(&bearer, &network_worker_binding)
+                .await;
         } else {
             tracing::warn!(
                 interface = %bearer.interface,
@@ -2634,7 +2635,7 @@ async fn connect_family(
     let worker = worker_binding.worker().clone();
     let pcscf = bearer.settings.ensure_family_match(local_addr, pcscf)?;
     ensure_worker_binding_current(worker_binding)?;
-    route_pcscf_in_worker(bearer, pcscf, &worker).await?;
+    route_pcscf_in_worker(bearer, pcscf, worker_binding).await?;
     ensure_worker_binding_current(worker_binding)?;
     // The policy rule that steers SIP onto this bearer is keyed on the source
     // address captured when the bearer settings were read. Maxis hands out a
@@ -4179,7 +4180,7 @@ async fn cleanup_live_session(live: &CellularImsLiveHandle) {
             None if session.worker_binding.is_current() => {
                 super::bearer::teardown_bearer_network_in_worker(
                     &session.bearer,
-                    &session.network_worker,
+                    &session.worker_binding,
                 )
                 .await;
             }
@@ -4214,7 +4215,7 @@ async fn cleanup_retained_failed_bearer(live: &CellularImsLiveHandle) {
         None if retained.worker_binding.is_current() => {
             super::bearer::teardown_bearer_network_in_worker(
                 &retained.bearer,
-                &retained.network_worker,
+                &retained.worker_binding,
             )
             .await;
         }
@@ -5052,7 +5053,7 @@ async fn handle_operator_sip_frame(
         let operator_remote = media_socket_addr(&operator_audio)?;
         ensure_operator_sdp_routes(
             &session.bearer,
-            &session.network_worker,
+            &session.worker_binding,
             sip::sip_body(frame),
         )
         .await?;
@@ -5304,7 +5305,7 @@ async fn handle_operator_sip_frame(
             if !sip::sip_body(frame).is_empty() {
                 ensure_operator_sdp_routes(
                     &session.bearer,
-                    &session.network_worker,
+                    &session.worker_binding,
                     sip::sip_body(frame),
                 )
                 .await?;
@@ -5383,7 +5384,7 @@ async fn handle_operator_sip_frame(
             if !sip::sip_body(frame).is_empty() {
                 ensure_operator_sdp_routes(
                     &session.bearer,
-                    &session.network_worker,
+                    &session.worker_binding,
                     sip::sip_body(frame),
                 )
                 .await?;
@@ -5544,7 +5545,7 @@ async fn begin_incoming_operator_call(
         });
     ensure_operator_media_routes(
         &session.bearer,
-        &session.network_worker,
+        &session.worker_binding,
         operator_remote,
         operator_video.as_ref(),
     )
@@ -5886,7 +5887,7 @@ fn prepare_final_operator_media(
 
 async fn ensure_operator_sdp_routes(
     bearer: &BearerConnection,
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
     body: &[u8],
 ) -> Result<(), CellularImsError> {
     let audio = parse_audio_sdp(body).map_err(|error| {
@@ -5905,7 +5906,7 @@ async fn ensure_operator_sdp_routes(
 
 async fn ensure_operator_media_routes(
     bearer: &BearerConnection,
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
     audio: SocketAddr,
     video: Option<&VideoOffer>,
 ) -> Result<(), CellularImsError> {

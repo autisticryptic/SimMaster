@@ -19,7 +19,7 @@ use tokio::process::Command;
 use crate::platform::network_routing::{
     host_selector, network_address, route_table, rule_priority, source_selector, RouteDomain,
 };
-use crate::services::ue_worker::{NetConfigOp, UeWorkerHandle};
+use crate::services::ue_worker::{NetConfigOp, UeWorkerBinding};
 
 use super::{
     errors::{code, CellularImsError},
@@ -608,12 +608,24 @@ pub async fn configure_bearer_network(bearer: &BearerConnection) -> Result<(), C
 /// UEs cannot collide.
 pub async fn configure_bearer_network_in_worker(
     bearer: &BearerConnection,
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
 ) -> Result<(), CellularImsError> {
-    apply_worker_ops(worker, bearer_network_ops(bearer)?).await
+    apply_worker_ops(worker, bearer_network_ops(bearer, true)?).await
 }
 
-fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, CellularImsError> {
+/// Ordinary data keeps kernel DAD and connected-prefix routes; IMS-specific
+/// address flags must not leak into the shared native bearer implementation.
+pub async fn configure_data_bearer_network_in_worker(
+    bearer: &BearerConnection,
+    worker: &UeWorkerBinding,
+) -> Result<(), CellularImsError> {
+    apply_worker_ops(worker, bearer_network_ops(bearer, false)?).await
+}
+
+fn bearer_network_ops(
+    bearer: &BearerConnection,
+    ims: bool,
+) -> Result<Vec<NetConfigOp>, CellularImsError> {
     let mut ops = Vec::new();
     if let Some(mtu) = bearer.mtu {
         ops.push(NetConfigOp::LinkSetMtu {
@@ -641,18 +653,33 @@ fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, Cel
         ),
     ] {
         let Some(address) = address else { continue };
-        ops.push(NetConfigOp::AddrReplace {
-            ifname: bearer.interface.clone(),
-            cidr: format!("{address}/{prefix}"),
+        ops.push(if ims && address.is_ipv6() {
+            NetConfigOp::ImsIpv6AddrReplace {
+                ifname: bearer.interface.clone(),
+                cidr: format!("{address}/{prefix}"),
+            }
+        } else {
+            NetConfigOp::AddrReplace {
+                ifname: bearer.interface.clone(),
+                cidr: format!("{address}/{prefix}"),
+            }
         });
+        if address.is_ipv6() {
+            ops.push(NetConfigOp::AddrWaitReady {
+                ifname: bearer.interface.clone(),
+                address: address.to_string(),
+            });
+        }
         for server in dns {
             ops.push(worker_host_route_op(bearer, *server)?);
         }
     }
-    if !ops
-        .iter()
-        .any(|op| matches!(op, NetConfigOp::AddrReplace { .. }))
-    {
+    if !ops.iter().any(|op| {
+        matches!(
+            op,
+            NetConfigOp::AddrReplace { .. } | NetConfigOp::ImsIpv6AddrReplace { .. }
+        )
+    }) {
         return Err(CellularImsError::new(code::IP_SETTINGS_MISSING));
     }
     Ok(ops)
@@ -661,7 +688,7 @@ fn bearer_network_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, Cel
 pub async fn route_pcscf_in_worker(
     bearer: &BearerConnection,
     pcscf: IpAddr,
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
 ) -> Result<(), CellularImsError> {
     apply_worker_ops(worker, vec![worker_host_route_op(bearer, pcscf)?]).await
 }
@@ -669,7 +696,7 @@ pub async fn route_pcscf_in_worker(
 pub async fn route_media_host_in_worker(
     bearer: &BearerConnection,
     host: IpAddr,
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
 ) -> Result<(), CellularImsError> {
     apply_worker_ops(worker, vec![worker_host_route_op(bearer, host)?]).await
 }
@@ -681,11 +708,15 @@ fn worker_host_route_op(
     let source = bearer
         .settings
         .local_addr_for_family(host)
+        .filter(|source| source.is_ipv6() == host.is_ipv6() && !source.is_unspecified())
         .ok_or_else(|| CellularImsError::new("volte_route_family_mismatch"))?;
-    let via = bearer
-        .settings
-        .gateway_for_family(host)
-        .map(|gateway| gateway.to_string());
+    let gateway = bearer.settings.gateway_for_family(host);
+    if gateway
+        .is_some_and(|gateway| gateway.is_ipv6() != host.is_ipv6() || gateway.is_unspecified())
+    {
+        return Err(CellularImsError::new("volte_route_gateway_family_mismatch"));
+    }
+    let via = gateway.map(|gateway| gateway.to_string());
     Ok(NetConfigOp::RouteReplace {
         target: host_selector(host),
         onlink: via.is_some(),
@@ -697,9 +728,14 @@ fn worker_host_route_op(
 }
 
 async fn apply_worker_ops(
-    worker: &UeWorkerHandle,
+    worker: &UeWorkerBinding,
     ops: Vec<NetConfigOp>,
 ) -> Result<(), CellularImsError> {
+    if !worker.is_current() {
+        return Err(CellularImsError::new(
+            code::RUNTIME_UE_WORKER_GENERATION_CHANGED,
+        ));
+    }
     let outcome = worker.apply_net_config(ops).await.map_err(|error| {
         CellularImsError::with_detail(code::COMMAND_FAILED, format!("worker net-config: {error}"))
     })?;
@@ -1036,7 +1072,10 @@ pub async fn teardown_bearer_network(bearer: &BearerConnection) {
 /// Remove only network state owned by a native IMS interface in a UE worker.
 /// The worker namespace may also contain VoWiFi/veth state, so cleanup is
 /// deliberately device-scoped and never flushes the whole main table.
-pub async fn teardown_bearer_network_in_worker(bearer: &BearerConnection, worker: &UeWorkerHandle) {
+pub async fn teardown_bearer_network_in_worker(
+    bearer: &BearerConnection,
+    worker: &UeWorkerBinding,
+) {
     let mut ops = vec![
         NetConfigOp::FlushRoutesForDevice {
             ifname: bearer.interface.clone(),
@@ -1192,7 +1231,7 @@ mod tests {
             mtu: None,
         };
 
-        let ops = bearer_network_ops(&bearer).unwrap();
+        let ops = bearer_network_ops(&bearer, true).unwrap();
         let link_up = ops
             .iter()
             .position(|op| matches!(op, NetConfigOp::LinkSetUp { .. }))
@@ -1231,6 +1270,61 @@ mod tests {
                 onlink: true,
             }
         );
+    }
+
+    #[test]
+    fn only_ims_ipv6_skips_dad_but_both_roles_wait_before_source_routes() {
+        let bearer = BearerConnection {
+            path: "native-bearer:test".into(),
+            interface: "wwan0".into(),
+            ip_type: "ipv4v6".into(),
+            settings: ImsIpSettings {
+                ipv6_address: Some("2001:db8::1".parse().unwrap()),
+                ipv6_gateway: Some("8000::500".parse().unwrap()),
+                ipv6_dns: vec!["2001:db8::53".parse().unwrap()],
+                ipv4_address: Some("192.0.2.1".parse().unwrap()),
+                ..Default::default()
+            },
+            ipv6_prefix: Some(64),
+            ipv4_prefix: Some(32),
+            mtu: None,
+        };
+        for ims in [true, false] {
+            let ops = bearer_network_ops(&bearer, ims).unwrap();
+            assert_eq!(
+                ops.iter()
+                    .any(|op| matches!(op, NetConfigOp::ImsIpv6AddrReplace { .. })),
+                ims
+            );
+            assert!(ops.contains(&NetConfigOp::AddrReplace {
+                ifname: "wwan0".into(),
+                cidr: "192.0.2.1/32".into()
+            }));
+            let address = ops
+                .iter()
+                .position(|op| {
+                    matches!(
+                        op,
+                        NetConfigOp::AddrReplace { .. } | NetConfigOp::ImsIpv6AddrReplace { .. }
+                    )
+                })
+                .unwrap();
+            let barrier = ops
+                .iter()
+                .position(|op| matches!(op, NetConfigOp::AddrWaitReady { .. }))
+                .unwrap();
+            let route = ops
+                .iter()
+                .position(|op| matches!(op, NetConfigOp::RouteReplace { .. }))
+                .unwrap();
+            assert!(address < barrier && barrier < route);
+        }
+        let mut invalid = bearer;
+        invalid.settings.ipv6_gateway = Some("192.0.2.2".parse().unwrap());
+        assert!(bearer_network_ops(&invalid, true).is_err());
+        invalid.settings.ipv6_gateway = None;
+        invalid.settings.ipv6_address = Some("192.0.2.1".parse().unwrap());
+        assert!(worker_host_route_op(&invalid, "2001:db8::53".parse().unwrap()).is_err());
     }
 
     /// Maxis re-addresses the IMS PDN on every activation, so the source-based

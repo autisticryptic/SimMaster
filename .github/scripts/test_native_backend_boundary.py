@@ -74,6 +74,19 @@ class NativeBackendBoundaryTests(unittest.TestCase):
             self.assertIn("hardware::cellular::modem_manager::roaming_observation_tests \\", text)
             self.assertIn("services::messaging::sms_listener::tests \\", text)
             self.assertIn("http_router_tests::backend_selection_", text)
+            for group in ("services::ue_worker::tests", "services::ue_netcfg::tests",
+                          "connectivity::modems::ims::cellular_ims::identity::tests",
+                          "connectivity::modems::ims::cellular_ims::bearer::tests"):
+                self.assertIn(group, text)
+
+    def test_native_data_uses_the_original_worker_binding_and_checks_route_outcome(self):
+        text = (SRC / "hardware/cellular/backends/bearer.rs").read_text()
+        start = text[text.index("impl CellularDataTransport for NativeDataTransport"):text.index("#[cfg(test)]\nmod tests")]
+        self.assertIn("session.worker_binding()", start)
+        self.assertIn("configure_data_bearer_network_in_worker", start)
+        self.assertIn("apply_data_routes(binding", start)
+        helper = text[text.index("async fn apply_data_routes("):text.index("impl CellularDataTransport for NativeDataTransport")]
+        self.assertIn("if !outcome.ok", helper)
 
     def test_native_qmi_leases_precede_commands_and_do_not_reconnect_old_cids(self):
         text = (SRC / "hardware/cellular/backends/io.rs").read_text()

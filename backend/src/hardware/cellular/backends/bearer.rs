@@ -23,7 +23,8 @@ use super::{
 };
 use crate::{
     connectivity::modems::ims::cellular_ims::{
-        bearer::configure_bearer_network_in_worker, native_bearer,
+        bearer::{configure_data_bearer_network_in_worker, BearerConnection},
+        native_bearer, CellularImsError,
     },
     hardware::{
         cellular::qmi_wds,
@@ -34,7 +35,7 @@ use crate::{
         },
     },
     platform::config::ApnConfig,
-    services::ue_worker::worker_for_line,
+    services::ue_worker::{worker_for_line, NetConfigOp, UeWorkerBinding},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -557,7 +558,12 @@ fn parse_ip(address: &str, family: u8) -> Result<IpAddr, NativeError> {
     address
         .parse::<IpAddr>()
         .ok()
-        .filter(|a| !a.is_unspecified() && a.is_ipv4() == (family == 4))
+        .filter(|a| {
+            matches!(family, 4 | 6)
+                && !a.is_unspecified()
+                && !a.is_multicast()
+                && a.is_ipv4() == (family == 4)
+        })
         .ok_or_else(|| NativeError::Protocol("native_bearer_ip_invalid".into()))
 }
 
@@ -592,33 +598,60 @@ fn parse_mbim_ip_configuration(text: &str) -> Result<qmi_wds::CurrentSettings, N
         if let Some(gateway) = labelled(line, "Gateway") {
             addresses = false;
             dns = false;
+            if gateway == "0.0.0.0" || gateway == "::" || gateway.eq_ignore_ascii_case("none") {
+                continue;
+            }
+            let gateway = parse_ip(gateway, family)?.to_string();
             if family == 4 {
-                settings.ipv4_gateway = Some(gateway.into());
+                settings.ipv4_gateway = Some(gateway);
             } else if family == 6 {
-                settings.ipv6_gateway = Some(gateway.into());
+                settings.ipv6_gateway = Some(gateway);
             }
             continue;
         }
-        let Some((_, value)) = line.split_once(':') else {
+        let Some((label, value)) = line.split_once(':') else {
             continue;
         };
+        if !matches!(family, 4 | 6) {
+            continue;
+        }
         let value = value.trim().trim_matches('\'');
-        if addresses || line.starts_with("IP [") {
-            let Some((ip, prefix)) = value.split_once('/') else {
-                continue;
-            };
+        // Explicit labels take precedence over the preceding section header:
+        // some mbimcli releases omit "DNS addresses" before a DNS [n] field.
+        // Never let the old address-section flag swallow that DNS entry, or
+        // mistake an unrelated labelled field for an IP address.
+        let index_only = label.starts_with('[') && label.ends_with(']');
+        if label.starts_with("IP [") || (addresses && index_only) {
+            let (ip, prefix) = value.split_once('/').ok_or_else(|| {
+                NativeError::Protocol("native_mbim_address_prefix_missing".into())
+            })?;
+            let ip = parse_ip(ip, family)?.to_string();
+            let prefix = prefix
+                .parse::<u8>()
+                .ok()
+                .filter(|prefix| *prefix <= if family == 4 { 32 } else { 128 })
+                .ok_or_else(|| {
+                    NativeError::Protocol("native_mbim_address_prefix_invalid".into())
+                })?;
             if family == 4 && settings.ipv4_address.is_none() {
-                settings.ipv4_address = Some(ip.into());
-                settings.ipv4_prefix = prefix.parse::<u8>().ok().filter(|v| *v <= 32);
+                settings.ipv4_address = Some(ip);
+                settings.ipv4_prefix = Some(prefix);
             } else if family == 6 && settings.ipv6_address.is_none() {
-                settings.ipv6_address = Some(ip.into());
-                settings.ipv6_prefix = prefix.parse::<u8>().ok().filter(|v| *v <= 128);
+                settings.ipv6_address = Some(ip);
+                settings.ipv6_prefix = Some(prefix);
             }
-        } else if (dns || line.starts_with("DNS [")) && value.parse::<IpAddr>().is_ok() {
-            if family == 4 {
-                settings.ipv4_dns.push(value.into());
-            } else if family == 6 {
-                settings.ipv6_dns.push(value.into());
+        } else if label.starts_with("DNS [") || (dns && index_only) {
+            if value == "0.0.0.0" || value == "::" {
+                continue;
+            }
+            let value = parse_ip(value, family)?.to_string();
+            let servers = if family == 4 {
+                &mut settings.ipv4_dns
+            } else {
+                &mut settings.ipv6_dns
+            };
+            if !servers.contains(&value) {
+                servers.push(value);
             }
         }
     }
@@ -760,6 +793,64 @@ impl NativeDataTransport {
         })
     }
 }
+
+fn data_route_ops(bearer: &BearerConnection) -> Result<Vec<NetConfigOp>, CellularImsError> {
+    let mut routes = Vec::new();
+    for (address, gateway) in [
+        (bearer.settings.ipv4_address, bearer.settings.ipv4_gateway),
+        (bearer.settings.ipv6_address, bearer.settings.ipv6_gateway),
+    ] {
+        let Some(address) = address else { continue };
+        if let Some(gateway) = gateway {
+            if gateway.is_ipv6() != address.is_ipv6()
+                || gateway.is_unspecified()
+                || gateway.is_multicast()
+            {
+                return Err(CellularImsError::new("native_data_gateway_family_invalid"));
+            }
+            // Raw-IP gateways may be outside the assigned prefix. Declare the
+            // direct host route before the family-explicit default route.
+            routes.push(NetConfigOp::RouteReplace {
+                target: format!("{gateway}/{}", if gateway.is_ipv6() { 128 } else { 32 }),
+                via: None,
+                dev: Some(bearer.interface.clone()),
+                src: None,
+                table: None,
+                onlink: false,
+            });
+            routes.push(NetConfigOp::DefaultRouteReplace {
+                via: gateway.to_string(),
+                dev: bearer.interface.clone(),
+            });
+        } else {
+            routes.push(NetConfigOp::DefaultRouteDeviceReplace {
+                dev: bearer.interface.clone(),
+                ipv6: address.is_ipv6(),
+                metric: 50,
+            });
+        }
+    }
+    Ok(routes)
+}
+
+async fn apply_data_routes(
+    binding: &UeWorkerBinding,
+    routes: Vec<NetConfigOp>,
+) -> Result<(), CellularImsError> {
+    let outcome = binding.apply_net_config(routes).await.map_err(|error| {
+        CellularImsError::with_detail("native_data_ue_route_failed", error.to_string())
+    })?;
+    if !outcome.ok {
+        return Err(CellularImsError::with_detail(
+            "native_data_ue_route_failed",
+            outcome
+                .error
+                .unwrap_or_else(|| "worker net-config failed".into()),
+        ));
+    }
+    Ok(())
+}
+
 impl CellularDataTransport for NativeDataTransport {
     fn interface(&self) -> TransportFuture<'_, Option<String>> {
         Box::pin(async move {
@@ -815,31 +906,13 @@ impl CellularDataTransport for NativeDataTransport {
                 .map_err(|e| e.to_string())?;
             let result = async {
                 session.move_into_worker(worker.clone()).await?;
-                configure_bearer_network_in_worker(&session.connection,&worker).await?;
-                let mut routes = Vec::new();
-                for (address, gateway) in [
-                    (session.connection.settings.ipv4_address, session.connection.settings.ipv4_gateway),
-                    (session.connection.settings.ipv6_address, session.connection.settings.ipv6_gateway),
-                ] {
-                    if let Some(address) = address {
-                        if let Some(gateway) = gateway {
-                            routes.push(crate::services::ue_worker::NetConfigOp::RouteReplace {
-                                target: format!("{gateway}/{}", if gateway.is_ipv6() { 128 } else { 32 }),
-                                via: None,
-                                dev: Some(session.interface.clone()),
-                                src: None,
-                                table: None,
-                                onlink: false,
-                            });
-                            routes.push(crate::services::ue_worker::NetConfigOp::DefaultRouteReplace { via: gateway.to_string(), dev: session.interface.clone() });
-                        } else {
-                            routes.push(crate::services::ue_worker::NetConfigOp::DefaultRouteDeviceReplace { dev: session.interface.clone(), ipv6: address.is_ipv6(), metric: 50 });
-                        }
-                    }
-                }
-                worker.apply_net_config(routes).await.map_err(|e| crate::connectivity::modems::ims::cellular_ims::CellularImsError::with_detail("native_data_ue_route_failed",e.to_string()))?;
-                Ok::<_,crate::connectivity::modems::ims::cellular_ims::CellularImsError>(())
-            }.await;
+                let binding = session.worker_binding().ok_or_else(|| {
+                    CellularImsError::new("native_data_ue_worker_binding_missing")
+                })?;
+                configure_data_bearer_network_in_worker(&session.connection, binding).await?;
+                apply_data_routes(binding, data_route_ops(&session.connection)?).await
+            }
+            .await;
             if let Err(error) = result {
                 native_bearer::release_native_ims_bearer(session).await;
                 return Err(error.to_string());
@@ -865,6 +938,85 @@ impl CellularDataTransport for NativeDataTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mbim_parser_accepts_explicit_dns_labels_without_section_headers() {
+        let settings = parse_mbim_ip_configuration("IPv4 configuration available: 'address, dns'\nIP addresses (1)\nIP [0]: '192.0.2.9/30'\nDNS [0]: '192.0.2.53'\nDNS [1]: '192.0.2.53'\nIPv6 configuration available: 'address, gateway, dns'\nIP addresses (1)\nIP [0]: '2001:db8::9/64'\nDNS [0]: '2001:db8::53'\nGateway: '8000::500'").unwrap();
+        assert_eq!(settings.ipv4_dns, vec!["192.0.2.53"]);
+        assert_eq!(settings.ipv6_dns, vec!["2001:db8::53"]);
+        assert_eq!(settings.ipv6_gateway.as_deref(), Some("8000::500"));
+    }
+
+    #[test]
+    fn mbim_parser_rejects_cross_family_and_bad_prefix_settings() {
+        for field in [
+            "IP [0]: '192.0.2.1/129'",
+            "IP [0]: '2001:db8::1/129'",
+            "IP [0]: '2001:db8::1'",
+            "IP [0]: '::/64'",
+            "IP [0]: '2001:db8::1/64'\nGateway: '192.0.2.1'",
+            "IP [0]: '2001:db8::1/64'\nDNS [0]: '192.0.2.53'",
+        ] {
+            assert!(parse_mbim_ip_configuration(&format!(
+                "IPv6 configuration available: 'address'\n{field}"
+            ))
+            .is_err());
+        }
+        let settings = parse_mbim_ip_configuration(
+            "IPv6 configuration available: 'address'\nIP [0]: '2001:db8::1/64'\nGateway: '::'",
+        )
+        .unwrap();
+        assert_eq!(settings.ipv6_gateway, None);
+    }
+
+    #[test]
+    fn native_data_routes_require_matching_gateway_family() {
+        let mut info = ImsBearerInfo {
+            interface: "wwan0".into(),
+            ipv6_address: Some("2001:db8::1".parse().unwrap()),
+            ipv6_prefix: Some(64),
+            ..Default::default()
+        };
+        let direct = native_bearer::to_bearer_connection(&info).unwrap();
+        assert!(matches!(
+            data_route_ops(&direct).unwrap().as_slice(),
+            [NetConfigOp::DefaultRouteDeviceReplace { ipv6: true, .. }]
+        ));
+        info.ipv6_gateway = Some("8000::500".parse().unwrap());
+        let bearer = native_bearer::to_bearer_connection(&info).unwrap();
+        let ops = data_route_ops(&bearer).unwrap();
+        assert!(
+            matches!(&ops[0], NetConfigOp::RouteReplace { target, via: None, .. } if target == "8000::500/128")
+        );
+        assert!(
+            matches!(&ops[1], NetConfigOp::DefaultRouteReplace { via, .. } if via == "8000::500")
+        );
+        info.ipv6_gateway = Some("192.0.2.1".parse().unwrap());
+        assert!(data_route_ops(&native_bearer::to_bearer_connection(&info).unwrap()).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_data_does_not_report_success_when_worker_rejects_a_route() {
+        let worker = crate::services::ue_worker::UeWorkerHandle::for_line(
+            "fixture",
+            crate::platform::netns::NetnsName::for_line("sa-ue", "fixture"),
+        );
+        worker
+            .enable_test_net_config_outcome(Some("fixture route failure".into()))
+            .await;
+        let error = apply_data_routes(
+            &worker.bind(),
+            vec![NetConfigOp::DefaultRouteDeviceReplace {
+                dev: "wwan0".into(),
+                ipv6: true,
+                metric: 50,
+            }],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code(), "native_data_ue_route_failed");
+        assert!(error.to_string().contains("fixture route failure"));
+    }
 
     #[test]
     fn native_data_accepts_existing_dual_apn_default_without_guessing_unknown_values() {
